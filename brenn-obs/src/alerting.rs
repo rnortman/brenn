@@ -1177,11 +1177,11 @@ mod tests {
     fn context_multiple_fields_preserve_order() {
         let ctx = AlertContext::default()
             .with_field("Host", "chef")
-            .with_field("Instance", "/etc/brenn/pfin.toml")
+            .with_field("Instance", "/etc/brenn/pfin.brenn")
             .with_field("App", "pfin");
         assert_eq!(
             ctx.render(),
-            "Host: chef\nInstance: /etc/brenn/pfin.toml\nApp: pfin\n"
+            "Host: chef\nInstance: /etc/brenn/pfin.brenn\nApp: pfin\n"
         );
     }
 
@@ -1466,11 +1466,11 @@ mod tests {
         // With context, render_alert_body prepends it.
         let ctx = AlertContext::default()
             .with_field("Host", "chef")
-            .with_field("Instance", "/etc/brenn/prod.toml");
+            .with_field("Instance", "/etc/brenn/prod.brenn");
         let full_body = render_alert_body(&ctx, "thread panicked at main.rs:42");
         assert_eq!(
             full_body,
-            "Host: chef\nInstance: /etc/brenn/prod.toml\n\nthread panicked at main.rs:42"
+            "Host: chef\nInstance: /etc/brenn/prod.brenn\n\nthread panicked at main.rs:42"
         );
     }
 

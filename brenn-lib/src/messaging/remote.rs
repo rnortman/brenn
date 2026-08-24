@@ -83,15 +83,12 @@ pub enum RemoteGrant {
 /// Depths are plain integers rather than the `Depth` ladder: `"unbounded"` is
 /// not an answer a B7 network principal may be given, so the type does not
 /// offer it.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RemoteSubscribeAclRaw {
     /// `exact = "channel"` — matches this channel and no other.
-    #[serde(default)]
     pub exact: Option<String>,
     /// `prefix = "channel-prefix."` — matches every channel under this prefix.
     /// Must end at a segment boundary, as everywhere else.
-    #[serde(default)]
     pub prefix: Option<String>,
     /// Push-row depth ceiling for a matching subscription. `0` is legal and
     /// means pull-only: the remote reads through its cursor and no live copy is
@@ -108,10 +105,8 @@ pub struct RemoteSubscribeAclRaw {
 /// Declares an authenticated native daemon as an ACL-bounded bus participant.
 /// `grants` is required with no default, exactly as `[[surface]]` and
 /// `[[wasm_consumer]]`: the operator states intent, and deny-by-default reads
-/// straight off the config. `deny_unknown_fields` here and on the nested ACL
-/// entry closes the door on typos.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// straight off the config.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RemoteConfigRaw {
     /// Globally unique slug; becomes `remote:<slug>` as the participant
     /// identity and the attach registry key. Charset enforced at resolution:
@@ -123,37 +118,29 @@ pub struct RemoteConfigRaw {
     /// Transport rights for this remote (deny-by-default). Required — no default.
     pub grants: Vec<RemoteGrant>,
     /// Durable (`brenn:`) subscribe ACL — bare channel names, no scheme.
-    #[serde(default)]
     pub subscribe_acl: Vec<RemoteSubscribeAclRaw>,
     /// Ephemeral (`ephemeral:`) subscribe ACL — bare channel names, no scheme.
-    #[serde(default)]
     pub ephemeral_subscribe_acl: Vec<RemoteSubscribeAclRaw>,
     /// Durable (`brenn:`) publish ACL — bare channel names, no scheme. No
     /// depths: a publish target has no queue of the publisher's to size.
-    #[serde(default)]
     pub publish_acl: Vec<ChannelMatcherRaw>,
     /// Ephemeral (`ephemeral:`) publish ACL — bare channel names, no scheme.
-    #[serde(default)]
     pub ephemeral_publish_acl: Vec<ChannelMatcherRaw>,
     /// Per-connection publish burst (tokens). Absent =
     /// `DEFAULT_SURFACE_PUBLISH_BURST` — the same default and the same ceiling
     /// rule as a surface's, because it is the same bucket in front of the same
     /// bus gate.
-    #[serde(default)]
     pub publish_burst: Option<u32>,
     /// Per-connection sustained publish refill (tokens/sec). Absent =
     /// `DEFAULT_SURFACE_PUBLISH_PER_SEC`.
-    #[serde(default)]
     pub publish_per_sec: Option<u32>,
     /// Concurrent sessions admitted for this remote. Absent =
     /// [`DEFAULT_REMOTE_MAX_SESSIONS`]. `1` is the strict single-connection
     /// posture, at the price of up to one watchdog interval of lockout after a
     /// netsplit.
-    #[serde(default)]
     pub max_sessions: Option<u32>,
     /// Concurrent subscriptions admitted per session. Absent =
     /// [`DEFAULT_REMOTE_MAX_SUBSCRIPTIONS`].
-    #[serde(default)]
     pub max_subscriptions: Option<u32>,
 }
 
@@ -356,6 +343,8 @@ pub fn resolve_remotes(
 ) -> Vec<ResolvedRemote> {
     use std::collections::HashSet;
 
+    // TODO(config-syntax-in-operator-messages): the panics here, and in the
+    // per-remote validators below, name a `remote` in table notation.
     let mut seen: HashSet<&str> = HashSet::new();
     for r in raw_remotes {
         assert!(
@@ -594,6 +583,7 @@ fn load_remote_token(slug: &str, path: &std::path::Path) -> RemoteToken {
 mod tests {
     use super::*;
     use crate::access::AppCapability;
+    use crate::config::{remote_exact_ceiling, remote_fleet, remote_raw};
 
     fn write_token(contents: &str) -> tempfile::NamedTempFile {
         use std::io::Write as _;
@@ -607,39 +597,30 @@ mod tests {
         f
     }
 
-    /// Parse a `[[remote]]` block, substituting `TOKEN_FILE` in the TOML with a
-    /// freshly written 0600 token file so every test exercises the real load.
-    fn parse(toml_body: &str) -> (RemoteConfigRaw, tempfile::NamedTempFile) {
+    /// Caller must keep the returned `NamedTempFile` alive; dropping it
+    /// removes the token file before resolution can read it.
+    fn remote(slug: &str, grants: &[RemoteGrant]) -> (RemoteConfigRaw, tempfile::NamedTempFile) {
         let token = write_token("s3cret-token\n");
-        let body = toml_body.replace("TOKEN_FILE", &token.path().display().to_string());
-        let raw: RemoteConfigRaw = toml::from_str(&body).expect("[[remote]] block must parse");
+        let raw = remote_raw(slug, token.path(), grants);
         (raw, token)
     }
 
-    fn resolve_one(toml_body: &str) -> ResolvedRemote {
-        let (raw, _token) = parse(toml_body);
+    fn resolve_one(raw: RemoteConfigRaw) -> ResolvedRemote {
         let mut resolved = resolve_remotes(&[raw], &MessagingGlobalConfig::default());
         resolved.pop().expect("one resolved remote")
     }
 
-    const FLEET: &str = r#"
-slug = "pod-kitchen"
-token_file = "TOKEN_FILE"
-grants = ["subscribe", "publish", "ephemeral_subscribe", "ephemeral_publish", "alert"]
-subscribe_acl = [
-  { exact  = "chat.app.home.roster", push_depth = 1, retain_depth = 1 },
-  { prefix = "chat.app.home.out.",   push_depth = 8, retain_depth = 64 },
-]
-ephemeral_subscribe_acl = [
-  { prefix = "chat.app.home.stream.", push_depth = 32, retain_depth = 32 },
-]
-publish_acl           = [ { prefix = "chat.app.home.in." } ]
-ephemeral_publish_acl = [ { prefix = "chat.app.home.wake." } ]
-"#;
+    /// Caller must keep the returned `NamedTempFile` alive (same as `remote`).
+    fn fleet() -> (RemoteConfigRaw, tempfile::NamedTempFile) {
+        let token = write_token("s3cret-token\n");
+        let raw = remote_fleet(token.path());
+        (raw, token)
+    }
 
     #[test]
     fn the_fleet_driver_block_resolves() {
-        let remote = resolve_one(FLEET);
+        let (raw, _token) = fleet();
+        let remote = resolve_one(raw);
         assert_eq!(remote.slug, "pod-kitchen");
         assert!(remote.policy.has_grant(AppCapability::MessagingSubscribe));
         assert!(remote.policy.has_grant(AppCapability::MessagingPublish));
@@ -712,14 +693,9 @@ ephemeral_publish_acl = [ { prefix = "chat.app.home.wake." } ]
 
     #[test]
     fn push_depth_zero_is_a_legal_pull_only_ceiling() {
-        let remote = resolve_one(
-            r#"
-slug = "puller"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-subscribe_acl = [ { exact = "cold.archive", push_depth = 0, retain_depth = 512 } ]
-"#,
-        );
+        let (mut raw, _token) = remote("puller", &[RemoteGrant::Subscribe]);
+        raw.subscribe_acl = vec![remote_exact_ceiling("cold.archive", 0, 512)];
+        let remote = resolve_one(raw);
         assert_eq!(
             remote.durable_ceiling("cold.archive"),
             Some(RemoteDepths {
@@ -732,124 +708,132 @@ subscribe_acl = [ { exact = "cold.archive", push_depth = 0, retain_depth = 512 }
     #[test]
     #[should_panic(expected = "retain_depth = 0")]
     fn retain_depth_zero_is_rejected() {
-        resolve_one(
-            r#"
-slug = "no-retention"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-subscribe_acl = [ { exact = "a.b", push_depth = 1, retain_depth = 0 } ]
-"#,
-        );
+        let (mut raw, _token) = remote("no-retention", &[RemoteGrant::Subscribe]);
+        raw.subscribe_acl = vec![remote_exact_ceiling("a.b", 1, 0)];
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "sets both exact and prefix")]
     fn a_matcher_naming_both_kinds_is_rejected() {
-        resolve_one(
-            r#"
-slug = "ambiguous"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-subscribe_acl = [ { exact = "a.b", prefix = "a.", push_depth = 1, retain_depth = 1 } ]
-"#,
-        );
+        let (mut raw, _token) = remote("ambiguous", &[RemoteGrant::Subscribe]);
+        raw.subscribe_acl = vec![RemoteSubscribeAclRaw {
+            exact: Some("a.b".to_string()),
+            prefix: Some("a.".to_string()),
+            push_depth: 1,
+            retain_depth: 1,
+        }];
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "sets neither exact nor prefix")]
     fn a_matcher_naming_no_kind_is_rejected() {
-        resolve_one(
-            r#"
-slug = "empty-matcher"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-subscribe_acl = [ { push_depth = 1, retain_depth = 1 } ]
-"#,
-        );
+        let (mut raw, _token) = remote("empty-matcher", &[RemoteGrant::Subscribe]);
+        raw.subscribe_acl = vec![RemoteSubscribeAclRaw {
+            exact: None,
+            prefix: None,
+            push_depth: 1,
+            retain_depth: 1,
+        }];
+        resolve_one(raw);
     }
 
-    /// No silent default for what a network principal may hold.
+    /// No silent default for what a network principal may hold: a ceiling
+    /// written without its depths is refused where it is written.
     #[test]
     fn subscribe_depths_are_required() {
-        let err = toml::from_str::<RemoteConfigRaw>(
+        let refusal = crate::config::sole_refusal(
             r#"
-slug = "sloppy"
-token_file = "/dev/null"
-grants = ["subscribe"]
-subscribe_acl = [ { exact = "a.b" } ]
+remote sloppy {
+    token_file = "/home/alice/.secrets/sloppy.token";
+    grants = [subscribe];
+
+    acl subscribe [exact "brenn:a.b"];
+}
 "#,
-        )
-        .expect_err("missing depths must fail to parse");
+        );
+        let rendered = refusal.render();
         assert!(
-            err.to_string().contains("push_depth"),
-            "error should name the missing field: {err}"
+            rendered.contains("push_depth"),
+            "the refusal must name the missing ceiling: {rendered}"
         );
     }
 
+    /// A typo does not become a silently ignored key, at the remote's own attrs
+    /// or inside one of its ceilings.
     #[test]
-    fn unknown_fields_are_rejected() {
-        assert!(
-            toml::from_str::<RemoteConfigRaw>(
-                "slug = \"x\"\ntoken_file = \"/dev/null\"\ngrants = []\nmax_session = 1\n"
-            )
-            .is_err(),
-            "a typoed top-level key must not parse",
+    fn unknown_keys_are_refused() {
+        let attr = crate::config::sole_refusal(
+            r#"
+remote typo {
+    token_file = "/home/alice/.secrets/typo.token";
+    grants = [subscribe];
+    max_session = 1;
+
+    acl subscribe [exact "brenn:a.b" { push_depth = 1, retain_depth = 1 }];
+}
+"#,
         );
         assert!(
-            toml::from_str::<RemoteConfigRaw>(
-                "slug = \"x\"\ntoken_file = \"/dev/null\"\ngrants = [\"subscribe\"]\n\
-                 subscribe_acl = [ { exact = \"a\", push_depth = 1, retain_depth = 1, \
-                 noise = \"metered\" } ]\n"
-            )
-            .is_err(),
-            "a typoed ACL key must not parse",
+            attr.render().contains("max_session"),
+            "the refusal must name the typoed attr: {}",
+            attr.render()
+        );
+        let ceiling = crate::config::sole_refusal(
+            r#"
+remote typo {
+    token_file = "/home/alice/.secrets/typo.token";
+    grants = [subscribe];
+
+    acl subscribe [exact "brenn:a.b" { push_depth = 1, retain_depth = 1, noise = 3 }];
+}
+"#,
+        );
+        assert!(
+            ceiling.render().contains("noise"),
+            "the refusal must name the typoed ceiling key: {}",
+            ceiling.render()
         );
     }
 
     #[test]
     fn takeover_is_not_a_remote_grant() {
+        use serde::Deserialize as _;
+        use serde::de::value::StrDeserializer;
         assert!(
-            toml::from_str::<RemoteConfigRaw>(
-                "slug = \"x\"\ntoken_file = \"/dev/null\"\ngrants = [\"takeover\"]\n"
-            )
-            .is_err(),
+            RemoteGrant::deserialize(StrDeserializer::<serde::de::value::Error>::new("takeover"))
+                .is_err(),
+            "takeover must not deserialize as a remote grant",
+        );
+        assert_eq!(
+            RemoteGrant::deserialize(StrDeserializer::<serde::de::value::Error>::new(
+                "ephemeral_subscribe"
+            ))
+            .expect("a real grant word deserializes"),
+            RemoteGrant::EphemeralSubscribe,
         );
     }
 
     #[test]
     #[should_panic(expected = "grant Subscribe is authored but subscribe_acl is empty")]
     fn a_grant_without_its_acl_is_rejected() {
-        resolve_one(
-            r#"
-slug = "dead-grant"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-"#,
-        );
+        let (raw, _token) = remote("dead-grant", &[RemoteGrant::Subscribe]);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "publish_acl lists channels but the matching grant Publish")]
     fn an_acl_without_its_grant_is_rejected() {
-        resolve_one(
-            r#"
-slug = "orphan-acl"
-token_file = "TOKEN_FILE"
-grants = []
-publish_acl = [ { prefix = "a." } ]
-"#,
-        );
+        let (mut raw, _token) = remote("orphan-acl", &[]);
+        raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
+        resolve_one(raw);
     }
 
     #[test]
     fn alert_needs_no_acl() {
-        let remote = resolve_one(
-            r#"
-slug = "pager"
-token_file = "TOKEN_FILE"
-grants = ["alert"]
-"#,
-        );
+        let (raw, _token) = remote("pager", &[RemoteGrant::Alert]);
+        let remote = resolve_one(raw);
         assert!(remote.policy.has_grant(AppCapability::SurfaceAlert));
         assert!(remote.subscribe_ceilings.is_empty());
     }
@@ -857,134 +841,82 @@ grants = ["alert"]
     #[test]
     #[should_panic(expected = "must consist of RFC 3986 unreserved characters")]
     fn a_slug_with_a_participant_separator_is_rejected() {
-        resolve_one(
-            r#"
-slug = "pod#kitchen"
-token_file = "TOKEN_FILE"
-grants = ["alert"]
-"#,
-        );
+        let (raw, _token) = remote("pod#kitchen", &[RemoteGrant::Alert]);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "duplicate [[remote]] slug")]
     fn duplicate_slugs_are_rejected() {
-        let (raw, _token) = parse(
-            r#"
-slug = "twin"
-token_file = "TOKEN_FILE"
-grants = ["alert"]
-"#,
-        );
+        let (raw, _token) = remote("twin", &[RemoteGrant::Alert]);
         resolve_remotes(&[raw.clone(), raw], &MessagingGlobalConfig::default());
     }
 
     #[test]
     #[should_panic(expected = "publish_burst 1000 exceeds")]
     fn a_publish_burst_above_the_bus_gate_is_rejected() {
-        resolve_one(
-            r#"
-slug = "firehose"
-token_file = "TOKEN_FILE"
-grants = ["publish"]
-publish_acl = [ { prefix = "a." } ]
-publish_burst = 1000
-"#,
-        );
+        let (mut raw, _token) = remote("firehose", &[RemoteGrant::Publish]);
+        raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
+        raw.publish_burst = Some(1000);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "publish_per_sec 1000 exceeds")]
     fn a_publish_per_sec_above_the_bus_gate_is_rejected() {
-        resolve_one(
-            r#"
-slug = "firehose"
-token_file = "TOKEN_FILE"
-grants = ["publish"]
-publish_acl = [ { prefix = "a." } ]
-publish_per_sec = 1000
-"#,
-        );
+        let (mut raw, _token) = remote("firehose", &[RemoteGrant::Publish]);
+        raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
+        raw.publish_per_sec = Some(1000);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "publish_burst must be >= 1")]
     fn a_zero_publish_burst_is_rejected() {
-        resolve_one(
-            r#"
-slug = "mute"
-token_file = "TOKEN_FILE"
-grants = ["publish"]
-publish_acl = [ { prefix = "a." } ]
-publish_burst = 0
-"#,
-        );
+        let (mut raw, _token) = remote("mute", &[RemoteGrant::Publish]);
+        raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
+        raw.publish_burst = Some(0);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "publish_per_sec must be >= 1")]
     fn a_zero_publish_per_sec_is_rejected() {
-        resolve_one(
-            r#"
-slug = "mute"
-token_file = "TOKEN_FILE"
-grants = ["publish"]
-publish_acl = [ { prefix = "a." } ]
-publish_per_sec = 0
-"#,
-        );
+        let (mut raw, _token) = remote("mute", &[RemoteGrant::Publish]);
+        raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
+        raw.publish_per_sec = Some(0);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "max_sessions must be >= 1")]
     fn zero_sessions_is_rejected() {
-        resolve_one(
-            r#"
-slug = "never"
-token_file = "TOKEN_FILE"
-grants = ["alert"]
-max_sessions = 0
-"#,
-        );
+        let (mut raw, _token) = remote("never", &[RemoteGrant::Alert]);
+        raw.max_sessions = Some(0);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "max_subscriptions must be >= 1")]
     fn zero_subscriptions_is_rejected() {
-        resolve_one(
-            r#"
-slug = "deaf"
-token_file = "TOKEN_FILE"
-grants = ["alert"]
-max_subscriptions = 0
-"#,
-        );
+        let (mut raw, _token) = remote("deaf", &[RemoteGrant::Alert]);
+        raw.max_subscriptions = Some(0);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "slug must be non-empty")]
     fn an_empty_slug_is_rejected() {
-        resolve_one(
-            r#"
-slug = ""
-token_file = "TOKEN_FILE"
-grants = ["alert"]
-"#,
-        );
+        let (raw, _token) = remote("", &[RemoteGrant::Alert]);
+        resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "failed to read secret file")]
     fn a_missing_token_file_is_a_boot_panic() {
-        let raw: RemoteConfigRaw = toml::from_str(
-            r#"
-slug = "ghost"
-token_file = "/nonexistent/brenn/remote.token"
-grants = ["alert"]
-"#,
-        )
-        .unwrap();
-        resolve_remotes(&[raw], &MessagingGlobalConfig::default());
+        let (mut raw, _token) = remote("ghost", &[RemoteGrant::Alert]);
+        raw.token_file = PathBuf::from("/nonexistent/brenn/remote.token");
+        resolve_one(raw);
     }
 
     #[cfg(unix)]
@@ -992,25 +924,15 @@ grants = ["alert"]
     #[should_panic(expected = "group/world-accessible")]
     fn a_world_readable_token_file_is_a_boot_panic() {
         use std::os::unix::fs::PermissionsExt as _;
-        let token = write_token("s3cret-token\n");
+        let (raw, token) = remote("leaky", &[RemoteGrant::Alert]);
         std::fs::set_permissions(token.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
-        let raw: RemoteConfigRaw = toml::from_str(&format!(
-            "slug = \"leaky\"\ntoken_file = \"{}\"\ngrants = [\"alert\"]\n",
-            token.path().display(),
-        ))
-        .unwrap();
-        resolve_remotes(&[raw], &MessagingGlobalConfig::default());
+        resolve_one(raw);
     }
 
     #[test]
     fn the_token_verifies_and_never_renders() {
-        let remote = resolve_one(
-            r#"
-slug = "pager"
-token_file = "TOKEN_FILE"
-grants = ["alert"]
-"#,
-        );
+        let (raw, _token) = remote("pager", &[RemoteGrant::Alert]);
+        let remote = resolve_one(raw);
         assert!(remote.token.verify("s3cret-token"));
         assert!(!remote.token.verify("s3cret-toker"));
         assert!(!remote.token.verify("s3cret-token-longer"));

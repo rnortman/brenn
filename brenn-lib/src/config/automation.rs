@@ -1,14 +1,9 @@
 //! `[automation]` configuration section.
-//!
-//! Deserialized by `BrennConfig` and stored on `AutomationEngine`.
-
-use serde::Deserialize;
 
 /// Global automation defaults from the `[automation]` config section.
 ///
 /// All fields have sensible defaults; the section may be omitted.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AutomationGlobalConfig {
     /// Per-job cap on fires per hour. Fires beyond this are dropped and
     /// produce an error report. Default 60.
@@ -47,33 +42,5 @@ mod tests {
         assert_eq!(cfg.max_error_reports_per_hour_per_job, 3);
         assert_eq!(cfg.consecutive_failures_to_disable, 5);
         assert_eq!(cfg.max_jobs_per_app, 50);
-    }
-
-    #[test]
-    fn toml_deserialization_full() {
-        let toml = r#"
-max_fires_per_hour_per_job = 30
-max_error_reports_per_hour_per_job = 5
-consecutive_failures_to_disable = 10
-max_jobs_per_app = 20
-"#;
-        let cfg: AutomationGlobalConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.max_fires_per_hour_per_job, 30);
-        assert_eq!(cfg.max_error_reports_per_hour_per_job, 5);
-        assert_eq!(cfg.consecutive_failures_to_disable, 10);
-        assert_eq!(cfg.max_jobs_per_app, 20);
-    }
-
-    #[test]
-    fn toml_deserialization_empty_uses_defaults() {
-        let cfg: AutomationGlobalConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.max_fires_per_hour_per_job, 60);
-    }
-
-    #[test]
-    #[should_panic]
-    fn toml_deserialization_rejects_unknown_fields() {
-        let toml = r#"unknown_field = 42"#;
-        toml::from_str::<AutomationGlobalConfig>(toml).unwrap();
     }
 }

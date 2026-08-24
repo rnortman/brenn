@@ -704,11 +704,12 @@ pub mod alert {
 pub mod config {
     //! Operator config access.
     //!
-    //! **Requires grant:** `"config"` in `[[wasm_consumer]]` grants.
+    //! **Requires grant:** `"config"` in the consumer's `grants`.
     //!
-    //! The config map is fixed for the process lifetime (seeded from host TOML
-    //! at startup; changes require a host restart). Keys under the reserved
-    //! prefix `"brenn."` are host-injected facts; operator TOML cannot set them.
+    //! The config map is fixed for the process lifetime (seeded from the host
+    //! config at startup; changes require a host restart). Keys under the
+    //! reserved prefix `"brenn."` are host-injected facts; an operator config
+    //! cannot set them.
 
     use super::Error;
     use core::str::FromStr;

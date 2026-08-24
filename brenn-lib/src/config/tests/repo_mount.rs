@@ -7,40 +7,34 @@ use crate::integration::IntegrationRegistry;
 // -----------------------------------------------------------------------
 
 #[test]
-fn mount_config_parses_from_toml() {
+fn mount_config_loads_from_a_document() {
     let dir = tempfile::tempdir().unwrap();
     let app_dir = dir.path().join("myapp");
     std::fs::create_dir(&app_dir).unwrap();
 
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[repo_sync]
-repo_dir = "{}"
+repo_sync {{ repo_dir = "{}"; }}
 
-[[repo]]
-slug = "life"
-remote = "https://example.com/life.git"
+repo life {{ remote = "https://example.com/life.git"; }}
 
-[[repo]]
-slug = "tech"
-remote = "https://example.com/tech.git"
-auto_pull = false
+repo tech {{
+    remote = "https://example.com/tech.git";
+    auto_pull = false;
+}}
 
-[[app]]
-slug = "myapp"
-working_dir = "{}"
+agent Assistant() {{
+    working_dir = "{}";
 
-[[app.mount]]
-repo = "life"
+    mount life {{}}
+    mount tech {{ auto_pull = true; }}
+}}
 
-[[app.mount]]
-repo = "tech"
-auto_pull = true
+new myapp: Assistant();
 "#,
         dir.path().display(),
         app_dir.display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert_eq!(config.apps[0].mounts.len(), 2);
     assert_eq!(config.apps[0].mounts[0].repo, "life");
     assert_eq!(config.apps[0].mounts[1].repo, "tech");
@@ -51,35 +45,36 @@ auto_pull = true
     assert!(!config.repos[1].auto_pull);
 }
 
-/// `repo_dir` lives in `[repo_sync]`, not at the top level. `BrennConfig`
-/// carries `deny_unknown_fields`, so a config that still sets the old
-/// top-level key fails to parse instead of silently losing the value — the
-/// no-shim cutover signal this codebase uses for moved config keys.
+/// `repo_dir` lives in `repo_sync`, not at the top level. The top level takes
+/// no bare keys at all, so a document that still sets the old one is refused
+/// instead of silently losing the value — the no-shim cutover signal this
+/// codebase uses for moved config keys.
 #[test]
-fn top_level_repo_dir_is_rejected() {
-    let toml = r#"
-repo_dir = "/home/alice/repos"
+fn top_level_repo_dir_is_refused() {
+    let refusal = sole_refusal(
+        r#"
+repo_dir = "/home/alice/repos";
 
-[[repo]]
-slug = "life"
-remote = "https://example.com/life.git"
-"#;
-    let error = toml::from_str::<BrennConfig>(toml).expect_err("top-level repo_dir is unknown");
+repo life { remote = "https://example.com/life.git"; }
+"#,
+    )
+    .render();
     assert!(
-        error.to_string().contains("repo_dir"),
-        "the parse error names the offending key: {error}"
+        refusal.contains("line 2") && refusal.contains("repo_dir"),
+        "the refusal points at the offending line and quotes it: {refusal}"
     );
 }
 
-/// `repo_dir` parses inside `[repo_sync]`.
 #[test]
-fn repo_sync_repo_dir_parses() {
-    let toml = r#"
-[repo_sync]
-repo_dir = "/home/alice/repos"
-poll_interval_secs = 60
-"#;
-    let config: BrennConfig = toml::from_str(toml).unwrap();
+fn repo_sync_repo_dir_loads() {
+    let config = config_from_dsl(
+        r#"
+repo_sync {
+    repo_dir = "/home/alice/repos";
+    poll_interval_secs = 60;
+}
+"#,
+    );
     assert_eq!(
         config.repo_sync.repo_dir.as_deref(),
         Some(std::path::Path::new("/home/alice/repos"))

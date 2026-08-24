@@ -3,21 +3,24 @@ use crate::config::ResolvedConfig;
 use crate::integration::IntegrationRegistry;
 
 // -----------------------------------------------------------------------
-// App config parsing
+// App config loading
 // -----------------------------------------------------------------------
+//
+// An app has no slug of its own to omit: the slug is the `new` instance name,
+// so there is no document that states an app without one. That is why nothing
+// here tests a missing slug.
 
 #[test]
-fn app_config_parses_minimal() {
+fn app_config_loads_minimal() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
+agent Finance() {{ working_dir = "{}"; }}
+
+new pfin: Finance();
 "#,
         dir.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert_eq!(config.apps.len(), 1);
     assert_eq!(config.apps[0].slug, "pfin");
     assert!(config.apps[0].name.is_none());
@@ -28,22 +31,23 @@ working_dir = "{}"
 }
 
 #[test]
-fn app_config_parses_full() {
+fn app_config_loads_every_scalar_it_states() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "pfin"
-name = "Personal Finance"
-working_dir = "{}"
-model = "opus"
-single_instance = true
-allowed_users = ["alice", "bob"]
-disabled_tools = ["Edit", "Write"]
+agent Finance() {{
+    name = "Personal Finance";
+    working_dir = "{}";
+    model = "opus";
+    single_instance = true;
+    allowed_users = ["alice", "bob"];
+    disabled_tools = ["Edit", "Write"];
+}}
+
+new pfin: Finance();
 "#,
         dir.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert_eq!(config.apps[0].name.as_deref(), Some("Personal Finance"));
     assert_eq!(config.apps[0].model.as_deref(), Some("opus"));
     assert!(config.apps[0].single_instance);
@@ -51,80 +55,25 @@ disabled_tools = ["Edit", "Write"]
     assert_eq!(config.apps[0].disabled_tools, vec!["Edit", "Write"]);
 }
 
-/// Migration-forcing (access-control design §2.5.1 / §6.6 / §8 decision-2):
-/// a config that still sets the removed `[app.messaging].enabled` authorization
-/// boolean must FAIL to parse with a precise error naming the field — forcing the
-/// operator to migrate to the explicit `grants` surface rather than silently
-/// parsing into a deny-everything policy. End-to-end through the full `BrennConfig`
-/// TOML parse (not just the `MessagingConfigRaw` unit), so the property holds for
-/// real operator config (e.g. out-of-tree deployments).
 #[test]
-fn removed_messaging_enabled_field_fails_to_parse() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
-        r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
-
-[app.messaging]
-enabled = true
-"#,
-        dir.path().display()
-    );
-    let result: Result<BrennConfig, _> = toml::from_str(&toml);
-    let err = result.expect_err("removed [app.messaging].enabled must fail to parse");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("enabled"),
-        "error must name the offending `enabled` field; got: {err_str}"
-    );
-}
-
-/// Migration-forcing counterpart for the removed `[app.pwa_push].enabled`
-/// authorization boolean (access-control §2.5.1 / §6.6 / §8 decision-2).
-#[test]
-fn removed_pwa_push_enabled_field_fails_to_parse() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
-        r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
-
-[app.pwa_push]
-enabled = true
-"#,
-        dir.path().display()
-    );
-    let result: Result<BrennConfig, _> = toml::from_str(&toml);
-    let err = result.expect_err("removed [app.pwa_push].enabled must fail to parse");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("enabled"),
-        "error must name the offending `enabled` field; got: {err_str}"
-    );
-}
-
-#[test]
-fn multiple_apps_parse() {
+fn multiple_apps_load() {
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
+agent Finance() {{ working_dir = "{}"; }}
 
-[[app]]
-slug = "graf"
-working_dir = "{}"
-model = "opus"
+agent Notes() {{
+    working_dir = "{}";
+    model = "opus";
+}}
+
+new pfin: Finance();
+new graf: Notes();
 "#,
         dir1.path().display(),
         dir2.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert_eq!(config.apps.len(), 2);
     assert_eq!(config.apps[0].slug, "pfin");
     assert_eq!(config.apps[1].slug, "graf");
@@ -163,7 +112,7 @@ fn validate_preserves_declared_app_order() {
 
 /// `resolve_messaging_layer` populates `AppConfig::messaging` only
 /// for apps that have a `[app.messaging]` block. Apps without one
-/// keep `messaging: None` (review F23).
+/// keep `messaging: None`.
 #[test]
 fn validate_resolves_messaging_layer_for_apps_with_messaging_blocks() {
     let dir = tempfile::tempdir().unwrap();
@@ -221,43 +170,78 @@ fn validate_resolves_messaging_layer_for_apps_with_messaging_blocks() {
 }
 
 #[test]
-fn app_config_unknown_field_rejected() {
+fn app_config_stray_key_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let refusal = sole_refusal(&format!(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
-bogus = true
+agent Finance() {{
+    working_dir = "{}";
+    bogus = true;
+}}
+
+new pfin: Finance();
 "#,
         dir.path().display()
+    ))
+    .render();
+    assert!(
+        refusal.contains("bogus"),
+        "the stray key is named: {refusal}"
     );
-    assert!(toml::from_str::<BrennConfig>(&toml).is_err());
+}
+
+/// `enabled` is not an authorization boolean anywhere in the messaging
+/// vocabulary. Authority is the
+/// explicit `grants` surface, so a document reaching for the removed word is
+/// refused rather than lowered into a silent deny-everything policy.
+///
+/// Per-app messaging has no block of its own in the agent vocabulary — the
+/// subscriptions and the send budget are stated directly on the agent — so the
+/// word's absence is stated where it could otherwise land: the global
+/// `messaging` section, and an agent attr.
+#[test]
+fn removed_messaging_enabled_word_is_refused() {
+    let section = sole_refusal("messaging { enabled = true; }").render();
+    assert!(
+        section.contains("enabled"),
+        "the refusal names the removed word: {section}"
+    );
+
+    let attr = sole_refusal(
+        r#"
+agent Finance() { enabled = true; }
+
+new pfin: Finance();
+"#,
+    )
+    .render();
+    assert!(
+        attr.contains("enabled"),
+        "the refusal names the removed word: {attr}"
+    );
+}
+
+/// The counterpart for `pwa_push`: the per-app push authorization is a grant,
+/// and `enabled` is not a word the section admits.
+#[test]
+fn removed_pwa_push_enabled_word_is_refused() {
+    let refusal = sole_refusal("pwa_push { enabled = true; }").render();
+    assert!(
+        refusal.contains("enabled"),
+        "the refusal names the removed word: {refusal}"
+    );
 }
 
 #[test]
-fn app_config_missing_slug_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+fn app_config_missing_working_dir_loads_ok() {
+    // Loading does not validate working_dir; validate_and_resolve does.
+    let config = config_from_dsl(
         r#"
-[[app]]
-working_dir = "{}"
-"#,
-        dir.path().display()
-    );
-    assert!(toml::from_str::<BrennConfig>(&toml).is_err());
-}
+agent Finance() {}
 
-#[test]
-fn app_config_missing_working_dir_parses_ok() {
-    // working_dir is now Option<PathBuf> — missing is valid at parse time.
-    // Validation happens in validate_and_resolve (which checks that either
-    // working_dir or a mount with working_dir=true is present).
-    let toml = r#"
-[[app]]
-slug = "pfin"
-"#;
-    let config = toml::from_str::<BrennConfig>(toml).unwrap();
+new pfin: Finance();
+"#,
+    );
     assert!(config.apps[0].working_dir.is_none());
 }
 
@@ -292,27 +276,28 @@ fn validate_mcp_servers_carried_through() {
 }
 
 #[test]
-fn multi_app_mcp_servers_parsed_correctly() {
+fn multi_app_mcp_servers_load_per_app() {
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
+agent Finance() {{
+    working_dir = "{}";
 
-[app.mcp_servers.finance-tool]
-command = "python3"
-args = ["finance.py"]
+    mcp_server finance-tool {{
+        command = "python3";
+        args = ["finance.py"];
+    }}
+}}
 
-[[app]]
-slug = "graf"
-working_dir = "{}"
+agent Notes() {{ working_dir = "{}"; }}
+
+new pfin: Finance();
+new graf: Notes();
 "#,
         dir1.path().display(),
         dir2.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert_eq!(config.apps.len(), 2);
 
     // First app has the MCP server.
@@ -332,29 +317,33 @@ working_dir = "{}"
 fn multi_app_each_with_different_mcp_servers() {
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
+agent Finance() {{
+    working_dir = "{}";
 
-[app.mcp_servers.finance-tool]
-command = "python3"
-args = ["finance.py"]
+    mcp_server finance-tool {{
+        command = "python3";
+        args = ["finance.py"];
+    }}
+}}
 
-[[app]]
-slug = "graf"
-working_dir = "{}"
+agent Notes() {{
+    working_dir = "{}";
 
-[app.mcp_servers.graph-tool]
-command = "node"
-args = ["graph.js"]
-env = {{ DB_URL = "postgres://localhost/graf" }}
+    mcp_server graph-tool {{
+        command = "node";
+        args = ["graph.js"];
+        env = {{ DB_URL = "postgres://localhost/graf" }};
+    }}
+}}
+
+new pfin: Finance();
+new graf: Notes();
 "#,
         dir1.path().display(),
         dir2.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert_eq!(config.apps.len(), 2);
 
     // First app: finance-tool, no graph-tool.

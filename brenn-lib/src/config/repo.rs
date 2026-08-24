@@ -3,29 +3,24 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Top-level repo declaration from `[[repo]]`.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct RepoDeclRaw {
     /// URL-safe identifier (`[a-z0-9][a-z0-9-]*`). Globally unique across repos.
     pub slug: String,
     /// Git remote URL for cloning.
     pub remote: String,
     /// Default auto-pull for apps that mount this repo. Default: true.
-    #[serde(default = "default_true")]
     pub auto_pull: bool,
 }
 
 /// Per-app mount from `[[app.mount]]`.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct MountConfigRaw {
     /// Slug of a `[[repo]]` entry.
     pub repo: String,
     /// Access level for this mount. Default: read-write.
-    #[serde(default)]
     pub access: AccessLevel,
     /// If true, this repo is the app's working directory. At most one per app.
-    #[serde(default)]
     pub working_dir: bool,
     /// Override the repo's `auto_pull` default for this mount.
     pub auto_pull: Option<bool>,
@@ -37,11 +32,12 @@ pub struct MountConfigRaw {
     /// Required (exactly one) when the clone has >1 RW mount; optional
     /// (implicit) when the clone has exactly one RW mount; forbidden when
     /// the clone is RO-only. Resolved in `validate_and_resolve`.
-    #[serde(default)]
     pub primary: bool,
 }
 
 /// Access level for a repo mount.
+///
+/// `Serialize` is live — coupled to tool output in `brenn_tools::git`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccessLevel {
@@ -89,8 +85,7 @@ impl ResolvedMount {
 }
 
 /// Repo-sync feature config from `[repo_sync]`. See `docs/designs/repo-sync.md`.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepoSyncConfig {
     /// Where Brenn stores repo clones on the host. Required if any `[[repo]]`
     /// is defined. Resolved relative to cwd like other paths.

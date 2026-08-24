@@ -1,70 +1,373 @@
 //! Lowering a derived `.brenn` document to a [`BrennConfig`].
 //!
-//! The shape of every test here is the same equivalence claim: a `.brenn`
-//! document and the TOML that says the same thing must parse to the same
-//! `BrennConfig`. That is what makes the transcription checkable rather than a
-//! second specification — the assertion runs against what the runtime will
-//! actually see, and everything downstream of `load_config` is provenance-blind.
+//! The shape of every test here is the same claim: a `.brenn` document lowers to
+//! the `BrennConfig` written out beside it. The expected value is stated as a
+//! Rust literal, so the assertion runs against what the runtime will actually
+//! see — everything downstream of `load_config` is provenance-blind.
+//!
+//! Whole-struct equality is the default, and deliberately so: it is what catches
+//! a lowering arm setting a field the document never stated.
 
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
-use brenn_dsl::diag::Diagnostic;
+use brenn_dsl::diag::{Diagnostic, render_all};
+use brenn_surface_schema::LogLevel;
 
-use crate::config::BrennConfig;
-use crate::config::dsl_lower::lower;
+use crate::access::AppCapability;
+use crate::access::raw::{
+    AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
+};
+use crate::config::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
+use crate::config::app::AppConfigRaw;
+use crate::config::attachment::{
+    AttachmentHandlerConfig, AttachmentTargetRaw, default_timeout_secs,
+};
+use crate::config::automation::AutomationGlobalConfig;
+use crate::config::claude_defaults::ClaudeDefaultsConfig;
+use crate::config::container::{ContainerConfig, default_container_home};
+use crate::config::events::EventsConfig;
+use crate::config::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksConfig};
+use crate::config::llm_chat::LlmChatConfig;
+use crate::config::logging::{LevelFilter, LoggingConfig};
+use crate::config::mcp::McpServerConfig;
+use crate::config::observability::{ObservabilityConfig, UsageObservabilityConfig};
+use crate::config::repo::{AccessLevel, MountConfigRaw, RepoDeclRaw, RepoSyncConfig, default_true};
+use crate::config::security::SecurityConfig;
+use crate::config::server::{DatabaseConfig, ServerConfig};
+use crate::config::surface_description::SurfaceDescriptionConfig;
+use crate::config::wasm::WasmConfig;
+use crate::config::watchdog::WatchdogConfig;
+use crate::config::{BrennConfig, config_from_dsl, lower_document, sole_refusal};
+use crate::messaging::Urgency;
+use crate::messaging::WakeMin;
+use crate::messaging::config::{
+    ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
+    NoiseLevel, SendRate, Sink, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceGrant,
+    SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw,
+    WasmConsumerIoPortRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
+};
+use crate::messaging::remote::{RemoteConfigRaw, RemoteGrant, RemoteSubscribeAclRaw};
+use crate::mqtt::config::{
+    AppMqttIngressSubscriptionRaw, MqttClientConfigRaw, default_backoff_initial,
+    default_backoff_max, default_client_urgency, default_inbound_payload_cap,
+    default_subscription_qos, default_tls_version_min,
+};
+use crate::pwa_push::config::PwaPushGlobalConfig;
+use crate::webhook::config::{
+    AppWebhookSubscriptionRaw, ReplayProtectionConfigRaw, WebhookEndpointConfigRaw,
+    WebhookKeyConfigRaw, WebhookSignatureConfigRaw, WebhookTokenConfigRaw, default_content_type,
+    default_hmac_algorithm, default_transport_ceiling,
+};
 
-/// Compile a `.brenn` document from a tempdir and lower it.
-///
-/// `compile` takes a root file path — the root file's directory is the module
-/// root — so a document under test is written out rather than passed as text.
-fn lowered(document: &str) -> Result<BrennConfig, Vec<Diagnostic>> {
-    let dir = tempfile::tempdir().expect("a tempdir");
-    let root = dir.path().join("main.brenn");
-    std::fs::write(&root, document).expect("write the root module");
-    let config = brenn_dsl::compile(&root)
-        .unwrap_or_else(|errors| panic!("the document must compile:\n{}", render(&errors)));
-    lower(config)
-}
-
-/// Every diagnostic, one per line, for a panic message.
-fn render(diagnostics: &[Diagnostic]) -> String {
-    diagnostics
-        .iter()
-        .map(Diagnostic::render)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The document lowers, and equals the TOML that says the same thing.
-fn assert_equivalent(document: &str, toml: &str) {
-    let from_dsl = lowered(document)
-        .unwrap_or_else(|errors| panic!("the document must lower:\n{}", render(&errors)));
-    let from_toml: BrennConfig = toml::from_str(toml).expect("the TOML twin must parse");
-    assert_eq!(from_dsl, from_toml);
-}
-
-/// The TOML twin of a refused document is refused too, by serde, and for the
-/// same reason: `because` is a substring serde's own error must contain.
-///
-/// What locks a hand-carried table to serde as the source of truth: the DSL side
-/// and the TOML side must agree about *what* is wrong. Asserting only that the
-/// twin is refused would pass on any unrelated defect in the fixture, which is
-/// exactly the drift this helper exists to catch.
-fn assert_toml_refused(toml: &str, because: &str) {
-    let refused = toml::from_str::<BrennConfig>(toml);
-    let error = refused.expect_err("the TOML twin must be refused too");
-    let text = error.to_string();
-    assert!(
-        text.contains(because),
-        "serde must refuse the twin over `{because}`, and refused it over: {text}"
-    );
+/// The document lowers, and to exactly `expected`.
+fn assert_lowers(document: &str, expected: BrennConfig) {
+    assert_eq!(config_from_dsl(document), expected);
 }
 
 /// The one diagnostic the document produces.
 fn refusal(document: &str) -> Diagnostic {
-    let mut errors = lowered(document).expect_err("the document must be refused");
-    assert_eq!(errors.len(), 1, "one refusal:\n{}", render(&errors));
-    errors.pop().expect("one refusal")
+    sole_refusal(document)
+}
+
+/// Every diagnostic the document produces, for the few tests whose subject is
+/// more than one of them.
+fn refusals(document: &str) -> Vec<Diagnostic> {
+    lower_document(document).expect_err("the document must be refused")
+}
+
+/// A channel block's lowered form with nothing stated but its address: what the
+/// tests below start from and then fill in.
+fn channel_at(address: &str) -> ChannelConfigRaw {
+    ChannelConfigRaw {
+        uuid: None,
+        address: Some(address.to_string()),
+        address_prefix: None,
+        description: None,
+        push_depth: None,
+        retain_depth: None,
+        standing_retain_depth: None,
+        noise: None,
+        sink: None,
+        wake_min: None,
+        send_rate: None,
+    }
+}
+
+/// The same, for a tuning block keyed by an address prefix.
+fn channel_at_prefix(prefix: &str) -> ChannelConfigRaw {
+    ChannelConfigRaw {
+        address: None,
+        address_prefix: Some(prefix.to_string()),
+        ..channel_at("unused")
+    }
+}
+
+fn mqtt_client_at(slug: &str, url: &str) -> MqttClientConfigRaw {
+    MqttClientConfigRaw {
+        slug: slug.to_string(),
+        url: url.to_string(),
+        username: None,
+        password_file: None,
+        ca_file: None,
+        tls_version_min: default_tls_version_min(),
+        keepalive_secs: None,
+        inbound_payload_cap_bytes: default_inbound_payload_cap(),
+        last_will: None,
+        reconnect_backoff_initial_secs: default_backoff_initial(),
+        reconnect_backoff_max_secs: default_backoff_max(),
+        qos: default_subscription_qos(),
+        urgency: default_client_urgency(),
+        session_expiry_secs: 0,
+    }
+}
+
+fn alice_cmd_channel() -> ChannelConfigRaw {
+    ChannelConfigRaw {
+        uuid: Some("c88e5596-574b-53d1-9b55-6e612b8f3d49".to_string()),
+        push_depth: Some(Depth::Bounded(8)),
+        retain_depth: Some(Depth::Bounded(32)),
+        standing_retain_depth: Some(Depth::Bounded(64)),
+        ..channel_at("brenn:alice.cmd")
+    }
+}
+
+fn cmd_subscriber(subscribe: MessagingSubscriptionRaw) -> AppConfigRaw {
+    AppConfigRaw {
+        slug: "alice".to_string(),
+        grants: vec![AppCapability::MessagingSubscribe],
+        messaging: Some(MessagingConfigRaw {
+            subscribe: vec![subscribe],
+            send_budget: None,
+        }),
+        acl: AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Exact("alice.cmd".to_string())],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn bearer_token_endpoint(slug: &str) -> WebhookEndpointConfigRaw {
+    WebhookEndpointConfigRaw {
+        slug: slug.to_string(),
+        mount: Some(format!("/webhooks/{slug}")),
+        description: None,
+        transport_ceiling_bytes: default_transport_ceiling(),
+        content_type: default_content_type(),
+        signature: WebhookSignatureConfigRaw::BearerToken {
+            header: "authorization".to_string(),
+            token_id_header: None,
+        },
+        keys: vec![],
+        tokens: vec![WebhookTokenConfigRaw {
+            token_id: "phone".to_string(),
+            secret_file: PathBuf::from(format!("/home/alice/.secrets/{slug}.token")),
+        }],
+        replay_protection: None,
+        urgency: None,
+    }
+}
+
+fn consumer(slug: &str, component_path: &str) -> WasmConsumerConfigRaw {
+    WasmConsumerConfigRaw::minimal(slug, PathBuf::from(component_path), &[])
+}
+
+fn attrless_subscription(port: &str, channel: &str) -> WasmConsumerSubscriptionRaw {
+    WasmConsumerSubscriptionRaw {
+        port: port.to_string(),
+        channel: Some(channel.to_string()),
+        push_depth: None,
+        retain_depth: None,
+        noise: None,
+        wake_min: None,
+        amplification: None,
+    }
+}
+
+fn tick_io_port() -> WasmConsumerIoPortRaw {
+    WasmConsumerIoPortRaw {
+        port: "tick".to_string(),
+        channel: None,
+        push_depth: Some(Depth::Bounded(1)),
+        retain_depth: Some(Depth::Bounded(2)),
+        noise: None,
+        amplification: None,
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }
+}
+
+/// A surface block's lowered form with nothing stated but its wire slug and its
+/// grants: no ACL entry, no component, no binding, no ceiling.
+fn surface(slug: &str, grants: Vec<SurfaceGrant>) -> SurfaceConfigRaw {
+    SurfaceConfigRaw {
+        slug: slug.to_string(),
+        grants,
+        subscribe_acl: vec![],
+        publish_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        components: vec![],
+        subscriptions: vec![],
+        outputs: vec![],
+        io_ports: vec![],
+        skin: None,
+        allowed_users: vec![],
+        publish_burst: None,
+        publish_per_sec: None,
+    }
+}
+
+/// A `dom` component instance whose instance id is its kind — what a `new`
+/// handle that matches the class's lowercased name lowers to.
+fn dom_component(kind: &str) -> SurfaceComponentRaw {
+    SurfaceComponentRaw {
+        kind: kind.to_string(),
+        instance: Some(kind.to_string()),
+        abi: "dom".to_string(),
+        send_burst: None,
+        send_refill_secs: None,
+        parked_batch_depth: None,
+        chrome: false,
+        config: None,
+    }
+}
+
+/// An input binding stating nothing but the channel it reads and the port it
+/// feeds.
+fn surface_input(instance: &str, port: &str, channel: &str) -> SurfaceSubscriptionRaw {
+    SurfaceSubscriptionRaw {
+        channel: Some(channel.to_string()),
+        instance: instance.to_string(),
+        port: port.to_string(),
+        push_depth: None,
+        retain_depth: None,
+        noise: None,
+        wake_min: None,
+    }
+}
+
+/// An output binding stating nothing but the port and the channel it writes.
+fn surface_output(instance: &str, port: &str, channel: &str) -> SurfaceOutputRaw {
+    SurfaceOutputRaw {
+        instance: instance.to_string(),
+        port: port.to_string(),
+        channel: Some(channel.to_string()),
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }
+}
+
+/// An `io` port on the surface's own auto channel: no address, no attr.
+fn surface_io_port(instance: &str, port: &str) -> SurfaceIoPortRaw {
+    SurfaceIoPortRaw {
+        instance: instance.to_string(),
+        port: port.to_string(),
+        channel: None,
+        push_depth: None,
+        retain_depth: None,
+        noise: None,
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }
+}
+
+/// A remote block's lowered form with nothing stated but its slug and the token
+/// file it authenticates against.
+fn remote(slug: &str, token_file: &str) -> RemoteConfigRaw {
+    RemoteConfigRaw {
+        slug: slug.to_string(),
+        token_file: PathBuf::from(token_file),
+        grants: vec![],
+        subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
+        publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        publish_burst: None,
+        publish_per_sec: None,
+        max_sessions: None,
+        max_subscriptions: None,
+    }
+}
+
+/// An exact subscribe entry with both ceilings, which a remote's entries always
+/// carry.
+fn remote_exact(channel: &str, push_depth: u64, retain_depth: u64) -> RemoteSubscribeAclRaw {
+    RemoteSubscribeAclRaw {
+        exact: Some(channel.to_string()),
+        prefix: None,
+        push_depth,
+        retain_depth,
+    }
+}
+
+/// The same, keyed by prefix.
+fn remote_prefix(prefix: &str, push_depth: u64, retain_depth: u64) -> RemoteSubscribeAclRaw {
+    RemoteSubscribeAclRaw {
+        exact: None,
+        prefix: Some(prefix.to_string()),
+        push_depth,
+        retain_depth,
+    }
+}
+
+/// A webhook endpoint with no signature block yet: every optional attr absent
+/// and the two defaulted scalars at their defaults. The caller supplies the
+/// `signature` and whichever of `keys`/`tokens` its scheme reads.
+fn webhook_endpoint(slug: &str) -> WebhookEndpointConfigRaw {
+    WebhookEndpointConfigRaw {
+        slug: slug.to_string(),
+        mount: None,
+        description: None,
+        transport_ceiling_bytes: default_transport_ceiling(),
+        content_type: default_content_type(),
+        signature: WebhookSignatureConfigRaw::BearerToken {
+            header: "unused".to_string(),
+            token_id_header: None,
+        },
+        keys: vec![],
+        tokens: vec![],
+        replay_protection: None,
+        urgency: None,
+    }
+}
+
+fn webhook_key(key_id: &str, secret_file: &str) -> WebhookKeyConfigRaw {
+    WebhookKeyConfigRaw {
+        key_id: key_id.to_string(),
+        secret_file: PathBuf::from(secret_file),
+    }
+}
+
+fn webhook_token(token_id: &str, secret_file: &str) -> WebhookTokenConfigRaw {
+    WebhookTokenConfigRaw {
+        token_id: token_id.to_string(),
+        secret_file: PathBuf::from(secret_file),
+    }
+}
+
+/// A command handler with no `cc_instructions`, no file roles and the default
+/// timeout: the shape a minimal `handler` block lowers to.
+fn command_handler(program: &str, args: &[&str]) -> AttachmentHandlerConfig {
+    AttachmentHandlerConfig::Command {
+        program: program.to_string(),
+        args: args.iter().map(|arg| arg.to_string()).collect(),
+        file_roles: HashMap::new(),
+        timeout_secs: default_timeout_secs(),
+        cc_instructions: None,
+    }
+}
+
+/// A config whose only content is its channel blocks.
+fn config_with_channels(channels: Vec<ChannelConfigRaw>) -> BrennConfig {
+    BrennConfig {
+        channels,
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +381,7 @@ fn refusal(document: &str) -> Diagnostic {
 /// lowered config created depends on it.
 #[test]
 fn a_durable_channel_lowers_with_its_derived_uuid() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel alerts at "brenn:alice-alerts" {
     description = "Where alice's alerts land.";
@@ -91,19 +394,22 @@ channel alerts at "brenn:alice-alerts" {
     send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 };
 }
 "#,
-        r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "brenn:alice-alerts"
-description = "Where alice's alerts land."
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = "unbounded"
-noise = "metered"
-sink = "archive"
-wake_min = "low"
-send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 }
-"#,
+        config_with_channels(vec![ChannelConfigRaw {
+            uuid: Some("85a5cf7e-6874-5766-9d69-712784754a1f".to_string()),
+            description: Some("Where alice's alerts land.".to_string()),
+            push_depth: Some(Depth::Bounded(8)),
+            retain_depth: Some(Depth::Bounded(128)),
+            standing_retain_depth: Some(Depth::Unbounded),
+            noise: Some(NoiseLevel::Metered),
+            sink: Some(Sink::Archive),
+            wake_min: Some(WakeMin::Low),
+            send_rate: Some(SendRate {
+                burst: 4,
+                refill_interval_secs: 60,
+                refill: 2,
+            }),
+            ..channel_at("brenn:alice-alerts")
+        }]),
     );
 }
 
@@ -111,40 +417,38 @@ send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 }
 /// one from its address — and states only the two depths it has.
 #[test]
 fn an_ephemeral_channel_lowers_without_a_uuid() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel presence at "ephemeral:alice-desk.presence" {
     push_depth = 4;
     retain_depth = 16;
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-desk.presence"
-push_depth = 4
-retain_depth = 16
-"#,
+        config_with_channels(vec![ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: Some(Depth::Bounded(16)),
+            ..channel_at("ephemeral:alice-desk.presence")
+        }]),
     );
 }
 
-/// The minimal body: every optional attr omitted on the DSL side, every
-/// defaulted key omitted on the TOML side. This is the defaults-parity lock —
-/// an omitted key must get exactly what serde would have given it.
+/// The minimal body: every optional attr omitted. An omitted attr must stay
+/// `None` in the lowered block — inheriting from the global defaults is the
+/// runtime's job, not lowering's.
 #[test]
-fn a_local_channel_with_a_minimal_body_matches_serde_defaults() {
-    assert_equivalent(
+fn a_local_channel_with_a_minimal_body_states_only_its_depths() {
+    assert_lowers(
         r#"
 channel scratch at "local:alice-scratch" {
     push_depth = 1;
     retain_depth = 1;
 }
 "#,
-        r#"
-[[channel]]
-address = "local:alice-scratch"
-push_depth = 1
-retain_depth = 1
-"#,
+        config_with_channels(vec![ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(1)),
+            retain_depth: Some(Depth::Bounded(1)),
+            ..channel_at("local:alice-scratch")
+        }]),
     );
 }
 
@@ -152,7 +456,7 @@ retain_depth = 1
 /// mints at it; it is not a declaration, so it carries no uuid.
 #[test]
 fn a_tuning_at_an_address_lowers_to_an_address_keyed_entry() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel at "brenn:tool-results/alice" {
     push_depth = 2;
@@ -160,13 +464,12 @@ channel at "brenn:tool-results/alice" {
     standing_retain_depth = 32;
 }
 "#,
-        r#"
-[[channel]]
-address = "brenn:tool-results/alice"
-push_depth = 2
-retain_depth = 32
-standing_retain_depth = 32
-"#,
+        config_with_channels(vec![ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(2)),
+            retain_depth: Some(Depth::Bounded(32)),
+            standing_retain_depth: Some(Depth::Bounded(32)),
+            ..channel_at("brenn:tool-results/alice")
+        }]),
     );
 }
 
@@ -174,7 +477,7 @@ standing_retain_depth = 32
 /// channels, and lands in `address_prefix` rather than `address`.
 #[test]
 fn a_tuning_at_a_prefix_lowers_to_a_prefix_keyed_entry() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel at prefix "brenn:tool-results/" {
     push_depth = 2;
@@ -182,13 +485,12 @@ channel at prefix "brenn:tool-results/" {
     standing_retain_depth = 32;
 }
 "#,
-        r#"
-[[channel]]
-address_prefix = "brenn:tool-results/"
-push_depth = 2
-retain_depth = 32
-standing_retain_depth = 32
-"#,
+        config_with_channels(vec![ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(2)),
+            retain_depth: Some(Depth::Bounded(32)),
+            standing_retain_depth: Some(Depth::Bounded(32)),
+            ..channel_at_prefix("brenn:tool-results/")
+        }]),
     );
 }
 
@@ -256,8 +558,8 @@ channel presence at "ephemeral:alice-desk.presence" {
 }
 
 /// `send_rate` is a table with no vocabulary behind it, so its keys are matched
-/// by hand — and a stray key is refused at its own token, which is the typo
-/// protection `deny_unknown_fields` gives the TOML path, relocated.
+/// by hand — and a stray key is refused at its own token, so a typo inside the
+/// table is caught where it was written.
 #[test]
 fn a_stray_send_rate_key_is_refused_with_the_legal_set() {
     let refusal = refusal(
@@ -275,12 +577,11 @@ channel presence at "ephemeral:alice-desk.presence" {
     assert!(message.contains("`burst`"), "{message}");
 }
 
-/// A `send_rate` that states only some of its keys gets serde's own defaults
-/// for the rest, from the same `SendRate::default()` its `#[serde(default)]`
-/// reads.
+/// A `send_rate` that states only some of its keys gets `SendRate::default()`
+/// for the rest.
 #[test]
 fn a_partial_send_rate_table_keeps_the_defaults_for_the_rest() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel presence at "ephemeral:alice-desk.presence" {
     push_depth = 1;
@@ -288,13 +589,15 @@ channel presence at "ephemeral:alice-desk.presence" {
     send_rate = { burst = 4 };
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-desk.presence"
-push_depth = 1
-retain_depth = 1
-send_rate = { burst = 4 }
-"#,
+        config_with_channels(vec![ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(1)),
+            retain_depth: Some(Depth::Bounded(1)),
+            send_rate: Some(SendRate {
+                burst: 4,
+                ..SendRate::default()
+            }),
+            ..channel_at("ephemeral:alice-desk.presence")
+        }]),
     );
 }
 
@@ -302,7 +605,7 @@ send_rate = { burst = 4 }
 /// accumulates and fails at the end.
 #[test]
 fn every_bad_value_in_a_document_is_reported() {
-    let errors = lowered(
+    let errors = refusals(
         r#"
 channel presence at "ephemeral:alice-desk.presence" {
     push_depth = -1;
@@ -310,8 +613,7 @@ channel presence at "ephemeral:alice-desk.presence" {
     noise = loud;
 }
 "#,
-    )
-    .expect_err("the document must be refused");
+    );
     // The identity of the three refusals is the substance; a count alone would
     // pass on one refusal reported three times.
     let mut keys: Vec<&str> = errors
@@ -328,7 +630,7 @@ channel presence at "ephemeral:alice-desk.presence" {
         keys,
         ["noise", "push_depth", "retain_depth"],
         "{}",
-        render(&errors)
+        render_all(&errors)
     );
 }
 
@@ -338,14 +640,7 @@ channel presence at "ephemeral:alice-desk.presence" {
 /// the wrong thing.
 #[test]
 fn an_empty_document_lowers_to_the_default_config() {
-    let dir = tempfile::tempdir().expect("a tempdir");
-    let root = dir.path().join("main.brenn");
-    std::fs::write(&root, "").expect("write the root module");
-    let config = brenn_dsl::compile(Path::new(&root)).expect("an empty document compiles");
-    assert_eq!(
-        lower(config).expect("an empty document lowers"),
-        BrennConfig::default()
-    );
+    assert_eq!(config_from_dsl(""), BrennConfig::default());
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +651,7 @@ fn an_empty_document_lowers_to_the_default_config() {
 /// default so a lowering line that dropped its value could not pass.
 #[test]
 fn every_section_lowers_with_every_key_stated() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 server {
     bind_address = "127.0.0.1:3100";
@@ -469,114 +764,132 @@ container cc {
     extra_args = ["--pids-limit", "512"];
 }
 "#,
-        r#"
-[server]
-bind_address = "127.0.0.1:3100"
-static_dir = "/opt/brenn/frontend/dist"
-surface_dist_dir = "/opt/brenn/surface/dist"
-secure_cookies = false
-trusted_proxy_hops = 1
-pid_file = "/run/brenn/brenn.pid"
-public_url = "https://brenn.example.com"
-
-[database]
-path = "/var/lib/brenn/alice.db"
-
-[logging]
-log_dir = "/var/log/brenn"
-console_level = "info"
-file_level = "trace"
-
-[security]
-auth_rate_interval_secs = 7
-auth_rate_burst = 11
-global_rate_interval_secs = 2
-global_rate_burst = 101
-asset_rate_interval_secs = 3
-asset_rate_burst = 2001
-auth_body_limit = 4097
-global_body_limit = 1048577
-upload_body_limit = 26214401
-max_image_long_edge = 2577
-
-[alerting]
-max_alerts = 11
-window_secs = 3601
-ntfy = { url = "https://ntfy.example.com/alice-alerts" }
-mail = { to = "alice@example.com", subject_label = "Alice's Brenn" }
-
-[claude_defaults]
-mcp_script_path = "/opt/brenn/alice_mcp.py"
-model = "opus"
-
-[repo_sync]
-repo_dir = "/home/alice/repos"
-poll_interval_secs = 301
-stale_conversation_days = 8
-
-[messaging]
-default_send_budget = 101
-max_body_bytes = 65537
-default_noise = "metered"
-default_sink = "archive"
-default_wake_min = "high"
-default_send_rate = { burst = 5, refill_interval_secs = 61, refill = 3 }
-archive_path = "/var/lib/brenn/archive"
-
-[observability]
-surface_error_channel = "brenn:alice-surface-errors"
-surface_error_publish_floor = "error"
-usage = { session_gap_minutes = 45 }
-
-[surface_description]
-prefix = "alice-surface"
-status_interval_secs = 61
-
-[llm_chat]
-prefix = "alice-chat"
-retained_window = 1001
-wake_min = "low"
-idle_timeout_secs = 301
-
-[pwa_push]
-keypair_file = "/var/lib/brenn/vapid.json"
-subject = "mailto:alice@example.com"
-endpoint_host_allowlist = ["push.example.com", "push.example.org"]
-endpoint_host_allowlist_enforce = false
-
-[automation]
-max_fires_per_hour_per_job = 61
-max_error_reports_per_hour_per_job = 4
-consecutive_failures_to_disable = 6
-max_jobs_per_app = 51
-
-[events]
-delivered_retention_days = 8
-
-[wasm]
-store_size_limit = "128MiB"
-
-[watchdog]
-sweep_interval_secs = 31
-wedge_grace_secs = 61
-
-[container.cc]
-image = "brenn-cc:latest"
-home_dir = "/home/alice/container-home"
-container_home = "/home/bob"
-extra_mounts = ["/srv/shared:/srv/shared"]
-extra_args = ["--pids-limit", "512"]
-"#,
+        BrennConfig {
+            server: ServerConfig {
+                bind_address: "127.0.0.1:3100".parse().expect("a socket address"),
+                static_dir: PathBuf::from("/opt/brenn/frontend/dist"),
+                surface_dist_dir: PathBuf::from("/opt/brenn/surface/dist"),
+                secure_cookies: false,
+                trusted_proxy_hops: 1,
+                pid_file: Some(PathBuf::from("/run/brenn/brenn.pid")),
+                public_url: Some("https://brenn.example.com".to_string()),
+            },
+            database: DatabaseConfig {
+                path: PathBuf::from("/var/lib/brenn/alice.db"),
+            },
+            logging: LoggingConfig {
+                log_dir: PathBuf::from("/var/log/brenn"),
+                console_level: LevelFilter::INFO,
+                file_level: LevelFilter::TRACE,
+            },
+            security: SecurityConfig {
+                auth_rate_interval_secs: 7,
+                auth_rate_burst: 11,
+                global_rate_interval_secs: 2,
+                global_rate_burst: 101,
+                asset_rate_interval_secs: 3,
+                asset_rate_burst: 2001,
+                auth_body_limit: 4097,
+                global_body_limit: 1048577,
+                upload_body_limit: 26214401,
+                max_image_long_edge: 2577,
+            },
+            alerting: Some(AlertingConfig {
+                max_alerts: 11,
+                window_secs: 3601,
+                ntfy: Some(NtfyConfig {
+                    url: "https://ntfy.example.com/alice-alerts".to_string(),
+                }),
+                mail: Some(MailConfig {
+                    to: "alice@example.com".to_string(),
+                    subject_label: "Alice's Brenn".to_string(),
+                }),
+            }),
+            claude_defaults: ClaudeDefaultsConfig {
+                mcp_script_path: PathBuf::from("/opt/brenn/alice_mcp.py"),
+                model: "opus".to_string(),
+            },
+            repo_sync: RepoSyncConfig {
+                repo_dir: Some(PathBuf::from("/home/alice/repos")),
+                poll_interval_secs: 301,
+                stale_conversation_days: 8,
+            },
+            messaging: MessagingGlobalConfig {
+                default_send_budget: 101,
+                max_body_bytes: 65537,
+                default_noise: NoiseLevel::Metered,
+                default_sink: Sink::Archive,
+                default_wake_min: WakeMin::High,
+                default_send_rate: SendRate {
+                    burst: 5,
+                    refill_interval_secs: 61,
+                    refill: 3,
+                },
+                archive_path: Some(PathBuf::from("/var/lib/brenn/archive")),
+            },
+            observability: ObservabilityConfig {
+                usage: UsageObservabilityConfig {
+                    session_gap_minutes: 45,
+                },
+                surface_error_channel: Some("brenn:alice-surface-errors".to_string()),
+                surface_error_publish_floor: LogLevel::Error,
+            },
+            surface_description: SurfaceDescriptionConfig {
+                prefix: "alice-surface".to_string(),
+                status_interval_secs: 61,
+            },
+            llm_chat: LlmChatConfig {
+                prefix: "alice-chat".to_string(),
+                retained_window: 1001,
+                wake_min: WakeMin::Low,
+                idle_timeout_secs: 301,
+            },
+            pwa_push: PwaPushGlobalConfig {
+                keypair_file: Some(PathBuf::from("/var/lib/brenn/vapid.json")),
+                subject: Some("mailto:alice@example.com".to_string()),
+                endpoint_host_allowlist: vec![
+                    "push.example.com".to_string(),
+                    "push.example.org".to_string(),
+                ],
+                endpoint_host_allowlist_enforce: false,
+            },
+            automation: AutomationGlobalConfig {
+                max_fires_per_hour_per_job: 61,
+                max_error_reports_per_hour_per_job: 4,
+                consecutive_failures_to_disable: 6,
+                max_jobs_per_app: 51,
+            },
+            events: EventsConfig {
+                delivered_retention_days: 8,
+            },
+            wasm: WasmConfig {
+                store_size_limit: "128MiB".to_string(),
+            },
+            watchdog: WatchdogConfig {
+                sweep_interval_secs: 31,
+                wedge_grace_secs: 61,
+            },
+            container: HashMap::from([(
+                "cc".to_string(),
+                ContainerConfig {
+                    image: "brenn-cc:latest".to_string(),
+                    home_dir: PathBuf::from("/home/alice/container-home"),
+                    container_home: PathBuf::from("/home/bob"),
+                    extra_mounts: vec!["/srv/shared:/srv/shared".to_string()],
+                    extra_args: vec!["--pids-limit".to_string(), "512".to_string()],
+                },
+            )]),
+            ..Default::default()
+        },
     );
 }
 
 /// The minimal body of every section that has one: only the keys the target
-/// requires. What the omitted keys get must be what serde gives them, which is
-/// what pins lowering to the default functions rather than to restated
-/// literals.
+/// requires. What the omitted keys get must be the target's own `Default`, which
+/// is what pins lowering to the default impls rather than to restated literals.
 #[test]
-fn minimal_sections_take_the_defaults_serde_would_give() {
-    assert_equivalent(
+fn minimal_sections_take_their_targets_defaults() {
+    assert_lowers(
         r#"
 server { public_url = "https://brenn.example.com"; }
 alerting {
@@ -591,25 +904,86 @@ container cc {
     home_dir = "/home/alice/container-home";
 }
 "#,
+        BrennConfig {
+            server: ServerConfig {
+                public_url: Some("https://brenn.example.com".to_string()),
+                ..Default::default()
+            },
+            alerting: Some(AlertingConfig {
+                max_alerts: 5,
+                window_secs: 60,
+                ntfy: None,
+                mail: Some(MailConfig {
+                    to: "alice@example.com".to_string(),
+                    subject_label: default_subject_label(),
+                }),
+            }),
+            observability: ObservabilityConfig {
+                surface_error_channel: Some("brenn:alice-surface-errors".to_string()),
+                ..Default::default()
+            },
+            pwa_push: PwaPushGlobalConfig {
+                subject: Some("mailto:alice@example.com".to_string()),
+                ..Default::default()
+            },
+            container: HashMap::from([(
+                "cc".to_string(),
+                ContainerConfig {
+                    image: "brenn-cc:latest".to_string(),
+                    home_dir: PathBuf::from("/home/alice/container-home"),
+                    container_home: default_container_home(),
+                    extra_mounts: vec![],
+                    extra_args: vec![],
+                },
+            )]),
+            ..Default::default()
+        },
+    );
+}
+
+/// A section that states a subset of its keys keeps the module's defaults for
+/// the rest — the shape an operator actually writes, between the empty document
+/// and the every-key row above.
+///
+/// The allowlist arm is security-relevant: an operator who states only the
+/// keypair and subject must still get the default enforcement against the three
+/// vendor hosts.
+#[test]
+fn a_partial_pwa_push_section_keeps_the_default_endpoint_allowlist() {
+    let config = config_from_dsl(
         r#"
-[server]
-public_url = "https://brenn.example.com"
-
-[alerting]
-max_alerts = 5
-window_secs = 60
-mail = { to = "alice@example.com" }
-
-[observability]
-surface_error_channel = "brenn:alice-surface-errors"
-
-[pwa_push]
-subject = "mailto:alice@example.com"
-
-[container.cc]
-image = "brenn-cc:latest"
-home_dir = "/home/alice/container-home"
+pwa_push {
+    keypair_file = "/var/lib/brenn/vapid.json";
+    subject = "mailto:alice@example.com";
+}
 "#,
+    );
+    assert_eq!(
+        config.pwa_push,
+        PwaPushGlobalConfig {
+            keypair_file: Some(PathBuf::from("/var/lib/brenn/vapid.json")),
+            subject: Some("mailto:alice@example.com".to_string()),
+            endpoint_host_allowlist: vec![
+                "fcm.googleapis.com".to_string(),
+                "updates.push.services.mozilla.com".to_string(),
+                "web.push.apple.com".to_string(),
+            ],
+            endpoint_host_allowlist_enforce: true,
+        }
+    );
+}
+
+/// The same property on a section whose keys are both plain scalars: the key the
+/// document does not state keeps the module's default, not the type's.
+#[test]
+fn a_partial_watchdog_section_keeps_the_defaults_for_the_rest() {
+    let config = config_from_dsl("watchdog { sweep_interval_secs = 10; }");
+    assert_eq!(
+        config.watchdog,
+        WatchdogConfig {
+            sweep_interval_secs: 10,
+            wedge_grace_secs: 60,
+        }
     );
 }
 
@@ -667,8 +1041,34 @@ fn every_configuration_section_kindword_lowers() {
         .iter()
         .map(|(_, section)| format!("{section}\n"))
         .collect();
-    lowered(&document)
-        .unwrap_or_else(|errors| panic!("every section must lower:\n{}", render(&errors)));
+    config_from_dsl(&document);
+}
+
+/// Every row above whose body is empty — the sections with no required key —
+/// states nothing at all, so a document of just those rows must lower to the
+/// default config.
+///
+/// This is what keeps the table a coverage gate rather than a panic check: a
+/// section arm that invents a value it was never given, or reaches for the
+/// type's `Default` instead of the module's, differs from the default config
+/// here.
+#[test]
+fn the_empty_bodied_configuration_sections_lower_to_the_defaults() {
+    let empty_bodied: Vec<&str> = MINIMAL_SECTIONS
+        .iter()
+        .map(|(_, section)| *section)
+        .filter(|section| section.ends_with("{ }"))
+        .collect();
+    assert_eq!(
+        empty_bodied.len(),
+        14,
+        "empty-bodied rows: {empty_bodied:?}"
+    );
+    let document: String = empty_bodied
+        .iter()
+        .map(|section| format!("{section}\n"))
+        .collect();
+    assert_eq!(config_from_dsl(&document), BrennConfig::default());
 }
 
 /// A minimal document per sub-block kindword, in the parent that admits it.
@@ -788,8 +1188,7 @@ fn every_sub_block_kindword_lowers() {
             "every sub-block kindword needs a row above, and a lowering arm"
         );
         for (kindword, document, carried) in table {
-            let config = lowered(document)
-                .unwrap_or_else(|errors| panic!("`{kindword}` must lower:\n{}", render(&errors)));
+            let config = config_from_dsl(document);
             assert!(
                 carried(&config),
                 "`{kindword}` lowered to nothing: its arm read the block and dropped it"
@@ -822,8 +1221,8 @@ fn a_bad_section_token_names_the_legal_spellings() {
     assert_eq!(diagnostic.span.text_str(), Some("loud"));
 }
 
-/// A log level goes through the config's own `deserialize_with`, so the DSL
-/// path refuses exactly what the TOML path refuses.
+/// A log level goes through the config module's own level parser, so lowering
+/// refuses exactly what that parser refuses.
 #[test]
 fn a_bad_log_level_is_refused_by_the_configs_own_parser() {
     let diagnostic = refusal("logging { console_level = chatty; }");
@@ -833,6 +1232,32 @@ fn a_bad_log_level_is_refused_by_the_configs_own_parser() {
         diagnostic.render()
     );
     assert_eq!(diagnostic.span.text_str(), Some("chatty"));
+}
+
+/// Every level word an operator can write, and the case-insensitivity of the
+/// spelling. `off` is the one that silences a plane outright, and it is the
+/// reason this row enumerates instead of sampling.
+#[test]
+fn every_log_level_word_lowers_to_its_filter() {
+    for (word, expected) in [
+        ("trace", LevelFilter::TRACE),
+        ("debug", LevelFilter::DEBUG),
+        ("info", LevelFilter::INFO),
+        ("warn", LevelFilter::WARN),
+        ("error", LevelFilter::ERROR),
+        ("off", LevelFilter::OFF),
+        ("Info", LevelFilter::INFO),
+        ("WARN", LevelFilter::WARN),
+    ] {
+        let config = config_from_dsl(&format!(
+            "logging {{ console_level = {word}; file_level = {word}; }}"
+        ));
+        assert_eq!(
+            config.logging.console_level, expected,
+            "console_level = {word}"
+        );
+        assert_eq!(config.logging.file_level, expected, "file_level = {word}");
+    }
 }
 
 /// A value of the wrong shape is refused at the value, saying what it found.
@@ -866,7 +1291,7 @@ fn a_count_out_of_the_targets_range_is_refused() {
 /// body.
 #[test]
 fn repos_and_the_mounts_that_reach_them_lower() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 repo life {
     remote = "forgejo@example.com:alice/life.git";
@@ -887,49 +1312,62 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[repo]]
-slug = "life"
-remote = "forgejo@example.com:alice/life.git"
-auto_pull = true
-
-[[repo]]
-slug = "notes"
-remote = "forgejo@example.com:alice/notes.git"
-auto_pull = false
-
-[[app]]
-slug = "alice"
-name = "Assistant"
-
-[[app.mount]]
-repo = "life"
-working_dir = true
-primary = true
-
-[[app.mount]]
-repo = "notes"
-access = "read-only"
-auto_pull = false
-"#,
+        BrennConfig {
+            repos: vec![
+                RepoDeclRaw {
+                    slug: "life".to_string(),
+                    remote: "forgejo@example.com:alice/life.git".to_string(),
+                    auto_pull: true,
+                },
+                RepoDeclRaw {
+                    slug: "notes".to_string(),
+                    remote: "forgejo@example.com:alice/notes.git".to_string(),
+                    auto_pull: false,
+                },
+            ],
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                name: Some("Assistant".to_string()),
+                mounts: vec![
+                    MountConfigRaw {
+                        repo: "life".to_string(),
+                        access: AccessLevel::default(),
+                        working_dir: true,
+                        auto_pull: None,
+                        primary: true,
+                    },
+                    MountConfigRaw {
+                        repo: "notes".to_string(),
+                        access: AccessLevel::ReadOnly,
+                        working_dir: false,
+                        auto_pull: Some(false),
+                        primary: false,
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
-/// The minimal repo body: only the remote, with `auto_pull` taking the same
-/// default function serde calls.
+/// The minimal repo body: only the remote, with `auto_pull` taking its default.
 #[test]
 fn a_minimal_repo_takes_its_default_auto_pull() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 repo life {
     remote = "forgejo@example.com:alice/life.git";
 }
 "#,
-        r#"
-[[repo]]
-slug = "life"
-remote = "forgejo@example.com:alice/life.git"
-"#,
+        BrennConfig {
+            repos: vec![RepoDeclRaw {
+                slug: "life".to_string(),
+                remote: "forgejo@example.com:alice/life.git".to_string(),
+                auto_pull: default_true(),
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -937,7 +1375,7 @@ remote = "forgejo@example.com:alice/life.git"
 /// default so a dropped key shows up as a difference.
 #[test]
 fn an_mqtt_client_lowers_every_key_it_states() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 mqtt_client broker {
     url = "mqtts://broker.example.com:8883";
@@ -954,41 +1392,59 @@ mqtt_client broker {
     urgency = high;
 }
 "#,
-        r#"
-[[mqtt_client]]
-slug = "broker"
-url = "mqtts://broker.example.com:8883"
-username = "alice"
-password_file = "/home/alice/.secrets/broker.password"
-ca_file = "/home/alice/.secrets/broker-ca.pem"
-tls_version_min = "1.3"
-keepalive_secs = 30
-inbound_payload_cap_bytes = 262144
-reconnect_backoff_initial_secs = 2
-reconnect_backoff_max_secs = 120
-session_expiry_secs = 300
-qos = 2
-urgency = "high"
-"#,
+        BrennConfig {
+            mqtt_clients: vec![MqttClientConfigRaw {
+                slug: "broker".to_string(),
+                url: "mqtts://broker.example.com:8883".to_string(),
+                username: Some("alice".to_string()),
+                password_file: Some(PathBuf::from("/home/alice/.secrets/broker.password")),
+                ca_file: Some(PathBuf::from("/home/alice/.secrets/broker-ca.pem")),
+                tls_version_min: "1.3".to_string(),
+                keepalive_secs: Some(30),
+                inbound_payload_cap_bytes: 262144,
+                last_will: None,
+                reconnect_backoff_initial_secs: 2,
+                reconnect_backoff_max_secs: 120,
+                qos: 2,
+                urgency: Urgency::High,
+                session_expiry_secs: 300,
+            }],
+            ..Default::default()
+        },
     );
 }
 
-/// The minimal mqtt client body: the broker url alone. Every other field takes
-/// the `#[serde(default = "fn")]` function serde itself would call, which is
-/// what this row locks.
+/// The minimal mqtt client body: the broker url alone. Every other field is
+/// filled from the default function the config module owns — which function
+/// fills which field is what this row locks; the values those functions return
+/// are pinned in `invariants.rs`.
 #[test]
 fn a_minimal_mqtt_client_takes_every_default() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 mqtt_client broker {
     url = "mqtts://broker.example.com:8883";
 }
 "#,
-        r#"
-[[mqtt_client]]
-slug = "broker"
-url = "mqtts://broker.example.com:8883"
-"#,
+        BrennConfig {
+            mqtt_clients: vec![MqttClientConfigRaw {
+                slug: "broker".to_string(),
+                url: "mqtts://broker.example.com:8883".to_string(),
+                username: None,
+                password_file: None,
+                ca_file: None,
+                tls_version_min: default_tls_version_min(),
+                keepalive_secs: None,
+                inbound_payload_cap_bytes: default_inbound_payload_cap(),
+                last_will: None,
+                reconnect_backoff_initial_secs: default_backoff_initial(),
+                reconnect_backoff_max_secs: default_backoff_max(),
+                qos: default_subscription_qos(),
+                urgency: default_client_urgency(),
+                session_expiry_secs: 0,
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -999,7 +1455,7 @@ url = "mqtts://broker.example.com:8883"
 /// Every scalar attr an agent body can state, each value away from its default.
 #[test]
 fn an_agent_lowers_every_scalar_attr_it_states() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 agent Assistant() {
     slug = "alice-pa";
@@ -1038,61 +1494,66 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[app]]
-slug = "alice-pa"
-name = "Personal Assistant"
-description = "The desk assistant."
-icon = "assistant"
-working_dir = "/home/alice/work"
-model = "sonnet"
-single_instance = true
-singleton = true
-persistent = true
-multiuser = true
-idle_timeout_secs = 900
-idle_hook_secs = 60
-compact_reminder_pct = 60
-compact_soft_pct = 70
-compact_red_pct = 85
-compact_hard_pct = 95
-compact_reminder_tokens = 120000
-compact_soft_tokens = 140000
-compact_red_tokens = 170000
-compact_hard_tokens = 190000
-compact_idle_secs = 1800
-history_replay_limit = 50
-allowed_users = ["alice", "bob"]
-disabled_tools = ["WebSearch"]
-cc_extra_args = ["--verbose"]
-integrations = ["calendar"]
-extra_mounts = ["/home/alice/notes"]
-prefix_username = true
-prefix_timestamp = false
-prefix_device = true
-container = "sandbox"
-container_working_dir = "/work"
-"#,
+        BrennConfig {
+            apps: vec![AppConfigRaw {
+                slug: "alice-pa".to_string(),
+                name: Some("Personal Assistant".to_string()),
+                description: Some("The desk assistant.".to_string()),
+                icon: Some("assistant".to_string()),
+                working_dir: Some(PathBuf::from("/home/alice/work")),
+                model: Some("sonnet".to_string()),
+                single_instance: true,
+                singleton: true,
+                persistent: true,
+                multiuser: true,
+                idle_timeout_secs: Some(900),
+                idle_hook_secs: Some(60),
+                compact_reminder_pct: Some(60),
+                compact_soft_pct: Some(70),
+                compact_red_pct: Some(85),
+                compact_hard_pct: Some(95),
+                compact_reminder_tokens: Some(120000),
+                compact_soft_tokens: Some(140000),
+                compact_red_tokens: Some(170000),
+                compact_hard_tokens: Some(190000),
+                compact_idle_secs: Some(1800),
+                history_replay_limit: Some(50),
+                allowed_users: vec!["alice".to_string(), "bob".to_string()],
+                disabled_tools: vec!["WebSearch".to_string()],
+                cc_extra_args: vec!["--verbose".to_string()],
+                integrations: vec!["calendar".to_string()],
+                extra_mounts: vec!["/home/alice/notes".to_string()],
+                prefix_username: Some(true),
+                prefix_timestamp: Some(false),
+                prefix_device: Some(true),
+                container: Some("sandbox".to_string()),
+                container_working_dir: Some(PathBuf::from("/work")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The minimal agent body: nothing but the wire slug the handle supplies. Every
-/// list is the empty one serde's `default` gives, and `messaging` is absent
-/// because an agent with no subscriptions and no budget has nothing to put in
-/// it.
+/// list is empty, and `messaging` is absent because an agent with no
+/// subscriptions and no budget has nothing to put in it.
 #[test]
 fn a_minimal_agent_states_only_its_slug() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 agent Assistant() {
 }
 
 new alice: Assistant();
 "#,
-        r#"
-[[app]]
-slug = "alice"
-"#,
+        BrennConfig {
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -1101,7 +1562,7 @@ slug = "alice"
 /// inside the agent.
 #[test]
 fn an_agent_lowers_its_hook_blocks_and_both_mcp_forms() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 mcp_server graf {
     command = "graf";
@@ -1130,42 +1591,59 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[app]]
-slug = "alice"
-
-[app.mcp_servers.graf]
-command = "graf"
-args = ["mcp"]
-env = { GRAF_ROOT = "/home/alice/kb" }
-
-[app.mcp_servers.pfin]
-command = "pf"
-args = ["mcp", "--quiet"]
-
-[app.start_hooks]
-host = ["git fetch"]
-container = ["pf rebuild"]
-
-[app.post_pull_hooks]
-host = ["cargo build"]
-
-[app.startup_hooks]
-container = ["pf migrate"]
-"#,
+        BrennConfig {
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                mcp_servers: HashMap::from([
+                    (
+                        "graf".to_string(),
+                        McpServerConfig {
+                            command: "graf".to_string(),
+                            args: vec!["mcp".to_string()],
+                            env: HashMap::from([(
+                                "GRAF_ROOT".to_string(),
+                                "/home/alice/kb".to_string(),
+                            )]),
+                        },
+                    ),
+                    (
+                        "pfin".to_string(),
+                        McpServerConfig {
+                            command: "pf".to_string(),
+                            args: vec!["mcp".to_string(), "--quiet".to_string()],
+                            env: HashMap::new(),
+                        },
+                    ),
+                ]),
+                start_hooks: Some(StartHooksConfig {
+                    host: vec!["git fetch".to_string()],
+                    container: vec!["pf rebuild".to_string()],
+                }),
+                post_pull_hooks: Some(PostPullHooksConfig {
+                    host: vec!["cargo build".to_string()],
+                    container: vec![],
+                }),
+                startup_hooks: Some(StartupHooksConfig {
+                    host: vec![],
+                    container: vec!["pf migrate".to_string()],
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// Per-integration overrides are named sub-blocks with open bodies, one per map
-/// key, and the value tree the DSL carries is the tree the TOML loader builds:
-/// a nested table, a scalar, and a list all land as their own `toml::Value`.
+/// key, carrying an opaque value tree: a nested table, a scalar, and a list all
+/// land as their own `toml::Value`.
 ///
 /// The block only overrides; naming an integration here implicitly enables it.
-/// This test does not verify that enablement — the `integrations` list in the
-/// twin below is the one the agent states, unchanged.
+/// This test does not verify that enablement — the `integrations` list below is
+/// the one the agent states, unchanged.
 #[test]
 fn an_agent_lowers_its_per_integration_config_blocks() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 agent Assistant() {
     integrations = ["ledger"];
@@ -1181,28 +1659,55 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[app]]
-slug = "alice"
-integrations = ["ledger"]
-
-[app.integration_config.ledger]
-env = { LEDGER_DATA = "/home/alice/ledger", LEDGER_STRICT = "1" }
-timeout_secs = 30
-
-[app.integration_config.calendar]
-accounts = ["alice", "bob"]
-"#,
+        BrennConfig {
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                integrations: vec!["ledger".to_string()],
+                integration_config: HashMap::from([
+                    (
+                        "ledger".to_string(),
+                        toml::Value::Table(toml::Table::from_iter([
+                            (
+                                "env".to_string(),
+                                toml::Value::Table(toml::Table::from_iter([
+                                    (
+                                        "LEDGER_DATA".to_string(),
+                                        toml::Value::String("/home/alice/ledger".to_string()),
+                                    ),
+                                    (
+                                        "LEDGER_STRICT".to_string(),
+                                        toml::Value::String("1".to_string()),
+                                    ),
+                                ])),
+                            ),
+                            ("timeout_secs".to_string(), toml::Value::Integer(30)),
+                        ])),
+                    ),
+                    (
+                        "calendar".to_string(),
+                        toml::Value::Table(toml::Table::from_iter([(
+                            "accounts".to_string(),
+                            toml::Value::Array(vec![
+                                toml::Value::String("alice".to_string()),
+                                toml::Value::String("bob".to_string()),
+                            ]),
+                        )])),
+                    ),
+                ]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The three subscription families ride one statement form, dispatched on the
 /// scheme of the address it names, and `send_budget` nests into the app's
 /// `messaging` table. Each subscription also derives the ACL entry that
-/// authorizes it, which is why the TOML twin spells them.
+/// authorizes it, which is why the expected config spells them.
 #[test]
 fn an_agent_lowers_all_three_subscription_families_and_its_send_budget() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel cmd at "brenn:alice.cmd" {
     push_depth = 8;
@@ -1240,72 +1745,81 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[channel]]
-uuid = "c88e5596-574b-53d1-9b55-6e612b8f3d49"
-address = "brenn:alice.cmd"
-push_depth = 8
-retain_depth = 32
-standing_retain_depth = 64
-
-[[channel]]
-address = "ephemeral:alice.presence"
-push_depth = 4
-retain_depth = 8
-
-[[mqtt_client]]
-slug = "broker"
-url = "mqtts://broker.example.com:8883"
-
-[[app]]
-slug = "alice"
-grants = ["messaging_subscribe", "ephemeral_subscribe", "mqtt_subscribe", "webhook"]
-
-[app.messaging]
-send_budget = 40
-
-[[app.messaging.subscribe]]
-channel = "brenn:alice.cmd"
-push_depth = 1000
-retain_depth = 2000
-noise = "metered"
-wake_min = "low"
-
-[[app.messaging.subscribe]]
-channel = "ephemeral:alice.presence"
-push_depth = 4
-retain_depth = 8
-
-[[app.webhook_subscription]]
-endpoint = "push-alice"
-push_depth = 10
-retain_depth = 20
-wake_min = "normal"
-
-[[app.mqtt_subscription]]
-channel = "mqtt:broker:alice/lamp"
-push_depth = 2
-retain_depth = 4
-noise = "alarm"
-
-[app.acl]
-brenn_subscribe = [{ exact = "alice.cmd" }]
-ephemeral_subscribe = [{ exact = "alice.presence" }]
-mqtt_subscribe = [{ client = "broker", topic_filter = "alice/lamp" }]
-webhook = [{ endpoint = "push-alice" }]
-
-[[webhook_endpoint]]
-slug = "push-alice"
-mount = "/webhooks/push-alice"
-
-[webhook_endpoint.signature]
-scheme = "bearer-token"
-header = "authorization"
-
-[[webhook_endpoint.token]]
-token_id = "phone"
-secret_file = "/home/alice/.secrets/push-alice.token"
-"#,
+        BrennConfig {
+            channels: vec![
+                ChannelConfigRaw {
+                    uuid: Some("c88e5596-574b-53d1-9b55-6e612b8f3d49".to_string()),
+                    push_depth: Some(Depth::Bounded(8)),
+                    retain_depth: Some(Depth::Bounded(32)),
+                    standing_retain_depth: Some(Depth::Bounded(64)),
+                    ..channel_at("brenn:alice.cmd")
+                },
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(8)),
+                    ..channel_at("ephemeral:alice.presence")
+                },
+            ],
+            mqtt_clients: vec![mqtt_client_at("broker", "mqtts://broker.example.com:8883")],
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                grants: vec![
+                    AppCapability::MessagingSubscribe,
+                    AppCapability::EphemeralSubscribe,
+                    AppCapability::MqttSubscribe,
+                    AppCapability::Webhook,
+                ],
+                messaging: Some(MessagingConfigRaw {
+                    send_budget: Some(40),
+                    subscribe: vec![
+                        MessagingSubscriptionRaw {
+                            channel: "brenn:alice.cmd".to_string(),
+                            push_depth: Some(Depth::Bounded(1000)),
+                            retain_depth: Some(Depth::Bounded(2000)),
+                            noise: Some(NoiseLevel::Metered),
+                            wake_min: Some(WakeMin::Low),
+                        },
+                        MessagingSubscriptionRaw {
+                            channel: "ephemeral:alice.presence".to_string(),
+                            push_depth: Some(Depth::Bounded(4)),
+                            retain_depth: Some(Depth::Bounded(8)),
+                            noise: None,
+                            wake_min: None,
+                        },
+                    ],
+                }),
+                webhook_subscriptions: vec![AppWebhookSubscriptionRaw {
+                    endpoint: "push-alice".to_string(),
+                    push_depth: Some(Depth::Bounded(10)),
+                    retain_depth: Some(Depth::Bounded(20)),
+                    wake_min: Some(WakeMin::Normal),
+                }],
+                mqtt_subscriptions: vec![AppMqttIngressSubscriptionRaw {
+                    channel: "mqtt:broker:alice/lamp".to_string(),
+                    push_depth: Some(Depth::Bounded(2)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                    noise: Some(NoiseLevel::Alarm),
+                    wake_min: None,
+                }],
+                acl: AppAclRaw {
+                    brenn_subscribe: vec![ChannelMatcherRaw::Exact("alice.cmd".to_string())],
+                    ephemeral_subscribe: vec![ChannelMatcherRaw::Exact(
+                        "alice.presence".to_string(),
+                    )],
+                    mqtt_subscribe: vec![MqttSubMatcherRaw {
+                        client: "broker".to_string(),
+                        topic_filter: "alice/lamp".to_string(),
+                    }],
+                    webhook: vec![WebhookMatcherRaw {
+                        endpoint: "push-alice".to_string(),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            webhook_endpoints: vec![bearer_token_endpoint("push-alice")],
+            ..Default::default()
+        },
     );
 }
 
@@ -1315,7 +1829,7 @@ secret_file = "/home/alice/.secrets/push-alice.token"
 /// patterns arrive scheme-stripped, which is how the raw config spells them.
 #[test]
 fn an_agent_lowers_acl_entries_from_every_provenance() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel notes at "brenn:shared.notes" {
     push_depth = 4;
@@ -1334,23 +1848,34 @@ new alice: Assistant();
 
 grant alice publish exact notes;
 "#,
-        r#"
-[[channel]]
-uuid = "46cec031-27ab-5416-b9ac-a72c8eb8a0d9"
-address = "brenn:shared.notes"
-push_depth = 4
-retain_depth = 8
-standing_retain_depth = 16
-
-[[app]]
-slug = "alice"
-grants = ["messaging_subscribe", "messaging_publish", "ephemeral_publish"]
-
-[app.acl]
-brenn_subscribe = [{ prefix = "alice." }, { exact = "alice-errors" }]
-ephemeral_publish = [{ prefix = "alice." }]
-brenn_publish = [{ exact = "shared.notes" }]
-"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                uuid: Some("46cec031-27ab-5416-b9ac-a72c8eb8a0d9".to_string()),
+                push_depth: Some(Depth::Bounded(4)),
+                retain_depth: Some(Depth::Bounded(8)),
+                standing_retain_depth: Some(Depth::Bounded(16)),
+                ..channel_at("brenn:shared.notes")
+            }],
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                grants: vec![
+                    AppCapability::MessagingSubscribe,
+                    AppCapability::MessagingPublish,
+                    AppCapability::EphemeralPublish,
+                ],
+                acl: AppAclRaw {
+                    brenn_subscribe: vec![
+                        ChannelMatcherRaw::Prefix("alice.".to_string()),
+                        ChannelMatcherRaw::Exact("alice-errors".to_string()),
+                    ],
+                    brenn_publish: vec![ChannelMatcherRaw::Exact("shared.notes".to_string())],
+                    ephemeral_publish: vec![ChannelMatcherRaw::Prefix("alice.".to_string())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -1521,7 +2046,7 @@ new alice: Assistant();
 /// a tuning never does" rule meets its own counterexample.
 #[test]
 fn a_document_mixing_a_tuning_and_a_declaration_emits_declarations_first() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel at prefix "brenn:tool-results/" {
     push_depth = 2;
@@ -1535,20 +2060,21 @@ channel alerts at "brenn:alice-alerts" {
     standing_retain_depth = 256;
 }
 "#,
-        r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "brenn:alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 256
-
-[[channel]]
-address_prefix = "brenn:tool-results/"
-push_depth = 2
-retain_depth = 32
-standing_retain_depth = 32
-"#,
+        config_with_channels(vec![
+            ChannelConfigRaw {
+                uuid: Some("85a5cf7e-6874-5766-9d69-712784754a1f".to_string()),
+                push_depth: Some(Depth::Bounded(8)),
+                retain_depth: Some(Depth::Bounded(128)),
+                standing_retain_depth: Some(Depth::Bounded(256)),
+                ..channel_at("brenn:alice-alerts")
+            },
+            ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(32)),
+                standing_retain_depth: Some(Depth::Bounded(32)),
+                ..channel_at_prefix("brenn:tool-results/")
+            },
+        ]),
     );
 }
 
@@ -1560,7 +2086,7 @@ standing_retain_depth = 32
 /// the budget can go.
 #[test]
 fn an_agent_with_only_a_send_budget_still_gets_a_messaging_block() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 agent Assistant() {
     send_budget = 40;
@@ -1568,13 +2094,17 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[app]]
-slug = "alice"
-
-[app.messaging]
-send_budget = 40
-"#,
+        BrennConfig {
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                messaging: Some(MessagingConfigRaw {
+                    subscribe: vec![],
+                    send_budget: Some(40),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -1582,7 +2112,7 @@ send_budget = 40
 /// list and no budget, so the app inherits the global one.
 #[test]
 fn an_agent_with_only_subscriptions_gets_a_messaging_block_without_a_budget() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel cmd at "brenn:alice.cmd" {
     push_depth = 8;
@@ -1597,26 +2127,17 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[channel]]
-uuid = "c88e5596-574b-53d1-9b55-6e612b8f3d49"
-address = "brenn:alice.cmd"
-push_depth = 8
-retain_depth = 32
-standing_retain_depth = 64
-
-[[app]]
-slug = "alice"
-grants = ["messaging_subscribe"]
-
-[[app.messaging.subscribe]]
-channel = "brenn:alice.cmd"
-push_depth = 4
-retain_depth = 8
-
-[app.acl]
-brenn_subscribe = [{ exact = "alice.cmd" }]
-"#,
+        BrennConfig {
+            channels: vec![alice_cmd_channel()],
+            apps: vec![cmd_subscriber(MessagingSubscriptionRaw {
+                channel: "brenn:alice.cmd".to_string(),
+                push_depth: Some(Depth::Bounded(4)),
+                retain_depth: Some(Depth::Bounded(8)),
+                noise: None,
+                wake_min: None,
+            })],
+            ..Default::default()
+        },
     );
 }
 
@@ -1625,7 +2146,7 @@ brenn_subscribe = [{ exact = "alice.cmd" }]
 /// the token per language.
 #[test]
 fn an_unbounded_depth_in_a_subscription_tail_lowers() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel cmd at "brenn:alice.cmd" {
     push_depth = 8;
@@ -1640,26 +2161,17 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[channel]]
-uuid = "c88e5596-574b-53d1-9b55-6e612b8f3d49"
-address = "brenn:alice.cmd"
-push_depth = 8
-retain_depth = 32
-standing_retain_depth = 64
-
-[[app]]
-slug = "alice"
-grants = ["messaging_subscribe"]
-
-[[app.messaging.subscribe]]
-channel = "brenn:alice.cmd"
-push_depth = 4
-retain_depth = "unbounded"
-
-[app.acl]
-brenn_subscribe = [{ exact = "alice.cmd" }]
-"#,
+        BrennConfig {
+            channels: vec![alice_cmd_channel()],
+            apps: vec![cmd_subscriber(MessagingSubscriptionRaw {
+                channel: "brenn:alice.cmd".to_string(),
+                push_depth: Some(Depth::Bounded(4)),
+                retain_depth: Some(Depth::Unbounded),
+                noise: None,
+                wake_min: None,
+            })],
+            ..Default::default()
+        },
     );
 }
 
@@ -1728,7 +2240,7 @@ new alice: Assistant();
 /// position here.
 #[test]
 fn two_bad_elements_of_a_string_list_are_both_reported() {
-    let errors = lowered(
+    let errors = refusals(
         r#"
 agent Assistant() {
     allowed_users = ["alice", 3, true];
@@ -1736,9 +2248,8 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-    )
-    .expect_err("the document must be refused");
-    assert_eq!(errors.len(), 2, "{}", render(&errors));
+    );
+    assert_eq!(errors.len(), 2, "{}", render_all(&errors));
     for error in &errors {
         assert!(
             error
@@ -1814,14 +2325,14 @@ new alice: Assistant();
 // A lowered config through the boot gates
 // ---------------------------------------------------------------------------
 
-/// Equality against a TOML twin says the two representations agree; it does not
-/// say the runtime accepts either. This runs a lowered config through the two
-/// gates a boot puts it through — the channel directory and the whole-config
-/// resolver — and compares the resolved channel entries against those the TOML
-/// twin produces while spelling its durable address bare, which is the form
-/// today's TOML corpus uses and lowering never emits.
+/// Equality against an expected config says lowering emits the right fields; it
+/// does not say the runtime accepts them. This runs a lowered config through the
+/// two gates a boot puts it through — the channel directory and the whole-config
+/// resolver — and compares the resolved channel entries against those a config
+/// spelling the same durable channel bare produces. Bare is the form the
+/// directory still canonicalizes and lowering never emits.
 #[test]
-fn a_lowered_config_resolves_the_same_entries_a_bare_address_toml_does() {
+fn a_lowered_config_resolves_the_same_entries_a_bare_address_config_does() {
     let dir = tempfile::tempdir().expect("a tempdir");
     let repo_dir = dir.path().join("repos");
     let clone = repo_dir.join("life");
@@ -1830,7 +2341,7 @@ fn a_lowered_config_resolves_the_same_entries_a_bare_address_toml_does() {
     std::fs::create_dir_all(&runtime_dir).expect("the runtime directory");
     let repos = repo_dir.display();
 
-    let from_dsl = lowered(&format!(
+    let from_dsl = config_from_dsl(&format!(
         r#"
 server {{ public_url = "https://brenn.example.com"; }}
 repo_sync {{ repo_dir = "{repos}"; }}
@@ -1855,51 +2366,21 @@ agent Assistant() {{
 
 new alice: Assistant();
 "#
-    ))
-    .unwrap_or_else(|errors| panic!("the document must lower:\n{}", render(&errors)));
+    ));
 
-    let from_toml: BrennConfig = toml::from_str(&format!(
-        r#"
-[server]
-public_url = "https://brenn.example.com"
-
-[repo_sync]
-repo_dir = "{repos}"
-
-[[repo]]
-slug = "life"
-remote = "forgejo@example.com:alice/life.git"
-
-[[channel]]
-uuid = "c88e5596-574b-53d1-9b55-6e612b8f3d49"
-address = "alice.cmd"
-push_depth = 8
-retain_depth = 32
-standing_retain_depth = 64
-
-[[channel]]
-address = "ephemeral:alice.presence"
-push_depth = 4
-retain_depth = 8
-
-[[app]]
-slug = "alice"
-grants = ["messaging_subscribe"]
-
-[[app.mount]]
-repo = "life"
-working_dir = true
-
-[[app.messaging.subscribe]]
-channel = "brenn:alice.cmd"
-push_depth = 0
-retain_depth = 8
-
-[app.acl]
-brenn_subscribe = [{{ exact = "alice.cmd" }}]
-"#
-    ))
-    .expect("the TOML twin must parse");
+    // Nothing but the channel blocks and the global messaging defaults feeds the
+    // channel directory, so the comparison config carries only those.
+    let bare_address = config_with_channels(vec![
+        ChannelConfigRaw {
+            address: Some("alice.cmd".to_string()),
+            ..alice_cmd_channel()
+        },
+        ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: Some(Depth::Bounded(8)),
+            ..channel_at("ephemeral:alice.presence")
+        },
+    ]);
 
     // The runtime canonicalizes a bare address to `brenn:`, so the two configs
     // — one qualified on emit, one bare as written — must resolve to the same
@@ -1907,9 +2388,11 @@ brenn_subscribe = [{{ exact = "alice.cmd" }}]
     // resolved field.
     let dsl_entries =
         crate::messaging::config::build_channel_entries(&from_dsl.channels, &from_dsl.messaging);
-    let toml_entries =
-        crate::messaging::config::build_channel_entries(&from_toml.channels, &from_toml.messaging);
-    assert_eq!(format!("{dsl_entries:#?}"), format!("{toml_entries:#?}"));
+    let bare_entries = crate::messaging::config::build_channel_entries(
+        &bare_address.channels,
+        &bare_address.messaging,
+    );
+    assert_eq!(format!("{dsl_entries:#?}"), format!("{bare_entries:#?}"));
 
     // And the whole config passes the resolver every boot runs.
     let resolved = crate::config::validate_and_resolve(
@@ -1935,12 +2418,12 @@ brenn_subscribe = [{{ exact = "alice.cmd" }}]
 /// Nine families means nine adjacent, identical-shaped lowering lines, which is
 /// the shape where a copy-paste crosses two permission families in silence —
 /// the highest-consequence mistake this module can make. So every one of them
-/// carries an entry here, checked against the TOML twin, and the two families
+/// carries an entry here, and the two families
 /// of each plane carry *different* patterns: identical ones would be blind to
 /// exactly the crossing, since a transposed pair would still compare equal.
 #[test]
 fn a_consumer_lowers_with_every_key_binding_and_acl_family() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 mqtt_client broker {
     url = "mqtts://broker.example.com:8883";
@@ -2046,130 +2529,173 @@ new router: Router {
     }
 }
 "#,
-        r#"
-[[mqtt_client]]
-slug = "broker"
-url = "mqtts://broker.example.com:8883"
-
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "brenn:alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 128
-
-[[channel]]
-uuid = "8b2e83fc-6121-55ef-a665-7bea3fb6a9a6"
-address = "brenn:alice-digests"
-push_depth = 2
-retain_depth = 32
-standing_retain_depth = 32
-
-[[channel]]
-address = "ephemeral:alice-desk.presence"
-push_depth = 4
-retain_depth = 16
-
-[[channel]]
-address = "ephemeral:alice-desk.status"
-push_depth = 2
-retain_depth = 8
-
-[[webhook_endpoint]]
-slug = "push-alice"
-mount = "/webhooks/push-alice"
-signature = { scheme = "bearer-token", header = "authorization" }
-token = [{ token_id = "phone", secret_file = "/home/alice/.secrets/push-alice.token" }]
-
-[[wasm_consumer]]
-slug = "router"
-component_path = "/lib/brenn_router.wasm"
-grants = ["ports", "store", "log", "config", "mqtt"]
-store_path = "/state/router.db"
-store_size_limit = "64MiB"
-activation_burst = 4
-activation_min_period_ms = 250
-subscribe_acl = [{ exact = "alice-alerts" }]
-publish_acl = [{ exact = "alice-digests" }]
-ephemeral_subscribe_acl = [{ exact = "alice-desk.presence" }]
-ephemeral_publish_acl = [{ exact = "alice-desk.status" }]
-local_subscribe_acl = [{ prefix = "router.in." }, { exact = "router.acks" }]
-local_publish_acl = [{ prefix = "router.out." }, { exact = "router.acks" }]
-mqtt_subscribe_acl = [{ client = "broker", topic_filter = "alice/#" }]
-mqtt_publish_acl = [{ client = "broker" }]
-webhook_acl = [{ endpoint = "push-alice" }]
-
-[wasm_consumer.config]
-mode = "fanout"
-depth = 3
-verbose = true
-
-[[wasm_consumer.subscription]]
-port = "inbound"
-channel = "brenn:alice-alerts"
-push_depth = 4
-retain_depth = "unbounded"
-noise = "metered"
-wake_min = "low"
-amplification = 0.5
-
-[[wasm_consumer.subscription]]
-port = "feed"
-channel = "local:router.in.feed"
-push_depth = 2
-retain_depth = 4
-
-[[wasm_consumer.subscription]]
-port = "status"
-channel = "ephemeral:alice-desk.presence"
-push_depth = 2
-retain_depth = 4
-
-[[wasm_consumer.subscription]]
-port = "hook"
-channel = "webhook:push-alice"
-push_depth = 1
-retain_depth = 2
-
-[[wasm_consumer.output]]
-port = "digest"
-channel = "brenn:alice-digests"
-urgency = "low"
-
-[[wasm_consumer.output]]
-port = "outbound"
-channel = "ephemeral:alice-desk.status"
-urgency = "high"
-publish_per_activation = 2.0
-publish_capacity = 3.5
-
-[[wasm_consumer.io_port]]
-port = "acks"
-channel = "local:router.acks"
-push_depth = 1
-retain_depth = 2
-
-[[wasm_consumer.io_port]]
-port = "tick"
-push_depth = 1
-retain_depth = 2
-noise = "alarm"
-amplification = 1.0
-urgency = "low"
-publish_per_activation = 1.0
-publish_capacity = 1.0
-"#,
+        BrennConfig {
+            mqtt_clients: vec![mqtt_client_at("broker", "mqtts://broker.example.com:8883")],
+            channels: vec![
+                ChannelConfigRaw {
+                    uuid: Some("85a5cf7e-6874-5766-9d69-712784754a1f".to_string()),
+                    push_depth: Some(Depth::Bounded(8)),
+                    retain_depth: Some(Depth::Bounded(128)),
+                    standing_retain_depth: Some(Depth::Bounded(128)),
+                    ..channel_at("brenn:alice-alerts")
+                },
+                ChannelConfigRaw {
+                    uuid: Some("8b2e83fc-6121-55ef-a665-7bea3fb6a9a6".to_string()),
+                    push_depth: Some(Depth::Bounded(2)),
+                    retain_depth: Some(Depth::Bounded(32)),
+                    standing_retain_depth: Some(Depth::Bounded(32)),
+                    ..channel_at("brenn:alice-digests")
+                },
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(16)),
+                    ..channel_at("ephemeral:alice-desk.presence")
+                },
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(2)),
+                    retain_depth: Some(Depth::Bounded(8)),
+                    ..channel_at("ephemeral:alice-desk.status")
+                },
+            ],
+            webhook_endpoints: vec![bearer_token_endpoint("push-alice")],
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![
+                    WasmGrant::Ports,
+                    WasmGrant::Store,
+                    WasmGrant::Log,
+                    WasmGrant::Config,
+                    WasmGrant::Mqtt,
+                ],
+                store_path: Some(PathBuf::from("/state/router.db")),
+                store_size_limit: Some("64MiB".to_string()),
+                subscriptions: vec![
+                    WasmConsumerSubscriptionRaw {
+                        port: "inbound".to_string(),
+                        channel: Some("brenn:alice-alerts".to_string()),
+                        push_depth: Some(Depth::Bounded(4)),
+                        retain_depth: Some(Depth::Unbounded),
+                        noise: Some(NoiseLevel::Metered),
+                        wake_min: Some(WakeMin::Low),
+                        amplification: Some(0.5),
+                    },
+                    WasmConsumerSubscriptionRaw {
+                        port: "feed".to_string(),
+                        channel: Some("local:router.in.feed".to_string()),
+                        push_depth: Some(Depth::Bounded(2)),
+                        retain_depth: Some(Depth::Bounded(4)),
+                        noise: None,
+                        wake_min: None,
+                        amplification: None,
+                    },
+                    WasmConsumerSubscriptionRaw {
+                        port: "status".to_string(),
+                        channel: Some("ephemeral:alice-desk.presence".to_string()),
+                        push_depth: Some(Depth::Bounded(2)),
+                        retain_depth: Some(Depth::Bounded(4)),
+                        noise: None,
+                        wake_min: None,
+                        amplification: None,
+                    },
+                    WasmConsumerSubscriptionRaw {
+                        port: "hook".to_string(),
+                        channel: Some("webhook:push-alice".to_string()),
+                        push_depth: Some(Depth::Bounded(1)),
+                        retain_depth: Some(Depth::Bounded(2)),
+                        noise: None,
+                        wake_min: None,
+                        amplification: None,
+                    },
+                ],
+                outputs: vec![
+                    WasmConsumerOutputRaw {
+                        port: "digest".to_string(),
+                        channel: Some("brenn:alice-digests".to_string()),
+                        urgency: Some(Urgency::Low),
+                        publish_per_activation: None,
+                        publish_capacity: None,
+                    },
+                    WasmConsumerOutputRaw {
+                        port: "outbound".to_string(),
+                        channel: Some("ephemeral:alice-desk.status".to_string()),
+                        urgency: Some(Urgency::High),
+                        publish_per_activation: Some(2.0),
+                        publish_capacity: Some(3.5),
+                    },
+                ],
+                io_ports: vec![
+                    WasmConsumerIoPortRaw {
+                        port: "acks".to_string(),
+                        channel: Some("local:router.acks".to_string()),
+                        push_depth: Some(Depth::Bounded(1)),
+                        retain_depth: Some(Depth::Bounded(2)),
+                        noise: None,
+                        amplification: None,
+                        urgency: None,
+                        publish_per_activation: None,
+                        publish_capacity: None,
+                    },
+                    WasmConsumerIoPortRaw {
+                        port: "tick".to_string(),
+                        channel: None,
+                        push_depth: Some(Depth::Bounded(1)),
+                        retain_depth: Some(Depth::Bounded(2)),
+                        noise: Some(NoiseLevel::Alarm),
+                        amplification: Some(1.0),
+                        urgency: Some(Urgency::Low),
+                        publish_per_activation: Some(1.0),
+                        publish_capacity: Some(1.0),
+                    },
+                ],
+                subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.presence".to_string(),
+                )],
+                local_subscribe_acl: vec![
+                    ChannelMatcherRaw::Prefix("router.in.".to_string()),
+                    ChannelMatcherRaw::Exact("router.acks".to_string()),
+                ],
+                publish_acl: vec![ChannelMatcherRaw::Exact("alice-digests".to_string())],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.status".to_string(),
+                )],
+                local_publish_acl: vec![
+                    ChannelMatcherRaw::Prefix("router.out.".to_string()),
+                    ChannelMatcherRaw::Exact("router.acks".to_string()),
+                ],
+                mqtt_publish_acl: vec![MqttClientMatcherRaw {
+                    client: "broker".to_string(),
+                }],
+                mqtt_subscribe_acl: vec![MqttSubMatcherRaw {
+                    client: "broker".to_string(),
+                    topic_filter: "alice/#".to_string(),
+                }],
+                webhook_acl: vec![WebhookMatcherRaw {
+                    endpoint: "push-alice".to_string(),
+                }],
+                config: Some(toml::Table::from_iter([
+                    (
+                        "mode".to_string(),
+                        toml::Value::String("fanout".to_string()),
+                    ),
+                    ("depth".to_string(), toml::Value::Integer(3)),
+                    ("verbose".to_string(), toml::Value::Boolean(true)),
+                ])),
+                activation_burst: Some(4),
+                activation_min_period_ms: Some(250),
+                ..consumer("router", "/lib/brenn_router.wasm")
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The minimal consumer body: a class, a grant and one input. Every optional
-/// key is omitted on the DSL side and every defaulted key on the TOML side, so
-/// this is the defaults-parity lock for `[[wasm_consumer]]` — and with no `acl`
-/// statement the input's own authority is what derivation reads off the
-/// binding.
+/// key is omitted, so this row locks what a `[[wasm_consumer]]` looks like when
+/// the operator states nothing — and with no `acl` statement the input's own
+/// authority is what derivation reads off the binding.
 #[test]
-fn a_minimal_consumer_lowers_with_serdes_defaults() {
-    assert_equivalent(
+fn a_minimal_consumer_states_only_its_grant_and_its_input() {
+    assert_lowers(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -2188,22 +2714,25 @@ new logger: Logger {
     in heard <- utterance;
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-pod.utterance"
-push_depth = 4
-retain_depth = 16
-
-[[wasm_consumer]]
-slug = "logger"
-component_path = "/lib/brenn_logger.wasm"
-grants = ["log"]
-ephemeral_subscribe_acl = [{ exact = "alice-pod.utterance" }]
-
-[[wasm_consumer.subscription]]
-port = "heard"
-channel = "ephemeral:alice-pod.utterance"
-"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(4)),
+                retain_depth: Some(Depth::Bounded(16)),
+                ..channel_at("ephemeral:alice-pod.utterance")
+            }],
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![WasmGrant::Log],
+                subscriptions: vec![attrless_subscription(
+                    "heard",
+                    "ephemeral:alice-pod.utterance",
+                )],
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-pod.utterance".to_string(),
+                )],
+                ..consumer("logger", "/lib/brenn_logger.wasm")
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -2213,7 +2742,7 @@ channel = "ephemeral:alice-pod.utterance"
 /// raw config's wire-facing `port` field.
 #[test]
 fn a_port_named_after_its_direction_keyword_lowers_to_that_wire_name() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -2239,32 +2768,39 @@ new reserved: Reserved {
     out out -> notes;
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-pod.utterance"
-push_depth = 4
-retain_depth = 16
-
-[[channel]]
-address = "ephemeral:alice-pod.notes"
-push_depth = 4
-retain_depth = 16
-
-[[wasm_consumer]]
-slug = "reserved"
-component_path = "/lib/brenn_reserved.wasm"
-grants = ["log", "ports"]
-ephemeral_subscribe_acl = [{ exact = "alice-pod.utterance" }]
-ephemeral_publish_acl = [{ exact = "alice-pod.notes" }]
-
-[[wasm_consumer.subscription]]
-port = "in"
-channel = "ephemeral:alice-pod.utterance"
-
-[[wasm_consumer.output]]
-port = "out"
-channel = "ephemeral:alice-pod.notes"
-"#,
+        BrennConfig {
+            channels: vec![
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(16)),
+                    ..channel_at("ephemeral:alice-pod.utterance")
+                },
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(16)),
+                    ..channel_at("ephemeral:alice-pod.notes")
+                },
+            ],
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![WasmGrant::Log, WasmGrant::Ports],
+                subscriptions: vec![attrless_subscription("in", "ephemeral:alice-pod.utterance")],
+                outputs: vec![WasmConsumerOutputRaw {
+                    port: "out".to_string(),
+                    channel: Some("ephemeral:alice-pod.notes".to_string()),
+                    urgency: None,
+                    publish_per_activation: None,
+                    publish_capacity: None,
+                }],
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-pod.utterance".to_string(),
+                )],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-pod.notes".to_string(),
+                )],
+                ..consumer("reserved", "/lib/brenn_reserved.wasm")
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -2277,7 +2813,7 @@ channel = "ephemeral:alice-pod.notes"
 /// wrote it. So this row pins the transcription *and* a config that boots.
 #[test]
 fn a_consumers_config_map_carries_typed_scalars() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 component Sink {
     abi = processor;
@@ -2296,22 +2832,19 @@ new sink: Sink {
     io tick { push_depth = 1; retain_depth = 2; }
 }
 "#,
-        r#"
-[[wasm_consumer]]
-slug = "sink"
-component_path = "/lib/brenn_sink.wasm"
-grants = ["config"]
-
-[wasm_consumer.config]
-mode = "fast"
-window_secs = 30
-strict = true
-
-[[wasm_consumer.io_port]]
-port = "tick"
-push_depth = 1
-retain_depth = 2
-"#,
+        BrennConfig {
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![WasmGrant::Config],
+                io_ports: vec![tick_io_port()],
+                config: Some(toml::Table::from_iter([
+                    ("mode".to_string(), toml::Value::String("fast".to_string())),
+                    ("window_secs".to_string(), toml::Value::Integer(30)),
+                    ("strict".to_string(), toml::Value::Boolean(true)),
+                ])),
+                ..consumer("sink", "/lib/brenn_sink.wasm")
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -2320,7 +2853,7 @@ retain_depth = 2
 /// covers `amplification`, a consumer-only knob carried on the subscription.
 #[test]
 fn a_consumers_io_port_on_a_declared_channel_lowers_to_the_pair() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel acks at "ephemeral:alice-pod.acks" {
     push_depth = 2;
@@ -2347,40 +2880,42 @@ new sink: Sink {
     }
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-pod.acks"
-push_depth = 2
-retain_depth = 4
-
-[[wasm_consumer]]
-slug = "sink"
-component_path = "/lib/brenn_sink.wasm"
-grants = ["ports"]
-ephemeral_subscribe_acl = [{ exact = "alice-pod.acks" }]
-ephemeral_publish_acl = [{ exact = "alice-pod.acks" }]
-
-[[wasm_consumer.subscription]]
-port = "acks"
-channel = "ephemeral:alice-pod.acks"
-push_depth = 1
-retain_depth = 2
-noise = "alarm"
-amplification = 0.5
-
-[[wasm_consumer.output]]
-port = "acks"
-channel = "ephemeral:alice-pod.acks"
-urgency = "low"
-publish_per_activation = 1.0
-publish_capacity = 1.0
-"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(4)),
+                ..channel_at("ephemeral:alice-pod.acks")
+            }],
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![WasmGrant::Ports],
+                subscriptions: vec![WasmConsumerSubscriptionRaw {
+                    push_depth: Some(Depth::Bounded(1)),
+                    retain_depth: Some(Depth::Bounded(2)),
+                    noise: Some(NoiseLevel::Alarm),
+                    amplification: Some(0.5),
+                    ..attrless_subscription("acks", "ephemeral:alice-pod.acks")
+                }],
+                outputs: vec![WasmConsumerOutputRaw {
+                    port: "acks".to_string(),
+                    channel: Some("ephemeral:alice-pod.acks".to_string()),
+                    urgency: Some(Urgency::Low),
+                    publish_per_activation: Some(1.0),
+                    publish_capacity: Some(1.0),
+                }],
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-pod.acks".to_string(),
+                )],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact("alice-pod.acks".to_string())],
+                ..consumer("sink", "/lib/brenn_sink.wasm")
+            }],
+            ..Default::default()
+        },
     );
 }
 
 #[test]
 fn an_attrless_consumer_io_port_on_a_declared_channel_lowers_to_the_pair() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel acks at "ephemeral:alice-pod.acks" {
     push_depth = 2;
@@ -2399,27 +2934,30 @@ new sink: Sink {
     io acks <-> acks;
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-pod.acks"
-push_depth = 2
-retain_depth = 4
-
-[[wasm_consumer]]
-slug = "sink"
-component_path = "/lib/brenn_sink.wasm"
-grants = ["ports"]
-ephemeral_subscribe_acl = [{ exact = "alice-pod.acks" }]
-ephemeral_publish_acl = [{ exact = "alice-pod.acks" }]
-
-[[wasm_consumer.subscription]]
-port = "acks"
-channel = "ephemeral:alice-pod.acks"
-
-[[wasm_consumer.output]]
-port = "acks"
-channel = "ephemeral:alice-pod.acks"
-"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(4)),
+                ..channel_at("ephemeral:alice-pod.acks")
+            }],
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![WasmGrant::Ports],
+                subscriptions: vec![attrless_subscription("acks", "ephemeral:alice-pod.acks")],
+                outputs: vec![WasmConsumerOutputRaw {
+                    port: "acks".to_string(),
+                    channel: Some("ephemeral:alice-pod.acks".to_string()),
+                    urgency: None,
+                    publish_per_activation: None,
+                    publish_capacity: None,
+                }],
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-pod.acks".to_string(),
+                )],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact("alice-pod.acks".to_string())],
+                ..consumer("sink", "/lib/brenn_sink.wasm")
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -2430,7 +2968,7 @@ channel = "ephemeral:alice-pod.acks"
 /// cannot see it.
 #[test]
 fn two_consumers_keep_their_own_grants_and_acls() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel alerts at "brenn:alice-alerts" {
     push_depth = 8;
@@ -2468,44 +3006,48 @@ new sink: Sink {
     in feed <- presence { push_depth = 2; retain_depth = 4; }
 }
 "#,
-        r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "brenn:alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 128
-
-[[channel]]
-address = "ephemeral:alice-desk.presence"
-push_depth = 4
-retain_depth = 16
-
-[[wasm_consumer]]
-slug = "router"
-component_path = "/lib/brenn_router.wasm"
-grants = ["log"]
-subscribe_acl = [{ exact = "alice-alerts" }]
-
-[[wasm_consumer.subscription]]
-port = "inbound"
-channel = "brenn:alice-alerts"
-push_depth = 4
-retain_depth = 8
-
-[[wasm_consumer]]
-slug = "sink"
-component_path = "/lib/brenn_sink.wasm"
-grants = ["store", "config"]
-store_path = "/state/sink.db"
-ephemeral_subscribe_acl = [{ exact = "alice-desk.presence" }]
-
-[[wasm_consumer.subscription]]
-port = "feed"
-channel = "ephemeral:alice-desk.presence"
-push_depth = 2
-retain_depth = 4
-"#,
+        BrennConfig {
+            channels: vec![
+                ChannelConfigRaw {
+                    uuid: Some("85a5cf7e-6874-5766-9d69-712784754a1f".to_string()),
+                    push_depth: Some(Depth::Bounded(8)),
+                    retain_depth: Some(Depth::Bounded(128)),
+                    standing_retain_depth: Some(Depth::Bounded(128)),
+                    ..channel_at("brenn:alice-alerts")
+                },
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(16)),
+                    ..channel_at("ephemeral:alice-desk.presence")
+                },
+            ],
+            wasm_consumers: vec![
+                WasmConsumerConfigRaw {
+                    grants: vec![WasmGrant::Log],
+                    subscriptions: vec![WasmConsumerSubscriptionRaw {
+                        push_depth: Some(Depth::Bounded(4)),
+                        retain_depth: Some(Depth::Bounded(8)),
+                        ..attrless_subscription("inbound", "brenn:alice-alerts")
+                    }],
+                    subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
+                    ..consumer("router", "/lib/brenn_router.wasm")
+                },
+                WasmConsumerConfigRaw {
+                    grants: vec![WasmGrant::Store, WasmGrant::Config],
+                    store_path: Some(PathBuf::from("/state/sink.db")),
+                    subscriptions: vec![WasmConsumerSubscriptionRaw {
+                        push_depth: Some(Depth::Bounded(2)),
+                        retain_depth: Some(Depth::Bounded(4)),
+                        ..attrless_subscription("feed", "ephemeral:alice-desk.presence")
+                    }],
+                    ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                        "alice-desk.presence".to_string(),
+                    )],
+                    ..consumer("sink", "/lib/brenn_sink.wasm")
+                },
+            ],
+            ..Default::default()
+        },
     );
 }
 
@@ -2513,11 +3055,11 @@ retain_depth = 4
 /// recurses: a float stays a float, a list stays an array in order, and an
 /// inner table stays a table.
 ///
-/// The two front ends must agree on the `toml::Value` they produce for the same
-/// map — that is the claim `rval_to_toml`'s recursion makes.
+/// A value of every shape the map admits appears here, which is the claim
+/// `rval_to_toml`'s recursion makes.
 #[test]
 fn a_consumers_config_map_transcribes_floats_lists_and_nested_tables() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 component Sink {
     abi = processor;
@@ -2536,22 +3078,31 @@ new sink: Sink {
     io tick { push_depth = 1; retain_depth = 2; }
 }
 "#,
-        r#"
-[[wasm_consumer]]
-slug = "sink"
-component_path = "/lib/brenn_sink.wasm"
-grants = ["config"]
-
-[wasm_consumer.config]
-rate = 1.5
-tags = ["fast", "quiet"]
-limits = { max = 3, spill = false }
-
-[[wasm_consumer.io_port]]
-port = "tick"
-push_depth = 1
-retain_depth = 2
-"#,
+        BrennConfig {
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![WasmGrant::Config],
+                io_ports: vec![tick_io_port()],
+                config: Some(toml::Table::from_iter([
+                    ("rate".to_string(), toml::Value::Float(1.5)),
+                    (
+                        "tags".to_string(),
+                        toml::Value::Array(vec![
+                            toml::Value::String("fast".to_string()),
+                            toml::Value::String("quiet".to_string()),
+                        ]),
+                    ),
+                    (
+                        "limits".to_string(),
+                        toml::Value::Table(toml::Table::from_iter([
+                            ("max".to_string(), toml::Value::Integer(3)),
+                            ("spill".to_string(), toml::Value::Boolean(false)),
+                        ])),
+                    ),
+                ])),
+                ..consumer("sink", "/lib/brenn_sink.wasm")
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -2644,7 +3195,7 @@ new sink: Sink {
 /// which is the raw config's shape rather than the document's nesting.
 #[test]
 fn a_surface_lowers_with_every_key_component_and_acl_family() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel alerts at "brenn:alice-alerts" {
     push_depth = 8;
@@ -2716,89 +3267,96 @@ surface alice_desk {
     }
 }
 "#,
-        r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "brenn:alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 128
-
-[[channel]]
-address = "ephemeral:alice-desk.presence"
-push_depth = 4
-retain_depth = 16
-
-[[surface]]
-slug = "alice-desk"
-grants = ["subscribe", "ephemeral_subscribe", "publish", "ephemeral_publish", "alert", "takeover"]
-skin = "bench"
-allowed_users = ["alice", "bob"]
-publish_burst = 32
-publish_per_sec = 4
-subscribe_acl = [{ exact = "alice-alerts" }]
-publish_acl = [{ prefix = "alice-desk." }]
-ephemeral_subscribe_acl = [{ prefix = "alice-desk." }]
-ephemeral_publish_acl = [{ exact = "alice-desk.presence" }]
-
-[[surface.component]]
-kind = "panel"
-instance = "panel"
-abi = "dom"
-send_burst = 16
-send_refill_secs = 30
-parked_batch_depth = "unbounded"
-
-[surface.component.config]
-mode = "compact"
-layout = "wide"
-
-[[surface.component]]
-kind = "chrome"
-instance = "chrome"
-abi = "dom"
-chrome = true
-
-[[surface.subscription]]
-channel = "brenn:alice-alerts"
-instance = "panel"
-port = "messages"
-push_depth = 4
-retain_depth = 8
-noise = "metered"
-wake_min = "low"
-
-[[surface.subscription]]
-channel = "ephemeral:alice-desk.presence"
-instance = "chrome"
-port = "state"
-push_depth = 1
-
-[[surface.output]]
-instance = "panel"
-port = "outbound"
-channel = "ephemeral:alice-desk.presence"
-urgency = "high"
-publish_per_activation = 2.0
-publish_capacity = 3.5
-
-[[surface.io_port]]
-instance = "panel"
-port = "acks"
-channel = "local:panel/acks"
-push_depth = 1
-retain_depth = 2
-
-[[surface.io_port]]
-instance = "panel"
-port = "tick"
-push_depth = 1
-retain_depth = 2
-noise = "alarm"
-urgency = "low"
-publish_per_activation = 1.0
-publish_capacity = 1.0
-"#,
+        BrennConfig {
+            channels: vec![
+                ChannelConfigRaw {
+                    uuid: Some("85a5cf7e-6874-5766-9d69-712784754a1f".to_string()),
+                    push_depth: Some(Depth::Bounded(8)),
+                    retain_depth: Some(Depth::Bounded(128)),
+                    standing_retain_depth: Some(Depth::Bounded(128)),
+                    ..channel_at("brenn:alice-alerts")
+                },
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(16)),
+                    ..channel_at("ephemeral:alice-desk.presence")
+                },
+            ],
+            surfaces: vec![SurfaceConfigRaw {
+                slug: "alice-desk".to_string(),
+                grants: vec![
+                    SurfaceGrant::Subscribe,
+                    SurfaceGrant::EphemeralSubscribe,
+                    SurfaceGrant::Publish,
+                    SurfaceGrant::EphemeralPublish,
+                    SurfaceGrant::Alert,
+                    SurfaceGrant::Takeover,
+                ],
+                subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
+                publish_acl: vec![ChannelMatcherRaw::Prefix("alice-desk.".to_string())],
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Prefix("alice-desk.".to_string())],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.presence".to_string(),
+                )],
+                components: vec![
+                    SurfaceComponentRaw {
+                        send_burst: Some(16),
+                        send_refill_secs: Some(30),
+                        parked_batch_depth: Some(Depth::Unbounded),
+                        config: Some(BTreeMap::from_iter([
+                            ("mode".to_string(), "compact".to_string()),
+                            ("layout".to_string(), "wide".to_string()),
+                        ])),
+                        ..dom_component("panel")
+                    },
+                    SurfaceComponentRaw {
+                        chrome: true,
+                        ..dom_component("chrome")
+                    },
+                ],
+                subscriptions: vec![
+                    SurfaceSubscriptionRaw {
+                        push_depth: Some(Depth::Bounded(4)),
+                        retain_depth: Some(Depth::Bounded(8)),
+                        noise: Some(NoiseLevel::Metered),
+                        wake_min: Some(WakeMin::Low),
+                        ..surface_input("panel", "messages", "brenn:alice-alerts")
+                    },
+                    SurfaceSubscriptionRaw {
+                        push_depth: Some(Depth::Bounded(1)),
+                        ..surface_input("chrome", "state", "ephemeral:alice-desk.presence")
+                    },
+                ],
+                outputs: vec![SurfaceOutputRaw {
+                    urgency: Some(Urgency::High),
+                    publish_per_activation: Some(2.0),
+                    publish_capacity: Some(3.5),
+                    ..surface_output("panel", "outbound", "ephemeral:alice-desk.presence")
+                }],
+                io_ports: vec![
+                    SurfaceIoPortRaw {
+                        channel: Some("local:panel/acks".to_string()),
+                        push_depth: Some(Depth::Bounded(1)),
+                        retain_depth: Some(Depth::Bounded(2)),
+                        ..surface_io_port("panel", "acks")
+                    },
+                    SurfaceIoPortRaw {
+                        push_depth: Some(Depth::Bounded(1)),
+                        retain_depth: Some(Depth::Bounded(2)),
+                        noise: Some(NoiseLevel::Alarm),
+                        urgency: Some(Urgency::Low),
+                        publish_per_activation: Some(1.0),
+                        publish_capacity: Some(1.0),
+                        ..surface_io_port("panel", "tick")
+                    },
+                ],
+                skin: Some("bench".to_string()),
+                allowed_users: vec!["alice".to_string(), "bob".to_string()],
+                publish_burst: Some(32),
+                publish_per_sec: Some(4),
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -2806,7 +3364,7 @@ publish_capacity = 1.0
 /// `[[surface.io_port]]`.
 #[test]
 fn an_io_port_on_a_declared_channel_lowers_to_the_pair() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel acks at "ephemeral:alice-desk.acks" {
     push_depth = 2;
@@ -2833,45 +3391,48 @@ surface alice_desk {
     }
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-desk.acks"
-push_depth = 2
-retain_depth = 4
-
-[[surface]]
-slug = "alice_desk"
-grants = ["ephemeral_subscribe", "ephemeral_publish"]
-ephemeral_subscribe_acl = [{ exact = "alice-desk.acks" }]
-ephemeral_publish_acl = [{ exact = "alice-desk.acks" }]
-
-[[surface.component]]
-kind = "panel"
-instance = "panel"
-abi = "dom"
-
-[[surface.subscription]]
-channel = "ephemeral:alice-desk.acks"
-instance = "panel"
-port = "acks"
-push_depth = 1
-retain_depth = 2
-noise = "alarm"
-
-[[surface.output]]
-instance = "panel"
-port = "acks"
-channel = "ephemeral:alice-desk.acks"
-urgency = "low"
-publish_per_activation = 1.0
-publish_capacity = 1.0
-"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(4)),
+                ..channel_at("ephemeral:alice-desk.acks")
+            }],
+            surfaces: vec![SurfaceConfigRaw {
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.acks".to_string(),
+                )],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.acks".to_string(),
+                )],
+                components: vec![dom_component("panel")],
+                subscriptions: vec![SurfaceSubscriptionRaw {
+                    push_depth: Some(Depth::Bounded(1)),
+                    retain_depth: Some(Depth::Bounded(2)),
+                    noise: Some(NoiseLevel::Alarm),
+                    ..surface_input("panel", "acks", "ephemeral:alice-desk.acks")
+                }],
+                outputs: vec![SurfaceOutputRaw {
+                    urgency: Some(Urgency::Low),
+                    publish_per_activation: Some(1.0),
+                    publish_capacity: Some(1.0),
+                    ..surface_output("panel", "acks", "ephemeral:alice-desk.acks")
+                }],
+                ..surface(
+                    "alice_desk",
+                    vec![
+                        SurfaceGrant::EphemeralSubscribe,
+                        SurfaceGrant::EphemeralPublish,
+                    ],
+                )
+            }],
+            ..Default::default()
+        },
     );
 }
 
 #[test]
 fn an_attrless_io_port_on_a_declared_channel_lowers_to_the_pair() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel acks at "ephemeral:alice-desk.acks" {
     push_depth = 2;
@@ -2891,43 +3452,42 @@ surface alice_desk {
     }
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-desk.acks"
-push_depth = 2
-retain_depth = 4
-
-[[surface]]
-slug = "alice_desk"
-grants = ["ephemeral_subscribe", "ephemeral_publish"]
-ephemeral_subscribe_acl = [{ exact = "alice-desk.acks" }]
-ephemeral_publish_acl = [{ exact = "alice-desk.acks" }]
-
-[[surface.component]]
-kind = "panel"
-instance = "panel"
-abi = "dom"
-
-[[surface.subscription]]
-channel = "ephemeral:alice-desk.acks"
-instance = "panel"
-port = "acks"
-
-[[surface.output]]
-instance = "panel"
-port = "acks"
-channel = "ephemeral:alice-desk.acks"
-"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(4)),
+                ..channel_at("ephemeral:alice-desk.acks")
+            }],
+            surfaces: vec![SurfaceConfigRaw {
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.acks".to_string(),
+                )],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.acks".to_string(),
+                )],
+                components: vec![dom_component("panel")],
+                subscriptions: vec![surface_input("panel", "acks", "ephemeral:alice-desk.acks")],
+                outputs: vec![surface_output("panel", "acks", "ephemeral:alice-desk.acks")],
+                ..surface(
+                    "alice_desk",
+                    vec![
+                        SurfaceGrant::EphemeralSubscribe,
+                        SurfaceGrant::EphemeralPublish,
+                    ],
+                )
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The minimal surface: a grant, one instance and one input. Every optional
-/// attr is omitted on the DSL side and every defaulted key on the TOML side, so
-/// this is the defaults-parity lock for `[[surface]]` — the wire slug falls back
-/// to the handle, the instance name to the `new` handle, and `chrome` to false.
+/// attr is omitted, so this row is where the defaults land — the wire slug
+/// falls back to the handle, the instance name to the `new` handle, and
+/// `chrome` to false.
 #[test]
-fn a_minimal_surface_lowers_with_serdes_defaults() {
-    assert_equivalent(
+fn a_minimal_surface_states_only_its_grant_and_one_input() {
+    assert_lowers(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -2947,28 +3507,25 @@ surface alice_pod {
     }
 }
 "#,
-        r#"
-[[channel]]
-address = "ephemeral:alice-pod.utterance"
-push_depth = 4
-retain_depth = 16
-
-[[surface]]
-slug = "alice_pod"
-grants = ["ephemeral_subscribe"]
-ephemeral_subscribe_acl = [{ exact = "alice-pod.utterance" }]
-
-[[surface.component]]
-kind = "widget"
-instance = "widget"
-abi = "dom"
-
-[[surface.subscription]]
-channel = "ephemeral:alice-pod.utterance"
-instance = "widget"
-port = "heard"
-push_depth = 2
-"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(4)),
+                retain_depth: Some(Depth::Bounded(16)),
+                ..channel_at("ephemeral:alice-pod.utterance")
+            }],
+            surfaces: vec![SurfaceConfigRaw {
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-pod.utterance".to_string(),
+                )],
+                components: vec![dom_component("widget")],
+                subscriptions: vec![SurfaceSubscriptionRaw {
+                    push_depth: Some(Depth::Bounded(2)),
+                    ..surface_input("widget", "heard", "ephemeral:alice-pod.utterance")
+                }],
+                ..surface("alice_pod", vec![SurfaceGrant::EphemeralSubscribe])
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -2978,7 +3535,7 @@ push_depth = 2
 /// kinds and subscribe with the other's ACLs. A one-surface row cannot see it.
 #[test]
 fn two_surfaces_keep_their_own_component_kinds_and_acls() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 channel alerts at "brenn:alice-alerts" {
     push_depth = 8;
@@ -3019,53 +3576,47 @@ surface bob_desk {
     }
 }
 "#,
-        r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "brenn:alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 128
-
-[[channel]]
-address = "ephemeral:alice-desk.presence"
-push_depth = 4
-retain_depth = 16
-
-[[surface]]
-slug = "alice_desk"
-grants = ["subscribe"]
-skin = "bench"
-subscribe_acl = [{ exact = "alice-alerts" }]
-
-[[surface.component]]
-kind = "panel"
-instance = "panel"
-abi = "dom"
-
-[[surface.subscription]]
-channel = "brenn:alice-alerts"
-instance = "panel"
-port = "messages"
-push_depth = 4
-
-[[surface]]
-slug = "bob_desk"
-grants = ["ephemeral_subscribe"]
-skin = "lab"
-ephemeral_subscribe_acl = [{ exact = "alice-desk.presence" }]
-
-[[surface.component]]
-kind = "board"
-instance = "board"
-abi = "dom"
-
-[[surface.subscription]]
-channel = "ephemeral:alice-desk.presence"
-instance = "board"
-port = "feed"
-push_depth = 2
-"#,
+        BrennConfig {
+            channels: vec![
+                ChannelConfigRaw {
+                    uuid: Some("85a5cf7e-6874-5766-9d69-712784754a1f".to_string()),
+                    push_depth: Some(Depth::Bounded(8)),
+                    retain_depth: Some(Depth::Bounded(128)),
+                    standing_retain_depth: Some(Depth::Bounded(128)),
+                    ..channel_at("brenn:alice-alerts")
+                },
+                ChannelConfigRaw {
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(16)),
+                    ..channel_at("ephemeral:alice-desk.presence")
+                },
+            ],
+            surfaces: vec![
+                SurfaceConfigRaw {
+                    skin: Some("bench".to_string()),
+                    subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
+                    components: vec![dom_component("panel")],
+                    subscriptions: vec![SurfaceSubscriptionRaw {
+                        push_depth: Some(Depth::Bounded(4)),
+                        ..surface_input("panel", "messages", "brenn:alice-alerts")
+                    }],
+                    ..surface("alice_desk", vec![SurfaceGrant::Subscribe])
+                },
+                SurfaceConfigRaw {
+                    skin: Some("lab".to_string()),
+                    ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                        "alice-desk.presence".to_string(),
+                    )],
+                    components: vec![dom_component("board")],
+                    subscriptions: vec![SurfaceSubscriptionRaw {
+                        push_depth: Some(Depth::Bounded(2)),
+                        ..surface_input("board", "feed", "ephemeral:alice-desk.presence")
+                    }],
+                    ..surface("bob_desk", vec![SurfaceGrant::EphemeralSubscribe])
+                },
+            ],
+            ..Default::default()
+        },
     );
 }
 
@@ -3258,7 +3809,7 @@ surface alice_pod {
 /// matchers on both publish planes.
 #[test]
 fn a_remote_lowers_with_ceilings_on_both_subscribe_planes() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 remote bob_pod {
     token_file = "/home/alice/.secrets/bob-pod.token";
@@ -3275,29 +3826,36 @@ remote bob_pod {
     acl publish [prefix "brenn:alice.in.", exact "ephemeral:bob.presence"];
 }
 "#,
-        r#"
-[[remote]]
-slug = "bob_pod"
-token_file = "/home/alice/.secrets/bob-pod.token"
-grants = ["subscribe", "ephemeral_subscribe", "publish", "ephemeral_publish", "alert"]
-publish_burst = 16
-publish_per_sec = 2
-max_sessions = 4
-max_subscriptions = 64
-subscribe_acl = [{ exact = "alice.cmd", push_depth = 0, retain_depth = 32 }]
-ephemeral_subscribe_acl = [{ prefix = "alice.", push_depth = 8, retain_depth = 1 }]
-publish_acl = [{ prefix = "alice.in." }]
-ephemeral_publish_acl = [{ exact = "bob.presence" }]
-"#,
+        BrennConfig {
+            remotes: vec![RemoteConfigRaw {
+                grants: vec![
+                    RemoteGrant::Subscribe,
+                    RemoteGrant::EphemeralSubscribe,
+                    RemoteGrant::Publish,
+                    RemoteGrant::EphemeralPublish,
+                    RemoteGrant::Alert,
+                ],
+                subscribe_acl: vec![remote_exact("alice.cmd", 0, 32)],
+                ephemeral_subscribe_acl: vec![remote_prefix("alice.", 8, 1)],
+                publish_acl: vec![ChannelMatcherRaw::Prefix("alice.in.".to_string())],
+                ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact("bob.presence".to_string())],
+                publish_burst: Some(16),
+                publish_per_sec: Some(2),
+                max_sessions: Some(4),
+                max_subscriptions: Some(64),
+                ..remote("bob_pod", "/home/alice/.secrets/bob-pod.token")
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The minimal remote: a token file, one grant and the entry that grant is
-/// about. Every optional attr is omitted on the DSL side and every defaulted
-/// key on the TOML side, so this is the defaults-parity lock for `[[remote]]`.
+/// about. Every optional attr is omitted, so every ceiling stays absent and
+/// resolution supplies its own.
 #[test]
-fn a_minimal_remote_lowers_with_serdes_defaults() {
-    assert_equivalent(
+fn a_minimal_remote_states_only_its_token_file_and_one_entry() {
+    assert_lowers(
         r#"
 remote bob_pod {
     token_file = "/home/alice/.secrets/bob-pod.token";
@@ -3306,13 +3864,14 @@ remote bob_pod {
     acl subscribe [exact "brenn:alice.cmd" { push_depth = 1, retain_depth = 8 }];
 }
 "#,
-        r#"
-[[remote]]
-slug = "bob_pod"
-token_file = "/home/alice/.secrets/bob-pod.token"
-grants = ["subscribe"]
-subscribe_acl = [{ exact = "alice.cmd", push_depth = 1, retain_depth = 8 }]
-"#,
+        BrennConfig {
+            remotes: vec![RemoteConfigRaw {
+                grants: vec![RemoteGrant::Subscribe],
+                subscribe_acl: vec![remote_exact("alice.cmd", 1, 8)],
+                ..remote("bob_pod", "/home/alice/.secrets/bob-pod.token")
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -3322,7 +3881,7 @@ subscribe_acl = [{ exact = "alice.cmd", push_depth = 1, retain_depth = 8 }]
 /// one-remote row cannot see it.
 #[test]
 fn two_remotes_keep_their_own_ceilings() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 remote bob_pod {
     token_file = "/home/alice/.secrets/bob-pod.token";
@@ -3341,22 +3900,24 @@ remote charlie_pod {
     acl publish [exact "brenn:alice.in.charlie"];
 }
 "#,
-        r#"
-[[remote]]
-slug = "bob_pod"
-token_file = "/home/alice/.secrets/bob-pod.token"
-grants = ["subscribe"]
-max_sessions = 4
-subscribe_acl = [{ exact = "alice.cmd", push_depth = 1, retain_depth = 8 }]
-
-[[remote]]
-slug = "charlie_pod"
-token_file = "/home/alice/.secrets/charlie-pod.token"
-grants = ["ephemeral_subscribe", "publish"]
-max_sessions = 2
-ephemeral_subscribe_acl = [{ prefix = "alice.", push_depth = 8, retain_depth = 1 }]
-publish_acl = [{ exact = "alice.in.charlie" }]
-"#,
+        BrennConfig {
+            remotes: vec![
+                RemoteConfigRaw {
+                    grants: vec![RemoteGrant::Subscribe],
+                    subscribe_acl: vec![remote_exact("alice.cmd", 1, 8)],
+                    max_sessions: Some(4),
+                    ..remote("bob_pod", "/home/alice/.secrets/bob-pod.token")
+                },
+                RemoteConfigRaw {
+                    grants: vec![RemoteGrant::EphemeralSubscribe, RemoteGrant::Publish],
+                    ephemeral_subscribe_acl: vec![remote_prefix("alice.", 8, 1)],
+                    publish_acl: vec![ChannelMatcherRaw::Exact("alice.in.charlie".to_string())],
+                    max_sessions: Some(2),
+                    ..remote("charlie_pod", "/home/alice/.secrets/charlie-pod.token")
+                },
+            ],
+            ..Default::default()
+        },
     );
 }
 
@@ -3389,7 +3950,7 @@ remote bob_pod {
 /// a replay-protection binding with a nested config map.
 #[test]
 fn a_webhook_endpoint_lowers_with_every_block() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 webhook alice_inbox {
     slug = "alice-inbox";
@@ -3418,48 +3979,47 @@ webhook alice_inbox {
     }
 }
 "#,
-        r#"
-[[webhook_endpoint]]
-slug = "alice-inbox"
-mount = "/webhooks/alice-inbox"
-description = "Pushes from alice's phone."
-transport_ceiling_bytes = 65536
-content_type = "application/json"
-urgency = "high"
-
-[webhook_endpoint.signature]
-scheme = "hmac-raw-body"
-algorithm = "hmac-sha512"
-header = "x-signature"
-format = "hex-lower"
-key_id_header = "x-key-id"
-
-[[webhook_endpoint.key]]
-key_id = "primary"
-secret_file = "/home/alice/.secrets/inbox-primary.key"
-
-[[webhook_endpoint.key]]
-key_id = "rotated"
-secret_file = "/home/alice/.secrets/inbox-rotated.key"
-
-[webhook_endpoint.replay_protection]
-component_path = "/opt/brenn/lib/replay.wasm"
-store_path = "/var/lib/brenn/alice-inbox-replay.sqlite"
-store_size_limit = "128MiB"
-config = { window_secs = 300, strict = true }
-"#,
+        BrennConfig {
+            webhook_endpoints: vec![WebhookEndpointConfigRaw {
+                slug: "alice-inbox".to_string(),
+                mount: Some("/webhooks/alice-inbox".to_string()),
+                description: Some("Pushes from alice's phone.".to_string()),
+                transport_ceiling_bytes: 65536,
+                content_type: "application/json".to_string(),
+                signature: WebhookSignatureConfigRaw::HmacRawBody {
+                    algorithm: "hmac-sha512".to_string(),
+                    header: "x-signature".to_string(),
+                    format: "hex-lower".to_string(),
+                    key_id_header: Some("x-key-id".to_string()),
+                },
+                keys: vec![
+                    webhook_key("primary", "/home/alice/.secrets/inbox-primary.key"),
+                    webhook_key("rotated", "/home/alice/.secrets/inbox-rotated.key"),
+                ],
+                tokens: vec![],
+                replay_protection: Some(ReplayProtectionConfigRaw {
+                    component_path: PathBuf::from("/opt/brenn/lib/replay.wasm"),
+                    store_path: PathBuf::from("/var/lib/brenn/alice-inbox-replay.sqlite"),
+                    store_size_limit: Some("128MiB".to_string()),
+                    config: Some(toml::Table::from_iter([
+                        ("window_secs".to_string(), toml::Value::Integer(300)),
+                        ("strict".to_string(), toml::Value::Boolean(true)),
+                    ])),
+                }),
+                urgency: Some(Urgency::High),
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The minimal webhook: a bearer scheme and the one token it checks against.
-/// Every optional attr is omitted on the DSL side and every defaulted key on
-/// the TOML side, so this is the defaults-parity lock for
-/// `[[webhook_endpoint]]` — the wire slug falls back to the handle, and
-/// `transport_ceiling_bytes`, `content_type` and `algorithm` to serde's own
-/// default functions.
+/// Every optional attr is omitted, so this row is where the defaults land — the
+/// wire slug falls back to the handle, and `transport_ceiling_bytes` and
+/// `content_type` to the module's own default functions.
 #[test]
-fn a_minimal_webhook_endpoint_lowers_with_serdes_defaults() {
-    assert_equivalent(
+fn a_minimal_webhook_endpoint_states_only_its_scheme_and_one_token() {
+    assert_lowers(
         r#"
 webhook alice_inbox {
     signature {
@@ -3470,18 +4030,20 @@ webhook alice_inbox {
     token phone { secret_file = "/home/alice/.secrets/inbox-phone.token"; }
 }
 "#,
-        r#"
-[[webhook_endpoint]]
-slug = "alice_inbox"
-
-[webhook_endpoint.signature]
-scheme = "bearer-token"
-header = "authorization"
-
-[[webhook_endpoint.token]]
-token_id = "phone"
-secret_file = "/home/alice/.secrets/inbox-phone.token"
-"#,
+        BrennConfig {
+            webhook_endpoints: vec![WebhookEndpointConfigRaw {
+                signature: WebhookSignatureConfigRaw::BearerToken {
+                    header: "authorization".to_string(),
+                    token_id_header: None,
+                },
+                tokens: vec![webhook_token(
+                    "phone",
+                    "/home/alice/.secrets/inbox-phone.token",
+                )],
+                ..webhook_endpoint("alice_inbox")
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -3489,7 +4051,7 @@ secret_file = "/home/alice/.secrets/inbox-phone.token"
 /// signature parity row for that variant.
 #[test]
 fn the_timestamped_body_signature_scheme_lowers() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 webhook alice_inbox {
     signature {
@@ -3504,29 +4066,32 @@ webhook alice_inbox {
     key primary { secret_file = "/home/alice/.secrets/inbox-primary.key"; }
 }
 "#,
-        r#"
-[[webhook_endpoint]]
-slug = "alice_inbox"
-
-[webhook_endpoint.signature]
-scheme = "hmac-timestamped-body"
-sig_header = "x-signature"
-sig_format = "v0=hex-lower"
-timestamp_header = "x-request-timestamp"
-template = "v0:{t}:{body}"
-max_skew_secs = 300
-
-[[webhook_endpoint.key]]
-key_id = "primary"
-secret_file = "/home/alice/.secrets/inbox-primary.key"
-"#,
+        BrennConfig {
+            webhook_endpoints: vec![WebhookEndpointConfigRaw {
+                signature: WebhookSignatureConfigRaw::HmacTimestampedBody {
+                    algorithm: default_hmac_algorithm(),
+                    sig_header: "x-signature".to_string(),
+                    sig_format: "v0=hex-lower".to_string(),
+                    timestamp_header: "x-request-timestamp".to_string(),
+                    template: "v0:{t}:{body}".to_string(),
+                    max_skew_secs: 300,
+                    key_id_header: None,
+                },
+                keys: vec![webhook_key(
+                    "primary",
+                    "/home/alice/.secrets/inbox-primary.key",
+                )],
+                ..webhook_endpoint("alice_inbox")
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The combined-header scheme: the signature parity row for that variant.
 #[test]
 fn the_stripe_signature_scheme_lowers() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 webhook alice_inbox {
     signature {
@@ -3538,26 +4103,28 @@ webhook alice_inbox {
     key primary { secret_file = "/home/alice/.secrets/inbox-primary.key"; }
 }
 "#,
-        r#"
-[[webhook_endpoint]]
-slug = "alice_inbox"
-
-[webhook_endpoint.signature]
-scheme = "hmac-stripe"
-header = "stripe-signature"
-max_skew_secs = 300
-
-[[webhook_endpoint.key]]
-key_id = "primary"
-secret_file = "/home/alice/.secrets/inbox-primary.key"
-"#,
+        BrennConfig {
+            webhook_endpoints: vec![WebhookEndpointConfigRaw {
+                signature: WebhookSignatureConfigRaw::HmacStripe {
+                    algorithm: default_hmac_algorithm(),
+                    header: "stripe-signature".to_string(),
+                    max_skew_secs: 300,
+                    key_id_header: None,
+                },
+                keys: vec![webhook_key(
+                    "primary",
+                    "/home/alice/.secrets/inbox-primary.key",
+                )],
+                ..webhook_endpoint("alice_inbox")
+            }],
+            ..Default::default()
+        },
     );
 }
 
 /// The `signature` vocabulary is the union of every scheme's fields, so an attr
-/// belonging to another variant is refused at lowering — the same answer
-/// `deny_unknown_fields` gives the TOML path, at the key that was written and
-/// naming the fields the chosen scheme reads.
+/// belonging to another variant is refused at lowering, at the key that was
+/// written and naming the fields the chosen scheme reads.
 #[test]
 fn a_signature_attr_the_chosen_scheme_has_no_field_for_is_refused() {
     let refusal = refusal(
@@ -3577,22 +4144,6 @@ webhook alice_inbox {
         refusal.message,
         "`max_skew_secs` is not a key of `signature` of webhook `alice_inbox`; expected \
          `scheme`, `header` or `token_id_header`"
-    );
-    assert_toml_refused(
-        r#"
-[[webhook_endpoint]]
-slug = "alice_inbox"
-
-[webhook_endpoint.signature]
-scheme = "bearer-token"
-header = "authorization"
-max_skew_secs = 300
-
-[[webhook_endpoint.token]]
-token_id = "phone"
-secret_file = "/home/alice/.secrets/inbox-phone.token"
-"#,
-        "max_skew_secs",
     );
 }
 
@@ -3616,25 +4167,10 @@ webhook alice_inbox {
         refusal.message,
         "`signature` of webhook `alice_inbox` states no `format`, which it requires"
     );
-    assert_toml_refused(
-        r#"
-[[webhook_endpoint]]
-slug = "alice_inbox"
-
-[webhook_endpoint.signature]
-scheme = "hmac-raw-body"
-header = "x-signature"
-
-[[webhook_endpoint.key]]
-key_id = "primary"
-secret_file = "/home/alice/.secrets/inbox-primary.key"
-"#,
-        "format",
-    );
 }
 
-/// The scheme word is matched against the raw enum's own tags, and a word that
-/// is not one of them is refused naming the four that are.
+/// The scheme word is matched against the schemes there are, and a word that is
+/// not one of them is refused naming the four that are.
 #[test]
 fn an_unknown_signature_scheme_is_refused() {
     let refusal = refusal(
@@ -3656,17 +4192,6 @@ webhook alice_inbox {
         refusal.span.text_str(),
         Some("hmac-blake3"),
         "the span is the scheme word's own, not the block's"
-    );
-    assert_toml_refused(
-        r#"
-[[webhook_endpoint]]
-slug = "alice_inbox"
-
-[webhook_endpoint.signature]
-scheme = "hmac-blake3"
-header = "x-signature"
-"#,
-        "unknown variant",
     );
 }
 
@@ -3695,8 +4220,8 @@ webhook alice_inbox {
 /// The one open-bodied section: every key the body wrote reaches the config's
 /// `toml::Value` tree, scalars and nested tables alike.
 #[test]
-fn integration_sections_lower_to_the_map_their_toml_twin_builds() {
-    assert_equivalent(
+fn integration_sections_lower_to_a_value_tree_of_every_key_they_state() {
+    assert_lowers(
         r#"
 integration graf {
     command = "graf";
@@ -3709,39 +4234,82 @@ integration graf {
 
 integration pfin { command = "pf"; }
 "#,
-        r#"
-[integrations.graf]
-command = "graf"
-timeout_secs = 30
-strict = true
-ratio = 0.5
-args = ["mcp", "--quiet"]
-env = { GRAF_ROOT = "/home/alice/kb", GRAF_LOG = "warn" }
-
-[integrations.pfin]
-command = "pf"
-"#,
+        BrennConfig {
+            integrations: HashMap::from_iter([
+                (
+                    "graf".to_string(),
+                    toml::Value::Table(toml::Table::from_iter([
+                        (
+                            "command".to_string(),
+                            toml::Value::String("graf".to_string()),
+                        ),
+                        ("timeout_secs".to_string(), toml::Value::Integer(30)),
+                        ("strict".to_string(), toml::Value::Boolean(true)),
+                        ("ratio".to_string(), toml::Value::Float(0.5)),
+                        (
+                            "args".to_string(),
+                            toml::Value::Array(vec![
+                                toml::Value::String("mcp".to_string()),
+                                toml::Value::String("--quiet".to_string()),
+                            ]),
+                        ),
+                        (
+                            "env".to_string(),
+                            toml::Value::Table(toml::Table::from_iter([
+                                (
+                                    "GRAF_ROOT".to_string(),
+                                    toml::Value::String("/home/alice/kb".to_string()),
+                                ),
+                                (
+                                    "GRAF_LOG".to_string(),
+                                    toml::Value::String("warn".to_string()),
+                                ),
+                            ])),
+                        ),
+                    ])),
+                ),
+                (
+                    "pfin".to_string(),
+                    toml::Value::Table(toml::Table::from_iter([(
+                        "command".to_string(),
+                        toml::Value::String("pf".to_string()),
+                    )])),
+                ),
+            ]),
+            ..Default::default()
+        },
     );
 }
 
-/// A body nesting two levels deep: an inline table inside an inline table is
-/// the same tree TOML's own nested tables build.
+/// A body nesting two levels deep: an inline table inside an inline table
+/// nests the value tree the same way.
 #[test]
 fn an_integration_body_nests_as_deep_as_it_is_written() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 integration graf {
     limits = { queries = { per_minute = 60, burst = 10 }, bytes = 4096 };
 }
 "#,
-        r#"
-[integrations.graf.limits]
-bytes = 4096
-
-[integrations.graf.limits.queries]
-per_minute = 60
-burst = 10
-"#,
+        BrennConfig {
+            integrations: HashMap::from_iter([(
+                "graf".to_string(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    "limits".to_string(),
+                    toml::Value::Table(toml::Table::from_iter([
+                        (
+                            "queries".to_string(),
+                            toml::Value::Table(toml::Table::from_iter([
+                                ("per_minute".to_string(), toml::Value::Integer(60)),
+                                ("burst".to_string(), toml::Value::Integer(10)),
+                            ])),
+                        ),
+                        ("bytes".to_string(), toml::Value::Integer(4096)),
+                    ])),
+                )])),
+            )]),
+            ..Default::default()
+        },
     );
 }
 
@@ -3774,7 +4342,7 @@ integration graf {
 /// A target stating every key, and the one handler type there is.
 #[test]
 fn an_attachment_target_lowers_with_every_key_and_its_handler() {
-    assert_equivalent(
+    assert_lowers(
         r#"
 agent Assistant() {
     attachment_target import {
@@ -3794,35 +4362,50 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[app]]
-slug = "alice"
-
-[[app.attachment_targets]]
-name = "import"
-label = "Import bank export"
-accept = [".ofx", ".qfx", ".csv"]
-multi = true
-
-[app.attachment_targets.handler]
-type = "command"
-program = "pf"
-args = ["--json", "import", "{ofx}", "--csv", "{csv}"]
-timeout_secs = 120
-cc_instructions = "Reconcile the import against the ledger."
-file_roles = { ofx = [".ofx", ".qfx"], csv = [".csv"] }
-"#,
+        BrennConfig {
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                attachment_targets: vec![AttachmentTargetRaw {
+                    name: "import".to_string(),
+                    label: "Import bank export".to_string(),
+                    accept: vec![".ofx".to_string(), ".qfx".to_string(), ".csv".to_string()],
+                    multi: true,
+                    handler: AttachmentHandlerConfig::Command {
+                        program: "pf".to_string(),
+                        args: vec![
+                            "--json".to_string(),
+                            "import".to_string(),
+                            "{ofx}".to_string(),
+                            "--csv".to_string(),
+                            "{csv}".to_string(),
+                        ],
+                        file_roles: HashMap::from_iter([
+                            (
+                                "ofx".to_string(),
+                                vec![".ofx".to_string(), ".qfx".to_string()],
+                            ),
+                            ("csv".to_string(), vec![".csv".to_string()]),
+                        ]),
+                        timeout_secs: 120,
+                        cc_instructions: Some(
+                            "Reconcile the import against the ledger.".to_string(),
+                        ),
+                    },
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
-/// The minimal target: `multi` and `timeout_secs` omitted on the DSL side and
-/// on the TOML side both, so this is the defaults-parity lock — the two sides
-/// call the same default function. The wire name falls back to the block's own
-/// name, and an explicit `name` overrides it, which is why the second target
-/// states one.
+/// The minimal target: `multi` and `timeout_secs` omitted, so `multi` is false
+/// and the timeout is the module's default. The wire name falls back to the
+/// block's own name, and an explicit `name` overrides it, which is why the
+/// second target states one.
 #[test]
-fn a_minimal_attachment_target_lowers_with_serdes_defaults() {
-    assert_equivalent(
+fn a_minimal_attachment_target_states_only_its_label_accept_and_handler() {
+    assert_lowers(
         r#"
 agent Assistant() {
     attachment_target import {
@@ -3840,32 +4423,29 @@ agent Assistant() {
 
 new alice: Assistant();
 "#,
-        r#"
-[[app]]
-slug = "alice"
-
-[[app.attachment_targets]]
-name = "import"
-label = "Import"
-accept = [".ofx"]
-
-[app.attachment_targets.handler]
-type = "command"
-program = "pf"
-args = ["import"]
-file_roles = {}
-
-[[app.attachment_targets]]
-name = "receipt-scan"
-label = "Scan a receipt"
-accept = [".jpg"]
-
-[app.attachment_targets.handler]
-type = "command"
-program = "pf"
-args = ["scan"]
-file_roles = {}
-"#,
+        BrennConfig {
+            apps: vec![AppConfigRaw {
+                slug: "alice".to_string(),
+                attachment_targets: vec![
+                    AttachmentTargetRaw {
+                        name: "import".to_string(),
+                        label: "Import".to_string(),
+                        accept: vec![".ofx".to_string()],
+                        multi: false,
+                        handler: command_handler("pf", &["import"]),
+                    },
+                    AttachmentTargetRaw {
+                        name: "receipt-scan".to_string(),
+                        label: "Scan a receipt".to_string(),
+                        accept: vec![".jpg".to_string()],
+                        multi: false,
+                        handler: command_handler("pf", &["scan"]),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
     );
 }
 
@@ -3901,23 +4481,6 @@ new alice: Assistant();
         "the position is the `handler` kindword's, which is the finest a missing key has: {}",
         refusal.render()
     );
-    assert_toml_refused(
-        r#"
-[[app]]
-slug = "alice"
-
-[[app.attachment_targets]]
-name = "import"
-label = "Import"
-accept = [".ofx"]
-
-[app.attachment_targets.handler]
-type = "command"
-program = "pf"
-file_roles = {}
-"#,
-        "args",
-    );
 }
 
 /// `file_roles` is required, and a required map is refused when it is absent
@@ -3942,27 +4505,10 @@ new alice: Assistant();
         "`handler` of `attachment_target import` of app `alice` states no `file_roles`, \
          which it requires"
     );
-    assert_toml_refused(
-        r#"
-[[app]]
-slug = "alice"
-
-[[app.attachment_targets]]
-name = "import"
-label = "Import"
-accept = [".ofx"]
-
-[app.attachment_targets.handler]
-type = "command"
-program = "pf"
-args = ["import"]
-"#,
-        "file_roles",
-    );
 }
 
-/// The type word is the raw enum's own serde tag, so an unknown one names the
-/// tags there are.
+/// The type word is matched against the handler types there are, so an unknown
+/// one names them.
 #[test]
 fn an_unknown_handler_type_names_the_legal_set() {
     let refusal = refusal(
@@ -3981,21 +4527,6 @@ new alice: Assistant();
     assert_eq!(
         refusal.message,
         "`webhook` is not an attachment handler type; expected `command`"
-    );
-    assert_toml_refused(
-        r#"
-[[app]]
-slug = "alice"
-
-[[app.attachment_targets]]
-name = "import"
-label = "Import"
-accept = [".ofx"]
-
-[app.attachment_targets.handler]
-type = "webhook"
-"#,
-        "command",
     );
 }
 

@@ -91,7 +91,7 @@ pub enum RuntimeSubscribeError {
     /// is the idempotent no-op `SubscribeOutcome::AlreadySubscribedIdentical`,
     /// not an error.)
     AlreadySubscribedDiffers { address: String },
-    /// The calling app already has a **static** (TOML-configured) subscription on
+    /// The calling app already has a **static** (config-declared) subscription on
     /// this channel. Static subs are config-managed and cannot be shadowed or
     /// mutated by a dynamic subscribe (an app cannot hold both a
     /// static and a dynamic sub on one channel). The app already receives this
@@ -222,7 +222,7 @@ impl SubscribeOutcome {
 /// bug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeUnsubscribeError {
-    /// The calling app holds a **static** (TOML-configured) subscription on this
+    /// The calling app holds a **static** (config-declared) subscription on this
     /// channel. A static subscription has no durable dynamic row, so it is
     /// structurally unreachable by unsubscribe — static subs are config-managed
     /// and cannot be removed by a tool. Discriminated from
@@ -608,7 +608,7 @@ impl Messenger {
     /// the broker UNSUBSCRIBE).
     ///
     /// Errors (never panics): no dynamic subscription for this app on the channel.
-    /// Removing another app's sub, or a static TOML sub, is structurally
+    /// Removing another app's sub, or a static config sub, is structurally
     /// impossible — the drop is keyed on `(channel_uuid, app_slug)` and static
     /// subs hold no registration.
     pub async fn unsubscribe_dynamic(

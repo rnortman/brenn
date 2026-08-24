@@ -479,7 +479,7 @@ impl MessagingDirectory {
     /// Insert a brand-new channel (entry + address index + iteration order).
     ///
     /// Used by the runtime `mqtt:` subscribe path to register a
-    /// channel for a filter that was never declared in TOML. Panics if a channel
+    /// channel for a filter that was never declared in the config. Panics if a channel
     /// with the same UUID or address already exists — callers resolve existence
     /// first and only call this for genuinely new channels, so a collision is a
     /// host bug (CLAUDE.md: panic on host bugs).
@@ -562,7 +562,7 @@ impl WakeMin {
         }
     }
 
-    /// Wire/DB/TOML string representation.
+    /// Wire/DB string representation.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::VeryLow => "very-low",
@@ -573,7 +573,7 @@ impl WakeMin {
         }
     }
 
-    /// Parse from a wire/DB/TOML string. Returns `None` on unknown values.
+    /// Parse from a wire/DB string. Returns `None` on unknown values.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "very-low" => Some(Self::VeryLow),

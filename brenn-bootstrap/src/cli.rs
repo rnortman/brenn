@@ -19,13 +19,13 @@ pub enum Commands {
     Serve,
     /// Generate an invite code and print it to stdout.
     Invite,
-    /// Compare two config files as configurations, not as documents. Each side
-    /// may be `.toml` or `.brenn`. Exits 0 when they are the same config, 1 with
-    /// a unified diff when they are not.
+    /// Compare two `.brenn` config documents as configurations, not as
+    /// documents. Exits 0 when they are the same config, 1 with a unified diff
+    /// when they are not.
     ConfigDiff { a: PathBuf, b: PathBuf },
-    /// Validate a config file the way the server loads it: a `.brenn` document
-    /// is parsed, resolved, derived and lowered, a `.toml` file is parsed. Exits
-    /// 0 when the file would load, 1 with the diagnostics when it would not.
+    /// Validate a `.brenn` config document the way the server loads it: parsed,
+    /// resolved, derived and lowered. Exits 0 when the file would load, 1 with
+    /// the diagnostics when it would not.
     /// Environment facts are not checked — container home directories, the
     /// integration registry and the runtime dir are the boot's business — so
     /// `ok` means the file is a config, not that it will boot on every host.

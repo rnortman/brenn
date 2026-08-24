@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Deserialize;
-
 use crate::integration::Integration;
 
 use super::attachment::{AttachmentTarget, AttachmentTargetRaw};
@@ -14,10 +12,9 @@ use super::mcp::McpServerConfig;
 use super::path_mapper::PathMapper;
 use super::repo::{MountConfigRaw, ResolvedMount};
 
-/// Raw per-app config as deserialized from TOML `[[app]]`.
+/// Raw per-app config, one per `agent` instantiation.
 /// Validated and resolved into `AppConfig` by `validate_and_resolve`.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct AppConfigRaw {
     /// URL-safe identifier (e.g. "pfin"). Must match `[a-z0-9][a-z0-9-]*`.
     pub slug: String,
@@ -33,15 +30,12 @@ pub struct AppConfigRaw {
     /// CC model override. If omitted, uses `claude_defaults.model`.
     pub model: Option<String>,
     /// Enforce at most one active CC session for this app (globally).
-    #[serde(default)]
     pub single_instance: bool,
     /// Singleton mode: one conversation per user, no conversation list.
     /// Mutually exclusive with `multiuser`.
-    #[serde(default)]
     pub singleton: bool,
     /// Persistent mode: CC survives browser tab closes and shuts down
     /// after an idle timeout instead of immediately.
-    #[serde(default)]
     pub persistent: bool,
     /// Idle timeout in seconds before killing CC when no subscribers are
     /// connected. Only meaningful when `persistent = true`. Default: 1800 (30 min).
@@ -84,16 +78,12 @@ pub struct AppConfigRaw {
     /// Default: 2700 (45 min).
     pub idle_hook_secs: Option<u64>,
     /// Usernames with access. Empty = all users have access.
-    #[serde(default)]
     pub allowed_users: Vec<String>,
     /// CC built-in tools to disable (blacklist).
-    #[serde(default)]
     pub disabled_tools: Vec<String>,
     /// Additional MCP servers for this app (merged with the base Brenn MCP server).
-    #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
     /// Enable multiuser mode: shared conversations, cross-user participation.
-    #[serde(default)]
     pub multiuser: bool,
     /// Prepend `[username ...]` to messages sent to CC. Defaults to `multiuser` value.
     ///
@@ -111,7 +101,7 @@ pub struct AppConfigRaw {
     /// Governs the legacy websocket door only. A bus peer has no device, so
     /// bus-originated input never carries a device prefix whatever this says.
     pub prefix_device: Option<bool>,
-    /// Name of a `[container.<name>]` definition. If absent, CC runs as a bare process.
+    /// Name of a `container` declaration. If absent, CC runs as a bare process.
     pub container: Option<String>,
     /// CC's working directory inside the container. Optional — derived from
     /// convention when working dir comes from a repo mount.
@@ -123,26 +113,20 @@ pub struct AppConfigRaw {
     /// Hook scripts that run once at server startup after all startup pulls succeed.
     pub startup_hooks: Option<StartupHooksConfig>,
     /// Extra CLI arguments passed verbatim to the `claude` command.
-    #[serde(default)]
     pub cc_extra_args: Vec<String>,
     /// Static auto-approval rules (pattern-based). Checked before DB rules.
-    #[serde(default)]
     pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets (e.g. "Import bank export").
-    #[serde(default)]
     pub attachment_targets: Vec<AttachmentTargetRaw>,
     /// Integrations to enable for this app (by name, using global defaults).
-    #[serde(default)]
     pub integrations: Vec<String>,
     /// Per-app integration config overrides. Keys are integration names;
-    /// values override/extend the global `[integrations.<name>]` section.
+    /// values override/extend the global `integration` declaration of that name.
     /// Listing a name here implicitly enables it (no need to also list in
     /// `integrations`).
-    #[serde(default)]
     pub integration_config: HashMap<String, toml::Value>,
-    /// Repo mounts for this app. Each mount references a top-level `[[repo]]`
-    /// by slug, with optional access level and working-dir designation.
-    #[serde(default, rename = "mount")]
+    /// Repo mounts for this app. Each mount references a top-level `repo`
+    /// declaration by slug, with optional access level and working-dir designation.
     pub mounts: Vec<MountConfigRaw>,
     /// Extra bind mounts injected only into this app's container, in
     /// addition to the container-level `extra_mounts`. Same
@@ -150,7 +134,6 @@ pub struct AppConfigRaw {
     /// validation panics if a bare app sets it. Same path-translation
     /// caveat as the container-level field: host paths inside these
     /// mounts are opaque to brenn's `PathMapper`.
-    #[serde(default)]
     pub extra_mounts: Vec<String>,
     /// Maximum number of messages to replay at full fidelity on connect.
     /// History beyond this limit is available via simplified backward pagination.
@@ -158,7 +141,6 @@ pub struct AppConfigRaw {
     pub history_replay_limit: Option<usize>,
     /// Optional per-app rendering rules for YAML frontmatter blocks at
     /// the top of markdown files. See `FrontmatterRenderConfig`.
-    #[serde(default)]
     pub frontmatter: FrontmatterRenderConfig,
     /// Messaging participation. Absent → app cannot publish or subscribe.
     /// See `crate::messaging::config::MessagingConfigRaw`.
@@ -167,42 +149,34 @@ pub struct AppConfigRaw {
     /// publish push notifications and clients must not register subscriptions.
     /// See `crate::pwa_push::config::AppPwaPushBlock`.
     pub pwa_push: Option<crate::pwa_push::config::AppPwaPushBlock>,
-    /// Webhook subscriptions for this app. Each entry references a
-    /// `[[webhook_endpoint]]` by slug.
+    /// Webhook subscriptions for this app. Each entry references a `webhook`
+    /// declaration by slug.
     /// See `crate::webhook::config::AppWebhookSubscriptionRaw`.
-    #[serde(default, rename = "webhook_subscription")]
     pub webhook_subscriptions: Vec<crate::webhook::config::AppWebhookSubscriptionRaw>,
     /// MQTT ingress subscriptions for this app. Each entry names a channel by
     /// its full address `mqtt:<client>:<topic>` (client mandatory).
     /// See `crate::mqtt::config::AppMqttIngressSubscriptionRaw`.
-    #[serde(default, rename = "mqtt_subscription")]
     pub mqtt_subscriptions: Vec<crate::mqtt::config::AppMqttIngressSubscriptionRaw>,
     /// Layer-1 capability grants for this app (deny-by-default). Absent ⇒ no
-    /// grants. Resolved into the app's `AppPolicy` by the
-    /// `resolve_access_policies` phase in `config/resolve.rs` (access-control
-    /// design §2.5.1/§2.5.2).
+    /// grants. Resolved into the app's `AppPolicy` by
+    /// `resolve_access_policies` in `config/resolve.rs`.
     ///
-    /// Migration-forcing (§2.5.1 / §8 decision-2): the legacy implicit-capability
-    /// *authorization booleans* (`[app.messaging].enabled`, `[app.pwa_push].enabled`)
-    /// were removed. Because the raw config structs carry
-    /// `#[serde(deny_unknown_fields)]`, a stale config that still sets one of those
-    /// booleans now fails to parse with a precise error, forcing the operator to
-    /// migrate to this explicit `grants` surface (tests in `config/tests/app_parse.rs`
-    /// and `messaging/config.rs`/`pwa_push/config.rs`). `grants`/`acl` themselves
-    /// remain `#[serde(default)]` (absent ⇒ deny-everything).
-    #[serde(default)]
+    /// The legacy implicit-capability *authorization booleans*
+    /// (`messaging.enabled`, `pwa_push.enabled`) were removed. No vocabulary
+    /// admits either word, so a stale config naming one is refused at that word,
+    /// forcing the operator to migrate to this explicit `grants` surface (tests
+    /// in `config/tests/app_parse.rs`). An agent that states neither `grants`
+    /// nor `acl` is deny-everything.
     pub grants: Vec<crate::access::AppCapability>,
-    /// Layer-2 ACL block (`[app.acl.*]`). Absent ⇒ all matcher lists empty.
-    /// Resolved into the app's `AppPolicy` by the `resolve_access_policies` phase
-    /// in `config/resolve.rs` (access-control design §2.5.1/§2.5.2).
-    #[serde(default)]
+    /// Layer-2 ACLs, from the agent's `acl` statements. Absent ⇒ all matcher lists empty.
+    /// Resolved into the app's `AppPolicy` by `resolve_access_policies` in
+    /// `config/resolve.rs`.
     pub acl: crate::access::raw::AppAclRaw,
-    /// Tool grants for this app (`[[app.tool_grant]]`). Each authorizes
+    /// Tool grants for this app. Each authorizes
     /// addressing a registry tool, optionally narrowed by an `acl` and throttled
     /// by `rate_limit`. Absent ⇒ no explicit grants (an app with git mounts still
     /// earns an implicit `git-repo-pull` grant during resolution). Resolved into
     /// the app's `AppPolicy::tool_grants` by the `resolve_access_policies` phase.
-    #[serde(default, rename = "tool_grant")]
     pub tool_grants: Vec<crate::tools::config::ToolGrantRaw>,
 }
 
@@ -263,7 +237,7 @@ pub struct AppConfig {
     pub startup_hooks: StartupHooksConfig,
     /// Extra CLI arguments passed verbatim to the `claude` command.
     pub cc_extra_args: Vec<String>,
-    /// Static auto-approval rules from the TOML config.
+    /// Static auto-approval rules from the config document.
     pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets.
     pub attachment_targets: Vec<AttachmentTarget>,
@@ -300,27 +274,26 @@ pub struct AppConfig {
     /// robustness principle: startup FS failure is a config/permission bug, not
     /// transient).
     pub state_dir: PathBuf,
-    /// Resolved per-app messaging config. `None` when the app has no
-    /// `[app.messaging]` section. See
+    /// Resolved per-app messaging config. `None` when the app states no
+    /// subscriptions and no send budget. See
     /// `crate::messaging::config::ResolvedMessagingConfig`.
     pub messaging: Option<crate::messaging::config::ResolvedMessagingConfig>,
-    /// Resolved global `[messaging].default_send_budget`. Stamped on
-    /// every `AppConfig` regardless of whether the app participates in
-    /// messaging — needed by `messaging_send_budget()` so apps without
-    /// a `[app.messaging]` block still see the operator's configured
-    /// default. See design §7.7.
+    /// Resolved global `default_send_budget`. Stamped on every `AppConfig`
+    /// regardless of whether the app participates in messaging — needed by
+    /// `messaging_send_budget()` so apps with no messaging config of their own
+    /// still see the operator's configured default.
     pub messaging_default_send_budget: u32,
-    /// Per-app pwa_push config block. `None` when the app has no
-    /// `[app.pwa_push]` section. See `crate::pwa_push::config::AppPwaPushBlock`.
+    /// Per-app pwa_push config block. `None` when the app states no pwa_push
+    /// settings. See `crate::pwa_push::config::AppPwaPushBlock`.
     pub pwa_push: Option<crate::pwa_push::config::AppPwaPushBlock>,
     /// Resolved webhook subscriptions for this app. Empty vec when the app
-    /// declares no `[[app.webhook_subscription]]` blocks.
+    /// subscribes to no webhook endpoint.
     pub webhook_subscriptions: Vec<crate::webhook::config::ResolvedWebhookSubscription>,
     /// Resolved MQTT ingress subscriptions for this app. Empty vec when the app
-    /// declares no `[[app.mqtt_subscription]]` blocks.
+    /// subscribes to no MQTT topic.
     pub mqtt_subscriptions: Vec<crate::mqtt::config::ResolvedMqttIngressSubscription>,
     /// Resolved access-control policy (grants + ACLs) for this app. Built from
-    /// the operator's explicit `grants`/`[app.acl.*]` config. `Default` (empty,
+    /// the operator's explicit `grant`/`acl` statements. `Default` (empty,
     /// deny-everything) until populated by the access-policy resolution phase.
     /// See `crate::access::AppPolicy`.
     pub policy: crate::access::AppPolicy,
@@ -355,17 +328,17 @@ impl AppConfig {
     ///
     /// Returns `true` if the app is authorized to participate in messaging —
     /// i.e. its resolved policy grants `MessagingPublish` **or**
-    /// `MessagingSubscribe`. The `[app.messaging]` block is retained only for
-    /// delivery settings (the per-app `send_budget`, read via
+    /// `MessagingSubscribe`. The per-app messaging config is retained only for
+    /// delivery settings (`send_budget`, read via
     /// `messaging_send_budget()`); it does not grant authorization. Gates
     /// `messaging::publish` layer-2 denial and the publisher identity-uniqueness
     /// check in `Messenger::new`. (It does **not** gate `BrennSend` tool
     /// visibility — see the closing paragraph.)
     ///
     /// **Deliberately a participation flag, not a publish gate.** The `OR`
-    /// reproduces the old single-boolean `[app.messaging].enabled` semantics,
+    /// reproduces the old single-boolean `messaging.enabled` semantics,
     /// which this Phase-0 re-expression is required to keep
-    /// authorization-equivalent (design §2.5.1/§2.7). The publish/subscribe
+    /// authorization-equivalent. The publish/subscribe
     /// split (Phase 2) gates the publish *enforcement* path on
     /// `MessagingPublish` directly — `publish/mod.rs` (Seam A), the automation
     /// fire-time re-check (Seam B), and the `AutomationEngine::create` / `edit`
@@ -375,7 +348,7 @@ impl AppConfig {
     /// assertion in `Messenger::new`, the `resolve_sender` read/management path,
     /// and the subsystem-boot gate.
     ///
-    /// `BrennSend` tool *visibility* (Phase 4, design §2.1) gates on the
+    /// `BrennSend` tool *visibility* gates on the
     /// `MessagingPublish` grant directly (`integration.rs`,
     /// `messaging_virtual_tools`), **not** on this `OR` — a subscribe-only app
     /// is no longer offered the publish tool. Both halves of the
@@ -393,7 +366,7 @@ impl AppConfig {
     ///
     /// Returns `true` if the app's resolved policy grants `PwaPush`. `PwaPush`
     /// is scope-less (a pure grant, no ACL), so the grant alone is the gate.
-    /// The `[app.pwa_push]` block is retained only for delivery settings
+    /// The per-app pwa_push block is retained only for delivery settings
     /// (e.g. `default_title`); it does not grant authorization. Gates WS
     /// subscription messages, `PushSend` / `PushListTargets` tool execution,
     /// and `MessageListChannels` pwa_push enumeration.
@@ -401,11 +374,10 @@ impl AppConfig {
         self.policy.has_grant(crate::access::AppCapability::PwaPush)
     }
 
-    /// Resolved messaging send budget for this app. Per design §7.7:
-    /// per-app override (`[app.messaging.send_budget]`) → global default
-    /// (`[messaging].default_send_budget`) → 100.
+    /// Resolved messaging send budget for this app: the agent's own
+    /// `send_budget` → the `messaging` section's `default_send_budget` → 100.
     ///
-    /// Apps with no `[app.messaging]` block return the global default
+    /// Apps with no messaging config of their own return the global default
     /// unchanged. The reset path uses this to avoid silently ignoring
     /// the configured global default when an operator sets it.
     pub fn messaging_send_budget(&self) -> u32 {

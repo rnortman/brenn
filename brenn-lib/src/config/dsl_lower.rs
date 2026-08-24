@@ -3,10 +3,10 @@
 //!
 //! Parse → deserialize → resolve → derive happen in `brenn-dsl`, which depends
 //! on no brenn domain crate. This module is the other side of that boundary: it
-//! reads the derived model field by field and constructs the raw config structs
-//! directly, with no TOML text and no `toml::Value` tree in between. Both of
-//! those would be middlemen between two typed representations, and both would
-//! be scaffolding to throw away when the TOML front end retires.
+//! reads the derived model
+//! field by field and constructs the raw config structs directly, with no
+//! intermediate value tree — that would only be a middleman between two typed
+//! representations.
 //!
 //! Two properties make the transcription mechanical rather than a second
 //! specification:
@@ -101,8 +101,7 @@ use super::watchdog::WatchdogConfig;
 /// environment.
 ///
 /// Lowering re-checks nothing that `validate_and_resolve`, the messaging boot
-/// or the access resolvers already refuse. A lowered config walks the identical
-/// validation path a TOML config does.
+/// or the access resolvers already refuse; a lowered config walks all three.
 pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
     let mut errors = Vec::new();
     let resolved = &derived.resolved;
@@ -172,9 +171,9 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
         wasm_consumers,
         surfaces,
         remotes,
-        // Never emitted, by design: a document wires ports to declared
-        // channels explicitly, so the auto-wiring form has no DSL spelling and
-        // a TOML config using it migrates by declaring the channel.
+        // TODO(dsl-connection-spelling): never emitted — a document wires ports
+        // to declared channels explicitly, so the auto-wiring form has no
+        // spelling and nothing populates this field.
         connections: Vec::new(),
         wasm: sections.wasm.unwrap_or_default(),
         watchdog: sections.watchdog.unwrap_or_default(),
@@ -325,11 +324,11 @@ fn expect_table<'a>(value: &'a RVal, key: &str) -> Result<&'a [(String, RVal)], 
 /// A `toml::Value`, for the two raw fields that literally store one.
 ///
 /// Everywhere else the transcription is field to typed field; these two
-/// positions are operator-supplied maps the config itself keeps as TOML, so
+/// positions are operator-supplied maps the config keeps as a value tree, so
 /// this is where a value tree is the target rather than a middleman.
 ///
-/// The recursion here is parity with what `toml::from_str` builds for the same
-/// map, not a claim about what the runtime accepts: both positions resolve
+/// The recursion accepts every shape the tree can hold; that is not a claim
+/// about what the runtime accepts, because both positions resolve
 /// through `crate::config::wasm::resolve_component_config`, a flat
 /// string/integer/boolean surface that panics on a float, an array or a nested
 /// table. Refusing those here instead would move a boot check into lowering.
@@ -598,9 +597,7 @@ fn depth(value: &IntOrWord, key: &str) -> Result<Depth, Diagnostic> {
 /// The three keys a `send_rate` table states.
 ///
 /// A table attr with no vocabulary behind it, so the keys are matched by hand
-/// and a stray one is refused at its own token — the typo protection
-/// `deny_unknown_fields` gives the TOML path, relocated to the key that was
-/// written.
+/// and a stray one is refused at its own token.
 ///
 /// TODO(dsl-vocabulary-config-parity): this key set is a hand transcription of
 /// `SendRate`'s fields.
@@ -608,10 +605,9 @@ const SEND_RATE_KEYS: [&str; 3] = ["burst", "refill_interval_secs", "refill"];
 
 /// A `send_rate` table.
 ///
-/// Starts from `SendRate::default()` — the same per-field source its
-/// `#[serde(default)]` reads — and overwrites the keys the table states, so an
-/// unstated key gets exactly what the TOML path would give it. A table holding
-/// two bad keys reports both.
+/// Starts from `SendRate::default()` and overwrites the keys the table states,
+/// so an unstated key gets the struct's own default. A table holding two bad
+/// keys reports both.
 fn send_rate(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<SendRate> {
     let entries = match value.value() {
         RValue::Table(entries) => entries,
@@ -665,9 +661,8 @@ fn send_rate(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<SendRate> {
 /// the keys, as it does for a section, an unclaimed key is a *stated attr that
 /// lowering ignores*: the one way a value could otherwise disappear silently
 /// between the two representations. Where the vocabulary does not gate them — a
-/// statement tail, a component body — it is also the typo protection
-/// `deny_unknown_fields` gives the TOML path, relocated to the key that was
-/// written.
+/// statement tail, a component body — it is typo protection, at the key that
+/// was written.
 ///
 /// The legal set a refusal names is the set of keys the readers asked for, so
 /// it cannot drift from the code that reads them.
@@ -899,8 +894,8 @@ impl<'a> Body<'a> {
 /// The scalar configuration sections of a document.
 ///
 /// One field per section kindword, `None` where the document states no such
-/// section: the assembly then gives that `BrennConfig` field its own default,
-/// which is what serde gives an omitted table. The two named kindwords are maps
+/// section: the assembly then gives that `BrennConfig` field its own default.
+/// The two named kindwords are maps
 /// instead — a document states as many `container` and `integration` sections as
 /// it has names for.
 #[derive(Default)]
@@ -1417,8 +1412,8 @@ fn repos(list: &[RNamed<RepoAttrs<RVal>>], errors: &mut Vec<Diagnostic>) -> Vec<
 
 /// `[[mqtt_client]]` per `mqtt_client` declaration.
 ///
-/// `last_will` has no attr spelling, so a lowered client never carries one; the
-/// runtime treats that exactly as an omitted TOML table.
+/// `last_will` has no attr spelling, so a lowered client never carries one, and
+/// the runtime treats `None` as no last will.
 fn mqtt_clients(
     list: &[RNamed<MqttClientAttrs<RVal>>],
     errors: &mut Vec<Diagnostic>,
@@ -1718,8 +1713,7 @@ fn mcp(attrs: &McpServerAttrs<RVal>, errors: &mut Vec<Diagnostic>) -> McpServerC
     let McpServerAttrs { command, args, env } = attrs;
     McpServerConfig {
         command: keep(expect_str(&command.value, "command"), errors).unwrap_or_default(),
-        // The raw field is a plain `Vec`, so an omitted `args` is the empty one
-        // — the TOML path spells that `args = []`.
+        // The raw field is a plain `Vec`, so an omitted `args` is the empty one.
         args: opt_strings(args.as_ref(), "args", errors).unwrap_or_default(),
         env: env
             .as_ref()
@@ -1849,8 +1843,8 @@ fn attachment_target(
 /// keys that arm asked for.
 ///
 /// TODO(dsl-vocabulary-config-parity): the type words below and each arm's
-/// field set are a hand transcription of `AttachmentHandlerConfig`'s serde tags
-/// and variants. The parity tests hold them to serde; nothing here does.
+/// field set are a hand transcription of `AttachmentHandlerConfig`'s variants.
+/// Nothing holds the two in step; the words here are the only spelling left.
 fn handler(
     block: &RAttachmentTarget,
     what: &str,
@@ -1901,7 +1895,8 @@ fn handler(
     built
 }
 
-/// The type words a `handler` block may name — the raw enum's own serde tags.
+/// The type words a `handler` block may name, one per `AttachmentHandlerConfig`
+/// variant.
 const HANDLER_TYPES: [&str; 1] = ["command"];
 
 /// The two script lists a hook block states, each empty where it says nothing.
@@ -2916,8 +2911,9 @@ fn webhook_blocks(
 /// refusal — [`Body::finish`] names exactly the keys that arm asked for.
 ///
 /// TODO(dsl-vocabulary-config-parity): the scheme words below and each arm's
-/// field set are a hand transcription of `WebhookSignatureConfigRaw`'s serde
-/// tags and variants. The parity tests hold them to serde; nothing here does.
+/// field set are a hand transcription of `WebhookSignatureConfigRaw`'s
+/// variants. Nothing holds the two in step; the words here are the only
+/// spelling left.
 fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSignatureConfigRaw> {
     let (scheme, at) = body.required_spanned_str("scheme", errors)?;
     let algorithm = |body: &mut Body, errors: &mut Vec<Diagnostic>| {

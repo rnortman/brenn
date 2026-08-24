@@ -6,8 +6,6 @@
 //! protocol whose addresses they are; this module supplies the prefix they are
 //! rooted at.
 
-use serde::Deserialize;
-
 use brenn_envelope::chat::{CHAT_SEGMENT_SEP, ChatLeaf, chat_leaf_prefix};
 
 use crate::access::acl::ChannelMatcher;
@@ -18,8 +16,7 @@ use crate::messaging::{ChannelScheme, WakeMin, is_unreserved_char};
 ///
 /// Values are validated at boot, not at parse time: a malformed value is a
 /// refusal to start.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmChatConfig {
     /// Bare-name segment rooting every chat channel address (e.g. `"chat"` ⇒
     /// `brenn:chat.app.<slug>.in.<id>`). Contains no `.` — it is one segment,
@@ -434,20 +431,5 @@ mod tests {
             ..LlmChatConfig::default()
         }
         .validate();
-    }
-
-    #[test]
-    fn section_parses_with_partial_keys() {
-        let parsed: LlmChatConfig =
-            toml::from_str("prefix = \"talk\"\nwake_min = \"very-low\"\n").expect("section parses");
-        assert_eq!(
-            parsed,
-            LlmChatConfig {
-                prefix: "talk".to_string(),
-                retained_window: default_retained_window(),
-                wake_min: WakeMin::VeryLow,
-                idle_timeout_secs: default_idle_timeout_secs(),
-            }
-        );
     }
 }

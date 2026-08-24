@@ -8,8 +8,10 @@
 use std::net::Ipv4Addr;
 
 use axum::http::HeaderValue;
+use brenn_lib::access::raw::ChannelMatcherRaw;
+use brenn_lib::config::{remote_prefix_ceiling, remote_raw};
 use brenn_lib::messaging::config::MessagingGlobalConfig;
-use brenn_lib::messaging::remote::{RemoteConfigRaw, resolve_remotes};
+use brenn_lib::messaging::remote::{RemoteConfigRaw, RemoteGrant, resolve_remotes};
 use brenn_obs::alerting::make_capturing_alerter;
 
 use super::*;
@@ -17,14 +19,6 @@ use super::*;
 const SLUG: &str = "pod-kitchen";
 const TOKEN: &str = "s3cret-token";
 const TEST_MAX_BODY_BYTES: usize = 64 * 1024;
-
-const BLOCK: &str = r#"
-slug = "pod-kitchen"
-token_file = "TOKEN_FILE"
-grants = ["subscribe", "publish"]
-subscribe_acl = [ { prefix = "chat.app.home.out.", push_depth = 8, retain_depth = 64 } ]
-publish_acl   = [ { prefix = "chat.app.home.in." } ]
-"#;
 
 /// A 0600 token file holding [`TOKEN`], so resolution runs the real
 /// mode-checked load rather than a stubbed credential.
@@ -44,8 +38,17 @@ fn write_token() -> tempfile::NamedTempFile {
 /// returned alongside so the caller holds it open for the test's length.
 fn runtimes() -> (HashMap<String, Arc<RemoteRuntime>>, tempfile::NamedTempFile) {
     let token = write_token();
-    let toml = BLOCK.replace("TOKEN_FILE", &token.path().display().to_string());
-    let raw: RemoteConfigRaw = toml::from_str(&toml).expect("[[remote]] block must parse");
+    // One remote reading the outbound conversation leaves and publishing on the
+    // inbound ones — enough authority that a refusal is about the credential.
+    let raw = RemoteConfigRaw {
+        subscribe_acl: vec![remote_prefix_ceiling("chat.app.home.out.", 8, 64)],
+        publish_acl: vec![ChannelMatcherRaw::Prefix("chat.app.home.in.".to_string())],
+        ..remote_raw(
+            SLUG,
+            token.path(),
+            &[RemoteGrant::Subscribe, RemoteGrant::Publish],
+        )
+    };
     let resolved = resolve_remotes(&[raw], &MessagingGlobalConfig::default());
     let messenger = brenn_messaging::testutils::empty_directory_messenger("remote-auth-tests");
     (

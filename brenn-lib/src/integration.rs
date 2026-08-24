@@ -5,15 +5,18 @@
 //! - MCP servers to add to CC's config
 //! - `AppTool` implementations for the tool registry
 //!
-//! Each app enables integrations via TOML config:
+//! Each app enables integrations in the config document:
 //!
-//! ```toml
-//! [integrations.pfin]
-//! command = "pf"
+//! ```text
+//! integration pfin {
+//!   command = "pf";
+//! }
 //!
-//! [[app]]
-//! slug = "pfin"
-//! integrations = ["pfin"]
+//! agent Pfin {
+//!   integrations = ["pfin"];
+//! }
+//!
+//! new pfin: Pfin;
 //! ```
 //!
 //! Two traits separate concerns:
@@ -71,8 +74,8 @@ pub struct VirtualToolDef {
 /// Registered once at startup in the integration registry. Creates
 /// configured `Integration` instances for each app that enables it.
 pub trait IntegrationFactory: Send + Sync + 'static {
-    /// Integration name (e.g., "pfin", "graf"). Must match the TOML key
-    /// under `[integrations.<name>]`.
+    /// Integration name (e.g., "pfin", "graf"). Must match the name of the
+    /// `integration` declaration.
     fn name(&self) -> &str;
 
     /// Create a configured integration instance for a specific app.
@@ -398,7 +401,8 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "- `description` (string, optional): human-readable label.\n",
                 "- `dynamic` (bool): `true` = a runtime (dynamic) subscription you created and ",
                 "CAN remove with MessageUnsubscribe; `false` = a static (config-managed) ",
-                "subscription declared in TOML that CANNOT be removed at runtime (edit config ",
+                "subscription declared in the config file that CANNOT be removed at runtime ",
+                "(edit config ",
                 "to change it).\n",
                 "- `push_depth`, `retain_depth`, `noise`, `wake_min`: YOUR resolved ",
                 "per-subscription parameters (not the channel-wide view).\n",
@@ -530,7 +534,8 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "`\"brenn:my-channel\"`, `\"mqtt:home:sensors/temperature\"`.\n\n",
                 "Only your own dynamic subscriptions can be removed. Static, ",
                 "config-declared subscriptions are NOT removable here — attempting to ",
-                "unsubscribe a channel you only have a static (TOML) subscription on, or ",
+                "unsubscribe a channel you only have a static (config-declared) subscription ",
+                "on, or ",
                 "no subscription on at all, is an error. For `mqtt:`, if you were the last ",
                 "subscriber on the topic filter, the standing broker SUBSCRIBE is dropped ",
                 "(other subscribers, if any, keep it alive).\n\n",

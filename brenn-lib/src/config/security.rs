@@ -1,7 +1,4 @@
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct SecurityConfig {
     /// Auth endpoint rate limit: token replenishment interval in seconds.
     /// One token is added every this many seconds.

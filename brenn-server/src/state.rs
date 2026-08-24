@@ -72,7 +72,7 @@ pub struct AppState {
     #[cfg_attr(test, allow(dead_code))]
     pub mcp_script_path: PathBuf,
     /// Per-app configurations, keyed by slug. Iteration order is the
-    /// declaration order of `[[app]]` blocks in `brenn.toml`.
+    /// declaration order of `agent` blocks in the config document.
     pub apps: Arc<IndexMap<String, AppConfig>>,
     /// Notification channel for bridge spawn events.
     /// WS connections subscribe to auto-attach when a bridge spawns

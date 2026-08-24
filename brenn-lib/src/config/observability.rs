@@ -1,9 +1,7 @@
 use brenn_surface_schema::LogLevel;
-use serde::Deserialize;
 
 /// Top-level `[observability]` config section.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct ObservabilityConfig {
     pub usage: UsageObservabilityConfig,
 
@@ -19,7 +17,6 @@ pub struct ObservabilityConfig {
     /// Only meaningful when `surface_error_channel` is set. Serde-typed as a
     /// [`LogLevel`], so an invalid level string fails config parse. Default
     /// `warn`.
-    #[serde(default = "default_surface_error_publish_floor")]
     pub surface_error_publish_floor: LogLevel,
 }
 
@@ -41,8 +38,7 @@ impl Default for ObservabilityConfig {
 }
 
 /// Usage-observability sub-section (`[observability.usage]`).
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct UsageObservabilityConfig {
     /// Inactivity gap in minutes that closes a usage session. Default: 30.
     pub session_gap_minutes: u32,
@@ -59,27 +55,27 @@ impl Default for UsageObservabilityConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::sole_refusal;
 
     #[test]
-    fn surface_error_publish_floor_defaults_to_warn() {
-        let cfg: ObservabilityConfig = toml::from_str("").expect("empty section parses");
+    fn defaults_match_documented_values() {
+        let cfg = ObservabilityConfig::default();
         assert_eq!(cfg.surface_error_publish_floor, LogLevel::Warn);
+        assert_eq!(cfg.surface_error_channel, None);
+        assert_eq!(cfg.usage.session_gap_minutes, 30);
     }
 
     #[test]
-    fn surface_error_publish_floor_parses_configured_level() {
-        let cfg: ObservabilityConfig =
-            toml::from_str("surface_error_publish_floor = \"error\"").expect("valid level parses");
-        assert_eq!(cfg.surface_error_publish_floor, LogLevel::Error);
-    }
-
-    #[test]
-    fn surface_error_publish_floor_rejects_invalid_level() {
-        // An unknown level string fails config parse (serde), not silently at boot.
-        let err = toml::from_str::<ObservabilityConfig>("surface_error_publish_floor = \"fatal\"");
+    fn an_unknown_publish_floor_word_is_refused() {
+        let refusal = sole_refusal("observability { surface_error_publish_floor = fatal; }\n");
+        let rendered = refusal.render();
         assert!(
-            err.is_err(),
-            "invalid floor level must be rejected at parse"
+            rendered.contains("surface_error_publish_floor"),
+            "the refusal must name the key: {rendered}"
+        );
+        assert!(
+            rendered.contains("fatal"),
+            "the refusal must quote the word it rejected: {rendered}"
         );
     }
 }

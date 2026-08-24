@@ -1,30 +1,17 @@
-//! `RemoteProfile` lowering tests, driven off real resolved `[[remote]]` blocks
-//! so the authoring shape and the authority answers are proved together.
+//! `RemoteProfile` lowering tests, driven off real resolved `remote` blocks so
+//! the authoring shape and the authority answers are proved together.
 
+use std::path::Path;
+
+use brenn_lib::access::raw::ChannelMatcherRaw;
+use brenn_lib::config::{remote_exact_ceiling, remote_fleet, remote_prefix_ceiling, remote_raw};
 use brenn_lib::messaging::config::MessagingGlobalConfig;
 use brenn_lib::messaging::remote::{
-    DEFAULT_REMOTE_MAX_SESSIONS, DEFAULT_REMOTE_MAX_SUBSCRIPTIONS, RemoteConfigRaw, resolve_remotes,
+    DEFAULT_REMOTE_MAX_SESSIONS, DEFAULT_REMOTE_MAX_SUBSCRIPTIONS, RemoteConfigRaw, RemoteGrant,
+    resolve_remotes,
 };
 
 use super::*;
-
-/// A representative fleet-driver block: a roster read at depth 1/1, the two
-/// outbound conversation leaves under prefixes, and publish rights on the two
-/// inbound ones.
-const FLEET: &str = r#"
-slug = "pod-kitchen"
-token_file = "TOKEN_FILE"
-grants = ["subscribe", "publish", "ephemeral_subscribe", "ephemeral_publish", "alert"]
-subscribe_acl = [
-  { exact  = "chat.app.home.roster", push_depth = 1, retain_depth = 1 },
-  { prefix = "chat.app.home.out.",   push_depth = 8, retain_depth = 64 },
-]
-ephemeral_subscribe_acl = [
-  { prefix = "chat.app.home.stream.", push_depth = 32, retain_depth = 32 },
-]
-publish_acl           = [ { prefix = "chat.app.home.in." } ]
-ephemeral_publish_acl = [ { prefix = "chat.app.home.wake." } ]
-"#;
 
 /// A 0600 token file, written fresh per fixture so resolution exercises the real
 /// mode-checked load rather than a stubbed token.
@@ -40,18 +27,18 @@ fn write_token() -> tempfile::NamedTempFile {
     f
 }
 
-/// Resolve one `[[remote]]` body and lower it. The token file is returned
-/// alongside so the caller holds it open for the length of the test.
-fn build(body: &str) -> (RemoteProfile, tempfile::NamedTempFile) {
+/// Resolve one `remote` and lower it. The block is built around a freshly
+/// written token file, whose handle is returned alongside so the caller holds it
+/// open for the length of the test.
+fn build(block: impl FnOnce(&Path) -> RemoteConfigRaw) -> (RemoteProfile, tempfile::NamedTempFile) {
     let token = write_token();
-    let toml = body.replace("TOKEN_FILE", &token.path().display().to_string());
-    let raw: RemoteConfigRaw = toml::from_str(&toml).expect("[[remote]] block must parse");
+    let raw = block(token.path());
     let resolved = resolve_remotes(&[raw], &MessagingGlobalConfig::default());
     (RemoteProfile::build(&resolved[0]), token)
 }
 
 fn fleet() -> (RemoteProfile, tempfile::NamedTempFile) {
-    build(FLEET)
+    build(remote_fleet)
 }
 
 fn facts(push_depth: u64, retain_depth: u64) -> SubscriptionFacts {
@@ -99,15 +86,15 @@ fn the_two_subscribe_acls_do_not_leak_across_schemes() {
 /// read — nor does an address carrying no scheme at all.
 #[test]
 fn confined_and_unschemed_addresses_are_refused_in_both_directions() {
-    let (profile, _token) = build(
-        r#"
-slug = "greedy"
-token_file = "TOKEN_FILE"
-grants = ["subscribe", "publish"]
-subscribe_acl = [ { prefix = "a.", push_depth = 4, retain_depth = 4 } ]
-publish_acl   = [ { prefix = "a." } ]
-"#,
-    );
+    let (profile, _token) = build(|token| RemoteConfigRaw {
+        subscribe_acl: vec![remote_prefix_ceiling("a.", 4, 4)],
+        publish_acl: vec![ChannelMatcherRaw::Prefix("a.".to_string())],
+        ..remote_raw(
+            "greedy",
+            token,
+            &[RemoteGrant::Subscribe, RemoteGrant::Publish],
+        )
+    });
     for address in ["local:a.confined", "a.bare", "mqtt:a.x", "webhook:a.x", ""] {
         assert_eq!(profile.subscribable(address), None, "subscribe {address}");
         assert!(!profile.publishable(None, address), "publish {address}");
@@ -119,17 +106,13 @@ publish_acl   = [ { prefix = "a." } ]
 /// channel, and the two knobs fold independently.
 #[test]
 fn overlapping_entries_fold_by_max_per_knob() {
-    let (profile, _token) = build(
-        r#"
-slug = "folder"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-subscribe_acl = [
-  { prefix = "chat.",     push_depth = 4,  retain_depth = 128 },
-  { exact  = "chat.deep", push_depth = 32, retain_depth = 8 },
-]
-"#,
-    );
+    let (profile, _token) = build(|token| RemoteConfigRaw {
+        subscribe_acl: vec![
+            remote_prefix_ceiling("chat.", 4, 128),
+            remote_exact_ceiling("chat.deep", 32, 8),
+        ],
+        ..remote_raw("folder", token, &[RemoteGrant::Subscribe])
+    });
     assert_eq!(
         profile.subscribable("brenn:chat.deep"),
         Some(facts(32, 128))
@@ -246,16 +229,12 @@ fn the_caps_come_from_config_and_the_session_grains_collapse() {
         DEFAULT_REMOTE_MAX_SUBSCRIPTIONS as usize
     );
 
-    let (tight, _token) = build(
-        r#"
-slug = "strict"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-subscribe_acl = [ { prefix = "a.", push_depth = 1, retain_depth = 1 } ]
-max_sessions = 1
-max_subscriptions = 3
-"#,
-    );
+    let (tight, _token) = build(|token| RemoteConfigRaw {
+        subscribe_acl: vec![remote_prefix_ceiling("a.", 1, 1)],
+        max_sessions: Some(1),
+        max_subscriptions: Some(3),
+        ..remote_raw("strict", token, &[RemoteGrant::Subscribe])
+    });
     assert_eq!(
         tight.session_caps(),
         SessionCaps {
@@ -271,15 +250,11 @@ max_subscriptions = 3
 /// subscribed — must not be killed for doing exactly what the roster told it to.
 #[test]
 fn the_subscribe_burst_admits_a_whole_reconcile() {
-    let (profile, _token) = build(
-        r#"
-slug = "churner"
-token_file = "TOKEN_FILE"
-grants = ["subscribe"]
-subscribe_acl = [ { prefix = "a.", push_depth = 1, retain_depth = 1 } ]
-max_subscriptions = 40
-"#,
-    );
+    let (profile, _token) = build(|token| RemoteConfigRaw {
+        subscribe_acl: vec![remote_prefix_ceiling("a.", 1, 1)],
+        max_subscriptions: Some(40),
+        ..remote_raw("churner", token, &[RemoteGrant::Subscribe])
+    });
     assert_eq!(profile.subscribe_burst(), 80);
     assert!(profile.subscribe_burst() as usize >= 2 * profile.max_active_subscriptions());
 }
@@ -287,16 +262,12 @@ max_subscriptions = 40
 /// **The alert plane and the publish bucket are grants, and deny-by-default.**
 #[test]
 fn the_alert_grant_and_publish_bucket_are_the_operators() {
-    let (granted, _token) = build(
-        r#"
-slug = "pager"
-token_file = "TOKEN_FILE"
-grants = ["alert", "publish"]
-publish_acl = [ { prefix = "a." } ]
-publish_burst = 7
-publish_per_sec = 3
-"#,
-    );
+    let (granted, _token) = build(|token| RemoteConfigRaw {
+        publish_acl: vec![ChannelMatcherRaw::Prefix("a.".to_string())],
+        publish_burst: Some(7),
+        publish_per_sec: Some(3),
+        ..remote_raw("pager", token, &[RemoteGrant::Alert, RemoteGrant::Publish])
+    });
     assert!(granted.alert_granted());
     assert_eq!(
         granted.publish_rate(),
@@ -306,14 +277,10 @@ publish_per_sec = 3
         }
     );
 
-    let (silent, _token) = build(
-        r#"
-slug = "quiet"
-token_file = "TOKEN_FILE"
-grants = ["publish"]
-publish_acl = [ { prefix = "a." } ]
-"#,
-    );
+    let (silent, _token) = build(|token| RemoteConfigRaw {
+        publish_acl: vec![ChannelMatcherRaw::Prefix("a.".to_string())],
+        ..remote_raw("quiet", token, &[RemoteGrant::Publish])
+    });
     assert!(!silent.alert_granted());
 }
 

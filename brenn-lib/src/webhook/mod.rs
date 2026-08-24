@@ -1,7 +1,7 @@
 //! Webhook configuration for Brenn.
 //!
 //! `webhook:` is a peer transport alongside `brenn:` / `mqtt:` / `pwa_push:`.
-//! This module holds the raw TOML blocks, the resolved endpoint table
+//! This module holds the raw config blocks, the resolved endpoint table
 //! `BrennConfig`/`AppConfig` carry, and the signature schemes resolution
 //! produces.
 //!

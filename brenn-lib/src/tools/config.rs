@@ -9,8 +9,6 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
-
 use super::{AclClause, ResolvedRateLimit, ResolvedToolGrant};
 
 /// Canonical name of the git-repo-pull tool, used both as the registry key and
@@ -20,14 +18,12 @@ pub const GIT_REPO_PULL_TOOL: &str = "git-repo-pull";
 /// Raw `[[*.tool_grant]]` table: a tool name, an optional list of ACL clauses
 /// (each a TOML table of `key = value` requirements), and an optional rate
 /// limit. `acl` clauses are OR'd; keys within a clause are AND'd.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolGrantRaw {
     /// Canonical (kebab-case) tool name this grant addresses.
     pub tool: String,
     /// ACL clauses narrowing the grant. Each table's values must be strings
     /// (`"*"` is the sole wildcard). Absent/empty ⇒ the tool takes no ACL.
-    #[serde(default)]
     pub acl: Vec<toml::Table>,
     /// Optional token-bucket throttle for `(participant, tool)`. Absent ⇒
     /// unlimited (the grant itself is the gate).
@@ -35,8 +31,7 @@ pub struct ToolGrantRaw {
 }
 
 /// Raw `rate_limit = { burst = N, sustained_per_minute = M }` table.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RateLimitRaw {
     /// Token-bucket capacity (`>= 1`, validated at resolution).
     pub burst: u32,
@@ -159,49 +154,6 @@ fn resolve_clause(owner: &str, tool: &str, table: &toml::Table) -> AclClause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfigRaw;
-    use crate::messaging::config::WasmConsumerConfigRaw;
-
-    #[test]
-    fn parses_tool_grant_under_app() {
-        // A `[[app.tool_grant]]` block round-trips through the app raw config.
-        let toml = r#"
-            slug = "pfin"
-            working_dir = "/srv/pfin"
-
-            [[tool_grant]]
-            tool = "git-repo-pull"
-            acl = [{ repo = "brenn" }, { repo = "pfin" }]
-            rate_limit = { burst = 4, sustained_per_minute = 12 }
-        "#;
-        let raw: AppConfigRaw = toml::from_str(toml).expect("app parses");
-        assert_eq!(raw.tool_grants.len(), 1);
-        assert_eq!(raw.tool_grants[0].tool, "git-repo-pull");
-        assert_eq!(raw.tool_grants[0].acl.len(), 2);
-        let rl = raw.tool_grants[0].rate_limit.expect("rate limit present");
-        assert_eq!(rl.burst, 4);
-        assert_eq!(rl.sustained_per_minute, 12);
-    }
-
-    #[test]
-    fn parses_tool_grant_under_wasm_consumer() {
-        // The identical table shape parses under `[[wasm_consumer.tool_grant]]`.
-        let toml = r#"
-            slug = "sync"
-            component_path = "/srv/sync.wasm"
-            grants = ["store"]
-            store_path = "/srv/sync.db"
-
-            [[tool_grant]]
-            tool = "git-repo-pull"
-            acl = [{ repo = "brenn" }]
-        "#;
-        let raw: WasmConsumerConfigRaw = toml::from_str(toml).expect("wasm consumer parses");
-        assert_eq!(raw.tool_grants.len(), 1);
-        assert_eq!(raw.tool_grants[0].tool, "git-repo-pull");
-        assert_eq!(raw.tool_grants[0].acl.len(), 1);
-        assert!(raw.tool_grants[0].rate_limit.is_none());
-    }
 
     fn grant(tool: &str, acl: &[&[(&str, &str)]]) -> ToolGrantRaw {
         ToolGrantRaw {

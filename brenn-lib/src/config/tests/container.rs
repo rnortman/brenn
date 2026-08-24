@@ -318,13 +318,18 @@ fn validate_bare_app_with_extra_mounts_panics() {
 
 #[test]
 fn validate_container_home_defaults_to_home_user() {
-    // Parse a ContainerConfig without container_home — should default.
-    let toml_str = r#"
-image = "brenn-cc:latest"
-home_dir = "/tmp"
-"#;
-    let parsed: ContainerConfig = toml::from_str(toml_str).unwrap();
-    assert_eq!(parsed.container_home, PathBuf::from("/home/user"));
+    let config = config_from_dsl(
+        r#"
+container cc {
+    image = "brenn-cc:latest";
+    home_dir = "/tmp";
+}
+"#,
+    );
+    assert_eq!(
+        config.container["cc"].container_home,
+        PathBuf::from("/home/user")
+    );
 }
 
 #[test]
@@ -796,52 +801,52 @@ fn validate_startup_container_hooks_on_bare_app_panics() {
 }
 
 #[test]
-fn parse_start_hooks_from_toml() {
+fn start_hooks_load_from_a_document() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "myapp"
-working_dir = "{}"
+agent Assistant() {{
+    working_dir = "{}";
 
-[app.start_hooks]
-host = ["./setup.sh", "echo hello"]
+    start_hooks {{ host = ["./setup.sh", "echo hello"]; }}
+}}
+
+new myapp: Assistant();
 "#,
         dir.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     let hooks = config.apps[0].start_hooks.as_ref().unwrap();
     assert_eq!(hooks.host.len(), 2);
     assert!(hooks.container.is_empty());
 }
 
 #[test]
-fn parse_cc_extra_args_from_toml() {
+fn cc_extra_args_load_from_a_document() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "myapp"
-working_dir = "{}"
-cc_extra_args = ["--max-turns", "50"]
+agent Assistant() {{
+    working_dir = "{}";
+    cc_extra_args = ["--max-turns", "50"];
+}}
+
+new myapp: Assistant();
 "#,
         dir.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert_eq!(config.apps[0].cc_extra_args, vec!["--max-turns", "50"]);
 }
 
 #[test]
 fn cc_extra_args_defaults_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "myapp"
-working_dir = "{}"
+agent Assistant() {{ working_dir = "{}"; }}
+
+new myapp: Assistant();
 "#,
         dir.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert!(config.apps[0].cc_extra_args.is_empty());
 }

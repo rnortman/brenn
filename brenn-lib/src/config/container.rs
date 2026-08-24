@@ -1,13 +1,10 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
 /// Podman container definition, referenced by apps via `container = "<name>"`.
 ///
 /// Multiple apps can share a container definition (at different working dirs).
 /// Each CC session gets its own ephemeral container instance (`--rm`).
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct ContainerConfig {
     /// Podman image name/tag (e.g. "brenn-cc:latest").
     pub image: String,
@@ -16,15 +13,12 @@ pub struct ContainerConfig {
     pub home_dir: PathBuf,
     /// Container-side home directory path. Default: `/home/user`.
     /// Set via `-e HOME=` to ensure CC finds credentials regardless of image user config.
-    #[serde(default = "default_container_home")]
     pub container_home: PathBuf,
     /// Additional bind mounts as `["host:container", ...]`.
     /// These are opaque to Brenn's path translation — CC-reported absolute paths
     /// within extra_mounts will not be resolvable by the host for artifact/file serving.
-    #[serde(default)]
     pub extra_mounts: Vec<String>,
     /// Extra `podman run` arguments for things we haven't anticipated.
-    #[serde(default)]
     pub extra_args: Vec<String>,
 }
 

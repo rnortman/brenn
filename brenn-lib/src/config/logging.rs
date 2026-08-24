@@ -3,16 +3,13 @@ use std::path::PathBuf;
 use serde::Deserialize;
 pub use tracing::level_filters::LevelFilter;
 
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct LoggingConfig {
     /// Directory for all log files (diagnostic, security, and CC transcripts).
     pub log_dir: PathBuf,
     /// Console log level (trace/debug/info/warn/error).
-    #[serde(deserialize_with = "deserialize_level_filter")]
     pub console_level: LevelFilter,
     /// File log level.
-    #[serde(deserialize_with = "deserialize_level_filter")]
     pub file_level: LevelFilter,
 }
 

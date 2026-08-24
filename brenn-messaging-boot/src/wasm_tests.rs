@@ -438,14 +438,6 @@ fn wasm_consumer_explicit_noise_on_channel_pull_only_panics() {
 
 // --- Port name validation ---
 
-/// Missing `port` key fails serde with a required-field error.
-#[test]
-fn missing_port_fails_deserialize() {
-    let toml_no_port = r#"channel = "brenn:ch""#;
-    let result: Result<WasmConsumerSubscriptionRaw, _> = toml::from_str(toml_no_port);
-    assert!(result.is_err(), "missing port must fail deserialization");
-}
-
 /// Duplicate port names (input/input) panic at bootstrap.
 #[test]
 #[should_panic(expected = "duplicate port name")]
@@ -1012,10 +1004,7 @@ fn store_grant_without_store_path_panics() {
 fn declared_clients(slugs: &[&str]) -> IndexMap<String, brenn_lib::mqtt::config::MqttClientConfig> {
     let raw: Vec<_> = slugs
         .iter()
-        .map(|s| {
-            toml::from_str(&format!("slug = \"{s}\"\nurl = \"mqtts://127.0.0.1:1\""))
-                .expect("minimal raw client config parses")
-        })
+        .map(|s| brenn_lib::mqtt::config::MqttClientConfigRaw::minimal(s, "mqtts://127.0.0.1:1"))
         .collect();
     brenn_lib::mqtt::config::resolve_clients(&raw)
 }

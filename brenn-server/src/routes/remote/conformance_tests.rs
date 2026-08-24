@@ -29,7 +29,12 @@ use brenn_attach_conformance::{
 };
 use brenn_attach_proto::{AlertSeverity, PublishOutcome, SUPPORTED_VERSIONS, Urgency};
 use brenn_envelope::chat::{ChatRoster, decode as chat_decode};
+use std::path::Path;
+
+use brenn_lib::access::raw::ChannelMatcherRaw;
+use brenn_lib::config::remote_fleet;
 use brenn_lib::messaging::config::Depth;
+use brenn_lib::messaging::remote::{RemoteConfigRaw, RemoteGrant};
 use brenn_lib::messaging::{ChannelEntry, SubscriberEntry, SubscriberEntryKind};
 use brenn_messaging::PublishResult;
 use brenn_messaging::testutils::{ephemeral_channel_entry, test_channel_entry};
@@ -48,20 +53,19 @@ use crate::test_support::http::{TestServer, http_base_addr, spawn_test_server};
 /// alternative is asserting delivery against rows this suite reached around the
 /// wire to insert. Both directions on one prefix is legal config, and it keeps
 /// every fact these tests read a fact the attacher established through frames.
-const LOOPBACK: &str = r#"
-slug = "pod-kitchen"
-token_file = "TOKEN_FILE"
-grants = ["subscribe", "publish", "ephemeral_subscribe", "ephemeral_publish", "alert"]
-subscribe_acl = [
-  { exact  = "chat.app.home.roster", push_depth = 1, retain_depth = 1 },
-  { prefix = "chat.app.home.out.",   push_depth = 8, retain_depth = 64 },
-]
-ephemeral_subscribe_acl = [
-  { prefix = "chat.app.home.stream.", push_depth = 32, retain_depth = 32 },
-]
-publish_acl           = [ { prefix = "chat.app.home.out." }, { prefix = "chat.app.home.in." } ]
-ephemeral_publish_acl = [ { prefix = "chat.app.home.stream." }, { prefix = "chat.app.home.wake." } ]
-"#;
+fn loopback(token_file: &Path) -> RemoteConfigRaw {
+    RemoteConfigRaw {
+        publish_acl: vec![
+            ChannelMatcherRaw::Prefix("chat.app.home.out.".to_string()),
+            ChannelMatcherRaw::Prefix("chat.app.home.in.".to_string()),
+        ],
+        ephemeral_publish_acl: vec![
+            ChannelMatcherRaw::Prefix("chat.app.home.stream.".to_string()),
+            ChannelMatcherRaw::Prefix("chat.app.home.wake.".to_string()),
+        ],
+        ..remote_fleet(token_file)
+    }
+}
 
 /// Granted exactly, at 1/1: the fleet roster, a state channel.
 const ROSTER_BARE: &str = "chat.app.home.roster";
@@ -124,8 +128,12 @@ struct Rig {
     _server: TestServer,
 }
 
-async fn build_rig(db: &brenn_db::Db, body: &str, channels: Vec<ChannelEntry>) -> Rig {
-    let harness = remote_harness_with_channels(db, body, channels).await;
+async fn build_rig(
+    db: &brenn_db::Db,
+    block: impl FnOnce(&Path) -> RemoteConfigRaw,
+    channels: Vec<ChannelEntry>,
+) -> Rig {
+    let harness = remote_harness_with_channels(db, block, channels).await;
     let (base, server) = spawn_test_server(harness.state.clone()).await;
     let relay = SeverableRelay::spawn(http_base_addr(&base)).await;
     let client = AttachClient::new(ClientConfig {
@@ -214,7 +222,7 @@ async fn expect_one_violation(rig: &Rig, context: &str) {
 #[tokio::test]
 async fn a_daemon_attaches_subscribes_publishes_and_resumes_across_a_severed_socket() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
 
     let facts = rig.client.attach().await;
     assert_eq!(
@@ -352,7 +360,7 @@ async fn expect_roster_delivery(client: &mut AttachClient) -> Delivery {
 #[tokio::test]
 async fn a_retained_roster_snapshot_replays_to_a_freshly_attached_remote() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     let conversation = seed_conversation(&db).await;
     publish_roster(&rig).await;
 
@@ -391,7 +399,7 @@ async fn a_retained_roster_snapshot_replays_to_a_freshly_attached_remote() {
 #[tokio::test]
 async fn a_roster_republish_reaches_a_subscribed_remote() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     rig.client.attach().await;
 
     let ack = rig
@@ -442,7 +450,7 @@ async fn a_roster_republish_reaches_a_subscribed_remote() {
 #[tokio::test]
 async fn a_conversation_the_attach_mints_reaches_a_subscribed_remote() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     let messenger = Arc::clone(
         rig.harness
             .state
@@ -493,7 +501,7 @@ async fn a_conversation_the_attach_mints_reaches_a_subscribed_remote() {
 #[tokio::test]
 async fn a_durable_leaf_and_an_ephemeral_stream_deliver_alike() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     rig.client.attach().await;
 
     for channel in [OUT_7, STREAM_7] {
@@ -530,7 +538,7 @@ async fn a_durable_leaf_and_an_ephemeral_stream_deliver_alike() {
 #[tokio::test]
 async fn the_first_subscribe_mints_the_directory_entry_at_the_clamped_profile_ceiling() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     rig.client.attach().await;
 
     assert!(
@@ -584,7 +592,7 @@ async fn the_first_subscribe_mints_the_directory_entry_at_the_clamped_profile_ce
 #[tokio::test]
 async fn a_granted_channel_the_directory_lacks_is_unavailable_until_it_is_provisioned() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     rig.client.attach().await;
 
     let settlement = rig
@@ -647,7 +655,7 @@ async fn subscribing_outside_the_grants_closes_the_attachment() {
         ),
     ] {
         let db = crate::test_support::init_db_memory();
-        let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+        let mut rig = build_rig(&db, loopback, fleet_channels()).await;
         rig.client.attach().await;
 
         // Fire-and-forget: the answer to a violation is a closed socket, so a
@@ -669,8 +677,15 @@ async fn subscribing_outside_the_grants_closes_the_attachment() {
 #[tokio::test]
 async fn subscribing_beyond_the_configured_cap_closes_the_attachment() {
     let db = crate::test_support::init_db_memory();
-    let body = format!("{LOOPBACK}max_subscriptions = 2\n");
-    let mut rig = build_rig(&db, &body, fleet_channels()).await;
+    let mut rig = build_rig(
+        &db,
+        |token| RemoteConfigRaw {
+            max_subscriptions: Some(2),
+            ..loopback(token)
+        },
+        fleet_channels(),
+    )
+    .await;
     rig.client.attach().await;
 
     rig.client
@@ -695,7 +710,7 @@ async fn subscribing_beyond_the_configured_cap_closes_the_attachment() {
 #[tokio::test]
 async fn publishing_under_a_named_attribution_closes_the_attachment() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     rig.client.attach().await;
 
     rig.client
@@ -719,7 +734,7 @@ async fn publishing_under_a_named_attribution_closes_the_attachment() {
 #[tokio::test]
 async fn publishing_into_a_deprovisioned_channel_is_a_failed_outcome() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     rig.client.attach().await;
     rig.client
         .subscribe(OUT_7, DEPTHS, ResumePolicy::Resume)
@@ -759,7 +774,7 @@ async fn publishing_into_a_deprovisioned_channel_is_a_failed_outcome() {
 #[tokio::test]
 async fn a_granted_alert_reaches_the_dispatcher_attributed_to_the_remote() {
     let db = crate::test_support::init_db_memory();
-    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
     rig.client.attach().await;
 
     rig.client
@@ -797,8 +812,20 @@ async fn a_granted_alert_reaches_the_dispatcher_attributed_to_the_remote() {
 #[tokio::test]
 async fn alerting_without_the_grant_closes_the_attachment() {
     let db = crate::test_support::init_db_memory();
-    let body = LOOPBACK.replace(", \"alert\"", "");
-    let mut rig = build_rig(&db, &body, fleet_channels()).await;
+    let mut rig = build_rig(
+        &db,
+        |token| RemoteConfigRaw {
+            grants: vec![
+                RemoteGrant::Subscribe,
+                RemoteGrant::Publish,
+                RemoteGrant::EphemeralSubscribe,
+                RemoteGrant::EphemeralPublish,
+            ],
+            ..loopback(token)
+        },
+        fleet_channels(),
+    )
+    .await;
 
     let facts = rig.client.attach().await;
     assert!(

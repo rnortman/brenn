@@ -2,6 +2,16 @@
 
 All notable changes to Brenn are documented here.
 
+## [Unreleased]
+
+### Removed
+
+- **BREAKING:** TOML config is no longer loadable. `--config` accepts only a
+  `.brenn` document; any other extension is a startup panic, and the no-`--config`
+  fallback probes `brenn.brenn` only. A `brenn.toml` beside it is ignored.
+  Convert the file before upgrading — `brenn config-check <file>.brenn` validates
+  the result, and `brenn config-diff` compares two documents as configurations.
+
 ## [0.17.0] — 2026-08-22
 
 ### Changed

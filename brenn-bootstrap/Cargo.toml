@@ -48,7 +48,6 @@ brenn-attach-server = { version = "0.1.0", path = "../attach/server", features =
 futures = "0.3.32"
 tempfile = "3.24.0"
 tokio-tungstenite = "0.29.0"
-toml = "1.1.2"
 brenn-db = { version = "0.1.0", path = "../brenn-db", features = ["testutils"] }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }

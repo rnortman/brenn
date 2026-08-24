@@ -1,12 +1,11 @@
 //! Global WASM-host policy configuration.
 //!
-//! Houses `WasmConfig` (the `[wasm]` top-level TOML block) and helpers shared
+//! Houses `WasmConfig` (the top-level `wasm` section) and helpers shared
 //! between config resolution and the store layer.
 
 use std::collections::HashMap;
 
 use brenn_common::PAGE_SIZE;
-use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -27,7 +26,7 @@ pub const MAX_CONFIG_KEY_BYTES: usize = 256;
 /// Maximum byte length of a component config value (after canonicalization).
 pub const MAX_CONFIG_VALUE_BYTES: usize = 4096;
 
-/// Reserved key prefix injected by the host; operator TOML cannot use it.
+/// Reserved key prefix injected by the host; an operator config cannot use it.
 pub const RESERVED_CONFIG_PREFIX: &str = "brenn.";
 
 // ---------------------------------------------------------------------------
@@ -36,13 +35,11 @@ pub const RESERVED_CONFIG_PREFIX: &str = "brenn.";
 
 /// Global WASM-host policy (`[wasm]` block). Omitting the block entirely
 /// produces the same defaults as an empty `[wasm]` block.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct WasmConfig {
     /// Default store size cap applied to every `[[webhook_endpoint]]` with
     /// replay protection unless overridden per-store. Human-readable binary
     /// byte-size string (e.g. `"64MiB"`). Parsed and validated at load time.
-    #[serde(default = "default_store_size_limit")]
     pub store_size_limit: String,
 }
 
@@ -153,7 +150,7 @@ pub fn byte_size_to_max_page_count(size_str: &str, field_name: &str) -> u32 {
 // Component config resolver
 // ---------------------------------------------------------------------------
 
-/// Resolve an operator-supplied `[…config]` TOML table into a flat
+/// Resolve an operator-supplied `config` table into a flat
 /// `HashMap<String, String>`.
 ///
 /// Accepted value types: string (as-is), integer (decimal string), boolean
@@ -171,7 +168,7 @@ pub fn byte_size_to_max_page_count(size_str: &str, field_name: &str) -> u32 {
 ///
 /// Returns an empty map when `raw` is `None`.
 ///
-/// `field_name` is used in panic messages (e.g. `"[[wasm_consumer]] \"x\" config"`).
+/// `field_name` is used in panic messages (e.g. `"wasm_consumer \"x\" config"`).
 pub fn resolve_component_config(
     raw: Option<&toml::Table>,
     field_name: &str,
@@ -203,7 +200,8 @@ pub fn resolve_component_config(
         assert!(
             !key.starts_with(RESERVED_CONFIG_PREFIX),
             "{field_name}: config key {key:?} uses the reserved prefix \
-             {RESERVED_CONFIG_PREFIX:?}; operator TOML cannot set keys under this prefix",
+             {RESERVED_CONFIG_PREFIX:?}; an operator config cannot set keys under this \
+             prefix",
         );
 
         // Canonicalize value to String.

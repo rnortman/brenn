@@ -22,7 +22,6 @@ mod repo_mount;
 mod resolve;
 mod resolved_config;
 mod server;
-mod toml_parse;
 mod webhook;
 
 // -----------------------------------------------------------------------

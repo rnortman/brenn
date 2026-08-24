@@ -18,12 +18,9 @@ brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 
 [dev-dependencies]
-# The profile suite writes each `[[remote]]` token to a temp file, because a
+# The profile suite writes each `remote`'s token to a temp file, because a
 # resolved remote reads its credential from a path.
 tempfile = "3.24.0"
-# The suite writes `[[remote]]` blocks as TOML and resolves them the way the
-# config loader does.
-toml = "1.1.2"
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
 # The credential suite holds a `Messenger` it never publishes through, from the
 # engine's empty-directory fixture builder.

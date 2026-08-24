@@ -1,4 +1,5 @@
 use crate::config::EventsConfig;
+use crate::config::config_from_dsl;
 
 #[test]
 fn events_config_defaults_match_design() {
@@ -9,23 +10,20 @@ fn events_config_defaults_match_design() {
     );
 }
 
-/// TOML round-trip: explicit value is parsed correctly.
 #[test]
-fn events_config_toml_parses_explicit_value() {
-    let config: crate::config::BrennConfig =
-        toml::from_str("[events]\ndelivered_retention_days = 14").unwrap();
+fn events_config_lowers_an_explicit_value() {
+    let config = config_from_dsl("events { delivered_retention_days = 14; }");
     assert_eq!(
         config.events.delivered_retention_days, 14,
-        "explicit delivered_retention_days=14 must parse to 14"
+        "explicit delivered_retention_days=14 must reach the config"
     );
 }
 
-/// TOML round-trip: omitting the [events] section uses the default.
 #[test]
-fn events_config_toml_omit_section_uses_default() {
-    let config: crate::config::BrennConfig = toml::from_str("").unwrap();
+fn events_config_omitted_section_uses_default() {
+    let config = config_from_dsl("");
     assert_eq!(
         config.events.delivered_retention_days, 7,
-        "omitting [events] must yield default of 7"
+        "omitting `events` must yield the default of 7"
     );
 }

@@ -7,17 +7,8 @@ use super::*;
 #[test]
 fn load_config_explicit_path() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.toml");
-    std::fs::write(
-        &path,
-        r#"
-[server]
-public_url = "https://brenn.example.com"
-bind_address = "127.0.0.1:4000"
-secure_cookies = false
-"#,
-    )
-    .unwrap();
+    let path = dir.path().join("main.brenn");
+    std::fs::write(&path, DOCUMENT).unwrap();
     let config = load_config_from(Some(&path), dir.path());
     assert_eq!(
         config.server.bind_address,
@@ -26,27 +17,23 @@ secure_cookies = false
     assert!(!config.server.secure_cookies);
 }
 
+// A named-but-absent config is its own operator error, so the panic names the
+// path it could not read and the reason it could not — not a bare "compile
+// failed" that a syntax error would produce just as well.
 #[test]
-#[should_panic(expected = "failed to read config file")]
+#[should_panic(
+    expected = "failed to compile config file /nonexistent/brenn.brenn:\n/nonexistent/brenn.brenn: No such file or directory"
+)]
 fn load_config_explicit_path_missing_panics() {
     load_config_from(
-        Some(Path::new("/nonexistent/brenn.toml")),
+        Some(Path::new("/nonexistent/brenn.brenn")),
         Path::new("/tmp"),
     );
 }
 
 #[test]
-#[should_panic(expected = "failed to parse config file")]
-fn load_config_explicit_path_invalid_toml_panics() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bad.toml");
-    std::fs::write(&path, "this is not valid toml [[[").unwrap();
-    load_config_from(Some(&path), dir.path());
-}
-
-#[test]
 fn load_config_no_path_no_file_returns_defaults() {
-    // Empty temp directory — no brenn.toml present.
+    // Empty temp directory — no config file present.
     let dir = tempfile::tempdir().unwrap();
     let config = load_config_from(None, dir.path());
     // Should get production defaults.
@@ -57,34 +44,10 @@ fn load_config_no_path_no_file_returns_defaults() {
     );
 }
 
-#[test]
-fn load_config_finds_brenn_toml_in_fallback_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("brenn.toml"),
-        r#"
-[server]
-bind_address = "10.0.0.1:5555"
-"#,
-    )
-    .unwrap();
-    let config = load_config_from(None, dir.path());
-    assert_eq!(config.server.bind_address, "10.0.0.1:5555".parse().unwrap());
-}
-
-#[test]
-#[should_panic(expected = "failed to parse")]
-fn load_config_invalid_brenn_toml_in_fallback_dir_panics() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("brenn.toml"), "garbage [[[").unwrap();
-    load_config_from(None, dir.path());
-}
-
 // -----------------------------------------------------------------------
-// Extension dispatch: `.toml` vs `.brenn`
+// Extension dispatch: `.brenn`, and nothing else
 // -----------------------------------------------------------------------
 
-/// A `.brenn` document; `TWIN` is its TOML equivalent.
 const DOCUMENT: &str = r#"
 server {
     public_url = "https://brenn.example.com";
@@ -98,37 +61,6 @@ channel alerts at "brenn:alice-alerts" {
     standing_retain_depth = 16;
 }
 "#;
-
-const TWIN: &str = r#"
-[server]
-public_url = "https://brenn.example.com"
-bind_address = "127.0.0.1:4000"
-secure_cookies = false
-
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "brenn:alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 16
-"#;
-
-#[test]
-fn load_config_brenn_path_equals_its_toml_twin() {
-    let dir = tempfile::tempdir().unwrap();
-    let document = dir.path().join("main.brenn");
-    std::fs::write(&document, DOCUMENT).unwrap();
-    let twin = dir.path().join("twin.toml");
-    std::fs::write(&twin, TWIN).unwrap();
-
-    let from_dsl = load_config_from(Some(&document), dir.path());
-    let from_toml = load_config_from(Some(&twin), dir.path());
-    assert_eq!(from_dsl, from_toml);
-    assert_eq!(
-        from_dsl.server.bind_address,
-        "127.0.0.1:4000".parse().unwrap()
-    );
-}
 
 #[test]
 #[should_panic(expected = "failed to compile config file")]
@@ -184,6 +116,19 @@ fn load_config_unrecognized_extension_panics() {
 
 #[test]
 #[should_panic(expected = "unrecognized extension")]
+fn load_config_toml_path_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("brenn.toml");
+    std::fs::write(
+        &path,
+        "[server]\npublic_url = \"https://brenn.example.com\"\n",
+    )
+    .unwrap();
+    load_config_from(Some(&path), dir.path());
+}
+
+#[test]
+#[should_panic(expected = "unrecognized extension")]
 fn load_config_extensionless_path_panics() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("brennconfig");
@@ -192,7 +137,7 @@ fn load_config_extensionless_path_panics() {
 }
 
 // -----------------------------------------------------------------------
-// The no-`--config` fallback probes both names
+// The no-`--config` fallback probe
 // -----------------------------------------------------------------------
 
 #[test]
@@ -222,27 +167,14 @@ fn load_config_invalid_brenn_brenn_in_fallback_dir_panics() {
     load_config_from(None, dir.path());
 }
 
-/// Two configs that could disagree, and no way to tell from the outside which
-/// one the server read. Neither is read.
-#[test]
-#[should_panic(expected = "holds more than one config file")]
-fn load_config_both_fallback_names_panics() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("brenn.brenn"), DOCUMENT).unwrap();
-    std::fs::write(dir.path().join("brenn.toml"), TWIN).unwrap();
-    load_config_from(None, dir.path());
-}
-
 /// A name that can neither be confirmed present nor confirmed absent is not
-/// read as absent: a symlink loop named `brenn.brenn` beside a real
-/// `brenn.toml` would otherwise boot the TOML file with no word said, which is
-/// the silent precedence the both-present panic exists to forbid.
+/// read as absent: a symlink loop named `brenn.brenn` would otherwise boot on
+/// defaults, with no word said about the config that is sitting right there.
 #[test]
 #[should_panic(expected = "cannot be determined")]
 fn load_config_unstattable_fallback_name_panics() {
     let dir = tempfile::tempdir().unwrap();
     let loop_path = dir.path().join("brenn.brenn");
     std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
-    std::fs::write(dir.path().join("brenn.toml"), TWIN).unwrap();
     load_config_from(None, dir.path());
 }

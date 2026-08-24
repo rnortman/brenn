@@ -734,10 +734,10 @@ pub mod brenn {
       #[allow(unused_unsafe, clippy::all)]
       /// Read one operator-supplied config value. Values are opaque strings;
       /// the guest parses. The map is fixed for the process lifetime (seeded
-      /// from host TOML at startup; changes require a host restart). Keys
+      /// from the host config at startup; changes require a host restart). Keys
       /// under the reserved prefix "brenn." are host-injected facts (e.g.
       /// "brenn.max-skew-secs" on replay components bound to a timestamped
-      /// signature scheme); operator TOML cannot set them.
+      /// signature scheme); an operator config cannot set them.
       #[allow(async_fn_in_trait)]
       pub fn get(key: &str,) -> Option<_rt::String>{
         unsafe {

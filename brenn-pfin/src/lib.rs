@@ -149,11 +149,12 @@ pub(crate) async fn run_pfin_assign(
 // Integration
 // ---------------------------------------------------------------------------
 
-/// Integration name, used in TOML config keys and the integration registry.
+/// Integration name, used in the config document and the integration registry.
 pub const INTEGRATION_NAME: &str = "pfin";
 
-/// Config for the pfin integration, deserialized from the merged
-/// `[integrations.pfin]` + per-app `[integration_config.pfin]` TOML.
+/// Config for the pfin integration, deserialized from the merged value tree of
+/// the `integration pfin` declaration and an agent's `integration_config pfin`
+/// block.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PfinConfig {
     /// pfin binary — bare name (PATH) or absolute path.
@@ -173,7 +174,7 @@ impl IntegrationFactory for PfinFactory {
 
     fn create(&self, config: Option<&toml::Value>) -> Arc<dyn Integration> {
         let config: PfinConfig = config
-            .expect("pfin integration requires [integrations.pfin] config with command")
+            .expect("pfin integration requires an `integration pfin` block with a command")
             .clone()
             .try_into()
             .expect("invalid pfin integration config");
@@ -653,34 +654,33 @@ mod tests {
         brenn_lib::runtime_dir::test_runtime_dir_once()
     }
 
-    /// End-to-end test: resolve a TOML config through `validate_and_resolve`
-    /// with `PfinFactory` registered, then assert `pfin_config` returns `Some`
-    /// with the correct values. This covers the resolve.rs → factory →
+    /// End-to-end test: load a document through `validate_and_resolve` with
+    /// `PfinFactory` registered, then assert `pfin_config` returns `Some` with
+    /// the correct values. This covers the resolve.rs → factory →
     /// `AppConfig.integrations` → downcast chain, which the factory-unit tests
     /// do not exercise.
     #[test]
     fn pfin_config_survives_resolve_chain_global_only() {
-        use brenn_lib::config::{BrennConfig, validate_and_resolve};
+        use brenn_lib::config::{config_from_dsl, validate_and_resolve};
         use brenn_lib::integration::IntegrationRegistry;
 
         let dir = tempfile::tempdir().unwrap();
         let registry = IntegrationRegistry::new(vec![Box::new(PfinFactory)]);
-        let config: BrennConfig = toml::from_str(&format!(
+        let config = config_from_dsl(&format!(
             r#"
-[server]
-public_url = "https://brenn.example.com"
+server {{ public_url = "https://brenn.example.com"; }}
 
-[integrations.pfin]
-command = "pf"
+integration pfin {{ command = "pf"; }}
 
-[[app]]
-slug = "myapp"
-working_dir = "{}"
-integrations = ["pfin"]
+agent Assistant() {{
+    working_dir = "{}";
+    integrations = ["pfin"];
+}}
+
+new myapp: Assistant();
 "#,
             dir.path().display(),
-        ))
-        .unwrap();
+        ));
         let resolved = validate_and_resolve(&config, &registry, Some(test_runtime_dir()));
         let app = resolved.apps.get("myapp").unwrap();
         let cfg = pfin_config(app).expect("pfin_config should return Some after resolve");
@@ -691,34 +691,34 @@ integrations = ["pfin"]
         );
     }
 
-    /// Same as above but with a per-app `[integration_config.pfin]` env stanza,
+    /// Same as above but with a per-agent `integration_config pfin` block,
     /// verifying that the global+per-app merge produces the expected merged config.
     #[test]
     fn pfin_config_survives_resolve_chain_with_per_app_env() {
-        use brenn_lib::config::{BrennConfig, validate_and_resolve};
+        use brenn_lib::config::{config_from_dsl, validate_and_resolve};
         use brenn_lib::integration::IntegrationRegistry;
 
         let dir = tempfile::tempdir().unwrap();
         let registry = IntegrationRegistry::new(vec![Box::new(PfinFactory)]);
-        let config: BrennConfig = toml::from_str(&format!(
+        let config = config_from_dsl(&format!(
             r#"
-[server]
-public_url = "https://brenn.example.com"
+server {{ public_url = "https://brenn.example.com"; }}
 
-[integrations.pfin]
-command = "pf"
+integration pfin {{ command = "pf"; }}
 
-[[app]]
-slug = "myapp"
-working_dir = "{}"
-integrations = ["pfin"]
+agent Assistant() {{
+    working_dir = "{}";
+    integrations = ["pfin"];
 
-[app.integration_config.pfin]
-env = {{ PFIN_DATA = "/data/pfin", PFIN_ENV_FILE = "/etc/pfin.env" }}
+    integration_config pfin {{
+        env = {{ PFIN_DATA = "/data/pfin", PFIN_ENV_FILE = "/etc/pfin.env" }};
+    }}
+}}
+
+new myapp: Assistant();
 "#,
             dir.path().display()
-        ))
-        .unwrap();
+        ));
         let resolved = validate_and_resolve(&config, &registry, Some(test_runtime_dir()));
         let app = resolved.apps.get("myapp").unwrap();
         let cfg = pfin_config(app).expect("pfin_config should return Some after resolve");
@@ -733,31 +733,31 @@ env = {{ PFIN_DATA = "/data/pfin", PFIN_ENV_FILE = "/etc/pfin.env" }}
         );
     }
 
-    /// App opts in via `integrations = ["pfin"]` but no global `[integrations.pfin]`
-    /// stanza is present. `validate_and_resolve` should panic at startup, not
-    /// silently drop the integration.
+    /// An agent opts in via `integrations = ["pfin"]` but no global `integration
+    /// pfin` block is present. `validate_and_resolve` should panic at startup,
+    /// not silently drop the integration.
     #[test]
     #[should_panic(expected = "pfin integration requires")]
     fn pfin_enabled_without_global_stanza_panics_at_startup() {
-        use brenn_lib::config::{BrennConfig, validate_and_resolve};
+        use brenn_lib::config::{config_from_dsl, validate_and_resolve};
         use brenn_lib::integration::IntegrationRegistry;
 
         let dir = tempfile::tempdir().unwrap();
         let registry = IntegrationRegistry::new(vec![Box::new(PfinFactory)]);
-        // No [integrations.pfin] block — factory.create() should panic.
-        let config: BrennConfig = toml::from_str(&format!(
+        // No global `integration pfin` block — factory.create() should panic.
+        let config = config_from_dsl(&format!(
             r#"
-[server]
-public_url = "https://brenn.example.com"
+server {{ public_url = "https://brenn.example.com"; }}
 
-[[app]]
-slug = "myapp"
-working_dir = "{}"
-integrations = ["pfin"]
+agent Assistant() {{
+    working_dir = "{}";
+    integrations = ["pfin"];
+}}
+
+new myapp: Assistant();
 "#,
             dir.path().display()
-        ))
-        .unwrap();
+        ));
         // pfin factory panics before state_dir resolution; None is fine.
         let _ = validate_and_resolve(&config, &registry, None);
     }

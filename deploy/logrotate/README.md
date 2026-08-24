@@ -12,10 +12,11 @@
    - PID file at `/run/brenn/brenn.pid`
    - `brenn` user/group
 
-3. Configure Brenn to write a PID file by adding to your config TOML:
-   ```toml
-   [server]
-   pid_file = "/run/brenn/brenn.pid"
+3. Configure Brenn to write a PID file by adding to your `.brenn` config:
+   ```
+   server {
+     pid_file = "/run/brenn/brenn.pid";
+   }
    ```
 
 4. Ensure the PID directory exists (typically via systemd's `RuntimeDirectory=brenn`).

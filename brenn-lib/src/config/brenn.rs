@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use brenn_dsl::diag::Diagnostic;
-use serde::Deserialize;
 
 use super::alerting::AlertingConfig;
 use super::app::AppConfigRaw;
@@ -70,8 +69,7 @@ pub const CC_KNOWN_TOOLS: &[&str] = &[
 ///
 /// Defaults are production-hardened (absolute paths, secure cookies on, etc.).
 /// Use `brenn.dev.brenn` for local development.
-#[derive(Debug, Deserialize, Default, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Default, PartialEq)]
 pub struct BrennConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -85,116 +83,74 @@ pub struct BrennConfig {
     pub repo_sync: RepoSyncConfig,
     /// Top-level repo declarations. Each repo is cloned to `<repo_dir>/<slug>/`
     /// on startup if the directory doesn't exist.
-    #[serde(default, rename = "repo")]
     pub repos: Vec<RepoDeclRaw>,
     /// Podman container definitions. Apps reference these by name.
-    #[serde(default)]
     pub container: HashMap<String, ContainerConfig>,
     /// Global integration defaults. Apps enable integrations by name and can
     /// override specific config keys per-app via `integration_config`.
-    #[serde(default)]
     pub integrations: HashMap<String, toml::Value>,
-    /// Per-app configurations. At least one must be defined.
-    /// Deserialized as a Vec from TOML `[[app]]` array, then validated and
-    /// converted to a HashMap keyed by slug via `validate_and_resolve`.
-    #[serde(rename = "app")]
+    /// Per-app configurations, one per `agent` instantiation. At least one must
+    /// be defined. Validated and converted to a HashMap keyed by slug via
+    /// `validate_and_resolve`.
     pub apps: Vec<AppConfigRaw>,
-    /// Top-level `[[channel]]` declarations — one table for every pub/sub
+    /// Top-level `channel` declarations — one entry for every pub/sub
     /// scheme, durable or not. The address's scheme picks the channel's
     /// capabilities. See `crate::messaging::config::ChannelConfigRaw`.
-    #[serde(default, rename = "channel")]
     pub channels: Vec<crate::messaging::config::ChannelConfigRaw>,
-    /// Global messaging defaults (`[messaging]`). Defaults to
+    /// Global messaging defaults (the `messaging` section). Defaults to
     /// `MessagingGlobalConfig::default()` when absent.
-    #[serde(default)]
     pub messaging: crate::messaging::config::MessagingGlobalConfig,
-    /// Observability settings (`[observability]`). Defaults to
+    /// Observability settings (the `observability` section). Defaults to
     /// `ObservabilityConfig::default()` when absent.
-    #[serde(default)]
     pub observability: ObservabilityConfig,
-    /// Surface self-description settings (`[surface_description]`). Defaults to
+    /// Surface self-description settings (the `surface_description` section). Defaults to
     /// `SurfaceDescriptionConfig::default()` (no prefix ⇒ feature off) when absent.
-    #[serde(default)]
     pub surface_description: SurfaceDescriptionConfig,
-    /// Chat-over-pubsub settings (`[llm_chat]`). Defaults to
+    /// Chat-over-pubsub settings (the `llm_chat` section). Defaults to
     /// `LlmChatConfig::default()` when absent.
-    #[serde(default)]
     pub llm_chat: super::llm_chat::LlmChatConfig,
     /// Global VAPID keypair and subject for PWA push notifications.
-    /// `[pwa_push]` block. Defaults to `PwaPushGlobalConfig::default()`
+    /// The `pwa_push` section. Defaults to `PwaPushGlobalConfig::default()`
     /// (all-None) when absent — safe zero values; no keypair loaded unless
     /// an app has `pwa_push.enabled = true`.
-    #[serde(default)]
     pub pwa_push: crate::pwa_push::config::PwaPushGlobalConfig,
-    /// Automation engine config (`[automation]`). Defaults to
+    /// Automation engine config (the `automation` section). Defaults to
     /// `AutomationGlobalConfig::default()` when absent.
-    #[serde(default)]
     pub automation: crate::config::AutomationGlobalConfig,
-    /// Top-level `[[mqtt_client]]` declarations. Each entry defines an MQTT
+    /// Top-level `mqtt_client` declarations. Each entry defines an MQTT
     /// client (the app-independent connection to a remote MQTT broker/server).
     /// Apps address it for egress via the `mqtt_publish` ACL naming the client
-    /// slug, and subscribe to it via `[[app.mqtt_subscription]]` naming
+    /// slug, and subscribe to it with a `subscribe` statement naming
     /// `mqtt:<client>:<topic>` (ingress).
-    #[serde(default, rename = "mqtt_client")]
     pub mqtt_clients: Vec<crate::mqtt::config::MqttClientConfigRaw>,
-    /// Top-level `[[webhook_endpoint]]` declarations. Each entry defines an
-    /// inbound HTTP webhook endpoint. Apps bind to endpoints via
-    /// `[[app.webhook_subscription]]`.
-    #[serde(default, rename = "webhook_endpoint")]
+    /// Top-level `webhook` declarations. Each entry defines an inbound HTTP
+    /// webhook endpoint. Apps bind to endpoints with a `subscribe` statement
+    /// naming `webhook:<slug>`.
     pub webhook_endpoints: Vec<crate::webhook::config::WebhookEndpointConfigRaw>,
-    /// Events table retention settings (`[events]`). Defaults to
+    /// Events table retention settings (the `events` section). Defaults to
     /// `EventsConfig::default()` when absent (7-day delivered-row retention).
-    #[serde(default)]
     pub events: EventsConfig,
-    /// TOML `[[wasm_consumer]]` blocks; see [`crate::messaging::config::WasmConsumerConfigRaw`]
-    /// for per-entry fields.
-    #[serde(default, rename = "wasm_consumer")]
+    /// One entry per WASM-consumer instantiation; see
+    /// [`crate::messaging::config::WasmConsumerConfigRaw`] for per-entry fields.
     pub wasm_consumers: Vec<crate::messaging::config::WasmConsumerConfigRaw>,
-    /// Top-level `[[surface]]` blocks; see
+    /// Top-level `surface` declarations; see
     /// [`crate::messaging::config::SurfaceConfigRaw`] for per-entry fields.
-    #[serde(default, rename = "surface")]
     pub surfaces: Vec<crate::messaging::config::SurfaceConfigRaw>,
-    /// Top-level `[[remote]]` blocks — authenticated native-daemon attachers on
+    /// Top-level `remote` declarations — authenticated native-daemon attachers on
     /// the same attach transport the browser surfaces use; see
     /// [`crate::messaging::remote::RemoteConfigRaw`] for per-entry fields.
-    #[serde(default, rename = "remote")]
     pub remotes: Vec<crate::messaging::remote::RemoteConfigRaw>,
-    /// Top-level `[[connection]]` blocks — auto channels declared by the ports
-    /// they wire together rather than by a `[[channel]]` block. See
+    /// Auto channels declared by the ports they wire together rather than by a
+    /// `channel` declaration. No document spells this form, so the field is
+    /// always empty. See
     /// [`crate::messaging::config::ConnectionConfigRaw`].
-    #[serde(default, rename = "connection")]
     pub connections: Vec<crate::messaging::config::ConnectionConfigRaw>,
-    /// Global WASM-host policy (`[wasm]` block). Controls defaults such as
+    /// Global WASM-host policy (the `wasm` section). Controls defaults such as
     /// store size limits. Omitting the block is equivalent to `WasmConfig::default()`.
-    #[serde(default)]
     pub wasm: WasmConfig,
-    /// Bridge-wedge watchdog settings (`[watchdog]`). Defaults to
+    /// Bridge-wedge watchdog settings (the `watchdog` section). Defaults to
     /// `WatchdogConfig::default()` when absent (30 s sweep, 60 s wedge grace).
-    #[serde(default)]
     pub watchdog: WatchdogConfig,
-}
-
-/// Qualify every bare `[[channel]]` and tuning address in a loaded config with
-/// `brenn:`.
-///
-/// The runtime reads a bare address as `brenn:` anyway, so the two spellings are
-/// one configuration; a lowered `.brenn` config is qualified on emit and a
-/// hand-written TOML file is mostly bare, so comparing the two without this
-/// reports every channel as changed. The per-address rule is the runtime's
-/// ([`canonicalize_channel_address`](crate::messaging::canonicalize_channel_address));
-/// this is the walk over the fields that carry one.
-///
-/// TODO(dsl-toml-twins): the whole walk retires with the TOML front end — a
-/// config that can only come from a `.brenn` document is already qualified.
-pub fn canonicalize_config_addresses(config: &mut BrennConfig) {
-    for channel in &mut config.channels {
-        for address in [&mut channel.address, &mut channel.address_prefix]
-            .into_iter()
-            .flatten()
-        {
-            *address = crate::messaging::canonicalize_channel_address(address);
-        }
-    }
 }
 
 /// Sort the collections in a loaded config whose order the runtime ignores.
@@ -381,21 +337,18 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
 
 /// Load configuration from a config file.
 ///
-/// If `path` is `Some`, reads that file, dispatching on its extension: `.toml`
-/// parses as TOML, `.brenn` compiles as a DSL document and lowers to the same
-/// `BrennConfig`. If `None`, probes the current working directory for
-/// `brenn.brenn` and then `brenn.toml`. If neither exists, returns
+/// If `path` is `Some`, reads that file: a `.brenn` document compiles and lowers
+/// to a `BrennConfig`, and no other extension is a config. If `None`, probes the
+/// current working directory for `brenn.brenn`. If it does not exist, returns
 /// `BrennConfig::default()`.
 ///
 /// # Panics
 ///
 /// Panics if:
-/// - `path` is `Some` and the file doesn't exist or fails to parse
-/// - `path` is `Some` and its extension is neither `toml` nor `brenn`
-/// - `path` is `None` and both fallback names exist in cwd
-/// - `path` is `None` and whether a fallback name exists cannot be determined
-/// - `path` is `None` and the one fallback that exists fails to load
-/// - The file contains unrecognized keys or invalid values
+/// - `path` is `Some` and the file doesn't exist or fails to compile or lower
+/// - `path` is `Some` and its extension is not `brenn`
+/// - `path` is `None` and whether the fallback name exists cannot be determined
+/// - `path` is `None` and the fallback that exists fails to load
 pub fn load_config(path: Option<&Path>) -> BrennConfig {
     let cwd = std::env::current_dir().expect("failed to determine current directory");
     load_config_from(path, &cwd)
@@ -418,69 +371,33 @@ pub(crate) fn load_config_from(path: Option<&Path>, fallback_dir: &Path) -> Bren
     check_config(&path).unwrap_or_else(|report| panic!("{report}"))
 }
 
-/// The two names a `--config`-less boot answers to, in the fallback directory.
-///
-/// Ordered `.brenn` first because that is the front end configs are written in;
-/// the TOML name is the one that retires with the TOML front end.
-///
-/// TODO(dsl-toml-twins): drop the `brenn.toml` probe when the TOML front end
-/// retires.
-const FALLBACK_NAMES: [&str; 2] = ["brenn.brenn", "brenn.toml"];
+/// The name a `--config`-less boot answers to, in the fallback directory.
+const FALLBACK_NAME: &str = "brenn.brenn";
 
-/// The one config file in `fallback_dir`, or nothing where it holds none.
+/// The config file in `fallback_dir`, or nothing where it holds none.
 ///
 /// # Panics
 ///
-/// Panics if the directory holds both names. Two configs that could disagree is
-/// exactly the ambiguity a silent precedence rule would hide: nobody can tell
-/// from the outside which one the server read, so neither is read.
-///
-/// Panics too where a name can neither be confirmed present nor confirmed
-/// absent — an unreadable directory, a symlink loop. "Could not check" read as
-/// "absent" would boot on defaults, or on the other of two names without the
-/// ambiguity panic, and the operator would have no way to tell.
+/// Panics where the name can neither be confirmed present nor confirmed
+/// absent — an unreadable directory, a symlink loop. Read as "absent", the
+/// server would boot on defaults with a config sitting right there, and the
+/// operator would have no way to tell.
 fn fallback_config(fallback_dir: &Path) -> Option<PathBuf> {
-    let found: Vec<PathBuf> = FALLBACK_NAMES
-        .iter()
-        .map(|name| fallback_dir.join(name))
-        .filter(|path| {
-            path.try_exists().unwrap_or_else(|error| {
-                panic!(
-                    "no --config was given and whether {} exists cannot be determined: {error}",
-                    path.display(),
-                )
-            })
-        })
-        .collect();
-    assert!(
-        found.len() < 2,
-        "no --config was given and {} holds more than one config file ({}); \
-         there is no precedence rule between them — pass --config, or remove one",
-        fallback_dir.display(),
-        found
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    found.into_iter().next()
+    let path = fallback_dir.join(FALLBACK_NAME);
+    let exists = path.try_exists().unwrap_or_else(|error| {
+        panic!(
+            "no --config was given and whether {} exists cannot be determined: {error}",
+            path.display(),
+        )
+    });
+    exists.then_some(path)
 }
 
-/// What to say about a path that is neither of the two forms a config takes.
 fn unrecognized_extension(path: &Path) -> String {
     format!(
-        "config file {}: unrecognized extension — a config is either a `.toml` file or a \
-         `.brenn` document",
+        "config file {}: unrecognized extension — a config is a `.brenn` document",
         path.display(),
     )
-}
-
-/// A TOML config file, read and parsed, or what to report about it.
-fn read_toml(path: &Path) -> Result<BrennConfig, String> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read config file {}: {e}", path.display()))?;
-    toml::from_str(&contents)
-        .map_err(|e| format!("failed to parse config file {}: {e}", path.display()))
 }
 
 /// Which stage of the `.brenn` pipeline refused a document, and with what.
@@ -534,7 +451,6 @@ fn read_dsl(path: &Path) -> Result<BrennConfig, DslFailure> {
 /// "this config will boot on every host".
 pub fn check_config(path: &Path) -> Result<BrennConfig, String> {
     match path.extension().and_then(std::ffi::OsStr::to_str) {
-        Some("toml") => read_toml(path),
         Some("brenn") => read_dsl(path).map_err(|failure| failure.render(path)),
         // The check tool reports; only boot panics.
         _ => Err(unrecognized_extension(path)),

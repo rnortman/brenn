@@ -33,6 +33,8 @@ use super::resolve_publish_millitokens;
 /// On an unbounded `retain_depth` (the ring is page memory — "unbounded" is a
 /// page that grows until the tab dies, not a retention policy), or on a
 /// `retain_depth` set for a reserved control channel.
+// TODO(config-syntax-in-operator-messages): every validator in this file names
+// the surface and its bindings in table notation.
 fn accumulate_local_ring_depth(
     slug: &str,
     depths: &mut IndexMap<String, u64>,
@@ -381,7 +383,7 @@ fn resolve_parked_batch_depth(slug: &str, instance: &str, comp: &SurfaceComponen
 }
 
 /// Resolve a component instance's static config map — the page-lifetime
-/// analogue of the backend's process-lifetime map seeded from host TOML and read
+/// analogue of the backend's process-lifetime map seeded from host config and read
 /// through the `config` import.
 ///
 /// Only a `processor` reads it: no other ABI is handed a `config` import, so a

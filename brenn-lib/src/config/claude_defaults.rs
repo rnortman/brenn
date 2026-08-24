@@ -1,11 +1,8 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
 /// Server-global CC defaults, shared across all apps.
 /// Per-app configs can override `model`.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct ClaudeDefaultsConfig {
     /// Path to the Brenn DisplayFile MCP stub script (noop_mcp.py).
     pub mcp_script_path: PathBuf,

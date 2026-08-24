@@ -552,12 +552,13 @@ pub struct AttrBlock<A = AttrMap> {
 // grammar gives generic sections and these bodies do not have yet.
 //
 // TODO(dsl-vocabulary-config-parity): nothing mechanically ties a vocabulary to
-// the config struct it transcribes. `brenn-dsl` does not depend on `brenn-lib`,
-// so a field added to a config struct cannot break a build here; it surfaces as
-// "not a key" at whoever writes the key months later. What is wanted is a gate
-// on the config side — reflected field names against a table of (config struct,
-// vocabulary, deliberately omitted fields and why) — and where it lives is a
-// question this crate cannot answer alone.
+// the config struct it transcribes. `brenn-dsl` does not depend on `brenn-lib`
+// today, so a field added to a config struct cannot break a build here; it
+// surfaces as "not a key" at whoever writes the key months later. Until the
+// brenn-lib split lets this crate see the config structs directly, what is
+// wanted is a gate on the config side — reflected field names against a table of
+// (config struct, vocabulary, deliberately omitted fields and why) — and where
+// it lives is a question this crate cannot answer alone.
 
 /// Declare attr vocabularies: the closed key sets a typed body admits.
 ///

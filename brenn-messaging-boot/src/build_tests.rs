@@ -7,6 +7,7 @@ use super::test_fixtures::{
 use super::*;
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig, WasmGrant};
+use brenn_lib::mqtt::config::MqttClientConfigRaw;
 use brenn_lib::webhook::ResolvedWebhookSubscription;
 
 /// An empty tool registry for `build_messaging` calls that do not exercise the
@@ -1393,10 +1394,7 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
     let (mut config, _channel_uuid) = config_with_one_brenn_channel(address);
     // Declare the `home` client so the matcher⇒declared-client check (2d) passes
     // and this exercises the matcher⇒grant check (2f) in isolation.
-    config.mqtt_clients = vec![
-        toml::from_str("slug = \"home\"\nurl = \"mqtts://127.0.0.1:1\"")
-            .expect("minimal raw client config parses"),
-    ];
+    config.mqtt_clients = vec![MqttClientConfigRaw::minimal("home", "mqtts://127.0.0.1:1")];
     // Authors an mqtt_publish ACL matcher but `grants` is empty (no `mqtt`).
     // Without the grant the matcher can never authorize a publish — dead config.
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
@@ -1894,10 +1892,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
     };
 
     let mut config = brenn_lib::config::BrennConfig {
-        mqtt_clients: vec![
-            toml::from_str("slug = \"home\"\nurl = \"mqtts://127.0.0.1:1\"")
-                .expect("minimal raw client config parses"),
-        ],
+        mqtt_clients: vec![MqttClientConfigRaw::minimal("home", "mqtts://127.0.0.1:1")],
         ..brenn_lib::config::BrennConfig::default()
     };
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
@@ -2003,10 +1998,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
     };
 
     let mut config = brenn_lib::config::BrennConfig {
-        mqtt_clients: vec![
-            toml::from_str("slug = \"home\"\nurl = \"mqtts://127.0.0.1:1\"")
-                .expect("minimal raw client config parses"),
-        ],
+        mqtt_clients: vec![MqttClientConfigRaw::minimal("home", "mqtts://127.0.0.1:1")],
         ..brenn_lib::config::BrennConfig::default()
     };
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
@@ -3292,11 +3284,11 @@ fn minimal_remote(
         std::fs::set_permissions(token.path(), std::fs::Permissions::from_mode(0o600))
             .expect("tighten the token file");
     }
-    let raw = toml::from_str(&format!(
-        "slug = {slug:?}\ntoken_file = {:?}\ngrants = [\"alert\"]\n",
-        token.path().display().to_string(),
-    ))
-    .expect("the [[remote]] block parses");
+    let raw = brenn_lib::config::remote_raw(
+        slug,
+        token.path(),
+        &[brenn_lib::messaging::remote::RemoteGrant::Alert],
+    );
     (raw, token)
 }
 

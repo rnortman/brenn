@@ -21,11 +21,12 @@ use brenn_lib::app::{AppTool, AutoApproveTool};
 use brenn_lib::config::AppConfig;
 use brenn_lib::integration::{Integration, IntegrationFactory};
 
-/// Integration name, used in TOML config keys and the integration registry.
+/// Integration name, used in the config document and the integration registry.
 const INTEGRATION_NAME: &str = "graf";
 
-/// Config for the graf integration, deserialized from the merged
-/// `[integrations.graf]` + per-app `[integration_config.graf]` TOML.
+/// Config for the graf integration, deserialized from the merged value tree of
+/// the `integration graf` declaration and an agent's `integration_config graf`
+/// block.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrafConfig {
     /// Graf binary — either a bare name (resolved via PATH) or an absolute path.
@@ -42,7 +43,7 @@ impl IntegrationFactory for GrafFactory {
 
     fn create(&self, config: Option<&toml::Value>) -> Arc<dyn Integration> {
         let config: GrafConfig = config
-            .expect("graf integration requires [integrations.graf] config with command")
+            .expect("graf integration requires an `integration graf` block with a command")
             .clone()
             .try_into()
             .expect("invalid graf integration config");

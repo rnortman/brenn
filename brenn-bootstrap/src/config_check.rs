@@ -1,8 +1,7 @@
 //! `brenn config-check <file>`: would the server load this config file?
 //!
 //! Runs the file through the same path `--config` boots from — parse, resolve,
-//! derive, lower for a `.brenn` document, read and parse for a `.toml` one —
-//! and renders diagnostics instead of panicking.
+//! derive, lower — and renders diagnostics instead of panicking.
 //!
 //! Environment facts are out of scope: see [`brenn_lib::config::check_config`].
 
@@ -74,22 +73,6 @@ channel alerts at "brenn:alice-alerts" {
         assert!(ok, "{report}");
     }
 
-    #[test]
-    fn a_valid_toml_config_passes() {
-        let (ok, report) = check(
-            "brenn.toml",
-            r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 16
-"#,
-        );
-        assert!(ok, "{report}");
-    }
-
     /// A document that parses, resolves and derives, and is refused only at
     /// lowering: `noise` is a key of the subscribe tail's union vocabulary and a
     /// field no `webhook:` subscription has.
@@ -122,13 +105,6 @@ new alice: Assistant();
         // that stopped at compile would report this file as fine.
         assert!(report.contains("failed to lower"), "{report}");
         assert!(report.contains("noise"), "{report}");
-    }
-
-    #[test]
-    fn an_unknown_key_fails_a_toml_config() {
-        let (ok, report) = check("brenn.toml", "nope = 1\n");
-        assert!(!ok);
-        assert!(report.contains("nope"), "{report}");
     }
 
     /// The check tool reports; only boot panics.

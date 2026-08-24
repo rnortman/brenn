@@ -11,7 +11,7 @@ use super::*;
 /// History beyond this is available via simplified backward pagination.
 const DEFAULT_HISTORY_REPLAY_LIMIT: usize = 2000;
 
-/// Shallow-merge two TOML values for integration config.
+/// Shallow-merge two integration-config value trees.
 ///
 /// Both values must be tables. Per-app keys override global keys at the
 /// top level — no deep merge.

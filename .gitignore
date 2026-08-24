@@ -16,7 +16,7 @@ logs/
 *.db
 *.db-shm
 *.db-wal
-brenn.toml
+brenn.brenn
 dev/grafdata/
 dev/graf-manifest.toml
 .claude/scheduled_tasks.lock

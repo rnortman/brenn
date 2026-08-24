@@ -1,12 +1,13 @@
 //! The rig both remote-route suites boot against: `ws_tests` for the HTTP edge,
 //! `conformance_tests` for a whole attacher driven through it.
 //!
-//! Booted-shaped rather than hand-built: the `[[remote]]` block is real TOML
-//! resolved off a real 0600 token file, lowered through the real runtime builder,
-//! over a messenger carrying the registrations and delivery bindings boot would
-//! install. What a test then asserts is a property of the wiring, not of a
-//! fixture that agreed with it.
+//! Booted-shaped rather than hand-built: the `remote` block resolves off a real
+//! 0600 token file, lowered through the real runtime builder, over a messenger
+//! carrying the registrations and delivery bindings boot would install. What a
+//! test then asserts is a property of the wiring, not of a fixture that agreed
+//! with it.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use brenn_envelope::chat::chat_roster_bare_name;
@@ -45,22 +46,9 @@ pub(crate) const TOKEN: &str = "s3cret-token";
 /// frame cap is a distinctive number in the `Welcome`.
 pub(crate) const TEST_MAX_BODY_BYTES: usize = 4096;
 
-/// A fleet-driver `[[remote]]` block: a roster read at 1/1, outbound
-/// conversation leaves under prefixes, publish rights on the inbound ones.
-pub(crate) const FLEET: &str = r#"
-slug = "pod-kitchen"
-token_file = "TOKEN_FILE"
-grants = ["subscribe", "publish", "ephemeral_subscribe", "ephemeral_publish", "alert"]
-subscribe_acl = [
-  { exact  = "chat.app.home.roster", push_depth = 1, retain_depth = 1 },
-  { prefix = "chat.app.home.out.",   push_depth = 8, retain_depth = 64 },
-]
-ephemeral_subscribe_acl = [
-  { prefix = "chat.app.home.stream.", push_depth = 32, retain_depth = 32 },
-]
-publish_acl           = [ { prefix = "chat.app.home.in." } ]
-ephemeral_publish_acl = [ { prefix = "chat.app.home.wake." } ]
-"#;
+/// A fleet-driver `remote` block: a roster read at 1/1, outbound conversation
+/// leaves under prefixes, publish rights on the inbound ones.
+pub(crate) use brenn_lib::config::remote_fleet as fleet;
 
 /// Everything one rig needs to assert against, past the `AppState` the server
 /// runs on.
@@ -100,9 +88,12 @@ fn write_token() -> tempfile::NamedTempFile {
     f
 }
 
-/// Build the rig around one `[[remote]]` body, with no channels provisioned.
-pub(crate) async fn remote_harness(db: &brenn_db::Db, body: &str) -> RemoteTestHarness {
-    remote_harness_with_channels(db, body, vec![]).await
+/// Build the rig around one `remote` block, with no channels provisioned.
+pub(crate) async fn remote_harness(
+    db: &brenn_db::Db,
+    block: impl FnOnce(&Path) -> RemoteConfigRaw,
+) -> RemoteTestHarness {
+    remote_harness_with_channels(db, block, vec![]).await
 }
 
 /// [`remote_harness`] over a directory carrying `entries`.
@@ -114,12 +105,11 @@ pub(crate) async fn remote_harness(db: &brenn_db::Db, body: &str) -> RemoteTestH
 /// a test failure.
 pub(crate) async fn remote_harness_with_channels(
     db: &brenn_db::Db,
-    body: &str,
+    block: impl FnOnce(&Path) -> RemoteConfigRaw,
     entries: Vec<ChannelEntry>,
 ) -> RemoteTestHarness {
     let token_file = write_token();
-    let toml = body.replace("TOKEN_FILE", &token_file.path().display().to_string());
-    let raw: RemoteConfigRaw = toml::from_str(&toml).expect("[[remote]] block must parse");
+    let raw = block(token_file.path());
     let resolved = resolve_remotes(&[raw], &MessagingGlobalConfig::default());
 
     let (nondurable, durable): (Vec<ChannelEntry>, Vec<ChannelEntry>) = entries

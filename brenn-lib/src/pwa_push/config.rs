@@ -1,6 +1,6 @@
 //! PWA push configuration types and validation.
 //!
-//! `PwaPushGlobalConfig` is the `[pwa_push]` TOML block on `BrennConfig`.
+//! `PwaPushGlobalConfig` is the `pwa_push` section on `BrennConfig`.
 //! `AppPwaPushBlock` is the `[app.pwa_push]` block on `AppConfigRaw`.
 //! `ResolvedPwaPushConfig` is produced by `resolve_pwa_push_layer` at startup.
 //! `EndpointPolicy` is the host-allowlist policy data.
@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
-use serde::Deserialize;
 
 use crate::config::AppConfig;
 
@@ -36,8 +35,7 @@ pub(crate) fn default_endpoint_host_allowlist_enforce() -> bool {
 ///
 /// This block may be absent when no app holds the `PwaPush` grant;
 /// in that case `PwaPushGlobalConfig::default()` provides safe zero-values.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PwaPushGlobalConfig {
     /// Path to the VAPID keypair secrets file. Required when any app has the
     /// `PwaPush` grant (`pwa_push_enabled()`). If the file does not exist on
@@ -51,14 +49,12 @@ pub struct PwaPushGlobalConfig {
     /// Defaults to `["fcm.googleapis.com", "updates.push.services.mozilla.com",
     /// "web.push.apple.com"]`. Operators who set this key override the default
     /// entirely (no merge). Self-hosted push services must add their hostname here.
-    #[serde(default = "default_endpoint_host_allowlist")]
     pub endpoint_host_allowlist: Vec<String>,
     /// When `true` (the default), endpoints whose host is not in
     /// `endpoint_host_allowlist` are rejected at subscribe and delivery time.
     /// When `false`, mismatches produce a warning but the endpoint is accepted
     /// (IP-block rules still apply). Useful for soft-rollout on existing
     /// deployments.
-    #[serde(default = "default_endpoint_host_allowlist_enforce")]
     pub endpoint_host_allowlist_enforce: bool,
 }
 
@@ -78,9 +74,7 @@ impl Default for PwaPushGlobalConfig {
 /// Push authorization is decided by the app's `AppPolicy`
 /// (`AppConfig::pwa_push_enabled()` reads the `PwaPush` grant). This block
 /// carries only the non-authorization `default_title` delivery setting.
-/// `#[serde(deny_unknown_fields)]` rejects any stale keys.
-#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppPwaPushBlock {
     /// Default notification title when `PushSend` omits the `title` field.
     /// Falls back to the app's display name when absent.
@@ -472,47 +466,9 @@ mod tests {
     }
 
     #[test]
-    fn serde_default_allowlist_when_key_absent_from_toml() {
-        // Exercises the #[serde(default = "default_endpoint_host_allowlist")] path:
-        // when the TOML block omits endpoint_host_allowlist, serde must call the
-        // default function. Constructing PwaPushGlobalConfig::default() in Rust does
-        // NOT exercise this code path.
-        let toml_str = "[pwa_push]\n";
-        let wrapper: toml::Table = toml::from_str(toml_str).expect("parse toml");
-        let global: PwaPushGlobalConfig = wrapper["pwa_push"]
-            .clone()
-            .try_into()
-            .expect("deserialize PwaPushGlobalConfig");
-        assert!(
-            global.endpoint_host_allowlist_enforce,
-            "enforce must default to true"
-        );
-        assert!(
-            global
-                .endpoint_host_allowlist
-                .contains(&"fcm.googleapis.com".to_string()),
-            "default allowlist must contain FCM"
-        );
-        assert!(
-            global
-                .endpoint_host_allowlist
-                .contains(&"updates.push.services.mozilla.com".to_string()),
-            "default allowlist must contain Mozilla"
-        );
-        assert!(
-            global
-                .endpoint_host_allowlist
-                .contains(&"web.push.apple.com".to_string()),
-            "default allowlist must contain Apple"
-        );
-        assert_eq!(global.endpoint_host_allowlist.len(), 3);
-    }
-
-    #[test]
     fn default_allowlist_contains_three_vendor_hosts() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let keypair_path = tempdir.path().join("vapid.json");
-        // Use Default::default() — omitting endpoint_host_allowlist key.
         let global = PwaPushGlobalConfig {
             keypair_file: Some(keypair_path),
             subject: Some("mailto:admin@example.com".to_string()),

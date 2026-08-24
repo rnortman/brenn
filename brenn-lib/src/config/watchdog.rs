@@ -1,13 +1,10 @@
-use serde::Deserialize;
-
 /// Settings for the bridge-wedge watchdog (`[watchdog]`).
 ///
 /// The watchdog sweeps every live bridge on an interval, looking for a bridge
 /// whose event loop has died or whose session I/O is dead while the bridge
 /// still believes CC is busy. Defaults are chosen so omitting the section
 /// requires no config-file change at deploy.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WatchdogConfig {
     /// How often the watchdog sweeps the bridge registry, in seconds.
     pub sweep_interval_secs: u64,
@@ -47,7 +44,6 @@ impl WatchdogConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
 
     #[test]
     fn defaults_match_documented_values() {
@@ -55,33 +51,6 @@ mod tests {
         assert_eq!(c.sweep_interval_secs, 30);
         assert_eq!(c.wedge_grace_secs, 60);
         assert_eq!(c.grace_sweeps(), 2);
-    }
-
-    #[test]
-    fn empty_toml_yields_defaults() {
-        // An omitted [watchdog] table must deserialize to the defaults so no
-        // config-file change is required at deploy.
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            watchdog: WatchdogConfig,
-        }
-        let w: Wrapper = toml::from_str("").expect("empty config parses");
-        assert_eq!(w.watchdog.sweep_interval_secs, 30);
-        assert_eq!(w.watchdog.wedge_grace_secs, 60);
-    }
-
-    #[test]
-    fn partial_table_keeps_other_default() {
-        let c: WatchdogConfig =
-            toml::from_str("sweep_interval_secs = 10").expect("partial config parses");
-        assert_eq!(c.sweep_interval_secs, 10);
-        assert_eq!(c.wedge_grace_secs, 60); // still the default
-    }
-
-    #[test]
-    fn unknown_field_rejected() {
-        assert!(toml::from_str::<WatchdogConfig>("bogus = 1").is_err());
     }
 
     #[test]

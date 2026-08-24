@@ -381,6 +381,8 @@ fn inject(principal: &str, grants: &[AutoGrant], policy: &mut AppPolicy) {
 /// named address that is reserved / mis-schemed / colliding, a `local:` name on a
 /// wire-spanning endpoint set, or a `uuid` on a channel that has no DB row to
 /// name.
+// TODO(dsl-connection-spelling): the connection arm below is unreachable — no
+// document produces a `ConnectionConfigRaw`, so only the io_port path runs.
 pub(crate) fn lower_auto_wiring(
     connections: &[ConnectionConfigRaw],
     consumers: &[WasmConsumerConfigRaw],

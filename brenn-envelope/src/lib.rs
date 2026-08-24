@@ -414,7 +414,7 @@ pub struct MqttEnvelope {
 /// Ordered low-to-high: `VeryLow < Low < Normal < High`. The `derive(Ord)`
 /// is load-bearing — `WakeMin::wakes` relies on `>=` comparison.
 ///
-/// Wire/DB/TOML/LLM strings: `"very-low"`, `"low"`, `"normal"`, `"high"` —
+/// Wire/DB/LLM strings: `"very-low"`, `"low"`, `"normal"`, `"high"` —
 /// identical to RFC 8030 §5.3, so `pwa_push` egress is a pass-through.
 ///
 /// Migration mapping from the legacy binary wake flag:
@@ -438,7 +438,7 @@ impl Urgency {
     /// never re-listed (and never silently drifts) at a call site.
     pub const ALL: [Urgency; 4] = [Self::VeryLow, Self::Low, Self::Normal, Self::High];
 
-    /// Wire/DB/TOML string representation (kebab-case; matches RFC 8030 §5.3).
+    /// Wire/DB string representation (kebab-case; matches RFC 8030 §5.3).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::VeryLow => "very-low",
@@ -448,7 +448,7 @@ impl Urgency {
         }
     }
 
-    /// Parse from a wire/DB/TOML string. Returns `None` on unknown values.
+    /// Parse from a wire/DB string. Returns `None` on unknown values.
     /// Named `parse` rather than `from_str` to avoid confusion with
     /// `std::str::FromStr::from_str` (clippy::should_implement_trait).
     pub fn parse(s: &str) -> Option<Self> {

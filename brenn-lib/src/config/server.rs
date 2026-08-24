@@ -1,10 +1,7 @@
 pub use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct ServerConfig {
     /// Socket address to bind to (e.g. "0.0.0.0:3000").
     pub bind_address: SocketAddr,
@@ -45,9 +42,9 @@ pub struct ServerConfig {
     /// on every published message. Separate from `bind_address`, which is the
     /// internal socket the reverse proxy connects to.
     ///
-    /// **Required.** `Option` here only so that a missing key produces the
+    /// **Required.** `Option` here only so that an unstated key produces the
     /// explanatory load-time panic (`validate_and_resolve`) rather than a terse
-    /// serde parse error; a config without it does not start.
+    /// one; a config without it does not start.
     pub public_url: Option<String>,
 }
 
@@ -65,8 +62,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct DatabaseConfig {
     /// Path to the SQLite database file.
     pub path: PathBuf,

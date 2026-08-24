@@ -39,11 +39,11 @@ use brenn_usage_obs::parse_ts;
     about = "Export Brenn usage sessions and events (CSV/JSON)"
 )]
 struct Cli {
-    /// Path to the Brenn SQLite database. Defaults to value from brenn.toml.
+    /// Path to the Brenn SQLite database. Defaults to the value from the config file.
     #[arg(long)]
     db: Option<PathBuf>,
 
-    /// Path to brenn.toml config file. Only used to resolve --db default.
+    /// Path to the `.brenn` config file. Only used to resolve --db default.
     #[arg(long)]
     config: Option<PathBuf>,
 

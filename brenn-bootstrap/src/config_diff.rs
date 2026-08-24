@@ -1,20 +1,17 @@
 //! `brenn config-diff <a> <b>`: are two config files the same configuration?
 //!
-//! The comparison is over parsed [`BrennConfig`] values, not over documents:
+//! The comparison is over loaded [`BrennConfig`] values, not over documents:
 //! defaults are applied, key order is gone, collections whose order the runtime
 //! ignores are sorted, and what is left is what the runtime will actually see.
-//! Everything downstream of `load_config` is provenance-blind, so TOML-vs-DSL,
-//! TOML-vs-TOML and DSL-vs-DSL are all the same question, and each side loads
-//! through the same extension dispatch `--config` uses.
+//! Each side loads through the same extension dispatch `--config` uses.
 //!
-//! This is the migration tool for the `.brenn` front end: it is how an operator
-//! proves a translated config is the config they were running.
+//! This is how an operator proves a rewritten document — split into modules,
+//! stamped from assemblies, refactored any other way — is still the config they
+//! were running.
 
 use std::path::Path;
 
-use brenn_lib::config::{
-    BrennConfig, canonicalize_config_addresses, load_config, sort_order_dead_collections,
-};
+use brenn_lib::config::{BrennConfig, load_config, sort_order_dead_collections};
 use similar::TextDiff;
 
 /// Load both files, compare, print the verdict. Returns whether they are equal,
@@ -45,8 +42,6 @@ pub(crate) fn diff(
     label_a: &str,
     label_b: &str,
 ) -> (bool, String) {
-    canonicalize_config_addresses(&mut a);
-    canonicalize_config_addresses(&mut b);
     // Comparison-only normalization: two configs that list the same ACL
     // matchers or the same grants in a different order are one configuration,
     // and a derived ACL's order is whatever the derivation pass emitted.
@@ -61,9 +56,9 @@ pub(crate) fn diff(
     let text_a = format!("{a:#?}\n");
     let text_b = format!("{b:#?}\n");
     // Two configs that compare unequal and render identically hold a field that
-    // is not equal to itself: a non-finite float, which TOML spells `nan` and
-    // which nothing rejects before `validate_and_resolve`. Reporting "these
-    // differ" over an empty diff is a verdict nobody can act on.
+    // is not equal to itself: a non-finite float, which nothing rejects before
+    // `validate_and_resolve`. Reporting an empty diff as "these differ" is a
+    // verdict nobody can act on.
     assert!(
         text_a != text_b,
         "{label_a} and {label_b} compare unequal but render identically: a `nan` float is \
@@ -80,19 +75,20 @@ pub(crate) fn diff(
 mod tests {
     use super::*;
 
+    use brenn_lib::access::raw::{AppAclRaw, ChannelMatcherRaw, WebhookMatcherRaw};
+    use brenn_lib::config::config_from_dsl;
+
     /// A config with one durable channel at `address`, everything else default.
     fn one_channel(address: &str) -> BrennConfig {
-        toml::from_str(&format!(
+        config_from_dsl(&format!(
             r#"
-[[channel]]
-address = "{address}"
-uuid = "11111111-2222-3333-4444-555555555555"
-push_depth = 4
-retain_depth = 4
-standing_retain_depth = 4
+channel target at "{address}" {{
+    push_depth = 4;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
 "#
         ))
-        .unwrap()
     }
 
     #[test]
@@ -101,10 +97,10 @@ standing_retain_depth = 4
             one_channel("brenn:alice-desk.in"),
             one_channel("brenn:alice-desk.in"),
             "a.brenn",
-            "b.toml",
+            "b.brenn",
         );
         assert!(equal);
-        assert_eq!(rendering, "a.brenn and b.toml are the same config\n");
+        assert_eq!(rendering, "a.brenn and b.brenn are the same config\n");
     }
 
     #[test]
@@ -113,11 +109,11 @@ standing_retain_depth = 4
             one_channel("brenn:alice-desk.in"),
             one_channel("brenn:bob-desk.in"),
             "a.brenn",
-            "b.toml",
+            "b.brenn",
         );
         assert!(!equal);
         assert!(rendering.contains("--- a.brenn"), "{rendering}");
-        assert!(rendering.contains("+++ b.toml"), "{rendering}");
+        assert!(rendering.contains("+++ b.brenn"), "{rendering}");
         assert!(rendering.contains("-  "), "{rendering}");
         assert!(
             rendering.contains("\"brenn:alice-desk.in\","),
@@ -126,133 +122,100 @@ standing_retain_depth = 4
         assert!(rendering.contains("\"brenn:bob-desk.in\","), "{rendering}");
     }
 
-    #[test]
-    fn a_bare_address_equals_its_brenn_qualified_twin() {
-        let (equal, _) = diff(
-            one_channel("alice-desk.in"),
-            one_channel("brenn:alice-desk.in"),
-            "bare.toml",
-            "qualified.toml",
-        );
-        assert!(equal);
-    }
-
-    #[test]
-    fn a_bare_tuning_prefix_equals_its_brenn_qualified_twin() {
-        let tuning = |address_prefix: &str| -> BrennConfig {
-            toml::from_str(&format!(
-                r#"
-[[channel]]
-address_prefix = "{address_prefix}"
-push_depth = 4
-retain_depth = 4
-standing_retain_depth = 4
-"#
-            ))
-            .unwrap()
-        };
-        let (equal, _) = diff(
-            tuning("tool-results/"),
-            tuning("brenn:tool-results/"),
-            "bare.toml",
-            "qualified.toml",
-        );
-        assert!(equal);
-    }
-
-    /// Exercises the extension dispatch: a `.brenn` document and the TOML it
-    /// translates to are the same configuration. Also catches a differ that
-    /// loads both sides as TOML or panics on a `.brenn` path.
-    #[test]
-    fn a_brenn_document_and_its_toml_twin_are_the_same_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let document = dir.path().join("main.brenn");
-        std::fs::write(
-            &document,
-            r#"
+    const IN_ORDER: &str = r#"
 channel alerts at "brenn:alice-alerts" {
     push_depth = 8;
     retain_depth = 128;
     standing_retain_depth = 16;
 }
-"#,
-        )
-        .unwrap();
-        let twin = dir.path().join("twin.toml");
-        std::fs::write(
-            &twin,
+"#;
+
+    fn write(dir: &std::path::Path, name: &str, document: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, document).unwrap();
+        path
+    }
+
+    /// Exercises the extension dispatch end to end: two `.brenn` documents that
+    /// say the same thing in a different key order are one config — the
+    /// comparison is over loaded values, and document order is gone by then.
+    /// Also catches a differ that panics on a `.brenn` path.
+    #[test]
+    fn two_brenn_documents_saying_the_same_thing_are_the_same_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write(dir.path(), "in-order.brenn", IN_ORDER);
+        let b = write(
+            dir.path(),
+            "reordered.brenn",
             r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "alice-alerts"
-push_depth = 8
-retain_depth = 128
-standing_retain_depth = 16
+channel alerts at "brenn:alice-alerts" {
+    standing_retain_depth = 16;
+    retain_depth = 128;
+    push_depth = 8;
+}
 "#,
-        )
-        .unwrap();
-        assert!(run_config_diff(&document, &twin));
+        );
+        assert!(run_config_diff(&a, &b));
     }
 
     /// Exit status 0 on configs that differ would be a false "safe to deploy".
     #[test]
-    fn a_brenn_document_and_a_different_toml_are_not_the_same_config() {
+    fn two_brenn_documents_saying_different_things_are_not_the_same_config() {
         let dir = tempfile::tempdir().unwrap();
-        let document = dir.path().join("main.brenn");
-        std::fs::write(
-            &document,
+        let a = write(dir.path(), "in-order.brenn", IN_ORDER);
+        let b = write(
+            dir.path(),
+            "other.brenn",
             r#"
 channel alerts at "brenn:alice-alerts" {
-    push_depth = 8;
+    push_depth = 4;
     retain_depth = 128;
     standing_retain_depth = 16;
 }
 "#,
-        )
-        .unwrap();
-        let other = dir.path().join("other.toml");
-        std::fs::write(
-            &other,
-            r#"
-[[channel]]
-uuid = "85a5cf7e-6874-5766-9d69-712784754a1f"
-address = "alice-alerts"
-push_depth = 4
-retain_depth = 128
-standing_retain_depth = 16
-"#,
-        )
-        .unwrap();
-        assert!(!run_config_diff(&document, &other));
+        );
+        assert!(!run_config_diff(&a, &b));
     }
 
     /// A `nan` compares false against its own copy, so the equality check and
     /// the rendering disagree. Reporting "these differ" over an empty diff is a
     /// verdict nobody can act on, so the differ dies instead.
+    ///
+    /// No document states a non-finite float — the DSL has no `nan` literal — so
+    /// the value is written onto the lowered config. The differ's assert guards
+    /// against a float arriving from anywhere at all, which is why it still
+    /// earns a test.
     #[test]
     #[should_panic(expected = "compare unequal but render identically")]
     fn a_non_finite_float_is_refused_rather_than_diffed_to_nothing() {
         let with_nan = || -> BrennConfig {
-            toml::from_str(
+            let mut config = config_from_dsl(
                 r#"
-[[wasm_consumer]]
-slug = "sink"
-component_path = "/lib/brenn_sink.wasm"
-grants = ["log"]
+channel acks at "ephemeral:sink.acks" { push_depth = 1; retain_depth = 2; }
 
-[[wasm_consumer.io_port]]
-port = "tick"
-push_depth = 1
-retain_depth = 2
-amplification = nan
+component Sink {
+    abi = processor;
+    component_path = "/lib/brenn_sink.wasm";
+    io tick;
+    out done;
+}
+
+new sink: Sink {
+    slug = "sink";
+    grants = [ports];
+
+    io tick { push_depth = 1; retain_depth = 2; amplification = 1; }
+    out done -> acks { urgency = low; }
+}
 "#,
-            )
-            .unwrap()
+            );
+            config.wasm_consumers[0].io_ports[0].amplification = Some(f64::NAN);
+            config
         };
-        diff(with_nan(), with_nan(), "a.toml", "a.toml");
+        diff(with_nan(), with_nan(), "a.brenn", "a.brenn");
     }
 
-    /// One app whose `brenn_subscribe` matchers appear **in the TOML text** in
+    /// One agent whose `brenn_subscribe` matchers appear **in the document** in
     /// the order `matchers` gives, and whose grants likewise. Order lives in the
     /// fixture rather than in a `.reverse()` on the loaded struct, so the test
     /// exercises what `config-diff` actually faces: two documents that list the
@@ -262,22 +225,23 @@ amplification = nan
     /// are different authority, so the kind is part of the fixture.
     fn app_with_acl(matchers: [(&str, &str); 3], grants: [&str; 2]) -> BrennConfig {
         let [grant_a, grant_b] = grants;
-        let entries: String = matchers
+        let entries = matchers
             .iter()
-            .map(|(kind, name)| format!("[[app.acl.brenn_subscribe]]\n{kind} = \"{name}\"\n\n"))
-            .collect();
-        toml::from_str(&format!(
+            .map(|(kind, name)| format!("{kind} \"brenn:{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        config_from_dsl(&format!(
             r#"
-[[app]]
-slug = "alice"
-grants = ["{grant_a}", "{grant_b}"]
+agent Assistant() {{
+    grants = [{grant_a}, {grant_b}];
 
-{entries}
-[[app.acl.brenn_publish]]
-exact = "alice-out"
+    acl subscribe [{entries}];
+    acl publish [exact "brenn:alice-out"];
+}}
+
+new alice: Assistant();
 "#
         ))
-        .unwrap()
     }
 
     const APP_MATCHERS: [(&str, &str); 3] = [
@@ -290,10 +254,10 @@ exact = "alice-out"
     #[test]
     fn grant_order_does_not_make_a_difference() {
         let (equal, rendering) = diff(
-            app_with_acl(APP_MATCHERS, ["messaging_subscribe", "messaging_publish"]),
-            app_with_acl(APP_MATCHERS, ["messaging_publish", "messaging_subscribe"]),
+            app_with_acl(APP_MATCHERS, ["subscribe", "publish"]),
+            app_with_acl(APP_MATCHERS, ["publish", "subscribe"]),
             "derived.brenn",
-            "explicit.toml",
+            "explicit.brenn",
         );
         assert!(equal, "grant order is set membership: {rendering}");
     }
@@ -305,10 +269,10 @@ exact = "alice-out"
         let mut reversed = APP_MATCHERS;
         reversed.reverse();
         let (equal, rendering) = diff(
-            app_with_acl(reversed, ["messaging_subscribe", "messaging_publish"]),
-            app_with_acl(APP_MATCHERS, ["messaging_subscribe", "messaging_publish"]),
+            app_with_acl(reversed, ["subscribe", "publish"]),
+            app_with_acl(APP_MATCHERS, ["subscribe", "publish"]),
             "derived.brenn",
-            "explicit.toml",
+            "explicit.brenn",
         );
         assert!(equal, "matcher order is dead: {rendering}");
     }
@@ -319,7 +283,7 @@ exact = "alice-out"
     /// can differ.
     #[test]
     fn a_channel_matcher_that_differs_in_content_is_still_a_difference() {
-        let baseline = || app_with_acl(APP_MATCHERS, ["messaging_subscribe", "messaging_publish"]);
+        let baseline = || app_with_acl(APP_MATCHERS, ["subscribe", "publish"]);
         let cases = [
             (
                 "a different exact channel",
@@ -338,104 +302,144 @@ exact = "alice-out"
                 ],
             ),
             (
-                "prefix where the baseline says exact",
+                "exact where the baseline says prefix",
                 [
-                    ("prefix", "alice-cmd"),
-                    ("prefix", "alice-desk."),
+                    ("exact", "alice-cmd"),
+                    ("exact", "alice-desk."),
                     ("exact", "alice-log"),
                 ],
             ),
         ];
         for (what, matchers) in cases {
             let (equal, _) = diff(
-                app_with_acl(matchers, ["messaging_subscribe", "messaging_publish"]),
+                app_with_acl(matchers, ["subscribe", "publish"]),
                 baseline(),
                 "a.brenn",
-                "b.toml",
+                "b.brenn",
             );
             assert!(!equal, "{what} is an authority difference");
         }
     }
 
-    /// One app with two entries on every ACL plane the apps arm sorts. Each
-    /// plane's entries are written to the TOML in reverse text order when
-    /// `reversed`, so the order under test is the document's, and `second_mqtt`
-    /// / `second_endpoint` vary the *content* of one entry per matcher type.
-    fn app_with_every_plane(
-        second_mqtt: (&str, &str),
-        second_endpoint: &str,
-        reversed: bool,
-    ) -> BrennConfig {
-        let (client, topic_filter) = second_mqtt;
-        let plane = |name: &str, entries: [String; 2]| -> String {
+    /// A bearer-token webhook endpoint block for `slug`, so an `endpoint`
+    /// matcher below has something to name.
+    fn webhook_block(slug: &str) -> String {
+        let handle = slug.replace('-', "_");
+        format!(
+            r#"
+webhook {handle} {{
+    slug = "{slug}";
+    mount = "/webhooks/{slug}";
+
+    signature {{
+        scheme = bearer-token;
+        header = "authorization";
+    }}
+
+    token phone {{ secret_file = "/home/alice/.secrets/{slug}.token"; }}
+}}
+"#
+        )
+    }
+
+    /// One agent with two entries on every ACL plane the apps arm sorts. Each
+    /// plane's entries are written to the document in reverse text order when
+    /// `reversed`, so the order under test is the document's.
+    ///
+    /// Both instances declare the same clients, endpoints and channels: the
+    /// content-difference test below varies an ACL entry on the lowered struct
+    /// instead of in the document, so that what differs is the ACL plane alone.
+    ///
+    /// The lowered planes are witnessed before returning: without the witness,
+    /// a lowering change that emptied a plane would leave every order test on
+    /// it comparing two empty vectors.
+    fn app_with_every_plane(reversed: bool) -> BrennConfig {
+        let (client, topic_filter) = ("shed", "sensors/+/humidity");
+        let second_endpoint = "alice-mail";
+        let plane = |statement: &str, entries: [String; 2]| -> String {
             let [first, second] = entries;
             let (first, second) = if reversed {
                 (second, first)
             } else {
                 (first, second)
             };
-            format!("{name} = [{first}, {second}]\n")
+            format!("    acl {statement} [{first}, {second}];\n")
         };
         let acl = [
             plane(
-                "mqtt_subscribe",
+                "subscribe",
                 [
-                    r#"{ client = "home", topic_filter = "sensors/+/temp" }"#.to_owned(),
-                    format!(r#"{{ client = "{client}", topic_filter = "{topic_filter}" }}"#),
+                    r#"topic_filter "mqtt:home:sensors/+/temp""#.to_owned(),
+                    format!(r#"topic_filter "mqtt:{client}:{topic_filter}""#),
                 ],
             ),
             plane(
-                "mqtt_publish",
+                "publish",
                 [
-                    r#"{ client = "home" }"#.to_owned(),
-                    format!(r#"{{ client = "{client}" }}"#),
+                    r#"client "mqtt:home""#.to_owned(),
+                    format!(r#"client "mqtt:{client}""#),
                 ],
             ),
             plane(
-                "webhook",
+                "subscribe",
                 [
-                    r#"{ endpoint = "alice-push" }"#.to_owned(),
-                    format!(r#"{{ endpoint = "{second_endpoint}" }}"#),
+                    r#"endpoint "webhook:alice-push""#.to_owned(),
+                    format!(r#"endpoint "webhook:{second_endpoint}""#),
                 ],
             ),
             plane(
-                "ephemeral_subscribe",
+                "subscribe",
                 [
-                    r#"{ exact = "alice-desk" }"#.to_owned(),
-                    r#"{ exact = "alice-bar" }"#.to_owned(),
+                    r#"exact "ephemeral:alice-desk""#.to_owned(),
+                    r#"exact "ephemeral:alice-bar""#.to_owned(),
                 ],
             ),
             plane(
-                "ephemeral_publish",
+                "publish",
                 [
-                    r#"{ exact = "alice-acks" }"#.to_owned(),
-                    r#"{ exact = "alice-out" }"#.to_owned(),
+                    r#"exact "ephemeral:alice-acks""#.to_owned(),
+                    r#"exact "ephemeral:alice-out""#.to_owned(),
                 ],
             ),
             plane(
-                "local_publish",
+                "publish",
                 [
-                    r#"{ exact = "alice-inner" }"#.to_owned(),
-                    r#"{ exact = "alice-outer" }"#.to_owned(),
+                    r#"exact "local:alice-inner""#.to_owned(),
+                    r#"exact "local:alice-outer""#.to_owned(),
                 ],
             ),
         ]
         .concat();
-        toml::from_str(&format!(
+        let push = webhook_block("alice-push");
+        let second = webhook_block(second_endpoint);
+        let config = config_from_dsl(&format!(
             r#"
-[[app]]
-slug = "alice"
-grants = ["mqtt_subscribe", "mqtt_publish", "webhook", "ephemeral_subscribe"]
+mqtt_client home {{ url = "mqtts://broker.example.com:8883"; }}
+mqtt_client {client} {{ url = "mqtts://{client}.example.com:8883"; }}
+{push}{second}
+agent Assistant() {{
+    grants = [subscribe, publish];
 
-[app.acl]
 {acl}
-"#
-        ))
-        .unwrap()
-    }
+    subscribe "mqtt:home:sensors/+/temp" {{ push_depth = 1; retain_depth = 1; }}
+    subscribe "webhook:alice-push" {{ push_depth = 1; retain_depth = 1; }}
+}}
 
-    fn app_every_plane_baseline(reversed: bool) -> BrennConfig {
-        app_with_every_plane(("shed", "sensors/+/humidity"), "alice-mail", reversed)
+new alice: Assistant();
+"#
+        ));
+        let acl = &config.apps[0].acl;
+        for (plane, len) in [
+            ("mqtt_subscribe", acl.mqtt_subscribe.len()),
+            ("mqtt_publish", acl.mqtt_publish.len()),
+            ("webhook", acl.webhook.len()),
+            ("ephemeral_subscribe", acl.ephemeral_subscribe.len()),
+            ("ephemeral_publish", acl.ephemeral_publish.len()),
+            ("local_publish", acl.local_publish.len()),
+        ] {
+            assert_eq!(len, 2, "{plane} holds the two entries the document states");
+        }
+        config
     }
 
     /// Every app ACL plane is sorted, not just the `brenn:` ones — and the MQTT
@@ -444,10 +448,10 @@ grants = ["mqtt_subscribe", "mqtt_publish", "webhook", "ephemeral_subscribe"]
     #[test]
     fn every_app_acl_plane_is_order_dead() {
         let (equal, rendering) = diff(
-            app_every_plane_baseline(true),
-            app_every_plane_baseline(false),
+            app_with_every_plane(true),
+            app_with_every_plane(false),
             "derived.brenn",
-            "explicit.toml",
+            "explicit.brenn",
         );
         assert!(equal, "no app ACL plane is order-sensitive: {rendering}");
     }
@@ -457,58 +461,128 @@ grants = ["mqtt_subscribe", "mqtt_publish", "webhook", "ephemeral_subscribe"]
     /// differs must survive the sort as a difference.
     #[test]
     fn an_mqtt_or_webhook_matcher_that_differs_in_content_is_still_a_difference() {
-        let cases = [
-            (
-                "an MQTT client",
-                app_with_every_plane(("garage", "sensors/+/humidity"), "alice-mail", false),
-            ),
-            (
-                "an MQTT topic filter",
-                app_with_every_plane(("shed", "sensors/+/pressure"), "alice-mail", false),
-            ),
-            (
-                "a webhook endpoint",
-                app_with_every_plane(("shed", "sensors/+/humidity"), "alice-alerts", false),
-            ),
+        // The variation is applied to the lowered ACL entry, not to the
+        // document: a differently-named client or endpoint in the document would
+        // also change its declaration block, and the configs would compare
+        // unequal on that alone whatever the sort did to the ACL plane.
+        type VaryOneEntry = fn(&mut AppAclRaw);
+        let cases: [(&str, VaryOneEntry); 3] = [
+            ("an MQTT client", |acl| {
+                acl.mqtt_publish[1].client = "garage".to_string();
+            }),
+            ("an MQTT topic filter", |acl| {
+                acl.mqtt_subscribe[1].topic_filter = "sensors/+/pressure".to_string();
+            }),
+            ("a webhook endpoint", |acl| {
+                acl.webhook[1].endpoint = "alice-alerts".to_string();
+            }),
         ];
-        for (what, config) in cases {
-            let (equal, _) = diff(config, app_every_plane_baseline(false), "a.brenn", "b.toml");
+        for (what, vary) in cases {
+            let mut varied = app_with_every_plane(false);
+            vary(&mut varied.apps[0].acl);
+            let (equal, _) = diff(varied, app_with_every_plane(false), "a.brenn", "b.brenn");
             assert!(!equal, "{what} is authority, not order");
         }
     }
 
     /// One WASM consumer with two entries on every plane the consumers arm
     /// sorts. No other fixture in the tree reaches that arm.
-    fn consumer_with_acls(channels: [&str; 2], endpoints: [&str; 2]) -> BrennConfig {
-        let [channel_a, channel_b] = channels;
-        let [endpoint_a, endpoint_b] = endpoints;
-        toml::from_str(&format!(
+    ///
+    /// Every instance declares the same channels and endpoints, and the lowered
+    /// planes are witnessed before returning, for the reasons on
+    /// `app_with_every_plane`.
+    fn consumer_with_acls() -> BrennConfig {
+        let (channel_a, channel_b) = ("alice-cmd", "alice-log");
+        let (endpoint_a, endpoint_b) = ("alice-push", "alice-mail");
+        let first = webhook_block(endpoint_a);
+        let second = webhook_block(endpoint_b);
+        let config = config_from_dsl(&format!(
             r#"
-[[wasm_consumer]]
-slug = "sink"
-component_path = "/lib/brenn_sink.wasm"
-grants = ["log", "config"]
-subscribe_acl = [{{ exact = "{channel_a}" }}, {{ exact = "{channel_b}" }}]
-ephemeral_subscribe_acl = [{{ exact = "alice-desk" }}, {{ exact = "alice-bar" }}]
-local_subscribe_acl = [{{ exact = "alice-inner" }}, {{ exact = "alice-outer" }}]
-publish_acl = [{{ exact = "{channel_b}" }}, {{ prefix = "{channel_a}." }}]
-ephemeral_publish_acl = [{{ exact = "alice-acks" }}, {{ exact = "alice-out" }}]
-local_publish_acl = [{{ exact = "alice-loop" }}, {{ exact = "alice-tick" }}]
-mqtt_publish_acl = [{{ client = "home" }}, {{ client = "shed" }}]
-mqtt_subscribe_acl = [
-    {{ client = "home", topic_filter = "sensors/+/temp" }},
-    {{ client = "shed", topic_filter = "sensors/+/humidity" }},
-]
-webhook_acl = [{{ endpoint = "{endpoint_a}" }}, {{ endpoint = "{endpoint_b}" }}]
+mqtt_client home {{ url = "mqtts://broker.example.com:8883"; }}
+mqtt_client shed {{ url = "mqtts://shed.example.com:8883"; }}
+{first}{second}
+channel inbox at "brenn:{channel_a}" {{
+    push_depth = 4;
+    retain_depth = 8;
+    standing_retain_depth = 8;
+}}
+
+channel outbox at "brenn:{channel_b}" {{
+    push_depth = 4;
+    retain_depth = 8;
+    standing_retain_depth = 8;
+}}
+
+component Sink {{
+    abi = processor;
+    component_path = "/lib/brenn_sink.wasm";
+    in inbound;
+    out outbound;
+}}
+
+new sink: Sink {{
+    slug = "sink";
+    grants = [log, config, ports, mqtt];
+
+    acl subscribe [
+        exact inbox,
+        exact outbox,
+        exact "ephemeral:alice-desk",
+        exact "ephemeral:alice-bar",
+        exact "local:alice-inner",
+        exact "local:alice-outer",
+        topic_filter "mqtt:home:sensors/+/temp",
+        topic_filter "mqtt:shed:sensors/+/humidity",
+        endpoint "webhook:{endpoint_a}",
+        endpoint "webhook:{endpoint_b}"
+    ];
+    acl publish [
+        exact outbox,
+        prefix "brenn:{channel_a}.",
+        exact "ephemeral:alice-acks",
+        exact "ephemeral:alice-out",
+        exact "local:alice-loop",
+        exact "local:alice-tick",
+        client "mqtt:home",
+        client "mqtt:shed"
+    ];
+
+    in inbound <- inbox {{ push_depth = 1; retain_depth = 2; }}
+    out outbound -> outbox {{ urgency = low; }}
+}}
 "#
-        ))
-        .unwrap()
+        ));
+        let consumer = &config.wasm_consumers[0];
+        assert_eq!(
+            consumer.grants.len(),
+            4,
+            "the four grants the document states"
+        );
+        for (plane, len) in [
+            ("subscribe_acl", consumer.subscribe_acl.len()),
+            ("publish_acl", consumer.publish_acl.len()),
+            (
+                "ephemeral_subscribe_acl",
+                consumer.ephemeral_subscribe_acl.len(),
+            ),
+            (
+                "ephemeral_publish_acl",
+                consumer.ephemeral_publish_acl.len(),
+            ),
+            ("local_subscribe_acl", consumer.local_subscribe_acl.len()),
+            ("local_publish_acl", consumer.local_publish_acl.len()),
+            ("mqtt_subscribe_acl", consumer.mqtt_subscribe_acl.len()),
+            ("mqtt_publish_acl", consumer.mqtt_publish_acl.len()),
+            ("webhook_acl", consumer.webhook_acl.len()),
+        ] {
+            assert_eq!(len, 2, "{plane} holds the two entries the document states");
+        }
+        config
     }
 
     #[test]
     fn a_wasm_consumers_grants_and_acl_planes_are_order_dead() {
-        let mut reordered =
-            consumer_with_acls(["alice-cmd", "alice-log"], ["alice-push", "alice-mail"]);
+        let mut reordered = consumer_with_acls();
         let consumer = &mut reordered.wasm_consumers[0];
         consumer.grants.reverse();
         consumer.subscribe_acl.reverse();
@@ -522,53 +596,97 @@ webhook_acl = [{{ endpoint = "{endpoint_a}" }}, {{ endpoint = "{endpoint_b}" }}]
         consumer.webhook_acl.reverse();
         let (equal, rendering) = diff(
             reordered,
-            consumer_with_acls(["alice-cmd", "alice-log"], ["alice-push", "alice-mail"]),
+            consumer_with_acls(),
             "derived.brenn",
-            "explicit.toml",
+            "explicit.brenn",
         );
         assert!(equal, "no consumer plane is order-sensitive: {rendering}");
     }
 
     #[test]
     fn a_wasm_consumer_acl_that_differs_in_content_is_still_a_difference() {
-        let (equal, _) = diff(
-            consumer_with_acls(["alice-cmd", "alice-other"], ["alice-push", "alice-mail"]),
-            consumer_with_acls(["alice-cmd", "alice-log"], ["alice-push", "alice-mail"]),
-            "a.brenn",
-            "b.toml",
-        );
+        // Varied on the lowered entry, not in the document: see the app arm's
+        // content test for why the declarations have to stay identical.
+        let mut varied = consumer_with_acls();
+        varied.wasm_consumers[0].subscribe_acl[1] =
+            ChannelMatcherRaw::Exact("alice-other".to_string());
+        let (equal, _) = diff(varied, consumer_with_acls(), "a.brenn", "b.brenn");
         assert!(!equal, "a consumer's subscribe channel is authority");
 
-        let (equal, _) = diff(
-            consumer_with_acls(["alice-cmd", "alice-log"], ["alice-push", "alice-alerts"]),
-            consumer_with_acls(["alice-cmd", "alice-log"], ["alice-push", "alice-mail"]),
-            "a.brenn",
-            "b.toml",
-        );
+        let mut varied = consumer_with_acls();
+        varied.wasm_consumers[0].webhook_acl[1] = WebhookMatcherRaw {
+            endpoint: "alice-alerts".to_string(),
+        };
+        let (equal, _) = diff(varied, consumer_with_acls(), "a.brenn", "b.brenn");
         assert!(!equal, "a consumer's webhook endpoint is authority");
     }
 
     /// One surface with two entries on each of the four ACL planes the surfaces
     /// arm sorts, plus two grants.
-    fn surface_with_acls(channels: [&str; 2]) -> BrennConfig {
-        let [channel_a, channel_b] = channels;
-        toml::from_str(&format!(
+    ///
+    /// Every instance declares the same channels, and the lowered planes are
+    /// witnessed before returning, for the reasons on `app_with_every_plane`.
+    fn surface_with_acls() -> BrennConfig {
+        let (channel_a, channel_b) = ("bar-a", "bar-b");
+        let config = config_from_dsl(&format!(
             r#"
-[[surface]]
-slug = "bar"
-grants = ["subscribe", "publish"]
-subscribe_acl = [{{ exact = "{channel_a}" }}, {{ exact = "{channel_b}" }}]
-publish_acl = [{{ exact = "{channel_b}" }}, {{ prefix = "{channel_a}." }}]
-ephemeral_subscribe_acl = [{{ exact = "bar-desk" }}, {{ exact = "bar-mode" }}]
-ephemeral_publish_acl = [{{ exact = "bar-acks" }}, {{ exact = "bar-out" }}]
+channel inbox at "brenn:{channel_a}" {{
+    push_depth = 4;
+    retain_depth = 8;
+    standing_retain_depth = 8;
+}}
+
+channel outbox at "brenn:{channel_b}" {{
+    push_depth = 4;
+    retain_depth = 8;
+    standing_retain_depth = 8;
+}}
+
+component Panel {{
+    abi = dom;
+    in messages;
+    out outbound;
+}}
+
+surface bar {{
+    slug = "bar";
+    grants = [subscribe, publish];
+
+    acl subscribe [exact inbox, exact outbox];
+    acl publish [exact outbox, prefix "brenn:{channel_a}."];
+    acl subscribe [exact "ephemeral:bar-desk", exact "ephemeral:bar-mode"];
+    acl publish [exact "ephemeral:bar-acks", exact "ephemeral:bar-out"];
+
+    new panel: Panel {{
+        in messages <- inbox {{ push_depth = 1; retain_depth = 2; }}
+        out outbound -> outbox {{ urgency = low; }}
+    }}
+}}
 "#
-        ))
-        .unwrap()
+        ));
+        let surface = &config.surfaces[0];
+        assert_eq!(
+            surface.grants.len(),
+            4,
+            "the two stated grants plus the two the ephemeral ACL planes derive"
+        );
+        for (plane, len) in [
+            ("subscribe_acl", surface.subscribe_acl.len()),
+            ("publish_acl", surface.publish_acl.len()),
+            (
+                "ephemeral_subscribe_acl",
+                surface.ephemeral_subscribe_acl.len(),
+            ),
+            ("ephemeral_publish_acl", surface.ephemeral_publish_acl.len()),
+        ] {
+            assert_eq!(len, 2, "{plane} holds the two entries the document states");
+        }
+        config
     }
 
     #[test]
     fn a_surfaces_grants_and_acl_planes_are_order_dead() {
-        let mut reordered = surface_with_acls(["bar-a", "bar-b"]);
+        let mut reordered = surface_with_acls();
         let surface = &mut reordered.surfaces[0];
         surface.grants.reverse();
         surface.subscribe_acl.reverse();
@@ -577,21 +695,18 @@ ephemeral_publish_acl = [{{ exact = "bar-acks" }}, {{ exact = "bar-out" }}]
         surface.ephemeral_publish_acl.reverse();
         let (equal, rendering) = diff(
             reordered,
-            surface_with_acls(["bar-a", "bar-b"]),
+            surface_with_acls(),
             "derived.brenn",
-            "explicit.toml",
+            "explicit.brenn",
         );
         assert!(equal, "no surface plane is order-sensitive: {rendering}");
     }
 
     #[test]
     fn a_surface_acl_that_differs_in_content_is_still_a_difference() {
-        let (equal, _) = diff(
-            surface_with_acls(["bar-a", "bar-other"]),
-            surface_with_acls(["bar-a", "bar-b"]),
-            "a.brenn",
-            "b.toml",
-        );
+        let mut varied = surface_with_acls();
+        varied.surfaces[0].subscribe_acl[1] = ChannelMatcherRaw::Exact("bar-other".to_string());
+        let (equal, _) = diff(varied, surface_with_acls(), "a.brenn", "b.brenn");
         assert!(!equal, "a surface's subscribe channel is authority");
     }
 
@@ -600,32 +715,26 @@ ephemeral_publish_acl = [{{ exact = "bar-acks" }}, {{ exact = "bar-out" }}]
     #[test]
     fn remote_subscribe_acl_order_does_not_make_a_difference_but_its_ceilings_do() {
         let remote = |first_push: u64| -> BrennConfig {
-            toml::from_str(&format!(
+            config_from_dsl(&format!(
                 r#"
-[[remote]]
-slug = "pod-kitchen"
-token_file = "/home/alice/.secrets/pod-kitchen.token"
-grants = ["subscribe"]
+remote pod_kitchen {{
+    token_file = "/home/alice/.secrets/pod-kitchen.token";
+    grants = [subscribe];
 
-[[remote.subscribe_acl]]
-prefix = "alice-pod."
-push_depth = {first_push}
-retain_depth = 8
-
-[[remote.subscribe_acl]]
-exact = "alice-pod.out.utterance"
-push_depth = 16
-retain_depth = 32
+    acl subscribe [
+        prefix "brenn:alice-pod." {{ push_depth = {first_push}, retain_depth = 8 }},
+        exact "brenn:alice-pod.out.utterance" {{ push_depth = 16, retain_depth = 32 }}
+    ];
+}}
 "#
             ))
-            .unwrap()
         };
         let mut reordered = remote(4);
         reordered.remotes[0].subscribe_acl.reverse();
-        let (equal, rendering) = diff(reordered, remote(4), "a.brenn", "b.toml");
+        let (equal, rendering) = diff(reordered, remote(4), "a.brenn", "b.brenn");
         assert!(equal, "{rendering}");
 
-        let (equal, _) = diff(remote(4), remote(8), "a.brenn", "b.toml");
+        let (equal, _) = diff(remote(4), remote(8), "a.brenn", "b.brenn");
         assert!(!equal, "a ceiling is authored data, not order");
     }
 
@@ -634,35 +743,23 @@ retain_depth = 32
     #[test]
     fn hook_command_order_still_makes_a_difference() {
         let hooks = |scripts: [&str; 2]| -> BrennConfig {
-            toml::from_str(&format!(
+            config_from_dsl(&format!(
                 r#"
-[[app]]
-slug = "alice"
+agent Assistant() {{
+    start_hooks {{ host = ["{}", "{}"]; }}
+}}
 
-[app.start_hooks]
-host = ["{}", "{}"]
+new alice: Assistant();
 "#,
                 scripts[0], scripts[1]
             ))
-            .unwrap()
         };
         let (equal, _) = diff(
             hooks(["git fetch", "cargo build"]),
             hooks(["cargo build", "git fetch"]),
             "a.brenn",
-            "b.toml",
+            "b.brenn",
         );
         assert!(!equal, "hook scripts run in the order they are written");
-    }
-
-    #[test]
-    fn a_non_brenn_scheme_is_left_alone() {
-        let (equal, rendering) = diff(
-            one_channel("ephemeral:alice-desk.in"),
-            one_channel("brenn:alice-desk.in"),
-            "ephemeral.toml",
-            "durable.toml",
-        );
-        assert!(!equal, "{rendering}");
     }
 }

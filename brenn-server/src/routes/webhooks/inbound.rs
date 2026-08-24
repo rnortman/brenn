@@ -2478,7 +2478,7 @@ mod tests {
             std::path::PathBuf::from(GENERIC_ARTIFACT_PATH)
         }
 
-        /// Build the `HmacTimestampedBody` + `text/plain` endpoint matching the §4 TOML recipe.
+        /// Build the `HmacTimestampedBody` + `text/plain` endpoint the push sender signs for.
         /// Template = "{t}.{body}" → prefix="", mid=".", suffix="", t_before_body=true.
         fn push_endpoint() -> Arc<ResolvedWebhookEndpoint> {
             let mut keys = HashMap::new();

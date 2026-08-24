@@ -326,7 +326,7 @@ pub struct MessagingResult {
 /// *dynamically* created subscription that the operator may later re-grant, a
 /// missing matcher is a transient/dormant state (handled non-destructively by the
 /// boot merge's `revoked` classification). But a **static** subscription is
-/// authored in TOML and resolved at boot; if its policy does not cover its own
+/// authored in the config and resolved at boot; if its policy does not cover its own
 /// channel, the two declarations that must agree (the `[[…subscription]]` and the
 /// `grants` + `[…acl…]` block) are out of sync and the subscription is *dead on
 /// arrival* — it would silently never deliver. Per CLAUDE.md "BETTER DEAD THAN WRONG / fail

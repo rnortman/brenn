@@ -123,7 +123,7 @@ impl KvStore {
         // symlinks, so two config entries aliasing the same physical file via a
         // symlink or a `..`-through-symlink path will both pass this dedup check.
         // Operators must not alias store paths via symlinks. This is acceptable
-        // because store_path comes from operator-controlled TOML config, not
+        // because store_path comes from operator-controlled config, not
         // untrusted input (closes `store-path-canon`).
         //
         // IMPORTANT: register_path is called AFTER a successful open+DDL so

@@ -6,22 +6,24 @@ use crate::integration::IntegrationRegistry;
 // -----------------------------------------------------------------------
 
 #[test]
-fn app_config_parses_mcp_servers() {
+fn app_config_loads_mcp_servers() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
+agent Assistant() {{
+    working_dir = "{}";
 
-[app.mcp_servers.custom-tool]
-command = "python3"
-args = ["custom_mcp.py"]
-env = {{ API_KEY = "secret" }}
+    mcp_server custom-tool {{
+        command = "python3";
+        args = ["custom_mcp.py"];
+        env = {{ API_KEY = "secret" }};
+    }}
+}}
+
+new pfin: Assistant();
 "#,
         dir.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     let servers = &config.apps[0].mcp_servers;
     assert_eq!(servers.len(), 1);
     let server = &servers["custom-tool"];
@@ -33,35 +35,37 @@ env = {{ API_KEY = "secret" }}
 #[test]
 fn app_config_mcp_servers_empty_by_default() {
     let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
+agent Assistant() {{ working_dir = "{}"; }}
+
+new pfin: Assistant();
 "#,
         dir.path().display()
-    );
-    let config: BrennConfig = toml::from_str(&toml).unwrap();
+    ));
     assert!(config.apps[0].mcp_servers.is_empty());
 }
 
 #[test]
-fn app_config_mcp_servers_unknown_field_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
+fn app_config_mcp_server_stray_key_refused() {
+    let refusal = sole_refusal(
         r#"
-[[app]]
-slug = "pfin"
-working_dir = "{}"
+agent Assistant() {
+    mcp_server bad {
+        command = "python3";
+        args = [];
+        bogus_field = true;
+    }
+}
 
-[app.mcp_servers.bad]
-command = "python3"
-args = []
-bogus_field = true
+new pfin: Assistant();
 "#,
-        dir.path().display()
+    )
+    .render();
+    assert!(
+        refusal.contains("bogus_field"),
+        "the stray key is named: {refusal}"
     );
-    assert!(toml::from_str::<BrennConfig>(&toml).is_err());
 }
 
 #[test]

@@ -539,7 +539,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
- "toml",
  "tracing",
  "uuid",
 ]
@@ -1003,7 +1002,6 @@ dependencies = [
  "brenn-obs",
  "tempfile",
  "tokio",
- "toml",
 ]
 
 [[package]]

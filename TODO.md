@@ -6,9 +6,9 @@
 `brenn-dsl/src/derive.rs` states, are each a hand transcription of something in
 `brenn-lib` — the vocabularies of a config struct — `ServerAttrs` of `ServerConfig`, `AgentAttrs` of
 `AppConfigRaw`, and so on. Nothing mechanically ties the two sides: `brenn-dsl`
-has no dependency on `brenn-lib` (deliberately — lowering is a later slice), so a
-field added to a config struct cannot break a build in the DSL crate. It surfaces
-as `` `some_new_knob` is not a server key `` to whoever migrates a config months
+has no dependency on `brenn-lib` today, so a field added to a config struct
+cannot break a build in the DSL crate. It surfaces as
+`` `some_new_knob` is not a server key `` to whoever migrates a config months
 later, and the fix at that point is a reconciliation across every struct pair.
 
 Nobody editing `brenn-lib/src/config/` has any signal that a second file exists.
@@ -21,7 +21,12 @@ omitted-fields column is load-bearing — `approval_rules`, `tool_grants`,
 build step reads.
 
 Where it lives is the open question, and it is what makes this a design item
-rather than a chore: the DSL crate must not depend on the config crates, so the
+rather than a chore. Note first that `brenn-dsl`'s independence from the config
+crates is **not** a requirement — it is only where the dependency graph happens
+to stand. `brenn-dsl → brenn-lib` would be a 2-cycle today, but the expected way
+this parity problem dissolves is the brenn-lib monolith split, after which the
+DSL crate can see the config structs directly and transcribe nothing. A gate
+built before that must not assume the split never happens. Until it does, the
 gate is a config-side test or an `xtask` subcommand, and how it obtains field
 names (a `field_names!()` macro beside each struct, a field-collecting
 `Deserializer`) is a decision with a maintenance cost of its own.
@@ -157,41 +162,13 @@ corpus golden is regenerated in one commit.
 Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/src/bin/brennfmt.rs.
 
 
-## `dsl-toml-twins`
-
-The root configs exist twice: `brenn.dev.brenn`/`brenn.dev.toml` and
-`brenn.e2e.brenn`/`brenn.e2e.toml` say the same thing, and `make launchdev` and
-`make e2e` read the `.brenn` side. They are held to their
-documents by `brenn-lib`'s twin-equivalence test, which is the only thing
-stopping them drifting apart.
-
-Retiring them is one checklist:
-
-- delete the TOML twins at the repo root, and their `exports_files` and
-  `brenn-lib` `data` entries;
-- delete the twin-equivalence test and the TOML arms of the config-file tests
-  (`brenn-lib/src/config/tests/config_files.rs`);
-- drop the `brenn.toml` probe from the no-`--config` fallback
-  (`brenn-lib/src/config/brenn.rs`, `FALLBACK_NAMES`);
-- delete `read_toml` and the TOML arm of `check_config`'s extension dispatch;
-- delete `canonicalize_config_addresses` and the differ's use of it — a config
-  that can only come from a `.brenn` document is already scheme-qualified;
-- refactor the production config's surface-description channels and its two
-  twin surfaces into assemblies (that file is in the ops annex, not here). They
-  are stamped out longhand only because the `[[channel]]` and surface-binding
-  arrays are order-compared against its TOML twin, and assembly-stamped
-  channels always land at the tail of the channel array — so the twin is what
-  forces the duplication, and its retirement is what lifts it.
-
-
 ## `dsl-config-shared-module`
 
 `brenn.dev.brenn` and `brenn.e2e.brenn` share about 240 lines verbatim: the
 component classes, both assemblies (`SurfaceDescription`, `KindDescription`),
 the bar channel declarations and the `bar`/`bar-pixel`/`bar-feeder` surface
-bodies. Nothing catches a change made to one and not the other — the
-twin-equivalence gate compares each document to its own TOML twin, never the two
-documents to each other.
+bodies. Nothing catches a change made to one and not the other —
+nothing compares the two documents to each other.
 
 The production config is now the third document, and it narrows what "shared"
 means:
@@ -202,10 +179,8 @@ means:
   one surface and not the others). Their doc comments have already diverged —
   the third copy carries none on two of the four and shortened rewrites on the
   other two — which is the leading indicator.
-- The **assemblies are not shared.** The third document bakes different depths
-  and cannot use them at all while its TOML twin pins the order-compared
-  channel array (see `dsl-toml-twins`), so parameterizing them across three
-  callers is still guesswork.
+- The **assemblies are not shared.** The third document bakes different depths,
+  so parameterizing them across three callers is still guesswork.
 - The **bar channels and bar surfaces are not shared either** — they exist only
   in the two root documents here.
 
@@ -224,6 +199,75 @@ divergence risk).
 
 Code sites (`TODO(dsl-config-shared-module)`): the header comment of
 `brenn.dev.brenn` and of `brenn.e2e.brenn`.
+
+
+## `dsl-connection-spelling`
+
+`ConnectionConfigRaw` (`brenn-lib/src/messaging/config.rs`) declares an **auto
+channel**: a channel that exists because ports are wired together, with its
+depths folded from the endpoints and its ACLs injected at boot from the
+connection itself. No `.brenn` document spells the form — `dsl_lower` emits
+`connections: Vec::new()` unconditionally — so the whole arm is unreachable from
+any configuration an operator can write. The retired TOML front end was the last
+way in.
+
+What survives behind that: `BrennConfig::connections`, the connection loop in
+`lower_auto_wiring` and its endpoint resolution / free-port assertions in
+`brenn-messaging-boot/src/auto.rs`, and ~15 tests in `auto_tests.rs` plus
+hand-built fixtures in `brenn-bootstrap`. It all passes and it all proves
+nothing about a real config, and it reads to the next maintainer as either a
+planned feature or debris with no way to tell which.
+
+The decision this needs is which of those it is, and that is a product call, not
+a chore: auto channels are a genuinely different authoring model from
+`channel` + explicit bindings (authorization by wiring rather than by ACL), so
+"give it a DSL spelling" is a vocabulary design item and "delete it" throws away
+a designed feature. `tool_grants` and `mqtt_outputs` are in the same class and
+are recorded in `dsl-vocabulary-config-parity`'s deliberately-omitted column;
+this one is bigger than that column because a whole boot subsystem hangs off it.
+
+Done = either the DSL has a spelling that reaches `lower_auto_wiring`'s
+connection arm, or `ConnectionConfigRaw`, the `connections` field, that arm and
+its tests are gone and only the io_port auto-channel path a document can reach
+remains.
+
+Code sites (`TODO(dsl-connection-spelling)`):
+`brenn-lib/src/messaging/config.rs` at `ConnectionConfigRaw`;
+`brenn-lib/src/config/dsl_lower.rs` at the `connections: Vec::new()` line;
+`brenn-messaging-boot/src/auto.rs` at `lower_auto_wiring`.
+
+
+## `config-syntax-in-operator-messages`
+
+Boot panics, tool errors and config doc comments still spell config concepts in
+TOML table notation — `[[remote]]`, `[[app]]`, `[[surface]]`,
+`[[app.acl.mqtt_subscribe]]`, `[[wasm_consumer.output]]` — a syntax that no
+longer has a spelling now that documents are the only front end. An operator who
+trips `config: duplicate [[remote]] slug ...` is sent looking for a table that
+cannot exist, and `grep '\[\[app\]\]'` over their config finds nothing. The
+doc comments have the same effect on the next maintainer, and because they are
+the only description of these fields' authoring shape, they keep minting new
+`[[...]]`-worded prose by imitation.
+
+Roughly 750 sites across `brenn-lib`, `brenn-messaging-boot`, `brenn-server`,
+`brenn-bootstrap` and `brenn-wasm` — about 330 in string literals (the
+operator-visible half) and 420 in comments. It is not a sed: each site needs the
+DSL spelling of the concept it names, several panic strings are asserted on by
+substring in `surface_tests.rs` / `auto_tests.rs` / the boot suites, and
+half-migrating is worse than either end state because a reader cannot then tell
+which mentions are stale and which are load-bearing. A grep gate — `[[` inside a
+string literal or doc line under the config, messaging, webhook, mqtt and access
+modules — is what keeps it from regrowing, and where that gate lives is the same
+open question `dsl-vocabulary-config-parity` has.
+
+Done = no config concept is named in table notation in a string an operator or an
+agent can see, the raw-struct field docs name the DSL spelling, and a check fails
+when a new one appears.
+
+Code sites (`TODO(config-syntax-in-operator-messages)`):
+`brenn-lib/src/access/raw.rs` at the matcher field docs;
+`brenn-lib/src/messaging/remote.rs` at the remote validation panics;
+`brenn-messaging-boot/src/surfaces.rs` at the surface binding validators.
 
 
 ## `test-task-panic-visibility`
@@ -1105,7 +1149,7 @@ A message may carry *impetus* — publish-time-checked evidence that live user
 interaction produced it — and a conversation redeems it by resetting its impetus
 pool, the stock every unattended turn-provoking bus injection draws from. Setting
 the field requires the `mint_impetus` capability, and **nothing in production
-holds or sets it**: the capability is not authorable from TOML, no surface or
+holds or sets it**: the capability is not authorable in a config, no surface or
 WASM publish path carries the field, and every internal wrapper passes `None`.
 Only the legacy websocket door refills a pool today.
 

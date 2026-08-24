@@ -122,7 +122,7 @@ fn public_url_empty_string_panics() {
 /// An unset `trusted_proxy_hops` defaults to `0` (no trusted proxy / use TCP peer).
 #[test]
 fn trusted_proxy_hops_defaults_to_zero() {
-    let config: BrennConfig = toml::from_str("[server]\n").unwrap();
+    let config = config_from_dsl("server { public_url = \"https://brenn.example.com\"; }");
     assert_eq!(config.server.trusted_proxy_hops, 0);
 }
 
@@ -163,13 +163,13 @@ fn trusted_proxy_hops_cap_accepted() {
 }
 
 /// The old `trust_forwarded_headers` key was replaced by `trusted_proxy_hops`
-/// (no compat shim). A stale config carrying it must fail to load via
-/// `deny_unknown_fields` rather than be silently ignored.
+/// (no compat shim). The word is not in the `server` vocabulary, so a stale
+/// config carrying it is refused rather than silently ignored.
 #[test]
-fn stale_trust_forwarded_headers_key_rejected() {
-    let toml = "[server]\ntrust_forwarded_headers = true\n";
+fn stale_trust_forwarded_headers_key_refused() {
+    let refusal = sole_refusal("server { trust_forwarded_headers = true; }").render();
     assert!(
-        toml::from_str::<BrennConfig>(toml).is_err(),
-        "stale trust_forwarded_headers key must be rejected by deny_unknown_fields"
+        refusal.contains("trust_forwarded_headers"),
+        "the refusal names the stale key: {refusal}"
     );
 }

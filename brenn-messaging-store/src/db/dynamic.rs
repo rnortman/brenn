@@ -190,7 +190,7 @@ pub fn insert_dynamic_subscription(conn: &Connection, row: &DynamicSubscriptionR
 ///
 /// Returns `true` if a durable dynamic row was removed, `false` if none existed
 /// for that `(channel, app)` — the caller (the unsubscribe tool) turns `false`
-/// into a tool error ("no dynamic subscription to remove"). A static TOML sub
+/// into a tool error ("no dynamic subscription to remove"). A static config sub
 /// has no durable dynamic row and is unreachable here, so this can never remove
 /// a static subscription.
 pub fn delete_dynamic_subscription(conn: &Connection, channel_uuid: Uuid, app_slug: &str) -> bool {

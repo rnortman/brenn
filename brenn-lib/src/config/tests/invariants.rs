@@ -83,25 +83,79 @@ fn default_security_config() {
     assert_eq!(sec.max_image_long_edge, 2576);
 }
 
+/// The values behind the config modules' default functions, pinned once.
+///
+/// The lowering suite's expected literals *call* these functions, so they lock
+/// which function fills a field and not what it returns. Two of them —
+/// `default_tls_version_min` and `default_hmac_algorithm` — are security
+/// defaults on an external ingress surface, so a silent weakening has to fail
+/// somewhere.
 #[test]
-fn security_config_upload_fields_override_via_toml() {
-    let toml = r#"
-upload_body_limit = 10485760
-max_image_long_edge = 1024
-"#;
-    let sec: SecurityConfig = toml::from_str(toml).unwrap();
-    assert_eq!(sec.upload_body_limit, 10 * 1024 * 1024);
-    assert_eq!(sec.max_image_long_edge, 1024);
+fn default_functions_return_the_values_they_are_relied_on_for() {
+    // Repos
+    assert!(crate::config::repo::default_true());
+    // Containers
+    assert_eq!(
+        crate::config::container::default_container_home(),
+        PathBuf::from("/home/user")
+    );
+    // Alerting
+    assert_eq!(crate::config::alerting::default_subject_label(), "Brenn");
+    // Attachments
+    assert_eq!(crate::config::attachment::default_timeout_secs(), 60);
+    // MQTT clients
+    assert_eq!(
+        crate::mqtt::config::default_client_urgency(),
+        crate::messaging::Urgency::Normal
+    );
+    assert_eq!(crate::mqtt::config::default_tls_version_min(), "1.2");
+    assert_eq!(
+        crate::mqtt::config::default_inbound_payload_cap(),
+        4 * 1024 * 1024
+    );
+    assert_eq!(crate::mqtt::config::default_backoff_initial(), 1);
+    assert_eq!(crate::mqtt::config::default_backoff_max(), 60);
+    assert_eq!(crate::mqtt::config::default_subscription_qos(), 1);
+    // Webhook endpoints
+    assert_eq!(
+        crate::webhook::config::default_transport_ceiling(),
+        1024 * 1024
+    );
+    assert_eq!(
+        crate::webhook::config::default_content_type(),
+        "application/json"
+    );
+    assert_eq!(
+        crate::webhook::config::default_hmac_algorithm(),
+        "hmac-sha256"
+    );
 }
 
 #[test]
-fn security_config_upload_fields_default_when_absent_from_toml() {
-    // [security] present with other fields set; upload fields absent → defaults apply.
-    let toml = r#"
-auth_rate_interval_secs = 10
-auth_body_limit = 2048
-"#;
-    let sec: SecurityConfig = toml::from_str(toml).unwrap();
-    assert_eq!(sec.upload_body_limit, 25 * 1024 * 1024);
-    assert_eq!(sec.max_image_long_edge, 2576);
+fn security_config_upload_fields_override() {
+    let config = config_from_dsl(
+        r#"
+security {
+    upload_body_limit = 10485760;
+    max_image_long_edge = 1024;
+}
+"#,
+    );
+    assert_eq!(config.security.upload_body_limit, 10 * 1024 * 1024);
+    assert_eq!(config.security.max_image_long_edge, 1024);
+}
+
+#[test]
+fn security_config_upload_fields_default_when_absent() {
+    // Section present with other keys stated; upload keys absent → defaults apply.
+    let config = config_from_dsl(
+        r#"
+security {
+    auth_rate_interval_secs = 10;
+    auth_body_limit = 2048;
+}
+"#,
+    );
+    assert_eq!(config.security.upload_body_limit, 25 * 1024 * 1024);
+    assert_eq!(config.security.max_image_long_edge, 2576);
 }

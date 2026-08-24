@@ -180,8 +180,7 @@ mod tests {
     }
 
     fn test_raw_client(slug: &str) -> MqttClientConfigRaw {
-        toml::from_str(&format!("slug = \"{slug}\"\nurl = \"mqtts://127.0.0.1:1\""))
-            .expect("minimal raw client config parses")
+        MqttClientConfigRaw::minimal(slug, "mqtts://127.0.0.1:1")
     }
 
     fn test_ingress_channel(client: &str, topic: &str) -> ResolvedMqttIngressChannel {

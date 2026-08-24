@@ -1,4 +1,4 @@
-//! MQTT config types: raw (TOML deserialized) and resolved forms.
+//! MQTT config types: raw (as lowered from a document) and resolved forms.
 //!
 //! Wired into `BrennConfig` via:
 //! - top-level `[[mqtt_client]]` arrays → `Vec<MqttClientConfigRaw>`
@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
-use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::config::{AppConfigRaw, load_secret_file};
@@ -18,7 +17,7 @@ use crate::messaging::{Urgency, WakeMin, mqtt_channel_uuid_from_address};
 use crate::mqtt::address::{parse_mqtt_address, validate_topic_filter_str};
 
 // ---------------------------------------------------------------------------
-// Raw config types (TOML deserialized)
+// Raw config types (as lowered from a document)
 // ---------------------------------------------------------------------------
 
 /// Top-level `[[mqtt_client]]` block.
@@ -34,8 +33,7 @@ use crate::mqtt::address::{parse_mqtt_address, validate_topic_filter_str};
 /// plugin) to restrict publish rights so only authorised clients can write to
 /// topics the app reads. The principle of least privilege applies: each client
 /// should be allowed to publish only to the topics it owns.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct MqttClientConfigRaw {
     /// URL-safe identifier for this client; charset `[A-Za-z0-9._~-]+`.
     pub slug: String,
@@ -49,36 +47,54 @@ pub struct MqttClientConfigRaw {
     /// Path to a PEM CA certificate file. When absent, system trust store used.
     pub ca_file: Option<PathBuf>,
     /// Minimum TLS version. Default: `"1.2"`.
-    #[serde(default = "default_tls_version_min")]
     pub tls_version_min: String,
     /// MQTT keepalive interval in seconds.
     pub keepalive_secs: Option<u32>,
     /// Maximum inbound payload size in bytes. Default: 4 MiB.
-    #[serde(default = "default_inbound_payload_cap")]
     pub inbound_payload_cap_bytes: usize,
     /// Optional Last-Will configuration.
     pub last_will: Option<LastWillRaw>,
     /// Reconnect backoff initial delay in seconds. Default: 1.
-    #[serde(default = "default_backoff_initial")]
     pub reconnect_backoff_initial_secs: u32,
     /// Reconnect backoff maximum delay in seconds. Default: 60.
-    #[serde(default = "default_backoff_max")]
     pub reconnect_backoff_max_secs: u32,
     /// Broker SUBSCRIBE QoS for this client's ingress subscriptions
     /// (per-connection default). Transport/sender-side feed property; applied to
     /// every `[[app.mqtt_subscription]]` naming this client. Default: 1.
-    #[serde(default = "default_subscription_qos")]
     pub qos: u8,
     /// Sender-side injection urgency stamped on every inbound message ingested
     /// via this client (distinct from the subscriber-side `wake_min`). Applied
     /// to all of this client's ingress subscriptions. Default: `normal`.
-    #[serde(default = "default_client_urgency")]
     pub urgency: Urgency,
     /// Broker-side session expiry in seconds for this client's single shared
     /// session. `0` (default) = ephemeral: the broker discards session state on
     /// disconnect.
-    #[serde(default)]
     pub session_expiry_secs: u32,
+}
+
+#[cfg(any(test, feature = "testutils"))]
+impl MqttClientConfigRaw {
+    /// A client stating only its slug and broker URL, every other key at its
+    /// default. Shared across this crate's tests and the boot crates above it so
+    /// a new key on this struct lands in one place instead of every literal.
+    pub fn minimal(slug: &str, url: &str) -> Self {
+        MqttClientConfigRaw {
+            slug: slug.to_string(),
+            url: url.to_string(),
+            username: None,
+            password_file: None,
+            ca_file: None,
+            tls_version_min: default_tls_version_min(),
+            keepalive_secs: None,
+            inbound_payload_cap_bytes: default_inbound_payload_cap(),
+            last_will: None,
+            reconnect_backoff_initial_secs: default_backoff_initial(),
+            reconnect_backoff_max_secs: default_backoff_max(),
+            qos: default_subscription_qos(),
+            urgency: default_client_urgency(),
+            session_expiry_secs: 0,
+        }
+    }
 }
 
 pub(crate) fn default_client_urgency() -> Urgency {
@@ -102,8 +118,7 @@ pub(crate) fn default_backoff_max() -> u32 {
 }
 
 /// Last-Will configuration for a broker connection.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LastWillRaw {
     /// Topic on which the will is published.
     pub topic: String,
@@ -132,8 +147,7 @@ pub(crate) fn default_subscription_qos() -> u8 {
 ///
 /// Transport/sender-side feed properties (`qos`/`urgency`) live on
 /// `[[mqtt_client]]`, not here.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct AppMqttIngressSubscriptionRaw {
     /// Full channel address `mqtt:<client>:<topic>`; client segment mandatory.
     pub channel: String,
@@ -156,11 +170,11 @@ pub struct AppMqttIngressSubscriptionRaw {
 
 /// Minimum TLS protocol version accepted for a broker connection.
 ///
-/// Config TOML string values `"1.2"` and `"1.3"` are parsed into this enum
+/// The config string values `"1.2"` and `"1.3"` are parsed into this enum
 /// during `resolve_clients`; any other value panics at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsVersionMin {
-    /// TLS 1.2 or later (rumqttc default; equivalent to `"1.2"` in TOML).
+    /// TLS 1.2 or later (rumqttc default; equivalent to `"1.2"` in a config).
     Tls12,
     /// TLS 1.3 only; a custom `rustls::ClientConfig` is built to enforce this.
     Tls13,
@@ -866,9 +880,9 @@ mod tests {
 
     #[test]
     fn client_qos_urgency_defaults_applied_when_omitted() {
-        // `raw_broker` mirrors a TOML block that omits qos/urgency; the
-        // #[serde(default …)] attributes supply 1 / Normal, and resolution
-        // carries them onto the resolved broker.
+        // `raw_broker` states neither qos nor urgency, so it carries the
+        // module's own defaults, 1 / Normal, and resolution carries them onto
+        // the resolved broker.
         let brokers = resolve_clients(&[raw_broker("ha", "mqtts://broker.example.com:8883")]);
         assert_eq!(brokers["ha"].qos, 1, "default ingress qos is 1");
         assert_eq!(
@@ -888,7 +902,7 @@ mod tests {
 
     #[test]
     fn client_session_expiry_default_and_explicit() {
-        // Omitted ⇒ serde default 0 (ephemeral); `raw_broker` mirrors that.
+        // Unstated ⇒ 0 (ephemeral); `raw_broker` states nothing here.
         let brokers = resolve_clients(&[raw_broker("ha", "mqtts://broker.example.com:8883")]);
         assert_eq!(brokers["ha"].session_expiry_secs, 0);
         // An explicit value carries onto the resolved client.

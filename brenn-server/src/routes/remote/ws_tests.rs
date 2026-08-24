@@ -10,11 +10,12 @@
 
 use brenn_attach_proto::{ClientFrame, SUPPORTED_VERSIONS, ServerFrame, max_client_frame_bytes};
 use brenn_lib::messaging::AttachScope;
+use brenn_lib::messaging::remote::RemoteConfigRaw;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use super::test_fixtures::{FLEET, SLUG, TEST_MAX_BODY_BYTES, TOKEN, remote_harness};
+use super::test_fixtures::{SLUG, TEST_MAX_BODY_BYTES, TOKEN, fleet, remote_harness};
 use crate::test_support::http::{
     UpgradeProbe, http_to_ws_url, remote_ws_open, spawn_test_server, ws_upgrade_probe,
 };
@@ -84,7 +85,7 @@ async fn open_attachment(ws: &mut RemoteWs) -> ServerFrame {
 #[tokio::test]
 async fn a_valid_token_attaches_and_welcomes_as_the_remote_principal() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, FLEET).await;
+    let harness = remote_harness(&db, fleet).await;
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
 
     let mut ws = remote_ws_open(&remote_ws_url(&base, SLUG), TOKEN).await;
@@ -126,7 +127,7 @@ async fn a_valid_token_attaches_and_welcomes_as_the_remote_principal() {
 #[tokio::test]
 async fn the_session_registers_under_the_remote_prefixed_key() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, FLEET).await;
+    let harness = remote_harness(&db, fleet).await;
     let registry = harness.state.attach_registry.clone();
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
 
@@ -152,7 +153,7 @@ async fn the_session_registers_under_the_remote_prefixed_key() {
 #[tokio::test]
 async fn every_auth_failure_answers_identically() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, FLEET).await;
+    let harness = remote_harness(&db, fleet).await;
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
 
     let unknown_slug = probe(&base, "no-such-remote", Some(&format!("Bearer {TOKEN}"))).await;
@@ -190,7 +191,7 @@ async fn every_auth_failure_answers_identically() {
 #[tokio::test]
 async fn each_auth_failure_is_one_auth_failure_event() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, FLEET).await;
+    let harness = remote_harness(&db, fleet).await;
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
 
     for credential in [
@@ -221,7 +222,7 @@ async fn each_auth_failure_is_one_auth_failure_event() {
 #[tokio::test]
 async fn an_unknown_slug_is_sanitized_in_the_security_event() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, FLEET).await;
+    let harness = remote_harness(&db, fleet).await;
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
 
     // Percent-encoded newline + a fake event prefix: if the slug reached the log
@@ -256,7 +257,7 @@ async fn an_unknown_slug_is_sanitized_in_the_security_event() {
 #[tokio::test]
 async fn at_the_session_cap_the_route_answers_503_without_a_security_event() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, FLEET).await;
+    let harness = remote_harness(&db, fleet).await;
     let registry = harness.state.attach_registry.clone();
     let caps = SessionCaps {
         per_attacher: 2,
@@ -303,7 +304,11 @@ async fn at_the_session_cap_the_route_answers_503_without_a_security_event() {
 #[tokio::test]
 async fn max_sessions_one_admits_exactly_one_session() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, &format!("{FLEET}max_sessions = 1\n")).await;
+    let harness = remote_harness(&db, |token| RemoteConfigRaw {
+        max_sessions: Some(1),
+        ..fleet(token)
+    })
+    .await;
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
 
     let mut first = remote_ws_open(&remote_ws_url(&base, SLUG), TOKEN).await;
@@ -322,7 +327,7 @@ async fn max_sessions_one_admits_exactly_one_session() {
 #[tokio::test]
 async fn a_session_cookie_is_not_a_credential_and_there_is_no_redirect() {
     let db = crate::test_support::init_db_memory();
-    let harness = remote_harness(&db, FLEET).await;
+    let harness = remote_harness(&db, fleet).await;
     let (base, _sd) = spawn_test_server(harness.state.clone()).await;
     let (session_token, _csrf) = crate::test_support::http::setup_authenticated_user(&db).await;
 

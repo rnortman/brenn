@@ -2,7 +2,7 @@
 //!
 //! This module hosts the shared `AppPolicy` capability-grant + ACL model that
 //! spans LLM conversations and WASM components (both modeled as "apps"). It is
-//! operator-authored TOML consumed by backend enforcement; it never crosses the
+//! operator-authored config consumed by backend enforcement; it never crosses the
 //! backend↔frontend boundary, so it carries **no** `ts-rs` derive.
 //!
 //! The model and resolution land incrementally. So far this module hosts the
@@ -195,7 +195,7 @@ impl AppPolicy {
     /// transport grant **plus** a covering `mqtt_subscribe` matcher, but **not**
     /// the `DynamicSubscribe` grant — `DynamicSubscribe` governs the runtime
     /// `MessageSubscribe` *tool*, not holding a subscription, so a static
-    /// subscriber (operator TOML) that never holds it must still be authorized to
+    /// subscriber (operator config) that never holds it must still be authorized to
     /// receive. This is the per-transport piece `allows_channel_access` composes.
     pub fn allows_mqtt_delivery(&self, client: &str, topic: &str) -> bool {
         self.grants.has(AppCapability::MqttSubscribe) && self.mqtt_acl_covers(client, topic)

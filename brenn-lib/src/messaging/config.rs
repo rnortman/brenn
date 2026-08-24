@@ -27,13 +27,13 @@ use super::{
 use crate::config::AppConfigRaw;
 
 // ---------------------------------------------------------------------------
-// Depth / NoiseLevel / Sink types (design §2.1)
+// Depth / NoiseLevel / Sink types
 // ---------------------------------------------------------------------------
 
 /// A retention depth value.
 ///
 /// `Bounded(n)` = exactly n most-recent messages; `Unbounded` = the legacy ∞
-/// behavior. An *omitted* TOML key is represented as `Option::None` at the
+/// behavior. An *unstated* key is represented as `Option::None` at the
 /// raw-config layer (meaning "inherit"), NOT as a `Depth` variant — the
 /// distinction between "unbounded" and "inherit" is carried by `Option`, the
 /// distinction between bounded/unbounded by this enum.
@@ -51,6 +51,9 @@ pub enum Depth {
 
 /// Custom deserializer: accepts a non-negative integer (→ `Bounded(n)`) or the
 /// string `"unbounded"` (→ `Unbounded`). Anything else is a deserialize error.
+///
+/// Still a live code path: used by `parse_depth_field` (`brenn-server`) to
+/// decode `MessageSubscribe` depth arguments on the LLM tool surface.
 struct DepthVisitor;
 
 impl<'de> Visitor<'de> for DepthVisitor {
@@ -166,7 +169,7 @@ pub enum NoiseLevel {
 }
 
 impl NoiseLevel {
-    /// Parse from a wire/DB/TOML string. Returns `None` on unknown values.
+    /// Parse from a wire/DB string. Returns `None` on unknown values.
     ///
     /// Mirrors [`crate::messaging::WakeMin::parse`] — the sister per-subscription
     /// enum — so the `MessageSubscribe` intercept decodes both optional enum
@@ -200,8 +203,7 @@ pub enum Sink {
 /// publish to), which is bounded because no publisher can mint a channel to
 /// widen its budget: channels come from operator config or from the server's
 /// own provisioning, and no publish reaches a creation path.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendRate {
     /// Publishes admitted before refill matters.
     pub burst: u32,
@@ -279,8 +281,7 @@ impl SendRate {
 /// synthesis owns identity and description — and all three depths are required.
 /// A tuning block may be keyed by `address_prefix` instead, standing for a whole
 /// family of dynamically named channels.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChannelConfigRaw {
     /// UUID v4 in canonical hyphenated form. Globally unique across `[[channel]]`.
     /// Required on a durable channel (it names the DB row); rejected on a
@@ -330,14 +331,13 @@ pub struct ChannelConfigRaw {
 /// declaration, because the connection *is* the operator's authorization signal.
 /// Channel-level tuning is not available: every depth is the fold over the
 /// subscribing endpoints' own declared depths, and `sink`, `send_rate`,
-/// `wake_min` and channel-level `noise` come from the `[messaging]` defaults. A
+/// `wake_min` and channel-level `noise` come from the `messaging` defaults. A
 /// channel that needs any of those stated for itself has outgrown auto
-/// declaration; write the `[[channel]]` block.
+/// declaration; write the `channel` declaration.
 ///
-/// ```toml
-/// [[connection]]
-/// endpoints = ["wasm:etl/batch-out", "wasm:indexer/batch-in"]
-/// ```
+/// **No document spells this form.** Lowering always emits an empty
+/// `connections` list, so nothing populates it; a document wires ports to
+/// declared channels explicitly instead.
 ///
 /// **Direction is inferred, never stated.** An endpoint naming a port declared in
 /// a `subscriptions` list subscribes; one naming a port in an `outputs` list
@@ -349,8 +349,9 @@ pub struct ChannelConfigRaw {
 /// all-one-surface ⇒ page-local `local:`, anything spanning the wire ⇒
 /// `ephemeral:`. Adding an endpoint changes the address; nothing outlives that,
 /// because an anonymous channel is never durable.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+// TODO(dsl-connection-spelling): unreachable from any configuration — either the
+// vocabulary grows a spelling or this form and its boot arm go.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConnectionConfigRaw {
     /// The ports this connection wires together. Two reference forms:
     /// `wasm:<slug>/<port>` for a port on a `[[wasm_consumer]]`, and
@@ -398,8 +399,7 @@ pub struct ConnectionConfigRaw {
 }
 
 /// `[messaging]` section.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MessagingGlobalConfig {
     /// Default per-conversation send budget. Overridable per-app via
     /// `[app.messaging.send_budget]`. Default 100.
@@ -443,30 +443,25 @@ impl Default for MessagingGlobalConfig {
 }
 
 /// Per-app `[app.messaging]` block (raw form).
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MessagingConfigRaw {
-    // NOTE: the legacy `enabled` authorization boolean was removed (access-control
-    // design §2.5.1 / §8 decision-2). Authorization is now decided by the app's
-    // `AppPolicy` (`messaging_enabled()` reads `MessagingPublish`/`MessagingSubscribe`
-    // grants). Because this struct carries `#[serde(deny_unknown_fields)]`, a stale
-    // config that still sets `enabled = true/false` under `[app.messaging]` now
-    // fails to parse with a precise error — the intended migration-forcing.
+    // NOTE: the legacy `enabled` authorization boolean was removed. Authorization
+    // is now decided by the app's `AppPolicy` (`messaging_enabled()` reads
+    // `MessagingPublish`/`MessagingSubscribe` grants). No vocabulary admits an
+    // `enabled` word, so a stale config naming one is refused at that word — the
+    // intended migration-forcing.
     /// Channel addresses (with `brenn:` prefix) this app subscribes to.
-    #[serde(default)]
     pub subscribe: Vec<MessagingSubscriptionRaw>,
     /// Per-conversation send budget reset on each user chat message.
     /// Defaults to the global `[messaging].default_send_budget`.
     pub send_budget: Option<u32>,
 }
 
-/// Per-subscription TOML block (`[[app.messaging.subscribe]]`).
+/// One agent subscription's per-subscription tuning.
 ///
-/// `standing_retain_depth` and `sink` are per-channel/global only; this struct
-/// has `deny_unknown_fields`, so an attempt to set them here produces a
-/// deserialize error automatically.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// `standing_retain_depth` and `sink` are per-channel/global only; a
+/// subscription tail that states either is refused at that key.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MessagingSubscriptionRaw {
     /// Channel address, e.g. `brenn:my-channel`.
     pub channel: String,
@@ -547,8 +542,7 @@ pub enum SurfaceGrant {
 /// Declares a WASM processing component as a bus subscriber. The component
 /// at `component_path` is loaded at bootstrap; a missing or unloadable
 /// component is a fail-fast bootstrap panic (config is host-authored).
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmConsumerConfigRaw {
     /// Globally unique slug; becomes `wasm:<slug>` as the participant identity.
     /// Charset: `[A-Za-z0-9._~-]+`, no `:` or `@`.
@@ -556,8 +550,8 @@ pub struct WasmConsumerConfigRaw {
     /// Path to the WASM component artifact (must exist at startup).
     pub component_path: std::path::PathBuf,
     /// Capability interfaces to link for this component (deny-by-default).
-    /// Required — no default. The operator states intent explicitly; a missing
-    /// field is a serde error at load time. Empty list = zero-capability consumer.
+    /// Required — no default. The operator states intent explicitly; an unstated
+    /// `grants` is refused. Empty list = zero-capability consumer.
     pub grants: Vec<WasmGrant>,
     /// Path to the per-component SQLite KV store. Required iff `"store"` is in
     /// `grants`; must be absent otherwise.
@@ -567,14 +561,11 @@ pub struct WasmConsumerConfigRaw {
     /// Must be absent when `"store"` is not in `grants`.
     pub store_size_limit: Option<String>,
     /// Channel subscriptions for this component.
-    #[serde(default, rename = "subscription")]
     pub subscriptions: Vec<WasmConsumerSubscriptionRaw>,
     /// Output port bindings for this component.
-    #[serde(default, rename = "output")]
     pub outputs: Vec<WasmConsumerOutputRaw>,
     /// Combined input+output port declarations for this component — the
     /// self-loop, made structural. See [`WasmConsumerIoPortRaw`].
-    #[serde(default, rename = "io_port")]
     pub io_ports: Vec<WasmConsumerIoPortRaw>,
     /// Layer-2 subscribe ACL: channel matchers narrowing which `brenn:`
     /// channels this component may hold a (static) subscription to.
@@ -587,7 +578,6 @@ pub struct WasmConsumerConfigRaw {
     /// authorization (deny-by-default at delivery). This list narrows `brenn:`
     /// subscriptions only; `webhook:` and `mqtt:` subscriptions are narrowed by
     /// `webhook_acl` / `mqtt_subscribe_acl` respectively.
-    #[serde(default)]
     pub subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 ephemeral subscribe ACL: channel matchers narrowing which
     /// `ephemeral:` channels this component may hold a (static) subscription to.
@@ -596,7 +586,6 @@ pub struct WasmConsumerConfigRaw {
     /// `EphemeralSubscribe` transport grant; empty means deny-by-default. A
     /// ring-backed input's authorization is decided here at boot — ring delivery
     /// reads the subscriber cursor directly and never re-runs a delivery ACL gate.
-    #[serde(default)]
     pub ephemeral_subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// `local:` (confined) channels this component may hold a (static) input on.
     /// Same flat shape as `ephemeral_subscribe_acl`, scoped to the `local:`
@@ -605,39 +594,34 @@ pub struct WasmConsumerConfigRaw {
     /// ephemeral case, a confined input's authorization is decided here at boot —
     /// ring delivery reads the subscriber cursor directly and never re-runs a
     /// delivery ACL gate.
-    #[serde(default)]
     pub local_subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 publish ACL: channel matchers narrowing which `brenn:` channels this
     /// component's output ports may publish to. Same flat-`Vec` shape as
     /// `subscribe_acl`; deny-by-default when empty.
-    #[serde(default)]
     pub publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 ephemeral publish ACL: channel matchers narrowing which
     /// `ephemeral:` channels this component's output ports may publish to. Same
     /// shape as `publish_acl`, scoped to the `ephemeral:` scheme (matchers are
     /// scheme-stripped names). Non-empty derives the `EphemeralPublish` capability;
     /// empty means deny-by-default.
-    #[serde(default)]
     pub ephemeral_publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 local publish ACL: channel matchers narrowing which `local:`
     /// (confined) channels this component's output ports may publish to. Same
     /// shape as `ephemeral_publish_acl`, scoped to the `local:` scheme. Non-empty
     /// derives the `LocalPublish` capability; empty means deny-by-default.
-    #[serde(default)]
     pub local_publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 MQTT publish ACL: per-client allowlist narrowing which
-    /// `[[mqtt_client]]` slugs this component's `mqtt-publish` host call may target
-    /// (mqtt-egress-unify design §2.5). Reuses the **same** `client`-keyed
-    /// `MqttClientMatcherRaw` matcher as the LLM `[[app.acl.mqtt_publish]]` block,
-    /// resolving into `AppPolicy.acls.mqtt_publish` exactly as the LLM side does;
-    /// the guest addresses MQTT egress by client slug (design §2.4) and the ACL is
-    /// the attenuation boundary. Same flat top-level `Vec` authoring convention as
+    /// `[[mqtt_client]]` slugs this component's `mqtt-publish` host call may
+    /// target. Reuses the **same** `client`-keyed `MqttClientMatcherRaw`
+    /// matcher as the LLM `[[app.acl.mqtt_publish]]` block, resolving into
+    /// `AppPolicy.acls.mqtt_publish` exactly as the LLM side does; the guest
+    /// addresses MQTT egress by client slug and the ACL is the attenuation
+    /// boundary. Same flat top-level `Vec` authoring convention as
     /// `subscribe_acl`/`publish_acl` (the table-nesting asymmetry vs. the LLM
-    /// `[app.acl.mqtt_publish]` sub-table is deliberate; both resolve into the same
-    /// `AppPolicy`, design §2.5). A non-empty list derives no grant on its own — the
-    /// `"mqtt"` grant must be authored explicitly in `grants`; an empty list means
-    /// the consumer holds no MQTT-publish authorization (deny-by-default).
-    #[serde(default)]
+    /// `[app.acl.mqtt_publish]` sub-table is deliberate; both resolve into the
+    /// same `AppPolicy`). A non-empty list derives no grant on its own — the
+    /// `"mqtt"` grant must be authored explicitly in `grants`; an empty list
+    /// means the consumer holds no MQTT-publish authorization (deny-by-default).
     pub mqtt_publish_acl: Vec<crate::access::raw::MqttClientMatcherRaw>,
     /// Layer-2 MQTT *subscribe* ACL: `(client, topic_filter)` matchers narrowing
     /// which inbound `mqtt:` channels this component may hold a (static)
@@ -650,7 +634,6 @@ pub struct WasmConsumerConfigRaw {
     /// `WasmGrant` for inbound subscribe, mirroring `subscribe_acl`'s
     /// `MessagingSubscribe` derivation); an empty list means the consumer holds no
     /// MQTT-subscribe authorization (deny-by-default at delivery).
-    #[serde(default)]
     pub mqtt_subscribe_acl: Vec<crate::access::raw::MqttSubMatcherRaw>,
     /// Layer-2 webhook subscribe ACL: endpoint-slug matchers narrowing which
     /// inbound `webhook:` channels this component may hold a (static) subscription
@@ -663,25 +646,22 @@ pub struct WasmConsumerConfigRaw {
     /// A non-empty list derives the `Webhook` transport grant (no `WasmGrant` for
     /// inbound webhook, mirroring `subscribe_acl`); an empty list means the consumer
     /// holds no webhook-subscribe authorization (deny-by-default at delivery).
-    #[serde(default)]
     pub webhook_acl: Vec<crate::access::raw::WebhookMatcherRaw>,
     /// Operator-supplied config map for this component (`[wasm_consumer.config]`).
     /// Values must be strings, integers, or booleans; floats, datetimes, arrays,
     /// and nested tables are rejected at load time. `None` when the sub-table is
     /// absent (equivalent to an empty table).
-    #[serde(default)]
     pub config: Option<toml::Table>,
-    /// Activation pacing burst — the token-bucket capacity in *activations*
-    /// (mqtt-wasm-republish-pacing design §3.1). Up to this many activations may
-    /// run back-to-back after idle before the sustained gate applies. `None` ⇒
-    /// `DEFAULT_ACTIVATION_BURST`. Rejected at resolve time when `< 1`. Unlike
-    /// `store_size_limit`, there is no `[wasm]`-table global fallback — the
-    /// per-consumer knob (or the hardcoded default) is the whole surface (design
-    /// §3.1 deliberate deviation).
+    /// Activation pacing burst — the token-bucket capacity in *activations*.
+    /// Up to this many activations may run back-to-back after idle before the
+    /// sustained gate applies. `None` ⇒ `DEFAULT_ACTIVATION_BURST`. Rejected
+    /// at resolve time when `< 1`. Unlike `store_size_limit`, there is no
+    /// `[wasm]`-table global fallback — the per-consumer knob (or the hardcoded
+    /// default) is the whole surface.
     pub activation_burst: Option<u32>,
     /// Activation pacing minimum period in milliseconds — one activation is
-    /// admitted per this interval under sustained load (bucket refill interval,
-    /// design §3.1). `None` ⇒ `DEFAULT_ACTIVATION_MIN_PERIOD`. Rejected at resolve
+    /// admitted per this interval under sustained load (bucket refill interval).
+    /// `None` ⇒ `DEFAULT_ACTIVATION_MIN_PERIOD`. Rejected at resolve
     /// time when `< 1` (a zero interval would panic in `TokenBucket::new`; we
     /// reject it at the config layer where the message names the slug).
     pub activation_min_period_ms: Option<u64>,
@@ -689,24 +669,21 @@ pub struct WasmConsumerConfigRaw {
     /// One sink exists per `mqtt_publish_acl`-allowed client regardless of these
     /// blocks; a block only overrides that sink's budget knobs. A block naming a
     /// client outside `mqtt_publish_acl`, or a duplicate `client`, is a boot panic.
-    #[serde(default, rename = "mqtt_output")]
     pub mqtt_outputs: Vec<WasmConsumerMqttOutputRaw>,
     /// Tool grants for this component (`[[wasm_consumer.tool_grant]]`). Identical
     /// table shape as `[[app.tool_grant]]` — one grant vocabulary, both
     /// participant kinds. Each authorizes addressing a registry tool, optionally
     /// narrowed by an `acl` and throttled by `rate_limit`. Absent ⇒ no tool
     /// authorization (deny-by-default).
-    #[serde(default, rename = "tool_grant")]
     pub tool_grants: Vec<crate::tools::config::ToolGrantRaw>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutils"))]
 impl WasmConsumerConfigRaw {
     /// Minimal raw consumer subscribing (port `in`) to each of `channels`, with
     /// everything else defaulted/empty. Shared across this crate's test modules
-    /// so a new field on this `deny_unknown_fields` struct does not fan out into
-    /// every hand-written literal here. `#[cfg(test)]` items are not visible to
-    /// dependent crates, so brenn-server keeps its own equivalent fixture.
+    /// and the boot crates above it so a new field on this struct lands in one
+    /// place instead of every hand-written literal.
     pub fn minimal(slug: &str, component_path: std::path::PathBuf, channels: &[&str]) -> Self {
         WasmConsumerConfigRaw {
             slug: slug.to_string(),
@@ -765,8 +742,7 @@ pub struct ActivationPacing {
 /// Reuses the same depth-inheritance ladder as app messaging subscriptions
 /// (`push_depth`/`retain_depth` optional, inherit channel → global).
 /// `noise` controls push-overflow alarm behavior.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmConsumerSubscriptionRaw {
     /// Channel address, e.g. `brenn:my-channel` or `webhook:my-endpoint`.
     ///
@@ -776,7 +752,6 @@ pub struct WasmConsumerSubscriptionRaw {
     /// panic. Addresses in the reserved `auto` namespace are rejected here — an
     /// anonymous auto channel is reachable only through the declarations that
     /// created it.
-    #[serde(default)]
     pub channel: Option<String>,
     /// Logical input port name presented to the guest. Required — no host default.
     /// Must be non-empty and consist of RFC 3986 unreserved characters.
@@ -804,8 +779,7 @@ pub struct WasmConsumerSubscriptionRaw {
 /// Binds a logical output port name to a bus channel address. The component
 /// may call `publish(port, payload)` with this port name to send a message
 /// on the bound channel.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmConsumerOutputRaw {
     /// Logical output port name. Must be non-empty and unreserved-charset.
     pub port: String,
@@ -813,7 +787,6 @@ pub struct WasmConsumerOutputRaw {
     ///
     /// `None` makes this a **free port**, bound by exactly one `[[connection]]`;
     /// see [`WasmConsumerSubscriptionRaw::channel`].
-    #[serde(default)]
     pub channel: Option<String>,
     /// Default urgency for messages published on this output port (sub → port →
     /// `normal`). Guests may override per-message via `publish-with-urgency`.
@@ -844,24 +817,19 @@ pub struct WasmConsumerOutputRaw {
 /// the publish interface is linked into the component at all, so it is not ACL
 /// boilerplate this block can absorb.
 ///
-/// ```toml
-/// [[wasm_consumer.io_port]]
-/// port = "timer"
-/// push_depth = 2
-/// retain_depth = 8
+/// ```text
+/// io timer { push_depth = 2; retain_depth = 8; }
 /// ```
 ///
-/// With no `channel` and no `[[connection]]` naming it, the port gets its own
-/// anonymous non-transportable channel — no channel-level config at all: no
-/// `[[channel]]` block, no ACLs. The port's depths are not optional though: the
+/// With no `channel` naming it, the port gets its own anonymous
+/// non-transportable channel — no channel-level config at all: no `channel`
+/// declaration, no ACLs. The port's depths are not optional though: the
 /// channel's every depth folds from `max(push_depth, retain_depth)` over its
 /// subscribing ports, so both must be written here, and both must be bounded on
 /// a non-durable channel or boot refuses. Give it a `channel` to
-/// make it a named auto channel (`brenn:` for schedules that survive restart),
-/// or list it in a `[[connection]]` to let other components see and feed the
-/// same traffic; setting both is a boot panic.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// make it a named auto channel (`brenn:` for schedules that survive restart)
+/// that other components can see and feed.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmConsumerIoPortRaw {
     /// Logical port name presented to the guest for both directions. Must be
     /// non-empty, unreserved-charset, and distinct from every other port name on
@@ -877,7 +845,6 @@ pub struct WasmConsumerIoPortRaw {
     /// same bare name is an unrelated page ring, by design — the two exchange no
     /// message and neither knows the other exists. `ephemeral:` is what reaches
     /// a page.
-    #[serde(default)]
     pub channel: Option<String>,
     /// Push depth for the input half. Required: an io_port is a subscribing
     /// endpoint on an auto channel, and the channel's depths are folded from
@@ -921,8 +888,7 @@ pub struct WasmConsumerIoPortRaw {
 /// presence is not what authorizes egress (that is the `mqtt_publish_acl` + `mqtt`
 /// grant). `client` must name a client covered by `mqtt_publish_acl`; a block for
 /// an unlisted client, or a duplicate `client`, is a boot panic (dead config).
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmConsumerMqttOutputRaw {
     /// MQTT client slug this override applies to. Must be covered by
     /// `mqtt_publish_acl` (validated at resolution).
@@ -972,7 +938,7 @@ pub const DEFAULT_SURFACE_PUBLISH_PER_SEC: u32 = 1;
 /// `[[wasm_consumer]]` precedent: operator-authored slug, explicit `grants`
 /// (no default — intent is stated, mirroring `WasmConsumerConfigRaw::grants`),
 /// four optional ACL matcher lists, and nested component/subscription/output
-/// blocks. `deny_unknown_fields` on every struct closes the door on typos.
+/// blocks.
 ///
 /// `allowed_users` is the surface access check (empty/absent = any
 /// authenticated user, `AppConfig::user_has_access` semantics); `publish_burst`
@@ -981,8 +947,7 @@ pub const DEFAULT_SURFACE_PUBLISH_PER_SEC: u32 = 1;
 ///
 /// This defines and parses these types; boot-time resolution + cross-validation
 /// (`resolve_surfaces`) is done separately.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceConfigRaw {
     /// Globally unique slug; becomes `surface:<slug>` as the participant identity.
     /// Charset enforced at resolution: `[A-Za-z0-9._~-]+`, no `:`/`@`/`#`.
@@ -991,39 +956,29 @@ pub struct SurfaceConfigRaw {
     /// the operator states intent explicitly, exactly like `[[wasm_consumer]]`.
     pub grants: Vec<SurfaceGrant>,
     /// Durable (`brenn:`) subscribe ACL — bare channel names, no scheme.
-    #[serde(default)]
     pub subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Durable (`brenn:`) publish ACL — bare channel names, no scheme.
-    #[serde(default)]
     pub publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Ephemeral (`ephemeral:`) subscribe ACL — bare channel names, no scheme.
-    #[serde(default)]
     pub ephemeral_subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Ephemeral (`ephemeral:`) publish ACL — bare channel names, no scheme.
-    #[serde(default)]
     pub ephemeral_publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Component modules to mount on this surface (`[[surface.component]]`).
-    #[serde(default, rename = "component")]
     pub components: Vec<SurfaceComponentRaw>,
     /// Static channel→port input bindings (`[[surface.subscription]]`).
-    #[serde(default, rename = "subscription")]
     pub subscriptions: Vec<SurfaceSubscriptionRaw>,
     /// Static port→channel output bindings (`[[surface.output]]`).
-    #[serde(default, rename = "output")]
     pub outputs: Vec<SurfaceOutputRaw>,
     /// Combined input+output port declarations (`[[surface.io_port]]`) — the
     /// self-loop, made structural. See [`SurfaceIoPortRaw`].
-    #[serde(default, rename = "io_port")]
     pub io_ports: Vec<SurfaceIoPortRaw>,
     /// Skin (CSS pack + vendored fonts) this surface wears. Absent ⇒ `"bench"`.
     /// Validated at resolution against the compiled-in skin registry; an unknown
     /// name is a boot panic.
-    #[serde(default)]
     pub skin: Option<String>,
     /// Usernames permitted to attach. Empty/absent = any authenticated user
     /// (mirrors `AppConfig::user_has_access`). Resolution rejects empty strings
     /// and duplicates.
-    #[serde(default)]
     pub allowed_users: Vec<String>,
     /// Per-connection publish burst (tokens). Absent =
     /// `DEFAULT_SURFACE_PUBLISH_BURST`. Resolution rejects `0` and any value
@@ -1032,19 +987,16 @@ pub struct SurfaceConfigRaw {
     /// documented "connection bucket trips first" layering cannot invert. That
     /// layering is per-connection only — all sessions of a surface share the one
     /// `surface:<slug>` bus participant and its single gate (shared-fate).
-    #[serde(default)]
     pub publish_burst: Option<u32>,
     /// Per-connection sustained publish refill (tokens/sec). Absent =
     /// `DEFAULT_SURFACE_PUBLISH_PER_SEC`. Resolution rejects `0` and any value
     /// above the bus per-sender refill (`EPHEMERAL_SENDER_REFILL_AMOUNT`/s), for
     /// the same layering reason as `publish_burst`.
-    #[serde(default)]
     pub publish_per_sec: Option<u32>,
 }
 
 /// A component module to mount on a surface (`[[surface.component]]`).
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceComponentRaw {
     /// Component module kind to mount. Must match `^[a-z0-9][a-z0-9-]*$` — the
     /// kind becomes a custom-element name (`brenn-<kind>`) and module filename.
@@ -1054,7 +1006,6 @@ pub struct SurfaceComponentRaw {
     /// defaults to `kind` (single-instance ergonomics). Must match the same
     /// charset as `kind` and be unique within the surface (enforced at
     /// resolution).
-    #[serde(default)]
     pub instance: Option<String>,
     /// Which artifact shape backs this instance (`"dom"`, `"processor"`,
     /// `"dom-ts"`, `"html"`) — a build/loading fact the page must not have to
@@ -1066,12 +1017,10 @@ pub struct SurfaceComponentRaw {
     /// Override for this instance's durable send-budget burst: how many
     /// publishes it may make back-to-back before the refill rate binds. Absent ⇒
     /// [`SURFACE_SEND_BURST`].
-    #[serde(default)]
     pub send_burst: Option<u32>,
     /// Override for this instance's durable send-budget refill interval, in
     /// seconds: one publish's worth of budget returns per interval. Absent ⇒
     /// [`SURFACE_SEND_REFILL`].
-    #[serde(default)]
     pub send_refill_secs: Option<u64>,
     /// How many of this instance's activation flushes the kernel parks while the
     /// link is down, before the oldest is dropped. Absent ⇒
@@ -1089,7 +1038,6 @@ pub struct SurfaceComponentRaw {
     /// outage). This knob is also what bounds the reconnect burst — cap ×
     /// per-activation quota, rather than an outage-length backlog the
     /// server-side bucket would mass-reject anyway.
-    #[serde(default)]
     pub parked_batch_depth: Option<Depth>,
     /// Marks this instance as the surface's chrome component: the singleton that
     /// owns layout/theme/takeover/banner/toast rendering and that the kernel
@@ -1099,7 +1047,6 @@ pub struct SurfaceComponentRaw {
     /// invariant is enforced at boot.
     /// Default false keeps the flag opt-in and out-of-tree-chrome first-class —
     /// the designation is this flag, not the kind string.
-    #[serde(default)]
     pub chrome: bool,
     /// Static key/value configuration handed to a `processor` instance and read
     /// through its `config` import. Absent ⇒ empty map.
@@ -1115,7 +1062,6 @@ pub struct SurfaceComponentRaw {
     /// matcher covering that channel — read access is ordinary deny-by-default
     /// ACL policy, with no further guard. It is operator configuration, not a
     /// secret store — never place credentials or secrets in it.
-    #[serde(default)]
     pub config: Option<BTreeMap<String, String>>,
 }
 
@@ -1210,15 +1156,13 @@ pub type AttachPrincipalBudgets = Vec<(Option<String>, AttachSendBudget)>;
 /// `channel` is a **full scheme-qualified address** (`ephemeral:protobar-demo`,
 /// `brenn:alerts.high`) — the scheme selects the delivery class, unlike the
 /// bare-name ACL matcher values.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceSubscriptionRaw {
     /// Full scheme-qualified channel address to subscribe.
     ///
     /// `None` makes this a **free port**: exactly one `[[connection]]` must
     /// reference it (as `surface:<slug>#<instance>/<port>`) to supply the
     /// channel. Bound by no connection, it is dead config and a boot panic.
-    #[serde(default)]
     pub channel: Option<String>,
     /// Declared component instance receiving deliveries on this binding.
     pub instance: String,
@@ -1266,8 +1210,7 @@ pub struct SurfaceSubscriptionRaw {
 ///
 /// `channel` is a **full scheme-qualified address**, as in
 /// `SurfaceSubscriptionRaw`.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceOutputRaw {
     /// Declared component instance publishing on this binding.
     pub instance: String,
@@ -1277,7 +1220,6 @@ pub struct SurfaceOutputRaw {
     ///
     /// `None` makes this a **free port**, bound by exactly one `[[connection]]`;
     /// see [`SurfaceSubscriptionRaw::channel`].
-    #[serde(default)]
     pub channel: Option<String>,
     /// Default urgency for messages published on this port (port → `normal`),
     /// mirroring `[[wasm_consumer]] [[output]] urgency`. Components override it
@@ -1296,13 +1238,11 @@ pub struct SurfaceOutputRaw {
     /// kernel is the host that mints this component's activations, so it runs
     /// the backend host's budget model over them rather than mirroring a foreign
     /// bucket. A component moved between hostings keeps its budget vocabulary.
-    #[serde(default)]
     pub publish_per_activation: Option<f64>,
     /// Max tokens carried over between activations for this output sink (the
     /// bucket capacity clamp applied at the *start* of the next activation).
     /// `None` ⇒ [`DEFAULT_WASM_PUBLISH_CAPACITY`] (1.0). Must be finite and
     /// `>= 0` when present. Same knob as `[[wasm_consumer.output]]`'s.
-    #[serde(default)]
     pub publish_capacity: Option<f64>,
 }
 
@@ -1322,8 +1262,7 @@ pub struct SurfaceOutputRaw {
 /// on the port's input half. The activation carries the instant to compute the
 /// release time from, and the standing tick can be cancelled or edited from a
 /// later activation.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceIoPortRaw {
     /// Declared component instance owning both halves of this port.
     pub instance: String,
@@ -1339,7 +1278,6 @@ pub struct SurfaceIoPortRaw {
     /// join the one page ring, and nothing on the server can. Reaching the
     /// backend takes `ephemeral:` (shared across this surface's sessions) or
     /// `brenn:` (durable as well).
-    #[serde(default)]
     pub channel: Option<String>,
     /// Queue depth for the input half. Required, in either realm: the port
     /// queue lives in page memory and must resolve bounded, and in the server
@@ -1360,11 +1298,9 @@ pub struct SurfaceIoPortRaw {
     pub urgency: Option<super::Urgency>,
     /// Token-bucket fill per activation for the output half. `None` ⇒
     /// [`DEFAULT_WASM_PUBLISH_PER_ACTIVATION`].
-    #[serde(default)]
     pub publish_per_activation: Option<f64>,
     /// Max tokens carried between activations for the output half. `None` ⇒
     /// [`DEFAULT_WASM_PUBLISH_CAPACITY`].
-    #[serde(default)]
     pub publish_capacity: Option<f64>,
 }
 
@@ -2811,7 +2747,7 @@ pub fn finalize_directory_with_subscribers(
 /// (design §2.1 boot merge).
 ///
 /// Runs *after* [`finalize_directory_with_subscribers`] has populated the
-/// directory with the static (TOML) and WASM subscribers. Each row in `rows` (loaded
+/// directory with the static (config-declared) and WASM subscribers. Each row in `rows` (loaded
 /// from `messaging_dynamic_subscriptions`, the durable truth that boot does NOT
 /// truncate) is folded onto its channel as an `App(app_slug)` subscriber via the
 /// directory's copy-on-write [`MessagingDirectory::add_subscriber`] — the same
@@ -3090,6 +3026,7 @@ pub fn build_runtime_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{config_from_dsl, sole_refusal};
 
     fn global_defaults() -> MessagingGlobalConfig {
         MessagingGlobalConfig::default()
@@ -3165,6 +3102,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // `Depth` deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn depth_decodes_unbounded_string() {
+        let d: Depth = serde_json::from_value(serde_json::json!("unbounded")).unwrap();
+        assert_eq!(d, Depth::Unbounded);
+    }
+
+    /// A non-negative integer decodes to exactly that bound, zero included: a
+    /// dynamic subscription's window is whatever the tool argument said, and `0`
+    /// is the legal pull-only ceiling rather than a value to clamp up.
+    #[test]
+    fn depth_decodes_integers_to_the_same_bound() {
+        let d: Depth = serde_json::from_value(serde_json::json!(5)).unwrap();
+        assert_eq!(d, Depth::Bounded(5));
+        let d: Depth = serde_json::from_value(serde_json::json!(0)).unwrap();
+        assert_eq!(d, Depth::Bounded(0));
+    }
+
+    #[test]
+    fn depth_rejects_negative_integer() {
+        let err = serde_json::from_value::<Depth>(serde_json::json!(-1)).unwrap_err();
+        assert!(
+            err.to_string().contains("non-negative"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn depth_rejects_unknown_string() {
+        let err = serde_json::from_value::<Depth>(serde_json::json!("inf")).unwrap_err();
+        assert!(
+            err.to_string().contains("unbounded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Non-durable `[[channel]]` blocks
     // -----------------------------------------------------------------------
 
@@ -3184,62 +3160,54 @@ mod tests {
         }
     }
 
+    /// The retired `ephemeral_channel` kindword is a refusal, not a
+    /// silently-ignored block: an operator carrying one forward is told the word
+    /// is not a section rather than booting with the block dropped.
     #[test]
-    fn channel_parses_bare_and_scheme_qualified() {
-        let full: ChannelConfigRaw = toml::from_str(
-            "address = \"ephemeral:protobar-demo\"\nretain_depth = 1\nnoise = \"metered\"\n",
-        )
-        .expect("scheme-qualified [[channel]] must parse");
-        assert_eq!(full.address.as_deref(), Some("ephemeral:protobar-demo"));
-        assert_eq!(full.retain_depth, Some(Depth::Bounded(1)));
-        assert_eq!(full.uuid, None);
-
-        let bare: ChannelConfigRaw =
-            toml::from_str("uuid = \"1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32\"\naddress = \"bare\"\n")
-                .expect("bare [[channel]] must parse");
-        assert_eq!(bare.address.as_deref(), Some("bare"));
-        assert_eq!(bare.retain_depth, None);
-    }
-
-    /// The retired `[[ephemeral_channel]]` table is a boot panic, not a
-    /// silently-ignored block: the config struct no longer carries the field and
-    /// `deny_unknown_fields` rejects it.
-    #[test]
-    fn retired_ephemeral_channel_table_is_rejected() {
-        let result: Result<crate::config::BrennConfig, _> =
-            toml::from_str("[[ephemeral_channel]]\nname = \"dev-stub\"\nretain_depth = 1\n");
-        let err = result.expect_err("[[ephemeral_channel]] must not parse");
+    fn the_retired_ephemeral_channel_kindword_is_refused() {
+        let diag = sole_refusal("ephemeral_channel dev_stub { retain_depth = 1; }");
         assert!(
-            err.to_string().contains("ephemeral_channel"),
-            "the rejection must name the retired table, got: {err}",
+            diag.render().contains("ephemeral_channel"),
+            "the refusal must name the retired word, got: {}",
+            diag.render()
         );
     }
 
+    /// A stray key in a `channel` body is refused: a misspelled tuning knob that
+    /// parsed and did nothing would leave the operator believing the channel was
+    /// sized.
     #[test]
-    fn channel_rejects_unknown_field() {
-        let result: Result<ChannelConfigRaw, _> =
-            toml::from_str("address = \"ephemeral:x\"\nbogus = 1\n");
+    fn a_stray_channel_key_is_refused() {
+        let diag = sole_refusal(
+            r#"
+channel demo at "ephemeral:protobar-demo" {
+    retain_depth = 1;
+    bogus = 1;
+}
+"#,
+        );
         assert!(
-            result.is_err(),
-            "deny_unknown_fields must reject an unknown key"
+            diag.render().contains("bogus"),
+            "the refusal must name the stray key, got: {}",
+            diag.render()
         );
     }
 
-    /// A config that still sets a removed depth default fails to parse rather
-    /// than being ignored: an operator who wrote a number and got silence would
-    /// believe their channels were sized.
+    /// The removed global depth defaults are refused rather than ignored: an
+    /// operator who wrote a number and got silence would believe every channel
+    /// was sized.
     #[test]
-    fn messaging_globals_reject_a_depth_default() {
+    fn a_removed_global_depth_default_is_refused() {
         for key in [
             "default_push_depth",
             "default_retain_depth",
             "default_standing_retain_depth",
         ] {
-            let result: Result<MessagingGlobalConfig, _> = toml::from_str(&format!("{key} = 8\n"));
-            let err = result.expect_err("a removed depth default must not parse");
+            let diag = sole_refusal(&format!("messaging {{ {key} = 8; }}"));
             assert!(
-                err.to_string().contains(key),
-                "the error must name the offending key; got: {err}"
+                diag.render().contains(key),
+                "the refusal must name the offending key; got: {}",
+                diag.render()
             );
         }
     }
@@ -4028,363 +3996,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // [[surface]] raw config types (parsing only; resolution and
-    // boot cross-validation are done separately)
+    // `surface` refusals: keys and words the vocabulary must not accept
+    //
+    // Every-key and minimal lowering rows for `surface`, `new`, and their
+    // bindings live in the lowering suite (`config/tests/dsl_lower.rs`); what
+    // stays here is the refusal side, where the raw structs' shape is the
+    // subject.
     // -----------------------------------------------------------------------
 
-    /// A fully-populated `[[surface]]` block — every ACL list, all four grant
-    /// tokens, and the nested component/subscription/output arrays — parses,
-    /// with scheme-qualified binding channels and bare-name ACL matchers.
+    /// `grants` is required on a surface: omitting it would be a silent
+    /// zero-grant surface rather than a stated deny-by-default posture.
     #[test]
-    fn surface_parses_full() {
-        use crate::access::raw::ChannelMatcherRaw;
-        let toml_str = r#"
-slug = "deskbar"
-grants = ["subscribe", "publish", "ephemeral_subscribe", "ephemeral_publish"]
-subscribe_acl = [{ exact = "alerts.high" }]
-publish_acl = [{ prefix = "cmd." }]
-ephemeral_subscribe_acl = [{ exact = "protobar-demo" }]
-ephemeral_publish_acl = [{ exact = "protobar-demo" }]
-allowed_users = ["alice"]
-publish_burst = 120
-publish_per_sec = 5
-skin = "foundry"
-
-[[component]]
-kind = "protobar"
-abi = "dom"
-
-[[subscription]]
-channel = "ephemeral:protobar-demo"
-instance = "protobar"
-port = "messages"
-
-[[output]]
-instance = "protobar"
-port = "out"
-channel = "brenn:alerts.high"
-"#;
-        let raw: SurfaceConfigRaw = toml::from_str(toml_str).expect("full [[surface]] must parse");
-        assert_eq!(raw.slug, "deskbar");
-        assert_eq!(
-            raw.grants,
-            vec![
-                SurfaceGrant::Subscribe,
-                SurfaceGrant::Publish,
-                SurfaceGrant::EphemeralSubscribe,
-                SurfaceGrant::EphemeralPublish,
-            ]
-        );
-        // ACL matchers are bare names, no scheme.
-        assert!(matches!(
-            raw.subscribe_acl.as_slice(),
-            [ChannelMatcherRaw::Exact(e)] if e == "alerts.high"
-        ));
-        assert!(matches!(
-            raw.publish_acl.as_slice(),
-            [ChannelMatcherRaw::Prefix(p)] if p == "cmd."
-        ));
-        assert!(matches!(
-            raw.ephemeral_subscribe_acl.as_slice(),
-            [ChannelMatcherRaw::Exact(e)] if e == "protobar-demo"
-        ));
-        assert!(matches!(
-            raw.ephemeral_publish_acl.as_slice(),
-            [ChannelMatcherRaw::Exact(e)] if e == "protobar-demo"
-        ));
-        assert_eq!(raw.components.len(), 1);
-        assert_eq!(raw.components[0].kind, "protobar");
-        assert_eq!(raw.components[0].instance, None);
-        // subscription.channel is scheme-qualified.
-        assert_eq!(raw.subscriptions.len(), 1);
-        assert_eq!(
-            raw.subscriptions[0].channel.as_deref(),
-            Some("ephemeral:protobar-demo")
-        );
-        assert_eq!(raw.subscriptions[0].instance, "protobar");
-        assert_eq!(raw.subscriptions[0].port, "messages");
-        assert_eq!(raw.outputs.len(), 1);
-        assert_eq!(raw.outputs[0].channel.as_deref(), Some("brenn:alerts.high"));
-        assert_eq!(raw.outputs[0].instance, "protobar");
-        assert_eq!(raw.outputs[0].port, "out");
-        // Access check + publish-budget caps parse from TOML.
-        assert_eq!(raw.allowed_users, vec!["alice".to_string()]);
-        assert_eq!(raw.publish_burst, Some(120));
-        assert_eq!(raw.publish_per_sec, Some(5));
-        // Skin parses.
-        assert_eq!(raw.skin.as_deref(), Some("foundry"));
-    }
-
-    /// Minimal `[[surface]]`: only slug + grants; every ACL list and nested
-    /// array defaults to empty (`#[serde(default)]`).
-    #[test]
-    fn surface_parses_minimal() {
-        let raw: SurfaceConfigRaw = toml::from_str("slug = \"bare\"\ngrants = []\n")
-            .expect("minimal [[surface]] must parse");
-        assert_eq!(raw.slug, "bare");
-        assert!(raw.grants.is_empty());
-        assert!(raw.subscribe_acl.is_empty());
-        assert!(raw.publish_acl.is_empty());
-        assert!(raw.ephemeral_subscribe_acl.is_empty());
-        assert!(raw.ephemeral_publish_acl.is_empty());
-        assert!(raw.components.is_empty());
-        assert!(raw.subscriptions.is_empty());
-        assert!(raw.outputs.is_empty());
-        assert!(raw.io_ports.is_empty());
-        // Access check + publish-budget caps default when omitted.
-        assert!(raw.allowed_users.is_empty());
-        assert!(raw.publish_burst.is_none());
-        assert!(raw.publish_per_sec.is_none());
-        // Skin absent when omitted.
-        assert!(raw.skin.is_none());
-    }
-
-    /// `grants` is required (no `#[serde(default)]`, like `[[wasm_consumer]]`):
-    /// omitting it is a serde error, not a silent zero-grant surface.
-    #[test]
-    fn surface_missing_grants_rejected() {
-        let result: Result<SurfaceConfigRaw, _> = toml::from_str("slug = \"x\"\n");
+    fn a_surface_without_grants_is_refused() {
+        let diag = sole_refusal("surface bare { slug = \"bare\"; }");
         assert!(
-            result.is_err(),
-            "missing grants field must be a serde error"
+            diag.render().contains("grants"),
+            "the refusal must name the missing key, got: {}",
+            diag.render()
         );
     }
 
-    /// A full `[[connection]]`: endpoint refs in both forms, plus the named
-    /// durable channel and its rename-stability uuid.
+    /// An unknown grant word is refused with the legal set, not silently
+    /// dropped into a narrower posture than the operator wrote.
     #[test]
-    fn connection_parses_full() {
-        let toml_str = r#"
-endpoints = ["wasm:etl/batch-out", "wasm:indexer/batch-in", "surface:bench#monitor/batch-tap"]
-channel = "brenn:etl.batches"
-uuid = "9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31"
-description = "ETL batch hand-off"
-"#;
-        let raw: ConnectionConfigRaw =
-            toml::from_str(toml_str).expect("full [[connection]] must parse");
-        assert_eq!(
-            raw.endpoints,
-            vec![
-                "wasm:etl/batch-out".to_string(),
-                "wasm:indexer/batch-in".to_string(),
-                "surface:bench#monitor/batch-tap".to_string(),
-            ]
-        );
-        assert_eq!(raw.channel.as_deref(), Some("brenn:etl.batches"));
-        assert_eq!(
-            raw.uuid.as_deref(),
-            Some("9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31")
-        );
-        assert_eq!(raw.description.as_deref(), Some("ETL batch hand-off"));
-    }
-
-    /// The anonymous spelling: endpoints alone, all optional fields absent.
-    #[test]
-    fn connection_parses_anonymous() {
-        let raw: ConnectionConfigRaw =
-            toml::from_str("endpoints = [\"wasm:a/out\", \"wasm:b/in\"]\n")
-                .expect("anonymous [[connection]] must parse");
-        assert_eq!(raw.endpoints.len(), 2);
-        assert!(raw.channel.is_none());
-        assert!(raw.uuid.is_none());
-        assert!(raw.description.is_none());
-    }
-
-    /// `endpoints` is required and unknown keys are rejected: a connection with
-    /// no endpoints declares nothing, and a typo'd knob would silently do
-    /// nothing.
-    #[test]
-    fn connection_rejects_missing_endpoints_and_unknown_fields() {
-        let missing: Result<ConnectionConfigRaw, _> = toml::from_str("channel = \"brenn:x\"\n");
-        assert!(missing.is_err(), "endpoints must be required");
-        let unknown: Result<ConnectionConfigRaw, _> =
-            toml::from_str("endpoints = [\"wasm:a/out\"]\nretain_depth = 4\n");
+    fn an_unknown_surface_grant_word_is_refused() {
+        let diag = sole_refusal("surface bare { grants = [not_a_grant]; }");
         assert!(
-            unknown.is_err(),
-            "channel-level tuning is not available on a [[connection]]"
+            diag.render().contains("not_a_grant"),
+            "the refusal must name the bad word, got: {}",
+            diag.render()
         );
     }
 
-    /// A `[[wasm_consumer.io_port]]` carries both directions' tuning under one
-    /// port name, and nests inside `[[wasm_consumer]]` as `io_port`.
+    /// A stray top-level surface key is refused: a misspelled ACL key would
+    /// otherwise be a silent deny-by-default over-narrowing.
     #[test]
-    fn wasm_consumer_io_port_parses() {
-        let toml_str = r#"
-slug = "etl"
-component_path = "/opt/brenn/etl.wasm"
-grants = ["ports"]
-
-[[io_port]]
-port = "timer"
-push_depth = 2
-retain_depth = 8
-noise = "metered"
-amplification = 0.5
-urgency = "low"
-publish_per_activation = 2.0
-publish_capacity = 4.0
-channel = "brenn:etl.timer"
-"#;
-        let raw: WasmConsumerConfigRaw =
-            toml::from_str(toml_str).expect("[[wasm_consumer.io_port]] must parse");
-        assert_eq!(raw.io_ports.len(), 1);
-        let io = &raw.io_ports[0];
-        assert_eq!(io.port, "timer");
-        assert_eq!(io.push_depth, Some(Depth::Bounded(2)));
-        assert_eq!(io.retain_depth, Some(Depth::Bounded(8)));
-        assert_eq!(io.noise, Some(NoiseLevel::Metered));
-        assert_eq!(io.amplification, Some(0.5));
-        assert_eq!(io.urgency, Some(crate::messaging::Urgency::Low));
-        assert_eq!(io.publish_per_activation, Some(2.0));
-        assert_eq!(io.publish_capacity, Some(4.0));
-        assert_eq!(io.channel.as_deref(), Some("brenn:etl.timer"));
-    }
-
-    /// The zero-config spelling: a port name and nothing else. Also pins that
-    /// `wake_min` is rejected — it has no referent on a WASM subscription.
-    #[test]
-    fn wasm_consumer_io_port_minimal_and_rejects_wake_min() {
-        let raw: WasmConsumerIoPortRaw =
-            toml::from_str("port = \"timer\"\n").expect("bare io_port must parse");
-        assert_eq!(raw.port, "timer");
-        assert!(raw.channel.is_none());
-        assert!(raw.push_depth.is_none());
-        assert!(raw.retain_depth.is_none());
-        let with_wake: Result<WasmConsumerIoPortRaw, _> =
-            toml::from_str("port = \"timer\"\nwake_min = \"normal\"\n");
-        assert!(with_wake.is_err(), "wake_min must not be accepted");
-    }
-
-    /// A `[[surface.io_port]]` names the owning instance and nests inside
-    /// `[[surface]]` as `io_port`; with no channel it is the page-local default.
-    #[test]
-    fn surface_io_port_parses() {
-        let toml_str = r#"
-slug = "bench"
-grants = []
-
-[[io_port]]
-instance = "monitor"
-port = "tick"
-push_depth = 4
-retain_depth = 4
-urgency = "normal"
-publish_capacity = 3.0
-"#;
-        let raw: SurfaceConfigRaw =
-            toml::from_str(toml_str).expect("[[surface.io_port]] must parse");
-        assert_eq!(raw.io_ports.len(), 1);
-        let io = &raw.io_ports[0];
-        assert_eq!(io.instance, "monitor");
-        assert_eq!(io.port, "tick");
-        assert_eq!(io.push_depth, Some(Depth::Bounded(4)));
-        assert_eq!(io.retain_depth, Some(Depth::Bounded(4)));
-        assert_eq!(io.urgency, Some(crate::messaging::Urgency::Normal));
-        assert_eq!(io.publish_capacity, Some(3.0));
-        assert!(io.channel.is_none());
-    }
-
-    /// A binding with no `channel` is a free port: the field is optional on all
-    /// four binding blocks.
-    #[test]
-    fn bindings_parse_as_free_ports() {
-        let sub: WasmConsumerSubscriptionRaw =
-            toml::from_str("port = \"in\"\n").expect("channel-less wasm subscription must parse");
-        assert!(sub.channel.is_none());
-        let out: WasmConsumerOutputRaw =
-            toml::from_str("port = \"out\"\n").expect("channel-less wasm output must parse");
-        assert!(out.channel.is_none());
-        let ssub: SurfaceSubscriptionRaw =
-            toml::from_str("instance = \"monitor\"\nport = \"in\"\n")
-                .expect("channel-less surface subscription must parse");
-        assert!(ssub.channel.is_none());
-        let sout: SurfaceOutputRaw = toml::from_str("instance = \"monitor\"\nport = \"out\"\n")
-            .expect("channel-less surface output must parse");
-        assert!(sout.channel.is_none());
-    }
-
-    /// The `"alert"` grant token parses to `SurfaceGrant::Alert` — the same
-    /// authoring string operators write for a WASM consumer's alert grant.
-    #[test]
-    fn surface_alert_grant_parses() {
-        let raw: SurfaceConfigRaw = toml::from_str("slug = \"deskbar\"\ngrants = [\"alert\"]\n")
-            .expect("[[surface]] with alert grant must parse");
-        assert_eq!(raw.grants, vec![SurfaceGrant::Alert]);
-    }
-
-    /// The `"takeover"` grant token parses to `SurfaceGrant::Takeover`.
-    #[test]
-    fn surface_takeover_grant_parses() {
-        let raw: SurfaceConfigRaw = toml::from_str("slug = \"deskbar\"\ngrants = [\"takeover\"]\n")
-            .expect("[[surface]] with takeover grant must parse");
-        assert_eq!(raw.grants, vec![SurfaceGrant::Takeover]);
-    }
-
-    /// An unknown grant token is rejected by serde.
-    #[test]
-    fn surface_unknown_grant_rejected() {
-        let result: Result<SurfaceConfigRaw, _> =
-            toml::from_str("slug = \"x\"\ngrants = [\"not-a-grant\"]\n");
-        assert!(result.is_err(), "unknown grant token must be rejected");
-    }
-
-    /// `deny_unknown_fields` on `SurfaceConfigRaw` rejects a top-level typo — a
-    /// misspelled ACL key would otherwise silently be a deny-by-default over-narrow.
-    #[test]
-    fn surface_rejects_unknown_field() {
-        let result: Result<SurfaceConfigRaw, _> =
-            toml::from_str("slug = \"x\"\ngrants = []\nbogus = 1\n");
+    fn a_stray_surface_key_is_refused() {
+        let diag = sole_refusal("surface bare { grants = []; bogus = 1; }");
         assert!(
-            result.is_err(),
-            "deny_unknown_fields must reject an unknown key"
+            diag.render().contains("bogus"),
+            "the refusal must name the stray key, got: {}",
+            diag.render()
         );
     }
 
-    /// `deny_unknown_fields` on `[[surface.component]]`.
+    /// `abi` is required on a component class.
+    ///
+    /// A defaulted `abi` would silently pick an artifact shape for the operator;
+    /// the field states which toolchain built the module, and no one but the
+    /// operator knows that. Pinned because "just default it to dom" is the
+    /// obvious ergonomic temptation.
     #[test]
-    fn surface_component_rejects_unknown_field() {
-        let result: Result<SurfaceConfigRaw, _> = toml::from_str(
-            "slug = \"x\"\ngrants = []\n\n[[component]]\nkind = \"protobar\"\nabi = \"dom\"\nbogus = 1\n",
+    fn a_component_class_without_an_abi_is_refused() {
+        let diag = sole_refusal("component Panel { in messages; }");
+        assert!(
+            diag.render().contains("abi"),
+            "the refusal must name the missing key, got: {}",
+            diag.render()
+        );
+    }
+
+    /// `wake_min` has no referent on a WASM binding — the consumer loop is
+    /// eager — so stating one is refused rather than accepted and ignored.
+    #[test]
+    fn a_wake_min_on_a_consumer_io_binding_is_refused() {
+        let diag = sole_refusal(
+            r#"
+component Router {
+    abi = processor;
+    component_path = "/lib/brenn_router.wasm";
+    io tick;
+}
+
+new router: Router {
+    grants = [ports];
+    io tick { push_depth = 1; retain_depth = 2; wake_min = normal; }
+}
+"#,
         );
         assert!(
-            result.is_err(),
-            "deny_unknown_fields must reject an unknown component key"
-        );
-    }
-
-    /// `abi` is required, with no default.
-    #[test]
-    fn surface_component_requires_abi() {
-        // A defaulted `abi` would silently pick an artifact shape for the
-        // operator; the field states which toolchain built the module, and no
-        // one but the operator knows that. Pinned because "just default it to
-        // dom" is the obvious ergonomic temptation.
-        let result: Result<SurfaceConfigRaw, _> =
-            toml::from_str("slug = \"x\"\ngrants = []\n\n[[component]]\nkind = \"protobar\"\n");
-        assert!(result.is_err(), "abi must be a required component key");
-    }
-
-    /// `deny_unknown_fields` on `[[surface.subscription]]`.
-    #[test]
-    fn surface_subscription_rejects_unknown_field() {
-        let result: Result<SurfaceConfigRaw, _> = toml::from_str(
-            "slug = \"x\"\ngrants = []\n\n[[subscription]]\nchannel = \"ephemeral:c\"\ncomponent = \"p\"\nport = \"m\"\nbogus = 1\n",
-        );
-        assert!(
-            result.is_err(),
-            "deny_unknown_fields must reject an unknown subscription key"
-        );
-    }
-
-    /// `deny_unknown_fields` on `[[surface.output]]`.
-    #[test]
-    fn surface_output_rejects_unknown_field() {
-        let result: Result<SurfaceConfigRaw, _> = toml::from_str(
-            "slug = \"x\"\ngrants = []\n\n[[output]]\ncomponent = \"p\"\nport = \"o\"\nchannel = \"brenn:c\"\nbogus = 1\n",
-        );
-        assert!(
-            result.is_err(),
-            "deny_unknown_fields must reject an unknown output key"
+            diag.render().contains("wake_min"),
+            "the refusal must name the key with no referent, got: {}",
+            diag.render()
         );
     }
 
@@ -4435,62 +4128,8 @@ publish_capacity = 3.0
     }
 
     // -----------------------------------------------------------------------
-    // Depth deserialization tests
+    // Depth semantics
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn depth_deserializes_integer_to_bounded() {
-        let d: Depth = toml::from_str("x = 5\n")
-            .map(|v: toml::Table| toml::Value::try_into(v["x"].clone()).unwrap())
-            .unwrap();
-        assert_eq!(d, Depth::Bounded(5));
-    }
-
-    #[test]
-    fn depth_zero_is_bounded_zero() {
-        let d: Depth = toml::from_str("x = 0\n")
-            .map(|v: toml::Table| toml::Value::try_into(v["x"].clone()).unwrap())
-            .unwrap();
-        assert_eq!(d, Depth::Bounded(0));
-    }
-
-    #[test]
-    fn depth_deserializes_unbounded_string() {
-        let d: Depth = toml::from_str("x = \"unbounded\"\n")
-            .map(|v: toml::Table| toml::Value::try_into(v["x"].clone()).unwrap())
-            .unwrap();
-        assert_eq!(d, Depth::Unbounded);
-    }
-
-    #[test]
-    fn depth_rejects_negative_integer() {
-        // Parse directly into a struct that uses Depth, so the outer TOML parse
-        // itself must fail — there is no two-step that could silently succeed.
-        #[derive(serde::Deserialize)]
-        struct Wrapper {
-            #[allow(dead_code)]
-            x: Depth,
-        }
-        let result: Result<Wrapper, _> = toml::from_str("x = -1\n");
-        assert!(
-            result.is_err(),
-            "negative depth must be a deserialize error"
-        );
-    }
-
-    #[test]
-    fn depth_rejects_unknown_string() {
-        #[derive(serde::Deserialize)]
-        struct Wrapper {
-            #[allow(dead_code)]
-            x: Depth,
-        }
-        let result: Result<Wrapper, _> = toml::from_str("x = \"inf\"\n");
-        assert!(
-            result.is_err(),
-            "unknown string depth must be a deserialize error"
-        );
-    }
 
     #[test]
     fn depth_is_push_enabled() {
@@ -4995,42 +4634,33 @@ publish_capacity = 3.0
         assert_eq!(entries[0].resolved_channel.sink, Sink::Archive);
     }
 
-    /// Migration-forcing (access-control design §2.5.1 / §6.6 / §8 decision-2):
-    /// the legacy `[app.messaging].enabled` authorization boolean was removed.
-    /// Because `MessagingConfigRaw` carries `#[serde(deny_unknown_fields)]`, a
-    /// stale config that still sets `enabled` must now FAIL to parse with a
-    /// precise error naming the offending field — forcing the operator to migrate
-    /// to the explicit `grants` surface rather than silently parsing.
+    /// `sender` is not a messaging key: a participant's identity is its app
+    /// slug, not a string it names for itself. A document carrying the word is
+    /// refused rather than lowered with the identity quietly ignored.
+    ///
+    /// Per-app messaging has no block of its own in the agent vocabulary — the
+    /// subscriptions and the send budget are stated on the agent — so the word's
+    /// absence is stated where it could otherwise land: the global `messaging`
+    /// section, and an agent attr.
     #[test]
-    fn legacy_enabled_field_is_rejected_as_unknown_field() {
-        let toml_with_legacy_enabled = r#"enabled = true"#;
-        let result: Result<MessagingConfigRaw, _> = toml::from_str(toml_with_legacy_enabled);
+    fn the_removed_sender_key_is_refused() {
+        let section = sole_refusal("messaging { sender = \"my-app\"; }").render();
         assert!(
-            result.is_err(),
-            "legacy [app.messaging].enabled must be rejected by deny_unknown_fields"
+            section.contains("sender"),
+            "the refusal names the removed word: {section}"
         );
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("enabled"),
-            "error message should name the offending field; got: {err_str}"
-        );
-    }
 
-    /// `sender` key is no longer accepted in `[app.messaging]` (removed in
-    /// the participant-identity slice — design §2.3/AC5). Startup with a
-    /// config still carrying `sender` must fail-fast via serde deny_unknown_fields.
-    #[test]
-    fn sender_key_is_rejected_as_unknown_field() {
-        let toml_with_legacy_sender = r#"sender = "my-app""#;
-        let result: Result<MessagingConfigRaw, _> = toml::from_str(toml_with_legacy_sender);
+        let attr = sole_refusal(
+            r#"
+agent Finance() { sender = "my-app"; }
+
+new pfin: Finance();
+"#,
+        )
+        .render();
         assert!(
-            result.is_err(),
-            "legacy sender key must be rejected by deny_unknown_fields"
-        );
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("sender"),
-            "error message should name the offending field; got: {err_str}"
+            attr.contains("sender"),
+            "the refusal names the removed word: {attr}"
         );
     }
 
@@ -5511,217 +5141,114 @@ publish_capacity = 3.0
     }
 
     // -----------------------------------------------------------------------
-    // WasmGrant TOML parsing (§8 item 12)
+    // `new` (WASM consumer) grant words and ACL refusals
+    //
+    // The every-key lowering row for a consumer, its bindings and its nine ACL
+    // families lives in the lowering suite; what stays here is the grant
+    // vocabulary and the refusals whose subject is the raw struct's shape.
     // -----------------------------------------------------------------------
 
-    /// `grants` parses all five known names from a TOML `[[wasm_consumer]]` block.
+    /// Every `WasmGrant` word a consumer may state lowers to its variant.
+    ///
+    /// `alert` is the reason this is not folded into the lowering suite's
+    /// every-key row: that row states the five grants a router wants, and this
+    /// one states all six the enum has today. It is not a gate on the enum: the
+    /// words are hardcoded here, so a variant added without a DSL spelling fails
+    /// nothing. That parity is held by review, per `dsl-vocabulary-config-parity`.
     #[test]
-    fn wasm_grant_all_names_parse() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = ["ports", "store", "log", "alert", "config"]
-store_path = "/tmp/test.sqlite"
-"#;
-        let raw: WasmConsumerConfigRaw = toml::from_str(toml_str).unwrap();
-        assert_eq!(raw.grants.len(), 5);
-        assert!(raw.grants.contains(&WasmGrant::Ports));
-        assert!(raw.grants.contains(&WasmGrant::Store));
-        assert!(raw.grants.contains(&WasmGrant::Log));
-        assert!(raw.grants.contains(&WasmGrant::Alert));
-        assert!(raw.grants.contains(&WasmGrant::Config));
-    }
+    fn every_consumer_grant_word_lowers_to_its_variant() {
+        let config = config_from_dsl(
+            r#"
+mqtt_client broker { url = "mqtts://broker.example.com:8883"; }
 
-    /// An unknown grant name is rejected by serde.
-    #[test]
-    fn wasm_grant_unknown_name_rejected() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = ["not-a-real-grant"]
-"#;
-        let result: Result<WasmConsumerConfigRaw, _> = toml::from_str(toml_str);
-        assert!(
-            result.is_err(),
-            "unknown grant name must be rejected by serde"
+channel digests at "brenn:alice-digests" {
+    push_depth = 2;
+    retain_depth = 32;
+    standing_retain_depth = 32;
+}
+
+component Router {
+    abi = processor;
+    component_path = "/lib/brenn_router.wasm";
+    out digest;
+}
+
+new router: Router {
+    grants = [ports, store, log, alert, config, mqtt];
+    store_path = "/state/router.db";
+
+    acl publish [exact digests, client "mqtt:broker"];
+
+    out digest -> digests {}
+}
+"#,
+        );
+        assert_eq!(
+            config.wasm_consumers[0].grants,
+            vec![
+                WasmGrant::Ports,
+                WasmGrant::Store,
+                WasmGrant::Log,
+                WasmGrant::Alert,
+                WasmGrant::Config,
+                WasmGrant::Mqtt,
+            ]
         );
     }
 
-    /// Missing `grants` field is a serde error (required, no default).
+    /// An unknown grant word is refused, not dropped: a typo would otherwise
+    /// leave the component running with less authority than the operator wrote,
+    /// which fails at some later runtime call instead of at load.
     #[test]
-    fn wasm_grant_missing_field_rejected() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-"#;
-        let result: Result<WasmConsumerConfigRaw, _> = toml::from_str(toml_str);
+    fn an_unknown_consumer_grant_word_is_refused() {
+        let diag = sole_refusal(
+            r#"
+component Router { abi = processor; component_path = "/lib/r.wasm"; io tick; }
+
+new router: Router { grants = [not_a_real_grant]; io tick {} }
+"#,
+        );
         assert!(
-            result.is_err(),
-            "missing grants field must be a serde error"
+            diag.render().contains("not_a_real_grant"),
+            "the refusal must name the bad word, got: {}",
+            diag.render()
         );
     }
 
-    /// Empty grants list parses successfully (degenerate zero-capability consumer).
+    /// An empty grant list lowers: a zero-capability consumer is a legal, if
+    /// degenerate, thing to declare.
     #[test]
-    fn wasm_grant_empty_list_parses() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = []
-"#;
-        let raw: WasmConsumerConfigRaw = toml::from_str(toml_str).unwrap();
-        assert!(raw.grants.is_empty());
-    }
+    fn a_consumer_with_no_grants_lowers_with_an_empty_list() {
+        let config = config_from_dsl(
+            r#"
+component Router { abi = processor; component_path = "/lib/r.wasm"; io tick; }
 
-    // -----------------------------------------------------------------------
-    // WASM ACL raw fields: subscribe_acl / publish_acl (design §2.5.1)
-    // -----------------------------------------------------------------------
-
-    /// The flat top-level `subscribe_acl` / `publish_acl` channel-matcher fields
-    /// parse from a `[[wasm_consumer]]` block, each entry deserializing into the
-    /// shared `ChannelMatcherRaw` (`{ exact = ... }` xor `{ prefix = ... }`).
-    #[test]
-    fn wasm_acl_fields_parse_channel_matchers() {
-        use crate::access::raw::ChannelMatcherRaw;
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = ["ports"]
-
-[[subscribe_acl]]
-exact = "inbox"
-
-[[subscribe_acl]]
-prefix = "events."
-
-[[publish_acl]]
-exact = "outbox"
-"#;
-        let raw: WasmConsumerConfigRaw = toml::from_str(toml_str).unwrap();
-        assert!(matches!(
-            raw.subscribe_acl.as_slice(),
-            [ChannelMatcherRaw::Exact(e), ChannelMatcherRaw::Prefix(p)]
-                if e == "inbox" && p == "events."
-        ));
-        assert!(matches!(
-            raw.publish_acl.as_slice(),
-            [ChannelMatcherRaw::Exact(e)] if e == "outbox"
-        ));
-    }
-
-    /// Absent ACL fields default to empty lists (`#[serde(default)]`): a component
-    /// that authors no ACL block still parses, with deny-by-default empty lists.
-    #[test]
-    fn wasm_acl_fields_default_empty() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = []
-"#;
-        let raw: WasmConsumerConfigRaw = toml::from_str(toml_str).unwrap();
-        assert!(raw.subscribe_acl.is_empty());
-        assert!(raw.publish_acl.is_empty());
-    }
-
-    /// `deny_unknown_fields` on `WasmConsumerConfigRaw` is preserved after adding
-    /// the ACL fields: a misspelled top-level key still fails to parse rather than
-    /// being silently dropped (a silent over-grant if it were an ACL typo).
-    #[test]
-    fn wasm_acl_unknown_field_rejected() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = []
-
-[[subscribe_acls]]
-exact = "inbox"
-"#;
-        let result: Result<WasmConsumerConfigRaw, _> = toml::from_str(toml_str);
-        assert!(
-            result.is_err(),
-            "a misspelled ACL field (subscribe_acls) must not parse"
+new router: Router { grants = []; io tick {} }
+"#,
         );
+        assert!(config.wasm_consumers[0].grants.is_empty());
+        assert!(config.wasm_consumers[0].subscribe_acl.is_empty());
+        assert!(config.wasm_consumers[0].publish_acl.is_empty());
+        assert!(config.wasm_consumers[0].mqtt_subscribe_acl.is_empty());
+        assert!(config.wasm_consumers[0].webhook_acl.is_empty());
     }
 
-    /// A `[[subscribe_acl]]` entry with neither `exact` nor `prefix` must fail to
-    /// parse on the WASM authoring surface, mirroring the LLM-side coverage in
-    /// `access/raw.rs` — the externally-tagged `ChannelMatcherRaw` requires exactly
-    /// one variant key, and that invariant must hold through `WasmConsumerConfigRaw`
-    /// directly (not only through the `AppAclRaw` parse-path wrapper).
+    /// A stray top-level consumer key is refused: a misspelled ACL statement or
+    /// knob would otherwise be a silent over-grant or a silent no-op.
     #[test]
-    fn wasm_acl_matcher_neither_key_rejected() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = []
+    fn a_stray_consumer_key_is_refused() {
+        let diag = sole_refusal(
+            r#"
+component Router { abi = processor; component_path = "/lib/r.wasm"; io tick; }
 
-[[subscribe_acl]]
-"#;
-        let result: Result<WasmConsumerConfigRaw, _> = toml::from_str(toml_str);
-        assert!(
-            result.is_err(),
-            "a WASM ACL matcher with no kind (neither exact nor prefix) must not parse"
+new router: Router { grants = []; subscribe_acls = []; io tick {} }
+"#,
         );
-    }
-
-    /// A `[[subscribe_acl]]` entry with both `exact` and `prefix` must fail to parse
-    /// on the WASM authoring surface (a matcher is one kind, not two —
-    /// `deny_unknown_fields` on `ChannelMatcherRaw` reinforces this).
-    #[test]
-    fn wasm_acl_matcher_both_keys_rejected() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = []
-
-[[subscribe_acl]]
-exact = "inbox"
-prefix = "events."
-"#;
-        let result: Result<WasmConsumerConfigRaw, _> = toml::from_str(toml_str);
         assert!(
-            result.is_err(),
-            "a WASM ACL matcher with two kinds (exact and prefix) must not parse"
+            diag.render().contains("subscribe_acls"),
+            "the refusal must name the stray key, got: {}",
+            diag.render()
         );
-    }
-
-    /// The flat top-level `mqtt_subscribe_acl` / `webhook_acl` fields parse from a
-    /// `[[wasm_consumer]]` block, each entry deserializing into the shared LLM-side
-    /// matcher type (`MqttSubMatcherRaw` / `WebhookMatcherRaw`).
-    #[test]
-    fn wasm_subscribe_acl_fields_parse() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = []
-
-[[mqtt_subscribe_acl]]
-client = "home"
-topic_filter = "sensors/+/temp"
-
-[[webhook_acl]]
-endpoint = "push-alice"
-"#;
-        let raw: WasmConsumerConfigRaw = toml::from_str(toml_str).unwrap();
-        assert_eq!(raw.mqtt_subscribe_acl.len(), 1);
-        assert_eq!(raw.mqtt_subscribe_acl[0].client, "home");
-        assert_eq!(raw.mqtt_subscribe_acl[0].topic_filter, "sensors/+/temp");
-        assert_eq!(raw.webhook_acl.len(), 1);
-        assert_eq!(raw.webhook_acl[0].endpoint, "push-alice");
-    }
-
-    /// Absent `mqtt_subscribe_acl` / `webhook_acl` default to empty lists
-    /// (`#[serde(default)]`): deny-by-default with no grant derived.
-    #[test]
-    fn wasm_subscribe_acl_fields_default_empty() {
-        let toml_str = r#"
-slug = "test"
-component_path = "/tmp/test.wasm"
-grants = []
-"#;
-        let raw: WasmConsumerConfigRaw = toml::from_str(toml_str).unwrap();
-        assert!(raw.mqtt_subscribe_acl.is_empty());
-        assert!(raw.webhook_acl.is_empty());
     }
 
     /// `finalize_directory_with_subscribers` threads an `App` (UrgencyGated)

@@ -1,4 +1,4 @@
-//! Webhook config types: raw (TOML deserialized) and resolved forms.
+//! Webhook config types: raw (as lowered from a document) and resolved forms.
 //!
 //! Wired into `BrennConfig` via:
 //! - top-level `[[webhook_endpoint]]` arrays → `Vec<WebhookEndpointConfigRaw>`
@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use http::HeaderName;
 use indexmap::IndexMap;
-use serde::Deserialize;
 
 use crate::config::wasm::{WasmConfig, byte_size_to_max_page_count, resolve_component_config};
 use crate::config::{AppConfig, AppConfigRaw, load_secret_file};
@@ -42,12 +41,11 @@ pub(crate) fn default_hmac_algorithm() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Raw config types (TOML deserialized)
+// Raw config types (as lowered from a document)
 // ---------------------------------------------------------------------------
 
 /// Top-level `[[webhook_endpoint]]` block.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct WebhookEndpointConfigRaw {
     /// URL-safe identifier; charset `[A-Za-z0-9._~-]+`, globally unique.
     pub slug: String,
@@ -58,19 +56,15 @@ pub struct WebhookEndpointConfigRaw {
     /// Human-readable description. Optional.
     pub description: Option<String>,
     /// Transport-level body size ceiling (bytes). Default 1 MiB.
-    #[serde(default = "default_transport_ceiling")]
     pub transport_ceiling_bytes: usize,
     /// Expected `Content-Type` header (media-type only, no params). Default
     /// `"application/json"`.
-    #[serde(default = "default_content_type")]
     pub content_type: String,
-    /// Signature scheme configuration (tagged enum keyed on `scheme`).
+    /// Signature scheme configuration, selected by the `scheme` word.
     pub signature: WebhookSignatureConfigRaw,
     /// HMAC key entries. Required for HMAC schemes; must be empty for `bearer-token`.
-    #[serde(default, rename = "key")]
     pub keys: Vec<WebhookKeyConfigRaw>,
     /// Bearer token entries. Required for `bearer-token`; must be empty for HMAC schemes.
-    #[serde(default, rename = "token")]
     pub tokens: Vec<WebhookTokenConfigRaw>,
     /// Optional replay-protection binding. When present, inbound requests are
     /// checked against the WASM replay component before being delivered.
@@ -85,14 +79,12 @@ pub struct WebhookEndpointConfigRaw {
     pub urgency: Option<Urgency>,
 }
 
-/// Tagged signature scheme config. `deny_unknown_fields` means a field
-/// belonging to the wrong variant is a hard parse error.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(tag = "scheme", rename_all = "kebab-case", deny_unknown_fields)]
+/// Signature scheme config: the variant is chosen by the `scheme` word, and a
+/// key belonging to another variant is refused at that key.
+#[derive(Debug, PartialEq)]
 pub enum WebhookSignatureConfigRaw {
     /// HMAC-SHA256 over raw body. Phonebuddy, GitHub/Forgejo, generic.
     HmacRawBody {
-        #[serde(default = "default_hmac_algorithm")]
         algorithm: String,
         header: String,
         format: String,
@@ -100,7 +92,6 @@ pub enum WebhookSignatureConfigRaw {
     },
     /// HMAC-SHA256 over `<template>` filled with `{t}` and `{body}`. Slack.
     HmacTimestampedBody {
-        #[serde(default = "default_hmac_algorithm")]
         algorithm: String,
         sig_header: String,
         sig_format: String,
@@ -111,7 +102,6 @@ pub enum WebhookSignatureConfigRaw {
     },
     /// Stripe's combined `t=...,v1=...` header. HMAC over `<t>.<body>`.
     HmacStripe {
-        #[serde(default = "default_hmac_algorithm")]
         algorithm: String,
         header: String,
         max_skew_secs: u64,
@@ -125,8 +115,7 @@ pub enum WebhookSignatureConfigRaw {
 }
 
 /// `[[webhook_endpoint.key]]` entry (HMAC variants only).
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct WebhookKeyConfigRaw {
     /// Opaque key identifier; charset `[A-Za-z0-9._-]{1,64}`.
     pub key_id: String,
@@ -135,8 +124,7 @@ pub struct WebhookKeyConfigRaw {
 }
 
 /// `[[webhook_endpoint.token]]` entry (`bearer-token` variant only).
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct WebhookTokenConfigRaw {
     /// Opaque token identifier; charset `[A-Za-z0-9._-]{1,64}`.
     pub token_id: String,
@@ -149,8 +137,7 @@ pub struct WebhookTokenConfigRaw {
 /// When present, inbound requests for this endpoint are checked against the
 /// named WASM replay component before being delivered. Both fields required
 /// when the sub-table is present.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct ReplayProtectionConfigRaw {
     /// Path to the WASM replay component artifact (must exist at startup).
     pub component_path: PathBuf,
@@ -160,19 +147,16 @@ pub struct ReplayProtectionConfigRaw {
     /// Per-store size cap override (e.g. `"128MiB"`). When absent the global
     /// `[wasm].store_size_limit` default applies. Human-readable binary
     /// byte-size string; parsed and validated at load time.
-    #[serde(default)]
     pub store_size_limit: Option<String>,
     /// Operator-supplied config map for this replay component
     /// (`[webhook_endpoint.replay_protection.config]`). Values must be strings,
     /// integers, or booleans; floats, datetimes, arrays, and nested tables are
     /// rejected at load time. `None` when the sub-table is absent.
-    #[serde(default)]
     pub config: Option<toml::Table>,
 }
 
 /// Per-app `[[app.webhook_subscription]]` block.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 pub struct AppWebhookSubscriptionRaw {
     /// References `[[webhook_endpoint]].slug`.
     pub endpoint: String,
@@ -2489,47 +2473,36 @@ mod tests {
         resolve(&[ep], &[app]);
     }
 
-    // -----------------------------------------------------------------------
-    // test-6: removed `wake_kind` on [[app.webhook_subscription]] is rejected
-    // -----------------------------------------------------------------------
-
-    /// Deserializing `AppWebhookSubscriptionRaw` with the removed `wake_kind` field
-    /// (pre-urgency-redesign config key) must fail due to `deny_unknown_fields`.
-    /// Guards the fail-fast boot behaviour described in design §2.7:
-    /// operators upgrading with a config still containing `wake_kind` get an
-    /// explicit parse error rather than silent field-ignore.
+    /// `wake_kind` is not a recognized subscription key; a document still
+    /// carrying it is refused with the key named rather than silently ignored.
     #[test]
-    fn app_webhook_subscription_wake_kind_rejected_by_deny_unknown_fields() {
-        let toml_str = r#"endpoint = "my-endpoint"
-wake_kind = "immediate"
-"#;
-        let result = toml::from_str::<AppWebhookSubscriptionRaw>(toml_str);
-        assert!(
-            result.is_err(),
-            "AppWebhookSubscriptionRaw with wake_kind must fail to deserialize (deny_unknown_fields)"
-        );
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("wake_kind"),
-            "error message must mention 'wake_kind': {err_str}"
-        );
+    fn the_removed_wake_kind_subscription_key_is_refused() {
+        let refusal = crate::config::sole_refusal(
+            r#"
+webhook push_alice {
+    slug = "push-alice";
+    mount = "/webhooks/push-alice";
+
+    signature {
+        scheme = bearer-token;
+        header = "authorization";
     }
 
-    /// Valid `AppWebhookSubscriptionRaw` (no `wake_kind`, optional `wake_min`) deserializes OK.
-    #[test]
-    fn app_webhook_subscription_valid_deserializes() {
-        let toml_str = r#"endpoint = "my-endpoint"
-wake_min = "low"
-"#;
-        let result = toml::from_str::<AppWebhookSubscriptionRaw>(toml_str);
-        assert!(
-            result.is_ok(),
-            "valid AppWebhookSubscriptionRaw must deserialize: {:?}",
-            result
+    token phone { secret_file = "/home/alice/.secrets/push-alice.token"; }
+}
+
+agent Assistant() {
+    grants = [subscribe];
+    subscribe "webhook:push-alice" { wake_kind = immediate; }
+}
+
+new alice: Assistant();
+"#,
         );
-        let raw = result.unwrap();
-        assert_eq!(raw.endpoint, "my-endpoint");
-        use crate::messaging::WakeMin;
-        assert_eq!(raw.wake_min, Some(WakeMin::Low));
+        let rendered = refusal.render();
+        assert!(
+            rendered.contains("wake_kind"),
+            "the refusal must name the key it rejected: {rendered}"
+        );
     }
 }

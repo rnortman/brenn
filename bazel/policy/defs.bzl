@@ -17,7 +17,7 @@ POLICY_SRC_EXCLUDE = [
     "**/node_modules/**",
     "**/target/**",
     "**/dist/**",
-    "brenn.toml",
+    "brenn.brenn",
     ".bazelrc.local",
     # Operator-local state that sits beside tracked files: session credentials
     # and tool scratch. A glob sees untracked files that `git ls-files` does

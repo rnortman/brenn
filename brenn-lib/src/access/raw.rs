@@ -1,36 +1,31 @@
-//! Operator-authored *raw* ACL config shapes for LLM apps (deserialize-only).
+//! Operator-authored *raw* ACL config shapes for LLM apps.
 //!
 //! These mirror the resolved matcher types in `acl.rs` but carry the operator's
-//! un-validated strings straight from TOML. Validation (client charset, topic
-//! filter syntax, channel/endpoint matcher rules) and conversion into the
-//! resolved `acl::*` types happen in `build_app_policy` at resolution time — a
-//! later increment (design §2.5.2/§2.5.3). Nothing here validates or converts.
+//! un-validated strings. Validation (client charset, topic filter syntax,
+//! channel/endpoint matcher rules) and conversion into the resolved `acl::*`
+//! types happen in `build_app_policy` at resolution time. Nothing here
+//! validates or converts.
 //!
 //! The LLM authoring surface nests these under a single `[app.acl.*]` sub-table
 //! (`AppAclRaw`), in contrast to the WASM side's flat top-level ACL `Vec`s; both
-//! resolve into the same `AppPolicy` (design §2.5.1 "Authoring-shape asymmetry").
+//! resolve into the same `AppPolicy`.
 //!
 //! Backend-only, like the rest of `access` — no `ts-rs` derive.
 
-use serde::Deserialize;
+// TODO(config-syntax-in-operator-messages): the field docs below name these
+// shapes in table notation, which no document spells.
 
-/// Raw `[app.acl]` sub-table for an LLM app. Absent in TOML ⇒ all lists empty
-/// (every field `#[serde(default)]`). `deny_unknown_fields` so a misspelled ACL
-/// key fails to parse rather than being silently ignored (design §2.5.1).
-#[derive(Debug, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// Raw `[app.acl]` sub-table for an LLM app. An agent that states no `acl`
+/// leaves every list empty, which is deny-everything.
+#[derive(Debug, Default, PartialEq)]
 pub struct AppAclRaw {
     /// `[[app.acl.mqtt_subscribe]]` entries: `(client, topic_filter)` pairs.
-    #[serde(default)]
     pub mqtt_subscribe: Vec<MqttSubMatcherRaw>,
     /// `[[app.acl.mqtt_publish]]` entries: client-slug only.
-    #[serde(default)]
     pub mqtt_publish: Vec<MqttClientMatcherRaw>,
     /// `[[app.acl.brenn_subscribe]]` entries: channel matchers.
-    #[serde(default)]
     pub brenn_subscribe: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.brenn_publish]]` entries: channel matchers.
-    #[serde(default)]
     pub brenn_publish: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.ephemeral_publish]]` entries: ephemeral channel matchers.
     ///
@@ -38,7 +33,6 @@ pub struct AppAclRaw {
     /// not `ephemeral:protobar-demo`) — same convention as `brenn_publish`, since
     /// `allows_channel_access`/`allows_ephemeral_publish` strip the scheme before
     /// matching and the ACL list name carries the class.
-    #[serde(default)]
     pub ephemeral_publish: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.ephemeral_subscribe]]` entries: ephemeral channel matchers.
     ///
@@ -47,25 +41,21 @@ pub struct AppAclRaw {
     /// read; combined with the `ephemeral_subscribe` grant by
     /// `allows_ephemeral_delivery`. There is no `local_subscribe` field: that
     /// grant token has no LLM-app path and boot-panics in `build_app_policy`, and
-    /// the serde field stays in lockstep with the token so neither can exist
+    /// this field stays in lockstep with the token so neither can exist
     /// without the other.
-    #[serde(default)]
     pub ephemeral_subscribe: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.local_publish]]` entries: confined (`local:`) channel matchers.
     ///
     /// Bare channel names, no scheme — same convention as `ephemeral_publish`.
     /// Non-empty derives the `LocalPublish` grant in `build_app_policy`.
-    #[serde(default)]
     pub local_publish: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.webhook]]` entries: endpoint slugs.
-    #[serde(default)]
     pub webhook: Vec<WebhookMatcherRaw>,
 }
 
 /// Raw MQTT subscribe matcher: `{ client = "...", topic_filter = "..." }`.
 /// Strings are validated and converted to `acl::MqttSubMatcher` at resolution.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MqttSubMatcherRaw {
     /// MQTT client slug (validated at resolution time).
     pub client: String,
@@ -75,23 +65,17 @@ pub struct MqttSubMatcherRaw {
 
 /// Raw MQTT publish matcher: `{ client = "..." }`. Publish is client-scoped
 /// only; there is no topic dimension.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MqttClientMatcherRaw {
     /// MQTT client slug (validated at resolution time).
     pub client: String,
 }
 
-/// Raw `brenn:` channel matcher. Carries an explicit kind, exactly one of
-/// `{ exact = "..." }` xor `{ prefix = "..." }`. This is an **externally-tagged**
-/// enum (serde's default — no explicit tag attribute), so each variant is a
-/// single-key map: `{ exact = "..." }` or `{ prefix = "..." }`. A TOML entry
-/// with neither key (empty table) is rejected because no variant tag is present;
-/// one with both keys is rejected because an external-tag variant value is a
-/// single newtype string, not a two-key table (`deny_unknown_fields` reinforces
-/// this).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
+/// Raw `brenn:` channel matcher. Carries an explicit kind: `exact` matches one
+/// channel, `prefix` matches every channel a name starts. An `acl` entry names
+/// exactly one of the two keywords, so neither "no kind" nor "both kinds" has a
+/// spelling.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChannelMatcherRaw {
     /// `{ exact = "channel" }` — matches the channel exactly.
     Exact(String),
@@ -100,8 +84,7 @@ pub enum ChannelMatcherRaw {
 }
 
 /// Raw inbound webhook matcher: `{ endpoint = "..." }`.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WebhookMatcherRaw {
     /// Webhook endpoint slug (validated at resolution time).
     pub endpoint: String,
@@ -140,180 +123,150 @@ pub struct WasmAclsRaw<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::config_from_dsl;
 
-    /// Build an `AppAclRaw` from a TOML fragment by wrapping it in a throwaway
-    /// table (TOML has no top-level standalone table literal). Mirrors how the
-    /// real `[app.acl]` sub-table parses inside `[[app]]`.
-    fn parse_acl(toml_src: &str) -> AppAclRaw {
-        #[derive(Deserialize)]
-        struct Wrap {
-            acl: AppAclRaw,
-        }
-        let wrap: Wrap = toml::from_str(toml_src).expect("acl fragment parses");
-        wrap.acl
+    /// Agent `alice`'s ACL, from a document of `declarations` plus an
+    /// `Assistant` class whose body is `body`.
+    ///
+    /// The preamble keeps the declarations an `acl` statement has to name out
+    /// of each test body, so a matcher test states matchers and nothing else.
+    fn alice_acl(declarations: &str, body: &str) -> AppAclRaw {
+        let document = format!(
+            "{declarations}\n\nagent Assistant() {{\n{body}\n}}\n\nnew alice: Assistant();\n"
+        );
+        config_from_dsl(&document)
+            .apps
+            .into_iter()
+            .find(|app| app.slug == "alice")
+            .expect("the instantiated agent")
+            .acl
     }
 
+    const MQTT_CLIENTS: &str = r#"
+mqtt_client home { url = "mqtts://broker.example.com:8883"; }
+mqtt_client office { url = "mqtts://office.example.com:8883"; }
+"#;
+
+    const WEBHOOK: &str = r#"
+webhook push_alice {
+    slug = "github";
+    mount = "/webhooks/github";
+
+    signature {
+        scheme = bearer-token;
+        header = "authorization";
+    }
+
+    token phone { secret_file = "/home/alice/.secrets/github.token"; }
+}
+"#;
+
+    /// Patterns arrive scheme-stripped: an `acl` statement names
+    /// `brenn:alerts.`, the matcher holds `alerts.`.
     #[test]
-    fn full_acl_round_trips_each_matcher_kind() {
-        let acl = parse_acl(
+    fn brenn_channel_matchers_land_scheme_stripped() {
+        let acl = alice_acl(
+            "",
             r#"
-            [[acl.mqtt_subscribe]]
-            client = "home"
-            topic_filter = "sensors/+/temp"
+    grants = [subscribe, publish];
 
-            [[acl.mqtt_publish]]
-            client = "office"
-
-            [[acl.brenn_subscribe]]
-            prefix = "alerts"
-
-            [[acl.brenn_subscribe]]
-            exact = "status.ready"
-
-            [[acl.brenn_publish]]
-            exact = "outbox"
-
-            [[acl.brenn_publish]]
-            prefix = "outbox."
-
-            [[acl.ephemeral_publish]]
-            exact = "protobar-demo"
-
-            [[acl.webhook]]
-            endpoint = "github"
-            "#,
+    acl subscribe [prefix "brenn:alerts.", exact "brenn:status.ready"];
+    acl publish [exact "brenn:outbox", prefix "brenn:outbox."];
+"#,
         );
 
-        assert_eq!(acl.mqtt_subscribe.len(), 1);
-        assert_eq!(acl.mqtt_subscribe[0].client, "home");
-        assert_eq!(acl.mqtt_subscribe[0].topic_filter, "sensors/+/temp");
-
-        assert_eq!(acl.mqtt_publish.len(), 1);
-        assert_eq!(acl.mqtt_publish[0].client, "office");
-
-        assert_eq!(acl.brenn_subscribe.len(), 2);
-        assert!(matches!(
-            &acl.brenn_subscribe[0],
-            ChannelMatcherRaw::Prefix(p) if p == "alerts"
-        ));
-        assert!(matches!(
-            &acl.brenn_subscribe[1],
-            ChannelMatcherRaw::Exact(e) if e == "status.ready"
-        ));
-
-        assert_eq!(acl.brenn_publish.len(), 2);
-        assert!(matches!(
-            &acl.brenn_publish[0],
-            ChannelMatcherRaw::Exact(e) if e == "outbox"
-        ));
-        assert!(matches!(
-            &acl.brenn_publish[1],
-            ChannelMatcherRaw::Prefix(p) if p == "outbox."
-        ));
-
-        assert_eq!(acl.ephemeral_publish.len(), 1);
-        assert!(matches!(
-            &acl.ephemeral_publish[0],
-            ChannelMatcherRaw::Exact(e) if e == "protobar-demo"
-        ));
-
-        assert_eq!(acl.webhook.len(), 1);
-        assert_eq!(acl.webhook[0].endpoint, "github");
+        assert_eq!(
+            acl.brenn_subscribe,
+            vec![
+                ChannelMatcherRaw::Prefix("alerts.".to_string()),
+                ChannelMatcherRaw::Exact("status.ready".to_string()),
+            ]
+        );
+        assert_eq!(
+            acl.brenn_publish,
+            vec![
+                ChannelMatcherRaw::Exact("outbox".to_string()),
+                ChannelMatcherRaw::Prefix("outbox.".to_string()),
+            ]
+        );
     }
 
+    /// The `ephemeral:` plane is its own matcher list, stripped the same way.
     #[test]
-    fn absent_acl_block_yields_empty_lists() {
-        // An `[app.acl]` with no sub-tables (or, here, an empty table) leaves
-        // every matcher list empty — the deny-by-default starting point.
-        let acl = parse_acl("acl = {}\n");
-        assert!(acl.mqtt_subscribe.is_empty());
-        assert!(acl.mqtt_publish.is_empty());
-        assert!(acl.brenn_subscribe.is_empty());
+    fn ephemeral_matchers_land_on_their_own_plane() {
+        let acl = alice_acl(
+            "",
+            r#"
+    grants = [publish];
+
+    acl publish [exact "ephemeral:protobar-demo"];
+"#,
+        );
+
+        assert_eq!(
+            acl.ephemeral_publish,
+            vec![ChannelMatcherRaw::Exact("protobar-demo".to_string())]
+        );
         assert!(acl.brenn_publish.is_empty());
-        assert!(acl.ephemeral_publish.is_empty());
-        assert!(acl.webhook.is_empty());
     }
 
+    /// An MQTT matcher is client-scoped: the client name leaves the pattern and
+    /// becomes the matcher's own field.
     #[test]
-    fn channel_matcher_requires_exactly_one_kind() {
-        // Exercised through the real `[app.acl.brenn_subscribe]` path.
-        // Each kind, on its own, parses to the matching variant — the positive
-        // cases that prove the rejections below are not vacuous (i.e. that a
-        // single valid key really is accepted, not that *every* shape is
-        // rejected).
-        let exact = toml::from_str::<AppAclRaw>("[[brenn_subscribe]]\nexact = \"x\"\n")
-            .expect("a single `exact` key parses");
-        assert!(matches!(
-            exact.brenn_subscribe.as_slice(),
-            [ChannelMatcherRaw::Exact(e)] if e == "x"
-        ));
-        let prefix = toml::from_str::<AppAclRaw>("[[brenn_subscribe]]\nprefix = \"y\"\n")
-            .expect("a single `prefix` key parses");
-        assert!(matches!(
-            prefix.brenn_subscribe.as_slice(),
-            [ChannelMatcherRaw::Prefix(p)] if p == "y"
-        ));
-        // Neither key ⇒ reject (no enum variant tag present).
-        let neither = toml::from_str::<AppAclRaw>("[[brenn_subscribe]]\n");
-        assert!(neither.is_err(), "a matcher with no kind must not parse");
-        // Both keys ⇒ reject (a variant value is a single newtype string, not a
-        // two-key table).
-        let both =
-            toml::from_str::<AppAclRaw>("[[brenn_subscribe]]\nexact = \"a\"\nprefix = \"b\"\n");
-        assert!(both.is_err(), "a matcher with two kinds must not parse");
-    }
+    fn mqtt_matchers_land_client_scoped() {
+        let acl = alice_acl(
+            MQTT_CLIENTS,
+            r#"
+    grants = [subscribe, publish];
 
-    #[test]
-    fn unknown_acl_key_is_rejected() {
-        // `deny_unknown_fields` on AppAclRaw: a misspelled sub-table fails fast
-        // rather than being silently dropped (design §2.5.1).
-        let bad = toml::from_str::<AppAclRaw>("[[mqtt_subscibe]]\nclient = \"home\"\n");
-        assert!(bad.is_err(), "an unknown ACL key must not parse");
-    }
+    acl subscribe [topic_filter "mqtt:home:sensors/+/temp"];
+    acl publish [client "mqtt:office"];
 
-    #[test]
-    fn unknown_field_inside_matcher_is_rejected() {
-        // `deny_unknown_fields` on the *leaf* matcher structs: a misspelled field
-        // inside an otherwise-valid sub-table fails fast, not just a misspelled
-        // sub-table name (design §2.5.1). The outer `AppAclRaw` check above only
-        // guards sub-table *names*; this guards each leaf struct's own fields.
-        let bad_mqtt_sub = toml::from_str::<AppAclRaw>(
-            "[[mqtt_subscribe]]\nclient = \"home\"\ntopic_filer = \"sensors/#\"\n",
+    subscribe "mqtt:home:sensors/+/temp" { push_depth = 1; retain_depth = 1; }
+"#,
         );
-        assert!(
-            bad_mqtt_sub.is_err(),
-            "a misspelled mqtt_subscribe field must not parse"
+
+        assert_eq!(
+            acl.mqtt_subscribe,
+            vec![MqttSubMatcherRaw {
+                client: "home".to_string(),
+                topic_filter: "sensors/+/temp".to_string(),
+            }]
         );
-        let bad_mqtt_pub =
-            toml::from_str::<AppAclRaw>("[[mqtt_publish]]\nclient = \"home\"\nextra = \"x\"\n");
-        assert!(
-            bad_mqtt_pub.is_err(),
-            "a misspelled mqtt_publish field must not parse"
-        );
-        let bad_webhook =
-            toml::from_str::<AppAclRaw>("[[webhook]]\nendpoint = \"github\"\nextra = \"x\"\n");
-        assert!(
-            bad_webhook.is_err(),
-            "a misspelled webhook field must not parse"
+        assert_eq!(
+            acl.mqtt_publish,
+            vec![MqttClientMatcherRaw {
+                client: "office".to_string(),
+            }]
         );
     }
 
+    /// A webhook matcher names the endpoint's slug, scheme stripped.
     #[test]
-    fn matcher_missing_required_field_is_rejected() {
-        // `MqttSubMatcherRaw` requires both `client` and `topic_filter` (neither
-        // is `#[serde(default)]`). An entry missing either must fail to parse,
-        // rather than silently defaulting to an empty string — an empty filter
-        // would be a narrow silent over-grant at `filter_covers` time.
-        let no_filter = toml::from_str::<AppAclRaw>("[[mqtt_subscribe]]\nclient = \"home\"\n");
-        assert!(
-            no_filter.is_err(),
-            "mqtt_subscribe missing topic_filter must not parse"
+    fn webhook_matchers_name_the_endpoint() {
+        let acl = alice_acl(
+            WEBHOOK,
+            r#"
+    grants = [subscribe];
+
+    acl subscribe [endpoint "webhook:github"];
+
+    subscribe "webhook:github" { push_depth = 1; retain_depth = 1; }
+"#,
         );
-        let no_client =
-            toml::from_str::<AppAclRaw>("[[mqtt_subscribe]]\ntopic_filter = \"sensors/#\"\n");
-        assert!(
-            no_client.is_err(),
-            "mqtt_subscribe missing client must not parse"
+
+        assert_eq!(
+            acl.webhook,
+            vec![WebhookMatcherRaw {
+                endpoint: "github".to_string(),
+            }]
         );
+    }
+
+    /// Deny by default: an agent that states no `acl` gets empty lists on every
+    /// plane, not a wildcard.
+    #[test]
+    fn an_agent_without_acls_is_empty_on_every_plane() {
+        assert_eq!(alice_acl("", "    grants = [];"), AppAclRaw::default());
     }
 }

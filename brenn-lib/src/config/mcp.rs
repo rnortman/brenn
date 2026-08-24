@@ -1,13 +1,9 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
-
 /// MCP server configuration for a custom MCP server.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     pub command: String,
     pub args: Vec<String>,
-    #[serde(default)]
     pub env: HashMap<String, String>,
 }

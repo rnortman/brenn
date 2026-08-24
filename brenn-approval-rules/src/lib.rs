@@ -2,7 +2,7 @@
 //!
 //! Rules match on tool name (exact) and a regex pattern applied to a
 //! tool-specific extract of the input (e.g., the `command` field for Bash).
-//! Three layers are checked in order: static (TOML config), permanent (DB,
+//! Three layers are checked in order: static (config file), permanent (DB,
 //! app-wide), and conversation-scoped (DB, per-conversation).
 
 use regex::Regex;
@@ -14,7 +14,7 @@ use serde::Deserialize;
 pub enum ApprovalMatch {
     /// Hardcoded read-only tool (Read, Glob, Grep, ToolSearch, app auto-approve).
     GlobalTool,
-    /// Matched a rule from the TOML config file.
+    /// Matched a rule from the config file.
     ConfigRule { pattern: String },
     /// Matched an "Always Allow" rule from the DB (user-created).
     AlwaysAllowRule { pattern: String },
@@ -72,10 +72,10 @@ const MULTI_SUBCOMMAND_TOOLS: &[&str] = &[
 const GLOBAL_AUTO_APPROVE_TOOLS: &[&str] = &["Read", "Glob", "Grep", "ToolSearch"];
 
 // ---------------------------------------------------------------------------
-// ApprovalRuleConfig — static rules from TOML
+// ApprovalRuleConfig — static rules from the config file
 // ---------------------------------------------------------------------------
 
-/// A single approval rule as defined in the TOML config.
+/// A single approval rule as defined in the config file.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRuleConfig {
@@ -143,7 +143,7 @@ impl CompiledRule {
 pub struct ApprovalRuleSet {
     /// Hardcoded read-only tool names (exact match, no pattern needed).
     global_tools: std::collections::HashSet<String>,
-    /// Static rules from TOML config (immutable after bridge creation).
+    /// Static rules from the config file (immutable after bridge creation).
     static_rules: Vec<CompiledRule>,
     /// Dynamic rules from DB (app-wide + conversation-scoped).
     /// May grow during the bridge's lifetime.
@@ -155,7 +155,7 @@ impl ApprovalRuleSet {
     ///
     /// `global_extra` adds tool names to the hardcoded global set (from
     /// `IntegrationFactory::tools()` auto-approve registrations).
-    /// `static_configs` are from the TOML config.
+    /// `static_configs` are from the config file.
     /// `db_rules` are pre-loaded from the database.
     ///
     /// Invalid static/DB patterns are logged and skipped (they were valid when

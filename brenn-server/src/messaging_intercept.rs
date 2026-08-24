@@ -4586,7 +4586,7 @@ mod tests {
         let bridge = crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe().await;
         let addr = "mqtt:home:home/kitchen/state";
 
-        // Subscribe creates the mqtt: channel (filter never in TOML).
+        // Subscribe creates the mqtt: channel (filter never in the config).
         let sub = subscribe_result(
             &bridge,
             json!({ "address": addr, "push_depth": 0, "retain_depth": 5 }),

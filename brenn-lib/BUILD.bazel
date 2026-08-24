@@ -58,9 +58,7 @@ rust_test(
     crate_features = ["testutils"],
     data = [
         "//:brenn.dev.brenn",
-        "//:brenn.dev.toml",
         "//:brenn.e2e.brenn",
-        "//:brenn.e2e.toml",
     ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},

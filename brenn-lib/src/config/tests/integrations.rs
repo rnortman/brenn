@@ -412,34 +412,30 @@ fn shallow_merge_panics_on_non_table_per_app() {
 }
 
 // -----------------------------------------------------------------------
-// TOML deserialization of integration fields
+// Integration fields, as a document states them
 // -----------------------------------------------------------------------
 
 #[test]
-fn toml_parse_integration_fields() {
+fn integration_fields_load_from_a_document() {
     let dir = tempfile::tempdir().unwrap();
-    let toml_str = format!(
+    let config = config_from_dsl(&format!(
         r#"
-[integrations.pfin]
-command = "pf"
+integration pfin {{ command = "pf"; }}
 
-[integrations.graf]
-command = "graf"
+integration graf {{ command = "graf"; }}
 
-[[app]]
-slug = "myapp"
-working_dir = "{}"
-integrations = ["pfin"]
+agent Assistant() {{
+    working_dir = "{}";
+    integrations = ["pfin"];
 
-[app.integration_config.graf]
-extra_setting = "custom_value"
+    integration_config graf {{ extra_setting = "custom_value"; }}
+}}
+
+new myapp: Assistant();
 "#,
         dir.path().display()
-    );
+    ));
 
-    let config: BrennConfig = toml::from_str(&toml_str).unwrap();
-
-    // Global integrations parsed.
     assert_eq!(config.integrations.len(), 2);
     assert_eq!(
         config.integrations["pfin"]["command"].as_str().unwrap(),
@@ -450,7 +446,6 @@ extra_setting = "custom_value"
         "graf"
     );
 
-    // Per-app integration fields parsed.
     let app = &config.apps[0];
     assert_eq!(app.integrations, vec!["pfin"]);
     assert_eq!(app.integration_config.len(), 1);

@@ -1,8 +1,5 @@
-use serde::Deserialize;
-
 /// Retention settings for the `events` table.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventsConfig {
     /// Retention window in days for delivered events.
     /// Delivered rows older than this are deleted by the hourly cleanup loop.

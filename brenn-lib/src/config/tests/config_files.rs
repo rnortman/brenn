@@ -1,22 +1,13 @@
 //! The shipped config files at the repo root, checked as files.
 //!
-//! Two claims live here. The first is that each file is a config the runtime
-//! could take: it loads, it sets the one field the messaging bootstrap requires
+//! One claim lives here: each file is a config the runtime could take — it
+//! loads, it sets the one field the messaging bootstrap requires
 //! unconditionally, and both channel-tuning passes run clean over its channel
-//! blocks. The second is that each `.brenn` document and its TOML twin are the
-//! *same* config — the twins exist only until the TOML front end retires, and
-//! nothing but this assertion keeps them from drifting apart in the meantime.
+//! blocks.
 
 use super::*;
-use crate::config::brenn::{
-    canonicalize_config_addresses, check_config, sort_order_dead_collections,
-};
+use crate::config::brenn::check_config;
 
-/// A config file at the repo root, loaded the way boot loads it.
-///
-/// Routed through `check_config` rather than `toml::from_str` so a `.brenn`
-/// document gets the whole pipeline — parse, resolve, derive, lower — and its
-/// diagnostics rather than a parse error about an unexpected `/`.
 fn load_config_file(filename: &str) -> BrennConfig {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -38,46 +29,11 @@ fn assert_config_file_messaging_invariant(filename: &str) {
         !public_url.is_empty(),
         "{filename} sets an empty server.public_url; it must be a well-formed URL"
     );
-    // Every depth a `[[channel]]` block owns is required, and nothing under
+    // Every depth a `channel` block owns is required, and nothing under
     // the block supplies one. Running both passes here catches a misconfigured
     // block at `make check` time rather than only at a live server start.
     crate::messaging::config::build_channel_entries(&config.channels, &config.messaging);
     crate::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging);
-}
-
-/// A `.brenn` document and its TOML twin are one config.
-///
-/// The comparison is the differ's, through the same two normalizations:
-/// addresses canonicalized so a bare TOML `address` and a scheme-qualified
-/// lowered one are not reported as different, and the collections whose order
-/// the runtime ignores sorted so a derived ACL and a hand-listed one compare
-/// equal. Everything else is `PartialEq` over the whole value, so an ordering
-/// regression in lowering still trips this.
-///
-/// TODO(dsl-toml-twins): this assertion and the TOML side of it retire together
-/// with the TOML front end.
-fn assert_twins(document: &str, toml: &str) {
-    let mut from_dsl = load_config_file(document);
-    let mut from_toml = load_config_file(toml);
-    canonicalize_config_addresses(&mut from_dsl);
-    canonicalize_config_addresses(&mut from_toml);
-    sort_order_dead_collections(&mut from_dsl);
-    sort_order_dead_collections(&mut from_toml);
-    assert_eq!(
-        from_dsl, from_toml,
-        "{document} and {toml} are no longer the same config; \
-         run `brenn config-diff {document} {toml}` for the diff"
-    );
-}
-
-#[test]
-fn brenn_dev_toml_parses() {
-    assert_config_file_messaging_invariant("brenn.dev.toml");
-}
-
-#[test]
-fn brenn_e2e_toml_parses() {
-    assert_config_file_messaging_invariant("brenn.e2e.toml");
 }
 
 #[test]
@@ -88,14 +44,4 @@ fn brenn_dev_brenn_parses() {
 #[test]
 fn brenn_e2e_brenn_parses() {
     assert_config_file_messaging_invariant("brenn.e2e.brenn");
-}
-
-#[test]
-fn brenn_e2e_twins_agree() {
-    assert_twins("brenn.e2e.brenn", "brenn.e2e.toml");
-}
-
-#[test]
-fn brenn_dev_twins_agree() {
-    assert_twins("brenn.dev.brenn", "brenn.dev.toml");
 }
