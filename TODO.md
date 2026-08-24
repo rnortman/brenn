@@ -1997,3 +1997,51 @@ Done = a gate fails when a crate declares a dependency its sources do not use,
 with the existing violations either cleared or explicitly allowed; or this entry
 closes with the measurement that says the false-positive rate on this tree makes
 the gate worse than the hand audit.
+
+## `register-page-invite-oracle`
+
+`GET /auth/register` returns a bare 404 whenever the `invite_codes` table holds
+no unused row (`brenn-server/src/routes/register.rs`, the `has_unused_invite_codes`
+early return). That is the steady state — prod has two codes, both consumed — so
+the `Register` link that `brenn-server/src/routes/login.rs` renders
+unconditionally on the login page leads to a dead end for every visitor.
+
+The same branch leaks a bit of live server state to anyone on the internet:
+200 vs 404 answers "is an onboarding window open right now?" without a session.
+It is not an access path — the code is 16 bytes from a CSPRNG, and a wrong code
+on `POST` raises `AuthFailure` for fail2ban — but the response varies with
+internal state, and the leak is *silent*: this branch deliberately does not log
+("this is NOT a security event"), while the global `not_found` fallback logs
+`UnrecognizedUrl` for every other unrouted path. Probing this one endpoint is
+the only free probe on the pre-auth surface, which cuts against the
+§5 policy in `docs/security-posture.md` that unrecognized requests are a
+defensive signal.
+
+The fix is to make the response invariant to invite state: always render the
+form (or a neutral invite-only page that does not reveal whether a code is
+outstanding) and let `POST` remain the only path that distinguishes valid from
+invalid. `POST /auth/register` is already reachable regardless of what `GET`
+returns — the route registers `.post(register_submit)` unconditionally and the
+handler never consults `has_unused_invite_codes` — so this adds no new
+attacker-reachable surface. A submission with no invite outstanding redirects to
+`?error=invite` like any bad code and logs the `AuthFailure` that today's 404
+suppresses.
+
+Two things this entry does not cover. The unconditional
+`alert(AlertSeverity::Info, "Registration attempt: ...")` at the top of
+`register_submit` fires before any validation, and the alert limiter is a single
+severity-blind global window (10/60s in prod), so cheap garbage `POST`s can
+starve `Critical` alerts; that is a separate concern about the alerting contract,
+not about this page. And whether the neutral page should exist at all, versus
+always showing the real form, is a UX call for the operator — showing the form
+means a stranger can submit codes at a server with no open invites, which is
+arguably the fail2ban signal we want rather than a cost.
+
+Code sites (`TODO(register-page-invite-oracle)`):
+brenn-server/src/routes/register.rs, at the `has_unused_invite_codes` early
+return in `register_page`; brenn-server/src/routes/login.rs, at the
+unconditional `Register` link in `login_page`.
+
+Done = `GET /auth/register` returns the same status regardless of whether an
+unused invite code exists, and the login page's `Register` link leads somewhere
+that explains itself.

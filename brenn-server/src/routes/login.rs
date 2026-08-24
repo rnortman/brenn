@@ -59,6 +59,8 @@ pub async fn login_page(
             <input type="password" id="password" name="password" autocomplete="current-password" required>
             <button type="submit">Log in</button>
         </form>
+        <!-- TODO(register-page-invite-oracle): /auth/register 404s whenever no unused
+             invite code exists, so this link is a dead end in the steady state. -->
         <p class="link"><a href="/auth/register">Register</a></p>
     </main>
     <script type="module" src="/static/nav-on-message.js?v={build_id}"></script>

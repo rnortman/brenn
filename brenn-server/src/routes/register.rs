@@ -41,6 +41,9 @@ pub async fn register_page(
     Query(query): Query<RegisterQuery>,
 ) -> Response {
     let conn = state.db.lock().await;
+    // TODO(register-page-invite-oracle): this 404 varies with invite state, which
+    // leaks whether an onboarding window is open and dead-ends the login page's
+    // Register link. Serve the same status either way.
     if !has_unused_invite_codes(&conn) {
         // No invite codes available — this is NOT a security event,
         // just a "nothing to do here" response.
