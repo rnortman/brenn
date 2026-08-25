@@ -25,14 +25,14 @@ use crate::mqtt::config::MqttClientConfig;
 /// `resolved_clients` is the already-resolved MQTT client map (Phase 6 output):
 /// every `mqtt_subscribe`/`mqtt_publish` matcher's `client` slug is cross-checked
 /// against it so an ACL referencing a nonexistent client fails fast at
-/// resolution rather than silently never-matching at runtime (design §2.5.2).
+/// resolution rather than silently never-matching at runtime.
 ///
 /// # Panics
 ///
 /// Panics (operator-authored config — fail-fast) on:
 /// - a WASM-host (`Wasm*`) or `Integration` token in an LLM app's `grants` — these
-///   are not part of the LLM-authorable grant vocabulary (design §2.2; authored
-///   as `WasmGrant` on WASM components and mapped internally),
+///   are not part of the LLM-authorable grant vocabulary (authored
+///   as `ComponentGrant` on WASM components and mapped internally),
 /// - a duplicate capability in `grants` (each grant must appear at most once),
 /// - an MQTT subscribe/publish matcher with an invalid client slug or a slug that
 ///   does not name a configured MQTT client,
@@ -55,8 +55,8 @@ pub fn build_app_policy(
         // enum derives `Deserialize` over the whole enum (so `grants =
         // ["wasm_store"]` parses), but the WASM-host caps and the reserved
         // `Integration` placeholder are not authorable on an LLM app — they are
-        // authored as `WasmGrant` on WASM components and mapped internally, and
-        // have no LLM-app enforcement (design §2.2). Reject them here (the
+        // authored as `ComponentGrant` on WASM components and mapped internally, and
+        // have no LLM-app enforcement. Reject them here (the
         // resolution boundary), fail-fast like every other operator-config error.
         match cap {
             AppCapability::WasmStore
@@ -65,22 +65,17 @@ pub fn build_app_policy(
             | AppCapability::WasmConfig
             | AppCapability::Integration => panic!(
                 "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (WASM-host caps are authored as `WasmGrant`; `integration` is reserved) \
+                 (WASM-host caps are authored as `ComponentGrant`; `integration` is reserved) \
                  — design §2.2",
             ),
-            // Surface-only capability, authored as `SurfaceGrant::Alert` on a
-            // `[[surface]]` and mapped in `build_surface_policy`; it has no
-            // enforcement point for an LLM app, so it is not authorable here.
+            // Attach-route capability, authored as `AttachGrant::Alert` on a
+            // `[[surface]]` or `[[remote]]` and mapped in `build_attach_policy`;
+            // it has no enforcement point for an LLM app, so it is not
+            // authorable here.
             AppCapability::SurfaceAlert => panic!(
                 "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (surface alert is authored as `SurfaceGrant` on a `[[surface]]`)",
-            ),
-            // Surface-only capability, authored as `SurfaceGrant::Takeover` on a
-            // `[[surface]]` and mapped in `build_surface_policy`; it has no
-            // enforcement point for an LLM app, so it is not authorable here.
-            AppCapability::SurfaceTakeover => panic!(
-                "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (surface takeover is authored as `SurfaceGrant` on a `[[surface]]`)",
+                 (attacher alert is authored as `AttachGrant` on a `[[surface]]` or \
+                 `[[remote]]`)",
             ),
             // No LLM-reachable API sets impetus, so the grant would be dead
             // config surface.
@@ -196,28 +191,26 @@ pub fn build_app_policy(
 }
 
 /// Build the resolved `AppPolicy` for a WASM component from its resolved
-/// `WasmGrant` set and its authored `subscribe_acl`/`publish_acl` channel
-/// matchers + `mqtt_publish_acl` client matchers (access-control design §2.5.4;
-/// mqtt-egress-unify design §2.5).
+/// `ComponentGrant` set and its authored `subscribe_acl`/`publish_acl` channel
+/// matchers + `mqtt_publish_acl` client matchers.
 ///
-/// The grant layer maps each `WasmGrant` onto its unified `AppCapability`
+/// The grant layer maps each `ComponentGrant` onto its unified `AppCapability`
 /// (`Ports → MessagingPublish`, `Store → WasmStore`, `Log → WasmLog`,
-/// `Alert → WasmAlert`, `Config → WasmConfig`, `Mqtt → MqttPublish` —
-/// design §2.5.4 / high-level §2.3).
+/// `Alert → WasmAlert`, `Config → WasmConfig`, `Mqtt → MqttPublish`).
 /// This is a **separate** mapping from the `brenn-wasm::Capability` conversion at
 /// the bootstrap linker seam (which Phase 0–1 do not touch); it exists so the
 /// unified policy model spans both app kinds. WASM publishes to / subscribes from
 /// `brenn:` channels (`brenn_subscribe`/`brenn_publish`, validated identically to
 /// the LLM side via `resolve_channel`); with the `mqtt` grant, publishes MQTT
-/// (`mqtt_publish`, the same `client`-keyed `MqttClientMatcher` as the LLM side —
-/// mqtt-egress-unify design §2.5); and subscribes to inbound `mqtt:`/`webhook:`
+/// (`mqtt_publish`, the same `client`-keyed `MqttClientMatcher` as the LLM side);
+/// and subscribes to inbound `mqtt:`/`webhook:`
 /// channels (`mqtt_subscribe`/`webhook`, the same matcher types the LLM side
 /// resolves into).
 ///
 /// Like `subscribe_acl` (which derives `MessagingSubscribe`), a non-empty
 /// `mqtt_subscribe_acl` derives the `MqttSubscribe` grant and a non-empty
 /// `webhook_acl` derives the `Webhook` grant: there is no "subscribe" WIT
-/// interface for these transports and therefore no `WasmGrant` token that maps to
+/// interface for these transports and therefore no `ComponentGrant` token that maps to
 /// them — a WASM consumer's inbound subscriptions are declared statically in
 /// config, not exercised through a host function, so the presence of the ACL list
 /// is the operator's statement that the consumer may hold such a subscription.
@@ -237,7 +230,7 @@ pub fn build_app_policy(
 /// only the delivery-time ACL gate consumes this policy today.
 ///
 /// The production caller (`brenn_messaging_boot::resolve_wasm_consumers`)
-/// iterates an already-deduplicated `BTreeSet<WasmGrant>`, so a duplicate grant
+/// iterates an already-deduplicated `BTreeSet<ComponentGrant>`, so a duplicate grant
 /// cannot reach this function via the in-tree path. The duplicate check below is
 /// nonetheless asserted (not silently absorbed) because this is a `pub`
 /// `brenn-lib` API: an out-of-tree caller could pass a non-deduplicated iterator,
@@ -246,7 +239,7 @@ pub fn build_app_policy(
 /// # Panics
 ///
 /// Panics (operator-authored config — fail-fast) on:
-/// - a duplicate `WasmGrant` in the supplied iterator (see above),
+/// - a duplicate `ComponentGrant` in the supplied iterator (see above),
 /// - a `brenn_subscribe`/`brenn_publish` channel matcher with an empty exact
 ///   value, an empty prefix, or a prefix that does not end at a segment boundary
 ///   (`/` or `.`) — same validation as the LLM channel matchers
@@ -260,10 +253,10 @@ pub fn build_app_policy(
 /// `slug` is used only for diagnostic messages on panic.
 pub fn build_wasm_policy(
     slug: &str,
-    grants: impl IntoIterator<Item = crate::messaging::config::WasmGrant>,
+    grants: impl IntoIterator<Item = crate::messaging::ComponentGrant>,
     acls: crate::access::raw::WasmAclsRaw<'_>,
 ) -> AppPolicy {
-    use crate::messaging::config::WasmGrant;
+    use crate::messaging::ComponentGrant;
 
     let crate::access::raw::WasmAclsRaw {
         subscribe: subscribe_acl,
@@ -280,16 +273,23 @@ pub fn build_wasm_policy(
     let mut grant_set = GrantSet::default();
     for grant in grants {
         let cap = match grant {
-            WasmGrant::Ports => AppCapability::MessagingPublish,
-            WasmGrant::Store => AppCapability::WasmStore,
-            WasmGrant::Log => AppCapability::WasmLog,
-            WasmGrant::Alert => AppCapability::WasmAlert,
-            WasmGrant::Config => AppCapability::WasmConfig,
-            WasmGrant::Mqtt => AppCapability::MqttPublish,
+            ComponentGrant::Ports => AppCapability::MessagingPublish,
+            ComponentGrant::Store => AppCapability::WasmStore,
+            ComponentGrant::Log => AppCapability::WasmLog,
+            ComponentGrant::Alert => AppCapability::WasmAlert,
+            ComponentGrant::Config => AppCapability::WasmConfig,
+            ComponentGrant::Mqtt => AppCapability::MqttPublish,
+            // `takeover` is a page capability and this is the backend consumer
+            // path, which has no page. The DSL refuses the word on a top-level
+            // instance, so reaching here means that refusal was bypassed.
+            ComponentGrant::Takeover => panic!(
+                "wasm component {slug:?}: granted `takeover`, which is a page capability — \
+                 a top-level consumer has no page, and the config front end refuses the word",
+            ),
         };
         // Fail-fast on a duplicate grant, mirroring `build_app_policy` above. The
         // production caller (`resolve_wasm_consumers`) iterates an already-deduped
-        // `BTreeSet<WasmGrant>` and the grant→capability map is injective, so this
+        // `BTreeSet<ComponentGrant>` and the grant→capability map is injective, so this
         // never fires on the in-tree path. It exists because this is a `pub`
         // `brenn-lib` API taking `impl IntoIterator` — an out-of-tree caller
         // (CLAUDE.md: out-of-tree components are first-class) could pass a
@@ -298,21 +298,21 @@ pub fn build_wasm_policy(
         let newly_inserted = grant_set.insert(cap);
         assert!(
             newly_inserted,
-            "wasm component {slug:?}: duplicate WasmGrant {grant:?} (maps to {cap:?}) \
+            "wasm component {slug:?}: duplicate ComponentGrant {grant:?} (maps to {cap:?}) \
              in grants iterator",
         );
     }
 
     // Imply the `MessagingSubscribe` transport grant when the operator authored any
-    // `subscribe_acl` matcher. Unlike publish (which has the `Ports` WasmGrant →
+    // `subscribe_acl` matcher. Unlike publish (which has the `Ports` ComponentGrant →
     // `MessagingPublish`), there is no "subscribe" WIT interface and therefore no
-    // `WasmGrant` that maps to `MessagingSubscribe`: a WASM consumer's input
+    // `ComponentGrant` that maps to `MessagingSubscribe`: a WASM consumer's input
     // subscriptions are declared statically in config, not exercised through a host
     // function. The delivery-time ACL gate (`allows_brenn_delivery`) requires
     // *both* the `MessagingSubscribe`
     // grant *and* a covering `brenn_subscribe` matcher; without deriving the grant
     // here, every operator-blessed `[[wasm_consumer.subscription]]` would be denied
-    // at delivery (no `WasmGrant` could ever satisfy the gate). The presence of a
+    // at delivery (no `ComponentGrant` could ever satisfy the gate). The presence of a
     // `subscribe_acl` matcher is exactly the operator's statement that this consumer
     // may hold a subscription, so it is the right signal to derive the grant from.
     // Empty `subscribe_acl` ⇒ no grant ⇒ deny-by-default (a consumer with no declared
@@ -321,7 +321,7 @@ pub fn build_wasm_policy(
     if !subscribe_acl.is_empty() {
         grant_set.insert(AppCapability::MessagingSubscribe);
     }
-    // Same derivation for the two inbound external transports: no `WasmGrant`
+    // Same derivation for the two inbound external transports: no `ComponentGrant`
     // token maps to `MqttSubscribe`/`Webhook` (a WASM consumer's inbound
     // subscriptions are static config, not host-function calls), so the presence
     // of the ACL list is the operator's authorization signal — exactly as
@@ -341,12 +341,12 @@ pub fn build_wasm_policy(
     if !local_publish_acl.is_empty() {
         grant_set.insert(AppCapability::LocalPublish);
     }
-    // No `WasmGrant` maps to `EphemeralSubscribe` (inputs are static config,
+    // No `ComponentGrant` maps to `EphemeralSubscribe` (inputs are static config,
     // not host calls); the non-empty ACL is the authorization signal.
     if !ephemeral_subscribe_acl.is_empty() {
         grant_set.insert(AppCapability::EphemeralSubscribe);
     }
-    // No `WasmGrant` maps to `LocalSubscribe`; the non-empty ACL is the
+    // No `ComponentGrant` maps to `LocalSubscribe`; the non-empty ACL is the
     // authorization signal.
     if !local_subscribe_acl.is_empty() {
         grant_set.insert(AppCapability::LocalSubscribe);
@@ -447,178 +447,125 @@ pub fn build_wasm_policy(
     }
 }
 
-/// Build the resolved `AppPolicy` for a `[[surface]]` bus participant from its
-/// authored `SurfaceGrant` set and its four channel-matcher ACL lists.
+/// Which attach-route principal a policy is being built for, and its slug.
+///
+/// Rendered by [`Display`](std::fmt::Display) into the prefix every panic in
+/// [`build_attach_policy`] carries (`surface "deskbar"` / `remote
+/// "pod-kitchen"`). A kind and a slug rather than a pre-rendered string, so no
+/// caller can spell the prefix a second way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachOwner<'a> {
+    /// A browser surface, by slug.
+    Surface(&'a str),
+    /// A native remote daemon, by slug.
+    Remote(&'a str),
+}
+
+impl std::fmt::Display for AttachOwner<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Surface(slug) => write!(f, "surface {slug:?}"),
+            Self::Remote(slug) => write!(f, "remote {slug:?}"),
+        }
+    }
+}
+
+/// Build the resolved `AppPolicy` for an attach-route principal — a
+/// `[[surface]]` or a `[[remote]]` — from its authored [`AttachGrant`] set and
+/// its four channel-matcher ACL lists.
+///
+/// One function for both, because there is one vocabulary for both: a browser
+/// page and a native daemon differ in how they authenticate and in what they
+/// are deployed beside, not in which transport rights a wire can carry.
 ///
 /// This mirrors `build_wasm_policy` in placement and panic style but differs in
 /// two deliberate ways:
 ///
 /// - **Explicit grants, not derived.** `build_wasm_policy` derives
-///   `MessagingSubscribe` from `subscribe_acl` presence because no `WasmGrant`
-///   token maps to it. The surface grant vocabulary names all four transport
-///   rights directly (`Subscribe → MessagingSubscribe`,
+///   `MessagingSubscribe` from `subscribe_acl` presence because no
+///   `ComponentGrant` token maps to it. The attach vocabulary names all four
+///   transport rights directly (`Subscribe → MessagingSubscribe`,
 ///   `Publish → MessagingPublish`, `EphemeralSubscribe → EphemeralSubscribe`,
 ///   `EphemeralPublish → EphemeralPublish`), so there is no missing-token gap
 ///   to paper over: a right is held iff its grant is authored, and
 ///   deny-by-default reads straight off the config.
-/// - **Four ACL classes.** A surface may hold durable *and* ephemeral
+/// - **Four ACL classes.** An attacher may hold durable *and* ephemeral
 ///   subscribe/publish ACLs, so all four lists (`subscribe`/`publish` →
 ///   `brenn_subscribe`/`brenn_publish`; `ephemeral_subscribe`/`ephemeral_publish`
 ///   → the matching `AclSet` fields) resolve here, each via `resolve_channel`.
 ///
-/// Grant/ACL inconsistency (a grant with no covering matcher, or matchers with
-/// no grant) is **not** a boot panic — it matches today's LLM-app behavior,
-/// where the two-factor policy check simply denies; the checks that matter
-/// (binding coverage) live in surface boot-resolution.
+/// Whether grant/ACL inconsistency is refused is the caller's to decide, and
+/// the two callers decide differently: a surface's is not a boot panic (it
+/// matches LLM-app behavior, where the two-factor check simply denies, and the
+/// checks that matter are binding coverage in surface boot-resolution), while a
+/// remote's is refused in `messaging::remote::resolve_remotes`. This function is
+/// the lowering, and the policy shape alone cannot say which direction an
+/// operator meant to authorize.
 ///
 /// # Panics
 ///
 /// Panics (operator-authored config — fail-fast) on:
-/// - a duplicate `SurfaceGrant` in the supplied iterator (each grant at most
+/// - a duplicate [`AttachGrant`] in the supplied iterator (each grant at most
 ///   once; mirrors `build_wasm_policy`, and this is a `pub` API an out-of-tree
 ///   caller could feed a non-deduplicated iterator),
 /// - any of the four ACL lists containing a channel matcher with an empty exact
 ///   value, an empty prefix, or a non-segment-boundary prefix (same
 ///   `resolve_channel` validation as every other channel ACL).
 ///
-/// `slug` is used only for diagnostic messages on panic.
-pub fn build_surface_policy(
-    slug: &str,
-    grants: impl IntoIterator<Item = crate::messaging::config::SurfaceGrant>,
-    subscribe_acl: &[ChannelMatcherRaw],
-    publish_acl: &[ChannelMatcherRaw],
-    ephemeral_subscribe_acl: &[ChannelMatcherRaw],
-    ephemeral_publish_acl: &[ChannelMatcherRaw],
+/// `owner` names the principal and prefixes every panic; it is rendered here, so
+/// the one spelling lives with the panics that use it.
+pub fn build_attach_policy(
+    owner: AttachOwner<'_>,
+    grants: impl IntoIterator<Item = crate::messaging::AttachGrant>,
+    acls: crate::access::raw::AttachAclsRaw<'_>,
 ) -> AppPolicy {
-    use crate::messaging::config::SurfaceGrant;
+    use crate::messaging::AttachGrant;
 
-    build_attach_policy(
-        &format!("surface {slug:?}"),
-        grants.into_iter().map(|grant| {
-            let cap = match grant {
-                SurfaceGrant::Subscribe => AppCapability::MessagingSubscribe,
-                SurfaceGrant::Publish => AppCapability::MessagingPublish,
-                SurfaceGrant::EphemeralSubscribe => AppCapability::EphemeralSubscribe,
-                SurfaceGrant::EphemeralPublish => AppCapability::EphemeralPublish,
-                SurfaceGrant::Alert => AppCapability::SurfaceAlert,
-                SurfaceGrant::Takeover => AppCapability::SurfaceTakeover,
-            };
-            (cap, format!("SurfaceGrant {grant:?}"))
-        }),
-        AttachAclsRaw {
-            subscribe: subscribe_acl,
-            publish: publish_acl,
-            ephemeral_subscribe: ephemeral_subscribe_acl,
-            ephemeral_publish: ephemeral_publish_acl,
-        },
-    )
-}
+    let crate::access::raw::AttachAclsRaw {
+        subscribe: subscribe_acl,
+        publish: publish_acl,
+        ephemeral_subscribe: ephemeral_subscribe_acl,
+        ephemeral_publish: ephemeral_publish_acl,
+    } = acls;
+    let owner = owner.to_string();
+    let owner = owner.as_str();
 
-/// Build the resolved `AppPolicy` for a `[[remote]]` bus participant from its
-/// authored `RemoteGrant` set and its four channel-matcher ACL lists.
-///
-/// The remote grant vocabulary is the surface's minus `Takeover` (a
-/// rendering-application right no daemon can exercise), and the lowering is
-/// otherwise identical — both are attach-route principals holding transport
-/// rights over the same two schemes, so they share [`build_attach_policy`]
-/// rather than each carrying a copy of the ACL construction.
-///
-/// Unlike a surface's, a remote's grant/ACL consistency **is** checked, but at
-/// boot resolution (`messaging::remote::resolve_remotes`), not here: this
-/// function is the lowering, and the policy shape alone cannot say which
-/// direction an operator meant to authorize.
-///
-/// # Panics
-///
-/// Same two families as [`build_surface_policy`]: a duplicate grant in the
-/// supplied iterator, or a matcher `resolve_channel` rejects.
-///
-/// `slug` is used only for diagnostic messages on panic.
-pub fn build_remote_policy(
-    slug: &str,
-    grants: impl IntoIterator<Item = crate::messaging::remote::RemoteGrant>,
-    subscribe_acl: &[ChannelMatcherRaw],
-    publish_acl: &[ChannelMatcherRaw],
-    ephemeral_subscribe_acl: &[ChannelMatcherRaw],
-    ephemeral_publish_acl: &[ChannelMatcherRaw],
-) -> AppPolicy {
-    use crate::messaging::remote::RemoteGrant;
-
-    build_attach_policy(
-        &format!("remote {slug:?}"),
-        grants.into_iter().map(|grant| {
-            let cap = match grant {
-                RemoteGrant::Subscribe => AppCapability::MessagingSubscribe,
-                RemoteGrant::Publish => AppCapability::MessagingPublish,
-                RemoteGrant::EphemeralSubscribe => AppCapability::EphemeralSubscribe,
-                RemoteGrant::EphemeralPublish => AppCapability::EphemeralPublish,
-                RemoteGrant::Alert => AppCapability::SurfaceAlert,
-            };
-            (cap, format!("RemoteGrant {grant:?}"))
-        }),
-        AttachAclsRaw {
-            subscribe: subscribe_acl,
-            publish: publish_acl,
-            ephemeral_subscribe: ephemeral_subscribe_acl,
-            ephemeral_publish: ephemeral_publish_acl,
-        },
-    )
-}
-
-/// The four ACL matcher lists an attach-route principal authors, named so the
-/// two same-typed subscribe/publish slices cannot be transposed at a call site.
-struct AttachAclsRaw<'a> {
-    subscribe: &'a [ChannelMatcherRaw],
-    publish: &'a [ChannelMatcherRaw],
-    ephemeral_subscribe: &'a [ChannelMatcherRaw],
-    ephemeral_publish: &'a [ChannelMatcherRaw],
-}
-
-/// The lowering both attach-route principals share: capabilities already mapped
-/// from the route's own grant vocabulary, plus the four channel-matcher lists.
-///
-/// `caps` yields `(capability, authoring token)` pairs; the token appears only
-/// in the duplicate-grant panic, so each route's diagnostics name the enum the
-/// operator actually wrote. `owner` prefixes every panic
-/// (`surface "deskbar"` / `remote "pod-kitchen"`).
-fn build_attach_policy(
-    owner: &str,
-    caps: impl IntoIterator<Item = (AppCapability, String)>,
-    acls: AttachAclsRaw<'_>,
-) -> AppPolicy {
     let mut grant_set = GrantSet::default();
-    for (cap, token) in caps {
+    for grant in grants {
+        let cap = match grant {
+            AttachGrant::Subscribe => AppCapability::MessagingSubscribe,
+            AttachGrant::Publish => AppCapability::MessagingPublish,
+            AttachGrant::EphemeralSubscribe => AppCapability::EphemeralSubscribe,
+            AttachGrant::EphemeralPublish => AppCapability::EphemeralPublish,
+            AttachGrant::Alert => AppCapability::SurfaceAlert,
+        };
         // Fail-fast on a duplicate grant, mirroring `build_wasm_policy`. The
         // grant→capability map is injective, so a resolved (deduplicated) grant
-        // set never trips this on the in-tree path; it exists because these are
-        // `pub` `brenn-lib` APIs taking `impl IntoIterator` — an out-of-tree
+        // set never trips this on the in-tree path; it exists because this is a
+        // `pub` `brenn-lib` API taking `impl IntoIterator` — an out-of-tree
         // caller could pass a non-deduplicated iterator, and silent absorption
         // would violate the project's fail-fast posture.
         let newly_inserted = grant_set.insert(cap);
         assert!(
             newly_inserted,
-            "{owner}: duplicate {token} (maps to {cap:?}) in grants iterator",
+            "{owner}: duplicate AttachGrant {grant:?} (maps to {cap:?}) in grants iterator",
         );
     }
 
     let resolved = AclSet {
-        brenn_subscribe: acls
-            .subscribe
+        brenn_subscribe: subscribe_acl
             .iter()
             .map(|m| resolve_channel(owner, "subscribe_acl", m))
             .collect(),
-        brenn_publish: acls
-            .publish
+        brenn_publish: publish_acl
             .iter()
             .map(|m| resolve_channel(owner, "publish_acl", m))
             .collect(),
-        ephemeral_subscribe: acls
-            .ephemeral_subscribe
+        ephemeral_subscribe: ephemeral_subscribe_acl
             .iter()
             .map(|m| resolve_channel(owner, "ephemeral_subscribe_acl", m))
             .collect(),
-        ephemeral_publish: acls
-            .ephemeral_publish
+        ephemeral_publish: ephemeral_publish_acl
             .iter()
             .map(|m| resolve_channel(owner, "ephemeral_publish_acl", m))
             .collect(),
@@ -712,7 +659,7 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
 mod tests {
     use super::*;
     use crate::access::raw::{
-        MqttClientMatcherRaw, MqttSubMatcherRaw, WasmAclsRaw, WebhookMatcherRaw,
+        AttachAclsRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WasmAclsRaw, WebhookMatcherRaw,
     };
 
     /// A minimal resolved `MqttClientConfig` for the given slug, for the
@@ -886,21 +833,10 @@ mod tests {
     #[should_panic(expected = "not authorable on an LLM app")]
     fn surface_alert_grant_token_in_llm_grants_panics() {
         // `SurfaceAlert` deserializes from an LLM `grants` list (whole enum derives
-        // Deserialize) but is a surface-only capability authored as `SurfaceGrant`
-        // on a `[[surface]]`; it has no LLM-app enforcement point and must be
-        // rejected at the resolution boundary.
+        // Deserialize) but is an attach-route capability authored as `AttachGrant`
+        // on a `[[surface]]` or `[[remote]]`; it has no LLM-app enforcement point
+        // and must be rejected at the resolution boundary.
         let grants = vec![AppCapability::SurfaceAlert];
-        build_app_policy("home", &grants, &AppAclRaw::default(), &clients(&[]));
-    }
-
-    #[test]
-    #[should_panic(expected = "not authorable on an LLM app")]
-    fn surface_takeover_grant_token_in_llm_grants_panics() {
-        // `SurfaceTakeover` deserializes from an LLM `grants` list but is a
-        // surface-only capability authored as `SurfaceGrant` on a `[[surface]]`;
-        // it has no LLM-app enforcement point and must be rejected at the
-        // resolution boundary.
-        let grants = vec![AppCapability::SurfaceTakeover];
         build_app_policy("home", &grants, &AppAclRaw::default(), &clients(&[]));
     }
 
@@ -1152,7 +1088,7 @@ mod tests {
         let local_acl = [ChannelMatcherRaw::Exact("tick".to_string())];
         let policy = build_wasm_policy(
             "ticker",
-            [WasmGrant::Ports],
+            [ComponentGrant::Ports],
             WasmAclsRaw {
                 local_publish: &local_acl,
                 ..Default::default()
@@ -1269,23 +1205,23 @@ mod tests {
         build_app_policy("home", &[], &acl, &clients(&[]));
     }
 
-    // --- WASM policy build (§2.5.4) ---
+    // --- WASM policy build ---
 
-    use crate::messaging::config::WasmGrant;
+    use crate::messaging::ComponentGrant;
 
     #[test]
     fn wasm_grants_map_to_unified_capabilities() {
-        // Every WasmGrant maps to its unified AppCapability (§2.5.4 table); a grant
-        // not in the set is denied (deny-by-default).
+        // Every ComponentGrant maps to one unified AppCapability; a grant not in
+        // the set is denied (deny-by-default).
         let policy = build_wasm_policy(
             "proc",
             [
-                WasmGrant::Ports,
-                WasmGrant::Store,
-                WasmGrant::Log,
-                WasmGrant::Alert,
-                WasmGrant::Config,
-                WasmGrant::Mqtt,
+                ComponentGrant::Ports,
+                ComponentGrant::Store,
+                ComponentGrant::Log,
+                ComponentGrant::Alert,
+                ComponentGrant::Config,
+                ComponentGrant::Mqtt,
             ],
             WasmAclsRaw::default(),
         );
@@ -1303,7 +1239,7 @@ mod tests {
     #[test]
     fn wasm_subset_of_grants_only_sets_those() {
         // A partial grant set maps only the granted variants.
-        let policy = build_wasm_policy("proc", [WasmGrant::Log], WasmAclsRaw::default());
+        let policy = build_wasm_policy("proc", [ComponentGrant::Log], WasmAclsRaw::default());
         assert!(policy.has_grant(AppCapability::WasmLog));
         assert!(!policy.has_grant(AppCapability::MessagingPublish));
         assert!(!policy.has_grant(AppCapability::WasmStore));
@@ -1323,7 +1259,7 @@ mod tests {
         let publish_acl = vec![ChannelMatcherRaw::Exact("outbox".to_string())];
         let policy = build_wasm_policy(
             "proc",
-            [WasmGrant::Ports],
+            [ComponentGrant::Ports],
             WasmAclsRaw {
                 subscribe: &subscribe_acl,
                 publish: &publish_acl,
@@ -1349,7 +1285,7 @@ mod tests {
     #[test]
     fn wasm_subscribe_acl_derives_messaging_subscribe_grant_and_passes_delivery() {
         // Production-path regression guard (security-2): a WASM consumer's policy
-        // is built ONLY via `build_wasm_policy`. There is no `WasmGrant` that maps
+        // is built ONLY via `build_wasm_policy`. There is no `ComponentGrant` that maps
         // to `MessagingSubscribe`, so before this fix a subscribed consumer could
         // never pass `allows_channel_access` and every `[[wasm_consumer.subscription]]`
         // silently stopped delivering. A non-empty `subscribe_acl` now derives the
@@ -1387,16 +1323,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate WasmGrant")]
+    #[should_panic(expected = "duplicate ComponentGrant")]
     fn wasm_duplicate_grant_panics() {
         // The in-tree caller passes a deduped BTreeSet, but this `pub` API also
         // accepts a raw iterator; a duplicate must fail fast rather than be
         // silently absorbed (mirrors build_app_policy's duplicate check).
         build_wasm_policy(
             "proc",
-            [WasmGrant::Log, WasmGrant::Log],
+            [ComponentGrant::Log, ComponentGrant::Log],
             WasmAclsRaw::default(),
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "a top-level consumer has no page")]
+    fn wasm_page_capability_grant_panics() {
+        // Same reasoning as the duplicate check above: the DSL refuses `takeover`
+        // on a top-level instance and boot refuses it again, so the in-tree path
+        // never reaches this arm — but an out-of-tree caller of this `pub` API
+        // must be told which of its words has no meaning here, rather than
+        // getting a policy that silently drops one.
+        build_wasm_policy("proc", [ComponentGrant::Takeover], WasmAclsRaw::default());
     }
 
     #[test]
@@ -1444,7 +1391,7 @@ mod tests {
         ];
         let policy = build_wasm_policy(
             "proc",
-            [WasmGrant::Mqtt],
+            [ComponentGrant::Mqtt],
             WasmAclsRaw {
                 mqtt_publish: &mqtt_publish_acl,
                 ..Default::default()
@@ -1472,7 +1419,7 @@ mod tests {
     fn wasm_mqtt_publish_acl_empty_denies_by_default() {
         // Grant held, empty matcher list ⇒ every client denied (`.any` over empty
         // = false), the deny-by-default invariant (design §3.4).
-        let policy = build_wasm_policy("proc", [WasmGrant::Mqtt], WasmAclsRaw::default());
+        let policy = build_wasm_policy("proc", [ComponentGrant::Mqtt], WasmAclsRaw::default());
         assert!(policy.has_grant(AppCapability::MqttPublish));
         assert!(policy.acls.mqtt_publish.is_empty());
         assert!(!policy.allows_mqtt_publish("home"));
@@ -1485,7 +1432,7 @@ mod tests {
         // `validate_mqtt_client` charset check (mqtt-egress-unify design §2.5).
         build_wasm_policy(
             "proc",
-            [WasmGrant::Mqtt],
+            [ComponentGrant::Mqtt],
             WasmAclsRaw {
                 mqtt_publish: &[MqttClientMatcherRaw {
                     client: "bad:slug".to_string(),
@@ -1498,7 +1445,7 @@ mod tests {
     #[test]
     fn wasm_mqtt_subscribe_acl_derives_grant_resolves_and_gates_delivery() {
         // A non-empty `mqtt_subscribe_acl` derives the `MqttSubscribe` grant (no
-        // WasmGrant maps to it) and resolves into the same `(client, topic_filter)`
+        // ComponentGrant maps to it) and resolves into the same `(client, topic_filter)`
         // `MqttSubMatcher` the LLM side uses. The delivery gate passes for a covered
         // `mqtt:` channel and denies wrong-client / broader-filter requests.
         let mqtt_subscribe_acl = vec![MqttSubMatcherRaw {
@@ -1574,7 +1521,7 @@ mod tests {
 
     #[test]
     fn wasm_webhook_acl_derives_grant_resolves_and_gates_delivery() {
-        // A non-empty `webhook_acl` derives the `Webhook` grant (no WasmGrant maps
+        // A non-empty `webhook_acl` derives the `Webhook` grant (no ComponentGrant maps
         // to it) and resolves into the same endpoint-slug `WebhookMatcher` the LLM
         // side uses. The delivery gate passes for a covered `webhook:` channel and
         // denies an uncovered endpoint.
@@ -1627,27 +1574,21 @@ mod tests {
         );
     }
 
-    // ---- build_surface_policy ----------------------------------------------
+    // ---- build_attach_policy: surface ----------------------------------------
 
-    use crate::messaging::config::SurfaceGrant;
+    use crate::messaging::AttachGrant;
 
     #[test]
     fn surface_grants_map_to_unified_capabilities() {
-        // Every SurfaceGrant maps to its unified AppCapability directly (no
-        // derivation): Subscribe→MessagingSubscribe, Publish→MessagingPublish,
-        // EphemeralSubscribe→EphemeralSubscribe, EphemeralPublish→EphemeralPublish.
-        let policy = build_surface_policy(
-            "deskbar",
+        let policy = build_attach_policy(
+            AttachOwner::Surface("deskbar"),
             [
-                SurfaceGrant::Subscribe,
-                SurfaceGrant::Publish,
-                SurfaceGrant::EphemeralSubscribe,
-                SurfaceGrant::EphemeralPublish,
+                AttachGrant::Subscribe,
+                AttachGrant::Publish,
+                AttachGrant::EphemeralSubscribe,
+                AttachGrant::EphemeralPublish,
             ],
-            &[],
-            &[],
-            &[],
-            &[],
+            AttachAclsRaw::default(),
         );
         assert!(policy.has_grant(AppCapability::MessagingSubscribe));
         assert!(policy.has_grant(AppCapability::MessagingPublish));
@@ -1660,39 +1601,23 @@ mod tests {
 
     #[test]
     fn surface_alert_grant_maps_to_surface_alert_capability() {
-        // SurfaceGrant::Alert maps to the surface-only AppCapability::SurfaceAlert
-        // (distinct from WasmAlert), and carries no ACL — it is a pure capability
-        // grant like the WASM alert host interface.
-        let policy = build_surface_policy("deskbar", [SurfaceGrant::Alert], &[], &[], &[], &[]);
+        let policy = build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [AttachGrant::Alert],
+            AttachAclsRaw::default(),
+        );
         assert!(policy.has_grant(AppCapability::SurfaceAlert));
-        // It grants nothing else, and is not conflated with WasmAlert.
         assert!(!policy.has_grant(AppCapability::WasmAlert));
         assert!(!policy.has_grant(AppCapability::MessagingPublish));
     }
 
     #[test]
-    fn surface_takeover_grant_maps_to_surface_takeover_capability() {
-        // SurfaceGrant::Takeover maps to the surface-only
-        // AppCapability::SurfaceTakeover (distinct from SurfaceAlert), carrying
-        // no ACL — a pure capability grant like the alert plane.
-        let policy = build_surface_policy("deskbar", [SurfaceGrant::Takeover], &[], &[], &[], &[]);
-        assert!(policy.has_grant(AppCapability::SurfaceTakeover));
-        // It grants nothing else, and is not conflated with the alert plane.
-        assert!(!policy.has_grant(AppCapability::SurfaceAlert));
-        assert!(!policy.has_grant(AppCapability::MessagingPublish));
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate SurfaceGrant")]
+    #[should_panic(expected = "duplicate AttachGrant")]
     fn surface_duplicate_alert_grant_panics() {
-        // Duplicate-grant rejection covers the new Alert grant too.
-        build_surface_policy(
-            "deskbar",
-            [SurfaceGrant::Alert, SurfaceGrant::Alert],
-            &[],
-            &[],
-            &[],
-            &[],
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [AttachGrant::Alert, AttachGrant::Alert],
+            AttachAclsRaw::default(),
         );
     }
 
@@ -1702,13 +1627,13 @@ mod tests {
         // exactly that capability, even though an ephemeral_subscribe_acl is
         // present — presence of a matcher list does NOT imply the grant (unlike
         // build_wasm_policy's subscribe_acl derivation).
-        let policy = build_surface_policy(
-            "deskbar",
-            [SurfaceGrant::EphemeralSubscribe],
-            &[],
-            &[],
-            &[ChannelMatcherRaw::Exact("protobar-demo".to_string())],
-            &[],
+        let policy = build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [AttachGrant::EphemeralSubscribe],
+            AttachAclsRaw {
+                ephemeral_subscribe: &[ChannelMatcherRaw::Exact("protobar-demo".to_string())],
+                ..Default::default()
+            },
         );
         assert!(policy.has_grant(AppCapability::EphemeralSubscribe));
         assert!(!policy.has_grant(AppCapability::MessagingSubscribe));
@@ -1718,22 +1643,20 @@ mod tests {
 
     #[test]
     fn surface_acls_resolve_to_matching_lists_and_authorize() {
-        // The four ACL lists resolve onto brenn_subscribe/brenn_publish and
-        // ephemeral_subscribe/ephemeral_publish respectively, with bare-name
-        // matcher values; the two-factor delivery/publish
-        // checks pass for a covered channel and deny an uncovered one.
-        let policy = build_surface_policy(
-            "deskbar",
+        let policy = build_attach_policy(
+            AttachOwner::Surface("deskbar"),
             [
-                SurfaceGrant::Subscribe,
-                SurfaceGrant::Publish,
-                SurfaceGrant::EphemeralSubscribe,
-                SurfaceGrant::EphemeralPublish,
+                AttachGrant::Subscribe,
+                AttachGrant::Publish,
+                AttachGrant::EphemeralSubscribe,
+                AttachGrant::EphemeralPublish,
             ],
-            &[ChannelMatcherRaw::Exact("alerts.high".to_string())],
-            &[ChannelMatcherRaw::Exact("outbox".to_string())],
-            &[ChannelMatcherRaw::Exact("protobar-demo".to_string())],
-            &[ChannelMatcherRaw::Exact("telemetry".to_string())],
+            AttachAclsRaw {
+                subscribe: &[ChannelMatcherRaw::Exact("alerts.high".to_string())],
+                publish: &[ChannelMatcherRaw::Exact("outbox".to_string())],
+                ephemeral_subscribe: &[ChannelMatcherRaw::Exact("protobar-demo".to_string())],
+                ephemeral_publish: &[ChannelMatcherRaw::Exact("telemetry".to_string())],
+            },
         );
         assert_eq!(
             policy.acls.brenn_subscribe,
@@ -1768,8 +1691,11 @@ mod tests {
 
     #[test]
     fn surface_empty_yields_default_deny() {
-        // No grants, no ACLs ⇒ every right denied (deny-by-default).
-        let policy = build_surface_policy("deskbar", [], &[], &[], &[], &[]);
+        let policy = build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [],
+            AttachAclsRaw::default(),
+        );
         assert!(!policy.has_grant(AppCapability::MessagingSubscribe));
         assert!(!policy.has_grant(AppCapability::MessagingPublish));
         assert!(!policy.has_grant(AppCapability::EphemeralSubscribe));
@@ -1783,16 +1709,12 @@ mod tests {
 
     #[test]
     fn surface_grant_without_matchers_denies_by_default() {
-        // A grant held with an empty matcher list ⇒ every channel denied
-        // (`.any` over empty = false). Grant/ACL inconsistency is not a boot
-        // panic — the two-factor check simply denies.
-        let policy = build_surface_policy(
-            "deskbar",
-            [SurfaceGrant::EphemeralSubscribe],
-            &[],
-            &[],
-            &[],
-            &[],
+        // Grant/ACL inconsistency is not a boot panic for a surface — the
+        // two-factor check simply denies.
+        let policy = build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [AttachGrant::EphemeralSubscribe],
+            AttachAclsRaw::default(),
         );
         assert!(policy.has_grant(AppCapability::EphemeralSubscribe));
         assert!(policy.acls.ephemeral_subscribe.is_empty());
@@ -1800,98 +1722,93 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate SurfaceGrant")]
+    #[should_panic(expected = "duplicate AttachGrant")]
     fn surface_duplicate_grant_panics() {
         // Mirrors build_wasm_policy: this `pub` API accepts a raw iterator, so a
         // duplicate must fail fast rather than be silently absorbed.
-        build_surface_policy(
-            "deskbar",
-            [SurfaceGrant::Subscribe, SurfaceGrant::Subscribe],
-            &[],
-            &[],
-            &[],
-            &[],
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [AttachGrant::Subscribe, AttachGrant::Subscribe],
+            AttachAclsRaw::default(),
         );
     }
 
     #[test]
     #[should_panic(expected = "subscribe_acl prefix matcher")]
     fn surface_non_boundary_subscribe_prefix_panics() {
-        build_surface_policy(
-            "deskbar",
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
             [],
-            &[ChannelMatcherRaw::Prefix("alert".to_string())],
-            &[],
-            &[],
-            &[],
+            AttachAclsRaw {
+                subscribe: &[ChannelMatcherRaw::Prefix("alert".to_string())],
+                ..Default::default()
+            },
         );
     }
 
     #[test]
     #[should_panic(expected = "publish_acl exact matcher is empty")]
     fn surface_empty_publish_exact_panics() {
-        build_surface_policy(
-            "deskbar",
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
             [],
-            &[],
-            &[ChannelMatcherRaw::Exact(String::new())],
-            &[],
-            &[],
+            AttachAclsRaw {
+                publish: &[ChannelMatcherRaw::Exact(String::new())],
+                ..Default::default()
+            },
         );
     }
 
     #[test]
     #[should_panic(expected = "ephemeral_subscribe_acl prefix matcher")]
     fn surface_non_boundary_ephemeral_subscribe_prefix_panics() {
-        build_surface_policy(
-            "deskbar",
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
             [],
-            &[],
-            &[],
-            &[ChannelMatcherRaw::Prefix("proto".to_string())],
-            &[],
+            AttachAclsRaw {
+                ephemeral_subscribe: &[ChannelMatcherRaw::Prefix("proto".to_string())],
+                ..Default::default()
+            },
         );
     }
 
     #[test]
     #[should_panic(expected = "ephemeral_publish_acl exact matcher is empty")]
     fn surface_empty_ephemeral_publish_exact_panics() {
-        build_surface_policy(
-            "deskbar",
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
             [],
-            &[],
-            &[],
-            &[],
-            &[ChannelMatcherRaw::Exact(String::new())],
+            AttachAclsRaw {
+                ephemeral_publish: &[ChannelMatcherRaw::Exact(String::new())],
+                ..Default::default()
+            },
         );
     }
 
-    // ---- build_remote_policy -----------------------------------------------
-
-    use crate::messaging::remote::RemoteGrant;
+    // ---- build_attach_policy: remote -----------------------------------------
 
     #[test]
     fn remote_grants_map_to_the_same_attach_capabilities() {
-        let policy = build_remote_policy(
-            "pod-kitchen",
+        let policy = build_attach_policy(
+            AttachOwner::Remote("pod-kitchen"),
             [
-                RemoteGrant::Subscribe,
-                RemoteGrant::Publish,
-                RemoteGrant::EphemeralSubscribe,
-                RemoteGrant::EphemeralPublish,
-                RemoteGrant::Alert,
+                AttachGrant::Subscribe,
+                AttachGrant::Publish,
+                AttachGrant::EphemeralSubscribe,
+                AttachGrant::EphemeralPublish,
+                AttachGrant::Alert,
             ],
-            &[ChannelMatcherRaw::Prefix("chat.app.home.out.".to_string())],
-            &[ChannelMatcherRaw::Prefix("chat.app.home.in.".to_string())],
-            &[],
-            &[],
+            AttachAclsRaw {
+                subscribe: &[ChannelMatcherRaw::Prefix("chat.app.home.out.".to_string())],
+                publish: &[ChannelMatcherRaw::Prefix("chat.app.home.in.".to_string())],
+                ..Default::default()
+            },
         );
         assert!(policy.has_grant(AppCapability::MessagingSubscribe));
         assert!(policy.has_grant(AppCapability::MessagingPublish));
         assert!(policy.has_grant(AppCapability::EphemeralSubscribe));
         assert!(policy.has_grant(AppCapability::EphemeralPublish));
         assert!(policy.has_grant(AppCapability::SurfaceAlert));
-        assert!(!policy.has_grant(AppCapability::SurfaceTakeover));
         assert!(policy.allows_channel_access("brenn:chat.app.home.out.42"));
         assert!(policy.allows_brenn_publish("chat.app.home.in.42"));
         // Directions do not leak into each other.
@@ -1899,28 +1816,25 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "remote \"pod-kitchen\": duplicate RemoteGrant Publish")]
+    #[should_panic(expected = "remote \"pod-kitchen\": duplicate AttachGrant Publish")]
     fn remote_duplicate_grant_panics_naming_the_remote() {
-        build_remote_policy(
-            "pod-kitchen",
-            [RemoteGrant::Publish, RemoteGrant::Publish],
-            &[],
-            &[],
-            &[],
-            &[],
+        build_attach_policy(
+            AttachOwner::Remote("pod-kitchen"),
+            [AttachGrant::Publish, AttachGrant::Publish],
+            AttachAclsRaw::default(),
         );
     }
 
     #[test]
     #[should_panic(expected = "remote \"pod-kitchen\": subscribe_acl prefix matcher")]
     fn remote_non_boundary_subscribe_prefix_panics() {
-        build_remote_policy(
-            "pod-kitchen",
+        build_attach_policy(
+            AttachOwner::Remote("pod-kitchen"),
             [],
-            &[ChannelMatcherRaw::Prefix("chat".to_string())],
-            &[],
-            &[],
-            &[],
+            AttachAclsRaw {
+                subscribe: &[ChannelMatcherRaw::Prefix("chat".to_string())],
+                ..Default::default()
+            },
         );
     }
 }

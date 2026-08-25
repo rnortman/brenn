@@ -301,6 +301,34 @@ fn the_alert_grant_is_lowered_from_the_resolved_policy() {
     assert!(granted.profile.alert_granted());
 }
 
+/// **The two scopes of the alert plane are independent answers.** The surface's
+/// grant is its transport right toward the backend; a component's is its right to
+/// spend it. A profile that folded them would either let every component of an
+/// alerting surface page (containment gone) or none of them (the grant dead),
+/// and both read identically from the surface's own flag.
+#[test]
+fn only_the_instances_granted_alert_are_alertable() {
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::SurfaceAlert);
+    let resolved = SurfaceFixture::new("deskbar", "chrome")
+        .processor("mode", "mode-clock", Default::default())
+        .policy(policy)
+        .grant("mode", ComponentGrant::Alert)
+        .build();
+    let profile = build_profile(&resolved);
+
+    assert!(profile.alert_granted(), "the surface holds the plane");
+    assert!(profile.attribution_may_alert("mode"));
+    assert!(
+        !profile.attribution_may_alert("chrome"),
+        "a declared instance that was granted nothing may not page"
+    );
+    assert!(
+        !profile.attribution_may_alert("ghost"),
+        "an undeclared name holds nothing"
+    );
+}
+
 /// The burst must cover a boot-valid maximum-size surface's first-connect
 /// reconcile — one `Subscribe` per bound channel in one burst — or a legitimate
 /// connect becomes a violation. Asserted against the binding maximum, so the

@@ -27,7 +27,6 @@ component Protobar {
 
 component EchoStub {
     abi = processor;
-    component_path = f"{components_dir}/brenn_echo_stub.wasm";
     in inbound: "brenn.panel.message@1";
     out outbound;
     io acks;
@@ -37,7 +36,6 @@ component EchoStub {
 // keywords, so a port literally named `in` reads as `in in <- …`.
 component Reserved {
     abi = processor;
-    component_path = f"{components_dir}/brenn_reserved.wasm";
     in in;
     out out;
 }
@@ -82,11 +80,14 @@ assembly Deskbar(slug: String, driver: Agent) {
         acl subscribe [prefix f"brenn:{slug}."];
 
         new p1: Protobar {
+            grants = [ports, log];
+            acl subscribe [prefix f"brenn:{slug}."];
             in messages <- messages_p1;
             io tick { push_depth = 1; retain_depth = 2; }
         }
 
         new echo: EchoStub {
+            grants = [ports, takeover];
             io acks <-> acks;
             out outbound -> "local:brenn/takeover";
             in inbound <- "local:brenn/theme" { push_depth = 8; }
@@ -102,6 +103,7 @@ new alice_desk: Deskbar(slug = "alice-desk", driver = alice_pa);
 
 new consume_demo: EchoStub {
     slug = "consume-demo";
+    component_path = f"{components_dir}/brenn_echo_stub.wasm";
     grants = [ports];
 
     in inbound <- "webhook:push-alice" { push_depth = 50; noise = alarm; }
@@ -110,6 +112,7 @@ new consume_demo: EchoStub {
 
 new reserved_demo: Reserved {
     slug = "reserved-demo";
+    component_path = f"{components_dir}/brenn_reserved.wasm";
     grants = [ports];
 
     in in <- "webhook:push-bob" { push_depth = 4; }

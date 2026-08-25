@@ -1769,9 +1769,12 @@ async fn an_alert_reaches_the_peer_on_a_granted_attachment() {
     )
     .await;
 
-    running
-        .handle
-        .alert(AlertSeverity::Warning, "wall down", "the wall is down");
+    running.handle.alert(
+        None,
+        AlertSeverity::Warning,
+        "wall down",
+        "the wall is down",
+    );
 
     wait_until(|| !controls.alerts().is_empty()).await;
     assert_eq!(
@@ -1867,6 +1870,7 @@ async fn the_best_effort_planes_are_absorbed_after_the_attachment_ended() {
         .front
         .alert_tx
         .try_send(AlertCommand {
+            attribution: None,
             severity: AlertSeverity::Warning,
             title: "late".to_string(),
             body: "later".to_string(),

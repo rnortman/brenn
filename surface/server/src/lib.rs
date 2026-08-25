@@ -335,8 +335,8 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
     );
     // Kind-grain checks (asset existence, manifest, profile) run once per
     // distinct kind across the whole config — several instances, on one surface
-    // or several, share one artifact. Alert-grant checking is per declaring
-    // surface, so the validated manifests are kept for that second pass.
+    // or several, share one artifact. Import⊆grants is per instance, so the
+    // validated manifests are kept for that second pass.
     let mut manifests: HashMap<&str, processor_assets::ProcessorManifest> = HashMap::new();
     let mut seen_dom: HashSet<&str> = HashSet::new();
     for surface in surfaces {
@@ -367,14 +367,19 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
             }
         }
     }
+    // Import⊆grants is per *instance*: sibling instances of one kind may hold
+    // different grants, so the question is asked once per declaration rather
+    // than once per kind.
     for surface in surfaces {
-        let granted = surface
-            .policy
-            .grants
-            .has(brenn_lib::access::AppCapability::SurfaceAlert);
         for comp in &surface.components {
             if let Some(manifest) = manifests.get(comp.kind.as_str()) {
-                processor_assets::assert_alert_grant(&surface.slug, &comp.kind, manifest, granted);
+                processor_assets::assert_imports_granted(
+                    &surface.slug,
+                    &comp.instance,
+                    &comp.kind,
+                    manifest,
+                    &comp.grants,
+                );
             }
         }
     }
@@ -763,6 +768,7 @@ mod tests {
                     parked_batch_depth: 8,
                     config: Default::default(),
                     chrome: true,
+                    grants: Default::default(),
                 },
                 ResolvedComponent {
                     instance: "writer".to_string(),
@@ -772,6 +778,7 @@ mod tests {
                     parked_batch_depth: 8,
                     config: Default::default(),
                     chrome: false,
+                    grants: Default::default(),
                 },
             ],
             subscriptions: vec![SurfaceBinding {
@@ -1090,6 +1097,9 @@ mod tests {
             parked_batch_depth: 8,
             config: Default::default(),
             chrome: false,
+            // Every fixture tree imports `ports`; the grant that answers it is
+            // the fixture's baseline, so a test perturbs one import at a time.
+            grants: [brenn_lib::messaging::ComponentGrant::Ports].into(),
         }];
         surface.subscriptions = vec![];
         surface.outputs = vec![];
@@ -1186,10 +1196,14 @@ mod tests {
             &["ports", "log", "config"],
             |_| {},
         );
-        validate_surface_assets(
-            dir.path(),
-            &[resolved_with_processor("deskbar", "transplant")],
-        );
+        let mut surface = resolved_with_processor("deskbar", "transplant");
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Log,
+            brenn_lib::messaging::ComponentGrant::Config,
+        ]
+        .into();
+        validate_surface_assets(dir.path(), &[surface]);
     }
 
     #[test]
@@ -1357,27 +1371,61 @@ mod tests {
         );
     }
 
+    /// Import⊆grants, the surface twin of the backend linker's deny-by-default:
+    /// jco hands a transpiled processor every surface import whatever the config
+    /// said, so an import the operator never granted is caught here instead.
     #[test]
-    #[should_panic(expected = "imports the alert interface, but the surface holds no")]
-    fn validate_surface_assets_panics_on_alert_import_without_grant() {
+    #[should_panic(expected = "imports the alert interface, but \"alert\" is not in the")]
+    fn validate_surface_assets_panics_on_an_ungranted_import() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         write_processor_tree(dir.path(), "noisy", &["ports", "alert"], |_| {});
         validate_surface_assets(dir.path(), &[resolved_with_processor("deskbar", "noisy")]);
     }
 
-    /// The same `alert`-importing kind passes on a surface that holds the grant:
-    /// the profile check is per kind, the grant check per declaring surface.
+    /// The same kind passes once the instance holds the grant its imports name.
     #[test]
-    fn validate_surface_assets_passes_alert_import_with_grant() {
+    fn validate_surface_assets_passes_a_granted_import() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         write_processor_tree(dir.path(), "noisy", &["ports", "alert"], |_| {});
         let mut surface = resolved_with_processor("deskbar", "noisy");
-        surface
-            .policy
+        surface.components[0]
             .grants
-            .insert(brenn_lib::access::AppCapability::SurfaceAlert);
+            .insert(brenn_lib::messaging::ComponentGrant::Alert);
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// The assert is per instance, not per kind: the module is shared, the
+    /// instantiation and its imports are not, so a granted sibling does not
+    /// cover an ungranted one.
+    #[test]
+    #[should_panic(expected = "component \"noisy-2\" runs processor kind \"noisy\"")]
+    fn one_instances_grant_does_not_cover_its_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "noisy", &["ports", "alert"], |_| {});
+        let mut surface = resolved_with_processor("deskbar", "noisy");
+        surface.components[0]
+            .grants
+            .insert(brenn_lib::messaging::ComponentGrant::Alert);
+        let mut sibling = surface.components[0].clone();
+        sibling.instance = "noisy-2".to_string();
+        sibling.grants = [brenn_lib::messaging::ComponentGrant::Ports].into();
+        surface.components.push(sibling);
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// `types` is in every processor's import list and no host implements it —
+    /// it defines the shared shapes the other interfaces speak. It names no
+    /// capability, so it is granted by no one and demanded of no one.
+    #[test]
+    fn the_types_import_names_no_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "plain", &["types"], |_| {});
+        let mut surface = resolved_with_processor("deskbar", "plain");
+        surface.components[0].grants = Default::default();
         validate_surface_assets(dir.path(), &[surface]);
     }
 

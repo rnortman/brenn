@@ -27,6 +27,15 @@ Two thirds of that is now mechanical and needs no gate:
   charsets, segment boundaries — is single-sourced in
   `brenn-envelope/src/addressing.rs` and read from there by the runtime, the
   guests and the DSL. Nothing is transcribed.
+- **The component grant vocabulary** — the words, their spellings, and what a
+  word parses to — is single-sourced in `brenn-envelope/src/grants.rs` as
+  `ComponentGrant`, read from there by the DSL (`derive.rs`'s `Capability` is
+  that enum plus two agent-only rights), by the backend policy builder, and by
+  the boot-time linker map. Nothing is transcribed.
+- **The attach grant vocabulary** — the words a surface or remote attacher may
+  state beyond its planes — is single-sourced in `brenn-envelope/src/grants.rs`
+  as `AttachGrant`, read from there by the DSL and by the policy builder.
+  Nothing is transcribed.
 
 What remains transcribed, and why a gate cannot reach it: these tables mirror
 *behavior* spread across runtime code with no single counterpart to compare
@@ -42,7 +51,10 @@ against.
   instead of diagnosing.
 - The remote-ceilings shape (`derive.rs`): two private panic-based helpers in
   `brenn-lib/src/messaging/remote.rs`.
-- The grant vocabularies and their plane-word expansions (`derive.rs`).
+- The agent grant vocabulary and every entity type's plane-word expansions
+  (`derive.rs`). The component and attach rows are single-sourced; these are not
+  — the authorable `AppCapability` tokens, and the table pairing each plane word
+  with the scheme tokens it lowers to, are still held equal by review.
 - The omissions ledger for vocabulary fields lowering resolves by default: the
   reasons live in prose that no build step reads.
 
@@ -60,13 +72,98 @@ Code sites (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
 entity attr vocabulary section header and the five statement tail vocabularies;
 brenn-dsl/src/derive.rs, at the channel-model presence rules, the ACL family
 table, the schemes a binding position may name, the remote subscribe ceilings
-shape, and the grant vocabularies and their plane-word expansions; and
+shape, and the grant vocabularies and their plane-word expansions (the component
+row there records what is now mechanical); and
 brenn-lib/src/config/dsl_lower.rs, at the `send_rate` key set, at the
 configuration-section kindword arms, at the webhook subscription family's key
 set, at the consumer body and ACL family map, at the surface component body and
 the per-family key sets its binding refusals name, at the webhook signature
 scheme words and their per-variant field sets, and at the attachment handler
 type words and their per-variant field sets.
+
+
+## `bindings-doc-typed-grants`
+
+`ComponentEntry::grants` is `Vec<String>` while its sibling fields on the same
+struct are typed (`abi: Abi`), and `ComponentGrant` — the enum those strings
+spell — is already a dependency of the schema crate. So the closed vocabulary
+degrades to free strings on the wire and every reader owes a word-to-variant
+reparse, plus its own decision about an unknown word. That is the shape the
+single grant vocabulary exists to delete.
+
+Fix = derive `Serialize` on `ComponentGrant` (it derives `Deserialize` today,
+and a test already pins the serde spelling equal to `word()`), type the field as
+the enum, and let the writer clone instead of rendering. Build skew then becomes
+one serde error at document parse for free. Weigh against it: a typed field
+fails the *whole* document parse on an unknown word, which loses the pointed
+"this word, this instance" skew report a hand parse could give — so decide the
+skew diagnostic first, then the type.
+
+Done = the bindings document carries the vocabulary, not its spelling, and no
+reader reparses.
+
+Code sites (`TODO(bindings-doc-typed-grants)`): surface/schema/src/lib.rs, at
+`ComponentEntry::grants`.
+
+
+## `budget-refusal-per-path`
+
+`brenn_budget::RefusalKind` is one enum spanning two paths, so neither host's
+conversion is total: the page's publish arm cannot see `InvalidDeliverAfter` and
+its defer arm cannot see `InvalidPayload`, and each writes an `unreachable!` for
+a state the type permits (`surface/kernel/src/publish_buffer.rs`,
+`brenn-wasm/src/lib.rs` — four arms in all). The same shape also makes both
+hosts pay for `InvalidPayload(String)`: the classification always formats the
+detail, and the page drops it, because the surface contract's `invalid-payload`
+carries none. That allocation is on a guest-drivable refusal path.
+
+Fix = one of two shapes, and the choice is a design decision rather than a
+mechanical edit, because the single enum is what the shared-classification
+design deliberately chose over per-family vocabularies. Either split into
+`PublishRefusalKind`/`DeferRefusalKind` so both hosts' matches are total and the
+`unreachable!`s (and the module doc's "no `NotPermitted` variant" argument)
+disappear, or keep one enum and make the detail path-shaped
+(`InvalidPayload { len, max }` and friends) so a host formats only if it has
+somewhere to put it.
+
+Done = no host writes an `unreachable!` over a gate classification, and no
+refusal formats a string its host discards.
+
+Code sites (`TODO(budget-refusal-per-path)`): brenn-budget/src/refusal.rs, at
+`RefusalKind`.
+
+
+## `surface-instance-acl-bound`
+
+A surface-placed instance may state its own `acl`, and the front end derives one
+from its bindings when it does not. Half of what that statement promises is
+enforced: an explicit statement must cover every binding of that plane, refused
+at derive time. The other half is not enforced anywhere — an instance's ACL set
+on the wire planes (`brenn:`/`ephemeral:`) is never checked against its
+surface's, so an operator can write a bound wider than the surface principal
+holds and get a document that loads. Nothing widens at runtime (the surface's
+own binding-coverage check still refuses the binding), so what is missing is the
+refusal that says the config is lying, not a containment hole.
+
+The carrier stops at the front end: lowering reads only `grants` off the
+per-instance authority the derive layer computes, and the raw surface-component
+struct has no ACL fields for the rest to cross into.
+
+Fix = decide where the check belongs. Either carry the per-instance ACL families
+into the raw config (with the key-parity re-pin that forces), resolve them, and
+assert at boot — instance bindings within the instance's set, and the instance's
+wire-plane set within the surface's — or state both asserts at derive time,
+where both authorities are already in hand, and say so where the design says
+boot.
+
+Done = an instance ACL wider than its surface's is refused, and the derived
+per-instance authority is either consumed whole or not carried. When it lands it
+also owes `brenn config-check` a fixture: that gate family is one of the three
+the check tool's boot-gate tests were meant to cover, and it stands substituted
+today because there is no gate to certify (`brenn-bootstrap/src/config_check.rs`).
+
+Code sites (`TODO(surface-instance-acl-bound)`): brenn-lib/src/config/dsl_lower.rs,
+in `surface_components` where the per-instance authority's `grants` is read.
 
 
 ## `dsl-mcp-ref-index`
@@ -388,13 +485,17 @@ Code site (`TODO(surface-single-publish-tightening)`):
 The browser-side wasm test suites — wasm-bindgen-test, real browser — now have
 **no runner at all**. `make surface-wasm-test` drove them out of band until the
 cargo teardown removed it, and no Bazel rule runs a wasm-bindgen-test binary.
-They are still compiled: the wasm-platform clippy build over `//surface/...`
-type-checks them, so they cannot rot silently. But a type-checked suite that
-never runs answers no behavioral question — and these are the XSS-adjacent
-text-not-markup pins, the DOM seam, mount/unmount, port dispatch, and the whole
-sync-call seam (the `brenn-activation-sync` listener, the door's answer
-vocabulary, the publish route's buffered/refused split), which exists only in
-the browser and is pinned only here.
+Nor are they compiled by any gate: each crate's `_test` target is host-only and
+cfgs the browser half out, and the wasm32 clippy lane over `//surface/...`
+builds the `_module` shared library, which carries no `cfg(test)`. So a suite
+can go red — or stop compiling — on an ordinary edit to the code it covers, and
+nothing says so; that has already happened once, to the kernel's publish-route
+test, when a per-instance grant gate landed against a fixture that granted
+nothing. And a suite that never runs answers no behavioral question — these are
+the XSS-adjacent text-not-markup pins, the DOM seam, mount/unmount, port
+dispatch, and the whole sync-call seam (the `brenn-activation-sync` listener,
+the door's answer vocabulary, the publish route's buffered/refused split), which
+exists only in the browser and is pinned only here.
 
 Done when a gate runs them. Two things have to land, in order. First a Bazel
 rule that drives `wasm-bindgen-test-runner` against a WebDriver browser — no
@@ -412,6 +513,31 @@ the note on the untargeted `tests/prebind_panic.rs`; `surface/kernel/src/entry.r
 the buffered-publish `None` arm (absent host slot → `"not-permitted"`), which
 depends on the live wasm host slot and can only be pinned by the browser test
 runner.
+
+---
+
+## `config-check-offline-residue`
+
+`brenn config-check` runs the messaging resolution passes that read only
+`BrennConfig` (`brenn_messaging_boot::resolve_messaging_offline`), so the
+per-instance surface gates decide its verdict. Two things it still cannot see,
+and they are different problems:
+
+- **Wasm-consumer resolution.** `resolve_wasm_consumers` takes the resolved
+  mqtt-client map, which is built by reading `password_file` / `ca_file` off
+  disk, so the pass is environment-coupled for a reason that has nothing to do
+  with what it checks. Separating client identity from the secret reads would
+  let the consumer gates join the offline pass. That is this entry.
+- **The per-instance import⊆grants assert** (`validate_surface_assets`) reads
+  the built `.wasm` component trees. A config checker does not have them and
+  should not grow a build. It is boot-and-CI-with-artifacts territory, listed
+  here only so it is not re-litigated into this slug.
+
+Done = on a machine holding no secrets, `brenn config-check` fails a
+`[[wasm_consumer]]` whose grants and wiring disagree.
+
+Code site (`TODO(config-check-offline-residue)`):
+`brenn-messaging-boot/src/offline.rs`, on `resolve_messaging_offline`.
 
 ---
 
@@ -438,6 +564,12 @@ every push, which is also the auto-deploy-to-staging path.
 
 Until then the operator-side trigger stands in for the gate: run `make e2e`
 before tagging a release, and after any change under `surface/`.
+
+Part of this suite's charter: the browser-executed proof that a component whose
+grants do not admit an import is actually refused in a live page. The refusal
+itself is a boot-time host panic with per-instance host tests
+(`surface/server/src/lib.rs`, `validate_surface_assets`); what only a browser can
+show is that the refused instance never renders.
 
 Code site (`TODO(e2e-in-ci)`): `Makefile`, the `e2e` target.
 
@@ -614,7 +746,7 @@ Code site: `surface/components/meeting/src/logic.rs` (`recompute`,
 
 A `[[wasm_consumer]]` with a non-empty `subscribe_acl` / `mqtt_subscribe_acl` /
 `webhook_acl` whose matchers cover none of the consumer's static subscriptions boots
-silently. For a WASM consumer those matchers are provably dead — no `WasmGrant` maps to
+silently. For a WASM consumer those matchers are provably dead — no `ComponentGrant` maps to
 `DynamicSubscribe`, so nothing can ever exercise them (unlike the LLM side, where an ACL
 without a static sub legitimately pre-authorizes future dynamic subs). Consider a boot
 check (2g) rejecting ACL-without-covering-sub for WASM consumers. This diverges WASM from
@@ -1141,7 +1273,7 @@ to Brenn is a bus surface has no way to restart it. That is transitional, not th
 intended end state.
 
 The chat-surface project (voice gateway behind it) is the first minter: author
-the `SurfaceGrant` → `MintImpetus` mapping, carry the field on the surface
+the `AttachGrant` → `MintImpetus` mapping, carry the field on the surface
 publish frames, and derive `Impetus::Replenish` from a genuine user gesture —
 never from component say-so alone. Done when an attended bus send refills the
 pool it draws from.

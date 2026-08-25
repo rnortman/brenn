@@ -52,12 +52,12 @@ use crate::access::raw::{
 };
 use crate::messaging::config::{
     ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
-    NoiseLevel, SendRate, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceGrant, SurfaceIoPortRaw,
+    NoiseLevel, SendRate, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw,
     SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
-    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
+    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
-use crate::messaging::remote::{RemoteConfigRaw, RemoteGrant, RemoteSubscribeAclRaw};
-use crate::messaging::{Urgency, WakeMin};
+use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
+use crate::messaging::{AttachGrant, ComponentGrant, Urgency, WakeMin};
 use crate::mqtt::config::{
     AppMqttIngressSubscriptionRaw, MqttClientConfigRaw, default_backoff_initial,
     default_backoff_max, default_client_urgency, default_inbound_payload_cap,
@@ -2202,13 +2202,16 @@ fn consumer(
     let bindings = wasm_bindings(resolved, instance, errors);
     let raw = WasmConsumerConfigRaw {
         slug: label.clone(),
-        // The artifact path is the class's, not the instance's; a consumer
-        // body never spells it.
-        component_path: component_path(instance, &label, errors).unwrap_or_default(),
+        // Required, and refused before lowering runs where it is absent, so an
+        // empty path here is a resolve-vs-lowering parity break rather than a
+        // document state.
+        component_path: body
+            .required_path("component_path", errors)
+            .unwrap_or_default(),
         grants: authority
             .grants
             .iter()
-            .map(|granted| grant::<WasmGrant>(granted.value(), granted.span(), &label))
+            .map(|granted| grant::<ComponentGrant>(granted.value(), granted.span(), &label))
             .collect(),
         store_path: body.path("store_path", errors),
         store_size_limit: body.str("store_size_limit", errors),
@@ -2234,27 +2237,6 @@ fn consumer(
     };
     body.finish(errors);
     raw
-}
-
-/// The artifact path a consumer's class declares.
-///
-/// A class that declares none cannot reach here: resolution refuses a top-level
-/// instance of such a class outright, so an absent path is a
-/// resolve-vs-lowering parity break rather than a document state — the same
-/// class of failure [`connected`] panics on, and loud for the same reason.
-fn component_path(
-    instance: &RConsumer,
-    label: &str,
-    errors: &mut Vec<Diagnostic>,
-) -> Option<PathBuf> {
-    let value = instance.class.component_path.as_ref().unwrap_or_else(|| {
-        panic!(
-            "consumer `{label}`'s class `{}` states no `component_path`, which resolution \
-             refuses before lowering runs",
-            instance.class.name.value()
-        )
-    });
-    keep(expect_path(value, "component_path"), errors)
 }
 
 /// A consumer's bindings, split into the three raw families they land in.
@@ -2392,8 +2374,9 @@ fn surfaces(derived: &DerivedConfig, errors: &mut Vec<Diagnostic>) -> Vec<Surfac
         .iter()
         .zip(&derived.surfaces)
         .zip(&derived.surface_component_kinds)
-        .map(|((surface, authority), kinds)| {
-            self::surface(resolved, surface, authority, kinds, errors)
+        .zip(&derived.surface_components)
+        .map(|(((surface, authority), kinds), placed)| {
+            self::surface(resolved, surface, authority, kinds, placed, errors)
         })
         .collect()
 }
@@ -2413,6 +2396,7 @@ fn surface(
     surface: &RSurface,
     authority: &DAuthority,
     kinds: &[String],
+    placed: &[DAuthority],
     errors: &mut Vec<Diagnostic>,
 ) -> SurfaceConfigRaw {
     // Destructured with no `..`: an attr added to `SurfaceAttrs` fails
@@ -2428,7 +2412,8 @@ fn surface(
         publish_per_sec,
     }: &SurfaceAttrs<RVal> = &surface.attrs;
     let label = surface.slug.value().clone();
-    let (components, bindings) = surface_components(resolved, surface, kinds, &label, errors);
+    let (components, bindings) =
+        surface_components(resolved, surface, kinds, placed, &label, errors);
     // The raw struct has neither a local, an mqtt nor a webhook family: a
     // surface's `local:` frames are authorized by the page it is served to, and
     // it reaches neither a broker nor a webhook endpoint. Derivation holds the
@@ -2448,7 +2433,7 @@ fn surface(
         grants: authority
             .grants
             .iter()
-            .map(|granted| grant::<SurfaceGrant>(granted.value(), granted.span(), &label))
+            .map(|granted| grant::<AttachGrant>(granted.value(), granted.span(), &label))
             .collect(),
         subscribe_acl: channel_matchers(&acl.brenn_subscribe),
         publish_acl: channel_matchers(&acl.brenn_publish),
@@ -2487,14 +2472,16 @@ fn surface_components(
     resolved: &DslResolved,
     surface: &RSurface,
     kinds: &[String],
+    placed: &[DAuthority],
     label: &str,
     errors: &mut Vec<Diagnostic>,
 ) -> (Vec<SurfaceComponentRaw>, SurfaceBindings) {
     let mut components = Vec::with_capacity(surface.components.len());
     let mut bindings = SurfaceBindings::default();
-    for (instance, kind) in surface.components.iter().zip(kinds) {
+    for ((instance, kind), authority) in surface.components.iter().zip(kinds).zip(placed) {
         let name = instance.instance.value().clone();
         let owner = format!("instance `{name}` of surface `{label}`");
+        let instance_label = format!("{label}#{name}");
         let mut body = Body::new(
             owner.clone(),
             instance.instance.span().clone(),
@@ -2518,6 +2505,23 @@ fn surface_components(
             ),
             chrome: body.bool("chrome", errors).unwrap_or_default(),
             config: body.string_map("config", errors),
+            // The words this instance was given, in the runtime's own
+            // spellings. A capability names no scheme, so derivation expands
+            // nothing here and the list crosses as written.
+            //
+            // TODO(surface-instance-acl-bound): `authority` also carries this
+            // instance's derived-or-explicit ACL families, and only `grants`
+            // crosses. What the front end already refuses is a binding outside
+            // the instance's own explicit statement; what nothing checks is the
+            // instance's set against its surface's on the wire planes, because
+            // the raw carrier has no field for it.
+            grants: authority
+                .grants
+                .iter()
+                .map(|granted| {
+                    grant::<ComponentGrant>(granted.value(), granted.span(), &instance_label)
+                })
+                .collect(),
         });
         body.finish(errors);
         surface_bindings(resolved, instance, &name, &owner, &mut bindings, errors);
@@ -2687,7 +2691,7 @@ fn remote(
         grants: authority
             .grants
             .iter()
-            .map(|granted| grant::<RemoteGrant>(granted.value(), granted.span(), &label))
+            .map(|granted| grant::<AttachGrant>(granted.value(), granted.span(), &label))
             .collect(),
         subscribe_acl: remote_ceilings(&authority.subscribe),
         ephemeral_subscribe_acl: remote_ceilings(&authority.ephemeral_subscribe),

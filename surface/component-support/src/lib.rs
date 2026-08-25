@@ -33,8 +33,9 @@
 //!   [`create_input`], [`create_element`], [`create_text_node`], [`append`],
 //!   [`append_node`]), the
 //!   page-lifetime [`add_listener`], the untrusted-detail readers
-//!   ([`string_field`], [`number_field`]), [`detail_object`], and the conformant
-//!   [`component_log`] dispatch.
+//!   ([`string_field`], [`number_field`]), [`detail_object`], the conformant
+//!   [`component_log`] dispatch, and [`config_get`] for this instance's own
+//!   static config map.
 //! - [`wire_gesture`] — mount-time wiring from a browser event to a sync-call
 //!   activation of this instance: the author supplies only the encoder from the
 //!   event to a request body, and the reply decides whether the browser's
@@ -78,10 +79,11 @@ mod wasm {
     use crate::gesture::reply_cancels;
     use brenn_surface_contract::{
         ACTIVATION_REGISTER, ACTIVATION_SYNC, Activation, ActivationError, COMPONENT_LOG,
-        COMPONENT_PANIC, DEFER_OP_CANCEL, DEFER_OP_EDIT, DEFER_OP_PUBLISH, DEFER_STATUS_FIELD,
-        DeferError, ENTRY_REPLY_FIELD, PORT_DEFER, PORT_PUBLISH, PUBLISH_STATUS_FIELD,
-        PublishError, SYNC_ERROR_FIELD, SYNC_REPLY_FIELD, SYNC_STATUS_FIELD, SyncStatus,
-        element_name_for_instance, parse_defer_status, parse_publish_status, parse_sync_status,
+        COMPONENT_PANIC, CONFIG_ANSWERED_FIELD, CONFIG_GET, CONFIG_VALUE_FIELD, DEFER_OP_CANCEL,
+        DEFER_OP_EDIT, DEFER_OP_PUBLISH, DEFER_STATUS_FIELD, DeferError, ENTRY_REPLY_FIELD,
+        PORT_DEFER, PORT_PUBLISH, PUBLISH_STATUS_FIELD, PublishError, SYNC_ERROR_FIELD,
+        SYNC_REPLY_FIELD, SYNC_STATUS_FIELD, SyncStatus, element_name_for_instance,
+        parse_defer_status, parse_publish_status, parse_sync_status,
     };
     use brenn_surface_schema::LogLevel;
     use brenn_surface_schema::Urgency;
@@ -1012,6 +1014,36 @@ export function define_component(tag, connected) {\n\
                 "component-support: brenn-log dispatch failed",
             ));
         }
+    }
+
+    /// Read one key of this instance's static config map, as the operator wrote
+    /// it in the surface's config.
+    ///
+    /// Synchronous. `None` means the key is absent or the instance is not
+    /// granted `config`.
+    ///
+    /// The map is fixed for the page's lifetime (a changed one arrives as changed
+    /// wiring, which reloads the page), so a component may read at mount and keep
+    /// the answer.
+    ///
+    /// # Panics
+    ///
+    /// If the kernel wrote no answer at all: the event never reached its
+    /// listener, which is a broken page rather than an outcome — the same verdict
+    /// a missing publish status gets.
+    pub fn config_get(host: &HtmlElement, key: &str) -> Option<String> {
+        let detail = detail_object(&[("key", JsValue::from_str(key))]);
+        dispatch_conformant(host, CONFIG_GET, &detail)
+            .expect("dispatch brenn-config-get on the host element");
+        let answered = Reflect::get(&detail, &JsValue::from_str(CONFIG_ANSWERED_FIELD))
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        assert!(
+            answered,
+            "component-support: the kernel did not answer the config read of {key:?}"
+        );
+        detail_string(&detail, CONFIG_VALUE_FIELD)
     }
 
     /// The module panic hook body: log the panic and best-effort dispatch
@@ -2063,6 +2095,64 @@ export function define_component(tag, connected) {\n\
                 answers.borrow().as_slice(),
                 &[Err(PublishError::NotPermitted)]
             );
+        }
+
+        /// The reader half of the config protocol against a stub kernel: the
+        /// dispatched detail names the key, a present value comes back, and every
+        /// absence the kernel spells — unknown key, no map, no grant — is one
+        /// `None`, because the answered flag is what tells a live page apart from
+        /// a broken one.
+        #[wasm_bindgen_test]
+        fn a_config_read_carries_its_key_and_reads_the_answer_back() {
+            let body = document().body().expect("test page has a body");
+            let seen: Recorder<String> = Rc::new(RefCell::new(Vec::new()));
+            let closure = {
+                let seen = Rc::clone(&seen);
+                Closure::<dyn Fn(Event)>::new(move |event: Event| {
+                    let ce = event.dyn_into::<CustomEvent>().expect("a CustomEvent");
+                    let detail = ce.detail();
+                    let key = detail_field(&detail, "key").as_string().unwrap_or_default();
+                    seen.borrow_mut().push(key.clone());
+                    // The kernel answers every read it heard; the value is written
+                    // only when the map holds the key.
+                    Reflect::set(
+                        &detail,
+                        &JsValue::from_str(CONFIG_ANSWERED_FIELD),
+                        &JsValue::TRUE,
+                    )
+                    .expect("write the answered flag onto the detail");
+                    if key == "mode" {
+                        Reflect::set(
+                            &detail,
+                            &JsValue::from_str(CONFIG_VALUE_FIELD),
+                            &JsValue::from_str("loud"),
+                        )
+                        .expect("write the value onto the detail");
+                    }
+                })
+            };
+            body.add_event_listener_with_callback(CONFIG_GET, closure.as_ref().unchecked_ref())
+                .expect("listen for the config event");
+            let host = mounted_host("wbt-cs-cfg");
+            let hit = config_get(&host, "mode");
+            let miss = config_get(&host, "absent");
+            body.remove_event_listener_with_callback(CONFIG_GET, closure.as_ref().unchecked_ref())
+                .expect("unlisten");
+
+            assert_eq!(seen.borrow().as_slice(), &["mode", "absent"]);
+            assert_eq!(hit, Some("loud".to_string()));
+            assert_eq!(miss, None, "an unwritten value is an absent one");
+        }
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "did not answer the config read")]
+        fn an_unanswered_config_read_panics_rather_than_reading_as_absent() {
+            // No listener at all is a broken page, not an operator who wrote no
+            // value. Reading it as `None` would hand a component the same answer a
+            // real empty map gives, and it would configure itself from a page that
+            // never heard the question.
+            let host = mounted_host("wbt-cs-cfg-nolisten");
+            let _ = config_get(&host, "mode");
         }
     }
 }

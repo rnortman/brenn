@@ -670,10 +670,16 @@ class ProcessorKindCache {
  *
  * The transpiled glue keys imports by unversioned interface name and pulls only
  * the interfaces the artifact actually imports, so offering all four is safe for
- * any transpilable-profile component. `alert` is offered unconditionally for the
- * same reason: a kind that does not import it never reads the key, and a kind
- * that does had its surface's alert grant proven at boot (and the kernel's own
- * `brenn_processor_alert` re-checks the live grant regardless).
+ * any transpilable-profile component. They are offered unconditionally on
+ * purpose: a kind that does not import one never reads the key, boot proved
+ * every import a kind does take against that instance's own grants, and each
+ * kernel host seam re-checks the live grant regardless. Policy lives in the
+ * kernel; this layer holds none and must not grow any.
+ *
+ * A `dom` component takes none of this: its artifact is a wasm-bindgen ES module
+ * per instance, loaded by `import()`, where a headless one is a jco
+ * `--instantiation` module per kind. Build-artifact-forced, which is the whole
+ * reason the loader forks here and nowhere else.
  *
  * A refused publish reaches the guest as the WIT `publish-error` variant, and a
  * refused deferred-message control op as the `defer-error` variant: the glue's

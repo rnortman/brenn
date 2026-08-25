@@ -63,6 +63,19 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
+# `panic_util`'s hook behaviour is only observable to a test that owns the
+# process: the delegating hook is installed once behind a `OnceLock`, so the
+# recorder it delegates to has to be set before any other test's first
+# `catch_quietly`. Its own binary is the only way to guarantee that.
+rust_test(
+    name = "panic_util_test",
+    size = "small",
+    srcs = ["tests/panic_util.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [":brenn-lib"],
+)
+
 rust_doc_test(
     name = "brenn-lib_doc_test",
     crate = ":brenn-lib",

@@ -170,14 +170,14 @@ new alice: Outer(slug = \"alice\");
 fn a_reference_from_outside_reaches_a_stamped_channel_through_the_instance() {
     let config = resolved(
         "\
-component Sink { abi = processor; component_path = \"/lib/sink.wasm\"; in messages; }
+component Sink { abi = processor; in messages; }
 
 assembly Pod(slug: String) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
 }
 
 new alice: Pod(slug = \"alice\");
-new sink: Sink { in messages <- alice.messages; }
+new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- alice.messages; }
 ",
     );
     let binding = &config.consumers[0].bindings[0];
@@ -332,12 +332,12 @@ new alice: Pod(source = bench);
 fn a_channel_parameter_carries_the_channel_into_the_body() {
     let config = resolved(
         "\
-component Sink { abi = processor; component_path = \"/lib/sink.wasm\"; in messages; }
+component Sink { abi = processor; in messages; }
 
 channel bench_status at \"brenn:bench.status\";
 
 assembly Pod(source: Channel) {
-    new sink: Sink { in messages <- source; }
+    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- source; }
 }
 
 new alice: Pod(source = bench_status);
@@ -466,14 +466,14 @@ fn a_channel_named_through_an_instance_that_stamped_none_is_refused() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; component_path = \"/lib/sink.wasm\"; in messages; }
+component Sink { abi = processor; in messages; }
 
 assembly Pod(slug: String) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
 }
 
 new alice: Pod(slug = \"alice\");
-new sink: Sink { in messages <- alice.nope; }
+new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- alice.nope; }
 "
         ),
         "`alice` stamps no channel `alice.nope`"
@@ -485,11 +485,11 @@ fn a_dotted_tail_on_a_channel_names_nothing() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; component_path = \"/lib/sink.wasm\"; in messages; }
+component Sink { abi = processor; in messages; }
 
 channel bench_status at \"brenn:bench.status\";
 
-new sink: Sink { in messages <- bench_status.tail; }
+new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- bench_status.tail; }
 "
         ),
         "`bench_status` is not an instance, so `.tail` names nothing"
@@ -501,12 +501,12 @@ fn a_dotted_tail_on_a_channel_parameter_names_nothing() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; component_path = \"/lib/sink.wasm\"; in messages; }
+component Sink { abi = processor; in messages; }
 
 channel bench_status at \"brenn:bench.status\";
 
 assembly Pod(source: Channel) {
-    new sink: Sink { in messages <- source.tail; }
+    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- source.tail; }
 }
 
 new alice: Pod(source = bench_status);
@@ -559,10 +559,10 @@ fn a_string_parameter_subscribed_to_says_what_it_names() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; component_path = \"/lib/sink.wasm\"; in messages; }
+component Sink { abi = processor; in messages; }
 
 assembly Pod(slug: String) {
-    new sink: Sink { in messages <- slug; }
+    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- slug; }
 }
 
 new alice: Pod(slug = \"alice\");
@@ -599,16 +599,16 @@ new alice: Pod(name = \"alice-pa\", ws = notes);
 fn a_table_parameter_reaches_a_stamped_components_config() {
     let config = resolved(
         "\
-component Sink { abi = processor; component_path = \"/lib/sink.wasm\"; }
+component Sink { abi = processor; }
 
 assembly Pod(tuning: Table) {
-    new sink: Sink { config = tuning; }
+    new sink: Sink { component_path = \"/lib/sink.wasm\"; config = tuning; }
 }
 
 new alice: Pod(tuning = { soft_pct = 80 });
 ",
     );
-    let (key, config_attr) = &config.consumers[0].attrs[0];
+    let (key, config_attr) = &config.consumers[0].attrs[1];
     assert_eq!(key, "config");
     match config_attr.value() {
         RValue::Table(fields) => {

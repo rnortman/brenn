@@ -101,28 +101,32 @@ new e2e: E2eFloor;
 /// subsumes its predecessor and `retain_depth = 2` covers a cancel and its
 /// replacement.
 ///
-/// No `takeover` grant, so chrome binds no takeover plane.
+/// No component here holds `takeover`, so chrome binds no takeover plane.
 assembly BarSurface(slug: String, skin: String) {
   surface bar {
     slug = f"{slug}";
     grants = [subscribe];
     skin = skin;
     new p1: Protobar {
+      grants = [ports, log];
       in messages <- bar_a;
       io tick { push_depth = 1; retain_depth = 2; }
 
     }
     new p2: Protobar {
+      grants = [ports, log];
       in messages <- bar_b;
       io tick { push_depth = 1; retain_depth = 2; }
 
     }
     new p3: Protobar {
+      grants = [ports, log];
       in messages <- bar_c;
       io tick { push_depth = 1; retain_depth = 2; }
 
     }
     new chrome: Chrome {
+      grants = [ports, log];
       chrome = true;
       in layout <- bar_layout { push_depth = 1; }
       in theme <- "local:brenn/theme" { push_depth = 1; }
@@ -151,18 +155,23 @@ new bar_pixel: BarSurface(slug = "bar-pixel", skin = "foundry");
 surface bar-feeder {
   grants = [publish];
   new feed-a: EchoStub {
+    grants = [ports, log];
     out out -> bar_a;
   }
   new feed-b: EchoStub {
+    grants = [ports, log];
     out out -> bar_b;
   }
   new feed-c: EchoStub {
+    grants = [ports, log];
     out out -> bar_c;
   }
   new feed-layout: EchoStub {
+    grants = [ports, log];
     out out -> bar_layout;
   }
   new chrome: Chrome {
+    grants = [ports, log];
     chrome = true;
     in theme <- "local:brenn/theme" { push_depth = 1; }
     in link-state <- "local:brenn/link-state" { push_depth = 1; }

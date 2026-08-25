@@ -6,7 +6,8 @@ use super::test_fixtures::{
 };
 use super::*;
 use brenn_lib::config::AppConfig;
-use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig, WasmGrant};
+use brenn_lib::messaging::ComponentGrant;
+use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig};
 use brenn_lib::mqtt::config::MqttClientConfigRaw;
 use brenn_lib::webhook::ResolvedWebhookSubscription;
 
@@ -1328,7 +1329,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "undeclared".to_string(),
         component_path: "/tmp/undeclared.wasm".into(),
-        grants: vec![WasmGrant::Mqtt],
+        grants: vec![ComponentGrant::Mqtt],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
@@ -1721,7 +1722,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-demo-alice".to_string(),
         component_path: "/tmp/brenn_processor_demo.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
         publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
@@ -2065,7 +2066,8 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
 async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
     use brenn_lib::config::BrennConfig;
-    use brenn_lib::messaging::config::{ChannelConfigRaw, SurfaceConfigRaw, SurfaceGrant};
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::{ChannelConfigRaw, SurfaceConfigRaw};
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
@@ -2088,7 +2090,7 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
             wake_min: None,
         }],
         surfaces: vec![SurfaceConfigRaw {
-            grants: vec![SurfaceGrant::EphemeralSubscribe],
+            grants: vec![AttachGrant::EphemeralSubscribe],
             ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("protobar-demo".to_string())],
             // The channel rung here is 1, which is not the page queue this
             // binding wants, so it states its own depth.
@@ -2582,7 +2584,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
         component_path: "/tmp/ticker.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         io_ports: vec![WasmConsumerIoPortRaw {
             port: "timer".to_string(),
             channel: None,
@@ -2707,7 +2709,7 @@ async fn build_messaging_gives_a_named_brenn_io_port_channel_a_db_row() {
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
         component_path: "/tmp/ticker.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         io_ports: vec![WasmConsumerIoPortRaw {
             port: "timer".to_string(),
             channel: Some("brenn:etl.timer".to_string()),
@@ -2778,7 +2780,7 @@ async fn auto_channels_list_as_their_durability_says() {
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
         component_path: "/tmp/ticker.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         io_ports: vec![
             io_port("anon", None),
             io_port("named", Some("brenn:etl.timer")),
@@ -2889,7 +2891,7 @@ async fn a_shared_local_name_across_the_two_realms_boots() {
     let config = BrennConfig {
         wasm_consumers: vec![brenn_lib::messaging::config::WasmConsumerConfigRaw {
             slug: "ticker".to_string(),
-            grants: vec![WasmGrant::Ports],
+            grants: vec![ComponentGrant::Ports],
             io_ports: vec![io_port_raw(
                 "tick",
                 Some("local:etl.tick"),
@@ -3287,7 +3289,7 @@ fn minimal_remote(
     let raw = brenn_lib::config::remote_raw(
         slug,
         token.path(),
-        &[brenn_lib::messaging::remote::RemoteGrant::Alert],
+        &[brenn_lib::messaging::AttachGrant::Alert],
     );
     (raw, token)
 }
@@ -3533,9 +3535,10 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
 async fn build_messaging_panics_when_a_connection_uuid_collides_with_a_tool_channel() {
     use super::test_fixtures::{out_raw, sub_raw};
     use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::{
         ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
-        WasmConsumerSubscriptionRaw, WasmGrant,
+        WasmConsumerSubscriptionRaw,
     };
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
@@ -3543,7 +3546,7 @@ async fn build_messaging_panics_when_a_connection_uuid_collides_with_a_tool_chan
     let mut repo_clause = toml::Table::new();
     repo_clause.insert("repo".to_string(), toml::Value::String("brenn".to_string()));
     let consumer = WasmConsumerConfigRaw {
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         tool_grants: vec![brenn_lib::tools::config::ToolGrantRaw {
             tool: "apull".to_string(),
             acl: vec![repo_clause],
@@ -3982,7 +3985,7 @@ fn io_port_consumer(
 
     WasmConsumerConfigRaw {
         slug: slug.to_string(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         io_ports: ports
             .iter()
             .map(|(port, channel)| {
@@ -4544,4 +4547,128 @@ fn published_rosters(conn: &rusqlite::Connection) -> Vec<(String, String)> {
         (address, body)
     })
     .collect()
+}
+
+/// A durable `[[channel]]` block at `address`.
+fn durable_channel(address: &str) -> brenn_lib::messaging::config::ChannelConfigRaw {
+    brenn_lib::messaging::config::ChannelConfigRaw {
+        address: Some(address.to_string()),
+        uuid: Some(uuid::Uuid::new_v4().to_string()),
+        standing_retain_depth: Some(Depth::Bounded(8)),
+        ..nondurable_channel(address, 4)
+    }
+}
+
+/// Two consumers wired to each other through a named `[[connection]]`: one free
+/// output port, one free input port, and the connection that mints the channel
+/// between them at `address`.
+fn connected_pair(address: &str) -> brenn_lib::config::BrennConfig {
+    use super::test_fixtures::{minimal_wasm_consumer, out_raw, sub_raw};
+    use brenn_lib::messaging::config::{
+        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
+        WasmConsumerSubscriptionRaw,
+    };
+
+    let publisher = WasmConsumerConfigRaw {
+        slug: "etl".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        outputs: vec![WasmConsumerOutputRaw {
+            channel: None,
+            ..out_raw("out", "brenn:unused")
+        }],
+        ..minimal_wasm_consumer()
+    };
+    let subscriber = WasmConsumerConfigRaw {
+        slug: "indexer".to_string(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            channel: None,
+            push_depth: Some(Depth::Bounded(2)),
+            retain_depth: Some(Depth::Bounded(2)),
+            ..sub_raw("brenn:unused", "tap")
+        }],
+        ..minimal_wasm_consumer()
+    };
+    brenn_lib::config::BrennConfig {
+        connections: vec![ConnectionConfigRaw {
+            endpoints: vec!["wasm:etl/out".to_string(), "wasm:indexer/tap".to_string()],
+            channel: Some(address.to_string()),
+            uuid: None,
+            description: None,
+        }],
+        wasm_consumers: vec![publisher, subscriber],
+        ..brenn_lib::config::BrennConfig::default()
+    }
+}
+
+/// `extra_durable_entries` is boot's environment-derived (`webhook:`/`mqtt:`)
+/// half of the channel set, and the offline pass's empty vector. The extras must
+/// reach both places a declared `[[channel]]` reaches — the durable half and the
+/// directory every binding resolves against — or a boot-time binding to a
+/// webhook channel stops resolving.
+#[test]
+fn extra_durable_entries_join_the_durable_half_and_the_directory() {
+    let config = brenn_lib::config::BrennConfig {
+        channels: vec![
+            durable_channel("brenn:declared"),
+            nondurable_channel("ephemeral:scratch", 4),
+        ],
+        ..brenn_lib::config::BrennConfig::default()
+    };
+
+    let topology = lower_channel_topology(
+        &config,
+        vec![super::test_fixtures::brenn_entry("webhook:push-alice")],
+    );
+
+    let durable: Vec<&str> = topology
+        .durable_entries
+        .iter()
+        .map(|e| e.address.as_str())
+        .collect();
+    assert_eq!(durable, vec!["brenn:declared", "webhook:push-alice"]);
+    let nondurable: Vec<&str> = topology
+        .nondurable_entries
+        .iter()
+        .map(|e| e.address.as_str())
+        .collect();
+    assert_eq!(nondurable, vec!["ephemeral:scratch"]);
+
+    let directory = topology.pre_directory();
+    for address in ["brenn:declared", "ephemeral:scratch", "webhook:push-alice"] {
+        assert!(
+            directory.resolve(address).is_some(),
+            "{address} must resolve in the pre-directory",
+        );
+    }
+}
+
+/// The extras are in the `declared_addresses` chain too, so an auto channel
+/// cannot mint an address a webhook or mqtt channel already owns — the footgun
+/// rule, which is otherwise enforced only against `[[channel]]` blocks. The
+/// offline pass passes no extras, so this collision is boot's alone to catch.
+#[test]
+#[should_panic(expected = "is also declared elsewhere")]
+fn an_auto_channel_colliding_with_an_extra_entry_panics() {
+    let config = connected_pair("brenn:shared");
+    lower_channel_topology(
+        &config,
+        vec![super::test_fixtures::brenn_entry("brenn:shared")],
+    );
+}
+
+/// The green half of the same wiring: with no extra entry claiming the address,
+/// the auto channel is minted and lands in the durable half beside the extras.
+#[test]
+fn an_auto_channel_lands_in_the_durable_half() {
+    let config = connected_pair("brenn:shared");
+    let topology = lower_channel_topology(
+        &config,
+        vec![super::test_fixtures::brenn_entry("webhook:push-alice")],
+    );
+    let durable: Vec<&str> = topology
+        .durable_entries
+        .iter()
+        .map(|e| e.address.as_str())
+        .collect();
+    assert_eq!(durable, vec!["webhook:push-alice", "brenn:shared"]);
 }

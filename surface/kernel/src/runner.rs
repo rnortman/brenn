@@ -1257,11 +1257,13 @@ async fn recv_open<T>(rx: &mut mpsc::Receiver<T>, closed: bool) -> Option<T> {
 /// One alert as the page's command vocabulary states it.
 fn alert_command(alert: AlertCommand) -> Command {
     let AlertCommand {
+        attribution,
         severity,
         title,
         body,
     } = alert;
     Command::Alert {
+        attribution,
         severity,
         title,
         body,

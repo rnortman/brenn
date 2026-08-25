@@ -154,6 +154,9 @@ pub enum PublishSlot {
 
 /// One alert, on its way to the page. Best-effort end to end.
 pub struct AlertCommand {
+    /// The component this alert is *from*, which becomes its sender
+    /// sub-identity on the wire; `None` when the kernel itself is paging.
+    pub attribution: Option<String>,
     pub severity: AlertSeverity,
     pub title: String,
     pub body: String,
@@ -481,14 +484,23 @@ impl SurfaceHandle {
 
     /// Page an operator, best-effort.
     ///
-    /// **Callers must pre-gate on the attachment's alert grant**
-    /// ([`Event::Connected`](crate::session::Event::Connected)'s `alert_granted`).
-    /// An ungranted alert is dropped by the page with a breadcrumb — the peer
-    /// would close the attachment over the frame — and one raised while detached
-    /// is dropped silently, since the alert rides the same socket as everything
-    /// else and there is no other sink for it.
-    pub fn alert(&self, severity: AlertSeverity, title: &str, body: &str) {
+    /// **Callers must pre-gate on the right the alert is raised under**: the
+    /// attachment's alert grant
+    /// ([`Event::Connected`](crate::session::Event::Connected)'s `alert_granted`)
+    /// for the kernel's own paging, and the component's own `alert` grant for an
+    /// attributed one. An ungranted alert is dropped by the page with a
+    /// breadcrumb — the peer would close the attachment over the frame — and one
+    /// raised while detached is dropped silently, since the alert rides the same
+    /// socket as everything else and there is no other sink for it.
+    pub fn alert(
+        &self,
+        attribution: Option<&str>,
+        severity: AlertSeverity,
+        title: &str,
+        body: &str,
+    ) {
         let command = AlertCommand {
+            attribution: attribution.map(str::to_owned),
             severity,
             title: title.to_owned(),
             body: body.to_owned(),

@@ -38,6 +38,12 @@ pub struct DerivedConfig {
     /// Parallel to `resolved.surfaces`; the inner vector parallel to that
     /// surface's `components`. The wire kind each instance's class folds to.
     pub surface_component_kinds: Vec<Vec<String>>,
+    /// Parallel the same way: what each placed instance itself may reach.
+    ///
+    /// Beside the surface's own authority, not inside it. The surface's is what
+    /// the backend admits over the wire; an instance's contains that instance
+    /// within the surface, and holds `local:` entries the surface has none of.
+    pub surface_components: Vec<Vec<DAuthority>>,
 }
 
 /// Every entity's authority, in the four vectors the derived config holds them
@@ -49,6 +55,9 @@ pub struct DerivedConfig {
 #[derive(Debug, Default, PartialEq)]
 pub struct DAuthorities {
     pub surfaces: Vec<DAuthority>,
+    /// Per surface, in `resolved.surfaces` order; the inner vector per placed
+    /// instance, in that surface's `components` order.
+    pub surface_components: Vec<Vec<DAuthority>>,
     pub consumers: Vec<DAuthority>,
     pub agents: Vec<DAuthority>,
     pub remotes: Vec<DRemoteAuthority>,
@@ -197,6 +206,11 @@ impl DerivedConfig {
             resolved.surfaces.len(),
             "one kind list per surface"
         );
+        assert_eq!(
+            authorities.surface_components.len(),
+            resolved.surfaces.len(),
+            "one instance-authority list per surface"
+        );
         for (surface, kinds) in resolved.surfaces.iter().zip(&surface_component_kinds) {
             assert_eq!(
                 kinds.len(),
@@ -205,8 +219,21 @@ impl DerivedConfig {
                 surface.handle.dotted()
             );
         }
+        for (surface, placed) in resolved
+            .surfaces
+            .iter()
+            .zip(&authorities.surface_components)
+        {
+            assert_eq!(
+                placed.len(),
+                surface.components.len(),
+                "one authority per component instance of `{}`",
+                surface.handle.dotted()
+            );
+        }
         let DAuthorities {
             surfaces,
+            surface_components,
             consumers,
             agents,
             remotes,
@@ -219,6 +246,7 @@ impl DerivedConfig {
             remotes,
             channel_uuids,
             surface_component_kinds,
+            surface_components,
         }
     }
 }

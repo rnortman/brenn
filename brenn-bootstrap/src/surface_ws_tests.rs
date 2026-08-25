@@ -655,9 +655,9 @@ const LINK_PORT: &str = "link";
 /// operator declares for every surface and without which the last attachment's
 /// terminal stamp has nowhere to land.
 fn spanning_connection_config() -> brenn_lib::config::BrennConfig {
+    use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::{
         ChannelConfigRaw, ConnectionConfigRaw, Depth, MessagingGlobalConfig, WasmConsumerConfigRaw,
-        WasmGrant,
     };
     use brenn_messaging_boot::test_fixtures::{
         io_port_raw, minimal_surface_raw, minimal_wasm_consumer, surface_io_port_raw,
@@ -666,7 +666,7 @@ fn spanning_connection_config() -> brenn_lib::config::BrennConfig {
     let worker = WasmConsumerConfigRaw {
         slug: "worker".to_string(),
         component_path: "/nonexistent/worker.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         io_ports: vec![io_port_raw(
             LINK_PORT,
             None,

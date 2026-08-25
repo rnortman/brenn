@@ -17,11 +17,10 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
 use crate::access::AppPolicy;
 use crate::access::acl::ChannelMatcher;
 use crate::access::raw::ChannelMatcherRaw;
+use crate::messaging::AttachGrant;
 use crate::messaging::config::{
     DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC, MessagingGlobalConfig,
 };
@@ -44,32 +43,6 @@ pub const DEFAULT_REMOTE_MAX_SESSIONS: u32 = 2;
 /// far above the fleet-driver case (two channels per conversation) and far below
 /// anything that strains a session's per-subscription bookkeeping.
 pub const DEFAULT_REMOTE_MAX_SUBSCRIPTIONS: u32 = 256;
-
-/// Grantable transport rights for a `[[remote]]` bus participant
-/// (operator-facing).
-///
-/// The `[[surface]]` vocabulary minus `takeover`: a fullscreen overlay is a
-/// rendering-application capability, and a daemon has nothing to render. Every
-/// other right is the same right — one token per delivery class × direction,
-/// plus the alert plane — so an operator who can read a `[[surface]]` block can
-/// read this one.
-///
-/// Serde `snake_case`, matching `SurfaceGrant`'s authoring tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RemoteGrant {
-    /// Durable (`brenn:`) delivery to the remote. Maps to `MessagingSubscribe`.
-    Subscribe,
-    /// Durable (`brenn:`) publish from the remote. Maps to `MessagingPublish`.
-    Publish,
-    /// Ephemeral (`ephemeral:`) delivery to the remote. Maps to `EphemeralSubscribe`.
-    EphemeralSubscribe,
-    /// Ephemeral (`ephemeral:`) publish from the remote. Maps to `EphemeralPublish`.
-    EphemeralPublish,
-    /// Alert (phone/operator paging) emission from the remote. Deny-by-default:
-    /// without this grant the remote has no alert plane.
-    Alert,
-}
 
 /// One subscribe-direction ACL entry: a channel matcher plus the depth ceilings
 /// the route answers a matching subscribe with.
@@ -116,7 +89,7 @@ pub struct RemoteConfigRaw {
     /// missing, unreadable, empty, or group/world-accessible is a boot panic.
     pub token_file: PathBuf,
     /// Transport rights for this remote (deny-by-default). Required — no default.
-    pub grants: Vec<RemoteGrant>,
+    pub grants: Vec<AttachGrant>,
     /// Durable (`brenn:`) subscribe ACL — bare channel names, no scheme.
     pub subscribe_acl: Vec<RemoteSubscribeAclRaw>,
     /// Ephemeral (`ephemeral:`) subscribe ACL — bare channel names, no scheme.
@@ -341,6 +314,36 @@ pub fn resolve_remotes(
     raw_remotes: &[RemoteConfigRaw],
     globals: &MessagingGlobalConfig,
 ) -> Vec<ResolvedRemote> {
+    assert_slugs_unique(raw_remotes);
+
+    raw_remotes
+        .iter()
+        .map(|remote| resolve_remote(remote, globals))
+        .collect()
+}
+
+/// Run every `[[remote]]` gate that reads only the config — gates 1 through 5
+/// of [`resolve_remotes`] — and load no bearer token.
+///
+/// Gate 6 is the token file, and it is the only part of a `[[remote]]` that a
+/// machine other than the deployment target cannot answer: the file lives on the
+/// host, with mode bits checked there. Everything above it is a fact about the
+/// document, so a config-checking tool runs it on a workstation and an operator
+/// hears about a duplicate slug or a grant with no ACL before the deploy rather
+/// than from the service dying after it.
+///
+/// # Panics
+///
+/// On gates 1 through 5 of [`resolve_remotes`].
+pub fn check_remotes(raw_remotes: &[RemoteConfigRaw], globals: &MessagingGlobalConfig) {
+    assert_slugs_unique(raw_remotes);
+    for remote in raw_remotes {
+        resolve_remote_facts(remote, globals);
+    }
+}
+
+/// Gate 1's first half: no two `[[remote]]` blocks may claim one slug.
+fn assert_slugs_unique(raw_remotes: &[RemoteConfigRaw]) {
     use std::collections::HashSet;
 
     // TODO(config-syntax-in-operator-messages): the panics here, and in the
@@ -353,14 +356,47 @@ pub fn resolve_remotes(
             r.slug,
         );
     }
+}
 
-    raw_remotes
-        .iter()
-        .map(|remote| resolve_remote(remote, globals))
-        .collect()
+/// Everything a `[[remote]]` resolves to except its bearer token.
+///
+/// The split is the environment boundary: these fields are computed from the
+/// document alone, and the token is read off the deployment host's disk. Boot
+/// takes both; [`check_remotes`] takes only these.
+struct RemoteFacts {
+    slug: String,
+    policy: AppPolicy,
+    subscribe_ceilings: RemoteSubscribeAcl,
+    ephemeral_subscribe_ceilings: RemoteSubscribeAcl,
+    publish_burst: u32,
+    publish_per_sec: u32,
+    max_sessions: u32,
+    max_subscriptions: u32,
+}
+
+impl RemoteFacts {
+    fn with_token(self, token: RemoteToken) -> ResolvedRemote {
+        ResolvedRemote {
+            slug: self.slug,
+            token,
+            policy: self.policy,
+            subscribe_ceilings: self.subscribe_ceilings,
+            ephemeral_subscribe_ceilings: self.ephemeral_subscribe_ceilings,
+            publish_burst: self.publish_burst,
+            publish_per_sec: self.publish_per_sec,
+            max_sessions: self.max_sessions,
+            max_subscriptions: self.max_subscriptions,
+        }
+    }
 }
 
 fn resolve_remote(remote: &RemoteConfigRaw, globals: &MessagingGlobalConfig) -> ResolvedRemote {
+    let facts = resolve_remote_facts(remote, globals);
+    let token = load_remote_token(&facts.slug, &remote.token_file);
+    facts.with_token(token)
+}
+
+fn resolve_remote_facts(remote: &RemoteConfigRaw, globals: &MessagingGlobalConfig) -> RemoteFacts {
     use crate::messaging::is_unreserved_char;
 
     let slug = &remote.slug;
@@ -381,13 +417,15 @@ fn resolve_remote(remote: &RemoteConfigRaw, globals: &MessagingGlobalConfig) -> 
         &remote.ephemeral_subscribe_acl,
     );
 
-    let policy = crate::access::resolve::build_remote_policy(
-        slug,
+    let policy = crate::access::resolve::build_attach_policy(
+        crate::access::resolve::AttachOwner::Remote(slug),
         remote.grants.iter().copied(),
-        &subscribe_matchers,
-        &remote.publish_acl,
-        &ephemeral_subscribe_matchers,
-        &remote.ephemeral_publish_acl,
+        crate::access::raw::AttachAclsRaw {
+            subscribe: &subscribe_matchers,
+            publish: &remote.publish_acl,
+            ephemeral_subscribe: &ephemeral_subscribe_matchers,
+            ephemeral_publish: &remote.ephemeral_publish_acl,
+        },
     );
 
     assert_grants_and_acls_agree(remote);
@@ -408,11 +446,8 @@ fn resolve_remote(remote: &RemoteConfigRaw, globals: &MessagingGlobalConfig) -> 
          subscribe holds only publish rights; drop the subscribe grants instead",
     );
 
-    let token = load_remote_token(slug, &remote.token_file);
-
-    ResolvedRemote {
+    RemoteFacts {
         slug: slug.clone(),
-        token,
         policy: policy.clone(),
         subscribe_ceilings: zip_ceilings(&policy.acls.brenn_subscribe, &remote.subscribe_acl),
         ephemeral_subscribe_ceilings: zip_ceilings(
@@ -491,24 +526,24 @@ fn zip_ceilings(
 /// grant.
 fn assert_grants_and_acls_agree(remote: &RemoteConfigRaw) {
     let slug = &remote.slug;
-    let checks: [(RemoteGrant, &str, bool); 4] = [
+    let checks: [(AttachGrant, &str, bool); 4] = [
         (
-            RemoteGrant::Subscribe,
+            AttachGrant::Subscribe,
             "subscribe_acl",
             !remote.subscribe_acl.is_empty(),
         ),
         (
-            RemoteGrant::Publish,
+            AttachGrant::Publish,
             "publish_acl",
             !remote.publish_acl.is_empty(),
         ),
         (
-            RemoteGrant::EphemeralSubscribe,
+            AttachGrant::EphemeralSubscribe,
             "ephemeral_subscribe_acl",
             !remote.ephemeral_subscribe_acl.is_empty(),
         ),
         (
-            RemoteGrant::EphemeralPublish,
+            AttachGrant::EphemeralPublish,
             "ephemeral_publish_acl",
             !remote.ephemeral_publish_acl.is_empty(),
         ),
@@ -599,7 +634,7 @@ mod tests {
 
     /// Caller must keep the returned `NamedTempFile` alive; dropping it
     /// removes the token file before resolution can read it.
-    fn remote(slug: &str, grants: &[RemoteGrant]) -> (RemoteConfigRaw, tempfile::NamedTempFile) {
+    fn remote(slug: &str, grants: &[AttachGrant]) -> (RemoteConfigRaw, tempfile::NamedTempFile) {
         let token = write_token("s3cret-token\n");
         let raw = remote_raw(slug, token.path(), grants);
         (raw, token)
@@ -627,8 +662,6 @@ mod tests {
         assert!(remote.policy.has_grant(AppCapability::EphemeralSubscribe));
         assert!(remote.policy.has_grant(AppCapability::EphemeralPublish));
         assert!(remote.policy.has_grant(AppCapability::SurfaceAlert));
-        // Takeover has no remote token, so no path grants it.
-        assert!(!remote.policy.has_grant(AppCapability::SurfaceTakeover));
         assert_eq!(
             remote.durable_ceiling("chat.app.home.roster"),
             Some(RemoteDepths {
@@ -693,7 +726,7 @@ mod tests {
 
     #[test]
     fn push_depth_zero_is_a_legal_pull_only_ceiling() {
-        let (mut raw, _token) = remote("puller", &[RemoteGrant::Subscribe]);
+        let (mut raw, _token) = remote("puller", &[AttachGrant::Subscribe]);
         raw.subscribe_acl = vec![remote_exact_ceiling("cold.archive", 0, 512)];
         let remote = resolve_one(raw);
         assert_eq!(
@@ -708,7 +741,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "retain_depth = 0")]
     fn retain_depth_zero_is_rejected() {
-        let (mut raw, _token) = remote("no-retention", &[RemoteGrant::Subscribe]);
+        let (mut raw, _token) = remote("no-retention", &[AttachGrant::Subscribe]);
         raw.subscribe_acl = vec![remote_exact_ceiling("a.b", 1, 0)];
         resolve_one(raw);
     }
@@ -716,7 +749,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "sets both exact and prefix")]
     fn a_matcher_naming_both_kinds_is_rejected() {
-        let (mut raw, _token) = remote("ambiguous", &[RemoteGrant::Subscribe]);
+        let (mut raw, _token) = remote("ambiguous", &[AttachGrant::Subscribe]);
         raw.subscribe_acl = vec![RemoteSubscribeAclRaw {
             exact: Some("a.b".to_string()),
             prefix: Some("a.".to_string()),
@@ -729,7 +762,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "sets neither exact nor prefix")]
     fn a_matcher_naming_no_kind_is_rejected() {
-        let (mut raw, _token) = remote("empty-matcher", &[RemoteGrant::Subscribe]);
+        let (mut raw, _token) = remote("empty-matcher", &[AttachGrant::Subscribe]);
         raw.subscribe_acl = vec![RemoteSubscribeAclRaw {
             exact: None,
             prefix: None,
@@ -798,27 +831,27 @@ remote typo {
     }
 
     #[test]
-    fn takeover_is_not_a_remote_grant() {
+    fn takeover_is_not_an_attach_grant() {
         use serde::Deserialize as _;
         use serde::de::value::StrDeserializer;
         assert!(
-            RemoteGrant::deserialize(StrDeserializer::<serde::de::value::Error>::new("takeover"))
+            AttachGrant::deserialize(StrDeserializer::<serde::de::value::Error>::new("takeover"))
                 .is_err(),
-            "takeover must not deserialize as a remote grant",
+            "takeover is a component capability, not a transport right",
         );
         assert_eq!(
-            RemoteGrant::deserialize(StrDeserializer::<serde::de::value::Error>::new(
+            AttachGrant::deserialize(StrDeserializer::<serde::de::value::Error>::new(
                 "ephemeral_subscribe"
             ))
             .expect("a real grant word deserializes"),
-            RemoteGrant::EphemeralSubscribe,
+            AttachGrant::EphemeralSubscribe,
         );
     }
 
     #[test]
     #[should_panic(expected = "grant Subscribe is authored but subscribe_acl is empty")]
     fn a_grant_without_its_acl_is_rejected() {
-        let (raw, _token) = remote("dead-grant", &[RemoteGrant::Subscribe]);
+        let (raw, _token) = remote("dead-grant", &[AttachGrant::Subscribe]);
         resolve_one(raw);
     }
 
@@ -832,7 +865,7 @@ remote typo {
 
     #[test]
     fn alert_needs_no_acl() {
-        let (raw, _token) = remote("pager", &[RemoteGrant::Alert]);
+        let (raw, _token) = remote("pager", &[AttachGrant::Alert]);
         let remote = resolve_one(raw);
         assert!(remote.policy.has_grant(AppCapability::SurfaceAlert));
         assert!(remote.subscribe_ceilings.is_empty());
@@ -841,21 +874,21 @@ remote typo {
     #[test]
     #[should_panic(expected = "must consist of RFC 3986 unreserved characters")]
     fn a_slug_with_a_participant_separator_is_rejected() {
-        let (raw, _token) = remote("pod#kitchen", &[RemoteGrant::Alert]);
+        let (raw, _token) = remote("pod#kitchen", &[AttachGrant::Alert]);
         resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "duplicate [[remote]] slug")]
     fn duplicate_slugs_are_rejected() {
-        let (raw, _token) = remote("twin", &[RemoteGrant::Alert]);
+        let (raw, _token) = remote("twin", &[AttachGrant::Alert]);
         resolve_remotes(&[raw.clone(), raw], &MessagingGlobalConfig::default());
     }
 
     #[test]
     #[should_panic(expected = "publish_burst 1000 exceeds")]
     fn a_publish_burst_above_the_bus_gate_is_rejected() {
-        let (mut raw, _token) = remote("firehose", &[RemoteGrant::Publish]);
+        let (mut raw, _token) = remote("firehose", &[AttachGrant::Publish]);
         raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
         raw.publish_burst = Some(1000);
         resolve_one(raw);
@@ -864,7 +897,7 @@ remote typo {
     #[test]
     #[should_panic(expected = "publish_per_sec 1000 exceeds")]
     fn a_publish_per_sec_above_the_bus_gate_is_rejected() {
-        let (mut raw, _token) = remote("firehose", &[RemoteGrant::Publish]);
+        let (mut raw, _token) = remote("firehose", &[AttachGrant::Publish]);
         raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
         raw.publish_per_sec = Some(1000);
         resolve_one(raw);
@@ -873,7 +906,7 @@ remote typo {
     #[test]
     #[should_panic(expected = "publish_burst must be >= 1")]
     fn a_zero_publish_burst_is_rejected() {
-        let (mut raw, _token) = remote("mute", &[RemoteGrant::Publish]);
+        let (mut raw, _token) = remote("mute", &[AttachGrant::Publish]);
         raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
         raw.publish_burst = Some(0);
         resolve_one(raw);
@@ -882,7 +915,7 @@ remote typo {
     #[test]
     #[should_panic(expected = "publish_per_sec must be >= 1")]
     fn a_zero_publish_per_sec_is_rejected() {
-        let (mut raw, _token) = remote("mute", &[RemoteGrant::Publish]);
+        let (mut raw, _token) = remote("mute", &[AttachGrant::Publish]);
         raw.publish_acl = vec![ChannelMatcherRaw::Prefix("a.".to_string())];
         raw.publish_per_sec = Some(0);
         resolve_one(raw);
@@ -891,7 +924,7 @@ remote typo {
     #[test]
     #[should_panic(expected = "max_sessions must be >= 1")]
     fn zero_sessions_is_rejected() {
-        let (mut raw, _token) = remote("never", &[RemoteGrant::Alert]);
+        let (mut raw, _token) = remote("never", &[AttachGrant::Alert]);
         raw.max_sessions = Some(0);
         resolve_one(raw);
     }
@@ -899,7 +932,7 @@ remote typo {
     #[test]
     #[should_panic(expected = "max_subscriptions must be >= 1")]
     fn zero_subscriptions_is_rejected() {
-        let (mut raw, _token) = remote("deaf", &[RemoteGrant::Alert]);
+        let (mut raw, _token) = remote("deaf", &[AttachGrant::Alert]);
         raw.max_subscriptions = Some(0);
         resolve_one(raw);
     }
@@ -907,14 +940,14 @@ remote typo {
     #[test]
     #[should_panic(expected = "slug must be non-empty")]
     fn an_empty_slug_is_rejected() {
-        let (raw, _token) = remote("", &[RemoteGrant::Alert]);
+        let (raw, _token) = remote("", &[AttachGrant::Alert]);
         resolve_one(raw);
     }
 
     #[test]
     #[should_panic(expected = "failed to read secret file")]
     fn a_missing_token_file_is_a_boot_panic() {
-        let (mut raw, _token) = remote("ghost", &[RemoteGrant::Alert]);
+        let (mut raw, _token) = remote("ghost", &[AttachGrant::Alert]);
         raw.token_file = PathBuf::from("/nonexistent/brenn/remote.token");
         resolve_one(raw);
     }
@@ -924,14 +957,14 @@ remote typo {
     #[should_panic(expected = "group/world-accessible")]
     fn a_world_readable_token_file_is_a_boot_panic() {
         use std::os::unix::fs::PermissionsExt as _;
-        let (raw, token) = remote("leaky", &[RemoteGrant::Alert]);
+        let (raw, token) = remote("leaky", &[AttachGrant::Alert]);
         std::fs::set_permissions(token.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
         resolve_one(raw);
     }
 
     #[test]
     fn the_token_verifies_and_never_renders() {
-        let (raw, _token) = remote("pager", &[RemoteGrant::Alert]);
+        let (raw, _token) = remote("pager", &[AttachGrant::Alert]);
         let remote = resolve_one(raw);
         assert!(remote.token.verify("s3cret-token"));
         assert!(!remote.token.verify("s3cret-toker"));

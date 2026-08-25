@@ -342,14 +342,14 @@ fn a_surface_that_declares_no_error_channel_queues_no_report() {
 #[test]
 fn an_alert_rides_its_own_channel_and_is_dropped_when_it_is_full() {
     let mut front = front();
-    front.handle.alert(AlertSeverity::Warning, "t", "b");
+    front.handle.alert(None, AlertSeverity::Warning, "t", "b");
     let alert = front.next_alert().expect("the alert is queued");
     assert_eq!(alert.severity, AlertSeverity::Warning);
     assert_eq!(alert.title, "t");
     assert_eq!(alert.body, "b");
     // Best-effort: a component alert-loop can neither panic the page nor block.
     for _ in 0..ALERT_CHANNEL_CAPACITY * 4 {
-        front.handle.alert(AlertSeverity::Critical, "t", "b");
+        front.handle.alert(None, AlertSeverity::Critical, "t", "b");
     }
     let mut drained = 0;
     while front.next_alert().is_some() {
@@ -421,7 +421,7 @@ fn the_best_effort_planes_are_silent_once_the_run_is_over() {
     let mut front = front();
     front.channels.alert_rx.close();
     front.channels.telemetry_rx.close();
-    front.handle.alert(AlertSeverity::Warning, "t", "b");
+    front.handle.alert(None, AlertSeverity::Warning, "t", "b");
     front.handle.send_geometry(1280, 720, 2.0);
     front
         .handle

@@ -42,6 +42,7 @@ use brenn_envelope::addressing::{
     MATCHER_BOUNDARIES, TUNING_BOUNDARIES, ends_at_matcher_boundary, ends_at_tuning_boundary,
     in_a_tool_namespace, is_auto_channel_name, nondurable_channel_uuid,
 };
+use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 
 use crate::derived::{
     DAclSet, DAuthorities, DAuthority, DMatcher, DMqttClient, DMqttSub, DRemoteAuthority,
@@ -478,21 +479,53 @@ fn collect_pins<'a>(
 enum EntityKind {
     Surface,
     Agent,
-    Consumer,
+    /// A component instance, wherever it was placed. One kind for both hosts:
+    /// what a component is given, and what it may be authorized to reach, is
+    /// the same question on a surface and at top level. The host it runs on
+    /// rides along because a few answers are the host's — which capabilities it
+    /// can implement, and which schemes it can attach to.
+    Component(ComponentHost),
     Remote,
 }
 
 impl EntityKind {
     /// What this kind is called in a diagnostic.
+    ///
+    /// A component keeps the name its placement gave it — the language calls a
+    /// top-level instance a consumer, and an operator reading a refusal is
+    /// looking at one word or the other in their own document.
     fn label(self) -> &'static str {
         match self {
             Self::Surface => "surface",
             Self::Agent => "agent",
-            Self::Consumer => "consumer",
+            Self::Component(ComponentHost::Surface) => "component",
+            Self::Component(ComponentHost::TopLevel) => "consumer",
             Self::Remote => "remote",
         }
     }
 }
+
+/// The reason this entity type cannot hold this right, where there is one.
+///
+/// Only a component's rights have a host to be illegal on: every other entity
+/// type's vocabulary is already exactly what it may state.
+fn host_refusal(kind: EntityKind, right: Capability) -> Option<&'static str> {
+    match (kind, right) {
+        (EntityKind::Component(host), Capability::Grant(grant)) => grant.illegal_on(host),
+        _ => None,
+    }
+}
+
+/// Every capability a component states, whichever host it runs on: the shared
+/// vocabulary whole, with [`host_refusal`] refusing what the host cannot
+/// implement. One list rather than one per host, so a word is legal-here or
+/// illegal-there and never unknown.
+///
+/// The leading segment of [`Capability::ALL`], which builds the shared words
+/// first and appends the agent-only rights after them — so the relationship
+/// between the two lists is structural rather than two builders held equal by
+/// review.
+const COMPONENT_CAPABILITIES: &[Capability] = Capability::ALL.split_at(ComponentGrant::ALL.len()).0;
 
 /// The principal a statement is about: what it is, and what to call it.
 #[derive(Debug, Clone, Copy)]
@@ -588,11 +621,17 @@ impl Family {
             // A confined channel reaches a component and nothing else: a surface
             // is authorized out of band by the page it is served to, and an agent
             // has no confined delivery path at all.
-            Self::LocalSubscribe => kind == EntityKind::Consumer,
-            Self::LocalPublish => matches!(kind, EntityKind::Agent | EntityKind::Consumer),
-            Self::MqttSubscribe | Self::MqttPublish | Self::Webhook => {
-                matches!(kind, EntityKind::Agent | EntityKind::Consumer)
+            Self::LocalSubscribe => matches!(kind, EntityKind::Component(_)),
+            Self::LocalPublish => {
+                matches!(kind, EntityKind::Agent | EntityKind::Component(_))
             }
+            // A broker and an endpoint are the backend host's: the page
+            // implements neither, which is the same fact the capability
+            // legality table states as `store`/`mqtt` being backend-only.
+            Self::MqttSubscribe | Self::MqttPublish | Self::Webhook => matches!(
+                kind,
+                EntityKind::Agent | EntityKind::Component(ComponentHost::TopLevel)
+            ),
         }
     }
 
@@ -743,9 +782,23 @@ struct Subject<'a> {
     /// holds no ports and states no subscriptions, so its authority is the
     /// entries it writes and the ones granted to it.
     bounds: Vec<Bound<'a>>,
+    /// Whether a refusal about one of its positions is this principal's to
+    /// report.
+    ///
+    /// False for a surface-placed instance: its bindings are also its surface's
+    /// positions, so the surface's pass reports what is wrong with an address
+    /// and the instance's pass only records that its own authority is
+    /// incomplete. One mistake, one message.
+    owns_bindings: bool,
+    /// Where its first free `io` port is, if it holds one. A free port connects
+    /// nothing, so it is no position — but the ring it is served mints a page
+    /// where the component publishes, so it is a send the `ports` rule asks
+    /// about.
+    free_send: Option<Span>,
     /// Its `grants` words, or `None` where the entity states no list at all —
     /// which an agent may do (no rights is a posture, as its config counterpart
-    /// allows) and a consumer may not (the field is required with no default).
+    /// allows) and a component may not, at either placement (the field is
+    /// required with no default).
     words: Option<&'a [Word]>,
 }
 
@@ -767,13 +820,14 @@ impl Subject<'_> {
         match self.words {
             Some(words) => words,
             None => {
-                if self.kind == EntityKind::Consumer {
+                if matches!(self.kind, EntityKind::Component(_)) {
                     *refused = true;
                     errors.push(Diagnostic::at(
                         format!(
-                            "consumer `{}` states no `grants`: what a component is given is \
+                            "{} `{}` states no `grants`: what a component is given is \
                              deny-by-default, so an empty list is written `grants = [];` \
                              rather than left out",
+                            self.kind.label(),
                             self.label
                         ),
                         self.span.clone(),
@@ -794,14 +848,33 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: surface_bounds(entity),
+        owns_bindings: true,
+        // A surface states no `grants` word about sending; the `ports` rule is
+        // its components'.
+        free_send: None,
         words: Some(&entity.attrs.grants.value.words),
     });
+    let components = config.surfaces.iter().flat_map(|surface| {
+        let prefix = surface.handle.dotted();
+        surface.components.iter().map(move |instance| Subject {
+            kind: EntityKind::Component(ComponentHost::Surface),
+            label: format!("{prefix}.{}", instance.instance.value()),
+            span: instance.instance.span().clone(),
+            acls: &instance.acls,
+            bounds: binding_bounds(&instance.bindings),
+            owns_bindings: false,
+            free_send: free_send(&instance.bindings),
+            words: instance.grants.as_ref().map(|list| list.words.as_slice()),
+        })
+    });
     let consumers = config.consumers.iter().map(|entity| Subject {
-        kind: EntityKind::Consumer,
+        kind: EntityKind::Component(ComponentHost::TopLevel),
         label: entity.handle.dotted(),
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: binding_bounds(&entity.bindings),
+        owns_bindings: true,
+        free_send: free_send(&entity.bindings),
         words: entity.grants.as_ref().map(|list| list.words.as_slice()),
     });
     let agents = config.agents.iter().map(|entity| Subject {
@@ -810,6 +883,8 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: agent_bounds(entity),
+        owns_bindings: true,
+        free_send: None,
         words: entity
             .attrs
             .grants
@@ -822,9 +897,12 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: Vec::new(),
+        owns_bindings: true,
+        free_send: None,
         words: Some(&entity.attrs.grants.value.words),
     });
     surfaces
+        .chain(components)
         .chain(consumers)
         .chain(agents)
         .chain(remotes)
@@ -841,9 +919,10 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
 struct Stated {
     entries: Vec<(Family, DEntry)>,
     explicit: Vec<(Plane, Span)>,
-    /// Where the first position on the publish plane is, if there is one. What a
-    /// wasm consumer's `ports` rule is about: an output is a right to send
-    /// whether or not an entry was ever filed for it.
+    /// Where the first send this principal makes is, if it makes one: a position
+    /// on the publish plane, or the ring a free `io` port mints. What the `ports`
+    /// rule is about at either placement — a send is a right to send whether or
+    /// not an entry was ever filed for it.
     output: Option<Span>,
     /// Whether anything this principal wrote was refused.
     ///
@@ -930,9 +1009,13 @@ impl Stated {
 fn derive_authorities(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -> DAuthorities {
     let refs = Refs::of(config);
     let subjects = subjects(config);
+    // Surface-placed components are deliberately absent: they hold no handle in
+    // the handle space, so nothing can name one as a `grant` target, and a
+    // label that happened to read like a real handle must not shadow it.
     let slots: HashMap<&str, usize> = subjects
         .iter()
         .enumerate()
+        .filter(|(_, subject)| subject.kind != EntityKind::Component(ComponentHost::Surface))
         .map(|(index, subject)| (subject.label.as_str(), index))
         .collect();
     let mut stated: Vec<Stated> = subjects
@@ -973,15 +1056,30 @@ fn derive_authorities(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -> 
     }
 
     let mut authorities = DAuthorities::default();
+    // Flat, in `subjects` walk order; re-nested per surface below.
+    let mut placed: Vec<DAuthority> = Vec::new();
     for (subject, held) in subjects.iter().zip(stated) {
         let grants = derive_grants(subject, &held, errors);
         match subject.kind {
             EntityKind::Surface => authorities.surfaces.push(authority(held, grants)),
-            EntityKind::Consumer => authorities.consumers.push(authority(held, grants)),
+            EntityKind::Component(ComponentHost::Surface) => placed.push(authority(held, grants)),
+            EntityKind::Component(ComponentHost::TopLevel) => {
+                authorities.consumers.push(authority(held, grants))
+            }
             EntityKind::Agent => authorities.agents.push(authority(held, grants)),
             EntityKind::Remote => authorities.remotes.push(remote_authority(held, grants)),
         }
     }
+    let mut rest = placed.into_iter();
+    authorities.surface_components = config
+        .surfaces
+        .iter()
+        .map(|surface| rest.by_ref().take(surface.components.len()).collect())
+        .collect();
+    assert!(
+        rest.next().is_none(),
+        "one authority per placed instance, in surface order"
+    );
     authorities
 }
 
@@ -1642,14 +1740,17 @@ fn bindable(kind: EntityKind, plane: Plane) -> &'static [ChannelScheme] {
             ChannelScheme::Ephemeral,
             ChannelScheme::Local,
         ],
-        (EntityKind::Consumer, Plane::Subscribe) => &[
+        (EntityKind::Component(ComponentHost::TopLevel), Plane::Subscribe) => &[
             ChannelScheme::Brenn,
             ChannelScheme::Ephemeral,
             ChannelScheme::Local,
             ChannelScheme::Webhook,
             ChannelScheme::Mqtt,
         ],
-        (EntityKind::Consumer, Plane::Publish) => &[
+        // A surface-placed instance attaches through the page, which reaches no
+        // broker and no endpoint.
+        (EntityKind::Component(ComponentHost::Surface), _)
+        | (EntityKind::Component(ComponentHost::TopLevel), Plane::Publish) => &[
             ChannelScheme::Brenn,
             ChannelScheme::Ephemeral,
             ChannelScheme::Local,
@@ -1695,6 +1796,19 @@ fn binding_bounds(bindings: &[RBinding]) -> Vec<Bound<'_>> {
         .collect()
 }
 
+/// Where the first free `io` port in a set of bindings is.
+///
+/// It holds no position, so it derives no entry — but the page-local ring it is
+/// served is something the component publishes into, which is what the `ports`
+/// rule asks about. Boot must count both halves of every `io` port for the same
+/// reason.
+fn free_send(bindings: &[RBinding]) -> Option<Span> {
+    bindings
+        .iter()
+        .find(|binding| binding.chan.is_none())
+        .map(|binding| binding.port.span().clone())
+}
+
 /// An agent's positions: its `subscribe` statements, which are inbound.
 fn agent_bounds(agent: &RAgent) -> Vec<Bound<'_>> {
     agent
@@ -1721,8 +1835,23 @@ fn derive_bounds(
     let kind = subject.kind;
     let label = &subject.label;
     let mut positions = Vec::new();
+    // A free `io` port is a send before any position is walked: the ring is
+    // minted whether or not the document names a channel.
+    stated.output = subject.free_send.clone();
+    // What is wrong with a position rather than with this principal's lists:
+    // reported only by the principal that owns the position, so a binding a
+    // surface and its instance both attach through earns one message.
+    //
+    // Dropping the non-owner's copy is sound only while the owner reaches the
+    // same refusal, which rests on two tables: `bindable` admits the same
+    // schemes to a surface and to a component placed on it, and `bound_entry`
+    // is infallible for every family those schemes reach (its fallible arms are
+    // mqtt and webhook, which `bindable` keeps off a surface). Widening either
+    // table — lifting `mqtt` onto a page, say — must come with a pass that
+    // reports here, or a refused document would carry no message at all.
+    let mut shared = Vec::new();
     for bound in &subject.bounds {
-        let Some((scheme, bare)) = bound_address(bound, kind, label, refs, errors) else {
+        let Some((scheme, bare)) = bound_address(bound, kind, label, refs, &mut shared) else {
             stated.refused = true;
             continue;
         };
@@ -1736,7 +1865,7 @@ fn derive_bounds(
             let family =
                 Family::of(scheme, plane).filter(|_| bindable(kind, plane).contains(&scheme));
             let Some(family) = family else {
-                errors.push(Diagnostic::at(
+                shared.push(Diagnostic::at(
                     unbindable(scheme, plane, kind, label, bound),
                     bound.span.clone(),
                 ));
@@ -1749,7 +1878,7 @@ fn derive_bounds(
             if !family.held_by(kind) {
                 continue;
             }
-            let Some(entry) = bound_entry(family, &bare, &bound.span, refs, errors) else {
+            let Some(entry) = bound_entry(family, &bare, &bound.span, refs, &mut shared) else {
                 stated.refused = true;
                 continue;
             };
@@ -1766,6 +1895,10 @@ fn derive_bounds(
                 what: bound.what,
             });
         }
+    }
+
+    if subject.owns_bindings {
+        errors.append(&mut shared);
     }
 
     for position in positions {
@@ -1915,8 +2048,9 @@ fn bound_entry(
 
 /// The words one entity type's `grants` list may hold.
 ///
-/// TODO(dsl-vocabulary-config-parity): held equal to `SurfaceGrant`,
-/// `RemoteGrant`, the authorable subset of `AppCapability` and `WasmGrant` by
+/// TODO(dsl-vocabulary-config-parity): the component words come from
+/// `ComponentGrant` and the attach words from `AttachGrant`, both mechanical;
+/// the agent row is held equal to the authorable subset of `AppCapability` by
 /// review.
 struct Vocabulary {
     /// Whether a plane word is a right here at all.
@@ -1937,17 +2071,14 @@ struct Vocabulary {
 /// The words this entity type states rights with.
 fn vocabulary(kind: EntityKind) -> Vocabulary {
     match kind {
-        EntityKind::Surface => Vocabulary {
+        // A surface and a remote hold one vocabulary between them: both are
+        // attach-route principals, and the rights a wire carries do not depend
+        // on which kind of client is at the far end. Nothing page-shaped is
+        // here — `takeover` is a capability a component holds within the page,
+        // stated on the component.
+        EntityKind::Surface | EntityKind::Remote => Vocabulary {
             planes: true,
-            capabilities: &[Capability::Alert, Capability::Takeover],
-            compound: &[
-                ("ephemeral_subscribe", "subscribe"),
-                ("ephemeral_publish", "publish"),
-            ],
-        },
-        EntityKind::Remote => Vocabulary {
-            planes: true,
-            capabilities: &[Capability::Alert],
+            capabilities: &[Capability::Grant(ComponentGrant::Alert)],
             compound: &[
                 ("ephemeral_subscribe", "subscribe"),
                 ("ephemeral_publish", "publish"),
@@ -1967,16 +2098,11 @@ fn vocabulary(kind: EntityKind) -> Vocabulary {
                 ("webhook", "subscribe"),
             ],
         },
-        EntityKind::Consumer => Vocabulary {
+        // The whole shared vocabulary at either placement; what the host cannot
+        // implement is refused by name rather than left out of the list.
+        EntityKind::Component(_) => Vocabulary {
             planes: false,
-            capabilities: &[
-                Capability::Ports,
-                Capability::Store,
-                Capability::Log,
-                Capability::Alert,
-                Capability::Config,
-                Capability::Mqtt,
-            ],
+            capabilities: COMPONENT_CAPABILITIES,
             compound: &[],
         },
     }
@@ -2003,48 +2129,51 @@ impl Vocabulary {
 ///
 /// A variant rather than a word, so a rule keyed on one of these cannot go on
 /// compiling once the word is renamed or misspelled.
-/// TODO(dsl-vocabulary-config-parity): held equal to `SurfaceGrant`,
-/// `RemoteGrant`, `AppCapability` and `WasmGrant` by review.
+///
+/// [`Capability::Grant`] carries the shared component vocabulary rather than
+/// restating it: the word list, its spellings, and what a word parses to all come
+/// from the one enum the host and the surface kernel also read. `alert` is one
+/// word across every entity type that states it — a component's and an
+/// attacher's — so it is one variant here too; a right no component vocabulary
+/// holds gets a variant of its own.
+///
+/// TODO(dsl-vocabulary-config-parity): the component grant row is now mechanical
+/// — `Capability::Grant` *is* `ComponentGrant`, and the one word an attacher
+/// states beyond its planes (`alert`) is the same word. What remains by review:
+/// the agent row (`AppCapability`'s authorable subset, and the two agent-only
+/// variants below), and the ACL family transcriptions in `brenn-lib`'s lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Capability {
-    Alert,
-    Takeover,
+    /// A right in the shared component grant vocabulary.
+    Grant(ComponentGrant),
+    /// The runtime's dynamic-subscribe tool. Agent-only; no component states it.
     DynamicSubscribe,
+    /// PWA push egress. Agent-only; no component states it.
     PwaPush,
-    Ports,
-    Store,
-    Log,
-    Config,
-    Mqtt,
 }
 
 impl Capability {
-    /// Every capability any entity type states, in the order the vocabularies
-    /// list them.
-    const ALL: [Capability; 9] = [
-        Capability::Alert,
-        Capability::Takeover,
-        Capability::DynamicSubscribe,
-        Capability::PwaPush,
-        Capability::Ports,
-        Capability::Store,
-        Capability::Log,
-        Capability::Config,
-        Capability::Mqtt,
-    ];
+    /// Every capability any entity type states: the whole shared component
+    /// vocabulary, then the agent-only rights. Built from `ComponentGrant::ALL`
+    /// so a word added there is parseable here without an edit.
+    const ALL: [Capability; ComponentGrant::ALL.len() + 2] = {
+        let mut all = [Capability::DynamicSubscribe; ComponentGrant::ALL.len() + 2];
+        let mut next = 0;
+        while next < ComponentGrant::ALL.len() {
+            all[next] = Capability::Grant(ComponentGrant::ALL[next]);
+            next += 1;
+        }
+        all[next] = Capability::DynamicSubscribe;
+        all[next + 1] = Capability::PwaPush;
+        all
+    };
 
     /// The word this right is written as.
     fn word(self) -> &'static str {
         match self {
-            Self::Alert => "alert",
-            Self::Takeover => "takeover",
+            Self::Grant(grant) => grant.word(),
             Self::DynamicSubscribe => "dynamic_subscribe",
             Self::PwaPush => "pwa_push",
-            Self::Ports => "ports",
-            Self::Store => "store",
-            Self::Log => "log",
-            Self::Config => "config",
-            Self::Mqtt => "mqtt",
         }
     }
 
@@ -2061,8 +2190,8 @@ impl Capability {
 /// it lowers to, so the expansion is the whole translation. Only the schemes the
 /// entity has entries on are written: a token over an empty list is dead
 /// configuration, which is what agreement refuses.
-/// TODO(dsl-vocabulary-config-parity): held equal to the `SurfaceGrant` and
-/// `RemoteGrant` variants and the authorable `AppCapability` tokens by review.
+/// TODO(dsl-vocabulary-config-parity): held equal to the `AttachGrant` variants
+/// and the authorable `AppCapability` tokens by review.
 fn expansions(kind: EntityKind) -> &'static [(Plane, ChannelScheme, &'static str)] {
     match kind {
         EntityKind::Surface | EntityKind::Remote => &[
@@ -2101,9 +2230,9 @@ fn expansions(kind: EntityKind) -> &'static [(Plane, ChannelScheme, &'static str
             (Plane::Publish, ChannelScheme::Local, "local_publish"),
             (Plane::Publish, ChannelScheme::Mqtt, "mqtt_publish"),
         ],
-        // A wasm consumer's words are capabilities, which name no scheme and
-        // expand to nothing: they cross into the config as written.
-        EntityKind::Consumer => &[],
+        // A component's words are capabilities, which name no scheme and expand
+        // to nothing: they cross into the config as written.
+        EntityKind::Component(_) => &[],
     }
 }
 
@@ -2136,18 +2265,22 @@ fn derive_grants(
                 None
             }
             Some(_) => Some(format!(
-                "consumer `{label}` states no `{}` right: a wasm consumer's grants name \
-                 the capability interfaces it is given, and its transport rights are \
-                 read off its acl statements",
+                "{} `{label}` states no `{}` right: a component's grants name the \
+                 capability interfaces it is given, and its transport rights are read off \
+                 its bindings and acl statements",
+                kind.label(),
                 name.value()
             )),
             None => match Capability::parse(name.value())
                 .filter(|right| vocabulary.capabilities.contains(right))
             {
-                Some(right) => {
-                    rights.push(Right::Capability(right, name));
-                    None
-                }
+                Some(right) => match host_refusal(kind, right) {
+                    Some(message) => Some(message.to_string()),
+                    None => {
+                        rights.push(Right::Capability(right, name));
+                        None
+                    }
+                },
                 // A word that spells a capability another entity type has is not
                 // one here, so it goes on to the same refusals any other word does.
                 None => match vocabulary
@@ -2275,17 +2408,24 @@ fn check_agreement(
             entry.span().clone(),
         ));
     }
-    if kind == EntityKind::Consumer {
-        check_wasm_agreement(label, rights, stated, errors);
+    if let EntityKind::Component(host) = kind {
+        check_component_agreement(host, kind.label(), label, rights, stated, errors);
     }
 }
 
-/// The rights a wasm consumer's lists demand, and the lists its rights demand.
+/// The rights a component's lists demand, and the lists its rights demand.
 ///
-/// Its transport rights are read off the ACLs, so only two words pair with a
-/// list at all: `ports`, which is the right to send anywhere, and `mqtt`, which
-/// is the right to reach a broker.
-fn check_wasm_agreement(
+/// Its transport rights are read off its bindings and ACLs, so only two words
+/// pair with a list at all: `ports`, which is the right to send anywhere, and
+/// `mqtt`, which is the right to reach a broker.
+///
+/// Both directions are asked wherever the instance runs. A free `io` port counts
+/// as a send at either placement — it has no channel for an entry to be about,
+/// but the page-local ring it mints is somewhere the component publishes, and
+/// boot must count the same port when it asks the forward direction.
+fn check_component_agreement(
+    host: ComponentHost,
+    what: &str,
     label: &str,
     rights: &[Right<'_>],
     stated: &Stated,
@@ -2306,24 +2446,32 @@ fn check_wasm_agreement(
     .find_map(|family| stated.first(family))
     .map(|entry| entry.span().clone())
     .or_else(|| stated.output.clone());
-    match (word(Capability::Ports), sends) {
+    match (word(Capability::Grant(ComponentGrant::Ports)), sends) {
         (None, Some(span)) => errors.push(Diagnostic::at(
             format!(
-                "consumer `{label}` sends and grants no `ports`: the messaging interface it \
+                "{what} `{label}` sends and grants no `ports`: the messaging interface it \
                  publishes through is what `ports` gives it"
             ),
             span,
         )),
         (Some(word), None) => errors.push(Diagnostic::at(
             format!(
-                "consumer `{label}` grants `ports` and neither binds an output nor states a \
+                "{what} `{label}` grants `ports` and neither binds an output nor states a \
                  publish entry, so the interface reaches nothing"
             ),
             word.span().clone(),
         )),
         _ => {}
     }
-    match (word(Capability::Mqtt), stated.first(Family::MqttPublish)) {
+    // `mqtt` is refused outright on a surface, so the pair below is a top-level
+    // question only; the legality table is what says so.
+    if host == ComponentHost::Surface {
+        return;
+    }
+    match (
+        word(Capability::Grant(ComponentGrant::Mqtt)),
+        stated.first(Family::MqttPublish),
+    ) {
         (None, Some(entry)) => errors.push(Diagnostic::at(
             format!(
                 "consumer `{label}` holds an `mqtt_publish` entry and grants no `mqtt`: the \
@@ -2439,7 +2587,6 @@ fn fold_component_kinds(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -
 fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
     left.name.value() == right.name.value()
         && left.abi.value() == right.abi.value()
-        && same_value(left.component_path.as_ref(), right.component_path.as_ref())
         && left.ports.len() == right.ports.len()
         && left
             .ports
@@ -2453,12 +2600,4 @@ fn same_port(left: &RPort, right: &RPort) -> bool {
     left.name.value() == right.name.value()
         && left.dir == right.dir
         && left.doctype.as_ref().map(Spanned::value) == right.doctype.as_ref().map(Spanned::value)
-}
-
-/// Two optional values, span excluded.
-fn same_value(left: Option<&RVal>, right: Option<&RVal>) -> bool {
-    fn strip(value: &RVal) -> &RValue {
-        value.value()
-    }
-    left.map(strip) == right.map(strip)
 }

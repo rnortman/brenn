@@ -10,8 +10,9 @@ use std::net::Ipv4Addr;
 use axum::http::HeaderValue;
 use brenn_lib::access::raw::ChannelMatcherRaw;
 use brenn_lib::config::{remote_prefix_ceiling, remote_raw};
+use brenn_lib::messaging::AttachGrant;
 use brenn_lib::messaging::config::MessagingGlobalConfig;
-use brenn_lib::messaging::remote::{RemoteConfigRaw, RemoteGrant, resolve_remotes};
+use brenn_lib::messaging::remote::{RemoteConfigRaw, resolve_remotes};
 use brenn_obs::alerting::make_capturing_alerter;
 
 use super::*;
@@ -46,7 +47,7 @@ fn runtimes() -> (HashMap<String, Arc<RemoteRuntime>>, tempfile::NamedTempFile) 
         ..remote_raw(
             SLUG,
             token.path(),
-            &[RemoteGrant::Subscribe, RemoteGrant::Publish],
+            &[AttachGrant::Subscribe, AttachGrant::Publish],
         )
     };
     let resolved = resolve_remotes(&[raw], &MessagingGlobalConfig::default());

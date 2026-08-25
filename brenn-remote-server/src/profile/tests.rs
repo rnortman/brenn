@@ -5,10 +5,10 @@ use std::path::Path;
 
 use brenn_lib::access::raw::ChannelMatcherRaw;
 use brenn_lib::config::{remote_exact_ceiling, remote_fleet, remote_prefix_ceiling, remote_raw};
+use brenn_lib::messaging::AttachGrant;
 use brenn_lib::messaging::config::MessagingGlobalConfig;
 use brenn_lib::messaging::remote::{
-    DEFAULT_REMOTE_MAX_SESSIONS, DEFAULT_REMOTE_MAX_SUBSCRIPTIONS, RemoteConfigRaw, RemoteGrant,
-    resolve_remotes,
+    DEFAULT_REMOTE_MAX_SESSIONS, DEFAULT_REMOTE_MAX_SUBSCRIPTIONS, RemoteConfigRaw, resolve_remotes,
 };
 
 use super::*;
@@ -92,7 +92,7 @@ fn confined_and_unschemed_addresses_are_refused_in_both_directions() {
         ..remote_raw(
             "greedy",
             token,
-            &[RemoteGrant::Subscribe, RemoteGrant::Publish],
+            &[AttachGrant::Subscribe, AttachGrant::Publish],
         )
     });
     for address in ["local:a.confined", "a.bare", "mqtt:a.x", "webhook:a.x", ""] {
@@ -111,7 +111,7 @@ fn overlapping_entries_fold_by_max_per_knob() {
             remote_prefix_ceiling("chat.", 4, 128),
             remote_exact_ceiling("chat.deep", 32, 8),
         ],
-        ..remote_raw("folder", token, &[RemoteGrant::Subscribe])
+        ..remote_raw("folder", token, &[AttachGrant::Subscribe])
     });
     assert_eq!(
         profile.subscribable("brenn:chat.deep"),
@@ -233,7 +233,7 @@ fn the_caps_come_from_config_and_the_session_grains_collapse() {
         subscribe_acl: vec![remote_prefix_ceiling("a.", 1, 1)],
         max_sessions: Some(1),
         max_subscriptions: Some(3),
-        ..remote_raw("strict", token, &[RemoteGrant::Subscribe])
+        ..remote_raw("strict", token, &[AttachGrant::Subscribe])
     });
     assert_eq!(
         tight.session_caps(),
@@ -253,7 +253,7 @@ fn the_subscribe_burst_admits_a_whole_reconcile() {
     let (profile, _token) = build(|token| RemoteConfigRaw {
         subscribe_acl: vec![remote_prefix_ceiling("a.", 1, 1)],
         max_subscriptions: Some(40),
-        ..remote_raw("churner", token, &[RemoteGrant::Subscribe])
+        ..remote_raw("churner", token, &[AttachGrant::Subscribe])
     });
     assert_eq!(profile.subscribe_burst(), 80);
     assert!(profile.subscribe_burst() as usize >= 2 * profile.max_active_subscriptions());
@@ -266,7 +266,7 @@ fn the_alert_grant_and_publish_bucket_are_the_operators() {
         publish_acl: vec![ChannelMatcherRaw::Prefix("a.".to_string())],
         publish_burst: Some(7),
         publish_per_sec: Some(3),
-        ..remote_raw("pager", token, &[RemoteGrant::Alert, RemoteGrant::Publish])
+        ..remote_raw("pager", token, &[AttachGrant::Alert, AttachGrant::Publish])
     });
     assert!(granted.alert_granted());
     assert_eq!(
@@ -279,7 +279,7 @@ fn the_alert_grant_and_publish_bucket_are_the_operators() {
 
     let (silent, _token) = build(|token| RemoteConfigRaw {
         publish_acl: vec![ChannelMatcherRaw::Prefix("a.".to_string())],
-        ..remote_raw("quiet", token, &[RemoteGrant::Publish])
+        ..remote_raw("quiet", token, &[AttachGrant::Publish])
     });
     assert!(!silent.alert_granted());
 }

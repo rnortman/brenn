@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use brenn_lib::access::AppCapability;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
-use brenn_lib::messaging::{AttachScope, ParticipantId, SubscriberEntry};
+use brenn_lib::messaging::{AttachScope, ComponentGrant, ParticipantId, SubscriberEntry};
 use brenn_messaging::MissingChannelPosture;
 
 use brenn_attach_server::profile::{
@@ -67,6 +67,13 @@ pub struct SurfaceProfile {
     /// attachment advertises and the one every `Alert` frame is judged against
     /// are one answer.
     alert_granted: bool,
+    /// The declared instances whose own grants name `alert` — the containment
+    /// half of the plane, disjoint in purpose from `alert_granted`: that one is
+    /// the surface's transport right toward the backend, this one says which of
+    /// the components behind it may spend it. Boot refuses an instance `alert`
+    /// grant on a surface without the surface-level one, so a name here implies
+    /// `alert_granted`.
+    component_alertable: HashSet<String>,
     /// The operator-tuned per-connection publish bucket every session of this
     /// surface starts full with.
     publish_rate: PublishRate,
@@ -200,6 +207,12 @@ impl SurfaceProfile {
             kernel_publishable,
             error_channel: None,
             alert_granted: resolved.policy.grants.has(AppCapability::SurfaceAlert),
+            component_alertable: resolved
+                .components
+                .iter()
+                .filter(|c| c.grants.contains(&ComponentGrant::Alert))
+                .map(|c| c.instance.clone())
+                .collect(),
             publish_rate: PublishRate {
                 burst: resolved.publish_burst,
                 per_sec: resolved.publish_per_sec,
@@ -308,6 +321,10 @@ impl AttachProfile for SurfaceProfile {
 
     fn alert_granted(&self) -> bool {
         self.alert_granted
+    }
+
+    fn attribution_may_alert(&self, attribution: &str) -> bool {
+        self.component_alertable.contains(attribution)
     }
 
     fn session_caps(&self) -> SessionCaps {

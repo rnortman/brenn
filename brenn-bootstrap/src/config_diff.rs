@@ -195,12 +195,12 @@ channel acks at "ephemeral:sink.acks" { push_depth = 1; retain_depth = 2; }
 
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io tick;
     out done;
 }
 
 new sink: Sink {
+    component_path = "/lib/brenn_sink.wasm";
     slug = "sink";
     grants = [ports];
 
@@ -515,12 +515,12 @@ channel outbox at "brenn:{channel_b}" {{
 
 component Sink {{
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     in inbound;
     out outbound;
 }}
 
 new sink: Sink {{
+    component_path = "/lib/brenn_sink.wasm";
     slug = "sink";
     grants = [log, config, ports, mqtt];
 
@@ -658,6 +658,7 @@ surface bar {{
     acl publish [exact "ephemeral:bar-acks", exact "ephemeral:bar-out"];
 
     new panel: Panel {{
+        grants = [ports];
         in messages <- inbox {{ push_depth = 1; retain_depth = 2; }}
         out outbound -> outbox {{ urgency = low; }}
     }}

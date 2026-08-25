@@ -28,6 +28,7 @@ fn component(instance: &str) -> ComponentEntry {
         abi: Abi::Dom,
         parked_batch_depth: 4,
         config: BTreeMap::new(),
+        grants: vec![],
     }
 }
 
@@ -72,7 +73,6 @@ fn doc(subscriptions: Vec<Binding>) -> BindingsDocument {
             status_interval_secs: 60,
             error_channel: None,
             error_report_floor: None,
-            takeover_granted: false,
         },
     }
 }

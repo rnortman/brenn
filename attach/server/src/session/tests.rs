@@ -303,8 +303,22 @@ async fn a_publish_batch_reaches_the_batch_handler() {
 // Alert
 // ---------------------------------------------------------------------------
 
-/// An alert plane fixture: the granted flag, and a dispatcher whose alerts the
-/// test can read back.
+/// An attacher declaring one sub-identity, `pager`, which holds the
+/// per-component alert right, and one, `mute`, which does not — the two answers
+/// the containment half of the plane has.
+fn alert_profile(granted: bool) -> TestProfile {
+    TestProfile {
+        alert_granted: granted,
+        declared: ["pager".to_string(), "mute".to_string()]
+            .into_iter()
+            .collect(),
+        alertable: ["pager".to_string()].into_iter().collect(),
+        ..TestProfile::new()
+    }
+}
+
+/// An alert plane fixture: the granted flag over [`alert_profile`], and a
+/// dispatcher whose alerts the test can read back.
 #[allow(clippy::type_complexity)]
 fn alert_fixture(
     granted: bool,
@@ -315,13 +329,7 @@ fn alert_fixture(
     Arc<Mutex<Vec<(NativeAlertSeverity, String, String)>>>,
 ) {
     let (dispatcher, captured, _handle) = make_capturing_alerter_with_severity();
-    let (ctx, _rx) = ctx_with(
-        TestProfile {
-            alert_granted: granted,
-            ..TestProfile::new()
-        },
-        dispatcher.clone(),
-    );
+    let (ctx, _rx) = ctx_with(alert_profile(granted), dispatcher.clone());
     let state = session_state(&ctx);
     (ctx, state, dispatcher, captured)
 }
@@ -336,6 +344,7 @@ async fn an_ungranted_alert_is_a_violation() {
         &ctx,
         &mut state.buckets.alert,
         &mut state.counters,
+        None,
         ProtoAlertSeverity::Critical,
         "title",
         "body",
@@ -358,6 +367,7 @@ async fn an_oversized_alert_is_a_violation_that_never_echoes_it() {
         &ctx,
         &mut state.buckets.alert,
         &mut state.counters,
+        None,
         ProtoAlertSeverity::Info,
         &"CANARY".repeat(MAX_ALERT_TITLE_BYTES),
         "body",
@@ -390,6 +400,7 @@ async fn a_granted_alert_dispatches_prefixed_and_attributed() {
                 &ctx,
                 &mut state.buckets.alert,
                 &mut state.counters,
+                None,
                 wire,
                 "disk filling",
                 "92% used",
@@ -426,6 +437,7 @@ async fn alerts_beyond_the_burst_are_dropped_not_fatal() {
                 &ctx,
                 &mut state.buckets.alert,
                 &mut state.counters,
+                None,
                 ProtoAlertSeverity::Info,
                 "noisy",
                 "again",
@@ -454,6 +466,7 @@ async fn an_alert_frame_reaches_the_alert_plane() {
         &ctx,
         &mut state,
         &ClientFrame::Alert {
+            attribution: None,
             severity: brenn_attach_proto::AlertSeverity::Info,
             title: "t".to_string(),
             body: "b".to_string(),
@@ -462,6 +475,80 @@ async fn an_alert_frame_reaches_the_alert_plane() {
     .await;
 
     assert!(violation_detail(outcome).ends_with("Alert from an attacher without the alert grant"));
+}
+
+/// The two scopes are independent rights, so an attributed alert names the
+/// sub-identity that raised it rather than the attacher behind it: an operator
+/// reading the page must be able to tell which component is broken.
+#[tokio::test]
+async fn an_attributed_alert_dispatches_under_the_component_that_raised_it() {
+    let (ctx, mut state, dispatcher, captured) = alert_fixture(true);
+
+    assert!(matches!(
+        handle_alert(
+            &ctx,
+            &mut state.buckets.alert,
+            &mut state.counters,
+            Some("pager"),
+            ProtoAlertSeverity::Warning,
+            "camera unreachable",
+            "no frames for 30s",
+        ),
+        FrameOutcome::Continue
+    ));
+    dispatcher.flush().await;
+
+    let alerts = captured.lock().expect("captured");
+    let (_severity, title, body) = &alerts[0];
+    assert_eq!(
+        title,
+        &format!("Attacher surface:{ATTACHER}#pager: camera unreachable")
+    );
+    assert!(
+        body.contains(&format!("attacher=surface:{ATTACHER}")),
+        "the attacher stays in the body: it is the connection the operator kills"
+    );
+}
+
+/// Undeclared attribution is a violation: admitting it would let a non-conforming
+/// client page under a name no operator wrote.
+#[tokio::test]
+async fn an_alert_under_an_undeclared_attribution_is_a_violation() {
+    let (ctx, mut state, _dispatcher, captured) = alert_fixture(true);
+
+    let detail = violation_detail(handle_alert(
+        &ctx,
+        &mut state.buckets.alert,
+        &mut state.counters,
+        Some("ghost"),
+        ProtoAlertSeverity::Info,
+        "t",
+        "b",
+    ));
+
+    assert!(detail.ends_with("Alert under undeclared attribution ghost"));
+    assert!(captured.lock().expect("captured").is_empty());
+}
+
+/// Declared but ungranted is a violation too, not a drop: the client gates on the
+/// component's own grant first, so a frame that arrives anyway means that gate was
+/// bypassed.
+#[tokio::test]
+async fn an_alert_from_a_declared_but_ungranted_attribution_is_a_violation() {
+    let (ctx, mut state, _dispatcher, captured) = alert_fixture(true);
+
+    let detail = violation_detail(handle_alert(
+        &ctx,
+        &mut state.buckets.alert,
+        &mut state.counters,
+        Some("mute"),
+        ProtoAlertSeverity::Info,
+        "t",
+        "b",
+    ));
+
+    assert!(detail.ends_with("Alert from declared attribution mute without the alert grant"));
+    assert!(captured.lock().expect("captured").is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +851,77 @@ async fn a_violation_ends_the_attachment_and_raises_one_security_event() {
         "attacher surface:{ATTACHER} account dev: unparseable client frame"
     )));
     assert!(!body.contains("Nonesuch"), "payload echoed: {body}");
+}
+
+/// **Attribution over a real socket, both verdicts.**
+///
+/// The unit suites judge `handle_alert`'s arguments; this one carries the
+/// attribution through serialization, the frame reader, and the dispatcher, which
+/// is the only place a field that never reached the wire would show — an alert
+/// arriving unattributed reads as the platform's own and dispatches under the
+/// bare attacher.
+#[tokio::test]
+async fn an_attributed_alert_crosses_the_socket_and_is_judged_on_the_instance_it_names() {
+    let attachment = Attachment::start_with(
+        alert_profile(true),
+        brenn_messaging::testutils::empty_directory_messenger("test-origin"),
+        AppPolicy::default(),
+        IDLE_HEARTBEAT_SECS,
+    );
+    let captured = attachment.captured.clone();
+    attachment.send_hello(SUPPORTED_VERSIONS);
+    attachment.send_frame(&ClientFrame::Alert {
+        attribution: Some("pager".to_string()),
+        severity: brenn_attach_proto::AlertSeverity::Warning,
+        title: "camera unreachable".to_string(),
+        body: "no frames for 10m".to_string(),
+    });
+    let (outcome, _frames) = attachment.finish().await;
+
+    assert!(!outcome.violation, "a granted sub-identity may page");
+    {
+        let alerts = captured.lock().expect("captured");
+        assert_eq!(alerts.len(), 1, "one alert, got {alerts:?}");
+        assert_eq!(
+            &alerts[0].1,
+            &format!("Attacher surface:{ATTACHER}#pager: camera unreachable"),
+            "the dispatched title names the minted sub-principal"
+        );
+    }
+
+    // The other verdict over the same path: declared, ungranted, and a kill.
+    let attachment = Attachment::start_with(
+        alert_profile(true),
+        brenn_messaging::testutils::empty_directory_messenger("test-origin"),
+        AppPolicy::default(),
+        IDLE_HEARTBEAT_SECS,
+    );
+    let captured = attachment.captured.clone();
+    attachment.send_hello(SUPPORTED_VERSIONS);
+    attachment.send_frame(&ClientFrame::Alert {
+        attribution: Some("mute".to_string()),
+        severity: brenn_attach_proto::AlertSeverity::Warning,
+        title: "paging anyway".to_string(),
+        body: String::new(),
+    });
+    let (outcome, _frames) = attachment.join_session().await;
+
+    assert!(
+        outcome.violation,
+        "the kernel gates first, so a frame that arrives anyway means it was bypassed"
+    );
+    let alerts = captured.lock().expect("captured");
+    assert_eq!(alerts.len(), 1, "the violation, and no dispatched alert");
+    assert!(
+        alerts[0].1.contains("attach_protocol_violation"),
+        "got {:?}",
+        alerts[0].1
+    );
+    assert!(
+        alerts[0].2.contains("without the alert grant"),
+        "got {:?}",
+        alerts[0].2
+    );
 }
 
 /// The protocol is JSON text in both directions, so a binary frame is not a frame

@@ -75,7 +75,7 @@ impl VersionRange {
 /// number on both ends at once. The negotiation *mechanism* exists from the
 /// start regardless, because it is the one thing that cannot be added later
 /// without breaking the frozen [`ClientFrame::Hello`] shell.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exactly(3);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exactly(4);
 
 /// The version two ends agree on, or `None` when their ranges do not overlap.
 ///
@@ -235,6 +235,17 @@ pub enum ClientFrame {
     /// suppresses ungranted alerts itself, and an alert from an ungranted
     /// attacher is a protocol violation.
     Alert {
+        /// Which sub-identity of the attached principal is paging, or `None` for
+        /// the attacher itself.
+        ///
+        /// Opaque to the transport and validated exactly as
+        /// [`Publish::attribution`](ClientFrame::Publish) is: the server admits
+        /// it against the declared set and then judges it against that
+        /// sub-identity's own alert right, so a sub-identity that may not page
+        /// cannot page under its neighbours' or its attacher's name. An
+        /// undeclared attribution is a protocol violation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attribution: Option<String>,
         severity: AlertSeverity,
         title: String,
         body: String,
@@ -855,7 +866,7 @@ mod tests {
     /// literal below is the acknowledgement that both ends moved together.
     #[test]
     fn the_wire_version_is_pinned_to_this_frame_shape() {
-        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exactly(3));
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exactly(4));
     }
 
     #[test]
@@ -1070,6 +1081,7 @@ mod tests {
     fn client_alert_is_pinned() {
         pin_client(
             &ClientFrame::Alert {
+                attribution: None,
                 severity: AlertSeverity::Critical,
                 title: "chrome died".to_string(),
                 body: "the mount plan failed".to_string(),
@@ -1079,6 +1091,25 @@ mod tests {
                 "severity": "critical",
                 "title": "chrome died",
                 "body": "the mount plan failed",
+            }),
+        );
+    }
+
+    #[test]
+    fn an_attributed_alert_carries_its_sub_identity() {
+        pin_client(
+            &ClientFrame::Alert {
+                attribution: Some("meeting".to_string()),
+                severity: AlertSeverity::Warning,
+                title: "camera unreachable".to_string(),
+                body: "no frames for 30s".to_string(),
+            },
+            json!({
+                "type": "Alert",
+                "attribution": "meeting",
+                "severity": "warning",
+                "title": "camera unreachable",
+                "body": "no frames for 30s",
             }),
         );
     }

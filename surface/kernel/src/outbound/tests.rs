@@ -31,6 +31,7 @@ fn component(instance: &str, parked_batch_depth: u64) -> ComponentEntry {
         abi: Abi::Dom,
         parked_batch_depth,
         config: BTreeMap::new(),
+        grants: vec![],
     }
 }
 
@@ -69,7 +70,6 @@ fn doc(outputs: Vec<OutputBinding>, error: Option<(&str, LogLevel)>) -> Bindings
             status_interval_secs: 60,
             error_channel: error.map(|(channel, _)| channel.to_string()),
             error_report_floor: error.map(|(_, floor)| floor),
-            takeover_granted: false,
         },
     }
 }

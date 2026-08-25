@@ -1220,14 +1220,13 @@ fn trigger_channel() -> brenn_lib::messaging::config::ChannelConfigRaw {
 /// io_port — via struct update.
 fn demo_consumer_raw(slug: &str) -> brenn_lib::messaging::config::WasmConsumerConfigRaw {
     use brenn_lib::access::raw::ChannelMatcherRaw;
-    use brenn_lib::messaging::config::{
-        WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw, WasmGrant,
-    };
+    use brenn_lib::messaging::ComponentGrant;
+    use brenn_lib::messaging::config::{WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw};
 
     WasmConsumerConfigRaw {
         slug: slug.to_string(),
         component_path: std::path::PathBuf::from(DEMO_WASM),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             channel: Some("brenn:e2e-trigger".to_string()),
             port: "in".to_string(),
@@ -1478,8 +1477,9 @@ async fn a_connection_carries_one_components_publish_into_anothers_activation() 
 /// producer's guest.
 fn connection_config() -> brenn_lib::config::BrennConfig {
     use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::{
-        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmGrant,
+        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
     };
 
     let producer = WasmConsumerConfigRaw {
@@ -1495,7 +1495,7 @@ fn connection_config() -> brenn_lib::config::BrennConfig {
     let reader = WasmConsumerConfigRaw {
         slug: "reader".to_string(),
         component_path: std::path::PathBuf::from(DEMO_WASM),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![free_input_raw("in")],
         ..brenn_messaging_boot::test_fixtures::minimal_wasm_consumer()
     };

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::messaging::config::{ResolvedLocalChannel, ResolvedSurface};
+use brenn_lib::messaging::{ComponentGrant, ComponentHost};
 use brenn_surface_schema::{LOCAL_THEME_CHANNEL, LogLevel, reserved_local_channel};
 
 use super::*;
@@ -106,17 +106,46 @@ fn an_unconfigured_error_channel_clears_both_halves() {
     assert!(doc.validate().is_ok());
 }
 
+/// The kernel gates each privileged entry on the instance's own grants, so the
+/// document has to carry them per component, in the canonical spellings the
+/// kernel parses.
 #[test]
-fn takeover_grant_reaches_the_platform_section() {
-    let without = build_bindings_document(&bar(), &params());
-    assert!(!without.platform.takeover_granted);
+fn instance_grants_reach_their_component_entry() {
+    let mut surface = bar();
+    surface.components[0].grants = [ComponentGrant::Ports, ComponentGrant::Log].into();
+    let doc = build_bindings_document(&surface, &params());
+    assert_eq!(doc.components[0].grants, vec!["ports", "log"]);
+    // The `config` map's reader is granted it; the chrome beside it is not.
+    let mode = doc
+        .components
+        .iter()
+        .find(|c| c.instance == "mode")
+        .expect("the fixture declares a processor named mode");
+    assert_eq!(mode.grants, vec!["config"]);
+}
 
-    let mut policy = AppPolicy::default();
-    policy.grants.insert(AppCapability::SurfaceTakeover);
-    let mut granted = bar();
-    granted.policy = policy;
-    let with = build_bindings_document(&granted, &params());
-    assert!(with.platform.takeover_granted);
+/// Every word the writer can emit is a word the reader parses. The document is
+/// the server/kernel contract, so the two halves of the spelling have to be one
+/// fact rather than two lists kept equal by hand.
+#[test]
+fn every_emitted_grant_word_parses_back_to_its_grant() {
+    let hosted: Vec<ComponentGrant> = ComponentGrant::ALL
+        .iter()
+        .copied()
+        .filter(|grant| grant.illegal_on(ComponentHost::Surface).is_none())
+        .collect();
+    let mut surface = bar();
+    surface.components[0].grants = hosted.iter().copied().collect();
+    let doc = build_bindings_document(&surface, &params());
+    let parsed: Vec<ComponentGrant> = doc.components[0]
+        .grants
+        .iter()
+        .map(|word| {
+            ComponentGrant::parse(word)
+                .unwrap_or_else(|| panic!("the document emitted {word:?}, which parses to nothing"))
+        })
+        .collect();
+    assert_eq!(parsed, hosted);
 }
 
 /// Determinism contract: same config, same bytes — consumers may use byte

@@ -43,6 +43,7 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: false,
+                grants: Default::default(),
             })
             .collect(),
         subscriptions,

@@ -5,9 +5,10 @@
 //! host target; the wasm effect executor consumes the [`KernelAction`]s it
 //! emits.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use brenn_attach_proto::AlertSeverity;
+use brenn_envelope::grants::ComponentGrant;
 
 use crate::schema::bindings::BindingsDocument;
 use crate::schema::telemetry::InstanceReport;
@@ -533,176 +534,214 @@ pub fn sync_refused(
     }
 }
 
-/// Route a component's `brenn-log` intent to a component-log action.
+impl KernelCore {
+    /// Route a component's log intent to a component-log action, gated on that
+    /// component's own `log` grant.
+    ///
+    /// One router for both ABIs, because the only difference between them is how the
+    /// call arrived — the same shape [`Self::route_alert`] takes. `target_tag` states which
+    /// seam it came through: `Some(tag)` is a `dom` component's delegated
+    /// `brenn-log` event, whose `instance` is the DOM-resolved mounted-instance id
+    /// for the retargeted target — a target that resolves to no mounted instance is
+    /// dropped with a `Report` rather than attributed by guess. `None` is a headless
+    /// processor's `log.*` import, whose identity is the loader's closure over the
+    /// instance it instantiated for; there is no element to resolve and nothing to
+    /// check it against.
+    ///
+    /// The gate is the instance's own right, read here off
+    /// [`instance_grants`](Self::instance_grants) rather than taken from the
+    /// caller: a seam states which instance is asking and this router decides
+    /// what it may do, so no entry point can hand in a verdict of its own. An
+    /// ungranted instance's log is dropped with a suppression breadcrumb naming
+    /// it, never forwarded as a `Log` frame.
+    ///
+    /// `level` and `message` are `None` when a `dom` component's event detail omitted
+    /// them or carried a non-string value (untrusted component-supplied detail); a
+    /// processor's WIT call always states both. `level` is additionally the untrusted
+    /// lowercase log-level wire string, parsed via [`proto::LogLevel::from_wire_str`].
+    /// A missing/non-string field or an unrecognized `level` is dropped-and-reported
+    /// as malformed — never coerced into a well-formed `Log` frame, which would
+    /// launder a component bug into a server log line at a level the component never
+    /// chose. For a processor an unrecognized level is transpile-glue drift rather
+    /// than a component typo, but the answer is the same.
+    ///
+    /// # Panics
+    ///
+    /// On a `None` instance with no `target_tag`: a processor log carries the
+    /// identity its loader closed over, so an absent one is a kernel bug rather than
+    /// component input.
+    pub fn route_log(
+        &self,
+        instance: Option<&str>,
+        target_tag: Option<&str>,
+        level: Option<&str>,
+        message: Option<&str>,
+    ) -> KernelAction {
+        let instance = match target_tag {
+            Some(tag) => match require_mounted_instance(instance, tag, contract::COMPONENT_LOG) {
+                Ok(instance) => instance,
+                Err(drop) => return drop,
+            },
+            None => instance.expect("a processor log names the instance its loader closed over"),
+        };
+        if !self.instance_granted(instance, ComponentGrant::Log) {
+            return ungranted_capability(instance, ComponentGrant::Log, contract::COMPONENT_LOG);
+        }
+        match (level.and_then(LogLevel::from_wire_str), message) {
+            (Some(level), Some(message)) => KernelAction::ComponentLog {
+                instance: instance.to_string(),
+                level,
+                message: message.to_string(),
+            },
+            _ => KernelAction::Report {
+                level: LogLevel::Warn,
+                message: format!(
+                    "dropped malformed {} from {}: level must be a known log \
+                     level and message a string",
+                    contract::COMPONENT_LOG,
+                    component_origin(instance, target_tag)
+                ),
+                subject: Some(instance.to_string()),
+            },
+        }
+    }
+
+    /// Route a component's alert intent to an alert action, gated on that
+    /// component's own `alert` grant.
+    ///
+    /// One router for both ABIs, because the only difference between them is how the
+    /// call arrived. `target_tag` states which seam it came through: `Some(tag)` is a
+    /// `dom` component's delegated `brenn-alert` event, whose `instance` is the
+    /// DOM-resolved mounted-instance id for the retargeted target — a target that
+    /// resolves to no mounted instance is dropped with a `Report` rather than
+    /// attributed by guess. `None` is a headless processor's `alert.*` import, whose
+    /// identity is the loader's closure over the instance it instantiated for; there
+    /// is no element to resolve and nothing to check it against.
+    ///
+    /// The gate is the *instance's* right, read here off its own grants
+    /// ([`instance_grants`](Self::instance_grants)) rather than taken from the
+    /// caller — and not the surface's. The surface grant is
+    /// the transport right toward the backend and still gates the kernel's own
+    /// alerts; this one is containment within the page, so one component's paging
+    /// bug cannot spend the plane in another's name. An ungranted instance's
+    /// well-formed alert is dropped with a `Report` suppression breadcrumb naming
+    /// it: a conforming kernel never emits an alert the server would judge a
+    /// violation. The component's own logs are unaffected.
+    ///
+    /// `severity`/`title`/`body` are `None` when a `dom` component's event detail
+    /// omitted them or carried a non-string value (untrusted component-supplied
+    /// detail); a processor's WIT call always states all three. `severity` is
+    /// additionally the untrusted lowercase severity wire string, parsed via
+    /// [`AlertSeverity::from_wire_str`]. A missing/non-string field or an
+    /// unrecognized `severity` is dropped-and-reported as malformed — never coerced
+    /// into a well-formed `Alert`.
+    ///
+    /// # Panics
+    ///
+    /// On a `None` instance with no `target_tag`: a processor alert carries the
+    /// identity its loader closed over, so an absent one is a kernel bug rather than
+    /// component input.
+    pub fn route_alert(
+        &self,
+        instance: Option<&str>,
+        target_tag: Option<&str>,
+        severity: Option<&str>,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> KernelAction {
+        let instance = match target_tag {
+            Some(tag) => match require_mounted_instance(instance, tag, contract::COMPONENT_ALERT) {
+                Ok(instance) => instance,
+                Err(drop) => return drop,
+            },
+            None => instance.expect("a processor alert names the instance its loader closed over"),
+        };
+        if !self.instance_granted(instance, ComponentGrant::Alert) {
+            return ungranted_capability(
+                instance,
+                ComponentGrant::Alert,
+                contract::COMPONENT_ALERT,
+            );
+        }
+        match (severity.and_then(AlertSeverity::from_wire_str), title, body) {
+            (Some(severity), Some(title), Some(body)) => KernelAction::Alert {
+                attribution: Some(instance.to_string()),
+                severity,
+                title: title.to_string(),
+                body: body.to_string(),
+            },
+            _ => KernelAction::Report {
+                level: LogLevel::Warn,
+                message: format!(
+                    "dropped malformed {} from {}: severity must be a known severity \
+                     and title and body strings",
+                    contract::COMPONENT_ALERT,
+                    component_origin(instance, target_tag)
+                ),
+                subject: Some(instance.to_string()),
+            },
+        }
+    }
+}
+
+/// Route a component's config read to the instance and key it names, or to the
+/// drop-and-report for a detail that does not spell one.
 ///
 /// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
 /// the DOM-resolved mounted-instance id for the retargeted target, and a target
-/// that does not resolve to a mounted instance element is dropped with `Report`
-/// rather than attributed by guess. `target_tag` is carried for the breadcrumb.
+/// that does not resolve to a mounted instance element is dropped with `Report`.
+/// `target_tag` is carried for the breadcrumb.
 ///
-/// `level` and `message` are `None` when the component's event detail omitted
-/// them or carried a non-string value (untrusted component-supplied detail);
-/// `level` is additionally the untrusted lowercase log-level wire string, parsed
-/// via [`proto::LogLevel::from_wire_str`]. A missing/non-string field or an
-/// unrecognized `level` is dropped-and-reported as malformed — never coerced
-/// into a well-formed `Log` frame, which would launder a component bug into a
-/// server log line at a level the component never chose.
-pub fn route_component_log(
-    instance: Option<&str>,
+/// `key` is `None` when the detail omitted it or carried a non-string value. A
+/// guessed key would answer a read the component never made, so it is dropped
+/// and reported instead. Either way the seam still writes the absence answer:
+/// the reader faults on a missing one.
+///
+/// The grant is not read here — [`KernelCore::component_config_get`] holds that
+/// gate, because it is the thing that would otherwise serve the value.
+pub fn route_config_get<'a>(
+    instance: Option<&'a str>,
     target_tag: &str,
-    level: Option<&str>,
-    message: Option<&str>,
-) -> KernelAction {
-    let instance = match require_mounted_instance(instance, target_tag, contract::COMPONENT_LOG) {
-        Ok(instance) => instance,
-        Err(drop) => return drop,
-    };
-    match (level.and_then(LogLevel::from_wire_str), message) {
-        (Some(level), Some(message)) => KernelAction::ComponentLog {
-            instance: instance.to_string(),
-            level,
-            message: message.to_string(),
-        },
-        _ => KernelAction::Report {
+    key: Option<&'a str>,
+) -> Result<(&'a str, &'a str), KernelAction> {
+    let instance = require_mounted_instance(instance, target_tag, contract::CONFIG_GET)?;
+    match key {
+        Some(key) => Ok((instance, key)),
+        None => Err(KernelAction::Report {
             level: LogLevel::Warn,
             message: format!(
-                "dropped malformed {} from <{target_tag}>: level must be a known log \
-                 level and message a string",
-                contract::COMPONENT_LOG
+                "dropped malformed {} from <{target_tag}>: key must be a string",
+                contract::CONFIG_GET
             ),
             subject: Some(instance.to_string()),
-        },
+        }),
     }
 }
 
-/// Route a component's `brenn-alert` intent to an alert action, gated on the
-/// surface's alert grant.
+/// The drop-and-report for a privileged entry an instance's grants do not admit.
 ///
-/// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
-/// the DOM-resolved mounted-instance id for the retargeted target, and a target
-/// that does not resolve to a mounted instance element is dropped with `Report`
-/// rather than attributed by guess. `target_tag` is carried for the breadcrumb.
-///
-/// `alert_granted` is the surface's current grant (from the latest attachment,
-/// [`KernelCore::alert_granted`]). On an **ungranted** surface a well-formed alert
-/// from a mounted instance is dropped with a `Report` suppression breadcrumb
-/// naming the instance — a conforming kernel never emits an ungranted `Alert`
-/// frame (the server treats one as a protocol violation). The component's own
-/// logs are unaffected: it can still record via `brenn-log`.
-///
-/// `severity`/`title`/`body` are `None` when the component's event detail omitted
-/// them or carried a non-string value (untrusted component-supplied detail);
-/// `severity` is additionally the untrusted lowercase severity wire string,
-/// parsed via [`AlertSeverity::from_wire_str`]. On a granted surface a
-/// missing/non-string field or an unrecognized `severity` is dropped-and-reported
-/// as malformed — never coerced into a well-formed `Alert`.
-pub fn route_component_alert(
-    instance: Option<&str>,
-    target_tag: &str,
-    severity: Option<&str>,
-    title: Option<&str>,
-    body: Option<&str>,
-    alert_granted: bool,
-) -> KernelAction {
-    let instance = match require_mounted_instance(instance, target_tag, contract::COMPONENT_ALERT) {
-        Ok(instance) => instance,
-        Err(drop) => return drop,
-    };
-    if !alert_granted {
-        return KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!(
-                "suppressed {} from component {instance}: surface is not granted the alert plane",
-                contract::COMPONENT_ALERT
-            ),
-            subject: Some(instance.to_string()),
-        };
-    }
-    match (severity.and_then(AlertSeverity::from_wire_str), title, body) {
-        (Some(severity), Some(title), Some(body)) => KernelAction::ComponentAlert {
-            severity,
-            title: title.to_string(),
-            body: body.to_string(),
-        },
-        _ => KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!(
-                "dropped malformed {} from <{target_tag}>: severity must be a known severity \
-                 and title and body strings",
-                contract::COMPONENT_ALERT
-            ),
-            subject: Some(instance.to_string()),
-        },
+/// One shape for every capability, because the verdict is one verdict: the
+/// component asked for something deny-by-default it was not given, and the page
+/// says so and does nothing. A conforming kernel never forwards past this — the
+/// backend judges the same grant a second time, and a frame that arrives anyway
+/// means the kernel was bypassed.
+pub fn ungranted_capability(instance: &str, grant: ComponentGrant, what: &str) -> KernelAction {
+    KernelAction::Report {
+        level: LogLevel::Warn,
+        message: format!(
+            "suppressed {what} from component {instance}: it is not granted the {} capability",
+            grant.word()
+        ),
+        subject: Some(instance.to_string()),
     }
 }
 
-/// Route a headless processor instance's `log.*` import call.
-///
-/// The tag-free sibling of [`route_component_log`]. It takes no
-/// [`require_mounted_instance`] step, and that is the whole difference: a
-/// processor has no element to resolve from, so its identity is the loader's
-/// closure over the instance it instantiated for — kernel-derived rather than
-/// element-derived, but never component-claimed either way.
-///
-/// `level` is the lowercase wire string the guest's WIT enum lifts to. An
-/// unrecognized one is transpile-glue drift rather than a component typo, but the
-/// answer is the same as the DOM path's: drop and report, never coerce to a
-/// default level the component did not choose.
-pub fn route_processor_log(instance: &str, level: &str, message: &str) -> KernelAction {
-    match LogLevel::from_wire_str(level) {
-        Some(level) => KernelAction::ComponentLog {
-            instance: instance.to_string(),
-            level,
-            message: message.to_string(),
-        },
-        None => KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!(
-                "dropped processor log from {instance}: {level:?} is not a known log level"
-            ),
-            subject: Some(instance.to_string()),
-        },
-    }
-}
-
-/// Route a headless processor instance's `alert.*` import call, gated on the
-/// surface's alert grant.
-///
-/// The tag-free sibling of [`route_component_alert`], with identical grant
-/// semantics: on an ungranted surface a well-formed alert is dropped with a
-/// suppression breadcrumb, because a conforming kernel never emits an ungranted
-/// `Alert` frame. Boot additionally refuses to start a surface declaring an
-/// `alert`-importing processor kind without the grant, so reaching the
-/// suppression arm means the config changed under a live page.
-pub fn route_processor_alert(
-    instance: &str,
-    severity: &str,
-    title: &str,
-    body: &str,
-    alert_granted: bool,
-) -> KernelAction {
-    if !alert_granted {
-        return KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!(
-                "suppressed alert from processor {instance}: surface is not granted the alert plane"
-            ),
-            subject: Some(instance.to_string()),
-        };
-    }
-    match AlertSeverity::from_wire_str(severity) {
-        Some(severity) => KernelAction::ComponentAlert {
-            severity,
-            title: title.to_string(),
-            body: body.to_string(),
-        },
-        None => KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!(
-                "dropped processor alert from {instance}: {severity:?} is not a known severity"
-            ),
-            subject: Some(instance.to_string()),
-        },
+/// How a dropped intent names where it came from: the dispatching element for a
+/// `dom` component, the instance itself for a headless one that has no element.
+fn component_origin(instance: &str, target_tag: Option<&str>) -> String {
+    match target_tag {
+        Some(tag) => format!("<{tag}>"),
+        None => format!("processor {instance}"),
     }
 }
 
@@ -835,14 +874,20 @@ pub enum KernelAction {
         level: LogLevel,
         message: String,
     },
-    /// Forward a component's `brenn-alert` intent to the server as an `Alert`
-    /// frame. Emitted only on an alert-granted surface (an ungranted surface
-    /// yields a `Report` suppression breadcrumb instead); `severity` is the
-    /// component's call-site-fixed severity (never derived by the kernel). The
-    /// executor emits `handle.alert(severity, title, body)`; component identity
-    /// is not carried on the frame — the server attributes the alert to the
-    /// surface, not the component.
-    ComponentAlert {
+    /// Page an operator as an `Alert` frame.
+    ///
+    /// `attribution` names the component whose alert this is, or `None` when the
+    /// kernel itself is speaking (a panic report is about a component but is not
+    /// the component's own statement, and a component that panicked may hold no
+    /// alert grant at all). `severity` is the call-site-fixed severity, never
+    /// derived by the kernel. Emitted only for a principal that holds the right:
+    /// a component's own alert needs its `alert` grant
+    /// ([`KernelCore::route_alert`]), the kernel's needs the surface's
+    /// ([`KernelCore::alert_granted`]); an ungranted one yields a `Report`
+    /// suppression breadcrumb or nothing at all. The executor emits
+    /// `handle.alert(attribution, severity, title, body)`.
+    Alert {
+        attribution: Option<String>,
         severity: AlertSeverity,
         title: String,
         body: String,
@@ -889,6 +934,65 @@ struct InstanceStatus {
     ports_attached: u32,
 }
 
+/// What one component instance was granted, in the vocabulary the config layer,
+/// the backend host and this kernel all read from one crate.
+pub type GrantSet = BTreeSet<ComponentGrant>;
+
+/// Why a bindings document was refused: what an operator reads, and the short
+/// reason the reload request carries.
+struct DocumentRefusal {
+    message: String,
+    reason: &'static str,
+}
+
+/// Parse every component entry's grant words, or refuse the document.
+///
+/// An unknown word is server/kernel build skew — the document was written by a
+/// backend whose vocabulary this page's assets predate — and the page's answer is
+/// to refuse the whole document rather than guess which capability was meant.
+/// Guessing in either direction is wrong: dropping the word silently disables a
+/// capability the operator granted, and admitting it grants one this build cannot
+/// enforce.
+///
+/// A repeated instance id is refused on the same terms. The config layer refuses
+/// duplicate instance names, so a document carrying one is a server bug; keeping
+/// either entry would enforce one entry's grants while every other reader of this
+/// list (the config map, the mount plan) took the first — one instance name
+/// standing for two different components.
+fn parse_instance_grants(
+    bindings: &BindingsDocument,
+) -> Result<HashMap<String, GrantSet>, DocumentRefusal> {
+    let mut parsed = HashMap::with_capacity(bindings.components.len());
+    for entry in &bindings.components {
+        let mut grants = GrantSet::new();
+        for word in &entry.grants {
+            match ComponentGrant::parse(word) {
+                Some(grant) => {
+                    grants.insert(grant);
+                }
+                None => {
+                    return Err(DocumentRefusal {
+                        message: format!(
+                            "refused the bindings document: {word:?} is not a capability this build knows, so this page's assets are older than the server's vocabulary"
+                        ),
+                        reason: "unknown component grant",
+                    });
+                }
+            }
+        }
+        if parsed.insert(entry.instance.clone(), grants).is_some() {
+            return Err(DocumentRefusal {
+                message: format!(
+                    "refused the bindings document: instance {:?} is declared twice, so no reader of it can say which component the name means",
+                    entry.instance
+                ),
+                reason: "duplicate component instance",
+            });
+        }
+    }
+    Ok(parsed)
+}
+
 /// The kernel's DOM-free state and transition logic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KernelCore {
@@ -901,11 +1005,18 @@ pub struct KernelCore {
     /// from a reconnect.
     bindings: Option<BindingsDocument>,
     /// Whether this surface holds the alert grant, from the latest `Connected`.
-    /// `false` until the first connect. A `brenn-alert` from a component is
-    /// forwarded as an `Alert` frame only when granted; otherwise the kernel
-    /// drops it with a `log(warn)` breadcrumb, and the panic-path alert is
-    /// gated on it too — a conforming kernel never sends an ungranted `Alert`.
+    /// `false` until the first connect. The surface's transport right toward the
+    /// backend, and so what gates the kernel's *own* alerts — the panic report
+    /// most of all. A component's alert is gated on its own grant instead
+    /// ([`KernelCore::instance_grants`]); a conforming kernel never sends an
+    /// `Alert` either scope would refuse.
     alert_granted: bool,
+    /// Instance → the capabilities its component entry declares, parsed once
+    /// from the bindings document. Empty until the page is first configured, and
+    /// the kernel's whole runtime enforcement input: a capability the operator
+    /// did not write is one this page refuses to exercise, whatever the
+    /// component asks for.
+    instance_grants: HashMap<String, GrantSet>,
     /// The last geometry reported, for no-change suppression; `None` until the
     /// first `SendGeometry`. A resize that lands back on the same viewport (a
     /// device rotating and rotating back, a debounce coalescing a jitter) emits
@@ -962,6 +1073,7 @@ impl KernelCore {
             link_state: LinkState::Connecting,
             bindings: None,
             alert_granted: false,
+            instance_grants: HashMap::new(),
             last_geometry: None,
             instances: Vec::new(),
             registered: HashSet::new(),
@@ -1140,22 +1252,57 @@ impl KernelCore {
         })
     }
 
-    /// Serve one `config.get` for a processor instance from the map its component
-    /// entry carries.
+    /// Serve one config read for an instance of either ABI from the map its
+    /// component entry carries, gated on that instance's `config` grant.
     ///
     /// Fixed for the page's lifetime, matching the backend's process-lifetime map:
     /// a changed map arrives only as changed wiring, which reloads the page. A
-    /// miss — unknown key, or an instance with no map — answers `None`, which is
-    /// `config.get`'s own `option<string>` and not an error.
-    pub fn processor_config_get(&self, instance: &str, key: &str) -> Option<String> {
-        self.bindings
-            .as_ref()?
-            .components
-            .iter()
-            .find(|c| c.instance == instance)?
-            .config
-            .get(key)
-            .cloned()
+    /// miss — unknown key, or an instance with no map — answers `Ok(None)`, which
+    /// is the `config.get` import's own `option<string>` and not an error.
+    ///
+    /// `Err` is the ungranted instance's drop-and-report, returned rather than
+    /// left to the caller so no seam can serve a read the grants do not admit:
+    /// the two seams differ only in how they carry the absence answer back.
+    pub fn component_config_get(
+        &self,
+        instance: &str,
+        key: &str,
+    ) -> Result<Option<String>, KernelAction> {
+        if !self.instance_granted(instance, ComponentGrant::Config) {
+            return Err(ungranted_capability(
+                instance,
+                ComponentGrant::Config,
+                contract::CONFIG_GET,
+            ));
+        }
+        Ok(self.bindings.as_ref().and_then(|bindings| {
+            bindings
+                .components
+                .iter()
+                .find(|c| c.instance == instance)?
+                .config
+                .get(key)
+                .cloned()
+        }))
+    }
+
+    /// Whether `instance` may reach the publish/defer family, and the refusal to
+    /// report if it may not.
+    ///
+    /// The decision every entry of that family asks, held here rather than at the
+    /// seams so it is one verdict with one breadcrumb — and so the answer is
+    /// testable off the browser, which the seams themselves are not. `what` names
+    /// the event family the DOM seam would have carried the call on, so an
+    /// operator reads one vocabulary whichever ABI refused.
+    ///
+    /// The seam keeps only the answer its own ABI writes back: a status on the
+    /// dispatching detail for a DOM event, the WIT error string for an export.
+    pub fn component_ports_gate(&self, instance: &str, what: &str) -> Result<(), KernelAction> {
+        if self.instance_granted(instance, ComponentGrant::Ports) {
+            Ok(())
+        } else {
+            Err(ungranted_capability(instance, ComponentGrant::Ports, what))
+        }
     }
 
     /// Whether `instance` has registered an activation entry. The gate's state,
@@ -1172,9 +1319,9 @@ impl KernelCore {
     }
 
     /// Whether the latest `Connected` advertised the alert grant. Read by the
-    /// kernel's `brenn-alert` forward (via [`route_component_alert`]) to gate an
-    /// `Alert` frame vs. a suppression breadcrumb, and by the panic listener to
-    /// gate the panic-path alert ([`on_component_panic`]).
+    /// panic listener to gate the panic-path alert ([`on_component_panic`]) —
+    /// the kernel's own paging. A component's `brenn-alert` forward is gated on
+    /// that component's grant instead ([`KernelCore::instance_grants`]).
     ///
     /// This is a kernel-side shadow of the client core's grant, refreshed when the
     /// event loop folds `Connected` — one event-loop hop after the core itself
@@ -1186,6 +1333,26 @@ impl KernelCore {
     /// grant and the `Connected` fold; it always fails closed.
     pub fn alert_granted(&self) -> bool {
         self.alert_granted
+    }
+
+    /// What `instance`'s component entry was granted — the per-instance
+    /// enforcement input every privileged kernel entry consults.
+    ///
+    /// An instance the bindings document never declared holds nothing, which is
+    /// the same answer a declared instance with an empty grants list gets:
+    /// deny-by-default, and no existence oracle in the difference. Empty before
+    /// the page is first configured, so a call that races the first `Connected`
+    /// fails closed.
+    pub fn instance_grants(&self, instance: &str) -> &GrantSet {
+        static NONE: GrantSet = GrantSet::new();
+        self.instance_grants.get(instance).unwrap_or(&NONE)
+    }
+
+    /// Whether `instance` holds `grant` — the question every privileged kernel
+    /// entry asks of [`instance_grants`](Self::instance_grants), spelled once so a
+    /// seam cannot ask it a different way.
+    pub fn instance_granted(&self, instance: &str, grant: ComponentGrant) -> bool {
+        self.instance_grants(instance).contains(&grant)
     }
 
     /// Fold one control-plane [`Event`] into the core, returning the actions
@@ -1408,7 +1575,27 @@ impl KernelCore {
         if self.bindings.is_some() {
             return self.set_link_state(LinkState::Connected);
         }
-        let takeover_granted = bindings.platform.takeover_granted;
+        // Vocabulary first: a document naming a capability this build cannot
+        // enforce is refused whole, before a single instance is configured from
+        // it. Stale assets are the only way it happens and the capped bootstrap
+        // reload is the only thing that heals it — the same answer, for the same
+        // reason, as a transport-version mismatch.
+        let instance_grants = match parse_instance_grants(bindings) {
+            Ok(parsed) => parsed,
+            Err(refusal) => {
+                let mut actions = vec![KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: refusal.message,
+                    subject: None,
+                }];
+                actions.extend(self.set_link_state(LinkState::Reloading));
+                actions.push(KernelAction::RequestReload {
+                    reason: refusal.reason.to_string(),
+                });
+                return actions;
+            }
+        };
+        self.instance_grants = instance_grants;
         self.bindings = Some(bindings.clone());
         self.chrome_instance = if bindings.chrome_instance.is_empty() {
             None
@@ -1422,7 +1609,7 @@ impl KernelCore {
         // identically; the table has no slot concept.
         self.instances = Vec::with_capacity(bindings.components.len());
         let mut actions = Vec::new();
-        actions.extend(self.dark_overlay_instrument_report(bindings, takeover_granted));
+        actions.extend(self.dark_overlay_instrument_report(bindings));
         // instance → kind for the instances that actually mounted (element
         // defined), so a subscription's pump can carry the kind for its terminal
         // error card without re-scanning the component list.
@@ -1445,6 +1632,10 @@ impl KernelCore {
                     reason: "chrome mount failed".to_string(),
                 }];
             }
+            // The one thing the ABI still decides in this core: a `dom` component
+            // renders into an element and a headless one has nowhere to render.
+            // DOM-forced. Every other per-instance decision — grants, config,
+            // ports, logs, alerts — reads the same entry the same way for both.
             let (state, reason) = if entry.abi == schema::Abi::Processor {
                 // Headless by construction: no element to check, no wrapper, no
                 // mount. The bootstrap loader instantiates the transpiled module
@@ -1551,15 +1742,21 @@ impl KernelCore {
     /// is the failure this plane exists to end. Drawn at connect, so the gap is
     /// visible before an incident rather than during one.
     ///
-    /// Only on a takeover-granted surface: nothing else can hold an overlay, and
-    /// the plane requires the grant.
-    fn dark_overlay_instrument_report(
-        &self,
-        bindings: &BindingsDocument,
-        takeover_granted: bool,
-    ) -> Option<KernelAction> {
+    /// Only where some component is actually wired to the takeover plane:
+    /// nothing else can hold an overlay, so an unbound overlay-state port on a
+    /// page that never takes over is the correct configuration rather than a
+    /// gap. Read off the bindings, which is where the capability now lives —
+    /// binding the plane requires the binding component's own `takeover` grant,
+    /// so a binding is the page's statement that overlays happen here.
+    fn dark_overlay_instrument_report(&self, bindings: &BindingsDocument) -> Option<KernelAction> {
         let chrome = self.chrome_instance.as_deref()?;
-        if !takeover_granted {
+        let takes_over = bindings
+            .subscriptions
+            .iter()
+            .map(|b| b.channel.as_str())
+            .chain(bindings.outputs.iter().map(|b| b.channel.as_str()))
+            .any(|channel| channel == schema::LOCAL_TAKEOVER_CHANNEL);
+        if !takes_over {
             return None;
         }
         let bound = bindings
@@ -1610,7 +1807,7 @@ impl KernelCore {
     ///
     /// A component panic is the one client-side event that pages: on an
     /// alert-granted surface ([`KernelCore::alert_granted`]) an attributed panic
-    /// additionally emits one `ComponentAlert { Warning, "component panic:
+    /// additionally emits one `Alert { None, Warning, "component panic:
     /// <instance>", <detail> }`. On an ungranted surface it stays error-cards +
     /// `log(error)` only — a conforming kernel never emits an ungranted `Alert`
     /// (the server treats one as a protocol violation). An unattributable panic
@@ -1663,7 +1860,11 @@ impl KernelCore {
             },
         ];
         if self.alert_granted {
-            actions.push(KernelAction::ComponentAlert {
+            actions.push(KernelAction::Alert {
+                // The kernel's own statement, not the dead component's: a panicked
+                // instance is in no position to hold a capability, and the operator
+                // must hear about the death whatever the instance was granted.
+                attribution: None,
                 severity: AlertSeverity::Warning,
                 title: format!("component panic: {subject}"),
                 body: detail.to_string(),
@@ -2063,6 +2264,15 @@ mod tests {
             abi: Abi::Dom,
             parked_batch_depth: 8,
             config: Default::default(),
+            grants: vec![],
+        }
+    }
+
+    /// The same entry, holding the capability words an operator wrote for it.
+    fn granted_entry(instance: &str, kind: &str, grants: &[&str]) -> ComponentEntry {
+        ComponentEntry {
+            grants: grants.iter().map(|g| (*g).to_string()).collect(),
+            ..entry(instance, kind)
         }
     }
 
@@ -2100,7 +2310,6 @@ mod tests {
                 status_interval_secs: 60,
                 error_channel: None,
                 error_report_floor: None,
-                takeover_granted: false,
             },
         }
     }
@@ -2143,6 +2352,27 @@ mod tests {
             |_, _| true,
         );
         core
+    }
+
+    /// A configured page whose `p1` (dom) and `counter-a` (headless) hold every
+    /// capability a router gates on — the granted side of the router suites,
+    /// which are about routing rather than about the gate.
+    fn routing_core() -> KernelCore {
+        connect(
+            vec![
+                granted_entry("p1", "protobar", &["log", "alert"]),
+                granted_entry("counter-a", "counter", &["log", "alert"]),
+            ],
+            true,
+        )
+    }
+
+    /// The same two instances, declared and granted nothing — the ungranted side.
+    fn ungranted_core() -> KernelCore {
+        connect(
+            vec![entry("p1", "protobar"), entry("counter-a", "counter")],
+            true,
+        )
     }
 
     // ── connect_url ───────────────────────────────────────────────────────
@@ -2781,11 +3011,12 @@ mod tests {
         assert!(message.contains("in flight"), "message: {message}");
     }
 
-    // ── route_component_log ───────────────────────────────────────────────
+    // ── route_log ─────────────────────────────────────────────────────────
 
     #[test]
     fn component_log_from_mounted_instance_forwards_with_instance() {
-        let action = route_component_log(Some("p1"), "brenn-protobar", Some("warn"), Some("hi"));
+        let action =
+            routing_core().route_log(Some("p1"), Some("brenn-protobar"), Some("warn"), Some("hi"));
         assert_eq!(
             action,
             KernelAction::ComponentLog {
@@ -2798,6 +3029,7 @@ mod tests {
 
     #[test]
     fn component_log_forwards_every_level() {
+        let core = routing_core();
         for (wire, level) in [
             ("trace", LogLevel::Trace),
             ("debug", LogLevel::Debug),
@@ -2805,7 +3037,7 @@ mod tests {
             ("warn", LogLevel::Warn),
             ("error", LogLevel::Error),
         ] {
-            let action = route_component_log(Some("p1"), "brenn-protobar", Some(wire), Some("m"));
+            let action = core.route_log(Some("p1"), Some("brenn-protobar"), Some(wire), Some("m"));
             assert_eq!(
                 action,
                 KernelAction::ComponentLog {
@@ -2819,8 +3051,9 @@ mod tests {
 
     #[test]
     fn component_log_from_unresolved_target_is_dropped_and_reported() {
+        let core = routing_core();
         for tag in ["brenn-protobar", "button"] {
-            let action = route_component_log(None, tag, Some("warn"), Some("m"));
+            let action = core.route_log(None, Some(tag), Some("warn"), Some("m"));
             let KernelAction::Report { level, message, .. } = action else {
                 panic!("expected Report for <{tag}>, got {action:?}");
             };
@@ -2838,7 +3071,8 @@ mod tests {
             (None, None),
         ];
         for (level, message) in cases {
-            let action = route_component_log(Some("p1"), "brenn-protobar", level, message);
+            let action =
+                routing_core().route_log(Some("p1"), Some("brenn-protobar"), level, message);
             let KernelAction::Report {
                 level: report_level,
                 message: report_message,
@@ -2856,26 +3090,238 @@ mod tests {
         }
     }
 
-    // ── route_component_alert ─────────────────────────────────────────────
+    /// An ungranted instance's well-formed log is a breadcrumb, never a `Log`
+    /// frame carrying its name.
+    #[test]
+    fn an_ungranted_instance_logs_nothing_at_either_seam() {
+        for target_tag in [Some("brenn-protobar"), None] {
+            let action =
+                ungranted_core().route_log(Some("p1"), target_tag, Some("warn"), Some("hi"));
+            let KernelAction::Report {
+                level,
+                message,
+                subject,
+            } = action
+            else {
+                panic!("expected a Report for {target_tag:?}, got {action:?}");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert_eq!(subject.as_deref(), Some("p1"));
+            assert!(message.contains("suppressed"), "message: {message}");
+            assert!(message.contains("log capability"), "message: {message}");
+        }
+    }
+
+    /// The gate is read before the detail: an ungranted instance is told it is
+    /// ungranted whatever it sent, rather than learning its detail was malformed
+    /// from a capability it does not hold.
+    #[test]
+    fn the_log_grant_is_checked_ahead_of_the_detail() {
+        let action =
+            ungranted_core().route_log(Some("p1"), Some("brenn-protobar"), Some("shout"), None);
+        assert!(matches!(
+            action,
+            KernelAction::Report { message, .. } if message.contains("not granted")
+        ));
+    }
+
+    /// One router, two seams: the headless one names the instance where the DOM
+    /// one names the element, and nothing else differs.
+    #[test]
+    fn a_headless_log_names_the_instance_in_its_drop() {
+        let action = routing_core().route_log(Some("counter-a"), None, Some("shout"), Some("m"));
+        let KernelAction::Report { message, .. } = action else {
+            panic!("expected a Report, got {action:?}");
+        };
+        assert!(
+            message.contains("processor counter-a"),
+            "message: {message}"
+        );
+        assert!(message.contains("malformed"), "message: {message}");
+    }
+
+    #[test]
+    #[should_panic(expected = "names the instance its loader closed over")]
+    fn a_headless_log_with_no_instance_is_a_kernel_bug() {
+        let _ = routing_core().route_log(None, None, Some("warn"), Some("m"));
+    }
+
+    #[test]
+    #[should_panic(expected = "names the instance its loader closed over")]
+    fn a_headless_alert_with_no_instance_is_a_kernel_bug() {
+        // The alert twin of the log panic: a softened identity here would page
+        // the backend under an empty attribution, which it judges undeclared and
+        // kills the session for.
+        let _ = routing_core().route_alert(None, None, Some("warning"), Some("t"), Some("b"));
+    }
+
+    // ── route_config_get ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_config_read_resolves_its_instance_and_key() {
+        assert_eq!(
+            route_config_get(Some("p1"), "brenn-protobar", Some("mode")),
+            Ok(("p1", "mode"))
+        );
+    }
+
+    #[test]
+    fn a_config_read_from_an_unresolved_target_is_dropped_and_reported() {
+        let Err(KernelAction::Report {
+            level,
+            message,
+            subject,
+        }) = route_config_get(None, "button", Some("mode"))
+        else {
+            panic!("expected a Report");
+        };
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(subject, None);
+        assert!(message.contains("button"), "message: {message}");
+        assert!(message.contains(contract::CONFIG_GET), "message: {message}");
+    }
+
+    #[test]
+    fn a_config_read_with_no_key_is_dropped_as_malformed() {
+        let Err(KernelAction::Report {
+            message, subject, ..
+        }) = route_config_get(Some("p1"), "brenn-protobar", None)
+        else {
+            panic!("expected a Report");
+        };
+        assert_eq!(subject.as_deref(), Some("p1"));
+        assert!(message.contains("key must be a string"), "{message}");
+    }
+
+    // ── per-instance grants ───────────────────────────────────────────────
+
+    #[test]
+    fn a_configured_instances_grants_are_read_off_its_component_entry() {
+        let core = connect(
+            vec![
+                granted_entry("p1", "protobar", &["ports", "alert"]),
+                granted_entry("p2", "protobar", &["ports"]),
+            ],
+            true,
+        );
+        assert!(core.instance_grants("p1").contains(&ComponentGrant::Alert));
+        assert!(core.instance_grants("p1").contains(&ComponentGrant::Ports));
+        assert!(
+            !core.instance_grants("p2").contains(&ComponentGrant::Alert),
+            "a sibling of the same kind holds only its own words"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_instance_and_an_unconfigured_page_both_hold_nothing() {
+        assert!(KernelCore::new().instance_grants("p1").is_empty());
+        let core = connect(vec![granted_entry("p1", "protobar", &["alert"])], true);
+        assert!(
+            core.instance_grants("ghost").is_empty(),
+            "deny-by-default, and no existence oracle in the difference"
+        );
+    }
+
+    /// Build skew: the server's vocabulary has a word this page's assets predate.
+    /// The page refuses the whole document and takes the capped reload rather than
+    /// guessing which capability was meant.
+    #[test]
+    fn a_document_naming_an_unknown_capability_is_refused_whole() {
+        let mut core = KernelCore::new();
+        let actions = core.on_event(
+            &connected_event_granted(
+                vec![granted_entry("p1", "protobar", &["ports", "telepathy"])],
+                vec![],
+                true,
+            ),
+            |_, _| true,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                KernelAction::RequestReload { reason } if reason == "unknown component grant"
+            )),
+            "expected a reload request, got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                KernelAction::Report { level: LogLevel::Error, message, .. }
+                    if message.contains("telepathy")
+            )),
+            "expected a report naming the word, got {actions:?}"
+        );
+        assert!(
+            core.instance_grants("p1").is_empty(),
+            "nothing from a refused document is in force"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, KernelAction::MountComponent { .. })),
+            "no instance is configured from a refused document: {actions:?}"
+        );
+    }
+
+    /// A server bug rather than skew, and refused on the same terms: with two
+    /// entries under one name, the grants in force would come from one and the
+    /// config map every other reader finds from the other.
+    #[test]
+    fn a_document_declaring_one_instance_twice_is_refused_whole() {
+        let mut core = KernelCore::new();
+        let actions = core.on_event(
+            &connected_event_granted(
+                vec![
+                    granted_entry("p1", "protobar", &["ports"]),
+                    granted_entry("p1", "protobar", &["ports", "alert"]),
+                ],
+                vec![],
+                true,
+            ),
+            |_, _| true,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                KernelAction::RequestReload { reason } if reason == "duplicate component instance"
+            )),
+            "expected a reload request, got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                KernelAction::Report { level: LogLevel::Error, message, .. }
+                    if message.contains("p1") && message.contains("declared twice")
+            )),
+            "expected a report naming the instance, got {actions:?}"
+        );
+        assert!(
+            core.instance_grants("p1").is_empty(),
+            "neither entry's grants are in force"
+        );
+    }
+
+    // ── route_alert ───────────────────────────────────────────────────────
 
     #[test]
     fn component_alert_from_granted_mounted_instance_forwards_each_severity() {
+        let core = routing_core();
         for (wire, severity) in [
             ("info", AlertSeverity::Info),
             ("warning", AlertSeverity::Warning),
             ("critical", AlertSeverity::Critical),
         ] {
-            let action = route_component_alert(
+            let action = core.route_alert(
                 Some("p1"),
-                "brenn-protobar",
+                Some("brenn-protobar"),
                 Some(wire),
                 Some("t"),
                 Some("b"),
-                true,
             );
             assert_eq!(
                 action,
-                KernelAction::ComponentAlert {
+                KernelAction::Alert {
+                    attribution: Some("p1".to_string()),
                     severity,
                     title: "t".to_string(),
                     body: "b".to_string(),
@@ -2885,14 +3331,13 @@ mod tests {
     }
 
     #[test]
-    fn component_alert_on_ungranted_surface_is_suppressed_with_breadcrumb() {
-        let action = route_component_alert(
+    fn component_alert_from_an_ungranted_instance_is_suppressed_with_breadcrumb() {
+        let action = ungranted_core().route_alert(
             Some("p1"),
-            "brenn-protobar",
+            Some("brenn-protobar"),
             Some("warning"),
             Some("t"),
             Some("b"),
-            false,
         );
         let KernelAction::Report { level, message, .. } = action else {
             panic!("expected Report suppression breadcrumb, got {action:?}");
@@ -2904,9 +3349,9 @@ mod tests {
 
     #[test]
     fn component_alert_from_unresolved_target_is_dropped_and_reported() {
+        let core = routing_core();
         for tag in ["brenn-protobar", "button"] {
-            let action =
-                route_component_alert(None, tag, Some("warning"), Some("t"), Some("b"), true);
+            let action = core.route_alert(None, Some(tag), Some("warning"), Some("t"), Some("b"));
             let KernelAction::Report { level, message, .. } = action else {
                 panic!("expected Report for <{tag}>, got {action:?}");
             };
@@ -2916,7 +3361,8 @@ mod tests {
     }
 
     #[test]
-    fn component_alert_with_malformed_detail_on_granted_surface_is_dropped_as_malformed() {
+    fn component_alert_with_malformed_detail_from_a_granted_instance_is_dropped_as_malformed() {
+        let core = routing_core();
         let cases = [
             (None, Some("t"), Some("b")),
             (Some("warning"), None, Some("b")),
@@ -2926,7 +3372,7 @@ mod tests {
         ];
         for (severity, title, body) in cases {
             let action =
-                route_component_alert(Some("p1"), "brenn-protobar", severity, title, body, true);
+                core.route_alert(Some("p1"), Some("brenn-protobar"), severity, title, body);
             let KernelAction::Report { level, message, .. } = action else {
                 panic!("expected Report for ({severity:?}, {title:?}, {body:?}), got {action:?}");
             };
@@ -2973,15 +3419,20 @@ mod tests {
                 level: LogLevel::Error,
                 ..
             },
-            KernelAction::ComponentAlert {
+            KernelAction::Alert {
+                attribution,
                 severity,
                 title,
                 body,
             },
         ] = shown.as_slice()
         else {
-            panic!("expected ErrorCard + Report + ComponentAlert, got {actions:?}");
+            panic!("expected ErrorCard + Report + Alert, got {actions:?}");
         };
+        assert_eq!(
+            *attribution, None,
+            "the kernel pages about the death; the dead instance states nothing"
+        );
         assert_eq!(*severity, AlertSeverity::Warning);
         assert_eq!(title, "component panic: e1");
         assert_eq!(body, "boom");
@@ -3027,7 +3478,7 @@ mod tests {
         assert_eq!(
             actions
                 .iter()
-                .filter(|a| matches!(a, KernelAction::ComponentAlert { .. }))
+                .filter(|a| matches!(a, KernelAction::Alert { .. }))
                 .count(),
             1,
             "one page for the one dead instance",
@@ -3405,6 +3856,7 @@ mod tests {
             abi: Abi::Processor,
             parked_batch_depth: 8,
             config: Default::default(),
+            grants: vec![],
         }
     }
 
@@ -3622,30 +4074,112 @@ mod tests {
         assert_eq!(core.instances[0].ports_attached, 2);
     }
 
+    /// One config map, either ABI. The map is the component entry's; nothing
+    /// about the DOM decides whether it can be read, so a `dom` instance holding
+    /// `config` reads its own exactly as a headless one does.
     #[test]
-    fn processor_config_get_answers_from_welcome_and_misses_are_none() {
+    fn config_get_answers_from_welcome_for_both_abis_and_misses_are_none() {
+        let mut core = KernelCore::new();
+        let mut headless = processor_entry("counter-a", "counter");
+        headless
+            .config
+            .insert("mode".to_string(), "loud".to_string());
+        headless.grants = vec!["config".to_string()];
+        let mut placed = granted_entry("p1", "protobar", &["config"]);
+        placed
+            .config
+            .insert("mode".to_string(), "quiet".to_string());
+        let mut sibling = processor_entry("counter-b", "counter");
+        sibling.grants = vec!["config".to_string()];
+        core.on_event(&connected_event(vec![headless, placed, sibling]), |_, _| {
+            false
+        });
+
+        assert_eq!(
+            core.component_config_get("counter-a", "mode"),
+            Ok(Some("loud".to_string()))
+        );
+        assert_eq!(
+            core.component_config_get("p1", "mode"),
+            Ok(Some("quiet".to_string()))
+        );
+        assert_eq!(core.component_config_get("counter-a", "absent"), Ok(None));
+        // Per-instance, not per-kind: a sibling of the same kind has its own map.
+        assert_eq!(core.component_config_get("counter-b", "mode"), Ok(None));
+    }
+
+    /// The gate is the serving path's own, so no seam can serve a read the
+    /// grants do not admit — including a read naming an instance the document
+    /// never declared, which holds nothing.
+    #[test]
+    fn an_ungranted_instance_reads_no_config() {
         let mut core = KernelCore::new();
         let mut entry = processor_entry("counter-a", "counter");
         entry.config.insert("mode".to_string(), "loud".to_string());
-        core.on_event(
-            &connected_event(vec![entry, processor_entry("counter-b", "counter")]),
-            |_, _| false,
-        );
+        core.on_event(&connected_event(vec![entry]), |_, _| false);
 
-        assert_eq!(
-            core.processor_config_get("counter-a", "mode").as_deref(),
-            Some("loud")
-        );
-        assert_eq!(core.processor_config_get("counter-a", "absent"), None);
-        // Per-instance, not per-kind: a sibling of the same kind has its own map.
-        assert_eq!(core.processor_config_get("counter-b", "mode"), None);
-        assert_eq!(core.processor_config_get("ghost", "mode"), None);
+        for instance in ["counter-a", "ghost"] {
+            let Err(KernelAction::Report {
+                level,
+                message,
+                subject,
+            }) = core.component_config_get(instance, "mode")
+            else {
+                panic!("expected a refusal for {instance}");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert_eq!(subject.as_deref(), Some(instance));
+            assert!(message.contains("config capability"), "{message}");
+        }
+    }
+
+    /// Every entry of the publish/defer family asks one question of one
+    /// authority. The six seams themselves are browser-only, but the decision
+    /// they share is not: an instance granted `ports` is admitted whichever
+    /// family it arrives on, and one that is not — declared or not — is refused
+    /// with a breadcrumb naming the family and the capability.
+    #[test]
+    fn every_ports_entry_shares_one_verdict() {
+        let granted = connect(vec![granted_entry("p1", "protobar", &["ports"])], true);
+        let ungranted = ungranted_core();
+        // The seam, and the event family it asks under: the two DOM listeners,
+        // then the four headless exports.
+        let seams = [
+            ("dom publish listener", contract::PORT_PUBLISH),
+            ("dom defer listener", contract::PORT_DEFER),
+            ("brenn_processor_publish", contract::PORT_PUBLISH),
+            ("brenn_processor_publish_deferred", contract::PORT_DEFER),
+            ("brenn_processor_defer_cancel", contract::PORT_DEFER),
+            ("brenn_processor_defer_edit", contract::PORT_DEFER),
+        ];
+        for (seam, what) in seams {
+            assert_eq!(
+                granted.component_ports_gate("p1", what),
+                Ok(()),
+                "{seam} refused a granted instance"
+            );
+            for instance in ["p1", "ghost"] {
+                let Err(KernelAction::Report {
+                    level,
+                    message,
+                    subject,
+                }) = ungranted.component_ports_gate(instance, what)
+                else {
+                    panic!("{seam} admitted {instance}, which holds no ports grant");
+                };
+                assert_eq!(level, LogLevel::Warn);
+                assert_eq!(subject.as_deref(), Some(instance));
+                assert!(message.contains(what), "{seam}: {message}");
+                assert!(message.contains("ports capability"), "{seam}: {message}");
+            }
+        }
     }
 
     #[test]
     fn processor_log_and_alert_route_without_an_element() {
+        let core = routing_core();
         assert_eq!(
-            route_processor_log("counter-a", "warn", "hi"),
+            core.route_log(Some("counter-a"), None, Some("warn"), Some("hi")),
             KernelAction::ComponentLog {
                 instance: "counter-a".to_string(),
                 level: LogLevel::Warn,
@@ -3653,13 +4187,20 @@ mod tests {
             }
         );
         assert!(matches!(
-            route_processor_log("counter-a", "shout", "hi"),
+            core.route_log(Some("counter-a"), None, Some("shout"), Some("hi")),
             KernelAction::Report { .. }
         ));
 
         assert_eq!(
-            route_processor_alert("counter-a", "warning", "t", "b", true),
-            KernelAction::ComponentAlert {
+            core.route_alert(
+                Some("counter-a"),
+                None,
+                Some("warning"),
+                Some("t"),
+                Some("b")
+            ),
+            KernelAction::Alert {
+                attribution: Some("counter-a".to_string()),
                 severity: AlertSeverity::Warning,
                 title: "t".to_string(),
                 body: "b".to_string(),
@@ -3668,11 +4209,17 @@ mod tests {
         // Ungranted: a suppression breadcrumb, never an `Alert` the server would
         // treat as a protocol violation.
         assert!(matches!(
-            route_processor_alert("counter-a", "warning", "t", "b", false),
+            ungranted_core().route_alert(
+                Some("counter-a"),
+                None,
+                Some("warning"),
+                Some("t"),
+                Some("b")
+            ),
             KernelAction::Report { message, .. } if message.contains("suppressed")
         ));
         assert!(matches!(
-            route_processor_alert("counter-a", "loud", "t", "b", true),
+            core.route_alert(Some("counter-a"), None, Some("loud"), Some("t"), Some("b")),
             KernelAction::Report { .. }
         ));
     }
@@ -4106,15 +4653,24 @@ mod tests {
 
     // ── the overlay-state instrument's own wiring ─────────────────────────
 
-    /// `connected_event_chrome` with the takeover grant and `outputs`.
+    /// `connected_event_chrome` with a component wired to the takeover plane and
+    /// `outputs`. The binding is what makes this a page that takes over — the
+    /// grant that consents to it is the binding component's, and boot has
+    /// already checked it.
     fn connected_event_takeover(
         components: Vec<ComponentEntry>,
         outputs: Vec<schema::OutputBinding>,
     ) -> Event {
-        let mut bindings = document(components, vec![]);
+        let mut bindings = document(
+            components,
+            vec![binding(
+                schema::LOCAL_TAKEOVER_CHANNEL,
+                "chrome",
+                "takeover",
+            )],
+        );
         bindings.chrome_instance = "chrome".to_string();
         bindings.outputs = outputs;
-        bindings.platform.takeover_granted = true;
         connected(bindings, false)
     }
 
@@ -4143,7 +4699,7 @@ mod tests {
     }
 
     #[test]
-    fn a_takeover_surface_whose_chrome_cannot_report_overlay_state_warns_at_connect() {
+    fn a_takeover_wired_surface_whose_chrome_cannot_report_overlay_state_warns_at_connect() {
         // The dark instrument. Chrome's overlay publishes are made from inside its
         // activation, where an unbound port is answered on the dispatching event's
         // detail and draws no report of its own — so without this, a surface
@@ -4159,7 +4715,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wired_or_ungranted_surface_says_nothing_about_overlay_state() {
+    fn a_wired_or_takeover_free_surface_says_nothing_about_overlay_state() {
         // Bound: the instrument is live, nothing to say.
         let mut core = KernelCore::new();
         let wired = core.on_event(
@@ -4171,15 +4727,49 @@ mod tests {
         );
         assert_eq!(instrument_warn(&wired), None);
 
-        // No takeover grant: nothing can hold an overlay, and the plane requires
-        // the grant — an unbound port there is the correct configuration, not a
-        // gap.
+        // Nothing wired to the takeover plane: no component can hold an overlay,
+        // so an unbound port there is the correct configuration, not a gap.
         let mut core = KernelCore::new();
         let ungranted = core.on_event(
             &connected_event_chrome(entries(&["chrome", "meeting"]), "chrome"),
             |_, _| true,
         );
         assert_eq!(instrument_warn(&ungranted), None);
+    }
+
+    #[test]
+    fn a_surface_that_publishes_takeover_is_read_as_taking_over() {
+        // The request travels outbound — a component publishes it — so the scan
+        // reads outputs as well as subscriptions. A page whose only takeover
+        // wiring is the publish is still a page that takes over.
+        let takeover_output = schema::OutputBinding {
+            channel: schema::LOCAL_TAKEOVER_CHANNEL.to_string(),
+            instance: "meeting".to_string(),
+            port: "takeover".to_string(),
+            urgency: Urgency::Normal,
+            fill_mt: 1_000,
+            capacity_mt: 8_000,
+        };
+        let event = |outputs: Vec<schema::OutputBinding>| {
+            let mut bindings = document(entries(&["chrome", "meeting"]), vec![]);
+            bindings.chrome_instance = "chrome".to_string();
+            bindings.outputs = outputs;
+            connected(bindings, false)
+        };
+
+        let mut core = KernelCore::new();
+        let actions = core.on_event(&event(vec![takeover_output.clone()]), |_, _| true);
+        let message = instrument_warn(&actions).expect("a warn about the unbound plane");
+        assert!(message.contains("chrome"), "message: {message}");
+
+        // ...and with chrome's overlay-state output beside it the instrument is
+        // live, so nothing is said.
+        let mut core = KernelCore::new();
+        let wired = core.on_event(
+            &event(vec![takeover_output, overlay_state_output()]),
+            |_, _| true,
+        );
+        assert_eq!(instrument_warn(&wired), None);
     }
 
     #[test]

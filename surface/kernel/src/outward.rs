@@ -583,6 +583,10 @@ pub fn drop_notices(verdicts: &DropVerdicts) -> DropNotices {
     for announcement in &verdicts.announce {
         let text = announcement.describe();
         notices.alerts.push(ClientFrame::Alert {
+            // The page's own account of what it lost, not the instance's: an
+            // overflowing component states nothing here, and it need hold no
+            // alert grant for the operator to hear about the loss.
+            attribution: None,
             severity: AlertSeverity::Warning,
             title: truncate_report_field(
                 format!("surface input overflow on {}", announcement.instance),

@@ -265,10 +265,17 @@
 //!   string (`"info"`/`"warning"`/`"critical"`, see
 //!   [`brenn_surface_schema::AlertSeverity::from_wire_str`]) fixed at the
 //!   component call site, `title`/`body` strings. Forwarded as an `Alert` frame
-//!   **only** on an alert-granted surface; on an ungranted surface the kernel
-//!   drops it and logs a `warn` breadcrumb naming the component, never sending
-//!   an ungranted `Alert`. A missing/non-string field or an unrecognized
+//!   **only** for a component granted `alert`; an ungranted one is dropped with
+//!   a `warn` breadcrumb naming it, never sent as an ungranted `Alert`. A missing/non-string field or an unrecognized
 //!   `severity` is dropped and reported as malformed rather than coerced.
+//! - [`CONFIG_GET`] — a component's read of one key from its own static config
+//!   map. Same dispatch rule and same identity resolution as [`PORT_PUBLISH`],
+//!   and answered synchronously on the detail: `detail = { key }` going in,
+//!   [`CONFIG_ANSWERED_FIELD`] always written and [`CONFIG_VALUE_FIELD`] written
+//!   only when the map holds that key. The kernel answers only an instance
+//!   granted `config`; an ungranted one gets the absence answer and a `warn`
+//!   breadcrumb. The map is fixed for the page's lifetime, so a component may
+//!   read it once at mount and keep the answer.
 //! - [`COMPONENT_PANIC`] — dispatched on `window` from the component module's
 //!   panic hook, which knows its own kind but not its element. `detail =
 //!   { component, message }`, both strings. A module-level panic hook cannot
@@ -916,6 +923,27 @@ pub const COMPONENT_LOG: &str = "brenn-log";
 /// strings. Forwarded as an `Alert` frame only on an alert-granted surface.
 pub const COMPONENT_ALERT: &str = "brenn-alert";
 
+/// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
+/// composed: true`, on the mounted element or from within its shadow root).
+/// `detail = { key }`, a string naming one entry of this instance's static
+/// config map. Answered synchronously on the same detail before the dispatch
+/// returns (see [`CONFIG_ANSWERED_FIELD`] and [`CONFIG_VALUE_FIELD`]).
+pub const CONFIG_GET: &str = "brenn-config-get";
+
+/// The [`CONFIG_GET`] detail field the kernel writes `true` into for every read
+/// it heard, whatever the answer was.
+///
+/// The absence marker the answer needs: a key the map does not hold, and an
+/// instance not granted `config`, both leave [`CONFIG_VALUE_FIELD`] unwritten,
+/// and a reader cannot tell that apart from a page whose kernel listener is
+/// absent without this. Missing means the event never reached the kernel, which
+/// is a broken page rather than an answer.
+pub const CONFIG_ANSWERED_FIELD: &str = "answered";
+
+/// The [`CONFIG_GET`] detail field the kernel writes the value into, written
+/// only when the instance is granted `config` and its map holds the key.
+pub const CONFIG_VALUE_FIELD: &str = "value";
+
 /// Component → kernel, dispatched on `window` from the component's panic hook.
 /// `detail = { component, message }` (both strings).
 pub const COMPONENT_PANIC: &str = "brenn-component-panic";
@@ -1057,6 +1085,7 @@ mod tests {
         assert_eq!(PORT_PUBLISH, "brenn-port-publish");
         assert_eq!(COMPONENT_LOG, "brenn-log");
         assert_eq!(COMPONENT_ALERT, "brenn-alert");
+        assert_eq!(CONFIG_GET, "brenn-config-get");
         assert_eq!(COMPONENT_PANIC, "brenn-component-panic");
         assert_eq!(SURFACE_RELOAD, "brenn-surface-reload");
         assert_eq!(SURFACE_READY, "brenn-surface-ready");
@@ -1118,6 +1147,8 @@ mod tests {
             );
         }
         assert_eq!(PUBLISH_STATUS_FIELD, "status");
+        assert_eq!(CONFIG_ANSWERED_FIELD, "answered");
+        assert_eq!(CONFIG_VALUE_FIELD, "value");
         assert_eq!(parse_publish_status("nope"), None);
         assert_eq!(parse_publish_status(""), None);
     }

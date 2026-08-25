@@ -294,9 +294,9 @@ fn the_push_scheme_is_not_spellable_in_a_pin_either() {
 fn the_push_scheme_is_not_spellable_as_a_binding_target_either() {
     assert_eq!(
         refusal(concat!(
-            "component Sink {\n    abi = processor;\n    component_path = \"sink.wasm\";\n",
-            "    out events;\n}\n",
+            "component Sink {\n    abi = processor;\n    out events;\n}\n",
             "new alice_sink: Sink {\n",
+            "    component_path = \"sink.wasm\";\n",
             "    out events -> \"pwa_push:alerts\";\n",
             "}\n",
         )),
@@ -1155,19 +1155,19 @@ fn an_unknown_instance_key_names_the_legal_set() {
             "        component_path = \"/lib/panel.wasm\";\n",
         )),
         "`component_path` is not a key of a component instance; expected one of \
-         chrome, send_burst, send_refill_secs, parked_batch_depth, config"
+         grants, chrome, send_burst, send_refill_secs, parked_batch_depth, config"
     );
 }
 
 #[test]
-fn a_components_acl_belongs_to_its_surface() {
-    assert_eq!(
-        refusal(&surface_doc(
-            "    abi = dom;\n    in messages;\n",
-            "        acl subscribe [prefix \"brenn:alice-desk.\"];\n",
-        )),
-        "a component's authority is its surface's; write the `acl` in the surface body"
-    );
+fn a_component_states_its_own_authority() {
+    let config = resolved(&surface_doc(
+        "    abi = dom;\n    in messages;\n",
+        "        acl subscribe [prefix \"brenn:alice-desk.\"];\n",
+    ));
+    let instance = &config.surfaces[0].components[0];
+    assert_eq!(instance.acls.len(), 1);
+    assert_eq!(instance.acls[0].plane.value(), "subscribe");
 }
 
 #[test]
@@ -1300,11 +1300,11 @@ fn a_top_level_instance_is_a_consumer() {
         "channel out_chan at \"brenn:alice.out.events\";\n",
         "component Sink {\n",
         "    abi = processor;\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    out events;\n",
         "}\n",
         "new alice_sink: Sink {\n",
         "    slug = \"alice-sink\";\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    grants = [ports];\n",
         "    acl publish [prefix \"brenn:alice.out.\"];\n",
         "    out events -> out_chan;\n",
@@ -1315,7 +1315,12 @@ fn a_top_level_instance_is_a_consumer() {
     assert_eq!(consumer.slug.value(), "alice-sink");
     assert_eq!(consumer.acls[0].plane.value(), "publish");
     assert_eq!(consumer.bindings[0].chan, Some(RChanRef::Decl(ChanId(0))));
-    assert!(consumer.class.component_path.is_some());
+    let path = consumer
+        .attrs
+        .iter()
+        .find(|(key, _)| key == "component_path")
+        .map(|(_, value)| value.value());
+    assert_eq!(path, Some(&RValue::Str("/lib/brenn_sink.wasm".to_string())));
 }
 
 #[test]
@@ -1337,22 +1342,8 @@ fn a_top_level_instance_needs_an_artifact_to_load() {
             "component Sink {\n    abi = processor;\n}\n",
             "new alice_sink: Sink {}\n",
         )),
-        "a top-level instance is loaded from an artifact, and `Sink` declares no \
-         `component_path`"
-    );
-}
-
-#[test]
-fn a_dom_class_is_served_rather_than_loaded() {
-    assert_eq!(
-        refusal(concat!(
-            "component Panel {\n",
-            "    abi = dom;\n",
-            "    component_path = \"/lib/panel.wasm\";\n",
-            "}\n",
-        )),
-        "a dom component is served to the browser, not loaded from a path; \
-         `component_path` on a dom class configures nothing"
+        "a top-level instance is loaded from an artifact, and this instance of `Sink` \
+         states no `component_path`"
     );
 }
 
@@ -1361,10 +1352,10 @@ fn a_literal_address_binds_where_no_channel_is_declared() {
     let config = resolved(concat!(
         "component Sink {\n",
         "    abi = processor;\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    out events;\n",
         "}\n",
         "new alice_sink: Sink {\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    out events -> \"local:brenn/takeover\";\n",
         "}\n",
     ));
@@ -1453,10 +1444,10 @@ fn a_binding_whose_tail_value_is_unresolvable_is_withheld() {
         "channel messages at \"brenn:alice-desk.in.messages\";\n",
         "component Panel {\n",
         "    abi = processor;\n",
-        "    component_path = \"/lib/brenn_panel.wasm\";\n",
         "    in messages;\n",
         "}\n",
         "new p1: Panel {\n",
+        "    component_path = \"/lib/brenn_panel.wasm\";\n",
         "    grants = [];\n",
         "    in messages <- messages { amplification = nowhere; }\n",
         "}\n",
@@ -2181,7 +2172,6 @@ fn every_carrier_of_a_literal_address_is_held_to_the_one_spelling_rule() {
         "channel alice_cmd at \"brenn:alice.cmd\";\n",
         "component Sink {\n",
         "    abi = processor;\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    out events;\n",
         "}\n",
         "surface alice_desk {\n",
@@ -2189,6 +2179,7 @@ fn every_carrier_of_a_literal_address_is_held_to_the_one_spelling_rule() {
         "    acl subscribe [exact \"brenn:alice.cmd\"];\n",
         "}\n",
         "new alice_sink: Sink {\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    grants = [ports];\n",
         "    acl publish [exact \"brenn:alice.cmd\"];\n",
         "    out events -> \"brenn:alice.cmd\";\n",
@@ -2217,8 +2208,9 @@ fn a_matcher_in_an_attribute_value_is_outside_the_one_spelling_rule() {
 #[test]
 fn a_literal_address_no_channel_declares_is_how_a_local_plane_is_named() {
     let config = resolved(concat!(
-        "component Sink {\n    abi = processor;\n    component_path = \"sink.wasm\";\n    out events;\n}\n",
+        "component Sink {\n    abi = processor;\n    out events;\n}\n",
         "new alice_sink: Sink {\n",
+        "    component_path = \"sink.wasm\";\n",
         "    out events -> \"local:brenn/takeover\";\n",
         "}\n",
     ));
@@ -2313,14 +2305,15 @@ fn a_consumer_whose_body_was_refused_is_not_in_the_model() {
     let errors = refusals(concat!(
         "component Sink {\n",
         "    abi = processor;\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "}\n",
         "new alice_sink: Sink {\n",
         "    slug = \"sink\";\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    store_path = nowhere;\n",
         "}\n",
         "new bob_sink: Sink {\n",
         "    slug = \"sink\";\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "}\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -2335,12 +2328,13 @@ fn a_consumer_with_a_refused_slug_value_does_not_fall_back_to_its_handle() {
     let errors = refusals(concat!(
         "component Sink {\n",
         "    abi = processor;\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "}\n",
         "new alice_sink: Sink {\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    slug = nowhere;\n",
         "}\n",
         "new bob_sink: Sink {\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    slug = \"alice_sink\";\n",
         "}\n",
     ));
@@ -2597,9 +2591,9 @@ fn a_grant_to_a_withheld_entity_is_not_a_missing_principal() {
     let errors = refusals(concat!(
         "component Sink {\n",
         "    abi = processor;\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "}\n",
         "new alice_sink: Sink {\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    store_path = nowhere;\n",
         "}\n",
         "grant alice_sink subscribe prefix \"brenn:alice-desk.\";\n",

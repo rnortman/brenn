@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntryKind, WakeMin,
-    canonicalize_channel_address, ends_at_tuning_boundary, in_a_tool_namespace,
-    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid, tuning_boundary_list,
+    AttachGrant, ChannelEntry, ChannelScheme, ComponentGrant, MessagingDirectory,
+    SubscriberEntryKind, WakeMin, canonicalize_channel_address, ends_at_tuning_boundary,
+    in_a_tool_namespace, is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid,
+    tuning_boundary_list,
 };
 use crate::config::AppConfigRaw;
 
@@ -478,65 +479,6 @@ pub struct MessagingSubscriptionRaw {
     pub wake_min: Option<WakeMin>,
 }
 
-/// Grantable capability interface names for WASM processor consumers (operator-facing, stable).
-///
-/// Each variant corresponds to one WIT interface in `world processor`. A grant
-/// selects whether that interface's host functions are linked for a given component.
-/// Deny-by-default: only listed grants are linked; all others are absent from the linker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WasmGrant {
-    /// `brenn:processor/ports` — output-port publish.
-    Ports,
-    /// `brenn:processor/store` — KV store (also requires `store_path` in config).
-    Store,
-    /// `brenn:processor/log` — structured logging.
-    Log,
-    /// `brenn:processor/alert` — phone/operator alerting.
-    Alert,
-    /// `brenn:processor/config` — read-only operator config.
-    Config,
-    /// `brenn:processor/mqtt` — synchronous direct-to-broker MQTT publish.
-    Mqtt,
-}
-
-/// Grantable transport rights for a `[[surface]]` bus participant (operator-facing).
-///
-/// Unlike `WasmGrant` (whose tokens name WIT interfaces, deriving
-/// `MessagingSubscribe` implicitly from `subscribe_acl` presence because no
-/// grant token maps to it — see `build_wasm_policy`), a surface's grant
-/// vocabulary names the four transport rights *directly*, one per delivery
-/// class × direction. This follows the deny-by-default sketch
-/// (`grants = ["ephemeral_subscribe"]`): with an explicit token for every
-/// right there is no missing-grant gap to paper over with derivation, and
-/// deny-by-default reads straight off the config.
-///
-/// Serde `snake_case` so the multi-word variants author as
-/// `ephemeral_subscribe`/`ephemeral_publish`, matching the
-/// `AppCapability` tokens they map onto.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SurfaceGrant {
-    /// Durable (`brenn:`) delivery to the surface. Maps to `MessagingSubscribe`.
-    Subscribe,
-    /// Durable (`brenn:`) publish from the surface. Maps to `MessagingPublish`.
-    Publish,
-    /// Ephemeral (`ephemeral:`) delivery to the surface. Maps to `EphemeralSubscribe`.
-    EphemeralSubscribe,
-    /// Ephemeral (`ephemeral:`) publish from the surface. Maps to `EphemeralPublish`.
-    EphemeralPublish,
-    /// Alert (phone/operator paging) emission from the surface. Maps to
-    /// `SurfaceAlert`. Deny-by-default: without this grant a surface has no
-    /// alert plane. Authoring token `"alert"` — the same string operators
-    /// already write for a WASM consumer's alert grant.
-    Alert,
-    /// Takeover (fullscreen overlay) emission from the surface. Maps to
-    /// `SurfaceTakeover`. Deny-by-default: without this grant the shell drops a
-    /// component's takeover request and never pushes an overlay. Authoring token
-    /// `"takeover"`.
-    Takeover,
-}
-
 /// Top-level `[[wasm_consumer]]` block.
 ///
 /// Declares a WASM processing component as a bus subscriber. The component
@@ -552,7 +494,7 @@ pub struct WasmConsumerConfigRaw {
     /// Capability interfaces to link for this component (deny-by-default).
     /// Required — no default. The operator states intent explicitly; an unstated
     /// `grants` is refused. Empty list = zero-capability consumer.
-    pub grants: Vec<WasmGrant>,
+    pub grants: Vec<ComponentGrant>,
     /// Path to the per-component SQLite KV store. Required iff `"store"` is in
     /// `grants`; must be absent otherwise.
     pub store_path: Option<std::path::PathBuf>,
@@ -631,7 +573,7 @@ pub struct WasmConsumerConfigRaw {
     /// (a matcher's `topic_filter` must be a superset of the subscribed filter).
     /// Same flat top-level `Vec` authoring convention as `subscribe_acl`. A
     /// non-empty list derives the `MqttSubscribe` transport grant (there is no
-    /// `WasmGrant` for inbound subscribe, mirroring `subscribe_acl`'s
+    /// `ComponentGrant` for inbound subscribe, mirroring `subscribe_acl`'s
     /// `MessagingSubscribe` derivation); an empty list means the consumer holds no
     /// MQTT-subscribe authorization (deny-by-default at delivery).
     pub mqtt_subscribe_acl: Vec<crate::access::raw::MqttSubMatcherRaw>,
@@ -643,7 +585,7 @@ pub struct WasmConsumerConfigRaw {
     /// subscribed `webhook:<endpoint>` channel. Same flat top-level `Vec` authoring
     /// convention as `subscribe_acl`. Unqualified (no direction suffix) because
     /// webhooks are inbound-only, matching the LLM side's unqualified `webhook` ACL.
-    /// A non-empty list derives the `Webhook` transport grant (no `WasmGrant` for
+    /// A non-empty list derives the `Webhook` transport grant (no `ComponentGrant` for
     /// inbound webhook, mirroring `subscribe_acl`); an empty list means the consumer
     /// holds no webhook-subscribe authorization (deny-by-default at delivery).
     pub webhook_acl: Vec<crate::access::raw::WebhookMatcherRaw>,
@@ -954,7 +896,7 @@ pub struct SurfaceConfigRaw {
     pub slug: String,
     /// Transport rights for this surface (deny-by-default). Required — no default;
     /// the operator states intent explicitly, exactly like `[[wasm_consumer]]`.
-    pub grants: Vec<SurfaceGrant>,
+    pub grants: Vec<AttachGrant>,
     /// Durable (`brenn:`) subscribe ACL — bare channel names, no scheme.
     pub subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Durable (`brenn:`) publish ACL — bare channel names, no scheme.
@@ -1022,6 +964,11 @@ pub struct SurfaceComponentRaw {
     /// seconds: one publish's worth of budget returns per interval. Absent ⇒
     /// [`SURFACE_SEND_REFILL`].
     pub send_refill_secs: Option<u64>,
+    /// The capability interfaces this instance is given, deny-by-default. Its
+    /// own, not its surface's: a surface's grants are the transport rights the
+    /// backend admits it over the wire, and these contain one component within
+    /// the page it runs in.
+    pub grants: Vec<ComponentGrant>,
     /// How many of this instance's activation flushes the kernel parks while the
     /// link is down, before the oldest is dropped. Absent ⇒
     /// [`DEFAULT_PARKED_BATCH_DEPTH`].
@@ -1048,12 +995,13 @@ pub struct SurfaceComponentRaw {
     /// Default false keeps the flag opt-in and out-of-tree-chrome first-class —
     /// the designation is this flag, not the kind string.
     pub chrome: bool,
-    /// Static key/value configuration handed to a `processor` instance and read
-    /// through its `config` import. Absent ⇒ empty map.
+    /// Static key/value configuration handed to this instance, read through its
+    /// `config` capability. Absent ⇒ empty map.
     ///
-    /// Processor ABI only: a `config` table on any other ABI is a config-time
-    /// panic, because nothing would ever read it. Keys must not start with
-    /// `brenn.`, which is the host-reserved namespace.
+    /// ABI-agnostic: a `dom` component reads the same map a `processor` does.
+    /// Readable only when the instance holds the `config` grant — resolution
+    /// requires both a map and the grant; either alone is dead config. Keys must
+    /// not start with `brenn.`, which is the host-reserved namespace.
     ///
     /// **Confidentiality:** this map is carried in the surface's bindings
     /// document, a retained message on the surface's ephemeral config channel.
@@ -1424,7 +1372,7 @@ pub struct ResolvedWasmConsumer {
     pub component_path: PathBuf,
     /// Granted capability interfaces for this component (deny-by-default).
     /// Determines which host functions are linked at component load time.
-    pub grants: BTreeSet<WasmGrant>,
+    pub grants: BTreeSet<ComponentGrant>,
     /// Path to the per-component SQLite KV store. `Some` iff `Store` is in
     /// `grants` (config layer enforces the invariant).
     pub store_path: Option<PathBuf>,
@@ -1484,11 +1432,17 @@ pub struct ResolvedComponent {
     /// page in the bindings document's `chrome_instance`.
     pub chrome: bool,
     /// This instance's static config map, served to the component through its
-    /// `config` import. Empty for every non-`processor` ABI.
+    /// `config` import. Empty unless the instance declares one.
     ///
     /// **Confidentiality:** carried in the surface's retained bindings
     /// document — operator configuration only, never secrets.
     pub config: BTreeMap<String, String>,
+    /// The capability interfaces this instance is given, deny-by-default and
+    /// deduplicated. Its own, not its surface's: the surface's grants are the
+    /// transport rights the backend admits it over the wire, these contain one
+    /// component within the page. Carried to the page in the bindings document,
+    /// where the kernel is the runtime enforcer.
+    pub grants: BTreeSet<ComponentGrant>,
 }
 
 /// A resolved `local:` channel: a page-local pub/sub channel the surface's own
@@ -4043,11 +3997,11 @@ channel demo at "ephemeral:protobar-demo" {
             r#"
 component Router {
     abi = processor;
-    component_path = "/lib/brenn_router.wasm";
     io tick;
 }
 
 new router: Router {
+    component_path = "/lib/r.wasm";
     grants = [ports];
     io tick { push_depth = 1; retain_depth = 2; wake_min = normal; }
 }
@@ -5127,7 +5081,7 @@ new pfin: Finance();
     // vocabulary and the refusals whose subject is the raw struct's shape.
     // -----------------------------------------------------------------------
 
-    /// Every `WasmGrant` word a consumer may state lowers to its variant.
+    /// Every `ComponentGrant` word a consumer may state lowers to its variant.
     ///
     /// `alert` is the reason this is not folded into the lowering suite's
     /// every-key row: that row states the five grants a router wants, and this
@@ -5148,11 +5102,11 @@ channel digests at "brenn:alice-digests" {
 
 component Router {
     abi = processor;
-    component_path = "/lib/brenn_router.wasm";
     out digest;
 }
 
 new router: Router {
+    component_path = "/lib/r.wasm";
     grants = [ports, store, log, alert, config, mqtt];
     store_path = "/state/router.db";
 
@@ -5165,12 +5119,12 @@ new router: Router {
         assert_eq!(
             config.wasm_consumers[0].grants,
             vec![
-                WasmGrant::Ports,
-                WasmGrant::Store,
-                WasmGrant::Log,
-                WasmGrant::Alert,
-                WasmGrant::Config,
-                WasmGrant::Mqtt,
+                ComponentGrant::Ports,
+                ComponentGrant::Store,
+                ComponentGrant::Log,
+                ComponentGrant::Alert,
+                ComponentGrant::Config,
+                ComponentGrant::Mqtt,
             ]
         );
     }
@@ -5182,9 +5136,9 @@ new router: Router {
     fn an_unknown_consumer_grant_word_is_refused() {
         let diag = sole_refusal(
             r#"
-component Router { abi = processor; component_path = "/lib/r.wasm"; io tick; }
+component Router { abi = processor; io tick; }
 
-new router: Router { grants = [not_a_real_grant]; io tick {} }
+new router: Router { component_path = "/lib/r.wasm"; grants = [not_a_real_grant]; io tick {} }
 "#,
         );
         assert!(
@@ -5200,9 +5154,16 @@ new router: Router { grants = [not_a_real_grant]; io tick {} }
     fn a_consumer_with_no_grants_lowers_with_an_empty_list() {
         let config = config_from_dsl(
             r#"
-component Router { abi = processor; component_path = "/lib/r.wasm"; io tick; }
+channel feed at "ephemeral:alice-feed" { push_depth = 4; retain_depth = 8; }
 
-new router: Router { grants = []; io tick {} }
+component Router { abi = processor; in inbound; }
+
+new router: Router {
+    component_path = "/lib/r.wasm";
+    grants = [];
+
+    in inbound <- feed;
+}
 "#,
         );
         assert!(config.wasm_consumers[0].grants.is_empty());
@@ -5218,9 +5179,9 @@ new router: Router { grants = []; io tick {} }
     fn a_stray_consumer_key_is_refused() {
         let diag = sole_refusal(
             r#"
-component Router { abi = processor; component_path = "/lib/r.wasm"; io tick; }
+component Router { abi = processor; io tick; }
 
-new router: Router { grants = []; subscribe_acls = []; io tick {} }
+new router: Router { component_path = "/lib/r.wasm"; grants = []; subscribe_acls = []; io tick {} }
 "#,
         );
         assert!(

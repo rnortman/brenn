@@ -21,6 +21,7 @@ fn component(instance: &str) -> ComponentEntry {
         abi: Abi::Dom,
         parked_batch_depth: 4,
         config: BTreeMap::new(),
+        grants: vec![],
     }
 }
 
@@ -79,7 +80,6 @@ fn doc() -> BindingsDocument {
             status_interval_secs: 60,
             error_channel: Some("brenn:site.surface.bar.errors".to_string()),
             error_report_floor: Some(LogLevel::Warn),
-            takeover_granted: true,
         },
     }
 }

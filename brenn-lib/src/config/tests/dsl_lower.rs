@@ -39,15 +39,17 @@ use crate::config::surface_description::SurfaceDescriptionConfig;
 use crate::config::wasm::WasmConfig;
 use crate::config::watchdog::WatchdogConfig;
 use crate::config::{BrennConfig, config_from_dsl, lower_document, sole_refusal};
+use crate::messaging::AttachGrant;
+use crate::messaging::ComponentGrant;
 use crate::messaging::Urgency;
 use crate::messaging::WakeMin;
 use crate::messaging::config::{
     ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
-    NoiseLevel, SendRate, Sink, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceGrant,
-    SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw,
-    WasmConsumerIoPortRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
+    NoiseLevel, SendRate, Sink, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw,
+    SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
+    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
-use crate::messaging::remote::{RemoteConfigRaw, RemoteGrant, RemoteSubscribeAclRaw};
+use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 use crate::mqtt::config::{
     AppMqttIngressSubscriptionRaw, MqttClientConfigRaw, default_backoff_initial,
     default_backoff_max, default_client_urgency, default_inbound_payload_cap,
@@ -201,7 +203,7 @@ fn tick_io_port() -> WasmConsumerIoPortRaw {
 
 /// A surface block's lowered form with nothing stated but its wire slug and its
 /// grants: no ACL entry, no component, no binding, no ceiling.
-fn surface(slug: &str, grants: Vec<SurfaceGrant>) -> SurfaceConfigRaw {
+fn surface(slug: &str, grants: Vec<AttachGrant>) -> SurfaceConfigRaw {
     SurfaceConfigRaw {
         slug: slug.to_string(),
         grants,
@@ -232,6 +234,7 @@ fn dom_component(kind: &str) -> SurfaceComponentRaw {
         parked_batch_depth: None,
         chrome: false,
         config: None,
+        grants: vec![],
     }
 }
 
@@ -2196,11 +2199,11 @@ channel cmd at "brenn:alice.cmd" {
 
 component Router {
     abi = processor;
-    component_path = "/lib/brenn_router.wasm";
     in inbound;
 }
 
 new router: Router {
+    component_path = "/lib/brenn_router.wasm";
     grants = [];
     store_path = exact "alice.";
 
@@ -2465,7 +2468,6 @@ webhook push_alice {
 
 component Router {
     abi = processor;
-    component_path = "/lib/brenn_router.wasm";
     in inbound;
     in feed;
     in status;
@@ -2477,6 +2479,7 @@ component Router {
 }
 
 new router: Router {
+    component_path = "/lib/brenn_router.wasm";
     slug = "router";
     grants = [ports, store, log, config, mqtt];
     store_path = "/state/router.db";
@@ -2560,11 +2563,11 @@ new router: Router {
             webhook_endpoints: vec![bearer_token_endpoint("push-alice")],
             wasm_consumers: vec![WasmConsumerConfigRaw {
                 grants: vec![
-                    WasmGrant::Ports,
-                    WasmGrant::Store,
-                    WasmGrant::Log,
-                    WasmGrant::Config,
-                    WasmGrant::Mqtt,
+                    ComponentGrant::Ports,
+                    ComponentGrant::Store,
+                    ComponentGrant::Log,
+                    ComponentGrant::Config,
+                    ComponentGrant::Mqtt,
                 ],
                 store_path: Some(PathBuf::from("/state/router.db")),
                 store_size_limit: Some("64MiB".to_string()),
@@ -2704,11 +2707,11 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 
 component Logger {
     abi = processor;
-    component_path = "/lib/brenn_logger.wasm";
     in heard;
 }
 
 new logger: Logger {
+    component_path = "/lib/brenn_logger.wasm";
     grants = [log];
 
     in heard <- utterance;
@@ -2721,7 +2724,7 @@ new logger: Logger {
                 ..channel_at("ephemeral:alice-pod.utterance")
             }],
             wasm_consumers: vec![WasmConsumerConfigRaw {
-                grants: vec![WasmGrant::Log],
+                grants: vec![ComponentGrant::Log],
                 subscriptions: vec![attrless_subscription(
                     "heard",
                     "ephemeral:alice-pod.utterance",
@@ -2756,12 +2759,12 @@ channel notes at "ephemeral:alice-pod.notes" {
 
 component Reserved {
     abi = processor;
-    component_path = "/lib/brenn_reserved.wasm";
     in in;
     out out;
 }
 
 new reserved: Reserved {
+    component_path = "/lib/brenn_reserved.wasm";
     grants = [log, ports];
 
     in in <- utterance;
@@ -2782,7 +2785,7 @@ new reserved: Reserved {
                 },
             ],
             wasm_consumers: vec![WasmConsumerConfigRaw {
-                grants: vec![WasmGrant::Log, WasmGrant::Ports],
+                grants: vec![ComponentGrant::Log, ComponentGrant::Ports],
                 subscriptions: vec![attrless_subscription("in", "ephemeral:alice-pod.utterance")],
                 outputs: vec![WasmConsumerOutputRaw {
                     port: "out".to_string(),
@@ -2817,12 +2820,12 @@ fn a_consumers_config_map_carries_typed_scalars() {
         r#"
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io tick;
 }
 
 new sink: Sink {
-    grants = [config];
+    component_path = "/lib/brenn_sink.wasm";
+    grants = [ports, config];
     config = {
         mode = "fast",
         window_secs = 30,
@@ -2834,7 +2837,7 @@ new sink: Sink {
 "#,
         BrennConfig {
             wasm_consumers: vec![WasmConsumerConfigRaw {
-                grants: vec![WasmGrant::Config],
+                grants: vec![ComponentGrant::Ports, ComponentGrant::Config],
                 io_ports: vec![tick_io_port()],
                 config: Some(toml::Table::from_iter([
                     ("mode".to_string(), toml::Value::String("fast".to_string())),
@@ -2862,11 +2865,11 @@ channel acks at "ephemeral:alice-pod.acks" {
 
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io acks;
 }
 
 new sink: Sink {
+    component_path = "/lib/brenn_sink.wasm";
     grants = [ports];
 
     io acks <-> acks {
@@ -2887,7 +2890,7 @@ new sink: Sink {
                 ..channel_at("ephemeral:alice-pod.acks")
             }],
             wasm_consumers: vec![WasmConsumerConfigRaw {
-                grants: vec![WasmGrant::Ports],
+                grants: vec![ComponentGrant::Ports],
                 subscriptions: vec![WasmConsumerSubscriptionRaw {
                     push_depth: Some(Depth::Bounded(1)),
                     retain_depth: Some(Depth::Bounded(2)),
@@ -2924,11 +2927,11 @@ channel acks at "ephemeral:alice-pod.acks" {
 
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io acks;
 }
 
 new sink: Sink {
+    component_path = "/lib/brenn_sink.wasm";
     grants = [ports];
 
     io acks <-> acks;
@@ -2941,7 +2944,7 @@ new sink: Sink {
                 ..channel_at("ephemeral:alice-pod.acks")
             }],
             wasm_consumers: vec![WasmConsumerConfigRaw {
-                grants: vec![WasmGrant::Ports],
+                grants: vec![ComponentGrant::Ports],
                 subscriptions: vec![attrless_subscription("acks", "ephemeral:alice-pod.acks")],
                 outputs: vec![WasmConsumerOutputRaw {
                     port: "acks".to_string(),
@@ -2983,23 +2986,23 @@ channel presence at "ephemeral:alice-desk.presence" {
 
 component Router {
     abi = processor;
-    component_path = "/lib/brenn_router.wasm";
     in inbound;
 }
 
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     in feed;
 }
 
 new router: Router {
+    component_path = "/lib/brenn_router.wasm";
     grants = [log];
 
     in inbound <- alerts { push_depth = 4; retain_depth = 8; }
 }
 
 new sink: Sink {
+    component_path = "/lib/brenn_sink.wasm";
     grants = [store, config];
     store_path = "/state/sink.db";
 
@@ -3023,7 +3026,7 @@ new sink: Sink {
             ],
             wasm_consumers: vec![
                 WasmConsumerConfigRaw {
-                    grants: vec![WasmGrant::Log],
+                    grants: vec![ComponentGrant::Log],
                     subscriptions: vec![WasmConsumerSubscriptionRaw {
                         push_depth: Some(Depth::Bounded(4)),
                         retain_depth: Some(Depth::Bounded(8)),
@@ -3033,7 +3036,7 @@ new sink: Sink {
                     ..consumer("router", "/lib/brenn_router.wasm")
                 },
                 WasmConsumerConfigRaw {
-                    grants: vec![WasmGrant::Store, WasmGrant::Config],
+                    grants: vec![ComponentGrant::Store, ComponentGrant::Config],
                     store_path: Some(PathBuf::from("/state/sink.db")),
                     subscriptions: vec![WasmConsumerSubscriptionRaw {
                         push_depth: Some(Depth::Bounded(2)),
@@ -3063,12 +3066,12 @@ fn a_consumers_config_map_transcribes_floats_lists_and_nested_tables() {
         r#"
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io tick;
 }
 
 new sink: Sink {
-    grants = [config];
+    component_path = "/lib/brenn_sink.wasm";
+    grants = [ports, config];
     config = {
         rate = 1.5,
         tags = ["fast", "quiet"],
@@ -3080,7 +3083,7 @@ new sink: Sink {
 "#,
         BrennConfig {
             wasm_consumers: vec![WasmConsumerConfigRaw {
-                grants: vec![WasmGrant::Config],
+                grants: vec![ComponentGrant::Ports, ComponentGrant::Config],
                 io_ports: vec![tick_io_port()],
                 config: Some(toml::Table::from_iter([
                     ("rate".to_string(), toml::Value::Float(1.5)),
@@ -3113,12 +3116,12 @@ fn a_matcher_nested_in_a_config_list_is_refused_at_the_inner_token() {
         r#"
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io tick;
 }
 
 new sink: Sink {
-    grants = [config];
+    component_path = "/lib/brenn_sink.wasm";
+    grants = [ports, config];
     config = { tags = ["fast", exact "alice."] };
 
     io tick { push_depth = 1; retain_depth = 2; }
@@ -3141,12 +3144,12 @@ fn a_non_number_in_a_budget_position_is_refused() {
         r#"
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io tick;
 }
 
 new sink: Sink {
-    grants = [log];
+    component_path = "/lib/brenn_sink.wasm";
+    grants = [ports, log];
 
     io tick { push_depth = 1; retain_depth = 2; amplification = "fast"; }
 }
@@ -3167,12 +3170,12 @@ fn a_matcher_in_a_consumers_config_map_is_refused() {
         r#"
 component Sink {
     abi = processor;
-    component_path = "/lib/brenn_sink.wasm";
     io tick;
 }
 
 new sink: Sink {
-    grants = [config];
+    component_path = "/lib/brenn_sink.wasm";
+    grants = [ports, config];
     config = { mode = exact "alice." };
 
     io tick { push_depth = 1; retain_depth = 2; }
@@ -3223,7 +3226,7 @@ component Chrome {
 
 surface alice_desk {
     slug = "alice-desk";
-    grants = [subscribe, publish, alert, takeover];
+    grants = [subscribe, publish, alert];
     skin = "bench";
     allowed_users = ["alice", "bob"];
     publish_burst = 32;
@@ -3233,6 +3236,7 @@ surface alice_desk {
     acl publish [prefix "brenn:alice-desk.", exact presence];
 
     new panel: Panel {
+        grants = [ports];
         send_burst = 16;
         send_refill_secs = 30;
         parked_batch_depth = unbounded;
@@ -3261,6 +3265,7 @@ surface alice_desk {
     }
 
     new chrome: Chrome {
+        grants = [];
         chrome = true;
 
         in state <- presence { push_depth = 1; }
@@ -3285,12 +3290,11 @@ surface alice_desk {
             surfaces: vec![SurfaceConfigRaw {
                 slug: "alice-desk".to_string(),
                 grants: vec![
-                    SurfaceGrant::Subscribe,
-                    SurfaceGrant::EphemeralSubscribe,
-                    SurfaceGrant::Publish,
-                    SurfaceGrant::EphemeralPublish,
-                    SurfaceGrant::Alert,
-                    SurfaceGrant::Takeover,
+                    AttachGrant::Subscribe,
+                    AttachGrant::EphemeralSubscribe,
+                    AttachGrant::Publish,
+                    AttachGrant::EphemeralPublish,
+                    AttachGrant::Alert,
                 ],
                 subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
                 publish_acl: vec![ChannelMatcherRaw::Prefix("alice-desk.".to_string())],
@@ -3307,6 +3311,7 @@ surface alice_desk {
                             ("mode".to_string(), "compact".to_string()),
                             ("layout".to_string(), "wide".to_string()),
                         ])),
+                        grants: vec![ComponentGrant::Ports],
                         ..dom_component("panel")
                     },
                     SurfaceComponentRaw {
@@ -3360,6 +3365,59 @@ surface alice_desk {
     );
 }
 
+/// A placed instance's own `acl` statement stops at this seam: `grants` crosses
+/// into the raw carrier and the ACL families do not, because the carrier has no
+/// field for them. The front end still refuses a binding outside the statement,
+/// so the statement is not inert — it is just not carried.
+///
+/// TODO(surface-instance-acl-bound) is the reason; when the field lands this
+/// test inverts rather than being written from scratch.
+#[test]
+fn a_placed_instances_acl_statement_does_not_cross_the_lowering_seam() {
+    assert_lowers(
+        r#"
+channel cmd at "ephemeral:alice-desk.cmd" {
+    push_depth = 2;
+    retain_depth = 4;
+}
+
+component Panel {
+    abi = dom;
+    in messages;
+}
+
+surface alice_desk {
+    grants = [subscribe];
+    acl subscribe [prefix "ephemeral:alice-desk."];
+
+    new panel: Panel {
+        grants = [];
+        acl subscribe [prefix "ephemeral:alice-desk."];
+        in messages <- cmd;
+    }
+}
+"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(4)),
+                ..channel_at("ephemeral:alice-desk.cmd")
+            }],
+            surfaces: vec![SurfaceConfigRaw {
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Prefix("alice-desk.".to_string())],
+                components: vec![dom_component("panel")],
+                subscriptions: vec![surface_input(
+                    "panel",
+                    "messages",
+                    "ephemeral:alice-desk.cmd",
+                )],
+                ..surface("alice_desk", vec![AttachGrant::EphemeralSubscribe])
+            }],
+            ..Default::default()
+        },
+    );
+}
+
 /// A declared channel's `io` port lowers to subscription/output, not
 /// `[[surface.io_port]]`.
 #[test]
@@ -3380,6 +3438,7 @@ surface alice_desk {
     grants = [subscribe, publish];
 
     new panel: Panel {
+        grants = [ports];
         io acks <-> acks {
             push_depth = 1;
             retain_depth = 2;
@@ -3404,7 +3463,10 @@ surface alice_desk {
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-desk.acks".to_string(),
                 )],
-                components: vec![dom_component("panel")],
+                components: vec![SurfaceComponentRaw {
+                    grants: vec![ComponentGrant::Ports],
+                    ..dom_component("panel")
+                }],
                 subscriptions: vec![SurfaceSubscriptionRaw {
                     push_depth: Some(Depth::Bounded(1)),
                     retain_depth: Some(Depth::Bounded(2)),
@@ -3420,8 +3482,8 @@ surface alice_desk {
                 ..surface(
                     "alice_desk",
                     vec![
-                        SurfaceGrant::EphemeralSubscribe,
-                        SurfaceGrant::EphemeralPublish,
+                        AttachGrant::EphemeralSubscribe,
+                        AttachGrant::EphemeralPublish,
                     ],
                 )
             }],
@@ -3448,6 +3510,7 @@ surface alice_desk {
     grants = [subscribe, publish];
 
     new panel: Panel {
+        grants = [ports];
         io acks <-> acks;
     }
 }
@@ -3465,14 +3528,17 @@ surface alice_desk {
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-desk.acks".to_string(),
                 )],
-                components: vec![dom_component("panel")],
+                components: vec![SurfaceComponentRaw {
+                    grants: vec![ComponentGrant::Ports],
+                    ..dom_component("panel")
+                }],
                 subscriptions: vec![surface_input("panel", "acks", "ephemeral:alice-desk.acks")],
                 outputs: vec![surface_output("panel", "acks", "ephemeral:alice-desk.acks")],
                 ..surface(
                     "alice_desk",
                     vec![
-                        SurfaceGrant::EphemeralSubscribe,
-                        SurfaceGrant::EphemeralPublish,
+                        AttachGrant::EphemeralSubscribe,
+                        AttachGrant::EphemeralPublish,
                     ],
                 )
             }],
@@ -3509,6 +3575,7 @@ surface alice_desk {
     grants = [subscribe];
 
     new panel: Panel {
+        grants = [];
         in messages <- messages;
     }
 }
@@ -3529,7 +3596,7 @@ surface alice_desk {
                     "messages",
                     "ephemeral:alice-desk.messages",
                 )],
-                ..surface("alice_desk", vec![SurfaceGrant::EphemeralSubscribe])
+                ..surface("alice_desk", vec![AttachGrant::EphemeralSubscribe])
             }],
             ..Default::default()
         },
@@ -3558,6 +3625,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        grants = [];
         in heard <- utterance { push_depth = 2; }
     }
 }
@@ -3577,7 +3645,7 @@ surface alice_pod {
                     push_depth: Some(Depth::Bounded(2)),
                     ..surface_input("widget", "heard", "ephemeral:alice-pod.utterance")
                 }],
-                ..surface("alice_pod", vec![SurfaceGrant::EphemeralSubscribe])
+                ..surface("alice_pod", vec![AttachGrant::EphemeralSubscribe])
             }],
             ..Default::default()
         },
@@ -3618,6 +3686,7 @@ surface alice_desk {
     skin = "bench";
 
     new panel: Panel {
+        grants = [];
         in messages <- alerts { push_depth = 4; }
     }
 }
@@ -3627,6 +3696,7 @@ surface bob_desk {
     skin = "lab";
 
     new board: Board {
+        grants = [];
         in feed <- presence { push_depth = 2; }
     }
 }
@@ -3655,7 +3725,7 @@ surface bob_desk {
                         push_depth: Some(Depth::Bounded(4)),
                         ..surface_input("panel", "messages", "brenn:alice-alerts")
                     }],
-                    ..surface("alice_desk", vec![SurfaceGrant::Subscribe])
+                    ..surface("alice_desk", vec![AttachGrant::Subscribe])
                 },
                 SurfaceConfigRaw {
                     skin: Some("lab".to_string()),
@@ -3667,7 +3737,7 @@ surface bob_desk {
                         push_depth: Some(Depth::Bounded(2)),
                         ..surface_input("board", "feed", "ephemeral:alice-desk.presence")
                     }],
-                    ..surface("bob_desk", vec![SurfaceGrant::EphemeralSubscribe])
+                    ..surface("bob_desk", vec![AttachGrant::EphemeralSubscribe])
                 },
             ],
             ..Default::default()
@@ -3697,6 +3767,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        grants = [];
         in heard <- utterance { push_depth = 2; amplification = 0.5; }
     }
 }
@@ -3709,7 +3780,7 @@ surface alice_pod {
     );
     assert_eq!(
         refusal.line_col(),
-        Some((16, 65)),
+        Some((17, 65)),
         "the span is the refused key's own value: {}",
         refusal.render()
     );
@@ -3736,6 +3807,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        grants = [ports];
         in heard <- utterance { push_depth = 2; }
         io tick { push_depth = 1; retain_depth = 2; amplification = 0.5; }
     }
@@ -3750,7 +3822,7 @@ surface alice_pod {
     );
     assert_eq!(
         refusal.line_col(),
-        Some((18, 69)),
+        Some((19, 69)),
         "the span is the refused key's own value: {}",
         refusal.render()
     );
@@ -3776,6 +3848,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        grants = [];
         in heard <- utterance { push_depth = 2; amplification = "half"; }
     }
 }
@@ -3810,6 +3883,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        grants = [];
         parked_batch_depth = -1;
 
         in heard <- utterance { push_depth = 2; }
@@ -3843,6 +3917,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        grants = [];
         config = { depth = 3 };
 
         in heard <- utterance { push_depth = 2; }
@@ -3884,11 +3959,11 @@ remote bob_pod {
         BrennConfig {
             remotes: vec![RemoteConfigRaw {
                 grants: vec![
-                    RemoteGrant::Subscribe,
-                    RemoteGrant::EphemeralSubscribe,
-                    RemoteGrant::Publish,
-                    RemoteGrant::EphemeralPublish,
-                    RemoteGrant::Alert,
+                    AttachGrant::Subscribe,
+                    AttachGrant::EphemeralSubscribe,
+                    AttachGrant::Publish,
+                    AttachGrant::EphemeralPublish,
+                    AttachGrant::Alert,
                 ],
                 subscribe_acl: vec![remote_exact("alice.cmd", 0, 32)],
                 ephemeral_subscribe_acl: vec![remote_prefix("alice.", 8, 1)],
@@ -3921,7 +3996,7 @@ remote bob_pod {
 "#,
         BrennConfig {
             remotes: vec![RemoteConfigRaw {
-                grants: vec![RemoteGrant::Subscribe],
+                grants: vec![AttachGrant::Subscribe],
                 subscribe_acl: vec![remote_exact("alice.cmd", 1, 8)],
                 ..remote("bob_pod", "/home/alice/.secrets/bob-pod.token")
             }],
@@ -3958,13 +4033,13 @@ remote charlie_pod {
         BrennConfig {
             remotes: vec![
                 RemoteConfigRaw {
-                    grants: vec![RemoteGrant::Subscribe],
+                    grants: vec![AttachGrant::Subscribe],
                     subscribe_acl: vec![remote_exact("alice.cmd", 1, 8)],
                     max_sessions: Some(4),
                     ..remote("bob_pod", "/home/alice/.secrets/bob-pod.token")
                 },
                 RemoteConfigRaw {
-                    grants: vec![RemoteGrant::EphemeralSubscribe, RemoteGrant::Publish],
+                    grants: vec![AttachGrant::EphemeralSubscribe, AttachGrant::Publish],
                     ephemeral_subscribe_acl: vec![remote_prefix("alice.", 8, 1)],
                     publish_acl: vec![ChannelMatcherRaw::Exact("alice.in.charlie".to_string())],
                     max_sessions: Some(2),

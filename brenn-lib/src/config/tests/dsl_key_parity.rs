@@ -58,6 +58,7 @@ fn surface_component_keys_account_for_every_field() {
         parked_batch_depth,
         chrome,
         config,
+        grants,
     });
     let omitted = [
         ("kind", "folds from the class name an instance names"),
@@ -101,7 +102,6 @@ fn consumer_keys_account_for_every_field() {
     let statement = "carried by a statement, not a key";
     let unspellable = "unspellable in this version, for want of a statement form";
     let omitted = [
-        ("component_path", "is the class's to say"),
         ("subscriptions", statement),
         ("outputs", statement),
         ("io_ports", statement),

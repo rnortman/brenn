@@ -103,6 +103,11 @@ pub enum Command {
     /// when there is no attachment to send it on and when the attachment carries
     /// no alert grant.
     Alert {
+        /// The component the alert is *from*, which becomes its sender
+        /// sub-identity; `None` for the kernel's own paging. The per-component
+        /// right behind it is the caller's to check — the page holds only the
+        /// attachment's.
+        attribution: Option<String>,
         severity: AlertSeverity,
         title: String,
         body: String,
@@ -200,10 +205,11 @@ pub fn on_command(page: &mut SurfacePage, command: Command) -> CommandOutcome {
             subject,
         } => on_report(page, level, &source, &message, subject.as_deref()),
         Command::Alert {
+            attribution,
             severity,
             title,
             body,
-        } => on_alert(page, severity, title, body),
+        } => on_alert(page, attribution, severity, title, body),
         Command::PublishControl {
             channel,
             body,
@@ -402,6 +408,7 @@ fn on_report(
 /// leaves a breadcrumb.
 fn on_alert(
     page: &mut SurfacePage,
+    attribution: Option<String>,
     severity: AlertSeverity,
     title: String,
     body: String,
@@ -418,6 +425,7 @@ fn on_alert(
     }
     CommandOutcome {
         frames: vec![ClientFrame::Alert {
+            attribution,
             severity,
             title: truncate_report_field(title, MAX_ALERT_TITLE_BYTES),
             body: truncate_report_field(body, MAX_ALERT_BODY_BYTES),

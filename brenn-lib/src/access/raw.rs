@@ -90,6 +90,27 @@ pub struct WebhookMatcherRaw {
     pub endpoint: String,
 }
 
+/// Borrowed view of an attach-route principal's four ACL lists, passed as one
+/// argument to
+/// [`build_attach_policy`](crate::access::resolve::build_attach_policy).
+///
+/// Named fields prevent transposing the same-typed slices: all four are
+/// `&[ChannelMatcherRaw]`, so a positional swap would silently exchange
+/// subscribe with publish — the direction that decides what a page or a daemon
+/// may put on the wire. [`Default`] yields all-empty lists, so a caller
+/// populates only the lists it has.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttachAclsRaw<'a> {
+    /// `brenn:` subscribe matchers.
+    pub subscribe: &'a [ChannelMatcherRaw],
+    /// `brenn:` publish matchers.
+    pub publish: &'a [ChannelMatcherRaw],
+    /// `ephemeral:` subscribe matchers.
+    pub ephemeral_subscribe: &'a [ChannelMatcherRaw],
+    /// `ephemeral:` publish matchers.
+    pub ephemeral_publish: &'a [ChannelMatcherRaw],
+}
+
 /// Borrowed view of a WASM consumer's ACL lists, passed as one argument to
 /// [`build_wasm_policy`](crate::access::resolve::build_wasm_policy).
 ///

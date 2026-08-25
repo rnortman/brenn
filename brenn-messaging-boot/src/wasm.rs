@@ -1,12 +1,11 @@
 use std::time::Duration;
 
-use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{
     ActivationPacing, DEFAULT_WASM_INPUT_AMPLIFICATION, DEFAULT_WASM_PUBLISH_CAPACITY,
     DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, NoiseLevel, ResolvedSubscription,
-    ResolvedWasmConsumer, WasmConsumerConfigRaw, WasmGrant, WasmInputPort, WasmOutputPort,
-    WasmSinkBudget,
+    ResolvedWasmConsumer, WasmConsumerConfigRaw, WasmInputPort, WasmOutputPort, WasmSinkBudget,
 };
+use brenn_lib::messaging::{ComponentGrant, ComponentHost, MessagingDirectory};
 use indexmap::IndexMap;
 
 /// Default activation-pacing burst (token-bucket capacity, in activations) when
@@ -85,18 +84,29 @@ pub(crate) fn resolve_wasm_consumers(
         // --- Grant resolution ---
 
         // 1. Panic on duplicate grant entries; collect into BTreeSet.
-        let mut grants: BTreeSet<WasmGrant> = BTreeSet::new();
+        let mut grants: BTreeSet<ComponentGrant> = BTreeSet::new();
         for grant in &consumer.grants {
             assert!(
                 grants.insert(*grant),
                 "[[wasm_consumer]] {slug:?}: duplicate grant {:?} in grants list",
                 grant,
             );
+            // The placement-legality table, at the top-level end — the twin of
+            // the surface's own check. Without it a word no backend host
+            // implements reaches the linker mapping, which can only panic about
+            // its own mechanics.
+            if let Some(why) = grant.illegal_on(ComponentHost::TopLevel) {
+                panic!(
+                    "[[wasm_consumer]] {slug:?}: is granted {:?}, but {why}; remove it from the \
+                     grants list",
+                    grant.word(),
+                );
+            }
         }
 
         // 3. [wasm_consumer.config] table present but Config not granted → dead config.
         //    Run before resolve_component_config so grant error takes precedence.
-        if consumer.config.is_some() && !grants.contains(&WasmGrant::Config) {
+        if consumer.config.is_some() && !grants.contains(&ComponentGrant::Config) {
             panic!(
                 "[[wasm_consumer]] {slug:?}: [wasm_consumer.config] table is present but \
                  \"config\" is not in grants — the component cannot read its config; \
@@ -105,21 +115,21 @@ pub(crate) fn resolve_wasm_consumers(
         }
 
         // 4a. store_path present but Store not granted.
-        if consumer.store_path.is_some() && !grants.contains(&WasmGrant::Store) {
+        if consumer.store_path.is_some() && !grants.contains(&ComponentGrant::Store) {
             panic!(
                 "[[wasm_consumer]] {slug:?}: store_path is set but \"store\" is not in grants — \
                  the component cannot access the store; add \"store\" to grants or remove store_path",
             );
         }
         // 4b. store_size_limit set but Store not granted.
-        if consumer.store_size_limit.is_some() && !grants.contains(&WasmGrant::Store) {
+        if consumer.store_size_limit.is_some() && !grants.contains(&ComponentGrant::Store) {
             panic!(
                 "[[wasm_consumer]] {slug:?}: store_size_limit is set but \"store\" is not in grants — \
                  remove store_size_limit or add \"store\" to grants",
             );
         }
         // 4c. Store granted but store_path absent.
-        if grants.contains(&WasmGrant::Store) && consumer.store_path.is_none() {
+        if grants.contains(&ComponentGrant::Store) && consumer.store_path.is_none() {
             panic!(
                 "[[wasm_consumer]] {slug:?}: \"store\" is in grants but store_path is not set — \
                  the store grant requires a store_path",
@@ -480,7 +490,7 @@ pub(crate) fn resolve_wasm_consumers(
         }
 
         // 2. outputs non-empty but Ports not granted → dead config.
-        if !outputs.is_empty() && !grants.contains(&WasmGrant::Ports) {
+        if !outputs.is_empty() && !grants.contains(&ComponentGrant::Ports) {
             panic!(
                 "[[wasm_consumer]] {slug:?}: has {} output port(s) but \"ports\" is not in grants \
                  — the component cannot publish; add \"ports\" to grants or remove the output bindings",
@@ -536,7 +546,7 @@ pub(crate) fn resolve_wasm_consumers(
         if (!consumer.publish_acl.is_empty()
             || !consumer.ephemeral_publish_acl.is_empty()
             || !consumer.local_publish_acl.is_empty())
-            && !grants.contains(&WasmGrant::Ports)
+            && !grants.contains(&ComponentGrant::Ports)
         {
             panic!(
                 "[[wasm_consumer]] {slug:?}: a publish ACL has matcher(s) but \"ports\" is not in \
@@ -586,7 +596,7 @@ pub(crate) fn resolve_wasm_consumers(
         //      fail-fast rejects. Panic now so the misconfiguration is fixed at boot,
         //      not discovered as an unexplained not-permitted after the grant is
         //      added.
-        if !consumer.mqtt_publish_acl.is_empty() && !grants.contains(&WasmGrant::Mqtt) {
+        if !consumer.mqtt_publish_acl.is_empty() && !grants.contains(&ComponentGrant::Mqtt) {
             panic!(
                 "[[wasm_consumer]] {slug:?}: mqtt_publish ACL has {} matcher(s) but \"mqtt\" is not \
                  in grants — without the mqtt grant the matchers can never authorize any MQTT \
@@ -698,7 +708,7 @@ pub(crate) fn resolve_wasm_consumers(
         // TODO(wasm-dead-subscribe-acl-check): no check rejects a non-empty
         // subscribe/mqtt_subscribe/webhook ACL whose matchers cover none of this
         // consumer's static subscriptions. For a WASM consumer such matchers are
-        // provably dead (no WasmGrant maps to DynamicSubscribe, so nothing can ever
+        // provably dead (no ComponentGrant maps to DynamicSubscribe, so nothing can ever
         // exercise them), unlike the LLM side where an ACL without a static sub
         // legitimately pre-authorizes future dynamic subs. Adding a 2g check here
         // diverges WASM from the shared subscribe_acl convention, so it wants a
@@ -709,7 +719,7 @@ pub(crate) fn resolve_wasm_consumers(
 
         // Build the unified AppPolicy from the resolved grants + authored
         // subscribe_acl/publish_acl channel matchers. This maps each
-        // WasmGrant onto its unified AppCapability and validates+converts the
+        // ComponentGrant onto its unified AppCapability and validates+converts the
         // channel matchers (fail-fast on a malformed matcher). It is a *separate*
         // mapping from the brenn-wasm::Capability linker conversion. The
         // `subscribe_acl` matchers (plus the derived `MessagingSubscribe` grant)

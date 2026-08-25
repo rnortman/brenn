@@ -246,8 +246,28 @@ pub struct ComponentEntry {
     /// the link down, so their flushes queue in page memory, and the operator
     /// bounds that queue per instance like any other.
     pub parked_batch_depth: u64,
-    /// This instance's static config map, read by a `processor` component
-    /// through its `config` import. Empty on every other ABI.
+    /// The capability interfaces this instance is given, deny-by-default, in
+    /// canonical `ComponentGrant::word()` spellings, sorted and deduplicated.
+    ///
+    /// Enforced page-side: the kernel gates every privileged entry a component
+    /// reaches on this list, identically for both ABIs — the publish/defer
+    /// family, the log router, the alert router, and config reads. A word this
+    /// build cannot parse means server/kernel skew and refuses the whole
+    /// document.
+    ///
+    /// The backend judges the same grants again, at boot against a processor's
+    /// imports and the surface's own grants, and per frame for an attributed
+    /// alert. Page-side gating is containment within the page; the backend's is
+    /// the security boundary.
+    ///
+    /// TODO(bindings-doc-typed-grants): carry `ComponentGrant` itself rather
+    /// than its spelling, so an unparseable word is a document-parse error
+    /// instead of a reparse obligation on every reader.
+    pub grants: Vec<String>,
+    /// This instance's static config map, read through the component's `config`
+    /// capability. Empty unless the instance declares one. Independent of the
+    /// ABI: a `dom` component reads it over the contract's config-get event, a
+    /// `processor` through its `config` import.
     ///
     /// Fixed for the page's lifetime — the backend's process-lifetime config
     /// map, at the page's grain. A changed map arrives only with a redelivered
@@ -418,8 +438,9 @@ pub struct ReservedLocalChannel {
     /// these planes, and widening the producer set later is additive.
     pub kernel_publish_only: bool,
     /// Whether binding this channel — in either direction — requires the
-    /// surface's `takeover` grant. Capability-as-binding: the grant gates the
-    /// wiring rather than a runtime DOM-event check.
+    /// binding *component's* `takeover` grant. Capability-as-binding: the grant
+    /// gates the wiring rather than a runtime DOM-event check. A component's
+    /// grants are its own; its surface holds no page capabilities.
     pub requires_takeover_grant: bool,
 }
 

@@ -2662,7 +2662,8 @@ fn parse_abi(word: &str) -> Option<Abi> {
 /// Public so the parity gate over the runtime's `SurfaceComponentRaw` can read
 /// it: a string list is the one vocabulary an exhaustive struct literal in
 /// lowering cannot police.
-pub const SURFACE_COMPONENT_KEYS: [&str; 5] = [
+pub const SURFACE_COMPONENT_KEYS: [&str; 6] = [
+    COMPONENT_GRANTS,
     "chrome",
     "send_burst",
     "send_refill_secs",
@@ -2675,29 +2676,37 @@ pub const SURFACE_COMPONENT_KEYS: [&str; 5] = [
 /// value position would resolve as a name.
 const SURFACE_PARKED_DEPTH: &str = "parked_batch_depth";
 
-/// The key of a consumer body that is a token context rather than a value.
+/// The key an instance body states its capabilities with, at either placement:
+/// what a component is given is the same question wherever it is placed, and
+/// deny-by-default means the list is required either way.
 ///
-/// A bare word in a value position would resolve as a name, which is the
-/// failure the projection types exist to prevent; the typed vocabularies handle
-/// it with a field type, and this table has to handle it by hand.
-const CONSUMER_WORDS: &str = "grants";
+/// A token context rather than a value: a bare word in a value position would
+/// resolve as a name, which is the failure the projection types exist to
+/// prevent. The typed vocabularies handle that with a field type, and this
+/// table has to handle it by hand.
+const COMPONENT_GRANTS: &str = "grants";
 
 /// The key of a consumer body that states its wire identity.
 const CONSUMER_SLUG: &str = "slug";
+
+/// The key of a consumer body that states where its artifact is loaded from.
+const CONSUMER_PATH: &str = "component_path";
 
 /// The keys a top-level component instance admits.
 ///
 /// The consumer's scalar fields, minus what statements carry: its ports are
 /// bindings and its nine authority lists are `acl` statements. `component_path`
-/// is deliberately absent — where the artifact lives is the class's to say, so
-/// writing it here is an unknown key. Unspellable in this version, for want of
-/// a statement form: `mqtt_output` and `tool_grant`.
+/// is one of them: where the artifact lives on this host is a fact of this
+/// deployment of this instance, not of the class, which several instances share.
+/// Unspellable in this version, for want of a statement form: `mqtt_output` and
+/// `tool_grant`.
 ///
 /// Public for the same reason as [`SURFACE_COMPONENT_KEYS`]: the parity gate
 /// over `WasmConsumerConfigRaw` reads it.
-pub const CONSUMER_KEYS: [&str; 7] = [
+pub const CONSUMER_KEYS: [&str; 8] = [
     CONSUMER_SLUG,
-    CONSUMER_WORDS,
+    COMPONENT_GRANTS,
+    CONSUMER_PATH,
     "store_path",
     "store_size_limit",
     "activation_burst",
@@ -2769,26 +2778,6 @@ fn class_ref(
         return None;
     };
     let abi = Spanned::new(parsed, word.span().clone());
-    let component_path = match class.attrs.component_path.as_ref() {
-        Some(attr) => match resolve_value(&attr.value, scope) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                errors.push(error);
-                return None;
-            }
-        },
-        None => None,
-    };
-    if *abi.value() == Abi::Dom
-        && let Some(path) = &component_path
-    {
-        errors.push(Diagnostic::at(
-            "a dom component is served to the browser, not loaded from a path; \
-             `component_path` on a dom class configures nothing",
-            path.span().clone(),
-        ));
-        return None;
-    }
     let mut ports: Vec<RPort> = Vec::new();
     for decl in &class.ports {
         if let Some(prior) = ports
@@ -2822,7 +2811,6 @@ fn class_ref(
     Some(ClassRef {
         name: class.name.clone(),
         abi,
-        component_path,
         ports,
     })
 }
@@ -2861,8 +2849,8 @@ impl Placement {
     /// before the value walk, and so skipped by it.
     fn projected_keys(self) -> &'static [&'static str] {
         match self {
-            Placement::Surface => &[SURFACE_PARKED_DEPTH],
-            Placement::TopLevel => &[CONSUMER_WORDS],
+            Placement::Surface => &[SURFACE_PARKED_DEPTH, COMPONENT_GRANTS],
+            Placement::TopLevel => &[COMPONENT_GRANTS],
         }
     }
 
@@ -2872,16 +2860,6 @@ impl Placement {
         match self {
             Placement::Surface => "a component instance",
             Placement::TopLevel => "a consumer",
-        }
-    }
-
-    /// Whether an instance here is a principal in its own right. A surface
-    /// component is not — the surface is — so an `acl` written in one is
-    /// refused rather than attached to nothing.
-    fn has_authority(self) -> bool {
-        match self {
-            Placement::Surface => false,
-            Placement::TopLevel => true,
         }
     }
 }
@@ -2969,13 +2947,16 @@ fn emit_component(
     let class = resolve_class(&inst, scope, classes, Placement::Surface, errors)?;
     check_instance_name(&inst.handle, siblings, errors);
     let parked_batch_depth = parked_depth(inst.body.as_ref(), errors);
+    let grants = instance_grants(inst.body.as_ref(), errors);
     let body = instance_body(inst.body, &class, Placement::Surface, scope, errors);
     Some((
         RComponentInst {
             instance: inst.handle,
             class,
             parked_batch_depth,
+            grants,
             attrs: body.attrs,
+            acls: body.acls,
             bindings: body.bindings,
         },
         body.refused,
@@ -2994,7 +2975,7 @@ fn emit_consumer(
         return;
     };
     let handle = scope.handle(inst.handle.clone());
-    let grants = consumer_grants(inst.body.as_ref(), errors);
+    let grants = instance_grants(inst.body.as_ref(), errors);
     let ResolvedBody {
         attrs,
         bindings,
@@ -3055,12 +3036,19 @@ fn parked_depth(
     }
 }
 
-/// A consumer's `grants`, projected out of the body before its values resolve.
-fn consumer_grants(
+/// Asked before the body's values resolve, because a top-level instance without
+/// a path is refused whole: its artifact location is deny-by-default deployment
+/// consent, and an instance nothing loads is not a configuration.
+fn states_component_path(body: Option<&Spanned<InstBody>>) -> bool {
+    body.is_some_and(|body| body.value().attrs.get(CONSUMER_PATH).is_some())
+}
+
+/// An instance's `grants`, projected out of the body before its values resolve.
+fn instance_grants(
     body: Option<&Spanned<InstBody>>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<RWordList> {
-    let value = body?.value().attrs.get(CONSUMER_WORDS)?;
+    let value = body?.value().attrs.get(COMPONENT_GRANTS)?;
     match RWordList::from_value(value) {
         Ok(words) => Some(words),
         Err(error) => {
@@ -3143,11 +3131,11 @@ fn resolve_class(
             ));
             return None;
         }
-        if class.component_path.is_none() {
+        if !states_component_path(inst.body.as_ref()) {
             errors.push(two_site(
                 format!(
-                    "a top-level instance is loaded from an artifact, and `{name}` \
-                     declares no `component_path`"
+                    "a top-level instance is loaded from an artifact, and this instance \
+                     of `{name}` states no `component_path`"
                 ),
                 span,
                 "declared here",
@@ -3194,20 +3182,10 @@ fn instance_body(
             None => refused.drop_part(),
         }
     }
-    let resolved = match place.has_authority() {
-        true => emit_acls(body.acls, scope, errors, &mut refused),
-        false => {
-            for stmt in &body.acls {
-                errors.push(Diagnostic::at(
-                    "a component's authority is its surface's; write the `acl` in the \
-                     surface body",
-                    stmt.plane.span().clone(),
-                ));
-                refused.drop_part();
-            }
-            Vec::new()
-        }
-    };
+    // Both placements: an instance is a principal in its own right wherever it
+    // is placed. A surface component's authority contains the component within
+    // the surface; the surface's own is what the backend admits over the wire.
+    let resolved = emit_acls(body.acls, scope, errors, &mut refused);
     ResolvedBody {
         attrs,
         bindings,
@@ -5417,7 +5395,7 @@ mod tests {
     #[test]
     fn a_parameter_name_is_never_a_wait() {
         let source = concat!(
-            "component Sink { abi = processor; component_path = \"/lib/s.wasm\"; }\n",
+            "component Sink { abi = processor; }\n",
             "new thing: Sink;\n",
             "new wired: Sink { config = thing.messages; }\n",
         );
@@ -5474,7 +5452,7 @@ mod tests {
     #[test]
     fn an_assembly_body_walk_carries_its_parameter_names() {
         let source = concat!(
-            "component Sink { abi = processor; component_path = \"/lib/s.wasm\"; }\n",
+            "component Sink { abi = processor; }\n",
             "assembly Leaf(chan: Channel) {\n",
             "}\n",
             "assembly Shadowing(thing: String) {\n",

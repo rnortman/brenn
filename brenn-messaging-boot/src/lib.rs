@@ -28,6 +28,7 @@ use brenn_server::active_bridge::ActiveBridges;
 use brenn_server::messaging_router::WakeRouterImpl;
 
 pub(crate) mod auto;
+mod offline;
 mod surfaces;
 mod wasm;
 
@@ -166,6 +167,7 @@ mod wasm_tests;
 use brenn_surface_server::boot_policy::{
     assert_output_bindings_covered, inject_surface_geometry_status_grants,
 };
+pub use offline::resolve_messaging_offline;
 pub(crate) use surfaces::{
     inject_surface_config_subscribe_grants, inject_surface_error_grant, resolve_surfaces,
 };
@@ -245,6 +247,107 @@ pub(crate) fn build_apps_with_messaging(
     }
 
     apps_with_messaging
+}
+
+/// The channel set every resolution pass runs against, and the auto-wiring the
+/// `[[connection]]` blocks lowered to.
+pub(crate) struct ChannelTopology {
+    /// The durable `[[channel]]` entries, the caller's environment-derived
+    /// entries, and the durable auto channels.
+    pub(crate) durable_entries: Vec<ChannelEntry>,
+    /// The non-durable `[[channel]]` entries and the non-durable auto channels.
+    /// These carry no DB row and are wired to the in-memory substrate.
+    pub(crate) nondurable_entries: Vec<ChannelEntry>,
+    pub(crate) auto_wiring: auto::AutoWiring,
+}
+
+impl ChannelTopology {
+    /// A directory over every entry, whatever its class. WASM inputs and surface
+    /// bindings alike may target non-durable (`ephemeral:`/`local:`) channels, so
+    /// one class-blind lookup answers every binding, whichever store holds the
+    /// channel's retention. Subscribers are not populated: resolution needs only
+    /// channel identity, transport, and the channel's resolved rungs.
+    pub(crate) fn pre_directory(&self) -> MessagingDirectory {
+        let mut entries = self.durable_entries.clone();
+        entries.extend(self.nondurable_entries.iter().cloned());
+        MessagingDirectory::with_entries(entries)
+    }
+}
+
+/// Lower `[[channel]]` and `[[connection]]` into the channel set the resolvers
+/// read, appending `extra_durable_entries` (the caller's environment-derived
+/// `webhook:`/`mqtt:` entries, or nothing) to the durable half.
+///
+/// A pure computation over `config`, which is why the offline pass
+/// ([`resolve_messaging_offline`]) and boot ([`build_messaging`]) share it
+/// rather than transcribing it: the two must reach the same verdict, and the
+/// order and inputs here decide which channels a binding can name at all.
+///
+/// Auto channels are lowered here, before any directory is built: they are
+/// referenced by config bindings, so their entries and grants must be present
+/// when the resolvers run. `declared_addresses` is drawn from the entries above
+/// them, so an address a connection block mints cannot collide with one the
+/// operator declared.
+fn lower_channel_topology(
+    config: &BrennConfig,
+    extra_durable_entries: Vec<ChannelEntry>,
+) -> ChannelTopology {
+    let global_defaults = &config.messaging;
+    let (mut nondurable_entries, durable_channels): (Vec<ChannelEntry>, Vec<ChannelEntry>) =
+        messaging::config::build_channel_entries(&config.channels, global_defaults)
+            .into_iter()
+            .partition(|e| !e.capabilities().durable);
+    let mut durable_entries = durable_channels;
+    durable_entries.extend(extra_durable_entries);
+
+    let declared_addresses: Vec<&str> = durable_entries
+        .iter()
+        .chain(nondurable_entries.iter())
+        .map(|e| e.address.as_str())
+        .collect();
+    let auto_wiring = auto::lower_auto_wiring(
+        &config.connections,
+        &config.wasm_consumers,
+        &config.surfaces,
+        &declared_addresses,
+        global_defaults,
+    );
+    durable_entries.extend(auto_wiring.durable_entries().iter().cloned());
+    nondurable_entries.extend(auto_wiring.nondurable_entries().iter().cloned());
+
+    ChannelTopology {
+        durable_entries,
+        nondurable_entries,
+        auto_wiring,
+    }
+}
+
+/// Inject the substrate grants every surface holds, then assert output coverage.
+///
+/// The three injections and the assert are one step, in this order, because the
+/// assert reads the injected policy: an output bound to the configured error
+/// channel is covered only by the error grant, so asserting before the injection
+/// would refuse a configuration that boots.
+///
+/// # Panics
+///
+/// On a non-`brenn:` error-channel address, and on an output binding no policy
+/// covers.
+fn finish_surface_policies(resolved_surfaces: &mut [ResolvedSurface], config: &BrennConfig) {
+    let error_channel_bare = config
+        .observability
+        .surface_error_channel
+        .as_deref()
+        .map(|addr| system_publisher_bare_channel("[observability] surface_error_channel", addr));
+    if let Some(bare) = &error_channel_bare {
+        inject_surface_error_grant(resolved_surfaces, bare);
+    }
+
+    inject_surface_geometry_status_grants(resolved_surfaces, &config.surface_description.prefix);
+
+    inject_surface_config_subscribe_grants(resolved_surfaces, &config.surface_description.prefix);
+
+    assert_output_bindings_covered(resolved_surfaces);
 }
 
 /// Scheme-strip an operator-configured system-publisher channel to its bare
@@ -659,56 +762,24 @@ pub async fn build_messaging(
     // --- Build apps_with_messaging, merging webhook subscriptions ---
     let apps_with_messaging = build_apps_with_messaging(apps, global_defaults);
 
-    // Build channel entries: `[[channel]]` first, then webhook:, then mqtt:.
-    // The `[[channel]]` table declares every pub/sub scheme, so split the
-    // non-durable entries off here — they carry no DB row and are wired to the
-    // in-memory substrate rather than the durable directory.
-    let (mut nondurable_channels, durable_channels): (Vec<ChannelEntry>, Vec<ChannelEntry>) =
-        messaging::config::build_channel_entries(&config.channels, global_defaults)
-            .into_iter()
-            .partition(|e| !e.capabilities().durable);
-    let mut all_entries = durable_channels;
-    all_entries.extend(webhook_channel_entries);
-    all_entries.extend(mqtt_channel_entries);
+    // The channel set the resolvers read: `[[channel]]` first, then the
+    // webhook: and mqtt: entries this host's environment produced, then the
+    // auto channels the `[[connection]]` blocks lower to. The offline pass runs
+    // the same helper with no environment-derived entries, so the two reach one
+    // verdict over one ordering.
+    let mut environment_entries = webhook_channel_entries;
+    environment_entries.extend(mqtt_channel_entries);
+    let topology = lower_channel_topology(config, environment_entries);
 
-    // --- Auto channels: lower the [[connection]] blocks ---
-    //
-    // Runs before the pre-directories are built: auto channels are referenced
-    // by config bindings, so their entries and grants must be present when
-    // the resolvers run.
-    let declared_addresses: Vec<&str> = all_entries
-        .iter()
-        .chain(nondurable_channels.iter())
-        .map(|e| e.address.as_str())
-        .collect();
-    let auto_wiring = auto::lower_auto_wiring(
-        &config.connections,
-        &config.wasm_consumers,
-        &config.surfaces,
-        &declared_addresses,
-        global_defaults,
-    );
-    all_entries.extend(auto_wiring.durable_entries().iter().cloned());
-    nondurable_channels.extend(auto_wiring.nondurable_entries().iter().cloned());
-
-    // Resolve WASM consumer subscriptions against the built entries before
-    // finalizing the directory (the directory itself is built from these same
-    // entries; we resolve first so the wasm_consumers vec is ready for
-    // finalize_directory_with_subscribers).
-    //
-    // Build a temporary MessagingDirectory from the raw entries for lookups.
-    // `finalize_directory_with_subscribers` then re-uses `all_entries` to build
-    // the final directory with subscribers populated.
-    //
-    // WASM inputs and surface bindings alike may target non-durable
-    // (ephemeral:/local:) channels, so the entry set includes the non-durable
-    // ones: one class-blind lookup answers every binding, whichever store holds
-    // the channel's retention.
-    let pre_directory = {
-        let mut pre_entries = all_entries.clone();
-        pre_entries.extend(nondurable_channels.iter().cloned());
-        MessagingDirectory::with_entries(pre_entries)
-    };
+    // Resolve WASM consumer subscriptions before finalizing the directory:
+    // the directory is built from these same entries, so the wasm_consumers
+    // vec must be ready when finalize_directory_with_subscribers runs.
+    let pre_directory = topology.pre_directory();
+    let ChannelTopology {
+        durable_entries: mut all_entries,
+        nondurable_entries: nondurable_channels,
+        auto_wiring,
+    } = topology;
     let mut resolved_wasm_consumers = resolve_wasm_consumers(
         &config.wasm_consumers,
         &pre_directory,
@@ -750,42 +821,7 @@ pub async fn build_messaging(
 
     let resolved_remotes = resolve_remotes(&config.remotes, global_defaults);
 
-    // Substrate error-reporting grant: scheme-strip the configured error channel
-    // once and inject a `MessagingPublish` grant + exact `brenn_publish` ACL onto
-    // every surface, before the policies fan out to the registry and validators.
-    // The bare name is reused for the relay spec below.
-    let error_channel_bare = config
-        .observability
-        .surface_error_channel
-        .as_deref()
-        .map(|addr| system_publisher_bare_channel("[observability] surface_error_channel", addr));
-    if let Some(bare) = &error_channel_bare {
-        inject_surface_error_grant(&mut resolved_surfaces, bare);
-    }
-
-    // Substrate surface self-description grant: inject each surface's own
-    // geometry/status `brenn_publish` coverage before the policies fan out to the
-    // runtimes, the registry, and the single-writer sweep (which excludes exactly
-    // this owning-surface coverage).
-    inject_surface_geometry_status_grants(
-        &mut resolved_surfaces,
-        &config.surface_description.prefix,
-    );
-
-    // Substrate config-channel grant: each surface may subscribe its own
-    // bindings channel. Injected here for the same reason and at the same point
-    // as the telemetry grants — the runtime's subscribe gate and the registry
-    // both read the finished policy.
-    inject_surface_config_subscribe_grants(
-        &mut resolved_surfaces,
-        &config.surface_description.prefix,
-    );
-
-    // Item-6 output publish-coverage, asserted after the substrate error-report
-    // grant is injected: an output bound to the configured error channel is
-    // covered by that grant (the sanctioned many-writer shape), while any other
-    // uncovered output is still dead config and fails fast here.
-    assert_output_bindings_covered(&resolved_surfaces);
+    finish_surface_policies(&mut resolved_surfaces, config);
 
     // Every surface subscription is a component instance's, keyed
     // `<slug>#<instance>` (`#` is outside the operator slug charset), so surface

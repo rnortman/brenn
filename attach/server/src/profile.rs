@@ -202,6 +202,19 @@ pub trait AttachProfile: Send + Sync {
     /// is a violation.
     fn alert_granted(&self) -> bool;
 
+    /// Whether the declared sub-identity `attribution` may raise an alert of its
+    /// own.
+    ///
+    /// The containment half of the paging plane, and independent of
+    /// [`AttachProfile::alert_granted`]: that grant is the attacher's transport
+    /// right toward the backend, this one is one sub-identity's right within the
+    /// attacher. An attacher whose route declares no sub-identity answers `false`
+    /// for every name — nothing it attributes could be admitted anyway. Asked
+    /// only after [`AttachProfile::admit_attribution`] admitted the name, so a
+    /// `false` answer means declared-but-ungranted, which is a violation exactly
+    /// as an ungranted attacher alert is.
+    fn attribution_may_alert(&self, attribution: &str) -> bool;
+
     /// How many concurrent attachments this attacher admits, in total and per
     /// account.
     ///

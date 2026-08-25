@@ -65,6 +65,8 @@ pub struct TestProfile {
     pub subscribe_burst: u32,
     pub publish_rate: PublishRate,
     pub alert_granted: bool,
+    /// The declared sub-identities that may page on their own name.
+    pub alertable: HashSet<String>,
     pub session_caps: SessionCaps,
     /// Concurrent subscriptions one attachment of this attacher may hold.
     pub max_active_subscriptions: usize,
@@ -104,6 +106,7 @@ impl TestProfile {
                 per_sec: 1,
             },
             alert_granted: false,
+            alertable: HashSet::new(),
             session_caps: SessionCaps::UNCAPPED,
             max_active_subscriptions: usize::MAX,
             missing_channel_posture: MissingChannelPosture::Invariant,
@@ -166,6 +169,10 @@ impl AttachProfile for TestProfile {
 
     fn alert_granted(&self) -> bool {
         self.alert_granted
+    }
+
+    fn attribution_may_alert(&self, attribution: &str) -> bool {
+        self.alertable.contains(attribution)
     }
 
     fn session_caps(&self) -> SessionCaps {

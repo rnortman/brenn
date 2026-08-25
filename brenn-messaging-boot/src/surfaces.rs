@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use brenn_budget::MAX_PUBLISHES_PER_ACTIVATION;
@@ -9,7 +9,9 @@ use brenn_lib::messaging::config::{
     ResolvedSurfaceSubscription, SurfaceBinding, SurfaceComponentRaw, SurfaceConfigRaw,
     SurfaceOutput, SurfaceOutputRaw,
 };
-use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency};
+use brenn_lib::messaging::{
+    ChannelScheme, ComponentGrant, ComponentHost, MessagingDirectory, Urgency,
+};
 use brenn_surface_schema::Abi;
 use indexmap::IndexMap;
 
@@ -382,35 +384,66 @@ fn resolve_parked_batch_depth(slug: &str, instance: &str, comp: &SurfaceComponen
     n
 }
 
+/// Resolve one instance's grants: the capability interfaces this component is
+/// given within its page, deduplicated and checked against what a surface can
+/// host at all.
+///
+/// Per instance rather than per surface, and that is the whole point: a
+/// surface's grants are the transport rights the backend admits it over the
+/// wire, and every component on the page inherits them. These contain one
+/// component from its neighbours, which is bug containment inside a page that
+/// was never trusted to begin with.
+///
+/// # Panics
+///
+/// On a repeated word (a list that says the same thing twice is a typo, not an
+/// emphasis) and on a word no surface can host, which
+/// [`ComponentGrant::illegal_on`] names and explains.
+fn resolve_component_grants(
+    slug: &str,
+    instance: &str,
+    comp: &SurfaceComponentRaw,
+) -> BTreeSet<ComponentGrant> {
+    let mut grants = BTreeSet::new();
+    for grant in &comp.grants {
+        assert!(
+            grants.insert(*grant),
+            "config: [[surface]] {slug:?}: component {instance:?} lists grant {:?} twice — a \
+             grants list states each capability once",
+            grant.word(),
+        );
+        if let Some(why) = grant.illegal_on(ComponentHost::Surface) {
+            panic!(
+                "config: [[surface]] {slug:?}: component {instance:?} is granted {:?}, but \
+                 {why}; remove it from the grants list",
+                grant.word(),
+            );
+        }
+    }
+    grants
+}
+
 /// Resolve a component instance's static config map — the page-lifetime
 /// analogue of the backend's process-lifetime map seeded from host config and read
 /// through the `config` import.
 ///
-/// Only a `processor` reads it: no other ABI is handed a `config` import, so a
-/// map declared elsewhere has no reader. Absent means the empty map — an
-/// operator need not write `config = {}`.
+/// ABI-agnostic: a `dom` component reads the same map a `processor` does.
+/// Absent means the empty map — an operator need not write `config = {}`.
+/// Readability is gated by the instance's `config` grant, checked against the
+/// map's presence in both directions by the caller.
 ///
 /// # Panics
 ///
-/// On a `config` table declared for a non-`processor` component (a dead
-/// declaration is a config error, not a silent no-op) and on any key in the
-/// host-reserved `brenn.` namespace (a collision-in-waiting or a typo; the host
-/// injects none browser-side).
+/// On any key in the host-reserved `brenn.` namespace (a collision-in-waiting
+/// or a typo; the host injects none browser-side).
 fn resolve_component_config(
     slug: &str,
     instance: &str,
-    abi: Abi,
     comp: &SurfaceComponentRaw,
 ) -> BTreeMap<String, String> {
     let Some(map) = comp.config.as_ref() else {
         return BTreeMap::new();
     };
-    assert!(
-        abi == Abi::Processor,
-        "config: [[surface]] {slug:?}: component {instance:?} declares a `config` table but its \
-         abi is {abi:?} — only a `processor` component is handed a `config` import, so this map \
-         would have no reader; remove it or declare the component as abi = \"processor\"",
-    );
     for key in map.keys() {
         assert!(
             !key.starts_with("brenn."),
@@ -570,7 +603,7 @@ pub(crate) fn resolve_surfaces(
         DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC,
     };
     use brenn_lib::messaging::is_unreserved_char;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     // Item 1: slug uniqueness across [[surface]] blocks.
     let mut seen_slugs: HashSet<&str> = HashSet::new();
@@ -648,11 +681,25 @@ pub(crate) fn resolve_surfaces(
                  may not)",
             );
             let abi = resolve_abi(slug, instance, &comp.abi);
+            // The chrome renders the shell — layout, theme, banner, the takeover
+            // stack — so it needs an element to render into. A headless instance
+            // named as the chrome leaves the page with no shell at all, which
+            // today surfaces as a mount failure and a reload loop rather than as
+            // the config error it is.
+            assert!(
+                !comp.chrome || abi == Abi::Dom,
+                "config: [[surface]] {slug:?}: component {instance:?} sets `chrome = true` but \
+                 declares abi = {:?} — chrome renders the shell, and a headless component has \
+                 nowhere to render it; make the chrome a `dom` component or move the flag",
+                abi.as_str(),
+            );
+            let grants = resolve_component_grants(slug, instance, comp);
             resolved_components.push(ResolvedComponent {
                 instance: instance.to_string(),
                 kind: comp.kind.clone(),
                 abi,
-                config: resolve_component_config(slug, instance, abi, comp),
+                config: resolve_component_config(slug, instance, comp),
+                grants,
                 send_budget: resolve_send_budget(slug, instance, comp),
                 parked_batch_depth: resolve_parked_batch_depth(slug, instance, comp),
                 chrome: comp.chrome,
@@ -772,13 +819,15 @@ pub(crate) fn resolve_surfaces(
 
         // Build the surface's resolved policy up front — the binding
         // coverage check (item 6) consults it.
-        let mut policy = brenn_lib::access::resolve::build_surface_policy(
-            slug,
+        let mut policy = brenn_lib::access::resolve::build_attach_policy(
+            brenn_lib::access::resolve::AttachOwner::Surface(slug),
             surface.grants.iter().copied(),
-            &surface.subscribe_acl,
-            &surface.publish_acl,
-            &surface.ephemeral_subscribe_acl,
-            &surface.ephemeral_publish_acl,
+            brenn_lib::access::raw::AttachAclsRaw {
+                subscribe: &surface.subscribe_acl,
+                publish: &surface.publish_acl,
+                ephemeral_subscribe: &surface.ephemeral_subscribe_acl,
+                ephemeral_publish: &surface.ephemeral_publish_acl,
+            },
         );
         // Auto-channel grants, injected before the binding coverage checks read
         // the policy: a `[[connection]]` is the operator's authorization signal,
@@ -892,33 +941,47 @@ pub(crate) fn resolve_surfaces(
         // by both directions. Ordinary operator-declared
         // local channels have no rules here: the server mediates no access to
         // page-local traffic, so it polices the *declaration* and nothing else.
-        let validate_local_binding = |direction: &str, channel: &str, is_output: bool| {
-            let Some(reserved) = brenn_surface_schema::reserved_local_channel(channel) else {
-                return;
-            };
-            // Capability-as-binding: the takeover grant gates the wiring itself,
-            // replacing the v0 runtime DOM-event gate. A surface without the
-            // grant declaring a takeover binding is dead config — the component
-            // could publish takeover requests no one is allowed to honour.
-            assert!(
-                !reserved.requires_takeover_grant
-                    || policy
-                        .grants
-                        .has(brenn_lib::access::AppCapability::SurfaceTakeover),
-                "config: [[surface]] {slug:?}: {direction} binds reserved control channel \
-                 {channel:?}, which requires the surface's `takeover` grant — add it to \
-                 [[surface]] grants or drop the binding",
-            );
-            // Kernel-publish-only planes have no component producers in v1. A
-            // component output bound here would publish into a plane the kernel
-            // owns and overwrite the kernel's own state reports.
-            assert!(
-                !(is_output && reserved.kernel_publish_only),
-                "config: [[surface]] {slug:?}: [[surface.output]] targets reserved control \
+        // Instance → its grants, for the per-binding gates below.
+        // `validate_binding` has already refused any binding naming an instance
+        // this surface does not declare.
+        let component_grants: HashMap<&str, &BTreeSet<ComponentGrant>> = resolved_components
+            .iter()
+            .map(|c| (c.instance.as_str(), &c.grants))
+            .collect();
+
+        let validate_local_binding =
+            |direction: &str, channel: &str, instance: &str, is_output: bool| {
+                let Some(reserved) = brenn_surface_schema::reserved_local_channel(channel) else {
+                    return;
+                };
+                // Capability-as-binding: the takeover grant gates the wiring itself,
+                // and it is the *instance's* grant. Takeover never leaves the page,
+                // so a surface-wide grant protects the backend from nothing and
+                // hands every component on the page the same fullscreen authority;
+                // read per instance it is what it claims to be — the operator naming
+                // which component may black out the screen. A binding without the
+                // grant is dead config: the component could publish takeover
+                // requests no one is allowed to honour.
+                assert!(
+                    !reserved.requires_takeover_grant
+                        || component_grants
+                            .get(instance)
+                            .is_some_and(|g| g.contains(&ComponentGrant::Takeover)),
+                    "config: [[surface]] {slug:?}: {direction} binds instance {instance:?} to \
+                 reserved control channel {channel:?}, which requires that component's \
+                 `takeover` grant — add `takeover` to the component's grants or drop the \
+                 binding",
+                );
+                // Kernel-publish-only planes have no component producers in v1. A
+                // component output bound here would publish into a plane the kernel
+                // owns and overwrite the kernel's own state reports.
+                assert!(
+                    !(is_output && reserved.kernel_publish_only),
+                    "config: [[surface]] {slug:?}: [[surface.output]] targets reserved control \
                  channel {channel:?}, which is kernel-publish-only — only the surface kernel \
                  publishes link-state/surface-state/toast; components may subscribe it",
-            );
-        };
+                );
+            };
 
         // Both halves of each io_port are channel-less and take the one address
         // the lowering pass assigned — the two directions cannot be wired apart.
@@ -1028,7 +1091,7 @@ pub(crate) fn resolve_surfaces(
             // behind it; `noise` is resolved and held for the overflow ladder
             // that lands in a later phase — no surface path reads it yet.
             let (push_depth, retain_depth, noise, wire) = if local {
-                validate_local_binding(direction, &channel, false);
+                validate_local_binding(direction, &channel, &sub.instance, false);
                 // A `local:` channel has no `[[channel]]` block, so its noise
                 // ladder is binding → global. `push_depth` has no such fallback:
                 // a depth is sized, not defaulted, so the binding states it. The
@@ -1240,7 +1303,7 @@ pub(crate) fn resolve_surfaces(
                 out.port,
             );
             if brenn_envelope::is_local_channel(&channel) {
-                validate_local_binding(direction, &channel, true);
+                validate_local_binding(direction, &channel, &out.instance, true);
                 // Outputs carry no depth knobs, so an output-only local channel
                 // takes the floor. Registering it here is what makes a
                 // publish-only local channel exist for the router at all.
@@ -1259,6 +1322,87 @@ pub(crate) fn resolve_surfaces(
                 default_urgency: out.urgency.unwrap_or(Urgency::Normal),
                 budget: resolve_output_budget(slug, out),
             });
+        }
+
+        // Grant/wiring agreement, per instance. Each rule is the surface twin of
+        // one a `[[wasm_consumer]]` already answers: a grant that reaches
+        // nothing and wiring that no grant permits are both dead config, and
+        // both are refused by name rather than discovered at runtime as a
+        // component that silently does nothing.
+        for comp in &resolved_components {
+            let instance = comp.instance.as_str();
+
+            // `ports` ⟸ outputs. A bound output (including both halves of an
+            // `io` port) is a publish this component intends to make, and
+            // without the ports capability it can make none.
+            let output_count = outputs.iter().filter(|o| o.instance == instance).count();
+            assert!(
+                output_count == 0 || comp.grants.contains(&ComponentGrant::Ports),
+                "config: [[surface]] {slug:?}: component {instance:?} has {output_count} output \
+                 binding(s) but \"ports\" is not in its grants — the component cannot publish; \
+                 add \"ports\" to its grants or remove the output bindings",
+            );
+
+            // `config` ⟺ a config map, both directions. A map no component may
+            // read is unread configuration; a grant with no map behind it reads
+            // nothing.
+            assert!(
+                comp.config.is_empty() || comp.grants.contains(&ComponentGrant::Config),
+                "config: [[surface]] {slug:?}: component {instance:?} declares a `config` map \
+                 but \"config\" is not in its grants — the component cannot read it; add \
+                 \"config\" to its grants or remove the map",
+            );
+            assert!(
+                !comp.grants.contains(&ComponentGrant::Config) || !comp.config.is_empty(),
+                "config: [[surface]] {slug:?}: component {instance:?} is granted \"config\" but \
+                 declares no config map — the grant reads an empty map forever; give it a \
+                 `config` map or drop the grant",
+            );
+
+            // `alert` ⟸ the surface's own alert grant. A component alert reaches
+            // the operator over the surface's alert plane, which the backend
+            // denies to a surface that was never granted it — so the component
+            // grant would name a delivery that cannot happen.
+            assert!(
+                !comp.grants.contains(&ComponentGrant::Alert)
+                    || policy
+                        .grants
+                        .has(brenn_lib::access::AppCapability::SurfaceAlert),
+                "config: [[surface]] {slug:?}: component {instance:?} is granted \"alert\" but \
+                 the surface has no `alert` grant — the kernel could never forward its alert \
+                 (the surface is the principal the backend judges); add `alert` to [[surface]] \
+                 grants or drop the component's",
+            );
+
+            // `takeover` ⟸ a takeover-plane binding. The forward direction (a
+            // binding without the grant) is refused at the binding itself; this
+            // is the reverse, where the capability reaches nothing.
+            let binds_takeover = subscriptions
+                .iter()
+                .filter(|b| b.instance == instance)
+                .map(|b| b.channel_address.as_str())
+                .chain(
+                    outputs
+                        .iter()
+                        .filter(|o| o.instance == instance)
+                        .map(|o| o.channel_address.as_str()),
+                )
+                .any(|channel| {
+                    brenn_surface_schema::reserved_local_channel(channel)
+                        .is_some_and(|reserved| reserved.requires_takeover_grant)
+                });
+            assert!(
+                !comp.grants.contains(&ComponentGrant::Takeover) || binds_takeover,
+                "config: [[surface]] {slug:?}: component {instance:?} is granted \"takeover\" \
+                 but binds no takeover-plane channel — takeover is exercised by publishing to \
+                 {:?}, so the grant consents to a binding that does not exist; wire it or drop \
+                 the grant",
+                brenn_surface_schema::RESERVED_LOCAL_CHANNELS
+                    .iter()
+                    .filter(|c| c.requires_takeover_grant)
+                    .map(|c| c.address)
+                    .collect::<Vec<_>>(),
+            );
         }
 
         let local_channels = local_ring_depths

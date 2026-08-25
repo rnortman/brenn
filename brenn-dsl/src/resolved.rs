@@ -372,7 +372,16 @@ pub struct RComponentInst {
     /// A token context, so it is projected rather than resolved, and it rides
     /// beside the other keys rather than among them.
     pub parked_batch_depth: Option<IntOrWord>,
+    /// The capabilities the operator gave this instance. A token context, like
+    /// the depth above, so it rides beside the other keys rather than among
+    /// them. Same field and same spellings as [`RConsumer::grants`]: what a
+    /// component is given does not depend on where it is placed.
+    pub grants: Option<RWordList>,
     pub attrs: Vec<(String, RVal)>,
+    /// The authority this instance states for itself, which contains it within
+    /// its surface. The surface's own statements are what the backend admits
+    /// over the wire; neither substitutes for the other.
+    pub acls: Vec<RAcl>,
     pub bindings: Vec<RBinding>,
 }
 
@@ -419,7 +428,6 @@ pub struct ClassRef {
     pub name: Spanned<String>,
     /// Which artifact shape, and with it where an instance may be placed.
     pub abi: Spanned<Abi>,
-    pub component_path: Option<RVal>,
     pub ports: Vec<RPort>,
 }
 

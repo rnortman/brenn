@@ -1,14 +1,9 @@
-/// Extract a panic message from a `catch_unwind` payload.
-///
-/// Accepts `String` (from `panic!("...", args)`) and `&'static str`
-/// (from `panic!("literal")`) payloads.
+/// Extract a panic message from a `catch_unwind` payload, or panic if it
+/// carries no text.
 pub(crate) fn unwrap_panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&str>() {
-        s.to_string()
-    } else {
-        panic!("panic payload was neither String nor &str");
+    match crate::panic_util::panic_message(&*payload) {
+        Some(message) => message.to_string(),
+        None => panic!("panic payload was neither String nor &str"),
     }
 }
 

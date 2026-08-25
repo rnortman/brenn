@@ -31,13 +31,25 @@ pub(crate) fn component(instance: &str) -> ComponentEntry {
 
 /// As [`component`], for a suite that cares what kind an instance is — a
 /// document's kind is what a remount compares.
+///
+/// Granted what every in-tree instance is granted, so a suite exercising a
+/// privileged seam gets the shape a real page has; a suite about the gate itself
+/// says so with [`component_with_grants`].
 pub(crate) fn component_of_kind(instance: &str, kind: &str) -> ComponentEntry {
+    component_with_grants(instance, kind, &["ports", "log"])
+}
+
+/// As [`component_of_kind`], with the capability words spelled out — for the
+/// suite whose subject is what an instance may do, including the ungranted case
+/// (`&[]`), which no default may stand in for.
+pub(crate) fn component_with_grants(instance: &str, kind: &str, grants: &[&str]) -> ComponentEntry {
     ComponentEntry {
         instance: instance.to_string(),
         kind: kind.to_string(),
         abi: Abi::Dom,
         parked_batch_depth: 2,
         config: BTreeMap::new(),
+        grants: grants.iter().map(|g| (*g).to_string()).collect(),
     }
 }
 
@@ -100,7 +112,6 @@ pub(crate) fn platform() -> PlatformSection {
         status_interval_secs: 60,
         error_channel: None,
         error_report_floor: None,
-        takeover_granted: false,
     }
 }
 

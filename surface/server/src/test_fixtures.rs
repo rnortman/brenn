@@ -181,6 +181,7 @@ pub fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
             parked_batch_depth: 8,
             config: Default::default(),
             chrome: false,
+            grants: Default::default(),
         }],
         subscriptions: vec![],
         wire_subscriptions: vec![],

@@ -207,6 +207,13 @@ impl AttachProfile for RemoteProfile {
         self.alert_granted
     }
 
+    fn attribution_may_alert(&self, _attribution: &str) -> bool {
+        // A remote declares no sub-identity, so `admit_attribution` refuses every
+        // name before this is asked. Answering `false` keeps the deny-by-default
+        // posture if that order ever changes.
+        false
+    }
+
     fn session_caps(&self) -> SessionCaps {
         // The two grains collapse: the account behind a remote attachment *is*
         // `remote:<slug>`, so a per-account cap below the per-attacher one would

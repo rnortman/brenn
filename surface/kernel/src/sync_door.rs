@@ -14,6 +14,14 @@
 //! for, because the activation itself is the answer — and everything below it is
 //! the same code the loop runs.
 //!
+//! # Why only a `dom` component has one
+//!
+//! The gesture is the whole reason: a user-activation token exists because a
+//! browser event fired on an element. A headless instance has no element and no
+//! gesture, so there is nothing for a synchronous pass to preserve. DOM-forced,
+//! not an ABI difference the kernel chose to keep — every other privileged entry
+//! is one router serving both.
+//!
 //! # What the door does not do
 //!
 //! It enacts nothing. Both of its turns' effects go back to the loop over a

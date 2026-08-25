@@ -911,10 +911,15 @@ fn an_announcement_becomes_one_alert_and_one_toast_with_one_sentence() {
     let sentence = announcement("p2", 3).describe();
     match &notices.alerts[0] {
         ClientFrame::Alert {
+            attribution,
             severity,
             title,
             body,
         } => {
+            assert_eq!(
+                *attribution, None,
+                "the page reports its own loss; the overflowing instance states nothing"
+            );
             assert_eq!(*severity, AlertSeverity::Warning);
             assert_eq!(title, "surface input overflow on p2");
             assert_eq!(body, &sentence);

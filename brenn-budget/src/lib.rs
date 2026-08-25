@@ -25,7 +25,10 @@
 //!
 //! [`ActivationGate`] composes both layers into the one per-activation gate each
 //! host runs a guest's publish and control-op calls through: the counters, the
-//! buckets, and the order the checks fire in.
+//! buckets, and the order the checks fire in. What a guest is *told* about a
+//! refusal is shared too — [`publish_refusal_kind`] and [`defer_refusal_kind`]
+//! classify a [`GateRefusal`] onto [`RefusalKind`], leaving each host only the
+//! conversion onto its own guest-facing enum.
 //!
 //! Config parsing lives elsewhere: the `f64` knobs an operator writes are
 //! resolved to the millitokens below by whoever reads the config. This crate
@@ -34,8 +37,10 @@
 #![forbid(unsafe_code)]
 
 mod gate;
+mod refusal;
 
 pub use gate::{ActivationGate, GateRefusal, PublishCheck, check_deliver_after};
+pub use refusal::{RefusalKind, defer_refusal_kind, publish_refusal_kind};
 
 /// Millitokens charged per publish: the token-bucket fixed-point scale.
 ///

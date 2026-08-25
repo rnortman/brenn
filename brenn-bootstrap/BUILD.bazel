@@ -60,8 +60,14 @@ rust_test(
     # The moved dispatch suite loads the demo guest; the harness names it as
     # `<manifest dir>/../brenn-wasm/target/components/`, which the fixture's
     # staging path and the workspace-relative manifest dir below agree on.
-    data = ["//brenn-wasm:fixture_processor_demo"],
+    # The config-check suite reads the shipped root configs and the modules
+    # they import; `rustc_env` below names the directory those paths hang off.
+    data = [
+        "//:brenn_configs",
+        "//brenn-wasm:fixture_processor_demo",
+    ],
     edition = "2024",
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-bootstrap"},
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + [
         "//attach/proto",

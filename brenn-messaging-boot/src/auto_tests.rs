@@ -8,10 +8,11 @@ use super::test_fixtures::{
     resolve_with_auto, sub_raw, surface_sub_raw,
 };
 use super::*;
+use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::config::{
     ConnectionConfigRaw, Depth, MessagingGlobalConfig, SurfaceConfigRaw, SurfaceIoPortRaw,
     SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
-    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
+    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
 
 /// Stock globals. Depths are not among them — every auto-channel depth is folded
@@ -54,7 +55,7 @@ fn free_out(port: &str) -> WasmConsumerOutputRaw {
 fn publisher(slug: &str) -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw {
         slug: slug.to_string(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw("brenn:feed", "in")],
         outputs: vec![free_out("out")],
         ..minimal_wasm_consumer()
@@ -104,7 +105,7 @@ fn surface_io_raw(port: &str, push: u64, retain: u64) -> SurfaceIoPortRaw {
 fn timer_consumer(slug: &str) -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw {
         slug: slug.to_string(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         io_ports: vec![io_raw("timer", 2, 8)],
         ..minimal_wasm_consumer()
     }

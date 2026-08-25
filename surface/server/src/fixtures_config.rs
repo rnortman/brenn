@@ -44,6 +44,7 @@ impl SurfaceFixture {
                     parked_batch_depth: 8,
                     config: Default::default(),
                     chrome: true,
+                    grants: Default::default(),
                 }],
                 subscriptions: vec![],
                 wire_subscriptions: vec![],
@@ -71,9 +72,33 @@ impl SurfaceFixture {
             abi: brenn_surface_schema::Abi::Processor,
             send_budget: AttachSendBudget::default(),
             parked_batch_depth: 8,
+            // A map is only readable by an instance granted `config`, so a
+            // fixture handed one grants it.
+            grants: if config.is_empty() {
+                Default::default()
+            } else {
+                [brenn_lib::messaging::ComponentGrant::Config].into()
+            },
             config,
             chrome: false,
         });
+        self
+    }
+
+    /// Grant a capability to an already-appended instance.
+    ///
+    /// # Panics
+    ///
+    /// On an instance this fixture never appended — a grant naming nothing is a
+    /// fixture bug, and a silently dropped one would pin the wrong thing.
+    pub fn grant(mut self, instance: &str, grant: brenn_lib::messaging::ComponentGrant) -> Self {
+        let component = self
+            .inner
+            .components
+            .iter_mut()
+            .find(|c| c.instance == instance)
+            .unwrap_or_else(|| panic!("no fixture component named {instance:?} to grant"));
+        component.grants.insert(grant);
         self
     }
 

@@ -107,6 +107,7 @@ pub fn build_bindings_document(
                 kind: c.kind.clone(),
                 abi: c.abi,
                 parked_batch_depth: c.parked_batch_depth,
+                grants: c.grants.iter().map(|g| g.word().to_string()).collect(),
                 config: c.config.clone(),
             })
             .collect(),
@@ -135,10 +136,6 @@ pub fn build_bindings_document(
             status_interval_secs: params.status_interval_secs,
             error_channel,
             error_report_floor,
-            takeover_granted: resolved
-                .policy
-                .grants
-                .has(brenn_lib::access::AppCapability::SurfaceTakeover),
         },
     }
 }

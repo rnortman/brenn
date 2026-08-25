@@ -33,8 +33,9 @@ use std::path::Path;
 
 use brenn_lib::access::raw::ChannelMatcherRaw;
 use brenn_lib::config::remote_fleet;
+use brenn_lib::messaging::AttachGrant;
 use brenn_lib::messaging::config::Depth;
-use brenn_lib::messaging::remote::{RemoteConfigRaw, RemoteGrant};
+use brenn_lib::messaging::remote::RemoteConfigRaw;
 use brenn_lib::messaging::{ChannelEntry, SubscriberEntry, SubscriberEntryKind};
 use brenn_messaging::PublishResult;
 use brenn_messaging::testutils::{ephemeral_channel_entry, test_channel_entry};
@@ -778,7 +779,12 @@ async fn a_granted_alert_reaches_the_dispatcher_attributed_to_the_remote() {
     rig.client.attach().await;
 
     rig.client
-        .send_alert(AlertSeverity::Warning, "mic array offline", "XVF3800 gone")
+        .send_alert(
+            None,
+            AlertSeverity::Warning,
+            "mic array offline",
+            "XVF3800 gone",
+        )
         .await;
     // The session reads frames in order, so an answered publish is the
     // happens-after edge that makes the alert readable without a sleep.
@@ -816,10 +822,10 @@ async fn alerting_without_the_grant_closes_the_attachment() {
         &db,
         |token| RemoteConfigRaw {
             grants: vec![
-                RemoteGrant::Subscribe,
-                RemoteGrant::Publish,
-                RemoteGrant::EphemeralSubscribe,
-                RemoteGrant::EphemeralPublish,
+                AttachGrant::Subscribe,
+                AttachGrant::Publish,
+                AttachGrant::EphemeralSubscribe,
+                AttachGrant::EphemeralPublish,
             ],
             ..loopback(token)
         },
@@ -834,8 +840,48 @@ async fn alerting_without_the_grant_closes_the_attachment() {
     );
 
     rig.client
-        .send_alert(AlertSeverity::Critical, "paging anyway", "")
+        .send_alert(None, AlertSeverity::Critical, "paging anyway", "")
         .await;
     expect_detach(&mut rig.client).await;
     expect_one_violation(&rig, "an alert from an ungranted attacher").await;
+}
+
+/// **Attribution is the surface's word, and it crosses the wire.**
+///
+/// A remote declares no sub-identities, so any attribution it writes names
+/// nobody — a violation, judged on the string the peer actually read off the
+/// frame. That is the only whole-socket witness that `attribution` survives
+/// serialization at all: were it dropped in transit, this alert would arrive as
+/// the platform's own, dispatch, and leave the attachment open.
+#[tokio::test]
+async fn an_attributed_alert_from_an_attacher_with_no_sub_identities_closes_the_attachment() {
+    let db = crate::test_support::init_db_memory();
+    let mut rig = build_rig(&db, loopback, fleet_channels()).await;
+    rig.client.attach().await;
+
+    rig.client
+        .send_alert(
+            Some("mic-watch"),
+            AlertSeverity::Warning,
+            "speaking for someone",
+            "",
+        )
+        .await;
+    expect_detach(&mut rig.client).await;
+    let events = rig.harness.captured().await;
+    assert_eq!(
+        events.len(),
+        1,
+        "one violation, and no dispatched alert, got {events:?}"
+    );
+    assert!(
+        events[0].0.contains("attach_protocol_violation"),
+        "the event is fail2ban-grade violation signal, got source {:?}",
+        events[0].0
+    );
+    assert!(
+        events[0].1.contains("mic-watch"),
+        "the violation names the attribution the peer read, got {:?}",
+        events[0].1
+    );
 }

@@ -4,7 +4,8 @@
 //! host and WASM guest components, and — in [`addressing`] — the channel
 //! address vocabulary all three of its consumer classes state in common: the
 //! host, the WASM guests, and the `.brenn` configuration front end, which is
-//! neither. It is intentionally kept free of host-only
+//! neither. [`grants`] holds the component capability vocabulary those same
+//! three read, plus the surface kernel. It is intentionally kept free of host-only
 //! dependencies (tokio, sqlite, etc.) so that guest components may depend on it
 //! directly when compiled to `wasm32-unknown-unknown`.
 //!
@@ -25,6 +26,7 @@ use uuid::Uuid;
 
 pub mod addressing;
 pub mod chat;
+pub mod grants;
 
 // ---------------------------------------------------------------------------
 // Address scheme

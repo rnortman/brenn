@@ -16,13 +16,17 @@
 //!
 //! The budget arithmetic and the order the checks fire in are not here: they are
 //! [`brenn_budget::ActivationGate`], which both hosts run their guests' calls
-//! through. What is here is the page's own half — the port table, the deferred
-//! snapshot, the buffered entries — plus the mapping from the gate's verdicts
-//! onto the contract's error vocabulary.
+//! through; so is the classification of its verdicts, which arrives here as
+//! [`brenn_budget::RefusalKind`]. What is here is the page's own half — the port
+//! table, the deferred snapshot, the buffered entries — plus the last step onto
+//! the contract's error vocabulary.
 
 use std::collections::HashMap;
 
-use brenn_budget::{ActivationGate, GateRefusal, PublishCheck, check_deliver_after};
+use brenn_budget::{
+    ActivationGate, GateRefusal, PublishCheck, RefusalKind, check_deliver_after,
+    defer_refusal_kind, publish_refusal_kind,
+};
 use brenn_envelope::Urgency;
 use brenn_surface_contract::{DeferError, PublishError};
 use uuid::Uuid;
@@ -33,36 +37,29 @@ use crate::bindings::channel_is_transportable;
 
 /// A gate verdict as the component sees it on the publish path.
 ///
-/// An oversize body and an impossible release time are facts about the
-/// argument — `invalid-payload`; everything else is a budget — `quota-exceeded`.
+/// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
+/// backend host.
 fn publish_error(refusal: GateRefusal) -> PublishError {
-    match refusal {
-        GateRefusal::BodyTooLarge { .. } | GateRefusal::UnrepresentableDeliverAfter { .. } => {
-            PublishError::InvalidPayload
+    match publish_refusal_kind(refusal) {
+        RefusalKind::InvalidPayload(_) => PublishError::InvalidPayload,
+        RefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
+        RefusalKind::InvalidDeliverAfter => {
+            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
         }
-        GateRefusal::CallCap { .. }
-        | GateRefusal::SinkExhausted
-        | GateRefusal::EntryCap { .. }
-        | GateRefusal::ByteCap { .. }
-        | GateRefusal::OpCap { .. } => PublishError::QuotaExceeded,
     }
 }
 
 /// A gate verdict as the component sees it on the control-op path.
 ///
-/// An impossible release time has its own variant here — the op is otherwise
-/// well-formed, and collapsing it into a quota refusal would tell the component
-/// to retry later. An oversize edit body *is* a quota refusal, because the body
-/// is charged against the activation's aggregate like any other.
+/// The classification is [`brenn_budget::defer_refusal_kind`], shared with the
+/// backend host.
 fn defer_error(refusal: GateRefusal) -> DeferError {
-    match refusal {
-        GateRefusal::UnrepresentableDeliverAfter { .. } => DeferError::InvalidDeliverAfter,
-        GateRefusal::CallCap { .. }
-        | GateRefusal::BodyTooLarge { .. }
-        | GateRefusal::SinkExhausted
-        | GateRefusal::EntryCap { .. }
-        | GateRefusal::ByteCap { .. }
-        | GateRefusal::OpCap { .. } => DeferError::QuotaExceeded,
+    match defer_refusal_kind(refusal) {
+        RefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
+        RefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
+        RefusalKind::InvalidPayload(_) => {
+            unreachable!("defer_refusal_kind never answers invalid-payload")
+        }
     }
 }
 

@@ -9,8 +9,9 @@ use super::test_fixtures::{
 };
 use super::wasm::{DEFAULT_ACTIVATION_BURST, DEFAULT_ACTIVATION_MIN_PERIOD};
 use super::*;
+use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::config::{
-    Depth, WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
+    Depth, WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
     WasmSinkBudget,
 };
 use std::time::Duration;
@@ -75,7 +76,7 @@ fn wasm_consumer_resolves_with_non_empty_acl() {
     raw.publish_acl = vec![ChannelMatcherRaw::Prefix("events.".to_string())];
     // A non-empty publish_acl requires the `ports` grant — without it the
     // matchers are dead (MessagingPublish absent) and resolution panics.
-    raw.grants = vec![WasmGrant::Ports];
+    raw.grants = vec![ComponentGrant::Ports];
 
     let resolved = resolve(&[raw], &dir);
     assert_eq!(
@@ -547,7 +548,7 @@ fn ephemeral_output_resolves_with_ephemeral_publish_acl() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "eph-pub".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         ephemeral_publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
             "eph-out".to_string(),
         )],
@@ -582,7 +583,7 @@ fn ephemeral_output_without_acl_panics() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "eph-noacl".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw("out", "ephemeral:eph-out")], // must panic
         ..minimal_wasm_consumer()
@@ -604,7 +605,7 @@ fn local_output_resolves_with_local_publish_acl() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "loc-pub".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         local_publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
             "loc-out".to_string(),
         )],
@@ -639,7 +640,7 @@ fn local_output_without_acl_panics() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "loc-noacl".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw("out", "local:loc-out")], // must panic
         ..minimal_wasm_consumer()
@@ -674,7 +675,7 @@ fn resolved_consumer_carries_port_and_channel_info() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "my-consumer".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         // Bound output port requires a covering publish_acl; without it
         // resolution panics (bound-ports + empty publish_acl).
         publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
@@ -700,7 +701,7 @@ fn resolved_consumer_carries_port_and_channel_info() {
     // Grants must round-trip through resolution.
     assert_eq!(
         c.grants,
-        std::collections::BTreeSet::from([WasmGrant::Ports]),
+        std::collections::BTreeSet::from([ComponentGrant::Ports]),
         "resolved grants must match configured grants"
     );
 }
@@ -720,7 +721,7 @@ fn bound_output_with_empty_publish_acl_panics() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "bound-empty-acl".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw("brenn:bound-in", "in")],
         outputs: vec![out_raw("out", "brenn:bound-out")],
         ..minimal_wasm_consumer()
@@ -738,7 +739,7 @@ fn ports_grant_no_outputs_empty_publish_acl_resolves() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "ports-no-outputs".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer() // empty publish_acl, no bound outputs → must not panic
     }];
@@ -830,7 +831,7 @@ fn missing_store_path_parent_panics() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "no-parent".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Store],
+        grants: vec![ComponentGrant::Store],
         store_path: Some(std::path::PathBuf::from(
             "/nonexistent_dir_xyz_brenn_test/store.sqlite",
         )),
@@ -859,7 +860,7 @@ fn wasm_consumer_config_carried_through() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "cfg-consumer".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Config],
+        grants: vec![ComponentGrant::Config],
         config: Some(config_table),
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
@@ -874,7 +875,7 @@ fn wasm_consumer_config_carried_through() {
     // Grants must round-trip through resolution.
     assert_eq!(
         result[0].grants,
-        std::collections::BTreeSet::from([WasmGrant::Config]),
+        std::collections::BTreeSet::from([ComponentGrant::Config]),
         "resolved grants must match configured grants"
     );
 }
@@ -905,7 +906,24 @@ fn duplicate_grant_entry_panics() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "dup-grant".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Ports, WasmGrant::Ports], // duplicate
+        grants: vec![ComponentGrant::Ports, ComponentGrant::Ports], // duplicate
+        subscriptions: vec![sub_raw(&chan_addr, "in")],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// The placement-legality table at the top-level end: `takeover` is a page
+/// capability and a backend consumer has no page. Refused here rather than at
+/// the linker mapping, which knows only that the word names no WIT interface.
+#[test]
+#[should_panic(expected = "a top-level consumer has no page")]
+fn a_page_only_grant_on_a_consumer_panics() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:page-grant-test");
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "page-grant".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        grants: vec![ComponentGrant::Takeover],
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
     }];
@@ -989,7 +1007,7 @@ fn store_grant_without_store_path_panics() {
     let raw = vec![WasmConsumerConfigRaw {
         slug: "store-grant-no-path".to_string(),
         component_path: "/tmp/a.wasm".into(),
-        grants: vec![WasmGrant::Store],
+        grants: vec![ComponentGrant::Store],
         store_path: None, // absent — panic
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
@@ -1017,7 +1035,7 @@ fn budget_consumer(chan: &str) -> WasmConsumerConfigRaw {
     use brenn_lib::access::raw::ChannelMatcherRaw;
     let addr = format!("brenn:{chan}");
     WasmConsumerConfigRaw {
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw(&addr, "in")],
         outputs: vec![out_raw("out", &addr)],
         publish_acl: vec![ChannelMatcherRaw::Exact(chan.to_string())],
@@ -1076,7 +1094,7 @@ fn wasm_mqtt_sink_defaults_from_publish_acl() {
     use brenn_lib::access::raw::MqttClientMatcherRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-default-sink");
     let mut raw = budget_consumer("mqtt-default-sink");
-    raw.grants = vec![WasmGrant::Ports, WasmGrant::Mqtt];
+    raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
     raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
         client: "home".to_string(),
     }];
@@ -1103,7 +1121,7 @@ fn wasm_mqtt_output_override_honored() {
     use brenn_lib::messaging::config::WasmConsumerMqttOutputRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-override");
     let mut raw = budget_consumer("mqtt-override");
-    raw.grants = vec![WasmGrant::Ports, WasmGrant::Mqtt];
+    raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
     raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
         client: "home".to_string(),
     }];
@@ -1183,7 +1201,7 @@ fn wasm_explicit_amplification_on_pull_only_input_panics() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
     let dir = make_two_brenn_dirs("brenn:push-in", "brenn:pull-in");
     let raw = WasmConsumerConfigRaw {
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![
             WasmConsumerSubscriptionRaw {
                 push_depth: Some(Depth::Bounded(1)),
@@ -1212,7 +1230,7 @@ fn wasm_dead_sink_pull_only_amplification_does_not_rescue() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
     let dir = make_two_brenn_dirs("brenn:push-in2", "brenn:pull-in2");
     let raw = WasmConsumerConfigRaw {
-        grants: vec![WasmGrant::Ports],
+        grants: vec![ComponentGrant::Ports],
         subscriptions: vec![
             WasmConsumerSubscriptionRaw {
                 push_depth: Some(Depth::Bounded(1)),
@@ -1242,7 +1260,7 @@ fn wasm_mqtt_output_unlisted_client_panics() {
     use brenn_lib::messaging::config::WasmConsumerMqttOutputRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-unlisted");
     let mut raw = budget_consumer("mqtt-unlisted");
-    raw.grants = vec![WasmGrant::Ports, WasmGrant::Mqtt];
+    raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
     raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
         client: "home".to_string(),
     }];
@@ -1267,7 +1285,7 @@ fn wasm_mqtt_output_duplicate_client_panics() {
     use brenn_lib::messaging::config::WasmConsumerMqttOutputRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-dup");
     let mut raw = budget_consumer("mqtt-dup");
-    raw.grants = vec![WasmGrant::Ports, WasmGrant::Mqtt];
+    raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
     raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
         client: "home".to_string(),
     }];
@@ -1315,7 +1333,7 @@ fn free_input_port_with_no_connection_panics() {
 fn free_output_port_with_no_connection_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:free-out");
     let mut raw = minimal_wasm_consumer_raw("orphan-out", "/tmp/a.wasm", &chan_addr);
-    raw.grants = vec![WasmGrant::Ports];
+    raw.grants = vec![ComponentGrant::Ports];
     raw.outputs.push(WasmConsumerOutputRaw {
         channel: None,
         ..out_raw("loose", &chan_addr)

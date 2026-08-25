@@ -1041,7 +1041,8 @@ pub enum ProcessorUrgency {
 }
 
 use brenn_budget::{
-    ActivationGate, GateRefusal, PublishCheck, check_deliver_after, seed_sink_budget,
+    ActivationGate, GateRefusal, PublishCheck, RefusalKind, check_deliver_after,
+    defer_refusal_kind, publish_refusal_kind, seed_sink_budget,
 };
 /// The publish-budget vocabulary, re-exported: this crate's public API hands
 /// out `SinkBudget`s and charges `MILLITOKENS_PER_PUBLISH` per publish, so the
@@ -1224,40 +1225,29 @@ impl ProcessorData {
 
 /// A gate verdict as the guest sees it on the publish path.
 ///
-/// An oversize payload and an impossible release time are facts about the
-/// argument — `invalid-payload`, with the detail the guest needs to fix it;
-/// everything else is a budget — `quota-exceeded`.
+/// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
+/// surface kernel.
 fn publish_error(refusal: GateRefusal) -> PublishError {
-    match refusal {
-        GateRefusal::BodyTooLarge { len, max } => {
-            PublishError::InvalidPayload(format!("payload {len} bytes exceeds max {max}"))
+    match publish_refusal_kind(refusal) {
+        RefusalKind::InvalidPayload(detail) => PublishError::InvalidPayload(detail),
+        RefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
+        RefusalKind::InvalidDeliverAfter => {
+            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
         }
-        GateRefusal::UnrepresentableDeliverAfter { ms } => PublishError::InvalidPayload(format!(
-            "deliver_after {ms} ms is not a representable timestamp"
-        )),
-        GateRefusal::CallCap { .. }
-        | GateRefusal::SinkExhausted
-        | GateRefusal::EntryCap { .. }
-        | GateRefusal::ByteCap { .. }
-        | GateRefusal::OpCap { .. } => PublishError::QuotaExceeded,
     }
 }
 
 /// A gate verdict as the guest sees it on the control-op path.
 ///
-/// An impossible release time has its own variant here — the op is otherwise
-/// well-formed, and collapsing it into a quota refusal would tell the guest to
-/// retry later. An oversize edit payload *is* a quota refusal: the payload is
-/// charged against the activation's byte aggregate like any other.
+/// The classification is [`brenn_budget::defer_refusal_kind`], shared with the
+/// surface kernel.
 fn defer_error(refusal: GateRefusal) -> DeferError {
-    match refusal {
-        GateRefusal::UnrepresentableDeliverAfter { .. } => DeferError::InvalidDeliverAfter,
-        GateRefusal::CallCap { .. }
-        | GateRefusal::BodyTooLarge { .. }
-        | GateRefusal::SinkExhausted
-        | GateRefusal::EntryCap { .. }
-        | GateRefusal::ByteCap { .. }
-        | GateRefusal::OpCap { .. } => DeferError::QuotaExceeded,
+    match defer_refusal_kind(refusal) {
+        RefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
+        RefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
+        RefusalKind::InvalidPayload(detail) => {
+            unreachable!("defer_refusal_kind never answers invalid-payload: {detail}")
+        }
     }
 }
 

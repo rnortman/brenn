@@ -491,6 +491,7 @@ fn a_granted_alert_composes_the_frame_with_both_fields_capped() {
     let outcome = on_command(
         &mut page,
         Command::Alert {
+            attribution: None,
             severity: AlertSeverity::Critical,
             title: "t".repeat(MAX_ALERT_TITLE_BYTES * 2),
             body: "b".repeat(MAX_ALERT_BODY_BYTES * 2),
@@ -501,6 +502,7 @@ fn a_granted_alert_composes_the_frame_with_both_fields_capped() {
             severity,
             title,
             body,
+            ..
         } => {
             assert_eq!(*severity, AlertSeverity::Critical);
             assert!(title.len() <= MAX_ALERT_TITLE_BYTES);
@@ -514,6 +516,7 @@ fn a_granted_alert_composes_the_frame_with_both_fields_capped() {
 fn an_ungranted_alert_and_one_with_no_attachment_are_both_dropped() {
     let mut ungranted = page();
     let alert = || Command::Alert {
+        attribution: None,
         severity: AlertSeverity::Warning,
         title: "look".to_string(),
         body: "here".to_string(),

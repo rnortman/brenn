@@ -8,6 +8,7 @@ use super::test_fixtures::{
 };
 use super::*;
 use brenn_lib::config::AppConfig;
+use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
     AttachSendBudget, DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC,
@@ -86,18 +87,18 @@ fn surface_with_policy(policy: brenn_lib::access::AppPolicy) -> ResolvedSurface 
 #[test]
 fn validate_static_subscriptions_surface_covered_passes() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
-    use brenn_lib::messaging::config::SurfaceGrant;
+    use brenn_lib::messaging::AttachGrant;
     use indexmap::IndexMap as IM;
 
     let directory = surface_boot_directory();
     let apps: IM<String, AppConfig> = IM::new();
-    let policy = brenn_lib::access::resolve::build_surface_policy(
-        "deskbar",
-        [SurfaceGrant::Subscribe],
-        &[ChannelMatcherRaw::Exact("surface-boot".to_string())],
-        &[],
-        &[],
-        &[],
+    let policy = brenn_lib::access::resolve::build_attach_policy(
+        brenn_lib::access::resolve::AttachOwner::Surface("deskbar"),
+        [AttachGrant::Subscribe],
+        brenn_lib::access::raw::AttachAclsRaw {
+            subscribe: &[ChannelMatcherRaw::Exact("surface-boot".to_string())],
+            ..Default::default()
+        },
     );
     // No panic: the surface policy authorizes delivery on brenn:surface-boot.
     validate_static_subscriptions_deliverable(
@@ -116,19 +117,16 @@ fn validate_static_subscriptions_surface_covered_passes() {
 #[test]
 #[should_panic(expected = "can never deliver on")]
 fn validate_static_subscriptions_surface_uncovered_panics() {
-    use brenn_lib::messaging::config::SurfaceGrant;
+    use brenn_lib::messaging::AttachGrant;
     use indexmap::IndexMap as IM;
 
     let directory = surface_boot_directory();
     let apps: IM<String, AppConfig> = IM::new();
     // Subscribe grant but no ACL matcher ⇒ allows_channel_access is false.
-    let policy = brenn_lib::access::resolve::build_surface_policy(
-        "deskbar",
-        [SurfaceGrant::Subscribe],
-        &[],
-        &[],
-        &[],
-        &[],
+    let policy = brenn_lib::access::resolve::build_attach_policy(
+        brenn_lib::access::resolve::AttachOwner::Surface("deskbar"),
+        [AttachGrant::Subscribe],
+        brenn_lib::access::raw::AttachAclsRaw::default(),
     );
     validate_static_subscriptions_deliverable(
         &directory,
@@ -284,11 +282,10 @@ fn ephem_with(
 /// `chrome` singleton, and grants + ACLs that cover both bindings.
 fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
     use brenn_lib::access::raw::ChannelMatcherRaw;
-    use brenn_lib::messaging::config::{
-        SurfaceComponentRaw, SurfaceConfigRaw, SurfaceGrant, SurfaceOutputRaw,
-    };
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::{SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutputRaw};
     SurfaceConfigRaw {
-        grants: vec![SurfaceGrant::EphemeralSubscribe, SurfaceGrant::Publish],
+        grants: vec![AttachGrant::EphemeralSubscribe, AttachGrant::Publish],
         publish_acl: vec![ChannelMatcherRaw::Exact("alerts".to_string())],
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("protobar-demo".to_string())],
         components: vec![
@@ -301,6 +298,7 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
                 parked_batch_depth: None,
                 config: None,
                 chrome: false,
+                grants: vec![ComponentGrant::Ports],
             },
             SurfaceComponentRaw {
                 kind: "sidecar".to_string(),
@@ -311,6 +309,7 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
                 parked_batch_depth: None,
                 config: None,
                 chrome: false,
+                grants: vec![ComponentGrant::Ports],
             },
             SurfaceComponentRaw {
                 kind: "chrome".to_string(),
@@ -321,6 +320,7 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
                 parked_batch_depth: None,
                 config: None,
                 chrome: true,
+                grants: vec![ComponentGrant::Ports],
             },
         ],
         subscriptions: vec![surface_sub_raw(
@@ -361,11 +361,10 @@ fn surface_dir_with(ephemeral: brenn_lib::messaging::ChannelEntry) -> MessagingD
 /// panic (the per-subscribe replay must be bounded).
 fn durable_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
     use brenn_lib::access::raw::ChannelMatcherRaw;
-    use brenn_lib::messaging::config::{
-        Depth, SurfaceConfigRaw, SurfaceGrant, SurfaceSubscriptionRaw,
-    };
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::{Depth, SurfaceConfigRaw, SurfaceSubscriptionRaw};
     SurfaceConfigRaw {
-        grants: vec![SurfaceGrant::Subscribe],
+        grants: vec![AttachGrant::Subscribe],
         subscribe_acl: vec![ChannelMatcherRaw::Exact("alerts".to_string())],
         subscriptions: vec![SurfaceSubscriptionRaw {
             push_depth: Some(Depth::Bounded(8)),
@@ -389,6 +388,7 @@ fn component_raw(instance: &str) -> brenn_lib::messaging::config::SurfaceCompone
         parked_batch_depth: None,
         config: None,
         chrome: false,
+        grants: vec![ComponentGrant::Ports],
     }
 }
 
@@ -493,6 +493,7 @@ fn surface_resolves_happy_path() {
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: false,
+                grants: [ComponentGrant::Ports].into(),
             },
             ResolvedComponent {
                 instance: "sidecar".to_string(),
@@ -502,6 +503,7 @@ fn surface_resolves_happy_path() {
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: false,
+                grants: [ComponentGrant::Ports].into(),
             },
             ResolvedComponent {
                 instance: "chrome".to_string(),
@@ -511,6 +513,7 @@ fn surface_resolves_happy_path() {
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: true,
+                grants: [ComponentGrant::Ports].into(),
             },
         ]
     );
@@ -701,7 +704,7 @@ fn surface_durable_retain_depth_unbounded_panics() {
 /// Explicit per-subscription durable knobs override the channel defaults.
 #[test]
 fn surface_durable_subscription_explicit_knobs_carry() {
-    use brenn_lib::messaging::config::SurfaceGrant;
+    use brenn_lib::messaging::AttachGrant;
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
     let (dir, _addr) = make_brenn_dir("brenn:alerts");
     let mut raw = durable_surface_raw();
@@ -709,7 +712,7 @@ fn surface_durable_subscription_explicit_knobs_carry() {
     raw.subscriptions[0].retain_depth = Some(Depth::Bounded(2));
     raw.subscriptions[0].noise = Some(NoiseLevel::Alarm);
     // `alarm` alerts on overflow, so the surface must hold the alert grant.
-    raw.grants.push(SurfaceGrant::Alert);
+    raw.grants.push(AttachGrant::Alert);
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let ds = &resolved[0].wire_subscriptions[0].subscription;
     assert_eq!(ds.push_depth, Depth::Bounded(4));
@@ -881,7 +884,7 @@ fn surface_noise_on_ephemeral_binding_resolves_not_panics() {
 /// rung is real. The `ephem_with` fixture's rung is `Alarm`.
 #[test]
 fn surface_ephemeral_binding_inherits_the_channel_noise() {
-    use brenn_lib::messaging::config::SurfaceGrant;
+    use brenn_lib::messaging::AttachGrant;
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
     let dir = surface_dir_with(ephem_with(
         "protobar-demo",
@@ -892,7 +895,7 @@ fn surface_ephemeral_binding_inherits_the_channel_noise() {
     // The inherited `alarm` alerts on overflow, so the surface must hold the
     // alert grant.
     let mut raw = valid_surface_raw();
-    raw.grants.push(SurfaceGrant::Alert);
+    raw.grants.push(AttachGrant::Alert);
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].noise, NoiseLevel::Alarm);
 }
@@ -941,12 +944,13 @@ fn surface_local_binding_retain_depth_defaults_to_the_rings_floor() {
 /// being rejected — the relaxation that lands with the surface noise ladder.
 #[test]
 fn surface_local_binding_explicit_noise_resolves() {
-    use brenn_lib::messaging::config::{NoiseLevel, SurfaceGrant};
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::NoiseLevel;
     let mut raw = local_surface_raw();
     raw.subscriptions[0].noise = Some(NoiseLevel::Alarm);
     // `alarm` alerts on overflow, so the surface must hold the alert grant — even
     // on a `local:` binding, whose kernel-side overflow still rides the plane.
-    raw.grants.push(SurfaceGrant::Alert);
+    raw.grants.push(AttachGrant::Alert);
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].noise, NoiseLevel::Alarm);
 }
@@ -1216,10 +1220,11 @@ fn surface_shared_subscription_max_fold_is_order_independent() {
 #[test]
 #[should_panic(expected = "conflicting noise")]
 fn surface_shared_subscription_conflicting_noise_panics() {
-    use brenn_lib::messaging::config::{Depth, NoiseLevel, SurfaceGrant};
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::{Depth, NoiseLevel};
     let dir = make_bounded_brenn_dir("brenn:alerts");
     let mut raw = durable_surface_raw();
-    raw.grants.push(SurfaceGrant::Alert);
+    raw.grants.push(AttachGrant::Alert);
     raw.subscriptions[0].push_depth = Some(Depth::Bounded(6));
     raw.subscriptions[0].noise = Some(NoiseLevel::Alarm);
     let mut alt = surface_sub_raw("brenn:alerts", "protobar", "alt");
@@ -1235,10 +1240,11 @@ fn surface_shared_subscription_conflicting_noise_panics() {
 /// subscription would pass the panic test just as well.
 #[test]
 fn surface_shared_subscription_agreeing_noise_carries() {
-    use brenn_lib::messaging::config::{Depth, NoiseLevel, SurfaceGrant};
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::{Depth, NoiseLevel};
     let dir = make_bounded_brenn_dir("brenn:alerts");
     let mut raw = durable_surface_raw();
-    raw.grants.push(SurfaceGrant::Alert);
+    raw.grants.push(AttachGrant::Alert);
     raw.subscriptions[0].push_depth = Some(Depth::Bounded(6));
     raw.subscriptions[0].noise = Some(NoiseLevel::Alarm);
     let mut alt = surface_sub_raw("brenn:alerts", "protobar", "alt");
@@ -1512,6 +1518,7 @@ fn surface_duplicate_component_instance_panics() {
         parked_batch_depth: None,
         config: None,
         chrome: false,
+        grants: vec![ComponentGrant::Ports],
     });
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
@@ -1573,6 +1580,7 @@ fn surface_two_instances_of_one_kind_ok() {
         parked_batch_depth: None,
         config: None,
         chrome: false,
+        grants: vec![ComponentGrant::Ports],
     });
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let kinds: Vec<&str> = resolved[0]
@@ -1654,6 +1662,7 @@ fn surface_sibling_instances_carry_their_own_send_budgets() {
             parked_batch_depth: None,
             config: None,
             chrome: false,
+            grants: vec![ComponentGrant::Ports],
         });
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let budgets: Vec<(&str, u32)> = resolved[0]
@@ -1833,26 +1842,26 @@ fn surface_duplicate_subscription_port_panics() {
 #[test]
 #[should_panic(expected = "does not authorize delivery there")]
 fn surface_subscription_not_covered_panics() {
-    use brenn_lib::messaging::config::SurfaceGrant;
+    use brenn_lib::messaging::AttachGrant;
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // Drop EphemeralSubscribe → the ephemeral sub's matcher is present but the
     // grant is gone, so allows_channel_access denies it (dead config).
-    raw.grants = vec![SurfaceGrant::Publish];
+    raw.grants = vec![AttachGrant::Publish];
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "does not authorize publishing there")]
 fn surface_output_not_covered_panics() {
-    use brenn_lib::messaging::config::SurfaceGrant;
+    use brenn_lib::messaging::AttachGrant;
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // Drop Publish → the brenn output's matcher is present but the grant is
     // gone, so allows_brenn_publish denies it. Coverage is asserted by the
     // post-pass (lifted out of resolve_surfaces so the error-report grant can be
     // injected first), so drive that here.
-    raw.grants = vec![SurfaceGrant::EphemeralSubscribe];
+    raw.grants = vec![AttachGrant::EphemeralSubscribe];
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_output_bindings_covered(&resolved);
 }
@@ -1865,7 +1874,8 @@ fn surface_output_not_covered_panics() {
 #[test]
 fn surface_output_to_error_channel_covered_by_injected_grant() {
     use super::test_fixtures::brenn_entry;
-    use brenn_lib::messaging::config::{SurfaceGrant, SurfaceOutputRaw};
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::SurfaceOutputRaw;
     // Directory carries both the surface's own output channel (brenn:alerts) and
     // the error channel it binds.
     let dir = dir_of(vec![
@@ -1877,7 +1887,7 @@ fn surface_output_to_error_channel_covered_by_injected_grant() {
     // Only the surface's own publish coverage (brenn:alerts) is operator-granted;
     // the error channel has no publish_acl entry — it must be covered solely by
     // the injected substrate grant.
-    raw.grants = vec![SurfaceGrant::EphemeralSubscribe, SurfaceGrant::Publish];
+    raw.grants = vec![AttachGrant::EphemeralSubscribe, AttachGrant::Publish];
     raw.outputs.push(SurfaceOutputRaw {
         instance: "protobar".to_string(),
         port: "errors".to_string(),
@@ -1890,6 +1900,44 @@ fn surface_output_to_error_channel_covered_by_injected_grant() {
     inject_surface_error_grant(&mut resolved, "surface-errors");
     // Must not panic: the injected grant covers the error-channel output.
     assert_output_bindings_covered(&resolved);
+}
+
+/// The shared post-pass `build_messaging` and `resolve_messaging_offline` both
+/// call. Its whole content is an order: the three substrate injections, then the
+/// coverage assert. An output on the configured error channel is covered by
+/// nothing else, so it passes here only while that order holds.
+#[test]
+fn finish_surface_policies_injects_before_it_asserts_coverage() {
+    use super::test_fixtures::brenn_entry;
+    use brenn_lib::messaging::AttachGrant;
+    use brenn_lib::messaging::config::SurfaceOutputRaw;
+    let dir = dir_of(vec![
+        brenn_entry("brenn:alerts"),
+        brenn_entry("brenn:surface-errors"),
+        ephem("protobar-demo"),
+    ]);
+    let mut raw = valid_surface_raw();
+    raw.grants = vec![AttachGrant::EphemeralSubscribe, AttachGrant::Publish];
+    raw.outputs.push(SurfaceOutputRaw {
+        instance: "protobar".to_string(),
+        port: "errors".to_string(),
+        channel: Some("brenn:surface-errors".to_string()),
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    });
+    let mut resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+
+    let mut config = BrennConfig::default();
+    config.observability.surface_error_channel = Some("brenn:surface-errors".to_string());
+    // Must not panic.
+    finish_surface_policies(&mut resolved, &config);
+
+    let policy = &resolved[0].policy;
+    assert!(policy.allows_brenn_publish("surface-errors"));
+    let slug = &resolved[0].slug;
+    assert!(policy.allows_brenn_publish(&format!("surface.surface.{slug}.geometry")));
+    assert!(policy.allows_ephemeral_delivery(&format!("surface.surface.{slug}.bindings")));
 }
 
 #[test]
@@ -2185,9 +2233,8 @@ fn local_retain_depth_on_a_reserved_channel_panics() {
 /// of its own beyond what its bindings' windows require.
 #[test]
 fn reserved_local_channels_carry_their_contract_fixed_ring_depths() {
-    use brenn_lib::messaging::config::SurfaceGrant;
     let mut raw = local_surface_raw();
-    raw.grants = vec![SurfaceGrant::Takeover];
+    raw.components[0].grants.push(ComponentGrant::Takeover);
     raw.outputs = vec![];
     raw.subscriptions = vec![
         local_sub_raw("local:brenn/theme", "protobar", "p1"),
@@ -2214,23 +2261,23 @@ fn reserved_local_channels_carry_their_contract_fixed_ring_depths() {
     );
 }
 
-/// Capability-as-binding: the takeover grant gates the *wiring*, replacing v0's
-/// runtime DOM-event gate.
+/// Capability-as-binding: the takeover grant gates the *wiring*, and the grant
+/// it reads is the binding component's own. A surface-wide one would hand the
+/// same authority to every component on the page, which contains nothing.
 #[test]
-#[should_panic(expected = "requires the surface's `takeover` grant")]
+#[should_panic(expected = "requires that component's `takeover` grant")]
 fn local_takeover_binding_without_the_grant_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![local_sub_raw("local:brenn/takeover", "protobar", "t")];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
-/// ...and with the grant it resolves. Pins that the check reads the grant
-/// rather than rejecting the channel outright.
+/// ...and with the instance's grant it resolves. Pins that the check reads the
+/// grant rather than rejecting the channel outright.
 #[test]
 fn local_takeover_binding_with_the_grant_resolves() {
-    use brenn_lib::messaging::config::SurfaceGrant;
     let mut raw = local_surface_raw();
-    raw.grants = vec![SurfaceGrant::Takeover];
+    raw.components[0].grants.push(ComponentGrant::Takeover);
     raw.subscriptions = vec![local_sub_raw("local:brenn/takeover", "protobar", "t")];
     raw.outputs = vec![];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
@@ -2238,6 +2285,79 @@ fn local_takeover_binding_with_the_grant_resolves() {
         resolved[0].local_channels[0].address,
         "local:brenn/takeover"
     );
+}
+
+/// A sibling instance's grant is not this one's: the gate is per component, so
+/// granting the neighbour takeover leaves this binding unconsented.
+#[test]
+#[should_panic(expected = "instance \"protobar\" to reserved control channel")]
+fn a_siblings_takeover_grant_does_not_cover_this_instance() {
+    let mut raw = local_surface_raw();
+    let mut sibling = raw.components[0].clone();
+    sibling.kind = "sidecar".to_string();
+    sibling.instance = Some("sidecar".to_string());
+    sibling.grants = vec![ComponentGrant::Takeover];
+    sibling.chrome = false;
+    raw.components.push(sibling);
+    raw.subscriptions = vec![
+        local_sub_raw("local:brenn/takeover", "protobar", "t"),
+        local_sub_raw("local:brenn/takeover", "sidecar", "t"),
+    ];
+    raw.outputs = vec![];
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
+}
+
+/// The output direction is the one a takeover request travels: a component
+/// *publishes* the request, so the gate has to read the binding component's
+/// grant on an output as it does on a subscription.
+#[test]
+#[should_panic(expected = "requires that component's `takeover` grant")]
+fn a_takeover_output_binding_without_the_grant_panics() {
+    use brenn_lib::messaging::config::SurfaceOutputRaw;
+    let mut raw = local_surface_raw();
+    raw.subscriptions = vec![];
+    raw.outputs = vec![SurfaceOutputRaw {
+        instance: "protobar".to_string(),
+        port: "takeover".to_string(),
+        channel: Some("local:brenn/takeover".to_string()),
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }];
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
+}
+
+/// ...and with the grant it resolves — which also pins that the reverse
+/// dead-config check counts an output as a takeover-plane binding.
+#[test]
+fn a_takeover_output_binding_with_the_grant_resolves() {
+    use brenn_lib::messaging::config::SurfaceOutputRaw;
+    let mut raw = local_surface_raw();
+    raw.components[0].grants.push(ComponentGrant::Takeover);
+    raw.subscriptions = vec![];
+    raw.outputs = vec![SurfaceOutputRaw {
+        instance: "protobar".to_string(),
+        port: "takeover".to_string(),
+        channel: Some("local:brenn/takeover".to_string()),
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }];
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
+    assert_eq!(
+        resolved[0].outputs[0].channel_address,
+        "local:brenn/takeover"
+    );
+}
+
+/// The reverse direction: a component granted takeover that binds no
+/// takeover-plane channel has consented to nothing, which is dead config.
+#[test]
+#[should_panic(expected = "binds no takeover-plane channel")]
+fn a_takeover_grant_with_no_takeover_binding_panics() {
+    let mut raw = local_surface_raw();
+    raw.components[0].grants.push(ComponentGrant::Takeover);
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// The kernel owns the state-reporting planes; a component output there would
@@ -2388,8 +2508,9 @@ fn component_abi_is_case_sensitive() {
 
 // --- the processor config map ---
 
-/// Turn the fixture's first component into a `processor` carrying `config`, and
-/// resolve. Returns the resolved surfaces so a caller can read the map back.
+/// Turn the fixture's first component into one of `abi` carrying `config` and
+/// the grant that reads it, and resolve. Returns the resolved surfaces so a
+/// caller can read the map back.
 fn resolve_with_component_config(
     config: Option<std::collections::BTreeMap<String, String>>,
     abi: &str,
@@ -2397,6 +2518,9 @@ fn resolve_with_component_config(
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].abi = abi.to_string();
+    if config.as_ref().is_some_and(|m| !m.is_empty()) {
+        raw.components[0].grants.push(ComponentGrant::Config);
+    }
     raw.components[0].config = config;
     resolve_surfaces(&[raw], &dir, &test_globals())
 }
@@ -2422,14 +2546,129 @@ fn absent_component_config_resolves_empty() {
     assert!(resolved[0].components[0].config.is_empty());
 }
 
-/// Only a `processor` is handed a `config` import, so a map on any other ABI has
-/// no reader — a dead declaration, which this project treats as a config error
-/// rather than a silent no-op.
+/// A `dom` component's map resolves identically to a `processor`'s — config
+/// is ABI-agnostic.
 #[test]
-#[should_panic(expected = "would have no reader")]
-fn component_config_on_a_dom_component_panics() {
+fn dom_component_config_resolves() {
     let map = std::collections::BTreeMap::from([("k".to_string(), "v".to_string())]);
-    resolve_with_component_config(Some(map), "dom");
+    let resolved = resolve_with_component_config(Some(map.clone()), "dom");
+    assert_eq!(resolved[0].components[0].config, map);
+}
+
+/// A map no one is granted to read is configuration with no reader — the dead
+/// declaration this project refuses rather than silently ignores.
+#[test]
+#[should_panic(expected = "declares a `config` map but \"config\" is not in its grants")]
+fn component_config_without_the_grant_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].config = Some(std::collections::BTreeMap::from([(
+        "k".to_string(),
+        "v".to_string(),
+    )]));
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// The other direction: a grant whose map does not exist reads an empty map
+/// forever, which is the same dead config seen from the capability side.
+#[test]
+#[should_panic(expected = "is granted \"config\" but declares no config map")]
+fn component_config_grant_without_a_map_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].grants.push(ComponentGrant::Config);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+// --- per-instance grants ---
+
+/// The grants an operator writes on an instance arrive on its
+/// `ResolvedComponent`, deduplicated and sorted.
+#[test]
+fn instance_grants_resolve_onto_the_component() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].grants = vec![ComponentGrant::Log, ComponentGrant::Ports];
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    assert_eq!(
+        resolved[0].components[0].grants,
+        [ComponentGrant::Ports, ComponentGrant::Log].into(),
+    );
+}
+
+/// A list that states the same capability twice is a typo, not an emphasis.
+#[test]
+#[should_panic(expected = "lists grant \"ports\" twice")]
+fn a_repeated_instance_grant_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].grants = vec![ComponentGrant::Ports, ComponentGrant::Ports];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// The placement-legality table, at the boot end: a page has no KV store, so no
+/// surface-hosted component can be granted one whatever the front end let
+/// through.
+#[test]
+#[should_panic(expected = "`store` is backend-only in v1")]
+fn a_backend_only_grant_on_a_placed_instance_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].grants.push(ComponentGrant::Store);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// An output binding is a publish the component intends to make; without the
+/// ports capability it can make none, so the pair is refused as dead config —
+/// the surface twin of the `[[wasm_consumer]]` rule.
+#[test]
+#[should_panic(expected = "output binding(s) but \"ports\" is not in its grants")]
+fn an_output_binding_without_the_ports_grant_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].grants = vec![];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A component alert reaches the operator over the surface's alert plane, which
+/// the backend denies a surface that holds no alert grant. Granting the
+/// component alone names a delivery that can never happen.
+#[test]
+#[should_panic(expected = "the surface has no `alert` grant")]
+fn an_instance_alert_grant_without_the_surfaces_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].grants.push(ComponentGrant::Alert);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// ...and with the surface's transport right behind it, the two scopes agree
+/// and it resolves. Both are real: the surface's protects the backend, the
+/// component's contains one component within the page.
+#[test]
+fn an_instance_alert_grant_under_an_alert_granted_surface_resolves() {
+    use brenn_lib::messaging::AttachGrant;
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.grants.push(AttachGrant::Alert);
+    raw.components[0].grants.push(ComponentGrant::Alert);
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    assert!(
+        resolved[0].components[0]
+            .grants
+            .contains(&ComponentGrant::Alert)
+    );
+}
+
+/// Chrome renders the shell; a headless component has nowhere to render it.
+#[test]
+#[should_panic(expected = "chrome renders the shell")]
+fn a_headless_chrome_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    let chrome = raw.components.len() - 1;
+    raw.components[chrome].abi = "processor".to_string();
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// `brenn.` is the host-reserved key namespace (`processor.wit`); an operator
@@ -2652,6 +2891,62 @@ fn surface_free_output_port_with_no_connection_panics() {
     let mut raw = valid_surface_raw();
     raw.outputs[0].channel = None;
     resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A surface whose `protobar` holds one free `io` port and the grants written
+/// here. A free port names no channel: the lowering pass mints the page-local
+/// ring it reads and writes, which is why these tests resolve through
+/// [`resolve_lowered`].
+fn io_surface_raw(grants: Vec<ComponentGrant>) -> brenn_lib::messaging::config::SurfaceConfigRaw {
+    use brenn_lib::messaging::config::{Depth, SurfaceIoPortRaw};
+    let mut raw = minimal_surface_raw();
+    raw.components[0].grants = grants;
+    raw.io_ports = vec![SurfaceIoPortRaw {
+        instance: "protobar".to_string(),
+        port: "tick".to_string(),
+        channel: None,
+        push_depth: Some(Depth::Bounded(1)),
+        retain_depth: Some(Depth::Bounded(2)),
+        noise: None,
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }];
+    raw
+}
+
+/// Resolve one surface against the wiring its own free ports lower to. The
+/// module's default `resolve_surfaces` hands an empty wiring, under which a free
+/// port has no address at all.
+fn resolve_lowered(raw: brenn_lib::messaging::config::SurfaceConfigRaw) -> Vec<ResolvedSurface> {
+    let globals = test_globals();
+    let wiring =
+        super::auto::lower_auto_wiring(&[], &[], std::slice::from_ref(&raw), &[], &globals);
+    super::resolve_surfaces(&[raw], &dir_of(vec![]), &globals, &wiring)
+}
+
+/// Both halves of an `io` port are bindings, and the output half is a publish:
+/// the ring is page-local, but writing it is still a send the `ports` capability
+/// is what admits. The front end asks the same question of the same port.
+#[test]
+#[should_panic(expected = "output binding(s) but \"ports\" is not in its grants")]
+fn a_free_io_port_without_the_ports_grant_panics() {
+    resolve_lowered(io_surface_raw(vec![]));
+}
+
+/// ...and with `ports` the pair resolves: one subscription and one output on the
+/// one minted address.
+#[test]
+fn a_free_io_port_with_the_ports_grant_resolves() {
+    let resolved = resolve_lowered(io_surface_raw(vec![ComponentGrant::Ports]));
+    let s = &resolved[0];
+    assert_eq!(s.outputs.len(), 1);
+    assert_eq!(s.subscriptions.len(), 1);
+    assert_eq!(
+        s.outputs[0].channel_address,
+        s.subscriptions[0].channel_address
+    );
+    assert_eq!(s.outputs[0].instance, "protobar");
 }
 
 /// A hand-written `local:auto.<cid>` on a surface binding is rejected: the page

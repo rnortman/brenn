@@ -19,7 +19,8 @@ use brenn_attach_client::conn::ConnConfig;
 
 use crate::WebSysConnector;
 use crate::contract::{
-    PublishError, SyncStatus, defer_status_str, element_name_for_instance, publish_status_str,
+    DeferError, PublishError, SyncStatus, defer_status_str, element_name_for_instance,
+    publish_status_str,
 };
 use crate::front::{self, EventStream, SurfaceHandle};
 use crate::page::SurfacePage;
@@ -30,9 +31,8 @@ use crate::session::Event;
 use crate::dom;
 use crate::logic::{
     ConnectIndicatorState, DeferIntent, KernelAction, KernelCore, SyncIntent,
-    malformed_registration, route_component_alert, route_component_log, route_defer_intent,
-    route_processor_alert, route_processor_log, route_publish_intent, route_sync_intent,
-    sync_refused, unbuffered_defer_refused, unbuffered_publish_refused,
+    malformed_registration, route_config_get, route_defer_intent, route_publish_intent,
+    route_sync_intent, sync_refused, unbuffered_defer_refused, unbuffered_publish_refused,
 };
 use crate::sync_door::{SyncAnswer, SyncDoor};
 
@@ -114,7 +114,7 @@ pub fn start() -> KernelHandle {
 
     // The DOM-free decision core is shared: `run_event_loop` folds control-plane
     // events through it, and the delegated alert listener reads its
-    // `alert_granted()` flag to gate a `brenn-alert` forward. Both touches are
+    // per-instance grants to gate a `brenn-alert` forward. Both touches are
     // short synchronous borrows on the single-threaded page, never overlapping
     // (the event loop's borrow is released before any DOM effect that could
     // re-enter via a component event).
@@ -180,6 +180,7 @@ fn install_listeners(
     // component is told so on the same detail.
     {
         let handle = Rc::clone(handle);
+        let core = Rc::clone(core);
         dom::install_publish_listener(move |instance, target_tag, port, body, urgency, detail| {
             let action = route_publish_intent(instance, target_tag, port, body, urgency);
             let KernelAction::Publish {
@@ -197,6 +198,10 @@ fn install_listeners(
                 dom::set_publish_status(detail, Err(PublishError::NotPermitted));
                 return;
             };
+            if !ports_granted(&core, &handle, instance, crate::contract::PORT_PUBLISH) {
+                dom::set_publish_status(detail, Err(PublishError::NotPermitted));
+                return;
+            }
             match handle.try_buffered_publish(instance, port, body, *urgency) {
                 Some(status) => {
                     dom::count_publish(instance);
@@ -219,6 +224,7 @@ fn install_listeners(
     // that failed to stage it.
     {
         let handle = Rc::clone(handle);
+        let core = Rc::clone(core);
         dom::install_defer_listener(move |instance, target_tag, detail, js_detail| {
             let intent = match route_defer_intent(instance, target_tag, detail) {
                 Ok(intent) => intent,
@@ -227,6 +233,29 @@ fn install_listeners(
                     return;
                 }
             };
+            if !ports_granted(
+                &core,
+                &handle,
+                intent.instance(),
+                crate::contract::PORT_DEFER,
+            ) {
+                // Answered in the vocabulary this op's reader parses: a
+                // deferred publish reads its status as a publish, a cancel or an
+                // edit as a defer. The two spell this refusal the same way today,
+                // and neither promises the other it always will.
+                dom::set_defer_status(
+                    js_detail,
+                    match &intent {
+                        DeferIntent::Publish { .. } => {
+                            publish_status_str(Err(PublishError::NotPermitted))
+                        }
+                        DeferIntent::Cancel { .. } | DeferIntent::Edit { .. } => {
+                            defer_status_str(Err(DeferError::NotPermitted))
+                        }
+                    },
+                );
+                return;
+            }
             let answer = match &intent {
                 DeferIntent::Publish {
                     instance,
@@ -338,42 +367,74 @@ fn install_listeners(
 
     // Route component log intents. The delegated `#surface-root` listener hands
     // each `brenn-log` event's (retargeted host) tag and its untrusted
-    // `{ level, message }` detail to the DOM-free `route_component_log`, which
-    // resolves the mounted component, stamps `source = "component:<kind>"`, and
-    // emits a `Log` frame; a misrouted or malformed log becomes a `Report`,
-    // never a mis-attributed server log line.
+    // `{ level, message }` detail to the DOM-free `route_log` — the same router
+    // the headless seam calls — which resolves the mounted component, gates the
+    // forward on that component's own `log` grant, stamps
+    // `source = "component:<kind>"`, and emits a `Log` frame; an ungranted
+    // instance yields a suppression breadcrumb, and a misrouted or malformed log
+    // a drop-report, never a mis-attributed server log line.
     {
         let handle = Rc::clone(handle);
+        let core = Rc::clone(core);
         dom::install_log_listener(move |instance, target_tag, level, message| {
-            let action = route_component_log(instance, target_tag, level, message);
+            let action = core
+                .borrow()
+                .route_log(instance, Some(target_tag), level, message);
             dom::apply_actions(std::slice::from_ref(&action), &handle);
         });
     }
 
     // Route component alert intents. The delegated `#surface-root` listener hands
     // each `brenn-alert` event's (retargeted host) tag and its untrusted
-    // `{ severity, title, body }` detail to the DOM-free `route_component_alert`,
-    // which — only on an alert-granted surface (`KernelCore::alert_granted`) —
-    // emits an `Alert` frame; an ungranted surface yields a `log(warn)`
-    // suppression breadcrumb, and a misrouted or malformed alert a drop-report. A
-    // conforming kernel never sends an ungranted `Alert` (the server kills on one).
+    // `{ severity, title, body }` detail to the DOM-free `route_alert`, which —
+    // only for an instance its own grants admit — emits an `Alert` frame; an
+    // ungranted instance yields a `log(warn)` suppression breadcrumb, and a
+    // misrouted or malformed alert a drop-report. A conforming kernel never sends
+    // an alert the server would kill over.
     {
         let handle = Rc::clone(handle);
         let core = Rc::clone(core);
         dom::install_alert_listener(move |instance, target_tag, severity, title, body| {
-            let action = route_component_alert(
-                instance,
-                target_tag,
-                severity,
-                title,
-                body,
-                core.borrow().alert_granted(),
-            );
+            let action =
+                core.borrow()
+                    .route_alert(instance, Some(target_tag), severity, title, body);
             dom::apply_actions(std::slice::from_ref(&action), &handle);
         });
     }
 
-    // Route component-module panics. A component's panic hook dispatches
+    // Serve component config reads. The delegated `#surface-root` listener hands
+    // each `brenn-config-get` event's (retargeted host) tag and its untrusted
+    // `{ key }` detail to the core, which answers from that instance's own config
+    // map — synchronously, on the same detail, because the dispatch is the
+    // component's whole call. An instance not granted `config`, an unknown key,
+    // and a page with no wiring yet all take the absence answer; only the first
+    // additionally leaves a breadcrumb. A misrouted read is answered too: the SDK
+    // reads a missing answer as a page whose kernel listener is absent.
+    {
+        let handle = Rc::clone(handle);
+        let core = Rc::clone(core);
+        dom::install_config_get_listener(move |instance, target_tag, key, detail| {
+            let answer = match route_config_get(instance, target_tag, key) {
+                Ok((instance, key)) => core.borrow().component_config_get(instance, key),
+                Err(drop) => Err(drop),
+            };
+            match answer {
+                Ok(value) => dom::set_config_answer(detail, value.as_deref()),
+                Err(report) => {
+                    dom::apply_actions(std::slice::from_ref(&report), &handle);
+                    dom::set_config_answer(detail, None);
+                }
+            }
+        });
+    }
+
+    // Route component-module panics. A `dom` component's death arrives as an
+    // event because a wasm-bindgen module can dispatch one from its panic hook; a
+    // headless component's arrives as a jco trap the loader catches. Different
+    // failure transport, same outcome class — ABI-forced, which is why this
+    // listener has no headless twin.
+    //
+    // A component's panic hook dispatches
     // `brenn-component-panic { component, message }` on `window`; the DOM-free
     // core turns the (untrusted) detail into an error-card + report for the named
     // mounted component, or a drop-and-report for an unattributable one. On an
@@ -418,6 +479,37 @@ fn with_processor_host<R>(what: &str, f: impl FnOnce(&ProcessorHost) -> R) -> R 
     })
 }
 
+/// Ask [`KernelCore::component_ports_gate`] whether `instance` may reach the
+/// publish/defer family, reporting the refusal if it may not.
+///
+/// All six entries of the family — the two DOM listeners and the four headless
+/// exports — must come through here so the verdict and its breadcrumb cannot
+/// drift. The decision itself lives on the core; this is the seam half: apply
+/// the report, answer `false`, and let the caller write the refusal back in the
+/// shape its own ABI answers in.
+///
+/// The gate sits at the entry seams rather than at the buffered-publish seam
+/// underneath them because [`SurfaceHandle`] is the cross-thread front half and
+/// holds no grants: the authority is [`KernelCore`], which only these seams
+/// hold. A seventh entry into this family belongs here too.
+fn ports_granted(
+    core: &Rc<RefCell<KernelCore>>,
+    handle: &SurfaceHandle,
+    instance: &str,
+    what: &str,
+) -> bool {
+    // The borrow is a temporary of this `let`: it must die before `apply_actions`
+    // can synchronously re-enter a listener that borrows the core again.
+    let verdict = core.borrow().component_ports_gate(instance, what);
+    match verdict {
+        Ok(()) => true,
+        Err(refusal) => {
+            dom::apply_actions(std::slice::from_ref(&refusal), handle);
+            false
+        }
+    }
+}
+
 /// A processor instance's `ports.publish` / `ports.publish-with-urgency` import.
 ///
 /// `instance` comes from the loader's own closure over the manifest entry it
@@ -449,6 +541,14 @@ pub fn brenn_processor_publish(
         None => None,
     };
     with_processor_host("processor publish", |host| {
+        if !ports_granted(
+            &host.core,
+            &host.handle,
+            instance,
+            crate::contract::PORT_PUBLISH,
+        ) {
+            return "not-permitted".to_string();
+        }
         match host
             .handle
             .try_buffered_publish(instance, port, body, urgency)
@@ -484,6 +584,14 @@ pub fn brenn_processor_publish_deferred(
     deliver_after: u64,
 ) -> String {
     with_processor_host("processor deferred publish", |host| {
+        if !ports_granted(
+            &host.core,
+            &host.handle,
+            instance,
+            crate::contract::PORT_DEFER,
+        ) {
+            return "not-permitted".to_string();
+        }
         match host
             .handle
             .try_buffered_publish_deferred(instance, port, body, deliver_after)
@@ -510,6 +618,14 @@ pub fn brenn_processor_publish_deferred(
 #[wasm_bindgen]
 pub fn brenn_processor_defer_cancel(instance: &str, port: &str, index: u32) -> String {
     with_processor_host("processor defer cancel", |host| {
+        if !ports_granted(
+            &host.core,
+            &host.handle,
+            instance,
+            crate::contract::PORT_DEFER,
+        ) {
+            return "not-permitted".to_string();
+        }
         match host.handle.try_buffered_defer_cancel(instance, port, index) {
             Some(Ok(())) => String::new(),
             Some(Err(err)) => crate::logic::defer_error_str(err),
@@ -533,6 +649,14 @@ pub fn brenn_processor_defer_edit(
     deliver_after: Option<u64>,
 ) -> String {
     with_processor_host("processor defer edit", |host| {
+        if !ports_granted(
+            &host.core,
+            &host.handle,
+            instance,
+            crate::contract::PORT_DEFER,
+        ) {
+            return "not-permitted".to_string();
+        }
         match host
             .handle
             .try_buffered_defer_edit(instance, port, index, body, deliver_after)
@@ -548,21 +672,29 @@ pub fn brenn_processor_defer_edit(
 /// the instance, on the same plane a `dom` component's `brenn-log` reaches.
 #[wasm_bindgen]
 pub fn brenn_processor_log(instance: &str, level: &str, message: &str) {
-    let action = route_processor_log(instance, level, message);
     with_processor_host("processor log", |host| {
+        let action = host
+            .core
+            .borrow()
+            .route_log(Some(instance), None, Some(level), Some(message));
         dom::apply_actions(std::slice::from_ref(&action), &host.handle);
     });
 }
 
-/// A processor instance's `alert.*` import. Gated on the surface's alert grant
-/// exactly as the DOM path is: boot proved the grant for a kind that imports
-/// `alert`, and this is the runtime half of that same gate — a conforming kernel
-/// never emits an ungranted `Alert`.
+/// A processor instance's `alert.*` import. Gated on that instance's own `alert`
+/// grant exactly as the DOM path is: boot proved the grant for an instance whose
+/// kind imports `alert`, and this is the runtime half of that same gate — a
+/// conforming kernel never emits an ungranted `Alert`.
 #[wasm_bindgen]
 pub fn brenn_processor_alert(instance: &str, severity: &str, title: &str, body: &str) {
     with_processor_host("processor alert", |host| {
-        let granted = host.core.borrow().alert_granted();
-        let action = route_processor_alert(instance, severity, title, body, granted);
+        let action = host.core.borrow().route_alert(
+            Some(instance),
+            None,
+            Some(severity),
+            Some(title),
+            Some(body),
+        );
         dom::apply_actions(std::slice::from_ref(&action), &host.handle);
     });
 }
@@ -570,10 +702,25 @@ pub fn brenn_processor_alert(instance: &str, severity: &str, title: &str, body: 
 /// A processor instance's `config.get` import. Answers from the map the
 /// instance's own component entry carries; a miss is `None`, which is the
 /// import's own `option<string>`.
+///
+/// Gated on that instance's own `config` grant, exactly as the DOM seam's
+/// [`contract::CONFIG_GET`](crate::contract::CONFIG_GET) is: an ungranted read
+/// gets the absence answer the import already spells, plus a breadcrumb. The
+/// export keeps its `processor` name because it is the loader's seam, not a
+/// policy surface.
 #[wasm_bindgen]
 pub fn brenn_processor_config_get(instance: &str, key: &str) -> Option<String> {
     with_processor_host("processor config get", |host| {
-        host.core.borrow().processor_config_get(instance, key)
+        // Bound before the match, deliberately: the borrow of a match scrutinee
+        // lives to the end of the match, and the refusal arm runs a DOM effect.
+        let answer = host.core.borrow().component_config_get(instance, key);
+        match answer {
+            Ok(value) => value,
+            Err(refusal) => {
+                dom::apply_actions(std::slice::from_ref(&refusal), &host.handle);
+                None
+            }
+        }
     })
 }
 
@@ -1087,6 +1234,37 @@ mod tests {
     fn inert(instance: &str) -> brenn_surface_schema::ComponentEntry {
         define_test_element(&element_name_for_instance(instance, instance), |_| {});
         component(instance)
+    }
+
+    /// Declare `instance` with the capability words and config map a test is
+    /// about, and define an element for it so it mounts. The counterpart of
+    /// [`inert`] for the suites whose subject is what an instance may do.
+    fn configured(
+        instance: &str,
+        grants: &[&str],
+        config: &[(&str, &str)],
+    ) -> brenn_surface_schema::ComponentEntry {
+        define_test_element(&element_name_for_instance(instance, instance), |_| {});
+        let mut entry = fixtures::component_with_grants(instance, instance, grants);
+        entry.config = config
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        entry
+    }
+
+    /// `instance`'s own mounted element, once the action walk has placed it.
+    fn mounted_element(instance: &str) -> Option<Element> {
+        doc()
+            .query_selector(&element_name_for_instance(instance, instance))
+            .expect("query_selector")
+    }
+
+    /// A boolean field of an answered event detail, the twin of [`str_field`].
+    fn bool_field(detail: &JsValue, key: &str) -> Option<bool> {
+        Reflect::get(detail, &JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_bool())
     }
 
     /// Declare and define `instance` as this document's chrome singleton.
@@ -1800,6 +1978,152 @@ mod tests {
         assert_eq!(entry.channel, OUT);
     }
 
+    /// The publish gate's other half: an instance its document granted nothing is
+    /// refused inside its own activation, where the granted one
+    /// ([`the_publish_route_buffers_the_running_entrys_publish_and_refuses_every_other`])
+    /// is buffered.
+    ///
+    /// Same seam, same entry, one word of the document different — which is what
+    /// makes this the pin for the gate itself rather than for the routing around
+    /// it. The breadcrumb is asserted too: an operator's only evidence that a
+    /// component asked for something it does not hold is that warn line, and a
+    /// refusal that answered `not-permitted` silently would read to the component
+    /// author exactly like an unbound port.
+    #[wasm_bindgen_test]
+    async fn an_ungranted_instances_publish_is_refused_inside_its_own_activation() {
+        const INST: &str = "wbt-ports-gate";
+        const CHROME: &str = "wbt-ports-gate-chrome";
+        const OUT: &str = "ephemeral:demo.ports-gate";
+        fresh_root();
+
+        let hosts: Rc<RefCell<Vec<HtmlElement>>> = Rc::new(RefCell::new(Vec::new()));
+        define_publishing_element(INST, INST, Rc::clone(&hosts));
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(
+            vec![
+                fixtures::component_with_grants(INST, INST, &[]),
+                chrome(CHROME),
+            ],
+            vec![],
+            vec![fixtures::output(INST, "out", OUT)],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+        wait_until("the component mounts", || !hosts.borrow().is_empty()).await;
+        let host = hosts.borrow()[0].clone();
+
+        let detail = admitted_request(&host, "own").await;
+        assert_eq!(str_field(&detail, SYNC_STATUS_FIELD).as_deref(), Some("ok"));
+        assert_eq!(
+            str_field(&detail, ENTRY_REPLY_FIELD).as_deref(),
+            Some("not-permitted"),
+            "the buffer is reachable, and the grant is what this instance lacks"
+        );
+
+        // The breadcrumb, from a second run of the same entry: the capture is
+        // synchronous, and the dispatch that carries the publish is too.
+        let warnings = capture_console_warn(|| {
+            let _ = dispatch_detail(
+                host.as_ref(),
+                ACTIVATION_SYNC,
+                &[("port", "own"), ("body", "{}")],
+            );
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("ports capability")),
+            "the refusal names the capability: {warnings:?}"
+        );
+
+        // Nothing an ungranted instance dispatched is on the wire.
+        assert!(
+            !sent_has(&ctrl, |f| matches!(f, ClientFrame::PublishBatch { .. })),
+            "a refused publish joins no buffer, so no flush carries it"
+        );
+    }
+
+    /// The `dom` config read end to end: the listener resolves the instance, the
+    /// core answers from that instance's own map, and the answer is on the
+    /// dispatching detail before the dispatch returns.
+    ///
+    /// The whole write-back protocol is only observable here — the SDK's
+    /// `config_get` faults on a missing answer, so a listener that never ran, a
+    /// non-bubbling event, or a field constant renamed on one side would surface
+    /// as a component killing itself at mount in a real browser. All three
+    /// absence cases are pinned as `answered` with no value, because that is what
+    /// distinguishes them from an unwired page.
+    #[wasm_bindgen_test]
+    async fn a_dom_config_read_is_answered_on_its_own_detail() {
+        use crate::contract::{CONFIG_ANSWERED_FIELD, CONFIG_GET, CONFIG_VALUE_FIELD};
+
+        const INST: &str = "wbt-config-get";
+        const UNGRANTED: &str = "wbt-config-get-ungranted";
+        const CHROME: &str = "wbt-config-get-chrome";
+        fresh_root();
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(
+            vec![
+                configured(INST, &["config"], &[("mode", "dark")]),
+                configured(UNGRANTED, &[], &[("mode", "dark")]),
+                chrome(CHROME),
+            ],
+            vec![],
+            vec![],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+        wait_until("both components mount", || {
+            mounted_element(INST).is_some() && mounted_element(UNGRANTED).is_some()
+        })
+        .await;
+
+        let host = mounted_element(INST).expect("the granted instance mounted");
+        let detail = dispatch_detail(host.as_ref(), CONFIG_GET, &[("key", "mode")]);
+        assert_eq!(
+            bool_field(&detail, CONFIG_ANSWERED_FIELD),
+            Some(true),
+            "every read the kernel heard is answered"
+        );
+        assert_eq!(
+            str_field(&detail, CONFIG_VALUE_FIELD).as_deref(),
+            Some("dark"),
+            "the value comes off this instance's own map"
+        );
+
+        let detail = dispatch_detail(host.as_ref(), CONFIG_GET, &[("key", "absent")]);
+        assert_eq!(bool_field(&detail, CONFIG_ANSWERED_FIELD), Some(true));
+        assert_eq!(
+            str_field(&detail, CONFIG_VALUE_FIELD),
+            None,
+            "an unknown key is an answered absence, not a value"
+        );
+
+        let ungranted = mounted_element(UNGRANTED).expect("the ungranted instance mounted");
+        let mut answer = JsValue::UNDEFINED;
+        let warnings = capture_console_warn(|| {
+            answer = dispatch_detail(ungranted.as_ref(), CONFIG_GET, &[("key", "mode")]);
+        });
+        assert_eq!(bool_field(&answer, CONFIG_ANSWERED_FIELD), Some(true));
+        assert_eq!(
+            str_field(&answer, CONFIG_VALUE_FIELD),
+            None,
+            "an ungranted instance reads no value, whatever its map holds"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("config capability")),
+            "the refusal names the capability: {warnings:?}"
+        );
+    }
+
     /// A gesture whose flush lands on a confined channel wakes the instance that
     /// reads it.
     ///
@@ -2156,7 +2480,7 @@ mod tests {
         assert_eq!(ready.borrow().len(), 1, "EmitReady fired once");
 
         // The kernel breadcrumb and the warn ComponentLog each console.warn and
-        // publish a reserved-port report; the ComponentAlert routes to an Alert.
+        // publish a reserved-port report; the Alert routes to an Alert frame.
         let warnings = capture_console_warn(|| {
             dom::apply_actions(
                 &[
@@ -2170,7 +2494,8 @@ mod tests {
                         level: LogLevel::Warn,
                         message: "clog".into(),
                     },
-                    KernelAction::ComponentAlert {
+                    KernelAction::Alert {
+                        attribution: Some(CK.into()),
                         severity: AlertSeverity::Warning,
                         title: "atitle".into(),
                         body: "abody".into(),
@@ -2188,16 +2513,23 @@ mod tests {
         // Both reports become publishes on the surface's error channel — the
         // kernel breadcrumb (source "kernel", unattributed) and the
         // ComponentLog (source "component:<instance>", attributed to it) — and the
-        // ComponentAlert reaches the wire as its own frame.
+        // Alert reaches the wire as its own frame, under the component that
+        // raised it.
         wait_until(
             "kernel report + component report + component Alert on the wire",
             || {
                 error_report_has(&ctrl, "kernel", None)
                     && error_report_has(&ctrl, "component:wbt-apply-clog", Some("clog"))
-                    && sent_has(
-                        &ctrl,
-                        |f| matches!(f, ClientFrame::Alert { title, .. } if title == "atitle"),
-                    )
+                    && sent_has(&ctrl, |f| {
+                        matches!(
+                            f,
+                            ClientFrame::Alert {
+                                attribution: Some(instance),
+                                title,
+                                ..
+                            } if title == "atitle" && instance == CK
+                        )
+                    })
             },
         )
         .await;

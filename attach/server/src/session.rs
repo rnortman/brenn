@@ -36,7 +36,8 @@ use uuid::Uuid;
 
 use super::profile::AttachProfile;
 use super::publish::{
-    PublishBatchRequest, PublishRequest, handle_publish, handle_publish_batch, seed_deferred_views,
+    PublishBatchRequest, PublishRequest, admit_attribution_or_violate, handle_publish,
+    handle_publish_batch, seed_deferred_views,
 };
 use super::registry::{AttachRegistry, AttachSessionGuard, SessionPush};
 use super::socket::{
@@ -801,6 +802,7 @@ async fn handle_client_frame(
             .await
         }
         ClientFrame::Alert {
+            attribution,
             severity,
             title,
             body,
@@ -808,6 +810,7 @@ async fn handle_client_frame(
             ctx,
             &mut state.buckets.alert,
             &mut state.counters,
+            attribution.as_deref(),
             severity,
             &title,
             &body,
@@ -833,23 +836,31 @@ fn map_alert_severity(severity: ProtoAlertSeverity) -> NativeAlertSeverity {
 ///    violation. The grant is advertised in `Welcome` and a conforming attacher
 ///    suppresses ungranted alerts itself, so the frame reaches here only from a
 ///    non-conforming one.
-/// 2. Size caps: an oversized title or body is a violation — the plane is opt-in
+/// 2. Who is paging, on the two-scope rule the publish path already runs: an
+///    undeclared attribution is a violation rather than a demotion to the bare
+///    identity, and a declared one that holds no alert right of its own is a
+///    violation too — the client gates first, so a frame that arrives anyway
+///    means the client's own gate was bypassed.
+/// 3. Size caps: an oversized title or body is a violation — the plane is opt-in
 ///    and its client is expected to conform. The payload is never echoed into the
 ///    security detail.
-/// 3. Per-connection alert bucket: beyond-burst alerts are dropped, counted, and
+/// 4. Per-connection alert bucket: beyond-burst alerts are dropped, counted, and
 ///    warned — not a kill. The process-wide alert rate limiter bounds total
-///    paging downstream.
-/// 4. Dispatch: title and body are sanitized, attribution is appended to the
-///    body, and the title is prefixed
-///    with the attacher's principal so an attachment cannot impersonate a host,
-///    app, or WASM alert source.
-/// 5. Record: one `warn!` — the operator's durable record of who paged. Alerts
+///    paging downstream. One bucket per connection, not per attribution: the
+///    plane is capped tightly enough that splitting it per sub-identity would
+///    multiply the operator's worst case by the declaration count.
+/// 5. Dispatch: title and body are sanitized, attribution is appended to the
+///    body, and the title is prefixed with the paging principal — the attacher,
+///    or the sub-identity it named — so an attachment cannot impersonate a host,
+///    app, or WASM alert source, nor one of its own components another.
+/// 6. Record: one `warn!` — the operator's durable record of who paged. Alerts
 ///    are not republished onto any channel; the plane exists precisely so paging
 ///    does not depend on the bus it may be reporting on.
 fn handle_alert(
     ctx: &AttachSessionCtx,
     alert_bucket: &mut TokenBucket,
     counters: &mut SessionCounters,
+    attribution: Option<&str>,
     severity: ProtoAlertSeverity,
     title: &str,
     body: &str,
@@ -861,7 +872,24 @@ fn handle_alert(
         return ctx.violation("Alert from an attacher without the alert grant");
     }
 
-    // 2. Size caps, without echoing the payload.
+    // 2. Who is paging. The principal is minted from the declared set, so the
+    //    dispatched text names an identity the operator wrote rather than one
+    //    the client spelled.
+    let principal = match admit_attribution_or_violate(ctx, attribution, "Alert") {
+        Ok(principal) => principal,
+        Err(violation) => return violation,
+    };
+    if let Some(instance) = attribution
+        && !ctx.profile.attribution_may_alert(instance)
+    {
+        return ctx.violation(format!(
+            "Alert from declared attribution {} without the alert grant",
+            sanitize_client_detail(instance),
+        ));
+    }
+    let principal = principal.as_str().to_string();
+
+    // 3. Size caps, without echoing the payload.
     if title.len() > MAX_ALERT_TITLE_BYTES || body.len() > MAX_ALERT_BODY_BYTES {
         return ctx.violation(format!(
             "Alert field exceeds size cap (title {}/{MAX_ALERT_TITLE_BYTES}, body \
@@ -871,7 +899,7 @@ fn handle_alert(
         ));
     }
 
-    // 3. Per-connection bucket. Beyond-bucket is dropped, counted, warned.
+    // 4. Per-connection bucket. Beyond-bucket is dropped, counted, warned.
     match alert_bucket.try_consume() {
         TokenBucketOutcome::Granted => {}
         TokenBucketOutcome::GrantedAfterSuppression { suppressed } => {
@@ -889,7 +917,7 @@ fn handle_alert(
         }
     }
 
-    // 4. Dispatch.
+    // 5. Dispatch.
     let title = sanitize_untrusted_str(title, MAX_ALERT_TITLE_BYTES);
     let body = sanitize_untrusted_str(body, MAX_ALERT_BODY_BYTES);
     let severity = map_alert_severity(severity);
@@ -899,12 +927,18 @@ fn handle_alert(
     );
     ctx.alert_dispatcher.alert(
         severity,
-        format!("Attacher {attacher}: {title}"),
+        format!("Attacher {principal}: {title}"),
         attributed_body,
     );
 
-    // 5. Record.
+    // 6. Record.
     counters.alerts_dispatched += 1;
-    warn!(severity = %severity, title = %title, "attachment alert dispatched");
+    warn!(
+        severity = %severity,
+        principal = %principal,
+        attribution = ?attribution,
+        title = %title,
+        "attachment alert dispatched"
+    );
     FrameOutcome::Continue
 }

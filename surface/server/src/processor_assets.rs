@@ -240,29 +240,51 @@ fn assert_import_profile(kind: &str, manifest: &ProcessorManifest) {
     }
 }
 
-/// The per-declaring-surface half of the profile check: importing `alert` means
-/// the component reaches the alert plane, which is the surface's grant to give.
+/// The per-instance half of the profile check: what a component *imports* must
+/// be what it was *granted*.
+///
+/// The surface twin of the backend linker's deny-by-default — there, an
+/// ungranted interface is simply never linked and the component fails to
+/// instantiate. jco hands a transpiled processor every surface import
+/// unconditionally, so the equivalent statement has to be made here, and made
+/// per instance: two instances of one kind may hold different grants, because
+/// the module is per kind but the instantiation and its imports are per
+/// instance.
+///
+/// `types` carries no capability (it defines the shared shapes, no host
+/// implements it), so it names no grant and is skipped — the same delta the
+/// vocabulary's legality table records. Backend-only imports are refused
+/// earlier, by the profile check.
+///
+/// This is a boot-time bound, not the enforcement point: the kernel gates each
+/// privileged entry on the same grants at runtime, for every ABI. A `dom`
+/// instance has no manifest to assert against and gets the runtime gate alone.
 ///
 /// # Panics
 ///
-/// When a surface declares an `alert`-importing kind without holding the alert
-/// grant.
-pub fn assert_alert_grant(slug: &str, kind: &str, manifest: &ProcessorManifest, granted: bool) {
-    if !manifest
-        .imports
-        .iter()
-        .any(|i| processor_import_interface(kind, i) == "alert")
-    {
-        return;
+/// When an instance's kind imports an interface the instance was not granted.
+pub fn assert_imports_granted(
+    slug: &str,
+    instance: &str,
+    kind: &str,
+    manifest: &ProcessorManifest,
+    grants: &BTreeSet<brenn_envelope::grants::ComponentGrant>,
+) {
+    for import in &manifest.imports {
+        let interface = processor_import_interface(kind, import);
+        let Some(grant) = brenn_envelope::grants::ComponentGrant::parse(interface) else {
+            continue;
+        };
+        assert!(
+            grants.contains(&grant),
+            "boot: [[surface]] {slug:?}: component {instance:?} runs processor kind {kind:?}, \
+             which imports the {interface} interface, but {:?} is not in the component's grants — \
+             a component is given what it is granted and nothing else. Add {interface:?} to its \
+             grants, or ship a build that does not import it. Refusing to start (fail-fast on \
+             invalid config).",
+            grant.word(),
+        );
     }
-    assert!(
-        granted,
-        "boot: [[surface]] {slug:?} declares processor component {kind:?}, which imports the alert \
-         interface, but the surface holds no \"alert\" grant — the alert plane is the surface's to \
-         grant, and a component cannot reach it otherwise. Add \"alert\" to the surface's grants, \
-         or declare this component on a surface that has it. Refusing to start (fail-fast on \
-         invalid config).",
-    );
 }
 
 /// Assert no kind is declared under two different ABIs anywhere in the config.
@@ -292,5 +314,60 @@ pub fn assert_kind_abi_unique(
             abis.len(),
             abis.into_iter().collect::<Vec<_>>().join(", "),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brenn_envelope::grants::{ComponentGrant, ComponentHost};
+
+    use super::{KNOWN_IMPORTS, SURFACE_IMPORTS};
+
+    /// The interface name in an import list that is no capability: it carries
+    /// the shared types every processor speaks and no host implements it.
+    const TYPES: &str = "types";
+
+    /// The grant that names no interface, so no import list can hold it.
+    const NO_INTERFACE: ComponentGrant = ComponentGrant::Takeover;
+
+    /// The interface a component reaches without a word for it: a tool grant is
+    /// derived from a connection, so it appears in no `grants` list.
+    const DERIVED: &str = "tools";
+
+    /// Each host's import list and the words that host admits are two statements
+    /// of one policy, written in two crates. They are held equal here, with
+    /// every deviation named above rather than tolerated as a difference.
+    fn assert_pinned(host: ComponentHost, imports: &[&str], derived: &[&str]) {
+        for import in imports {
+            if *import == TYPES || derived.contains(import) {
+                continue;
+            }
+            let grant = ComponentGrant::parse(import)
+                .unwrap_or_else(|| panic!("{import} names an interface and no grant word"));
+            assert!(
+                grant.illegal_on(host).is_none(),
+                "{import} is linkable on this host and its word is refused there"
+            );
+        }
+        for grant in ComponentGrant::ALL {
+            if grant.illegal_on(host).is_some() || grant == NO_INTERFACE {
+                continue;
+            }
+            assert!(
+                imports.contains(&grant.word()),
+                "`{}` is granted on this host and names no interface it links",
+                grant.word()
+            );
+        }
+    }
+
+    #[test]
+    fn the_surface_profile_matches_what_a_surface_component_may_be_granted() {
+        assert_pinned(ComponentHost::Surface, &SURFACE_IMPORTS, &[]);
+    }
+
+    #[test]
+    fn the_world_matches_what_a_top_level_component_may_be_granted() {
+        assert_pinned(ComponentHost::TopLevel, &KNOWN_IMPORTS, &[DERIVED]);
     }
 }

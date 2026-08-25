@@ -592,8 +592,8 @@ fn a_surface_instance_carries_the_kind_its_class_folds_to() {
     let config = derived(
         "component ModeClock { abi = dom; in messages; }\n\
          component P1Panel { abi = dom; in messages; }\n\
-         surface desk {\n    grants = [];\n    new clock: ModeClock;\n    \
-         new panel: P1Panel;\n}\n",
+         surface desk {\n    grants = [];\n    new clock: ModeClock { grants = []; }\n    \
+         new panel: P1Panel { grants = []; }\n}\n",
     );
     assert_eq!(
         config.surface_component_kinds,
@@ -604,8 +604,8 @@ fn a_surface_instance_carries_the_kind_its_class_folds_to() {
 #[test]
 fn a_top_level_instance_takes_no_kind() {
     let config = derived(
-        "component ModeClock { abi = processor; component_path = \"clock.wasm\"; }\n\
-         new clock: ModeClock { grants = []; }\n",
+        "component ModeClock { abi = processor; }\n\
+         new clock: ModeClock { component_path = \"clock.wasm\"; grants = []; }\n",
     );
     assert_eq!(config.resolved.consumers.len(), 1);
     assert!(config.surface_component_kinds.is_empty());
@@ -623,14 +623,14 @@ fn two_panels(first_body: &str, second_body: &str) -> Vec<(&'static str, String)
             "one",
             format!(
                 "const marker_one = 1;\ncomponent Panel {{ {first_body} }}\n\
-                 surface first {{\n    grants = [];\n    new view: Panel;\n}}\n"
+                 surface first {{\n    grants = [];\n    new view: Panel {{ grants = []; }}\n}}\n"
             ),
         ),
         (
             "two",
             format!(
                 "const marker_two = 2;\ncomponent Panel {{ {second_body} }}\n\
-                 surface second {{\n    grants = [];\n    new view: Panel;\n}}\n"
+                 surface second {{\n    grants = [];\n    new view: Panel {{ grants = []; }}\n}}\n"
             ),
         ),
     ]
@@ -655,11 +655,6 @@ fn two_classes_folding_to_one_kind_with_different_facts_are_refused() {
     for (first, second) in [
         // the abi the browser instantiates against
         ("abi = processor; in messages;", "abi = dom; in messages;"),
-        // the artifact a processor class is loaded from
-        (
-            "abi = processor; component_path = \"one.wasm\"; in messages;",
-            "abi = processor; component_path = \"two.wasm\"; in messages;",
-        ),
         // a port's name and direction
         ("abi = dom; in messages;", "abi = dom; out results;"),
         // how many ports there are

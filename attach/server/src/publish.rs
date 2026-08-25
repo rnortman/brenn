@@ -72,6 +72,28 @@ pub struct PublishRequest<'a> {
     pub correlation: Option<u64>,
 }
 
+/// Mint the principal a frame's `attribution` names, or the violation an
+/// undeclared one is.
+///
+/// An unknown attribution is a violation and never a silent demotion to the bare
+/// identity: demoting would let a non-conforming client launder a sub-identity's
+/// traffic onto the attacher's own budget, which is the blast-radius scoping
+/// this grain exists to enforce. `frame` names the frame class in the security
+/// detail — which, with the sanitization, is what makes the fail2ban signal
+/// parseable across every frame family that carries an attribution.
+pub(crate) fn admit_attribution_or_violate(
+    ctx: &AttachSessionCtx,
+    attribution: Option<&str>,
+    frame: &str,
+) -> Result<ParticipantId, FrameOutcome> {
+    ctx.profile.admit_attribution(attribution).ok_or_else(|| {
+        ctx.violation(format!(
+            "{frame} under undeclared attribution {}",
+            sanitize_client_detail(attribution.unwrap_or_default()),
+        ))
+    })
+}
+
 /// Handle a `Publish` frame — one immediate message, addressed by channel.
 ///
 /// Order, and why: the sub-identity is admitted first (a sender must be
@@ -108,15 +130,9 @@ pub async fn handle_publish(
         correlation,
     } = request;
 
-    // 1. Who is sending. An unknown attribution is a violation, never a silent
-    //    demotion to the bare identity: demoting would let a non-conforming
-    //    client launder a sub-identity's traffic onto the attacher's own budget,
-    //    which is exactly the blast-radius scoping this grain exists to enforce.
-    if ctx.profile.admit_attribution(attribution).is_none() {
-        return ctx.violation(format!(
-            "Publish under undeclared attribution {}",
-            sanitize_client_detail(attribution.unwrap_or_default()),
-        ));
+    // 1. Who is sending.
+    if let Err(violation) = admit_attribution_or_violate(ctx, attribution, "Publish") {
+        return violation;
     }
 
     // 2. May that sender write here.
@@ -354,15 +370,10 @@ pub async fn handle_publish_batch(
         deferred_ops,
     } = request;
 
-    // 1. Who is sending. An undeclared attribution is a violation rather than a
-    //    demotion to the bare identity: demoting would let a non-conforming
-    //    client launder a flush onto the attacher's own budget, which is the
-    //    blast-radius scoping this grain exists to enforce.
-    let Some(sender) = ctx.profile.admit_attribution(attribution) else {
-        return ctx.violation(format!(
-            "PublishBatch under undeclared attribution {}",
-            sanitize_client_detail(attribution.unwrap_or_default()),
-        ));
+    // 1. Who is sending.
+    let sender = match admit_attribution_or_violate(ctx, attribution, "PublishBatch") {
+        Ok(sender) => sender,
+        Err(violation) => return violation,
     };
 
     // 2. Batch shape. A conforming attacher never flushes an empty buffer (it

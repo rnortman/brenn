@@ -18,7 +18,6 @@ use support::{at, derive_errors, derive_refusal, derive_refusals, derived, durab
 const SINK: &str = concat!(
     "component Sink {\n",
     "    abi = processor;\n",
-    "    component_path = \"sink.wasm\";\n",
     "    out events;\n",
     "}\n",
 );
@@ -42,7 +41,10 @@ fn surface(statements: &str) -> String {
 /// A top-level component instance granting the capabilities named and holding
 /// the statements written into it.
 fn consumer(grants: &str, statements: &str) -> String {
-    format!("{SINK}new alice_sink: Sink {{\n    grants = [{grants}];\n{statements}}}\n")
+    format!(
+        "{SINK}new alice_sink: Sink {{\n    component_path = \"sink.wasm\";\n    \
+         grants = [{grants}];\n{statements}}}\n"
+    )
 }
 
 /// An agent granting the rights named and holding the statements written into
@@ -752,7 +754,6 @@ const PANEL: &str = concat!(
 const RELAY: &str = concat!(
     "component Relay {\n",
     "    abi = processor;\n",
-    "    component_path = \"relay.wasm\";\n",
     "    in inbound;\n",
     "    out outbound;\n",
     "    io acks;\n",
@@ -762,9 +763,15 @@ const RELAY: &str = concat!(
 /// A surface holding the statements written into it and one `Panel` holding the
 /// bindings.
 fn panel_surface_with(grants: &str, statements: &str, bindings: &str) -> String {
+    // The instance grants `ports` exactly when the bindings written into it
+    // send: a grant with nothing to send to is dead config and refused on its
+    // own, which would answer every one of these documents with the wrong
+    // message.
+    let sends = bindings.contains("out ") || bindings.contains("io ");
+    let ports = if sends { "ports" } else { "" };
     format!(
         "{PANEL}surface alice_desk {{\n    grants = [{grants}];\n{statements}    \
-         new p1: Panel {{\n{bindings}    }}\n}}\n"
+         new p1: Panel {{\n        grants = [{ports}];\n{bindings}    }}\n}}\n"
     )
 }
 
@@ -773,10 +780,23 @@ fn panel_surface(statements: &str, bindings: &str) -> String {
     panel_surface_with("subscribe", statements, bindings)
 }
 
+/// A surface with one `Panel` whose own body is written out: its grants and
+/// whatever statements and bindings it holds.
+fn placed_panel(grants: &str, body: &str) -> String {
+    format!(
+        "{PANEL}surface alice_desk {{\n    grants = [subscribe, publish];\n    \
+         acl subscribe [prefix \"brenn:alice.\"];\n    acl publish [prefix \"brenn:alice.\"];\n    \
+         new p1: Panel {{\n        grants = [{grants}];\n{body}    }}\n}}\n"
+    )
+}
+
 /// A top-level instance granting the capabilities named and holding the
 /// statements and bindings written into it.
 fn relay_with(grants: &str, body: &str) -> String {
-    format!("{RELAY}new alice_relay: Relay {{\n    grants = [{grants}];\n{body}}}\n")
+    format!(
+        "{RELAY}new alice_relay: Relay {{\n    component_path = \"relay.wasm\";\n    \
+         grants = [{grants}];\n{body}}}\n"
+    )
 }
 
 /// A top-level instance whose lists demand no capability word.
@@ -789,7 +809,6 @@ fn relay(body: &str) -> String {
 const FAN_IN: &str = concat!(
     "component FanIn {\n",
     "    abi = processor;\n",
-    "    component_path = \"fan-in.wasm\";\n",
     "    in first;\n",
     "    in second;\n",
     "    in third;\n",
@@ -798,7 +817,10 @@ const FAN_IN: &str = concat!(
 
 /// A top-level `FanIn` instance holding the bindings written into it.
 fn fan_in(body: &str) -> String {
-    format!("{FAN_IN}new alice_fan_in: FanIn {{\n    grants = [];\n{body}}}\n")
+    format!(
+        "{FAN_IN}new alice_fan_in: FanIn {{\n    component_path = \"fan-in.wasm\";\n    \
+         grants = [];\n{body}}}\n"
+    )
 }
 
 #[test]
@@ -856,8 +878,8 @@ fn two_positions_on_one_channel_derive_one_entry() {
         concat!(
             "surface alice_desk {\n",
             "    grants = [subscribe];\n",
-            "    new p1: Panel {\n        in messages <- cmd;\n    }\n",
-            "    new p2: Panel {\n        in messages <- cmd;\n    }\n",
+            "    new p1: Panel {\n        grants = [];\n        in messages <- cmd;\n    }\n",
+            "    new p2: Panel {\n        grants = [];\n        in messages <- cmd;\n    }\n",
             "}\n",
         ),
     ));
@@ -1323,7 +1345,7 @@ fn a_plane_word_expands_to_one_token_per_scheme_it_has_entries_on() {
         durable("cmd", "brenn:alice.cmd"),
         nondurable("cache", "ephemeral:alice.cache"),
         surface_with(
-            "subscribe, publish, takeover",
+            "subscribe, publish, alert",
             concat!(
                 "    acl subscribe [exact cmd, exact cache];\n",
                 "    acl publish [exact cmd, exact cache];\n",
@@ -1337,7 +1359,7 @@ fn a_plane_word_expands_to_one_token_per_scheme_it_has_entries_on() {
             "ephemeral_subscribe",
             "publish",
             "ephemeral_publish",
-            "takeover"
+            "alert"
         ]
     );
 }
@@ -1463,18 +1485,18 @@ fn a_word_that_names_no_right_is_refused_with_the_ones_that_do() {
     for (source, expected) in [
         (
             surface_with("dance", ""),
-            "`dance` is not a right surface grants hold; they name `subscribe`, `publish`, \
-             `alert` or `takeover`",
+            "`dance` is not a right surface grants hold; they name `subscribe`, `publish` \
+             or `alert`",
         ),
         (
             surface_with("ports", ""),
-            "`ports` is not a right surface grants hold; they name `subscribe`, `publish`, \
-             `alert` or `takeover`",
+            "`ports` is not a right surface grants hold; they name `subscribe`, `publish` \
+             or `alert`",
         ),
         (
             surface_with("dynamic_subscribe", ""),
             "`dynamic_subscribe` is not a right surface grants hold; they name `subscribe`, \
-             `publish`, `alert` or `takeover`",
+             `publish` or `alert`",
         ),
         (
             agent_with("takeover", ""),
@@ -1487,9 +1509,15 @@ fn a_word_that_names_no_right_is_refused_with_the_ones_that_do() {
              or `alert`",
         ),
         (
+            surface_with("takeover", ""),
+            // A surface and a remote answer with one vocabulary: takeover is a
+            // page capability a component holds, not a right over the wire.
+            "`takeover` is not a right surface grants hold; they name `subscribe`, `publish` \
+             or `alert`",
+        ),
+        (
             consumer("takeover", ""),
-            "`takeover` is not a right consumer grants hold; they name `ports`, `store`, \
-             `log`, `alert`, `config` or `mqtt`",
+            "`takeover` is a page capability; a top-level consumer has no page",
         ),
     ] {
         assert_eq!(derive_refusal(&source), expected);
@@ -1553,9 +1581,9 @@ fn a_raw_scheme_compound_token_is_refused_by_name() {
 fn a_plane_word_on_a_wasm_list_is_refused() {
     assert_eq!(
         derive_refusal(&consumer("subscribe", "")),
-        "consumer `alice_sink` states no `subscribe` right: a wasm consumer's grants name the \
-         capability interfaces it is given, and its transport rights are read off its acl \
-         statements"
+        "consumer `alice_sink` states no `subscribe` right: a component's grants name the \
+         capability interfaces it is given, and its transport rights are read off its bindings \
+         and acl statements"
     );
 }
 
@@ -1625,10 +1653,10 @@ fn a_dynamic_subscribe_right_beside_the_plane_stands() {
 
 #[test]
 fn a_scopeless_right_answers_to_no_list() {
-    // `alert`, `takeover` and `pwa_push` reach a device rather than a channel, so
-    // there is no list for them to agree with.
-    let config = derived(&surface_with("alert, takeover", ""));
-    assert_eq!(granted(&config.surfaces[0].grants), ["alert", "takeover"]);
+    // `alert` and `pwa_push` reach a device rather than a channel, so there is
+    // no list for them to agree with.
+    let config = derived(&surface_with("alert", ""));
+    assert_eq!(granted(&config.surfaces[0].grants), ["alert"]);
 }
 
 #[test]
@@ -1687,7 +1715,9 @@ fn an_mqtt_right_with_no_broker_entry_is_refused() {
 #[test]
 fn a_consumer_states_its_grants() {
     assert_eq!(
-        derive_refusal(&format!("{SINK}new alice_sink: Sink;\n")),
+        derive_refusal(&format!(
+            "{SINK}new alice_sink: Sink {{\n    component_path = \"sink.wasm\";\n}}\n"
+        )),
         "consumer `alice_sink` states no `grants`: what a component is given is \
          deny-by-default, so an empty list is written `grants = [];` rather than left out"
     );
@@ -1899,4 +1929,191 @@ fn a_tail_that_carries_nothing_points_at_the_value_written() {
         errors[0].message
     );
     assert_eq!(errors[0].line_col(), at(&source, "4 }"));
+}
+
+// ── what a placed instance holds ─────────────────────────────────────────────
+
+#[test]
+fn a_placed_instance_states_its_grants_or_is_refused() {
+    let source =
+        format!("{PANEL}surface alice_desk {{\n    grants = [];\n    new p1: Panel {{}}\n}}\n");
+    assert_eq!(
+        derive_refusal(&source),
+        "component `alice_desk.p1` states no `grants`: what a component is given is \
+         deny-by-default, so an empty list is written `grants = [];` rather than left out"
+    );
+}
+
+#[test]
+fn a_backend_only_capability_is_refused_on_a_placed_instance() {
+    for (word, expected) in [
+        (
+            "store",
+            "`store` is backend-only in v1; a surface-hosted component cannot be granted it",
+        ),
+        (
+            "mqtt",
+            "`mqtt` is backend-only in v1; a surface-hosted component cannot be granted it",
+        ),
+    ] {
+        assert_eq!(derive_refusal(&placed_panel(word, "")), expected);
+    }
+}
+
+#[test]
+fn a_page_capability_is_a_placed_instances_to_hold() {
+    let config = derived(&placed_panel("takeover", ""));
+    assert_eq!(
+        config.surface_components[0][0]
+            .grants
+            .iter()
+            .map(|word| word.value().as_str())
+            .collect::<Vec<_>>(),
+        ["takeover"]
+    );
+}
+
+#[test]
+fn a_placed_instances_bindings_derive_its_own_authority() {
+    let config = derived(&format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel(
+            "ports",
+            "        in messages <- cmd;\n        out acks -> \"local:p1/acks\";\n",
+        ),
+    ));
+    let instance = &config.surface_components[0][0];
+    assert_eq!(patterns(&instance.acl.brenn_subscribe), ["alice.cmd"]);
+    // The confined ring is the containment case: the instance holds the entry
+    // its own binding derived, and its surface holds no local family at all.
+    assert_eq!(patterns(&instance.acl.local_publish), ["p1/acks"]);
+    assert!(config.surfaces[0].acl.local_publish.is_empty());
+}
+
+#[test]
+fn an_explicit_statement_on_a_placed_instance_is_its_whole_plane() {
+    let config = derived(&format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel(
+            "",
+            "        acl subscribe [prefix \"brenn:alice.\"];\n        in messages <- cmd;\n",
+        ),
+    ));
+    // The statement suppressed derivation, so the entry is the one written —
+    // a prefix, not the binding's exact name.
+    assert_eq!(
+        patterns(&config.surface_components[0][0].acl.brenn_subscribe),
+        ["alice."]
+    );
+}
+
+#[test]
+fn a_binding_outside_a_placed_instances_own_statement_is_refused() {
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel(
+            "",
+            "        acl subscribe [exact \"brenn:alice.other\"];\n        in messages <- cmd;\n",
+        ),
+    );
+    assert_eq!(
+        derive_refusal(&source),
+        "this binding reaches `brenn:alice.cmd`, which nothing in alice_desk.p1's \
+         `brenn_subscribe` authority covers: an explicit `acl subscribe` is the whole \
+         authority for the plane, so a binding beside it derives nothing"
+    );
+}
+
+#[test]
+fn a_placed_instance_that_sends_and_grants_no_ports_is_refused() {
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel("log", "        out acks -> cmd;\n"),
+    );
+    assert_eq!(
+        derive_refusal(&source),
+        "component `alice_desk.p1` sends and grants no `ports`: the messaging interface it \
+         publishes through is what `ports` gives it"
+    );
+}
+
+#[test]
+fn a_placed_instance_may_grant_ports_for_a_free_io_port() {
+    // A free `io` port mints a page-local ring the instance publishes into, so
+    // `ports` has something to reach even though no channel is named and no
+    // entry is derived.
+    let config = derived(&placed_panel(
+        "ports",
+        "        io tick { push_depth = 1; retain_depth = 2; }\n",
+    ));
+    assert!(config.surface_components[0][0].acl.local_publish.is_empty());
+}
+
+#[test]
+fn a_placed_instances_free_io_port_demands_ports() {
+    // Boot must count both halves of every `io` port when it asks the same
+    // question, so a document the front end passes here would panic there.
+    assert_eq!(
+        derive_refusal(&placed_panel(
+            "log",
+            "        io tick { push_depth = 1; retain_depth = 2; }\n",
+        )),
+        "component `alice_desk.p1` sends and grants no `ports`: the messaging interface it \
+         publishes through is what `ports` gives it"
+    );
+}
+
+#[test]
+fn a_placed_instances_ports_grant_with_nothing_to_send_is_refused() {
+    let source = format!(
+        "{}{}",
+        durable("cmd", "brenn:alice.cmd"),
+        placed_panel("ports", "        in messages <- cmd;\n"),
+    );
+    assert_eq!(
+        derive_refusal(&source),
+        "component `alice_desk.p1` grants `ports` and neither binds an output nor states a \
+         publish entry, so the interface reaches nothing"
+    );
+}
+
+#[test]
+fn an_unbindable_scheme_under_a_placed_instance_is_refused_once() {
+    // The scheme refusal, like the undeclared-channel one, is about the
+    // position — which the surface owns. Counted rather than searched: a
+    // duplicate would pass an `any` check and read as two mistakes.
+    assert_eq!(
+        derive_refusal(&placed_panel(
+            "",
+            "        in messages <- \"mqtt:bob_hub:alice/status\";\n",
+        )),
+        "surface `alice_desk` can hold no `mqtt_subscribe` authority, so this binding cannot \
+         name `mqtt:`: the runtime keeps no such list for a surface"
+    );
+}
+
+#[test]
+fn a_malformed_address_under_a_placed_instance_is_refused_once() {
+    assert_eq!(
+        derive_refusal(&placed_panel("", "        in messages <- \"alice.cmd\";\n")),
+        "address `alice.cmd` names no scheme; expected one of brenn:, ephemeral:, local:, \
+         webhook:, mqtt:"
+    );
+}
+
+#[test]
+fn an_undeclared_channel_under_a_placed_instance_is_refused_once() {
+    // The binding is a position of both the instance and its surface, and one
+    // mistake earns one message: the surface's, which owns the position.
+    let source = placed_panel("", "        in messages <- \"brenn:alice.cmd\";\n");
+    assert_eq!(
+        derive_refusal(&source),
+        "`brenn:alice.cmd` names no declared channel, so this binding of surface `alice_desk` \
+         attaches to nothing: a transportable channel exists because a `channel` block \
+         declares it"
+    );
 }

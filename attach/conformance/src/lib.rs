@@ -361,8 +361,17 @@ impl AttachClient {
     /// alert plane deliberately touches no channel and answers no frame, so what
     /// a granted alert produces is visible only at the peer's dispatcher, and
     /// what an ungranted one produces is a closed socket.
-    pub async fn send_alert(&mut self, severity: AlertSeverity, title: &str, body: &str) {
+    /// `attribution` names a declared sub-identity paging on its own right, or
+    /// `None` for the attacher itself.
+    pub async fn send_alert(
+        &mut self,
+        attribution: Option<&str>,
+        severity: AlertSeverity,
+        title: &str,
+        body: &str,
+    ) {
         self.write(vec![ClientFrame::Alert {
+            attribution: attribution.map(str::to_string),
             severity,
             title: title.to_string(),
             body: body.to_string(),

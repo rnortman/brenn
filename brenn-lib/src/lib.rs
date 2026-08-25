@@ -8,6 +8,7 @@ pub mod mcp_tool_names;
 pub mod messaging;
 pub mod model_window_cache;
 pub mod mqtt;
+pub mod panic_util;
 pub mod pwa_push;
 pub mod runtime_dir;
 pub mod subprocess;

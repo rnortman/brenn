@@ -22,7 +22,8 @@ use crate::config::{
     AppConfig, BrennConfig, FrontmatterRenderConfig, PathMapper, PostPullHooksConfig,
     RepoSyncConfig, StartHooksConfig, StartupHooksConfig,
 };
-use crate::messaging::remote::{RemoteConfigRaw, RemoteGrant, RemoteSubscribeAclRaw};
+use crate::messaging::AttachGrant;
+use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 
 /// A minimal `AppConfig`: `slug` for both the slug and the display name, and
 /// default-shape values for everything else, so the fields a test actually
@@ -122,7 +123,7 @@ pub fn sole_refusal(document: &str) -> Diagnostic {
 ///
 /// The caller keeps the token file alive: resolution reads it, so dropping the
 /// handle before the fixture resolves leaves an unreadable path.
-pub fn remote_raw(slug: &str, token_file: &Path, grants: &[RemoteGrant]) -> RemoteConfigRaw {
+pub fn remote_raw(slug: &str, token_file: &Path, grants: &[AttachGrant]) -> RemoteConfigRaw {
     RemoteConfigRaw {
         slug: slug.to_string(),
         token_file: token_file.to_path_buf(),
@@ -182,11 +183,11 @@ pub fn remote_fleet(token_file: &Path) -> RemoteConfigRaw {
             "pod-kitchen",
             token_file,
             &[
-                RemoteGrant::Subscribe,
-                RemoteGrant::Publish,
-                RemoteGrant::EphemeralSubscribe,
-                RemoteGrant::EphemeralPublish,
-                RemoteGrant::Alert,
+                AttachGrant::Subscribe,
+                AttachGrant::Publish,
+                AttachGrant::EphemeralSubscribe,
+                AttachGrant::EphemeralPublish,
+                AttachGrant::Alert,
             ],
         )
     }

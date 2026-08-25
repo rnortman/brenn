@@ -73,8 +73,8 @@ pub(crate) struct ConsumerLoadParts {
 pub(crate) fn lower_consumer_load_parts(
     consumer: &brenn_lib::messaging::config::ResolvedWasmConsumer,
 ) -> ConsumerLoadParts {
+    use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::Urgency;
-    use brenn_lib::messaging::config::WasmGrant;
     use brenn_wasm::{Capability, ProcessorUrgency};
     use std::collections::{BTreeSet, HashMap};
 
@@ -126,15 +126,24 @@ pub(crate) fn lower_consumer_load_parts(
         .grants
         .iter()
         .map(|g| match g {
-            WasmGrant::Ports => Capability::Ports,
-            WasmGrant::Store => Capability::Store,
-            WasmGrant::Log => Capability::Log,
-            WasmGrant::Alert => Capability::Alert,
-            WasmGrant::Config => Capability::Config,
-            WasmGrant::Mqtt => Capability::Mqtt,
+            ComponentGrant::Ports => Capability::Ports,
+            ComponentGrant::Store => Capability::Store,
+            ComponentGrant::Log => Capability::Log,
+            ComponentGrant::Alert => Capability::Alert,
+            ComponentGrant::Config => Capability::Config,
+            ComponentGrant::Mqtt => Capability::Mqtt,
+            // `takeover` names no WIT interface — it is consented to at a page
+            // binding, not linked — and cannot reach this loader: the config
+            // front end refuses the word on a top-level instance.
+            ComponentGrant::Takeover => panic!(
+                "consumer {:?}: granted `takeover`, which names no WIT interface and belongs \
+                 to a page — a top-level consumer has no page, and the config front end \
+                 refuses the word",
+                consumer.slug,
+            ),
         })
         .collect();
-    // No `WasmGrant::Tools` variant — the `Tools` capability is derived from
+    // No `ComponentGrant::Tools` variant — the `Tools` capability is derived from
     // the presence of tool grants, not declared. The `tools` WIT interface
     // links iff this capability is set.
     if !consumer.policy.tool_grants.is_empty() {
@@ -701,7 +710,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
             // service.
             let mqtt_publish: Option<brenn_wasm::MqttPublishFn> = if consumer
                 .grants
-                .contains(&brenn_lib::messaging::config::WasmGrant::Mqtt)
+                .contains(&brenn_lib::messaging::ComponentGrant::Mqtt)
             {
                 Some(wasm_mqtt::make_wasm_mqtt_publish_fn(
                     consumer.policy.clone(),

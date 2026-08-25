@@ -836,14 +836,15 @@ fn validate_resolves_app_mqtt_subscriptions() {
 #[should_panic(expected = "collides with an [[app]] slug")]
 fn validate_wasm_consumer_slug_colliding_with_app_panics() {
     use crate::access::raw::MqttClientMatcherRaw;
-    use crate::messaging::config::{WasmConsumerConfigRaw, WasmGrant};
+    use crate::messaging::ComponentGrant;
+    use crate::messaging::config::WasmConsumerConfigRaw;
 
     let dir = tempfile::tempdir().unwrap();
     // WASM consumer whose slug equals the app slug below ("pa").
     let colliding = WasmConsumerConfigRaw {
         slug: "pa".to_string(),
         component_path: dir.path().join("c.wasm"),
-        grants: vec![WasmGrant::Mqtt],
+        grants: vec![ComponentGrant::Mqtt],
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![],

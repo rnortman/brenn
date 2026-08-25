@@ -885,17 +885,6 @@ vocabulary! {
         opt send_rate: V,
     }
 
-    /// A `component` class body's attrs.
-    ///
-    /// Ports are `in`/`out`/`io` declarations. `abi` is required because the
-    /// runtime requires it and because where an instance of the class may be
-    /// placed is decided by it, so a class without one is refused at the class
-    /// rather than at each instantiation.
-    struct ComponentClassAttrs<V> {
-        req abi: Word,
-        opt component_path: V,
-    }
-
     /// A `surface` body's attrs.
     ///
     /// Components are `new` statements, subscriptions and outputs and io ports
@@ -1017,6 +1006,23 @@ vocabulary! {
         req command: V,
         opt args: V,
         opt env: V,
+    }
+}
+
+vocabulary! {
+    /// A `component` class body's attrs.
+    ///
+    /// Ports are `in`/`out`/`io` declarations. `abi` is required because the
+    /// runtime requires it and because where an instance of the class may be
+    /// placed is decided by it, so a class without one is refused at the class
+    /// rather than at each instantiation.
+    ///
+    /// `abi` is the whole vocabulary, and it is a projection, so this body is
+    /// one type in both phases: where the artifact lives is a deployment fact
+    /// of one instance, written in the instance body, so the class carries no
+    /// value at all.
+    struct ComponentClassAttrs; {
+        req abi: Word,
     }
 }
 

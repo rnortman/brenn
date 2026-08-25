@@ -7,10 +7,10 @@
 use crate::contract::ActivationError;
 use crate::contract::{
     ACTIVATION_REGISTER, ACTIVATION_SYNC, COMPONENT_ALERT, COMPONENT_LOG, COMPONENT_PANIC,
-    DEFER_STATUS_FIELD, ENTRY_REPLY_FIELD, PORT_DEFER, PORT_PUBLISH, PROCESSOR_START,
-    PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY, SURFACE_RELOAD, SURFACE_ROOT_ID,
-    SYNC_ERROR_FIELD, SYNC_REPLY_FIELD, SYNC_STATUS_FIELD, element_name_for_instance,
-    publish_status_str, sync_status_str,
+    CONFIG_ANSWERED_FIELD, CONFIG_GET, CONFIG_VALUE_FIELD, DEFER_STATUS_FIELD, ENTRY_REPLY_FIELD,
+    PORT_DEFER, PORT_PUBLISH, PROCESSOR_START, PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY,
+    SURFACE_RELOAD, SURFACE_ROOT_ID, SYNC_ERROR_FIELD, SYNC_REPLY_FIELD, SYNC_STATUS_FIELD,
+    element_name_for_instance, publish_status_str, sync_status_str,
 };
 use crate::front::SurfaceHandle;
 use crate::schema::LogLevel;
@@ -266,12 +266,13 @@ pub(crate) fn apply_action(action: &KernelAction, handle: &SurfaceHandle) {
             message,
             Some(instance),
         ),
-        KernelAction::ComponentAlert {
+        KernelAction::Alert {
+            attribution,
             severity,
             title,
             body,
         } => {
-            handle.alert(*severity, title, body);
+            handle.alert(attribution.as_deref(), *severity, title, body);
         }
         KernelAction::SendGeometry {
             width,
@@ -1014,8 +1015,8 @@ pub fn install_activation_register_listener(
 /// Install the delegated `brenn-log` listener (see
 /// [`install_root_component_listener`]): forwards the resolved instance, the
 /// retargeted tag, and the `{ level, message }` detail to `callback`, wired to
-/// [`crate::logic::route_component_log`], which stamps the `component:<instance>`
-/// source.
+/// [`crate::logic::route_log`], which gates the forward on the resolved
+/// component's own `log` grant and stamps the `component:<instance>` source.
 pub fn install_log_listener(
     callback: impl Fn(Option<&str>, &str, Option<&str>, Option<&str>) + 'static,
 ) {
@@ -1031,8 +1032,8 @@ pub fn install_log_listener(
 /// Install the delegated `brenn-alert` listener (see
 /// [`install_root_component_listener`]): forwards the resolved instance, the
 /// retargeted tag, and the `{ severity, title, body }` detail to `callback`, wired
-/// to [`crate::logic::route_component_alert`], which gates the forward on the
-/// surface's alert grant.
+/// to [`crate::logic::route_alert`], which gates the forward on the resolved
+/// component's own `alert` grant.
 pub fn install_alert_listener(
     callback: impl Fn(Option<&str>, &str, Option<&str>, Option<&str>, Option<&str>) + 'static,
 ) {
@@ -1049,6 +1050,57 @@ pub fn install_alert_listener(
             );
         },
     );
+}
+
+/// Install the delegated `brenn-config-get` listener: forwards the resolved
+/// instance, the retargeted tag, the `{ key }` detail, and the event's `detail`
+/// object to `callback`, wired to [`crate::logic::route_config_get`] and
+/// [`crate::logic::KernelCore::component_config_get`] behind it.
+///
+/// Built on [`install_root_event_listener`] rather than
+/// [`install_root_component_listener`] for the reason the publish listener is:
+/// the answer has to reach back across the module boundary, and the `detail`
+/// object is the only channel a synchronous one can take (see
+/// [`set_config_answer`]).
+pub fn install_config_get_listener(
+    callback: impl Fn(Option<&str>, &str, Option<&str>, &JsValue) + 'static,
+) {
+    install_root_event_listener(CONFIG_GET, move |instance, tag, event| {
+        let detail = event
+            .dyn_ref::<CustomEvent>()
+            .map(|ce| ce.detail())
+            .unwrap_or(JsValue::UNDEFINED);
+        let [key] = custom_event_string_fields(event, ["key"]);
+        callback(instance, tag, key.as_deref(), &detail);
+    });
+}
+
+/// Write a config read's answer onto the dispatching event's `detail`, where the
+/// component's SDK reads it as its call returns.
+///
+/// [`CONFIG_ANSWERED_FIELD`] is written for every read the kernel heard, whatever
+/// became of it, and [`CONFIG_VALUE_FIELD`] only when there is a value: an
+/// unknown key, an ungranted instance and an unwired page all answer absence, and
+/// a reader must not have to tell those apart from a page whose kernel listener
+/// never ran.
+///
+/// A detail that refuses the write is a non-conformant dispatcher — a frozen or
+/// primitive detail — so the answer is dropped rather than panicking the kernel
+/// on a component's malformed event. The reader then sees no answer and faults on
+/// that, which is the same verdict reached one layer out.
+pub fn set_config_answer(detail: &JsValue, value: Option<&str>) {
+    let _ = Reflect::set(
+        detail,
+        &JsValue::from_str(CONFIG_ANSWERED_FIELD),
+        &JsValue::TRUE,
+    );
+    if let Some(value) = value {
+        let _ = Reflect::set(
+            detail,
+            &JsValue::from_str(CONFIG_VALUE_FIELD),
+            &JsValue::from_str(value),
+        );
+    }
 }
 
 /// Install the one `brenn-component-panic` listener on `window`.

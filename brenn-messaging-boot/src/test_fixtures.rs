@@ -3,6 +3,7 @@
 
 use super::*;
 use brenn_lib::config::AppConfig;
+use brenn_lib::messaging::ComponentGrant;
 #[cfg(test)]
 use brenn_lib::messaging::WakeMin;
 use brenn_lib::messaging::config::{
@@ -290,6 +291,7 @@ pub fn minimal_surface_raw() -> SurfaceConfigRaw {
                 send_refill_secs: None,
                 parked_batch_depth: None,
                 config: None,
+                grants: vec![ComponentGrant::Ports],
                 chrome: false,
             },
             SurfaceComponentRaw {
@@ -300,6 +302,7 @@ pub fn minimal_surface_raw() -> SurfaceConfigRaw {
                 send_refill_secs: None,
                 parked_batch_depth: None,
                 config: None,
+                grants: vec![ComponentGrant::Ports],
                 chrome: true,
             },
         ],

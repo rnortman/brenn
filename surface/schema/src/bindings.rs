@@ -83,7 +83,11 @@ pub struct BindingsDocument {
 }
 
 /// The kernel-level half of a bindings document: where the kernel's own
-/// telemetry and error reports go, and which surface-wide grants it holds.
+/// telemetry and error reports go.
+///
+/// It carries no capability flags. What a page's components may do is stated
+/// per component in [`ComponentEntry::grants`](crate::ComponentEntry::grants) —
+/// a page-wide flag every component reads alike gates nothing.
 ///
 /// Addresses are explicit rather than derived. The kernel cannot know the
 /// operator's channel prefix, and a client that reconstructs addresses from a
@@ -106,9 +110,6 @@ pub struct PlatformSection {
     /// The lowest level admitted to `error_channel`: a report is published iff
     /// `level >= floor`. `None` exactly when `error_channel` is `None`.
     pub error_report_floor: Option<LogLevel>,
-    /// Whether this surface's components may drive the page-local takeover
-    /// plane. Config-gated at boot; the kernel enacts it page-side.
-    pub takeover_granted: bool,
 }
 
 /// Why a bindings document was refused. Carries a rendered message rather than
@@ -366,6 +367,7 @@ mod tests {
             abi: Abi::Dom,
             parked_batch_depth: 4,
             config: BTreeMap::new(),
+            grants: vec![],
         }
     }
 
@@ -412,7 +414,6 @@ mod tests {
                 status_interval_secs: 60,
                 error_channel: Some("brenn:site.surface.bar.errors".to_string()),
                 error_report_floor: Some(LogLevel::Warn),
-                takeover_granted: true,
             },
         }
     }

@@ -33,6 +33,7 @@ pub use brenn_envelope::addressing::{
     mqtt_channel_uuid_from_address, nondurable_channel_uuid, tool_channel_uuid_from_address,
     tuning_boundary_list, webhook_channel_uuid_from_slug,
 };
+pub use brenn_envelope::grants::{AttachGrant, ComponentGrant, ComponentHost};
 pub use config::{
     ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
     NoiseLevel, ResolvedChannel, ResolvedMessagingConfig, ResolvedSubscription, Sink,
@@ -43,7 +44,7 @@ pub use directory::{
     SubscriberRegistration, WakeEconomics, WakeMin,
 };
 pub use identity::{AttachKind, AttachScope, ParticipantId, SubscriberKind};
-pub use remote::{RemoteConfigRaw, RemoteDepths, RemoteGrant, RemoteToken, ResolvedRemote};
+pub use remote::{RemoteConfigRaw, RemoteDepths, RemoteToken, ResolvedRemote};
 
 // The wire contract between the Brenn host and WASM guest components lives in
 // `brenn-envelope` so guests can depend on that lightweight crate without

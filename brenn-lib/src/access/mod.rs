@@ -395,7 +395,7 @@ pub enum AppCapability {
     /// first minter: it authors the grant mapping, carries the field on its
     /// publish frames, and derives it from a real user gesture.
     MintImpetus,
-    // WASM host capabilities. Authored as `WasmGrant` on WASM components and
+    // WASM host capabilities. Authored as `ComponentGrant` on WASM components and
     // mapped to these variants internally; not part of the LLM `grants` token
     // vocabulary. Because `Deserialize` is derived for the whole enum, these
     // tokens (`"wasm_store"`, …) and `"integration"` *do* technically parse from
@@ -410,16 +410,11 @@ pub enum AppCapability {
     WasmAlert,
     /// WASM host: config read access.
     WasmConfig,
-    /// Surface: alert emission. Authored as `SurfaceGrant::Alert` on a
-    /// `[[surface]]` and mapped internally (not part of the LLM `grants` token
-    /// vocabulary). A capability distinct from `WasmAlert` so policy inspection
-    /// keeps alert-grant provenance per boundary.
+    /// Attacher: alert emission. Authored as `AttachGrant::Alert` on a
+    /// `[[surface]]` or `[[remote]]` and mapped internally (not part of the LLM
+    /// `grants` token vocabulary). A capability distinct from `WasmAlert` so
+    /// policy inspection keeps alert-grant provenance per boundary.
     SurfaceAlert,
-    /// Surface: takeover (fullscreen overlay) emission. Authored as
-    /// `SurfaceGrant::Takeover` on a `[[surface]]` and mapped internally (not
-    /// part of the LLM `grants` token vocabulary). Surface-only, mirroring
-    /// `SurfaceAlert`; the shell reads it to gate a takeover request.
-    SurfaceTakeover,
     /// Integration access (pfin, graf, …). A bare variant with no associated
     /// `IntegrationKind` payload: the payload and its enforcement are reserved
     /// for a later phase. Bare so the token list deserializes from plain strings.
@@ -474,7 +469,6 @@ mod tests {
         AppCapability::WasmAlert,
         AppCapability::WasmConfig,
         AppCapability::SurfaceAlert,
-        AppCapability::SurfaceTakeover,
         AppCapability::Integration,
     ];
 
@@ -499,7 +493,6 @@ mod tests {
             | AppCapability::WasmAlert
             | AppCapability::WasmConfig
             | AppCapability::SurfaceAlert
-            | AppCapability::SurfaceTakeover
             | AppCapability::Integration => (),
         };
         assert!(
