@@ -1,0 +1,9 @@
+/// The browser-driven echo fixture: publishes what was typed, renders what
+/// arrives. A feeder instance publishes and never renders, so `messages` is
+/// optional; every instance drives `out`.
+component EchoStub {
+  abi = dom;
+  requires = [ports, log];
+  optional in messages;
+  out out;
+}

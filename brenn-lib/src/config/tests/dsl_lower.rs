@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use brenn_dsl::diag::{Diagnostic, render_all};
+use brenn_dsl::{dom_any, processor_any};
 use brenn_surface_schema::LogLevel;
 
 use crate::access::AppCapability;
@@ -445,6 +446,27 @@ fn a_local_channel_with_a_minimal_body_states_only_its_depths() {
 channel scratch at "local:alice-scratch" {
     push_depth = 1;
     retain_depth = 1;
+}
+"#,
+        config_with_channels(vec![ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(1)),
+            retain_depth: Some(Depth::Bounded(1)),
+            ..channel_at("local:alice-scratch")
+        }]),
+    );
+}
+
+/// A doctype is a compile-time expectation checked against the component ports
+/// bound to the channel, so it reaches no runtime field: a channel stating one
+/// lowers exactly as the same channel without it.
+#[test]
+fn a_channel_doctype_reaches_no_lowered_field() {
+    assert_lowers(
+        r#"
+channel scratch at "local:alice-scratch" {
+    push_depth = 1;
+    retain_depth = 1;
+    doctype = "alice.scratch@1";
 }
 "#,
         config_with_channels(vec![ChannelConfigRaw {
@@ -2189,7 +2211,7 @@ new alice: Assistant();
 /// there.
 #[test]
 fn a_matcher_in_a_value_position_is_refused_as_one() {
-    let error = refusal(
+    let error = refusal(concat!(
         r#"
 channel cmd at "brenn:alice.cmd" {
     push_depth = 8;
@@ -2198,7 +2220,9 @@ channel cmd at "brenn:alice.cmd" {
 }
 
 component Router {
-    abi = processor;
+    "#,
+        processor_any!(),
+        r#"
     in inbound;
 }
 
@@ -2209,8 +2233,8 @@ new router: Router {
 
     in inbound <- cmd;
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(error.message, "`store_path`: a matcher is not a value here");
     assert_eq!(
         error.line_col(),
@@ -2427,7 +2451,8 @@ new alice: Assistant();
 #[test]
 fn a_consumer_lowers_with_every_key_binding_and_acl_family() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 mqtt_client broker {
     url = "mqtts://broker.example.com:8883";
 }
@@ -2467,7 +2492,9 @@ webhook push_alice {
 }
 
 component Router {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     in inbound;
     in feed;
     in status;
@@ -2531,7 +2558,8 @@ new router: Router {
         publish_capacity = 1;
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             mqtt_clients: vec![mqtt_client_at("broker", "mqtts://broker.example.com:8883")],
             channels: vec![
@@ -2699,14 +2727,17 @@ new router: Router {
 #[test]
 fn a_minimal_consumer_states_only_its_grant_and_its_input() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
     retain_depth = 16;
 }
 
 component Logger {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     in heard;
 }
 
@@ -2716,7 +2747,8 @@ new logger: Logger {
 
     in heard <- utterance;
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(4)),
@@ -2746,7 +2778,8 @@ new logger: Logger {
 #[test]
 fn a_port_named_after_its_direction_keyword_lowers_to_that_wire_name() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
     retain_depth = 16;
@@ -2758,7 +2791,9 @@ channel notes at "ephemeral:alice-pod.notes" {
 }
 
 component Reserved {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     in in;
     out out;
 }
@@ -2770,7 +2805,8 @@ new reserved: Reserved {
     in in <- utterance;
     out out -> notes;
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![
                 ChannelConfigRaw {
@@ -2817,9 +2853,12 @@ new reserved: Reserved {
 #[test]
 fn a_consumers_config_map_carries_typed_scalars() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 component Sink {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     io tick;
 }
 
@@ -2834,7 +2873,8 @@ new sink: Sink {
 
     io tick { push_depth = 1; retain_depth = 2; }
 }
-"#,
+"#
+        ),
         BrennConfig {
             wasm_consumers: vec![WasmConsumerConfigRaw {
                 grants: vec![ComponentGrant::Ports, ComponentGrant::Config],
@@ -2857,14 +2897,17 @@ new sink: Sink {
 #[test]
 fn a_consumers_io_port_on_a_declared_channel_lowers_to_the_pair() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel acks at "ephemeral:alice-pod.acks" {
     push_depth = 2;
     retain_depth = 4;
 }
 
 component Sink {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     io acks;
 }
 
@@ -2882,7 +2925,8 @@ new sink: Sink {
         publish_capacity = 1;
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(2)),
@@ -2919,14 +2963,17 @@ new sink: Sink {
 #[test]
 fn an_attrless_consumer_io_port_on_a_declared_channel_lowers_to_the_pair() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel acks at "ephemeral:alice-pod.acks" {
     push_depth = 2;
     retain_depth = 4;
 }
 
 component Sink {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     io acks;
 }
 
@@ -2936,7 +2983,8 @@ new sink: Sink {
 
     io acks <-> acks;
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(2)),
@@ -2972,7 +3020,8 @@ new sink: Sink {
 #[test]
 fn two_consumers_keep_their_own_grants_and_acls() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel alerts at "brenn:alice-alerts" {
     push_depth = 8;
     retain_depth = 128;
@@ -2985,12 +3034,16 @@ channel presence at "ephemeral:alice-desk.presence" {
 }
 
 component Router {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     in inbound;
 }
 
 component Sink {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     in feed;
 }
 
@@ -3008,7 +3061,8 @@ new sink: Sink {
 
     in feed <- presence { push_depth = 2; retain_depth = 4; }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![
                 ChannelConfigRaw {
@@ -3063,9 +3117,12 @@ new sink: Sink {
 #[test]
 fn a_consumers_config_map_transcribes_floats_lists_and_nested_tables() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 component Sink {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     io tick;
 }
 
@@ -3080,7 +3137,8 @@ new sink: Sink {
 
     io tick { push_depth = 1; retain_depth = 2; }
 }
-"#,
+"#
+        ),
         BrennConfig {
             wasm_consumers: vec![WasmConsumerConfigRaw {
                 grants: vec![ComponentGrant::Ports, ComponentGrant::Config],
@@ -3112,10 +3170,12 @@ new sink: Sink {
 /// A refusal inside a nested config value cites the inner token, not the map.
 #[test]
 fn a_matcher_nested_in_a_config_list_is_refused_at_the_inner_token() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 component Sink {
-    abi = processor;
+    "#,
+        processor_any!(),
+        r#"
     io tick;
 }
 
@@ -3126,8 +3186,8 @@ new sink: Sink {
 
     io tick { push_depth = 1; retain_depth = 2; }
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(refusal.message, "`config`: a matcher is not a value here");
     assert_eq!(
         refusal.span.text_str(),
@@ -3140,10 +3200,12 @@ new sink: Sink {
 /// same number: what is refused is a value that is no number at all.
 #[test]
 fn a_non_number_in_a_budget_position_is_refused() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 component Sink {
-    abi = processor;
+    "#,
+        processor_any!(),
+        r#"
     io tick;
 }
 
@@ -3153,8 +3215,8 @@ new sink: Sink {
 
     io tick { push_depth = 1; retain_depth = 2; amplification = "fast"; }
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(
         refusal.message,
         "`amplification`: expected a number, got a string"
@@ -3166,10 +3228,12 @@ new sink: Sink {
 /// refused at the matcher's own token.
 #[test]
 fn a_matcher_in_a_consumers_config_map_is_refused() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 component Sink {
-    abi = processor;
+    "#,
+        processor_any!(),
+        r#"
     io tick;
 }
 
@@ -3180,8 +3244,8 @@ new sink: Sink {
 
     io tick { push_depth = 1; retain_depth = 2; }
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(refusal.message, "`config`: a matcher is not a value here");
 }
 
@@ -3199,7 +3263,8 @@ new sink: Sink {
 #[test]
 fn a_surface_lowers_with_every_key_component_and_acl_family() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel alerts at "brenn:alice-alerts" {
     push_depth = 8;
     retain_depth = 128;
@@ -3212,7 +3277,9 @@ channel presence at "ephemeral:alice-desk.presence" {
 }
 
 component Panel {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     in messages;
     out outbound;
     io acks;
@@ -3220,7 +3287,9 @@ component Panel {
 }
 
 component Chrome {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     in state;
 }
 
@@ -3271,7 +3340,8 @@ surface alice_desk {
         in state <- presence { push_depth = 1; }
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![
                 ChannelConfigRaw {
@@ -3375,14 +3445,17 @@ surface alice_desk {
 #[test]
 fn a_placed_instances_acl_statement_does_not_cross_the_lowering_seam() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel cmd at "ephemeral:alice-desk.cmd" {
     push_depth = 2;
     retain_depth = 4;
 }
 
 component Panel {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     in messages;
 }
 
@@ -3396,7 +3469,8 @@ surface alice_desk {
         in messages <- cmd;
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(2)),
@@ -3423,14 +3497,17 @@ surface alice_desk {
 #[test]
 fn an_io_port_on_a_declared_channel_lowers_to_the_pair() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel acks at "ephemeral:alice-desk.acks" {
     push_depth = 2;
     retain_depth = 4;
 }
 
 component Panel {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     io acks;
 }
 
@@ -3449,7 +3526,8 @@ surface alice_desk {
         }
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(2)),
@@ -3495,14 +3573,17 @@ surface alice_desk {
 #[test]
 fn an_attrless_io_port_on_a_declared_channel_lowers_to_the_pair() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel acks at "ephemeral:alice-desk.acks" {
     push_depth = 2;
     retain_depth = 4;
 }
 
 component Panel {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     io acks;
 }
 
@@ -3514,7 +3595,8 @@ surface alice_desk {
         io acks <-> acks;
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(2)),
@@ -3547,10 +3629,10 @@ surface alice_desk {
     );
 }
 
-/// A declared port an instance does not bind is inert: it contributes no
+/// An `optional` port an instance does not bind is inert: it contributes no
 /// subscription, no output, no `io_port` and no ACL entry. This is what makes a
-/// superset component class shareable between documents that bind different
-/// subsets of its ports — the class is a declaration, the instance decides.
+/// component class shareable between documents that bind different subsets of
+/// its ports — the class permits the absence, the instance decides.
 ///
 /// The grant list holds only `subscribe` because a granted right that no bound
 /// port or acl statement reaches is separately refused: an unbound `out` port
@@ -3558,17 +3640,20 @@ surface alice_desk {
 #[test]
 fn a_port_the_instance_does_not_bind_lowers_to_nothing() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel messages at "ephemeral:alice-desk.messages" {
     push_depth = 2;
     retain_depth = 4;
 }
 
 component Panel {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     in messages;
-    out outbound;
-    io tick;
+    optional out outbound;
+    optional io tick;
 }
 
 surface alice_desk {
@@ -3579,7 +3664,8 @@ surface alice_desk {
         in messages <- messages;
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(2)),
@@ -3610,14 +3696,17 @@ surface alice_desk {
 #[test]
 fn a_minimal_surface_states_only_its_grant_and_one_input() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
     retain_depth = 16;
 }
 
 component Widget {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     in heard;
 }
 
@@ -3629,7 +3718,8 @@ surface alice_pod {
         in heard <- utterance { push_depth = 2; }
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![ChannelConfigRaw {
                 push_depth: Some(Depth::Bounded(4)),
@@ -3659,7 +3749,8 @@ surface alice_pod {
 #[test]
 fn two_surfaces_keep_their_own_component_kinds_and_acls() {
     assert_lowers(
-        r#"
+        concat!(
+            r#"
 channel alerts at "brenn:alice-alerts" {
     push_depth = 8;
     retain_depth = 128;
@@ -3672,12 +3763,16 @@ channel presence at "ephemeral:alice-desk.presence" {
 }
 
 component Panel {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     in messages;
 }
 
 component Board {
-    abi = dom;
+    "#,
+            dom_any!(),
+            r#"
     in feed;
 }
 
@@ -3700,7 +3795,8 @@ surface bob_desk {
         in feed <- presence { push_depth = 2; }
     }
 }
-"#,
+"#
+        ),
         BrennConfig {
             channels: vec![
                 ChannelConfigRaw {
@@ -3751,7 +3847,7 @@ surface bob_desk {
 /// naming the port and the keys that direction reads.
 #[test]
 fn amplification_on_a_surface_in_binding_is_refused() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -3759,7 +3855,9 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 }
 
 component Widget {
-    abi = dom;
+    "#,
+        dom_any!(),
+        r#"
     in heard;
 }
 
@@ -3771,8 +3869,8 @@ surface alice_pod {
         in heard <- utterance { push_depth = 2; amplification = 0.5; }
     }
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(
         refusal.message,
         "`amplification` is not a key of the `heard` port of instance `widget` of surface \
@@ -3790,7 +3888,7 @@ surface alice_pod {
 /// the surface families still hold no `amplification` field.
 #[test]
 fn amplification_on_a_surface_io_binding_is_refused() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -3798,7 +3896,9 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 }
 
 component Widget {
-    abi = dom;
+    "#,
+        dom_any!(),
+        r#"
     in heard;
     io tick;
 }
@@ -3812,8 +3912,8 @@ surface alice_pod {
         io tick { push_depth = 1; retain_depth = 2; amplification = 0.5; }
     }
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(
         refusal.message,
         "`amplification` is not a key of the `tick` port of instance `widget` of surface \
@@ -3832,7 +3932,7 @@ surface alice_pod {
 /// `amplification` is not also read as a number.
 #[test]
 fn a_refused_surface_binding_key_is_not_also_value_checked() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -3840,7 +3940,9 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 }
 
 component Widget {
-    abi = dom;
+    "#,
+        dom_any!(),
+        r#"
     in heard;
 }
 
@@ -3852,8 +3954,8 @@ surface alice_pod {
         in heard <- utterance { push_depth = 2; amplification = "half"; }
     }
 }
-"#,
-    );
+"#
+    ));
     assert!(
         refusal
             .message
@@ -3867,7 +3969,7 @@ surface alice_pod {
 /// offending token rather than the instance.
 #[test]
 fn a_bad_value_in_a_surface_component_body_is_refused() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -3875,7 +3977,9 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 }
 
 component Widget {
-    abi = dom;
+    "#,
+        dom_any!(),
+        r#"
     in heard;
 }
 
@@ -3889,8 +3993,8 @@ surface alice_pod {
         in heard <- utterance { push_depth = 2; }
     }
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(
         refusal.message,
         "`parked_batch_depth`: expected a non-negative integer or the word `unbounded`, got -1"
@@ -3901,7 +4005,7 @@ surface alice_pod {
 /// consumer's is, so a non-string value is refused at that value.
 #[test]
 fn a_non_string_in_a_surface_components_config_is_refused() {
-    let refusal = refusal(
+    let refusal = refusal(concat!(
         r#"
 channel utterance at "ephemeral:alice-pod.utterance" {
     push_depth = 4;
@@ -3909,7 +4013,9 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 }
 
 component Widget {
-    abi = dom;
+    "#,
+        dom_any!(),
+        r#"
     in heard;
 }
 
@@ -3923,8 +4029,8 @@ surface alice_pod {
         in heard <- utterance { push_depth = 2; }
     }
 }
-"#,
-    );
+"#
+    ));
     assert_eq!(
         refusal.message,
         "`config`: expected a string, got an integer"

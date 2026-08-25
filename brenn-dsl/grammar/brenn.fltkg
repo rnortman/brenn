@@ -1,5 +1,8 @@
 // The Brenn configuration language.
 //
+// This file is the syntax reference. The prose reference — what the constructs
+// are for and how to use them well — is `docs/config-dsl.md`.
+//
 // Ordering matters throughout: this is a PEG, so the first alternative that
 // succeeds wins and the parser never re-enters a rule that already succeeded.
 // Every ordering choice below is annotated where it is load-bearing.
@@ -65,9 +68,17 @@ pin := addr:string , %"=" , uuid:string , %";" , ;
 // do.
 component_class := doc:doc? , %"component" : name:cname , %"{" , (attrs:attr | ports:port_decl)* , %"}"  , ;
 
-// `in messages: "brenn.panel.message@1";` — the doctype is reserved syntax:
-// parsed here, inert until the resolver checks it against channel doctypes.
-port_decl := dir:port_dir : name:name , doctype:port_doctype? , %";" , ;
+// `in messages: "brenn.panel.message@1";` — the doctype names the document
+// contract the port's binding must agree with; derive checks it against the
+// channel's doctype and against the other doctyped ports on that channel.
+//
+// `optional` is the author's statement that an instance may leave the port
+// unwired; without it the resolver refuses an instance that does. It leads the
+// rule inside the class body's `(attrs:attr | ports:port_decl)*` alternation,
+// where `attr` is tried first and consumes the word as a key before failing for
+// want of `=`; the declaration form then gets the input back, exactly as
+// `channel_def`'s two alternatives rely on.
+port_decl := optional:"optional"? , dir:port_dir : name:name , doctype:port_doctype? , %";" , ;
 port_dir := into:"in" | outof:"out" | both:"io" ;
 port_doctype := %":" , ty:str_like ;
 

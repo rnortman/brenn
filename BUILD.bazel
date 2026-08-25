@@ -21,6 +21,7 @@ exports_files([
 BRENN_CONFIGS = glob([
     "*.brenn",
     "config/*.brenn",
+    "config/specs/*.brenn",
 ])
 
 # Roots and every module they import, so test consumers get a complete config

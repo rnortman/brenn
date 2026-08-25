@@ -4,8 +4,15 @@
 //
 // `bind_address` must match `E2E_BASE_URL` in the Makefile's `e2e` target,
 // which polls this port.
+//
+// Authoring conventions for this tree: `docs/config-dsl.md`.
 use config::bar::*;
-use config::components::*;
+use config::specs::chrome::*;
+use config::specs::echo-stub::*;
+use config::specs::meeting::*;
+use config::specs::mode-clock::*;
+use config::specs::processor-demo::*;
+use config::specs::protobar::*;
 use config::surfaces::*;
 
 /// Where the server listens and what it believes about the proxy in front. The

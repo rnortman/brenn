@@ -248,10 +248,14 @@ pub struct ComponentClass {
     pub ports: Vec<PortDecl>,
 }
 
-/// One port of a component class, with its reserved doctype annotation.
+/// One port of a component class, with its optional doctype annotation.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PortDecl {
+    /// Whether `optional` was written: the author's statement that an instance
+    /// may leave this port unwired. Without it, an instance that names no
+    /// binding for the port is refused.
+    pub optional: bool,
     pub dir: Spanned<PortDir>,
     pub name: Spanned<String>,
     pub doctype: Option<Spanned<StrLike>>,
@@ -883,6 +887,12 @@ vocabulary! {
         opt sink: Word,
         opt wake_min: Word,
         opt send_rate: V,
+        /// The document type the operator expects on this channel, checked
+        /// against the doctypes of the component ports bound to it. Compile-time
+        /// only: no runtime field carries it. Legal on a declaration, refused on
+        /// a tuning — a tuning matches a family the system mints, so it names no
+        /// single document contract.
+        opt doctype: V,
     }
 
     /// A `surface` body's attrs.
@@ -1017,12 +1027,19 @@ vocabulary! {
     /// placed is decided by it, so a class without one is refused at the class
     /// rather than at each instantiation.
     ///
-    /// `abi` is the whole vocabulary, and it is a projection, so this body is
-    /// one type in both phases: where the artifact lives is a deployment fact
-    /// of one instance, written in the instance body, so the class carries no
-    /// value at all.
+    /// `requires` and `optional` are the grant words the component's author
+    /// says it needs and the ones it can use without: the spec side of what an
+    /// instance's `grants` list states. Every key here is a projection, so this
+    /// body is one type in both phases: where the artifact lives is a
+    /// deployment fact of one instance, written in the instance body, so the
+    /// class carries no value at all.
+    ///
+    /// `requires` is `opt` in the vocabulary and required by the resolver,
+    /// which is what lets the refusal say why an empty list is written out.
     struct ComponentClassAttrs; {
         req abi: Word,
+        opt requires: WordList,
+        opt optional: WordList,
     }
 }
 

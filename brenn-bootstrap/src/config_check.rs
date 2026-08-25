@@ -122,6 +122,8 @@ fn refusal_text(payload: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use brenn_dsl::{dom_any, processor_any};
+
     use super::*;
 
     /// Exercises both `run_config_check` (the boolean) and `check_config` (the
@@ -290,7 +292,8 @@ new alice: Assistant();
         message
     }
 
-    const PREAMBLE: &str = r#"
+    const PREAMBLE: &str = concat!(
+        r#"
 channel feed at "brenn:alice.feed" {
     push_depth = 8;
     retain_depth = 64;
@@ -298,15 +301,20 @@ channel feed at "brenn:alice.feed" {
 }
 
 component Widget {
-    abi = dom;
+    "#,
+        dom_any!(),
+        r#"
     in messages;
-    out takeover;
+    optional out takeover;
 }
 
 component Shell {
-    abi = dom;
+    "#,
+        dom_any!(),
+        r#"
 }
-"#;
+"#
+    );
 
     /// Every surface needs exactly one chrome; these fixtures are about other
     /// gates, so theirs binds nothing and is granted nothing.
@@ -429,7 +437,8 @@ channel feed at "brenn:alice.feed" {
     fn a_config_full_of_environment_coupled_blocks_still_passes() {
         let (ok, report) = check(
             "main.brenn",
-            r#"
+            concat!(
+                r#"
 channel feed at "brenn:alice.feed" {
     push_depth = 8;
     retain_depth = 64;
@@ -453,7 +462,9 @@ mqtt_client broker {
 }
 
 component Sink {
-    abi = processor;
+    "#,
+                processor_any!(),
+                r#"
     in inbound;
 }
 
@@ -464,7 +475,8 @@ new sink: Sink {
 
     in inbound <- feed { push_depth = 4; }
 }
-"#,
+"#
+            ),
         );
         assert!(ok, "{report}");
     }

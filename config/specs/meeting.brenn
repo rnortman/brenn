@@ -1,0 +1,11 @@
+/// Meeting notice: shows time-to-next-meeting and escalates to a fullscreen
+/// takeover. Reads the agenda snapshot, requests takeover, and both publishes
+/// and reads dismiss/snooze acks so every device converges — hence `io acks`.
+component Meeting {
+  abi = dom;
+  requires = [ports, log, takeover];
+  in agenda;
+  io acks;
+  out takeover: "brenn.surface.takeover@1";
+  io tick;
+}

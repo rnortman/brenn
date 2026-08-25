@@ -327,7 +327,7 @@ fn a_syntax_error_names_its_file_without_a_position() {
 #[test]
 fn a_deserialize_failure_through_parse_str_is_positioned() {
     let error = parse_str(
-        "component Alice {\n    abi = dom;\n    abi = processor;\n}\n",
+        "component Alice {\n    abi = dom; requires = [];\n    abi = processor; requires = [];\n}\n",
         "alice.brenn",
     )
     .expect_err("the second `abi` has no home");

@@ -1,0 +1,10 @@
+/// Demo bus consumer: republishes what arrives, and answers sentinel bodies
+/// with deferred publishes so the defer surface is exercisable from a live
+/// bus. Each instance states its own `component_path`; that module must be
+/// present in the host's components directory.
+component ProcessorDemo {
+  abi = processor;
+  requires = [ports];
+  in in;
+  out out;
+}

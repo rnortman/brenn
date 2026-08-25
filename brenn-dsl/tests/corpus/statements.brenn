@@ -7,11 +7,14 @@ uuid_pins {
     "brenn:bob-pad.in.p1.messages" = "7d1f6c02-3a44-4c1b-9b0e-2f8f4d5a6b7c";
 }
 
+// The doctype here is an expectation with no doctyped port bound to it: legal
+// and inert, which is the state an operator writes it in ahead of the component.
 /// Utterances from the pod host.
 channel utterance at "brenn:alice-pod.out.utterance" {
     description = "What the pod host heard.";
     push_depth = 8;
     retain_depth = 128;
+    doctype = "brenn.pod.utterance@1";
 }
 
 // Depth tuning for a system-minted family: no handle, nothing to bind.
@@ -22,22 +25,31 @@ channel at prefix "mqtt:broker:alice/" {
 
 component Protobar {
     abi = dom;
-    in messages;
+    requires = [ports, log];
+    in messages: "brenn.panel.message@1";
 }
 
+// `optional` reads as an attr key and as a port marker in one body: the attr
+// alternative is tried first and fails whole at the port, so the marker gets
+// the input.
 component EchoStub {
     abi = processor;
+    requires = [ports];
+    optional = [takeover];
     in inbound: "brenn.panel.message@1";
     out outbound;
-    io acks;
+    optional io acks;
 }
 
-// Port names are the component's own and nothing reserves the binding
-// keywords, so a port literally named `in` reads as `in in <- …`.
+// Port names are the component's own and nothing reserves the binding or
+// declaration keywords, so a port literally named `in` reads as `in in <- …`
+// and one named `optional` can itself be optional.
 component Reserved {
     abi = processor;
+    requires = [ports];
     in in;
     out out;
+    optional io optional;
 }
 
 agent PersonalAssistant(slug: String, user: String, ws: Repo, skin: String = "bench") {
@@ -71,7 +83,7 @@ mcp_server graf {
 }
 
 assembly Deskbar(slug: String, driver: Agent) {
-    channel messages_p1 at f"brenn:{slug}.in.p1.messages" { push_depth = 64; retain_depth = 64; }
+    channel messages_p1 at f"brenn:{slug}.in.p1.messages" { push_depth = 64; retain_depth = 64; doctype = "brenn.panel.message@1"; }
     channel acks at f"brenn:{slug}.out.meeting.acks" { push_depth = 8; retain_depth = 32; }
 
     surface panel {

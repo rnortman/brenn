@@ -31,7 +31,7 @@
 //! seeds. `brenn-dsl` depends on no brenn domain crate, so they are stated here
 //! and carry the same drift exposure as the attr vocabularies do.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
@@ -53,7 +53,7 @@ use crate::model::Word;
 use crate::resolved::scheme::{config_identified, spellable_quoted_list, split_spellable};
 use crate::resolved::{
     ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef, RChannel,
-    RMatcher, RMatcherVal, RPort, RSurface, RTuning, RVal, RValue, ResolvedConfig,
+    RMatcher, RMatcherVal, RPort, RSurface, RTuning, RVal, RValue, ResolvedConfig, str_value,
 };
 
 /// Derive a resolved document.
@@ -65,8 +65,10 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
     check_channel_roles(&config, &mut errors);
     check_channel_model(&config, &mut errors);
     let channel_uuids = derive_channel_identity(&config, &mut errors);
-    let authorities = derive_authorities(&config, &mut errors);
+    let refs = Refs::of(&config);
+    let authorities = derive_authorities(&config, &refs, &mut errors);
     let surface_component_kinds = fold_component_kinds(&config, &mut errors);
+    check_doctypes(&config, &refs, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -283,6 +285,16 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                     tuning.address.span().clone(),
                 ));
             }
+        }
+        if let Some(attr) = &tuning.attrs.doctype {
+            errors.push(Diagnostic::at(
+                format!(
+                    "the block tuning `{label}` states no doctype: a tuning matches a \
+                     family the system mints, so it names no one document contract — a \
+                     doctype belongs on a `channel` declaration, which is one channel"
+                ),
+                attr.value.span().clone(),
+            ));
         }
     }
 }
@@ -800,6 +812,9 @@ struct Subject<'a> {
     /// allows) and a component may not, at either placement (the field is
     /// required with no default).
     words: Option<&'a [Word]>,
+    /// What its class declares it needs, for a component instance; `None` for
+    /// every other principal, none of which instantiates a spec.
+    spec: Option<&'a ClassRef>,
 }
 
 impl Subject<'_> {
@@ -853,6 +868,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         // its components'.
         free_send: None,
         words: Some(&entity.attrs.grants.value.words),
+        spec: None,
     });
     let components = config.surfaces.iter().flat_map(|surface| {
         let prefix = surface.handle.dotted();
@@ -865,6 +881,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
             owns_bindings: false,
             free_send: free_send(&instance.bindings),
             words: instance.grants.as_ref().map(|list| list.words.as_slice()),
+            spec: Some(&instance.class),
         })
     });
     let consumers = config.consumers.iter().map(|entity| Subject {
@@ -876,6 +893,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         owns_bindings: true,
         free_send: free_send(&entity.bindings),
         words: entity.grants.as_ref().map(|list| list.words.as_slice()),
+        spec: Some(&entity.class),
     });
     let agents = config.agents.iter().map(|entity| Subject {
         kind: EntityKind::Agent,
@@ -890,6 +908,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
             .grants
             .as_ref()
             .map(|attr| attr.value.words.as_slice()),
+        spec: None,
     });
     let remotes = config.remotes.iter().map(|entity| Subject {
         kind: EntityKind::Remote,
@@ -900,6 +919,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         owns_bindings: true,
         free_send: None,
         words: Some(&entity.attrs.grants.value.words),
+        spec: None,
     });
     surfaces
         .chain(components)
@@ -1006,8 +1026,11 @@ impl Stated {
 /// Order is the statement set's, not a hash's: explicit entries in source order,
 /// then `grant` entries in source order, then derived entries in binding order,
 /// so the derived model is a pure function of the document.
-fn derive_authorities(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -> DAuthorities {
-    let refs = Refs::of(config);
+fn derive_authorities(
+    config: &ResolvedConfig,
+    refs: &Refs<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> DAuthorities {
     let subjects = subjects(config);
     // Surface-placed components are deliberately absent: they hold no handle in
     // the handle space, so nothing can name one as a `grant` target, and a
@@ -1020,7 +1043,7 @@ fn derive_authorities(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -> 
         .collect();
     let mut stated: Vec<Stated> = subjects
         .iter()
-        .map(|subject| collect_statements(subject, &refs, errors))
+        .map(|subject| collect_statements(subject, refs, errors))
         .collect();
 
     for grant in &config.grants {
@@ -1037,7 +1060,7 @@ fn derive_authorities(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -> 
             plane,
             subjects[index].principal(),
             Source::Grant,
-            &refs,
+            refs,
             errors,
             &mut held.refused,
         );
@@ -1052,7 +1075,7 @@ fn derive_authorities(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -> 
     // Bindings after grants: a derived entry is a duplicate of one already held
     // if anything states it, and what states it may be a grant.
     for (subject, held) in subjects.iter().zip(stated.iter_mut()) {
-        derive_bounds(held, subject, &refs, errors);
+        derive_bounds(held, subject, refs, errors);
     }
 
     let mut authorities = DAuthorities::default();
@@ -2347,7 +2370,80 @@ fn derive_grants(
     if !stated.refused && !refused {
         check_agreement(kind, label, &rights, stated, errors);
     }
+    // Not behind `refused`: a word the host cannot implement is still a word
+    // the spec does not see granted, and both refusals are true of the same
+    // contradiction. A garbage word never became a right, so it cannot reach
+    // the second direction at all. What the flag would guard against is the
+    // list nobody wrote, which `words` has already refused whole.
+    if let Some(spec) = subject.spec
+        && subject.words.is_some()
+    {
+        check_spec_fit(subject, spec, &rights, errors);
+    }
     expand(kind, &rights, stated)
+}
+
+/// One instance's grants against the needs its class declares, both directions.
+///
+/// The class is the author's statement of what the component cannot run without
+/// and what it can use; the instance's list is the deployer's act of consent.
+/// Neither is derived from the other, so the check is what makes a spec worth
+/// writing: a deployment that under-grants is refused before it boots, and one
+/// that over-grants is refused because a capability the spec never asked for is
+/// authority nothing reads.
+fn check_spec_fit(
+    subject: &Subject<'_>,
+    spec: &ClassRef,
+    rights: &[Right<'_>],
+    errors: &mut Vec<Diagnostic>,
+) {
+    let what = subject.kind.label();
+    let label = &subject.label;
+    let class = spec.name.value();
+    let held = |needed: ComponentGrant| {
+        rights.iter().any(
+            |right| matches!(right, Right::Capability(Capability::Grant(grant), _) if *grant == needed),
+        )
+    };
+    for word in &spec.requires {
+        if held(*word.value()) {
+            continue;
+        }
+        errors.push(two_site(
+            format!(
+                "{what} `{label}` does not grant `{}`, which `{class}` requires: a \
+                 component runs with what it was given, and this one was not \
+                 given what it needs",
+                word.value().word()
+            ),
+            subject.span.clone(),
+            "required here",
+            word.span().clone(),
+        ));
+    }
+    for right in rights {
+        let Right::Capability(Capability::Grant(grant), word) = right else {
+            continue;
+        };
+        if spec
+            .requires
+            .iter()
+            .chain(&spec.optional)
+            .any(|declared| declared.value() == grant)
+        {
+            continue;
+        }
+        errors.push(two_site(
+            format!(
+                "{what} `{label}` grants `{}`, which `{class}` neither requires nor \
+                 lists optional: the spec is the vocabulary",
+                word.value()
+            ),
+            word.span().clone(),
+            "declared here",
+            spec.name.span().clone(),
+        ));
+    }
 }
 
 /// That every right reaches a list and every list is reached by a right.
@@ -2587,6 +2683,8 @@ fn fold_component_kinds(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -
 fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
     left.name.value() == right.name.value()
         && left.abi.value() == right.abi.value()
+        && same_words(&left.requires, &right.requires)
+        && same_words(&left.optional, &right.optional)
         && left.ports.len() == right.ports.len()
         && left
             .ports
@@ -2595,9 +2693,224 @@ fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
             .all(|(left, right)| same_port(left, right))
 }
 
+/// One grant list's facts, span excluded and order included: a list is
+/// written, and two spellings of one class write it the same way.
+fn same_words(left: &[Spanned<ComponentGrant>], right: &[Spanned<ComponentGrant>]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.value() == right.value())
+}
+
 /// One port's facts, span excluded.
 fn same_port(left: &RPort, right: &RPort) -> bool {
     left.name.value() == right.name.value()
         && left.dir == right.dir
+        && left.optional == right.optional
         && left.doctype.as_ref().map(Spanned::value) == right.doctype.as_ref().map(Spanned::value)
+}
+
+// ── pass 6: document types ───────────────────────────────────────────────────
+
+/// One doctype tag, as one port declares it.
+///
+/// The site is the port declaration's, not the binding's: the tag is a fact of
+/// the class contract, so a disagreement is between two authors and the
+/// diagnostic points at what each of them wrote.
+struct DoctypeClaim<'a> {
+    tag: &'a str,
+    site: &'a Span,
+    class: &'a str,
+    port: &'a str,
+}
+
+/// The ring a claim rides on.
+///
+/// A `local:` namespace is private to one ring: the server ring and each
+/// surface's page ring cannot exchange a message, so one `local:` name appearing
+/// in two of them is two channels spelled alike and nothing about the first
+/// constrains the second. Every other scheme is transportable, so one address is
+/// one channel wherever it is bound.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Realm {
+    /// A transportable address: one channel, whoever binds it.
+    Wire,
+    /// The server ring's private namespace, which top-level components share.
+    Backend,
+    /// One surface's page ring, by that surface's index in the document.
+    Page(usize),
+}
+
+/// A `BTreeMap` so disagreements on two channels report in a stable order.
+type DoctypeClaims<'a> = BTreeMap<(Realm, &'a str), Vec<DoctypeClaim<'a>>>;
+
+/// Every doctype reaching one channel names the same document.
+///
+/// Claims are keyed by realm and resolved address, which is what makes one key
+/// one channel: transportable addresses are disjoint by spelling, and a `local:`
+/// name is disjoint per ring.
+///
+/// A port with no doctype binds to anything, and a channel with no doctyped port
+/// bound to it is inert. Nothing here forces a declaration; what it refuses is
+/// two declarations that disagree.
+fn check_doctypes(config: &ResolvedConfig, refs: &Refs<'_>, errors: &mut Vec<Diagnostic>) {
+    let mut claims: DoctypeClaims<'_> = BTreeMap::new();
+    for (index, surface) in config.surfaces.iter().enumerate() {
+        for instance in &surface.components {
+            collect_doctypes(
+                &instance.class,
+                &instance.bindings,
+                refs,
+                Realm::Page(index),
+                &mut claims,
+            );
+        }
+    }
+    for consumer in &config.consumers {
+        collect_doctypes(
+            &consumer.class,
+            &consumer.bindings,
+            refs,
+            Realm::Backend,
+            &mut claims,
+        );
+    }
+    // The handle a declared channel is known by, so a diagnostic names the
+    // channel the way the document does. Looked up where a conflict is being
+    // reported rather than tabulated up front: the common load has no conflict
+    // and needs no table. A literal address has no handle and is named by the
+    // address itself.
+    let handle_of = |address: &str| {
+        config
+            .channels
+            .iter()
+            .find(|channel| channel.address.value() == address)
+            .map(|channel| &channel.handle)
+    };
+    for ((_, address), claims) in &claims {
+        if claims.len() < 2 {
+            continue;
+        }
+        let label = match handle_of(address) {
+            Some(handle) => format!("`{}` (`{address}`)", handle.dotted()),
+            None => format!("`{address}`"),
+        };
+        let mut diagnostic = Diagnostic::at(
+            format!(
+                "the ports bound to {label} declare {} different document types, and one \
+                 channel carries one document: a tag is compared whole, so `x@2` is not \
+                 `x@1`",
+                claims.len()
+            ),
+            claims[0].site.clone(),
+        );
+        for claim in claims {
+            diagnostic.related.push((
+                format!(
+                    "port `{}` of `{}` declares `{}` here",
+                    claim.port, claim.class, claim.tag
+                ),
+                claim.site.clone(),
+            ));
+        }
+        errors.push(diagnostic);
+    }
+    // A channel's own doctype is the operator's expectation: never required,
+    // inert where no doctyped port arrived, and the arbiter where one did.
+    for channel in &config.channels {
+        let Some(attr) = &channel.attrs.doctype else {
+            continue;
+        };
+        let Some(expected) = doctype_tag(&attr.value, errors) else {
+            continue;
+        };
+        // Every realm that bound this address, not one: a declaration is one row
+        // in the document and the ring each binding lands on is where the row is
+        // realized, so the expectation the row states holds in all of them.
+        for claim in claims
+            .iter()
+            .filter(|((_, address), _)| *address == channel.address.value().as_str())
+            .flat_map(|(_, held)| held)
+        {
+            if claim.tag == expected {
+                continue;
+            }
+            errors.push(two_site(
+                format!(
+                    "port `{}` of `{}` declares `{}`, and channel `{}` expects `{expected}`",
+                    claim.port,
+                    claim.class,
+                    claim.tag,
+                    channel.handle.dotted()
+                ),
+                claim.site.clone(),
+                "the channel states its document type here",
+                attr.value.span().clone(),
+            ));
+        }
+    }
+}
+
+/// The claims one instance's bindings contribute.
+///
+/// Deduped by tag: classes are copied onto every instance, so N instances of one
+/// class on one channel are N identical records and one claim. A binding naming
+/// no channel — a free `io` port tuned in place — connects nothing and claims
+/// nothing.
+///
+/// `realm` is the ring this instance runs on, and it keys a `local:` address; a
+/// transportable address is keyed globally whatever the placement.
+fn collect_doctypes<'a>(
+    class: &'a ClassRef,
+    bindings: &'a [RBinding],
+    refs: &'a Refs<'a>,
+    realm: Realm,
+    claims: &mut DoctypeClaims<'a>,
+) {
+    for binding in bindings {
+        let Some(chan) = &binding.chan else {
+            continue;
+        };
+        let Some(port) = class
+            .ports
+            .iter()
+            .find(|port| port.name.value() == binding.port.value())
+        else {
+            continue;
+        };
+        let Some(doctype) = &port.doctype else {
+            continue;
+        };
+        let address = match chan {
+            RChanRef::Decl(id) => refs.address(*id),
+            RChanRef::Addr(address) => address.value().as_str(),
+        };
+        let ring = match ChannelScheme::of(address) {
+            Some(ChannelScheme::Local) => realm,
+            _ => Realm::Wire,
+        };
+        let held = claims.entry((ring, address)).or_default();
+        if held.iter().any(|claim| claim.tag == doctype.value()) {
+            continue;
+        }
+        held.push(DoctypeClaim {
+            tag: doctype.value(),
+            site: doctype.span(),
+            class: class.name.value(),
+            port: port.name.value(),
+        });
+    }
+}
+
+/// A channel's `doctype`, which is a tag and nothing else: the name of a
+/// document shape and its version, as a string.
+fn doctype_tag<'a>(value: &'a RVal, errors: &mut Vec<Diagnostic>) -> Option<&'a str> {
+    match str_value(value, "a document type") {
+        Ok(tag) => Some(tag),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    }
 }

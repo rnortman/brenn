@@ -23,6 +23,7 @@
 //! unchecked. Resolution answers "what does this text mean"; whether what it
 //! means is legal is the next pass's question.
 
+use brenn_envelope::grants::ComponentGrant;
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 
@@ -148,6 +149,22 @@ impl RValue {
             RValue::Table(_) => "a table",
             RValue::Matcher(_) => "a matcher",
         }
+    }
+}
+
+/// The string a scalar attr's value holds, or the refusal that it is not one.
+///
+/// The one home for the value-shape refusal on an attr whose whole content is
+/// text — a slug, a document type — so every such attr says the same thing about
+/// a list or a matcher written where a string belongs. `what` names the thing in
+/// the author's words, article included: `a slug`, `a document type`.
+pub fn str_value<'a>(value: &'a RVal, what: &str) -> Result<&'a str, crate::diag::Diagnostic> {
+    match value.value() {
+        RValue::Str(text) => Ok(text),
+        other => Err(crate::diag::Diagnostic::at(
+            format!("{what} is a string; this is {}", other.kind()),
+            value.span().clone(),
+        )),
     }
 }
 
@@ -428,6 +445,14 @@ pub struct ClassRef {
     pub name: Spanned<String>,
     /// Which artifact shape, and with it where an instance may be placed.
     pub abi: Spanned<Abi>,
+    /// The capabilities an instance of this class cannot run without, in the
+    /// vocabulary its `grants` list is written in. Variants rather than words:
+    /// the resolver decides what each word spells once, so a rule keyed on one
+    /// of these cannot go on compiling once a word is renamed. Empty is a
+    /// statement — the class needs nothing.
+    pub requires: Vec<Spanned<ComponentGrant>>,
+    /// The capabilities it can use and runs without. Disjoint from `requires`.
+    pub optional: Vec<Spanned<ComponentGrant>>,
     pub ports: Vec<RPort>,
 }
 
@@ -436,8 +461,11 @@ pub struct ClassRef {
 pub struct RPort {
     pub name: Spanned<String>,
     pub dir: PortDir,
-    /// Reserved syntax: parsed, resolved, and inert until channels can declare
-    /// a doctype to check it against.
+    /// Whether the class permits an instance to leave this port unwired.
+    pub optional: bool,
+    /// Document type constraint for this port's binding. When set, the bound
+    /// channel and all other doctyped ports on the same address must agree.
+    /// `None` binds to any channel regardless of doctype.
     pub doctype: Option<Spanned<String>>,
 }
 

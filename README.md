@@ -128,7 +128,9 @@ No vaporware in the pitch, so:
   Assistant interfaces.
 - **Getting-started docs are not done.** You can build and run it (`make build`,
   `make launchdev`), but standing up a real configuration is currently more
-  archaeology than onboarding. It's not ready for anybody who doesn't know what
+  archaeology than onboarding. The configuration language itself has a prose
+  reference — [the config DSL document](docs/config-dsl.md) — but there is no
+  guide to a first deployment. It's not ready for anybody who doesn't know what
   they're doing to host it yet. I'd just rather not pretend it's turnkey. So if
   you were looking for the install guide, there isn't one. (Your LLM can figure
   it out though, even if you can't.)

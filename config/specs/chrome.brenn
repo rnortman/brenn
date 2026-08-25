@@ -1,0 +1,17 @@
+/// The page chrome: layout, theme, takeover stack, banner, toasts, and
+/// overlay-holdership reporting. A surface with no layout channel renders the
+/// default layout, and one with no takeover plane has no overlay to hold, so
+/// those three ports are optional.
+component Chrome {
+  abi = dom;
+  requires = [ports, log];
+  optional = [takeover];
+  optional in layout;
+  in theme: "brenn.surface.theme@1";
+  optional in takeover: "brenn.surface.takeover@1";
+  in link-state: "brenn.surface.link-state@1";
+  in surface-state: "brenn.surface.surface-state@1";
+  in toast: "brenn.surface.toast@1";
+  optional out overlay-state: "brenn.surface.overlay-state@1";
+  io toast-tick;
+}

@@ -75,8 +75,15 @@ pub(crate) fn diff(
 mod tests {
     use super::*;
 
+    use brenn_dsl::{dom_any, processor_any};
     use brenn_lib::access::raw::{AppAclRaw, ChannelMatcherRaw, WebhookMatcherRaw};
     use brenn_lib::config::config_from_dsl;
+
+    /// A fixture class's header: its abi, and grant declarations permitting
+    /// everything its host admits, so no case's grants meet a spec that refuses
+    /// them.
+    const DOM: &str = dom_any!();
+    const PROCESSOR: &str = processor_any!();
 
     /// A config with one durable channel at `address`, everything else default.
     fn one_channel(address: &str) -> BrennConfig {
@@ -189,12 +196,14 @@ channel alerts at "brenn:alice-alerts" {
     #[should_panic(expected = "compare unequal but render identically")]
     fn a_non_finite_float_is_refused_rather_than_diffed_to_nothing() {
         let with_nan = || -> BrennConfig {
-            let mut config = config_from_dsl(
+            let mut config = config_from_dsl(concat!(
                 r#"
 channel acks at "ephemeral:sink.acks" { push_depth = 1; retain_depth = 2; }
 
 component Sink {
-    abi = processor;
+    "#,
+                processor_any!(),
+                r#"
     io tick;
     out done;
 }
@@ -207,8 +216,8 @@ new sink: Sink {
     io tick { push_depth = 1; retain_depth = 2; amplification = 1; }
     out done -> acks { urgency = low; }
 }
-"#,
-            );
+"#
+            ));
             config.wasm_consumers[0].io_ports[0].amplification = Some(f64::NAN);
             config
         };
@@ -514,7 +523,7 @@ channel outbox at "brenn:{channel_b}" {{
 }}
 
 component Sink {{
-    abi = processor;
+    {PROCESSOR}
     in inbound;
     out outbound;
 }}
@@ -643,7 +652,7 @@ channel outbox at "brenn:{channel_b}" {{
 }}
 
 component Panel {{
-    abi = dom;
+    {DOM}
     in messages;
     out outbound;
 }}

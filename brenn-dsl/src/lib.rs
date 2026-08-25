@@ -23,6 +23,8 @@ pub mod derive;
 /// The far side of derivation: what a document comes to.
 pub mod derived;
 pub mod diag;
+/// DSL text a test fixture states, single-sourced from the vocabulary it spells.
+pub mod fixture_text;
 pub mod model;
 // `parser` and `unparser` are public because the formatter binary names their
 // types from outside this crate; `cst` is public because their signatures are

@@ -94,7 +94,7 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         "statements.brenn",
         Some("component Protobar {"),
     ),
-    ("port_decl", "statements.brenn", Some("in messages;")),
+    ("port_decl", "statements.brenn", Some("in in;")),
     ("port_dir", "statements.brenn", Some("out outbound;")),
     (
         "port_doctype",

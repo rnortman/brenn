@@ -1,0 +1,7 @@
+/// A bar panel: renders what arrives on `messages`, wakes itself on `tick`.
+component Protobar {
+  abi = dom;
+  requires = [ports, log];
+  in messages: "brenn.panel.message@1";
+  io tick;
+}

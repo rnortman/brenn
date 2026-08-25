@@ -508,6 +508,7 @@ dependencies = [
  "brenn-automation",
  "brenn-common",
  "brenn-db",
+ "brenn-dsl",
  "brenn-git",
  "brenn-graf",
  "brenn-hooks",

@@ -272,7 +272,7 @@ fn a_binding_tail_is_typed_by_its_direction() {
         format!(
             concat!(
                 "component Panel {{\n",
-                "    abi = dom;\n",
+                "    abi = dom; requires = [];\n",
                 "    in messages;\n",
                 "    out outbound;\n",
                 "    io tick;\n",
@@ -452,7 +452,7 @@ fn an_assembly_body_refuses_what_it_has_no_semantics_for() {
 #[test]
 fn a_component_class_body_is_a_closed_vocabulary() {
     let file = parse_str(
-        "component Protobar {\n    abi = dom;\n    in messages;\n}\n",
+        "component Protobar {\n    abi = dom; requires = [];\n    in messages;\n}\n",
         "t.brenn",
     )
     .expect("a parse");
@@ -460,7 +460,7 @@ fn a_component_class_body_is_a_closed_vocabulary() {
     assert_eq!(class.attrs.abi.value.as_str(), "dom");
 
     let error = parse_str(
-        "component Sink {\n    abi = processor;\n    component_path = \"/lib/s.wasm\";\n}\n",
+        "component Sink {\n    abi = processor; requires = [];\n    component_path = \"/lib/s.wasm\";\n}\n",
         "t.brenn",
     )
     .expect_err("`component_path` is an instance's key, not a class's");
@@ -475,7 +475,7 @@ fn a_component_class_body_is_a_closed_vocabulary() {
     assert!(error.message.contains("abi"), "{}", error.message);
 
     let error = parse_str(
-        "component Protobar {\n    abi = dom;\n    kind = panel;\n}\n",
+        "component Protobar {\n    abi = dom; requires = [];\n    kind = panel;\n}\n",
         "t.brenn",
     )
     .expect_err("`kind` is not a class key");
@@ -588,9 +588,14 @@ fn a_port_may_be_named_after_its_direction_keyword() {
         .iter()
         .map(|port| port.name.value().as_str())
         .collect();
-    assert_eq!(names, ["in", "out"]);
+    assert_eq!(names, ["in", "out", "optional"]);
     assert_eq!(class.ports[0].dir.value(), &PortDir::Into);
     assert_eq!(class.ports[1].dir.value(), &PortDir::Outof);
+    // The declaration keyword is no more reserved than the binding ones: the
+    // third port is named `optional` and is itself optional.
+    assert!(!class.ports[1].optional);
+    assert!(class.ports[2].optional);
+    assert_eq!(class.ports[2].dir.value(), &PortDir::Both);
 
     let instance = file
         .instantiations()
@@ -654,9 +659,9 @@ fn a_class_name_refuses_consecutive_uppercase() {
     );
 
     for accepted in [
-        "component HttpProxy {\n    abi = dom;\n}\n",
-        "component A {\n    abi = dom;\n}\n",
-        "component HttpA {\n    abi = dom;\n}\n",
+        "component HttpProxy {\n    abi = dom; requires = [];\n}\n",
+        "component A {\n    abi = dom; requires = [];\n}\n",
+        "component HttpA {\n    abi = dom; requires = [];\n}\n",
     ] {
         let file = parse_str(accepted, "t.brenn").expect("a parse");
         assert!(
@@ -702,7 +707,7 @@ fn an_acl_matcher_may_carry_an_attribute_tail() {
 #[test]
 fn a_duplicate_key_in_an_entity_body_is_refused() {
     let error = parse_str(
-        "component Alice {\n  abi = dom;\n  abi = processor;\n}\n",
+        "component Alice {\n  abi = dom; requires = [];\n  abi = processor; requires = [];\n}\n",
         "t.brenn",
     )
     .expect_err("the second `abi` has no home");

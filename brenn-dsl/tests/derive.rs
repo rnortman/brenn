@@ -9,10 +9,16 @@ mod support;
 
 use brenn_dsl::derive::wire_kind;
 use brenn_dsl::diag::Diagnostic;
+use brenn_dsl::{dom_any, processor_any};
 use support::{
     derive_errors, derive_refusal, derive_refusals, derived, durable, nondurable, prefix_tuning,
     tuning,
 };
+
+/// A fixture class's header: its abi, and grant declarations permitting
+/// everything its host admits so the spec fit answers nothing this suite asks.
+const DOM: &str = dom_any!();
+const PROCESSOR: &str = processor_any!();
 
 // ── roles: which blocks declare and which tune ───────────────────────────────
 
@@ -589,12 +595,16 @@ fn the_goldens_are_class_names_the_runtime_accepts_the_fold_of() {
 
 #[test]
 fn a_surface_instance_carries_the_kind_its_class_folds_to() {
-    let config = derived(
-        "component ModeClock { abi = dom; in messages; }\n\
-         component P1Panel { abi = dom; in messages; }\n\
-         surface desk {\n    grants = [];\n    new clock: ModeClock { grants = []; }\n    \
-         new panel: P1Panel { grants = []; }\n}\n",
-    );
+    let config = derived(concat!(
+        "component ModeClock { ",
+        dom_any!(),
+        " optional in messages; }\n\
+             component P1Panel { ",
+        dom_any!(),
+        " optional in messages; }\n\
+             surface desk {\n    grants = [];\n    new clock: ModeClock { grants = []; }\n    \
+             new panel: P1Panel { grants = []; }\n}\n",
+    ));
     assert_eq!(
         config.surface_component_kinds,
         vec![vec!["mode-clock".to_string(), "p1-panel".to_string()]]
@@ -603,10 +613,12 @@ fn a_surface_instance_carries_the_kind_its_class_folds_to() {
 
 #[test]
 fn a_top_level_instance_takes_no_kind() {
-    let config = derived(
-        "component ModeClock { abi = processor; }\n\
-         new clock: ModeClock { component_path = \"clock.wasm\"; grants = []; }\n",
-    );
+    let config = derived(concat!(
+        "component ModeClock { ",
+        processor_any!(),
+        " }\n\
+             new clock: ModeClock { component_path = \"clock.wasm\"; grants = []; }\n",
+    ));
     assert_eq!(config.resolved.consumers.len(), 1);
     assert!(config.surface_component_kinds.is_empty());
 }
@@ -636,8 +648,9 @@ fn two_panels(first_body: &str, second_body: &str) -> Vec<(&'static str, String)
     ]
 }
 
-/// The class body every same-facts fixture uses on both sides.
-const DOM_PANEL: &str = "abi = dom; in messages;";
+/// The class body every same-facts fixture uses on both sides. Its port is
+/// `optional` because the instances the helper writes bind nothing.
+const DOM_PANEL: &str = concat!(dom_any!(), " optional in messages;");
 
 /// The tree helper takes borrowed sources; the fixtures build owned ones.
 fn borrow<'a>(modules: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
@@ -654,21 +667,37 @@ fn two_classes_folding_to_one_kind_with_different_facts_are_refused() {
     // than silently serving two contracts under one kind.
     for (first, second) in [
         // the abi the browser instantiates against
-        ("abi = processor; in messages;", "abi = dom; in messages;"),
+        (
+            format!("{PROCESSOR} optional in messages;"),
+            format!("{DOM} optional in messages;"),
+        ),
         // a port's name and direction
-        ("abi = dom; in messages;", "abi = dom; out results;"),
+        (
+            format!("{DOM} optional in messages;"),
+            format!("{DOM} optional out results;"),
+        ),
         // how many ports there are
         (
-            "abi = dom; in messages;",
-            "abi = dom; in messages; in extra;",
+            format!("{DOM} optional in messages;"),
+            format!("{DOM} optional in messages; optional in extra;"),
+        ),
+        // which capabilities the spec permits
+        (
+            "abi = dom; requires = []; optional = [ports]; optional in messages;".to_string(),
+            "abi = dom; requires = []; optional = [log]; optional in messages;".to_string(),
         ),
         // what a port carries
         (
-            "abi = dom; in messages: \"alice.panel@1\";",
-            "abi = dom; in messages;",
+            format!("{DOM} optional in messages: \"alice.panel@1\";"),
+            format!("{DOM} optional in messages;"),
+        ),
+        // the order the spec's words are written in, which the comparison keeps
+        (
+            "abi = dom; requires = []; optional = [ports, log]; optional in messages;".to_string(),
+            "abi = dom; requires = []; optional = [log, ports]; optional in messages;".to_string(),
         ),
     ] {
-        let modules = two_panels(first, second);
+        let modules = two_panels(&first, &second);
         let errors = support::derive_tree(&borrow(&modules)).expect_err("one kind, two contracts");
         assert_eq!(errors.len(), 1, "{first} / {second}: {errors:?}");
         assert_eq!(
@@ -681,6 +710,80 @@ fn two_classes_folding_to_one_kind_with_different_facts_are_refused() {
     }
 }
 
+/// Optionality is a wire fact like the rest: one module's `Panel` permitting an
+/// unwired port and another's requiring it are two contracts under one kind.
+/// Written out rather than added to the loop above because both instances have
+/// to bind the port — the required side would otherwise be refused in
+/// resolution, before the fold is reached.
+#[test]
+fn two_classes_disagreeing_on_optionality_are_refused() {
+    let panel = |module: &'static str, marker: &str, surface: &str, port: &str| {
+        (
+            module,
+            format!(
+                "const {marker} = 1;\ncomponent Panel {{ {DOM} {port} }}\n\
+                 surface {surface} {{\n    grants = [];\n    \
+                 new view: Panel {{ grants = []; in messages <- \"local:brenn/m\"; }}\n}}\n"
+            ),
+        )
+    };
+    let modules = vec![
+        (
+            "",
+            "use one::marker_one;\nuse two::marker_two;\n".to_string(),
+        ),
+        panel("one", "marker_one", "first", "optional in messages;"),
+        panel("two", "marker_two", "second", "in messages;"),
+    ];
+    let errors = support::derive_tree(&borrow(&modules)).expect_err("one kind, two contracts");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "two component classes are served as `panel`: `Panel` on surface `second` states \
+         different facts than the one already claiming it"
+    );
+}
+
+/// A class's declared needs are wire facts too: one module's `Panel` that cannot
+/// run without `log` and another's that merely permits it are two contracts
+/// under one kind, even where both deployments happen to grant it. Written out
+/// rather than added to the loop above because a requirement no instance grants
+/// is refused at the instance, before the fold is reached.
+#[test]
+fn two_classes_disagreeing_on_declared_needs_are_refused() {
+    let panel = |module: &'static str, marker: &str, surface: &str, needs: &str| {
+        (
+            module,
+            format!(
+                "const {marker} = 1;\ncomponent Panel {{ abi = dom; {needs} \
+                 optional in messages; }}\n\
+                 surface {surface} {{\n    grants = [];\n    \
+                 new view: Panel {{ grants = [log]; }}\n}}\n"
+            ),
+        )
+    };
+    let modules = vec![
+        (
+            "",
+            "use one::marker_one;\nuse two::marker_two;\n".to_string(),
+        ),
+        panel("one", "marker_one", "first", "requires = [log];"),
+        panel(
+            "two",
+            "marker_two",
+            "second",
+            "requires = []; optional = [log];",
+        ),
+    ];
+    let errors = support::derive_tree(&borrow(&modules)).expect_err("one kind, two contracts");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "two component classes are served as `panel`: `Panel` on surface `second` states \
+         different facts than the one already claiming it"
+    );
+}
+
 #[test]
 fn two_byte_identical_classes_folding_to_one_kind_stand() {
     let modules = two_panels(DOM_PANEL, DOM_PANEL);
@@ -689,4 +792,540 @@ fn two_byte_identical_classes_folding_to_one_kind_stand() {
         config.surface_component_kinds,
         vec![vec!["panel".to_string()], vec!["panel".to_string()]]
     );
+}
+
+// ── document types ───────────────────────────────────────────────────────────
+
+/// A local channel and one surface, carrying the class declarations and
+/// instances a doctype case needs.
+///
+/// A `local:` plane throughout: the pass keys on the resolved address and cares
+/// nothing for the scheme, and a plane needs no transport grant, so a case about
+/// document types states nothing about authority.
+fn planes(classes: &str, instances: &str) -> String {
+    format!(
+        "channel m at \"local:alice.m\" {{\n    push_depth = 4;\n    retain_depth = 16;\n}}\n\
+         {classes}surface page {{\n    grants = [];\n{instances}}}\n"
+    )
+}
+
+/// One class with one `in messages` port, tagged or not.
+fn tagged_class(name: &str, doctype: &str) -> String {
+    format!("component {name} {{ {DOM} in messages{doctype}; }}\n")
+}
+
+/// One instance of `class`, binding `messages` to the declared channel.
+fn tagged_inst(handle: &str, class: &str) -> String {
+    format!("    new {handle}: {class} {{ grants = []; in messages <- m; }}\n")
+}
+
+#[test]
+fn two_ports_agreeing_on_a_document_type_stand() {
+    let source = planes(
+        &format!(
+            "{}{}",
+            tagged_class("Panel", ": \"alice.panel@1\""),
+            tagged_class("Board", ": \"alice.panel@1\"")
+        ),
+        &format!(
+            "{}{}",
+            tagged_inst("panel", "Panel"),
+            tagged_inst("board", "Board")
+        ),
+    );
+    let config = support::derived(&source);
+    assert_eq!(config.resolved.channels.len(), 1);
+}
+
+#[test]
+fn an_untagged_port_binds_to_a_tagged_channel() {
+    // The whole point of the tag being optional: a class that says nothing about
+    // its payload is not thereby wrong, at either end of the same plane.
+    let source = planes(
+        &format!(
+            "{}{}",
+            tagged_class("Panel", ": \"alice.panel@1\""),
+            tagged_class("Board", "")
+        ),
+        &format!(
+            "{}{}",
+            tagged_inst("panel", "Panel"),
+            tagged_inst("board", "Board")
+        ),
+    );
+    support::derived(&source);
+}
+
+#[test]
+fn two_ports_disagreeing_on_a_document_type_are_refused() {
+    let source = planes(
+        &format!(
+            "{}{}",
+            tagged_class("Panel", ": \"alice.panel@1\""),
+            tagged_class("Board", ": \"alice.board@1\"")
+        ),
+        &format!(
+            "{}{}",
+            tagged_inst("panel", "Panel"),
+            tagged_inst("board", "Board")
+        ),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "the ports bound to `m` (`local:alice.m`) declare 2 different document types, and \
+         one channel carries one document: a tag is compared whole, so `x@2` is not `x@1`"
+    );
+    assert_eq!(
+        errors[0]
+            .related
+            .iter()
+            .map(|(note, _)| note.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "port `messages` of `Panel` declares `alice.panel@1` here",
+            "port `messages` of `Board` declares `alice.board@1` here",
+        ]
+    );
+    assert_eq!(
+        errors[0].related[0].1.line_col_inner().map(|p| p.line + 1),
+        support::at(&source, "\"alice.panel@1\"").map(|(line, _)| line)
+    );
+    assert_eq!(
+        errors[0].related[1].1.line_col_inner().map(|p| p.line + 1),
+        support::at(&source, "\"alice.board@1\"").map(|(line, _)| line)
+    );
+}
+
+#[test]
+fn a_version_bump_is_a_different_document() {
+    let source = planes(
+        &format!(
+            "{}{}",
+            tagged_class("Panel", ": \"alice.panel@1\""),
+            tagged_class("Board", ": \"alice.panel@2\"")
+        ),
+        &format!(
+            "{}{}",
+            tagged_inst("panel", "Panel"),
+            tagged_inst("board", "Board")
+        ),
+    );
+    assert!(
+        derive_refusal(&source).contains("declare 2 different document types"),
+        "no version arithmetic: `@2` is a different tag"
+    );
+}
+
+#[test]
+fn three_disagreeing_ports_are_one_diagnostic_with_three_sites() {
+    let source = planes(
+        &format!(
+            "{}{}{}",
+            tagged_class("Panel", ": \"alice.panel@1\""),
+            tagged_class("Board", ": \"alice.board@1\""),
+            tagged_class("Sign", ": \"alice.sign@1\"")
+        ),
+        &format!(
+            "{}{}{}",
+            tagged_inst("panel", "Panel"),
+            tagged_inst("board", "Board"),
+            tagged_inst("sign", "Sign")
+        ),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0]
+            .message
+            .contains("declare 3 different document types"),
+        "{}",
+        errors[0].message
+    );
+    assert_eq!(errors[0].related.len(), 3);
+}
+
+#[test]
+fn many_instances_of_one_class_are_one_claim() {
+    // Classes are copied onto every instance, so N instances on one channel are N
+    // identical records. Deduping by tag is what keeps that from reading as a
+    // conflict, and from repeating a related entry per instance.
+    let source = planes(
+        &format!(
+            "{}{}",
+            tagged_class("Panel", ": \"alice.panel@1\""),
+            tagged_class("Board", ": \"alice.board@1\"")
+        ),
+        &format!(
+            "{}{}{}{}",
+            tagged_inst("one", "Panel"),
+            tagged_inst("two", "Panel"),
+            tagged_inst("three", "Board"),
+            tagged_inst("four", "Board")
+        ),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].related.len(), 2);
+}
+
+#[test]
+fn two_ports_of_one_class_on_one_channel_must_agree() {
+    let source = planes(
+        concat!(
+            "component Panel { ",
+            dom_any!(),
+            " in messages: \"alice.panel@1\"; out results: \"alice.board@1\"; }\n",
+        ),
+        "    new panel: Panel { grants = [ports]; in messages <- m; out results -> m; }\n",
+    );
+    assert!(
+        derive_refusal(&source).contains("declare 2 different document types"),
+        "one class can contradict itself on one channel"
+    );
+}
+
+#[test]
+fn a_literal_address_participates() {
+    // No `channel` block anywhere: the resolver hands the pass a resolved
+    // address either way, and a plane two doctyped ports share deserves the same
+    // agreement check as a declared channel.
+    let source = format!(
+        "{}{}surface page {{\n    grants = [];\n\
+             new panel: Panel {{ grants = []; in messages <- \"local:alice.m\"; }}\n\
+             new board: Board {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n",
+        tagged_class("Panel", ": \"alice.panel@1\""),
+        tagged_class("Board", ": \"alice.board@1\"")
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "the ports bound to `local:alice.m` declare 2 different document types, and one \
+         channel carries one document: a tag is compared whole, so `x@2` is not `x@1`"
+    );
+}
+
+#[test]
+fn a_free_io_port_claims_nothing() {
+    // A free `io` port is tuned in place and connects nothing, so its tag reaches
+    // no channel and cannot disagree with one.
+    let source = planes(
+        concat!(
+            "component Panel { ",
+            dom_any!(),
+            " io tick: \"alice.tick@1\"; in messages: \"alice.panel@1\"; }\n\
+             component Board { ",
+            dom_any!(),
+            " io tick: \"alice.board@1\"; }\n",
+        ),
+        "    new panel: Panel { grants = [ports]; io tick { push_depth = 1; retain_depth = 2; } \
+         in messages <- m; }\n\
+             new board: Board { grants = [ports]; io tick { push_depth = 1; \
+         retain_depth = 2; } }\n",
+    );
+    support::derived(&source);
+}
+
+#[test]
+fn a_consumers_ports_participate() {
+    // A transportable plane, because that is what a backend component and a
+    // page component can actually share: one `ephemeral:` address is one
+    // channel on either side of the wire.
+    let source = format!(
+        "channel m at \"ephemeral:alice.m\" {{\n    push_depth = 4;\n    retain_depth = 16;\n}}\n\
+         component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+         {}surface page {{\n    grants = [subscribe];\n{}}}\n\
+         new sink: Sink {{\n    slug = \"sink\";\n    component_path = \"/tmp/sink.wasm\";\n    \
+         grants = [];\n    in messages <- m;\n}}\n",
+        tagged_class("Panel", ": \"alice.panel@1\""),
+        tagged_inst("panel", "Panel"),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0]
+            .related
+            .iter()
+            .map(|(note, _)| note.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "port `messages` of `Panel` declares `alice.panel@1` here",
+            "port `messages` of `Sink` declares `alice.sink@1` here",
+        ]
+    );
+}
+
+#[test]
+fn two_surfaces_reusing_one_local_name_are_two_channels() {
+    // Each surface's page ring has its own `local:` namespace, so one bare name
+    // in two of them is two channels spelled alike. Two documents, no conflict.
+    let page = |surface: &str, class: &str| {
+        format!(
+            "surface {surface} {{\n    grants = [];\n    \
+             new view: {class} {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n"
+        )
+    };
+    let source = format!(
+        "{}{}{}{}",
+        tagged_class("Panel", ": \"alice.panel@1\""),
+        tagged_class("Board", ": \"alice.board@1\""),
+        page("first", "Panel"),
+        page("second", "Board"),
+    );
+    support::derived(&source);
+}
+
+#[test]
+fn a_page_local_name_and_a_server_local_name_are_two_channels() {
+    // The server ring and a page ring cannot exchange a message, so a backend
+    // component and a page component naming one `local:` address are describing
+    // two private channels, not disagreeing about one.
+    let source = format!(
+        "component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+         {}surface page {{\n    grants = [];\n    \
+         new panel: Panel {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n\
+         new sink: Sink {{\n    slug = \"sink\";\n    component_path = \"/tmp/sink.wasm\";\n    \
+         grants = [];\n    in messages <- \"local:alice.m\";\n}}\n",
+        tagged_class("Panel", ": \"alice.panel@1\""),
+    );
+    support::derived(&source);
+}
+
+#[test]
+fn an_interpolated_tag_is_compared_as_the_string_it_resolved_to() {
+    let source = planes(
+        &format!(
+            "const tag = \"alice.panel@1\";\n{}{}",
+            tagged_class("Panel", ": f\"{tag}\""),
+            tagged_class("Board", ": \"alice.panel@1\"")
+        ),
+        &format!(
+            "{}{}",
+            tagged_inst("panel", "Panel"),
+            tagged_inst("board", "Board")
+        ),
+    );
+    support::derived(&source);
+}
+
+// ── the channel's own expectation ────────────────────────────────────────────
+
+/// A local channel declaring the document it expects.
+fn expecting(tag: &str) -> String {
+    format!(
+        "channel m at \"local:alice.m\" {{\n    push_depth = 4;\n    retain_depth = 16;\n    \
+         doctype = \"{tag}\";\n}}\n"
+    )
+}
+
+#[test]
+fn a_channel_doctype_a_port_matches_stands() {
+    let source = format!(
+        "{}{}surface page {{\n    grants = [];\n{}}}\n",
+        expecting("alice.panel@1"),
+        tagged_class("Panel", ": \"alice.panel@1\""),
+        tagged_inst("panel", "Panel"),
+    );
+    support::derived(&source);
+}
+
+#[test]
+fn a_channel_doctype_a_port_contradicts_is_refused() {
+    let source = format!(
+        "{}{}surface page {{\n    grants = [];\n{}}}\n",
+        expecting("alice.board@1"),
+        tagged_class("Panel", ": \"alice.panel@1\""),
+        tagged_inst("panel", "Panel"),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "port `messages` of `Panel` declares `alice.panel@1`, and channel `m` expects \
+         `alice.board@1`"
+    );
+    assert_eq!(
+        errors[0].related[0].0,
+        "the channel states its document type here"
+    );
+    assert_eq!(
+        errors[0].related[0].1.line_col_inner().map(|p| p.line + 1),
+        support::at(&source, "\"alice.board@1\"").map(|(line, _)| line)
+    );
+}
+
+#[test]
+fn a_channel_doctype_over_disagreeing_ports_says_both_things() {
+    // Two families of diagnostic on one channel: the ports disagree with each
+    // other, and the one that does not match the channel disagrees with the
+    // channel too. Both are true and both are reported.
+    let source = format!(
+        "{}{}{}surface page {{\n    grants = [];\n{}{}}}\n",
+        expecting("alice.panel@1"),
+        tagged_class("Panel", ": \"alice.panel@1\""),
+        tagged_class("Board", ": \"alice.board@1\""),
+        tagged_inst("panel", "Panel"),
+        tagged_inst("board", "Board"),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "the ports bound to `m` (`local:alice.m`) declare 2 different document types, and \
+         one channel carries one document: a tag is compared whole, so `x@2` is not `x@1`"
+    );
+    assert_eq!(
+        errors[0]
+            .related
+            .iter()
+            .map(|(note, _)| note.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "port `messages` of `Panel` declares `alice.panel@1` here",
+            "port `messages` of `Board` declares `alice.board@1` here",
+        ]
+    );
+    assert_eq!(
+        errors[1].message,
+        "port `messages` of `Board` declares `alice.board@1`, and channel `m` expects \
+         `alice.panel@1`"
+    );
+    assert_eq!(
+        errors[1].related[0].0,
+        "the channel states its document type here"
+    );
+}
+
+#[test]
+fn a_channel_doctype_with_no_doctyped_port_is_inert() {
+    // Deliberately not dead config: the attr exists to catch a *future* binding,
+    // so an expectation awaiting components is the state it is written in.
+    let source = format!(
+        "{}{}surface page {{\n    grants = [];\n{}}}\n",
+        expecting("alice.panel@1"),
+        tagged_class("Panel", ""),
+        tagged_inst("panel", "Panel"),
+    );
+    support::derived(&source);
+}
+
+#[test]
+fn a_channel_doctype_with_nothing_bound_at_all_is_inert() {
+    support::derived(&expecting("alice.panel@1"));
+}
+
+#[test]
+fn a_channel_doctype_that_is_not_a_tag_is_refused() {
+    let source = "channel m at \"local:alice.m\" {\n    push_depth = 4;\n    \
+                  retain_depth = 16;\n    doctype = 3;\n}\n";
+    assert_eq!(
+        derive_refusal(source),
+        "a document type is a string; this is an integer"
+    );
+}
+
+#[test]
+fn a_tuning_states_no_doctype() {
+    let source = "channel at prefix \"mqtt:broker:alice/\" {\n    push_depth = 4;\n    \
+                  retain_depth = 16;\n    standing_retain_depth = 64;\n    \
+                  doctype = \"alice.panel@1\";\n}\n";
+    assert_eq!(
+        derive_refusal(source),
+        "the block tuning `prefix mqtt:broker:alice/` states no doctype: a tuning matches a \
+         family the system mints, so it names no one document contract — a doctype belongs \
+         on a `channel` declaration, which is one channel"
+    );
+}
+
+// ── across module and assembly boundaries ────────────────────────────────────
+
+#[test]
+fn two_modules_wiring_one_plane_are_checked_against_each_other() {
+    // Neither author can see the other's class; the pass is whole-document, so
+    // the plane they share is where the disagreement surfaces. Both components
+    // are backend-placed, which is what makes the `local:` name they both wrote
+    // one channel.
+    let module = |key: &'static str, marker: &str, class: &str, tag: &str, inst: &str| {
+        (
+            key,
+            format!(
+                "const {marker} = 1;\ncomponent {class} {{ {PROCESSOR} in messages: \"{tag}\"; \
+                 }}\nnew {inst}: {class} {{\n    slug = \"{inst}\";\n    \
+                 component_path = \"/tmp/{inst}.wasm\";\n    grants = [];\n    \
+                 in messages <- \"local:alice.m\";\n}}\n"
+            ),
+        )
+    };
+    let modules = vec![
+        (
+            "",
+            "use one::marker_one;\nuse two::marker_two;\n".to_string(),
+        ),
+        module("one", "marker_one", "Panel", "alice.panel@1", "panel"),
+        module("two", "marker_two", "Board", "alice.board@1", "board"),
+    ];
+    let errors = support::derive_tree(&borrow(&modules)).expect_err("one plane, two documents");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0]
+            .message
+            .contains("the ports bound to `local:alice.m` declare 2 different document types"),
+        "{}",
+        errors[0].message
+    );
+    assert_eq!(errors[0].related[0].1.filename_inner(), Some("one.brenn"));
+    assert_eq!(errors[0].related[1].1.filename_inner(), Some("two.brenn"));
+}
+
+#[test]
+fn a_stamped_channel_is_checked_per_stamping() {
+    // Two stampings of one assembly are two channels carrying identical claims,
+    // so the disagreement is reported once per stamped channel and both cite the
+    // one declaration in the assembly body.
+    let source = concat!(
+        "component Panel { ",
+        dom_any!(),
+        " in messages: \"alice.panel@1\"; }\n\
+component Board { ",
+        dom_any!(),
+        " in messages: \"alice.board@1\"; }
+
+assembly Pod(slug: String) {
+    channel messages at f\"local:{slug}.messages\" { push_depth = 4; retain_depth = 16; }
+    surface page {
+        slug = slug;
+        grants = [];
+        new panel: Panel { grants = []; in messages <- messages; }
+        new board: Board { grants = []; in messages <- messages; }
+    }
+}
+
+new alice: Pod(slug = \"alice\");
+new bob: Pod(slug = \"bob\");
+",
+    );
+    let errors = derive_errors(source);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "the ports bound to `alice.messages` (`local:alice.messages`) declare 2 \
+             different document types, and one channel carries one document: a tag is \
+             compared whole, so `x@2` is not `x@1`",
+            "the ports bound to `bob.messages` (`local:bob.messages`) declare 2 different \
+             document types, and one channel carries one document: a tag is compared \
+             whole, so `x@2` is not `x@1`",
+        ]
+    );
+    for error in &errors {
+        assert_eq!(
+            error.related[0].1.line_col_inner().map(|p| p.line + 1),
+            support::at(source, "\"alice.panel@1\"").map(|(line, _)| line)
+        );
+    }
 }

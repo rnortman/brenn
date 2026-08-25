@@ -192,6 +192,7 @@ rule pin
 rule port_decl
 {
     group;
+    after "optional" { nbsp; }
 }
 
 rule new_stmt

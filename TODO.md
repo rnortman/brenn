@@ -303,6 +303,13 @@ a designed feature. `tool_grants` and `mqtt_outputs` are in the same class and
 are recorded in `dsl-vocabulary-config-parity`'s deliberately-omitted column;
 this one is bigger than that column because a whole boot subsystem hangs off it.
 
+`tool_grants` carries a rider from the component-spec vocabulary: a component
+class states its capability needs as `requires`/`optional` word lists over the
+`ComponentGrant` words, and `tools` is deliberately not one of them, because
+tool grants have no instance-level `grants` spelling to check a class-level need
+against. When tool grants get a statement form, `tools` joins the spec
+vocabulary with it.
+
 Done = either the DSL has a spelling that reaches `lower_auto_wiring`'s
 connection arm, or `ConnectionConfigRaw`, the `connections` field, that arm and
 its tests are gone and only the io_port auto-channel path a document can reach
@@ -2158,18 +2165,39 @@ Done = `GET /auth/register` returns the same status regardless of whether an
 unused invite code exists, and the login page's `Register` link leads somewhere
 that explains itself.
 
-## `dsl-idioms-canonical-doc`
+## `dsl-doc-examples-ungated`
 
-The `.brenn` authoring conventions (root file is the deployment manifest; modules
-hold definitions; an assembly earns its place at the second stamping; a rationale
-is written once at the definition site; component classes unify as the superset)
-now exist as two comment blocks that are already worded differently and already
-carry different content: `config/components.brenn` in this repo, and
-`deploy/brenn/config/prod/site.brenn` in the private brenn-ops annex. Each points
-at the other, which is the most a comment can do; nothing makes the second copy
-move when a rule changes, and the divergence has already started.
+`docs/config-dsl.md` carries ~26 fenced DSL blocks. Exactly one — the `Chrome`
+spec — is held against anything (`brenn-lib/src/config/tests/config_files.rs`,
+`the_dsl_doc_transcribes_the_chrome_spec_verbatim`, which compares the block to
+`config/specs/chrome.brenn` byte for byte). Every other snippet is prose: the
+`channel` declaration, the tuning form, the consumer and surface instances, the
+`agent` block with its `mount`/`mcp_server`/`subscribe` tails, the `assembly`
+block, and the `acl` matcher-tail example. Nothing parses them.
 
-Wanted: one canonical home, with the second copy reduced to its local delta plus a
-pointer. Open first: whether that home is a `docs/` page here (this repo has no DSL
-prose doc at all yet, and starting one is a scope decision, not a comment edit) and
-whether a config in a permanently-private repo may point at a path in a public one.
+So a key-set or grammar change — renaming a body key, dropping a `CONSUMER_KEYS`
+entry, retiring the free-`io` form, changing a binding arrow — leaves the one
+reference an operator copies from full of examples that no longer compile, and
+no gate notices.
+
+What makes this more than mechanical: most snippets are fragments, not
+documents. A `channel` block alone is not a loadable root (a durable channel
+needs a uuid pin; a root needs server keys), so gating them means deciding what
+a wrapping root looks like, whether the fixture or the doc is the source of
+truth, and which snippets are normative versus deliberately illustrative. That
+is an authoring decision about the document, not just a test to write.
+
+Two shapes to weigh. (a) Self-contained snippets move to fixture files (e.g.
+`docs/examples/*.brenn`), join the format and compile gates by glob, and the doc
+transcribes them under a table-driven version of the existing
+transcription test. (b) The doc stays the source and a harness extracts each
+block, wraps it in a minimal root, and compiles it — no duplication, but the
+wrapping is machinery the doc's author cannot see.
+
+Code site (`TODO(dsl-doc-examples-ungated)`):
+brenn-lib/src/config/tests/config_files.rs, on the transcription test that
+gates the one block.
+
+Done = every block in `docs/config-dsl.md` that is presented as compilable is
+compiled by `make check`, and the blocks that are not are marked as fragments in
+the prose.

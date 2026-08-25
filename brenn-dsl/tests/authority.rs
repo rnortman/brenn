@@ -9,16 +9,29 @@ mod support;
 
 use brenn_dsl::derived::{DAclSet, DMatcher};
 use brenn_dsl::diag::Diagnostic;
+use brenn_dsl::{dom_any, processor_any};
 use fltk_serde_core::Spanned;
 use support::{at, derive_errors, derive_refusal, derive_refusals, derived, durable, nondurable};
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
 /// The class every consumer fixture instantiates.
+///
+/// Every port here is `optional`: a fixture class exists so each case binds only
+/// the ports the case is about, and a required port would answer every other
+/// case with an unconnected-port refusal instead of the one it asked for. The
+/// required-port contract itself is asserted in the resolve suite.
+///
+/// Its grant declarations are read the same way: `requires` is empty and
+/// `optional` is every word this host admits, so each case grants what the case
+/// is about without the spec fit answering it first. The fit contract itself is
+/// asserted below.
 const SINK: &str = concat!(
     "component Sink {\n",
-    "    abi = processor;\n",
-    "    out events;\n",
+    "    ",
+    processor_any!(),
+    "\n",
+    "    optional out events;\n",
     "}\n",
 );
 
@@ -740,23 +753,29 @@ fn each_authority_belongs_to_the_entity_at_its_own_index() {
 
 // ── what a binding derives ───────────────────────────────────────────────────
 
-/// A dom class with a port facing each way and one facing both.
+/// A dom class with a port facing each way and one facing both. Every port is
+/// `optional` for the reason `SINK` states.
 const PANEL: &str = concat!(
     "component Panel {\n",
-    "    abi = dom;\n",
-    "    in messages;\n",
-    "    out acks;\n",
-    "    io tick;\n",
+    "    ",
+    dom_any!(),
+    "\n",
+    "    optional in messages;\n",
+    "    optional out acks;\n",
+    "    optional io tick;\n",
     "}\n",
 );
 
-/// A processor class a top-level instance is made of.
+/// A processor class a top-level instance is made of. Every port is `optional`
+/// for the reason `SINK` states.
 const RELAY: &str = concat!(
     "component Relay {\n",
-    "    abi = processor;\n",
-    "    in inbound;\n",
-    "    out outbound;\n",
-    "    io acks;\n",
+    "    ",
+    processor_any!(),
+    "\n",
+    "    optional in inbound;\n",
+    "    optional out outbound;\n",
+    "    optional io acks;\n",
     "}\n",
 );
 
@@ -808,10 +827,12 @@ fn relay(body: &str) -> String {
 /// positions on one ingress address.
 const FAN_IN: &str = concat!(
     "component FanIn {\n",
-    "    abi = processor;\n",
-    "    in first;\n",
-    "    in second;\n",
-    "    in third;\n",
+    "    ",
+    processor_any!(),
+    "\n",
+    "    optional in first;\n",
+    "    optional in second;\n",
+    "    optional in third;\n",
     "}\n",
 );
 
@@ -2115,5 +2136,200 @@ fn an_undeclared_channel_under_a_placed_instance_is_refused_once() {
         "`brenn:alice.cmd` names no declared channel, so this binding of surface `alice_desk` \
          attaches to nothing: a transportable channel exists because a `channel` block \
          declares it"
+    );
+}
+
+// ── an instance's grants against its class's needs ────────────────────────────
+//
+// The class is the author's statement of what the component cannot run without;
+// the instance's list is the deployer's act of consent. Neither is derived from
+// the other, so the fit is checked in both directions, at both placements. The
+// fixtures here name `log` rather than `ports` so no agreement rule answers the
+// case before the fit does.
+
+/// A dom class needing one capability, and a surface holding one instance of it
+/// with the grants named.
+fn needy_panel(needs: &str, grants: &str) -> String {
+    format!(
+        "component Needy {{\n    abi = dom; {needs};\n    optional in messages;\n}}\n\
+         surface alice_desk {{\n    grants = [];\n    \
+         new p1: Needy {{\n        grants = [{grants}];\n    }}\n}}\n"
+    )
+}
+
+/// A processor class needing one capability, and a top-level instance of it with
+/// the grants named.
+fn needy_sink(needs: &str, grants: &str) -> String {
+    format!(
+        "component Needy {{\n    abi = processor; {needs};\n    optional in inbound;\n}}\n\
+         new alice_sink: Needy {{\n    component_path = \"needy.wasm\";\n    \
+         grants = [{grants}];\n}}\n"
+    )
+}
+
+#[test]
+fn a_placed_instance_missing_a_required_capability_is_refused() {
+    let source = needy_panel("requires = [log]", "");
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "component `alice_desk.p1` does not grant `log`, which `Needy` requires: a component \
+         runs with what it was given, and this one was not given what it needs"
+    );
+    // The omission is the instance's, and the contract it broke is the class's.
+    assert_eq!(errors[0].line_col(), at(&source, "p1"));
+    assert_eq!(errors[0].related[0].0, "required here");
+    assert_eq!(
+        errors[0].related[0].1.line_col_inner().map(|p| p.line + 1),
+        at(&source, "requires = [log]").map(|(line, _)| line)
+    );
+}
+
+#[test]
+fn a_consumer_missing_a_required_capability_is_refused() {
+    assert_eq!(
+        derive_refusal(&needy_sink("requires = [log]", "")),
+        "consumer `alice_sink` does not grant `log`, which `Needy` requires: a component \
+         runs with what it was given, and this one was not given what it needs"
+    );
+}
+
+/// Every requirement is named, so a deployment under-granting two capabilities
+/// sees both rather than one per run.
+#[test]
+fn every_unmet_requirement_is_reported() {
+    let errors = derive_refusals(&needy_panel("requires = [log, alert]", ""));
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("`log`"), "{errors:?}");
+    assert!(errors[1].contains("`alert`"), "{errors:?}");
+}
+
+/// The other direction: a capability the spec never asked for is authority
+/// nothing reads, so the grant is refused where it was written.
+#[test]
+fn a_grant_the_spec_never_asked_for_is_refused() {
+    let source = needy_panel("requires = []", "alert");
+    let errors = derive_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "component `alice_desk.p1` grants `alert`, which `Needy` neither requires nor lists \
+         optional: the spec is the vocabulary"
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "alert]"));
+    assert_eq!(errors[0].related[0].0, "declared here");
+}
+
+#[test]
+fn a_consumers_undeclared_grant_is_refused() {
+    assert_eq!(
+        derive_refusal(&needy_sink("requires = []", "alert")),
+        "consumer `alice_sink` grants `alert`, which `Needy` neither requires nor lists \
+         optional: the spec is the vocabulary"
+    );
+}
+
+/// What `optional` means: the deployment decides, and both decisions compile.
+#[test]
+fn an_optional_capability_may_be_granted_or_left_out() {
+    for grants in ["", "log"] {
+        let config = derived(&needy_panel("requires = []; optional = [log]", grants));
+        assert_eq!(config.surface_components[0].len(), 1, "granting {grants:?}");
+    }
+}
+
+/// A requirement met is silent, and the word crosses into the derived model as
+/// written: the fit check adds a question, not a transformation.
+#[test]
+fn a_met_requirement_crosses_as_written() {
+    let config = derived(&needy_sink("requires = [log]", "log"));
+    assert_eq!(granted(&config.consumers[0].grants), ["log"]);
+}
+
+/// The two questions compose without either standing in for the other: a
+/// processor class may legally require `store`, and every surface placement of
+/// it is refused twice — the host cannot implement the word, and the word
+/// therefore never reaches the instance's grants. Both messages are true of the
+/// same contradiction.
+#[test]
+fn a_surface_placement_of_a_backend_only_requirement_is_refused_twice() {
+    let errors = derive_refusals(concat!(
+        "component Needy {\n    abi = processor; requires = [store];\n",
+        "    optional in inbound;\n}\n",
+        "surface alice_desk {\n    grants = [];\n",
+        "    new p1: Needy {\n        grants = [store];\n    }\n}\n",
+    ));
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert_eq!(
+        errors[0],
+        "`store` is backend-only in v1; a surface-hosted component cannot be granted it"
+    );
+    assert!(errors[1].contains("does not grant `store`"), "{errors:?}");
+}
+
+/// The list nobody wrote is one refusal, not one plus a fit refusal per
+/// requirement: the words are not what the document states, so the fit has
+/// nothing to ask about.
+#[test]
+fn a_missing_grants_list_is_not_followed_by_fit_refusals() {
+    let source = concat!(
+        "component Needy {\n    abi = dom; requires = [log, alert];\n    optional in messages;\n}\n",
+        "surface alice_desk {\n    grants = [];\n    new p1: Needy {}\n}\n",
+    );
+    assert_eq!(
+        derive_refusal(source),
+        "component `alice_desk.p1` states no `grants`: what a component is given is \
+         deny-by-default, so an empty list is written `grants = [];` rather than left out"
+    );
+}
+
+/// A page capability the spec never named is refused as an over-grant, with the
+/// wiring it was granted for in place: what the class permits is the only rule
+/// that speaks for `takeover`, because the agreement rules pair only `ports` and
+/// `mqtt` with an entry.
+#[test]
+fn a_takeover_grant_no_spec_permits_is_refused_even_with_the_wiring() {
+    let errors = derive_refusals(concat!(
+        "component Needy {\n    abi = dom; requires = [ports];\n",
+        "    optional in messages;\n    out takeover;\n}\n",
+        "surface alice_desk {\n    grants = [];\n",
+        "    new p1: Needy {\n        grants = [ports, takeover];\n",
+        "        out takeover -> \"local:brenn/takeover\";\n    }\n}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0],
+        "component `alice_desk.p1` grants `takeover`, which `Needy` neither requires nor \
+         lists optional: the spec is the vocabulary"
+    );
+}
+
+/// The same grant the spec lists optional stands with no takeover wiring at all:
+/// the fit check compares grants to the spec and nothing else, so it neither
+/// demands a binding nor answers for one.
+#[test]
+fn a_permitted_takeover_grant_needs_no_takeover_binding() {
+    let config = derived(concat!(
+        "component Needy {\n    abi = dom; requires = []; optional = [takeover];\n",
+        "    optional in messages;\n    optional out takeover;\n}\n",
+        "surface alice_desk {\n    grants = [];\n",
+        "    new p1: Needy {\n        grants = [takeover];\n    }\n}\n",
+    ));
+    assert_eq!(
+        granted(&config.surface_components[0][0].grants),
+        ["takeover"]
+    );
+}
+
+/// A word the vocabulary does not hold is refused once, as a word: the fit
+/// check reads the classified rights, so a garbage word never reaches it.
+#[test]
+fn a_garbage_word_does_not_also_fail_the_fit() {
+    let errors = derive_refusals(&needy_panel("requires = []", "frobnicate"));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].starts_with("`frobnicate` is not a right"),
+        "{errors:?}"
     );
 }

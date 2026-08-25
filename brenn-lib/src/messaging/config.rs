@@ -2958,6 +2958,8 @@ pub fn build_runtime_directory(
 
 #[cfg(test)]
 mod tests {
+    use brenn_dsl::processor_any;
+
     use super::*;
     use crate::config::{config_from_dsl, sole_refusal};
 
@@ -3993,10 +3995,12 @@ channel demo at "ephemeral:protobar-demo" {
     /// eager — so stating one is refused rather than accepted and ignored.
     #[test]
     fn a_wake_min_on_a_consumer_io_binding_is_refused() {
-        let diag = sole_refusal(
+        let diag = sole_refusal(concat!(
             r#"
 component Router {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     io tick;
 }
 
@@ -4005,8 +4009,8 @@ new router: Router {
     grants = [ports];
     io tick { push_depth = 1; retain_depth = 2; wake_min = normal; }
 }
-"#,
-        );
+"#
+        ));
         assert!(
             diag.render().contains("wake_min"),
             "the refusal must name the key with no referent, got: {}",
@@ -5090,7 +5094,7 @@ new pfin: Finance();
     /// nothing. That parity is held by review, per `dsl-vocabulary-config-parity`.
     #[test]
     fn every_consumer_grant_word_lowers_to_its_variant() {
-        let config = config_from_dsl(
+        let config = config_from_dsl(concat!(
             r#"
 mqtt_client broker { url = "mqtts://broker.example.com:8883"; }
 
@@ -5101,7 +5105,9 @@ channel digests at "brenn:alice-digests" {
 }
 
 component Router {
-    abi = processor;
+    "#,
+            processor_any!(),
+            r#"
     out digest;
 }
 
@@ -5114,8 +5120,8 @@ new router: Router {
 
     out digest -> digests {}
 }
-"#,
-        );
+"#
+        ));
         assert_eq!(
             config.wasm_consumers[0].grants,
             vec![
@@ -5134,13 +5140,15 @@ new router: Router {
     /// which fails at some later runtime call instead of at load.
     #[test]
     fn an_unknown_consumer_grant_word_is_refused() {
-        let diag = sole_refusal(
+        let diag = sole_refusal(concat!(
             r#"
-component Router { abi = processor; io tick; }
+component Router { "#,
+            processor_any!(),
+            r#" io tick; }
 
 new router: Router { component_path = "/lib/r.wasm"; grants = [not_a_real_grant]; io tick {} }
-"#,
-        );
+"#
+        ));
         assert!(
             diag.render().contains("not_a_real_grant"),
             "the refusal must name the bad word, got: {}",
@@ -5152,11 +5160,13 @@ new router: Router { component_path = "/lib/r.wasm"; grants = [not_a_real_grant]
     /// degenerate, thing to declare.
     #[test]
     fn a_consumer_with_no_grants_lowers_with_an_empty_list() {
-        let config = config_from_dsl(
+        let config = config_from_dsl(concat!(
             r#"
 channel feed at "ephemeral:alice-feed" { push_depth = 4; retain_depth = 8; }
 
-component Router { abi = processor; in inbound; }
+component Router { "#,
+            processor_any!(),
+            r#" in inbound; }
 
 new router: Router {
     component_path = "/lib/r.wasm";
@@ -5164,8 +5174,8 @@ new router: Router {
 
     in inbound <- feed;
 }
-"#,
-        );
+"#
+        ));
         assert!(config.wasm_consumers[0].grants.is_empty());
         assert!(config.wasm_consumers[0].subscribe_acl.is_empty());
         assert!(config.wasm_consumers[0].publish_acl.is_empty());
@@ -5177,13 +5187,15 @@ new router: Router {
     /// knob would otherwise be a silent over-grant or a silent no-op.
     #[test]
     fn a_stray_consumer_key_is_refused() {
-        let diag = sole_refusal(
+        let diag = sole_refusal(concat!(
             r#"
-component Router { abi = processor; io tick; }
+component Router { "#,
+            processor_any!(),
+            r#" io tick; }
 
 new router: Router { component_path = "/lib/r.wasm"; grants = []; subscribe_acls = []; io tick {} }
-"#,
-        );
+"#
+        ));
         assert!(
             diag.render().contains("subscribe_acls"),
             "the refusal must name the stray key, got: {}",

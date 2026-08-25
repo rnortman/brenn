@@ -17,6 +17,7 @@
 //! in one document are all reported.
 
 use brenn_envelope::addressing::is_unreserved_name;
+use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
@@ -27,22 +28,22 @@ use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 
 use crate::derived::DerivedConfig;
-use crate::diag::{Diagnostic, check_unique, duplicate_statement, two_site};
+use crate::diag::{Diagnostic, check_unique, duplicate_statement, or_list, two_site};
 use crate::model::{
     AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem,
-    AttachmentTargetAttrs, AttrBlock, AttrMap, Binding as BindStmt, ChanAddr, ChanRef,
+    AttachmentTargetAttrs, Attr, AttrBlock, AttrMap, Binding as BindStmt, ChanAddr, ChanRef,
     ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
     InlineTable, InstBody, IntOrWord, IoTail, Item, MapValues, Matcher, MatcherVal, McpServerStmt,
     MountStmt, MountTail, NamedAttrDef, NewStmt, OutTail, Param, ParamList, PathRef, PathSeg,
     PortDir as DeclDir, SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail,
-    SurfaceDef, TypedBlock, UseStmt, UuidPin, Value,
+    SurfaceDef, TypedBlock, UseStmt, UuidPin, Value, WordList,
 };
 use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RAttachmentTarget,
     RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks, RMatcher, RMatcherVal,
     RMcp, RMount, RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTail, RTuning,
-    RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig,
+    RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, str_value,
 };
 
 /// The module key of the root file: the crate root has no path to name it by.
@@ -2554,13 +2555,10 @@ fn slug_of(
     errors: &mut Vec<Diagnostic>,
 ) -> Spanned<String> {
     match explicit {
-        Some(value) => match value.value() {
-            RValue::Str(text) => Spanned::new(text.clone(), value.span().clone()),
-            other => {
-                errors.push(Diagnostic::at(
-                    format!("a slug is a string; this is {}", other.kind()),
-                    value.span().clone(),
-                ));
+        Some(value) => match str_value(value, "a slug") {
+            Ok(text) => Spanned::new(text.to_string(), value.span().clone()),
+            Err(error) => {
+                errors.push(error);
                 Spanned::new(handle.dotted(), name.clone())
             }
         },
@@ -2778,6 +2776,7 @@ fn class_ref(
         return None;
     };
     let abi = Spanned::new(parsed, word.span().clone());
+    let needs = class_grants(class, abi.value(), errors)?;
     let mut ports: Vec<RPort> = Vec::new();
     for decl in &class.ports {
         if let Some(prior) = ports
@@ -2805,14 +2804,137 @@ fn class_ref(
         ports.push(RPort {
             name: decl.name.clone(),
             dir: port_dir(decl.dir.value()),
+            optional: decl.optional,
             doctype,
         });
     }
     Some(ClassRef {
         name: class.name.clone(),
         abi,
+        requires: needs.requires,
+        optional: needs.optional,
         ports,
     })
+}
+
+/// The two grant lists a class declares, checked as a pair.
+struct ClassGrants {
+    requires: Vec<Spanned<ComponentGrant>>,
+    optional: Vec<Spanned<ComponentGrant>>,
+}
+
+/// A class's `requires` and `optional`, refused whole where either is unusable.
+///
+/// `None` refuses the class, which is the same answer the abi word gets: the
+/// spec is what an instance's fit is checked against, so a spec that does not
+/// say what it needs is answered once here rather than at every instantiation.
+/// Every refusal the pair can hold is reported before returning, so an author
+/// fixing one word does not discover the next on the following build.
+fn class_grants(
+    class: &ComponentClass,
+    abi: &Abi,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<ClassGrants> {
+    let before = errors.len();
+    let list = |attr: Option<&Attr<WordList>>| -> Vec<Spanned<String>> {
+        attr.map(|attr| {
+            attr.value
+                .words
+                .iter()
+                .map(|word| word.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let requires = list(class.attrs.requires.as_ref());
+    let optional = list(class.attrs.optional.as_ref());
+    if class.attrs.requires.is_none() {
+        errors.push(Diagnostic::at(
+            format!(
+                "component `{}` states no `requires`: what a component needs is \
+                 deny-by-default, so a class needing nothing is written \
+                 `requires = [];` rather than left out",
+                class.name.value()
+            ),
+            class.name.span().clone(),
+        ));
+    }
+    // A dom class can only ever be surface-placed, so a word no surface admits
+    // is a spec no legal placement satisfies. A processor class admits both
+    // hosts, and its instances' words are host-checked where they are written.
+    let host = match abi {
+        Abi::Dom => Some(ComponentHost::Surface),
+        Abi::Processor => None,
+    };
+    // Every word is parsed into its grant variant here; nothing downstream
+    // re-decides it from text.
+    let mut parsed: [Vec<Spanned<ComponentGrant>>; 2] = [Vec::new(), Vec::new()];
+    for (slot, (which, words)) in [("requires", &requires), ("optional", &optional)]
+        .into_iter()
+        .enumerate()
+    {
+        check_unique(
+            words
+                .iter()
+                .map(|word| (word.value().as_str(), (), word.span())),
+            |word, (), span, (), prior| {
+                two_site(
+                    format!(
+                        "`{word}` is listed twice in `{which}`; one statement of a need states it"
+                    ),
+                    span.clone(),
+                    "it is listed here",
+                    prior.clone(),
+                )
+            },
+            errors,
+        );
+        for word in words {
+            let Some(grant) = ComponentGrant::parse(word.value()) else {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`{}` is not a capability a component holds; a spec's `{which}` names \
+                         the same words a `grants` list does: {}",
+                        word.value(),
+                        or_list(ComponentGrant::ALL.map(ComponentGrant::word))
+                    ),
+                    word.span().clone(),
+                ));
+                continue;
+            };
+            parsed[slot].push(Spanned::new(grant, word.span().clone()));
+            if let Some(host) = host
+                && let Some(message) = grant.illegal_on(host)
+            {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "{message}, and a dom class runs nowhere else, so `{}` cannot be \
+                         satisfied at any placement",
+                        word.value()
+                    ),
+                    word.span().clone(),
+                ));
+            }
+        }
+    }
+    for word in &requires {
+        if let Some(other) = optional.iter().find(|other| other.value() == word.value()) {
+            errors.push(two_site(
+                format!(
+                    "`{}` is both required and optional; it is one or the other",
+                    word.value()
+                ),
+                word.span().clone(),
+                "listed optional here",
+                other.span().clone(),
+            ));
+        }
+    }
+    if errors.len() > before {
+        return None;
+    }
+    let [requires, optional] = parsed;
+    Some(ClassGrants { requires, optional })
 }
 
 /// The direction a port declaration faces, spelled the way a binding spells it.
@@ -2948,7 +3070,8 @@ fn emit_component(
     check_instance_name(&inst.handle, siblings, errors);
     let parked_batch_depth = parked_depth(inst.body.as_ref(), errors);
     let grants = instance_grants(inst.body.as_ref(), errors);
-    let body = instance_body(inst.body, &class, Placement::Surface, scope, errors);
+    let at = inst.handle.span().clone();
+    let body = instance_body(inst.body, &class, Placement::Surface, &at, scope, errors);
     Some((
         RComponentInst {
             instance: inst.handle,
@@ -2976,12 +3099,13 @@ fn emit_consumer(
     };
     let handle = scope.handle(inst.handle.clone());
     let grants = instance_grants(inst.body.as_ref(), errors);
+    let at = inst.handle.span().clone();
     let ResolvedBody {
         attrs,
         bindings,
         acls,
         refused,
-    } = instance_body(inst.body, &class, Placement::TopLevel, scope, errors);
+    } = instance_body(inst.body, &class, Placement::TopLevel, &at, scope, errors);
     // The slug is read unless the slug's own value was refused: a substitute
     // there would name the consumer after its handle, which is a different
     // identity and could collide with a real one.
@@ -3160,23 +3284,32 @@ struct ResolvedBody {
 /// An instance body: its attrs typed against the placement's key set, its
 /// bindings checked against the class's ports, its authority carried or
 /// refused.
+///
+/// `at` is the instance name's span, which the required-port refusal is
+/// positioned at: both halves of the binding↔port contract are checked here,
+/// against the ports this walk saw, so a placement that emits instances cannot
+/// wire one up without them.
 fn instance_body(
     body: Option<Spanned<InstBody>>,
     class: &ClassRef,
     place: Placement,
+    at: &Span,
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> ResolvedBody {
     let Some(body) = body else {
+        check_required_ports(class, &[], at, errors);
         return ResolvedBody::default();
     };
     let body = body.into_value();
     let (attrs, mut refused) = instance_attrs(&body.attrs, place, scope, errors);
     let mut bindings = Vec::new();
+    let mut named_ports = Vec::new();
     // A binding that could not be resolved leaves the instance wired to less
     // than it declared, so it withholds the instance the way a refused value
     // does.
     for binding in body.bindings {
+        named_ports.push(bound_port(&binding).value().clone());
         match resolve_binding(binding, class, scope, errors) {
             Some(binding) => bindings.push(binding),
             None => refused.drop_part(),
@@ -3186,11 +3319,57 @@ fn instance_body(
     // is placed. A surface component's authority contains the component within
     // the surface; the surface's own is what the backend admits over the wire.
     let resolved = emit_acls(body.acls, scope, errors, &mut refused);
+    check_required_ports(class, &named_ports, at, errors);
     ResolvedBody {
         attrs,
         bindings,
         acls: resolved,
         refused,
+    }
+}
+
+/// The port a binding statement names, whichever direction it faces.
+fn bound_port(binding: &BindStmt) -> &Spanned<String> {
+    match binding {
+        BindStmt::Into(bound) => &bound.port,
+        BindStmt::Outof(bound) => &bound.port,
+        BindStmt::Both(bound) => &bound.port,
+    }
+}
+
+/// Every port the class does not mark `optional` must be named by a binding.
+///
+/// The class states the contract; an instance that leaves a required port
+/// unwired is a component that cannot do its job, not a component with less
+/// wiring. A free `io port { … }` tuning counts: the port is claimed, even
+/// though it connects to nothing but its own page-local ring.
+///
+/// `named_ports` is every port a binding statement *named*, resolved or not: a
+/// binding dropped for an unreadable channel still claims its port, and
+/// reporting it unconnected too would answer one mistake twice. A name that
+/// matches no declared port is refused on its own by `check_port` and satisfies
+/// nothing here.
+fn check_required_ports(
+    class: &ClassRef,
+    named_ports: &[String],
+    at: &Span,
+    errors: &mut Vec<Diagnostic>,
+) {
+    for port in &class.ports {
+        if port.optional || named_ports.iter().any(|named| named == port.name.value()) {
+            continue;
+        }
+        errors.push(two_site(
+            format!(
+                "this instance leaves port `{}` of `{}` unconnected; bind it, or the \
+                 class declares it `optional`",
+                port.name.value(),
+                class.name.value()
+            ),
+            at.clone(),
+            "the port is declared here",
+            port.name.span().clone(),
+        ));
     }
 }
 
@@ -5395,7 +5574,7 @@ mod tests {
     #[test]
     fn a_parameter_name_is_never_a_wait() {
         let source = concat!(
-            "component Sink { abi = processor; }\n",
+            "component Sink { abi = processor; requires = []; }\n",
             "new thing: Sink;\n",
             "new wired: Sink { config = thing.messages; }\n",
         );
@@ -5452,7 +5631,7 @@ mod tests {
     #[test]
     fn an_assembly_body_walk_carries_its_parameter_names() {
         let source = concat!(
-            "component Sink { abi = processor; }\n",
+            "component Sink { abi = processor; requires = []; }\n",
             "assembly Leaf(chan: Channel) {\n",
             "}\n",
             "assembly Shadowing(thing: String) {\n",

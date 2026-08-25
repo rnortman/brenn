@@ -213,6 +213,10 @@ fn channel(
         sink,
         wake_min,
         send_rate: rate,
+        // Bound and dropped: a doctype is the expectation the component ports
+        // bound to this channel are checked against at compile time, and no
+        // runtime field carries it.
+        doctype: _,
     } = attrs;
     ChannelConfigRaw {
         uuid,

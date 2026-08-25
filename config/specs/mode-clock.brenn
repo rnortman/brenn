@@ -1,0 +1,9 @@
+/// Headless theme driver: no layout slot, so it mounts hidden. Its only
+/// output is a `ThemeBody` on `theme` carrying the active theme choice.
+component ModeClock {
+  abi = dom;
+  requires = [ports, log];
+  in config;
+  out theme: "brenn.surface.theme@1";
+  io tick;
+}

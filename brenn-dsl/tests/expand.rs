@@ -21,7 +21,7 @@ fn channels(config: &ResolvedConfig) -> Vec<String> {
 
 /// The acid test: one assembly, two instantiations, two disjoint entity sets.
 const PODS: &str = "\
-component Panel { abi = dom; in messages; }
+component Panel { abi = dom; requires = []; in messages; }
 
 assembly Pod(slug: String, owner: Agent) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
@@ -145,7 +145,7 @@ new alice: Outer(slug = \"alice\");
 fn a_body_names_a_channel_a_nested_instantiation_stamped() {
     let config = resolved(
         "\
-component Panel { abi = dom; in messages; }
+component Panel { abi = dom; requires = []; in messages; }
 
 assembly Inner(addr: String) {
     channel messages at f\"{addr}\";
@@ -170,7 +170,7 @@ new alice: Outer(slug = \"alice\");
 fn a_reference_from_outside_reaches_a_stamped_channel_through_the_instance() {
     let config = resolved(
         "\
-component Sink { abi = processor; in messages; }
+component Sink { abi = processor; requires = []; in messages; }
 
 assembly Pod(slug: String) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
@@ -332,7 +332,7 @@ new alice: Pod(source = bench);
 fn a_channel_parameter_carries_the_channel_into_the_body() {
     let config = resolved(
         "\
-component Sink { abi = processor; in messages; }
+component Sink { abi = processor; requires = []; in messages; }
 
 channel bench_status at \"brenn:bench.status\";
 
@@ -426,7 +426,7 @@ fn a_channel_and_an_instance_under_one_name_in_an_assembly_body_are_refused() {
     // channel would both be emitted and `alice.panel` would name one of them.
     let messages = refusals(
         "\
-component Panel { abi = dom; }
+component Panel { abi = dom; requires = []; }
 
 assembly Pod() {
     channel panel at \"brenn:alice.panel\";
@@ -466,7 +466,7 @@ fn a_channel_named_through_an_instance_that_stamped_none_is_refused() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; in messages; }
+component Sink { abi = processor; requires = []; in messages; }
 
 assembly Pod(slug: String) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
@@ -485,7 +485,7 @@ fn a_dotted_tail_on_a_channel_names_nothing() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; in messages; }
+component Sink { abi = processor; requires = []; in messages; }
 
 channel bench_status at \"brenn:bench.status\";
 
@@ -501,7 +501,7 @@ fn a_dotted_tail_on_a_channel_parameter_names_nothing() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; in messages; }
+component Sink { abi = processor; requires = []; in messages; }
 
 channel bench_status at \"brenn:bench.status\";
 
@@ -559,7 +559,7 @@ fn a_string_parameter_subscribed_to_says_what_it_names() {
     assert_eq!(
         refusal(
             "\
-component Sink { abi = processor; in messages; }
+component Sink { abi = processor; requires = []; in messages; }
 
 assembly Pod(slug: String) {
     new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- slug; }
@@ -599,7 +599,7 @@ new alice: Pod(name = \"alice-pa\", ws = notes);
 fn a_table_parameter_reaches_a_stamped_components_config() {
     let config = resolved(
         "\
-component Sink { abi = processor; }
+component Sink { abi = processor; requires = []; }
 
 assembly Pod(tuning: Table) {
     new sink: Sink { component_path = \"/lib/sink.wasm\"; config = tuning; }
@@ -906,7 +906,7 @@ fn two_instantiations_that_stamp_one_address_cite_both() {
 fn a_stamped_channel_is_named_rather_than_spelled_out() {
     assert_eq!(
         refusal(concat!(
-            "component Panel { abi = dom; in messages; }\n",
+            "component Panel { abi = dom; requires = []; in messages; }\n",
             "assembly Pod(slug: String) {\n",
             "    channel messages at f\"brenn:{slug}.in.messages\";\n",
             "    surface panel {\n",

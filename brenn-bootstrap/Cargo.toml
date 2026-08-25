@@ -44,6 +44,7 @@ similar = { version = "3.2.0", default-features = false, features = ["text"] }
 
 [dev-dependencies]
 brenn-attach-proto = { version = "0.1.0", path = "../attach/proto" }
+brenn-dsl = { version = "0.1.0", path = "../brenn-dsl" }
 brenn-attach-server = { version = "0.1.0", path = "../attach/server", features = ["testutils"] }
 futures = "0.3.32"
 tempfile = "3.24.0"

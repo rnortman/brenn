@@ -294,7 +294,7 @@ fn the_push_scheme_is_not_spellable_in_a_pin_either() {
 fn the_push_scheme_is_not_spellable_as_a_binding_target_either() {
     assert_eq!(
         refusal(concat!(
-            "component Sink {\n    abi = processor;\n    out events;\n}\n",
+            "component Sink {\n    abi = processor; requires = [];\n    out events;\n}\n",
             "new alice_sink: Sink {\n",
             "    component_path = \"sink.wasm\";\n",
             "    out events -> \"pwa_push:alerts\";\n",
@@ -1095,7 +1095,7 @@ fn surface_doc(class_body: &str, inst_body: &str) -> String {
 #[test]
 fn a_surface_carries_its_components_and_their_bindings() {
     let config = resolved(&surface_doc(
-        "    abi = dom;\n    in messages;\n",
+        "    abi = dom; requires = [];\n    in messages;\n",
         "        chrome = \"bare\";\n        in messages <- messages { push_depth = 4; }\n",
     ));
     let surface = &config.surfaces[0];
@@ -1121,7 +1121,7 @@ fn a_surface_carries_its_components_and_their_bindings() {
 #[test]
 fn a_components_parked_depth_is_projected() {
     let config = resolved(&surface_doc(
-        "    abi = dom;\n    in messages;\n",
+        "    abi = dom; requires = [];\n    in messages;\n",
         "        parked_batch_depth = unbounded;\n        in messages <- messages;\n",
     ));
     let component = &config.surfaces[0].components[0];
@@ -1140,7 +1140,7 @@ fn a_components_parked_depth_is_projected() {
 
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom;\n    in messages;\n",
+            "    abi = dom; requires = [];\n    optional in messages;\n",
             "        parked_batch_depth = \"unbounded\";\n",
         )),
         "expected an integer or a bare word, found a string"
@@ -1151,7 +1151,7 @@ fn a_components_parked_depth_is_projected() {
 fn an_unknown_instance_key_names_the_legal_set() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom;\n    in messages;\n",
+            "    abi = dom; requires = [];\n    optional in messages;\n",
             "        component_path = \"/lib/panel.wasm\";\n",
         )),
         "`component_path` is not a key of a component instance; expected one of \
@@ -1162,7 +1162,7 @@ fn an_unknown_instance_key_names_the_legal_set() {
 #[test]
 fn a_component_states_its_own_authority() {
     let config = resolved(&surface_doc(
-        "    abi = dom;\n    in messages;\n",
+        "    abi = dom; requires = [];\n    optional in messages;\n",
         "        acl subscribe [prefix \"brenn:alice-desk.\"];\n",
     ));
     let instance = &config.surfaces[0].components[0];
@@ -1174,7 +1174,7 @@ fn a_component_states_its_own_authority() {
 fn a_port_a_class_does_not_declare_names_the_ones_it_does() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom;\n    in messages;\n    io tick;\n",
+            "    abi = dom; requires = [];\n    optional in messages;\n    optional io tick;\n",
             "        in mesages <- messages;\n",
         )),
         "`Panel` declares no port `mesages`; it declares `in messages`, `io tick`"
@@ -1185,7 +1185,7 @@ fn a_port_a_class_does_not_declare_names_the_ones_it_does() {
 fn a_port_bound_the_wrong_way_says_which_way_it_faces() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom;\n    io messages;\n",
+            "    abi = dom; requires = [];\n    io messages;\n",
             "        in messages <- messages;\n",
         )),
         "port `messages` is an `io` port, bound as `in`"
@@ -1196,7 +1196,7 @@ fn a_port_bound_the_wrong_way_says_which_way_it_faces() {
 fn a_free_io_binding_needs_a_declared_io_port() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom;\n    in messages;\n",
+            "    abi = dom; requires = [];\n    in messages;\n",
             "        io messages { push_depth = 1; }\n",
         )),
         "port `messages` is an `in` port, bound as `io`"
@@ -1207,10 +1207,124 @@ fn a_free_io_binding_needs_a_declared_io_port() {
 fn a_class_declares_each_port_once() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom;\n    in messages;\n    out messages;\n",
+            "    abi = dom; requires = [];\n    optional in messages;\n    optional out messages;\n",
             "",
         )),
         "port `messages` is declared twice"
+    );
+}
+
+// ── the class's own contract: which ports an instance must connect ───────────
+
+#[test]
+fn an_instance_leaving_a_required_port_unconnected_is_refused() {
+    let source = surface_doc("    abi = dom; requires = [];\n    in messages;\n", "");
+    let errors = resolve_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "this instance leaves port `messages` of `Panel` unconnected; bind it, or the \
+         class declares it `optional`"
+    );
+    // The refusal sits at the `new`; the contract it broke is the related site.
+    assert_eq!(errors[0].line_col(), at(&source, "p1"));
+    assert_eq!(errors[0].related[0].0, "the port is declared here");
+    assert_eq!(
+        errors[0].related[0].1.line_col_inner().map(|p| p.line + 1),
+        at(&source, "in messages;").map(|(line, _)| line)
+    );
+}
+
+/// A misspelled binding satisfies nothing: it names no declared port, so the
+/// port it was meant for is still unconnected and both refusals stand. Nothing
+/// normalizes a name into the port it resembles.
+#[test]
+fn a_misspelled_binding_leaves_the_required_port_unconnected() {
+    let source = surface_doc(
+        "    abi = dom; requires = [];\n    in messages;\n",
+        "        in mesages <- messages;\n",
+    );
+    let errors = resolve_errors(&source);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`Panel` declares no port `mesages`; it declares `in messages`"
+    );
+    assert_eq!(
+        errors[1].message,
+        "this instance leaves port `messages` of `Panel` unconnected; bind it, or the \
+         class declares it `optional`"
+    );
+}
+
+#[test]
+fn an_optional_port_may_be_left_unconnected() {
+    let config = resolved(&surface_doc(
+        "    abi = dom; requires = [];\n    optional in messages;\n    in theme;\n",
+        "        in theme <- messages;\n",
+    ));
+    let component = &config.surfaces[0].components[0];
+    assert_eq!(component.bindings.len(), 1);
+    assert!(component.class.ports[0].optional);
+    assert!(!component.class.ports[1].optional);
+}
+
+/// A free `io` tuning block claims its port: the port is connected to its own
+/// page-local ring, which is a wiring decision and not an omission.
+#[test]
+fn a_free_io_tuning_counts_as_connecting_the_port() {
+    let config = resolved(&surface_doc(
+        "    abi = dom; requires = [];\n    io tick;\n",
+        "        io tick { push_depth = 1; }\n",
+    ));
+    assert_eq!(config.surfaces[0].components[0].bindings.len(), 1);
+}
+
+/// Every required port is named, so a class with several unwired ports reports
+/// each: the deployer sees the whole list rather than fixing them one per run.
+#[test]
+fn a_bodyless_instance_is_refused_once_per_required_port() {
+    let errors = refusals(&surface_doc(
+        "    abi = dom; requires = [];\n    in messages;\n    out acks;\n    optional io tick;\n",
+        "",
+    ));
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("`messages`"), "{errors:?}");
+    assert!(errors[1].contains("`acks`"), "{errors:?}");
+}
+
+/// The check reads the ports a body *named*, not the bindings that survived: a
+/// binding dropped for an unreadable channel still claims its port, and saying
+/// the port is unconnected too would be a second complaint about one mistake.
+#[test]
+fn a_binding_that_did_not_resolve_still_claims_its_port() {
+    let errors = refusals(&surface_doc(
+        "    abi = dom; requires = [];\n    in messages;\n",
+        "        in messages <- \"alice.cmd\";\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("names no scheme"), "{errors:?}");
+}
+
+/// The contract is the class's, so it binds a consumer exactly as it binds a
+/// surface-placed instance.
+#[test]
+fn a_consumer_leaving_a_required_port_unconnected_is_refused() {
+    let errors = refusals(concat!(
+        "component Sink {\n",
+        "    abi = processor; requires = [];\n",
+        "    out events;\n",
+        "    optional in commands;\n",
+        "}\n",
+        "new alice_sink: Sink {\n",
+        "    component_path = \"sink.wasm\";\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0],
+        "this instance leaves port `events` of `Sink` unconnected; bind it, or the \
+         class declares it `optional`"
     );
 }
 
@@ -1222,10 +1336,182 @@ fn an_abi_is_one_of_the_shapes_the_runtime_loads() {
     );
 }
 
+// ── what a class declares it needs ───────────────────────────────────────────
+//
+// Class-side, so an uninstantiated spec is checked too: a spec is a contract
+// whether or not this deployment uses it. What an *instance* grants against
+// these lists is the authority suite's.
+
+/// The spec side of deny-by-default, at either abi: a class that says nothing
+/// about what it needs is refused where it is declared.
+#[test]
+fn a_class_states_what_it_requires() {
+    for abi in ["dom", "processor"] {
+        let source = format!("component Panel {{\n    abi = {abi};\n}}\n");
+        assert_eq!(
+            refusal(&source),
+            "component `Panel` states no `requires`: what a component needs is \
+             deny-by-default, so a class needing nothing is written `requires = [];` \
+             rather than left out",
+            "at abi {abi}"
+        );
+    }
+}
+
+/// One vocabulary for the spec and the grant, so a word neither side spells is
+/// answered with the list both of them are written from.
+#[test]
+fn a_need_names_a_capability() {
+    assert_eq!(
+        refusal("component Panel {\n    abi = dom; requires = [frobnicate];\n}\n"),
+        "`frobnicate` is not a capability a component holds; a spec's `requires` names \
+         the same words a `grants` list does: `ports`, `store`, `log`, `alert`, \
+         `config`, `mqtt` or `takeover`"
+    );
+    assert!(
+        refusal("component Panel {\n    abi = dom; requires = []; optional = [subscribe];\n}\n")
+            .starts_with("`subscribe` is not a capability a component holds"),
+        "a transport plane is not a capability on either list"
+    );
+}
+
+#[test]
+fn a_need_is_listed_once() {
+    let source = "component Panel {\n    abi = dom; requires = [ports, ports];\n}\n";
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`ports` is listed twice in `requires`; one statement of a need states it"
+    );
+    assert_eq!(errors[0].related[0].0, "it is listed here");
+}
+
+/// The two lists are answers to different questions, so one word cannot be both
+/// answers at once.
+#[test]
+fn a_word_is_required_or_optional_and_not_both() {
+    let source = "component Panel {\n    abi = dom; requires = [ports]; optional = [ports];\n}\n";
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`ports` is both required and optional; it is one or the other"
+    );
+    assert_eq!(errors[0].related[0].0, "listed optional here");
+}
+
+/// A dom class runs on a surface and nowhere else, so a word the surface cannot
+/// implement is a need no legal placement satisfies — refused at the class
+/// rather than at whichever surface happened to instantiate it.
+#[test]
+fn a_dom_class_cannot_need_what_no_surface_admits() {
+    for lists in ["requires = [{word}]", "requires = []; optional = [{word}]"] {
+        for word in ["store", "mqtt"] {
+            let lists = lists.replace("{word}", word);
+            let source = format!("component Panel {{\n    abi = dom; {lists};\n}}\n");
+            assert_eq!(
+                refusal(&source),
+                format!(
+                    "`{word}` is backend-only in v1; a surface-hosted component cannot be \
+                     granted it, and a dom class runs nowhere else, so `{word}` cannot be \
+                     satisfied at any placement"
+                )
+            );
+        }
+    }
+}
+
+/// A processor class admits both hosts, so no class-side host question applies
+/// to it: an instance's own words are host-checked where they are written.
+#[test]
+fn a_processor_class_may_need_a_backend_only_capability() {
+    let config = resolved(
+        "component Sink {\n    abi = processor; requires = [store]; optional = [mqtt];\n}\n",
+    );
+    assert!(
+        config.consumers.is_empty(),
+        "declaring is not instantiating"
+    );
+}
+
+/// The words the class stated reach the instance, which is what the fit check
+/// has to compare against: dropping a host-questionable word here would leave
+/// an over-grant with nothing to contradict it.
+#[test]
+fn a_backend_only_requirement_reaches_the_instance_that_carries_it() {
+    let config = resolved(concat!(
+        "component Sink {\n    abi = processor; requires = [store]; optional = [mqtt];\n}\n",
+        "new alice_sink: Sink {\n",
+        "    component_path = \"/lib/brenn_sink.wasm\";\n",
+        "    grants = [store];\n",
+        "}\n",
+    ));
+    let consumer = &config.consumers[0];
+    assert_eq!(
+        consumer
+            .class
+            .requires
+            .iter()
+            .map(|word| word.value().word())
+            .collect::<Vec<_>>(),
+        vec!["store"]
+    );
+    assert_eq!(
+        consumer
+            .class
+            .optional
+            .iter()
+            .map(|word| word.value().word())
+            .collect::<Vec<_>>(),
+        vec!["mqtt"]
+    );
+    assert_eq!(
+        consumer
+            .grants
+            .as_ref()
+            .expect("the instance states its grants")
+            .words
+            .iter()
+            .map(|word| word.name.value().as_str())
+            .collect::<Vec<_>>(),
+        vec!["store"]
+    );
+}
+
+/// Every refusal the pair holds is reported in one run: an author fixing one
+/// word does not discover the next on the following build.
+#[test]
+fn every_bad_word_in_a_spec_is_reported_at_once() {
+    let errors = refusals(
+        "component Panel {\n    abi = dom; requires = [frobnicate, store]; optional = [gibber];\n}\n",
+    );
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert!(errors[0].starts_with("`frobnicate` is not"), "{errors:?}");
+    assert!(errors[1].contains("`store` cannot be"), "{errors:?}");
+    assert!(errors[2].starts_with("`gibber` is not"), "{errors:?}");
+}
+
+/// A class the spec check refused is a class instances say nothing new about:
+/// the same answer the abi word gets, one indirection closer to where it was
+/// written.
+#[test]
+fn an_instance_of_a_spec_refused_class_reports_nothing_further() {
+    let errors = refusals(concat!(
+        "component Panel {\n    abi = dom;\n    in messages;\n}\n",
+        "surface alice_desk {\n",
+        "    grants = [subscribe];\n",
+        "    new p1: Panel {}\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("states no `requires`"), "{errors:?}");
+}
+
 #[test]
 fn a_component_instantiation_takes_no_arguments() {
     let source = concat!(
-        "component Panel {\n    abi = dom;\n}\n",
+        "component Panel {\n    abi = dom; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    new p1: Panel(skin = \"bench\");\n",
@@ -1241,7 +1527,10 @@ fn a_component_instantiation_takes_no_arguments() {
 #[test]
 fn an_instance_name_is_what_the_runtime_calls_the_component() {
     assert_eq!(
-        refusal(&surface_doc("    abi = dom;\n", "").replace("new p1:", "new panel_one:")),
+        refusal(
+            &surface_doc("    abi = dom; requires = [];\n", "")
+                .replace("new p1:", "new panel_one:")
+        ),
         "`panel_one` is not a legal component instance name (lowercase, digits and \
          single `-`, starting with a letter or digit)"
     );
@@ -1250,7 +1539,7 @@ fn an_instance_name_is_what_the_runtime_calls_the_component() {
 #[test]
 fn one_surface_has_one_component_of_each_name() {
     let source = concat!(
-        "component Panel {\n    abi = dom;\n}\n",
+        "component Panel {\n    abi = dom; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    new p1: Panel {}\n",
@@ -1299,7 +1588,7 @@ fn a_top_level_instance_is_a_consumer() {
     let config = resolved(concat!(
         "channel out_chan at \"brenn:alice.out.events\";\n",
         "component Sink {\n",
-        "    abi = processor;\n",
+        "    abi = processor; requires = [];\n",
         "    out events;\n",
         "}\n",
         "new alice_sink: Sink {\n",
@@ -1327,7 +1616,7 @@ fn a_top_level_instance_is_a_consumer() {
 fn a_dom_component_has_nowhere_to_render_at_top_level() {
     assert_eq!(
         refusal(concat!(
-            "component Panel {\n    abi = dom;\n}\n",
+            "component Panel {\n    abi = dom; requires = [];\n}\n",
             "new alice_panel: Panel {}\n",
         )),
         "`Panel` is a dom component, which runs inside a surface; \
@@ -1339,7 +1628,7 @@ fn a_dom_component_has_nowhere_to_render_at_top_level() {
 fn a_top_level_instance_needs_an_artifact_to_load() {
     assert_eq!(
         refusal(concat!(
-            "component Sink {\n    abi = processor;\n}\n",
+            "component Sink {\n    abi = processor; requires = [];\n}\n",
             "new alice_sink: Sink {}\n",
         )),
         "a top-level instance is loaded from an artifact, and this instance of `Sink` \
@@ -1351,7 +1640,7 @@ fn a_top_level_instance_needs_an_artifact_to_load() {
 fn a_literal_address_binds_where_no_channel_is_declared() {
     let config = resolved(concat!(
         "component Sink {\n",
-        "    abi = processor;\n",
+        "    abi = processor; requires = [];\n",
         "    out events;\n",
         "}\n",
         "new alice_sink: Sink {\n",
@@ -1443,7 +1732,7 @@ fn a_binding_whose_tail_value_is_unresolvable_is_withheld() {
     let errors = refusals(concat!(
         "channel messages at \"brenn:alice-desk.in.messages\";\n",
         "component Panel {\n",
-        "    abi = processor;\n",
+        "    abi = processor; requires = [];\n",
         "    in messages;\n",
         "}\n",
         "new p1: Panel {\n",
@@ -1600,7 +1889,7 @@ fn a_consumer_whose_class_is_unknown_is_still_a_principal() {
 fn a_consumer_refused_its_placement_is_still_a_principal() {
     assert_eq!(
         refusal(concat!(
-            "component Panel { abi = dom; }\n",
+            "component Panel { abi = dom; requires = []; }\n",
             "new alice_box: Panel { };\n",
             "grant alice_box subscribe exact \"local:alice.cmd\";\n",
         )),
@@ -1906,7 +2195,10 @@ fn a_slug_of_nothing_legal_is_told_to_write_a_name() {
 #[test]
 fn a_component_instance_name_carries_no_double_hyphen() {
     assert_eq!(
-        refusal(&surface_doc("    abi = dom;\n", "").replace("new p1:", "new panel--one:")),
+        refusal(
+            &surface_doc("    abi = dom; requires = [];\n", "")
+                .replace("new p1:", "new panel--one:")
+        ),
         "`panel--one` is not a legal component instance name (lowercase, digits and \
          single `-`, starting with a letter or digit)"
     );
@@ -2020,7 +2312,7 @@ fn a_prefix_on_a_declaration_is_refused() {
     let source = concat!(
         "channel alice at prefix \"brenn:alice.\" {\n    push_depth = 4;\n}\n",
         "channel bob at \"brenn:bob.in.messages\";\n",
-        "component Panel {\n    abi = dom;\n    in messages;\n}\n",
+        "component Panel {\n    abi = dom; requires = [];\n    in messages;\n}\n",
         "surface alice_desk {\n    grants = [subscribe];\n",
         "    new p1: Panel {\n        in messages <- alice;\n    }\n}\n",
     );
@@ -2113,7 +2405,7 @@ fn every_repeat_of_an_identity_is_reported_against_the_first_holder() {
 fn a_binding_names_a_declared_channel_rather_than_its_address() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom;\n    in messages;\n",
+            "    abi = dom; requires = [];\n    in messages;\n",
             "        in messages <- \"brenn:alice-desk.in.messages\";\n",
         )),
         "`brenn:alice-desk.in.messages` is the address channel `messages` declares; \
@@ -2171,7 +2463,7 @@ fn every_carrier_of_a_literal_address_is_held_to_the_one_spelling_rule() {
     let messages = refusals(concat!(
         "channel alice_cmd at \"brenn:alice.cmd\";\n",
         "component Sink {\n",
-        "    abi = processor;\n",
+        "    abi = processor; requires = [];\n",
         "    out events;\n",
         "}\n",
         "surface alice_desk {\n",
@@ -2208,7 +2500,7 @@ fn a_matcher_in_an_attribute_value_is_outside_the_one_spelling_rule() {
 #[test]
 fn a_literal_address_no_channel_declares_is_how_a_local_plane_is_named() {
     let config = resolved(concat!(
-        "component Sink {\n    abi = processor;\n    out events;\n}\n",
+        "component Sink {\n    abi = processor; requires = [];\n    out events;\n}\n",
         "new alice_sink: Sink {\n",
         "    component_path = \"sink.wasm\";\n",
         "    out events -> \"local:brenn/takeover\";\n",
@@ -2304,7 +2596,7 @@ fn a_consumer_whose_body_was_refused_is_not_in_the_model() {
     // reported and the one real mistake is.
     let errors = refusals(concat!(
         "component Sink {\n",
-        "    abi = processor;\n",
+        "    abi = processor; requires = [];\n",
         "}\n",
         "new alice_sink: Sink {\n",
         "    slug = \"sink\";\n",
@@ -2327,7 +2619,7 @@ fn a_consumer_with_a_refused_slug_value_does_not_fall_back_to_its_handle() {
     // refusal is the only diagnostic; no invented collision.
     let errors = refusals(concat!(
         "component Sink {\n",
-        "    abi = processor;\n",
+        "    abi = processor; requires = [];\n",
         "}\n",
         "new alice_sink: Sink {\n",
         "    component_path = \"/lib/brenn_sink.wasm\";\n",
@@ -2348,7 +2640,7 @@ fn a_refused_component_body_withholds_its_surface() {
     // leaves the surface half-resolved, so the identity collision it would
     // have raised is not reported.
     let errors = refusals(concat!(
-        "component Panel {\n    abi = dom;\n}\n",
+        "component Panel {\n    abi = dom; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    slug = \"panel\";\n",
@@ -2590,7 +2882,7 @@ fn a_grant_to_a_withheld_entity_is_not_a_missing_principal() {
     // one false diagnostic per grant.
     let errors = refusals(concat!(
         "component Sink {\n",
-        "    abi = processor;\n",
+        "    abi = processor; requires = [];\n",
         "}\n",
         "new alice_sink: Sink {\n",
         "    component_path = \"/lib/brenn_sink.wasm\";\n",

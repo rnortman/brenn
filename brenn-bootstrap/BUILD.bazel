@@ -75,6 +75,8 @@ rust_test(
         "//brenn-automation",
         "//brenn-common",
         "//brenn-db",
+        # Test-only: fixture-text macros.
+        "//brenn-dsl",
         "//brenn-git",
         "//brenn-graf",
         "//brenn-hooks",

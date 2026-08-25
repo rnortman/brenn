@@ -4,4 +4,7 @@ policy_srcs()
 
 # Docs that tests read as fixtures, so a protocol description and the code it
 # describes cannot drift apart unnoticed.
-exports_files(["chat-protocol.md"])
+exports_files([
+    "chat-protocol.md",
+    "config-dsl.md",
+])

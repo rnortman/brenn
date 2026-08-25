@@ -34,8 +34,9 @@ rust_library(
     deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
 )
 
-# Two unit tests read the shipped configs through `env!("CARGO_MANIFEST_DIR")`,
-# so the constant has to name this package and the files have to be runfiles.
+# Several unit tests read the shipped configs, and one of them also reads the DSL
+# prose doc, through `env!("CARGO_MANIFEST_DIR")`, so the constant has to name
+# this package and the files have to be runfiles.
 # The workspace-relative form resolves from the runfiles root, which is where a
 # Bazel test starts.
 #
@@ -56,7 +57,10 @@ rust_test(
     size = "small",
     crate = ":brenn-lib",
     crate_features = ["testutils"],
-    data = ["//:brenn_configs"],
+    data = [
+        "//:brenn_configs",
+        "//docs:config-dsl.md",
+    ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
