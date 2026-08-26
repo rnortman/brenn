@@ -1,0 +1,15 @@
+/// The first stage of the git push pipeline: it turns a forge's push webhook
+/// into one normalized push event carrying the repository's remote URLs. Forge
+/// discrimination is structural — the input port names the forge, so the
+/// component never sniffs headers to guess which dialect it is reading, and a
+/// deployment wires one port per forge it actually receives from. Both forge
+/// ports are optional for that reason: a deployment that registers webhooks
+/// with one forge has no channel to bind the other to. An envelope on a port
+/// this component does not know is a wiring error and fails the activation.
+component GitForgeParser {
+  abi = processor;
+  requires = [ports, log];
+  optional in forgejo;
+  optional in github;
+  out push-events;
+}

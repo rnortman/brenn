@@ -65,8 +65,24 @@ use crate::webhook::config::{
 use brenn_envelope::grants::AppCapability;
 
 /// The document lowers, and to exactly `expected`.
+///
+/// Every consumer's `spec_sha256` is checked against the document's own hash
+/// first and then cleared, so the structural comparison below is written
+/// against `expected` literals that state nothing about content hashes. A
+/// one-file document declares its classes in itself, so the document's hash is
+/// what every class in it carries.
 fn assert_lowers(document: &str, expected: BrennConfig) {
-    assert_eq!(config_from_dsl(document), expected);
+    let mut actual = config_from_dsl(document);
+    let document_hash = brenn_dsl::source_sha256(document);
+    for consumer in &mut actual.wasm_consumers {
+        assert_eq!(
+            consumer.spec_sha256, document_hash,
+            "consumer {:?} carries the hash of the file its class was declared in",
+            consumer.slug
+        );
+        consumer.spec_sha256 = String::new();
+    }
+    assert_eq!(actual, expected);
 }
 
 /// The one diagnostic the document produces.
@@ -2782,6 +2798,49 @@ new router: Router {
             }],
             ..Default::default()
         },
+    );
+}
+
+/// Every other lowering test asserts `spec_sha256` through `assert_lowers`;
+/// this one names it directly.
+#[test]
+fn a_consumer_lowers_the_hash_of_the_file_its_class_was_declared_in() {
+    let document = concat!(
+        r#"
+channel utterance at "ephemeral:alice-pod.utterance" {
+    push_depth = 4;
+    retain_depth = 16;
+}
+
+component Logger {
+    "#,
+        processor_any!(),
+        r#"
+    in heard;
+}
+
+new logger: Logger {
+    component_path = "/lib/brenn_logger.wasm";
+    grants = [log];
+
+    in heard <- utterance;
+}
+"#
+    );
+    let config = config_from_dsl(document);
+    assert_eq!(
+        config.wasm_consumers[0].spec_sha256,
+        brenn_dsl::source_sha256(document)
+    );
+    // A comment-only edit to the declaring file is a different hash: the
+    // binding is byte identity, not semantic equality.
+    let commented = format!(
+        "// a note
+{document}"
+    );
+    assert_ne!(
+        config_from_dsl(&commented).wasm_consumers[0].spec_sha256,
+        config.wasm_consumers[0].spec_sha256
     );
 }
 

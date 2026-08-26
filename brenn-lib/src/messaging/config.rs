@@ -493,6 +493,10 @@ pub struct WasmConsumerConfigRaw {
     pub slug: String,
     /// Path to the WASM component artifact (must exist at startup).
     pub component_path: std::path::PathBuf,
+    /// Lowercase hex SHA-256 of the spec file this instance's class was
+    /// declared in. Not a body key — the class's fact, carried through lowering
+    /// so boot can bind it to the spec packaged beside the artifact.
+    pub spec_sha256: String,
     /// Capability interfaces to link for this component (deny-by-default).
     /// Required — no default. The operator states intent explicitly; an unstated
     /// `grants` is refused. Empty list = zero-capability consumer.
@@ -632,6 +636,7 @@ impl WasmConsumerConfigRaw {
         WasmConsumerConfigRaw {
             slug: slug.to_string(),
             component_path,
+            spec_sha256: String::new(),
             grants: vec![],
             store_path: None,
             store_size_limit: None,
@@ -1371,6 +1376,10 @@ pub struct WasmOutputPort {
 pub struct ResolvedWasmConsumer {
     pub slug: String,
     pub component_path: PathBuf,
+    /// Lowercase hex SHA-256 of the spec file this consumer's class was
+    /// declared in — what boot compares against the record packaged beside the
+    /// artifact at `component_path`.
+    pub spec_sha256: String,
     /// Granted capability interfaces for this component (deny-by-default).
     /// Determines which host functions are linked at component load time.
     pub grants: BTreeSet<ComponentGrant>,

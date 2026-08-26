@@ -9,6 +9,8 @@
 use config::bar::*;
 use config::specs::chrome::*;
 use config::specs::echo-stub::*;
+use config::specs::git-forge-parser::*;
+use config::specs::git-sync-consumer::*;
 use config::specs::meeting::*;
 use config::specs::mode-clock::*;
 use config::specs::processor-demo::*;

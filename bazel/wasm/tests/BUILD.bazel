@@ -43,6 +43,47 @@ native_test(
     target_compatible_with = HOST_ONLY,
 )
 
+# Driven over the real artifacts, one per world: the emitter's world
+# cross-check reads a component's own imports, so a synthetic `.wasm` would
+# exercise the arm that finds nothing and none of the arms that matter.
+native_test(
+    name = "emit_package_test",
+    size = "small",
+    src = "emit_package_test.sh",
+    args = [
+        "$(rootpath //bazel/wasm:emit_package.sh)",
+        "$(rootpath //brenn-wasm/components/processor-demo:component)",
+        "$(rootpath //brenn-wasm/components/replay:component)",
+        "$(rootpath //bazel/tools:wasm-tools)",
+        "$(rootpath //bazel/wasm:wit_lib.sh)",
+        "$(rootpath //bazel/wasm:record_lib.sh)",
+    ],
+    data = [
+        "//bazel/tools:wasm-tools",
+        "//bazel/wasm:emit_package.sh",
+        "//bazel/wasm:record_lib.sh",
+        "//bazel/wasm:wit_lib.sh",
+        "//brenn-wasm/components/processor-demo:component",
+        "//brenn-wasm/components/replay:component",
+    ],
+    out = "emit_package_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# The package's file grammar, on the same footing as the manifest's below: four
+# readers derive the two sidecar names from an artifact basename, and the order
+# the two are printed in is the join between them — a swap mis-files every
+# record under its spec's name with nothing else noticing.
+native_test(
+    name = "package_names_test",
+    size = "small",
+    src = "package_names_test.sh",
+    args = ["$(rootpath //bazel/wasm:package_names.sh)"],
+    data = ["//bazel/wasm:package_names.sh"],
+    out = "package_names_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
 # The manifest grammar has one implementation and three callers, so its edge
 # cases are asserted here rather than in each gate.
 native_test(

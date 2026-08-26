@@ -58,7 +58,8 @@ rust_test(
     name = "brenn-bootstrap_test",
     size = "medium",
     crate = ":brenn-bootstrap",
-    # The moved dispatch suite loads the demo guest; the harness names it as
+    # The moved dispatch suite and the verified-load acceptance cases load the
+    # demo guest, and the replay acceptance case its own; the harness names them as
     # `<manifest dir>/../brenn-wasm/target/components/`, which the fixture's
     # staging path and the workspace-relative manifest dir below agree on.
     # The config-check suite reads the shipped root configs and the modules
@@ -66,6 +67,7 @@ rust_test(
     data = [
         "//:brenn_configs",
         "//brenn-wasm:fixture_processor_demo",
+        "//brenn-wasm:fixture_replay",
     ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-bootstrap"},

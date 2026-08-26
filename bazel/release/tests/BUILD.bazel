@@ -11,6 +11,21 @@ load("//bazel/policy:defs.bzl", "policy_srcs")
 
 policy_srcs()
 
+# Both gates derive a package's sidecar names, so both are handed the one
+# script that states them. `package_check` reads the binding records, so its fixtures are written by the
+# build's own emitter rather than by hand: a gate proven against a record shape
+# nothing holds equal to the emitted one is a gate that can drift green.
+# `assemble` only copies the files, so its fixtures stay opaque.
+_EXTRA = {
+    "assemble": ["//bazel/wasm:package_names.sh"],
+    "package_check": [
+        "//bazel/wasm:package_names.sh",
+        "//bazel/wasm:record_lib.sh",
+        "//bazel/wasm:emit_package.sh",
+        "//bazel/wasm:wit_lib.sh",
+    ],
+}
+
 [
     native_test(
         name = script + "_test",
@@ -19,11 +34,11 @@ policy_srcs()
         args = [
             "$(rootpath //bazel/wasm:manifest_names.sh)",
             "$(rootpath //bazel/release:%s.sh)" % script,
-        ],
+        ] + ["$(rootpath %s)" % label for label in _EXTRA[script]],
         data = [
             "//bazel/release:%s.sh" % script,
             "//bazel/wasm:manifest_names.sh",
-        ],
+        ] + _EXTRA[script],
         out = script + "_test.run",
         target_compatible_with = HOST_ONLY,
     )

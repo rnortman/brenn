@@ -25,6 +25,12 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// SHA-256 of `bytes` as lowercase hex, the textual form every digest this host
+/// writes or compares takes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(sha256(bytes))
+}
+
 /// Constant-time equality for two variable-length secrets, compared as digests.
 ///
 /// Hashes both sides and compares the two 32-byte results with [`ct_eq_bytes`],
@@ -499,6 +505,26 @@ mod tests {
     fn truncate_empty_string_any_cap_returns_empty() {
         assert_eq!(truncate_with_marker("", 0), "");
         assert_eq!(truncate_with_marker("", 10), "");
+    }
+
+    /// Known-answer vectors from FIPS 180-4, so the digest is pinned to
+    /// standard SHA-256 rather than to whichever crate computes it.
+    ///
+    /// The component binding compares a hash this function wrote against one
+    /// `sha256sum` wrote in a build action, and nothing else in the tree holds
+    /// the two implementations equal. A normalization or a salt introduced
+    /// here would leave every gate green and refuse every component on the
+    /// next deploy.
+    #[test]
+    fn sha256_hex_is_standard_sha256() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

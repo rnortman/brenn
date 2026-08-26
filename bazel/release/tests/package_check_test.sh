@@ -10,6 +10,10 @@ set -uo pipefail
 
 names="$1"
 check="$2"
+package_names="$3"
+record_lib="$4"
+emit="$5"
+export WIT_LIB="$6"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
 failures=0
 
@@ -39,21 +43,44 @@ build_tree() {
     cp "$manifest" "$pkg/lib/deployed-components.txt"
     printf '\0asm\1\0\0\0' > "$pkg/lib/shipped.wasm"
     printf '\0asm\1\0\0\0' > "$pkg/lib/also_shipped.wasm"
+
+    # The records are written by the build's own emitter, over the fixtures'
+    # own bytes. Hand-written ones would prove the gate against a format
+    # nothing holds equal to what ships, and a record whose hashes were made up
+    # would pass a gate that re-computed nothing.
+    "$emit" shipped brenn:processor "$pkg/lib/shipped.wasm" \
+        "$pkg/lib/shipped.package.json" "$authored_spec" "$pkg/lib/shipped.spec.brenn"
+    "$emit" also_shipped brenn:replay "$pkg/lib/also_shipped.wasm" \
+        "$pkg/lib/also_shipped.package.json"
 }
+
+# The emitter reads the artifact's imports through `wasm-tools`, and these
+# artifacts are seven bytes of fixture. The stub answers with a world that
+# imports nothing, which is all the emitter needs to agree the declared world is
+# not contradicted; what is under test here is the gate, not the scrape.
+export WASM_TOOLS="$tmp/wasm-tools-stub"
+cat > "$WASM_TOOLS" <<'EOF'
+#!/usr/bin/env bash
+echo "package brenn:fixture;"
+EOF
+chmod +x "$WASM_TOOLS"
+
+authored_spec="$tmp/authored.brenn"
+printf 'component Shipped {}\n' > "$authored_spec"
 
 pkg="$tmp/pkg"
 build_tree "$pkg"
 
-if ! "$check" "$names" "$pkg" "$manifest" dynamic > "$tmp/ok.log" 2>&1; then
+if ! "$check" "$names" "$package_names" "$record_lib" "$pkg" "$manifest" dynamic > "$tmp/ok.log" 2>&1; then
     fail "a complete tree should pass: $(cat "$tmp/ok.log")"
 fi
-if ! "$check" "$names" "$pkg" "$manifest" static > "$tmp/ok-static.log" 2>&1; then
+if ! "$check" "$names" "$package_names" "$record_lib" "$pkg" "$manifest" static > "$tmp/ok-static.log" 2>&1; then
     fail "a complete tree with no loader named should pass static: $(cat "$tmp/ok-static.log")"
 fi
 
 reject() {
     local label="$1" needle="$2" linkage="${3:-dynamic}" out
-    if out=$("$check" "$names" "$pkg" "$manifest" "$linkage" 2>&1); then
+    if out=$("$check" "$names" "$package_names" "$record_lib" "$pkg" "$manifest" "$linkage" 2>&1); then
         fail "$label should be rejected, exited 0: $out"
     elif ! printf '%s' "$out" | grep -qF "$needle"; then
         fail "$label: the rejection does not name the problem: $out"
@@ -80,7 +107,7 @@ reject "a missing MCP stub" "lib/noop_mcp.py is missing"
 for loader in /lib64/ld-linux-x86-64.so.2 /lib/ld-musl-x86_64.so.1; do
     build_tree "$pkg"; printf 'ELF %s\n' "$loader" > "$pkg/bin/brenn"
     reject "a binary naming $loader in a static build" "not a static build" static
-    if ! "$check" "$names" "$pkg" "$manifest" dynamic > "$tmp/dyn.log" 2>&1; then
+    if ! "$check" "$names" "$package_names" "$record_lib" "$pkg" "$manifest" dynamic > "$tmp/dyn.log" 2>&1; then
         fail "the same binary should pass in dynamic mode: $(cat "$tmp/dyn.log")"
     fi
 done
@@ -97,6 +124,44 @@ reject "a component the manifest ships but the tree lacks" "lib/shipped.wasm is 
 
 build_tree "$pkg"; printf '\0asm\1\0\0\0' > "$pkg/lib/test_only.wasm"
 reject "a component nothing listed" "test_only.wasm"
+
+# ---------------------------------------------------------------------------
+# The component packages. Each of these reaches the deploy host as a component
+# the service refuses to load, with the service already stopped.
+# ---------------------------------------------------------------------------
+build_tree "$pkg"; rm "$pkg/lib/shipped.package.json"
+reject "a component with no binding record" "lib/shipped.package.json is missing"
+
+build_tree "$pkg"; printf '\0asm\1\0\0\1' > "$pkg/lib/shipped.wasm"
+reject "an artifact its record does not bind" "but its record binds"
+
+build_tree "$pkg"; printf 'component Shipped { abi = processor; }\n' > "$pkg/lib/shipped.spec.brenn"
+reject "a spec its record does not bind" "but its record binds"
+
+build_tree "$pkg"; rm "$pkg/lib/shipped.spec.brenn"
+reject "a record naming a spec that did not ship" "which is missing or empty"
+
+build_tree "$pkg"; printf 'component Stray {}\n' > "$pkg/lib/also_shipped.spec.brenn"
+reject "a spec beside a record that names none" "names no spec"
+
+build_tree "$pkg"
+sed -i '/spec_sha256/d' "$pkg/lib/shipped.package.json"
+sed -i 's/"spec": "shipped.spec.brenn",/"spec": "shipped.spec.brenn"/' "$pkg/lib/shipped.package.json"
+reject "a record naming a spec with no hash" "states no spec_sha256"
+
+# The host reads the stem-derived name and compares the record's `spec` field
+# against it, so a record naming any other file is one it refuses — even when
+# the file is there and hashes correctly, which is what would otherwise walk
+# past this gate.
+build_tree "$pkg"
+cp "$pkg/lib/shipped.spec.brenn" "$pkg/lib/elsewhere.brenn"
+sed -i 's/"spec": "shipped.spec.brenn"/"spec": "elsewhere.brenn"/' "$pkg/lib/shipped.package.json"
+reject "a record naming a spec that is not the stem-derived one" "the host derives that name"
+
+build_tree "$pkg"
+sed -i '/artifact_sha256/d' "$pkg/lib/also_shipped.package.json"
+sed -i 's/"artifact": "also_shipped.wasm",/"artifact": "also_shipped.wasm"/' "$pkg/lib/also_shipped.package.json"
+reject "a record stating no artifact hash" "states no artifact_sha256"
 
 build_tree "$pkg"
 printf '# nothing\n' > "$pkg/lib/deployed-components.txt"
@@ -117,12 +182,12 @@ build_tree "$pkg"; rm "$pkg/frontend/main.js"
 reject "an asset tree that was never built" "frontend/ holds no files"
 
 # And the gate's own preconditions.
-if out=$("$check" "$names" "$tmp/absent" "$manifest" dynamic 2>&1); then
+if out=$("$check" "$names" "$package_names" "$record_lib" "$tmp/absent" "$manifest" dynamic 2>&1); then
     fail "a package dir that does not exist should be rejected, exited 0: $out"
 elif ! printf '%s' "$out" | grep -qF "not a directory"; then
     fail "the rejection does not say what went wrong: $out"
 fi
-if "$check" "$names" "$pkg" "$manifest" sideways > /dev/null 2>&1; then
+if "$check" "$names" "$package_names" "$record_lib" "$pkg" "$manifest" sideways > /dev/null 2>&1; then
     fail "an unrecognized linkage mode should be rejected"
 fi
 

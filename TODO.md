@@ -2192,3 +2192,41 @@ gates the one block.
 Done = every block in `docs/config-dsl.md` that is presented as compilable is
 compiled by `make check`, and the blocks that are not are marked as fragments in
 the prose.
+
+## `surface-spec-binding`
+
+Backend components are bound to their specifications at boot: a shipped
+component travels as artifact + author's spec + record, and
+`brenn-lib/src/wasm_package.rs` refuses to start when the configuration's spec
+copy is not byte-identical to the packaged one (`docs/component-packages.md`).
+
+Surface-placed components have no such binding. A `dom` kind is checked for the
+existence of its wasm-bindgen module pair and nothing more; a surface-hosted
+`processor` kind has a transpilation manifest with a `source_sha256` over its
+own source, plus a per-instance import⊆grants check — real, but it says nothing
+about ports, doctypes, or optionality. So the same drift the backend path now
+refuses runs silently on a surface: a config spec copy from one release, a dist
+tree from another, and a component whose ports no longer mean what the
+configuration compiled against.
+
+The provenance half is already built and already runs for these kinds:
+`File.source_sha256` and `ClassRef.spec_sha256` are computed for every class the
+compiler resolves, dom included. What is missing is the delivery half, and it
+differs mechanically from the backend's because a surface artifact is a
+multi-file dist tree rather than one file: where the sidecar record lives
+relative to that tree, whether the existing `manifest.json` grows the spec
+fields instead of a second sidecar (dom kinds have no manifest at all, so that
+choice is not free), and how the jco-side packaging emits it.
+
+Work: lower `spec_sha256` onto `SurfaceComponentRaw` — deliberately not done
+when the backend half landed, because a lowered field with no boot consumer is
+dead config — decide the dist-tree record shape, emit it from the surface build,
+and extend `validate_surface_assets` to verify it per kind and bind it per
+instance.
+
+Code site (`TODO(surface-spec-binding)`): surface/server/src/lib.rs, on
+`validate_surface_assets`.
+
+Done = a surface component whose configured specification is not the one its
+installed dist tree was built against is a boot refusal, in the same shape and
+with the same message discipline as the backend path's.

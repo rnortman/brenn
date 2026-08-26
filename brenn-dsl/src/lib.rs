@@ -65,7 +65,18 @@ const MAX_DEPTH: u32 = 250;
 ///
 /// `filename` is what diagnostics name; it need not exist on disk.
 pub fn parse_str(src: &str, filename: &str) -> Result<model::File, Diagnostic> {
-    parse_bounded(src, filename).map_err(|error| Diagnostic::from_parse_error(error, filename))
+    let mut file = parse_bounded(src, filename)
+        .map_err(|error| Diagnostic::from_parse_error(error, filename))?;
+    // Over the same bytes the parse consumed, so hash identity and parse input
+    // agree by construction. This is the only site that fills the field.
+    file.source_sha256 = source_sha256(src);
+    Ok(file)
+}
+
+/// Lowercase hex SHA-256 of a document's source text.
+pub fn source_sha256(src: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(src.as_bytes()))
 }
 
 /// The generated `de::from_str`, with the depth limit this crate sets.

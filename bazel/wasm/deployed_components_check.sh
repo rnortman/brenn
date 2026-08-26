@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
-# Assert every artifact the deploy manifest names is actually built.
+# Assert every artifact the deploy manifest names is built, and packaged.
 #
 # Usage: deployed_components_check.sh <names-tool> <space-joined basenames>
+#                                     <space-joined packaged basenames>
 #                                     <manifest> [label]
 #
 # The manifest is what the packaging step ships; a name in it that no target
 # produces ships nothing, and the failure would first appear on the deploy
 # target.
 #
+# Packaging is the second direction. A component reaches a host with a binding
+# record beside it or it does not load at all, so a manifest entry with no
+# `component_package` target ships an artifact the host refuses — the same
+# never-deployed outcome as a missing artifact, one release later.
+#
 # `<names-tool>` is `manifest_names.sh`, which states the manifest's grammar for
 # every reader of it.
 set -euo pipefail
 
-if [ "$#" -lt 3 ]; then
-    echo "usage: $0 <names-tool> <declared basenames> <manifest> [label]" >&2
+if [ "$#" -lt 4 ]; then
+    echo "usage: $0 <names-tool> <declared basenames> <packaged basenames>" \
+         "<manifest> [label]" >&2
     exit 2
 fi
 names="$1"
 declared="$2"
-manifest="$3"
-label="${4:-$manifest}"
+packaged="$3"
+manifest="$4"
+label="${5:-$manifest}"
 
 missing=0
 entries=0
@@ -29,6 +37,11 @@ while read -r line; do
     entries=$((entries + 1))
     if ! echo "$declared" | tr ' ' '\n' | grep -qx "$line"; then
         echo "ERROR: $label lists $line, which no wasm_component target produces"
+        missing=1
+    fi
+    if ! echo "$packaged" | tr ' ' '\n' | grep -qx "$line"; then
+        echo "ERROR: $label lists $line, which no component_package target packages;" \
+             "a component installs with its binding record or the host refuses it"
         missing=1
     fi
 done <<< "$listed"

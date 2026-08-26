@@ -61,6 +61,24 @@ fn duplicate_wasm_slug_panics_at_bootstrap() {
     resolve(&raw, &dir);
 }
 
+/// The class's spec hash reaches the resolved consumer intact.
+///
+/// This is the only hop carrying it from the lowered config to the value
+/// `run_server` hands the package verifier, and every other fixture in the tree
+/// leaves the field empty — so without this the clone is only ever exercised
+/// over the empty string. A hash that arrived wrong would panic on the deploy
+/// target, for every consumer at once.
+#[test]
+fn a_consumers_spec_hash_reaches_the_resolved_consumer() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:spec-hash-passthrough");
+    let mut raw = minimal_wasm_consumer_raw("hashed", "/tmp/a.wasm", &chan_addr);
+    let hash = "a".repeat(64);
+    raw.spec_sha256 = hash.clone();
+
+    let resolved = resolve(&[raw], &dir);
+    assert_eq!(resolved[0].spec_sha256, hash);
+}
+
 /// Non-empty `subscribe_acl`/`publish_acl` pass through `resolve_wasm_consumers`
 /// without panicking and the consumer is resolved. The ACL entries are resolved
 /// into the policy by `build_wasm_policy`; this test pins that the resolver

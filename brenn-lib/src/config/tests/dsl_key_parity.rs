@@ -64,6 +64,7 @@ fn consumer_keys_account_for_every_field() {
     let fields = field_names!(WasmConsumerConfigRaw {
         slug,
         component_path,
+        spec_sha256,
         grants,
         store_path,
         store_size_limit,
@@ -101,6 +102,10 @@ fn consumer_keys_account_for_every_field() {
         ("webhook_acl", statement),
         ("mqtt_outputs", statement),
         ("tool_grants", statement),
+        (
+            "spec_sha256",
+            "is the class's declaring file's content hash",
+        ),
     ];
     assert_parity("consumer", &fields, &CONSUMER_KEYS, &omitted);
 }

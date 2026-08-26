@@ -121,6 +121,7 @@ pub fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw {
         slug: "probe".to_string(),
         component_path: std::path::PathBuf::from("/nonexistent/probe.wasm"),
+        spec_sha256: String::new(),
         grants: vec![],
         store_path: None,
         store_size_limit: None,

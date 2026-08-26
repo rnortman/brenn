@@ -847,6 +847,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
     let colliding = WasmConsumerConfigRaw {
         slug: "pa".to_string(),
         component_path: dir.path().join("c.wasm"),
+        spec_sha256: String::new(),
         grants: vec![ComponentGrant::Mqtt],
         store_path: None,
         store_size_limit: None,

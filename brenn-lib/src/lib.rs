@@ -17,6 +17,7 @@ mod test_utils;
 pub mod token_bucket;
 pub mod tools;
 pub mod util;
+pub mod wasm_package;
 pub mod webhook;
 
 /// Re-export rusqlite for downstream crates that handle DB errors.

@@ -1258,6 +1258,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "deadwasm".to_string(),
         component_path: "/tmp/deadwasm.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1329,6 +1330,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "undeclared".to_string(),
         component_path: "/tmp/undeclared.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![ComponentGrant::Mqtt],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1401,6 +1403,7 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "aclless".to_string(),
         component_path: "/tmp/aclless.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1473,6 +1476,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "scoped-wasm".to_string(),
         component_path: "/tmp/scoped-wasm.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         // Non-empty ⇒ MessagingSubscribe grant is derived, but the matcher names
         // a different channel, so allows_channel_access("brenn:secret-channel") is false.
@@ -1547,6 +1551,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "covered-wasm".to_string(),
         component_path: "/tmp/covered-wasm.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![ChannelMatcherRaw::Exact(subscribed.to_string())],
         ephemeral_subscribe_acl: vec![],
@@ -1657,6 +1662,7 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "undeclared-sub".to_string(),
         component_path: "/tmp/undeclared-sub.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1722,6 +1728,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-demo-alice".to_string(),
         component_path: "/tmp/brenn_processor_demo.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![ComponentGrant::Ports],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1815,6 +1822,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-demo-alice".to_string(),
         component_path: "/tmp/brenn_processor_demo.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1899,6 +1907,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-mqtt".to_string(),
         component_path: "/tmp/consume-mqtt.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -2005,6 +2014,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-mqtt".to_string(),
         component_path: "/tmp/consume-mqtt.wasm".into(),
+        spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],

@@ -5,13 +5,15 @@
 # nothing about whether the script would notice its inputs going wrong. Here
 # every input is a fixture: the happy path is checked layout entry by layout
 # entry, and each way the packaging can be handed something broken — a manifest
-# naming an artifact nobody built, a manifest that reads as empty, an asset tree
-# that was never built, two components with one basename — is checked to fail
-# rather than to ship a tarball missing a piece.
+# naming an artifact nobody built, a manifest naming a component nothing
+# packaged, a manifest that reads as empty, an asset tree that was never built,
+# two components with one basename — is checked to fail rather than to ship a
+# tarball missing a piece.
 set -uo pipefail
 
 names="$1"
 assemble="$2"
+package_names="$3"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
 failures=0
 
@@ -33,6 +35,21 @@ for name in shipped.wasm also_shipped.wasm test_only.wasm; do
     printf '\0asm\1\0\0\0' > "$tmp/in/wasm/$name"
 done
 
+mkdir -p "$tmp/in/pkg"
+printf '{"v": 1, "artifact": "shipped.wasm"}\n' > "$tmp/in/pkg/shipped.package.json"
+printf 'component Shipped {}\n' > "$tmp/in/pkg/shipped.spec.brenn"
+printf '{"v": 1, "artifact": "also_shipped.wasm"}\n' > "$tmp/in/pkg/also_shipped.package.json"
+printf '{"v": 1, "artifact": "test_only.wasm"}\n' > "$tmp/in/pkg/test_only.package.json"
+
+# Repeated at every invocation below, because a package is not optional: the
+# host refuses an artifact whose record did not travel with it.
+packages=(
+    --package "$tmp/in/pkg/shipped.package.json"
+    --package "$tmp/in/pkg/shipped.spec.brenn"
+    --package "$tmp/in/pkg/also_shipped.package.json"
+    --package "$tmp/in/pkg/test_only.package.json"
+)
+
 cat > "$tmp/in/manifest.txt" <<'EOF'
 # Components shipped to deployments.
 shipped.wasm
@@ -42,7 +59,7 @@ EOF
 
 run() {
     "$assemble" \
-        --names "$names" \
+        --names "$names" --package-names "$package_names" \
         --out "$1" \
         --manifest "$2" \
         --frontend "$tmp/in/frontend" \
@@ -52,7 +69,8 @@ run() {
         --lib "$tmp/in/noop_mcp.py" \
         --component "$tmp/in/wasm/shipped.wasm" \
         --component "$tmp/in/wasm/also_shipped.wasm" \
-        --component "$tmp/in/wasm/test_only.wasm"
+        --component "$tmp/in/wasm/test_only.wasm" \
+        "${packages[@]}"
 }
 
 if ! run "$tmp/out" "$tmp/in/manifest.txt" > "$tmp/out.log" 2>&1; then
@@ -69,12 +87,22 @@ for path in \
     lib/noop_mcp.py \
     lib/deployed-components.txt \
     lib/shipped.wasm \
-    lib/also_shipped.wasm; do
+    lib/shipped.package.json \
+    lib/shipped.spec.brenn \
+    lib/also_shipped.wasm \
+    lib/also_shipped.package.json; do
     [ -f "$tmp/out/$path" ] || fail "the staged tree is missing $path"
 done
 
-# The manifest is what decides; a component nobody listed must not ride along.
+# The manifest is what decides; a component nobody listed must not ride along —
+# nor may its record, which would name an artifact that is not there.
 [ ! -e "$tmp/out/lib/test_only.wasm" ] || fail "an unlisted component reached lib/"
+[ ! -e "$tmp/out/lib/test_only.package.json" ] || fail "an unlisted component's record reached lib/"
+
+# A replay-world package is two files; a spec beside it is a file the host would
+# never read.
+[ ! -e "$tmp/out/lib/also_shipped.spec.brenn" ] \
+    || fail "a spec-less package staged a spec"
 
 [ -x "$tmp/out/bin/brenn" ] || fail "bin/brenn is not executable"
 cmp -s "$tmp/in/manifest.txt" "$tmp/out/lib/deployed-components.txt" \
@@ -99,6 +127,16 @@ printf 'shipped.wasm\nabsent.wasm\n' > "$tmp/in/bad-name.txt"
 expect_failure "a manifest naming an unbuilt artifact" "absent.wasm" \
     run "$tmp/out-bad-name" "$tmp/in/bad-name.txt"
 
+# The other shipping failure mode: a manifest entry whose record nobody emitted.
+# The artifact would install and the host would refuse it.
+expect_failure "a manifest entry with no package" "no component_package target packages" \
+    "$assemble" --names "$names" --package-names "$package_names" --out "$tmp/out-nopkg" --manifest "$tmp/in/manifest.txt" \
+    --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
+    --bin "$tmp/in/bin/brenn" \
+    --component "$tmp/in/wasm/shipped.wasm" \
+    --component "$tmp/in/wasm/also_shipped.wasm" \
+    --package "$tmp/in/pkg/also_shipped.package.json"
+
 # A manifest that yields nothing has stopped being read.
 printf '# only a comment\n\n' > "$tmp/in/empty.txt"
 expect_failure "an empty manifest" "names no components" \
@@ -107,37 +145,37 @@ expect_failure "an empty manifest" "names no components" \
 # An asset tree that was never built.
 mkdir -p "$tmp/in/unbuilt"
 expect_failure "an empty asset tree" "holds no files" \
-    "$assemble" --names "$names" --out "$tmp/out-unbuilt" --manifest "$tmp/in/manifest.txt" \
+    "$assemble" --names "$names" --package-names "$package_names" --out "$tmp/out-unbuilt" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/unbuilt" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm"
+    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
 
 expect_failure "a non-directory asset tree" "not a directory" \
-    "$assemble" --names "$names" --out "$tmp/out-notdir" --manifest "$tmp/in/manifest.txt" \
+    "$assemble" --names "$names" --package-names "$package_names" --out "$tmp/out-notdir" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/noop_mcp.py" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm"
+    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
 
 # Two components with one basename: the manifest names basenames, so one of the
 # two would silently win.
 mkdir -p "$tmp/in/wasm-dup"
 printf '\0asm\1\0\0\0' > "$tmp/in/wasm-dup/shipped.wasm"
 expect_failure "two components sharing a basename" "share the basename" \
-    "$assemble" --names "$names" --out "$tmp/out-dup" --manifest "$tmp/in/manifest.txt" \
+    "$assemble" --names "$names" --package-names "$package_names" --out "$tmp/out-dup" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" \
     --component "$tmp/in/wasm/shipped.wasm" \
     --component "$tmp/in/wasm-dup/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm"
+    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
 
 expect_failure "no binaries at all" "no --bin given" \
-    "$assemble" --names "$names" --out "$tmp/out-nobin" --manifest "$tmp/in/manifest.txt" \
+    "$assemble" --names "$names" --package-names "$package_names" --out "$tmp/out-nobin" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
     --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm"
+    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
 
 expect_failure "an unrecognized argument" "unrecognized argument" \
-    "$assemble" --names "$names" --out "$tmp/out-badarg" --whatever
+    "$assemble" --names "$names" --package-names "$package_names" --out "$tmp/out-badarg" --whatever
 
 # Each required flag in turn. A rule wired without one of these still fails
 # somewhere downstream, but as a `mkdir: cannot create directory '/bin'` or a
@@ -145,11 +183,11 @@ expect_failure "an unrecognized argument" "unrecognized argument" \
 required_args=(
     --out "$tmp/out-required"
     --manifest "$tmp/in/manifest.txt"
-    --names "$names"
+    --names "$names" --package-names "$package_names"
     --frontend "$tmp/in/frontend"
     --surface "$tmp/in/surface"
 )
-for dropped in out manifest names frontend surface; do
+for dropped in out manifest names package-names frontend surface; do
     argv=()
     for ((i = 0; i < ${#required_args[@]}; i += 2)); do
         [ "${required_args[i]}" = "--$dropped" ] && continue
@@ -158,7 +196,7 @@ for dropped in out manifest names frontend surface; do
     expect_failure "a missing --$dropped" "--$dropped is required" \
         "$assemble" "${argv[@]}" --bin "$tmp/in/bin/brenn" \
         --component "$tmp/in/wasm/shipped.wasm" \
-        --component "$tmp/in/wasm/also_shipped.wasm"
+        --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
 done
 
 # ---------------------------------------------------------------------------
@@ -169,11 +207,11 @@ ln -s "$tmp/in/frontend/main.js" "$tmp/in/linked-frontend/main.js"
 ln -s "$tmp/in/frontend/skins/dark.css" "$tmp/in/linked-frontend/skins/dark.css"
 ln -s "$tmp/in/bin/brenn" "$tmp/in/linked-brenn"
 
-if ! "$assemble" --names "$names" --out "$tmp/out-linked" --manifest "$tmp/in/manifest.txt" \
+if ! "$assemble" --names "$names" --package-names "$package_names" --out "$tmp/out-linked" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/linked-frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/linked-brenn" \
     --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" > "$tmp/linked.log" 2>&1; then
+    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}" > "$tmp/linked.log" 2>&1; then
     fail "symlinked inputs should assemble: $(cat "$tmp/linked.log")"
 fi
 # A copied link rather than its target leaves a dangling path in the tarball,

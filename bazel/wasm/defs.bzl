@@ -230,6 +230,113 @@ def wasm_component(name, module, visibility = None):
     )
 
 # ---------------------------------------------------------------------------
+# Component packages
+# ---------------------------------------------------------------------------
+
+# A package's file grammar, on the Starlark side. `bazel/wasm/package_names.sh`
+# is the same statement for the shell readers — the release assembly and the
+# staged-tree gate — and the two are held together by the gates that run over
+# the tree both of them produced. The extensions are named rather than spelled
+# at each site because the flat layout is provisional: a package becomes a
+# directory when configuration resolves components by name.
+_RECORD_EXT = ".package.json"
+
+_SPEC_EXT = ".spec.brenn"
+
+_ARTIFACT_EXT = ".wasm"
+
+def _component_package_impl(ctx):
+    artifact = _module_file(ctx.attr.component)
+    stem = artifact.basename[:-len(_ARTIFACT_EXT)]
+
+    # Package-relative outputs under the target's own name: two packages of one
+    # component would otherwise declare the same files, and the stem is the
+    # artifact's, not the target's.
+    record = ctx.actions.declare_file("%s/%s%s" % (ctx.label.name, stem, _RECORD_EXT))
+    outputs = [record]
+
+    args = [stem, ctx.attr.world, artifact.path, record.path]
+    inputs = [artifact]
+    if ctx.file.spec:
+        packaged_spec = ctx.actions.declare_file("%s/%s%s" % (ctx.label.name, stem, _SPEC_EXT))
+        outputs.append(packaged_spec)
+        inputs.append(ctx.file.spec)
+        args += [ctx.file.spec.path, packaged_spec.path]
+
+    ctx.actions.run(
+        outputs = outputs,
+        inputs = inputs + [ctx.file._wit_lib],
+        executable = ctx.file._emit,
+        tools = [ctx.file._wasm_tools],
+        env = {
+            "WASM_TOOLS": ctx.file._wasm_tools.path,
+            "WIT_LIB": ctx.file._wit_lib.path,
+        },
+        arguments = args,
+        mnemonic = "ComponentPackage",
+        progress_message = "Packaging %s" % stem,
+    )
+    return [DefaultInfo(files = depset(outputs))]
+
+_component_package = rule(
+    implementation = _component_package_impl,
+    doc = """The sidecar half of a shipped component: its binding record and its spec.
+
+    The artifact itself is not re-emitted — it ships from its own target — so
+    the release tree holds three files per component and the build holds one
+    copy of the bytes.
+    """,
+    attrs = {
+        "component": attr.label(
+            mandatory = True,
+            doc = "The `wasm_component` target producing the artifact.",
+        ),
+        "spec": attr.label(
+            allow_single_file = [".brenn"],
+            doc = "The authored specification, for a `brenn:processor` component.",
+        ),
+        "world": attr.string(
+            mandatory = True,
+            values = ["brenn:processor", "brenn:replay"],
+            doc = "The WIT package the artifact targets.",
+        ),
+        "_emit": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:emit_package.sh"),
+        ),
+        "_wasm_tools": attr.label(
+            allow_single_file = True,
+            cfg = "exec",
+            default = Label("//bazel/tools:wasm-tools"),
+        ),
+        "_wit_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:wit_lib.sh"),
+        ),
+    },
+)
+
+def component_package(name, component, world, spec = None, visibility = None):
+    """See `_component_package`.
+
+    Args:
+        name: target name; also the directory its outputs are declared under.
+        component: the `wasm_component` target producing the artifact.
+        world: `brenn:processor` or `brenn:replay`.
+        spec: the authored specification; required iff the world is
+            `brenn:processor`, and refused otherwise.
+        visibility: target visibility.
+    """
+    _component_package(
+        name = name,
+        component = component,
+        spec = spec,
+        world = world,
+        target_compatible_with = HOST_ONLY,
+        visibility = visibility,
+    )
+
+# ---------------------------------------------------------------------------
 # Host-side fixtures
 # ---------------------------------------------------------------------------
 
@@ -324,6 +431,15 @@ _wasi_import_test = rule(
 
 def _deployed_components_test_impl(ctx):
     components = [_module_file(t) for t in ctx.attr.components]
+
+    # A package is identified by the artifact it binds: the record's stem is the
+    # artifact's, so the manifest's own vocabulary — basenames — is what the two
+    # lists are compared in.
+    packaged = [
+        f.basename[:-len(_RECORD_EXT)] + _ARTIFACT_EXT
+        for f in ctx.files.packages
+        if f.basename.endswith(_RECORD_EXT)
+    ]
     check = ctx.file._check
     names = ctx.file._names
     script = _check_wrapper(
@@ -332,6 +448,7 @@ def _deployed_components_test_impl(ctx):
         [
             names.short_path,
             " ".join(sorted([c.basename for c in components])),
+            " ".join(sorted(packaged)),
             ctx.file.manifest.short_path,
             str(ctx.attr.manifest.label),
         ],
@@ -343,11 +460,12 @@ def _deployed_components_test_impl(ctx):
 
 _deployed_components_test = rule(
     implementation = _deployed_components_test_impl,
-    doc = """Assert every artifact the deploy manifest names is actually built.
+    doc = """Assert every artifact the deploy manifest names is built, and packaged.
 
     The manifest is what the packaging step ships; a name in it that no target
-    produces ships nothing, and the failure would first appear on the deploy
-    target.
+    produces ships nothing, and one no target packages ships an artifact the
+    host refuses for want of its binding record. Both failures would first
+    appear on the deploy target.
     """,
     attrs = {
         "components": attr.label_list(
@@ -357,6 +475,10 @@ _deployed_components_test = rule(
         "manifest": attr.label(
             allow_single_file = True,
             mandatory = True,
+        ),
+        "packages": attr.label_list(
+            mandatory = True,
+            doc = "Every `component_package` target in the tree.",
         ),
         "_check": attr.label(
             allow_single_file = True,
@@ -370,18 +492,20 @@ _deployed_components_test = rule(
     test = True,
 )
 
-def deployed_components_test(name, manifest, components):
+def deployed_components_test(name, manifest, components, packages):
     """See `_deployed_components_test`.
 
     Args:
         name: target name.
         manifest: the deploy manifest listing artifact basenames.
         components: every `wasm_component` target in the tree.
+        packages: every `component_package` target in the tree.
     """
     _deployed_components_test(
         name = name,
         components = components,
         manifest = manifest,
+        packages = packages,
         size = "small",
         target_compatible_with = HOST_ONLY,
     )

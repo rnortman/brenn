@@ -3456,3 +3456,135 @@ fn a_tool_statement_on_a_surface_placed_instance_is_refused() {
         "{errors:?}"
     );
 }
+
+// ── spec provenance ──────────────────────────────────────────────────────────
+
+/// A processor class declaration, for use as a module in the provenance tests.
+fn spec_module(comment: &str) -> String {
+    format!("{comment}component Sink {{ abi = processor; requires = []; in messages; }}\n")
+}
+
+/// The root of a two-module tree: a channel, and an instance of the class the
+/// module declares.
+const SPEC_ROOT: &str = "\
+use spec::Sink;
+
+channel messages at \"brenn:bench.status\" { push_depth = 4; retain_depth = 16; \
+standing_retain_depth = 64; }
+
+new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- messages; }
+";
+
+#[test]
+fn a_source_hash_is_the_digest_of_the_text_it_parsed_from() {
+    let source = spec_module("");
+    let file = brenn_dsl::parse_str(&source, "spec.brenn").expect("the class parses");
+    assert_eq!(file.source_sha256, brenn_dsl::source_sha256(&source));
+    assert_eq!(file.source_sha256.len(), 64);
+    assert!(file.source_sha256.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn a_comment_changes_the_source_hash() {
+    let plain = brenn_dsl::parse_str(&spec_module(""), "spec.brenn").expect("parses");
+    let commented =
+        brenn_dsl::parse_str(&spec_module("// a note\n"), "spec.brenn").expect("parses");
+    assert_ne!(plain.source_sha256, commented.source_sha256);
+}
+
+#[test]
+fn a_class_carries_its_declaring_files_hash() {
+    let module = spec_module("");
+    let config = resolved_tree(&[("", SPEC_ROOT), ("spec", &module)]);
+    assert_eq!(
+        config.consumers[0].class.spec_sha256,
+        brenn_dsl::source_sha256(&module)
+    );
+}
+
+#[test]
+fn a_source_hash_is_standard_sha256_of_the_text() {
+    // Pinned against a known answer rather than against the function that
+    // computes it: the build hashes the same file with `sha256sum` and the two
+    // must agree, so a normalization introduced ahead of the digest here would
+    // otherwise leave every in-repo assertion true and refuse every component
+    // at boot.
+    assert_eq!(
+        brenn_dsl::source_sha256("abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
+fn two_modules_holding_verbatim_copies_carry_one_hash() {
+    // Genuinely distinct inputs: the same bytes under two different module
+    // keys, which is the shape a deployment's verbatim copy takes. Hashing one
+    // string twice would assert nothing — what is under test is that the hash
+    // is of the text and not of the module it arrived under.
+    let module = spec_module("");
+    let under_spec = resolved_tree(&[("", SPEC_ROOT), ("spec", &module)]);
+    let under_vendor = resolved_tree(&[
+        (
+            "",
+            &SPEC_ROOT.replace("use spec::Sink;", "use vendor::Sink;"),
+        ),
+        ("vendor", &module),
+    ]);
+    assert_eq!(
+        under_spec.consumers[0].class.spec_sha256,
+        brenn_dsl::source_sha256(&module)
+    );
+    assert_eq!(
+        under_vendor.consumers[0].class.spec_sha256,
+        brenn_dsl::source_sha256(&module)
+    );
+}
+
+#[test]
+fn each_class_carries_its_own_modules_hash() {
+    // The per-module hashes are collected into a vec the class walk indexes
+    // positionally. Two modules whose texts differ is what makes a
+    // misalignment visible: with one module, every index is the right one.
+    let sink = spec_module("");
+    let drain = "component Drain { abi = processor; requires = []; in messages; }\n";
+    let root = "\
+use sink::Sink;
+use drain::Drain;
+
+channel messages at \"brenn:bench.status\" { push_depth = 4; retain_depth = 16; \
+standing_retain_depth = 64; }
+
+new one: Sink { component_path = \"/lib/sink.wasm\"; in messages <- messages; }
+new two: Drain { component_path = \"/lib/drain.wasm\"; in messages <- messages; }
+";
+    let config = resolved_tree(&[("", root), ("sink", &sink), ("drain", drain)]);
+    for consumer in &config.consumers {
+        let expected = match consumer.class.name.value().as_str() {
+            "Sink" => brenn_dsl::source_sha256(&sink),
+            "Drain" => brenn_dsl::source_sha256(drain),
+            other => panic!("unexpected class {other}"),
+        };
+        assert_eq!(
+            consumer.class.spec_sha256,
+            expected,
+            "{} carries another module's hash",
+            consumer.slug.value()
+        );
+    }
+    assert_eq!(config.consumers.len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "was declared in a file with no source hash")]
+fn a_file_built_without_a_source_hash_is_refused_at_class_resolution() {
+    // The hole `serde(skip)` opens, closed at the join: a `File` that did not
+    // come from `parse_str` carries the empty hash.
+    let mut module =
+        brenn_dsl::parse_str(&spec_module(""), "spec.brenn").expect("the class parses");
+    module.source_sha256 = String::new();
+    let root = brenn_dsl::parse_str(SPEC_ROOT, "main.brenn").expect("the root parses");
+    let _ = brenn_dsl::resolve_files(
+        vec![(String::new(), root), ("spec".to_string(), module)],
+        "",
+    );
+}

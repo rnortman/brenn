@@ -29,6 +29,9 @@ release_package(
     frontend = "//frontend:dist",
     lib_files = ["//:noop_mcp.py"],
     manifest = "//brenn-wasm:deployed-components.txt",
+    # The sidecars, offered the same way the artifacts are: the manifest decides
+    # which of them ship, and an entry whose package is missing fails assembly.
+    packages = ["//brenn-wasm:packages"],
     surface = "//surface:dist",
     visibility = ["//visibility:public"],
 )

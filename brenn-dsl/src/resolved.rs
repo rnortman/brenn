@@ -483,6 +483,10 @@ pub struct ClassRef {
     /// The capabilities it can use and runs without. Disjoint from `requires`.
     pub optional: Vec<Spanned<ComponentGrant>>,
     pub ports: Vec<RPort>,
+    /// Lowercase hex SHA-256 of the file this class was declared in — the
+    /// identity a deployment's spec copy is bound to the shipped artifact by.
+    /// Never empty: class resolution refuses a file with no hash.
+    pub spec_sha256: String,
 }
 
 /// One port a class declares.

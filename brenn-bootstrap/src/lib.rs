@@ -635,7 +635,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         if let Some(ref svc) = webhook_result.service {
             for ep in svc.all_endpoints() {
                 if let Some(ref rp) = ep.replay_protection {
-                    let component = brenn_wasm::ReplayComponent::load(
+                    let component = load_verified_replay(
                         &ep.slug,
                         &rp.component_path,
                         &rp.store_path,
@@ -746,22 +746,25 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
             } else {
                 None
             };
-            let component = brenn_wasm::ProcessorComponent::load(brenn_wasm::ProcessorLoadSpec {
-                component_path: &consumer.component_path,
-                slug: &consumer.slug,
-                output_ports,
-                input_amplification_mt,
-                mqtt_sinks,
-                config: consumer.config.clone(),
-                grants,
-                store_path: consumer.store_path.as_deref(),
-                max_page_count: consumer.max_page_count,
-                max_payload_bytes: config.messaging.max_body_bytes,
-                alerter,
-                output_acl,
-                mqtt_publish,
-                tool_host,
-            });
+            let component = load_verified_consumer(
+                &consumer.spec_sha256,
+                brenn_wasm::ProcessorLoadSpec {
+                    component_path: &consumer.component_path,
+                    slug: &consumer.slug,
+                    output_ports,
+                    input_amplification_mt,
+                    mqtt_sinks,
+                    config: consumer.config.clone(),
+                    grants,
+                    store_path: consumer.store_path.as_deref(),
+                    max_page_count: consumer.max_page_count,
+                    max_payload_bytes: config.messaging.max_body_bytes,
+                    alerter,
+                    output_acl,
+                    mqtt_publish,
+                    tool_host,
+                },
+            );
             let store_path_present = consumer.store_path.is_some();
             info!(
                 slug = %consumer.slug,
@@ -1177,6 +1180,39 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
     drop(guard);
 }
 
+/// Verify a replay component's package, then load it.
+///
+/// The pair is one function because the order is the point: a component whose
+/// package does not bind it must never reach the loader, where it would be
+/// instantiated on its own say-so. Separating them puts a `load` one edit away
+/// from running unverified.
+fn load_verified_replay(
+    slug: &str,
+    component_path: &std::path::Path,
+    store_path: &std::path::Path,
+    max_page_count: u32,
+    config: std::collections::HashMap<String, String>,
+) -> brenn_wasm::ReplayComponent {
+    brenn_lib::wasm_package::verify_replay(component_path, slug);
+    brenn_wasm::ReplayComponent::load(slug, component_path, store_path, max_page_count, config)
+}
+
+/// Verify a top-level consumer's package against the configuration that drives
+/// it, then load it.
+///
+/// `config_spec_sha256` is the consumer's lowered class hash — the bytes the
+/// configuration compiled against, which the packaged specification must equal.
+/// Same ordering rule as [`load_verified_replay`], plus the binding: an empty
+/// hash here would match nothing a package can carry, so a lowering that stopped
+/// filling the field fails loudly rather than silently accepting any component.
+fn load_verified_consumer(
+    config_spec_sha256: &str,
+    spec: brenn_wasm::ProcessorLoadSpec<'_>,
+) -> brenn_wasm::ProcessorComponent {
+    brenn_lib::wasm_package::verify_consumer(spec.component_path, spec.slug, config_spec_sha256);
+    brenn_wasm::ProcessorComponent::load(spec)
+}
+
 /// Assert that all replay store paths and consumer store paths are unique across
 /// both sets.
 ///
@@ -1268,6 +1304,202 @@ fn assert_every_subscriber_wired(
 mod tests {
     use super::*;
 
+    /// The verify-then-load pair, over a package on disk.
+    ///
+    /// The unit checks live in `brenn-lib`; what is pinned here is that the boot
+    /// path runs them, and runs them *first*. Each case hands the loader an
+    /// artifact it would reject on its own terms, so a panic naming the package
+    /// is proof the verification happened before the load rather than instead of
+    /// it — and a refactor that drops or reorders the call fails here instead of
+    /// shipping a host that loads unbound components.
+    mod verified_load {
+        use std::path::{Path, PathBuf};
+
+        struct NoopAlerter;
+
+        impl brenn_wasm::ProcessorAlerter for NoopAlerter {
+            fn alert(&self, _severity: brenn_wasm::GuestAlertSeverity, _title: &str, _body: &str) {}
+        }
+
+        /// A package on disk: the artifact's bytes, and a record binding
+        /// whatever `artifact_bytes` and `spec` are given here. The record is
+        /// written by hand — not by the emitter — because these cases need
+        /// records the emitter refuses to write.
+        fn package(dir: &Path, stem: &str, artifact_bytes: &[u8], spec: Option<&str>) -> PathBuf {
+            let artifact = dir.join(format!("{stem}.wasm"));
+            std::fs::write(&artifact, artifact_bytes).expect("write artifact");
+            let artifact_sha = brenn_lib::util::sha256_hex(artifact_bytes);
+            let record = match spec {
+                Some(text) => {
+                    std::fs::write(dir.join(format!("{stem}.spec.brenn")), text)
+                        .expect("write spec");
+                    format!(
+                        "{{\n  \"v\": 1,\n  \"name\": \"{stem}\",\n  \"world\": \
+                         \"brenn:processor\",\n  \"artifact\": \"{stem}.wasm\",\n  \
+                         \"artifact_sha256\": \"{artifact_sha}\",\n  \"spec\": \
+                         \"{stem}.spec.brenn\",\n  \"spec_sha256\": \"{}\"\n}}\n",
+                        brenn_lib::util::sha256_hex(text.as_bytes()),
+                    )
+                }
+                None => format!(
+                    "{{\n  \"v\": 1,\n  \"name\": \"{stem}\",\n  \"world\": \
+                     \"brenn:replay\",\n  \"artifact\": \"{stem}.wasm\",\n  \
+                     \"artifact_sha256\": \"{artifact_sha}\"\n}}\n",
+                ),
+            };
+            std::fs::write(dir.join(format!("{stem}.package.json")), record).expect("write record");
+            artifact
+        }
+
+        fn load_spec<'a>(artifact: &'a Path, slug: &'a str) -> brenn_wasm::ProcessorLoadSpec<'a> {
+            brenn_wasm::ProcessorLoadSpec {
+                component_path: artifact,
+                slug,
+                output_ports: Default::default(),
+                input_amplification_mt: Default::default(),
+                mqtt_sinks: Default::default(),
+                config: Default::default(),
+                grants: Default::default(),
+                store_path: None,
+                max_page_count: 1,
+                max_payload_bytes: 1024,
+                alerter: std::sync::Arc::new(NoopAlerter),
+                output_acl: std::sync::Arc::new(|_| true),
+                mqtt_publish: None,
+                tool_host: None,
+            }
+        }
+
+        const SPEC: &str = "component Demo {\n  abi = processor;\n}\n";
+
+        /// A real built component's bytes, by artifact basename.
+        ///
+        /// The refusal cases below hand the loader bytes it rejects, which is
+        /// what makes them proof of ordering; the two acceptance cases need the
+        /// opposite — an artifact that loads — or a false refusal on a valid
+        /// package would first be seen on a deploy target.
+        fn fixture_bytes(basename: &str) -> Vec<u8> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../brenn-wasm/target/components")
+                .join(format!("{basename}.wasm"));
+            std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        }
+
+        #[test]
+        fn a_consumer_whose_package_binds_it_loads() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = package(
+                dir.path(),
+                "demo",
+                &fixture_bytes("brenn_processor_demo"),
+                Some(SPEC),
+            );
+            let mut spec = load_spec(&artifact, "demo");
+            // processor-demo imports `ports`; the load is a real one, so the
+            // grant it needs is the real one too.
+            spec.grants = [brenn_wasm::Capability::Ports].into_iter().collect();
+            // Returning at all is the assertion: verification passed and the
+            // loader instantiated the artifact behind it. Both would panic.
+            let component = super::super::load_verified_consumer(
+                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
+                spec,
+            );
+            drop(component);
+        }
+
+        #[test]
+        fn a_replay_endpoint_whose_package_binds_it_loads() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = package(dir.path(), "replay", &fixture_bytes("brenn_replay"), None);
+            // A real page budget, unlike the refusal cases below: this load
+            // reaches the KV store, which cannot lay out its schema in one
+            // page.
+            let component = super::super::load_verified_replay(
+                "endpoint",
+                &artifact,
+                &dir.path().join("replay.sqlite"),
+                brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
+                Default::default(),
+            );
+            drop(component);
+        }
+
+        #[test]
+        #[should_panic(expected = "was configured against a specification that hashes to")]
+        fn a_consumer_configured_against_no_specification_at_all_never_reaches_the_loader() {
+            // The empty hash is what a lowering that stopped filling the field
+            // would produce, and every hand-built fixture in the tree defaults
+            // it to one. It must match nothing rather than match everything.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = package(dir.path(), "demo", b"not a component", Some(SPEC));
+            super::super::load_verified_consumer("", load_spec(&artifact, "demo"));
+        }
+
+        #[test]
+        #[should_panic(expected = "but its package record binds")]
+        fn a_consumer_artifact_its_record_does_not_bind_never_reaches_the_loader() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = package(dir.path(), "demo", b"not a component", Some(SPEC));
+            std::fs::write(&artifact, b"tampered").expect("tamper");
+            super::super::load_verified_consumer(
+                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
+                load_spec(&artifact, "demo"),
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "was configured against a specification that hashes to")]
+        fn a_consumer_whose_config_spec_is_not_the_packaged_one_never_reaches_the_loader() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = package(dir.path(), "demo", b"not a component", Some(SPEC));
+            super::super::load_verified_consumer(
+                &brenn_lib::util::sha256_hex(b"component Demo {}\n"),
+                load_spec(&artifact, "demo"),
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "has no readable package record")]
+        fn a_consumer_with_no_record_never_reaches_the_loader() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = dir.path().join("demo.wasm");
+            std::fs::write(&artifact, b"not a component").expect("write artifact");
+            super::super::load_verified_consumer(
+                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
+                load_spec(&artifact, "demo"),
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "but its package record binds")]
+        fn a_replay_artifact_its_record_does_not_bind_never_reaches_the_loader() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = package(dir.path(), "replay", b"not a component", None);
+            std::fs::write(&artifact, b"tampered").expect("tamper");
+            super::super::load_verified_replay(
+                "endpoint",
+                &artifact,
+                &dir.path().join("replay.sqlite"),
+                1,
+                Default::default(),
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "declares world")]
+        fn a_replay_endpoint_handed_a_processor_package_never_reaches_the_loader() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = package(dir.path(), "replay", b"not a component", Some(SPEC));
+            super::super::load_verified_replay(
+                "endpoint",
+                &artifact,
+                &dir.path().join("replay.sqlite"),
+                1,
+                Default::default(),
+            );
+        }
+    }
+
     /// A resolved consumer with the given grant words and tool names, all
     /// other fields defaulted.
     fn tool_consumer(
@@ -1287,6 +1519,7 @@ mod tests {
         brenn_lib::messaging::config::ResolvedWasmConsumer {
             slug: "tooler".to_string(),
             component_path: "/tmp/tooler.wasm".into(),
+            spec_sha256: String::new(),
             grants: grants.iter().copied().collect(),
             store_path: None,
             max_page_count: 1,

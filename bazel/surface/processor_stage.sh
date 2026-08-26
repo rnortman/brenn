@@ -10,7 +10,9 @@
 # because it lists the files it sits among.
 #
 # WASM_TOOLS points the emitter at the pinned binary; without it the emitter
-# falls back to a `wasm-tools` on PATH, which no sandbox carries.
+# falls back to a `wasm-tools` on PATH, which no sandbox carries. WIT_LIB points
+# it at the shared import scrape the same way. Both are read from the
+# environment by the emitter, so this script only has to pass them through.
 set -euo pipefail
 
 kind="$1"

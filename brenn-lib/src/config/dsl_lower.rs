@@ -2245,6 +2245,8 @@ fn consumer(
         component_path: body
             .required_path("component_path", errors)
             .unwrap_or_default(),
+        // A class fact, not a body key: carried from the declaring file.
+        spec_sha256: instance.class.spec_sha256.clone(),
         grants: authority
             .grants
             .iter()

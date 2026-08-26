@@ -319,6 +319,8 @@ pub fn build_surface_runtimes(
 /// Lives beside `build_surface_runtimes` (a plain function over the resolved
 /// list), not in `SurfaceRuntime::build`, so it never runs on the
 /// `AppState`-constructing unit tests.
+// TODO(surface-spec-binding): no spec-binding check here — a dist tree from one
+// release under a spec copy from another passes silently.
 pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[ResolvedSurface]) {
     if surfaces.is_empty() {
         return;

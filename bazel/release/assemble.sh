@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 # Stage the deploy tarball's directory tree.
 #
-# Usage: assemble.sh --out DIR --manifest FILE --names FILE --frontend DIR
-#                    --surface DIR
+# Usage: assemble.sh --out DIR --manifest FILE --names FILE --package-names FILE
+#                    --frontend DIR --surface DIR
 #                    [--bin FILE]... [--lib FILE]... [--component FILE]...
+#                    [--package FILE]...
 #
 # `--names` is `manifest_names.sh`, which states the manifest's grammar for
-# every reader of it.
+# every reader of it; `--package-names` is `package_names.sh`, which states a
+# package's file grammar the same way.
 #
 # The layout is the one `deploy.sh` unpacks and reads: `bin/` for the two host
 # binaries, `frontend/` and `surface/` for the served asset trees, and `lib/`
 # for the MCP stub, the deploy manifest, and the WASM components the manifest
-# names. `VERSION` and `deploy.sh` itself are not here: the script lives in the
-# deploying repo and the version is the pin that repo resolved, so both are
-# added there.
+# names with their package sidecars. `VERSION` and `deploy.sh` itself are not
+# here: the script lives in the deploying repo and the version is the pin that
+# repo resolved, so both are added there.
+#
+# A shipped component is three flat sibling files sharing the artifact's stem —
+# the `.wasm`, its `.package.json` binding record, and, for a processor-world
+# component, the `.spec.brenn` copy of its specification. The host refuses to
+# load an artifact whose record is absent, so a manifest entry reaching here
+# with no record fails the build rather than the deploy target's next boot.
 #
 # Nothing here sets file modes. Bazel normalizes a declared output directory to
 # read-only after the action runs, so any mode this script chose would be
@@ -29,22 +37,26 @@ set -euo pipefail
 out=""
 manifest=""
 names=""
+package_names=""
 frontend=""
 surface=""
 bins=()
 libs=()
 components=()
+packages=()
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --out) out="$2"; shift 2 ;;
         --manifest) manifest="$2"; shift 2 ;;
         --names) names="$2"; shift 2 ;;
+        --package-names) package_names="$2"; shift 2 ;;
         --frontend) frontend="$2"; shift 2 ;;
         --surface) surface="$2"; shift 2 ;;
         --bin) bins+=("$2"); shift 2 ;;
         --lib) libs+=("$2"); shift 2 ;;
         --component) components+=("$2"); shift 2 ;;
+        --package) packages+=("$2"); shift 2 ;;
         *) echo "ERROR: unrecognized argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -55,6 +67,11 @@ for required in out manifest names frontend surface; do
         exit 2
     fi
 done
+# Named apart from the loop above: its flag spells the underscore as a hyphen.
+if [ -z "$package_names" ]; then
+    echo "ERROR: --package-names is required" >&2
+    exit 2
+fi
 if [ "${#bins[@]}" -eq 0 ]; then
     echo "ERROR: no --bin given; a package with no binaries deploys nothing" >&2
     exit 2
@@ -92,15 +109,17 @@ done
 # Shipped beside the artifacts it names so the deploy step can resolve them.
 cp -L "$manifest" "$out/lib/deployed-components.txt"
 
-# Basename → path, so a manifest entry is resolved by the name it states.
+# Basename → path, so a manifest entry is resolved by the name it states. The
+# sidecars share the index: their basenames are the artifact's stem plus a
+# second extension, so a manifest entry resolves all three by name alone.
 declare -A by_name=()
-for component in "${components[@]}"; do
-    name="$(basename "$component")"
+for file in "${components[@]}" "${packages[@]}"; do
+    name="$(basename "$file")"
     if [ -n "${by_name[$name]:-}" ]; then
-        echo "ERROR: two components share the basename $name: ${by_name[$name]} and $component" >&2
+        echo "ERROR: two inputs share the basename $name: ${by_name[$name]} and $file" >&2
         exit 1
     fi
-    by_name["$name"]="$component"
+    by_name["$name"]="$file"
 done
 
 shipped=0
@@ -114,6 +133,27 @@ while read -r line; do
     fi
     cp -L "$src" "$out/lib/$line"
     shipped=$((shipped + 1))
+
+    # The record is mandatory: without it the artifact is unloadable, so a
+    # tarball missing one deploys a host that panics on the component it was
+    # built to ship.
+    # Assigned before being read: a names-tool failure inside a process
+    # substitution is invisible to `set -e`, and a manifest entry that is not a
+    # component artifact would surface as "no component_package target packages"
+    # rather than as the name grammar refusing it.
+    sidecars="$("$package_names" "$line")"
+    { read -r record_name; read -r spec_name; } <<< "$sidecars"
+    record="${by_name[$record_name]:-}"
+    if [ -z "$record" ]; then
+        echo "ERROR: $manifest lists $line, which no component_package target packages" >&2
+        exit 1
+    fi
+    cp -L "$record" "$out/lib/$record_name"
+
+    spec="${by_name[$spec_name]:-}"
+    if [ -n "$spec" ]; then
+        cp -L "$spec" "$out/lib/$spec_name"
+    fi
 done <<< "$listed"
 
 # A manifest that yields nothing is a manifest that stopped being read, and the

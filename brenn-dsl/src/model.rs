@@ -55,6 +55,16 @@ use crate::diag::Diagnostic;
 pub struct File {
     pub uses: Vec<UseStmt>,
     pub items: Vec<Spanned<Item>>,
+    /// Lowercase hex SHA-256 of the source text this file parsed from, the
+    /// identity a class declared here is bound to downstream.
+    ///
+    /// Not a document key: this struct is the parser's direct deserialization
+    /// target under `deny_unknown_fields`, so the field is skipped there and
+    /// filled by [`crate::parse_str`] over the same bytes it consumed. A `File`
+    /// built any other way carries the empty string, which class resolution
+    /// refuses rather than propagates.
+    #[serde(skip)]
+    pub source_sha256: String,
 }
 
 /// A top-level declaration.

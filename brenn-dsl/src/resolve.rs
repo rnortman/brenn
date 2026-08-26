@@ -1838,6 +1838,12 @@ fn emit_entities(
     files: Vec<(String, File)>,
     errors: &mut Vec<Diagnostic>,
 ) -> Emitted {
+    // Taken before the files are consumed into their item lists: a class's
+    // identity is its declaring file's, and only the file carries it.
+    let hashes: Vec<String> = files
+        .iter()
+        .map(|(_, file)| file.source_sha256.clone())
+        .collect();
     let modules: Vec<Vec<Spanned<Item>>> = files.into_iter().map(|(_, file)| file.items).collect();
     let mut config = Emitted::default();
     let (mut channels, declared, minted) = channel_addresses(index, &modules, errors);
@@ -1869,7 +1875,7 @@ fn emit_entities(
             config.withhold_stamps(inst.handle.value());
         }
     }
-    let classes = component_classes(index, &modules, &channels, &links, &stamps, errors);
+    let classes = component_classes(index, &modules, &hashes, &channels, &links, &stamps, errors);
     let agents = agent_classes(&modules);
 
     // Section multiplicity is decided over the whole document before any body
@@ -2907,6 +2913,7 @@ impl ClassTable {
 fn component_classes(
     index: &Index,
     modules: &[Vec<Spanned<Item>>],
+    hashes: &[String],
     channels: &ChannelTable,
     links: &LinkTable,
     stamps: &StampTable,
@@ -2919,7 +2926,7 @@ fn component_classes(
             let Item::Component(class) = item.value() else {
                 continue;
             };
-            if let Some(reference) = class_ref(class, &scope, errors) {
+            if let Some(reference) = class_ref(class, &hashes[position], &scope, errors) {
                 table.by_site.insert((position, offset), reference);
             }
         }
@@ -2930,9 +2937,19 @@ fn component_classes(
 /// One component class, resolved to what an instance of it needs to know.
 fn class_ref(
     class: &ComponentClass,
+    spec_sha256: &str,
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<ClassRef> {
+    // The empty hash is the hole `File::source_sha256`'s `serde(skip)` opens: a
+    // `File` built anywhere but `parse_str` carries one. Refused here rather
+    // than flowed onward, where two empty hashes would spuriously bind.
+    assert!(
+        !spec_sha256.is_empty(),
+        "class `{}` was declared in a file with no source hash; every `File` \
+         reaching resolution is built by `parse_str`",
+        class.name.value()
+    );
     let word = &class.attrs.abi.value.name;
     let Some(parsed) = parse_abi(word.value()) else {
         errors.push(Diagnostic::at(
@@ -2984,6 +3001,7 @@ fn class_ref(
         requires: needs.requires,
         optional: needs.optional,
         ports,
+        spec_sha256: spec_sha256.to_string(),
     })
 }
 

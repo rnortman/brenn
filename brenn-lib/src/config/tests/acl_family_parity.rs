@@ -174,6 +174,7 @@ fn a_consumers_config_holds_exactly_its_families() {
     let fields = field_names!(WasmConsumerConfigRaw {
         slug,
         component_path,
+        spec_sha256,
         grants,
         store_path,
         store_size_limit,
@@ -203,6 +204,7 @@ fn a_consumers_config_holds_exactly_its_families() {
         &[
             "slug",
             "component_path",
+            "spec_sha256",
             "grants",
             "store_path",
             "store_size_limit",

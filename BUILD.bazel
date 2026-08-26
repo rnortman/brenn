@@ -15,6 +15,13 @@ exports_files([
     "noop_mcp.py",
 ])
 
+# The specifications, exported because `component_package` targets in
+# `//brenn-wasm` read them directly and a raw source file is package-private by
+# default. Globbed rather than listed, for the same reason the config filegroup
+# below is: a new specification is readable by its package target by existing,
+# so shipping a component never waits on an edit here.
+exports_files(glob(["config/specs/*.brenn"]))
+
 # The shipped root configs and the shared modules they import, globbed rather
 # than listed: a new module joins the config-file tests and the format gate
 # below by existing, so neither can be silently skipped.

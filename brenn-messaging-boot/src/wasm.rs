@@ -801,6 +801,7 @@ pub(crate) fn resolve_wasm_consumers(
         result.push(ResolvedWasmConsumer {
             slug: slug.clone(),
             component_path: consumer.component_path.clone(),
+            spec_sha256: consumer.spec_sha256.clone(),
             grants,
             store_path,
             max_page_count,

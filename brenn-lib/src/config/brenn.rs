@@ -281,6 +281,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
         let crate::messaging::config::WasmConsumerConfigRaw {
             slug: _,
             component_path: _,
+            spec_sha256: _,
             grants,
             store_path: _,
             store_size_limit: _,

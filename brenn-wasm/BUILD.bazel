@@ -1,5 +1,5 @@
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "component_fixtures", "deployed_components_test")
+load("//bazel/wasm:defs.bzl", "component_fixtures", "component_package", "deployed_components_test")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
@@ -38,10 +38,51 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+# The sidecars every shipped component installs with: its binding record, and —
+# for a processor-world component — the specification its author wrote, copied
+# verbatim under the artifact's stem. One instance per manifest entry and no
+# more: a test-only component is never installed, so it has nothing to bind.
+#
+# The world is declared here rather than inferred, and the emitter refuses a
+# declaration the artifact's own imports contradict.
+COMPONENT_PACKAGES = {
+    "git-forge-parser": ("brenn:processor", "//:config/specs/git-forge-parser.brenn"),
+    "git-sync-consumer": ("brenn:processor", "//:config/specs/git-sync-consumer.brenn"),
+    "processor-demo": ("brenn:processor", "//:config/specs/processor-demo.brenn"),
+    # Replay components have no component class, no ports and no grants, so
+    # their packages are artifact plus record and nothing else.
+    "replay": ("brenn:replay", None),
+    "replay-generic": ("brenn:replay", None),
+}
+
+[
+    component_package(
+        name = "package_" + name.replace("-", "_"),
+        component = "//brenn-wasm/components/{}:component".format(name),
+        spec = spec,
+        visibility = ["//visibility:public"],
+        world = world,
+    )
+    for name, (world, spec) in COMPONENT_PACKAGES.items()
+]
+
+PACKAGES = [
+    ":package_" + name.replace("-", "_")
+    for name in COMPONENT_PACKAGES
+]
+
+# What the release tree stages beside the artifacts the manifest names.
+filegroup(
+    name = "packages",
+    srcs = PACKAGES,
+    visibility = ["//visibility:public"],
+)
+
 deployed_components_test(
     name = "deployed_components_test",
     components = COMPONENTS,
     manifest = "deployed-components.txt",
+    packages = PACKAGES,
 )
 
 # One fixture target per component, never a bundle. Runfiles are part of a test

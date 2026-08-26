@@ -69,11 +69,15 @@ def _processor_stage_impl(ctx):
             ctx.file.transpiled,
             ctx.file.jco_version,
             ctx.file._emitter,
+            ctx.file._wit_lib,
         ],
         tools = [ctx.file._wasm_tools],
         executable = ctx.file._stage,
         arguments = [args],
-        env = {"WASM_TOOLS": ctx.file._wasm_tools.path},
+        env = {
+            "WASM_TOOLS": ctx.file._wasm_tools.path,
+            "WIT_LIB": ctx.file._wit_lib.path,
+        },
         mnemonic = "SurfaceProcessorStage",
         progress_message = "Staging surface processor assets for %s" % ctx.attr.kind,
     )
@@ -115,6 +119,10 @@ _processor_stage = rule(
             allow_single_file = True,
             cfg = "exec",
             default = Label("//bazel/tools:wasm-tools"),
+        ),
+        "_wit_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:wit_lib.sh"),
         ),
     },
 )

@@ -2989,7 +2989,10 @@ fn fold_component_kinds(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -
 /// Do two class references state the same wire facts?
 ///
 /// Compared by value, span excluded: the same class written in two modules is two
-/// positions in the source and one contract on the wire.
+/// positions in the source and one contract on the wire. `spec_sha256` is
+/// excluded for the same reason: two copies differing only in comments state
+/// the same contract, and whether their bytes bind to an artifact is a
+/// deployment question this fold does not ask.
 fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
     left.name.value() == right.name.value()
         && left.abi.value() == right.abi.value()

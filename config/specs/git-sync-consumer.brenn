@@ -1,0 +1,20 @@
+/// The terminal stage of the git push pipeline: it matches a normalized push
+/// event's remote URLs against the remote-to-slug map it is configured with and
+/// pulls the matched repositories through the `git-repo-pull` tool, one async
+/// call per push. The call's result arrives later on `tool-results`, the
+/// component's inbox for the tool substrate, where each repository's outcome is
+/// logged, alerted on when it failed, and republished on `outcomes`.
+///
+/// Every capability is load-bearing and none is optional: `config` carries the
+/// remote-to-slug map, without which no push matches anything; `store` holds
+/// the monotonic counter the async call ids come from, so a pull cannot be
+/// issued without it; `alert` is how a failed pull reaches an operator, which
+/// is the whole point of running the pipeline unattended; `tools` is the
+/// authority to call `git-repo-pull` at all.
+component GitSyncConsumer {
+  abi = processor;
+  requires = [ports, log, store, alert, config, tools];
+  in push-events;
+  in tool-results;
+  out outcomes;
+}

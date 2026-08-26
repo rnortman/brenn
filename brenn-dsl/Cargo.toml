@@ -13,7 +13,9 @@ publish = false
 # so the DSL tooling stays free of the host runtime.
 brenn-envelope = { path = "../brenn-envelope" }
 clap = { version = "4", features = ["derive"] }
+hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.11.0"
 # Durable channel identity is a pinned UUIDv5 derivation, so v5 is the whole
 # reason this is here.
 uuid = { version = "1.23.0", features = ["v5"] }

@@ -19,8 +19,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 /// Manifest schema version this server understands. A tree written by a
 /// different version is a deploy/toolchain mismatch, not something to
 /// best-effort parse.
@@ -173,7 +171,7 @@ fn assert_source_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManife
             path.display(),
         )
     });
-    let actual = hex::encode(Sha256::digest(&bytes));
+    let actual = brenn_lib::util::sha256_hex(&bytes);
     assert!(
         actual == manifest.source_sha256,
         "boot: processor component {kind:?} has a stale transpile: {artifact} hashes to {actual}, \

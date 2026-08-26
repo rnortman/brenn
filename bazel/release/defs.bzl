@@ -62,23 +62,26 @@ def _release_package_impl(ctx):
     args.add("--out", out.path)
     args.add("--manifest", ctx.file.manifest)
     args.add("--names", ctx.file._manifest_names)
+    args.add("--package-names", ctx.file._package_names)
     args.add("--frontend", frontend.path)
     args.add("--surface", surface.path)
     args.add_all(binaries, before_each = "--bin")
     args.add_all(ctx.files.lib_files, before_each = "--lib")
     args.add_all(components, before_each = "--component")
+    args.add_all(ctx.files.packages, before_each = "--package")
 
     ctx.actions.run(
         outputs = [out],
         inputs = depset(
-            binaries + components + ctx.files.lib_files + [ctx.file.manifest],
+            binaries + components + ctx.files.packages + ctx.files.lib_files +
+            [ctx.file.manifest],
             transitive = [
                 ctx.attr.frontend[DefaultInfo].files,
                 ctx.attr.surface[DefaultInfo].files,
             ],
         ),
         executable = ctx.file._assemble,
-        tools = [ctx.file._manifest_names],
+        tools = [ctx.file._manifest_names, ctx.file._package_names],
         arguments = [args],
         mnemonic = "ReleasePackage",
         progress_message = "Staging the release tree at %s" % out.short_path,
@@ -122,6 +125,11 @@ _release_package = rule(
             mandatory = True,
             doc = "The deploy manifest naming the components that ship.",
         ),
+        "packages": attr.label_list(
+            allow_empty = False,
+            mandatory = True,
+            doc = "The package sidecars; the manifest picks the shipped ones.",
+        ),
         "surface": attr.label(
             mandatory = True,
             doc = "The surface asset tree, copied to `surface/`.",
@@ -134,10 +142,14 @@ _release_package = rule(
             allow_single_file = True,
             default = Label("//bazel/wasm:manifest_names.sh"),
         ),
+        "_package_names": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:package_names.sh"),
+        ),
     },
 )
 
-def release_package(name, manifest, binaries, components, frontend, surface, lib_files = [], visibility = None):
+def release_package(name, manifest, binaries, components, packages, frontend, surface, lib_files = [], visibility = None):
     """The staged release tree, plus the gate on the contract `deploy.sh` reads.
 
     Pairing them here makes the gate structural: the tree cannot be added to
@@ -150,6 +162,7 @@ def release_package(name, manifest, binaries, components, frontend, surface, lib
         manifest: the deploy manifest naming the components that ship.
         binaries: host binaries, installed to `bin/`.
         components: every `wasm_component` target in the tree.
+        packages: every `component_package` target in the tree.
         frontend: the frontend asset tree.
         surface: the surface asset tree.
         lib_files: loose files installed to `lib/`.
@@ -162,6 +175,7 @@ def release_package(name, manifest, binaries, components, frontend, surface, lib
         frontend = frontend,
         lib_files = lib_files,
         manifest = manifest,
+        packages = packages,
         surface = surface,
         target_compatible_with = HOST_ONLY,
         visibility = visibility,
@@ -173,6 +187,8 @@ def release_package(name, manifest, binaries, components, frontend, surface, lib
         src = "//bazel/release:package_check.sh",
         args = [
             "$(rootpath //bazel/wasm:manifest_names.sh)",
+            "$(rootpath //bazel/wasm:package_names.sh)",
+            "$(rootpath //bazel/wasm:record_lib.sh)",
             "$(rootpath :%s)" % name,
             "$(rootpath %s)" % manifest,
         ] + select({
@@ -182,6 +198,8 @@ def release_package(name, manifest, binaries, components, frontend, surface, lib
         data = [
             manifest,
             "//bazel/wasm:manifest_names.sh",
+            "//bazel/wasm:package_names.sh",
+            "//bazel/wasm:record_lib.sh",
             ":" + name,
         ],
         out = name + "_contract.run",
