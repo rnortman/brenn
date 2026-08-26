@@ -20,9 +20,9 @@ use crate::messaging::ChannelEntry;
 pub fn delivery_policy_for_addresses<'a>(
     addresses: impl IntoIterator<Item = &'a str>,
 ) -> AppPolicy {
-    use crate::access::AppCapability;
     use crate::access::acl::{ChannelMatcher, MqttSubMatcher, WebhookMatcher};
     use crate::messaging::ChannelScheme;
+    use brenn_envelope::grants::AppCapability;
 
     let mut policy = AppPolicy::default();
     for address in addresses {

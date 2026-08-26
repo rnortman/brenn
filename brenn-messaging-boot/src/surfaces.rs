@@ -10,7 +10,8 @@ use brenn_lib::messaging::config::{
     SurfaceOutput, SurfaceOutputRaw,
 };
 use brenn_lib::messaging::{
-    ChannelScheme, ComponentGrant, ComponentHost, MessagingDirectory, Urgency,
+    ChannelScheme, ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, Urgency,
+    bindable_schemes,
 };
 use brenn_surface_schema::Abi;
 use indexmap::IndexMap;
@@ -830,8 +831,8 @@ pub(crate) fn resolve_surfaces(
             },
         );
         // Auto-channel grants, injected before the binding coverage checks read
-        // the policy: a `[[connection]]` is the operator's authorization signal,
-        // so an endpoint needs no authored ACL for the channel it wires.
+        // the policy: a `link` is the operator's authorization signal, so an
+        // endpoint needs no authored ACL for the channel it wires.
         auto_wiring.inject_surface_grants(slug, &mut policy);
         let policy = policy;
 
@@ -859,8 +860,21 @@ pub(crate) fn resolve_surfaces(
                 "config: [[surface]] {slug:?}: {direction} port name {port:?} must consist of \
                  RFC 3986 unreserved characters only (A-Za-z0-9._~-)",
             );
-            // Items 3 + 4: scheme restriction and channel existence.
-            match ChannelScheme::split(channel) {
+            // Items 3 + 4: scheme restriction and channel existence. Both
+            // planes give a surface the same row, so one lookup covers a
+            // binding of either direction.
+            let split = ChannelScheme::split(channel);
+            assert!(
+                split.is_some_and(|(scheme, _)| bindable_schemes(
+                    EntityKind::Surface,
+                    Plane::Subscribe
+                )
+                .contains(&scheme)),
+                "config: [[surface]] {slug:?}: {direction} channel {channel:?} must be a \
+                 brenn:, ephemeral:, or local: address — surfaces bind only those three \
+                 schemes (the scheme restriction that keeps surfaces off ingress paths)",
+            );
+            match split {
                 // Both transportable schemes take one lookup in the one
                 // directory. The transport check is defense-in-depth for the
                 // "surfaces off ingress paths" guarantee: an address must
@@ -925,15 +939,9 @@ pub(crate) fn resolve_surfaces(
                         );
                     }
                 }
-                Some((
-                    ChannelScheme::Mqtt | ChannelScheme::Webhook | ChannelScheme::PwaPush,
-                    _,
-                ))
-                | None => panic!(
-                    "config: [[surface]] {slug:?}: {direction} channel {channel:?} must be a \
-                     brenn:, ephemeral:, or local: address — surfaces bind only those three \
-                     schemes (the scheme restriction that keeps surfaces off ingress paths)",
-                ),
+                _ => {
+                    unreachable!("the scheme assert above admits only the schemes a surface binds",)
+                }
             }
         };
 
@@ -1208,7 +1216,7 @@ pub(crate) fn resolve_surfaces(
                 noise < NoiseLevel::Alarm
                     || policy
                         .grants
-                        .has(brenn_lib::access::AppCapability::SurfaceAlert),
+                        .has(brenn_envelope::grants::AppCapability::SurfaceAlert),
                 "config: [[surface]] {slug:?}: instance {:?} binds channel {:?} with noise {:?}, \
                  which alerts on overflow — that requires the surface's `alert` grant so the \
                  kernel may deliver the alert; add it to [[surface]] grants or lower the noise",
@@ -1367,7 +1375,7 @@ pub(crate) fn resolve_surfaces(
                 !comp.grants.contains(&ComponentGrant::Alert)
                     || policy
                         .grants
-                        .has(brenn_lib::access::AppCapability::SurfaceAlert),
+                        .has(brenn_envelope::grants::AppCapability::SurfaceAlert),
                 "config: [[surface]] {slug:?}: component {instance:?} is granted \"alert\" but \
                  the surface has no `alert` grant — the kernel could never forward its alert \
                  (the surface is the principal the backend judges); add `alert` to [[surface]] \
@@ -1448,7 +1456,7 @@ pub(crate) fn resolve_surfaces(
 /// `bare` is the scheme-stripped channel name (the `brenn_publish` matcher
 /// convention).
 pub(crate) fn inject_surface_error_grant(surfaces: &mut [ResolvedSurface], bare: &str) {
-    use brenn_lib::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::ChannelMatcher;
     for surface in surfaces {
         surface
@@ -1479,7 +1487,7 @@ pub(crate) fn inject_surface_config_subscribe_grants(
     surfaces: &mut [ResolvedSurface],
     prefix: &str,
 ) {
-    use brenn_lib::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::ChannelMatcher;
     use brenn_surface_server::description::surface_config_bare;
     for surface in surfaces {

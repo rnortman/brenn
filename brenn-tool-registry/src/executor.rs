@@ -536,8 +536,9 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::ChannelMatcher;
-    use brenn_lib::access::{AppCapability, AppPolicy, GrantSet};
+    use brenn_lib::access::{AppPolicy, GrantSet};
     use brenn_lib::messaging::config::MessagingGlobalConfig;
     use brenn_lib::messaging::{
         ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind, WakeMin,

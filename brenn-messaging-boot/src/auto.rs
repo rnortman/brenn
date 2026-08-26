@@ -1,21 +1,22 @@
-//! Auto channels: the pass that turns `[[connection]]` blocks into channels,
-//! port addresses, and the ACL grants those bindings need.
+//! Auto channels: the pass that turns `link` declarations into channels, port
+//! addresses, and the ACL grants those bindings need.
 //!
-//! Post-lowering a connection endpoint is an ordinary resolved binding, so
-//! nothing downstream of the resolvers knows auto channels exist.
+//! Post-lowering a link endpoint is an ordinary resolved binding, so nothing
+//! downstream of the resolvers knows auto channels exist.
 //!
 //! Pure over resolved config types — no DB, no directory — so the delicate
 //! `build_messaging` assembly can call it and it can be unit-tested in isolation.
 
 use std::collections::{HashMap, HashSet};
 
-use brenn_lib::access::AppCapability;
+use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
 use brenn_lib::messaging::config::{
-    ConnectionConfigRaw, Depth, MessagingGlobalConfig, ResolvedChannel, Sink, SurfaceConfigRaw,
-    SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw,
-    WasmConsumerIoPortRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
+    Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingGlobalConfig, ResolvedChannel,
+    Sink, SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw,
+    WasmConsumerConfigRaw, WasmConsumerIoPortRaw, WasmConsumerOutputRaw,
+    WasmConsumerSubscriptionRaw,
 };
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, auto_channel_cid, auto_channel_name, durable_auto_channel_uuid,
@@ -35,9 +36,9 @@ pub(crate) fn surface_endpoint_ref(slug: &str, instance: &str, port: &str) -> St
     format!("surface:{slug}#{instance}/{port}")
 }
 
-/// Where a connection's endpoints live, which is what decides an anonymous
-/// channel's scheme: a channel is non-transportable when everything on it sits on
-/// one side of a wire, and transportable only when the connection spans one.
+/// Where a link's endpoints live, which is what decides an anonymous channel's
+/// scheme: a channel is non-transportable when everything on it sits on one side
+/// of a wire, and transportable only when the endpoint set spans one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Realm {
     /// Every endpoint is a backend `[[wasm_consumer]]` port — the server ring.
@@ -48,16 +49,15 @@ enum Realm {
     Spanning,
 }
 
-/// Which host a connection endpoint lives on.
+/// Which host an endpoint lives on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EndpointHost {
     Wasm { slug: String },
     Surface { slug: String, instance: String },
 }
 
-/// One resolved connection endpoint: the port it names, the roles that port's
-/// declarations give it, and the depths its subscribing half contributes to the
-/// channel's ring.
+/// One resolved endpoint: the port it names, the roles its binding gave it, and
+/// the depths its subscribing half contributes to the channel's ring.
 #[derive(Debug, Clone)]
 struct Endpoint {
     /// Canonical ref text — the cid key material and the label in messages.
@@ -130,6 +130,228 @@ fn surface_io_endpoint(slug: &str, io: &SurfaceIoPortRaw) -> Endpoint {
     }
 }
 
+/// What a port's own declarations say about it: the roles they give it, whether
+/// it is an io_port, any channel it already binds, and the window its
+/// subscribing half states for itself.
+struct PortDeclaration {
+    publishes: bool,
+    subscribes: bool,
+    io_port: bool,
+    bound: Option<String>,
+    /// The subscribing declaration's `push_depth`, `None` on a port with no
+    /// subscribing half or one that states no window.
+    push_depth: Option<Depth>,
+    /// The subscribing declaration's `retain_depth`. See [`Self::push_depth`].
+    retain_depth: Option<Depth>,
+}
+
+impl PortDeclaration {
+    fn declared(&self) -> bool {
+        self.publishes || self.subscribes
+    }
+}
+
+/// What the declarations of one `[[wasm_consumer]]` say about one port name.
+fn wasm_port_declaration(consumer: &WasmConsumerConfigRaw, port: &str) -> PortDeclaration {
+    let io = consumer.io_ports.iter().find(|p| p.port == port);
+    let sub = consumer.subscriptions.iter().find(|s| s.port == port);
+    let out = consumer.outputs.iter().find(|o| o.port == port);
+    let (push_depth, retain_depth) = io
+        .map(|p| (p.push_depth, p.retain_depth))
+        .or_else(|| sub.map(|s| (s.push_depth, s.retain_depth)))
+        .unwrap_or((None, None));
+    PortDeclaration {
+        publishes: io.is_some() || out.is_some(),
+        subscribes: io.is_some() || sub.is_some(),
+        io_port: io.is_some(),
+        bound: io
+            .and_then(|p| p.channel.clone())
+            .or_else(|| sub.and_then(|s| s.channel.clone()))
+            .or_else(|| out.and_then(|o| o.channel.clone())),
+        push_depth,
+        retain_depth,
+    }
+}
+
+/// What the declarations of one `[[surface]]` say about one instance's port.
+fn surface_port_declaration(
+    surface: &SurfaceConfigRaw,
+    instance: &str,
+    port: &str,
+) -> PortDeclaration {
+    let io = surface
+        .io_ports
+        .iter()
+        .find(|p| p.instance == instance && p.port == port);
+    let sub = surface
+        .subscriptions
+        .iter()
+        .find(|s| s.instance == instance && s.port == port);
+    let out = surface
+        .outputs
+        .iter()
+        .find(|o| o.instance == instance && o.port == port);
+    let (push_depth, retain_depth) = io
+        .map(|p| (p.push_depth, p.retain_depth))
+        .or_else(|| sub.map(|s| (s.push_depth, s.retain_depth)))
+        .unwrap_or((None, None));
+    PortDeclaration {
+        publishes: io.is_some() || out.is_some(),
+        subscribes: io.is_some() || sub.is_some(),
+        io_port: io.is_some(),
+        bound: io
+            .and_then(|p| p.channel.clone())
+            .or_else(|| sub.and_then(|s| s.channel.clone()))
+            .or_else(|| out.and_then(|o| o.channel.clone())),
+        push_depth,
+        retain_depth,
+    }
+}
+
+/// Assert a link endpoint names a port that exists, is free, and carries exactly
+/// the roles and window its own declaration states.
+///
+/// The endpoint carries its roles and its window rather than resolving them, but
+/// a hand-built config can still name a slug, an instance or a port no
+/// declaration has. Such an endpoint is not inert: it perturbs the channel's cid
+/// and injects a transport capability plus an exact channel matcher into a real
+/// principal's policy, authority nothing downstream would ever exercise or
+/// notice.
+fn assert_endpoint_declared(
+    label: &str,
+    reference: &str,
+    raw: &LinkEndpointRaw,
+    consumers: &[WasmConsumerConfigRaw],
+    surfaces: &[SurfaceConfigRaw],
+) {
+    let declaration = match &raw.host {
+        LinkHostRaw::Wasm { slug } => {
+            let consumer = consumers
+                .iter()
+                .find(|c| &c.slug == slug)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "config: {label}: endpoint {reference:?} names no declared \
+                         [[wasm_consumer]] (slug {slug:?})",
+                    )
+                });
+            wasm_port_declaration(consumer, &raw.port)
+        }
+        LinkHostRaw::Surface { slug, instance } => {
+            let surface = surfaces
+                .iter()
+                .find(|s| &s.slug == slug)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "config: {label}: endpoint {reference:?} names no declared [[surface]] \
+                     (slug {slug:?})",
+                    )
+                });
+            assert!(
+                surface
+                    .components
+                    .iter()
+                    .any(|c| c.instance.as_deref().unwrap_or(&c.kind) == instance),
+                "config: {label}: endpoint {reference:?} names instance {instance:?}, which is \
+                 not declared as a [[surface.component]] on surface {slug:?}",
+            );
+            surface_port_declaration(surface, instance, &raw.port)
+        }
+    };
+    assert!(
+        declaration.declared(),
+        "config: {label}: endpoint {reference:?} names no port declared on its host — a link \
+         binds ports that already declare themselves (and their tuning) on their own block",
+    );
+    assert!(
+        declaration.bound.is_none(),
+        "config: {label}: endpoint {reference:?} already binds channel {:?} on its own \
+         declaration — a port binds exactly one channel; drop the declaration's channel or \
+         drop the endpoint from this link",
+        declaration.bound.unwrap_or_default(),
+    );
+    assert!(
+        raw.publishes == declaration.publishes,
+        "config: {label}: endpoint {reference:?} says publishes = {}, and its declaration says \
+         {} — a port's roles come from the ports it declares, and a role withheld here is a \
+         role the link grants nothing for",
+        raw.publishes,
+        declaration.publishes,
+    );
+    assert!(
+        raw.subscribes == declaration.subscribes,
+        "config: {label}: endpoint {reference:?} says subscribes = {}, and its declaration says \
+         {} — a port's roles come from the ports it declares, and a role withheld here is a \
+         role the link grants nothing for",
+        raw.subscribes,
+        declaration.subscribes,
+    );
+    assert!(
+        raw.io_port == declaration.io_port,
+        "config: {label}: endpoint {reference:?} says io_port = {}, and its declaration says \
+         {} — whether a port loops back to itself is the declaration's answer",
+        raw.io_port,
+        declaration.io_port,
+    );
+    if raw.subscribes {
+        assert!(
+            raw.push_depth == declaration.push_depth
+                && raw.retain_depth == declaration.retain_depth,
+            "config: {label}: endpoint {reference:?} carries the window ({:?}, {:?}), and its \
+             declaration states ({:?}, {:?}) — the link's ring is folded from the endpoint's \
+             numbers and the subscriber's cursor from the declaration's, so two answers size \
+             two different windows",
+            raw.push_depth,
+            raw.retain_depth,
+            declaration.push_depth,
+            declaration.retain_depth,
+        );
+    } else {
+        assert!(
+            raw.push_depth.is_none() && raw.retain_depth.is_none(),
+            "config: {label}: endpoint {reference:?} carries a window but does not subscribe — \
+             only a subscribing half has one, and this one would fold into nothing",
+        );
+    }
+}
+
+/// The endpoint one link binding presents.
+///
+/// Nothing is resolved: the binding that named the link carried the port's roles
+/// and its window, so this is a shape change. That the port exists, is free, and
+/// holds those roles is [`assert_endpoint_declared`]'s question.
+fn link_endpoint(label: &str, raw: &LinkEndpointRaw) -> Endpoint {
+    let (reference, host) = match &raw.host {
+        LinkHostRaw::Wasm { slug } => (
+            wasm_endpoint_ref(slug, &raw.port),
+            EndpointHost::Wasm { slug: slug.clone() },
+        ),
+        LinkHostRaw::Surface { slug, instance } => (
+            surface_endpoint_ref(slug, instance, &raw.port),
+            EndpointHost::Surface {
+                slug: slug.clone(),
+                instance: instance.clone(),
+            },
+        ),
+    };
+    assert!(
+        raw.publishes || raw.subscribes,
+        "config: {label}: endpoint {reference:?} neither publishes nor subscribes — a port is \
+         bound to a link in the direction its declaration gives it",
+    );
+    let depths = raw
+        .subscribes
+        .then(|| endpoint_depths(&reference, raw.push_depth, raw.retain_depth));
+    Endpoint {
+        reference,
+        host,
+        publishes: raw.publishes,
+        subscribes: raw.subscribes,
+        io_port: raw.io_port,
+        depths,
+    }
+}
+
 /// One principal's authorization on one auto channel: the transport capability
 /// and exact channel matcher its role needs.
 #[derive(Debug, Clone)]
@@ -182,7 +404,7 @@ impl AutoWiring {
         &self.nondurable_entries
     }
 
-    /// The address a backend free port is bound to, or `None` when no connection
+    /// The address a backend free port is bound to, or `None` when no link
     /// claimed it.
     pub(crate) fn wasm_channel(&self, slug: &str, port: &str) -> Option<&str> {
         self.port_channels
@@ -200,7 +422,7 @@ impl AutoWiring {
     /// Inject a consumer's auto-channel grants into its just-built policy.
     ///
     /// Called before every existing coverage assert, so the asserts hold with no
-    /// operator-written ACL for an auto channel: the connection *is* the
+    /// operator-written ACL for an auto channel: the link *is* the
     /// authorization signal, exactly as a tool grant is for the async-tool
     /// substrate.
     pub(crate) fn inject_wasm_grants(&self, slug: &str, policy: &mut AppPolicy) {
@@ -364,27 +586,22 @@ fn inject(principal: &str, grants: &[AutoGrant], policy: &mut AppPolicy) {
     }
 }
 
-/// Lower every `[[connection]]` block and every io_port declaration into
-/// channels, port addresses, and grants.
+/// Lower every `link` declaration and every io_port declaration into channels,
+/// port addresses, and grants.
 ///
 /// `declared_addresses` is every channel address already claimed by another
-/// declaration (`[[channel]]` blocks, webhook and mqtt derivations): an auto
+/// declaration (`channel` declarations, webhook and mqtt derivations): an auto
 /// channel address that also appears there is the seam through which auto-ACLs
 /// could reach a channel other parties legitimately use, so it is a boot panic.
 ///
 /// # Panics
 ///
-/// On every malformed, dead, or ambiguous connection — a malformed endpoint ref,
-/// an endpoint naming an unknown consumer/surface/instance/port, a port that
-/// already binds a channel of its own or is claimed by another connection, a
-/// connection with no publisher or no subscriber or naming one io_port alone, a
-/// named address that is reserved / mis-schemed / colliding, a `local:` name on a
-/// wire-spanning endpoint set, or a `uuid` on a channel that has no DB row to
-/// name.
-// TODO(dsl-connection-spelling): the connection arm below is unreachable — no
-// document produces a `ConnectionConfigRaw`, so only the io_port path runs.
+/// On every dead or ambiguous link — a port claimed by two links or listed twice
+/// on one, a link with no endpoints, with no publisher or no subscriber, or
+/// naming one io_port alone — on an endpoint no declaration backs
+/// ([`assert_endpoint_declared`]), and on anything [`place_channel`] rejects.
 pub(crate) fn lower_auto_wiring(
-    connections: &[ConnectionConfigRaw],
+    links: &[LinkConfigRaw],
     consumers: &[WasmConsumerConfigRaw],
     surfaces: &[SurfaceConfigRaw],
     declared_addresses: &[&str],
@@ -392,30 +609,27 @@ pub(crate) fn lower_auto_wiring(
 ) -> AutoWiring {
     let declared: HashSet<&str> = declared_addresses.iter().copied().collect();
     let mut wiring = AutoWiring::default();
-    // Endpoint ref → the connection that claimed it. Doubles as the
-    // twice-in-one-list check: the second occurrence finds its own connection.
+    // Endpoint ref → the link that claimed it. Doubles as the twice-in-one-list
+    // check: the second occurrence finds its own link.
     let mut claimed: HashMap<String, String> = HashMap::new();
     let mut synthesized: HashMap<String, String> = HashMap::new();
 
-    for (index, conn) in connections.iter().enumerate() {
-        let label = format!(
-            "[[connection]] #{} (endpoints: {})",
-            index + 1,
-            conn.endpoints.join(", "),
-        );
+    for link in links {
+        let label = format!("link {:?}", link.link);
         assert!(
-            !conn.endpoints.is_empty(),
-            "config: {label}: endpoints is empty — a connection exists to wire ports \
-             together, so it needs at least one publisher and one subscriber",
+            !link.endpoints.is_empty(),
+            "config: {label}: endpoints is empty — a link exists to wire ports together, so it \
+             needs at least one publisher and one subscriber",
         );
 
-        let mut endpoints: Vec<Endpoint> = Vec::with_capacity(conn.endpoints.len());
-        for reference in &conn.endpoints {
-            let endpoint = resolve_endpoint(&label, reference, consumers, surfaces);
+        let mut endpoints: Vec<Endpoint> = Vec::with_capacity(link.endpoints.len());
+        for raw in &link.endpoints {
+            let endpoint = link_endpoint(&label, raw);
+            assert_endpoint_declared(&label, &endpoint.reference, raw, consumers, surfaces);
             if let Some(owner) = claimed.get(&endpoint.reference) {
                 panic!(
                     "config: {label}: endpoint {:?} is already bound by {owner} — a free port \
-                     is named by exactly one connection",
+                     is bound by exactly one link",
                     endpoint.reference,
                 );
             }
@@ -424,34 +638,33 @@ pub(crate) fn lower_auto_wiring(
         }
 
         // An io_port already has a channel of its own serving both of its
-        // directions, so a connection naming nothing else adds nothing.
+        // directions, so a link binding nothing else adds nothing.
         assert!(
             !(endpoints.len() == 1 && endpoints[0].io_port),
-            "config: {label}: names one io_port and nothing else — an io_port is already wired \
-             to itself through its own channel, so this block changes nothing; name the io_port's \
-             `channel` field if it needs an address, or add the other ports that share the \
-             channel",
+            "config: {label}: binds one io_port and nothing else — an io_port is already wired \
+             to itself through its own channel, so this link changes nothing; give the io_port \
+             a channel of its own if it needs an address, or bind the other ports that share \
+             the link",
         );
 
         // A channel with no publisher can never carry a message; one with no
-        // subscriber can never deliver. Either way the connection is dead config.
+        // subscriber can never deliver. Either way the link is dead config.
         assert!(
             endpoints.iter().any(|e| e.publishes),
-            "config: {label}: no endpoint publishes — every port named here is declared as a \
-             subscription only, so nothing can ever put a message on this channel",
+            "config: {label}: no endpoint publishes — every port bound here subscribes only, so \
+             nothing can ever put a message on this channel",
         );
         assert!(
             endpoints.iter().any(|e| e.subscribes),
-            "config: {label}: no endpoint subscribes — every port named here is declared as an \
-             output only, so nothing can ever receive from this channel",
+            "config: {label}: no endpoint subscribes — every port bound here publishes only, so \
+             nothing can ever receive from this channel",
         );
 
         place_channel(
             &label,
             &endpoints,
-            conn.channel.as_deref(),
-            conn.uuid.as_deref(),
-            conn.description.clone(),
+            None,
+            link.description.clone(),
             &declared,
             &mut synthesized,
             defaults,
@@ -485,14 +698,13 @@ fn place_channel(
     label: &str,
     endpoints: &[Endpoint],
     declared: Option<&str>,
-    declared_uuid: Option<&str>,
     description: Option<String>,
     declared_addresses: &HashSet<&str>,
     synthesized: &mut HashMap<String, String>,
     defaults: &MessagingGlobalConfig,
     wiring: &mut AutoWiring,
 ) {
-    let placement = decide_placement(label, endpoints, declared, declared_uuid);
+    let placement = decide_placement(label, endpoints, declared);
 
     if let Some(owner) = synthesized.get(&placement.address) {
         panic!(
@@ -567,11 +779,11 @@ fn place_channel(
     }
 }
 
-/// Record every declared io_port, and give each one no `[[connection]]` claimed a
-/// channel of its own.
+/// Record every declared io_port, and give each one no `link` claimed a channel
+/// of its own.
 ///
-/// Each io_port ends up on exactly one channel: either the one a `[[connection]]`
-/// placed, or one this function synthesizes.
+/// Each io_port ends up on exactly one channel: either the one a `link` placed,
+/// or one this function synthesizes.
 ///
 /// # Panics
 ///
@@ -593,12 +805,18 @@ fn lower_io_ports(
                 consumer.slug, io.port,
             );
             let endpoint = wasm_io_endpoint(&consumer.slug, io);
-            if !claimed.contains_key(&endpoint.reference) {
+            let claimed_by = claimed.get(&endpoint.reference);
+            assert_free(
+                &label,
+                &endpoint.reference,
+                io.channel.as_deref(),
+                claimed_by,
+            );
+            if claimed_by.is_none() {
                 place_channel(
                     &label,
                     std::slice::from_ref(&endpoint),
                     io.channel.as_deref(),
-                    None,
                     None,
                     declared_addresses,
                     synthesized,
@@ -624,12 +842,18 @@ fn lower_io_ports(
                 io.instance,
             );
             let endpoint = surface_io_endpoint(&surface.slug, io);
-            if !claimed.contains_key(&endpoint.reference) {
+            let claimed_by = claimed.get(&endpoint.reference);
+            assert_free(
+                &label,
+                &endpoint.reference,
+                io.channel.as_deref(),
+                claimed_by,
+            );
+            if claimed_by.is_none() {
                 place_channel(
                     &label,
                     std::slice::from_ref(&endpoint),
                     io.channel.as_deref(),
-                    None,
                     None,
                     declared_addresses,
                     synthesized,
@@ -648,7 +872,7 @@ fn lower_io_ports(
 /// outgrown auto declaration.
 ///
 /// The fold is the only number the declaration grounded, so it answers all three
-/// depth questions. `push_depth` is a rung nothing on the connection itself
+/// depth questions. `push_depth` is a rung nothing on the link itself
 /// reads — each endpoint carries its own — and is consulted only by a later
 /// third-party binding on a *named* auto channel, which is exactly the case
 /// where "as deep as the ports that declared this channel" is the right answer.
@@ -705,7 +929,7 @@ fn synthesize_entry(
 /// The subscribers' consumption parameters are what the ring must cover, so
 /// publish-only endpoints contribute nothing and the hungriest subscriber sets
 /// the depth. The floor exists because a depth-0 ring retains nothing at all,
-/// which no connection asked for. `Depth`'s own ordering is the fold: every
+/// which no link asked for. `Depth`'s own ordering is the fold: every
 /// `Bounded(_)` sorts below `Unbounded`, so "no cap declared" dominates a cap
 /// that bounds only one port's need.
 ///
@@ -723,7 +947,7 @@ fn fold_retain_depth(label: &str, endpoints: &[Endpoint], durable: bool) -> Dept
     }
     assert!(
         durable || folded != Depth::Unbounded,
-        "config: {label}: the connection's subscribing port(s) fold to retain_depth = \
+        "config: {label}: the subscribing port(s) fold to retain_depth = \
          \"unbounded\", but this channel is non-durable and its retention is process memory; \
          the fold takes max(push_depth, retain_depth) per subscribing port, so both halves \
          must be bounded: give the subscribing port(s) bounded depths, or name the channel \
@@ -732,7 +956,7 @@ fn fold_retain_depth(label: &str, endpoints: &[Endpoint], durable: bool) -> Dept
     folded
 }
 
-/// Which realm a connection's endpoint set lives in.
+/// Which realm an endpoint set lives in.
 fn realm_of(endpoints: &[Endpoint]) -> Realm {
     let mut surface_slug: Option<&str> = None;
     let mut any_wasm = false;
@@ -755,25 +979,15 @@ fn realm_of(endpoints: &[Endpoint]) -> Realm {
 
 /// Decide an auto channel's address, delivery class, and entry identity.
 ///
-/// Anonymous (no operator `channel`): the bare name is `auto.<cid>` over the
-/// sorted endpoint set, and the scheme follows the realm — non-transportable
-/// when every endpoint is on one side of a wire, `ephemeral:` when the connection
-/// spans one. Named: the operator's scheme picks the capability, and `brenn:` is
-/// what buys durability.
-fn decide_placement(
-    label: &str,
-    endpoints: &[Endpoint],
-    declared: Option<&str>,
-    declared_uuid: Option<&str>,
-) -> Placement {
+/// Anonymous — every link, and an io_port that names no channel of its own: the
+/// bare name is `auto.<cid>` over the sorted endpoint set, and the scheme follows
+/// the realm — non-transportable when every endpoint is on one side of a wire,
+/// `ephemeral:` when the endpoint set spans one. Named — only an io_port reaches
+/// this arm: the operator's scheme picks the capability, and `brenn:` is what
+/// buys durability.
+fn decide_placement(label: &str, endpoints: &[Endpoint], declared: Option<&str>) -> Placement {
     let realm = realm_of(endpoints);
     let Some(address) = declared else {
-        assert!(
-            declared_uuid.is_none(),
-            "config: {label}: uuid is set but no channel name is — an anonymous auto channel is \
-             never durable and has no DB row to name; give the connection a brenn: channel or \
-             drop the uuid",
-        );
         let refs: Vec<String> = endpoints.iter().map(|e| e.reference.clone()).collect();
         let bare = auto_channel_name(auto_channel_cid(&refs));
         let (scheme, page_local) = match realm {
@@ -804,8 +1018,8 @@ fn decide_placement(
             ChannelScheme::Brenn | ChannelScheme::Ephemeral | ChannelScheme::Local
         ),
         "config: {label}: channel {address:?} must be a brenn:, ephemeral:, or local: address — \
-         a connection wires pub/sub ports, and ingress/egress transports are declared by their \
-         own config blocks",
+         an auto channel wires pub/sub ports, and ingress/egress transports are declared by \
+         their own config blocks",
     );
     assert!(
         !bare.is_empty(),
@@ -827,27 +1041,20 @@ fn decide_placement(
         && match &realm {
             Realm::Page(_) => true,
             Realm::Backend => false,
-            Realm::Spanning => panic!(
-                "config: {label}: channel {address:?} is a local: address, but the endpoint set \
-                 spans the wire (backend and surface, or two surfaces) — local: cannot span the \
-                 wire; use an ephemeral: address",
+            // Only an io_port names its channel, and an io_port is one
+            // endpoint on one host, which is never Spanning.
+            Realm::Spanning => unreachable!(
+                "config: {label}: channel {address:?} is named by a single endpoint, which \
+                 cannot span the wire",
             ),
         };
-    let uuid =
-        match (durable, declared_uuid, page_local) {
-            (true, Some(raw), _) => Some(Uuid::parse_str(raw).unwrap_or_else(|e| {
-                panic!("config: {label}: uuid {raw:?} is not a valid UUID: {e}")
-            })),
-            (true, None, _) => Some(durable_auto_channel_uuid(bare)),
-            (false, Some(_), _) => panic!(
-                "config: {label}: uuid is set but channel {address:?} is not durable — only a \
-             brenn: channel has a DB row to name; drop the uuid or make the channel brenn:",
-            ),
-            // A page-local channel has no server entry at all: it exists only as the
-            // surface bindings the pass lowers, like every surface `local:` channel.
-            (false, None, true) => None,
-            (false, None, false) => Some(nondurable_channel_uuid(scheme, bare)),
-        };
+    let uuid = match (durable, page_local) {
+        (true, _) => Some(durable_auto_channel_uuid(bare)),
+        // A page-local channel has no server entry at all: it exists only as the
+        // surface bindings the pass lowers, like every surface `local:` channel.
+        (false, true) => None,
+        (false, false) => Some(nondurable_channel_uuid(scheme, bare)),
+    };
 
     Placement {
         scheme,
@@ -859,167 +1066,23 @@ fn decide_placement(
     }
 }
 
-/// Resolve one endpoint ref against the declarations it names, inferring the
-/// port's roles from the lists it appears in.
+/// A port bound to a link states no channel of its own: a port binds exactly one
+/// channel, so an address on the io_port and a link claiming it are two answers
+/// to one question.
 ///
-/// Direction is never stated on the connection: a port declared in a
-/// `subscriptions` list subscribes, one in an `outputs` list publishes. Stating
-/// it here would only invite contradiction with the port declaration.
-fn resolve_endpoint(
-    label: &str,
-    reference: &str,
-    consumers: &[WasmConsumerConfigRaw],
-    surfaces: &[SurfaceConfigRaw],
-) -> Endpoint {
-    let malformed = || -> ! {
+/// The other port shapes cannot reach this: a binding names a link or an
+/// address, never both. An io_port carries its address on the port declaration
+/// rather than on the binding, so this is the one place the two can be written
+/// together.
+fn assert_free(label: &str, reference: &str, declared: Option<&str>, claimed_by: Option<&String>) {
+    let Some(address) = declared else {
+        return;
+    };
+    if let Some(owner) = claimed_by {
         panic!(
-            "config: {label}: endpoint {reference:?} is malformed — an endpoint is \
-             \"wasm:<slug>/<port>\" for a [[wasm_consumer]] port, or \
-             \"surface:<slug>#<instance>/<port>\" for a surface component's port",
-        )
-    };
-    let Some((kind, rest)) = reference.split_once(':') else {
-        malformed()
-    };
-    match kind {
-        "wasm" => {
-            let Some((slug, port)) = rest.split_once('/') else {
-                malformed()
-            };
-            assert!(
-                !slug.is_empty() && !port.is_empty() && port.chars().all(is_unreserved_char),
-                "config: {label}: endpoint {reference:?} is malformed — \"wasm:<slug>/<port>\" \
-                 takes one port name, of RFC 3986 unreserved characters (A-Za-z0-9._~-)",
-            );
-            let consumer = consumers
-                .iter()
-                .find(|c| c.slug == slug)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "config: {label}: endpoint {reference:?} names no declared \
-                         [[wasm_consumer]] (slug {slug:?})",
-                    )
-                });
-            if let Some(io) = consumer.io_ports.iter().find(|p| p.port == port) {
-                assert_free(label, reference, io.channel.as_deref());
-                return wasm_io_endpoint(slug, io);
-            }
-            let subscription = consumer.subscriptions.iter().find(|s| s.port == port);
-            let output = consumer.outputs.iter().find(|o| o.port == port);
-            assert!(
-                subscription.is_some() || output.is_some(),
-                "config: {label}: endpoint {reference:?} names no port declared on \
-                 [[wasm_consumer]] {slug:?} — a connection binds ports that already declare \
-                 themselves (and their tuning) on their own block",
-            );
-            if let Some(sub) = subscription {
-                assert_free(label, reference, sub.channel.as_deref());
-            }
-            if let Some(out) = output {
-                assert_free(label, reference, out.channel.as_deref());
-            }
-            Endpoint {
-                reference: wasm_endpoint_ref(slug, port),
-                host: EndpointHost::Wasm {
-                    slug: slug.to_string(),
-                },
-                publishes: output.is_some(),
-                subscribes: subscription.is_some(),
-                io_port: false,
-                depths: subscription.map(|s| {
-                    endpoint_depths(&wasm_endpoint_ref(slug, port), s.push_depth, s.retain_depth)
-                }),
-            }
-        }
-        "surface" => {
-            let Some((head, port)) = rest.split_once('/') else {
-                malformed()
-            };
-            let Some((slug, instance)) = head.split_once('#') else {
-                malformed()
-            };
-            assert!(
-                !slug.is_empty()
-                    && !instance.is_empty()
-                    && !port.is_empty()
-                    && port.chars().all(is_unreserved_char),
-                "config: {label}: endpoint {reference:?} is malformed — \
-                 \"surface:<slug>#<instance>/<port>\" takes one port name, of RFC 3986 \
-                 unreserved characters (A-Za-z0-9._~-)",
-            );
-            let surface = surfaces.iter().find(|s| s.slug == slug).unwrap_or_else(|| {
-                panic!(
-                    "config: {label}: endpoint {reference:?} names no declared [[surface]] \
-                     (slug {slug:?})",
-                )
-            });
-            assert!(
-                surface
-                    .components
-                    .iter()
-                    .any(|c| c.instance.as_deref().unwrap_or(&c.kind) == instance),
-                "config: {label}: endpoint {reference:?} names instance {instance:?}, which is \
-                 not declared as a [[surface.component]] on surface {slug:?}",
-            );
-            if let Some(io) = surface
-                .io_ports
-                .iter()
-                .find(|p| p.instance == instance && p.port == port)
-            {
-                assert_free(label, reference, io.channel.as_deref());
-                return surface_io_endpoint(slug, io);
-            }
-            let subscription = surface
-                .subscriptions
-                .iter()
-                .find(|s| s.instance == instance && s.port == port);
-            let output = surface
-                .outputs
-                .iter()
-                .find(|o| o.instance == instance && o.port == port);
-            assert!(
-                subscription.is_some() || output.is_some(),
-                "config: {label}: endpoint {reference:?} names no port declared on surface \
-                 {slug:?} — a connection binds ports that already declare themselves (and their \
-                 tuning) on their own block",
-            );
-            if let Some(sub) = subscription {
-                assert_free(label, reference, sub.channel.as_deref());
-            }
-            if let Some(out) = output {
-                assert_free(label, reference, out.channel.as_deref());
-            }
-            Endpoint {
-                reference: surface_endpoint_ref(slug, instance, port),
-                host: EndpointHost::Surface {
-                    slug: slug.to_string(),
-                    instance: instance.to_string(),
-                },
-                publishes: output.is_some(),
-                subscribes: subscription.is_some(),
-                io_port: false,
-                depths: subscription.map(|s| {
-                    endpoint_depths(
-                        &surface_endpoint_ref(slug, instance, port),
-                        s.push_depth,
-                        s.retain_depth,
-                    )
-                }),
-            }
-        }
-        _ => malformed(),
+            "config: {label}: endpoint {reference:?} already binds channel {address:?} on its \
+             own declaration but is also bound by {owner} — a port binds exactly one channel; \
+             drop the io_port's channel or unbind it from the link",
+        );
     }
-}
-
-/// A port a connection names must be *free* — declared with no `channel` of its
-/// own. A port binds exactly one channel, so an address on the binding and a
-/// connection claiming it are two answers to one question.
-fn assert_free(label: &str, reference: &str, declared: Option<&str>) {
-    assert!(
-        declared.is_none(),
-        "config: {label}: endpoint {reference:?} already binds channel {:?} on its own block — \
-         a port binds exactly one channel; remove the binding's channel or drop the endpoint \
-         from this connection",
-        declared.unwrap_or_default(),
-    );
 }

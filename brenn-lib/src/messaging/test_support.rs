@@ -75,9 +75,9 @@ pub fn test_app_config(
             let mut p = crate::access::AppPolicy::default();
             if messaging.is_some() {
                 p.grants
-                    .insert(crate::access::AppCapability::MessagingPublish);
+                    .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
                 p.grants
-                    .insert(crate::access::AppCapability::MessagingSubscribe);
+                    .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
                 p.acls
                     .brenn_subscribe
                     .push(crate::access::acl::ChannelMatcher::Prefix(String::new()));
@@ -113,7 +113,7 @@ pub fn brenn_delivery_policy(
 ) -> crate::access::AppPolicy {
     let mut p = crate::access::AppPolicy::default();
     p.grants
-        .insert(crate::access::AppCapability::MessagingSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     p.acls.brenn_subscribe.push(matcher);
     p
 }

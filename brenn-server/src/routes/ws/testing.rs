@@ -850,7 +850,7 @@ pub(super) fn test_apps_with_pwa_push() -> Arc<IndexMap<String, AppConfig>> {
     // (pwa_push_enabled()) passes for this push-enabled fixture.
     cfg.policy
         .grants
-        .insert(brenn_lib::access::AppCapability::PwaPush);
+        .insert(brenn_envelope::grants::AppCapability::PwaPush);
     apps.insert("test".to_string(), cfg);
     Arc::new(apps)
 }

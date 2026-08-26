@@ -1861,7 +1861,7 @@ mod tests {
             testapp_cfg
                 .policy
                 .grants
-                .insert(brenn_lib::access::AppCapability::MessagingPublish);
+                .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
             testapp_cfg.policy.acls.brenn_publish.push(
                 brenn_lib::access::acl::ChannelMatcher::Exact("known".to_string()),
             );
@@ -1872,7 +1872,7 @@ mod tests {
         testapp_cfg
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         testapp_cfg
             .policy
             .acls
@@ -2241,7 +2241,7 @@ mod tests {
         testapp_cfg
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MqttSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         testapp_cfg
             .policy
             .acls
@@ -2997,7 +2997,7 @@ mod tests {
         testapp_cfg
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::Webhook);
+            .insert(brenn_envelope::grants::AppCapability::Webhook);
         testapp_cfg
             .policy
             .acls
@@ -3233,7 +3233,7 @@ mod tests {
             testapp_cfg
                 .policy
                 .grants
-                .insert(brenn_lib::access::AppCapability::EphemeralPublish);
+                .insert(brenn_envelope::grants::AppCapability::EphemeralPublish);
             testapp_cfg.policy.acls.ephemeral_publish.push(
                 brenn_lib::access::acl::ChannelMatcher::Exact("protobar".to_string()),
             );
@@ -3244,7 +3244,7 @@ mod tests {
             testapp_cfg
                 .policy
                 .grants
-                .insert(brenn_lib::access::AppCapability::MessagingPublish);
+                .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         }
         apps.insert("testapp".to_string(), testapp_cfg);
         let messenger = brenn_messaging::Messenger::new(
@@ -4018,7 +4018,7 @@ mod tests {
     /// a restart when continuity matters.
     #[tokio::test]
     async fn message_subscribe_nondurable_channel_carries_the_restart_caveat() {
-        use brenn_lib::access::AppCapability;
+        use brenn_envelope::grants::AppCapability;
         use brenn_lib::access::acl::ChannelMatcher;
 
         let mut policy = brenn_lib::access::AppPolicy::default();
@@ -4052,7 +4052,7 @@ mod tests {
     /// process.
     #[tokio::test]
     async fn message_subscribe_nondurable_push_enabled_succeeds() {
-        use brenn_lib::access::AppCapability;
+        use brenn_envelope::grants::AppCapability;
         use brenn_lib::access::acl::ChannelMatcher;
 
         let mut policy = brenn_lib::access::AppPolicy::default();

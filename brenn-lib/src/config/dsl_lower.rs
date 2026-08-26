@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use serde::de::DeserializeOwned;
 use serde::de::value::StrDeserializer;
@@ -36,25 +37,25 @@ use brenn_dsl::derived::{
 };
 use brenn_dsl::diag::{Diagnostic, duplicate_statement, or_list};
 use brenn_dsl::model::{
-    AgentAttrs, Attr, ChannelAttrs, InTail, IntOrWord, IoTail, McpServerAttrs, MountTail,
-    MqttClientAttrs, OutTail, RemoteAttrs, RepoAttrs, SubscribeTail, SurfaceAttrs, WebhookAttrs,
-    Word, section_key,
+    AgentAttrs, Attr, ChannelAttrs, DocComment, InTail, IntOrWord, IoTail, McpServerAttrs,
+    MountTail, MqttClientAttrs, OutTail, RemoteAttrs, RepoAttrs, SubscribeTail, SurfaceAttrs,
+    WebhookAttrs, Word, section_key,
 };
 use brenn_dsl::resolved::{
     RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer, RHooks, RMcp, RMount, RNamed,
-    RRemote, RSection, RSubscribe, RSurface, RTail, RVal, RValue, RWebhook, RWebhookBlock,
-    ResolvedConfig as DslResolved,
+    RRemote, RSection, RSubscribe, RSurface, RTail, RToolGrant, RVal, RValue, RWebhook,
+    RWebhookBlock, ResolvedConfig as DslResolved,
 };
 
-use crate::access::AppCapability;
 use crate::access::raw::{
     AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
 };
 use crate::messaging::config::{
-    ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
-    NoiseLevel, SendRate, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw,
-    SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
-    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
+    ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingConfigRaw,
+    MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel, SendRate, SurfaceComponentRaw,
+    SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw,
+    WasmConsumerConfigRaw, WasmConsumerIoPortRaw, WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw,
+    WasmConsumerSubscriptionRaw,
 };
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 use crate::messaging::{AttachGrant, ComponentGrant, Urgency, WakeMin};
@@ -66,11 +67,13 @@ use crate::mqtt::config::{
 use crate::pwa_push::config::{
     PwaPushGlobalConfig, default_endpoint_host_allowlist, default_endpoint_host_allowlist_enforce,
 };
+use crate::tools::config::{RateLimitRaw, ToolGrantRaw};
 use crate::webhook::config::{
     AppWebhookSubscriptionRaw, ReplayProtectionConfigRaw, WebhookEndpointConfigRaw,
     WebhookKeyConfigRaw, WebhookSignatureConfigRaw, WebhookTokenConfigRaw, default_content_type,
     default_hmac_algorithm, default_transport_ceiling,
 };
+use brenn_envelope::grants::AppCapability;
 
 use super::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
 use super::app::AppConfigRaw;
@@ -141,10 +144,12 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
     let repos = repos(&resolved.repos, &mut errors);
     let mqtt_clients = mqtt_clients(&resolved.mqtt_clients, &mut errors);
     let apps = apps(&derived, &mut errors);
-    let wasm_consumers = consumers(&derived, &mut errors);
-    let surfaces = surfaces(&derived, &mut errors);
+    let mut link_endpoints = LinkEndpoints::new();
+    let wasm_consumers = consumers(&derived, &mut link_endpoints, &mut errors);
+    let surfaces = surfaces(&derived, &mut link_endpoints, &mut errors);
     let remotes = remotes(&derived, &mut errors);
     let webhook_endpoints = webhook_endpoints(&resolved.webhooks, &mut errors);
+    let links = links(resolved, link_endpoints);
 
     let config = BrennConfig {
         server: sections.server.unwrap_or_default(),
@@ -171,10 +176,7 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
         wasm_consumers,
         surfaces,
         remotes,
-        // TODO(dsl-connection-spelling): never emitted — a document wires ports
-        // to declared channels explicitly, so the auto-wiring form has no
-        // spelling and nothing populates this field.
-        connections: Vec::new(),
+        links,
         wasm: sections.wasm.unwrap_or_default(),
         watchdog: sections.watchdog.unwrap_or_default(),
     };
@@ -1646,9 +1648,31 @@ fn app(
             .map(|granted| grant::<AppCapability>(granted.value(), granted.span(), &label))
             .collect(),
         acl: app_acl(&authority.acl, &label),
-        // No statement form: a tool grant nests an acl and a rate limit.
-        tool_grants: Vec::new(),
+        tool_grants: tool_grants(&agent.tools),
     }
+}
+
+/// The `tool` statements a participant holds, one raw grant each.
+///
+/// Same shape for an agent and for a component instance: one statement form,
+/// one raw. What the clause keys mean is the registry's at boot — the document
+/// carried them unexamined and so does this.
+fn tool_grants(tools: &[RToolGrant]) -> Vec<ToolGrantRaw> {
+    tools
+        .iter()
+        .map(|grant| ToolGrantRaw {
+            tool: grant.tool.value().clone(),
+            acl: grant
+                .clauses
+                .iter()
+                .map(|clause| clause.iter().cloned().collect())
+                .collect(),
+            rate_limit: grant.rate_limit.map(|limit| RateLimitRaw {
+                burst: limit.burst,
+                sustained_per_minute: limit.sustained_per_minute,
+            }),
+        })
+        .collect()
 }
 
 /// One `[[app.mount]]`, from a `mount` statement's tail.
@@ -1966,6 +1990,9 @@ fn chan_address(resolved: &DslResolved, chan: &RChanRef) -> String {
     match chan {
         RChanRef::Decl(id) => resolved.channels[id.0].address.value().clone(),
         RChanRef::Addr(address) => address.value().clone(),
+        // A link has no address until boot places it; every caller filters one
+        // out before asking.
+        RChanRef::Link(_) => unreachable!("a link names no address"),
     }
 }
 
@@ -2093,14 +2120,17 @@ fn io_tail(tail: &IoTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIo {
     }
 }
 
-/// TODO(dsl-vocabulary-config-parity): the key set below is a hand
-/// transcription of `AppWebhookSubscriptionRaw`'s non-address fields. The
-/// raw-field direction is mechanical — the family ends in an exhaustive struct
-/// literal — but a new field on that struct is caught by nothing here.
-///
+const WEBHOOK_MASKED_KEY: &str = "noise";
+
 /// The keys of a `subscribe` tail that this family's raw struct has a field
 /// for, for the refusal a family-inappropriate key gets.
-const WEBHOOK_SUBSCRIPTION_KEYS: [&str; 3] = ["push_depth", "retain_depth", "wake_min"];
+static WEBHOOK_SUBSCRIPTION_KEYS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    SubscribeTail::KEYS
+        .iter()
+        .copied()
+        .filter(|key| *key != WEBHOOK_MASKED_KEY)
+        .collect()
+});
 
 fn messaging_subscription(
     channel: String,
@@ -2134,7 +2164,7 @@ fn webhook_subscription(
     let mut masked = sub.tail.clone();
     refuse_word(
         masked.noise.take().as_ref(),
-        "noise",
+        WEBHOOK_MASKED_KEY,
         &format!("a subscription to `webhook:{endpoint}`"),
         &WEBHOOK_SUBSCRIPTION_KEYS,
         errors,
@@ -2171,27 +2201,30 @@ fn mqtt_subscription(
 
 /// `[[wasm_consumer]]` per top-level component instance, with the authority
 /// derivation computed for it.
-fn consumers(derived: &DerivedConfig, errors: &mut Vec<Diagnostic>) -> Vec<WasmConsumerConfigRaw> {
+fn consumers(
+    derived: &DerivedConfig,
+    endpoints: &mut LinkEndpoints,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<WasmConsumerConfigRaw> {
     let resolved = &derived.resolved;
     resolved
         .consumers
         .iter()
         .zip(&derived.consumers)
-        .map(|(instance, authority)| consumer(resolved, instance, authority, errors))
+        .map(|(instance, authority)| consumer(resolved, instance, authority, endpoints, errors))
         .collect()
 }
 
 /// One `[[wasm_consumer]]`.
 ///
-/// TODO(dsl-vocabulary-config-parity): the key set the body below reads, and
-/// the nine ACL family assignments in the struct literal below, are hand
-/// transcriptions of `WasmConsumerConfigRaw`'s fields. The raw-field direction is mechanical —
-/// this ends in an exhaustive struct literal — but a new key on that struct is
-/// caught by nothing here.
+/// The key set the body reads is gated against the struct's fields by
+/// `tests::dsl_key_parity`, and the nine ACL family assignments by
+/// `tests::acl_family_parity`.
 fn consumer(
     resolved: &DslResolved,
     instance: &RConsumer,
     authority: &DAuthority,
+    endpoints: &mut LinkEndpoints,
     errors: &mut Vec<Diagnostic>,
 ) -> WasmConsumerConfigRaw {
     let label = instance.slug.value().clone();
@@ -2203,7 +2236,7 @@ fn consumer(
     // Consume so `Body::finish` does not reject it; the slug is already
     // captured in `instance.slug`.
     body.take("slug");
-    let bindings = wasm_bindings(resolved, instance, errors);
+    let bindings = wasm_bindings(resolved, instance, endpoints, errors);
     let raw = WasmConsumerConfigRaw {
         slug: label.clone(),
         // Required, and refused before lowering runs where it is absent, so an
@@ -2234,10 +2267,8 @@ fn consumer(
         config: body.config("config", errors),
         activation_burst: body.int("activation_burst", errors),
         activation_min_period_ms: body.int("activation_min_period_ms", errors),
-        // No statement form: a per-client budget override table.
-        mqtt_outputs: Vec::new(),
-        // No statement form: a tool grant nests an acl and a rate limit.
-        tool_grants: Vec::new(),
+        mqtt_outputs: mqtt_outputs(&authority.acl.mqtt_publish),
+        tool_grants: tool_grants(&instance.tools),
     };
     body.finish(errors);
     raw
@@ -2260,6 +2291,7 @@ struct WasmBindings {
 fn wasm_bindings(
     resolved: &DslResolved,
     instance: &RConsumer,
+    endpoints: &mut LinkEndpoints,
     errors: &mut Vec<Diagnostic>,
 ) -> WasmBindings {
     let mut out = WasmBindings::default();
@@ -2267,14 +2299,25 @@ fn wasm_bindings(
         let channel = binding
             .chan
             .as_ref()
+            .filter(|chan| !matches!(chan, RChanRef::Link(_)))
             .map(|chan| chan_address(resolved, chan));
         let port = binding.port.value().clone();
         let owner = format!("consumer `{}`", instance.slug.value());
         match &binding.tail {
             RTail::In(tail) => {
                 let tail = in_tail(tail, errors);
+                link_endpoint(
+                    endpoints,
+                    binding.chan.as_ref(),
+                    || LinkHostRaw::Wasm {
+                        slug: instance.slug.value().clone(),
+                    },
+                    &port,
+                    (false, true, false),
+                    (tail.push_depth, tail.retain_depth),
+                );
                 out.subscriptions.push(WasmConsumerSubscriptionRaw {
-                    channel: Some(connected(channel, &port, &owner)),
+                    channel: connected(binding.chan.as_ref(), channel, &port, &owner),
                     port,
                     push_depth: tail.push_depth,
                     retain_depth: tail.retain_depth,
@@ -2285,8 +2328,18 @@ fn wasm_bindings(
             }
             RTail::Out(tail) => {
                 let tail = out_tail(tail, errors);
+                link_endpoint(
+                    endpoints,
+                    binding.chan.as_ref(),
+                    || LinkHostRaw::Wasm {
+                        slug: instance.slug.value().clone(),
+                    },
+                    &port,
+                    (true, false, false),
+                    (None, None),
+                );
                 out.outputs.push(WasmConsumerOutputRaw {
-                    channel: Some(connected(channel, &port, &owner)),
+                    channel: connected(binding.chan.as_ref(), channel, &port, &owner),
                     port,
                     urgency: tail.urgency,
                     publish_per_activation: tail.publish_per_activation,
@@ -2295,6 +2348,16 @@ fn wasm_bindings(
             }
             RTail::Io(tail) => {
                 let tail = io_tail(tail, errors);
+                link_endpoint(
+                    endpoints,
+                    binding.chan.as_ref(),
+                    || LinkHostRaw::Wasm {
+                        slug: instance.slug.value().clone(),
+                    },
+                    &port,
+                    (true, true, true),
+                    (tail.push_depth, tail.retain_depth),
+                );
                 match io_shape(binding.chan.as_ref(), channel) {
                     IoShape::Pair(address) => {
                         out.subscriptions.push(WasmConsumerSubscriptionRaw {
@@ -2334,6 +2397,83 @@ fn wasm_bindings(
     out
 }
 
+/// Every link endpoint one document states, keyed by the link's id.
+///
+/// Filled by the binding walks themselves: the arm that lowers a binding is the
+/// arm that knows its roles and its window, so the endpoint is a second reading
+/// of nothing.
+type LinkEndpoints = BTreeMap<usize, Vec<LinkEndpointRaw>>;
+
+/// Record the endpoint a link-bound binding presents, where it is one.
+///
+/// A window rides only on the subscribing half: an endpoint that only publishes
+/// folds nothing into the ring's retention, and boot refuses one that carries a
+/// window anyway.
+fn link_endpoint(
+    endpoints: &mut LinkEndpoints,
+    chan: Option<&RChanRef>,
+    host: impl FnOnce() -> LinkHostRaw,
+    port: &str,
+    roles: (bool, bool, bool),
+    window: (Option<Depth>, Option<Depth>),
+) {
+    let Some(RChanRef::Link(id)) = chan else {
+        return;
+    };
+    let (publishes, subscribes, io_port) = roles;
+    let (push_depth, retain_depth) = match subscribes {
+        true => window,
+        false => (None, None),
+    };
+    endpoints.entry(id.0).or_default().push(LinkEndpointRaw {
+        host: host(),
+        port: port.to_owned(),
+        publishes,
+        subscribes,
+        io_port,
+        push_depth,
+        retain_depth,
+    });
+}
+
+/// `[[link]]` per declared link, with the ports bound to it as its endpoints.
+///
+/// Every endpoint the binding walks recorded belongs to a link this walk
+/// claims: the ids they key on are positions in the same list. An endpoint left
+/// over is a parity break between the resolver and lowering, and a dropped `io`
+/// endpoint would boot as a free port on its own private ring rather than fail,
+/// so the leftovers are asserted away.
+fn links(resolved: &DslResolved, mut endpoints: LinkEndpoints) -> Vec<LinkConfigRaw> {
+    let links: Vec<LinkConfigRaw> = resolved
+        .links
+        .iter()
+        .enumerate()
+        .map(|(index, link)| LinkConfigRaw {
+            link: link.handle.dotted(),
+            description: link.doc.as_ref().map(doc_text),
+            endpoints: endpoints.remove(&index).unwrap_or_default(),
+        })
+        .collect();
+    assert!(
+        endpoints.is_empty(),
+        "link ids {:?} carry endpoints no declared link claims",
+        endpoints.keys().collect::<Vec<_>>()
+    );
+    links
+}
+
+/// A doc comment as one block of text.
+///
+/// The line's own leading space is trivia of the comment marker, not content;
+/// a deeper indent inside a doc block is the author's and stays.
+fn doc_text(doc: &DocComment) -> String {
+    doc.lines
+        .iter()
+        .map(|line| line.value().strip_prefix(' ').unwrap_or(line.value()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What an `io` binding lowers to.
 ///
 /// A declared channel becomes a subscription/output `Pair` on the declared
@@ -2350,19 +2490,30 @@ fn io_shape(chan: Option<&RChanRef>, channel: Option<String>) -> IoShape {
         (Some(RChanRef::Decl(_)), address) => IoShape::Pair(
             address.expect("a binding on a declared channel names that channel's address"),
         ),
-        (None | Some(RChanRef::Addr(_)), channel) => IoShape::Port(channel),
+        // A link-bound `io` port is a `Port` with no channel, exactly like a
+        // free one: boot places the ring and re-joins the port to it.
+        (None | Some(RChanRef::Addr(_) | RChanRef::Link(_)), channel) => IoShape::Port(channel),
     }
 }
 
-/// The address a connected binding names.
+/// The address a connected binding names, or nothing where it names a link.
 ///
-/// `in` and `out` bindings must name a channel; `None` here is a parity break
-/// between the DSL and lowering crates, not a state a document can produce.
-/// `owner` names the port's holder — a consumer, or an instance on a surface.
-fn connected(channel: Option<String>, port: &str, owner: &str) -> String {
-    channel.unwrap_or_else(|| {
+/// `in` and `out` bindings must name a channel or a link; `None` from a binding
+/// that names neither is a parity break between the DSL and lowering crates,
+/// not a state a document can produce. `owner` names the port's holder — a
+/// consumer, or an instance on a surface.
+fn connected(
+    chan: Option<&RChanRef>,
+    channel: Option<String>,
+    port: &str,
+    owner: &str,
+) -> Option<String> {
+    if matches!(chan, Some(RChanRef::Link(_))) {
+        return None;
+    }
+    Some(channel.unwrap_or_else(|| {
         panic!("the `{port}` port of {owner} is connected in one direction and names no channel")
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2371,7 +2522,11 @@ fn connected(channel: Option<String>, port: &str, owner: &str) -> String {
 
 /// `[[surface]]` per declared surface, with the authority derivation and the
 /// wire kinds computed for it.
-fn surfaces(derived: &DerivedConfig, errors: &mut Vec<Diagnostic>) -> Vec<SurfaceConfigRaw> {
+fn surfaces(
+    derived: &DerivedConfig,
+    endpoints: &mut LinkEndpoints,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<SurfaceConfigRaw> {
     let resolved = &derived.resolved;
     resolved
         .surfaces
@@ -2380,7 +2535,9 @@ fn surfaces(derived: &DerivedConfig, errors: &mut Vec<Diagnostic>) -> Vec<Surfac
         .zip(&derived.surface_component_kinds)
         .zip(&derived.surface_components)
         .map(|(((surface, authority), kinds), placed)| {
-            self::surface(resolved, surface, authority, kinds, placed, errors)
+            self::surface(
+                resolved, surface, authority, kinds, placed, endpoints, errors,
+            )
         })
         .collect()
 }
@@ -2401,6 +2558,7 @@ fn surface(
     authority: &DAuthority,
     kinds: &[String],
     placed: &[DAuthority],
+    endpoints: &mut LinkEndpoints,
     errors: &mut Vec<Diagnostic>,
 ) -> SurfaceConfigRaw {
     // Destructured with no `..`: an attr added to `SurfaceAttrs` fails
@@ -2417,7 +2575,7 @@ fn surface(
     }: &SurfaceAttrs<RVal> = &surface.attrs;
     let label = surface.slug.value().clone();
     let (components, bindings) =
-        surface_components(resolved, surface, kinds, placed, &label, errors);
+        surface_components(resolved, surface, kinds, placed, &label, endpoints, errors);
     // The raw struct has neither a local, an mqtt nor a webhook family: a
     // surface's `local:` frames are authorized by the page it is served to, and
     // it reaches neither a broker nor a webhook endpoint. Derivation holds the
@@ -2466,18 +2624,18 @@ struct SurfaceBindings {
 /// `[[surface.component]]` per instance placed on the surface, and the bindings
 /// those instances hold.
 ///
-/// TODO(dsl-vocabulary-config-parity): the key set the body below reads is a
-/// hand transcription of `SurfaceComponentRaw`'s scalar fields, as is the
-/// per-family key set the two `amplification` refusals in [`surface_bindings`]
-/// name. The raw-field direction is mechanical — every family ends in an
-/// exhaustive struct literal — but a new key on those structs is caught by
-/// nothing here.
+/// TODO(dsl-vocabulary-config-parity): the per-family key sets the two
+/// `amplification` refusals in [`surface_bindings`] name are hand lists that no
+/// reflected destructure reaches — the refusals themselves are gated, but the
+/// key set each names in its message is not. (The key set the body below reads
+/// is gated against `SurfaceComponentRaw`'s fields by `tests::dsl_key_parity`.)
 fn surface_components(
     resolved: &DslResolved,
     surface: &RSurface,
     kinds: &[String],
     placed: &[DAuthority],
     label: &str,
+    endpoints: &mut LinkEndpoints,
     errors: &mut Vec<Diagnostic>,
 ) -> (Vec<SurfaceComponentRaw>, SurfaceBindings) {
     let mut components = Vec::with_capacity(surface.components.len());
@@ -2528,9 +2686,22 @@ fn surface_components(
                 .collect(),
         });
         body.finish(errors);
-        surface_bindings(resolved, instance, &name, &owner, &mut bindings, errors);
+        let at = Placement {
+            surface: label,
+            instance: &name,
+            owner: &owner,
+        };
+        surface_bindings(resolved, instance, &at, &mut bindings, endpoints, errors);
     }
     (components, bindings)
+}
+
+/// Which instance of which surface a binding belongs to.
+struct Placement<'a> {
+    surface: &'a str,
+    instance: &'a str,
+    /// What a diagnostic about one of its bindings calls the pair.
+    owner: &'a str,
 }
 
 /// One binding statement per port of one instance, dispatched on direction.
@@ -2542,18 +2713,19 @@ fn surface_components(
 fn surface_bindings(
     resolved: &DslResolved,
     instance: &RComponentInst,
-    name: &str,
-    owner: &str,
+    at: &Placement<'_>,
     out: &mut SurfaceBindings,
+    endpoints: &mut LinkEndpoints,
     errors: &mut Vec<Diagnostic>,
 ) {
     for binding in &instance.bindings {
         let channel = binding
             .chan
             .as_ref()
+            .filter(|chan| !matches!(chan, RChanRef::Link(_)))
             .map(|chan| chan_address(resolved, chan));
         let port = binding.port.value().clone();
-        let what = format!("the `{port}` port of {owner}");
+        let what = format!("the `{port}` port of {}", at.owner);
         match &binding.tail {
             RTail::In(tail) => {
                 // Masked out before the tail is lowered, so one token earns
@@ -2567,9 +2739,20 @@ fn surface_bindings(
                     errors,
                 );
                 let tail = in_tail(&masked, errors);
+                link_endpoint(
+                    endpoints,
+                    binding.chan.as_ref(),
+                    || LinkHostRaw::Surface {
+                        slug: at.surface.to_owned(),
+                        instance: at.instance.to_owned(),
+                    },
+                    &port,
+                    (false, true, false),
+                    (tail.push_depth, tail.retain_depth),
+                );
                 out.subscriptions.push(SurfaceSubscriptionRaw {
-                    channel: Some(connected(channel, &port, owner)),
-                    instance: name.to_owned(),
+                    channel: connected(binding.chan.as_ref(), channel, &port, at.owner),
+                    instance: at.instance.to_owned(),
                     port,
                     push_depth: tail.push_depth,
                     retain_depth: tail.retain_depth,
@@ -2579,9 +2762,20 @@ fn surface_bindings(
             }
             RTail::Out(tail) => {
                 let tail = out_tail(tail, errors);
+                link_endpoint(
+                    endpoints,
+                    binding.chan.as_ref(),
+                    || LinkHostRaw::Surface {
+                        slug: at.surface.to_owned(),
+                        instance: at.instance.to_owned(),
+                    },
+                    &port,
+                    (true, false, false),
+                    (None, None),
+                );
                 out.outputs.push(SurfaceOutputRaw {
-                    instance: name.to_owned(),
-                    channel: Some(connected(channel, &port, owner)),
+                    instance: at.instance.to_owned(),
+                    channel: connected(binding.chan.as_ref(), channel, &port, at.owner),
                     port,
                     urgency: tail.urgency,
                     publish_per_activation: tail.publish_per_activation,
@@ -2598,11 +2792,22 @@ fn surface_bindings(
                     errors,
                 );
                 let tail = io_tail(&masked, errors);
+                link_endpoint(
+                    endpoints,
+                    binding.chan.as_ref(),
+                    || LinkHostRaw::Surface {
+                        slug: at.surface.to_owned(),
+                        instance: at.instance.to_owned(),
+                    },
+                    &port,
+                    (true, true, true),
+                    (tail.push_depth, tail.retain_depth),
+                );
                 match io_shape(binding.chan.as_ref(), channel) {
                     IoShape::Pair(address) => {
                         out.subscriptions.push(SurfaceSubscriptionRaw {
                             channel: Some(address.clone()),
-                            instance: name.to_owned(),
+                            instance: at.instance.to_owned(),
                             port: port.clone(),
                             push_depth: tail.push_depth,
                             retain_depth: tail.retain_depth,
@@ -2610,7 +2815,7 @@ fn surface_bindings(
                             wake_min: None,
                         });
                         out.outputs.push(SurfaceOutputRaw {
-                            instance: name.to_owned(),
+                            instance: at.instance.to_owned(),
                             channel: Some(address),
                             port,
                             urgency: tail.urgency,
@@ -2620,7 +2825,7 @@ fn surface_bindings(
                     }
                     IoShape::Port(channel) => {
                         out.io_ports.push(SurfaceIoPortRaw {
-                            instance: name.to_owned(),
+                            instance: at.instance.to_owned(),
                             port,
                             channel,
                             push_depth: tail.push_depth,
@@ -3097,6 +3302,23 @@ fn mqtt_client_matchers(entries: &[DMqttClient]) -> Vec<MqttClientMatcherRaw> {
         .iter()
         .map(|entry| MqttClientMatcherRaw {
             client: entry.client.value().clone(),
+        })
+        .collect()
+}
+
+/// The per-client egress budgets, one per outbound MQTT entry that carried one.
+///
+/// The entry that authorizes a client is what mints its sink, so the override
+/// rides that entry rather than a table of its own; an entry with no budget
+/// leaves the sink on the runtime's default and produces no block here.
+fn mqtt_outputs(entries: &[DMqttClient]) -> Vec<WasmConsumerMqttOutputRaw> {
+    entries
+        .iter()
+        .filter(|entry| entry.publish_per_activation.is_some() || entry.publish_capacity.is_some())
+        .map(|entry| WasmConsumerMqttOutputRaw {
+            client: entry.client.value().clone(),
+            publish_per_activation: entry.publish_per_activation,
+            publish_capacity: entry.publish_capacity,
         })
         .collect()
 }

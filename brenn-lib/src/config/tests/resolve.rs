@@ -690,11 +690,11 @@ fn messaging_enabled_reads_grant_not_section_present_block_without_grant() {
     let app = minimal_app_config_for_budget_test(Some(messaging), 100);
     assert!(
         !app.policy
-            .has_grant(crate::access::AppCapability::MessagingPublish)
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
     );
     assert!(
         !app.policy
-            .has_grant(crate::access::AppCapability::MessagingSubscribe)
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingSubscribe)
     );
     assert!(!app.messaging_enabled());
 }
@@ -711,7 +711,7 @@ fn messaging_enabled_reads_grant_not_section_grant_without_block() {
     assert!(app.messaging.is_none());
     app.policy
         .grants
-        .insert(crate::access::AppCapability::MessagingSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     assert!(app.messaging_enabled());
 
     // Publish arm (a distinct app holding only `MessagingPublish`).
@@ -720,11 +720,11 @@ fn messaging_enabled_reads_grant_not_section_grant_without_block() {
     publish_only
         .policy
         .grants
-        .insert(crate::access::AppCapability::MessagingPublish);
+        .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
     assert!(
         !publish_only
             .policy
-            .has_grant(crate::access::AppCapability::MessagingSubscribe)
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingSubscribe)
     );
     assert!(publish_only.messaging_enabled());
 }
@@ -742,7 +742,10 @@ fn pwa_push_enabled_reads_grant_not_section_present_block_without_grant() {
     app.pwa_push = Some(crate::pwa_push::config::AppPwaPushBlock {
         default_title: None,
     });
-    assert!(!app.policy.has_grant(crate::access::AppCapability::PwaPush));
+    assert!(
+        !app.policy
+            .has_grant(brenn_envelope::grants::AppCapability::PwaPush)
+    );
     assert!(!app.pwa_push_enabled());
 }
 
@@ -754,7 +757,7 @@ fn pwa_push_enabled_reads_grant_not_section_grant_without_block() {
     assert!(app.pwa_push.is_none());
     app.policy
         .grants
-        .insert(crate::access::AppCapability::PwaPush);
+        .insert(brenn_envelope::grants::AppCapability::PwaPush);
     assert!(app.pwa_push_enabled());
 }
 
@@ -1053,11 +1056,11 @@ fn validate_same_topic_two_clients_yields_two_channels() {
 /// `AppPolicy` whose grants and matchers match the authored config exactly.
 #[test]
 fn validate_resolves_explicit_grants_and_acl_into_policy() {
-    use crate::access::AppCapability;
     use crate::access::acl::{ChannelMatcher, MqttClientMatcher, MqttSubMatcher, WebhookMatcher};
     use crate::access::raw::{
         AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
     };
+    use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1165,7 +1168,7 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
 /// policy — deny-by-default end to end.
 #[test]
 fn validate_app_without_grants_resolves_default_deny_policy() {
-    use crate::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1195,8 +1198,8 @@ fn validate_app_without_grants_resolves_default_deny_policy() {
 /// an authored policy that gained nothing from the derivation.
 #[test]
 fn validate_derives_chat_tree_authority_for_every_app() {
-    use crate::access::AppCapability;
     use brenn_envelope::chat::{ChatLeaf, chat_bare_name};
+    use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1299,9 +1302,9 @@ fn validate_app_without_authored_grants_gets_no_bus_send_tool() {
 /// conjunct reads the authored ACLs, which no longer carry a chat matcher.
 #[test]
 fn validate_dynamic_subscribe_does_not_reach_the_chat_tree() {
-    use crate::access::AppCapability;
     use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
     use brenn_envelope::chat::{ChatLeaf, chat_bare_name};
+    use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1346,7 +1349,7 @@ fn validate_dynamic_subscribe_does_not_reach_the_chat_tree() {
 /// ACL), so resolution emits a non-fatal warning rather than failing fast.
 #[test]
 fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
-    use crate::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1381,8 +1384,8 @@ fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
 /// channels and denies the rest.
 #[test]
 fn validate_publish_grant_with_matchers_resolves_covering_policy() {
-    use crate::access::AppCapability;
     use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
+    use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1426,7 +1429,7 @@ fn validate_publish_grant_with_matchers_resolves_covering_policy() {
 /// the other publish capability so both warning branches are pinned.
 #[test]
 fn validate_mqtt_publish_grant_without_matcher_resolves_deny_all_no_panic() {
-    use crate::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {

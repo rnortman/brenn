@@ -32,6 +32,7 @@
 //! and carry the same drift exposure as the attr vocabularies do.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::LazyLock;
 
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
@@ -42,7 +43,13 @@ use brenn_envelope::addressing::{
     MATCHER_BOUNDARIES, TUNING_BOUNDARIES, ends_at_matcher_boundary, ends_at_tuning_boundary,
     in_a_tool_namespace, is_auto_channel_name, nondurable_channel_uuid,
 };
-use brenn_envelope::grants::{ComponentGrant, ComponentHost};
+use brenn_envelope::channel_model::{
+    ChannelBlockRole, ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted,
+    standing_admitted,
+};
+use brenn_envelope::grants::{
+    AppCapability, AttachGrant, ComponentGrant, ComponentHost, EntityKind, Plane, bindable_schemes,
+};
 
 use crate::derived::{
     DAclSet, DAuthorities, DAuthority, DMatcher, DMqttClient, DMqttSub, DRemoteAuthority,
@@ -52,8 +59,9 @@ use crate::diag::{Diagnostic, check_unique, or_list, two_site};
 use crate::model::Word;
 use crate::resolved::scheme::{config_identified, spellable_quoted_list, split_spellable};
 use crate::resolved::{
-    ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef, RChannel,
-    RMatcher, RMatcherVal, RPort, RSurface, RTuning, RVal, RValue, ResolvedConfig, str_value,
+    ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
+    RChannel, RMatcher, RMatcherVal, RPort, RSurface, RTail, RToolGrant, RTuning, RVal, RValue,
+    ResolvedConfig, str_value,
 };
 
 /// Derive a resolved document.
@@ -68,6 +76,7 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
     let refs = Refs::of(&config);
     let authorities = derive_authorities(&config, &refs, &mut errors);
     let surface_component_kinds = fold_component_kinds(&config, &mut errors);
+    check_links(&config, &mut errors);
     check_doctypes(&config, &refs, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
@@ -91,6 +100,128 @@ fn is_system_minted(address: &str) -> bool {
         Some((ChannelScheme::Mqtt | ChannelScheme::Webhook, _)) => true,
         Some((ChannelScheme::Brenn, name)) => in_a_tool_namespace(name),
         _ => false,
+    }
+}
+
+/// One port bound to a link, as the link's own rules see it.
+struct LinkBinding<'a> {
+    dir: PortDir,
+    /// Where the port was named, which is what a refusal about this endpoint
+    /// points at.
+    span: &'a Span,
+    /// Whether the binding's tail states both halves of a window. Only a
+    /// subscribing port has one, and the window rule asks only those.
+    windowed: bool,
+}
+
+/// Every link is a channel some set of ports brings into existence.
+///
+/// The endpoint set is the whole of what a link is, so the rules are about it:
+/// a link nobody binds is dead configuration, a link one port binds connects
+/// nothing, and a link with no publisher or no subscriber is a ring one side
+/// talks past. Boot asserts the same three as a backstop for hand-built
+/// configurations; here they are refused with the spans the document wrote.
+fn check_links(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
+    let mut bound: BTreeMap<LinkId, Vec<LinkBinding<'_>>> = BTreeMap::new();
+    fn collect<'a>(bindings: &'a [RBinding], bound: &mut BTreeMap<LinkId, Vec<LinkBinding<'a>>>) {
+        for binding in bindings {
+            let Some(RChanRef::Link(id)) = &binding.chan else {
+                continue;
+            };
+            let windowed = match &binding.tail {
+                RTail::In(tail) => tail.push_depth.is_some() && tail.retain_depth.is_some(),
+                RTail::Io(tail) => tail.push_depth.is_some() && tail.retain_depth.is_some(),
+                RTail::Out(_) => false,
+            };
+            bound.entry(*id).or_default().push(LinkBinding {
+                dir: binding.dir(),
+                span: binding.port.span(),
+                windowed,
+            });
+        }
+    }
+    for surface in &config.surfaces {
+        for instance in &surface.components {
+            collect(&instance.bindings, &mut bound);
+        }
+    }
+    for consumer in &config.consumers {
+        collect(&consumer.bindings, &mut bound);
+    }
+    for (index, link) in config.links.iter().enumerate() {
+        let handle = link.handle.dotted();
+        let endpoints = bound.get(&LinkId(index)).map(Vec::as_slice).unwrap_or(&[]);
+        match endpoints {
+            [] => {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "link `{handle}` is bound by no port: a link is the channel its \
+                         endpoints bring into existence, so one nobody binds is nothing"
+                    ),
+                    link.span.clone(),
+                ));
+                continue;
+            }
+            [lone] => {
+                let advice = match lone.dir {
+                    PortDir::Io => {
+                        "an `io` port that connects to nothing is written `io <port>;`, \
+                         with no link"
+                    }
+                    _ => "a link needs a port at each end",
+                };
+                errors.push(two_site(
+                    format!(
+                        "link `{handle}` is bound by one port, which connects it to \
+                         nothing: {advice}"
+                    ),
+                    link.span.clone(),
+                    "the one port bound to it",
+                    lone.span.clone(),
+                ));
+                continue;
+            }
+            _ => {}
+        }
+        let publishes = endpoints
+            .iter()
+            .any(|end| matches!(end.dir, PortDir::Out | PortDir::Io));
+        let subscribes = endpoints
+            .iter()
+            .any(|end| matches!(end.dir, PortDir::In | PortDir::Io));
+        for (present, missing, role) in [
+            (publishes, "publisher", "out"),
+            (subscribes, "subscriber", "in"),
+        ] {
+            if present {
+                continue;
+            }
+            errors.push(Diagnostic::at(
+                format!(
+                    "link `{handle}` has no {missing}: every port bound to it faces the \
+                     other way, so nothing would ever reach the ring. Bind an `{role}` or an \
+                     `io` port to it"
+                ),
+                link.span.clone(),
+            ));
+        }
+        for endpoint in endpoints {
+            // Direction decides whether the question applies at all: an `out`
+            // port folds nothing into the ring's retention and states no
+            // window.
+            if !matches!(endpoint.dir, PortDir::In | PortDir::Io) || endpoint.windowed {
+                continue;
+            }
+            errors.push(Diagnostic::at(
+                format!(
+                    "this port subscribes to link `{handle}` and states no window: a link's \
+                     address appears nowhere in the document, so there is no `channel` block \
+                     to carry the depths — write `push_depth` and `retain_depth` in the \
+                     binding's tail"
+                ),
+                endpoint.span.clone(),
+            ));
+        }
     }
 }
 
@@ -205,41 +336,31 @@ fn check_tuning_address(tuning: &RTuning, errors: &mut Vec<Diagnostic>) {
 
 /// Which depth attrs each block must state and which it must leave alone.
 ///
-/// Presence and absence only. What a depth's *value* may be — a count, the word
-/// `unbounded`, the noise and sink vocabularies — is lowering's, which is where
-/// the runtime's own types live.
-/// TODO(dsl-vocabulary-config-parity): held equal to `build_channel_entries` and
-/// `build_system_channel_tuning` by review.
+/// Presence and absence only — the predicates are
+/// [`brenn_envelope::channel_model`]'s, so this side and the boot builders
+/// cannot disagree about the shape of a block. What a depth's *value* may be —
+/// a count, the word `unbounded`, the noise and sink vocabularies — is
+/// lowering's, which is where the runtime's own types live.
 fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     for channel in &config.channels {
         let address = channel.address.value();
         let span = channel.address.span();
         let durable = split_spellable(address).is_some_and(|(scheme, _)| config_identified(scheme));
-        require_depth(
-            channel.attrs.push_depth.is_some(),
-            "push_depth",
-            address,
-            span,
-            errors,
-        );
-        require_depth(
-            channel.attrs.retain_depth.is_some(),
-            "retain_depth",
-            address,
-            span,
-            errors,
-        );
-        if durable {
-            require_depth(
-                channel.attrs.standing_retain_depth.is_some(),
-                "standing_retain_depth",
-                address,
-                span,
-                errors,
-            );
-            continue;
+        for key in ChannelDepthKey::ALL {
+            let present = match key {
+                ChannelDepthKey::PushDepth => channel.attrs.push_depth.is_some(),
+                ChannelDepthKey::RetainDepth => channel.attrs.retain_depth.is_some(),
+                ChannelDepthKey::StandingRetainDepth => {
+                    channel.attrs.standing_retain_depth.is_some()
+                }
+            };
+            if depth_required(key, ChannelBlockRole::Declaring, durable) {
+                require_depth(present, key.word(), address, span, errors);
+            }
         }
-        if let Some(attr) = &channel.attrs.standing_retain_depth {
+        if let Some(attr) = &channel.attrs.standing_retain_depth
+            && !standing_admitted(durable)
+        {
             errors.push(Diagnostic::at(
                 format!(
                     "`{address}` is not disk-backed, so it states no \
@@ -249,7 +370,9 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                 int_or_word_span(&attr.value).clone(),
             ));
         }
-        if let Some(attr) = &channel.attrs.sink {
+        if let Some(attr) = &channel.attrs.sink
+            && !sink_admitted(durable)
+        {
             errors.push(Diagnostic::at(
                 format!(
                     "`{address}` is not disk-backed, so it states no sink: it evicts \
@@ -267,20 +390,22 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
             true => format!("prefix {}", tuning.address.value()),
             false => tuning.address.value().clone(),
         };
-        for (present, key) in [
-            (tuning.attrs.push_depth.is_some(), "push_depth"),
-            (tuning.attrs.retain_depth.is_some(), "retain_depth"),
-            (
-                tuning.attrs.standing_retain_depth.is_some(),
-                "standing_retain_depth",
-            ),
-        ] {
-            if !present {
+        for key in ChannelDepthKey::ALL {
+            let present = match key {
+                ChannelDepthKey::PushDepth => tuning.attrs.push_depth.is_some(),
+                ChannelDepthKey::RetainDepth => tuning.attrs.retain_depth.is_some(),
+                ChannelDepthKey::StandingRetainDepth => {
+                    tuning.attrs.standing_retain_depth.is_some()
+                }
+            };
+            if !present && depth_required(key, ChannelBlockRole::Tuning, TUNING_DURABILITY_IGNORED)
+            {
                 errors.push(Diagnostic::at(
                     format!(
-                        "the block tuning `{label}` requires {key}: a system-minted channel \
+                        "the block tuning `{label}` requires {}: a system-minted channel \
                          has a bounded in-code default, and a block that tunes it states \
-                         every depth"
+                         every depth",
+                        key.word(),
                     ),
                     tuning.address.span().clone(),
                 ));
@@ -486,37 +611,6 @@ fn collect_pins<'a>(
 
 // ── pass 4: authority ────────────────────────────────────────────────────────
 
-/// Which entity holds an authority, and with it which families it has at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntityKind {
-    Surface,
-    Agent,
-    /// A component instance, wherever it was placed. One kind for both hosts:
-    /// what a component is given, and what it may be authorized to reach, is
-    /// the same question on a surface and at top level. The host it runs on
-    /// rides along because a few answers are the host's — which capabilities it
-    /// can implement, and which schemes it can attach to.
-    Component(ComponentHost),
-    Remote,
-}
-
-impl EntityKind {
-    /// What this kind is called in a diagnostic.
-    ///
-    /// A component keeps the name its placement gave it — the language calls a
-    /// top-level instance a consumer, and an operator reading a refusal is
-    /// looking at one word or the other in their own document.
-    fn label(self) -> &'static str {
-        match self {
-            Self::Surface => "surface",
-            Self::Agent => "agent",
-            Self::Component(ComponentHost::Surface) => "component",
-            Self::Component(ComponentHost::TopLevel) => "consumer",
-            Self::Remote => "remote",
-        }
-    }
-}
-
 /// The reason this entity type cannot hold this right, where there is one.
 ///
 /// Only a component's rights have a host to be illegal on: every other entity
@@ -546,31 +640,6 @@ struct Principal<'a> {
     label: &'a str,
 }
 
-/// The two planes an authority statement names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Plane {
-    Subscribe,
-    Publish,
-}
-
-impl Plane {
-    /// Both planes, in the order a diagnostic lists them.
-    const ALL: [Plane; 2] = [Plane::Subscribe, Plane::Publish];
-
-    /// The word this plane is written as.
-    fn word(self) -> &'static str {
-        match self {
-            Plane::Subscribe => "subscribe",
-            Plane::Publish => "publish",
-        }
-    }
-
-    /// The plane a word spells, or `None` when it spells none.
-    fn parse(word: &str) -> Option<Plane> {
-        Self::ALL.into_iter().find(|plane| plane.word() == word)
-    }
-}
-
 /// Where an entry was written.
 ///
 /// A `grant` reaches into another principal's authority, and one thing is legal
@@ -585,10 +654,11 @@ enum Source {
 ///
 /// The plane and the scheme together select the list; which entity types have it
 /// is the second half of the table.
-/// TODO(dsl-vocabulary-config-parity): held equal to `AppAclRaw`,
-/// `WasmConsumerConfigRaw`, `SurfaceConfigRaw` and `RemoteConfigRaw` by review.
+///
+/// The runtime structs that hold these lists must carry exactly the fields this
+/// table names; a parity test in `brenn-lib` asserts the equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Family {
+pub enum Family {
     BrennSubscribe,
     BrennPublish,
     EphemeralSubscribe,
@@ -600,12 +670,43 @@ enum Family {
     Webhook,
 }
 
+/// How a struct spells the ACL list a [`Family`] names.
+///
+/// The same nine lists are fielded three ways across the runtime's structs;
+/// keeping the transforms here avoids ad-hoc mapping in each parity test.
+// TODO(acl-field-spelling-home): these transforms are brenn-lib's field-naming
+// conventions, held in the crate that cannot see brenn-lib's structs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclShape {
+    /// An LLM app's ACL block, which spells the `brenn:` families in full.
+    App,
+    /// A borrowed view of a component's or an attacher's lists, where the
+    /// unqualified word means `brenn:`.
+    View,
+    /// A consumer's or a remote's own config struct, where the unqualified word
+    /// means `brenn:` and every list carries an `_acl` suffix.
+    ConsumerConfig,
+}
+
 impl Family {
+    /// Every list the runtime keeps, in the order the families are declared.
+    pub const ALL: [Family; 9] = [
+        Family::BrennSubscribe,
+        Family::BrennPublish,
+        Family::EphemeralSubscribe,
+        Family::EphemeralPublish,
+        Family::LocalSubscribe,
+        Family::LocalPublish,
+        Family::MqttSubscribe,
+        Family::MqttPublish,
+        Family::Webhook,
+    ];
+
     /// The list a plane and a scheme together name.
     ///
     /// `None` only for a webhook on the publish plane: webhooks are inbound, so
     /// there is no list for a right to send to one.
-    fn of(scheme: ChannelScheme, plane: Plane) -> Option<Family> {
+    pub fn of(scheme: ChannelScheme, plane: Plane) -> Option<Family> {
         Some(match (scheme, plane) {
             (ChannelScheme::Brenn, Plane::Subscribe) => Self::BrennSubscribe,
             (ChannelScheme::Brenn, Plane::Publish) => Self::BrennPublish,
@@ -624,7 +725,7 @@ impl Family {
     }
 
     /// Does this entity type have this list?
-    fn held_by(self, kind: EntityKind) -> bool {
+    pub fn held_by(self, kind: EntityKind) -> bool {
         match self {
             Self::BrennSubscribe
             | Self::BrennPublish
@@ -668,7 +769,7 @@ impl Family {
     }
 
     /// Is this a list whose entries a remote states depth ceilings on?
-    fn carries_ceilings(self) -> bool {
+    pub fn carries_ceilings(self) -> bool {
         matches!(self, Self::BrennSubscribe | Self::EphemeralSubscribe)
     }
 
@@ -687,8 +788,25 @@ impl Family {
         }
     }
 
+    /// The field this list is held in, in a struct of this shape.
+    ///
+    /// [`Family::name`] is the `App` spelling; the other two drop the `brenn_`
+    /// qualifier, because a struct that is already about one principal's
+    /// `brenn:` lists says it once in the type rather than nine times in the
+    /// fields, and a config struct appends `_acl` because its ACL lists sit
+    /// beside its ports and its budgets.
+    pub fn field_name(self, shape: AclShape) -> String {
+        let name = self.name();
+        match shape {
+            AclShape::App => name.to_string(),
+            AclShape::View => name.strip_prefix("brenn_").unwrap_or(name).to_string(),
+            AclShape::ConsumerConfig => {
+                format!("{}_acl", name.strip_prefix("brenn_").unwrap_or(name))
+            }
+        }
+    }
     /// The field this list is held in.
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::BrennSubscribe => "brenn_subscribe",
             Self::BrennPublish => "brenn_publish",
@@ -815,6 +933,9 @@ struct Subject<'a> {
     /// What its class declares it needs, for a component instance; `None` for
     /// every other principal, none of which instantiates a spec.
     spec: Option<&'a ClassRef>,
+    /// The `tool` statements it holds. A component's are coupled to its `tools`
+    /// word; an agent's are its whole tool authority, coupled to nothing.
+    tools: &'a [RToolGrant],
 }
 
 impl Subject<'_> {
@@ -869,6 +990,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         free_send: None,
         words: Some(&entity.attrs.grants.value.words),
         spec: None,
+        tools: &[],
     });
     let components = config.surfaces.iter().flat_map(|surface| {
         let prefix = surface.handle.dotted();
@@ -882,6 +1004,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
             free_send: free_send(&instance.bindings),
             words: instance.grants.as_ref().map(|list| list.words.as_slice()),
             spec: Some(&instance.class),
+            tools: &instance.tools,
         })
     });
     let consumers = config.consumers.iter().map(|entity| Subject {
@@ -894,6 +1017,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         free_send: free_send(&entity.bindings),
         words: entity.grants.as_ref().map(|list| list.words.as_slice()),
         spec: Some(&entity.class),
+        tools: &entity.tools,
     });
     let agents = config.agents.iter().map(|entity| Subject {
         kind: EntityKind::Agent,
@@ -909,6 +1033,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
             .as_ref()
             .map(|attr| attr.value.words.as_slice()),
         spec: None,
+        tools: &entity.tools,
     });
     let remotes = config.remotes.iter().map(|entity| Subject {
         kind: EntityKind::Remote,
@@ -920,6 +1045,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         free_send: None,
         words: Some(&entity.attrs.grants.value.words),
         spec: None,
+        tools: &[],
     });
     surfaces
         .chain(components)
@@ -1076,6 +1202,7 @@ fn derive_authorities(
     // if anything states it, and what states it may be a grant.
     for (subject, held) in subjects.iter().zip(stated.iter_mut()) {
         derive_bounds(held, subject, refs, errors);
+        check_mqtt_sinks(subject, held, errors);
     }
 
     let mut authorities = DAuthorities::default();
@@ -1246,9 +1373,13 @@ fn resolve_entry(
             DEntry::MqttSub(mqtt_sub_entry(&bare, &span, refs, errors)?)
         }
         Family::MqttPublish => {
-            *refused |= refuse_tail(matcher, family, errors);
+            let budget = mqtt_sink_budget(matcher, principal, errors);
+            *refused |= budget.is_none();
+            let (publish_per_activation, publish_capacity) = budget.unwrap_or((None, None));
             DEntry::MqttPub(DMqttClient {
                 client: mqtt_client(&bare, &span, refs, errors)?,
+                publish_per_activation,
+                publish_capacity,
             })
         }
         Family::Webhook => {
@@ -1453,15 +1584,22 @@ fn mqtt_client(
     Some(Spanned::new(bare.to_string(), span.clone()))
 }
 
+const PUSH_DEPTH_KEY: &str = "push_depth";
+const RETAIN_DEPTH_KEY: &str = "retain_depth";
+
+/// The keys a remote's subscribe entry states, in the order it must state them.
+///
+/// Exported so that a parity test can gate the runtime struct's fields against
+/// this list.
+pub const REMOTE_CEILING_KEYS: [&str; 2] = [PUSH_DEPTH_KEY, RETAIN_DEPTH_KEY];
+
 /// The depths a remote's subscribe entry caps a matching subscription at.
 ///
 /// Both required, and plain counts: a remote has no `channel` block of its own to
 /// inherit a depth from, and an unbounded window is not an answer a network
 /// principal may be given.
-/// TODO(dsl-vocabulary-config-parity): held equal to `RemoteSubscribeAclRaw` and
-/// the depth and one-of assertions in
-/// `brenn_lib::messaging::remote::{lower_subscribe_matchers, zip_ceilings}` by
-/// review.
+/// The admitted keys are [`REMOTE_CEILING_KEYS`], pinned by a parity test in
+/// `brenn-lib` against the runtime struct's fields.
 fn remote_ceilings(
     matcher: &RMatcher,
     span: &Span,
@@ -1472,8 +1610,8 @@ fn remote_ceilings(
     let mut refused = false;
     for (key, value) in &matcher.tail {
         let slot = match key.as_str() {
-            "push_depth" => &mut push,
-            "retain_depth" => &mut retain,
+            PUSH_DEPTH_KEY => &mut push,
+            RETAIN_DEPTH_KEY => &mut retain,
             other => {
                 errors.push(Diagnostic::at(
                     format!(
@@ -1492,8 +1630,8 @@ fn remote_ceilings(
         }
     }
     for (key, present) in [
-        ("push_depth", push.is_some()),
-        ("retain_depth", retain.is_some()),
+        (PUSH_DEPTH_KEY, push.is_some()),
+        (RETAIN_DEPTH_KEY, retain.is_some()),
     ] {
         if !present && !refused {
             errors.push(Diagnostic::at(
@@ -1540,6 +1678,103 @@ fn count(value: &RVal, key: &str, errors: &mut Vec<Diagnostic>) -> Option<u64> {
                 format!(
                     "{key} is {}, and a remote's ceiling is a plain count: an unbounded \
                      window is not an answer a network principal may be given",
+                    other.kind()
+                ),
+                value.span().clone(),
+            ));
+            None
+        }
+    }
+}
+
+const PUBLISH_PER_ACTIVATION_KEY: &str = "publish_per_activation";
+const PUBLISH_CAPACITY_KEY: &str = "publish_capacity";
+
+/// The keys an outbound MQTT entry may carry, in the order it states them.
+///
+/// Exported so that a parity test in `brenn-lib` can gate the runtime struct's
+/// non-client fields against this list.
+pub const MQTT_SINK_KEYS: [&str; 2] = [PUBLISH_PER_ACTIVATION_KEY, PUBLISH_CAPACITY_KEY];
+
+/// The egress budget an `mqtt_publish` entry overrides for the sink it mints.
+///
+/// Both keys are optional — an entry that states neither takes the runtime's
+/// default budget — and both are token counts, so an integer is the same number
+/// as the float it widens to. Only a top-level component holds an MQTT sink of
+/// its own; every other principal publishes through a host that budgets its
+/// egress elsewhere, and a tail there is refused.
+///
+/// `None` says something in the tail was refused: the entry is still the client
+/// it names, but not the budget that was written.
+fn mqtt_sink_budget(
+    matcher: &RMatcher,
+    principal: Principal<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<(Option<f64>, Option<f64>)> {
+    if matcher.tail.is_empty() {
+        return Some((None, None));
+    }
+    if principal.kind != EntityKind::Component(ComponentHost::TopLevel) {
+        for (key, value) in &matcher.tail {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{key}` is not part of {} `{}`'s `mqtt_publish` entry: an egress budget \
+                     tunes the sink a component holds, and this principal publishes through a \
+                     host that budgets its own",
+                    principal.kind.label(),
+                    principal.label
+                ),
+                value.span().clone(),
+            ));
+        }
+        return None;
+    }
+    let mut fill = None;
+    let mut capacity = None;
+    let mut refused = false;
+    for (key, value) in &matcher.tail {
+        let slot = match key.as_str() {
+            PUBLISH_PER_ACTIVATION_KEY => &mut fill,
+            PUBLISH_CAPACITY_KEY => &mut capacity,
+            other => {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`{other}` is not part of an `mqtt_publish` entry: the sink it mints \
+                         takes publish_per_activation and publish_capacity and nothing else"
+                    ),
+                    value.span().clone(),
+                ));
+                refused = true;
+                continue;
+            }
+        };
+        match tokens(value, key, errors) {
+            Some(count) => *slot = Some(count),
+            None => refused = true,
+        }
+    }
+    match refused {
+        true => None,
+        false => Some((fill, capacity)),
+    }
+}
+
+/// A budget knob's value: a number of tokens.
+///
+/// An integer widens, because a budget written `2` is the same number as `2.0`
+/// and the language has no float literal for a whole number.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a budget knob is a small count; the wide end of i64 is not a rate"
+)]
+fn tokens(value: &RVal, key: &str, errors: &mut Vec<Diagnostic>) -> Option<f64> {
+    match value.value() {
+        RValue::Flt(number) => Some(*number),
+        RValue::Int(count) => Some(*count as f64),
+        other => {
+            errors.push(Diagnostic::at(
+                format!(
+                    "{key} is {}, and a budget is a number of tokens",
                     other.kind()
                 ),
                 value.span().clone(),
@@ -1740,56 +1975,6 @@ fn planes(dir: PortDir) -> &'static [Plane] {
     }
 }
 
-/// The schemes a position on this plane may name.
-///
-/// Not the same question as which families an entity holds ([`Family::held_by`]),
-/// and it deviates from it in exactly three places, each deliberate:
-///
-/// - a surface may bind a `local:` channel although it holds no local family —
-///   the page it is served to authorizes those frames, out of band;
-/// - a wasm consumer holds an `mqtt_publish` family but names no `mqtt:` output —
-///   its egress to a broker is its own block;
-/// - an agent holds publish families but states no outbound position at all — it
-///   publishes through the tools its grants admit.
-///
-/// Everywhere else this is the family table read through the plane.
-/// TODO(dsl-vocabulary-config-parity): held equal to
-/// `brenn_lib::messaging::boot::surfaces::validate_binding`,
-/// `WasmConsumerSubscriptionRaw` and `AppAclRaw` by review.
-fn bindable(kind: EntityKind, plane: Plane) -> &'static [ChannelScheme] {
-    match (kind, plane) {
-        (EntityKind::Surface, _) => &[
-            ChannelScheme::Brenn,
-            ChannelScheme::Ephemeral,
-            ChannelScheme::Local,
-        ],
-        (EntityKind::Component(ComponentHost::TopLevel), Plane::Subscribe) => &[
-            ChannelScheme::Brenn,
-            ChannelScheme::Ephemeral,
-            ChannelScheme::Local,
-            ChannelScheme::Webhook,
-            ChannelScheme::Mqtt,
-        ],
-        // A surface-placed instance attaches through the page, which reaches no
-        // broker and no endpoint.
-        (EntityKind::Component(ComponentHost::Surface), _)
-        | (EntityKind::Component(ComponentHost::TopLevel), Plane::Publish) => &[
-            ChannelScheme::Brenn,
-            ChannelScheme::Ephemeral,
-            ChannelScheme::Local,
-        ],
-        (EntityKind::Agent, Plane::Subscribe) => &[
-            ChannelScheme::Brenn,
-            ChannelScheme::Ephemeral,
-            ChannelScheme::Webhook,
-            ChannelScheme::Mqtt,
-        ],
-        // An agent states no outbound position: it publishes through the tools
-        // its grants admit, against the authority its `acl publish` states.
-        (EntityKind::Agent, Plane::Publish) | (EntityKind::Remote, _) => &[],
-    }
-}
-
 /// Every position one surface attaches through: the bound ports of every
 /// instance placed on it.
 fn surface_bounds(surface: &RSurface) -> Vec<Bound<'_>> {
@@ -1804,14 +1989,21 @@ fn surface_bounds(surface: &RSurface) -> Vec<Bound<'_>> {
 ///
 /// A free `io` port is not one: it connects nothing, the ring it reads is minted
 /// for the page it is served to, and there is no channel for an entry to be
-/// about.
+/// about. Nor is a link-bound binding: the link's channel is minted at boot from
+/// the endpoint set, and the transport capability and channel matcher its
+/// endpoints need are injected there — binding the port *is* the authorization,
+/// so there is nothing here to derive or to cover.
 fn binding_bounds(bindings: &[RBinding]) -> Vec<Bound<'_>> {
     bindings
         .iter()
         .filter_map(|binding| {
+            let chan = binding.chan.as_ref()?;
+            if matches!(chan, RChanRef::Link(_)) {
+                return None;
+            }
             Some(Bound {
                 dir: binding.dir(),
-                chan: binding.chan.as_ref()?,
+                chan,
                 span: binding.port.span().clone(),
                 what: "binding",
             })
@@ -1819,16 +2011,23 @@ fn binding_bounds(bindings: &[RBinding]) -> Vec<Bound<'_>> {
         .collect()
 }
 
-/// Where the first free `io` port in a set of bindings is.
+/// Where the first send this principal makes outside the position walk is.
 ///
-/// It holds no position, so it derives no entry — but the page-local ring it is
-/// served is something the component publishes into, which is what the `ports`
-/// rule asks about. Boot must count both halves of every `io` port for the same
-/// reason.
+/// Two shapes hold none: a free `io` port, whose page-local ring is minted for
+/// the page it is served to, and any link-bound binding with a publishing role,
+/// whose channel is minted at boot. Neither derives an entry — but both are
+/// something the component publishes into, which is what the `ports` rule asks
+/// about. Boot must count both halves of every `io` port for the same reason.
 fn free_send(bindings: &[RBinding]) -> Option<Span> {
     bindings
         .iter()
-        .find(|binding| binding.chan.is_none())
+        .find(|binding| match &binding.chan {
+            None => true,
+            Some(RChanRef::Link(_)) => {
+                matches!(binding.dir(), PortDir::Out | PortDir::Io)
+            }
+            Some(_) => false,
+        })
         .map(|binding| binding.port.span().clone())
 }
 
@@ -1844,6 +2043,41 @@ fn agent_bounds(agent: &RAgent) -> Vec<Bound<'_>> {
             what: "subscription",
         })
         .collect()
+}
+
+/// One egress budget per MQTT sink.
+///
+/// A client is one sink however many entries name it, so two entries carrying a
+/// budget for one client state two answers to one question. This must be caught
+/// here; by boot time the conflict would panic.
+fn check_mqtt_sinks(subject: &Subject<'_>, stated: &mut Stated, errors: &mut Vec<Diagnostic>) {
+    let mut budgeted: Vec<&str> = Vec::new();
+    let mut duplicates: Vec<(String, Span)> = Vec::new();
+    for (family, entry) in &stated.entries {
+        let (Family::MqttPublish, DEntry::MqttPub(sink)) = (family, entry) else {
+            continue;
+        };
+        if sink.publish_per_activation.is_none() && sink.publish_capacity.is_none() {
+            continue;
+        }
+        let client = sink.client.value().as_str();
+        match budgeted.contains(&client) {
+            true => duplicates.push((client.to_string(), sink.client.span().clone())),
+            false => budgeted.push(client),
+        }
+    }
+    for (client, span) in duplicates {
+        errors.push(Diagnostic::at(
+            format!(
+                "{} `{}` states an egress budget for client `{client}` twice: one client is one \
+                 sink, and one sink holds one budget",
+                subject.kind.label(),
+                subject.label
+            ),
+            span,
+        ));
+        stated.refused = true;
+    }
 }
 
 /// What one principal's positions come to: the entries they derive where nothing
@@ -1885,8 +2119,8 @@ fn derive_bounds(
             // One lookup answers both questions: a scheme with no family on this
             // plane, and a scheme this position may not name, are refused the
             // same way. No invariant spans the two tables.
-            let family =
-                Family::of(scheme, plane).filter(|_| bindable(kind, plane).contains(&scheme));
+            let family = Family::of(scheme, plane)
+                .filter(|_| bindable_schemes(kind, plane).contains(&scheme));
             let Some(family) = family else {
                 shared.push(Diagnostic::at(
                     unbindable(scheme, plane, kind, label, bound),
@@ -1972,7 +2206,7 @@ fn unbindable(
             family.absent_reason(kind),
         );
     }
-    let schemes = bindable(kind, plane);
+    let schemes = bindable_schemes(kind, plane);
     if schemes.is_empty() {
         // The two empty rows are an agent's publish plane and a remote's every
         // plane, and neither reaches here: an agent's positions are its
@@ -2008,6 +2242,9 @@ fn bound_address(
     let address = match bound.chan {
         RChanRef::Decl(id) => refs.address(*id),
         RChanRef::Addr(address) => address.value().as_str(),
+        // `binding_bounds` and `agent_bounds` are the only producers, and
+        // neither makes a position of a link.
+        RChanRef::Link(_) => unreachable!("a link holds no position"),
     };
     let Some((scheme, bare)) = split_spellable(address) else {
         unreachable!("a resolved address names a scheme");
@@ -2071,10 +2308,9 @@ fn bound_entry(
 
 /// The words one entity type's `grants` list may hold.
 ///
-/// TODO(dsl-vocabulary-config-parity): the component words come from
-/// `ComponentGrant` and the attach words from `AttachGrant`, both mechanical;
-/// the agent row is held equal to the authorable subset of `AppCapability` by
-/// review.
+/// Every row is derived, never authored: the component words from
+/// `ComponentGrant`, the attach words from `AttachGrant`, the agent words from
+/// the LLM-authorable subset of `AppCapability`.
 struct Vocabulary {
     /// Whether a plane word is a right here at all.
     ///
@@ -2102,24 +2338,12 @@ fn vocabulary(kind: EntityKind) -> Vocabulary {
         EntityKind::Surface | EntityKind::Remote => Vocabulary {
             planes: true,
             capabilities: &[Capability::Grant(ComponentGrant::Alert)],
-            compound: &[
-                ("ephemeral_subscribe", "subscribe"),
-                ("ephemeral_publish", "publish"),
-            ],
+            compound: &ATTACH_COMPOUND,
         },
         EntityKind::Agent => Vocabulary {
             planes: true,
-            capabilities: &[Capability::DynamicSubscribe, Capability::PwaPush],
-            compound: &[
-                ("messaging_subscribe", "subscribe"),
-                ("messaging_publish", "publish"),
-                ("ephemeral_subscribe", "subscribe"),
-                ("ephemeral_publish", "publish"),
-                ("local_publish", "publish"),
-                ("mqtt_subscribe", "subscribe"),
-                ("mqtt_publish", "publish"),
-                ("webhook", "subscribe"),
-            ],
+            capabilities: &AGENT_CAPABILITIES,
+            compound: &AGENT_COMPOUND,
         },
         // The whole shared vocabulary at either placement; what the host cannot
         // implement is refused by name rather than left out of the list.
@@ -2158,13 +2382,8 @@ impl Vocabulary {
 /// from the one enum the host and the surface kernel also read. `alert` is one
 /// word across every entity type that states it — a component's and an
 /// attacher's — so it is one variant here too; a right no component vocabulary
-/// holds gets a variant of its own.
-///
-/// TODO(dsl-vocabulary-config-parity): the component grant row is now mechanical
-/// — `Capability::Grant` *is* `ComponentGrant`, and the one word an attacher
-/// states beyond its planes (`alert`) is the same word. What remains by review:
-/// the agent row (`AppCapability`'s authorable subset, and the two agent-only
-/// variants below), and the ACL family transcriptions in `brenn-lib`'s lowering.
+/// holds gets a variant of its own. The two that do are the agent-only
+/// capabilities, and they take their spelling from `AppCapability` as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Capability {
     /// A right in the shared component grant vocabulary.
@@ -2195,8 +2414,8 @@ impl Capability {
     fn word(self) -> &'static str {
         match self {
             Self::Grant(grant) => grant.word(),
-            Self::DynamicSubscribe => "dynamic_subscribe",
-            Self::PwaPush => "pwa_push",
+            Self::DynamicSubscribe => AppCapability::DynamicSubscribe.word(),
+            Self::PwaPush => AppCapability::PwaPush.word(),
         }
     }
 
@@ -2206,6 +2425,48 @@ impl Capability {
     }
 }
 
+/// The rights an agent may state that name a plane, as the compound tokens the
+/// config this lowers to spells them, each with the plane word that replaces it.
+///
+/// Derived: an agent's transport rights are exactly the LLM-authorable
+/// capabilities that have a transport shape. Order is lookup order only —
+/// nothing reads this list front to back.
+static AGENT_COMPOUND: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
+    AppCapability::ALL
+        .into_iter()
+        .filter(|cap| cap.llm_authorable().is_ok())
+        .filter_map(|cap| cap.transport().map(|(plane, _)| (cap.word(), plane.word())))
+        .collect()
+});
+
+/// The same, for an attacher: the transport rights whose word is not already
+/// the plane word.
+static ATTACH_COMPOUND: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
+    AttachGrant::ALL
+        .into_iter()
+        .filter_map(|grant| grant.transport().map(|(plane, _)| (grant, plane)))
+        .filter(|(grant, plane)| grant.word() != plane.word())
+        .map(|(grant, plane)| (grant.word(), plane.word()))
+        .collect()
+});
+
+/// The rights an agent states that name no plane: the LLM-authorable
+/// capabilities with no transport shape.
+static AGENT_CAPABILITIES: LazyLock<Vec<Capability>> = LazyLock::new(|| {
+    AppCapability::ALL
+        .into_iter()
+        .filter(|cap| cap.transport().is_none() && cap.llm_authorable().is_ok())
+        .map(|cap| match Capability::parse(cap.word()) {
+            Some(right) => right,
+            None => panic!(
+                "`{}` is authorable on an agent and names no plane, so it needs a \
+                 `Capability` variant to be stated as",
+                cap.word()
+            ),
+        })
+        .collect()
+});
+
 /// What a plane word expands to: one raw token per scheme the plane reaches,
 /// in the order they are written out.
 ///
@@ -2213,50 +2474,56 @@ impl Capability {
 /// it lowers to, so the expansion is the whole translation. Only the schemes the
 /// entity has entries on are written: a token over an empty list is dead
 /// configuration, which is what agreement refuses.
-/// TODO(dsl-vocabulary-config-parity): held equal to the `AttachGrant` variants
-/// and the authorable `AppCapability` tokens by review.
+///
+/// Derived from the same two vocabularies the grant words come from, so a token
+/// cannot be spelled one way here and another where it is granted. The rows are
+/// generated plane-major — every subscribe row, then every publish row — and
+/// within a plane in variant declaration order.
 fn expansions(kind: EntityKind) -> &'static [(Plane, ChannelScheme, &'static str)] {
     match kind {
-        EntityKind::Surface | EntityKind::Remote => &[
-            (Plane::Subscribe, ChannelScheme::Brenn, "subscribe"),
-            (
-                Plane::Subscribe,
-                ChannelScheme::Ephemeral,
-                "ephemeral_subscribe",
-            ),
-            (Plane::Publish, ChannelScheme::Brenn, "publish"),
-            (
-                Plane::Publish,
-                ChannelScheme::Ephemeral,
-                "ephemeral_publish",
-            ),
-        ],
-        EntityKind::Agent => &[
-            (
-                Plane::Subscribe,
-                ChannelScheme::Brenn,
-                "messaging_subscribe",
-            ),
-            (
-                Plane::Subscribe,
-                ChannelScheme::Ephemeral,
-                "ephemeral_subscribe",
-            ),
-            (Plane::Subscribe, ChannelScheme::Mqtt, "mqtt_subscribe"),
-            (Plane::Subscribe, ChannelScheme::Webhook, "webhook"),
-            (Plane::Publish, ChannelScheme::Brenn, "messaging_publish"),
-            (
-                Plane::Publish,
-                ChannelScheme::Ephemeral,
-                "ephemeral_publish",
-            ),
-            (Plane::Publish, ChannelScheme::Local, "local_publish"),
-            (Plane::Publish, ChannelScheme::Mqtt, "mqtt_publish"),
-        ],
+        EntityKind::Surface | EntityKind::Remote => &ATTACH_EXPANSIONS,
+        EntityKind::Agent => &AGENT_EXPANSIONS,
         // A component's words are capabilities, which name no scheme and expand
         // to nothing: they cross into the config as written.
         EntityKind::Component(_) => &[],
     }
+}
+
+/// The agent expansion rows: every LLM-authorable transport capability.
+static AGENT_EXPANSIONS: LazyLock<Vec<(Plane, ChannelScheme, &'static str)>> =
+    LazyLock::new(|| {
+        plane_major(AppCapability::ALL.into_iter().filter_map(|cap| {
+            cap.llm_authorable().ok()?;
+            let (plane, scheme) = cap.transport()?;
+            Some((plane, scheme, cap.word()))
+        }))
+    });
+
+/// The attacher expansion rows: every attach right with a transport shape.
+static ATTACH_EXPANSIONS: LazyLock<Vec<(Plane, ChannelScheme, &'static str)>> =
+    LazyLock::new(|| {
+        plane_major(AttachGrant::ALL.into_iter().filter_map(|grant| {
+            let (plane, scheme) = grant.transport()?;
+            Some((plane, scheme, grant.word()))
+        }))
+    });
+
+/// Rows sorted plane-major, each plane's rows keeping the order they arrived in.
+///
+/// The order is behavior: it is the order tokens are written into the lowered
+/// config, and the expansion tests pin it.
+fn plane_major(
+    rows: impl Iterator<Item = (Plane, ChannelScheme, &'static str)>,
+) -> Vec<(Plane, ChannelScheme, &'static str)> {
+    let rows: Vec<_> = rows.collect();
+    Plane::ALL
+        .into_iter()
+        .flat_map(|plane| {
+            rows.iter()
+                .copied()
+                .filter(move |(row_plane, _, _)| *row_plane == plane)
+        })
+        .collect()
 }
 
 /// One word, once it is known what kind of word it is.
@@ -2380,7 +2647,49 @@ fn derive_grants(
     {
         check_spec_fit(subject, spec, &rights, errors);
     }
+    if matches!(kind, EntityKind::Component(_)) && subject.words.is_some() {
+        check_tool_coupling(subject, &rights, errors);
+    }
     expand(kind, &rights, stated)
+}
+
+/// A component's `tools` word against the `tool` statements beside it, both
+/// directions.
+///
+/// The same split-kill rule the rest of this pass applies to a right and the
+/// list it reaches: the word is the deployer's consent to the registry, the
+/// statements are what that consent covers, and neither means anything alone. A
+/// word with no statement authorizes no invocation of anything; a statement
+/// with no word is authority nobody granted.
+///
+/// A component only. An agent's tool authority is the statements themselves —
+/// there is no agent-side word to couple them to.
+fn check_tool_coupling(subject: &Subject<'_>, rights: &[Right<'_>], errors: &mut Vec<Diagnostic>) {
+    let what = subject.kind.label();
+    let label = &subject.label;
+    let word = rights.iter().find_map(|right| match right {
+        Right::Capability(Capability::Grant(ComponentGrant::Tools), word) => Some(word),
+        _ => None,
+    });
+    match (word, subject.tools.first()) {
+        (Some(word), None) => errors.push(Diagnostic::at(
+            format!(
+                "{what} `{label}` grants `tools` and states no `tool`: a grant that names \
+                 no tool reaches nothing"
+            ),
+            word.span().clone(),
+        )),
+        (None, Some(first)) => errors.push(two_site(
+            format!(
+                "{what} `{label}` states a `tool` grant and does not grant `tools`: the \
+                 word is what consents to reaching the registry at all"
+            ),
+            first.tool.span().clone(),
+            "granted here",
+            subject.span.clone(),
+        )),
+        _ => {}
+    }
 }
 
 /// One instance's grants against the needs its class declares, both directions.
@@ -2515,10 +2824,11 @@ fn check_agreement(
 /// pair with a list at all: `ports`, which is the right to send anywhere, and
 /// `mqtt`, which is the right to reach a broker.
 ///
-/// Both directions are asked wherever the instance runs. A free `io` port counts
-/// as a send at either placement — it has no channel for an entry to be about,
-/// but the page-local ring it mints is somewhere the component publishes, and
-/// boot must count the same port when it asks the forward direction.
+/// Both directions are asked wherever the instance runs. A free `io` port and a
+/// link-bound binding with a publishing role both count as a send at either
+/// placement — neither has a channel for an entry to be about, but the ring
+/// each mints is somewhere the component publishes, and boot must count the
+/// same ports when it asks the forward direction.
 fn check_component_agreement(
     host: ComponentHost,
     what: &str,
@@ -2742,8 +3052,19 @@ enum Realm {
     Page(usize),
 }
 
+/// What makes one group of claims one channel.
+///
+/// A link is grouped by its identity, not by an address: it has none until boot
+/// places it, and every port bound to it will read and write the one ring that
+/// placement mints.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DoctypeKey<'a> {
+    Address(Realm, &'a str),
+    Link(LinkId),
+}
+
 /// A `BTreeMap` so disagreements on two channels report in a stable order.
-type DoctypeClaims<'a> = BTreeMap<(Realm, &'a str), Vec<DoctypeClaim<'a>>>;
+type DoctypeClaims<'a> = BTreeMap<DoctypeKey<'a>, Vec<DoctypeClaim<'a>>>;
 
 /// Every doctype reaching one channel names the same document.
 ///
@@ -2788,13 +3109,18 @@ fn check_doctypes(config: &ResolvedConfig, refs: &Refs<'_>, errors: &mut Vec<Dia
             .find(|channel| channel.address.value() == address)
             .map(|channel| &channel.handle)
     };
-    for ((_, address), claims) in &claims {
+    for (key, claims) in &claims {
         if claims.len() < 2 {
             continue;
         }
-        let label = match handle_of(address) {
-            Some(handle) => format!("`{}` (`{address}`)", handle.dotted()),
-            None => format!("`{address}`"),
+        let label = match key {
+            DoctypeKey::Address(_, address) => match handle_of(address) {
+                Some(handle) => format!("`{}` (`{address}`)", handle.dotted()),
+                None => format!("`{address}`"),
+            },
+            DoctypeKey::Link(id) => {
+                format!("link `{}`", config.links[id.0].handle.dotted())
+            }
         };
         let mut diagnostic = Diagnostic::at(
             format!(
@@ -2830,7 +3156,10 @@ fn check_doctypes(config: &ResolvedConfig, refs: &Refs<'_>, errors: &mut Vec<Dia
         // realized, so the expectation the row states holds in all of them.
         for claim in claims
             .iter()
-            .filter(|((_, address), _)| *address == channel.address.value().as_str())
+            .filter(|(key, _)| {
+                matches!(key, DoctypeKey::Address(_, address)
+                    if *address == channel.address.value().as_str())
+            })
             .flat_map(|(_, held)| held)
         {
             if claim.tag == expected {
@@ -2882,15 +3211,22 @@ fn collect_doctypes<'a>(
         let Some(doctype) = &port.doctype else {
             continue;
         };
-        let address = match chan {
-            RChanRef::Decl(id) => refs.address(*id),
-            RChanRef::Addr(address) => address.value().as_str(),
+        let key = match chan {
+            RChanRef::Link(id) => DoctypeKey::Link(*id),
+            _ => {
+                let address = match chan {
+                    RChanRef::Decl(id) => refs.address(*id),
+                    RChanRef::Addr(address) => address.value().as_str(),
+                    RChanRef::Link(_) => unreachable!("handled above"),
+                };
+                let ring = match ChannelScheme::of(address) {
+                    Some(ChannelScheme::Local) => realm,
+                    _ => Realm::Wire,
+                };
+                DoctypeKey::Address(ring, address)
+            }
         };
-        let ring = match ChannelScheme::of(address) {
-            Some(ChannelScheme::Local) => realm,
-            _ => Realm::Wire,
-        };
-        let held = claims.entry((ring, address)).or_default();
+        let held = claims.entry(key).or_default();
         if held.iter().any(|claim| claim.tag == doctype.value()) {
             continue;
         }

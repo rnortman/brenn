@@ -23,7 +23,7 @@ pub fn default_test_app_config(slug: &str, name: &str) -> AppConfig {
 /// unlike a `Prefix("")` catch-all which resolution rejects). `webhook` is empty;
 /// webhook-gate coverage uses targeted policies built inline by those tests.
 pub fn mqtt_acl_policy(client: &str, filter: &str) -> brenn_lib::access::AppPolicy {
-    use brenn_lib::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::{AclSet, ChannelMatcher, MqttSubMatcher};
 
     let mut policy = brenn_lib::access::AppPolicy::default();

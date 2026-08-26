@@ -165,8 +165,9 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::{AclSet, MqttClientMatcher};
-    use brenn_lib::access::{AppCapability, AppPolicy, GrantSet};
+    use brenn_lib::access::{AppPolicy, GrantSet};
     use brenn_mqtt::state::MqttClientHandle;
     use brenn_obs::alerting::{make_capturing_alerter, noop_alert_dispatcher};
     use brenn_wasm::MqttPublishOutcome;

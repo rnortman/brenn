@@ -643,21 +643,22 @@ async fn subscribe_and_observe_close(base: &str, token: &str, channel: &str) -> 
 // Auto channels across the wire
 // ---------------------------------------------------------------------------
 
-/// The port both endpoints of the spanning connection declare.
+/// The port both endpoints of the spanning link declare.
 const LINK_PORT: &str = "link";
 
 /// A backend WASM consumer and a surface component, each declaring one io_port,
-/// joined by a single `[[connection]]`. The endpoint set spans the wire, so the
-/// auto channel is `ephemeral:` — and nothing in this config names that channel,
+/// joined by a single `link`. The endpoint set spans the wire, so the auto
+/// channel is `ephemeral:` — and nothing in this config names that channel,
 /// writes an ACL entry, or tunes a depth outside the two port declarations.
 ///
-/// The one `[[channel]]` block is the surface's derived status channel, which an
-/// operator declares for every surface and without which the last attachment's
+/// The one `channel` declaration is the surface's derived status channel, which
+/// an operator declares for every surface and without which the last attachment's
 /// terminal stamp has nowhere to land.
-fn spanning_connection_config() -> brenn_lib::config::BrennConfig {
+fn spanning_link_config() -> brenn_lib::config::BrennConfig {
     use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::{
-        ChannelConfigRaw, ConnectionConfigRaw, Depth, MessagingGlobalConfig, WasmConsumerConfigRaw,
+        ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw,
+        MessagingGlobalConfig, WasmConsumerConfigRaw,
     };
     use brenn_messaging_boot::test_fixtures::{
         io_port_raw, minimal_surface_raw, minimal_wasm_consumer, surface_io_port_raw,
@@ -710,14 +711,34 @@ fn spanning_connection_config() -> brenn_lib::config::BrennConfig {
         channels: vec![status_channel],
         wasm_consumers: vec![worker],
         surfaces: vec![deskbar],
-        connections: vec![ConnectionConfigRaw {
-            endpoints: vec![
-                "wasm:worker/link".to_string(),
-                format!("surface:deskbar#{COMPONENT}/{LINK_PORT}"),
-            ],
-            channel: None,
-            uuid: None,
+        links: vec![LinkConfigRaw {
+            link: "span".to_string(),
             description: None,
+            endpoints: vec![
+                LinkEndpointRaw {
+                    host: LinkHostRaw::Wasm {
+                        slug: "worker".to_string(),
+                    },
+                    port: LINK_PORT.to_string(),
+                    publishes: true,
+                    subscribes: true,
+                    io_port: true,
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                },
+                LinkEndpointRaw {
+                    host: LinkHostRaw::Surface {
+                        slug: "deskbar".to_string(),
+                        instance: COMPONENT.to_string(),
+                    },
+                    port: LINK_PORT.to_string(),
+                    publishes: true,
+                    subscribes: true,
+                    io_port: true,
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                },
+            ],
         }],
         ..brenn_lib::config::BrennConfig::default()
     }
@@ -725,7 +746,7 @@ fn spanning_connection_config() -> brenn_lib::config::BrennConfig {
 
 /// **The address boot registered and the address the page is handed are one.**
 /// An anonymous auto channel's address is a uuid nobody wrote down, derived at
-/// boot from a `[[connection]]` alone; if the directory's derivation and the
+/// boot from a `link` alone; if the directory's derivation and the
 /// surface resolution's ever drift, the page subscribes a name the directory
 /// does not hold. Everything below rides the boot-derived address read back off
 /// the resolution — the subscribe, the delivery-time ACL (satisfied only by the
@@ -736,8 +757,7 @@ async fn surface_ws_an_auto_channel_carries_a_backend_publish_to_the_page() {
 
     let db = brenn_server::test_support::init_db_memory();
     let harness =
-        crate::surface_boot_harness::booted_surface_harness(&db, &spanning_connection_config())
-            .await;
+        crate::surface_boot_harness::booted_surface_harness(&db, &spanning_link_config()).await;
     let address = harness.surface_sub_address(COMPONENT, LINK_PORT);
     assert!(
         address.starts_with("ephemeral:auto."),

@@ -1081,3 +1081,135 @@ new use_it: Use(ws = alice.panel);
          and an instantiation stamps no repo"
     );
 }
+
+// ── links ────────────────────────────────────────────────────────────────────
+
+/// A link is stamped per instantiation, exactly as a channel is: two
+/// instantiations of one assembly are two anonymous channels, and a binding
+/// written in the body names the one its own instantiation stamped.
+#[test]
+fn two_instantiations_stamp_two_links() {
+    let config = resolved(
+        "component Duplex { abi = processor; requires = [ports]; io feed; }\n\
+         assembly Pod(slug: String) {\n    \
+             link relay;\n    \
+             new left: Duplex {\n        slug = f\"{slug}-left\";\n        \
+             component_path = \"/tmp/d.wasm\";\n        \
+             io feed <-> relay { push_depth = 4; retain_depth = 4; }\n    }\n    \
+             new right: Duplex {\n        slug = f\"{slug}-right\";\n        \
+             component_path = \"/tmp/d.wasm\";\n        \
+             io feed <-> relay { push_depth = 4; retain_depth = 4; }\n    }\n}\n\
+         new a: Pod(slug = \"a\");\n\
+         new b: Pod(slug = \"b\");\n",
+    );
+    assert_eq!(
+        config
+            .links
+            .iter()
+            .map(|link| link.handle.dotted())
+            .collect::<Vec<_>>(),
+        vec!["a.relay", "b.relay"]
+    );
+    // Each stamping's four bindings name their own link, and a `LinkId` is the
+    // position it indexes.
+    for (index, consumer) in config.consumers.iter().enumerate() {
+        let Some(RChanRef::Link(id)) = &consumer.bindings[0].chan else {
+            panic!("a link-bound binding");
+        };
+        assert_eq!(id.0, index / 2);
+    }
+}
+
+/// A link an assembly stamped is reached from outside through the handle it was
+/// stamped under: cross-assembly wiring is the reason to declare a link inside
+/// an assembly at all, so the dotted path resolves to the same anonymous ring
+/// the body binds directly.
+#[test]
+fn a_stamped_link_is_reached_by_its_dotted_handle() {
+    let config = resolved(
+        "component Duplex { abi = processor; requires = [ports]; io feed; }\n\
+         component Sink { abi = processor; requires = []; in quiet; }\n\
+         assembly Pod() {\n    link relay;\n    \
+         new inner: Duplex {\n        slug = \"inner\";\n        \
+         component_path = \"/tmp/d.wasm\";\n        \
+         io feed <-> relay { push_depth = 4; retain_depth = 4; }\n    }\n}\n\
+         new pod: Pod();\n\
+         new outer: Sink {\n    slug = \"outer\";\n    \
+         component_path = \"/tmp/s.wasm\";\n    \
+         in quiet <- pod.relay { push_depth = 2; retain_depth = 2; }\n}\n",
+    );
+    assert_eq!(
+        config
+            .links
+            .iter()
+            .map(|link| link.handle.dotted())
+            .collect::<Vec<_>>(),
+        vec!["pod.relay"]
+    );
+    // Both bindings — the one written inside the body and the one that reached
+    // in from outside — name the one link the instantiation stamped.
+    let bound: Vec<&RChanRef> = config
+        .consumers
+        .iter()
+        .flat_map(|consumer| &consumer.bindings)
+        .filter_map(|binding| binding.chan.as_ref())
+        .collect();
+    assert_eq!(bound.len(), 2, "{bound:?}");
+    for reference in bound {
+        let RChanRef::Link(id) = reference else {
+            panic!("a link-bound binding, not {reference:?}");
+        };
+        assert_eq!(id.0, 0);
+    }
+}
+
+/// Top-level links and stamped ones are minted in two phases into one id space,
+/// and a `LinkId` is the position it indexes in the emitted list. A document
+/// holding both is the only shape an off-by-base error in the second phase can
+/// break.
+#[test]
+fn top_level_and_stamped_links_share_one_id_space() {
+    let config = resolved(
+        "component Duplex { abi = processor; requires = [ports]; io feed; optional io spare; }\n\
+         assembly Pod(slug: String) {\n    link inner;\n    \
+         new node: Duplex {\n        slug = f\"{slug}-node\";\n        \
+         component_path = \"/tmp/d.wasm\";\n        \
+         io feed <-> inner { push_depth = 4; retain_depth = 4; }\n        \
+         io spare <-> shared { push_depth = 4; retain_depth = 4; }\n    }\n}\n\
+         link shared;\n\
+         new x: Pod(slug = \"x\");\n\
+         new y: Pod(slug = \"y\");\n",
+    );
+    assert_eq!(
+        config
+            .links
+            .iter()
+            .map(|link| link.handle.dotted())
+            .collect::<Vec<_>>(),
+        vec!["shared", "x.inner", "y.inner"]
+    );
+    // Each binding indexes the link it named: the shared top-level one keeps id
+    // 0, and each stamping's own sits at the position its handle does.
+    for (index, consumer) in config.consumers.iter().enumerate() {
+        let ids: Vec<usize> = consumer
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding.chan.as_ref() {
+                Some(RChanRef::Link(id)) => Some(id.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![index + 1, 0], "{ids:?}");
+    }
+}
+
+/// A handle naming no declared link is refused the way any unresolved name is.
+#[test]
+fn a_binding_naming_no_declaration_is_refused() {
+    let refusal = refusal(
+        "component Sink { abi = processor; requires = [ports]; io feed; }\n\
+         new s: Sink {\n    slug = \"s\";\n    component_path = \"/tmp/s.wasm\";\n    \
+         io feed <-> relay { push_depth = 1; retain_depth = 1; }\n}\n",
+    );
+    assert!(refusal.contains("relay"), "{refusal}");
+}

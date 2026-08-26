@@ -617,8 +617,8 @@ fn load_remote_token(slug: &str, path: &std::path::Path) -> RemoteToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::AppCapability;
     use crate::config::{remote_exact_ceiling, remote_fleet, remote_raw};
+    use brenn_envelope::grants::AppCapability;
 
     fn write_token(contents: &str) -> tempfile::NamedTempFile {
         use std::io::Write as _;

@@ -1,11 +1,10 @@
-//! Operator-authored `[[*.tool_grant]]` config and its resolution into
-//! `ResolvedToolGrant` values.
+//! Operator-authored tool grants and their resolution into `ResolvedToolGrant`
+//! values.
 //!
-//! The raw shape is identical under `[[app.tool_grant]]` and
-//! `[[wasm_consumer.tool_grant]]` — one grant vocabulary, both participant
-//! kinds. Resolution is fail-fast (CLAUDE.md robustness): a duplicate tool, an
-//! empty/malformed ACL clause, or an out-of-range rate limit panics at config
-//! load.
+//! The raw shape is identical for an agent and for a component instance — one
+//! grant vocabulary, both participant kinds, one `tool` statement spelling.
+//! Resolution is fail-fast (CLAUDE.md robustness): a duplicate tool, an empty
+//! ACL clause, or an out-of-range rate limit panics at config load.
 
 use std::collections::BTreeMap;
 
@@ -15,22 +14,23 @@ use super::{AclClause, ResolvedRateLimit, ResolvedToolGrant};
 /// for the implicit-from-mounts grant an app earns from its git mounts.
 pub const GIT_REPO_PULL_TOOL: &str = "git-repo-pull";
 
-/// Raw `[[*.tool_grant]]` table: a tool name, an optional list of ACL clauses
-/// (each a TOML table of `key = value` requirements), and an optional rate
-/// limit. `acl` clauses are OR'd; keys within a clause are AND'd.
+/// A raw tool grant: a tool name, an optional list of ACL clauses (each a flat
+/// map of `key = value` requirements), and an optional rate limit. `acl`
+/// clauses are OR'd; keys within a clause are AND'd.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolGrantRaw {
     /// Canonical (kebab-case) tool name this grant addresses.
     pub tool: String,
-    /// ACL clauses narrowing the grant. Each table's values must be strings
-    /// (`"*"` is the sole wildcard). Absent/empty ⇒ the tool takes no ACL.
-    pub acl: Vec<toml::Table>,
+    /// ACL clauses narrowing the grant. Values are strings (`"*"` is the sole
+    /// wildcard). Absent/empty ⇒ the tool takes no ACL, and the grant alone
+    /// authorizes every invocation.
+    pub acl: Vec<BTreeMap<String, String>>,
     /// Optional token-bucket throttle for `(participant, tool)`. Absent ⇒
     /// unlimited (the grant itself is the gate).
     pub rate_limit: Option<RateLimitRaw>,
 }
 
-/// Raw `rate_limit = { burst = N, sustained_per_minute = M }` table.
+/// A raw rate limit: `rate_limit { burst = N; sustained_per_minute = M; }`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RateLimitRaw {
     /// Token-bucket capacity (`>= 1`, validated at resolution).
@@ -39,15 +39,14 @@ pub struct RateLimitRaw {
     pub sustained_per_minute: u32,
 }
 
-/// Resolve a participant's `[[*.tool_grant]]` tables into a tool-name-keyed map.
+/// Resolve a participant's tool grants into a tool-name-keyed map.
 /// `owner` is a diagnostic label such as `app "pfin"` or `wasm consumer "sync"`.
 ///
 /// # Panics
 ///
 /// Panics (operator config — fail-fast) on: a duplicate `tool` entry, an empty
-/// `tool` name, an empty ACL clause (would match everything), an ACL clause
-/// value that is not a string or is empty, or a rate limit with `burst < 1` or
-/// `sustained_per_minute < 1`.
+/// `tool` name, an empty ACL clause (would match everything), an empty ACL
+/// clause value, or a rate limit with `burst < 1` or `sustained_per_minute < 1`.
 pub fn resolve_tool_grants(
     owner: &str,
     raw: &[ToolGrantRaw],
@@ -65,10 +64,10 @@ pub fn resolve_tool_grants(
     grants
 }
 
-/// Resolve an LLM app's tool grants: its explicit `[[app.tool_grant]]` tables
-/// plus an implicit `git-repo-pull` grant derived from `mount_slugs` when the
-/// app mounts repos and did not author an explicit `git-repo-pull` grant.
-/// Explicit replaces derived (an operator may tighten the mount-derived grant).
+/// Resolve an LLM app's tool grants: the ones it stated, plus an implicit
+/// `git-repo-pull` grant derived from `mount_slugs` when the app mounts repos
+/// and did not author an explicit `git-repo-pull` grant. Explicit replaces
+/// derived (an operator may tighten the mount-derived grant).
 pub fn resolve_app_tool_grants(
     owner: &str,
     raw: &[ToolGrantRaw],
@@ -132,23 +131,18 @@ fn resolve_one(owner: &str, raw: &ToolGrantRaw) -> ResolvedToolGrant {
     ResolvedToolGrant { acl, rate_limit }
 }
 
-fn resolve_clause(owner: &str, tool: &str, table: &toml::Table) -> AclClause {
+fn resolve_clause(owner: &str, tool: &str, table: &BTreeMap<String, String>) -> AclClause {
     assert!(
         !table.is_empty(),
         "{owner}: tool_grant {tool:?} has an empty ACL clause (would match everything)",
     );
-    let mut clause = BTreeMap::new();
     for (key, value) in table {
-        let s = value.as_str().unwrap_or_else(|| {
-            panic!("{owner}: tool_grant {tool:?} ACL clause key {key:?} must be a string value",)
-        });
         assert!(
-            !s.is_empty(),
+            !value.is_empty(),
             "{owner}: tool_grant {tool:?} ACL clause key {key:?} has an empty value",
         );
-        clause.insert(key.clone(), s.to_string());
     }
-    AclClause::new(clause)
+    AclClause::new(table.clone())
 }
 
 #[cfg(test)]
@@ -163,7 +157,7 @@ mod tests {
                 .map(|clause| {
                     clause
                         .iter()
-                        .map(|(k, v)| (k.to_string(), toml::Value::String(v.to_string())))
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect()
                 })
                 .collect(),
@@ -176,7 +170,7 @@ mod tests {
         let raw = vec![ToolGrantRaw {
             tool: "git-repo-pull".to_string(),
             acl: vec![
-                [("repo".to_string(), toml::Value::String("brenn".to_string()))]
+                [("repo".to_string(), "brenn".to_string())]
                     .into_iter()
                     .collect(),
             ],
@@ -219,17 +213,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must be a string value")]
-    fn non_string_acl_value_panics() {
-        let raw = vec![ToolGrantRaw {
-            tool: "git-repo-pull".to_string(),
-            acl: vec![
-                [("repo".to_string(), toml::Value::Integer(7))]
-                    .into_iter()
-                    .collect(),
-            ],
-            rate_limit: None,
-        }];
+    #[should_panic(expected = "has an empty value")]
+    fn empty_acl_value_panics() {
+        let raw = vec![grant("git-repo-pull", &[&[("repo", "")]])];
         resolve_tool_grants("app \"pfin\"", &raw);
     }
 

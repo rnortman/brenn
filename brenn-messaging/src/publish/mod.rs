@@ -24,7 +24,7 @@ use super::{
     PrepaidDestination, PrepaidEntry, SubscriberEntryKind, Urgency, store,
 };
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
-use brenn_lib::access::AppCapability;
+use brenn_envelope::grants::AppCapability;
 
 use brenn_obs::security::{DenialKind, SecurityEventType, log_component_security_event};
 

@@ -140,6 +140,48 @@ Pins are collected document-wide over every loaded module, including the ones an
 assembly stamps, and an **unused pin is a compile error** — which is what keeps
 the block honest against the declarations rather than becoming a graveyard.
 
+### Links
+
+A **link** wires ports to each other with no channel in between:
+
+```
+/// Frames the collector hands the indexer.
+link telemetry;
+
+new collector: Sensors { out readings -> telemetry; }
+new indexer: Indexing { in feed <- telemetry { push_depth = 8; retain_depth = 8; } }
+```
+
+A link is declared wherever a `channel` is — at the top level or inside an
+assembly, where it stamps per instantiation — and bindings target it exactly as
+they target a channel handle. It has no address, no body, no ACL matchers and no
+doctype of its own. The channel is minted at boot: its name is a uuid over the
+endpoint set, and its scheme comes from where the endpoints live — all-backend
+or all-on-one-surface gives a `local:` ring, anything spanning the wire gives an
+`ephemeral:` one. Its depths fold from the endpoints' own windows; everything
+else comes from the `messaging` defaults. A channel that needs `sink`,
+`send_rate`, `wake_min` or its own `noise` has outgrown a link — declare the
+channel.
+
+Binding a port to a link *is* the authorization for it: the transport capability
+and the channel matcher each endpoint needs are injected at boot, so neither the
+holder nor its surface writes an `acl` entry or a grant word for the link.
+
+Four rules follow from a link being nothing but its endpoint set, and all four
+are refused at compile time:
+
+- a link no port binds is nothing;
+- a link one port binds connects nothing — a lone `io` wants the free `io` form
+  instead, and a lone `in` or `out` wants a channel;
+- the endpoints must include at least one publisher (`out` or `io`) and at least
+  one subscriber (`in` or `io`);
+- an `in` or `io` bound to a link must state `push_depth` and `retain_depth` in
+  its tail. There is no `channel` block to carry them, and no default to fall
+  back on.
+
+Doctypes agree across a link the way they agree across a channel: every doctyped
+port bound to one link must name the same document.
+
 ### Component classes: the specification
 
 A `component` class is a component's specification. It states the artifact ABI,
@@ -274,6 +316,45 @@ Each placement admits its own body keys — a consumer states its artifact path,
 store, and activation budget; a surface-placed instance states its send budget
 and whether it is the page's chrome — and an unknown key is refused naming the
 set that placement admits.
+
+### Tool grants
+
+A participant that invokes registry tools names each one in a `tool` statement.
+Both participant kinds write it the same way — inside an agent body, or inside a
+top-level instance body:
+
+```
+new puller: Syncer {
+  component_path = f"{components_dir}/brenn_syncer.wasm";
+  grants = [ports, tools];
+
+  tool git-repo-pull {
+    allow { repo = "ws"; }
+    allow { repo = "notes"; }
+    rate_limit { burst = 2; sustained_per_minute = 10; }
+  }
+}
+```
+
+Each `allow` block is one clause: the requirements inside it are ANDed, the
+blocks are ORed, and `"*"` is the sole wildcard. **A `tool` statement with no
+`allow` block admits every invocation of that tool** — which is what a tool
+taking no ACL wants, and is why an empty `allow {}` is refused as the other
+spelling of the same thing. The clause keys are the tool's own resource
+attributes, a registration fact no document can see: the language carries them
+unexamined and the registry refuses a key the tool does not declare at boot.
+
+`rate_limit` is optional, and states both of its counts or neither. Each is at
+least one; a bucket that holds nothing or refills by nothing throttles the grant
+to nothing.
+
+On a component instance the word and the statements are one configuration:
+`tools` in `grants` iff at least one `tool` statement, refused in both
+directions. A word with no statement reaches nothing, and a statement with no
+word is authority nobody granted. `tools` is backend-only — the surface host
+links no tools interface — so a surface-placed instance is refused at the word
+and at the statement alike. An agent needs no word: its tool authority is the
+statements themselves.
 
 ### Surfaces
 
@@ -435,6 +516,19 @@ inline-table tail (`prefix "…" { push_depth = 4, retain_depth = 64 }`) where t
 subscription's depths belong with the scope. `grant <principal> <plane> <matcher>;` is the cross-principal
 form — authority written *about* another principal, which is what an assembly
 needs to wire its driver.
+
+A `client` entry on a top-level component's publish plane may carry a tail too,
+and it tunes the MQTT egress sink that entry mints:
+
+```
+acl publish [client "mqtt:broker" { publish_per_activation = 2.0, publish_capacity = 4.0 }];
+```
+
+Both keys are optional and both are token counts, spelled as the `out` binding
+spells the same two knobs; an entry with no tail leaves the sink on the
+runtime's default budget. One client is one sink, so two budgeted entries naming
+one client are refused, and only a top-level component holds a sink of its own —
+the tail on any other principal's `client` entry is refused too.
 
 A component states no plane at all: its transport rights are read off its
 bindings and ACL entries. Two of its capability words therefore pair with

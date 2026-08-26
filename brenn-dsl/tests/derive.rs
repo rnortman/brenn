@@ -8,6 +8,7 @@
 mod support;
 
 use brenn_dsl::derive::wire_kind;
+use brenn_dsl::derived::DAclSet;
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::{dom_any, processor_any};
 use support::{
@@ -1328,4 +1329,252 @@ new bob: Pod(slug = \"bob\");
             support::at(source, "\"alice.panel@1\"").map(|(line, _)| line)
         );
     }
+}
+
+// ── links ────────────────────────────────────────────────────────────────────
+
+/// A document with one link and two consumers whose bodies are written per case.
+///
+/// Every port is `optional`, so a case that binds nothing is answered by the
+/// link rule it asked about rather than by the unconnected-port rule; and each
+/// body carries its own `grants`, so a case can leave a consumer inert.
+fn linked(collector: &str, indexer: &str, doctypes: (&str, &str)) -> String {
+    let (source, sink) = doctypes;
+    format!(
+        "component Source {{ {PROCESSOR} optional out events{source}; }}\n\
+         component Sink {{ {PROCESSOR} optional io feed{sink}; optional in quiet; }}\n\
+         link relay;\n\
+         new collector: Source {{\n    slug = \"collector\";\n    \
+         component_path = \"/tmp/c.wasm\";\n{collector}}}\n\
+         new indexer: Sink {{\n    slug = \"indexer\";\n    \
+         component_path = \"/tmp/i.wasm\";\n{indexer}}}\n"
+    )
+}
+
+/// The canonical shape: an `out` and an `io`, no address written anywhere.
+const PUBLISHER: &str = "    grants = [ports];\n    out events -> relay;\n";
+const SUBSCRIBER: &str =
+    "    grants = [ports];\n    io feed <-> relay { push_depth = 8; retain_depth = 8; }\n";
+const INERT: &str = "    grants = [];\n";
+
+#[test]
+fn a_link_derives_no_acl_entry_on_either_side() {
+    // Binding a port to a link *is* the authorization: the transport capability
+    // and the channel matcher are injected at boot, once the channel exists.
+    let config = derived(&linked(PUBLISHER, SUBSCRIBER, ("", "")));
+    assert_eq!(config.resolved.links.len(), 1);
+    for consumer in &config.consumers {
+        assert_eq!(consumer.acl, DAclSet::default(), "{:?}", consumer.acl);
+    }
+}
+
+#[test]
+fn a_link_nobody_binds_is_refused() {
+    assert_eq!(
+        derive_refusal(&linked(INERT, INERT, ("", ""))),
+        "link `relay` is bound by no port: a link is the channel its endpoints bring into \
+         existence, so one nobody binds is nothing"
+    );
+}
+
+#[test]
+fn a_link_one_port_binds_connects_nothing() {
+    let refusal = derive_refusal(&linked(PUBLISHER, INERT, ("", "")));
+    assert!(
+        refusal.contains("is bound by one port") && refusal.contains("a port at each end"),
+        "{refusal}"
+    );
+}
+
+/// A lone `io` on a link has its own spelling: drop the link.
+#[test]
+fn a_lone_io_port_on_a_link_is_told_to_drop_the_link() {
+    let refusal = derive_refusal(&linked(INERT, SUBSCRIBER, ("", "")));
+    assert!(refusal.contains("io <port>;"), "{refusal}");
+}
+
+#[test]
+fn a_link_every_port_of_which_faces_one_way_is_refused() {
+    const SUBSCRIBE_ONLY: &str =
+        "    grants = [ports];\n    in quiet <- relay { push_depth = 2; retain_depth = 2; }\n";
+    // Both instances take the same class where the case needs the same port
+    // twice; `Source` has no `in`, so the subscriber case writes `Sink` on both
+    // sides by naming a port only it declares. Each case states the class swap
+    // it needs, so the expected text is only ever an assert substring.
+    for (collector, indexer, (from, to), missing) in [
+        (
+            PUBLISHER,
+            "    grants = [ports];\n    out events -> relay;\n",
+            ("new indexer: Sink", "new indexer: Source"),
+            "has no subscriber",
+        ),
+        (
+            SUBSCRIBE_ONLY,
+            SUBSCRIBE_ONLY,
+            ("new collector: Source", "new collector: Sink"),
+            "has no publisher",
+        ),
+    ] {
+        let source = linked(collector, indexer, ("", "")).replace(from, to);
+        let refusals = derive_refusals(&source);
+        assert!(
+            refusals.iter().any(|refusal| refusal.contains(missing)),
+            "{refusals:?}"
+        );
+    }
+}
+
+#[test]
+fn a_link_bound_subscriber_states_its_own_window() {
+    // A link's address appears nowhere, so there is no `channel` block to carry
+    // the depths and no default to fall back on. Both subscribing shapes answer
+    // to the rule: an `io` port and a plain `in` read the same ring.
+    for tail in ["", " { push_depth = 8; }", " { retain_depth = 8; }"] {
+        for binding in [
+            format!("    grants = [ports];\n    io feed <-> relay{tail}\n"),
+            format!("    grants = [];\n    in quiet <- relay{tail}\n"),
+        ] {
+            let refusals = derive_refusals(&linked(PUBLISHER, &binding, ("", "")));
+            assert!(
+                refusals
+                    .iter()
+                    .any(|refusal| refusal.contains("states no window")),
+                "{refusals:?}"
+            );
+        }
+    }
+}
+
+/// Binding a publishing port to a link is a send: the ring boot places is
+/// somewhere the component publishes, so the `ports` rule counts it.
+#[test]
+fn a_link_bound_publisher_must_grant_ports() {
+    let collector = "    grants = [];\n    out events -> relay;\n";
+    let refusals = derive_refusals(&linked(collector, SUBSCRIBER, ("", "")));
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal.contains("sends and grants no `ports`")),
+        "{refusals:?}"
+    );
+}
+
+/// The other direction: a link-bound `in` is not a send, so `ports` on a
+/// component that only subscribes reaches nothing.
+#[test]
+fn a_link_bound_subscriber_that_grants_ports_reaches_nothing() {
+    let indexer =
+        "    grants = [ports];\n    in quiet <- relay { push_depth = 2; retain_depth = 2; }\n";
+    let refusals = derive_refusals(&linked(PUBLISHER, indexer, ("", "")));
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal.contains("grants `ports` and neither binds an output")),
+        "{refusals:?}"
+    );
+}
+
+/// A link has no address to key claims by, so its identity is the key: every
+/// port bound to one link reads and writes the ring boot places for it.
+#[test]
+fn doctypes_across_a_link_must_agree() {
+    let errors = derive_errors(&linked(
+        PUBLISHER,
+        SUBSCRIBER,
+        (": \"alice.events@1\"", ": \"alice.events@2\""),
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("link `relay`"), "{errors:?}");
+}
+
+/// A link handle in a channel position says so: a matcher, an assembly argument
+/// and every other channel-only site read the handle space a link does not live
+/// in, and the message names the declaration the document actually made.
+#[test]
+fn a_link_named_where_a_channel_is_required_says_it_names_a_link() {
+    let matcher = format!(
+        "component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+         link relay;\n\
+         new indexer: Sink {{\n    slug = \"indexer\";\n    \
+         component_path = \"/tmp/i.wasm\";\n    grants = [subscribe];\n    \
+         acl subscribe [exact relay];\n}}\n"
+    );
+    let argument = format!(
+        "component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+         assembly Pod(ch: Channel) {{\n    \
+         new inner: Sink {{\n        slug = \"inner\";\n        \
+         component_path = \"/tmp/i.wasm\";\n        grants = [];\n        \
+         in quiet <- ch {{ push_depth = 1; retain_depth = 1; }}\n    }}\n}}\n\
+         link relay;\n\
+         new pod: Pod(ch = relay);\n"
+    );
+    for source in [matcher, argument] {
+        let refusals = support::refusals(&source);
+        assert!(
+            refusals
+                .iter()
+                .any(|refusal| refusal.contains("`relay` names a link, not a channel")),
+            "{refusals:?}"
+        );
+    }
+}
+
+/// The same message inside an assembly body, where the link is one the body
+/// itself stamped: the inner scope answers for what it declared rather than
+/// letting the file's scope report a name that is plainly there as missing.
+#[test]
+fn a_stamped_link_named_where_a_channel_is_required_says_it_names_a_link() {
+    let refusals = support::refusals(&format!(
+        "component Sink {{ {PROCESSOR} optional io feed; }}\n\
+         assembly Pod() {{\n    link relay;\n    \
+         new inner: Sink {{\n        slug = \"inner\";\n        \
+         component_path = \"/tmp/i.wasm\";\n        grants = [subscribe, ports];\n        \
+         acl subscribe [exact relay];\n        \
+         io feed <-> relay {{ push_depth = 1; retain_depth = 1; }}\n    }}\n}}\n\
+         new pod: Pod();\n"
+    ));
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal.contains("`relay` names a link, not a channel")),
+        "{refusals:?}"
+    );
+}
+
+/// A link takes a handle out of the one handle space a file has: a channel and
+/// a link cannot answer to one name, and the index pass refuses the second
+/// declaration whichever kind it is.
+#[test]
+fn a_link_handle_collides_with_a_channel_of_the_same_name() {
+    for second in [
+        "channel relay at \"brenn:alice.in.relay\";\n",
+        "link relay;\n",
+    ] {
+        let refusals = support::refusals(&format!(
+            "channel relay at \"brenn:alice.in.other\";\n\
+             link relay;\n{second}"
+        ));
+        assert!(
+            refusals
+                .iter()
+                .any(|refusal| refusal.contains("`relay` is declared twice in this file")),
+            "{refusals:?}"
+        );
+    }
+}
+
+/// An agent holds no port, so `subscribe` is not a place a link can be named.
+#[test]
+fn an_agent_cannot_subscribe_to_a_link() {
+    let refusals = support::refusals(
+        "link relay;\n\
+         agent Assistant() {\n    name = \"A\";\n    grants = [subscribe];\n    \
+         subscribe relay { push_depth = 4; }\n}\nnew alice: Assistant();\n",
+    );
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal.contains("names a link")),
+        "{refusals:?}"
+    );
 }

@@ -63,4 +63,23 @@ agent PersonalAssistant(slug: String) {
         env = { CALENDAR_HOME = "/home/alice/calendar" };
         timeout_secs = 30;
     }
+    /// The one registry tool this app reaches, and the repos it may pull.
+    tool git-repo-pull {
+        allow { repo = "ws"; }
+    }
+}
+
+// An instance body admits sections too. A `tool` grant is one named registry
+// tool this component may invoke: the `allow` blocks are ORed clauses narrowing
+// which invocations it reaches, and the bucket throttles what is left.
+new pull_bot: Syncer {
+    slug = "pull-bot";
+    component_path = "/home/alice/lib/brenn_syncer.wasm";
+    grants = [ports, tools];
+
+    tool git-repo-pull {
+        allow { repo = "ws"; }
+        allow { repo = "notes"; }
+        rate_limit { burst = 2; sustained_per_minute = 10; }
+    }
 }

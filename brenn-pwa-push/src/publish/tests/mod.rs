@@ -76,7 +76,8 @@ pub(super) fn make_app_config(
         policy: {
             let mut p = brenn_lib::access::AppPolicy::default();
             if pwa_push_enabled {
-                p.grants.insert(brenn_lib::access::AppCapability::PwaPush);
+                p.grants
+                    .insert(brenn_envelope::grants::AppCapability::PwaPush);
             }
             p
         },

@@ -9,8 +9,9 @@
 //! folds the returned `ChannelEntry`s and `ResolvedSubscription`s into the same
 //! finalize/rebuild path every other channel and subscription flows through.
 
+use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::{AclSet, ChannelMatcher};
-use brenn_lib::access::{AppCapability, AppPolicy, GrantSet};
+use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::messaging::config::{
     Depth, MILLITOKENS_PER_PUBLISH, MessagingGlobalConfig, NoiseLevel, ResolvedSubscription,
     SystemChannelTuning, WasmInputPort, resolve_system_channel,

@@ -179,6 +179,11 @@ rule chan_tuning
     group;
 }
 
+rule link_stmt
+{
+    group;
+}
+
 rule chan_addr
 {
     ws_allowed: nbsp;

@@ -8,9 +8,10 @@
 
 use brenn_envelope::chat::{CHAT_SEGMENT_SEP, ChatLeaf, chat_leaf_prefix};
 
+use crate::access::AppPolicy;
 use crate::access::acl::ChannelMatcher;
-use crate::access::{AppCapability, AppPolicy};
 use crate::messaging::{ChannelScheme, WakeMin, is_unreserved_name};
+use brenn_envelope::grants::AppCapability;
 
 /// Top-level `[llm_chat]` config section.
 ///

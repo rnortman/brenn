@@ -268,7 +268,7 @@ fn resolved_config_pwa_push_round_trip() {
             // `[app.pwa_push].enabled` section presence (access-control Phase 0).
             // The section is retained for its delivery settings; the grant is what
             // makes `resolve_pwa_push_layer` load the keypair.
-            grants: vec![crate::access::AppCapability::PwaPush],
+            grants: vec![brenn_envelope::grants::AppCapability::PwaPush],
             pwa_push: Some(AppPwaPushBlock {
                 default_title: None,
             }),

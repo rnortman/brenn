@@ -82,6 +82,7 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         Some("at \"brenn:alice-pod.out.utterance\""),
     ),
     ("chan_ref", "statements.brenn", Some("<- messages_p1;")),
+    ("link_stmt", "statements.brenn", Some("link relay;")),
     ("uuid_pins", "statements.brenn", Some("uuid_pins {")),
     (
         "pin",

@@ -2333,3 +2333,181 @@ fn a_garbage_word_does_not_also_fail_the_fit() {
         "{errors:?}"
     );
 }
+
+// ── tool grants ──────────────────────────────────────────────────────────────
+//
+// A `tool` statement and the `tools` word are one configuration written in two
+// places, and the pass refuses either without the other — the same split-kill
+// rule it applies to a right and the list it reaches.
+
+/// One `tool` statement per registry tool, resolved into the grant beside the
+/// word that consents to it.
+#[test]
+fn a_tool_statement_lands_beside_the_word_that_consents_to_it() {
+    let config = derived(&consumer(
+        "tools",
+        "    tool git-repo-pull {\n        allow { repo = \"ws\"; }\n        \
+         allow { repo = \"notes\"; }\n        \
+         rate_limit { burst = 2; sustained_per_minute = 10; }\n    }\n",
+    ));
+    let grants = &config.resolved.consumers[0].tools;
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].tool.value(), "git-repo-pull");
+    assert_eq!(
+        grants[0].clauses,
+        vec![
+            vec![("repo".to_string(), "ws".to_string())],
+            vec![("repo".to_string(), "notes".to_string())],
+        ]
+    );
+    let limit = grants[0].rate_limit.expect("the bucket");
+    assert_eq!((limit.burst, limit.sustained_per_minute), (2, 10));
+}
+
+/// An `allow`-less grant is the statement that every invocation of the tool is
+/// admitted, not an omission.
+#[test]
+fn a_tool_statement_with_no_allow_block_admits_everything() {
+    let config = derived(&consumer("tools", "    tool git-repo-pull {}\n"));
+    let grants = &config.resolved.consumers[0].tools;
+    assert!(grants[0].clauses.is_empty());
+    assert_eq!(grants[0].rate_limit, None);
+}
+
+#[test]
+fn a_tools_grant_with_no_tool_statement_is_refused() {
+    assert_eq!(
+        derive_refusal(&consumer("tools", "")),
+        "consumer `alice_sink` grants `tools` and states no `tool`: a grant that \
+         names no tool reaches nothing"
+    );
+}
+
+#[test]
+fn a_tool_statement_with_no_tools_grant_is_refused() {
+    assert_eq!(
+        derive_refusal(&consumer(
+            "",
+            "    tool git-repo-pull {\n        allow { repo = \"ws\"; }\n    }\n"
+        )),
+        "consumer `alice_sink` states a `tool` grant and does not grant `tools`: \
+         the word is what consents to reaching the registry at all"
+    );
+}
+
+/// An agent's tool authority is the statements themselves: there is no
+/// agent-side word to couple them to, so a `tool` block stands alone.
+#[test]
+fn an_agent_states_tool_grants_with_no_word_beside_them() {
+    let config = derived(&agent(
+        "    tool git-repo-pull {\n        allow { repo = \"ws\"; }\n    }\n",
+    ));
+    let grants = &config.resolved.agents[0].tools;
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].tool.value(), "git-repo-pull");
+}
+
+// ── the egress budget an mqtt_publish entry carries ──────────────────────────
+//
+// The entry that authorizes a client is what mints its sink, so the two sink
+// knobs ride that entry's tail rather than a table of their own.
+
+#[test]
+fn a_client_entry_carries_the_sinks_budget() {
+    let config = derived(&format!(
+        "{}{}",
+        INGRESS,
+        consumer(
+            "mqtt",
+            "    acl publish [client \"mqtt:bob_hub\" { publish_per_activation = 2.0, \
+             publish_capacity = 4 }];\n",
+        ),
+    ));
+    let sink = &config.consumers[0].acl.mqtt_publish[0];
+    assert_eq!(sink.client.value(), "bob_hub");
+    assert_eq!(sink.publish_per_activation, Some(2.0));
+    assert_eq!(sink.publish_capacity, Some(4.0));
+}
+
+#[test]
+fn a_client_entry_with_no_tail_takes_the_default_budget() {
+    let config = derived(&format!(
+        "{}{}",
+        INGRESS,
+        consumer("mqtt", "    acl publish [client \"mqtt:bob_hub\"];\n"),
+    ));
+    let sink = &config.consumers[0].acl.mqtt_publish[0];
+    assert_eq!(sink.publish_per_activation, None);
+    assert_eq!(sink.publish_capacity, None);
+}
+
+#[test]
+fn a_budget_key_the_sink_has_no_knob_for_is_refused_by_name() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            INGRESS,
+            consumer(
+                "mqtt",
+                "    acl publish [client \"mqtt:bob_hub\" { publish_burst = 2 }];\n",
+            ),
+        )),
+        "`publish_burst` is not part of an `mqtt_publish` entry: the sink it mints takes \
+         publish_per_activation and publish_capacity and nothing else"
+    );
+}
+
+#[test]
+fn a_budget_that_is_not_a_number_is_refused() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            INGRESS,
+            consumer(
+                "mqtt",
+                "    acl publish [client \"mqtt:bob_hub\" { publish_capacity = \"lots\" }];\n",
+            ),
+        )),
+        "publish_capacity is a string, and a budget is a number of tokens"
+    );
+}
+
+/// An agent reaches the broker through the app host, which budgets its own
+/// egress; only a component holds a sink of its own to tune.
+#[test]
+fn a_budget_on_a_principal_that_holds_no_sink_is_refused() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            INGRESS,
+            agent_with(
+                "publish",
+                "    acl publish [client \"mqtt:bob_hub\" { publish_capacity = 2 }];\n",
+            ),
+        )),
+        "`publish_capacity` is not part of agent `alice`'s `mqtt_publish` entry: an egress \
+         budget tunes the sink a component holds, and this principal publishes through a \
+         host that budgets its own"
+    );
+}
+
+#[test]
+fn one_client_holds_one_budget() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            INGRESS,
+            consumer(
+                "mqtt",
+                concat!(
+                    "    acl publish [\n",
+                    "        client \"mqtt:bob_hub\" { publish_capacity = 2 },\n",
+                    "        client \"mqtt:bob_hub\" { publish_capacity = 4 }\n",
+                    "    ];\n",
+                ),
+            ),
+        )),
+        "consumer `alice_sink` states an egress budget for client `bob_hub` twice: one \
+         client is one sink, and one sink holds one budget"
+    );
+}

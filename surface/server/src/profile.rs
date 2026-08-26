@@ -13,7 +13,7 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 
-use brenn_lib::access::AppCapability;
+use brenn_envelope::grants::AppCapability;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
 use brenn_lib::messaging::{AttachScope, ComponentGrant, ParticipantId, SubscriberEntry};
 use brenn_messaging::MissingChannelPosture;

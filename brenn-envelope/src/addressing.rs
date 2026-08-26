@@ -133,7 +133,7 @@ pub fn in_a_tool_namespace(name: &str) -> bool {
 /// Channel-name segment owned by the auto-channel machinery: an anonymous auto
 /// channel's bare name is `auto.<cid>`. Operators may not declare, reference, or
 /// write ACL matchers reaching into it — an anonymous channel is reachable only
-/// through the `[[connection]]` / `io_port` declarations that created it.
+/// through the `link` / `io_port` declarations that created it.
 pub const AUTO_CHANNEL_SEGMENT: &str = "auto";
 
 /// Does `name` (a scheme-stripped channel name) fall in a namespace reserved by
@@ -195,10 +195,10 @@ pub fn auto_channel_name(cid: Uuid) -> String {
 /// Derive the DB-row identity of a *durable named* auto channel from its bare
 /// name.
 ///
-/// Durable auto channels have no operator-written `uuid` by default, so their
-/// identity is derived — which means renaming one re-keys its DB row (fresh
-/// `resume_epoch`, old row kept orphaned). An operator who needs
-/// rename-stability writes the `uuid` field on the `[[connection]]` instead.
+/// A durable auto channel is a named io_port's, and carries no operator-written
+/// `uuid`, so its identity is derived — which means renaming one re-keys its DB
+/// row (fresh `resume_epoch`, old row kept orphaned). An operator who needs
+/// rename-stability declares the channel instead.
 ///
 /// The namespace seed (`"brenn.auto-channel-durable"`) is distinct from
 /// [`auto_channel_cid`]'s, so a name and an endpoint-set key can never derive

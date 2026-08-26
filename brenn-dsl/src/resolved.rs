@@ -45,6 +45,8 @@ pub struct ResolvedConfig {
     /// `channel at prefix "…"` blocks: tuning for a system-minted family, with
     /// no handle and nothing to reference.
     pub tunings: Vec<RTuning>,
+    /// Declared links, post-expansion. A [`LinkId`] indexes this vector.
+    pub links: Vec<RLink>,
     /// Every `uuid_pins` entry, concatenated across files. Duplicate and unused
     /// pins are derivation's to refuse: the precedence rules it needs are not
     /// here.
@@ -301,6 +303,13 @@ pub enum RMatcherVal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChanId(pub usize);
 
+/// A declared link, by position in [`ResolvedConfig::links`].
+///
+/// The same index discipline as [`ChanId`], and for the same reason: a link has
+/// no address at all, so an index is the only thing that names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LinkId(pub usize);
+
 /// An entity's identity after expansion: `alice_desk.messages_p1`.
 ///
 /// The full path, not the leaf, because two instantiations of one assembly
@@ -345,6 +354,21 @@ pub struct RChannel {
     pub address: Spanned<String>,
     pub attrs: ChannelAttrs<RVal>,
     pub doc: Option<DocComment>,
+}
+
+/// `link telemetry;` — an anonymous channel the ports bound to it bring into
+/// existence.
+///
+/// It has no address, and it never gets one here: which scheme it lands on and
+/// which name it takes are decided at boot from where its endpoints live. What
+/// is resolved is the identity — the stamped handle — and the doc comment that
+/// becomes the placed channel's directory description.
+#[derive(Debug, PartialEq)]
+pub struct RLink {
+    pub handle: HandlePath,
+    pub doc: Option<DocComment>,
+    /// Where the declaration was written, for a refusal about the link itself.
+    pub span: Span,
 }
 
 /// `channel at prefix "mqtt:broker:alice/" { … }` — depth tuning for a family
@@ -400,6 +424,9 @@ pub struct RComponentInst {
     /// over the wire; neither substitutes for the other.
     pub acls: Vec<RAcl>,
     pub bindings: Vec<RBinding>,
+    /// The `tool` statements it holds. Always empty on a surface: the surface
+    /// host links no tools interface, and the statement is refused there.
+    pub tools: Vec<RToolGrant>,
 }
 
 /// A top-level component instance: a consumer, with an identity and authority
@@ -416,6 +443,8 @@ pub struct RConsumer {
     pub attrs: Vec<(String, RVal)>,
     pub acls: Vec<RAcl>,
     pub bindings: Vec<RBinding>,
+    /// The `tool` statements it holds, which its `tools` grant consents to.
+    pub tools: Vec<RToolGrant>,
     pub doc: Option<DocComment>,
 }
 
@@ -529,6 +558,9 @@ pub enum RChanRef {
     /// A literal address where no declaration exists — a `local:` plane, a
     /// system-minted `webhook:` or `mqtt:` channel.
     Addr(Spanned<String>),
+    /// A declared link. Anonymous: there is no address to compare, and the
+    /// authority its endpoints need is injected at boot rather than derived.
+    Link(LinkId),
 }
 
 /// An expanded agent instantiation.
@@ -554,6 +586,9 @@ pub struct RAgent {
     /// tree; the config field is a map, and resolution has already refused two
     /// blocks under one name.
     pub integration_configs: Vec<RSection>,
+    /// The `tool` statements it holds. An app's tool authority is the grant
+    /// itself, so there is no second word coupled to this list.
+    pub tools: Vec<RToolGrant>,
     pub doc: Option<DocComment>,
 }
 
@@ -635,6 +670,30 @@ pub struct RGrant {
     pub principal_span: Spanned<String>,
     pub plane: Spanned<String>,
     pub m: RMatcher,
+}
+
+/// `tool git-repo-pull { allow { repo = "ws"; } }`, resolved.
+///
+/// The grant names one registry tool and says which of its invocations this
+/// participant reaches. The tool's own resource attributes are a registration
+/// fact no document can see, so the clause keys are carried unexamined and the
+/// registry checks them at boot.
+#[derive(Debug, PartialEq)]
+pub struct RToolGrant {
+    pub tool: Spanned<String>,
+    /// One entry per `allow` block: the pairs inside one are ANDed, the blocks
+    /// are ORed. Empty is a statement, not an omission — the grant then admits
+    /// every invocation of the tool.
+    pub clauses: Vec<Vec<(String, String)>>,
+    pub rate_limit: Option<RRateLimit>,
+}
+
+/// `rate_limit { burst = 2; sustained_per_minute = 10; }`, resolved to the
+/// counts a token bucket is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RRateLimit {
+    pub burst: u32,
+    pub sustained_per_minute: u32,
 }
 
 /// A resolved hook block, with the point in an agent's life it runs at.

@@ -77,7 +77,7 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
     // audit detail.
     if !app_config
         .policy
-        .has_grant(brenn_lib::access::AppCapability::MessagingPublish)
+        .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
     {
         let detail = format!(
             "owner app {:?} holds no messaging_publish grant",
@@ -2292,7 +2292,7 @@ mod tests {
     /// needs to succeed.
     fn publish_policy_for(channel: &str) -> brenn_lib::access::AppPolicy {
         let mut p = brenn_lib::access::AppPolicy::with_grants(&[
-            brenn_lib::access::AppCapability::MessagingPublish,
+            brenn_envelope::grants::AppCapability::MessagingPublish,
         ]);
         p.acls
             .brenn_publish
@@ -2412,7 +2412,7 @@ mod tests {
         // Subscribe-only policy: `messaging_enabled()` is still true, but the
         // publish grant is absent.
         let policy = brenn_lib::access::AppPolicy::with_grants(&[
-            brenn_lib::access::AppCapability::MessagingSubscribe,
+            brenn_envelope::grants::AppCapability::MessagingSubscribe,
         ]);
         let engine = make_engine_with_policy(
             db.clone(),

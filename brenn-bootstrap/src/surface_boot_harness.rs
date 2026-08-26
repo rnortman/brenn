@@ -16,7 +16,7 @@ use brenn_surface_server::test_fixtures::{
 ///
 /// For the cases whose subject is boot's own derivation: an auto channel's
 /// address, its ring depth, and the ACL matchers that authorize its endpoints
-/// are all derived from `[[connection]]` and io_port declarations. A
+/// are all derived from `link` and io_port declarations. A
 /// fixture-built surface would carry a policy the test wrote itself, which
 /// proves nothing about the wiring.
 pub struct BootedSurfaceHarness {

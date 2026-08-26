@@ -236,7 +236,7 @@ fn drain_test_app_config(allowed_user: &str) -> brenn_lib::config::AppConfig {
     app.allowed_users = vec![allowed_user.to_string()];
     app.policy
         .grants
-        .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     app.policy
         .acls
         .brenn_subscribe

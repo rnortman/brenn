@@ -12,20 +12,6 @@ use brenn_dsl::resolve::{CONSUMER_KEYS, SURFACE_COMPONENT_KEYS};
 
 use crate::messaging::config::{SurfaceComponentRaw, WasmConsumerConfigRaw};
 
-/// Every field of a struct, as strings, with a compile-time proof the list is
-/// complete: the never-called function destructures with no `..`, and the same
-/// identifiers produce the strings, so a rename cannot pass silently either.
-macro_rules! field_names {
-    ($ty:ident { $($field:ident),+ $(,)? }) => {{
-        #[allow(dead_code)]
-        fn exhaustive(v: $ty) {
-            let $ty { $($field),+ } = v;
-            $(let _ = $field;)+
-        }
-        [$(stringify!($field)),+]
-    }};
-}
-
 /// Every field is either a key the DSL admits or a deliberate omission with a
 /// reason; every key and every omission names a field.
 fn assert_parity(what: &str, fields: &[&str], keys: &[&str], omitted: &[(&str, &str)]) {
@@ -100,7 +86,6 @@ fn consumer_keys_account_for_every_field() {
         tool_grants,
     });
     let statement = "carried by a statement, not a key";
-    let unspellable = "unspellable in this version, for want of a statement form";
     let omitted = [
         ("subscriptions", statement),
         ("outputs", statement),
@@ -114,8 +99,8 @@ fn consumer_keys_account_for_every_field() {
         ("mqtt_publish_acl", statement),
         ("mqtt_subscribe_acl", statement),
         ("webhook_acl", statement),
-        ("mqtt_outputs", unspellable),
-        ("tool_grants", unspellable),
+        ("mqtt_outputs", statement),
+        ("tool_grants", statement),
     ];
     assert_parity("consumer", &fields, &CONSUMER_KEYS, &omitted);
 }

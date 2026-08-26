@@ -1243,8 +1243,7 @@ fn demo_consumer_raw(slug: &str) -> brenn_lib::messaging::config::WasmConsumerCo
 
 use brenn_messaging_boot::test_fixtures::io_port_raw;
 
-/// A free input port: no channel of its own, tuned here, bound by a
-/// `[[connection]]`.
+/// A free input port: no channel of its own, tuned here, bound by a `link`.
 fn free_input_raw(port: &str) -> brenn_lib::messaging::config::WasmConsumerSubscriptionRaw {
     brenn_lib::messaging::config::WasmConsumerSubscriptionRaw {
         channel: None,
@@ -1369,7 +1368,7 @@ async fn owed_pairs(
 }
 
 /// The timer idiom, end to end and structural. The config declares one io_port
-/// and nothing else — no `[[channel]]` block for it, no `[[connection]]`, no ACL
+/// and nothing else — no `[[channel]]` block for it, no `link`, no ACL
 /// entry — and the guest's own `publish-deferred` parks on the channel the
 /// lowering pass placed for that port. When it releases, the port that scheduled
 /// it is the port that receives it: the self-loop cannot be miswired, because
@@ -1432,15 +1431,15 @@ async fn an_io_port_timer_loop_delivers_the_guests_own_deferred_wake() {
     );
 }
 
-/// Two consumers and one `[[connection]]`: the producer's output port and the
-/// consumer's input port are both free — no channel is named anywhere in the
-/// config, and neither block carries an ACL entry for the wire. The producer's
-/// publish through the real guest is what the second component is activated on,
-/// payload intact.
+/// Two consumers and one `link`: the producer's output port and the consumer's
+/// input port are both free — no channel is named anywhere in the config, and
+/// neither declaration carries an ACL entry for the wire. The producer's publish
+/// through the real guest is what the second component is activated on, payload
+/// intact.
 #[tokio::test]
-async fn a_connection_carries_one_components_publish_into_anothers_activation() {
+async fn a_link_carries_one_components_publish_into_anothers_activation() {
     let (result, cfgs, _alert_handle) =
-        boot_dispatch(&connection_config(), init_db_memory_lib_slice(), &no_apps()).await;
+        boot_dispatch(&link_config(), init_db_memory_lib_slice(), &no_apps()).await;
     let messenger = result.messenger.clone().unwrap();
     let producer_sub = ParticipantId::for_wasm("producer");
     let reader_sub = ParticipantId::for_wasm("reader");
@@ -1473,13 +1472,14 @@ async fn a_connection_carries_one_components_publish_into_anothers_activation() 
 }
 
 /// A producer whose free output port and a reader whose free input port are
-/// wired by one `[[connection]]`, plus the trigger channel that drives the
-/// producer's guest.
-fn connection_config() -> brenn_lib::config::BrennConfig {
+/// wired by one `link`, plus the trigger channel that drives the producer's
+/// guest.
+fn link_config() -> brenn_lib::config::BrennConfig {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::{
-        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
+        Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, WasmConsumerConfigRaw,
+        WasmConsumerOutputRaw,
     };
 
     let producer = WasmConsumerConfigRaw {
@@ -1502,27 +1502,46 @@ fn connection_config() -> brenn_lib::config::BrennConfig {
     BrennConfig {
         channels: vec![trigger_channel()],
         wasm_consumers: vec![producer, reader],
-        connections: vec![ConnectionConfigRaw {
-            endpoints: vec![
-                "wasm:producer/out".to_string(),
-                "wasm:reader/in".to_string(),
-            ],
-            channel: None,
-            uuid: None,
+        links: vec![LinkConfigRaw {
+            link: "hand-off".to_string(),
             description: None,
+            endpoints: vec![
+                LinkEndpointRaw {
+                    host: LinkHostRaw::Wasm {
+                        slug: "producer".to_string(),
+                    },
+                    port: "out".to_string(),
+                    publishes: true,
+                    subscribes: false,
+                    io_port: false,
+                    push_depth: None,
+                    retain_depth: None,
+                },
+                LinkEndpointRaw {
+                    host: LinkHostRaw::Wasm {
+                        slug: "reader".to_string(),
+                    },
+                    port: "in".to_string(),
+                    publishes: false,
+                    subscribes: true,
+                    io_port: false,
+                    push_depth: Some(Depth::Bounded(4)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                },
+            ],
         }],
         ..BrennConfig::default()
     }
 }
 
-/// Auto-injected grants reach exactly the endpoints of the connection. A
-/// bystander app that holds the transport grant and a `local_publish` allowlist
-/// of its own is still denied on the anonymous address: the connection is the
-/// authorization signal, and nothing else in the config can express reach into
-/// it (an ACL matcher naming the `auto` namespace is a boot panic).
+/// Auto-injected grants reach exactly the endpoints of the link. A bystander app
+/// that holds the transport grant and a `local_publish` allowlist of its own is
+/// still denied on the anonymous address: the link is the authorization signal,
+/// and nothing else in the config can express reach into it (an ACL matcher
+/// naming the `auto` namespace is a boot panic).
 #[tokio::test]
 async fn a_third_party_publishing_to_an_anonymous_auto_channel_is_denied() {
-    use brenn_lib::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::ChannelMatcher;
     use brenn_lib::messaging::Urgency;
     use brenn_messaging::publish::{PublishOrigin, PublishResult};
@@ -1538,21 +1557,17 @@ async fn a_third_party_publishing_to_an_anonymous_auto_channel_is_denied() {
     let mut apps = IndexMap::new();
     apps.insert("graf".to_string(), bystander);
 
-    let (result, cfgs, _alert_handle) = boot_dispatch(
-        &connection_config(),
-        init_db_memory_lib_slice(),
-        &Arc::new(apps),
-    )
-    .await;
+    let (result, cfgs, _alert_handle) =
+        boot_dispatch(&link_config(), init_db_memory_lib_slice(), &Arc::new(apps)).await;
     let messenger = result.messenger.clone().unwrap();
     let auto_address = cfgs[0].outputs[0].channel_address.clone();
     let bare = auto_address.strip_prefix("local:").unwrap();
 
     // The endpoint's own reach, for contrast: the same address the bystander is
-    // denied on is granted to the component the connection named.
+    // denied on is granted to the component the link bound.
     assert!(
         result.wasm_consumers[0].policy.allows_local_publish(bare),
-        "the publishing endpoint holds the injected grant on its own connection"
+        "the publishing endpoint holds the injected grant on its own link"
     );
 
     let denied = messenger
@@ -1669,8 +1684,8 @@ async fn a_durable_named_io_port_channel_carries_a_schedule_across_a_restart() {
 /// Renaming a durable auto channel with no explicit `uuid` re-keys it: the
 /// identity is derived from the name, so the new name is a new row and the old
 /// one is left behind for the operator to delete. That is the existing posture
-/// for a uuid that leaves config, and the `uuid` field on `[[connection]]` is
-/// the opt-out — pinned here so the trade-off cannot drift silently.
+/// for a uuid that leaves config — pinned here so the trade-off cannot drift
+/// silently.
 #[tokio::test]
 async fn renaming_a_durable_auto_channel_writes_a_fresh_row() {
     use brenn_lib::config::BrennConfig;

@@ -876,7 +876,7 @@ mod tests {
         app.allowed_users = vec!["wake-user".to_string()];
         app.policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         app.policy
             .acls
             .brenn_subscribe

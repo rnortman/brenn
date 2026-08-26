@@ -12,6 +12,7 @@ description = "MQTT transport runtime: per-client supervisors, sessions, payload
 # `messaging` read them, and everything on the wire lives here.
 [dependencies]
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
 brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
 async-trait = "0.1.89"

@@ -3104,7 +3104,7 @@ mod tests {
     fn brenn_exact_policy(channel: &str) -> brenn_lib::access::AppPolicy {
         let mut p = brenn_lib::access::AppPolicy::default();
         p.grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         p.acls
             .brenn_subscribe
             .push(brenn_lib::access::acl::ChannelMatcher::Exact(
@@ -3162,7 +3162,7 @@ mod tests {
         let mut policy = brenn_lib::access::AppPolicy::default();
         policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MqttSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         policy
             .acls
             .mqtt_subscribe
@@ -3226,7 +3226,7 @@ mod tests {
         let mut policy = brenn_lib::access::AppPolicy::default();
         policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         // (no brenn_subscribe matcher, no mqtt_subscribe matcher)
 
         let messenger = accessible_messenger(vec![chan], &[("app-a", policy)]);
@@ -3252,10 +3252,10 @@ mod tests {
         let mut policy = brenn_lib::access::AppPolicy::default();
         policy
             .grants
-            .insert(brenn_lib::access::AppCapability::EphemeralSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::EphemeralSubscribe);
         policy
             .grants
-            .insert(brenn_lib::access::AppCapability::DynamicSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::DynamicSubscribe);
         policy
             .acls
             .ephemeral_subscribe
@@ -3307,7 +3307,7 @@ mod tests {
         let mut policy = brenn_lib::access::AppPolicy::default();
         policy
             .grants
-            .insert(brenn_lib::access::AppCapability::Webhook);
+            .insert(brenn_envelope::grants::AppCapability::Webhook);
         policy
             .acls
             .webhook
@@ -3401,7 +3401,7 @@ mod tests {
         let mut app = super::test_support::test_app_config("known-app", None, vec![]);
         app.policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingPublish);
+            .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         let mut apps = indexmap::IndexMap::new();
         apps.insert("known-app".to_string(), app);
 
@@ -3418,7 +3418,7 @@ mod tests {
             .app_policy("known-app")
             .expect("registered app must have a policy");
         assert!(
-            policy.has_grant(brenn_lib::access::AppCapability::MessagingPublish),
+            policy.has_grant(brenn_envelope::grants::AppCapability::MessagingPublish),
             "accessor must return the registered app's actual policy, not a default"
         );
 
@@ -3441,14 +3441,14 @@ mod tests {
         let mut app = super::test_support::test_app_config("known-app", None, vec![]);
         app.policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingPublish);
+            .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         let mut apps = indexmap::IndexMap::new();
         apps.insert("known-app".to_string(), app);
 
         let mut wasm_policy = brenn_lib::access::AppPolicy::default();
         wasm_policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         let mut wasm_policies = std::collections::HashMap::new();
         wasm_policies.insert("known-wasm".to_string(), wasm_policy);
 
@@ -3467,7 +3467,7 @@ mod tests {
             .subscriber_policy(&SubscriberEntryKind::App("known-app".to_string()))
             .expect("App subscriber must resolve to its registered policy");
         assert!(
-            app_pol.has_grant(brenn_lib::access::AppCapability::MessagingPublish),
+            app_pol.has_grant(brenn_envelope::grants::AppCapability::MessagingPublish),
             "App kind must return the app's actual policy"
         );
 
@@ -3476,7 +3476,7 @@ mod tests {
             .subscriber_policy(&SubscriberEntryKind::Wasm("known-wasm".to_string()))
             .expect("Wasm subscriber must resolve to its installed policy");
         assert!(
-            wasm_pol.has_grant(brenn_lib::access::AppCapability::MessagingSubscribe),
+            wasm_pol.has_grant(brenn_envelope::grants::AppCapability::MessagingSubscribe),
             "Wasm kind must return the WASM consumer's actual policy"
         );
 
@@ -3505,7 +3505,7 @@ mod tests {
         let mut surface_policy = brenn_lib::access::AppPolicy::default();
         surface_policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         let mut surface_policies = std::collections::HashMap::new();
         surface_policies.insert("deskbar".to_string(), surface_policy);
 
@@ -3523,7 +3523,7 @@ mod tests {
             .subscriber_policy(&SubscriberEntryKind::Surface("deskbar".to_string()))
             .expect("Surface subscriber must resolve to its installed policy");
         assert!(
-            pol.has_grant(brenn_lib::access::AppCapability::MessagingSubscribe),
+            pol.has_grant(brenn_envelope::grants::AppCapability::MessagingSubscribe),
             "Surface kind must return the surface's actual policy"
         );
 
@@ -6006,7 +6006,7 @@ mod tests {
             let policy = &mut apps.get_mut("assistant").expect("fixture app").policy;
             policy
                 .grants
-                .insert(brenn_lib::access::AppCapability::EphemeralSubscribe);
+                .insert(brenn_envelope::grants::AppCapability::EphemeralSubscribe);
             policy
                 .acls
                 .ephemeral_subscribe

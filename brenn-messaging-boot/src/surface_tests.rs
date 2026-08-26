@@ -185,8 +185,9 @@ fn system_spec_with_policy(
 /// A code-built policy with `MessagingSubscribe` and one exact `brenn_subscribe`
 /// matcher on `channel`.
 fn system_subscribe_policy(channel: &str) -> brenn_lib::access::AppPolicy {
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::{AclSet, ChannelMatcher};
-    use brenn_lib::access::{AppCapability, AppPolicy, GrantSet};
+    use brenn_lib::access::{AppPolicy, GrantSet};
     let mut grants = GrantSet::default();
     grants.insert(AppCapability::MessagingSubscribe);
     let mut acls = AclSet::default();
@@ -2872,11 +2873,11 @@ fn an_instance_with_no_input_bindings_is_not_judged() {
 
 // --- Free ports and the auto namespace ---
 
-/// A channel-less surface subscription is a free port; with no `[[connection]]`
-/// claiming it, nothing supplies a channel — dead config.
+/// A channel-less surface subscription is a free port; with no `link` binding
+/// it, nothing supplies a channel — dead config.
 #[test]
-#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
-fn surface_free_input_port_with_no_connection_panics() {
+#[should_panic(expected = "declares no channel and no link binds it")]
+fn surface_free_input_port_with_no_link_panics() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].channel = None;
@@ -2885,8 +2886,8 @@ fn surface_free_input_port_with_no_connection_panics() {
 
 /// Same for a surface output binding.
 #[test]
-#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
-fn surface_free_output_port_with_no_connection_panics() {
+#[should_panic(expected = "declares no channel and no link binds it")]
+fn surface_free_output_port_with_no_link_panics() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs[0].channel = None;

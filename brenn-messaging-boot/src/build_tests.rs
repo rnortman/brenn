@@ -213,7 +213,7 @@ fn a_transport_only_apps_budget_survives_the_unmerged_map() {
     app.messaging_default_send_budget = budget;
     app.policy
         .grants
-        .insert(brenn_lib::access::AppCapability::MessagingPublish);
+        .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
     let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
     apps.insert(slug.to_string(), app);
 
@@ -228,7 +228,7 @@ fn a_transport_only_apps_budget_survives_the_unmerged_map() {
     let resolved = brenn_lib::messaging::gates::resolve_publish_sender(
         &apps,
         slug,
-        brenn_lib::access::AppCapability::MessagingPublish,
+        brenn_envelope::grants::AppCapability::MessagingPublish,
     )
     .expect("a granted app resolves as a publish sender");
 
@@ -2569,7 +2569,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
 }
 
 /// The whole io_port story through a real boot: a consumer whose only port is an
-/// io_port, with no `[[channel]]` block, no `[[connection]]`, and no ACL entry in
+/// io_port, with no `[[channel]]` block, no `link`, and no ACL entry in
 /// config. One channel serves both halves, so the component's own publish lands in
 /// its own ring cursor — the self-loop the timer idiom rides, structural rather
 /// than an operator convention.
@@ -2812,7 +2812,7 @@ async fn auto_channels_list_as_their_durability_says() {
     let mut policy = brenn_lib::access::AppPolicy::default();
     policy
         .grants
-        .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     policy.acls.brenn_subscribe = vec![brenn_lib::access::acl::ChannelMatcher::Exact(
         "etl.feed".to_string(),
     )];
@@ -3476,8 +3476,7 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
-    let mut repo_clause = toml::Table::new();
-    repo_clause.insert("repo".to_string(), toml::Value::String("brenn".to_string()));
+    let repo_clause = std::collections::BTreeMap::from([("repo".to_string(), "brenn".to_string())]);
     let mut consumer = minimal_wasm_consumer();
     consumer.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
         tool: "apull".to_string(),
@@ -3526,55 +3525,36 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
     assert!(!policy.allows_channel_access("brenn:tool-results/other"));
 }
 
-/// The uuid uniqueness assert covers tool-substrate entries too. A
-/// `[[connection]] uuid` pasted from a `brenn:tools/<tool>` channel is only
-/// visible once all entry sources have contributed — and nothing downstream
-/// catches the collision.
+/// The uuid uniqueness assert covers tool-substrate entries too. A channel uuid
+/// pasted from a `brenn:tools/<tool>` channel is only visible once all entry
+/// sources have contributed — and nothing downstream catches the collision.
 #[tokio::test]
 #[should_panic(expected = "both carry uuid")]
-async fn build_messaging_panics_when_a_connection_uuid_collides_with_a_tool_channel() {
-    use super::test_fixtures::{out_raw, sub_raw};
+async fn build_messaging_panics_when_a_channel_uuid_collides_with_a_tool_channel() {
     use brenn_lib::config::BrennConfig;
-    use brenn_lib::messaging::ComponentGrant;
-    use brenn_lib::messaging::config::{
-        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
-        WasmConsumerSubscriptionRaw,
-    };
+    use brenn_lib::messaging::config::WasmConsumerConfigRaw;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
-    let mut repo_clause = toml::Table::new();
-    repo_clause.insert("repo".to_string(), toml::Value::String("brenn".to_string()));
+    let repo_clause = std::collections::BTreeMap::from([("repo".to_string(), "brenn".to_string())]);
     let consumer = WasmConsumerConfigRaw {
-        grants: vec![ComponentGrant::Ports],
         tool_grants: vec![brenn_lib::tools::config::ToolGrantRaw {
             tool: "apull".to_string(),
             acl: vec![repo_clause],
             rate_limit: None,
-        }],
-        subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: None,
-            push_depth: Some(Depth::Bounded(2)),
-            retain_depth: Some(Depth::Bounded(2)),
-            ..sub_raw("brenn:unused", "in")
-        }],
-        outputs: vec![WasmConsumerOutputRaw {
-            channel: None,
-            ..out_raw("out", "brenn:unused")
         }],
         ..minimal_wasm_consumer()
     };
 
     let config = BrennConfig {
         wasm_consumers: vec![consumer],
-        connections: vec![ConnectionConfigRaw {
-            endpoints: vec!["wasm:probe/out".to_string(), "wasm:probe/in".to_string()],
-            channel: Some("brenn:probe.loop".to_string()),
+        channels: vec![brenn_lib::messaging::config::ChannelConfigRaw {
             uuid: Some(
                 brenn_lib::messaging::tool_channel_uuid_from_address("brenn:tools/apull")
                     .to_string(),
             ),
-            description: None,
+            standing_retain_depth: Some(Depth::Bounded(8)),
+            ..nondurable_channel("brenn:probe.loop", 4)
         }],
         ..BrennConfig::default()
     };
@@ -4003,8 +3983,9 @@ fn io_port_consumer(
 /// explain itself to nobody.
 #[tokio::test]
 async fn a_named_auto_channel_lists_to_a_third_party_with_its_description() {
+    use brenn_envelope::grants::AppCapability;
+    use brenn_lib::access::AppPolicy;
     use brenn_lib::access::acl::ChannelMatcher;
-    use brenn_lib::access::{AppCapability, AppPolicy};
     use brenn_lib::config::BrennConfig;
     use brenn_server::test_support::init_db_memory;
 
@@ -4206,8 +4187,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
         urgency: brenn_lib::messaging::Urgency::Normal,
     };
 
-    let mut repo_clause = toml::Table::new();
-    repo_clause.insert("repo".to_string(), toml::Value::String("brenn".to_string()));
+    let repo_clause = std::collections::BTreeMap::from([("repo".to_string(), "brenn".to_string())]);
     let mut consumer = minimal_wasm_consumer();
     consumer.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
         tool: "apull".to_string(),
@@ -4559,43 +4539,30 @@ fn durable_channel(address: &str) -> brenn_lib::messaging::config::ChannelConfig
     }
 }
 
-/// Two consumers wired to each other through a named `[[connection]]`: one free
-/// output port, one free input port, and the connection that mints the channel
-/// between them at `address`.
-fn connected_pair(address: &str) -> brenn_lib::config::BrennConfig {
-    use super::test_fixtures::{minimal_wasm_consumer, out_raw, sub_raw};
-    use brenn_lib::messaging::config::{
-        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
-        WasmConsumerSubscriptionRaw,
-    };
+/// One consumer whose io_port mints the auto channel at `address`: the io_port
+/// is the spelling that gives an auto channel an address of its own.
+fn io_port_at(address: &str) -> brenn_lib::config::BrennConfig {
+    use super::test_fixtures::minimal_wasm_consumer;
+    use brenn_lib::messaging::config::{WasmConsumerConfigRaw, WasmConsumerIoPortRaw};
 
-    let publisher = WasmConsumerConfigRaw {
+    let consumer = WasmConsumerConfigRaw {
         slug: "etl".to_string(),
         grants: vec![ComponentGrant::Ports],
-        outputs: vec![WasmConsumerOutputRaw {
-            channel: None,
-            ..out_raw("out", "brenn:unused")
-        }],
-        ..minimal_wasm_consumer()
-    };
-    let subscriber = WasmConsumerConfigRaw {
-        slug: "indexer".to_string(),
-        subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: None,
+        io_ports: vec![WasmConsumerIoPortRaw {
+            port: "loop".to_string(),
+            channel: Some(address.to_string()),
             push_depth: Some(Depth::Bounded(2)),
             retain_depth: Some(Depth::Bounded(2)),
-            ..sub_raw("brenn:unused", "tap")
+            noise: None,
+            amplification: None,
+            urgency: None,
+            publish_per_activation: None,
+            publish_capacity: None,
         }],
         ..minimal_wasm_consumer()
     };
     brenn_lib::config::BrennConfig {
-        connections: vec![ConnectionConfigRaw {
-            endpoints: vec!["wasm:etl/out".to_string(), "wasm:indexer/tap".to_string()],
-            channel: Some(address.to_string()),
-            uuid: None,
-            description: None,
-        }],
-        wasm_consumers: vec![publisher, subscriber],
+        wasm_consumers: vec![consumer],
         ..brenn_lib::config::BrennConfig::default()
     }
 }
@@ -4649,7 +4616,7 @@ fn extra_durable_entries_join_the_durable_half_and_the_directory() {
 #[test]
 #[should_panic(expected = "is also declared elsewhere")]
 fn an_auto_channel_colliding_with_an_extra_entry_panics() {
-    let config = connected_pair("brenn:shared");
+    let config = io_port_at("brenn:shared");
     lower_channel_topology(
         &config,
         vec![super::test_fixtures::brenn_entry("brenn:shared")],
@@ -4660,7 +4627,7 @@ fn an_auto_channel_colliding_with_an_extra_entry_panics() {
 /// the auto channel is minted and lands in the durable half beside the extras.
 #[test]
 fn an_auto_channel_lands_in_the_durable_half() {
-    let config = connected_pair("brenn:shared");
+    let config = io_port_at("brenn:shared");
     let topology = lower_channel_topology(
         &config,
         vec![super::test_fixtures::brenn_entry("webhook:push-alice")],

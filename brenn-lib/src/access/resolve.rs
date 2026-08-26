@@ -16,8 +16,9 @@ use crate::access::acl::{
     AclSet, ChannelMatcher, MqttClientMatcher, MqttSubMatcher, WebhookMatcher,
 };
 use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
-use crate::access::{AppCapability, AppPolicy, GrantSet};
+use crate::access::{AppPolicy, GrantSet};
 use crate::mqtt::config::MqttClientConfig;
+use brenn_envelope::grants::AppCapability;
 
 /// Build the resolved `AppPolicy` for an LLM app from its authored `grants` and
 /// `[app.acl.*]` block.
@@ -53,53 +54,16 @@ pub fn build_app_policy(
     for &cap in grants {
         // Pin the LLM-authorable grant vocabulary: the unified `AppCapability`
         // enum derives `Deserialize` over the whole enum (so `grants =
-        // ["wasm_store"]` parses), but the WASM-host caps and the reserved
-        // `Integration` placeholder are not authorable on an LLM app — they are
-        // authored as `ComponentGrant` on WASM components and mapped internally, and
-        // have no LLM-app enforcement. Reject them here (the
-        // resolution boundary), fail-fast like every other operator-config error.
-        match cap {
-            AppCapability::WasmStore
-            | AppCapability::WasmLog
-            | AppCapability::WasmAlert
-            | AppCapability::WasmConfig
-            | AppCapability::Integration => panic!(
+        // ["wasm_store"]` parses), but not every variant is authorable on an
+        // LLM app. `AppCapability::llm_authorable` is the single authority on
+        // which and why; refusing here is this boundary's decision, fail-fast
+        // like every other operator-config error.
+        cap.llm_authorable().unwrap_or_else(|reason| {
+            panic!(
                 "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (WASM-host caps are authored as `ComponentGrant`; `integration` is reserved) \
-                 — design §2.2",
-            ),
-            // Attach-route capability, authored as `AttachGrant::Alert` on a
-            // `[[surface]]` or `[[remote]]` and mapped in `build_attach_policy`;
-            // it has no enforcement point for an LLM app, so it is not
-            // authorable here.
-            AppCapability::SurfaceAlert => panic!(
-                "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (attacher alert is authored as `AttachGrant` on a `[[surface]]` or \
-                 `[[remote]]`)",
-            ),
-            // No LLM-reachable API sets impetus, so the grant would be dead
-            // config surface.
-            AppCapability::MintImpetus => panic!(
-                "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (no LLM-reachable API sets impetus)",
-            ),
-            // No delivery path carries confined `local:` traffic to a
-            // conversation in v1, so the grant would be dead config.
-            AppCapability::LocalSubscribe => panic!(
-                "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (no local delivery path to a conversation in v1)",
-            ),
-            AppCapability::MessagingPublish
-            | AppCapability::MessagingSubscribe
-            | AppCapability::DynamicSubscribe
-            | AppCapability::EphemeralSubscribe
-            | AppCapability::EphemeralPublish
-            | AppCapability::LocalPublish
-            | AppCapability::MqttPublish
-            | AppCapability::MqttSubscribe
-            | AppCapability::Webhook
-            | AppCapability::PwaPush => {}
-        }
+                 ({reason})",
+            )
+        });
         let newly_inserted = grant_set.insert(cap);
         assert!(
             newly_inserted,
@@ -256,8 +220,6 @@ pub fn build_wasm_policy(
     grants: impl IntoIterator<Item = crate::messaging::ComponentGrant>,
     acls: crate::access::raw::WasmAclsRaw<'_>,
 ) -> AppPolicy {
-    use crate::messaging::ComponentGrant;
-
     let crate::access::raw::WasmAclsRaw {
         subscribe: subscribe_acl,
         ephemeral_subscribe: ephemeral_subscribe_acl,
@@ -272,20 +234,19 @@ pub fn build_wasm_policy(
 
     let mut grant_set = GrantSet::default();
     for grant in grants {
-        let cap = match grant {
-            ComponentGrant::Ports => AppCapability::MessagingPublish,
-            ComponentGrant::Store => AppCapability::WasmStore,
-            ComponentGrant::Log => AppCapability::WasmLog,
-            ComponentGrant::Alert => AppCapability::WasmAlert,
-            ComponentGrant::Config => AppCapability::WasmConfig,
-            ComponentGrant::Mqtt => AppCapability::MqttPublish,
-            // `takeover` is a page capability and this is the backend consumer
-            // path, which has no page. The DSL refuses the word on a top-level
-            // instance, so reaching here means that refusal was bypassed.
-            ComponentGrant::Takeover => panic!(
+        // Two grants name no capability. `tools` is authority the resolved
+        // tool-grant map carries key by key, so there is nothing to insert here.
+        // `takeover` is a page capability and this is the backend consumer path,
+        // which has no page; the DSL refuses the word on a top-level instance,
+        // so reaching here means that refusal was bypassed.
+        let Some(cap) = grant.app_capability() else {
+            if grant == crate::messaging::ComponentGrant::Tools {
+                continue;
+            }
+            panic!(
                 "wasm component {slug:?}: granted `takeover`, which is a page capability — \
                  a top-level consumer has no page, and the config front end refuses the word",
-            ),
+            )
         };
         // Fail-fast on a duplicate grant, mirroring `build_app_policy` above. The
         // production caller (`resolve_wasm_consumers`) iterates an already-deduped
@@ -519,8 +480,6 @@ pub fn build_attach_policy(
     grants: impl IntoIterator<Item = crate::messaging::AttachGrant>,
     acls: crate::access::raw::AttachAclsRaw<'_>,
 ) -> AppPolicy {
-    use crate::messaging::AttachGrant;
-
     let crate::access::raw::AttachAclsRaw {
         subscribe: subscribe_acl,
         publish: publish_acl,
@@ -532,13 +491,7 @@ pub fn build_attach_policy(
 
     let mut grant_set = GrantSet::default();
     for grant in grants {
-        let cap = match grant {
-            AttachGrant::Subscribe => AppCapability::MessagingSubscribe,
-            AttachGrant::Publish => AppCapability::MessagingPublish,
-            AttachGrant::EphemeralSubscribe => AppCapability::EphemeralSubscribe,
-            AttachGrant::EphemeralPublish => AppCapability::EphemeralPublish,
-            AttachGrant::Alert => AppCapability::SurfaceAlert,
-        };
+        let cap = grant.app_capability();
         // Fail-fast on a duplicate grant, mirroring `build_wasm_policy`. The
         // grant→capability map is injective, so a resolved (deduplicated) grant
         // set never trips this on the in-tree path; it exists because this is a
@@ -629,7 +582,7 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
                 !crate::messaging::is_auto_channel_name(s),
                 "{owner}: {list} exact matcher {s:?} reaches into the reserved auto \
                  namespace — an auto channel's endpoints are its ACL; to let another \
-                 participant in, give the channel a name on its [[connection]] or io_port",
+                 participant in, give the channel a name on its io_port declaration",
             );
             ChannelMatcher::Exact(s.clone())
         }
@@ -648,7 +601,7 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
                 !crate::messaging::is_auto_channel_name(p),
                 "{owner}: {list} prefix matcher {p:?} reaches into the reserved auto \
                  namespace — an auto channel's endpoints are its ACL; to let another \
-                 participant in, give the channel a name on its [[connection]] or io_port",
+                 participant in, give the channel a name on its io_port declaration",
             );
             ChannelMatcher::Prefix(p.clone())
         }

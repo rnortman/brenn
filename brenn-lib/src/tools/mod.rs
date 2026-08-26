@@ -3,8 +3,8 @@
 //!
 //! A tool grant authorizes a participant to address a named registry tool,
 //! optionally narrowed by an ACL and throttled by a rate limit. Both participant
-//! kinds author identical `[[*.tool_grant]]` tables (`config::ToolGrantRaw`)
-//! that resolve into the `ResolvedToolGrant` values below, keyed by tool name in
+//! kinds author identical `tool` statements (`config::ToolGrantRaw`) that
+//! resolve into the `ResolvedToolGrant` values below, keyed by tool name in
 //! `AppPolicy::tool_grants`. Backend-only — no `ts-rs` derive.
 //!
 //! This module owns config parsing/resolution and the ACL-matching primitive.

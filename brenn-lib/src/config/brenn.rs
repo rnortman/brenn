@@ -140,11 +140,11 @@ pub struct BrennConfig {
     /// the same attach transport the browser surfaces use; see
     /// [`crate::messaging::remote::RemoteConfigRaw`] for per-entry fields.
     pub remotes: Vec<crate::messaging::remote::RemoteConfigRaw>,
-    /// Auto channels declared by the ports they wire together rather than by a
-    /// `channel` declaration. No document spells this form, so the field is
-    /// always empty. See
-    /// [`crate::messaging::config::ConnectionConfigRaw`].
-    pub connections: Vec<crate::messaging::config::ConnectionConfigRaw>,
+    /// `link` declarations — auto channels named by nothing, brought into
+    /// existence by the ports bound to them rather than by a `channel`
+    /// declaration. No document spells this form yet, so the field is always
+    /// empty. See [`crate::messaging::config::LinkConfigRaw`].
+    pub links: Vec<crate::messaging::config::LinkConfigRaw>,
     /// Global WASM-host policy (the `wasm` section). Controls defaults such as
     /// store size limits. Omitting the block is equivalent to `WasmConfig::default()`.
     pub wasm: WasmConfig,

@@ -225,11 +225,10 @@ publish or subscribe reach its own role needs.
 
 Two spellings:
 
-- **`[[connection]]`** — a top-level block listing endpoints (`wasm:<slug>/<port>`,
-  or `surface:<slug>#<instance>/<port>`). The ports it names are declared on
-  their own component's block with no `channel` of their own ("free ports"), so
-  the tuning stays with the subscriber it describes and the wire stays with the
-  connection.
+- **`link`** — an anonymous channel handle that bindings target where they would
+  otherwise name a channel. The ports bound to it state their own tuning and no
+  channel of their own ("free ports"), so the tuning stays with the subscriber it
+  describes and the wire stays with the link.
 - **`io_port`** — one port name resolving to an input *and* an output on the same
   channel. This is the sanctioned timer idiom: `deliver_after` on the port is a
   wake the component is guaranteed to receive, because the two halves
@@ -239,11 +238,12 @@ Two spellings:
 An auto channel with no name is **anonymous**: its address is `auto.<cid>`, where
 the cid is derived from the endpoint set. The `auto` namespace is reserved —
 nothing else may declare, bind, or write an ACL matcher into it — so an anonymous
-channel is reachable *only* through the declaration that created it. Giving the
-channel a name instead makes it an ordinary directory entry that third parties
-may bind with ordinary bindings and ordinary ACLs (naming grants nothing by
-itself; deny-by-default still holds), and a `brenn:` name is what makes it
-durable, which is what makes a parked schedule survive a restart.
+channel is reachable *only* through the declaration that created it. A link is
+always anonymous. An `io_port` may instead be given a name, which makes it an
+ordinary directory entry that third parties may bind with ordinary bindings and
+ordinary ACLs (naming grants nothing by itself; deny-by-default still holds), and
+a `brenn:` name is what makes it durable, which is what makes a parked schedule
+survive a restart.
 
 Scheme, when the channel is anonymous, follows from where the endpoints live —
 non-transportable while everything sits on one side of a wire, transportable only

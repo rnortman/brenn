@@ -14,6 +14,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
         "//brenn-db",
+        "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging-store",
     ],
@@ -34,6 +35,7 @@ rust_test(
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + [
         "//brenn-db",
+        "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging-store",
     ],
@@ -79,6 +81,7 @@ rust_test(
     ) + [
         ":brenn-mqtt",
         "//brenn-db",
+        "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging-store",
     ],

@@ -1306,6 +1306,56 @@ fn a_binding_that_did_not_resolve_still_claims_its_port() {
     assert!(errors[0].contains("names no scheme"), "{errors:?}");
 }
 
+/// One port, one wire: two statements naming it are two channels a port cannot
+/// be joined to at once, and the refusal names both sites rather than leaving
+/// the contradiction to a boot panic.
+#[test]
+fn a_port_bound_twice_is_refused_with_both_sites() {
+    let source = surface_doc(
+        "    abi = dom; requires = [];\n    in messages;\n",
+        "        in messages <- messages;\n        in messages <- messages;\n",
+    );
+    let errors = resolve_errors(&source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "this instance binds port `messages` twice; a port is wired once"
+    );
+    assert_eq!(errors[0].related[0].0, "first bound here");
+    // The repeat still claims the port: the instance is not told the port it
+    // bound twice is unconnected.
+    assert!(
+        errors[0].related[0].1.line_col_inner().is_some(),
+        "{errors:?}"
+    );
+}
+
+/// The rule is the port's, not the target's: binding one port to a link and to
+/// a channel is the same contradiction, and it is refused at compile time
+/// rather than at the boot assert behind it.
+#[test]
+fn a_port_bound_to_both_a_link_and_a_channel_is_refused() {
+    let errors = refusals(concat!(
+        "channel feed at \"brenn:alice.in.feed\";\n",
+        "component Sink {\n",
+        "    abi = processor; requires = [ports];\n",
+        "    io events;\n",
+        "}\n",
+        "link relay;\n",
+        "new alice_sink: Sink {\n",
+        "    slug = \"alice-sink\";\n",
+        "    component_path = \"sink.wasm\";\n",
+        "    io events <-> relay { push_depth = 2; retain_depth = 2; }\n",
+        "    io events <-> feed;\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0],
+        "this instance binds port `events` twice; a port is wired once"
+    );
+}
+
 /// The contract is the class's, so it binds a consumer exactly as it binds a
 /// surface-placed instance.
 #[test]
@@ -1366,7 +1416,7 @@ fn a_need_names_a_capability() {
         refusal("component Panel {\n    abi = dom; requires = [frobnicate];\n}\n"),
         "`frobnicate` is not a capability a component holds; a spec's `requires` names \
          the same words a `grants` list does: `ports`, `store`, `log`, `alert`, \
-         `config`, `mqtt` or `takeover`"
+         `config`, `mqtt`, `tools` or `takeover`"
     );
     assert!(
         refusal("component Panel {\n    abi = dom; requires = []; optional = [subscribe];\n}\n")
@@ -3280,6 +3330,129 @@ fn an_unresolvable_value_in_an_attachment_target_is_reported() {
     ));
     assert!(
         errors.iter().any(|error| error.contains("nowhere")),
+        "{errors:?}"
+    );
+}
+
+// ── tool grants ──────────────────────────────────────────────────────────────
+
+/// A top-level instance holding the `tool` statements written into it.
+fn tool_doc(statements: &str) -> String {
+    format!(
+        concat!(
+            "component Sink {{\n    abi = processor; requires = []; optional = [tools];\n}}\n",
+            "new alice_sink: Sink {{\n",
+            "    component_path = \"sink.wasm\";\n",
+            "    grants = [tools];\n",
+            "{}",
+            "}}\n",
+        ),
+        statements
+    )
+}
+
+/// Two statements naming one tool are two answers to one question.
+#[test]
+fn a_tool_is_granted_once() {
+    let errors = refusals(&tool_doc(concat!(
+        "    tool git-repo-pull { allow { repo = \"ws\"; } }\n",
+        "    tool git-repo-pull { allow { repo = \"notes\"; } }\n",
+    )));
+    assert!(errors[0].contains("`tool git-repo-pull`"), "{errors:?}");
+}
+
+/// The tool body has no key set: everything a grant says, it says in a block.
+#[test]
+fn a_key_in_a_tool_body_is_refused() {
+    assert_eq!(
+        refusal(&tool_doc("    tool git-repo-pull { repo = \"ws\"; }\n")),
+        "`repo` is not a key of a `tool` statement: which invocations a grant admits \
+         is written as `allow` blocks, and what throttles them as a `rate_limit` block"
+    );
+}
+
+/// A clause requirement is an exact string or the wildcard; nothing else is a
+/// resource attribute a call can carry.
+#[test]
+fn an_allow_requirement_is_a_string() {
+    assert_eq!(
+        refusal(&tool_doc(
+            "    tool git-repo-pull { allow { repo = 7; } }\n"
+        )),
+        "an `allow` requirement is a string; this is an integer"
+    );
+}
+
+/// An empty `allow` block and no `allow` block at all say the same thing, so
+/// only one of them is a legal spelling of it.
+#[test]
+fn an_empty_allow_block_is_refused() {
+    assert_eq!(
+        refusal(&tool_doc("    tool git-repo-pull { allow {} }\n")),
+        "an `allow` block with no requirements admits every invocation of the tool, \
+         which is what a `tool` statement with no `allow` block already says; write \
+         one or the other"
+    );
+}
+
+/// A bucket that holds nothing throttles the grant to nothing, which is not a
+/// grant anybody writes on purpose.
+#[test]
+fn a_rate_limit_count_is_at_least_one() {
+    assert_eq!(
+        refusal(&tool_doc(
+            "    tool git-repo-pull { rate_limit { burst = 0; sustained_per_minute = 10; } }\n"
+        )),
+        "`burst` is a count of at least one; this one throttles the grant to nothing"
+    );
+}
+
+/// A tool accepts at most one rate limit; a second has no defined precedence.
+#[test]
+fn a_tool_carries_one_rate_limit() {
+    let errors = refusals(&tool_doc(concat!(
+        "    tool git-repo-pull {\n",
+        "      rate_limit { burst = 2; sustained_per_minute = 4; }\n",
+        "      rate_limit { burst = 1; sustained_per_minute = 1; }\n",
+        "    }\n",
+    )));
+    assert!(
+        errors[0].contains("a `tool` grant carries one `rate_limit`"),
+        "{errors:?}"
+    );
+}
+
+/// The `rate_limit` body is a closed vocabulary, so an unknown key is named
+/// against the two the bucket has.
+#[test]
+fn an_unknown_rate_limit_key_is_refused() {
+    let errors = refusals(&tool_doc(
+        "    tool git-repo-pull { rate_limit { burst = 2; sustained_per_minute = 4; ceiling = 1; } }\n",
+    ));
+    assert!(errors[0].contains("ceiling"), "{errors:?}");
+}
+
+/// A kindword the instance body does not admit is refused by name, with the
+/// word it does admit listed — a parse error would say neither.
+#[test]
+fn an_unknown_kindword_in_an_instance_body_is_refused_by_name() {
+    let errors = refusals(&tool_doc("    frobnicate whatever { key = \"v\"; }\n"));
+    assert!(errors[0].contains("frobnicate"), "{errors:?}");
+    assert!(errors[0].contains("tool"), "{errors:?}");
+}
+
+/// The surface host links no tools interface, so a component placed on a page
+/// reaches no registry tool — refused at the statement and at the word.
+#[test]
+fn a_tool_statement_on_a_surface_placed_instance_is_refused() {
+    let errors = refusals(&surface_doc(
+        "    abi = dom; requires = []; optional = [];\n",
+        "        grants = [];\n        tool git-repo-pull { allow { repo = \"ws\"; } }\n",
+    ));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("backend-only in v1")),
         "{errors:?}"
     );
 }

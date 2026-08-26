@@ -15,7 +15,6 @@ use brenn_dsl::diag::{Diagnostic, render_all};
 use brenn_dsl::{dom_any, processor_any};
 use brenn_surface_schema::LogLevel;
 
-use crate::access::AppCapability;
 use crate::access::raw::{
     AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
 };
@@ -45,10 +44,11 @@ use crate::messaging::ComponentGrant;
 use crate::messaging::Urgency;
 use crate::messaging::WakeMin;
 use crate::messaging::config::{
-    ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
-    NoiseLevel, SendRate, Sink, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw,
-    SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
-    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
+    ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingConfigRaw,
+    MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel, SendRate, Sink,
+    SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw,
+    SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
+    WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 use crate::mqtt::config::{
@@ -62,6 +62,7 @@ use crate::webhook::config::{
     WebhookKeyConfigRaw, WebhookSignatureConfigRaw, WebhookTokenConfigRaw, default_content_type,
     default_hmac_algorithm, default_transport_ceiling,
 };
+use brenn_envelope::grants::AppCapability;
 
 /// The document lowers, and to exactly `expected`.
 fn assert_lowers(document: &str, expected: BrennConfig) {
@@ -1142,7 +1143,7 @@ const MINIMAL_OBSERVABILITY_BLOCKS: [(&str, &str, BlockWitness); 1] = [(
     |config| config.observability.usage.session_gap_minutes == 45,
 )];
 
-const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 5] = [
+const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 6] = [
     (
         "start_hooks",
         r#"agent A() { start_hooks { host = ["git fetch"]; } }
@@ -1183,6 +1184,17 @@ const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 5] = [
         r#"agent A() { integration_config ledger { env = { LEDGER_DATA = "/srv/ledger" }; } }
            new alice: A();"#,
         |config| only_app(config).integration_config.contains_key("ledger"),
+    ),
+    (
+        "tool",
+        r#"agent A() { tool git-repo-pull { allow { repo = "ws"; } } }
+           new alice: A();"#,
+        |config| {
+            only_app(config)
+                .tool_grants
+                .iter()
+                .any(|grant| grant.tool == "git-repo-pull")
+        },
     ),
 ];
 
@@ -1393,6 +1405,54 @@ repo life {
             }],
             ..Default::default()
         },
+    );
+}
+
+/// Only entries that state at least one budget key produce an override block;
+/// an unbudgeted entry must not emit one (would collide with the default row
+/// at boot).
+#[test]
+fn an_mqtt_sink_override_is_lowered_per_budgeted_entry() {
+    let document = format!(
+        concat!(
+            "mqtt_client plain {{ url = \"mqtts://plain.example.com:8883\"; }}\n",
+            "mqtt_client half {{ url = \"mqtts://half.example.com:8883\"; }}\n",
+            "mqtt_client full {{ url = \"mqtts://full.example.com:8883\"; }}\n",
+            "channel feed at \"brenn:feed\" {{\n",
+            "    push_depth = 1; retain_depth = 1; standing_retain_depth = 1;\n",
+            "}}\n",
+            "component Sink {{\n{}\n    in feed;\n    out echo;\n}}\n",
+            "new sink: Sink {{\n",
+            "    component_path = \"/lib/sink.wasm\";\n",
+            "    grants = [ports, mqtt];\n",
+            "    acl subscribe [ exact feed ];\n",
+            "    in feed <- feed {{ push_depth = 1; retain_depth = 1; }}\n",
+            "    out echo -> feed;\n",
+            "    acl publish [\n",
+            "        exact feed,\n",
+            "        client \"mqtt:plain\",\n",
+            "        client \"mqtt:half\" {{ publish_per_activation = 2.5 }},\n",
+            "        client \"mqtt:full\" {{ publish_per_activation = 2, publish_capacity = 3.5 }}\n",
+            "    ];\n",
+            "}}\n",
+        ),
+        processor_any!(),
+    );
+    let config = config_from_dsl(&document);
+    assert_eq!(
+        config.wasm_consumers[0].mqtt_outputs,
+        vec![
+            WasmConsumerMqttOutputRaw {
+                client: "half".to_string(),
+                publish_per_activation: Some(2.5),
+                publish_capacity: None,
+            },
+            WasmConsumerMqttOutputRaw {
+                client: "full".to_string(),
+                publish_per_activation: Some(2.0),
+                publish_capacity: Some(3.5),
+            },
+        ],
     );
 }
 
@@ -2528,7 +2588,7 @@ new router: Router {
         exact status,
         prefix "local:router.out.",
         exact "local:router.acks",
-        client "mqtt:broker"
+        client "mqtt:broker" { publish_per_activation = 2, publish_capacity = 3.5 }
     ];
 
     in inbound <- alerts {
@@ -2702,6 +2762,11 @@ new router: Router {
                 }],
                 webhook_acl: vec![WebhookMatcherRaw {
                     endpoint: "push-alice".to_string(),
+                }],
+                mqtt_outputs: vec![WasmConsumerMqttOutputRaw {
+                    client: "broker".to_string(),
+                    publish_per_activation: Some(2.0),
+                    publish_capacity: Some(3.5),
                 }],
                 config: Some(toml::Table::from_iter([
                     (
@@ -4820,4 +4885,126 @@ new alice: Assistant();
         refusal.message,
         "`file_roles`: expected a table of string lists, got a list"
     );
+}
+
+/// A consumer's `tool` statements lower to the raw grants the registry
+/// resolves, clause for clause and bucket for bucket.
+#[test]
+fn a_consumers_tool_statements_lower_to_raw_grants() {
+    let config = config_from_dsl(concat!(
+        "component Sink {\n    abi = processor; requires = []; optional = [tools];\n}\n",
+        "new alice_sink: Sink {\n",
+        "    component_path = \"sink.wasm\";\n",
+        "    grants = [tools];\n",
+        "    tool git-repo-pull {\n",
+        "        allow { repo = \"ws\"; }\n",
+        "        allow { repo = \"notes\"; }\n",
+        "        rate_limit { burst = 2; sustained_per_minute = 10; }\n",
+        "    }\n",
+        "}\n",
+    ));
+    assert_eq!(
+        config.wasm_consumers[0].tool_grants,
+        vec![crate::tools::config::ToolGrantRaw {
+            tool: "git-repo-pull".to_string(),
+            acl: vec![
+                std::collections::BTreeMap::from([("repo".to_string(), "ws".to_string())]),
+                std::collections::BTreeMap::from([("repo".to_string(), "notes".to_string())]),
+            ],
+            rate_limit: Some(crate::tools::config::RateLimitRaw {
+                burst: 2,
+                sustained_per_minute: 10,
+            }),
+        }]
+    );
+}
+
+/// A `link` lowers to a `[[link]]` whose endpoints carry their roles and, on
+/// the subscribing halves, the window their own port declarations state.
+///
+/// Written across the wire — a backend consumer and a surface-placed instance —
+/// because that is the shape whose two host arms differ, and every binding
+/// direction rides along.
+#[test]
+fn a_link_lowers_to_its_endpoint_set() {
+    let document = format!(
+        concat!(
+            "component Feeder {{\n{}\n    out events;\n}}\n",
+            "component Panel {{\n{}\n    in feed;\n    io chatter;\n}}\n",
+            "/// Frames the feeder hands the panel.\n",
+            // The description an operator reads keeps the author's shape:
+            // a deeper indent inside the doc block survives lowering.
+            "///     wire format: one frame per event\n",
+            "link relay;\n",
+            "surface desk {{\n",
+            // The surface states no rights: what a link's endpoints need is
+            // injected at boot, once the channel it places exists.
+            "    grants = [];\n",
+            "    new view: Panel {{\n",
+            "        grants = [ports];\n",
+            "        in feed <- relay {{ push_depth = 8; retain_depth = 16; }}\n",
+            "        io chatter <-> relay {{ push_depth = 2; retain_depth = 4; }}\n",
+            "    }}\n",
+            "}}\n",
+            "new feeder: Feeder {{\n",
+            "    component_path = \"/lib/feeder.wasm\";\n",
+            "    grants = [ports];\n",
+            "    out events -> relay;\n",
+            "}}\n",
+        ),
+        processor_any!(),
+        dom_any!(),
+    );
+    let config = config_from_dsl(&document);
+    assert_eq!(
+        config.links,
+        vec![LinkConfigRaw {
+            link: "relay".to_string(),
+            description: Some(
+                "Frames the feeder hands the panel.\n    wire format: one frame per event"
+                    .to_string()
+            ),
+            endpoints: vec![
+                LinkEndpointRaw {
+                    host: LinkHostRaw::Wasm {
+                        slug: "feeder".to_string(),
+                    },
+                    port: "events".to_string(),
+                    publishes: true,
+                    subscribes: false,
+                    io_port: false,
+                    push_depth: None,
+                    retain_depth: None,
+                },
+                LinkEndpointRaw {
+                    host: LinkHostRaw::Surface {
+                        slug: "desk".to_string(),
+                        instance: "view".to_string(),
+                    },
+                    port: "feed".to_string(),
+                    publishes: false,
+                    subscribes: true,
+                    io_port: false,
+                    push_depth: Some(Depth::Bounded(8)),
+                    retain_depth: Some(Depth::Bounded(16)),
+                },
+                LinkEndpointRaw {
+                    host: LinkHostRaw::Surface {
+                        slug: "desk".to_string(),
+                        instance: "view".to_string(),
+                    },
+                    port: "chatter".to_string(),
+                    publishes: true,
+                    subscribes: true,
+                    io_port: true,
+                    push_depth: Some(Depth::Bounded(2)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                },
+            ],
+        }],
+    );
+    // Every link-bound port lowers channel-less: boot places the ring.
+    assert!(config.wasm_consumers[0].outputs[0].channel.is_none());
+    assert!(config.surfaces[0].subscriptions[0].channel.is_none());
+    assert!(config.surfaces[0].io_ports[0].channel.is_none());
 }

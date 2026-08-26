@@ -313,15 +313,15 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
     tools.extend(messaging_virtual_tools(
         app_config
             .policy
-            .has_grant(crate::access::AppCapability::MessagingPublish)
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
             || app_config
                 .policy
-                .has_grant(crate::access::AppCapability::EphemeralPublish),
+                .has_grant(brenn_envelope::grants::AppCapability::EphemeralPublish),
     ));
     tools.extend(pwa_push_virtual_tools(
         app_config
             .policy
-            .has_grant(crate::access::AppCapability::PwaPush),
+            .has_grant(brenn_envelope::grants::AppCapability::PwaPush),
     ));
     tools.extend(device_virtual_tools());
     tools.extend(usage_virtual_tools());
@@ -329,7 +329,7 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
     tools.extend(mqtt_virtual_tools(
         app_config
             .policy
-            .has_grant(crate::access::AppCapability::MqttPublish),
+            .has_grant(brenn_envelope::grants::AppCapability::MqttPublish),
     ));
     tools
 }
@@ -1346,7 +1346,7 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
 
     struct FakeFactory;
 

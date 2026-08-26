@@ -776,8 +776,9 @@ mod tests {
     /// silently starves one they did.
     #[tokio::test]
     async fn the_delivery_gate_checks_each_transport_against_its_own_acl() {
+        use brenn_envelope::grants::AppCapability;
+        use brenn_lib::access::AppPolicy;
         use brenn_lib::access::acl::{MqttSubMatcher, WebhookMatcher};
-        use brenn_lib::access::{AppCapability, AppPolicy};
 
         let covered_mqtt = transport_channel(
             "mqtt:home:sensors/kitchen/temp",

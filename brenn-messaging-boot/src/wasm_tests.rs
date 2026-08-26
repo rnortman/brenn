@@ -174,7 +174,7 @@ fn wasm_consumer_resolves_tool_grants_into_policy() {
     raw.tool_grants = vec![ToolGrantRaw {
         tool: "git-repo-pull".to_string(),
         acl: vec![
-            [("repo".to_string(), toml::Value::String("brenn".to_string()))]
+            [("repo".to_string(), "brenn".to_string())]
                 .into_iter()
                 .collect(),
         ],
@@ -1312,12 +1312,12 @@ fn wasm_mqtt_output_duplicate_client_panics() {
 
 // --- Free ports and the auto namespace ---
 
-/// A channel-less subscription is a free port; with no `[[connection]]` claiming
-/// it, nothing ever supplies a channel — dead config, same posture as an output
+/// A channel-less subscription is a free port; with no `link` binding it,
+/// nothing ever supplies a channel — dead config, same posture as an output
 /// port on a consumer that never activates.
 #[test]
-#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
-fn free_input_port_with_no_connection_panics() {
+#[should_panic(expected = "declares no channel and no link binds it")]
+fn free_input_port_with_no_link_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:free-in");
     let mut raw = minimal_wasm_consumer_raw("orphan", "/tmp/a.wasm", &chan_addr);
     raw.subscriptions.push(WasmConsumerSubscriptionRaw {
@@ -1329,8 +1329,8 @@ fn free_input_port_with_no_connection_panics() {
 
 /// Same for an output port: the free-port contract is direction-blind.
 #[test]
-#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
-fn free_output_port_with_no_connection_panics() {
+#[should_panic(expected = "declares no channel and no link binds it")]
+fn free_output_port_with_no_link_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:free-out");
     let mut raw = minimal_wasm_consumer_raw("orphan-out", "/tmp/a.wasm", &chan_addr);
     raw.grants = vec![ComponentGrant::Ports];
@@ -1380,6 +1380,77 @@ fn an_ingress_channel_named_auto_resolves() {
     assert_eq!(
         resolved[0].inputs[0].sub.channel_address,
         "webhook:auto.github"
+    );
+}
+
+/// `pwa_push:` is an egress-only scheme; subscribing through it is refused.
+#[test]
+#[should_panic(expected = "names a scheme a consumer does not subscribe through")]
+fn pwa_push_input_channel_panics() {
+    let push = ChannelEntry {
+        uuid: uuid::Uuid::new_v4(),
+        transport_type: ChannelScheme::PwaPush,
+        ..brenn_entry("pwa_push:phone")
+    };
+    let dir = dir_of(vec![push]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "pusher".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        subscriptions: vec![sub_raw("pwa_push:phone", "in")],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// An address with no recognized scheme prefix is refused.
+#[test]
+#[should_panic(expected = "carries no recognized scheme prefix")]
+fn scheme_less_input_channel_panics() {
+    let bare = ChannelEntry {
+        uuid: uuid::Uuid::new_v4(),
+        ..brenn_entry("noscheme")
+    };
+    let dir = dir_of(vec![bare]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "bare".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        subscriptions: vec![sub_raw("noscheme", "in")],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// The other half of the admit list: an `mqtt:` ingress port is a scheme a
+/// consumer does subscribe through.
+#[test]
+fn an_mqtt_input_channel_resolves() {
+    let topic = ChannelEntry {
+        uuid: brenn_lib::messaging::mqtt_channel_uuid_from_address("mqtt:home:sensors/temp"),
+        transport_type: ChannelScheme::Mqtt,
+        ..brenn_entry("mqtt:home:sensors/temp")
+    };
+    let dir = dir_of(vec![topic]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "sensors".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        subscriptions: vec![sub_raw("mqtt:home:sensors/temp", "in")],
+        mqtt_subscribe_acl: vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+            client: "home".to_string(),
+            topic_filter: "sensors/#".to_string(),
+        }],
+        grants: vec![ComponentGrant::Ports, ComponentGrant::Mqtt],
+        ..minimal_wasm_consumer()
+    }];
+    let resolved = resolve_wasm_consumers(
+        &raw,
+        &dir,
+        "64MiB",
+        &declared_clients(&["home"]),
+        &no_auto(),
+    );
+    assert_eq!(
+        resolved[0].inputs[0].sub.channel_address,
+        "mqtt:home:sensors/temp"
     );
 }
 

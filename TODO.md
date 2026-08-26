@@ -2,15 +2,14 @@
 
 ## `dsl-vocabulary-config-parity`
 
-`brenn-dsl/src/model.rs`'s ~30 attr vocabularies, and the rule tables
-`brenn-dsl/src/derive.rs` states, are hand transcriptions of something in
-`brenn-lib` — the vocabulary of a config struct, or the behavior of a boot-time
-builder. The failure this entry exists for is a field added to a config struct
-that nobody adds a DSL key for: it surfaces as
+`brenn-dsl`'s attr vocabularies and rule tables were hand transcriptions of
+something in `brenn-lib` — the vocabulary of a config struct, or the behavior of
+a boot-time builder. The failure this entry exists for is a field added to a
+config struct that nobody adds a DSL key for: it surfaces as
 `` `some_new_knob` is not a server key `` to whoever migrates a config months
 later, and the fix at that point is a reconciliation across every struct pair.
 
-Two thirds of that is now mechanical and needs no gate:
+Most of that is now either shared-sourced or gated, and needs nothing further:
 
 - **The attr vocabularies.** `brenn-lib/src/config/dsl_lower.rs` builds the real
   config structs with exhaustive struct literals, so a field added to a gated
@@ -18,68 +17,73 @@ Two thirds of that is now mechanical and needs no gate:
   to compile where lowering reads it. What the literal does not police is the
   developer who answers that compile error by hardcoding a value instead of
   adding a DSL key — that is the residual below.
-- **The resolver key tables.** String lists, which no struct literal reaches, so
-  they are gated by
-  `brenn-lib/src/config/tests/dsl_key_parity.rs`: every field of
-  `SurfaceComponentRaw` / `WasmConsumerConfigRaw` is either a key the DSL admits
-  or a listed omission with a reason.
+- **The resolver key tables and the statement tails.** String lists, which no
+  struct literal reaches, so they are gated:
+  `brenn-lib/src/config/tests/dsl_key_parity.rs` holds every field of
+  `SurfaceComponentRaw` / `WasmConsumerConfigRaw` to a key the DSL admits or a
+  listed omission with a reason, and
+  `brenn-lib/src/config/tests/dsl_tail_parity.rs` does the same for the mount,
+  subscribe, `in`, `out` and `io` tails against the `KEYS` each vocabulary
+  emits. The omissions ledger is those two lists, which a check reads.
 - **The addressing vocabulary** — schemes, uuid seeds, reserved segments,
   charsets, segment boundaries — is single-sourced in
   `brenn-envelope/src/addressing.rs` and read from there by the runtime, the
-  guests and the DSL. Nothing is transcribed.
-- **The component grant vocabulary** — the words, their spellings, and what a
-  word parses to — is single-sourced in `brenn-envelope/src/grants.rs` as
-  `ComponentGrant`, read from there by the DSL (`derive.rs`'s `Capability` is
-  that enum plus two agent-only rights), by the backend policy builder, and by
-  the boot-time linker map. Nothing is transcribed.
-- **The attach grant vocabulary** — the words a surface or remote attacher may
-  state beyond its planes — is single-sourced in `brenn-envelope/src/grants.rs`
-  as `AttachGrant`, read from there by the DSL and by the policy builder.
-  Nothing is transcribed.
+  guests and the DSL.
+- **The grant vocabularies** — component, attach, and the `AppCapability` words
+  an agent states, with their plane-word expansions — are single-sourced in
+  `brenn-envelope/src/grants.rs`. `derive.rs` derives its compound tokens and
+  every `(plane, scheme, token)` expansion from `AppCapability::transport()` and
+  `llm_authorable()`; the policy builders read the same maps.
+- **`bindable`, `EntityKind` and `Plane`** live in `brenn-envelope/src/grants.rs`
+  as `bindable_schemes`, read by the DSL's position walk and by the boot
+  validators in `brenn-messaging-boot/src/{surfaces,wasm}.rs`.
+- **The channel-model presence rules** live in
+  `brenn-envelope/src/channel_model.rs`, read by `derive.rs`'s
+  `check_channel_model` and by both builders in
+  `brenn-lib/src/messaging/config.rs`.
+- **The ACL `Family` table** is gated by
+  `brenn-lib/src/config/tests/acl_family_parity.rs`: the four ACL-bearing raw
+  structs and `RemoteConfigRaw` are destructured field by field against
+  `Family::held_by`, so a family added on one side without the other fails to
+  compile or fails the assert.
+- **The remote-ceilings and mqtt-sink tail shapes** are `REMOTE_CEILING_KEYS` and
+  `MQTT_SINK_KEYS` in `derive.rs`, gated against their raw structs by the same
+  test.
 
-What remains transcribed, and why a gate cannot reach it: these tables mirror
-*behavior* spread across runtime code with no single counterpart to compare
-against.
+What remains transcribed is dispatch prose and one hand list — sites where the
+runtime counterpart is a set of match arms, not a struct a destructure can
+reach:
 
-- The ACL `Family` table (`derive.rs`): the field presence of four raw structs
-  plus policy-building logic in `brenn-lib/src/access/resolve.rs`.
-- `bindable` (`derive.rs`): a closure that reads a live `MessagingDirectory` in
-  `brenn-messaging-boot/src/surfaces.rs`, with three documented deliberate
-  deviations.
-- The channel-model presence rules (`derive.rs`): two ~150-line builders in
-  `brenn-lib/src/messaging/config.rs` that reach the mqtt module and panic
-  instead of diagnosing.
-- The remote-ceilings shape (`derive.rs`): two private panic-based helpers in
-  `brenn-lib/src/messaging/remote.rs`.
-- The agent grant vocabulary and every entity type's plane-word expansions
-  (`derive.rs`). The component and attach rows are single-sourced; these are not
-  — the authorable `AppCapability` tokens, and the table pairing each plane word
-  with the scheme tokens it lowers to, are still held equal by review.
-- The omissions ledger for vocabulary fields lowering resolves by default: the
-  reasons live in prose that no build step reads.
+- The kindword-dispatch ledgers in `brenn-lib/src/config/dsl_lower.rs`: the
+  `send_rate` key set, the configuration-section arms, the attachment-handler
+  type words and their per-variant field sets, and the webhook-signature scheme
+  words and theirs. Each arm ends in an exhaustive struct literal, so the
+  raw-field direction is held; a *new* section, type word or scheme is caught by
+  nothing.
+- The per-family key sets the two `amplification` refusals in
+  `surface_bindings` name — hand lists inside diagnostic messages, which no
+  reflected destructure reaches. (The key set the surface component body reads
+  is gated by `dsl_key_parity`.)
+- `Family::absent_reason` in `brenn-dsl/src/derive.rs`: prose stating why an
+  entity type holds no list of a family, mirroring the policy builders'
+  structure in `brenn-lib/src/access/resolve.rs`.
+- The two channel-model rules deliberately left runtime-only, named at
+  `brenn-envelope/src/channel_model.rs`: a non-durable channel's `retain_depth`
+  must be bounded, and a tuning block's must not be zero. Both are value rules,
+  not presence rules, and the DSL does not own values.
+- The hand-listed consumer grant words in
+  `brenn-lib/src/messaging/config.rs`'s `every_consumer_grant_word_lowers_to_its_variant`:
+  a variant added without a DSL spelling fails nothing there.
 
-Single-sourcing any of the rule tables means extracting shared predicate cores
-that both a diagnostic-emitting pass and a panic-based boot path call. That is
-real design work, and it depends on the brenn-lib monolith split (below), after
-which the DSL crate can see the config structs directly. A gate built before
-the split must not assume it never happens.
+Done = each residual above either reads a shared source the runtime also reads,
+or is gone.
 
-Done = every rule table above either reads a shared predicate the runtime also
-reads, or is gone; and the omissions ledger is a list a check reads rather than
-prose.
-
-Code sites (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
-entity attr vocabulary section header and the five statement tail vocabularies;
-brenn-dsl/src/derive.rs, at the channel-model presence rules, the ACL family
-table, the schemes a binding position may name, the remote subscribe ceilings
-shape, and the grant vocabularies and their plane-word expansions (the component
-row there records what is now mechanical); and
-brenn-lib/src/config/dsl_lower.rs, at the `send_rate` key set, at the
-configuration-section kindword arms, at the webhook subscription family's key
-set, at the consumer body and ACL family map, at the surface component body and
-the per-family key sets its binding refusals name, at the webhook signature
-scheme words and their per-variant field sets, and at the attachment handler
-type words and their per-variant field sets.
+Code sites (`TODO(dsl-vocabulary-config-parity)`):
+`brenn-lib/src/config/dsl_lower.rs`, at the `send_rate` key set, at the
+configuration-section kindword arms, at the `amplification` refusal key sets the
+surface component's binding refusals name, at the webhook signature scheme words
+and their per-variant field sets, and at the attachment handler type words and
+their per-variant field sets.
 
 
 ## `bindings-doc-typed-grants`
@@ -104,6 +108,30 @@ reader reparses.
 
 Code sites (`TODO(bindings-doc-typed-grants)`): surface/schema/src/lib.rs, at
 `ComponentEntry::grants`.
+
+
+## `acl-field-spelling-home`
+
+`Family::field_name(AclShape)` in `brenn-dsl/src/derive.rs` encodes brenn-lib's
+struct-naming conventions inside the crate that deliberately cannot see them:
+that `WasmConsumerConfigRaw` suffixes its ACL fields with `_acl`, that the view
+structs drop the `brenn_` qualifier, and a variant named `ConsumerConfig` after a
+brenn-lib type. So a rename on the brenn-lib side fails the parity gate with a
+message pointing at another crate, and the fix for it is an edit in brenn-dsl for
+a change that happened entirely in brenn-lib; every future ACL-holding struct
+with a fourth spelling adds a fourth variant here.
+
+Fix = keep `Family::name()`, the one spelling the DSL owns, and move the two
+transforms beside `held()` in `brenn-lib/src/config/tests/acl_family_parity.rs`,
+where the structs are. Weigh against it: the transforms were put in brenn-dsl so
+that the mapping is part of the vocabulary rather than left to the test author,
+which is the tradeoff to re-decide rather than a refactor to do in passing.
+
+Done = brenn-dsl exports one ACL family spelling and carries no knowledge of how
+a brenn-lib struct fields it.
+
+Code sites (`TODO(acl-field-spelling-home)`): brenn-dsl/src/derive.rs, at
+`AclShape`.
 
 
 ## `budget-refusal-per-path`
@@ -278,49 +306,6 @@ corpus golden is regenerated in one commit.
 Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/src/bin/brennfmt.rs.
 
 
-## `dsl-connection-spelling`
-
-`ConnectionConfigRaw` (`brenn-lib/src/messaging/config.rs`) declares an **auto
-channel**: a channel that exists because ports are wired together, with its
-depths folded from the endpoints and its ACLs injected at boot from the
-connection itself. No `.brenn` document spells the form — `dsl_lower` emits
-`connections: Vec::new()` unconditionally — so the whole arm is unreachable from
-any configuration an operator can write. The retired TOML front end was the last
-way in.
-
-What survives behind that: `BrennConfig::connections`, the connection loop in
-`lower_auto_wiring` and its endpoint resolution / free-port assertions in
-`brenn-messaging-boot/src/auto.rs`, and ~15 tests in `auto_tests.rs` plus
-hand-built fixtures in `brenn-bootstrap`. It all passes and it all proves
-nothing about a real config, and it reads to the next maintainer as either a
-planned feature or debris with no way to tell which.
-
-The decision this needs is which of those it is, and that is a product call, not
-a chore: auto channels are a genuinely different authoring model from
-`channel` + explicit bindings (authorization by wiring rather than by ACL), so
-"give it a DSL spelling" is a vocabulary design item and "delete it" throws away
-a designed feature. `tool_grants` and `mqtt_outputs` are in the same class and
-are recorded in `dsl-vocabulary-config-parity`'s deliberately-omitted column;
-this one is bigger than that column because a whole boot subsystem hangs off it.
-
-`tool_grants` carries a rider from the component-spec vocabulary: a component
-class states its capability needs as `requires`/`optional` word lists over the
-`ComponentGrant` words, and `tools` is deliberately not one of them, because
-tool grants have no instance-level `grants` spelling to check a class-level need
-against. When tool grants get a statement form, `tools` joins the spec
-vocabulary with it.
-
-Done = either the DSL has a spelling that reaches `lower_auto_wiring`'s
-connection arm, or `ConnectionConfigRaw`, the `connections` field, that arm and
-its tests are gone and only the io_port auto-channel path a document can reach
-remains.
-
-Code sites (`TODO(dsl-connection-spelling)`):
-`brenn-lib/src/messaging/config.rs` at `ConnectionConfigRaw`;
-`brenn-lib/src/config/dsl_lower.rs` at the `connections: Vec::new()` line;
-`brenn-messaging-boot/src/auto.rs` at `lower_auto_wiring`.
-
-
 ## `config-syntax-in-operator-messages`
 
 Boot panics, tool errors and config doc comments still spell config concepts in
@@ -332,6 +317,12 @@ cannot exist, and `grep '\[\[app\]\]'` over their config finds nothing. The
 doc comments have the same effect on the next maintainer, and because they are
 the only description of these fields' authoring shape, they keep minting new
 `[[...]]`-worded prose by imitation.
+
+The `[[wasm_consumer.tool_grant]]` and `[[wasm_consumer.mqtt_output]]` mentions
+are in scope like the rest, and now name concepts that do have a spelling — a
+`tool` statement and a `client` matcher tail. The `[[connection]]` mentions are
+not: that arm is gone, and the sites that named it were rewritten to speak of
+links when it was replaced.
 
 Roughly 750 sites across `brenn-lib`, `brenn-messaging-boot`, `brenn-server`,
 `brenn-bootstrap` and `brenn-wasm` — about 330 in string literals (the

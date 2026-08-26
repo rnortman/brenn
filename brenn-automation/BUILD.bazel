@@ -14,6 +14,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
         "//brenn-db",
+        "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging",
         "//brenn-obs",

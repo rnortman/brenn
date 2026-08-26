@@ -18,8 +18,9 @@ use super::{CHAT_PREFIX as PREFIX, ChatFixture, test_app_config};
 use crate::SubscriberEntryKind;
 use crate::config::ResolvedMessagingConfig;
 use brenn_envelope::chat::{ChatLeaf, chat_address, chat_bare_name, chat_leaf_prefix};
+use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::{AclSet, ChannelMatcher};
-use brenn_lib::access::{AppCapability, AppPolicy};
 use indexmap::IndexMap;
 use std::sync::Arc;
 

@@ -129,9 +129,15 @@ pub struct DMqttSub {
 
 /// One outbound MQTT entry. Publish is client-scoped: there is no topic
 /// dimension to narrow.
+///
+/// The two budgets are the egress sink's, and the entry that mints the sink is
+/// where they are written: an entry with neither takes the runtime's default
+/// budget, which is why they are `Option` rather than a resolved pair.
 #[derive(Debug, PartialEq)]
 pub struct DMqttClient {
     pub client: Spanned<String>,
+    pub publish_per_activation: Option<f64>,
+    pub publish_capacity: Option<f64>,
 }
 
 /// One inbound webhook entry, by endpoint slug.

@@ -28,6 +28,7 @@ item := const_def:const_def
       | agent:agent_class
       | assembly:assembly_def
       | channel:channel_def
+      | link:link_stmt
       | surface:surface_def
       | inst:new_stmt
       | remote:remote_def
@@ -54,6 +55,18 @@ chan_tuning := doc:doc? , %"channel" : %"at" : addr:chan_addr , body:body_block?
 
 // A whole address, or the prefix of a system-minted family.
 chan_addr := is_prefix:"prefix"? , addr:str_like ;
+
+// `link telemetry;` — a handle for an anonymous channel, declared where a
+// `channel` is and targeted by bindings in a channel's place. There is no
+// address and no body: a link has neither, and the ports bound to it are what
+// bring it into existence.
+//
+// The terminator takes `.`, not `,`, for `use_stmt`'s reason: the handle is the
+// rule's last content, so a `,` there would be the one optional-whitespace
+// position in the statement, and the formatter re-emits a suppressed terminator
+// after the trivia it finds at one — putting the `;` below the blank line that
+// follows the statement.
+link_stmt := doc:doc? , %"link" : handle:name . %";" , ;
 
 // Hand-minted uuids carried across a port, keyed by canonical address. A `Vec`,
 // not a keyed region: a region's key must reach text through a transparent
@@ -95,7 +108,8 @@ agent_class := doc:doc? , %"agent" : name:cname , params:param_list? , %"{" ,
 // dropped.
 assembly_def := doc:doc? , %"assembly" : name:cname , params:param_list , %"{" , items:assembly_item* , %"}"  , ;
 
-assembly_item := channel:channel_def | surface:surface_def | inst:new_stmt | grant:grant_stmt ;
+assembly_item := channel:channel_def | link:link_stmt | surface:surface_def | inst:new_stmt
+               | grant:grant_stmt ;
 
 param_list := %"(" , (params:param , (%"," , params:param)*)? , %")" ;
 param := name:name , %":" , ty:cname , default:param_default? ;
@@ -108,7 +122,10 @@ surface_def := doc:doc? , %"surface" : name:name , %"{" , (attrs:attr | acls:acl
 new_stmt := doc:doc? , %"new" : handle:name , %":" , cls:path , args:arg_list? , body:inst_body? , semi:";"? , ;
 arg_list := %"(" , (args:arg , (%"," , args:arg)*)? , %")" ;
 arg := name:name , %"=" , value:value ;
-inst_body := %"{" , (attrs:attr | bindings:binding | acls:acl_stmt)* , %"}" ;
+// `section` is last, exactly as the agent body orders it: it is identifier-led,
+// so a statement that fails partway through backtracks cleanly into it. What a
+// section means here is its kindword's to say, and today that is `tool`.
+inst_body := %"{" , (attrs:attr | bindings:binding | acls:acl_stmt | blocks:section)* , %"}" ;
 
 // ── bindings ─────────────────────────────────────────────────────────────────
 //

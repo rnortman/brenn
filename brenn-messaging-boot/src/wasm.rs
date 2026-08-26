@@ -5,7 +5,9 @@ use brenn_lib::messaging::config::{
     DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, NoiseLevel, ResolvedSubscription,
     ResolvedWasmConsumer, WasmConsumerConfigRaw, WasmInputPort, WasmOutputPort, WasmSinkBudget,
 };
-use brenn_lib::messaging::{ComponentGrant, ComponentHost, MessagingDirectory};
+use brenn_lib::messaging::{
+    ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, bindable_schemes,
+};
 use indexmap::IndexMap;
 
 /// Default activation-pacing burst (token-bucket capacity, in activations) when
@@ -273,13 +275,31 @@ pub(crate) fn resolve_wasm_consumers(
             // ACL gate; their authorization is asserted at boot (below), keyed by
             // scheme.
             use brenn_lib::messaging::ChannelScheme;
-            match ChannelScheme::of(&entry.address) {
-                Some(ChannelScheme::Ephemeral) => {
+            let in_scheme = ChannelScheme::of(&entry.address).unwrap_or_else(|| {
+                panic!(
+                    "[[wasm_consumer]] {slug:?}: {kind} channel {:?} carries no recognized \
+                     scheme prefix",
+                    entry.address,
+                )
+            });
+            assert!(
+                bindable_schemes(
+                    EntityKind::Component(ComponentHost::TopLevel),
+                    Plane::Subscribe
+                )
+                .contains(&in_scheme),
+                "[[wasm_consumer]] {slug:?}: {kind} channel {:?} names a scheme a consumer \
+                 does not subscribe through — a push target is an egress address a policy \
+                 names, never one a port reads from",
+                entry.address,
+            );
+            match in_scheme {
+                ChannelScheme::Ephemeral => {
                     if let Some((_, bare)) = ChannelScheme::split(&entry.address) {
                         ephemeral_inputs.push(bare.to_string());
                     }
                 }
-                Some(ChannelScheme::Local) => {
+                ChannelScheme::Local => {
                     if let Some((_, bare)) = ChannelScheme::split(&entry.address) {
                         local_inputs.push(bare.to_string());
                     }
@@ -444,12 +464,11 @@ pub(crate) fn resolve_wasm_consumers(
                     )
                 });
             assert!(
-                matches!(
-                    out_scheme,
-                    brenn_lib::messaging::ChannelScheme::Brenn
-                        | brenn_lib::messaging::ChannelScheme::Ephemeral
-                        | brenn_lib::messaging::ChannelScheme::Local
-                ),
+                bindable_schemes(
+                    EntityKind::Component(ComponentHost::TopLevel),
+                    Plane::Publish
+                )
+                .contains(&out_scheme),
                 "[[wasm_consumer]] {slug:?}: output.channel {:?} must be a pub/sub address \
                  (brenn:/ephemeral:/local:); the buffered ports.publish path never carries \
                  mqtt:/webhook:/pwa_push: egress — MQTT egress uses the separate mqtt-publish \
@@ -501,10 +520,10 @@ pub(crate) fn resolve_wasm_consumers(
         // 2b. Address-bound output + empty publish ACL for that scheme ⇒ every
         //      publish would deny at runtime. Panic now so the operator authors an
         //      explicit ACL. One check per pub/sub scheme (brenn:/ephemeral:/local:).
-        //      An *auto-bound* output (bound by a [[connection]] rather than by an
-        //      address on the binding) legitimately leaves the list empty: its
-        //      coverage is the matcher injected from the connection, and the
-        //      downstream coverage asserts still verify it.
+        //      An *auto-bound* output (bound by a link rather than by an address
+        //      on the binding) legitimately leaves the list empty: its coverage is
+        //      the matcher injected from the link, and the downstream coverage
+        //      asserts still verify it.
         use brenn_lib::messaging::ChannelScheme;
         let has_brenn_output = address_bound_outputs
             .iter()
@@ -751,9 +770,9 @@ pub(crate) fn resolve_wasm_consumers(
             &consumer.tool_grants,
         );
         // Auto-channel grants, injected before every coverage assert below so all
-        // of them hold for a consumer whose connections are its only ACL: the
-        // `[[connection]]` declaration is the authorization signal, the way a tool
-        // grant is for the async-tool substrate.
+        // of them hold for a consumer whose links are its only ACL: the link
+        // declaration is the authorization signal, the way a tool grant is for the
+        // async-tool substrate.
         auto_wiring.inject_wasm_grants(slug, &mut policy);
 
         // Ring delivery has no runtime ACL gate, so an uncovered ephemeral:

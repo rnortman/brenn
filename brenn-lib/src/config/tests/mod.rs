@@ -3,7 +3,25 @@ use std::path::{Path, PathBuf};
 
 use crate::config::*;
 
+/// Every field of a struct, as strings, with a compile-time proof the list is
+/// complete: the never-called function destructures with no `..`, and the same
+/// identifiers produce the strings, so a rename cannot pass silently either.
+///
+/// Declared before the parity-gate modules because `macro_rules!` scoping is
+/// declaration-order.
+macro_rules! field_names {
+    ($ty:ident { $($field:ident),+ $(,)? }) => {{
+        #[allow(dead_code)]
+        fn exhaustive(v: $ty) {
+            let $ty { $($field),+ } = v;
+            $(let _ = $field;)+
+        }
+        [$(stringify!($field)),+]
+    }};
+}
+
 mod access_mount;
+mod acl_family_parity;
 mod alerting;
 mod app_parse;
 mod attachment;
@@ -11,6 +29,7 @@ mod config_files;
 mod container;
 mod dsl_key_parity;
 mod dsl_lower;
+mod dsl_tail_parity;
 mod events;
 mod integrations;
 mod invariants;

@@ -330,16 +330,12 @@ mod tests {
     /// The grant that names no interface, so no import list can hold it.
     const NO_INTERFACE: ComponentGrant = ComponentGrant::Takeover;
 
-    /// The interface a component reaches without a word for it: a tool grant is
-    /// derived from a connection, so it appears in no `grants` list.
-    const DERIVED: &str = "tools";
-
     /// Each host's import list and the words that host admits are two statements
     /// of one policy, written in two crates. They are held equal here, with
     /// every deviation named above rather than tolerated as a difference.
-    fn assert_pinned(host: ComponentHost, imports: &[&str], derived: &[&str]) {
+    fn assert_pinned(host: ComponentHost, imports: &[&str]) {
         for import in imports {
-            if *import == TYPES || derived.contains(import) {
+            if *import == TYPES {
                 continue;
             }
             let grant = ComponentGrant::parse(import)
@@ -363,11 +359,11 @@ mod tests {
 
     #[test]
     fn the_surface_profile_matches_what_a_surface_component_may_be_granted() {
-        assert_pinned(ComponentHost::Surface, &SURFACE_IMPORTS, &[]);
+        assert_pinned(ComponentHost::Surface, &SURFACE_IMPORTS);
     }
 
     #[test]
     fn the_world_matches_what_a_top_level_component_may_be_granted() {
-        assert_pinned(ComponentHost::TopLevel, &KNOWN_IMPORTS, &[DERIVED]);
+        assert_pinned(ComponentHost::TopLevel, &KNOWN_IMPORTS);
     }
 }

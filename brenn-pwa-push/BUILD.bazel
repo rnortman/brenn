@@ -9,6 +9,7 @@ exports_files(["Cargo.toml"])
 
 FIRST_PARTY_DEPS = [
     "//brenn-db",
+    "//brenn-envelope",
     "//brenn-lib",
     "//brenn-messaging-store",
     "//brenn-obs",

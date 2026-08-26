@@ -39,7 +39,7 @@ use crate::{finish_surface_policies, lower_channel_topology, resolve_surfaces};
 /// # This is a subset certifier
 ///
 /// The directory built here holds the `[[channel]]` entries and the auto
-/// channels lowered from `[[connection]]` blocks, and nothing else: `webhook:`
+/// channels lowered from `link` declarations, and nothing else: `webhook:`
 /// and `mqtt:` entries are environment-derived. No surface binding can name
 /// either scheme, so no surface gate can miss them — but an address collision
 /// between a declared channel and a webhook or mqtt channel escapes this pass.

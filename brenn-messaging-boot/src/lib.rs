@@ -1,7 +1,7 @@
 //! Build the messaging layer (channel directory, messenger, wake router).
 //!
 //! This is the boot-time lowering of the messaging configuration: `[[channel]]`,
-//! `[[connection]]`, `[[wasm_consumer]]`, `[[surface]]` and `[[remote]]` blocks,
+//! `link`, `[[wasm_consumer]]`, `[[surface]]` and `[[remote]]` blocks,
 //! plus the transport endpoints resolved elsewhere, become one `MessagingDirectory`
 //! and one live `Messenger` with its wake router. Nothing here serves a request or
 //! owns a task: [`build_messaging`] returns a [`MessagingResult`] and the
@@ -36,16 +36,16 @@ mod wasm;
 ///
 /// `declared` is the `channel` the operator wrote on the binding. A binding
 /// without one is a *free port*: it declares the port and its tuning, and expects
-/// exactly one `[[connection]]` to supply the channel — `lowered`, the address the
+/// exactly one `link` to supply the channel — `lowered`, the address the
 /// auto-wiring pass assigned it. Reaching this function with neither means no
-/// connection claimed the port — dead config, and a boot panic in the same posture
-/// as an output port on a consumer that never activates. Both at once means the
-/// port name is claimed twice: by this address and by an auto channel (a
-/// `[[connection]]` endpoint, or an io_port wearing the same name).
+/// link claimed the port — dead config, and a boot panic in the same posture as
+/// an output port on a consumer that never activates. Both at once means the port
+/// name is claimed twice: by this address and by an auto channel (a link
+/// endpoint, or an io_port wearing the same name).
 ///
 /// An operator-written address is also the one place a hand-computed
 /// `auto.<cid>` could enter: auto cids are deterministic, so without a check here
-/// a third party could bind an "anonymous" channel with no connection to show for
+/// a third party could bind an "anonymous" channel with no link to show for
 /// it. A lowered address bypasses the check by construction — the pass placed it.
 /// That check is scoped to the pub/sub schemes, which are the only schemes an
 /// auto channel is ever placed on: ingress/egress slugs live in their own
@@ -64,9 +64,9 @@ fn bound_channel(
         return lowered
             .unwrap_or_else(|| {
                 panic!(
-                    "config: {owner}: {port_label} declares no channel and no [[connection]] \
-                     binds it — a free port must be named by exactly one connection's \
-                     endpoints, or carry its own channel address"
+                    "config: {owner}: {port_label} declares no channel and no link binds it — \
+                     a free port must be bound to exactly one link, or carry its own channel \
+                     address"
                 )
             })
             .to_string();
@@ -74,9 +74,8 @@ fn bound_channel(
     assert!(
         lowered.is_none(),
         "config: {owner}: {port_label} binds channel {address:?}, but the port name is also \
-         claimed by an auto channel — either a [[connection]] lists it as an endpoint, or an \
-         io_port declares the same name. A port binds exactly one channel: drop this address, \
-         or drop the claim.",
+         claimed by an auto channel — either a link binds it, or an io_port declares the same \
+         name. A port binds exactly one channel: drop this address, or drop the claim.",
     );
     let bare = match ChannelScheme::split(address) {
         Some((ChannelScheme::Brenn | ChannelScheme::Ephemeral | ChannelScheme::Local, name)) => {
@@ -92,7 +91,7 @@ fn bound_channel(
         !messaging::is_auto_channel_name(bare),
         "config: {owner}: {port_label} binds channel {address:?}, which is in the reserved \
          auto namespace — an auto channel's endpoints are its ACL, so it cannot be joined by \
-         address; list this port in the channel's [[connection]], or give that channel a name",
+         address; bind this port to the channel's link, or give that channel a name",
     );
     address.to_string()
 }
@@ -250,7 +249,7 @@ pub(crate) fn build_apps_with_messaging(
 }
 
 /// The channel set every resolution pass runs against, and the auto-wiring the
-/// `[[connection]]` blocks lowered to.
+/// `link` declarations lowered to.
 pub(crate) struct ChannelTopology {
     /// The durable `[[channel]]` entries, the caller's environment-derived
     /// entries, and the durable auto channels.
@@ -274,7 +273,7 @@ impl ChannelTopology {
     }
 }
 
-/// Lower `[[channel]]` and `[[connection]]` into the channel set the resolvers
+/// Lower `[[channel]]` and `link` into the channel set the resolvers
 /// read, appending `extra_durable_entries` (the caller's environment-derived
 /// `webhook:`/`mqtt:` entries, or nothing) to the durable half.
 ///
@@ -306,7 +305,7 @@ fn lower_channel_topology(
         .map(|e| e.address.as_str())
         .collect();
     let auto_wiring = auto::lower_auto_wiring(
-        &config.connections,
+        &config.links,
         &config.wasm_consumers,
         &config.surfaces,
         &declared_addresses,
@@ -764,7 +763,7 @@ pub async fn build_messaging(
 
     // The channel set the resolvers read: `[[channel]]` first, then the
     // webhook: and mqtt: entries this host's environment produced, then the
-    // auto channels the `[[connection]]` blocks lower to. The offline pass runs
+    // auto channels the `link` declarations lower to. The offline pass runs
     // the same helper with no environment-derived entries, so the two reach one
     // verdict over one ordering.
     let mut environment_entries = webhook_channel_entries;

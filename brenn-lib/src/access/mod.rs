@@ -22,6 +22,8 @@ pub mod test_fixtures;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use brenn_envelope::grants::AppCapability;
+
 use crate::access::acl::AclSet;
 use crate::messaging::ChannelScheme;
 use crate::tools::ResolvedToolGrant;
@@ -336,91 +338,6 @@ impl AppPolicy {
     }
 }
 
-/// Layer 1: the coarse, binary capabilities an app may be granted.
-///
-/// This is the **unified** capability enum spanning LLM conversations and WASM
-/// components. The full variant set is defined now so later phases need not
-/// widen it. Named `AppCapability` — **not** `Capability` — to avoid colliding
-/// with `brenn-wasm`'s own `Capability` enum, which lives in a crate that does
-/// not depend on `brenn-lib`.
-///
-/// `Ord` is derived so a `GrantSet` (a `BTreeSet<AppCapability>`) iterates in a
-/// stable order once a later phase's logging needs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AppCapability {
-    // messaging bus
-    /// Publish to the `brenn:` bus.
-    MessagingPublish,
-    /// Hold any subscription to `brenn:`/`webhook:` (static or dynamic).
-    MessagingSubscribe,
-    /// Additionally gates the runtime `MessageSubscribe` tool (LLM apps only).
-    DynamicSubscribe,
-    /// Publish to the `ephemeral:` bus. A distinct transport grant
-    /// from `MessagingPublish`: the two delivery classes are gated separately.
-    EphemeralPublish,
-    /// Hold a subscription to the `ephemeral:` bus. A distinct
-    /// transport grant from `MessagingSubscribe`: an operator grants each
-    /// delivery class explicitly.
-    EphemeralSubscribe,
-    /// Publish to a confined `local:` channel. A distinct transport grant from
-    /// `MessagingPublish`/`EphemeralPublish`: each delivery class is gated
-    /// separately. A `local:` channel is process-local and non-transportable,
-    /// but a backend publisher still needs authorization to reach one.
-    LocalPublish,
-    /// Hold a subscription to a confined `local:` channel. A distinct transport
-    /// grant from `MessagingSubscribe`/`EphemeralSubscribe`: each delivery class
-    /// is gated separately. LLM-app-unauthorable in v1 (no local delivery path
-    /// to a conversation).
-    LocalSubscribe,
-    // external transports
-    /// Publish to MQTT.
-    MqttPublish,
-    /// Subscribe to MQTT.
-    MqttSubscribe,
-    /// Hold an inbound webhook subscription.
-    Webhook,
-    /// Receive PWA push notifications (no per-channel scope).
-    PwaPush,
-    // carried authority
-    /// Set `impetus` on a published message — the claim that live user
-    /// interaction produced it. Orthogonal to channel ACL: a minting principal
-    /// still needs publish authority over its target, and a publish carrying
-    /// impetus without this grant is refused whole rather than stripped.
-    ///
-    /// TODO(chat-surface-mints-impetus): nothing in production mints yet, so a
-    /// conversation's impetus pool is refilled only by the legacy websocket
-    /// door. A user who reaches their conversations over the bus alone will see
-    /// them exhaust and stall with no bus-side remedy. The chat surface is the
-    /// first minter: it authors the grant mapping, carries the field on its
-    /// publish frames, and derives it from a real user gesture.
-    MintImpetus,
-    // WASM host capabilities. Authored as `ComponentGrant` on WASM components and
-    // mapped to these variants internally; not part of the LLM `grants` token
-    // vocabulary. Because `Deserialize` is derived for the whole enum, these
-    // tokens (`"wasm_store"`, …) and `"integration"` *do* technically parse from
-    // an LLM app's `grants` list — but `build_app_policy` (the resolution
-    // boundary) rejects them for an LLM app (panic, operator config = fail-fast),
-    // so an LLM `grants` list may carry only the LLM-authorable subset above.
-    /// WASM host: key/value store access.
-    WasmStore,
-    /// WASM host: structured logging.
-    WasmLog,
-    /// WASM host: alert emission.
-    WasmAlert,
-    /// WASM host: config read access.
-    WasmConfig,
-    /// Attacher: alert emission. Authored as `AttachGrant::Alert` on a
-    /// `[[surface]]` or `[[remote]]` and mapped internally (not part of the LLM
-    /// `grants` token vocabulary). A capability distinct from `WasmAlert` so
-    /// policy inspection keeps alert-grant provenance per boundary.
-    SurfaceAlert,
-    /// Integration access (pfin, graf, …). A bare variant with no associated
-    /// `IntegrationKind` payload: the payload and its enforcement are reserved
-    /// for a later phase. Bare so the token list deserializes from plain strings.
-    Integration,
-}
-
 /// Layer-1 grant set. Deny-by-default: a capability not in the set is denied.
 ///
 /// Backed by a `BTreeSet` so a later phase's logging can iterate grants in a
@@ -447,65 +364,10 @@ mod tests {
     use super::*;
     use crate::access::acl::{ChannelMatcher, MqttClientMatcher, MqttSubMatcher, WebhookMatcher};
 
-    /// Every `AppCapability` variant. The exhaustive `match` arm below is a
-    /// compile-time guard: adding a variant to `AppCapability` without listing it
-    /// here is a compile error, so the deny-by-default test (and any other test
-    /// iterating all variants) cannot silently skip a new capability.
-    const ALL_CAPABILITIES: &[AppCapability] = &[
-        AppCapability::MessagingPublish,
-        AppCapability::MessagingSubscribe,
-        AppCapability::DynamicSubscribe,
-        AppCapability::EphemeralPublish,
-        AppCapability::EphemeralSubscribe,
-        AppCapability::LocalPublish,
-        AppCapability::LocalSubscribe,
-        AppCapability::MqttPublish,
-        AppCapability::MqttSubscribe,
-        AppCapability::Webhook,
-        AppCapability::PwaPush,
-        AppCapability::MintImpetus,
-        AppCapability::WasmStore,
-        AppCapability::WasmLog,
-        AppCapability::WasmAlert,
-        AppCapability::WasmConfig,
-        AppCapability::SurfaceAlert,
-        AppCapability::Integration,
-    ];
-
-    /// Forces `ALL_CAPABILITIES` to stay in sync with the enum: a new variant is
-    /// a non-exhaustive-`match` compile error here until it is added above.
-    fn assert_all_capabilities_exhaustive(cap: AppCapability) {
-        let _: () = match cap {
-            AppCapability::MessagingPublish
-            | AppCapability::MessagingSubscribe
-            | AppCapability::DynamicSubscribe
-            | AppCapability::EphemeralPublish
-            | AppCapability::EphemeralSubscribe
-            | AppCapability::LocalPublish
-            | AppCapability::LocalSubscribe
-            | AppCapability::MqttPublish
-            | AppCapability::MqttSubscribe
-            | AppCapability::Webhook
-            | AppCapability::PwaPush
-            | AppCapability::MintImpetus
-            | AppCapability::WasmStore
-            | AppCapability::WasmLog
-            | AppCapability::WasmAlert
-            | AppCapability::WasmConfig
-            | AppCapability::SurfaceAlert
-            | AppCapability::Integration => (),
-        };
-        assert!(
-            ALL_CAPABILITIES.contains(&cap),
-            "ALL_CAPABILITIES is missing {cap:?}"
-        );
-    }
-
     #[test]
     fn empty_grant_set_denies_everything() {
         let g = GrantSet::default();
-        for &cap in ALL_CAPABILITIES {
-            assert_all_capabilities_exhaustive(cap);
+        for cap in AppCapability::ALL {
             assert!(!g.has(cap), "empty GrantSet must deny {cap:?}");
         }
     }

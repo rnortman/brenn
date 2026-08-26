@@ -8,9 +8,10 @@
 
 use indexmap::IndexMap;
 
-use crate::access::{AppCapability, AppPolicy};
+use crate::access::AppPolicy;
 use crate::config::AppConfig;
 use crate::messaging::{ChannelScheme, is_unreserved_name};
+use brenn_envelope::grants::AppCapability;
 
 /// Strip `scheme`'s prefix from `addr` and validate the bare name: the prefix
 /// must be present and the remainder a well-formed name

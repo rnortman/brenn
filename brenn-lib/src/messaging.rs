@@ -33,7 +33,10 @@ pub use brenn_envelope::addressing::{
     mqtt_channel_uuid_from_address, nondurable_channel_uuid, tool_channel_uuid_from_address,
     tuning_boundary_list, webhook_channel_uuid_from_slug,
 };
-pub use brenn_envelope::grants::{AttachGrant, ComponentGrant, ComponentHost};
+pub use brenn_envelope::channel_model::ChannelBlockRole;
+pub use brenn_envelope::grants::{
+    AttachGrant, ComponentGrant, ComponentHost, EntityKind, Plane, bindable_schemes,
+};
 pub use config::{
     ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
     NoiseLevel, ResolvedChannel, ResolvedMessagingConfig, ResolvedSubscription, Sink,

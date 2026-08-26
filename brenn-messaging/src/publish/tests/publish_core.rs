@@ -23,7 +23,8 @@ use crate::{
     ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, ParticipantId,
     SubscriberEntry, SubscriberEntryKind, Urgency, WakeMin, WakeRouter, canonical_address, db,
 };
-use brenn_lib::access::{AppCapability, AppPolicy, acl::ChannelMatcher};
+use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::{AppPolicy, acl::ChannelMatcher};
 use chrono::Utc;
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -126,7 +127,7 @@ async fn publish_with_grant_but_no_messaging_block_uses_global_default_budget() 
         pa_bob
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingPublish);
+            .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         // Phase-2 Seam A also requires a covering `brenn_publish` matcher; stamp a
         // universal one so this test continues to exercise the budget fallback,
         // not the new ACL gate.
@@ -328,7 +329,7 @@ async fn the_fold0_context_feed_skips_a_parked_message_and_feeds_its_retention_p
     let mut surface_policy = brenn_lib::access::AppPolicy::default();
     surface_policy
         .grants
-        .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     surface_policy
         .acls
         .brenn_subscribe
@@ -651,7 +652,7 @@ async fn publish_acl_denied_when_channel_not_in_brenn_publish() {
     // channel, so `brenn:pa-alice` is out of scope.
     let mut p = brenn_lib::access::AppPolicy::default();
     p.grants
-        .insert(brenn_lib::access::AppCapability::MessagingPublish);
+        .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
     p.acls
         .brenn_publish
         .push(brenn_lib::access::acl::ChannelMatcher::Exact(
@@ -690,7 +691,7 @@ async fn publish_subscribe_only_app_is_missing_sender() {
     // ACL.
     let mut p = brenn_lib::access::AppPolicy::default();
     p.grants
-        .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     p.acls
         .brenn_publish
         .push(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));
@@ -729,7 +730,7 @@ async fn publish_allowed_with_grant_and_covering_matcher() {
     let (mut m, _, _, _, _) = build_messenger(1).await;
     let mut p = brenn_lib::access::AppPolicy::default();
     p.grants
-        .insert(brenn_lib::access::AppCapability::MessagingPublish);
+        .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
     p.acls
         .brenn_publish
         .push(brenn_lib::access::acl::ChannelMatcher::Exact(
@@ -786,7 +787,7 @@ async fn publish_acl_denied_consumes_no_budget() {
     // Tighten: grant held but matcher no longer covers pa-alice.
     let mut p = brenn_lib::access::AppPolicy::default();
     p.grants
-        .insert(brenn_lib::access::AppCapability::MessagingPublish);
+        .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
     p.acls
         .brenn_publish
         .push(brenn_lib::access::acl::ChannelMatcher::Exact(

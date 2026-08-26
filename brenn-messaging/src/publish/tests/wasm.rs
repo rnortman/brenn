@@ -930,7 +930,7 @@ async fn build_wasm_ephemeral_surface_messenger(
     let mut surface_policy = brenn_lib::access::AppPolicy::default();
     surface_policy
         .grants
-        .insert(brenn_lib::access::AppCapability::EphemeralSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::EphemeralSubscribe);
     surface_policy
         .acls
         .ephemeral_subscribe

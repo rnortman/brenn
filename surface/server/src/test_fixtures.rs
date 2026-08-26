@@ -19,8 +19,9 @@
 
 use std::sync::Arc;
 
+use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
-use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{
     AttachSendBudget, ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent,

@@ -8,7 +8,7 @@ use crate::db::init_db_memory;
 use crate::store::RingStores;
 use crate::testutils::{ephemeral_channel_entry, local_channel_entry, test_channel_entry};
 use crate::{MessagingDirectory, WakeRouter, canonical_address, db::upsert_channels};
-use brenn_lib::access::AppCapability;
+use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::ChannelMatcher;
 use indexmap::IndexMap;
 use std::sync::Arc;

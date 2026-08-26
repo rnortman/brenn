@@ -88,8 +88,9 @@ fn a_surface_body_types_its_grants_as_words() {
 /// reaches a field of its own is the fixture parse itself: the vocabulary
 /// denies unknown fields, so a key with no field fails the load in `entities()`.
 /// What the config struct declares and what this vocabulary spells are tied by
-/// nothing mechanical — that is `TODO(dsl-vocabulary-config-parity)`, not this
-/// test.
+/// lowering's exhaustive struct literal, not by this test. What that leaves —
+/// a new field answered with a hardcoded value instead of a key — is the
+/// residual `dsl-vocabulary-config-parity` names.
 #[test]
 fn an_agent_body_admits_the_whole_scalar_vocabulary() {
     let file = entities();

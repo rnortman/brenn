@@ -4,9 +4,10 @@
 use fltk_serde_core::Spanned;
 
 use brenn_dsl::model::{
-    AGENT_BLOCK_KINDWORDS, AgentBlock, AgentClass, AttachmentBlock, File, IntOrWord, Item,
-    SectionNode, Value, WEBHOOK_BLOCK_KINDWORDS, WebhookBlock, WebhookDef, Word, WordList,
-    agent_block, attachment_block, section_kindword, webhook_block,
+    AGENT_BLOCK_KINDWORDS, AgentBlock, AgentClass, AttachmentBlock, File, INSTANCE_BLOCK_KINDWORDS,
+    IntOrWord, Item, SectionNode, TOOL_BLOCK_KINDWORDS, Value, WEBHOOK_BLOCK_KINDWORDS,
+    WebhookBlock, WebhookDef, Word, WordList, agent_block, attachment_block, instance_block,
+    section_kindword, tool_block, webhook_block,
 };
 use brenn_dsl::parse_str;
 
@@ -127,7 +128,7 @@ fn the_bearer_endpoint_writes_a_token_where_the_hmac_one_writes_a_key() {
 fn an_agent_body_types_each_of_its_hook_blocks() {
     let file = sections();
     let class = agent(&file, "PersonalAssistant");
-    assert_eq!(class.blocks.len(), 6);
+    assert_eq!(class.blocks.len(), 7);
 
     let typed: Vec<_> = class
         .blocks
@@ -343,6 +344,37 @@ fn every_sub_block_kindword_is_written_by_the_corpus() {
             .find(|node| section_kindword(node).0 == *kindword)
             .unwrap_or_else(|| panic!("no corpus agent writes a `{kindword}` block"));
         agent_block(node).unwrap_or_else(|error| panic!("{kindword}: {error}"));
+    }
+
+    let instance_blocks: Vec<&SectionNode> = file
+        .instantiations()
+        .filter_map(|inst| inst.body.as_ref())
+        .flat_map(|body| body.value().blocks.iter())
+        .collect();
+    for kindword in INSTANCE_BLOCK_KINDWORDS {
+        let node = instance_blocks
+            .iter()
+            .find(|node| section_kindword(node).0 == *kindword)
+            .unwrap_or_else(|| panic!("no corpus instance writes a `{kindword}` block"));
+        instance_block(node).unwrap_or_else(|error| panic!("{kindword}: {error}"));
+    }
+
+    // A `tool` block is the one place a typed section nests a second level, so
+    // its own vocabulary is reached through the block that holds it.
+    let tool_blocks: Vec<SectionNode> = instance_blocks
+        .iter()
+        .flat_map(|node| {
+            let block = instance_block(node).expect("a legal kindword");
+            let (_, subs) = block.parts();
+            subs.to_vec()
+        })
+        .collect();
+    for kindword in TOOL_BLOCK_KINDWORDS {
+        let node = tool_blocks
+            .iter()
+            .find(|node| section_kindword(node).0 == *kindword)
+            .unwrap_or_else(|| panic!("no corpus `tool` block writes a `{kindword}` block"));
+        tool_block(node).unwrap_or_else(|error| panic!("{kindword}: {error}"));
     }
 }
 

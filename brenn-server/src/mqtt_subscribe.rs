@@ -1002,7 +1002,7 @@ mod tests {
         brenn_matchers: Vec<brenn_lib::access::acl::ChannelMatcher>,
         webhook_endpoints: Vec<&str>,
     ) -> brenn_lib::access::AppPolicy {
-        use brenn_lib::access::AppCapability;
+        use brenn_envelope::grants::AppCapability;
         use brenn_lib::access::acl::WebhookMatcher;
 
         let mut policy = brenn_lib::access::AppPolicy::default();
@@ -1144,7 +1144,7 @@ mod tests {
     /// subscriber is folded into the directory.
     #[tokio::test]
     async fn subscribe_ephemeral_granted_is_local_only_and_writes_no_row() {
-        use brenn_lib::access::AppCapability;
+        use brenn_envelope::grants::AppCapability;
         let mut policy = brenn_webhook_policy(true, false, false, vec![], vec![]);
         policy.grants.insert(AppCapability::EphemeralSubscribe);
         policy.acls.ephemeral_subscribe = vec![brenn_lib::access::acl::ChannelMatcher::Exact(

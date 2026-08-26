@@ -1107,7 +1107,7 @@ fn resolve_access_policies(
 /// so it is a non-fatal warning, **not** a panic. Mirrors the subscribe side's
 /// existing posture and the granted-but-no-matcher mitigation the design names.
 fn warn_granted_publish_no_matcher(app_slug: &str, policy: &crate::access::AppPolicy) {
-    use crate::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
 
     // `grant_token` (config `grants` spelling) and `acl_table` (`[[app.acl.*]]`
     // block name) differ only for `MessagingPublish`, whose ACL is `brenn_publish`.
@@ -1327,9 +1327,9 @@ fn validate_trusted_proxy_hops(server: &ServerConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::AppCapability;
     use crate::access::AppPolicy;
     use crate::access::acl::ChannelMatcher;
+    use brenn_envelope::grants::AppCapability;
     use tracing_test::traced_test;
 
     #[traced_test]

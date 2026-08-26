@@ -181,8 +181,9 @@ pub async fn enforce_and_publish(
 mod tests {
     use super::*;
     use crate::state::MqttClientHandle;
+    use brenn_envelope::grants::AppCapability;
+    use brenn_lib::access::AppPolicy;
     use brenn_lib::access::acl::MqttClientMatcher;
-    use brenn_lib::access::{AppCapability, AppPolicy};
     use brenn_messaging_store::db::init_db_memory;
     use brenn_messaging_store::testutils::ensure_user_and_conv;
 

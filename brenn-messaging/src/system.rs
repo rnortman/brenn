@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
+use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
-use brenn_lib::access::{AppCapability, AppPolicy};
 
 use super::config::NoiseLevel;
 use super::store::MessageSeq;
@@ -371,8 +372,9 @@ mod tests {
     use crate::query::NoopWakeRouter;
     use crate::testutils::test_channel_entry;
     use crate::{ChannelScheme, MessagingDirectory, Urgency, WakeRouter};
+    use brenn_envelope::grants::AppCapability;
+    use brenn_lib::access::GrantSet;
     use brenn_lib::access::acl::{AclSet, ChannelMatcher};
-    use brenn_lib::access::{AppCapability, GrantSet};
 
     use super::*;
 

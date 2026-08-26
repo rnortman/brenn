@@ -835,8 +835,9 @@ mod tests {
     /// nor receive deliveries from. Returns the messenger and a still-pending
     /// message id authored by `pa-bob` on `brenn:pa-alice`.
     async fn build_narrow_messenger() -> (Arc<Messenger>, Uuid) {
+        use brenn_envelope::grants::AppCapability;
+        use brenn_lib::access::AppPolicy;
         use brenn_lib::access::acl::ChannelMatcher;
-        use brenn_lib::access::{AppCapability, AppPolicy};
 
         let db = init_db_memory();
         {

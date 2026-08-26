@@ -15,6 +15,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use brenn_envelope::channel_model::ChannelBlockRole;
+use brenn_envelope::channel_model::{
+    ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted, standing_admitted,
+};
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -323,80 +327,78 @@ pub struct ChannelConfigRaw {
     pub send_rate: Option<SendRate>,
 }
 
-/// Top-level `[[connection]]` block — an **auto channel** declared by the ports
-/// it wires together instead of by a `[[channel]]` block.
+/// A `link` declaration — an **auto channel** named by nothing, brought into
+/// existence by the ports bound to it.
 ///
-/// An auto channel comes into existence because ports are connected. It has no
-/// `[[channel]]` block and no operator-written ACL entries: the transport grants
-/// and channel matchers its endpoints need are injected at boot from this
-/// declaration, because the connection *is* the operator's authorization signal.
-/// Channel-level tuning is not available: every depth is the fold over the
-/// subscribing endpoints' own declared depths, and `sink`, `send_rate`,
-/// `wake_min` and channel-level `noise` come from the `messaging` defaults. A
-/// channel that needs any of those stated for itself has outgrown auto
-/// declaration; write the `channel` declaration.
+/// A link has no address, no `channel` declaration and no operator-written ACL
+/// entries: the transport grants and channel matchers its endpoints need are
+/// injected at boot from this declaration, because binding a port to the link
+/// *is* the operator's authorization signal. Channel-level tuning is not
+/// available: every depth is the fold over the subscribing endpoints' own
+/// declared depths, and `sink`, `send_rate`, `wake_min` and channel-level
+/// `noise` come from the `messaging` defaults. A channel that needs any of those
+/// stated for itself has outgrown a link; declare the channel.
 ///
-/// **No document spells this form.** Lowering always emits an empty
-/// `connections` list, so nothing populates it; a document wires ports to
-/// declared channels explicitly instead.
-///
-/// **Direction is inferred, never stated.** An endpoint naming a port declared in
-/// a `subscriptions` list subscribes; one naming a port in an `outputs` list
-/// publishes; one naming an `io_port` does both.
-///
-/// **Anonymous by default.** With `channel` absent the channel's bare name is
-/// `auto.<cid>`, where `cid` is a UUIDv5 of the sorted endpoint set, and its
-/// scheme is decided from where the endpoints live: all-backend ⇒ `local:`,
-/// all-one-surface ⇒ page-local `local:`, anything spanning the wire ⇒
-/// `ephemeral:`. Adding an endpoint changes the address; nothing outlives that,
-/// because an anonymous channel is never durable.
-// TODO(dsl-connection-spelling): unreachable from any configuration — either the
-// vocabulary grows a spelling or this form and its boot arm go.
+/// **Anonymous, always.** The channel's bare name is `auto.<cid>`, where `cid`
+/// is a UUIDv5 of the sorted endpoint set, and its scheme is decided from where
+/// the endpoints live: all-backend ⇒ `local:`, all-one-surface ⇒ page-local
+/// `local:`, anything spanning the wire ⇒ `ephemeral:`. Adding an endpoint
+/// changes the address; nothing outlives that, because a link's channel is never
+/// durable.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ConnectionConfigRaw {
-    /// The ports this connection wires together. Two reference forms:
-    /// `wasm:<slug>/<port>` for a port on a `[[wasm_consumer]]`, and
-    /// `surface:<surface-slug>#<instance>/<port>` for a port on a
-    /// surface-hosted component (the prefix before `/<port>` is exactly the
-    /// component's participant id, so endpoint refs grep against logs and cursor
-    /// rows).
-    ///
-    /// Every referenced port must be *free*: declared without a `channel` of its
-    /// own, and referenced by exactly one connection. The endpoint set must
-    /// contain at least one publisher and at least one subscriber, and must not
-    /// be a single `io_port` (which needs no connection to loop back to itself).
-    pub endpoints: Vec<String>,
-    /// Absent ⇒ anonymous. Present ⇒ a **named** auto channel at this full
-    /// scheme-qualified address, where the scheme picks the capability:
-    /// `brenn:` is durable (the reason to name one at all), `ephemeral:` is
-    /// transportable-only and shared across sessions, `local:` is neither and is
-    /// legal only when every endpoint lives on one side of the wire.
-    ///
-    /// The name wears `[[channel]]`-grade validation and may not fall in a
-    /// reserved namespace. Colliding with a `[[channel]]` block, a
-    /// webhook/mqtt-derived channel, or another connection's or io_port's name is
-    /// a boot panic: that overlap is the seam through which auto-injected ACLs
-    /// could reach a channel other parties legitimately use.
-    ///
-    /// Naming a channel is what lets a third party bind it with ordinary
-    /// bindings and ordinary ACLs — but for `local:` that reach stops at the
-    /// realm boundary. An all-backend `local:` channel is a server ring only
-    /// backend bindings join; an all-one-surface one is a page ring only that
-    /// surface's bindings join. Crossing the two is a boot panic, not a silent
-    /// dead binding. Wiring a page to the backend takes `ephemeral:`.
-    pub channel: Option<String>,
-    /// UUID v4 in canonical hyphenated form, naming the DB row. Legal only on a
-    /// durable (`brenn:`) named channel.
-    ///
-    /// Absent, a durable auto channel's identity is derived from its bare name —
-    /// so renaming it re-keys the DB row (fresh resume epoch; old row kept
-    /// orphaned until manually deleted). Writing this field is the
-    /// rename-stability opt-out.
-    pub uuid: Option<String>,
+pub struct LinkConfigRaw {
+    /// The handle the link was declared under, for boot messages. Not an
+    /// address: nothing resolves a channel through this text.
+    pub link: String,
     /// Lands in the channel's directory description. Absent, a description is
     /// generated from the endpoint set, so a uuid-named row in a listing or log
     /// still explains itself.
     pub description: Option<String>,
+    /// The ports bound to this link. Each must name a port its host declares,
+    /// with the roles that declaration gives it, and must be *free* — declared
+    /// with no `channel` of its own. The direction-carrying shape below is what
+    /// spares boot a reverse lookup over endpoint strings; that the port is
+    /// there at all is still checked, because an endpoint nobody declared would
+    /// carry real authority to a port that reads and writes nothing.
+    ///
+    /// The endpoint set must contain at least one publisher and at least one
+    /// subscriber, and must not be a single io_port (which needs no link to loop
+    /// back to itself).
+    pub endpoints: Vec<LinkEndpointRaw>,
+}
+
+/// One port bound to a link, with the roles and depths its binding gave it.
+///
+/// Direction and depths are carried, not inferred: the binding that named the
+/// link is the same statement that declared the port's tuning, so one lowering
+/// site fills both and nothing downstream re-derives a role by searching the
+/// subscription and output lists for a port name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkEndpointRaw {
+    pub host: LinkHostRaw,
+    pub port: String,
+    pub publishes: bool,
+    pub subscribes: bool,
+    /// Whether the port is an io_port — both roles by declaration, and already
+    /// entitled to a channel of its own.
+    pub io_port: bool,
+    /// The subscribing half's window. Required on a subscribing endpoint, and
+    /// equal to what the port's own declaration states: a link's retention is
+    /// folded from these numbers while the subscriber's cursor window comes
+    /// from the declaration, so two answers would size two different windows.
+    /// Absent on an endpoint that does not subscribe.
+    pub push_depth: Option<Depth>,
+    /// The subscribing half's retained window. Same rules as `push_depth`.
+    pub retain_depth: Option<Depth>,
+}
+
+/// Which host a link endpoint's port lives on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkHostRaw {
+    /// A port on a backend `wasm_consumer`.
+    Wasm { slug: String },
+    /// A port on a surface-hosted component instance.
+    Surface { slug: String, instance: String },
 }
 
 /// `[messaging]` section.
@@ -689,11 +691,10 @@ pub struct WasmConsumerSubscriptionRaw {
     /// Channel address, e.g. `brenn:my-channel` or `webhook:my-endpoint`.
     ///
     /// `None` makes this a **free port**: the binding declares the port and its
-    /// tuning, and exactly one `[[connection]]` must reference it to supply the
-    /// channel. A free port bound by no connection is dead config and a boot
-    /// panic. Addresses in the reserved `auto` namespace are rejected here — an
-    /// anonymous auto channel is reachable only through the declarations that
-    /// created it.
+    /// tuning, and exactly one `link` must bind it to supply the channel. A free
+    /// port bound by no link is dead config and a boot panic. Addresses in the
+    /// reserved `auto` namespace are rejected here — an anonymous auto channel is
+    /// reachable only through the declarations that created it.
     pub channel: Option<String>,
     /// Logical input port name presented to the guest. Required — no host default.
     /// Must be non-empty and consist of RFC 3986 unreserved characters.
@@ -727,8 +728,8 @@ pub struct WasmConsumerOutputRaw {
     pub port: String,
     /// Target channel address.
     ///
-    /// `None` makes this a **free port**, bound by exactly one `[[connection]]`;
-    /// see [`WasmConsumerSubscriptionRaw::channel`].
+    /// `None` makes this a **free port**, bound by exactly one `link`; see
+    /// [`WasmConsumerSubscriptionRaw::channel`].
     pub channel: Option<String>,
     /// Default urgency for messages published on this output port (sub → port →
     /// `normal`). Guests may override per-message via `publish-with-urgency`.
@@ -780,7 +781,7 @@ pub struct WasmConsumerIoPortRaw {
     pub port: String,
     /// Absent ⇒ the port's own anonymous non-transportable channel. Present ⇒ a
     /// named auto channel at this full scheme-qualified address. Must be absent
-    /// when a `[[connection]]` lists this port.
+    /// when a `link` binds this port.
     ///
     /// A `local:` name here is a *server* ring: only backend bindings join it.
     /// `local:` namespaces are private per realm, so a surface binding on the
@@ -1108,9 +1109,9 @@ pub type AttachPrincipalBudgets = Vec<(Option<String>, AttachSendBudget)>;
 pub struct SurfaceSubscriptionRaw {
     /// Full scheme-qualified channel address to subscribe.
     ///
-    /// `None` makes this a **free port**: exactly one `[[connection]]` must
-    /// reference it (as `surface:<slug>#<instance>/<port>`) to supply the
-    /// channel. Bound by no connection, it is dead config and a boot panic.
+    /// `None` makes this a **free port**: exactly one `link` must bind it to
+    /// supply the channel. Bound by no link, it is dead config and a boot
+    /// panic.
     pub channel: Option<String>,
     /// Declared component instance receiving deliveries on this binding.
     pub instance: String,
@@ -1166,8 +1167,8 @@ pub struct SurfaceOutputRaw {
     pub port: String,
     /// Full scheme-qualified channel address the port publishes onto.
     ///
-    /// `None` makes this a **free port**, bound by exactly one `[[connection]]`;
-    /// see [`SurfaceSubscriptionRaw::channel`].
+    /// `None` makes this a **free port**, bound by exactly one `link`; see
+    /// [`SurfaceSubscriptionRaw::channel`].
     pub channel: Option<String>,
     /// Default urgency for messages published on this port (port → `normal`),
     /// mirroring `[[wasm_consumer]] [[output]] urgency`. Components override it
@@ -1201,7 +1202,7 @@ pub struct SurfaceOutputRaw {
 /// input binding and one output binding on the *same* channel, so a component
 /// sees its own publishes there by construction.
 ///
-/// The default (no `channel`, no `[[connection]]`) is a **page-local** channel —
+/// The default (no `channel`, no `link`) is a **page-local** channel —
 /// per-session, browser-side, never on the server ring — riding the same
 /// declared-by-bindings `local:` machinery as any `local:` surface binding.
 ///
@@ -1220,7 +1221,7 @@ pub struct SurfaceIoPortRaw {
     pub port: String,
     /// Absent ⇒ the port's own anonymous page-local channel. Present ⇒ a named
     /// auto channel at this full scheme-qualified address. Must be absent when a
-    /// `[[connection]]` lists this port.
+    /// `link` binds this port.
     ///
     /// A `local:` name here stays page-local: other bindings *on this surface*
     /// join the one page ring, and nothing on the server can. Reaching the
@@ -1230,7 +1231,7 @@ pub struct SurfaceIoPortRaw {
     /// Queue depth for the input half. Required, in either realm: the port
     /// queue lives in page memory and must resolve bounded, and in the server
     /// realm — a named `ephemeral:`/`brenn:` address, or membership in a
-    /// wire-spanning `[[connection]]` — it also feeds the channel's depth fold.
+    /// wire-spanning `link` — it also feeds the channel's depth fold.
     pub push_depth: Option<Depth>,
     /// Retain depth for the input half. Required, and in the server realm it
     /// feeds the auto channel's depths via the same fold as
@@ -1821,18 +1822,45 @@ pub fn build_channel_entries(
         // Class-uniform: every scheme states its own depths and inherits
         // channel → global for noise and wake_min. A depth has no global rung —
         // sizing the window is the decision this block exists to record.
-        let push_depth = ch.push_depth.unwrap_or_else(|| {
-            panic!(
-                "config: [[channel]] {canonical:?} requires push_depth — how many unseen \
-                 messages one activation hands over is a sizing decision, not a default"
-            )
-        });
-        let retain_depth = ch.retain_depth.unwrap_or_else(|| {
-            panic!(
-                "config: [[channel]] {canonical:?} requires retain_depth — the retained \
-                 window is sized for the outage it must survive, not defaulted"
-            )
-        });
+        // Only a depth this block's role and durability require is fetched here;
+        // the ones it may omit are computed from the ones it stated.
+        let stated = |key: ChannelDepthKey, value: Option<Depth>, why: &str| -> Depth {
+            match value {
+                Some(depth) => depth,
+                None if depth_required(key, ChannelBlockRole::Declaring, capabilities.durable) => {
+                    panic!(
+                        "config: [[channel]] {canonical:?} requires {} — {why}",
+                        key.word(),
+                    )
+                }
+                None => unreachable!(
+                    "{} is not required of this block, so nothing fetches it",
+                    key.word(),
+                ),
+            }
+        };
+        let push_depth = stated(
+            ChannelDepthKey::PushDepth,
+            ch.push_depth,
+            "how many unseen messages one activation hands over is a sizing decision, not a \
+             default",
+        );
+        let retain_depth = stated(
+            ChannelDepthKey::RetainDepth,
+            ch.retain_depth,
+            "the retained window is sized for the outage it must survive, not defaulted",
+        );
+        assert!(
+            standing_admitted(capabilities.durable) || ch.standing_retain_depth.is_none(),
+            "config: [[channel]] {canonical:?} must not set standing_retain_depth — \
+             it is the durable reaper's frontier; a non-durable channel's retention \
+             is retain_depth alone",
+        );
+        assert!(
+            sink_admitted(capabilities.durable) || ch.sink.is_none(),
+            "config: [[channel]] {canonical:?} must not set sink — a non-durable \
+             channel evicts from memory and has nothing to archive",
+        );
         let noise = ch.noise.unwrap_or(defaults.default_noise);
         let wake_min = ch.wake_min.unwrap_or(defaults.default_wake_min);
         let send_rate = ch.send_rate.unwrap_or(defaults.default_send_rate);
@@ -1840,27 +1868,15 @@ pub fn build_channel_entries(
 
         let (standing_retain_depth, sink) = if capabilities.durable {
             (
-                ch.standing_retain_depth.unwrap_or_else(|| {
-                    panic!(
-                        "config: [[channel]] {canonical:?} requires standing_retain_depth — \
-                         it is the reaper's disk frontier and bounds what the channel keeps \
-                         for subscribers that do not exist yet"
-                    )
-                }),
+                stated(
+                    ChannelDepthKey::StandingRetainDepth,
+                    ch.standing_retain_depth,
+                    "it is the reaper's disk frontier and bounds what the channel keeps for \
+                     subscribers that do not exist yet",
+                ),
                 ch.sink.unwrap_or(defaults.default_sink),
             )
         } else {
-            assert!(
-                ch.standing_retain_depth.is_none(),
-                "config: [[channel]] {canonical:?} must not set standing_retain_depth — \
-                 it is the durable reaper's frontier; a non-durable channel's retention \
-                 is retain_depth alone",
-            );
-            assert!(
-                ch.sink.is_none(),
-                "config: [[channel]] {canonical:?} must not set sink — a non-durable \
-                 channel evicts from memory and has nothing to archive",
-            );
             assert!(
                 retain_depth != Depth::Unbounded,
                 "config: [[channel]] {canonical:?} retain_depth must be bounded — \
@@ -2021,16 +2037,6 @@ impl SystemChannelFamily {
     }
 }
 
-/// Which role a `[[channel]]` block plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelBlockRole {
-    /// Mints a `ChannelEntry` for an operator-owned `brenn:`/`ephemeral:`/`local:`
-    /// channel.
-    Declaring,
-    /// Supplies depths and knobs for channels the system mints. Mints nothing.
-    Tuning,
-}
-
 /// The role a block keyed by this exact address plays. An address in a
 /// system-minted family tunes; anything else declares.
 pub fn channel_block_role(address: &str) -> ChannelBlockRole {
@@ -2186,19 +2192,31 @@ pub fn build_system_channel_tuning(
              description — the endpoint/tool that mints the channel owns it",
         );
 
-        let depth = |field: &str, value: Option<Depth>| -> Depth {
-            value.unwrap_or_else(|| {
-                panic!(
-                    "config: [[channel]] {label} requires {field} — a system-minted channel \
-                     has a bounded in-code default, and a block that tunes it states every \
-                     depth rather than inheriting some of them"
-                )
-            })
+        let stated = |key: ChannelDepthKey, value: Option<Depth>| -> Depth {
+            let required = depth_required(key, ChannelBlockRole::Tuning, TUNING_DURABILITY_IGNORED);
+            match value {
+                Some(depth) => depth,
+                None if required => {
+                    panic!(
+                        "config: [[channel]] {label} requires {} — a system-minted channel \
+                         has a bounded in-code default, and a block that tunes it states every \
+                         depth rather than inheriting some of them",
+                        key.word(),
+                    )
+                }
+                None => unreachable!(
+                    "a tuning block requires every depth, so {} has no unstated form here",
+                    key.word(),
+                ),
+            }
         };
         let entry = SystemChannelTuningEntry {
-            push_depth: depth("push_depth", ch.push_depth),
-            retain_depth: depth("retain_depth", ch.retain_depth),
-            standing_retain_depth: depth("standing_retain_depth", ch.standing_retain_depth),
+            push_depth: stated(ChannelDepthKey::PushDepth, ch.push_depth),
+            retain_depth: stated(ChannelDepthKey::RetainDepth, ch.retain_depth),
+            standing_retain_depth: stated(
+                ChannelDepthKey::StandingRetainDepth,
+                ch.standing_retain_depth,
+            ),
             noise: ch.noise,
             sink: ch.sink,
             wake_min: ch.wake_min,
@@ -5633,7 +5651,8 @@ new router: Router { component_path = "/lib/r.wasm"; grants = []; subscribe_acls
     /// dormant). The channel itself remains present but with no subscriber.
     #[test]
     fn merge_revokes_row_when_policy_does_not_cover_channel() {
-        use crate::access::{AppCapability, AppPolicy};
+        use crate::access::AppPolicy;
+        use brenn_envelope::grants::AppCapability;
 
         let (dir, address) = directory_with_one_channel();
         let chan_uuid = dir.list()[0].uuid;

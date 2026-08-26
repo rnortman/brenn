@@ -509,6 +509,7 @@ dependencies = [
  "brenn-common",
  "brenn-db",
  "brenn-dsl",
+ "brenn-envelope",
  "brenn-git",
  "brenn-graf",
  "brenn-hooks",
@@ -889,6 +890,7 @@ dependencies = [
  "async-trait",
  "base64ct",
  "brenn-db",
+ "brenn-envelope",
  "brenn-lib",
  "brenn-messaging-store",
  "libc",
@@ -967,6 +969,7 @@ dependencies = [
  "async-trait",
  "base64ct",
  "brenn-db",
+ "brenn-envelope",
  "brenn-lib",
  "brenn-messaging-store",
  "brenn-obs",
@@ -1220,6 +1223,7 @@ name = "brenn-tool-registry"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "brenn-envelope",
  "brenn-git",
  "brenn-lib",
  "brenn-messaging",

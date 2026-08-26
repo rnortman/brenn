@@ -244,7 +244,9 @@ mod tests {
         // exactly as the operator's `pwa_push` grant would.
         let mut policy = crate::access::AppPolicy::default();
         if push_authorized {
-            policy.grants.insert(crate::access::AppCapability::PwaPush);
+            policy
+                .grants
+                .insert(brenn_envelope::grants::AppCapability::PwaPush);
         }
         // AppConfig is a large struct; use a minimal builder approach.
         AppConfig {

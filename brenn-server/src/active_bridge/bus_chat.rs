@@ -1685,7 +1685,7 @@ mod tests {
             app.allowed_users = vec!["bob".to_string()];
             app.policy
                 .grants
-                .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+                .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
             app.policy
                 .acls
                 .brenn_subscribe
@@ -3894,7 +3894,7 @@ mod tests {
             app.policy = brenn_lib::access::AppPolicy::default();
             app.policy
                 .grants
-                .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+                .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
             app.policy
                 .acls
                 .brenn_subscribe

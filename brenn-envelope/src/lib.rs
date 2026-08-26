@@ -5,7 +5,9 @@
 //! address vocabulary all three of its consumer classes state in common: the
 //! host, the WASM guests, and the `.brenn` configuration front end, which is
 //! neither. [`grants`] holds the component capability vocabulary those same
-//! three read, plus the surface kernel. It is intentionally kept free of host-only
+//! three read, plus the surface kernel; [`channel_model`] holds the shape of a
+//! channel block, which the front end and the boot builders both decide. It is
+//! intentionally kept free of host-only
 //! dependencies (tokio, sqlite, etc.) so that guest components may depend on it
 //! directly when compiled to `wasm32-unknown-unknown`.
 //!
@@ -25,6 +27,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub mod addressing;
+pub mod channel_model;
 pub mod chat;
 pub mod grants;
 

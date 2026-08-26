@@ -46,11 +46,12 @@ macro_rules! dom_any {
 
 /// A backend-hosted fixture class's header, permitting everything a top-level
 /// host admits:
-/// `abi = processor; requires = []; optional = [ports, store, log, alert, config, mqtt];`
+/// `abi = processor; requires = []; optional = [ports, store, log, alert, config, mqtt,
+/// tools];`
 #[macro_export]
 macro_rules! processor_any {
     () => {
-        "abi = processor; requires = []; optional = [ports, store, log, alert, config, mqtt];"
+        "abi = processor; requires = []; optional = [ports, store, log, alert, config, mqtt, tools];"
     };
 }
 

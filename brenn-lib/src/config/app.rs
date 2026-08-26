@@ -167,7 +167,7 @@ pub struct AppConfigRaw {
     /// forcing the operator to migrate to this explicit `grants` surface (tests
     /// in `config/tests/app_parse.rs`). An agent that states neither `grants`
     /// nor `acl` is deny-everything.
-    pub grants: Vec<crate::access::AppCapability>,
+    pub grants: Vec<brenn_envelope::grants::AppCapability>,
     /// Layer-2 ACLs, from the agent's `acl` statements. Absent ⇒ all matcher lists empty.
     /// Resolved into the app's `AppPolicy` by `resolve_access_policies` in
     /// `config/resolve.rs`.
@@ -356,10 +356,10 @@ impl AppConfig {
     /// now done; this method is no longer on either side of that split.
     pub fn messaging_enabled(&self) -> bool {
         self.policy
-            .has_grant(crate::access::AppCapability::MessagingPublish)
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
             || self
                 .policy
-                .has_grant(crate::access::AppCapability::MessagingSubscribe)
+                .has_grant(brenn_envelope::grants::AppCapability::MessagingSubscribe)
     }
 
     /// Whether PWA push is enabled for this app.
@@ -371,7 +371,8 @@ impl AppConfig {
     /// subscription messages, `PushSend` / `PushListTargets` tool execution,
     /// and `MessageListChannels` pwa_push enumeration.
     pub fn pwa_push_enabled(&self) -> bool {
-        self.policy.has_grant(crate::access::AppCapability::PwaPush)
+        self.policy
+            .has_grant(brenn_envelope::grants::AppCapability::PwaPush)
     }
 
     /// Resolved messaging send budget for this app: the agent's own

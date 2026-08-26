@@ -200,7 +200,7 @@ impl AutomationEngine {
         };
         if !app_config
             .policy
-            .has_grant(brenn_lib::access::AppCapability::MessagingPublish)
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
         {
             return CreateResult::MissingSender;
         }
@@ -412,7 +412,7 @@ impl AutomationEngine {
         // folding into the unified address error below.
         if !app_config
             .policy
-            .has_grant(brenn_lib::access::AppCapability::MessagingPublish)
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
         {
             return EditResult::Unauthorized(format!(
                 "app {caller_app_slug:?} holds no messaging_publish grant"
@@ -807,7 +807,7 @@ mod tests {
         // a subscribe-only one. `messaging_enabled()` reads the grant set, so it
         // is still true; only the publish grant is missing.
         app_cfg.policy = brenn_lib::access::AppPolicy::with_grants(&[
-            brenn_lib::access::AppCapability::MessagingSubscribe,
+            brenn_envelope::grants::AppCapability::MessagingSubscribe,
         ]);
         let mut apps = indexmap::IndexMap::new();
         apps.insert("test-app".to_string(), app_cfg);
@@ -1179,7 +1179,7 @@ mod tests {
     /// `"allowed"` — every other channel is out of publish scope.
     fn restricted_publish_policy() -> brenn_lib::access::AppPolicy {
         let mut p = brenn_lib::access::AppPolicy::with_grants(&[
-            brenn_lib::access::AppCapability::MessagingPublish,
+            brenn_envelope::grants::AppCapability::MessagingPublish,
         ]);
         p.acls
             .brenn_publish
@@ -1339,7 +1339,7 @@ mod tests {
         let mut policy = restricted_publish_policy();
         policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         policy
             .acls
             .brenn_subscribe

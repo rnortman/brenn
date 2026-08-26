@@ -267,7 +267,7 @@ mod tests {
     use crate::store::{OverflowEvent, RingStores};
     use crate::testutils::{ephemeral_channel_entry, local_channel_entry};
     use crate::{MessagingDirectory, MessagingGlobalConfig, WakeRouter};
-    use brenn_lib::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::ChannelMatcher;
 
     const CHANNEL: &str = "ephemeral:protobar";

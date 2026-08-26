@@ -102,7 +102,7 @@ async fn build_webhook_messenger(
         myapp
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::Webhook);
+            .insert(brenn_envelope::grants::AppCapability::Webhook);
         myapp
             .policy
             .acls
@@ -203,7 +203,7 @@ async fn build_mqtt_messenger(
         myapp
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MqttSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         myapp
             .policy
             .acls

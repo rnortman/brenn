@@ -23,6 +23,12 @@ channel at prefix "mqtt:broker:alice/" {
     retain_depth = 16;
 }
 
+// An anonymous channel: no address, no body, and no `channel` block anywhere.
+// Which ring it lands on and what it is called are decided at boot from the
+// ports bound to it.
+/// Frames the echo stub hands the reserved-port demo.
+link relay;
+
 component Protobar {
     abi = dom;
     requires = [ports, log];
@@ -113,13 +119,16 @@ new alice_pa: PersonalAssistant(slug = "alice-pa", user = "alice", ws = ws_alice
 
 new alice_desk: Deskbar(slug = "alice-desk", driver = alice_pa);
 
+// The `client` entry that authorizes egress is what mints the sink, so the
+// sink's budget rides the entry's tail rather than a block of its own.
 new consume_demo: EchoStub {
     slug = "consume-demo";
     component_path = f"{components_dir}/brenn_echo_stub.wasm";
-    grants = [ports];
+    grants = [ports, mqtt];
 
     in inbound <- "webhook:push-alice" { push_depth = 50; noise = alarm; }
-    out outbound -> wasm_demo_out;
+    out outbound -> relay;
+    acl publish [client "mqtt:broker" { publish_per_activation = 2.0, publish_capacity = 4.0 }];
 }
 
 new reserved_demo: Reserved {
@@ -127,7 +136,7 @@ new reserved_demo: Reserved {
     component_path = f"{components_dir}/brenn_reserved.wasm";
     grants = [ports];
 
-    in in <- "webhook:push-bob" { push_depth = 4; }
+    in in <- relay { push_depth = 4; retain_depth = 8; }
     out out -> wasm_demo_out;
 }
 

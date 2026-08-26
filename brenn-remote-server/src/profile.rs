@@ -19,7 +19,8 @@ mod tests;
 use std::sync::Arc;
 
 use brenn_envelope::ChannelScheme;
-use brenn_lib::access::{AppCapability, AppPolicy};
+use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::config::{Depth, NoiseLevel};
 use brenn_lib::messaging::remote::{RemoteDepths, RemoteSubscribeAcl, ResolvedRemote};
 use brenn_lib::messaging::{AttachScope, ParticipantId, SubscriberEntry, SubscriberEntryKind};

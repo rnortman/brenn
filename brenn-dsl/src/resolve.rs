@@ -20,6 +20,7 @@ use brenn_envelope::addressing::is_unreserved_name;
 use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -33,17 +34,19 @@ use crate::model::{
     AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem,
     AttachmentTargetAttrs, Attr, AttrBlock, AttrMap, Binding as BindStmt, ChanAddr, ChanRef,
     ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
-    InlineTable, InstBody, IntOrWord, IoTail, Item, MapValues, Matcher, MatcherVal, McpServerStmt,
-    MountStmt, MountTail, NamedAttrDef, NewStmt, OutTail, Param, ParamList, PathRef, PathSeg,
-    PortDir as DeclDir, SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail,
-    SurfaceDef, TypedBlock, UseStmt, UuidPin, Value, WordList,
+    InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapValues, Matcher, MatcherVal,
+    McpServerStmt, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs, OutTail, Param,
+    ParamList, PathRef, PathSeg, PortDir as DeclDir, RateLimitAttrs, SectionNode, StrLike, StrLit,
+    StrPart, SubscribeStmt, SubscribeTail, SurfaceDef, ToolBlock, TypedBlock, UseStmt, UuidPin,
+    Value, WordList,
 };
 use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
-    Abi, ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RAttachmentTarget,
-    RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks, RMatcher, RMatcherVal,
-    RMcp, RMount, RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTail, RTuning,
-    RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, str_value,
+    Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent,
+    RAttachmentTarget, RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks,
+    RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort, RRateLimit, RRemote, RSection,
+    RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal, RValue, RWebhook, RWebhookBlock,
+    RWordList, ResolvedConfig, str_value,
 };
 
 /// The module key of the root file: the crate root has no path to name it by.
@@ -268,6 +271,7 @@ pub enum SymKind {
     AgentClass,
     Assembly,
     Channel,
+    Link,
     Surface,
     Instance,
     Remote,
@@ -286,6 +290,7 @@ impl SymKind {
             SymKind::AgentClass => "an agent class",
             SymKind::Assembly => "an assembly",
             SymKind::Channel => "a channel",
+            SymKind::Link => "a link",
             SymKind::Surface => "a surface",
             SymKind::Instance => "an instance",
             SymKind::Remote => "a remote",
@@ -614,6 +619,7 @@ fn stamped_name(item: &AssemblyItem) -> Option<&Spanned<String>> {
             // A tuning block has no handle: it is a matcher, not an identity.
             crate::model::ChannelDef::Tuning(_) => None,
         },
+        AssemblyItem::Link(stmt) => Some(&stmt.handle),
         AssemblyItem::Surface(def) => Some(&def.name),
         AssemblyItem::Inst(inst) => Some(&inst.handle),
         // A grant declares nothing; it names two things already declared.
@@ -633,6 +639,7 @@ fn declared_name(item: &Item) -> Option<(SymKind, &Spanned<String>)> {
             // A tuning block has no handle: it is a matcher, not an identity.
             crate::model::ChannelDef::Tuning(_) => return None,
         },
+        Item::Link(stmt) => (SymKind::Link, &stmt.handle),
         Item::Surface(def) => (SymKind::Surface, &def.name),
         Item::Inst(stmt) => (SymKind::Instance, &stmt.handle),
         Item::Remote(def) => (SymKind::Remote, &def.name),
@@ -880,6 +887,14 @@ pub trait ValueScope {
 
     /// The declared channel a path names, for an `exact` matcher.
     fn lookup_channel(&self, path: &PathRef, span: &Span) -> Result<ChanId, Diagnostic>;
+
+    /// What a binding's handle names: a declared channel, or a link.
+    ///
+    /// One method rather than two lookups at the call site, because which of
+    /// the two a handle is comes from the symbol it resolves to and nothing
+    /// else — asking for a channel first would report "not a channel" about a
+    /// link the binding is entitled to name.
+    fn lookup_chan_target(&self, path: &PathRef, span: &Span) -> Result<RChanRef, Diagnostic>;
 }
 
 /// The scope a leaf position has: none.
@@ -903,6 +918,10 @@ impl ValueScope for LeafScope {
             "a channel reference is not legal here",
             span.clone(),
         ))
+    }
+
+    fn lookup_chan_target(&self, path: &PathRef, span: &Span) -> Result<RChanRef, Diagnostic> {
+        self.lookup_channel(path, span).map(RChanRef::Decl)
     }
 }
 
@@ -1104,6 +1123,16 @@ fn interpolate(fstr: &crate::model::FStr, scope: &impl ValueScope) -> Result<Str
 
 // ── the file-scope value scope ───────────────────────────────────────────────
 
+/// A handle path as the tables key it: the head and its `.`-segments joined.
+fn dotted_path(head: &str, rest: &[&Spanned<String>]) -> String {
+    let mut dotted = head.to_string();
+    for segment in rest {
+        dotted.push('.');
+        dotted.push_str(segment.value());
+    }
+    dotted
+}
+
 /// What a file's dotted handles name.
 ///
 /// One keying rule for every kind of handle a document can reach: the file a
@@ -1137,35 +1166,29 @@ impl<T: Copy> HandleTable<T> {
     fn get(&self, file: usize, handle: &str) -> Option<T> {
         self.by_handle.get(&file)?.get(handle).copied()
     }
-}
 
-/// Every declared channel, found the way a document names one.
-///
-/// Keyed by the declaration rather than by address: two spellings of one
-/// address are a refusal, not a lookup, and a reference names a handle.
-pub(crate) type ChannelTable = HandleTable<ChanId>;
-
-impl HandleTable<ChanId> {
-    /// Record a declaration. The id is the channel's position in the config.
+    /// Record a declaration. The id is the entity's position in the config.
     ///
     /// A handle reaches this once: duplicates at a file's top level are refused
-    /// by the index pass and inside an assembly body by [`check_bodies`],
-    /// so a second insert under one handle would mean a reference resolves to a
-    /// channel no one named.
-    fn declare(&mut self, file: usize, handle: &str, id: ChanId) {
+    /// by the index pass and inside an assembly body by [`check_bodies`], so a
+    /// second insert under one handle would mean a reference resolves to an
+    /// entity no one named. `noun` is what the panic calls the space.
+    fn declare(&mut self, noun: &'static str, file: usize, handle: &str, id: T) {
         let prior = self.record(file, handle.to_string(), id);
         assert!(
             prior.is_none(),
-            "channel handle `{handle}` declared twice in file {file}"
+            "{noun} handle `{handle}` declared twice in file {file}"
         );
     }
+}
 
+impl<T: Copy + Eq + Hash> HandleTable<T> {
     /// Apply an id remapping after renumbering.
     ///
     /// Stamped ids are minted in the order the instantiations completed and
     /// renumbered into source order once expansion is done; the table has to
-    /// follow, or a reference resolves to the position some other channel took.
-    fn renumber(&mut self, remap: &HashMap<ChanId, ChanId>) {
+    /// follow, or a reference resolves to the position some other entity took.
+    fn renumber(&mut self, remap: &HashMap<T, T>) {
         for handles in self.by_handle.values_mut() {
             for id in handles.values_mut() {
                 if let Some(fresh) = remap.get(id) {
@@ -1175,6 +1198,18 @@ impl HandleTable<ChanId> {
         }
     }
 }
+
+/// Every declared channel, found the way a document names one.
+///
+/// Keyed by the declaration rather than by address: two spellings of one
+/// address are a refusal, not a lookup, and a reference names a handle.
+pub(crate) type ChannelTable = HandleTable<ChanId>;
+
+/// Every declared link, found the way a document names one.
+///
+/// The [`ChannelTable`] discipline, on the other handle space: a link is
+/// referenced by handle and by nothing else, so nothing else can key it.
+pub(crate) type LinkTable = HandleTable<LinkId>;
 
 /// What an instantiation stamped, and what kind of entity it is.
 ///
@@ -1228,6 +1263,9 @@ struct FileScope<'a> {
     /// The channels declared so far. Empty while the addresses themselves are
     /// being resolved: an address cannot name a channel.
     channels: &'a ChannelTable,
+    /// The links declared so far. Never empty for the same reason the channels
+    /// are: a link has no address to resolve.
+    links: &'a LinkTable,
     /// What the instantiations expanded so far stamped.
     stamps: &'a StampTable,
 }
@@ -1241,12 +1279,14 @@ impl<'a> FileScope<'a> {
         index: &'a Index,
         file: usize,
         channels: &'a ChannelTable,
+        links: &'a LinkTable,
         stamps: &'a StampTable,
     ) -> FileScope<'a> {
         FileScope {
             index,
             file,
             channels,
+            links,
             stamps,
         }
     }
@@ -1279,17 +1319,51 @@ impl ValueScope for FileScope<'_> {
 
     fn lookup_channel(&self, path: &PathRef, span: &Span) -> Result<ChanId, Diagnostic> {
         let (symbol, name, rest) = self.symbol(path, span)?;
+        self.channel_of(&symbol, &name, &rest, span)
+    }
+
+    fn lookup_chan_target(&self, path: &PathRef, span: &Span) -> Result<RChanRef, Diagnostic> {
+        let (symbol, name, rest) = self.symbol(path, span)?;
+        // A stamped handle is reached through the instance that stamped it, and
+        // which of the two spaces it lands in is the table's answer, not the
+        // symbol's: the symbol is the instantiation either way.
+        if !rest.is_empty() || symbol.kind != SymKind::Link {
+            if symbol.kind == SymKind::Instance
+                && let Some(id) = self.links.get(symbol.file, &dotted_path(&name, &rest))
+            {
+                return Ok(RChanRef::Link(id));
+            }
+            return self
+                .channel_of(&symbol, &name, &rest, span)
+                .map(RChanRef::Decl);
+        }
+        self.links
+            .get(symbol.file, &name)
+            .map(RChanRef::Link)
+            .ok_or_else(|| Diagnostic::at(format!("link `{name}` did not resolve"), span.clone()))
+    }
+}
+
+impl FileScope<'_> {
+    /// The channel an already-resolved symbol and its `.`-segments name.
+    ///
+    /// Split out of [`ValueScope::lookup_channel`] so that the channel-target
+    /// lookup, which has resolved the symbol to ask about links first, does not
+    /// resolve it a second time.
+    fn channel_of(
+        &self,
+        symbol: &Symbol,
+        name: &str,
+        rest: &[&Spanned<String>],
+        span: &Span,
+    ) -> Result<ChanId, Diagnostic> {
         if let Some(segment) = rest.first() {
             // A channel an instantiation stamped is named through the handle it
             // was stamped under, and that handle is what the table holds it by.
             if symbol.kind != SymKind::Instance {
-                return Err(no_such_segment(&name, None, segment));
+                return Err(no_such_segment(name, None, segment));
             }
-            let mut dotted = name.clone();
-            for segment in &rest {
-                dotted.push('.');
-                dotted.push_str(segment.value());
-            }
+            let dotted = dotted_path(name, rest);
             return self.channels.get(symbol.file, &dotted).ok_or_else(|| {
                 Diagnostic::at(
                     format!("`{name}` stamps no channel `{dotted}`"),
@@ -1303,7 +1377,7 @@ impl ValueScope for FileScope<'_> {
                 span.clone(),
             ));
         }
-        self.channels.get(symbol.file, &name).ok_or_else(|| {
+        self.channels.get(symbol.file, name).ok_or_else(|| {
             Diagnostic::at(
                 format!("channel `{name}` did not resolve to an address"),
                 span.clone(),
@@ -1484,10 +1558,11 @@ impl<'a> Scope<'a> {
         index: &'a Index,
         file: usize,
         channels: &'a ChannelTable,
+        links: &'a LinkTable,
         stamps: &'a StampTable,
     ) -> Scope<'a> {
         Scope {
-            outer: FileScope::in_file(index, file, channels, stamps),
+            outer: FileScope::in_file(index, file, channels, links, stamps),
             params: None,
             prefix: None,
             root: file,
@@ -1524,17 +1599,21 @@ impl<'a> Scope<'a> {
         HandlePath::stamp(self.prefix, name)
     }
 
+    /// What this body stamped in one handle space under the name a path spells.
+    fn stamped_in<T: Copy>(&self, table: &HandleTable<T>, path: &PathRef) -> Option<T> {
+        let prefix = self.prefix?;
+        let head = format!("{}.{}", prefix.dotted(), path.head.value());
+        table.get(self.root, &dotted_path(&head, &Scope::segments(path)))
+    }
+
     /// The channel this body stamped under the name a path spells, if any.
     fn stamped(&self, path: &PathRef) -> Option<ChanId> {
-        let prefix = self.prefix?;
-        let mut dotted = prefix.dotted();
-        dotted.push('.');
-        dotted.push_str(path.head.value());
-        for segment in Scope::segments(path) {
-            dotted.push('.');
-            dotted.push_str(segment.value());
-        }
-        self.outer.channels.get(self.root, &dotted)
+        self.stamped_in(self.outer.channels, path)
+    }
+
+    /// The link this body stamped under the name a path spells, if any.
+    fn stamped_link(&self, path: &PathRef) -> Option<LinkId> {
+        self.stamped_in(self.outer.links, path)
     }
 
     /// The declaration a class path names.
@@ -1595,6 +1674,18 @@ impl ValueScope for Scope<'_> {
             if let Some(id) = self.stamped(path) {
                 return Ok(id);
             }
+            // A handle this body stamped as a link is a declaration the outer
+            // scope cannot see, so it would report a name that plainly exists
+            // as naming nothing.
+            if self.stamped_link(path).is_some() {
+                return Err(Diagnostic::at(
+                    format!(
+                        "`{}` names a link, not a channel",
+                        dotted_path(path.head.value(), &Scope::segments(path))
+                    ),
+                    span.clone(),
+                ));
+            }
             return self.outer.lookup_channel(path, span);
         };
         if let Some(segment) = Scope::segments(path).first() {
@@ -1615,6 +1706,21 @@ impl ValueScope for Scope<'_> {
                 span.clone(),
             )),
         }
+    }
+
+    fn lookup_chan_target(&self, path: &PathRef, span: &Span) -> Result<RChanRef, Diagnostic> {
+        // A parameter is never a link — an assembly takes channels, and a link
+        // has no address to hand across a parameter list — so a bound name is
+        // the channel lookup's whole business.
+        if self.param(path).is_none()
+            && let Some(id) = self.stamped_link(path)
+        {
+            return Ok(RChanRef::Link(id));
+        }
+        if self.param(path).is_none() && self.stamped(path).is_none() {
+            return self.outer.lookup_chan_target(path, span);
+        }
+        self.lookup_channel(path, span).map(RChanRef::Decl)
     }
 }
 
@@ -1735,12 +1841,25 @@ fn emit_entities(
     let modules: Vec<Vec<Spanned<Item>>> = files.into_iter().map(|(_, file)| file.items).collect();
     let mut config = Emitted::default();
     let (mut channels, declared, minted) = channel_addresses(index, &modules, errors);
+    let (mut links, minted_links) = link_handles(&modules);
     let mut stamps = StampTable::default();
     // Expansion runs between the addresses and the bodies: an assembly stamps
     // channels of its own, and a reference anywhere in the document may name
     // one of them.
-    let (stamped, failed) =
-        expand_assemblies(index, &modules, &mut channels, &mut stamps, minted, errors);
+    let (stamped, failed) = {
+        let mut handles = Handles {
+            channels: &mut channels,
+            links: &mut links,
+        };
+        expand_assemblies(
+            index,
+            &modules,
+            &mut handles,
+            &mut stamps,
+            (minted, minted_links),
+            errors,
+        )
+    };
     // An instantiation that was refused stamped nothing, and what it would
     // have stamped is not knowable: the whole space under its handle is
     // registered as declared so a grant naming one of those entities is not
@@ -1750,7 +1869,7 @@ fn emit_entities(
             config.withhold_stamps(inst.handle.value());
         }
     }
-    let classes = component_classes(index, &modules, &channels, &stamps, errors);
+    let classes = component_classes(index, &modules, &channels, &links, &stamps, errors);
     let agents = agent_classes(&modules);
 
     // Section multiplicity is decided over the whole document before any body
@@ -1772,7 +1891,7 @@ fn emit_entities(
     );
 
     for (position, items) in modules.into_iter().enumerate() {
-        let scope = Scope::top(index, position, &channels, &stamps);
+        let scope = Scope::top(index, position, &channels, &links, &stamps);
         for (offset, item) in items.into_iter().enumerate() {
             // Only a section can be in the set, and a refused one is dropped
             // whole rather than resolved.
@@ -1797,6 +1916,7 @@ fn emit_entities(
     let tables = Tables {
         index,
         channels: &channels,
+        links: &links,
         stamps: &stamps,
         classes: &classes,
         agents: &agents,
@@ -1827,10 +1947,11 @@ fn channel_addresses(
     // An address resolves under a scope with no channels in it: an address is
     // what a channel *is*, so naming one here would be circular.
     let empty = ChannelTable::default();
+    let nolinks = LinkTable::default();
     let unstamped = StampTable::default();
     let mut next = 0;
     for (position, items) in modules.iter().enumerate() {
-        let scope = Scope::top(index, position, &empty, &unstamped);
+        let scope = Scope::top(index, position, &empty, &nolinks, &unstamped);
         for (offset, item) in items.iter().enumerate() {
             let Item::Channel(def) = item.value() else {
                 continue;
@@ -1843,7 +1964,7 @@ fn channel_addresses(
                 Ok(address) => {
                     let id = handle.map(|handle| {
                         let id = ChanId(next);
-                        channels.declare(position, handle.value(), id);
+                        channels.declare("channel", position, handle.value(), id);
                         next += 1;
                         id
                     });
@@ -1854,6 +1975,27 @@ fn channel_addresses(
         }
     }
     (channels, declared, next)
+}
+
+/// Every top-level link's handle, and how many ids they took.
+///
+/// A separate walk from the channels' because there is nothing to resolve: a
+/// link declares a handle and stops. The ids are minted in source order and the
+/// emission pass pushes in the same order, which is what makes a [`LinkId`] the
+/// position it indexes.
+fn link_handles(modules: &[Vec<Spanned<Item>>]) -> (LinkTable, usize) {
+    let mut links = LinkTable::default();
+    let mut next = 0;
+    for (position, items) in modules.iter().enumerate() {
+        for item in items {
+            let Item::Link(stmt) = item.value() else {
+                continue;
+            };
+            links.declare("link", position, stmt.handle.value(), LinkId(next));
+            next += 1;
+        }
+    }
+    (links, next)
 }
 
 /// One top-level declaration, resolved into whatever it contributes.
@@ -1904,6 +2046,7 @@ fn emit_item(
             }
         }
         Item::Channel(def) => emit_channel(*def, declaration, scope, config, errors),
+        Item::Link(stmt) => emit_link(*stmt, scope, config),
         Item::Remote(def) => {
             let handle = HandlePath(vec![def.name.clone()]);
             let (attrs, mut refused) = resolve_attrs(def.attrs, scope, errors);
@@ -2058,6 +2201,32 @@ fn emit_channel(
             });
         }
     }
+}
+
+/// One `link` statement.
+///
+/// Nothing to resolve and nothing to refuse: the handle is its whole content,
+/// and every rule about a link is about the bindings that name it.
+fn emit_link(stmt: LinkStmt, scope: &Scope<'_>, config: &mut Emitted) {
+    // `LinkId` indexes `config.links`, and the ids were minted in a separate
+    // walk over the same items in the same order.
+    let id = LinkId(config.links.len());
+    let span = stmt.handle.span().clone();
+    let handle = scope.handle(stmt.handle);
+    assert_eq!(
+        scope
+            .outer
+            .links
+            .get(scope.root, &handle.dotted())
+            .map(|declared| declared.0),
+        Some(id.0),
+        "a link's id is its position in the resolved config"
+    );
+    config.links.push(RLink {
+        handle,
+        doc: stmt.doc,
+        span,
+    });
 }
 
 /// Which of a body's value positions were refused.
@@ -2739,12 +2908,13 @@ fn component_classes(
     index: &Index,
     modules: &[Vec<Spanned<Item>>],
     channels: &ChannelTable,
+    links: &LinkTable,
     stamps: &StampTable,
     errors: &mut Vec<Diagnostic>,
 ) -> ClassTable {
     let mut table = ClassTable::default();
     for (position, items) in modules.iter().enumerate() {
-        let scope = Scope::top(index, position, channels, stamps);
+        let scope = Scope::top(index, position, channels, links, stamps);
         for (offset, item) in items.iter().enumerate() {
             let Item::Component(class) = item.value() else {
                 continue;
@@ -3081,6 +3251,7 @@ fn emit_component(
             attrs: body.attrs,
             acls: body.acls,
             bindings: body.bindings,
+            tools: body.tools,
         },
         body.refused,
     ))
@@ -3104,6 +3275,7 @@ fn emit_consumer(
         attrs,
         bindings,
         acls,
+        tools,
         refused,
     } = instance_body(inst.body, &class, Placement::TopLevel, &at, scope, errors);
     // The slug is read unless the slug's own value was refused: a substitute
@@ -3139,6 +3311,7 @@ fn emit_consumer(
         attrs,
         acls,
         bindings,
+        tools,
         doc: inst.doc,
     });
 }
@@ -3278,6 +3451,7 @@ struct ResolvedBody {
     attrs: Vec<(String, RVal)>,
     bindings: Vec<RBinding>,
     acls: Vec<RAcl>,
+    tools: Vec<RToolGrant>,
     refused: Refused,
 }
 
@@ -3305,11 +3479,36 @@ fn instance_body(
     let (attrs, mut refused) = instance_attrs(&body.attrs, place, scope, errors);
     let mut bindings = Vec::new();
     let mut named_ports = Vec::new();
+    let bound = check_unique(
+        body.bindings.iter().enumerate().map(|(at, binding)| {
+            (
+                bound_port(binding).value().clone(),
+                at,
+                bound_port(binding).span(),
+            )
+        }),
+        |port, _, at, _, first| {
+            two_site(
+                format!("this instance binds port `{port}` twice; a port is wired once"),
+                at.clone(),
+                "first bound here",
+                first.clone(),
+            )
+        },
+        errors,
+    );
+    let kept: HashSet<usize> = bound.into_values().map(|(at, _)| at).collect();
     // A binding that could not be resolved leaves the instance wired to less
     // than it declared, so it withholds the instance the way a refused value
-    // does.
-    for binding in body.bindings {
+    // does. A port bound twice is the same: the repeat is dropped, the port is
+    // still claimed, and the required-port rule does not answer the mistake a
+    // second time.
+    for (at, binding) in body.bindings.into_iter().enumerate() {
         named_ports.push(bound_port(&binding).value().clone());
+        if !kept.contains(&at) {
+            refused.drop_part();
+            continue;
+        }
         match resolve_binding(binding, class, scope, errors) {
             Some(binding) => bindings.push(binding),
             None => refused.drop_part(),
@@ -3319,11 +3518,27 @@ fn instance_body(
     // is placed. A surface component's authority contains the component within
     // the surface; the surface's own is what the backend admits over the wire.
     let resolved = emit_acls(body.acls, scope, errors, &mut refused);
+    // A `tool` statement is authority over the registry, which only the backend
+    // host reaches: on a surface the statement is refused, and the instance is
+    // withheld the way any other refused part of its body withholds it.
+    let tools = match place {
+        Placement::Surface => {
+            if !body.blocks.is_empty() {
+                refuse_surface_blocks(&body.blocks, errors);
+                refused.drop_part();
+            }
+            Vec::new()
+        }
+        Placement::TopLevel => {
+            emit_tool_grants(&body.blocks, "an instance", scope, errors, &mut refused)
+        }
+    };
     check_required_ports(class, &named_ports, at, errors);
     ResolvedBody {
         attrs,
         bindings,
         acls: resolved,
+        tools,
         refused,
     }
 }
@@ -3540,13 +3755,11 @@ fn port_list(class: &ClassRef) -> String {
         .join(", ")
 }
 
-/// What a binding names: a declared channel, or a literal address where no
-/// declaration exists.
+/// What a binding names: a declared channel, a declared link, or a literal
+/// address where no declaration exists.
 fn resolve_chan_ref(chan: &ChanRef, scope: &impl ValueScope) -> Result<RChanRef, Diagnostic> {
     match chan {
-        ChanRef::Handle(path) => Ok(RChanRef::Decl(
-            scope.lookup_channel(path, path.head.span())?,
-        )),
+        ChanRef::Handle(path) => scope.lookup_chan_target(path, path.head.span()),
         ChanRef::Addr(text) => {
             let span = str_like_span(text);
             let address = resolve_str_like(text.value(), scope)?;
@@ -3747,6 +3960,7 @@ fn emit_agent(
             scope.outer.index,
             symbol.file,
             scope.outer.channels,
+            scope.outer.links,
             scope.outer.stamps,
         ),
         params: Some(&params),
@@ -3787,6 +4001,7 @@ fn emit_agent(
         hooks: blocks.hooks,
         attachment_targets: blocks.attachment_targets,
         integration_configs: blocks.integration_configs,
+        tools: blocks.tools,
         doc: inst.doc,
     };
     if refused.any() {
@@ -4103,6 +4318,7 @@ fn instance_is_an_agent(
         scope.outer.index,
         symbol.file,
         scope.outer.channels,
+        scope.outer.links,
         scope.outer.stamps,
     );
     // A class that does not resolve is refused where the instantiation is
@@ -4301,6 +4517,16 @@ fn emit_subs(
     for sub in subs {
         let (tail, tail_refused) = typed_tail(sub.tail, SubscribeTail::empty, scope, errors);
         match resolve_chan_ref(&sub.chan, scope) {
+            // A link is wired port to port; a conversation holds no port, so
+            // there is nothing on this side for a link to reach.
+            Ok(RChanRef::Link(_)) => {
+                errors.push(Diagnostic::at(
+                    "a `subscribe` statement names a channel, and this names a link: a link \
+                     connects ports, and an agent has none",
+                    chan_ref_span(&sub.chan),
+                ));
+                refused.drop_part();
+            }
             Ok(chan) if !tail_refused.any() => resolved.push(RSubscribe {
                 chan,
                 span: chan_ref_span(&sub.chan),
@@ -4325,6 +4551,7 @@ struct AgentBlocks {
     hooks: Vec<RHooks>,
     attachment_targets: Vec<RAttachmentTarget>,
     integration_configs: Vec<RSection>,
+    tools: Vec<RToolGrant>,
 }
 
 /// An agent's sub-blocks, typed by their kindword.
@@ -4344,6 +4571,7 @@ fn emit_blocks(
         hooks: Vec::new(),
         attachment_targets: Vec::new(),
         integration_configs: Vec::new(),
+        tools: Vec::new(),
     };
     let duplicates = duplicate_sections(
         blocks.iter().enumerate(),
@@ -4384,6 +4612,12 @@ fn emit_blocks(
                     }),
                 }
             }
+            // Two `tool` blocks under one name are already refused above, by
+            // the same rule that refuses two `start_hooks`.
+            AgentBlock::Tool(block) => match emit_tool_grant(*block, scope, errors) {
+                Some(grant) => resolved.tools.push(grant),
+                None => withhold.drop_part(),
+            },
             AgentBlock::AttachmentTarget(block) => {
                 match emit_attachment_target(*block, scope, errors) {
                     Some(target) => resolved.attachment_targets.push(target),
@@ -4497,6 +4731,220 @@ fn emit_handler(
     resolved
 }
 
+/// The `tool` statements a body holds, in declaration order.
+///
+/// Two statements naming one tool are two answers to one question — which
+/// invocations of it this participant reaches — so the second is refused here,
+/// ahead of the panic the resolved map raises for a hand-built config.
+fn emit_tool_grants(
+    blocks: &[SectionNode],
+    context: &str,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+    withhold: &mut Refused,
+) -> Vec<RToolGrant> {
+    let duplicates = duplicate_sections(
+        blocks.iter().enumerate(),
+        context,
+        crate::model::INSTANCE_BLOCK_KINDWORDS,
+        errors,
+    );
+    let mut resolved = Vec::new();
+    for (offset, node) in blocks.iter().enumerate() {
+        if duplicates.contains(&offset) {
+            withhold.drop_part();
+            continue;
+        }
+        let block = match crate::model::instance_block(node) {
+            Ok(crate::model::InstanceBlock::Tool(block)) => *block,
+            Err(error) => {
+                errors.push(error);
+                withhold.drop_part();
+                continue;
+            }
+        };
+        match emit_tool_grant(block, scope, errors) {
+            Some(grant) => resolved.push(grant),
+            None => withhold.drop_part(),
+        }
+    }
+    resolved
+}
+
+/// One `tool` statement: the tool it names, the `allow` clauses that narrow it,
+/// and the throttle it may carry.
+///
+/// `None` where any part of it did not come out whole. A grant that admits less
+/// than it says is a narrower authority than the operator wrote, and a grant
+/// that admits more is one they did not write at all.
+fn emit_tool_grant(
+    block: TypedBlock<OpenAttrs>,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<RToolGrant> {
+    let TypedBlock {
+        doc: _,
+        kindword: _,
+        name,
+        attrs,
+        subs,
+    } = block;
+    // The dispatch refuses a `tool` block with no name before this, so the
+    // absence here is that refusal already reported.
+    let tool = name?;
+    let mut whole = true;
+    // Everything a tool grant says, it says in a sub-block: the body itself has
+    // no key set, so a key here is a shape mistake rather than an unknown word.
+    for (key, value) in attrs.entries() {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{key}` is not a key of a `tool` statement: which invocations a grant \
+                 admits is written as `allow` blocks, and what throttles them as a \
+                 `rate_limit` block"
+            ),
+            value.span().clone(),
+        ));
+        whole = false;
+    }
+    let mut clauses = Vec::new();
+    let mut rate_limit = None;
+    let mut throttled: Option<Span> = None;
+    for node in &subs {
+        let sub = match crate::model::tool_block(node) {
+            Ok(sub) => sub,
+            Err(error) => {
+                errors.push(error);
+                whole = false;
+                continue;
+            }
+        };
+        match sub {
+            ToolBlock::Allow(block) => {
+                let block = *block;
+                refuse_subs(block.kindword.value(), &block.subs, errors);
+                let (attrs, refused) = resolve_attrs(block.attrs, scope, errors);
+                let entries = attrs.entries();
+                if entries.is_empty() {
+                    errors.push(Diagnostic::at(
+                        "an `allow` block with no requirements admits every invocation of \
+                         the tool, which is what a `tool` statement with no `allow` block \
+                         already says; write one or the other",
+                        block.kindword.span().clone(),
+                    ));
+                    whole = false;
+                    continue;
+                }
+                let mut clause = Vec::new();
+                for (key, value) in entries {
+                    match str_value(&value, "an `allow` requirement") {
+                        Ok(text) => clause.push((key, text.to_string())),
+                        Err(error) => {
+                            errors.push(error);
+                            whole = false;
+                        }
+                    }
+                }
+                match refused.any() || !whole {
+                    true => whole = false,
+                    false => clauses.push(clause),
+                }
+            }
+            ToolBlock::RateLimit(block) => {
+                let block = *block;
+                refuse_subs(block.kindword.value(), &block.subs, errors);
+                if let Some(prior) = &throttled {
+                    errors.push(two_site(
+                        "a `tool` grant carries one `rate_limit`: two buckets over one \
+                         tool have no order to apply in"
+                            .to_string(),
+                        block.kindword.span().clone(),
+                        "it is throttled here".to_string(),
+                        prior.clone(),
+                    ));
+                    whole = false;
+                    continue;
+                }
+                throttled = Some(block.kindword.span().clone());
+                let (attrs, refused) = resolve_attrs(block.attrs, scope, errors);
+                let RateLimitAttrs {
+                    burst,
+                    sustained_per_minute,
+                } = attrs;
+                let burst = rate_count(&burst.value, "burst", errors);
+                let sustained =
+                    rate_count(&sustained_per_minute.value, "sustained_per_minute", errors);
+                match (refused.any(), burst, sustained) {
+                    (false, Some(burst), Some(sustained_per_minute)) => {
+                        rate_limit = Some(RRateLimit {
+                            burst,
+                            sustained_per_minute,
+                        });
+                    }
+                    _ => whole = false,
+                }
+            }
+        }
+    }
+    match whole {
+        true => Some(RToolGrant {
+            tool,
+            clauses,
+            rate_limit,
+        }),
+        false => None,
+    }
+}
+
+/// One token-bucket parameter: a whole count of at least one.
+///
+/// Zero is refused here rather than at boot because it is spellable and
+/// meaningless: a bucket that holds nothing, or refills by nothing, throttles
+/// the grant to nothing and is a grant the operator did not mean to write.
+fn rate_count(value: &RVal, key: &str, errors: &mut Vec<Diagnostic>) -> Option<u32> {
+    let refuse = |message: String, errors: &mut Vec<Diagnostic>| {
+        errors.push(Diagnostic::at(message, value.span().clone()));
+        None
+    };
+    match value.value() {
+        RValue::Int(count) => match u32::try_from(*count) {
+            Ok(count) if count >= 1 => Some(count),
+            _ => refuse(
+                format!(
+                    "`{key}` is a count of at least one; this one throttles the grant to nothing"
+                ),
+                errors,
+            ),
+        },
+        other => refuse(
+            format!("`{key}` is a count; this is {}", other.kind()),
+            errors,
+        ),
+    }
+}
+
+/// Where a `tool` statement has no host to run on.
+///
+/// The double diagnosis a surface-placed instance gets: the statement is
+/// refused here, and the `tools` grant word is refused beside it by the host
+/// legality table.
+fn refuse_surface_blocks(blocks: &[SectionNode], errors: &mut Vec<Diagnostic>) {
+    for node in blocks {
+        let (kindword, span) = crate::model::section_kindword(node);
+        match crate::model::instance_block(node) {
+            // One arm per kindword, so a second word states its own reason
+            // instead of inheriting this one.
+            Ok(crate::model::InstanceBlock::Tool(_)) => errors.push(Diagnostic::at(
+                format!(
+                    "`{kindword}` is backend-only in v1: the surface host links no tools \
+                     interface, so a component placed on a surface reaches no registry tool"
+                ),
+                span,
+            )),
+            Err(error) => errors.push(error),
+        }
+    }
+}
+
 /// A statement's trailing block, deserialized into the statement form's own
 /// vocabulary.
 ///
@@ -4564,10 +5012,11 @@ impl Frame {
         &'a self,
         index: &'a Index,
         channels: &'a ChannelTable,
+        links: &'a LinkTable,
         stamps: &'a StampTable,
     ) -> Scope<'a> {
         Scope {
-            outer: FileScope::in_file(index, self.file, channels, stamps),
+            outer: FileScope::in_file(index, self.file, channels, links, stamps),
             params: Some(&self.params),
             prefix: self.prefix.as_ref(),
             root: self.root,
@@ -4585,6 +5034,8 @@ struct Stamped {
     item: AssemblyItem,
     /// A channel item's address and minted id, resolved by the walk.
     declaration: Option<ChannelDecl>,
+    /// A link item's minted id.
+    link: Option<LinkId>,
     frame: Rc<Frame>,
     /// Where this item's top-level instantiation was written, and how far into
     /// that expansion it came. Expansion completes in dependency order; the
@@ -4607,15 +5058,17 @@ struct Stamped {
 fn expand_assemblies(
     index: &Index,
     modules: &[Vec<Spanned<Item>>],
-    channels: &mut ChannelTable,
+    handles: &mut Handles<'_>,
     stamps: &mut StampTable,
-    minted: usize,
+    minted: (usize, usize),
     errors: &mut Vec<Diagnostic>,
 ) -> (Vec<Stamped>, HashSet<(usize, usize)>) {
+    let (minted, minted_links) = minted;
     let mut walk = Walk {
         index,
         assemblies: assembly_defs(modules),
         next: minted,
+        next_link: minted_links,
         out: Vec::new(),
         root: (0, 0),
         seq: 0,
@@ -4660,7 +5113,8 @@ fn expand_assemblies(
         for mut item in queue {
             item.waiting = Waits {
                 index,
-                channels,
+                channels: handles.channels,
+                links: handles.links,
                 stamps,
                 assemblies: &walk.assemblies,
                 pending: &pending,
@@ -4684,7 +5138,7 @@ fn expand_assemblies(
             let _expanded = walk.instantiate(
                 item.inst,
                 &item.frame,
-                channels,
+                handles,
                 stamps,
                 &mut Vec::new(),
                 &mut raised,
@@ -4725,8 +5179,29 @@ fn expand_assemblies(
             *id = fresh;
         }
     }
-    channels.renumber(&remap);
+    handles.channels.renumber(&remap);
+    let mut link_remap: HashMap<LinkId, LinkId> = HashMap::new();
+    let mut next_link = minted_links;
+    for item in &mut out {
+        if let Some(id) = &mut item.link {
+            let fresh = LinkId(next_link);
+            next_link += 1;
+            link_remap.insert(*id, fresh);
+            *id = fresh;
+        }
+    }
+    handles.links.renumber(&link_remap);
     (out, failed)
+}
+
+/// The two handle spaces a declaration lands in, carried together.
+///
+/// The expansion walk writes to both, and every scope it builds reads both, so
+/// they travel as one — separately they are two parameters that must never be
+/// passed in the wrong order and never one without the other.
+struct Handles<'a> {
+    channels: &'a mut ChannelTable,
+    links: &'a mut LinkTable,
 }
 
 /// A top-level instantiation the walk has not expanded yet.
@@ -4754,6 +5229,7 @@ struct Wait {
 struct Waits<'a> {
     index: &'a Index,
     channels: &'a ChannelTable,
+    links: &'a LinkTable,
     stamps: &'a StampTable,
     assemblies: &'a AssemblyTable,
     /// The instantiations that have not expanded yet.
@@ -4794,7 +5270,7 @@ impl Waits<'_> {
         params: &[&str],
         seen: &mut Vec<(usize, usize)>,
     ) -> Option<Wait> {
-        let scope = frame.scope(self.index, self.channels, self.stamps);
+        let scope = frame.scope(self.index, self.channels, self.links, self.stamps);
         if let Some(args) = inst.args.as_ref() {
             for arg in &args.args {
                 if let Some(wait) = self.wait_for(&scope, &arg.value, params) {
@@ -4914,6 +5390,8 @@ struct Walk<'a> {
     assemblies: AssemblyTable,
     /// The next channel id to mint.
     next: usize,
+    /// The next link id to mint.
+    next_link: usize,
     out: Vec<Stamped>,
     /// The top-level instantiation being expanded, which every item it stamps
     /// is ordered under.
@@ -4935,14 +5413,14 @@ impl Walk<'_> {
         &mut self,
         inst: &NewStmt,
         parent: &Rc<Frame>,
-        channels: &mut ChannelTable,
+        handles: &mut Handles<'_>,
         stamps: &mut StampTable,
         chain: &mut Vec<((usize, usize), String)>,
         errors: &mut Vec<Diagnostic>,
     ) -> Option<SymKind> {
         let span = inst.cls.head.span().clone();
         let symbol = {
-            let scope = parent.scope(self.index, channels, stamps);
+            let scope = parent.scope(self.index, handles.channels, handles.links, stamps);
             match scope.class(&inst.cls, &span) {
                 Ok((_, symbol)) => symbol,
                 Err(_) => return None,
@@ -4977,7 +5455,7 @@ impl Walk<'_> {
             return Some(SymKind::Assembly);
         }
         let params = {
-            let scope = parent.scope(self.index, channels, stamps);
+            let scope = parent.scope(self.index, handles.channels, handles.links, stamps);
             bind_args(
                 Some(&def.params),
                 inst.args.as_ref(),
@@ -5003,12 +5481,33 @@ impl Walk<'_> {
             let AssemblyItem::Channel(channel) = item.value() else {
                 continue;
             };
-            self.stamp_channel(channel, &frame, channels, stamps, errors);
+            self.stamp_channel(channel, &frame, handles, stamps, errors);
+        }
+        for item in &def.items {
+            let AssemblyItem::Link(stmt) = item.value() else {
+                continue;
+            };
+            let id = LinkId(self.next_link);
+            self.next_link += 1;
+            handles.links.declare(
+                "link",
+                frame.root,
+                &frame.stamp(stmt.handle.clone()).dotted(),
+                id,
+            );
+            self.out.push(Stamped {
+                item: item.value().clone(),
+                declaration: None,
+                link: Some(id),
+                frame: frame.clone(),
+                order: (self.root, self.seq),
+            });
+            self.seq += 1;
         }
         chain.push((site, def.name.value().clone()));
         for item in &def.items {
             match item.value() {
-                AssemblyItem::Channel(_) => {}
+                AssemblyItem::Channel(_) | AssemblyItem::Link(_) => {}
                 AssemblyItem::Surface(surface) => {
                     stamps.record(
                         frame.root,
@@ -5018,7 +5517,7 @@ impl Walk<'_> {
                     self.push(item.value().clone(), None, &frame);
                 }
                 AssemblyItem::Inst(nested) => {
-                    let kind = self.instantiate(nested, &frame, channels, stamps, chain, errors);
+                    let kind = self.instantiate(nested, &frame, handles, stamps, chain, errors);
                     if let Some(stamped) = kind.and_then(StampKind::of_class) {
                         stamps.record(
                             frame.root,
@@ -5043,6 +5542,7 @@ impl Walk<'_> {
         self.out.push(Stamped {
             item,
             declaration,
+            link: None,
             frame: frame.clone(),
             order: (self.root, self.seq),
         });
@@ -5053,7 +5553,7 @@ impl Walk<'_> {
         &mut self,
         def: &ChannelDef,
         frame: &Rc<Frame>,
-        channels: &mut ChannelTable,
+        handles: &mut Handles<'_>,
         stamps: &StampTable,
         errors: &mut Vec<Diagnostic>,
     ) {
@@ -5065,7 +5565,7 @@ impl Walk<'_> {
         // and nothing else — the same reason the declared addresses do.
         let empty = ChannelTable::default();
         let address = {
-            let scope = frame.scope(self.index, &empty, stamps);
+            let scope = frame.scope(self.index, &empty, handles.links, stamps);
             match resolve_address(addr, &scope) {
                 Ok(address) => address,
                 Err(error) => {
@@ -5081,7 +5581,12 @@ impl Walk<'_> {
         let id = handle.map(|handle| {
             let id = ChanId(self.next);
             self.next += 1;
-            channels.declare(frame.root, &frame.stamp(handle.clone()).dotted(), id);
+            handles.channels.declare(
+                "channel",
+                frame.root,
+                &frame.stamp(handle.clone()).dotted(),
+                id,
+            );
             id
         });
         self.push(
@@ -5096,6 +5601,7 @@ impl Walk<'_> {
 struct Tables<'a> {
     index: &'a Index,
     channels: &'a ChannelTable,
+    links: &'a LinkTable,
     stamps: &'a StampTable,
     classes: &'a ClassTable,
     agents: &'a AgentTable,
@@ -5110,12 +5616,13 @@ fn emit_stamped(
 ) {
     let scope = stamped
         .frame
-        .scope(tables.index, tables.channels, tables.stamps);
+        .scope(tables.index, tables.channels, tables.links, tables.stamps);
     let (classes, agents) = (tables.classes, tables.agents);
     match stamped.item {
         AssemblyItem::Channel(def) => {
             emit_channel(*def, stamped.declaration, &scope, config, errors)
         }
+        AssemblyItem::Link(stmt) => emit_link(*stmt, &scope, config),
         AssemblyItem::Surface(def) => emit_surface(*def, &scope, classes, config, errors),
         AssemblyItem::Inst(inst) => emit_inst(*inst, &scope, classes, agents, config, errors),
         AssemblyItem::Grant(stmt) => match emit_grant(*stmt, &scope) {
@@ -5390,6 +5897,8 @@ fn literal_addresses(config: &ResolvedConfig) -> Vec<(&str, &Span)> {
     let ResolvedConfig {
         channels: _,
         tunings: _,
+        // A link has no address at all, so it spells none.
+        links: _,
         uuid_pins: _,
         surfaces: _,
         consumers: _,
@@ -5587,6 +6096,7 @@ mod tests {
             .expect("the reference");
         let (index, _) = indexed(source);
         let channels = ChannelTable::default();
+        let links = LinkTable::default();
         let stamps = StampTable::default();
         let assemblies = AssemblyTable::new();
         let frame = Frame {
@@ -5595,7 +6105,7 @@ mod tests {
             prefix: None,
             params: ParamBindings::new(),
         };
-        let scope = frame.scope(&index, &channels, &stamps);
+        let scope = frame.scope(&index, &channels, &links, &stamps);
         let Value::Ref(path) = value.value() else {
             panic!("a reference");
         };
@@ -5605,6 +6115,7 @@ mod tests {
         let waits = Waits {
             index: &index,
             channels: &channels,
+            links: &links,
             stamps: &stamps,
             assemblies: &assemblies,
             pending: &pending,
@@ -5649,6 +6160,7 @@ mod tests {
         let assemblies = assembly_defs(&modules);
         let (index, _) = indexed(source);
         let channels = ChannelTable::default();
+        let links = LinkTable::default();
         let stamps = StampTable::default();
         let frame = Frame {
             file: 0,
@@ -5656,7 +6168,7 @@ mod tests {
             prefix: None,
             params: ParamBindings::new(),
         };
-        let scope = frame.scope(&index, &channels, &stamps);
+        let scope = frame.scope(&index, &channels, &links, &stamps);
         // The site of `new thing`, read the way the reference in either body
         // would read it.
         let probe = parse_str("const probe = thing;\n", "p.brenn").expect("a parse");
@@ -5670,6 +6182,7 @@ mod tests {
         let waits = Waits {
             index: &index,
             channels: &channels,
+            links: &links,
             stamps: &stamps,
             assemblies: &assemblies,
             pending: &pending,
@@ -5698,8 +6211,9 @@ mod tests {
         let file = parse_str(probe, "p.brenn").expect("a parse");
         let constant = file.consts().next().expect("one constant");
         let channels = ChannelTable::default();
+        let links = LinkTable::default();
         let stamps = StampTable::default();
-        let scope = FileScope::in_file(&index, 0, &channels, &stamps);
+        let scope = FileScope::in_file(&index, 0, &channels, &links, &stamps);
         let resolved = resolve_value(&constant.value, &scope)?;
         match resolved.value() {
             RValue::Str(text) => Ok(text.clone()),

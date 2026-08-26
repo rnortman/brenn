@@ -122,7 +122,7 @@ pub(crate) fn lower_consumer_load_parts(
         })
         .collect();
     // Exhaustive match: a new variant on either side is a compile error.
-    let mut grants: BTreeSet<Capability> = consumer
+    let grants: BTreeSet<Capability> = consumer
         .grants
         .iter()
         .map(|g| match g {
@@ -132,6 +132,7 @@ pub(crate) fn lower_consumer_load_parts(
             ComponentGrant::Alert => Capability::Alert,
             ComponentGrant::Config => Capability::Config,
             ComponentGrant::Mqtt => Capability::Mqtt,
+            ComponentGrant::Tools => Capability::Tools,
             // `takeover` names no WIT interface — it is consented to at a page
             // binding, not linked — and cannot reach this loader: the config
             // front end refuses the word on a top-level instance.
@@ -143,12 +144,16 @@ pub(crate) fn lower_consumer_load_parts(
             ),
         })
         .collect();
-    // No `ComponentGrant::Tools` variant — the `Tools` capability is derived from
-    // the presence of tool grants, not declared. The `tools` WIT interface
-    // links iff this capability is set.
-    if !consumer.policy.tool_grants.is_empty() {
-        grants.insert(Capability::Tools);
-    }
+    // The word and the statements it consents to are one configuration, refused
+    // at derive in either direction. Asserted again here because a hand-built
+    // config reaches this loader without passing through that refusal.
+    assert_eq!(
+        grants.contains(&Capability::Tools),
+        !consumer.policy.tool_grants.is_empty(),
+        "consumer {:?}: `tools` is granted iff the consumer names a tool — a grant with \
+         no tool reaches nothing, and a tool with no grant is authority nobody gave",
+        consumer.slug,
+    );
     // `brenn-wasm` never sees a brenn-lib type; this closure bridges the two.
     let policy = consumer.policy.clone();
     let output_acl: brenn_wasm::OutputAclFn = std::sync::Arc::new(move |addr: &str| {
@@ -1262,6 +1267,70 @@ fn assert_every_subscriber_wired(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resolved consumer with the given grant words and tool names, all
+    /// other fields defaulted.
+    fn tool_consumer(
+        grants: &[brenn_lib::messaging::ComponentGrant],
+        tools: &[&str],
+    ) -> brenn_lib::messaging::config::ResolvedWasmConsumer {
+        let mut policy = brenn_lib::access::AppPolicy::default();
+        for tool in tools {
+            policy.tool_grants.insert(
+                (*tool).to_string(),
+                brenn_lib::tools::ResolvedToolGrant {
+                    acl: Vec::new(),
+                    rate_limit: None,
+                },
+            );
+        }
+        brenn_lib::messaging::config::ResolvedWasmConsumer {
+            slug: "tooler".to_string(),
+            component_path: "/tmp/tooler.wasm".into(),
+            grants: grants.iter().copied().collect(),
+            store_path: None,
+            max_page_count: 1,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            config: std::collections::HashMap::new(),
+            policy,
+            activation_pacing: brenn_lib::messaging::config::ActivationPacing {
+                burst: 1,
+                min_period: std::time::Duration::from_millis(1),
+            },
+            mqtt_sinks: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_granted_tools_word_with_a_named_tool_lowers_to_the_capability() {
+        let parts = lower_consumer_load_parts(&tool_consumer(
+            &[
+                brenn_lib::messaging::ComponentGrant::Ports,
+                brenn_lib::messaging::ComponentGrant::Tools,
+            ],
+            &["git-repo-pull"],
+        ));
+        assert!(parts.grants.contains(&brenn_wasm::Capability::Tools));
+    }
+
+    #[test]
+    #[should_panic(expected = "granted iff the consumer names a tool")]
+    fn a_tools_word_with_no_tool_statement_panics() {
+        lower_consumer_load_parts(&tool_consumer(
+            &[brenn_lib::messaging::ComponentGrant::Tools],
+            &[],
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "granted iff the consumer names a tool")]
+    fn a_tool_statement_with_no_tools_word_panics() {
+        lower_consumer_load_parts(&tool_consumer(
+            &[brenn_lib::messaging::ComponentGrant::Ports],
+            &["git-repo-pull"],
+        ));
+    }
 
     /// Two distinct store paths (no duplicates) must not panic.
     #[test]

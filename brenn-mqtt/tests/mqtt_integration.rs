@@ -10,8 +10,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::{AclSet, MqttClientMatcher};
-use brenn_lib::access::{AppCapability, AppPolicy, GrantSet};
+use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::mqtt::address::MqttAddress;
 use brenn_lib::mqtt::config::TlsVersionMin;
 use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};

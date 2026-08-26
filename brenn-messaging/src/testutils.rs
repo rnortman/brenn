@@ -75,13 +75,13 @@ pub fn bus_delivery_policy(matcher: brenn_lib::access::acl::ChannelMatcher) -> A
     let mut policy = AppPolicy::default();
     policy
         .grants
-        .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     policy
         .grants
-        .insert(brenn_lib::access::AppCapability::EphemeralSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::EphemeralSubscribe);
     policy
         .grants
-        .insert(brenn_lib::access::AppCapability::LocalSubscribe);
+        .insert(brenn_envelope::grants::AppCapability::LocalSubscribe);
     policy.acls.brenn_subscribe.push(matcher.clone());
     policy.acls.ephemeral_subscribe.push(matcher.clone());
     policy.acls.local_subscribe.push(matcher);

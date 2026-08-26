@@ -563,11 +563,11 @@ impl ActiveBridge {
         testapp_cfg
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingPublish);
+            .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         testapp_cfg
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         // Layer-2 publish ACL: authorize publishing to `test-channel` so the
         // happy-path send/cancel/edit intercept tests pass the Seam-A
         // brenn_publish gate (mirrors the brenn_subscribe matcher below;
@@ -586,7 +586,7 @@ impl ActiveBridge {
         testapp_cfg
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::DynamicSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::DynamicSubscribe);
         testapp_cfg.policy.acls.brenn_subscribe.push(
             brenn_lib::access::acl::ChannelMatcher::Exact("test-channel".to_string()),
         );
@@ -693,7 +693,7 @@ impl ActiveBridge {
         testapp_cfg
             .policy
             .grants
-            .insert(brenn_lib::access::AppCapability::MqttSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         testapp_cfg
             .policy
             .acls
@@ -1077,7 +1077,7 @@ impl ActiveBridge {
                 policy: {
                     let mut p = brenn_lib::access::AppPolicy::default();
                     p.grants
-                        .insert(brenn_lib::access::AppCapability::MessagingPublish);
+                        .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
                     p.acls
                         .brenn_publish
                         .push(brenn_lib::access::acl::ChannelMatcher::Exact(
@@ -1455,7 +1455,7 @@ fn make_test_messenger_with_mqtt_publish(
     testapp_cfg
         .policy
         .grants
-        .insert(brenn_lib::access::AppCapability::MqttPublish);
+        .insert(brenn_envelope::grants::AppCapability::MqttPublish);
     for client in clients {
         testapp_cfg
             .policy
@@ -1552,7 +1552,8 @@ fn make_test_push_app_config(
         policy: {
             let mut p = brenn_lib::access::AppPolicy::default();
             if push_enabled {
-                p.grants.insert(brenn_lib::access::AppCapability::PwaPush);
+                p.grants
+                    .insert(brenn_envelope::grants::AppCapability::PwaPush);
             }
             p
         },

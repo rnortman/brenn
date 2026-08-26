@@ -24,8 +24,9 @@ use crate::{
     ChannelEntry, ChannelScheme, MessagingDirectory, ParticipantId, SubscriberEntry,
     SubscriberEntryKind, Urgency, WakeMin, WakeRouter, canonical_address,
 };
+use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
-use brenn_lib::access::{AppCapability, AppPolicy};
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::Duration;

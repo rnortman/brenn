@@ -865,7 +865,7 @@ mod tests {
         app.singleton = true;
         app.policy
             .grants
-            .insert(brenn_lib::access::AppCapability::EphemeralSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::EphemeralSubscribe);
         app.policy
             .acls
             .ephemeral_subscribe

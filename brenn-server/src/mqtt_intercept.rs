@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
-use brenn_lib::access::AppCapability;
+use brenn_envelope::grants::AppCapability;
 use brenn_lib::mqtt::address::parse_topic_name;
 use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
 use brenn_mqtt::payload::decode_outbound_body;

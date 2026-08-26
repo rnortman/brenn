@@ -990,8 +990,9 @@ pub mod tests {
     /// isolate other behavior (the retain-depth clamp).
     fn covering_policy(address: &str) -> brenn_lib::access::AppPolicy {
         use crate::ChannelScheme;
+        use brenn_envelope::grants::AppCapability;
+        use brenn_lib::access::AppPolicy;
         use brenn_lib::access::acl::{ChannelMatcher, MqttSubMatcher, WebhookMatcher};
-        use brenn_lib::access::{AppCapability, AppPolicy};
 
         let mut p = AppPolicy::default();
         match ChannelScheme::split(address) {
@@ -1311,7 +1312,8 @@ pub mod tests {
             policy: {
                 let mut p = brenn_lib::access::AppPolicy::default();
                 if pwa_push_enabled {
-                    p.grants.insert(brenn_lib::access::AppCapability::PwaPush);
+                    p.grants
+                        .insert(brenn_envelope::grants::AppCapability::PwaPush);
                 }
                 p
             },
@@ -1405,7 +1407,7 @@ pub mod tests {
         let mut cfg = crate::test_support::test_app_config("app", None, vec![]);
         let mut p = brenn_lib::access::AppPolicy::default();
         p.grants
-            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         cfg.policy = p;
         apps.insert("app".to_string(), cfg);
         let messenger = clamp_messenger(
@@ -1460,7 +1462,8 @@ pub mod tests {
         let mut apps = indexmap::IndexMap::new();
         let mut cfg = crate::test_support::test_app_config("app", None, vec![]);
         let mut p = brenn_lib::access::AppPolicy::default();
-        p.grants.insert(brenn_lib::access::AppCapability::Webhook);
+        p.grants
+            .insert(brenn_envelope::grants::AppCapability::Webhook);
         cfg.policy = p;
         apps.insert("app".to_string(), cfg);
         let messenger = clamp_messenger(
@@ -1486,7 +1489,7 @@ pub mod tests {
         let mut cfg = crate::test_support::test_app_config("app", None, vec![]);
         let mut p = brenn_lib::access::AppPolicy::default();
         p.grants
-            .insert(brenn_lib::access::AppCapability::MqttSubscribe);
+            .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         cfg.policy = p;
         apps.insert("app".to_string(), cfg);
         let messenger = clamp_messenger(
@@ -2117,8 +2120,9 @@ pub mod tests {
         // stamps the grant directly — an ordinary app query of `local:` denies).
         use crate::config::MessagingGlobalConfig;
         use crate::store::RingStores;
+        use brenn_envelope::grants::AppCapability;
+        use brenn_lib::access::AppPolicy;
         use brenn_lib::access::acl::ChannelMatcher;
-        use brenn_lib::access::{AppCapability, AppPolicy};
         use brenn_lib::config::AppConfig;
         use indexmap::IndexMap;
         use std::sync::Arc;

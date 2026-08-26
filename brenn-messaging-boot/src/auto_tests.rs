@@ -1,6 +1,6 @@
 //! Unit tests for the auto-channel lowering pass: the realm/scheme decision, the
-//! depth fold, named-channel validation, the endpoint-ref grammar, io_ports, and
-//! the resolver-side effects (free-port addresses and injected grants).
+//! depth fold, named-channel validation, io_ports, and the resolver-side effects
+//! (free-port addresses and injected grants).
 
 use super::auto::{lower_auto_wiring, wasm_endpoint_ref};
 use super::test_fixtures::{
@@ -10,9 +10,9 @@ use super::test_fixtures::{
 use super::*;
 use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::config::{
-    ConnectionConfigRaw, Depth, MessagingGlobalConfig, SurfaceConfigRaw, SurfaceIoPortRaw,
-    SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
-    WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
+    Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingGlobalConfig, SurfaceConfigRaw,
+    SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw,
+    WasmConsumerIoPortRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
 
 /// Stock globals. Depths are not among them — every auto-channel depth is folded
@@ -21,14 +21,120 @@ fn globals() -> MessagingGlobalConfig {
     MessagingGlobalConfig::default()
 }
 
-/// A connection over `endpoints` with no name (anonymous).
-fn conn(endpoints: &[&str]) -> ConnectionConfigRaw {
-    ConnectionConfigRaw {
-        endpoints: endpoints.iter().map(|e| e.to_string()).collect(),
-        channel: None,
-        uuid: None,
+/// A link over `endpoints`. The handle reaches boot messages and nothing else,
+/// so every fixture that does not assert on the text uses the same one.
+fn link(endpoints: Vec<LinkEndpointRaw>) -> LinkConfigRaw {
+    LinkConfigRaw {
+        link: "feed".to_string(),
         description: None,
+        endpoints,
     }
+}
+
+/// An endpoint on a backend consumer's port, roles unset.
+fn wasm_ep(slug: &str, port: &str) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        host: LinkHostRaw::Wasm {
+            slug: slug.to_string(),
+        },
+        port: port.to_string(),
+        publishes: false,
+        subscribes: false,
+        io_port: false,
+        push_depth: None,
+        retain_depth: None,
+    }
+}
+
+/// An endpoint on a surface component's port, roles unset. Every fixture surface
+/// here hosts one instance, `protobar`.
+fn surface_ep(slug: &str, port: &str) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        host: LinkHostRaw::Surface {
+            slug: slug.to_string(),
+            instance: "protobar".to_string(),
+        },
+        port: port.to_string(),
+        publishes: false,
+        subscribes: false,
+        io_port: false,
+        push_depth: None,
+        retain_depth: None,
+    }
+}
+
+/// A backend `out` port bound to the link.
+fn wasm_pub(slug: &str, port: &str) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        publishes: true,
+        ..wasm_ep(slug, port)
+    }
+}
+
+/// A backend `in` port bound to the link, with the window its binding stated.
+fn wasm_sub(slug: &str, port: &str, push: Depth, retain: Depth) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        subscribes: true,
+        push_depth: Some(push),
+        retain_depth: Some(retain),
+        ..wasm_ep(slug, port)
+    }
+}
+
+/// A backend io_port bound to the link: both roles, and the input half's window.
+fn wasm_io(slug: &str, port: &str, push: u64, retain: u64) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        publishes: true,
+        subscribes: true,
+        io_port: true,
+        push_depth: Some(Depth::Bounded(push)),
+        retain_depth: Some(Depth::Bounded(retain)),
+        ..wasm_ep(slug, port)
+    }
+}
+
+/// A surface `out` port bound to the link.
+fn surface_pub(slug: &str, port: &str) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        publishes: true,
+        ..surface_ep(slug, port)
+    }
+}
+
+/// A surface `in` port bound to the link, with the window its binding stated.
+fn surface_sub(slug: &str, port: &str, push: u64, retain: u64) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        subscribes: true,
+        push_depth: Some(Depth::Bounded(push)),
+        retain_depth: Some(Depth::Bounded(retain)),
+        ..surface_ep(slug, port)
+    }
+}
+
+/// A surface io_port bound to the link. See [`wasm_io`].
+fn surface_io(slug: &str, port: &str, push: u64, retain: u64) -> LinkEndpointRaw {
+    LinkEndpointRaw {
+        publishes: true,
+        subscribes: true,
+        io_port: true,
+        push_depth: Some(Depth::Bounded(push)),
+        retain_depth: Some(Depth::Bounded(retain)),
+        ..surface_ep(slug, port)
+    }
+}
+
+/// The endpoint pair every backend fixture wires: [`publisher`]'s `out` and
+/// [`subscriber`]'s `tap`, with the subscriber's own declared window.
+fn etl_to_indexer(push: u64, retain: u64) -> Vec<LinkEndpointRaw> {
+    vec![
+        wasm_pub("etl", "out"),
+        wasm_sub(
+            "indexer",
+            "tap",
+            Depth::Bounded(push),
+            Depth::Bounded(retain),
+        ),
+    ]
 }
 
 /// A free (channel-less) `[[wasm_consumer.subscription]]` on `port`, with the
@@ -67,6 +173,19 @@ fn subscriber(slug: &str, push: u64, retain: u64) -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw {
         slug: slug.to_string(),
         subscriptions: vec![free_sub("tap", push, retain)],
+        ..minimal_wasm_consumer()
+    }
+}
+
+/// A consumer whose port `both` is declared twice — once as a free input, once
+/// as a free output — so its declaration gives the port both halves without
+/// making it an io_port.
+fn duplex(slug: &str, push: u64, retain: u64) -> WasmConsumerConfigRaw {
+    WasmConsumerConfigRaw {
+        slug: slug.to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![free_sub("both", push, retain)],
+        outputs: vec![free_out("both")],
         ..minimal_wasm_consumer()
     }
 }
@@ -146,10 +265,10 @@ fn surface_with_free_ports(slug: &str) -> SurfaceConfigRaw {
 /// Backend-only endpoints never leave the process, so the channel is a `local:`
 /// server ring — non-transportable, one entry, ring depth from the fold.
 #[test]
-fn backend_only_connection_lowers_to_a_server_local_channel() {
+fn a_backend_only_link_lowers_to_a_server_local_channel() {
     let consumers = vec![publisher("etl"), subscriber("indexer", 2, 6)];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(etl_to_indexer(2, 6))],
         &consumers,
         &[],
         &[],
@@ -173,9 +292,12 @@ fn backend_only_connection_lowers_to_a_server_local_channel() {
 /// An endpoint set spanning the wire needs a transportable channel, and
 /// `ephemeral:` is the transportable non-durable class.
 #[test]
-fn wire_spanning_connection_lowers_to_ephemeral() {
+fn a_wire_spanning_link_lowers_to_ephemeral() {
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "surface:deskbar#protobar/tap"])],
+        &[link(vec![
+            wasm_pub("etl", "out"),
+            surface_sub("deskbar", "tap", 2, 3),
+        ])],
         &[publisher("etl")],
         &[surface_with_free_ports("deskbar")],
         &[],
@@ -190,15 +312,15 @@ fn wire_spanning_connection_lowers_to_ephemeral() {
 /// Two surfaces are two pages: their traffic crosses the wire even though no
 /// backend port is on the channel.
 #[test]
-fn two_surface_connection_lowers_to_ephemeral() {
+fn a_two_surface_link_lowers_to_ephemeral() {
     let surfaces = vec![
         surface_with_free_ports("deskbar"),
         surface_with_free_ports("wallboard"),
     ];
     let wiring = lower_auto_wiring(
-        &[conn(&[
-            "surface:deskbar#protobar/out",
-            "surface:wallboard#protobar/tap",
+        &[link(vec![
+            surface_pub("deskbar", "out"),
+            surface_sub("wallboard", "tap", 2, 3),
         ])],
         &[],
         &surfaces,
@@ -226,11 +348,11 @@ fn two_surface_connection_lowers_to_ephemeral() {
 /// One surface's own ports wire page-locally: per session, browser-side, and with
 /// no server entry at all — the ring is the surface's, resolved from its bindings.
 #[test]
-fn single_surface_connection_lowers_to_a_page_local_channel() {
+fn a_single_surface_link_lowers_to_a_page_local_channel() {
     let wiring = lower_auto_wiring(
-        &[conn(&[
-            "surface:deskbar#protobar/out",
-            "surface:deskbar#protobar/tap",
+        &[link(vec![
+            surface_pub("deskbar", "out"),
+            surface_sub("deskbar", "tap", 2, 3),
         ])],
         &[],
         &[surface_with_free_ports("deskbar")],
@@ -250,19 +372,15 @@ fn single_surface_connection_lowers_to_a_page_local_channel() {
 fn anonymous_address_is_order_independent() {
     let consumers = vec![publisher("etl"), subscriber("indexer", 2, 2)];
     let forward = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(etl_to_indexer(2, 2))],
         &consumers,
         &[],
         &[],
         &globals(),
     );
-    let reverse = lower_auto_wiring(
-        &[conn(&["wasm:indexer/tap", "wasm:etl/out"])],
-        &consumers,
-        &[],
-        &[],
-        &globals(),
-    );
+    let mut swapped = etl_to_indexer(2, 2);
+    swapped.reverse();
+    let reverse = lower_auto_wiring(&[link(swapped)], &consumers, &[], &[], &globals());
     assert_eq!(
         forward.nondurable_entries()[0].address,
         reverse.nondurable_entries()[0].address,
@@ -270,72 +388,38 @@ fn anonymous_address_is_order_independent() {
 }
 
 // --- Named auto channels ---
+//
+// A link is anonymous, always. The named arm below is reached only by an io_port
+// that gives itself an address, so every fixture here is an io_port.
 
-/// Naming a channel `brenn:` is what buys durability, and the entry's identity is
-/// derived from the name so no `uuid` line is needed.
+/// A link's doc comment reaches the directory entry, where the generated
+/// endpoint listing would otherwise be all a reader has.
 #[test]
-fn named_brenn_channel_is_durable_with_a_derived_uuid() {
+fn a_links_description_lands_on_the_synthesized_entry() {
     let consumers = vec![publisher("etl"), subscriber("indexer", 2, 2)];
     let wiring = lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:etl.batches".to_string()),
+        &[LinkConfigRaw {
             description: Some("ETL batch hand-off".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
+            ..link(etl_to_indexer(2, 2))
         }],
         &consumers,
         &[],
         &[],
         &globals(),
     );
-    assert!(wiring.nondurable_entries().is_empty());
-    let entry = &wiring.durable_entries()[0];
-    assert_eq!(entry.address, "brenn:etl.batches");
-    assert_eq!(
-        entry.uuid,
-        brenn_lib::messaging::durable_auto_channel_uuid("etl.batches"),
-    );
+    assert!(wiring.durable_entries().is_empty());
+    let entry = &wiring.nondurable_entries()[0];
     assert_eq!(entry.description.as_deref(), Some("ETL batch hand-off"));
-    assert_eq!(wiring.wasm_channel("etl", "out"), Some("brenn:etl.batches"));
-}
-
-/// The explicit `uuid` is the rename-stability opt-out, so it wins over the
-/// derivation.
-#[test]
-fn explicit_uuid_names_the_durable_row() {
-    let pinned = "9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31";
-    let wiring = lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:etl.batches".to_string()),
-            uuid: Some(pinned.to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-    assert_eq!(
-        wiring.durable_entries()[0].uuid,
-        uuid::Uuid::parse_str(pinned).unwrap(),
-    );
 }
 
 /// A durable channel may fold to an unbounded ring — its retention is disk, not
 /// process memory.
 #[test]
-fn durable_named_channel_accepts_an_unbounded_fold() {
-    let mut consumer = subscriber("indexer", 1, 1);
-    consumer.subscriptions[0].retain_depth = Some(Depth::Unbounded);
-    let wiring = lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:etl.batches".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), consumer],
-        &[],
-        &[],
-        &globals(),
-    );
+fn a_durable_named_channel_accepts_an_unbounded_fold() {
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("brenn:etl.batches".to_string());
+    consumer.io_ports[0].retain_depth = Some(Depth::Unbounded);
+    let wiring = lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
     assert_eq!(
         wiring.durable_entries()[0].resolved_channel.retain_depth,
         Depth::Unbounded,
@@ -343,185 +427,60 @@ fn durable_named_channel_accepts_an_unbounded_fold() {
 }
 
 #[test]
-#[should_panic(expected = "local: cannot span the wire")]
-fn named_local_channel_spanning_the_wire_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("local:etl.batches".to_string()),
-            ..conn(&["wasm:etl/out", "surface:deskbar#protobar/tap"])
-        }],
-        &[publisher("etl")],
-        &[surface_with_free_ports("deskbar")],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
 #[should_panic(expected = "is in a reserved namespace")]
-fn named_channel_in_the_auto_namespace_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("local:auto.mine".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
+fn a_named_channel_in_the_auto_namespace_panics() {
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("local:auto.mine".to_string());
+    lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
 }
 
 #[test]
 #[should_panic(expected = "carries no scheme prefix")]
-fn named_channel_without_a_scheme_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("etl.batches".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-/// The footgun rule: an auto channel whose address another declaration already
-/// owns would leak its injected ACLs onto a channel other parties legitimately
-/// use.
-#[test]
-#[should_panic(expected = "is also declared elsewhere")]
-fn named_channel_colliding_with_a_declared_channel_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:shared".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &["brenn:shared"],
-        &globals(),
-    );
+fn a_named_channel_without_a_scheme_panics() {
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("etl.batches".to_string());
+    lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
 }
 
 /// The other half of the footgun rule, and the worse half: two auto channels on
-/// one address would merge both endpoint sets' injected ACLs, handing each
-/// connection's endpoints authority the other connection authorized.
+/// one address would merge both endpoint sets' injected ACLs, handing each set's
+/// ports authority the other set was authorized for.
 #[test]
 #[should_panic(expected = "is already declared by")]
-fn two_connections_naming_one_channel_panic() {
-    let consumers = vec![
-        publisher("etl"),
-        subscriber("indexer", 2, 2),
-        publisher("mailer"),
-        subscriber("archiver", 2, 2),
-    ];
-    lower_auto_wiring(
-        &[
-            ConnectionConfigRaw {
-                channel: Some("brenn:shared".to_string()),
-                ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-            },
-            ConnectionConfigRaw {
-                channel: Some("brenn:shared".to_string()),
-                ..conn(&["wasm:mailer/out", "wasm:archiver/tap"])
-            },
-        ],
-        &consumers,
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-/// The same rule across the two spellings: an io_port's own name and a
-/// connection's name are one address space.
-#[test]
-#[should_panic(expected = "is already declared by")]
-fn an_io_port_and_a_connection_naming_one_channel_panic() {
-    let mut consumers = vec![
-        timer_consumer("etl"),
-        publisher("mailer"),
-        subscriber("archiver", 2, 2),
-    ];
+fn two_io_ports_naming_one_channel_panic() {
+    let mut consumers = vec![timer_consumer("etl"), timer_consumer("mailer")];
     consumers[0].io_ports[0].channel = Some("brenn:shared".to_string());
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:shared".to_string()),
-            ..conn(&["wasm:mailer/out", "wasm:archiver/tap"])
-        }],
-        &consumers,
-        &[],
-        &[],
-        &globals(),
-    );
+    consumers[1].io_ports[0].channel = Some("brenn:shared".to_string());
+    lower_auto_wiring(&[], &consumers, &[], &[], &globals());
 }
 
-/// A connection wires pub/sub ports. An ingress/egress transport is declared by
-/// its own config block, and an address on one carries no pub/sub ACL an auto
+/// An auto channel wires pub/sub ports. An ingress/egress transport is declared
+/// by its own config block, and an address on one carries no pub/sub ACL an auto
 /// channel could inject.
 #[test]
 #[should_panic(expected = "must be a brenn:, ephemeral:, or local: address")]
-fn named_channel_on_an_ingress_scheme_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("webhook:hook".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
+fn a_named_channel_on_an_ingress_scheme_panics() {
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("webhook:hook".to_string());
+    lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
 }
 
 #[test]
 #[should_panic(expected = "must name a channel after its scheme")]
-fn named_channel_with_an_empty_name_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
+fn a_named_channel_with_an_empty_name_panics() {
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("brenn:".to_string());
+    lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
 }
 
 /// A name outside the charset would pass boot and fail the publish-time
 /// well-formedness gate instead — a runtime failure where a boot panic belongs.
 #[test]
 #[should_panic(expected = "RFC 3986 unreserved characters")]
-fn named_channel_with_a_bad_charset_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:etl batches".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "is not a valid UUID")]
-fn unparseable_connection_uuid_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:etl.batches".to_string()),
-            uuid: Some("not-a-uuid".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
+fn a_named_channel_with_a_bad_charset_panics() {
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("brenn:etl batches".to_string());
+    lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
 }
 
 /// An auto channel inherits every channel-level knob from the global defaults,
@@ -533,47 +492,9 @@ fn archive_sink_without_an_archive_path_panics() {
         default_sink: brenn_lib::messaging::config::Sink::Archive,
         ..globals()
     };
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("brenn:etl.batches".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &defaults,
-    );
-}
-
-#[test]
-#[should_panic(expected = "uuid is set but no channel name is")]
-fn uuid_on_an_anonymous_connection_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            uuid: Some("9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "uuid is set but channel")]
-fn uuid_on_a_nondurable_named_connection_panics() {
-    lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("ephemeral:etl.batches".to_string()),
-            uuid: Some("9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
+    let mut consumer = timer_consumer("etl");
+    consumer.io_ports[0].channel = Some("brenn:etl.batches".to_string());
+    lower_auto_wiring(&[], &[consumer], &[], &[], &defaults);
 }
 
 /// The hungriest subscriber sets the ring: max over subscribing endpoints of
@@ -586,7 +507,11 @@ fn fold_takes_the_max_of_maxes_over_subscribers() {
         subscriber("fast", 9, 1),
     ];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:slow/tap", "wasm:fast/tap"])],
+        &[link(vec![
+            wasm_pub("etl", "out"),
+            wasm_sub("slow", "tap", Depth::Bounded(2), Depth::Bounded(3)),
+            wasm_sub("fast", "tap", Depth::Bounded(9), Depth::Bounded(1)),
+        ])],
         &consumers,
         &[],
         &[],
@@ -606,7 +531,10 @@ fn fold_takes_the_max_of_maxes_over_subscribers() {
 fn the_synthesized_entrys_push_and_standing_depths_are_the_fold() {
     let consumers = vec![publisher("etl"), subscriber("slow", 2, 3)];
     let nondurable = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:slow/tap"])],
+        &[link(vec![
+            wasm_pub("etl", "out"),
+            wasm_sub("slow", "tap", Depth::Bounded(2), Depth::Bounded(3)),
+        ])],
         &consumers,
         &[],
         &[],
@@ -617,9 +545,11 @@ fn the_synthesized_entrys_push_and_standing_depths_are_the_fold() {
     assert_eq!(rc.retain_depth, Depth::Bounded(3));
     assert_eq!(rc.standing_retain_depth, Depth::Bounded(3));
 
-    let mut named = conn(&["wasm:etl/out", "wasm:slow/tap"]);
-    named.channel = Some("brenn:etl.feed".to_string());
-    let durable = lower_auto_wiring(&[named], &consumers, &[], &[], &globals());
+    let mut named = timer_consumer("clock");
+    named.io_ports[0].channel = Some("brenn:etl.feed".to_string());
+    named.io_ports[0].push_depth = Some(Depth::Bounded(2));
+    named.io_ports[0].retain_depth = Some(Depth::Bounded(3));
+    let durable = lower_auto_wiring(&[], &[named], &[], &[], &globals());
     let rc = &durable.durable_entries()[0].resolved_channel;
     assert_eq!(rc.push_depth, Depth::Bounded(3));
     assert_eq!(rc.retain_depth, Depth::Bounded(3));
@@ -632,7 +562,7 @@ fn the_synthesized_entrys_push_and_standing_depths_are_the_fold() {
 fn fold_has_a_floor_of_one() {
     let consumer = subscriber("indexer", 0, 0);
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(etl_to_indexer(0, 0))],
         &[publisher("etl"), consumer],
         &[],
         &[],
@@ -652,7 +582,10 @@ fn unbounded_fold_on_a_nondurable_channel_panics() {
     let mut consumer = subscriber("indexer", 1, 1);
     consumer.subscriptions[0].retain_depth = Some(Depth::Unbounded);
     lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(vec![
+            wasm_pub("etl", "out"),
+            wasm_sub("indexer", "tap", Depth::Bounded(1), Depth::Unbounded),
+        ])],
         &[publisher("etl"), consumer],
         &[],
         &[],
@@ -666,10 +599,11 @@ fn unbounded_fold_on_a_nondurable_channel_panics() {
 #[test]
 #[should_panic(expected = "\"wasm:indexer/tap\" is a subscribing endpoint of an auto channel")]
 fn a_subscribing_port_without_a_push_depth_panics() {
-    let mut consumer = subscriber("indexer", 1, 1);
-    consumer.subscriptions[0].push_depth = None;
+    let consumer = subscriber("indexer", 1, 1);
+    let mut endpoints = etl_to_indexer(1, 1);
+    endpoints[1].push_depth = None;
     lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(endpoints)],
         &[publisher("etl"), consumer],
         &[],
         &[],
@@ -682,10 +616,11 @@ fn a_subscribing_port_without_a_push_depth_panics() {
 #[test]
 #[should_panic(expected = "\"wasm:indexer/tap\" is a subscribing endpoint of an auto channel")]
 fn a_subscribing_port_without_a_retain_depth_panics() {
-    let mut consumer = subscriber("indexer", 1, 1);
-    consumer.subscriptions[0].retain_depth = None;
+    let consumer = subscriber("indexer", 1, 1);
+    let mut endpoints = etl_to_indexer(1, 1);
+    endpoints[1].retain_depth = None;
     lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(endpoints)],
         &[publisher("etl"), consumer],
         &[],
         &[],
@@ -693,19 +628,20 @@ fn a_subscribing_port_without_a_retain_depth_panics() {
     );
 }
 
-/// The requirement reaches a surface subscription bound by a connection, the
-/// one endpoint shape whose reference the operator never writes anywhere: the
-/// panic has to name the computed `surface:<slug>#<instance>/<port>` or they are
-/// told a depth is missing with no way to find the port.
+/// The requirement reaches a surface subscription bound to a link, the one
+/// endpoint shape whose reference the operator never writes anywhere: the panic
+/// has to name the computed `surface:<slug>#<instance>/<port>` or they are told a
+/// depth is missing with no way to find the port.
 #[test]
 #[should_panic(
     expected = "\"surface:deskbar#protobar/tap\" is a subscribing endpoint of an auto channel"
 )]
-fn a_connection_bound_surface_subscription_without_a_push_depth_panics() {
-    let mut surfaces = vec![surface_with_free_ports("deskbar")];
-    surfaces[0].subscriptions[0].push_depth = None;
+fn a_link_bound_surface_subscription_without_a_push_depth_panics() {
+    let surfaces = vec![surface_with_free_ports("deskbar")];
+    let mut tap = surface_sub("deskbar", "tap", 2, 3);
+    tap.push_depth = None;
     lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "surface:deskbar#protobar/tap"])],
+        &[link(vec![wasm_pub("etl", "out"), tap])],
         &[publisher("etl")],
         &surfaces,
         &[],
@@ -726,179 +662,11 @@ fn a_bare_io_port_without_depths_panics() {
 }
 
 #[test]
-#[should_panic(expected = "is malformed")]
-fn endpoint_with_an_unknown_prefix_panics() {
-    lower_auto_wiring(
-        &[conn(&["app:etl/out", "wasm:indexer/tap"])],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "is malformed")]
-fn wasm_endpoint_without_a_port_panics() {
-    lower_auto_wiring(
-        &[conn(&["wasm:etl", "wasm:indexer/tap"])],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "names no declared [[wasm_consumer]]")]
-fn endpoint_naming_an_unknown_consumer_panics() {
-    lower_auto_wiring(
-        &[conn(&["wasm:nonesuch/out", "wasm:indexer/tap"])],
-        &[subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "names no port declared on [[wasm_consumer]]")]
-fn endpoint_naming_an_undeclared_port_panics() {
-    lower_auto_wiring(
-        &[conn(&["wasm:etl/nonesuch", "wasm:indexer/tap"])],
-        &[publisher("etl"), subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "names instance")]
-fn surface_endpoint_naming_an_undeclared_instance_panics() {
-    lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "surface:deskbar#nonesuch/tap"])],
-        &[publisher("etl")],
-        &[surface_with_free_ports("deskbar")],
-        &[],
-        &globals(),
-    );
-}
-
-/// The message the pass rejects `reference` with, driven through the real
-/// lowering pass against a fixture that declares `etl`, `indexer`, and the
-/// `deskbar` surface. The endpoint ref is the whole operator-facing syntax of
-/// the feature, so each rejection is pinned by the text that names the mistake.
-fn endpoint_rejection(reference: &str) -> String {
-    let consumers = vec![publisher("etl"), subscriber("indexer", 2, 2)];
-    let surfaces = vec![surface_with_free_ports("deskbar")];
-    let connection = ConnectionConfigRaw {
-        endpoints: vec![reference.to_string(), "wasm:indexer/tap".to_string()],
-        ..conn(&[])
-    };
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lower_auto_wiring(
-            std::slice::from_ref(&connection),
-            &consumers,
-            &surfaces,
-            &[],
-            &globals(),
-        );
-    }))
-    .expect_err("the endpoint ref must be rejected");
-    std::panic::set_hook(previous);
-    payload
-        .downcast::<String>()
-        .expect("config panics carry formatted messages")
-        .to_string()
-}
-
-/// Every shape the grammar cannot parse lands on one message that spells both
-/// forms out, so the operator sees the syntax rather than the branch that
-/// tripped.
-#[test]
-fn malformed_endpoint_refs_are_rejected() {
-    for reference in [
-        "wasm:/out",                 // empty slug
-        "wasm:etl/",                 // empty port
-        "wasm:etl/bad port",         // port outside the unreserved charset
-        "surface:deskbar/tap",       // no `#instance`
-        "surface:#protobar/tap",     // empty slug
-        "surface:deskbar#/tap",      // empty instance
-        "surface:deskbar#protobar/", // empty port
-        "surface:deskbar#protobar/bad port",
-    ] {
-        let message = endpoint_rejection(reference);
-        assert!(
-            message.contains("is malformed"),
-            "endpoint {reference:?} must be rejected as malformed, got {message:?}",
-        );
-    }
-}
-
-/// The surface twin of the unknown-consumer rejection: a ref naming no declared
-/// block is dead config either way.
-#[test]
-fn endpoint_naming_an_unknown_surface_panics() {
-    let message = endpoint_rejection("surface:nonesuch#protobar/out");
-    assert!(
-        message.contains("names no declared [[surface]]"),
-        "got {message:?}",
-    );
-}
-
-/// A connection binds ports that already declare themselves; it cannot mint one.
-#[test]
-fn surface_endpoint_naming_an_undeclared_port_panics() {
-    let message = endpoint_rejection("surface:deskbar#protobar/nonesuch");
-    assert!(
-        message.contains("names no port declared on surface"),
-        "got {message:?}",
-    );
-}
-
-/// The one-channel-per-port rule holds on the surface side too.
-#[test]
-#[should_panic(expected = "already binds channel")]
-fn endpoint_naming_an_address_bound_surface_port_panics() {
-    let mut surfaces = vec![surface_with_free_ports("deskbar")];
-    surfaces[0].outputs[0].channel = Some("brenn:elsewhere".to_string());
-    lower_auto_wiring(
-        &[conn(&["surface:deskbar#protobar/out", "wasm:indexer/tap"])],
-        &[subscriber("indexer", 2, 2)],
-        &surfaces,
-        &[],
-        &globals(),
-    );
-}
-
-/// A port binds exactly one channel: an address on the binding and a connection
-/// claiming it are two answers to one question.
-#[test]
-#[should_panic(expected = "already binds channel")]
-fn endpoint_naming_an_address_bound_port_panics() {
-    let mut consumer = publisher("etl");
-    consumer.outputs[0].channel = Some("brenn:elsewhere".to_string());
-    lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
-        &[consumer, subscriber("indexer", 2, 2)],
-        &[],
-        &[],
-        &globals(),
-    );
-}
-
-#[test]
 #[should_panic(expected = "is already bound by")]
-fn port_claimed_by_two_connections_panics() {
+fn a_port_claimed_by_two_links_panics() {
     let consumers = vec![publisher("etl"), subscriber("indexer", 2, 2)];
     lower_auto_wiring(
-        &[
-            conn(&["wasm:etl/out", "wasm:indexer/tap"]),
-            conn(&["wasm:etl/out", "wasm:indexer/tap"]),
-        ],
+        &[link(etl_to_indexer(2, 2)), link(etl_to_indexer(2, 2))],
         &consumers,
         &[],
         &[],
@@ -908,9 +676,11 @@ fn port_claimed_by_two_connections_panics() {
 
 #[test]
 #[should_panic(expected = "is already bound by")]
-fn port_listed_twice_in_one_connection_panics() {
+fn a_port_bound_twice_to_one_link_panics() {
+    let mut endpoints = etl_to_indexer(2, 2);
+    endpoints.push(wasm_pub("etl", "out"));
     lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap", "wasm:etl/out"])],
+        &[link(endpoints)],
         &[publisher("etl"), subscriber("indexer", 2, 2)],
         &[],
         &[],
@@ -920,9 +690,9 @@ fn port_listed_twice_in_one_connection_panics() {
 
 #[test]
 #[should_panic(expected = "no endpoint subscribes")]
-fn connection_with_no_subscriber_panics() {
+fn a_link_with_no_subscriber_panics() {
     lower_auto_wiring(
-        &[conn(&["wasm:etl/out"])],
+        &[link(vec![wasm_pub("etl", "out")])],
         &[publisher("etl")],
         &[],
         &[],
@@ -932,9 +702,14 @@ fn connection_with_no_subscriber_panics() {
 
 #[test]
 #[should_panic(expected = "no endpoint publishes")]
-fn connection_with_no_publisher_panics() {
+fn a_link_with_no_publisher_panics() {
     lower_auto_wiring(
-        &[conn(&["wasm:indexer/tap"])],
+        &[link(vec![wasm_sub(
+            "indexer",
+            "tap",
+            Depth::Bounded(2),
+            Depth::Bounded(2),
+        )])],
         &[subscriber("indexer", 2, 2)],
         &[],
         &[],
@@ -944,20 +719,267 @@ fn connection_with_no_publisher_panics() {
 
 #[test]
 #[should_panic(expected = "endpoints is empty")]
-fn connection_with_no_endpoints_panics() {
-    lower_auto_wiring(&[conn(&[])], &[], &[], &[], &globals());
+fn a_link_with_no_endpoints_panics() {
+    lower_auto_wiring(&[link(vec![])], &[], &[], &[], &globals());
+}
+
+/// An endpoint carries its roles rather than resolving them, but the port it
+/// names must still be one its host declares: a phantom endpoint perturbs the
+/// channel's cid and injects a transport capability and an exact matcher into a
+/// real consumer's policy for a port that reads and writes nothing.
+#[test]
+#[should_panic(expected = "names no declared [[wasm_consumer]]")]
+fn a_link_endpoint_on_an_undeclared_consumer_panics() {
+    lower_auto_wiring(
+        &[link(etl_to_indexer(2, 6))],
+        &[publisher("etl")],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "names no port declared on its host")]
+fn a_link_endpoint_on_an_undeclared_port_panics() {
+    lower_auto_wiring(
+        &[link(vec![
+            wasm_pub("etl", "out"),
+            wasm_sub("indexer", "nonesuch", Depth::Bounded(2), Depth::Bounded(6)),
+        ])],
+        &[publisher("etl"), subscriber("indexer", 2, 6)],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "names no declared [[surface]]")]
+fn a_link_endpoint_on_an_undeclared_surface_panics() {
+    lower_auto_wiring(
+        &[link(vec![
+            wasm_pub("etl", "out"),
+            surface_sub("deskbar", "tap", 2, 3),
+        ])],
+        &[publisher("etl")],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "not declared as a [[surface.component]]")]
+fn a_link_endpoint_on_an_undeclared_instance_panics() {
+    let endpoint = LinkEndpointRaw {
+        host: LinkHostRaw::Surface {
+            slug: "deskbar".to_string(),
+            instance: "nonesuch".to_string(),
+        },
+        ..surface_sub("deskbar", "tap", 2, 3)
+    };
+    lower_auto_wiring(
+        &[link(vec![wasm_pub("etl", "out"), endpoint])],
+        &[publisher("etl")],
+        &[surface_with_free_ports("deskbar")],
+        &[],
+        &globals(),
+    );
+}
+
+/// A port that declares only an input publishes nothing, whatever the link says:
+/// the roles the endpoint carries are the declaration's, and a mismatch would
+/// hand out publish authority nobody wrote down.
+#[test]
+#[should_panic(expected = "says publishes = true, and its declaration says false")]
+fn a_link_endpoint_claiming_a_role_its_port_lacks_panics() {
+    lower_auto_wiring(
+        &[link(vec![
+            wasm_pub("indexer", "tap"),
+            wasm_sub("indexer2", "tap", Depth::Bounded(2), Depth::Bounded(6)),
+        ])],
+        &[subscriber("indexer", 2, 6), subscriber("indexer2", 2, 6)],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// The mirror of the publishing case: a link may not claim a subscribing half a
+/// port's declaration does not give it.
+#[test]
+#[should_panic(expected = "says subscribes = true, and its declaration says false")]
+fn a_link_endpoint_claiming_a_subscribing_half_its_port_lacks_panics() {
+    let endpoint = LinkEndpointRaw {
+        publishes: true,
+        ..wasm_sub("etl", "out", Depth::Bounded(2), Depth::Bounded(6))
+    };
+    lower_auto_wiring(
+        &[link(vec![endpoint, wasm_pub("etl2", "out")])],
+        &[publisher("etl"), publisher("etl2")],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// Under-claiming is refused as loudly as over-claiming: a withheld role would
+/// bind the port to the link's channel without authorizing it there.
+#[test]
+#[should_panic(expected = "says publishes = false, and its declaration says true")]
+fn a_link_endpoint_withholding_a_role_its_port_declares_panics() {
+    lower_auto_wiring(
+        &[link(vec![
+            wasm_sub("duplex", "both", Depth::Bounded(2), Depth::Bounded(6)),
+            wasm_pub("etl", "out"),
+        ])],
+        &[duplex("duplex", 2, 6), publisher("etl")],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// The io_port flag must match in both directions: it affects placement and
+/// grants.
+#[test]
+#[should_panic(expected = "says io_port = true, and its declaration says false")]
+fn a_link_endpoint_claiming_io_port_over_a_plain_port_panics() {
+    let endpoint = LinkEndpointRaw {
+        io_port: true,
+        publishes: true,
+        ..wasm_sub("duplex", "both", Depth::Bounded(2), Depth::Bounded(6))
+    };
+    lower_auto_wiring(
+        &[link(vec![
+            endpoint,
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(6)),
+        ])],
+        &[duplex("duplex", 2, 6), subscriber("indexer", 2, 6)],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "says io_port = false, and its declaration says true")]
+fn a_link_endpoint_denying_a_declared_io_port_panics() {
+    let endpoint = LinkEndpointRaw {
+        io_port: false,
+        ..wasm_io("timer", "timer", 2, 8)
+    };
+    lower_auto_wiring(
+        &[link(vec![
+            endpoint,
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(8)),
+        ])],
+        &[timer_consumer("timer"), subscriber("indexer", 2, 8)],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// A surface endpoint's roles come from its instance's declarations exactly as a
+/// consumer's do — the same assert over the other host's lookup.
+#[test]
+#[should_panic(expected = "says publishes = true, and its declaration says false")]
+fn a_surface_link_endpoint_claiming_a_role_its_port_lacks_panics() {
+    lower_auto_wiring(
+        &[link(vec![
+            surface_pub("deskbar", "tap"),
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(6)),
+        ])],
+        &[subscriber("indexer", 2, 6)],
+        &[surface_with_free_ports("deskbar")],
+        &[],
+        &globals(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "neither publishes nor subscribes")]
+fn a_link_endpoint_in_no_direction_panics() {
+    lower_auto_wiring(
+        &[link(vec![wasm_ep("etl", "out"), wasm_pub("etl2", "out")])],
+        &[publisher("etl"), publisher("etl2")],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// The ring is folded from the endpoint's numbers and the subscriber's cursor
+/// window comes from the declaration's, so a divergence sizes two different
+/// windows and drops messages the operator sized for.
+#[test]
+#[should_panic(expected = "carries the window")]
+fn a_link_endpoint_whose_window_differs_from_its_declaration_panics() {
+    lower_auto_wiring(
+        &[link(vec![
+            wasm_pub("etl", "out"),
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(99)),
+        ])],
+        &[publisher("etl"), subscriber("indexer", 2, 6)],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// Only a subscribing half has a window; one on a publish-only endpoint folds
+/// into nothing and would read as tuning that took effect.
+#[test]
+#[should_panic(expected = "carries a window but does not subscribe")]
+fn a_publishing_only_link_endpoint_carrying_a_window_panics() {
+    let endpoint = LinkEndpointRaw {
+        push_depth: Some(Depth::Bounded(2)),
+        retain_depth: Some(Depth::Bounded(6)),
+        ..wasm_pub("etl", "out")
+    };
+    lower_auto_wiring(
+        &[link(vec![
+            endpoint,
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(6)),
+        ])],
+        &[publisher("etl"), subscriber("indexer", 2, 6)],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// A port already bound to a channel of its own has its answer; a link claiming
+/// it too is two answers to one question.
+#[test]
+#[should_panic(expected = "already binds channel")]
+fn a_link_endpoint_on_a_channel_bound_port_panics() {
+    let bound = WasmConsumerConfigRaw {
+        slug: "indexer".to_string(),
+        subscriptions: vec![sub_raw("brenn:feed", "tap")],
+        ..minimal_wasm_consumer()
+    };
+    lower_auto_wiring(
+        &[link(etl_to_indexer(2, 6))],
+        &[publisher("etl"), bound],
+        &[],
+        &[],
+        &globals(),
+    );
 }
 
 // --- Resolver effects ---
 
-/// The end of the whole exercise: two consumers wired by one connection resolve
-/// with zero operator ACLs and zero `[[channel]]` blocks, and every boot coverage
-/// assert holds because the connection's grants were injected.
+/// The end of the whole exercise: two consumers wired by one link resolve with
+/// zero operator ACLs and zero `channel` declarations, and every boot coverage
+/// assert holds because the link's grants were injected.
 #[test]
-fn connection_bound_ports_resolve_with_no_operator_acls() {
+fn link_bound_ports_resolve_with_no_operator_acls() {
     let consumers = vec![publisher("etl"), subscriber("indexer", 2, 6)];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(etl_to_indexer(2, 6))],
         &consumers,
         &[],
         &[],
@@ -982,6 +1004,83 @@ fn connection_bound_ports_resolve_with_no_operator_acls() {
     assert!(!indexer.policy.allows_local_publish(&bare));
 }
 
+/// The document-to-placed-channel claim, end to end: a `.brenn` document
+/// declaring a link is the only input, and the ports it wires come out of
+/// resolution bound to a channel no one wrote an address for.
+///
+/// Every other test in this file hands `lower_auto_wiring` raws it built
+/// itself, which leaves the lowering pass between a document and those raws
+/// unasserted from this side; this one starts a step earlier.
+///
+/// The indexer's port is an `io` and the etl subscribes to a declared channel
+/// because a consumer must reach somewhere with the interface it is granted and
+/// must have an input to activate on — the smallest document holding both is
+/// this one.
+#[test]
+fn a_document_link_places_the_channel_its_ports_resolve_to() {
+    let config = brenn_lib::config::config_from_dsl(concat!(
+        "component Etl {\n",
+        "    abi = processor; requires = [ports];\n",
+        "    in ticks;\n",
+        "    out events;\n",
+        "}\n",
+        "component Indexer {\n",
+        "    abi = processor; requires = [ports];\n",
+        "    io feed;\n",
+        "}\n",
+        "channel ticks at \"brenn:ticks\" {\n",
+        "    push_depth = 1; retain_depth = 1; standing_retain_depth = 1;\n",
+        "}\n",
+        "link relay;\n",
+        "new etl: Etl {\n",
+        "    component_path = \"/lib/etl.wasm\";\n",
+        "    grants = [ports];\n",
+        "    in ticks <- ticks { push_depth = 1; retain_depth = 1; }\n",
+        "    out events -> relay;\n",
+        "}\n",
+        "new indexer: Indexer {\n",
+        "    component_path = \"/lib/indexer.wasm\";\n",
+        "    grants = [ports];\n",
+        "    io feed <-> relay { push_depth = 2; retain_depth = 6; }\n",
+        "}\n",
+    ));
+    let declared: Vec<&str> = config
+        .channels
+        .iter()
+        .filter_map(|channel| channel.address.as_deref())
+        .collect();
+    let wiring = lower_auto_wiring(
+        &config.links,
+        &config.wasm_consumers,
+        &config.surfaces,
+        &declared,
+        &config.messaging,
+    );
+
+    // Backend-only endpoints, so a server-local ring whose depth is the fold.
+    let entries = wiring.nondurable_entries();
+    assert_eq!(entries.len(), 1);
+    let address = entries[0].address.clone();
+    assert_eq!(entries[0].transport_type, ChannelScheme::Local);
+    assert_eq!(entries[0].resolved_channel.retain_depth, Depth::Bounded(6));
+    assert_eq!(
+        entries[0].description.as_deref(),
+        Some("auto channel: wasm:etl/events, wasm:indexer/feed"),
+    );
+
+    let mut directory = entries.to_vec();
+    directory.push(brenn_entry("brenn:ticks"));
+    let resolved = resolve_with_auto(&config.wasm_consumers, &dir_of(directory), &wiring);
+    let bare = address.strip_prefix("local:").expect("a local address");
+    let etl = &resolved[0];
+    assert_eq!(etl.outputs[0].channel_address, address);
+    assert!(etl.policy.allows_local_publish(bare));
+    let indexer = &resolved[1];
+    assert_eq!(indexer.inputs[0].sub.channel_address, address);
+    assert_eq!(indexer.inputs[0].sub.push_depth, Depth::Bounded(2));
+    assert!(indexer.policy.allows_local_delivery(bare));
+}
+
 /// Auto-injection means a consumer's ACL lists in config no longer enumerate its
 /// full reach, so the boot log is what restores a complete accounting for a
 /// config security review: one line per (principal, capability, channel).
@@ -990,7 +1089,7 @@ fn connection_bound_ports_resolve_with_no_operator_acls() {
 fn every_injected_grant_is_boot_logged() {
     let consumers = vec![publisher("etl"), subscriber("indexer", 2, 6)];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(etl_to_indexer(2, 6))],
         &consumers,
         &[],
         &[],
@@ -1024,7 +1123,7 @@ fn a_non_endpoint_consumer_is_not_covered() {
         },
     ];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(etl_to_indexer(2, 6))],
         &consumers,
         &[],
         &[],
@@ -1043,15 +1142,15 @@ fn a_non_endpoint_consumer_is_not_covered() {
     assert!(!bystander.policy.allows_local_publish(&bare));
 }
 
-/// The `ports` grant is a linker-level capability, not ACL boilerplate a
-/// connection can absorb: without it the publish interface is never linked.
+/// The `ports` grant is a linker-level capability, not ACL boilerplate a link
+/// can absorb: without it the publish interface is never linked.
 #[test]
 #[should_panic(expected = "\"ports\" is not in grants")]
-fn connection_bound_output_still_needs_the_ports_grant() {
+fn a_link_bound_output_still_needs_the_ports_grant() {
     let mut consumers = vec![publisher("etl"), subscriber("indexer", 2, 6)];
     consumers[0].grants = vec![];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[link(etl_to_indexer(2, 6))],
         &consumers,
         &[],
         &[],
@@ -1069,9 +1168,9 @@ fn connection_bound_output_still_needs_the_ports_grant() {
 fn surface_free_ports_resolve_onto_a_page_local_channel() {
     let surfaces = vec![surface_with_free_ports("deskbar")];
     let wiring = lower_auto_wiring(
-        &[conn(&[
-            "surface:deskbar#protobar/out",
-            "surface:deskbar#protobar/tap",
+        &[link(vec![
+            surface_pub("deskbar", "out"),
+            surface_sub("deskbar", "tap", 2, 3),
         ])],
         &[],
         &surfaces,
@@ -1102,7 +1201,7 @@ fn surface_free_ports_resolve_onto_a_page_local_channel() {
 /// is asserted per role in both directions: a read-only page port must not come
 /// away with publish authority on the channel it reads.
 #[test]
-fn wire_spanning_connection_injects_grants_on_both_sides() {
+fn a_wire_spanning_link_injects_grants_on_both_sides() {
     let surfaces = vec![surface_with_free_ports("deskbar")];
     let consumers = [WasmConsumerConfigRaw {
         subscriptions: vec![sub_raw("brenn:feed", "in"), free_sub("in-from-page", 2, 2)],
@@ -1110,8 +1209,14 @@ fn wire_spanning_connection_injects_grants_on_both_sides() {
     }];
     let wiring = lower_auto_wiring(
         &[
-            conn(&["wasm:etl/out", "surface:deskbar#protobar/tap"]),
-            conn(&["surface:deskbar#protobar/out", "wasm:etl/in-from-page"]),
+            link(vec![
+                wasm_pub("etl", "out"),
+                surface_sub("deskbar", "tap", 2, 3),
+            ]),
+            link(vec![
+                surface_pub("deskbar", "out"),
+                wasm_sub("etl", "in-from-page", Depth::Bounded(2), Depth::Bounded(2)),
+            ]),
         ],
         &consumers,
         &surfaces,
@@ -1133,7 +1238,7 @@ fn wire_spanning_connection_injects_grants_on_both_sides() {
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions[0].channel_address, to_page);
     assert!(surface.policy.allows_ephemeral_delivery(&bare));
-    // Its own output rides the second connection's channel, publish-granted.
+    // Its own output rides the second link's channel, publish-granted.
     let from_page = surface.outputs[0]
         .channel_address
         .strip_prefix("ephemeral:")
@@ -1165,91 +1270,9 @@ fn wire_spanning_connection_injects_grants_on_both_sides() {
     assert!(!consumer.policy.allows_ephemeral_publish(&from_page));
 }
 
-/// Naming a surface-only connection with an explicit `ephemeral:` address moves
-/// its channel onto the server ring instead of the default page ring, so every
-/// session of that surface shares one copy.
-#[test]
-fn a_named_ephemeral_channel_lands_on_the_server_ring_not_the_page() {
-    let surfaces = vec![surface_with_free_ports("deskbar")];
-    let wiring = lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("ephemeral:page.share".to_string()),
-            ..conn(&[
-                "surface:deskbar#protobar/out",
-                "surface:deskbar#protobar/tap",
-            ])
-        }],
-        &[],
-        &surfaces,
-        &[],
-        &globals(),
-    );
-    assert!(wiring.durable_entries().is_empty());
-    let entries = wiring.nondurable_entries();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].address, "ephemeral:page.share");
-    assert_eq!(entries[0].transport_type, ChannelScheme::Ephemeral);
-    assert_eq!(
-        entries[0].uuid,
-        brenn_lib::messaging::nondurable_channel_uuid(ChannelScheme::Ephemeral, "page.share"),
-    );
-
-    let resolved = resolve_surfaces(&surfaces, &dir_of(entries.to_vec()), &globals(), &wiring);
-    let surface = &resolved[0];
-    assert_eq!(
-        surface.subscriptions[0].channel_address,
-        "ephemeral:page.share",
-    );
-    assert_eq!(surface.outputs[0].channel_address, "ephemeral:page.share");
-    // Named ephemeral is the opposite of the page-local default: no page ring at
-    // all, and the traffic is bus-gated on both roles.
-    assert!(surface.local_channels.is_empty());
-    assert!(surface.policy.allows_ephemeral_delivery("page.share"));
-    assert!(surface.policy.allows_ephemeral_publish("page.share"));
-}
-
-/// Naming a backend-only connection `local:` keeps it on the server ring it
-/// would have taken anonymously, with an address an operator can grep for.
-#[test]
-fn a_named_backend_local_channel_keeps_its_server_ring() {
-    let consumers = vec![publisher("etl"), subscriber("indexer", 2, 6)];
-    let wiring = lower_auto_wiring(
-        &[ConnectionConfigRaw {
-            channel: Some("local:etl.batches".to_string()),
-            ..conn(&["wasm:etl/out", "wasm:indexer/tap"])
-        }],
-        &consumers,
-        &[],
-        &[],
-        &globals(),
-    );
-    assert!(wiring.durable_entries().is_empty());
-    let entries = wiring.nondurable_entries();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].address, "local:etl.batches");
-    assert_eq!(entries[0].transport_type, ChannelScheme::Local);
-    assert_eq!(
-        entries[0].uuid,
-        brenn_lib::messaging::nondurable_channel_uuid(ChannelScheme::Local, "etl.batches"),
-    );
-
-    let mut dir_entries = entries.to_vec();
-    dir_entries.push(brenn_entry("brenn:feed"));
-    let resolved = resolve_with_auto(&consumers, &dir_of(dir_entries), &wiring);
-    assert_eq!(resolved[0].outputs[0].channel_address, "local:etl.batches");
-    assert!(resolved[0].policy.allows_local_publish("etl.batches"));
-    assert!(!resolved[0].policy.allows_local_delivery("etl.batches"));
-    assert_eq!(
-        resolved[1].inputs[0].sub.channel_address,
-        "local:etl.batches",
-    );
-    assert!(resolved[1].policy.allows_local_delivery("etl.batches"));
-    assert!(!resolved[1].policy.allows_local_publish("etl.batches"));
-}
-
 // --- io_ports ---
 
-/// The zero-config case: no `[[connection]]`, no `channel`, no `[[channel]]`
+/// The zero-config case: no `link`, no `channel`, no `[[channel]]`
 /// block — the port gets its own server-side ring, sized by its own depths.
 #[test]
 fn solo_wasm_io_port_gets_its_own_backend_local_channel() {
@@ -1340,14 +1363,17 @@ fn two_io_ports_get_distinct_channels() {
     );
 }
 
-/// Listed in a connection, the io_port rides that channel and counts as both a
+/// Bound to a link, the io_port rides that channel and counts as both a
 /// publisher and a subscriber on it — so the self-loop survives the other
 /// parties joining, and its depths still feed the fold.
 #[test]
-fn io_port_in_a_connection_rides_the_connection_channel() {
+fn an_io_port_in_a_link_rides_the_links_channel() {
     let consumers = vec![timer_consumer("etl"), subscriber("indexer", 2, 3)];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/timer", "wasm:indexer/tap"])],
+        &[link(vec![
+            wasm_io("etl", "timer", 2, 8),
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(3)),
+        ])],
         &consumers,
         &[],
         &[],
@@ -1372,14 +1398,17 @@ fn io_port_in_a_connection_rides_the_connection_channel() {
     assert!(!indexer.policy.allows_local_publish(&bare));
 }
 
-/// A backend io_port and a surface io_port on one connection span the wire, so
-/// the channel is `ephemeral:` and each side is granted both of its roles.
+/// A backend io_port and a surface io_port on one link span the wire, so the
+/// channel is `ephemeral:` and each side is granted both of its roles.
 #[test]
 fn io_ports_spanning_the_wire_share_one_ephemeral_channel() {
     let consumers = vec![timer_consumer("etl")];
     let surfaces = vec![surface_with_io_port("deskbar")];
     let wiring = lower_auto_wiring(
-        &[conn(&["wasm:etl/timer", "surface:deskbar#protobar/loop"])],
+        &[link(vec![
+            wasm_io("etl", "timer", 2, 8),
+            surface_io("deskbar", "loop", 2, 5),
+        ])],
         &consumers,
         &surfaces,
         &[],
@@ -1488,15 +1517,18 @@ fn a_named_page_local_auto_channel_shares_its_ring_with_an_operator_binding() {
     assert!(surface.policy.acls.local_publish.is_empty());
 }
 
-/// A port binds exactly one channel: its own `channel` field and a connection
-/// claiming it are two answers to one question.
+/// A port binds exactly one channel: its own `channel` field and a link claiming
+/// it are two answers to one question.
 #[test]
 #[should_panic(expected = "already binds channel")]
-fn io_port_with_both_a_channel_and_a_connection_panics() {
+fn an_io_port_with_both_a_channel_and_a_link_panics() {
     let mut consumers = vec![timer_consumer("etl"), subscriber("indexer", 2, 3)];
     consumers[0].io_ports[0].channel = Some("brenn:etl.timer".to_string());
     lower_auto_wiring(
-        &[conn(&["wasm:etl/timer", "wasm:indexer/tap"])],
+        &[link(vec![
+            wasm_io("etl", "timer", 2, 8),
+            wasm_sub("indexer", "tap", Depth::Bounded(2), Depth::Bounded(3)),
+        ])],
         &consumers,
         &[],
         &[],
@@ -1504,13 +1536,13 @@ fn io_port_with_both_a_channel_and_a_connection_panics() {
     );
 }
 
-/// An io_port is already wired to itself, so a connection naming it alone is a
+/// An io_port is already wired to itself, so a link binding it alone is a
 /// redundant spelling of the default rather than a second way to say it.
 #[test]
-#[should_panic(expected = "names one io_port and nothing else")]
-fn connection_naming_only_one_io_port_panics() {
+#[should_panic(expected = "binds one io_port and nothing else")]
+fn a_link_binding_only_one_io_port_panics() {
     lower_auto_wiring(
-        &[conn(&["wasm:etl/timer"])],
+        &[link(vec![wasm_io("etl", "timer", 2, 8)])],
         &[timer_consumer("etl")],
         &[],
         &[],

@@ -70,7 +70,7 @@ pub fn assert_output_bindings_covered(surfaces: &[ResolvedSurface]) {
 /// no *other* principal can write them. `prefix` roots the derived bare names.
 pub fn inject_surface_geometry_status_grants(surfaces: &mut [ResolvedSurface], prefix: &str) {
     use super::description::{surface_geometry_bare, surface_status_bare};
-    use brenn_lib::access::AppCapability;
+    use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::acl::ChannelMatcher;
     for surface in surfaces {
         let geometry = surface_geometry_bare(prefix, &surface.slug);

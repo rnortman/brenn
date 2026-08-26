@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use brenn_attach_proto::{GapReason as ProtoGapReason, ServerFrame, SubscribeOutcome};
 use brenn_db::Db;
+use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
-use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{SubscriberEntry, SubscriberEntryKind};
 use brenn_messaging::{GapReason as BusGapReason, Replay};
