@@ -18,7 +18,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library
 load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
 load("//bazel/gencode:defs.bzl", "generated_parity_test")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY", "WASM32_ONLY")
-load(":dist.bzl", "surface_crate_stage")
+load(":dist.bzl", "surface_crate_stage", "surface_dom_package")
 
 # Where the component dirs live: any direct child of these packages is a
 # component, and its directory name is the kind.
@@ -58,9 +58,10 @@ def surface_wasm_crate(
         test_data: runtime files the host unit tests read.
         test_rustc_env: extra compile-time environment for the host unit tests.
         test_tags: tags for the host unit test target.
-        sidecars: documentation files shipped beside the bundle in the asset
-            tree; hand-authored ones are renamed to the artifact's basename,
-            generated ones already carry it.
+        sidecars: files shipped flat beside the bundle in the asset tree —
+            documentation, and for a component its binding record and packaged
+            specification; hand-authored ones are renamed to the artifact's
+            basename, generated ones already carry it.
         visibility: visibility of the host library and the bundle.
     """
     srcs = native.glob(["src/**/*.rs"])
@@ -239,7 +240,7 @@ def surface_component(
         crate_name = crate_name,
         deps = deps,
         edition = edition,
-        sidecars = [":" + kind + "_help"] + schema,
+        sidecars = [":" + kind + "_help", ":" + kind + "_package"] + schema,
         test_data = committed_help + schema,
         test_deps = test_deps,
         test_rustc_env = test_rustc_env,
@@ -252,4 +253,17 @@ def surface_component(
         crate_name = crate_name,
         edition = edition,
         kind = kind,
+    )
+
+    # The spec label is derived, never declared: a component is named entirely
+    # by where it lives, and its specification is the file under `config/specs`
+    # carrying its kind. A component whose author wrote no specification fails
+    # here, at the missing label, rather than shipping an artifact no
+    # configuration can bind to.
+    surface_dom_package(
+        name = kind + "_package",
+        artifact = crate_name,
+        bundle = ":" + kind + "_bundle",
+        kind = kind,
+        spec = "//:config/specs/" + kind + ".brenn",
     )

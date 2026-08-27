@@ -1,0 +1,23 @@
+/// The transplant fixture: one artifact, two hostings, one transcript. It is
+/// driven by the wasmtime harness and by the browser suite from a shared
+/// script, and is instantiated by no deployment configuration — it is declared
+/// here because it ships in the surface asset tree, and a shipped kind owns an
+/// authored specification.
+///
+/// The guest is deliberately input-agnostic: it iterates whatever input windows
+/// the host binds and summarizes each one, so no input port is load-bearing for
+/// it. Both inputs are therefore optional, and the two named here are the ones
+/// the harnesses bind — a deployment that bound neither would still get a
+/// well-formed transcript.
+///
+/// `out` is not optional: every activation publishes its summary there, and the
+/// deferral markers name it as the only port they park, cancel, and edit on.
+/// Bodies are free-form (a JSON summary, echo markers), so no port carries a
+/// doctype.
+component ProcessorTransplant {
+  abi = processor;
+  requires = [ports, log, config];
+  optional in in;
+  optional in ctx;
+  out out;
+}

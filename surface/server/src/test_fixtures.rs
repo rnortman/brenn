@@ -24,8 +24,8 @@ use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{
-    AttachSendBudget, ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent,
-    ResolvedSurface, SurfaceOutput, build_channel_entries,
+    ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent, ResolvedSurface,
+    SurfaceOutput, build_channel_entries,
 };
 use brenn_lib::messaging::{ChannelEntry, Urgency};
 use brenn_messaging_store::store::RingStores;
@@ -174,16 +174,13 @@ pub fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
     ResolvedSurface {
         slug: "writer-surface".to_string(),
         skin: "bench".to_string(),
-        components: vec![ResolvedComponent {
-            instance: "writer".to_string(),
-            kind: "writer".to_string(),
-            abi: brenn_surface_schema::Abi::Dom,
-            send_budget: AttachSendBudget::default(),
-            parked_batch_depth: 8,
-            config: Default::default(),
-            chrome: false,
-            grants: Default::default(),
-        }],
+        // Never run through asset validation, so `minimal`'s empty binding
+        // hash has nothing to bind to.
+        components: vec![ResolvedComponent::minimal(
+            "writer",
+            "writer",
+            brenn_surface_schema::Abi::Dom,
+        )],
         subscriptions: vec![],
         wire_subscriptions: vec![],
         local_channels: vec![],

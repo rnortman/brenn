@@ -82,6 +82,16 @@ fn assert_lowers(document: &str, expected: BrennConfig) {
         );
         consumer.spec_sha256 = String::new();
     }
+    for surface in &mut actual.surfaces {
+        for component in &mut surface.components {
+            assert_eq!(
+                component.spec_sha256, document_hash,
+                "surface {:?} component {:?} carries the hash of the file its class was declared in",
+                surface.slug, component.instance
+            );
+            component.spec_sha256 = String::new();
+        }
+    }
     assert_eq!(actual, expected);
 }
 
@@ -243,16 +253,11 @@ fn surface(slug: &str, grants: Vec<AttachGrant>) -> SurfaceConfigRaw {
 /// A `dom` component instance whose instance id is its kind — what a `new`
 /// handle that matches the class's lowercased name lowers to.
 fn dom_component(kind: &str) -> SurfaceComponentRaw {
+    // The hash `minimal` leaves empty is cleared by `assert_lowers` after it
+    // checks the real one, like every consumer's.
     SurfaceComponentRaw {
-        kind: kind.to_string(),
         instance: Some(kind.to_string()),
-        abi: "dom".to_string(),
-        send_burst: None,
-        send_refill_secs: None,
-        parked_batch_depth: None,
-        chrome: false,
-        config: None,
-        grants: vec![],
+        ..SurfaceComponentRaw::minimal(kind)
     }
 }
 
@@ -2841,6 +2846,51 @@ new logger: Logger {
     assert_ne!(
         config_from_dsl(&commented).wasm_consumers[0].spec_sha256,
         config.wasm_consumers[0].spec_sha256
+    );
+}
+
+/// The surface twin of the consumer hash test: a placed instance carries the
+/// hash of the file its class was declared in, and a comment-only edit to that
+/// file is a different hash — the binding boot checks is byte identity, not
+/// semantic equality.
+#[test]
+fn a_surface_component_lowers_the_hash_of_the_file_its_class_was_declared_in() {
+    let document = concat!(
+        r#"
+channel acks at "ephemeral:alice-desk.acks" {
+    push_depth = 2;
+    retain_depth = 4;
+}
+
+component Panel {
+    "#,
+        dom_any!(),
+        r#"
+    io acks;
+}
+
+surface alice_desk {
+    grants = [subscribe, publish];
+
+    new panel: Panel {
+        grants = [ports];
+        io acks <-> acks;
+    }
+}
+"#
+    );
+    let config = config_from_dsl(document);
+    assert_eq!(
+        config.surfaces[0].components[0].spec_sha256,
+        brenn_dsl::source_sha256(document)
+    );
+    let commented = format!(
+        "// a note
+{document}"
+    );
+    assert_ne!(
+        config_from_dsl(&commented).surfaces[0].components[0].spec_sha256,
+        config.surfaces[0].components[0].spec_sha256
     );
 }
 

@@ -552,4 +552,51 @@ remote pod {
     fn brenn_e2e_brenn_passes_the_strengthened_check() {
         shipped_config("brenn.e2e.brenn");
     }
+
+    /// Each component's `spec_sha256` must match `config/specs/<kind>.brenn`.
+    ///
+    /// No automated suite boots the real asset tree, so a spec that drifted
+    /// would pass every gate and refuse to start on the deploy host. This
+    /// checks the hermetic half: config against specification sources, no
+    /// built artifacts.
+    fn shipped_config_binds_to_its_packaged_specs(filename: &str) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let config = match check_config(&root.join(filename)) {
+            Ok(config) => config,
+            Err(report) => panic!("{filename} must compile: {report}"),
+        };
+        let mut checked = 0;
+        for surface in &config.surfaces {
+            for component in &surface.components {
+                let spec = root.join(format!("config/specs/{}.brenn", component.kind));
+                let bytes = std::fs::read(&spec).unwrap_or_else(|e| {
+                    panic!(
+                        "{filename} mounts kind {} but {} is unreadable: {e}",
+                        component.kind,
+                        spec.display(),
+                    )
+                });
+                assert_eq!(
+                    component.spec_sha256,
+                    brenn_lib::util::sha256_hex(&bytes),
+                    "{filename} declares kind {} in a file other than {}; the build packages \
+                     that file and boot binds this hash to it",
+                    component.kind,
+                    spec.display(),
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "{filename} mounts no surface components");
+    }
+
+    #[test]
+    fn brenn_dev_brenn_binds_to_its_packaged_specs() {
+        shipped_config_binds_to_its_packaged_specs("brenn.dev.brenn");
+    }
+
+    #[test]
+    fn brenn_e2e_brenn_binds_to_its_packaged_specs() {
+        shipped_config_binds_to_its_packaged_specs("brenn.e2e.brenn");
+    }
 }

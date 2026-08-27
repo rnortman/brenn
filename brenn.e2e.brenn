@@ -14,6 +14,7 @@ use config::specs::git-sync-consumer::*;
 use config::specs::meeting::*;
 use config::specs::mode-clock::*;
 use config::specs::processor-demo::*;
+use config::specs::processor-transplant::*;
 use config::specs::protobar::*;
 use config::surfaces::*;
 

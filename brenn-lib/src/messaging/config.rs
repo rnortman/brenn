@@ -962,6 +962,10 @@ pub struct SurfaceComponentRaw {
     /// grants, because a default would silently pick a toolchain for them.
     /// Resolution rejects any value the shell cannot load.
     pub abi: String,
+    /// Lowercase hex SHA-256 of the spec file this instance's class was
+    /// declared in. Not a body key — the class's fact, carried through lowering
+    /// so boot can bind it to the spec packaged in the dist tree.
+    pub spec_sha256: String,
     /// Override for this instance's durable send-budget burst: how many
     /// publishes it may make back-to-back before the refill rate binds. Absent ⇒
     /// [`SURFACE_SEND_BURST`].
@@ -1017,6 +1021,29 @@ pub struct SurfaceComponentRaw {
     /// ACL policy, with no further guard. It is operator configuration, not a
     /// secret store — never place credentials or secrets in it.
     pub config: Option<BTreeMap<String, String>>,
+}
+
+#[cfg(any(test, feature = "testutils"))]
+impl SurfaceComponentRaw {
+    /// Minimal raw `dom` component of `kind`, with a defaulted instance id, no
+    /// grants, no overrides and an empty specification hash. Shared across this
+    /// crate's test modules and the boot crates above it so a new field on this
+    /// struct lands in one place instead of every hand-written literal; a test
+    /// that is *about* a field overrides that one field and nothing else.
+    pub fn minimal(kind: &str) -> Self {
+        SurfaceComponentRaw {
+            kind: kind.to_string(),
+            instance: None,
+            abi: "dom".to_string(),
+            spec_sha256: String::new(),
+            send_burst: None,
+            send_refill_secs: None,
+            grants: vec![],
+            parked_batch_depth: None,
+            chrome: false,
+            config: None,
+        }
+    }
 }
 
 /// Default parked-batch depth when `parked_batch_depth` is unset: eight
@@ -1428,6 +1455,9 @@ pub struct ResolvedComponent {
     /// Resolved artifact shape, validated at boot against the ABIs the shell can
     /// actually load. Carried to the page in the bindings document.
     pub abi: brenn_surface_schema::Abi,
+    /// Lowercase hex SHA-256 of the spec file this instance's class was declared
+    /// in. Must match the hash in the record packaged with this kind's artifacts.
+    pub spec_sha256: String,
     /// This instance's durable send budget: its own declared override, or the
     /// defaults. Server-side only — the page is told nothing about it, because
     /// the server is the authority and a mirrored bucket has no reader yet.
@@ -1453,6 +1483,32 @@ pub struct ResolvedComponent {
     /// component within the page. Carried to the page in the bindings document,
     /// where the kernel is the runtime enforcer.
     pub grants: BTreeSet<ComponentGrant>,
+}
+
+#[cfg(any(test, feature = "testutils"))]
+impl ResolvedComponent {
+    /// Minimal resolved component: the identity triple, default budgets, no
+    /// grants, no config, not chrome, and an empty specification hash. Shared
+    /// across this crate's test modules and the crates above it so a new field
+    /// on this struct lands in one place instead of every hand-written literal;
+    /// a test that is *about* a field overrides that one field and nothing else.
+    ///
+    /// The empty hash is what a fixture that never runs asset validation wants —
+    /// there is nothing installed for it to bind to. A fixture that does run it
+    /// overrides the hash with the one its tree packages.
+    pub fn minimal(instance: &str, kind: &str, abi: brenn_surface_schema::Abi) -> Self {
+        ResolvedComponent {
+            instance: instance.to_string(),
+            kind: kind.to_string(),
+            abi,
+            spec_sha256: String::new(),
+            send_budget: AttachSendBudget::default(),
+            parked_batch_depth: DEFAULT_PARKED_BATCH_DEPTH,
+            chrome: false,
+            config: BTreeMap::new(),
+            grants: BTreeSet::new(),
+        }
+    }
 }
 
 /// A resolved `local:` channel: a page-local pub/sub channel the surface's own

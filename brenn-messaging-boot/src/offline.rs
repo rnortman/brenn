@@ -28,9 +28,11 @@ use crate::{finish_surface_policies, lower_channel_topology, resolve_surfaces};
 /// - [`resolve_wasm_consumers`](crate::resolve_wasm_consumers): it takes the
 ///   resolved mqtt-client map, so it is environment-coupled today. Consumer
 ///   gates stay boot-only.
-/// - The per-instance import⊆grants assert (`brenn_surface_server`'s
-///   `validate_surface_assets`): it reads the built `.wasm` component trees,
-///   which a config checker does not have.
+/// - The per-instance import⊆grants assert and the per-instance specification
+///   binding (`brenn_surface_server`'s `validate_surface_assets`): both read the
+///   built surface asset tree — the component trees and the binding records that
+///   state which specification each kind's artifacts were built against — which
+///   a config checker does not have.
 /// - `load_remote_token`, and only it: a `[[remote]]`'s bearer token is read off
 ///   the deployment host's disk, mode bits and all. Every other `[[remote]]`
 ///   gate is a fact about the document and runs here through

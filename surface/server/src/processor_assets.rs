@@ -3,8 +3,9 @@
 //! A processor kind ships as a jco-transpiled tree under
 //! `<surface_dist_dir>/processor/<kind>/`: the transpiled JS + core wasm, the
 //! source component artifact it was transpiled from, and a `manifest.json`
-//! recording the source hash, the pinned jco version, the component's WIT import
-//! list, and the emitted file set.
+//! recording the source hash, the pinned jco version, the specification the
+//! component was authored against and that specification's hash, the component's
+//! WIT import list, and the emitted file set.
 //!
 //! Every check here is a named boot panic. The trust argument: the manifest is
 //! operator-deployed build output, and the source-hash check binds it to the
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 /// Manifest schema version this server understands. A tree written by a
 /// different version is a deploy/toolchain mismatch, not something to
 /// best-effort parse.
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 
 /// The package namespace every processor host interface lives under. An import
 /// outside this namespace (a stray `wasi:*` a dependency dragged in, or a future
@@ -71,6 +72,15 @@ pub struct ProcessorManifest {
     /// build writes.
     #[allow(dead_code)]
     pub jco_version: String,
+    /// The packaged copy of the component's authored specification, by name
+    /// inside the kind directory. Stated as well as derivable, and checked
+    /// against the derived name: a field nothing checks is a guarantee the
+    /// record does not actually carry.
+    pub spec: String,
+    /// SHA-256 of that specification, hex-encoded. The configuration naming this
+    /// kind compiled against a copy of the same file, so byte equality between
+    /// the two carries every compile-time check over to the installed artifact.
+    pub spec_sha256: String,
     /// The component world's import list, extracted from the artifact at build
     /// time. This is the import profile.
     pub imports: Vec<String>,
@@ -91,6 +101,12 @@ fn component_artifact(kind: &str) -> String {
     format!("{kind}.component.wasm")
 }
 
+/// The packaged specification copied beside the transpiled output, named from
+/// the kind exactly as the component artifact is.
+fn spec_artifact(kind: &str) -> String {
+    format!("{kind}.spec.brenn")
+}
+
 /// Validate one processor kind's deployed tree, returning its manifest so the
 /// caller can run the per-surface grant checks against the import profile.
 ///
@@ -98,8 +114,9 @@ fn component_artifact(kind: &str) -> String {
 ///
 /// On a missing/unparseable manifest, a wrong schema version, a kind/directory
 /// mismatch, a missing listed file, a source-hash mismatch (stale transpile or
-/// partial deploy), a backend-only import, or an import name no WIT interface
-/// defines.
+/// partial deploy), a specification name that is not the one the kind derives, a
+/// missing or divergent packaged specification, a backend-only import, or an
+/// import name no WIT interface defines.
 pub fn validate_processor_kind(surface_dist_dir: &Path, kind: &str) -> ProcessorManifest {
     let dir = kind_dir(surface_dist_dir, kind);
     let manifest_path = dir.join("manifest.json");
@@ -143,13 +160,14 @@ pub fn validate_processor_kind(surface_dist_dir: &Path, kind: &str) -> Processor
         assert!(
             path.exists(),
             "boot: processor component {kind:?} asset manifest lists {file:?}, which is missing at \
-             {} — the transpiled tree is incomplete (run `make surface-wasm`; on deploy ensure \
+             {} — the transpiled tree is incomplete (run `make build`; on deploy ensure \
              surface_dist_dir is populated). Refusing to start (fail-fast on invalid config).",
             path.display(),
         );
     }
 
     assert_source_hash_matches(&dir, kind, &manifest);
+    assert_spec_hash_matches(&dir, kind, &manifest);
     assert_import_profile(kind, &manifest);
 
     manifest
@@ -166,7 +184,7 @@ fn assert_source_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManife
         panic!(
             "boot: processor component {kind:?} source artifact {artifact} is unreadable at {} \
              ({err}) — without it the transpiled tree's provenance cannot be verified. Rebuild the \
-             surface assets (`make surface-wasm`) and redeploy. Refusing to start (fail-fast on \
+             surface assets (`make build`) and redeploy. Refusing to start (fail-fast on \
              invalid config).",
             path.display(),
         )
@@ -176,9 +194,53 @@ fn assert_source_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManife
         actual == manifest.source_sha256,
         "boot: processor component {kind:?} has a stale transpile: {artifact} hashes to {actual}, \
          but its manifest was written from {} — the component was rebuilt without re-transpiling, \
-         or the deploy synced only part of the tree. Re-run `make surface-wasm` and redeploy the \
+         or the deploy synced only part of the tree. Re-run `make build` and redeploy the \
          whole surface_dist_dir. Refusing to start (fail-fast on invalid config).",
         manifest.source_sha256,
+    );
+}
+
+/// The spec-binding half of the record: the packaged specification is the
+/// author's file verbatim, and its hash is what a configured instance's own
+/// spec hash is bound to.
+///
+/// The name is checked before the bytes: the manifest states the file it hashed
+/// and the kind derives that name, so a record naming something else is drift in
+/// the emitter rather than a stale deploy, and says so.
+///
+/// The window between this check and any later read of the tree is not defended:
+/// this is anti-drift, not anti-attacker — a writer to the surface asset
+/// directory already owns the host. The backend record's statement of the same
+/// stance is in `wasm_package.rs`.
+fn assert_spec_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManifest) {
+    let derived = spec_artifact(kind);
+    assert!(
+        manifest.spec == derived,
+        "boot: processor component {kind:?} asset manifest names its specification {:?}, but this \
+         kind's packaged specification is {derived:?} — the record and the tree's naming disagree, \
+         which is build drift. Rebuild the surface assets with a matching toolchain. Refusing to \
+         start (fail-fast on invalid config).",
+        manifest.spec,
+    );
+    let path = dir.join(&derived);
+    let bytes = std::fs::read(&path).unwrap_or_else(|err| {
+        panic!(
+            "boot: processor component {kind:?} packaged specification {derived} is unreadable at \
+             {} ({err}) — without it the configuration's specification cannot be bound to this \
+             tree. Rebuild the surface assets (`make build`) and redeploy. Refusing to \
+             start (fail-fast on invalid config).",
+            path.display(),
+        )
+    });
+    let actual = brenn_lib::util::sha256_hex(&bytes);
+    assert!(
+        actual == manifest.spec_sha256,
+        "boot: processor component {kind:?} has a specification that does not match its record: \
+         {derived} hashes to {actual}, but its manifest was written from {} — the tree was \
+         assembled from mismatched parts, or the packaged specification was edited in place. \
+         Rebuild the surface assets and redeploy the whole surface_dist_dir. Refusing to start \
+         (fail-fast on invalid config).",
+        manifest.spec_sha256,
     );
 }
 

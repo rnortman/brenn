@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Emit the boot-validation manifest for one jco-transpiled processor kind.
 #
-# Usage: emit-processor-manifest.sh <kind> <source-component.wasm> <out-dir> <jco-version>
+# Usage: emit-processor-manifest.sh <kind> <source-component.wasm> <out-dir> \
+#            <jco-version> <spec-path>
 #
 # WASM_TOOLS names the `wasm-tools` binary; unset, one is looked up on PATH.
 # WIT_LIB names the shared WIT-scraping library; unset, it is read from its path
@@ -13,14 +14,34 @@
 # without re-transpiling fails the deploy instead of the page load. `imports` is
 # read out of the artifact itself (never hand-written) and is the import profile
 # boot validation checks against the transpilable set.
+#
+# `spec_sha256` binds the tree to the specification the component was authored
+# against, the same way the backend package record binds a component to its
+# spec: the deployment's configuration compiled against exactly those bytes, so
+# byte equality at boot carries every compile-time check over to the installed
+# artifact. The specification is named by its path alone and the name is taken
+# from it: the boot reader derives `<kind>.spec.brenn` and refuses anything
+# else, so a caller that could state a name and a path separately could write a
+# record hashing one file and naming another. It is copied into the staged tree
+# before this runs, so it joins the observed `files` list.
 set -euo pipefail
 
 kind="$1"
 component="$2"
 out_dir="$3"
 jco_version="$4"
+spec_path="$5"
+
+# The one name the boot reader will accept, and the one this record may state.
+spec_name="$(basename "$spec_path")"
+if [ "$spec_name" != "$kind.spec.brenn" ]; then
+    echo "emit-processor-manifest: $kind packages its specification as $spec_name, but the" \
+         "reader derives $kind.spec.brenn and reads no other file." >&2
+    exit 1
+fi
 
 sha=$(sha256sum "$component" | awk '{print $1}')
+spec_sha=$(sha256sum "$spec_path" | awk '{print $1}')
 
 # The world's import list, fully qualified — package namespace included — so
 # the server's profile check can reject a foreign-namespace import (a stray
@@ -51,10 +72,12 @@ json_array() {
 
 {
     printf '{\n'
-    printf '  "v": 1,\n'
+    printf '  "v": 2,\n'
     printf '  "kind": "%s",\n' "$(json_escape "$kind")"
     printf '  "source_sha256": "%s",\n' "$(json_escape "$sha")"
     printf '  "jco_version": "%s",\n' "$(json_escape "$jco_version")"
+    printf '  "spec": "%s",\n' "$(json_escape "$spec_name")"
+    printf '  "spec_sha256": "%s",\n' "$(json_escape "$spec_sha")"
     printf '  "imports": '
     printf '%s\n' "$imports" | json_array
     printf ',\n'

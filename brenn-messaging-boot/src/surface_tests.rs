@@ -11,8 +11,8 @@ use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
-    AttachSendBudget, DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC,
-    ResolvedComponent, ResolvedLocalChannel,
+    DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC, ResolvedComponent,
+    ResolvedLocalChannel,
 };
 use brenn_lib::messaging::config::{Depth, SendRate};
 
@@ -277,6 +277,12 @@ fn ephem_with(
     }
 }
 
+/// A stand-in class-file hash for `kind`. Hashing per-kind bytes keeps the
+/// whole-value pin honest and two kinds distinguishable.
+fn spec_hash(kind: &str) -> String {
+    brenn_lib::util::sha256_hex(format!("// specification for {kind}\n").as_bytes())
+}
+
 /// A valid `[[surface]]` raw block: one bound component (`protobar`) with an
 /// ephemeral input + a brenn output, one presentational component (`sidecar`,
 /// no bindings — pins the allowed "component with no ports" case), the required
@@ -291,37 +297,20 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("protobar-demo".to_string())],
         components: vec![
             SurfaceComponentRaw {
-                kind: "protobar".to_string(),
-                instance: None,
-                abi: "dom".to_string(),
-                send_burst: None,
-                send_refill_secs: None,
-                parked_batch_depth: None,
-                config: None,
-                chrome: false,
+                spec_sha256: spec_hash("protobar"),
                 grants: vec![ComponentGrant::Ports],
+                ..SurfaceComponentRaw::minimal("protobar")
             },
             SurfaceComponentRaw {
-                kind: "sidecar".to_string(),
-                instance: None,
-                abi: "dom".to_string(),
-                send_burst: None,
-                send_refill_secs: None,
-                parked_batch_depth: None,
-                config: None,
-                chrome: false,
+                spec_sha256: spec_hash("sidecar"),
                 grants: vec![ComponentGrant::Ports],
+                ..SurfaceComponentRaw::minimal("sidecar")
             },
             SurfaceComponentRaw {
-                kind: "chrome".to_string(),
-                instance: None,
-                abi: "dom".to_string(),
-                send_burst: None,
-                send_refill_secs: None,
-                parked_batch_depth: None,
-                config: None,
+                spec_sha256: spec_hash("chrome"),
+                grants: vec![ComponentGrant::Ports],
                 chrome: true,
-                grants: vec![ComponentGrant::Ports],
+                ..SurfaceComponentRaw::minimal("chrome")
             },
         ],
         subscriptions: vec![surface_sub_raw(
@@ -381,15 +370,10 @@ fn durable_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
 /// per-instance principal exists for.
 fn component_raw(instance: &str) -> brenn_lib::messaging::config::SurfaceComponentRaw {
     brenn_lib::messaging::config::SurfaceComponentRaw {
-        kind: "agenda".to_string(),
         instance: Some(instance.to_string()),
-        abi: "dom".to_string(),
-        send_burst: None,
-        send_refill_secs: None,
-        parked_batch_depth: None,
-        config: None,
-        chrome: false,
+        spec_sha256: spec_hash("agenda"),
         grants: vec![ComponentGrant::Ports],
+        ..brenn_lib::messaging::config::SurfaceComponentRaw::minimal("agenda")
     }
 }
 
@@ -487,34 +471,20 @@ fn surface_resolves_happy_path() {
         s.components,
         vec![
             ResolvedComponent {
-                instance: "protobar".to_string(),
-                kind: "protobar".to_string(),
-                abi: brenn_surface_schema::Abi::Dom,
-                send_budget: AttachSendBudget::default(),
-                parked_batch_depth: 8,
-                config: Default::default(),
-                chrome: false,
+                spec_sha256: spec_hash("protobar"),
                 grants: [ComponentGrant::Ports].into(),
+                ..ResolvedComponent::minimal("protobar", "protobar", brenn_surface_schema::Abi::Dom)
             },
             ResolvedComponent {
-                instance: "sidecar".to_string(),
-                kind: "sidecar".to_string(),
-                abi: brenn_surface_schema::Abi::Dom,
-                send_budget: AttachSendBudget::default(),
-                parked_batch_depth: 8,
-                config: Default::default(),
-                chrome: false,
+                spec_sha256: spec_hash("sidecar"),
                 grants: [ComponentGrant::Ports].into(),
+                ..ResolvedComponent::minimal("sidecar", "sidecar", brenn_surface_schema::Abi::Dom)
             },
             ResolvedComponent {
-                instance: "chrome".to_string(),
-                kind: "chrome".to_string(),
-                abi: brenn_surface_schema::Abi::Dom,
-                send_budget: AttachSendBudget::default(),
-                parked_batch_depth: 8,
-                config: Default::default(),
+                spec_sha256: spec_hash("chrome"),
+                grants: [ComponentGrant::Ports].into(),
                 chrome: true,
-                grants: [ComponentGrant::Ports].into(),
+                ..ResolvedComponent::minimal("chrome", "chrome", brenn_surface_schema::Abi::Dom)
             },
         ]
     );
@@ -537,6 +507,53 @@ fn surface_resolves_happy_path() {
     assert!(s.user_has_access("anyone"));
     assert_eq!(s.publish_burst, DEFAULT_SURFACE_PUBLISH_BURST);
     assert_eq!(s.publish_per_sec, DEFAULT_SURFACE_PUBLISH_PER_SEC);
+}
+
+/// The field-by-field pin on what resolution puts on a `ResolvedComponent`.
+///
+/// [`surface_resolves_happy_path`] compares whole values, but every literal in
+/// it is written as an override of `ResolvedComponent::minimal`, so a field
+/// added to the struct would be filled by `minimal` everywhere and asserted by
+/// nothing. This destructures the resolved value instead: a new field fails to
+/// compile here until someone states what resolution is supposed to put in it.
+#[test]
+fn every_field_of_a_resolved_component_is_pinned() {
+    let dir = surface_dir();
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+    let ResolvedComponent {
+        instance,
+        kind,
+        abi,
+        spec_sha256,
+        send_budget,
+        parked_batch_depth,
+        chrome,
+        config,
+        grants,
+    } = &resolved[0].components[0];
+
+    assert_eq!(instance, "protobar");
+    assert_eq!(kind, "protobar");
+    assert_eq!(*abi, brenn_surface_schema::Abi::Dom);
+    assert_eq!(*spec_sha256, spec_hash("protobar"));
+    assert_eq!(
+        *send_budget,
+        brenn_lib::messaging::config::AttachSendBudget::default()
+    );
+    assert_eq!(
+        *parked_batch_depth,
+        brenn_lib::messaging::config::DEFAULT_PARKED_BATCH_DEPTH
+    );
+    // The chrome singleton is the third component, not this one.
+    assert!(!chrome);
+    assert!(config.is_empty());
+    assert_eq!(
+        grants.iter().copied().collect::<Vec<_>>(),
+        [ComponentGrant::Ports]
+    );
+
+    // The one field the first component cannot exercise.
+    assert!(resolved[0].components[2].chrome);
 }
 
 /// Injection adds the substrate error-reporting grant to every surface policy:
@@ -1511,15 +1528,9 @@ fn surface_duplicate_component_instance_panics() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components.push(SurfaceComponentRaw {
-        kind: "protobar".to_string(),
-        instance: None,
-        abi: "dom".to_string(),
-        send_burst: None,
-        send_refill_secs: None,
-        parked_batch_depth: None,
-        config: None,
-        chrome: false,
+        spec_sha256: spec_hash("protobar"),
         grants: vec![ComponentGrant::Ports],
+        ..SurfaceComponentRaw::minimal("protobar")
     });
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
@@ -1573,15 +1584,10 @@ fn surface_two_instances_of_one_kind_ok() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components.push(SurfaceComponentRaw {
-        kind: "protobar".to_string(),
         instance: Some("p2".to_string()),
-        abi: "dom".to_string(),
-        send_burst: None,
-        send_refill_secs: None,
-        parked_batch_depth: None,
-        config: None,
-        chrome: false,
+        spec_sha256: spec_hash("protobar"),
         grants: vec![ComponentGrant::Ports],
+        ..SurfaceComponentRaw::minimal("protobar")
     });
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let kinds: Vec<&str> = resolved[0]
@@ -1655,15 +1661,11 @@ fn surface_sibling_instances_carry_their_own_send_budgets() {
     let mut raw = valid_surface_raw();
     raw.components
         .push(brenn_lib::messaging::config::SurfaceComponentRaw {
-            kind: "protobar".to_string(),
             instance: Some("p2".to_string()),
-            abi: "dom".to_string(),
+            spec_sha256: spec_hash("protobar"),
             send_burst: Some(512),
-            send_refill_secs: None,
-            parked_batch_depth: None,
-            config: None,
-            chrome: false,
             grants: vec![ComponentGrant::Ports],
+            ..brenn_lib::messaging::config::SurfaceComponentRaw::minimal("protobar")
         });
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let budgets: Vec<(&str, u32)> = resolved[0]

@@ -527,16 +527,9 @@ fn dimensions_sidecar_filename(kind: &str) -> String {
     format!("{}.dimensions.json", sidecar_stem(kind))
 }
 
-/// The `brenn_<kind_underscored>` stem shared by the module and its sidecars,
-/// derived from the frozen `module_artifact` convention rather than
-/// re-implementing the hyphen→underscore mapping.
+/// The `brenn_<kind_underscored>` stem shared by the module and its sidecars.
 fn sidecar_stem(kind: &str) -> String {
-    let js = module_artifact(kind);
-    js.strip_suffix(".js")
-        .unwrap_or_else(|| {
-            panic!("module_artifact({kind:?}) = {js:?} lacks a .js suffix — host bug")
-        })
-        .to_string()
+    brenn_surface_contract::module_stem(kind)
 }
 
 /// Read the kind's markdown help sidecar (any valid UTF-8 accepted). `None` +

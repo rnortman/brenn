@@ -6,7 +6,9 @@ binding the two. The host re-computes that binding at boot and refuses to start
 when anything disagrees.
 
 This page is the contract. An out-of-tree component author needs everything
-here and nothing else to make a component loadable.
+here and nothing else to make a backend component loadable. Surface-placed
+components are bound the same way with a different record shape, which is
+in-tree only — the last section says why.
 
 ## Why the binding exists
 
@@ -186,11 +188,62 @@ Downstream of that, the release tree stages all three files into `lib/`,
 the tarball is proven internally bound before it ships, and the deploy script
 installs the sidecars beside each artifact.
 
-## Not yet packaged
+## Surface packages
 
-Surface-hosted components — dom kinds and surface-hosted processor kinds — are
-not bound this way yet. Their artifacts are multi-file dist trees rather than a
-single file, so the record shape and the verification walk differ mechanically.
-Surface-hosted processor kinds do already carry a transpilation manifest with a
-source hash, checked at boot, so the exposure there is the smaller half. Tracked
-as `surface-spec-binding` in `TODO.md`.
+Surface-placed components are bound the same way, with a different carrier. A
+surface artifact is not one file: a `dom` kind ships as a wasm-bindgen module
+pair flat in the surface asset root, a surface-hosted `processor` kind as a
+jco-transpiled directory. So the record takes the shape each already affords.
+The vocabulary is the backend's — a packaged verbatim copy of the author's
+specification, a content hash of it in a versioned `deny_unknown_fields`
+record, and byte-hash equality checked at boot — and only the carrier differs.
+
+**A dom kind**, flat in the asset root, sharing the artifact stem:
+
+```
+brenn_mode_clock.js                 the module
+brenn_mode_clock_bg.wasm            its wasm
+brenn_mode_clock.spec.brenn         the author's specification, verbatim
+brenn_mode_clock.manifest.json      the binding record, v1
+```
+
+The record states the kind, each of the three named files, and a hash of each.
+The module-pair hashes make the dom path's own staleness detectable for the
+first time; the shared `snippets/` tree, the `.d.ts` files and the help and
+schema sidecars are deliberately unhashed — nothing per-kind can state
+`snippets/` truthfully, and the rest are not load-bearing at boot.
+
+**A surface-hosted processor kind** already had a record, so the record grew
+rather than gaining a sibling. `processor/<kind>/manifest.json` is v2: the
+pre-existing `source_sha256`, `jco_version`, `imports` and `files` plus `spec`
+and `spec_sha256`, with the packaged copy in the kind directory as
+`<kind>.spec.brenn`. Both new fields are required; there is no spec-less
+surface kind.
+
+Neither record states the abi. Its location and shape is that statement — a
+record in the asset root and a record under `processor/<kind>/` cannot be
+confused — and the configuration's abi decides which lookup runs.
+
+At boot `validate_surface_assets` reads the record for every configured kind,
+re-derives each stated filename from the stem, re-hashes each named file, and
+then binds **per instance**: the specification hash the configuration compiled
+against must equal the record's. Per instance rather than per kind because the
+compiler's kind fold admits comment-divergent copies of one class under one
+kind; at most one of those copies is the bytes the tree was built from, and the
+one that is not now refuses at boot. The surface kernel is exempt: it is not a
+component, so it has no kind, no class and no specification to bind.
+
+In-tree, the records are emitted by the build. `surface_component` derives its
+kind's specification label from the package path — `//:config/specs/<kind>.brenn`
+— so a dom component with no authored specification does not build at all;
+`surface_processor_assets` names the spec at its call site. `package_check.sh`
+re-verifies every surface record over the staged release tree, and the deploy
+installs the asset tree as a whole rather than overlaying it, so no file from a
+prior release survives beside a fresh record.
+
+**These shapes are in-tree contracts, not external ones.** There is no
+out-of-tree surface authoring path today, and claiming a contract nobody can
+consume would freeze a shape that still needs room to move as surface
+components migrate out of tree. The version counters are in place for the day
+that status is granted deliberately. The backend package above is an external
+contract and is stated as one; this asymmetry is deliberate, not an oversight.

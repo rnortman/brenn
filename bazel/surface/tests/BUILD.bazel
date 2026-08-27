@@ -21,6 +21,18 @@ native_test(
     target_compatible_with = HOST_ONLY,
 )
 
+# The four names a dom kind contributes, and the order they are printed in: two
+# of the three readers consume them positionally.
+native_test(
+    name = "dom_names_test",
+    size = "small",
+    src = "dom_names_test.sh",
+    args = ["$(rootpath //bazel/surface:dom_names.sh)"],
+    data = ["//bazel/surface:dom_names.sh"],
+    out = "dom_names_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
 native_test(
     name = "processor_stage_test",
     size = "small",
@@ -28,5 +40,53 @@ native_test(
     args = ["$(rootpath //bazel/surface:processor_stage.sh)"],
     data = ["//bazel/surface:processor_stage.sh"],
     out = "processor_stage_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# Fixture-driven: the emitter hashes whatever it is handed and never reads a
+# file's contents, so synthetic bytes exercise every arm the real bundles do —
+# and the refusal arms, which no production run reaches.
+native_test(
+    name = "emit_dom_manifest_test",
+    size = "small",
+    src = "emit_dom_manifest_test.sh",
+    args = [
+        "$(rootpath //bazel/surface:emit_dom_manifest.sh)",
+        "$(rootpath //bazel/wasm:wit_lib.sh)",
+        "$(rootpath //bazel/wasm:record_lib.sh)",
+        "$(rootpath //bazel/surface:dom_names.sh)",
+    ],
+    data = [
+        "//bazel/surface:dom_names.sh",
+        "//bazel/surface:emit_dom_manifest.sh",
+        "//bazel/wasm:record_lib.sh",
+        "//bazel/wasm:wit_lib.sh",
+    ],
+    out = "emit_dom_manifest_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# Driven over the real transplant artifact: the emitter reads a component's own
+# imports, so a synthetic `.wasm` would exercise the arm that finds nothing and
+# none of the arms that matter.
+native_test(
+    name = "emit_processor_manifest_test",
+    size = "small",
+    src = "emit_processor_manifest_test.sh",
+    args = [
+        "$(rootpath //surface:emit-processor-manifest.sh)",
+        "$(rootpath //brenn-wasm/components/processor-transplant:component)",
+        "$(rootpath //bazel/tools:wasm-tools)",
+        "$(rootpath //bazel/wasm:wit_lib.sh)",
+        "$(rootpath //bazel/wasm:record_lib.sh)",
+    ],
+    data = [
+        "//bazel/tools:wasm-tools",
+        "//bazel/wasm:record_lib.sh",
+        "//bazel/wasm:wit_lib.sh",
+        "//brenn-wasm/components/processor-transplant:component",
+        "//surface:emit-processor-manifest.sh",
+    ],
+    out = "emit_processor_manifest_test.run",
     target_compatible_with = HOST_ONLY,
 )

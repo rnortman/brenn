@@ -6,8 +6,8 @@ use brenn_lib::access::acl::ChannelMatcher;
 use brenn_lib::config::SurfaceDescriptionConfig;
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{
-    AttachSendBudget, ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent,
-    ResolvedSurface, SurfaceBinding, SurfaceOutput, build_channel_entries,
+    ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent, ResolvedSurface,
+    SurfaceBinding, SurfaceOutput, build_channel_entries,
 };
 
 use super::*;
@@ -36,15 +36,10 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
         skin: skin.to_string(),
         components: components
             .iter()
-            .map(|(instance, kind)| ResolvedComponent {
-                instance: (*instance).to_string(),
-                kind: (*kind).to_string(),
-                abi: brenn_surface_schema::Abi::Dom,
-                send_budget: AttachSendBudget::default(),
-                parked_batch_depth: 8,
-                config: Default::default(),
-                chrome: false,
-                grants: Default::default(),
+            // Never run through asset validation, so `minimal`'s empty binding
+            // hash has nothing to bind to.
+            .map(|(instance, kind)| {
+                ResolvedComponent::minimal(instance, kind, brenn_surface_schema::Abi::Dom)
             })
             .collect(),
         subscriptions,

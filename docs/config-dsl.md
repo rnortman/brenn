@@ -576,18 +576,22 @@ A spec change lands in the author's repo first and is then recopied. The copy
 step is interim — it exists only until the config language can import a
 component's package directly — but the ownership rule it protects is not.
 
-For backend components the copy is checked twice, and the second check is the
-binding one. A shipped component travels as a package: the artifact, the
-author's specification, and a record binding the two by content hash
-(`component-packages.md`). At boot the host compares the hash of the
-specification the running configuration compiled against with the hash the
-component's package carries, and refuses to start on any difference. So a
-deployment's CI diff catches drift between the copy and the authored original,
-and the host catches drift between the copy and the component actually
-installed — including the case CI cannot see, where the copy is faithful and the
-installed artifact is from another release. One practical consequence: a class
-declared inline in a deployment's own configuration cannot drive a backend
-component instance, because its file is not the author's file byte for byte.
+The copy is checked twice, and the second check is the binding one. A shipped
+component travels with the author's specification and a record binding the two
+by content hash (`component-packages.md`). At boot the host compares the hash of
+the specification the running configuration compiled against with the hash that
+record carries, and refuses to start on any difference. So a deployment's CI
+diff catches drift between the copy and the authored original, and the host
+catches drift between the copy and the component actually installed — including
+the case CI cannot see, where the copy is faithful and the installed artifact is
+from another release.
+
+This holds at **both placements**. A backend component's carrier is the package
+beside its `.wasm`; a surface-placed component's is the record its build emits
+into the surface asset tree, per kind and per abi. One practical consequence,
+also at both placements: a class declared inline in a deployment's own
+configuration cannot drive a component instance, because its file is not the
+author's file byte for byte.
 
 ## Authoring conventions
 

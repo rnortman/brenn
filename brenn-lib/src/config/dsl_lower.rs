@@ -2658,6 +2658,8 @@ fn surface_components(
             instance: Some(name.clone()),
             // The artifact shape is the class's, not the instance's.
             abi: instance.class.abi.value().as_str().to_owned(),
+            // A class fact, not a body key: carried from the declaring file.
+            spec_sha256: instance.class.spec_sha256.clone(),
             send_burst: body.int("send_burst", errors),
             send_refill_secs: body.int("send_refill_secs", errors),
             // A depth is a count or a bare word, so it was projected out of

@@ -23,6 +23,9 @@ _EXTRA = {
         "//bazel/wasm:record_lib.sh",
         "//bazel/wasm:emit_package.sh",
         "//bazel/wasm:wit_lib.sh",
+        "//bazel/surface:emit_dom_manifest.sh",
+        "//surface:emit-processor-manifest.sh",
+        "//bazel/surface:dom_names.sh",
     ],
 }
 

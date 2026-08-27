@@ -285,26 +285,13 @@ pub fn minimal_surface_raw() -> SurfaceConfigRaw {
         ephemeral_publish_acl: vec![],
         components: vec![
             SurfaceComponentRaw {
-                kind: "protobar".to_string(),
-                instance: None,
-                abi: "dom".to_string(),
-                send_burst: None,
-                send_refill_secs: None,
-                parked_batch_depth: None,
-                config: None,
                 grants: vec![ComponentGrant::Ports],
-                chrome: false,
+                ..SurfaceComponentRaw::minimal("protobar")
             },
             SurfaceComponentRaw {
-                kind: "chrome".to_string(),
-                instance: None,
-                abi: "dom".to_string(),
-                send_burst: None,
-                send_refill_secs: None,
-                parked_batch_depth: None,
-                config: None,
                 grants: vec![ComponentGrant::Ports],
                 chrome: true,
+                ..SurfaceComponentRaw::minimal("chrome")
             },
         ],
         subscriptions: vec![],

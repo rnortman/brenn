@@ -16,6 +16,7 @@
 pub mod bindings_doc;
 pub mod boot_policy;
 pub mod description;
+pub mod dom_assets;
 pub mod processor_assets;
 pub mod profile;
 pub mod telemetry;
@@ -25,17 +26,17 @@ pub mod fixtures_config;
 #[cfg(any(test, feature = "testutils"))]
 pub mod test_fixtures;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use brenn_envelope::{channel_capabilities, is_local_channel};
 use brenn_lib::access::AppPolicy;
-use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
+use brenn_lib::messaging::config::{ResolvedComponent, ResolvedSurface, ResolvedWasmConsumer};
 use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::{ChannelScheme, MessagingDirectory};
 use brenn_messaging::Messenger;
 use brenn_messaging::system::SystemParticipantSpec;
-use brenn_surface_contract::{KERNEL_ARTIFACT, module_artifact};
+use brenn_surface_contract::KERNEL_ARTIFACT;
 use brenn_surface_schema::surface_bindable_address;
 
 use self::profile::SurfaceProfile;
@@ -310,17 +311,19 @@ pub fn build_surface_runtimes(
 /// (`brenn_surface_kernel.js` + `…_bg.wasm`, referenced unconditionally by every
 /// surface page) must exist under `surface_dist_dir`, and every configured
 /// component kind must have the assets its ABI implies: a `dom` kind its
-/// wasm-bindgen module pair (`brenn_<kind>.js` + `…_bg.wasm`), a `processor`
-/// kind its transpiled tree plus a conforming manifest and import profile
-/// (`processor_assets`). A missing or stale artifact is a deploy/packaging
-/// mistake — config-shaped, boot-time, never attacker-reachable — so this panics
-/// (house fail-fast policy). No-op when no surfaces are configured.
+/// wasm-bindgen module pair, packaged specification and the record binding them
+/// (`dom_assets`), a `processor` kind its transpiled tree plus a conforming
+/// manifest and import profile (`processor_assets`). A missing or stale artifact
+/// is a deploy/packaging mistake — config-shaped, boot-time, never
+/// attacker-reachable — so this panics (house fail-fast policy). No-op when no
+/// surfaces are configured.
+///
+/// The kernel keeps a bare pair-existence check: it is not a component, so it
+/// has no kind, no class and no specification to bind — nothing to record.
 ///
 /// Lives beside `build_surface_runtimes` (a plain function over the resolved
 /// list), not in `SurfaceRuntime::build`, so it never runs on the
 /// `AppState`-constructing unit tests.
-// TODO(surface-spec-binding): no spec-binding check here — a dist tree from one
-// release under a spec copy from another passes silently.
 pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[ResolvedSurface]) {
     if surfaces.is_empty() {
         return;
@@ -335,29 +338,33 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
             .iter()
             .flat_map(|s| s.components.iter().map(|c| (c.kind.clone(), c.abi))),
     );
-    // Kind-grain checks (asset existence, manifest, profile) run once per
-    // distinct kind across the whole config — several instances, on one surface
-    // or several, share one artifact. Import⊆grants is per instance, so the
-    // validated manifests are kept for that second pass.
-    let mut manifests: HashMap<&str, processor_assets::ProcessorManifest> = HashMap::new();
-    let mut seen_dom: HashSet<&str> = HashSet::new();
+    // Kind-grain checks (asset existence, record, profile) run once per distinct
+    // kind across the whole config — several instances, on one surface or
+    // several, share one artifact. Import⊆grants and the specification binding
+    // are per instance, so what those need is kept for the second pass.
+    let mut kinds: HashMap<&str, KindAssets> = HashMap::new();
     for surface in surfaces {
         for comp in &surface.components {
-            match comp.abi {
+            if kinds.contains_key(comp.kind.as_str()) {
+                continue;
+            }
+            // The one place an ABI selects a record shape: a dom kind's record
+            // sits flat beside its module pair, a processor kind's inside its
+            // transpile directory. Downstream reads the assets, not the ABI.
+            let assets = match comp.abi {
                 brenn_surface_schema::Abi::Dom => {
-                    if seen_dom.insert(comp.kind.as_str()) {
-                        assert_module_pair_exists(
-                            surface_dist_dir,
-                            &module_artifact(&comp.kind),
-                            &format!("component {:?}", comp.kind),
-                        );
+                    let manifest = dom_assets::validate_dom_kind(surface_dist_dir, &comp.kind);
+                    KindAssets {
+                        spec_sha256: manifest.spec_sha256,
+                        processor: None,
                     }
                 }
                 brenn_surface_schema::Abi::Processor => {
-                    if !manifests.contains_key(comp.kind.as_str()) {
-                        let manifest =
-                            processor_assets::validate_processor_kind(surface_dist_dir, &comp.kind);
-                        manifests.insert(comp.kind.as_str(), manifest);
+                    let manifest =
+                        processor_assets::validate_processor_kind(surface_dist_dir, &comp.kind);
+                    KindAssets {
+                        spec_sha256: manifest.spec_sha256.clone(),
+                        processor: Some(manifest),
                     }
                 }
                 // `resolve_abi` rejects the reserved ABIs at config resolution,
@@ -366,15 +373,26 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
                     "reserved abi {:?} resolved for component {:?} — resolve_abi must reject it",
                     comp.abi, comp.instance,
                 ),
-            }
+            };
+            kinds.insert(comp.kind.as_str(), assets);
         }
     }
-    // Import⊆grants is per *instance*: sibling instances of one kind may hold
-    // different grants, so the question is asked once per declaration rather
-    // than once per kind.
+    // Sibling instances of one kind may hold different grants, and each carries
+    // its own class's hash — the kind fold admits comment-divergent class
+    // copies, so both questions are asked once per declaration rather than once
+    // per kind.
     for surface in surfaces {
         for comp in &surface.components {
-            if let Some(manifest) = manifests.get(comp.kind.as_str()) {
+            let assets = kinds.get(comp.kind.as_str()).unwrap_or_else(|| {
+                // The kind-grain pass above visited every configured kind, so a
+                // missing entry is this function's own bug, not a tree state.
+                unreachable!(
+                    "component {:?} of surface {:?} names kind {:?}, which the kind-grain pass \
+                     did not record",
+                    comp.instance, surface.slug, comp.kind,
+                )
+            });
+            if let Some(manifest) = &assets.processor {
                 processor_assets::assert_imports_granted(
                     &surface.slug,
                     &comp.instance,
@@ -383,8 +401,57 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
                     &comp.grants,
                 );
             }
+            assert_spec_bound(&surface.slug, comp, &assets.spec_sha256);
         }
     }
+}
+
+/// What one validated component kind's installed assets tell the per-instance
+/// pass, whichever ABI they arrived in: the specification hash every instance of
+/// the kind is bound to, and — for a processor kind — the record carrying the
+/// reflected import profile the grants must cover. A dom bundle has no
+/// component-model reflection, so it has no profile to check.
+struct KindAssets {
+    spec_sha256: String,
+    processor: Option<processor_assets::ProcessorManifest>,
+}
+
+/// Bind one configured instance to the specification its kind's installed
+/// artifacts were built against.
+///
+/// Byte equality, not a comparison of facts: the configuration compiled against
+/// exactly these bytes, so equality carries the fit check, the port optionality,
+/// the doctypes and the ABI over to the installed tree in one step.
+///
+/// The record shapes carrying the packaged hash and the reasoning behind the
+/// backend twin of this check are documented in `docs/component-packages.md`.
+///
+/// # Panics
+///
+/// On an empty configured hash — the class fact is `serde(skip)` in the
+/// document layer, so a lowering that stopped filling it must fail loudly
+/// rather than match anything — and on a hash that is not the packaged one.
+fn assert_spec_bound(slug: &str, comp: &ResolvedComponent, packaged: &str) {
+    assert!(
+        !comp.spec_sha256.is_empty(),
+        "boot: [[surface]] {slug:?} component {:?} carries no specification hash — the class fact \
+         is filled at lowering, so an empty one would match nothing a record can carry and this \
+         is a lowering bug, not a deployment state. Refusing to start (fail-fast on invalid \
+         config).",
+        comp.instance,
+    );
+    assert!(
+        comp.spec_sha256 == packaged,
+        "boot: [[surface]] {slug:?} component {:?} of kind {:?} was configured against a \
+         specification that hashes to {}, but the installed surface assets for that kind were \
+         built against one that hashes to {packaged}. The author's specification travels with the \
+         component; a deployment's copy of it is verbatim. Re-copy the specification from the \
+         release that carries these assets, or install the release the configuration was written \
+         for. Refusing to start (fail-fast on invalid config).",
+        comp.instance,
+        comp.kind,
+        comp.spec_sha256,
+    );
 }
 
 /// The durable-publisher principal classes swept by
@@ -714,16 +781,13 @@ fn assert_no_covering_publish(
 /// and its `_bg.wasm` sibling — exist under `dir`. `what` labels the module in
 /// the panic message (e.g. `"kernel"` or `"component \"echo-stub\""`).
 fn assert_module_pair_exists(dir: &std::path::Path, js_artifact: &str, what: &str) {
-    let wasm_artifact = js_artifact
-        .strip_suffix(".js")
-        .map(|stem| format!("{stem}_bg.wasm"))
-        .unwrap_or_else(|| panic!("surface artifact name {js_artifact:?} lacks a .js suffix"));
+    let wasm_artifact = brenn_surface_contract::module_wasm_sibling(js_artifact);
     for artifact in [js_artifact, wasm_artifact.as_str()] {
         let path = dir.join(artifact);
         assert!(
             path.exists(),
             "boot: {what} surface asset {artifact} missing at {} — surface assets are not \
-             built/deployed (run `make surface-wasm`; on deploy ensure surface_dist_dir is \
+             built/deployed (run `make build`; on deploy ensure surface_dist_dir is \
              populated). Refusing to start (fail-fast on invalid config).",
             path.display(),
         );
@@ -734,8 +798,8 @@ fn assert_module_pair_exists(dir: &std::path::Path, js_artifact: &str, what: &st
 mod tests {
     use brenn_lib::messaging::Urgency;
     use brenn_lib::messaging::config::{
-        AttachSendBudget, ResolvedComponent, ResolvedSubscription, ResolvedSurface,
-        ResolvedSurfaceSubscription, SurfaceBinding, SurfaceOutput,
+        ResolvedComponent, ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription,
+        SurfaceBinding, SurfaceOutput,
     };
 
     use super::test_fixtures::{TEST_MAX_BODY_BYTES, directory_with, directory_with_standing};
@@ -743,6 +807,7 @@ mod tests {
     use brenn_attach_server::profile::AttachProfile;
     use brenn_attach_server::profile::SubscriptionFacts;
     use brenn_messaging::testutils::empty_directory_messenger;
+    use brenn_surface_contract::module_artifact;
 
     /// The bindings document this surface's resolved config lowers to, under the
     /// boot parameters the disconnected-stamp fixtures already use.
@@ -761,26 +826,21 @@ mod tests {
         ResolvedSurface {
             slug: slug.to_string(),
             skin: "bench".to_string(),
+            // The hashes are the ones the fixture trees package, so these
+            // instances bind rather than merely resolve.
             components: vec![
                 ResolvedComponent {
-                    instance: "protobar".to_string(),
-                    kind: "protobar".to_string(),
-                    abi: brenn_surface_schema::Abi::Dom,
-                    send_budget: AttachSendBudget::default(),
-                    parked_batch_depth: 8,
-                    config: Default::default(),
+                    spec_sha256: fixture_spec_hash("protobar"),
                     chrome: true,
-                    grants: Default::default(),
+                    ..ResolvedComponent::minimal(
+                        "protobar",
+                        "protobar",
+                        brenn_surface_schema::Abi::Dom,
+                    )
                 },
                 ResolvedComponent {
-                    instance: "writer".to_string(),
-                    kind: "writer".to_string(),
-                    abi: brenn_surface_schema::Abi::Dom,
-                    send_budget: AttachSendBudget::default(),
-                    parked_batch_depth: 8,
-                    config: Default::default(),
-                    chrome: false,
-                    grants: Default::default(),
+                    spec_sha256: fixture_spec_hash("writer"),
+                    ..ResolvedComponent::minimal("writer", "writer", brenn_surface_schema::Abi::Dom)
                 },
             ],
             subscriptions: vec![SurfaceBinding {
@@ -1035,17 +1095,50 @@ mod tests {
         touch(dir, "brenn_surface_kernel_bg.wasm");
     }
 
-    /// Touch a component's `.js` + `_bg.wasm` pair, deriving both names from the
-    /// contract convention (`module_artifact`) rather than re-implementing it, so
-    /// the test tracks the code under test.
-    fn touch_component_pair(dir: &std::path::Path, kind: &str) {
-        let js = module_artifact(kind);
-        let wasm = format!(
-            "{}_bg.wasm",
-            js.strip_suffix(".js").expect("artifact ends in .js")
-        );
-        touch(dir, &js);
-        touch(dir, &wasm);
+    /// Write a conforming dom kind: the module pair, the packaged
+    /// specification, and a record whose three hashes actually hash those
+    /// bytes. `tweak` edits the record before serialization, so each failure
+    /// test is one perturbation of an otherwise valid tree.
+    fn write_dom_kind(
+        dist: &std::path::Path,
+        kind: &str,
+        tweak: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let module_bytes = format!("export function init() {{}} // {kind}\n").into_bytes();
+        let wasm_bytes = format!("wasm-bytes-for-{kind}").into_bytes();
+        let spec_bytes = spec_bytes_for(kind);
+
+        // The names come from the contract's dom file grammar, the same source
+        // the code under test derives them from.
+        let module = module_artifact(kind);
+        let module_wasm = brenn_surface_contract::module_wasm_artifact(kind);
+        let spec = brenn_surface_contract::dom_spec_artifact(kind);
+        std::fs::write(dist.join(&module), &module_bytes).expect("write module");
+        std::fs::write(dist.join(&module_wasm), &wasm_bytes).expect("write module wasm");
+        std::fs::write(dist.join(&spec), &spec_bytes).expect("write spec");
+
+        use sha2::Digest as _;
+        let mut record = serde_json::json!({
+            "v": 1,
+            "kind": kind,
+            "module": module,
+            "module_sha256": hex::encode(sha2::Sha256::digest(&module_bytes)),
+            "module_wasm": module_wasm,
+            "module_wasm_sha256": hex::encode(sha2::Sha256::digest(&wasm_bytes)),
+            "spec": spec,
+            "spec_sha256": hex::encode(sha2::Sha256::digest(&spec_bytes)),
+        });
+        tweak(&mut record);
+        std::fs::write(
+            dom_assets::record_path(dist, kind),
+            serde_json::to_vec_pretty(&record).expect("serialize dom record"),
+        )
+        .expect("write dom record");
+    }
+
+    /// The conforming tree, unperturbed.
+    fn write_valid_dom_kind(dir: &std::path::Path, kind: &str) {
+        write_dom_kind(dir, kind, |_| {});
     }
 
     #[test]
@@ -1056,12 +1149,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_surface_assets_passes_with_all_pairs_present() {
+    fn validate_surface_assets_passes_with_all_dom_records_present() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         let surface = resolved("deskbar");
         for comp in &surface.components {
-            touch_component_pair(dir.path(), &comp.kind);
+            write_valid_dom_kind(dir.path(), &comp.kind);
         }
         validate_surface_assets(dir.path(), &[surface]);
     }
@@ -1072,18 +1165,130 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let surface = resolved("deskbar");
         for comp in &surface.components {
-            touch_component_pair(dir.path(), &comp.kind);
+            write_valid_dom_kind(dir.path(), &comp.kind);
         }
         validate_surface_assets(dir.path(), &[surface]);
     }
 
     #[test]
-    #[should_panic(expected = "component \"writer\" surface asset brenn_writer.js missing")]
-    fn validate_surface_assets_panics_on_missing_component_artifact() {
+    #[should_panic(expected = "dom component \"writer\" has no readable asset record")]
+    fn validate_surface_assets_panics_on_missing_component_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         let surface = resolved("deskbar");
-        touch_component_pair(dir.path(), &surface.components[0].kind);
+        write_valid_dom_kind(dir.path(), &surface.components[0].kind);
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// The dom fixture: the kernel pair, a conforming record for the first
+    /// configured dom kind, and `tweak` applied to `writer`'s record alone —
+    /// so a failing test states exactly one divergence and the sibling kind
+    /// proves the check is not refusing everything.
+    fn dom_fixture(
+        dir: &std::path::Path,
+        tweak: impl FnOnce(&mut serde_json::Value),
+    ) -> ResolvedSurface {
+        write_kernel_pair(dir);
+        let surface = resolved("deskbar");
+        write_valid_dom_kind(dir, &surface.components[0].kind);
+        write_dom_kind(dir, &surface.components[1].kind, tweak);
+        surface
+    }
+
+    #[test]
+    #[should_panic(expected = "dom component \"writer\" asset record at")]
+    fn validate_surface_assets_panics_on_unknown_dom_record_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |record| {
+            record["snippets_sha256"] = serde_json::json!("00");
+        });
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "asset record declares v = 2")]
+    fn validate_surface_assets_panics_on_wrong_dom_record_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |record| {
+            record["v"] = serde_json::json!(2);
+        });
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "carries a record for kind \"protobar\"")]
+    fn validate_surface_assets_panics_on_dom_record_kind_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |record| {
+            record["kind"] = serde_json::json!("protobar");
+        });
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "asset record names its module \"brenn_other.js\"")]
+    fn validate_surface_assets_panics_on_dom_record_stated_module_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |record| {
+            record["module"] = serde_json::json!("brenn_other.js");
+        });
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "asset record names its spec \"brenn_writer.brenn\"")]
+    fn validate_surface_assets_panics_on_dom_record_stated_spec_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |record| {
+            record["spec"] = serde_json::json!("brenn_writer.brenn");
+        });
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "surface asset brenn_writer.js is unreadable")]
+    fn validate_surface_assets_panics_on_missing_dom_module_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |_| {});
+        std::fs::remove_file(dir.path().join("brenn_writer.js")).expect("remove module");
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has a stale module: brenn_writer.js hashes to")]
+    fn validate_surface_assets_panics_on_dom_module_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |_| {});
+        // The record is written from this release's bytes; the file is from
+        // another. Editing the file rather than the record is the shape a
+        // half-synced deploy actually takes.
+        std::fs::write(
+            dir.path().join("brenn_writer.js"),
+            b"export function init() {}\n",
+        )
+        .expect("rewrite module");
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has a stale module_wasm: brenn_writer_bg.wasm hashes to")]
+    fn validate_surface_assets_panics_on_dom_module_wasm_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |_| {});
+        std::fs::write(dir.path().join("brenn_writer_bg.wasm"), b"stale").expect("rewrite wasm");
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has a stale spec: brenn_writer.spec.brenn hashes to")]
+    fn validate_surface_assets_panics_on_dom_spec_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let surface = dom_fixture(dir.path(), |_| {});
+        std::fs::write(
+            dir.path().join("brenn_writer.spec.brenn"),
+            b"// a specification from some other release\n",
+        )
+        .expect("rewrite spec");
         validate_surface_assets(dir.path(), &[surface]);
     }
 
@@ -1092,16 +1297,15 @@ mod tests {
     fn resolved_with_processor(slug: &str, kind: &str) -> ResolvedSurface {
         let mut surface = resolved(slug);
         surface.components = vec![ResolvedComponent {
-            instance: format!("{kind}-1"),
-            kind: kind.to_string(),
-            abi: brenn_surface_schema::Abi::Processor,
-            send_budget: AttachSendBudget::default(),
-            parked_batch_depth: 8,
-            config: Default::default(),
-            chrome: false,
+            spec_sha256: fixture_spec_hash(kind),
             // Every fixture tree imports `ports`; the grant that answers it is
             // the fixture's baseline, so a test perturbs one import at a time.
             grants: [brenn_lib::messaging::ComponentGrant::Ports].into(),
+            ..ResolvedComponent::minimal(
+                &format!("{kind}-1"),
+                kind,
+                brenn_surface_schema::Abi::Processor,
+            )
         }];
         surface.subscriptions = vec![];
         surface.outputs = vec![];
@@ -1109,10 +1313,11 @@ mod tests {
     }
 
     /// Write a conforming transpiled tree for `kind`: a stand-in component
-    /// artifact, one transpiled file, and a manifest whose `source_sha256`
-    /// actually hashes the artifact bytes. `imports` and any manifest edits are
-    /// applied by the caller through `tweak` before serialization, so each
-    /// failure test perturbs exactly one field of an otherwise valid tree.
+    /// artifact, one transpiled file, a stand-in packaged specification, and a
+    /// manifest whose `source_sha256` and `spec_sha256` actually hash those
+    /// bytes. `imports` and any manifest edits are applied by the caller through
+    /// `tweak` before serialization, so each failure test perturbs exactly one
+    /// field of an otherwise valid tree.
     fn write_processor_tree(
         dist: &std::path::Path,
         kind: &str,
@@ -1134,18 +1339,42 @@ mod tests {
             })
             .collect();
         let component_bytes = format!("component-bytes-for-{kind}").into_bytes();
-        write_processor_tree_from_bytes(dist, kind, &component_bytes, qualified, true, tweak);
+        write_processor_tree_from_bytes(
+            dist,
+            kind,
+            &component_bytes,
+            &spec_bytes_for(kind),
+            qualified,
+            true,
+            tweak,
+        );
+    }
+
+    /// A stand-in authored specification for `kind`. Boot validation binds
+    /// hashes, never parses the document, so a per-kind byte string is a
+    /// faithful stand-in and keeps two kinds' specifications distinguishable.
+    fn spec_bytes_for(kind: &str) -> Vec<u8> {
+        format!("// specification for {kind}\n").into_bytes()
+    }
+
+    /// What a configured instance of `kind` carries as its class hash when the
+    /// configuration was compiled against the very bytes the fixture tree
+    /// packages — the bound case, computed rather than pasted.
+    fn fixture_spec_hash(kind: &str) -> String {
+        brenn_lib::util::sha256_hex(&spec_bytes_for(kind))
     }
 
     /// The one place test code constructs a deployed processor tree and its
     /// manifest schema. `component_bytes` are the shipped artifact (a stand-in
     /// string for the synthetic tests, real artifact bytes for the real-artifact
-    /// test), `imports` the profile verbatim, and `with_module` controls whether a
-    /// stand-in transpiled `<kind>.js` is written and listed.
+    /// test), `spec_bytes` the packaged specification, `imports` the profile
+    /// verbatim, and `with_module` controls whether a stand-in transpiled
+    /// `<kind>.js` is written and listed.
     fn write_processor_tree_from_bytes(
         dist: &std::path::Path,
         kind: &str,
         component_bytes: &[u8],
+        spec_bytes: &[u8],
         imports: Vec<String>,
         with_module: bool,
         tweak: impl FnOnce(&mut serde_json::Value),
@@ -1164,12 +1393,20 @@ mod tests {
         }
         files.push(component_name);
 
+        // The build stages the specification before the emitter's file walk, so
+        // the record lists it like any other staged file.
+        let spec_name = format!("{kind}.spec.brenn");
+        std::fs::write(dir.join(&spec_name), spec_bytes).expect("write spec");
+        files.push(spec_name.clone());
+
         use sha2::Digest as _;
         let mut manifest = serde_json::json!({
-            "v": 1,
+            "v": 2,
             "kind": kind,
             "source_sha256": hex::encode(sha2::Sha256::digest(component_bytes)),
             "jco_version": PINNED_JCO_VERSION_FOR_TESTS,
+            "spec": spec_name,
+            "spec_sha256": hex::encode(sha2::Sha256::digest(spec_bytes)),
             "imports": imports,
             "files": files,
         });
@@ -1237,12 +1474,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "manifest declares v = 2")]
+    #[should_panic(expected = "manifest declares v = 3")]
     fn validate_surface_assets_panics_on_processor_manifest_version() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
-            m["v"] = serde_json::json!(2);
+            m["v"] = serde_json::json!(3);
         });
         validate_surface_assets(
             dir.path(),
@@ -1274,6 +1511,81 @@ mod tests {
         write_kernel_pair(dir.path());
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
             m["source_sha256"] = serde_json::json!("00".repeat(32));
+        });
+        validate_surface_assets(
+            dir.path(),
+            &[resolved_with_processor("deskbar", "transplant")],
+        );
+    }
+
+    /// The packaged specification is what the configuration's own copy is bound
+    /// to, so a tree that lost it cannot answer the binding question at all. It
+    /// is staged before the emitter walks the tree, so the record lists it and
+    /// the file-set check is what reports its absence.
+    #[test]
+    #[should_panic(expected = "manifest lists \"transplant.spec.brenn\", which is missing")]
+    fn validate_surface_assets_panics_on_missing_processor_spec_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "transplant", &["ports"], |_| {});
+        std::fs::remove_file(
+            processor_assets::kind_dir(dir.path(), "transplant").join("transplant.spec.brenn"),
+        )
+        .expect("remove the packaged spec");
+        validate_surface_assets(
+            dir.path(),
+            &[resolved_with_processor("deskbar", "transplant")],
+        );
+    }
+
+    /// A record that both omits the specification from its file list and ships
+    /// without it: the file-set check has nothing to say, and the binding check
+    /// refuses on its own rather than reading a hash it cannot verify.
+    #[test]
+    #[should_panic(expected = "packaged specification transplant.spec.brenn is unreadable")]
+    fn validate_surface_assets_panics_on_unlisted_missing_processor_spec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
+            let files = m["files"].as_array_mut().expect("files is an array");
+            files.retain(|f| f != "transplant.spec.brenn");
+        });
+        std::fs::remove_file(
+            processor_assets::kind_dir(dir.path(), "transplant").join("transplant.spec.brenn"),
+        )
+        .expect("remove the packaged spec");
+        validate_surface_assets(
+            dir.path(),
+            &[resolved_with_processor("deskbar", "transplant")],
+        );
+    }
+
+    /// A record whose spec hash is not the packaged file's: the tree was
+    /// assembled from mismatched parts, or the copy was edited in place.
+    #[test]
+    #[should_panic(expected = "has a specification that does not match its record")]
+    fn validate_surface_assets_panics_on_processor_spec_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
+            m["spec_sha256"] = serde_json::json!("00".repeat(32));
+        });
+        validate_surface_assets(
+            dir.path(),
+            &[resolved_with_processor("deskbar", "transplant")],
+        );
+    }
+
+    /// The record states the specification it hashed and the kind derives that
+    /// name; a stated name the kind does not derive is emitter drift, and is
+    /// diagnosed as such rather than as a missing file.
+    #[test]
+    #[should_panic(expected = "names its specification \"elsewhere.spec.brenn\"")]
+    fn validate_surface_assets_panics_on_processor_spec_name_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
+            m["spec"] = serde_json::json!("elsewhere.spec.brenn");
         });
         validate_surface_assets(
             dir.path(),
@@ -1329,6 +1641,7 @@ mod tests {
             dir.path(),
             kind,
             &bytes,
+            &spec_bytes_for(kind),
             brenn_wasm::processor_component_imports(artifact),
             false,
             |_| {},
@@ -1418,6 +1731,131 @@ mod tests {
         validate_surface_assets(dir.path(), &[surface]);
     }
 
+    // -----------------------------------------------------------------------
+    // The specification binding, instance grain, both ABIs. The kind-grain
+    // checks above prove the tree is internally consistent; these prove the
+    // configuration was written against the tree that is installed.
+    // -----------------------------------------------------------------------
+
+    /// A dom instance whose class hash is not the one its kind's installed
+    /// assets were built against — the comment-divergent copy the kind fold
+    /// legally admits at compile time, refused here.
+    #[test]
+    #[should_panic(
+        expected = "component \"writer\" of kind \"writer\" was configured against a specification"
+    )]
+    fn validate_surface_assets_panics_on_divergent_dom_instance_spec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        let mut surface = resolved("deskbar");
+        for comp in &surface.components {
+            write_valid_dom_kind(dir.path(), &comp.kind);
+        }
+        surface.components[1].spec_sha256 =
+            brenn_lib::util::sha256_hex(b"// specification for writer, plus a note\n");
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// The processor twin: same refusal, same words, the other carrier.
+    #[test]
+    #[should_panic(
+        expected = "component \"transplant-1\" of kind \"transplant\" was configured against a \
+                    specification"
+    )]
+    fn validate_surface_assets_panics_on_divergent_processor_instance_spec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "transplant", &["ports"], |_| {});
+        let mut surface = resolved_with_processor("deskbar", "transplant");
+        surface.components[0].spec_sha256 =
+            brenn_lib::util::sha256_hex(b"// specification for transplant, plus a note\n");
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// Sibling instances of one kind are bound one at a time: a conforming
+    /// sibling does not carry a divergent one past the check.
+    #[test]
+    #[should_panic(expected = "component \"protobar-2\" of kind \"protobar\"")]
+    fn one_instances_specification_does_not_cover_its_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        let mut surface = resolved("deskbar");
+        for comp in &surface.components {
+            write_valid_dom_kind(dir.path(), &comp.kind);
+        }
+        let mut sibling = surface.components[0].clone();
+        sibling.instance = "protobar-2".to_string();
+        sibling.spec_sha256 = brenn_lib::util::sha256_hex(b"another copy\n");
+        surface.components.push(sibling);
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// The `serde(skip)` backstop: the class fact is filled at lowering, so an
+    /// empty hash is a lowering bug and must not be read as "matches anything".
+    #[test]
+    #[should_panic(expected = "component \"writer\" carries no specification hash")]
+    fn validate_surface_assets_panics_on_empty_dom_instance_spec_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        let mut surface = resolved("deskbar");
+        for comp in &surface.components {
+            write_valid_dom_kind(dir.path(), &comp.kind);
+        }
+        surface.components[1].spec_sha256 = String::new();
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// The processor twin of the backstop.
+    #[test]
+    #[should_panic(expected = "component \"transplant-1\" carries no specification hash")]
+    fn validate_surface_assets_panics_on_empty_processor_instance_spec_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_processor_tree(dir.path(), "transplant", &["ports"], |_| {});
+        let mut surface = resolved_with_processor("deskbar", "transplant");
+        surface.components[0].spec_sha256 = String::new();
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
+    /// The kernel is not a component: it has no kind, no class and no
+    /// specification, so nothing binds it. Asserted by planting a kernel record
+    /// and a kernel specification that are internally *false* — the record's
+    /// hashes match none of the bytes beside it — and requiring validation to
+    /// pass anyway. A change that started reading the kernel's record would
+    /// fail here, which an absence assertion could not do.
+    #[test]
+    fn the_kernel_is_not_bound_to_any_specification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        let stem = "brenn_surface_kernel";
+        std::fs::write(
+            dir.path().join(format!("{stem}.spec.brenn")),
+            b"// not a specification the kernel has\n",
+        )
+        .expect("write kernel spec");
+        std::fs::write(
+            dir.path().join(format!("{stem}.manifest.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "v": 1,
+                "kind": "surface-kernel",
+                "module": format!("{stem}.js"),
+                "module_sha256": "00".repeat(32),
+                "module_wasm": format!("{stem}_bg.wasm"),
+                "module_wasm_sha256": "00".repeat(32),
+                "spec": format!("{stem}.spec.brenn"),
+                "spec_sha256": "00".repeat(32),
+            }))
+            .expect("serialize kernel record"),
+        )
+        .expect("write kernel record");
+
+        let surface = resolved("deskbar");
+        for comp in &surface.components {
+            write_valid_dom_kind(dir.path(), &comp.kind);
+        }
+        validate_surface_assets(dir.path(), &[surface]);
+    }
+
     /// `types` is in every processor's import list and no host implements it —
     /// it defines the shared shapes the other interfaces speak. It names no
     /// capability, so it is granted by no one and demanded of no one.
@@ -1442,7 +1880,7 @@ mod tests {
         let mut clash = resolved_with_processor("kiosk", "protobar");
         clash.slug = "kiosk".to_string();
         for comp in &dom.components {
-            touch_component_pair(dir.path(), &comp.kind);
+            write_valid_dom_kind(dir.path(), &comp.kind);
         }
         validate_surface_assets(dir.path(), &[dom, clash]);
     }
@@ -1638,6 +2076,161 @@ mod tests {
             Some("brenn:surface-errors"),
             Some(&dir),
             SURFACE_ERROR_BODY_MAX_BYTES - 1,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Emitter → reader parity.
+    //
+    // Every other test in this module hand-builds a record with `serde_json`,
+    // and every test beside the emitters scrapes their output with shell. Both
+    // halves therefore pin their own literals, and a field renamed on one side
+    // leaves the whole build graph green: the divergence surfaces as a
+    // `deny_unknown_fields` panic at the bounce, on the deploy host, which is
+    // exactly the late failure the binding exists to move earlier.
+    //
+    // Source scripts, so the runfiles path is the workspace path.
+    // TODO(bazel-fixture-list-guard): hand-held against the source, like the
+    // other fixture paths in this file.
+    // -----------------------------------------------------------------------
+
+    /// Run one of the record emitters, failing the test with its own output.
+    fn run_emitter(script: &str, args: &[&std::ffi::OsStr], env: &[(&str, &std::ffi::OsStr)]) {
+        let path = std::path::Path::new(script);
+        assert!(
+            path.exists(),
+            "the record emitter is missing at {script} — it is a data dependency of this test",
+        );
+        let mut command = std::process::Command::new("bash");
+        command.arg(path).args(args);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let out = command.output().expect("run the record emitter");
+        assert!(
+            out.status.success(),
+            "{script} failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn the_dom_emitters_record_is_the_one_the_reader_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path();
+        let kind = "protobar";
+
+        let module_bytes = b"export function init() {}\n";
+        let wasm_bytes = b"\0asm\x01\0\0\0";
+        let spec_bytes = b"component Protobar { abi = dom; }\n";
+        let module = dist.join(module_artifact(kind));
+        let module_wasm = dist.join(brenn_surface_contract::module_wasm_artifact(kind));
+        let spec_in = dist.join("authored.brenn");
+        let spec_out = dist.join(brenn_surface_contract::dom_spec_artifact(kind));
+        std::fs::write(&module, module_bytes).expect("write module");
+        std::fs::write(&module_wasm, wasm_bytes).expect("write module wasm");
+        std::fs::write(&spec_in, spec_bytes).expect("write spec");
+
+        use std::ffi::OsStr;
+        run_emitter(
+            "bazel/surface/emit_dom_manifest.sh",
+            &[
+                OsStr::new(kind),
+                module.as_os_str(),
+                module_wasm.as_os_str(),
+                spec_in.as_os_str(),
+                dom_assets::record_path(dist, kind).as_os_str(),
+                spec_out.as_os_str(),
+            ],
+            &[
+                ("DOM_NAMES", OsStr::new("bazel/surface/dom_names.sh")),
+                ("WIT_LIB", OsStr::new("bazel/wasm/wit_lib.sh")),
+            ],
+        );
+        // The emitter's own input file, which no dom kind's record names.
+        std::fs::remove_file(&spec_in).expect("remove the emitter's input spec");
+
+        let manifest = dom_assets::validate_dom_kind(dist, kind);
+        use sha2::Digest as _;
+        assert_eq!(manifest.kind, kind);
+        assert_eq!(
+            manifest.spec_sha256,
+            hex::encode(sha2::Sha256::digest(spec_bytes)),
+            "the hash a configured instance is bound to is the hash of the packaged spec",
+        );
+        assert_eq!(
+            manifest.module_sha256,
+            hex::encode(sha2::Sha256::digest(module_bytes)),
+        );
+    }
+
+    #[test]
+    fn the_processor_emitters_record_is_the_one_the_reader_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path();
+        let kind = "transplant";
+        let kind_dir = processor_assets::kind_dir(dist, kind);
+        std::fs::create_dir_all(&kind_dir).expect("create the kind directory");
+
+        let component_bytes = b"\0asm\x01\0\0\0";
+        let spec_bytes =
+            b"component Transplant { abi = processor; requires = [ports]; out out; }\n";
+        let component = kind_dir.join(format!("{kind}.component.wasm"));
+        let spec = kind_dir.join(format!("{kind}.spec.brenn"));
+        std::fs::write(&component, component_bytes).expect("write component");
+        std::fs::write(
+            kind_dir.join(format!("{kind}.js")),
+            b"export function i() {}\n",
+        )
+        .expect("write module");
+        std::fs::write(&spec, spec_bytes).expect("write spec");
+
+        // The emitter reads the artifact's imports through `wasm-tools`, and
+        // this artifact is eight bytes of fixture. What is under test is the
+        // record's shape, not the import scrape.
+        let wasm_tools = dist.join("wasm-tools-stub");
+        std::fs::write(
+            &wasm_tools,
+            "#!/usr/bin/env bash\necho \"package brenn:fixture;\"\n",
+        )
+        .expect("write the wasm-tools stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&wasm_tools, std::fs::Permissions::from_mode(0o755))
+                .expect("make the stub executable");
+        }
+
+        use std::ffi::OsStr;
+        run_emitter(
+            "surface/emit-processor-manifest.sh",
+            &[
+                OsStr::new(kind),
+                component.as_os_str(),
+                kind_dir.as_os_str(),
+                OsStr::new("1.4.0"),
+                spec.as_os_str(),
+            ],
+            &[
+                ("WASM_TOOLS", wasm_tools.as_os_str()),
+                ("WIT_LIB", OsStr::new("bazel/wasm/wit_lib.sh")),
+            ],
+        );
+        // The stub is not part of the kind's tree; the record's observed file
+        // list is taken from the kind directory alone.
+        std::fs::remove_file(&wasm_tools).expect("remove the stub");
+
+        let manifest = processor_assets::validate_processor_kind(dist, kind);
+        use sha2::Digest as _;
+        assert_eq!(manifest.kind, kind);
+        assert_eq!(
+            manifest.spec_sha256,
+            hex::encode(sha2::Sha256::digest(spec_bytes)),
+        );
+        assert_eq!(
+            manifest.source_sha256,
+            hex::encode(sha2::Sha256::digest(component_bytes)),
         );
     }
 }

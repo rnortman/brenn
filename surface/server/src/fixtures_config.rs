@@ -1,7 +1,7 @@
 use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
-    AttachSendBudget, NoiseLevel, ResolvedComponent, ResolvedSubscription, ResolvedSurface,
+    NoiseLevel, ResolvedComponent, ResolvedSubscription, ResolvedSurface,
     ResolvedSurfaceSubscription, SurfaceBinding, SurfaceOutput,
 };
 
@@ -36,15 +36,15 @@ impl SurfaceFixture {
                 // The lone component doubles as the surface's chrome singleton so
                 // the fixture satisfies the exactly-one-chrome invariant the build
                 // path relies on.
+                // Never run through asset validation, so `minimal`'s empty
+                // binding hash has nothing to bind to.
                 components: vec![ResolvedComponent {
-                    instance: component.to_string(),
-                    kind: component.to_string(),
-                    abi: brenn_surface_schema::Abi::Dom,
-                    send_budget: AttachSendBudget::default(),
-                    parked_batch_depth: 8,
-                    config: Default::default(),
                     chrome: true,
-                    grants: Default::default(),
+                    ..ResolvedComponent::minimal(
+                        component,
+                        component,
+                        brenn_surface_schema::Abi::Dom,
+                    )
                 }],
                 subscriptions: vec![],
                 wire_subscriptions: vec![],
@@ -67,11 +67,6 @@ impl SurfaceFixture {
         config: std::collections::BTreeMap<String, String>,
     ) -> Self {
         self.inner.components.push(ResolvedComponent {
-            instance: instance.to_string(),
-            kind: kind.to_string(),
-            abi: brenn_surface_schema::Abi::Processor,
-            send_budget: AttachSendBudget::default(),
-            parked_batch_depth: 8,
             // A map is only readable by an instance granted `config`, so a
             // fixture handed one grants it.
             grants: if config.is_empty() {
@@ -80,7 +75,7 @@ impl SurfaceFixture {
                 [brenn_lib::messaging::ComponentGrant::Config].into()
             },
             config,
-            chrome: false,
+            ..ResolvedComponent::minimal(instance, kind, brenn_surface_schema::Abi::Processor)
         });
         self
     }

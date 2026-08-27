@@ -189,6 +189,7 @@ def release_package(name, manifest, binaries, components, packages, frontend, su
             "$(rootpath //bazel/wasm:manifest_names.sh)",
             "$(rootpath //bazel/wasm:package_names.sh)",
             "$(rootpath //bazel/wasm:record_lib.sh)",
+            "$(rootpath //bazel/surface:dom_names.sh)",
             "$(rootpath :%s)" % name,
             "$(rootpath %s)" % manifest,
         ] + select({
@@ -197,6 +198,7 @@ def release_package(name, manifest, binaries, components, packages, frontend, su
         }),
         data = [
             manifest,
+            "//bazel/surface:dom_names.sh",
             "//bazel/wasm:manifest_names.sh",
             "//bazel/wasm:package_names.sh",
             "//bazel/wasm:record_lib.sh",

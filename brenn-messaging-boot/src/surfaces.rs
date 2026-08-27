@@ -699,6 +699,9 @@ pub(crate) fn resolve_surfaces(
                 instance: instance.to_string(),
                 kind: comp.kind.clone(),
                 abi,
+                // Carried, not checked here: validated at boot by the surface
+                // asset gate.
+                spec_sha256: comp.spec_sha256.clone(),
                 config: resolve_component_config(slug, instance, comp),
                 grants,
                 send_budget: resolve_send_budget(slug, instance, comp),

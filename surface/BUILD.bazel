@@ -57,6 +57,7 @@ surface_processor_assets(
     component = "//brenn-wasm/components/processor-transplant:component",
     jco_version = ":jco_version",
     kind = "processor-transplant",
+    spec = "//:config/specs/processor-transplant.brenn",
 )
 
 # Derived, not retyped. `surface_component()` mints `<kind>_dist` in every

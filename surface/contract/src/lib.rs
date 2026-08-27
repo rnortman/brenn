@@ -1030,6 +1030,53 @@ pub fn module_artifact(kind: &str) -> String {
     format!("brenn_{}.js", kind.replace('-', "_"))
 }
 
+/// The stem every one of a dom kind's files is named from
+/// (`mode-clock` → `brenn_mode_clock`): the module pair, the packaged
+/// specification, the binding record and the documentation sidecars all take
+/// it. Derived from [`module_artifact`] so the hyphen→underscore mapping has
+/// one definition.
+pub fn module_stem(kind: &str) -> String {
+    let js = module_artifact(kind);
+    js.strip_suffix(".js")
+        .unwrap_or_else(|| panic!("module_artifact({kind:?}) = {js:?} lacks a .js suffix"))
+        .to_string()
+}
+
+/// The `_bg.wasm` half of a wasm-bindgen `--target web` module pair, given the
+/// `.js` half's artifact name. Named here because the kernel is a fixed
+/// artifact rather than a kind, so its sibling cannot come from
+/// [`module_wasm_artifact`].
+pub fn module_wasm_sibling(js_artifact: &str) -> String {
+    let stem = js_artifact
+        .strip_suffix(".js")
+        .unwrap_or_else(|| panic!("surface artifact name {js_artifact:?} lacks a .js suffix"));
+    format!("{stem}_bg.wasm")
+}
+
+/// The `_bg.wasm` half of a dom kind's module pair: `brenn_<kind>_bg.wasm`.
+pub fn module_wasm_artifact(kind: &str) -> String {
+    format!("{}_bg.wasm", module_stem(kind))
+}
+
+/// A dom kind's binding record in the surface asset root:
+/// `brenn_<kind>.manifest.json`.
+///
+/// This function and its two siblings are the single home for the dom file
+/// grammar on the Rust side; `bazel/surface/dom_names.sh` is the same statement
+/// for the shell readers — the record emitter and the staged-tree gate. The
+/// layout is provisional (a dom kind becomes a directory when out-of-tree
+/// components arrive), and readers that agree only by inspection disagree the
+/// first time it moves.
+pub fn dom_record_artifact(kind: &str) -> String {
+    format!("{}.manifest.json", module_stem(kind))
+}
+
+/// The packaged copy of a dom kind's authored specification in the surface
+/// asset root: `brenn_<kind>.spec.brenn`.
+pub fn dom_spec_artifact(kind: &str) -> String {
+    format!("{}.spec.brenn", module_stem(kind))
+}
+
 /// First line of every in-tree help sidecar, which is generated rather than
 /// hand-written: an HTML comment, so it is invisible in rendered markdown and
 /// merely informative in the raw text an LLM reads. Nothing at runtime parses
@@ -1091,6 +1138,31 @@ mod tests {
         assert_eq!(SURFACE_READY, "brenn-surface-ready");
         assert_eq!(ACTIVATION_REGISTER, "brenn-activation-register");
         assert_eq!(PORT_DEFER, "brenn-port-defer");
+    }
+
+    #[test]
+    fn dom_file_grammar_is_one_stem() {
+        // The shell statement of this grammar is `bazel/surface/dom_names.sh`;
+        // the two are held together by the gates running over the tree the
+        // emitter writes and this reads.
+        assert_eq!(module_stem("mode-clock"), "brenn_mode_clock");
+        assert_eq!(module_artifact("mode-clock"), "brenn_mode_clock.js");
+        assert_eq!(
+            module_wasm_artifact("mode-clock"),
+            "brenn_mode_clock_bg.wasm"
+        );
+        assert_eq!(
+            dom_record_artifact("mode-clock"),
+            "brenn_mode_clock.manifest.json"
+        );
+        assert_eq!(
+            dom_spec_artifact("mode-clock"),
+            "brenn_mode_clock.spec.brenn"
+        );
+        assert_eq!(
+            module_wasm_sibling(KERNEL_ARTIFACT),
+            "brenn_surface_kernel_bg.wasm"
+        );
     }
 
     #[test]

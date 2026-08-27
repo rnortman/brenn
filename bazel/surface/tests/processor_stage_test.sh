@@ -25,12 +25,15 @@ emitter="$tmp/emit.sh"
 cat > "$emitter" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-kind="$1"; component="$2"; dest="$3"; version="$4"
-printf '{"kind":"%s","jco_version":"%s","files":[' "$kind" "$version" > "$dest/manifest.json"
+kind="$1"; component="$2"; dest="$3"; version="$4"; spec_path="$5"
+spec_name="$(basename "$spec_path")"
+printf '{"kind":"%s","jco_version":"%s","spec":"%s","files":[' \
+    "$kind" "$version" "$spec_name" > "$dest/manifest.json"
 (cd "$dest" && find -L . -type f -printf '%P\n' | LC_ALL=C sort | paste -sd,) \
     >> "$dest/manifest.json"
 printf ']}\n' >> "$dest/manifest.json"
 [ -r "$component" ] || { echo "emitter cannot read the component" >&2; exit 1; }
+[ -r "$spec_path" ] || { echo "emitter cannot read the spec" >&2; exit 1; }
 STUB
 chmod +x "$emitter"
 
@@ -44,10 +47,13 @@ ln -s "$tmp/real/interfaces/ports.d.ts" "$tmp/transpiled/interfaces/ports.d.ts"
 printf '\0asm fixture\n' > "$tmp/demo.wasm"
 chmod a-w "$tmp/demo.wasm"
 printf '1.4.0' > "$tmp/version.txt"
+# Read-only, like every source input a sandboxed action is handed.
+printf 'component Demo {\n  abi = processor;\n}\n' > "$tmp/demo.brenn"
+chmod a-w "$tmp/demo.brenn"
 
 out="$tmp/out"
-if ! "$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" "$emitter" "$out" \
-    > "$tmp/stage.log" 2>&1; then
+if ! "$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" "$tmp/demo.brenn" \
+    "$emitter" "$out" > "$tmp/stage.log" 2>&1; then
     fail "staging a well-formed transpile failed: $(cat "$tmp/stage.log")"
 fi
 
@@ -75,11 +81,23 @@ if [ ! -w "$dest/demo.component.wasm" ]; then
     fail "the staged component is not writable"
 fi
 
+# The specification is staged under the kind's name, byte-identical to the
+# authored file, and early enough that the emitter's file walk lists it.
+if ! cmp -s "$tmp/demo.brenn" "$dest/demo.spec.brenn"; then
+    fail "the staged specification is not a verbatim copy of the authored file"
+fi
+if ! grep -qF "demo.spec.brenn" "$dest/manifest.json"; then
+    fail "the manifest does not list the staged specification: $(cat "$dest/manifest.json")"
+fi
+if [ ! -w "$dest/demo.spec.brenn" ]; then
+    fail "the staged specification is not writable"
+fi
+
 # A version file the derivation left empty would put an empty jco version in
 # every manifest.
 : > "$tmp/empty-version.txt"
 if out_text=$("$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/empty-version.txt" \
-    "$emitter" "$tmp/out_empty" 2>&1); then
+    "$tmp/demo.brenn" "$emitter" "$tmp/out_empty" 2>&1); then
     fail "an empty version file should be rejected, exited 0: $out_text"
 elif ! printf '%s' "$out_text" | grep -qF "empty-version.txt"; then
     fail "the rejection does not name the version file: $out_text"
