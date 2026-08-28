@@ -17,13 +17,17 @@ use similar::TextDiff;
 /// Load both files, compare, print the verdict. Returns whether they are equal,
 /// which the binary turns into its exit status.
 ///
+/// One module root serves both sides: the two documents being compared are
+/// versions of one deployment, so a diff across two module universes is not a
+/// real operation.
+///
 /// # Panics
 ///
 /// Panics if either file fails to load — the differ compares valid configs, and
 /// an invalid one is a louder failure than a diff.
-pub fn run_config_diff(a: &Path, b: &Path) -> bool {
-    let config_a = load_config(Some(a));
-    let config_b = load_config(Some(b));
+pub fn run_config_diff(a: &Path, b: &Path, module_root: Option<&Path>) -> bool {
+    let config_a = load_config(Some(a), module_root);
+    let config_b = load_config(Some(b), module_root);
     let (equal, rendering) = diff(
         config_a,
         config_b,
@@ -73,6 +77,8 @@ pub(crate) fn diff(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     use brenn_dsl::{dom_any, processor_any};
@@ -162,7 +168,72 @@ channel alerts at "brenn:alice-alerts" {
 }
 "#,
         );
-        assert!(run_config_diff(&a, &b));
+        assert!(run_config_diff(&a, &b, None));
+    }
+
+    /// The packaged module both sides of the diff reach for, and the two
+    /// documents that reach for it, differing in one field.
+    ///
+    /// The module root is a sibling of neither document's own directory in any
+    /// sense that resolution reads: only the argument finds it, which is what
+    /// makes forwarding it to both sides observable.
+    fn packaged_pair() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let modules = dir.path().join("modules");
+        std::fs::create_dir(&modules).unwrap();
+        std::fs::write(
+            modules.join("sink.brenn"),
+            concat!(
+                "component Sink {\n",
+                "    ",
+                processor_any!(),
+                "\n",
+                "    in messages;\n",
+                "    out events;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let document = |push_depth: u32| {
+            format!(
+                r#"use @sink::Sink;
+
+channel feed at "brenn:alice.feed" {{
+    push_depth = {push_depth};
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}}
+
+channel replies at "brenn:alice.replies" {{
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}}
+
+new alice_sink: Sink {{
+    component_path = "sink.wasm";
+    grants = [ports];
+    in messages <- feed;
+    out events -> replies;
+}}
+"#
+            )
+        };
+        let a = write(dir.path(), "a.brenn", &document(4));
+        let same = write(dir.path(), "same.brenn", &document(4));
+        let other = write(dir.path(), "other.brenn", &document(8));
+        (dir, modules, a, same, other)
+    }
+
+    /// The module root reaches both sides. Dropping it from either one turns a
+    /// valid document into the "pass `--modules`" refusal, which the differ
+    /// raises as a panic — an operator certifying a config before a bounce gets
+    /// a boot-shaped failure out of a comparison tool.
+    #[test]
+    fn both_sides_of_a_diff_resolve_against_the_module_root() {
+        let (_dir, modules, a, same, other) = packaged_pair();
+        assert!(run_config_diff(&a, &same, Some(&modules)));
+        assert!(!run_config_diff(&a, &other, Some(&modules)));
     }
 
     /// Exit status 0 on configs that differ would be a false "safe to deploy".
@@ -181,7 +252,7 @@ channel alerts at "brenn:alice-alerts" {
 }
 "#,
         );
-        assert!(!run_config_diff(&a, &b));
+        assert!(!run_config_diff(&a, &b, None));
     }
 
     /// A `nan` compares false against its own copy, so the equality check and

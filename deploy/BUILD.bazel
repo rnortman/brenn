@@ -29,6 +29,10 @@ release_package(
     frontend = "//frontend:dist",
     lib_files = ["//:noop_mcp.py"],
     manifest = "//brenn-wasm:deployed-components.txt",
+    # The module root a deployment's `use @<name>::…` imports resolve against.
+    # Only the backend half: a surface kind's module is harvested from the
+    # staged surface tree, which already carries it per kind.
+    modules = ["//brenn-wasm:deployed_modules"],
     # The sidecars, offered the same way the artifacts are: the manifest decides
     # which of them ship, and an entry whose package is missing fails assembly.
     packages = ["//brenn-wasm:packages"],

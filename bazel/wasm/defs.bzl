@@ -337,6 +337,62 @@ def component_package(name, component, world, spec = None, visibility = None):
     )
 
 # ---------------------------------------------------------------------------
+# The installed layout, for a locally run server
+# ---------------------------------------------------------------------------
+
+def _component_install_tree_impl(ctx):
+    outs = []
+    seen = {}
+    artifacts = [_module_file(target) for target in ctx.attr.components]
+    for src in artifacts + ctx.files.packages:
+        if src.basename in seen:
+            fail("two inputs are named %s; an install tree is flat" % src.basename)
+        seen[src.basename] = True
+        out = ctx.actions.declare_file(ctx.label.name + "/" + src.basename)
+        ctx.actions.symlink(output = out, target_file = src)
+        outs.append(out)
+    return [DefaultInfo(files = depset(outs), runfiles = ctx.runfiles(files = outs))]
+
+_component_install_tree = rule(
+    implementation = _component_install_tree_impl,
+    doc = """Each artifact beside its own sidecars, in one flat directory.
+
+    The build keeps an artifact and its package in separate output directories;
+    a host reads them as `<stem>.wasm` plus `<stem>.package.json` plus
+    `<stem>.spec.brenn` in the directory a `component_path` names. This is that
+    directory, so a server started from the workspace loads a component the way
+    a deployment does — package verification included.
+    """,
+    attrs = {
+        "components": attr.label_list(
+            mandatory = True,
+            doc = "The `wasm_component` targets whose artifacts to stage.",
+        ),
+        "packages": attr.label_list(
+            mandatory = True,
+            doc = "Their `component_package` targets.",
+        ),
+    },
+)
+
+def component_install_tree(name, components, packages, visibility = None):
+    """See `_component_install_tree`.
+
+    Args:
+        name: target name; also the directory its outputs are declared under.
+        components: the `wasm_component` targets whose artifacts to stage.
+        packages: the `component_package` targets for those artifacts.
+        visibility: target visibility.
+    """
+    _component_install_tree(
+        name = name,
+        components = components,
+        packages = packages,
+        target_compatible_with = HOST_ONLY,
+        visibility = visibility,
+    )
+
+# ---------------------------------------------------------------------------
 # Host-side fixtures
 # ---------------------------------------------------------------------------
 
@@ -460,12 +516,15 @@ def _deployed_components_test_impl(ctx):
 
 _deployed_components_test = rule(
     implementation = _deployed_components_test_impl,
-    doc = """Assert every artifact the deploy manifest names is built, and packaged.
+    doc = """Hold the deploy manifest and the packaged set equal, both directions.
 
     The manifest is what the packaging step ships; a name in it that no target
     produces ships nothing, and one no target packages ships an artifact the
     host refuses for want of its binding record. Both failures would first
-    appear on the deploy target.
+    appear on the deploy target. The other direction is the release's module
+    root: a package the manifest omits stages its authored module there with no
+    component installed beside it, which the release contract test refuses far
+    from the manifest that caused it.
     """,
     attrs = {
         "components": attr.label_list(

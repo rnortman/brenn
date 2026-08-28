@@ -3,15 +3,15 @@
 //
 // Authoring conventions for this tree: `docs/config-dsl.md`.
 use config::bar::*;
-use config::specs::chrome::*;
-use config::specs::echo-stub::*;
-use config::specs::git-forge-parser::*;
-use config::specs::git-sync-consumer::*;
-use config::specs::meeting::*;
-use config::specs::mode-clock::*;
-use config::specs::processor-demo::*;
-use config::specs::processor-transplant::*;
-use config::specs::protobar::*;
+use @chrome::*;
+use @echo-stub::*;
+use @git-forge-parser::*;
+use @git-sync-consumer::*;
+use @meeting::*;
+use @mode-clock::*;
+use @processor-demo::*;
+use @processor-transplant::*;
+use @protobar::*;
 use config::surfaces::*;
 
 /// Where the server listens and what it believes about the proxy in front.

@@ -2,6 +2,8 @@
 
 use wiring::alice::Deskbar;
 use wiring::bob::*;
+use @deskbar::Panel;
+use @clock::*;
 
 /// Where component artifacts live on this host.
 /// Second line of the same doc comment.

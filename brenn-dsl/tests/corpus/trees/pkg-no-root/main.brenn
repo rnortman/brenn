@@ -1,0 +1,4 @@
+use @widget::*;
+use @gadget::*;
+
+const host = "example.com";

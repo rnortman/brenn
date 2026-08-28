@@ -11,7 +11,9 @@
 //! Environment facts remain out of scope: the passes that stat a path, read a
 //! secret, or touch the DB are excluded by name on
 //! [`resolve_messaging_offline`]. A workstation must be able to check a config
-//! destined for another host.
+//! destined for another host. What the check does read is exactly its declared
+//! inputs: the root document, and the module root its packaged imports resolve
+//! against.
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -26,8 +28,8 @@ use brenn_messaging_boot::resolve_messaging_offline;
 /// Strictly stronger than [`check_config`]: a document that compiles and lowers
 /// clean can still be refused here, by a messaging gate that reads only the
 /// configuration.
-pub fn run_config_check(file: &Path) -> bool {
-    let config = match check_config(file) {
+pub fn run_config_check(file: &Path, module_root: Option<&Path>) -> bool {
+    let config = match check_config(file, module_root) {
         Ok(config) => config,
         Err(report) => {
             eprintln!("{report}");
@@ -122,6 +124,8 @@ fn refusal_text(payload: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use brenn_dsl::{dom_any, processor_any};
 
     use super::*;
@@ -141,8 +145,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(name);
         std::fs::write(&file, contents).unwrap();
-        let ok = run_config_check(&file);
-        let config = check_config(&file);
+        let ok = run_config_check(&file, None);
+        let config = check_config(&file, None);
         assert!(
             config.is_ok() || !ok,
             "the report refused the document but the verdict passed it",
@@ -262,6 +266,73 @@ new alice: Assistant();
         assert!(report.contains("noise"), "{report}");
     }
 
+    /// The packaged module a checked document reaches for.
+    const PACKAGED_SINK: &str = concat!(
+        "component Sink {\n",
+        "    ",
+        processor_any!(),
+        "\n",
+        "    in messages;\n",
+        "    out events;\n",
+        "}\n",
+    );
+
+    /// A document reaching for a packaged module, and the module it reaches for.
+    ///
+    /// The module root is a sibling directory of the document, so the two are
+    /// related only by the flag: nothing about the document's own location
+    /// finds it.
+    fn packaged_document() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let modules = dir.path().join("modules");
+        std::fs::create_dir(&modules).unwrap();
+        std::fs::write(modules.join("sink.brenn"), PACKAGED_SINK).unwrap();
+        let file = dir.path().join("main.brenn");
+        std::fs::write(
+            &file,
+            r#"use @sink::Sink;
+
+channel feed at "brenn:alice.feed" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+channel replies at "brenn:alice.replies" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+new alice_sink: Sink {
+    component_path = "sink.wasm";
+    grants = [ports];
+    in messages <- feed;
+    out events -> replies;
+}
+"#,
+        )
+        .unwrap();
+        (dir, file, modules)
+    }
+
+    /// The check reads no facts beyond its declared inputs, and the module root
+    /// is one of them: the same document checks against whichever module tree
+    /// the caller names, and is refused when it names none.
+    #[test]
+    fn a_document_importing_packaged_modules_checks_against_the_module_root() {
+        let (_dir, file, modules) = packaged_document();
+        assert!(run_config_check(&file, Some(&modules)));
+    }
+
+    #[test]
+    fn the_same_document_without_a_module_root_is_refused_naming_the_flag() {
+        let (_dir, file, _modules) = packaged_document();
+        assert!(!run_config_check(&file, None));
+        let report = check_config(&file, None).expect_err("the document must be refused");
+        assert!(report.contains("pass `--modules <dir>`"), "{report}");
+    }
+
     /// The check tool reports; only boot panics.
     #[test]
     fn an_unrecognized_extension_fails_without_panicking() {
@@ -281,12 +352,12 @@ new alice: Assistant();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("main.brenn");
         std::fs::write(&file, contents).unwrap();
-        let config = check_config(&file)
+        let config = check_config(&file, None)
             .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"));
         let message = offline_messaging_refusal(&config)
             .expect("a messaging gate must refuse this configuration");
         assert!(
-            !run_config_check(&file),
+            !run_config_check(&file, None),
             "the offline pass refused it but the verdict passed it",
         );
         message
@@ -537,10 +608,11 @@ remote pod {
     /// messaging pass, a config that lowers clean but panics the service at boot
     /// is reported `ok`.
     fn shipped_config(filename: &str) {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join(filename);
-        assert!(run_config_check(&path), "{filename} must pass config-check");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        assert!(
+            run_config_check(&root.join(filename), Some(&root.join("config/specs"))),
+            "{filename} must pass config-check"
+        );
     }
 
     #[test]
@@ -561,7 +633,7 @@ remote pod {
     /// built artifacts.
     fn shipped_config_binds_to_its_packaged_specs(filename: &str) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let config = match check_config(&root.join(filename)) {
+        let config = match check_config(&root.join(filename), Some(&root.join("config/specs"))) {
             Ok(config) => config,
             Err(report) => panic!("{filename} must compile: {report}"),
         };

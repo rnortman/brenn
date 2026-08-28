@@ -8,3 +8,27 @@ component ProcessorDemo {
   in in;
   out out;
 }
+
+/// The republish loop this component is for, shipped ready to stamp: the
+/// channel it publishes onto, and a consumer bound between a caller-supplied
+/// source and that channel.
+///
+/// `components_dir` is a parameter rather than a constant because where the
+/// artifact is installed is the deployment's fact, not this component's; the
+/// artifact's basename is the component's, so it is spelled here.
+assembly DemoLoop(slug: String, source: Channel, components_dir: String) {
+  channel out at f"ephemeral:{slug}.out" {
+    description = "Republished bodies from a demo consumer";
+    push_depth = 8;
+    retain_depth = 8;
+  }
+  new consume: ProcessorDemo {
+    component_path = f"{components_dir}/brenn_processor_demo.wasm";
+    grants = [ports];
+    activation_burst = 60;
+    activation_min_period_ms = 100;
+    in in <- source { push_depth = 8; retain_depth = 8; }
+    out out -> out;
+  }
+
+}

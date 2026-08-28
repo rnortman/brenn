@@ -30,8 +30,11 @@ enum Command {
     },
     /// Compile a document from its root file: parse, resolve, derive, report.
     Check {
-        /// The root `.brenn` file. Its directory is the module root.
+        /// The root `.brenn` file. Its directory is where `use` resolves from.
         root: PathBuf,
+        /// The directory `use @<name>::…` imports resolve against.
+        #[arg(long, value_name = "DIR")]
+        modules: Option<PathBuf>,
         /// Print the derived configuration.
         #[arg(long)]
         dump: bool,
@@ -55,7 +58,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Check { root, dump } => match brenn_dsl::compile(&root) {
+        Command::Check {
+            root,
+            modules,
+            dump,
+        } => match brenn_dsl::compile(&root, modules.as_deref()) {
             Ok(config) => {
                 if dump {
                     println!("{config:#?}");

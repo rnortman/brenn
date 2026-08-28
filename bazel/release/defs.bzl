@@ -63,25 +63,33 @@ def _release_package_impl(ctx):
     args.add("--manifest", ctx.file.manifest)
     args.add("--names", ctx.file._manifest_names)
     args.add("--package-names", ctx.file._package_names)
+    args.add("--dom-names", ctx.file._dom_names)
+    args.add("--record-lib", ctx.file._record_lib)
     args.add("--frontend", frontend.path)
     args.add("--surface", surface.path)
     args.add_all(binaries, before_each = "--bin")
     args.add_all(ctx.files.lib_files, before_each = "--lib")
     args.add_all(components, before_each = "--component")
     args.add_all(ctx.files.packages, before_each = "--package")
+    args.add_all(ctx.files.modules, before_each = "--module")
 
     ctx.actions.run(
         outputs = [out],
         inputs = depset(
-            binaries + components + ctx.files.packages + ctx.files.lib_files +
-            [ctx.file.manifest],
+            binaries + components + ctx.files.packages + ctx.files.modules +
+            ctx.files.lib_files + [ctx.file.manifest],
             transitive = [
                 ctx.attr.frontend[DefaultInfo].files,
                 ctx.attr.surface[DefaultInfo].files,
             ],
         ),
         executable = ctx.file._assemble,
-        tools = [ctx.file._manifest_names, ctx.file._package_names],
+        tools = [
+            ctx.file._manifest_names,
+            ctx.file._package_names,
+            ctx.file._dom_names,
+            ctx.file._record_lib,
+        ],
         arguments = [args],
         mnemonic = "ReleasePackage",
         progress_message = "Staging the release tree at %s" % out.short_path,
@@ -125,6 +133,12 @@ _release_package = rule(
             mandatory = True,
             doc = "The deploy manifest naming the components that ship.",
         ),
+        "modules": attr.label_list(
+            allow_empty = False,
+            allow_files = [".brenn"],
+            mandatory = True,
+            doc = "The authored modules of the backend components that ship, staged under `modules/`.",
+        ),
         "packages": attr.label_list(
             allow_empty = False,
             mandatory = True,
@@ -138,6 +152,10 @@ _release_package = rule(
             allow_single_file = True,
             default = Label("//bazel/release:assemble.sh"),
         ),
+        "_dom_names": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/surface:dom_names.sh"),
+        ),
         "_manifest_names": attr.label(
             allow_single_file = True,
             default = Label("//bazel/wasm:manifest_names.sh"),
@@ -146,10 +164,14 @@ _release_package = rule(
             allow_single_file = True,
             default = Label("//bazel/wasm:package_names.sh"),
         ),
+        "_record_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:record_lib.sh"),
+        ),
     },
 )
 
-def release_package(name, manifest, binaries, components, packages, frontend, surface, lib_files = [], visibility = None):
+def release_package(name, manifest, binaries, components, packages, modules, frontend, surface, lib_files = [], visibility = None):
     """The staged release tree, plus the gate on the contract `deploy.sh` reads.
 
     Pairing them here makes the gate structural: the tree cannot be added to
@@ -163,6 +185,7 @@ def release_package(name, manifest, binaries, components, packages, frontend, su
         binaries: host binaries, installed to `bin/`.
         components: every `wasm_component` target in the tree.
         packages: every `component_package` target in the tree.
+        modules: the authored module of every backend component that ships.
         frontend: the frontend asset tree.
         surface: the surface asset tree.
         lib_files: loose files installed to `lib/`.
@@ -175,6 +198,7 @@ def release_package(name, manifest, binaries, components, packages, frontend, su
         frontend = frontend,
         lib_files = lib_files,
         manifest = manifest,
+        modules = modules,
         packages = packages,
         surface = surface,
         target_compatible_with = HOST_ONLY,

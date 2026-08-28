@@ -1,0 +1,9 @@
+// A packaged module a second packaged module builds on.
+
+const base_skin = "bench";
+
+component Drain {
+    abi = processor;
+    requires = [];
+    in messages;
+}

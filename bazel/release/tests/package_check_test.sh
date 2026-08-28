@@ -42,6 +42,7 @@ build_tree() {
     printf 'ELF static\n' > "$pkg/bin/brenn-cli"
     chmod +x "$pkg/bin/brenn" "$pkg/bin/brenn-cli"
     printf 'main\n' > "$pkg/frontend/main.js"
+    build_module_root "$pkg"
     printf 'shell\n' > "$pkg/surface/brenn_kernel.js"
     build_surface_tree "$pkg"
     printf 'stub\n' > "$pkg/lib/noop_mcp.py"
@@ -59,6 +60,19 @@ build_tree() {
         "$pkg/lib/also_shipped.package.json"
 }
 
+# The module root a deployment imports against: a surface kind's module under
+# its kind, a backend component's under its authored basename. Each is a copy of
+# the specification its package carries, which is the whole of what the gate
+# checks — the three authored files here differ from each other so that a module
+# joined to the wrong package cannot pass by coincidence.
+build_module_root() {
+    local pkg="$1"
+    mkdir -p "$pkg/modules"
+    cp "$authored_spec" "$pkg/modules/shipped.brenn"
+    cp "$dom_spec" "$pkg/modules/protobar.brenn"
+    cp "$processor_spec" "$pkg/modules/transplant.brenn"
+}
+
 # One dom kind and one processor kind, both written by the emitters the build
 # uses, for the same reason the component packages are: a surface fixture whose
 # records were hand-written would prove the gate against a shape nothing ships.
@@ -68,14 +82,14 @@ build_surface_tree() {
     printf '\0asm\1\0\0\0' > "$pkg/surface/brenn_protobar_bg.wasm"
     "$emit_dom" protobar \
         "$pkg/surface/brenn_protobar.js" "$pkg/surface/brenn_protobar_bg.wasm" \
-        "$authored_spec" "$pkg/surface/brenn_protobar.manifest.json" \
+        "$dom_spec" "$pkg/surface/brenn_protobar.manifest.json" \
         "$pkg/surface/brenn_protobar.spec.brenn"
 
     local kind_dir="$pkg/surface/processor/transplant"
     mkdir -p "$kind_dir"
     printf '\0asm\1\0\0\0' > "$kind_dir/transplant.component.wasm"
     printf 'export function instantiate() {}\n' > "$kind_dir/transplant.js"
-    cp "$authored_spec" "$kind_dir/transplant.spec.brenn"
+    cp "$processor_spec" "$kind_dir/transplant.spec.brenn"
     "$emit_processor" transplant "$kind_dir/transplant.component.wasm" "$kind_dir" \
         1.4.0 "$kind_dir/transplant.spec.brenn"
 }
@@ -93,6 +107,10 @@ chmod +x "$WASM_TOOLS"
 
 authored_spec="$tmp/authored.brenn"
 printf 'component Shipped {}\n' > "$authored_spec"
+dom_spec="$tmp/authored-dom.brenn"
+printf 'component Protobar {}\n' > "$dom_spec"
+processor_spec="$tmp/authored-processor.brenn"
+printf 'component Transplant {}\n' > "$processor_spec"
 
 pkg="$tmp/pkg"
 build_tree "$pkg"
@@ -274,6 +292,49 @@ cp "$pkg/surface/processor/transplant/transplant.spec.brenn" \
 sed -i 's/"spec": "transplant.spec.brenn"/"spec": "elsewhere.brenn"/' \
     "$pkg/surface/processor/transplant/manifest.json"
 reject "a processor record naming a spec the host would not read" "the host derives that name as transplant.spec.brenn"
+
+# ---------------------------------------------------------------------------
+# The module root. Each of these reaches the deploy host as a configuration that
+# cannot compile, or as one that compiles against bytes nothing installed binds.
+# ---------------------------------------------------------------------------
+build_tree "$pkg"; rm -rf "$pkg/modules"
+reject "a tree with no module root" "modules/ is missing"
+# An absent module root must not abort the gate early; later checks and the
+# summary must still run.
+out=$("$check" "$names" "$package_names" "$record_lib" "$dom_names" "$pkg" "$manifest" dynamic 2>&1 || true)
+if ! printf '%s' "$out" | grep -qF "problem(s) with the staged release tree"; then
+    fail "a tree with no module root: the gate stopped before its summary: $out"
+fi
+
+build_tree "$pkg"; rm "$pkg"/modules/*
+reject "an empty module root" "modules/ holds no files"
+
+build_tree "$pkg"; printf 'component Protobar { abi = dom; }\n' > "$pkg/modules/protobar.brenn"
+reject "a staged module that differs from the kind's packaged copy" \
+    "modules/protobar.brenn differs from surface/brenn_protobar.spec.brenn"
+
+build_tree "$pkg"; rm "$pkg/modules/transplant.brenn"
+reject "a surface processor kind whose module did not stage" \
+    "modules/transplant.brenn is missing or empty"
+
+build_tree "$pkg"; rm "$pkg/modules/shipped.brenn"
+reject "a backend package whose module did not stage" \
+    "lib/shipped.spec.brenn matches no file in modules/"
+
+# The staged module is fine and the copy it stands for is not: a module root is
+# only worth what the packaged copies behind it are, so an empty one is named
+# here rather than reported as a difference between two files.
+build_tree "$pkg"; : > "$pkg/surface/brenn_protobar.spec.brenn"
+reject "a packaged copy emptied under its staged module" \
+    "stands for nothing"
+
+build_tree "$pkg"; printf 'component Stray {}\n' > "$pkg/modules/stray.brenn"
+reject "a module no package stands behind" \
+    "modules/stray.brenn is byte-identical to no packaged specification"
+
+build_tree "$pkg"; printf 'notes\n' > "$pkg/modules/README.txt"
+reject "a file in the module root that is not a module" \
+    "modules/README.txt is not a .brenn module"
 
 # And the gate's own preconditions.
 if out=$("$check" "$names" "$package_names" "$record_lib" "$dom_names" "$tmp/absent" "$manifest" dynamic 2>&1); then

@@ -1,5 +1,5 @@
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "component_fixtures", "component_package", "deployed_components_test")
+load("//bazel/wasm:defs.bzl", "component_fixtures", "component_install_tree", "component_package", "deployed_components_test")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
@@ -71,10 +71,36 @@ PACKAGES = [
     for name in COMPONENT_PACKAGES
 ]
 
+# The same three-files-per-component layout a deployment installs, staged in one
+# directory so a server run from the workspace — `make launchdev`, `make e2e` —
+# can name it as its `components_dir` and load a component through the real
+# package verification.
+component_install_tree(
+    name = "install_tree",
+    components = [
+        "//brenn-wasm/components/{}:component".format(name)
+        for name in COMPONENT_PACKAGES
+    ],
+    packages = PACKAGES,
+    visibility = ["//visibility:public"],
+)
+
 # What the release tree stages beside the artifacts the manifest names.
 filegroup(
     name = "packages",
     srcs = PACKAGES,
+    visibility = ["//visibility:public"],
+)
+
+# The authored module of every packaged component, for the release's module
+# root. Every one of these stages, unfiltered by the deploy manifest, so what
+# keeps the modules staged and the components shipped naming one set is
+# `deployed_components_test`: it holds the manifest and this dict equal in both
+# directions. A world with no component class — replay — contributes nothing to
+# import.
+filegroup(
+    name = "deployed_modules",
+    srcs = [spec for (_, spec) in COMPONENT_PACKAGES.values() if spec],
     visibility = ["//visibility:public"],
 )
 

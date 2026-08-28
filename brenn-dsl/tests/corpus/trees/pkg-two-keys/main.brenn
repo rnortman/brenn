@@ -1,0 +1,6 @@
+// The same file reached twice: once down the tree, once through the sigil.
+
+use modules::widget::*;
+use @widget::*;
+
+const host = "example.com";

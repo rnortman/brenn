@@ -1,0 +1,20 @@
+// The shape a component author ships: the class, the constants, and an assembly
+// that wires the arrangement — declared here, stamped by whoever writes `new`.
+
+use @base::Drain;
+
+const widget_skin = "widget";
+
+component Widget {
+    abi = processor;
+    requires = [];
+    in messages;
+}
+
+assembly Bench(slug: String) {
+    channel messages at f"brenn:{slug}.in.p1.messages" {
+        push_depth = 8;
+        retain_depth = 32;
+        standing_retain_depth = 128;
+    }
+}

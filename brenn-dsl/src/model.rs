@@ -172,13 +172,17 @@ pub enum AssemblyItem {
     Grant(Box<GrantStmt>),
 }
 
-/// `use wiring::deskbar::Deskbar;` or `use wiring::deskbar::*;`.
+/// `use wiring::deskbar::Deskbar;` or `use wiring::deskbar::*;`, and their
+/// packaged-module forms `use @deskbar::Deskbar;` / `use @deskbar::*;`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UseStmt {
     pub path: PathRef,
     /// Whether the import ended in `::*`.
     pub glob: bool,
+    /// Whether the path was led by `@`: the module resolves against the module
+    /// root the caller supplied rather than against the root file's directory.
+    pub pkg: bool,
 }
 
 /// `const components_dir = "/home/alice/lib";`.

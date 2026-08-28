@@ -9,7 +9,7 @@ fn load_config_explicit_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.brenn");
     std::fs::write(&path, DOCUMENT).unwrap();
-    let config = load_config_from(Some(&path), dir.path());
+    let config = load_config_from(Some(&path), None, dir.path());
     assert_eq!(
         config.server.bind_address,
         "127.0.0.1:4000".parse().unwrap()
@@ -27,6 +27,7 @@ fn load_config_explicit_path() {
 fn load_config_explicit_path_missing_panics() {
     load_config_from(
         Some(Path::new("/nonexistent/brenn.brenn")),
+        None,
         Path::new("/tmp"),
     );
 }
@@ -35,7 +36,7 @@ fn load_config_explicit_path_missing_panics() {
 fn load_config_no_path_no_file_returns_defaults() {
     // Empty temp directory — no config file present.
     let dir = tempfile::tempdir().unwrap();
-    let config = load_config_from(None, dir.path());
+    let config = load_config_from(None, None, dir.path());
     // Should get production defaults.
     assert!(config.server.secure_cookies);
     assert_eq!(
@@ -68,7 +69,7 @@ fn load_config_brenn_path_that_does_not_compile_panics() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.brenn");
     std::fs::write(&path, "server { bind_address = ").unwrap();
-    load_config_from(Some(&path), dir.path());
+    load_config_from(Some(&path), None, dir.path());
 }
 
 #[test]
@@ -83,7 +84,7 @@ fn load_config_brenn_path_that_does_not_lower_panics() {
         r#"server { public_url = "https://brenn.example.com"; secure_cookies = 3; }"#,
     )
     .unwrap();
-    load_config_from(Some(&path), dir.path());
+    load_config_from(Some(&path), None, dir.path());
 }
 
 /// The boot panic shows every refusal, not just the first.
@@ -94,7 +95,7 @@ fn load_config_brenn_lower_panic_reports_every_refusal() {
     // Two independent value-typing refusals in one section.
     std::fs::write(&path, "server { public_url = 3; secure_cookies = 3; }").unwrap();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        load_config_from(Some(&path), dir.path())
+        load_config_from(Some(&path), None, dir.path())
     }))
     .expect_err("the document must not lower");
     let message = panic
@@ -111,7 +112,7 @@ fn load_config_unrecognized_extension_panics() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("brenn.yaml");
     std::fs::write(&path, "server: {}\n").unwrap();
-    load_config_from(Some(&path), dir.path());
+    load_config_from(Some(&path), None, dir.path());
 }
 
 #[test]
@@ -124,7 +125,7 @@ fn load_config_toml_path_panics() {
         "[server]\npublic_url = \"https://brenn.example.com\"\n",
     )
     .unwrap();
-    load_config_from(Some(&path), dir.path());
+    load_config_from(Some(&path), None, dir.path());
 }
 
 #[test]
@@ -133,7 +134,7 @@ fn load_config_extensionless_path_panics() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("brennconfig");
     std::fs::write(&path, "[server]\n").unwrap();
-    load_config_from(Some(&path), dir.path());
+    load_config_from(Some(&path), None, dir.path());
 }
 
 // -----------------------------------------------------------------------
@@ -144,7 +145,7 @@ fn load_config_extensionless_path_panics() {
 fn load_config_finds_brenn_brenn_in_fallback_dir() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("brenn.brenn"), DOCUMENT).unwrap();
-    let config = load_config_from(None, dir.path());
+    let config = load_config_from(None, None, dir.path());
     assert_eq!(
         config.server.bind_address,
         "127.0.0.1:4000".parse().unwrap()
@@ -164,7 +165,7 @@ fn load_config_invalid_brenn_brenn_in_fallback_dir_panics() {
          standing_retain_depth = 16;\n  noise = deafening;\n}\n",
     )
     .unwrap();
-    load_config_from(None, dir.path());
+    load_config_from(None, None, dir.path());
 }
 
 /// A name that can neither be confirmed present nor confirmed absent is not
@@ -176,5 +177,5 @@ fn load_config_unstattable_fallback_name_panics() {
     let dir = tempfile::tempdir().unwrap();
     let loop_path = dir.path().join("brenn.brenn");
     std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
-    load_config_from(None, dir.path());
+    load_config_from(None, None, dir.path());
 }

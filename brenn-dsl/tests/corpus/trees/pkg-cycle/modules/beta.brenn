@@ -1,0 +1,3 @@
+use @alpha::*;
+
+const beta_skin = "beta";

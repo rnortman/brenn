@@ -14,6 +14,14 @@
 # `component_package` target ships an artifact the host refuses — the same
 # never-deployed outcome as a missing artifact, one release later.
 #
+# Packaging is also checked the other way round, which is what makes the two
+# lists one set. A package's authored module is staged into the release's module
+# root unconditionally, while its artifact and sidecars ship only if the
+# manifest names them, so a package the manifest omits puts a module in that
+# root standing for a component nobody installed — refused by the release
+# contract test, in a message about the module root that says nothing about the
+# manifest. It is refused here instead, where the manifest is the subject.
+#
 # `<names-tool>` is `manifest_names.sh`, which states the manifest's grammar for
 # every reader of it.
 set -euo pipefail
@@ -45,6 +53,17 @@ while read -r line; do
         missing=1
     fi
 done <<< "$listed"
+
+# Every packaged component is a listed one.
+while read -r name; do
+    [ -n "$name" ] || continue
+    if ! echo "$listed" | grep -qx "$name"; then
+        echo "ERROR: $name has a component_package target but $label does not list it;" \
+             "its authored module would stage into the release's module root with no" \
+             "component installed beside it"
+        missing=1
+    fi
+done <<< "$(echo "$packaged" | tr ' ' '\n')"
 
 # A manifest that yields nothing is a manifest that stopped being read.
 if [ "$entries" -eq 0 ]; then

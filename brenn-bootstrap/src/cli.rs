@@ -9,6 +9,13 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
+    /// Directory holding the packaged component modules `use @<name>::…`
+    /// imports resolve against. An environment fact, so it is named here and
+    /// never in the document: the same document checks on a workstation against
+    /// a source checkout and boots on a host against the installed tree.
+    #[arg(long, value_name = "DIR")]
+    pub modules: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -30,4 +37,34 @@ pub enum Commands {
     /// integration registry and the runtime dir are the boot's business — so
     /// `ok` means the file is a config, not that it will boot on every host.
     ConfigCheck { file: PathBuf },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// `--modules` is declared on the root parser and is not `global`, so it
+    /// parses before the subcommand and nowhere else. The operator-facing
+    /// invocation that certifies a config on the host before a bounce is
+    /// spelled that way, so which orderings parse is a contract and not a
+    /// convenience: making the flag global, or moving it onto the subcommands,
+    /// breaks the last gate before a restart while every build stays green.
+    #[test]
+    fn the_module_root_is_named_before_the_subcommand_and_not_after_it() {
+        let cli = Cli::try_parse_from(["brenn", "--modules", "/srv/modules", "config-check", "x"])
+            .expect("the flag precedes the subcommand");
+        assert_eq!(cli.modules.as_deref(), Some(Path::new("/srv/modules")));
+        let Some(Commands::ConfigCheck { file }) = cli.command else {
+            panic!("the subcommand still parses");
+        };
+        assert_eq!(file, PathBuf::from("x"));
+
+        assert!(
+            Cli::try_parse_from(["brenn", "config-check", "--modules", "/srv/modules", "x"])
+                .is_err(),
+            "a subcommand of its own does not take the flag"
+        );
+    }
 }

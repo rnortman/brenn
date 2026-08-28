@@ -10,16 +10,17 @@ reference; this page is about how to use the language well.
 ### The shape of a document
 
 A document is one **root file** and the **modules** it imports. The root file's
-directory is the module root, and a module key is a path under it: `use
-config::specs::chrome::*;` reads `config/specs/chrome.brenn`, relative to
-wherever the root file lives. Nothing in the language can escape that
-directory — the grammar admits neither `..` nor an absolute path segment — so a
-whole tree can be moved or copied and still means the same thing.
+directory anchors the tree, and a module key is a path under it: `use
+config::bar::*;` reads `config/bar.brenn`, relative to wherever the root file
+lives. Nothing in the language can escape that directory — the grammar admits
+neither `..` nor an absolute path segment — so a whole tree can be moved or
+copied and still means the same thing. The one import that reaches outside the
+tree says so in its syntax (*Packaged-module imports*, below).
 
 ```
 use config::bar::*;
-use config::specs::chrome::*;
 use config::surfaces::*;
+use @chrome::*;
 ```
 
 - One file is one module. Reaching the same file under two keys is refused, and
@@ -35,6 +36,76 @@ use config::surfaces::*;
 `//` is a comment and reaches nothing. `///` is a **doc comment**, attaches to
 the declaration that follows it, and is carried into the resolved config, so it
 is where the reasoning behind a declaration belongs.
+
+### Packaged-module imports
+
+A second import form reaches *outside* the tree, to a module a component's
+author shipped with the component:
+
+```
+use @processor-demo::*;
+use @chrome::Chrome;
+```
+
+The `@` sigil says the name is not a path under the root's directory. It names
+one file, `<module root>/<name>.brenn`, in a directory named on the command
+line:
+
+```
+brenn --config brenn.dev.brenn --modules config/specs serve
+```
+
+The module root is deliberately not in the document. Where the authored modules
+live is an environment fact: on a workstation it is a source checkout, on a
+deployment host it is the tree the release installed. The same document must
+mean the same thing in both places, so the document names the module and the
+invocation names the root. A document with a `@` import and no `--modules` is
+refused naming the flag, and a `--modules` that is not a readable directory is
+refused whether or not anything imports.
+
+A packaged module is one level deep — `use @a::b::C;` is refused — and the
+first segment is the whole module name. Everything else about a module holds:
+a glob binds what the module declares, a named import checks the name exists,
+one file is one module across both roots, and cycles are refused.
+
+**A packaged module declares vocabulary and instantiates nothing.** It may hold
+component classes (any number, including none), assemblies, constants, and
+further `@` imports — and nothing else. No `new`, no `channel`, no `surface`, no
+agent, no attacher, no `acl`, no `uuid_pins`, and no import of a deployment's
+own tree, which it can know nothing about. Loading a module runs its top-level
+statements, so this is what keeps an author-owned file from adding instances or
+channels to a deployment that consented to neither.
+
+Assemblies are welcome there precisely because declaring one effects nothing:
+
+```
+// Shipped by the author, in @processor-demo:
+assembly DemoLoop(slug: String, source: Channel, components_dir: String) {
+  channel out at f"ephemeral:{slug}.out" { push_depth = 8; retain_depth = 8; }
+  new consume: ProcessorDemo {
+    component_path = f"{components_dir}/brenn_processor_demo.wasm";
+    grants = [ports];
+    in in <- source;
+    out out -> out;
+  }
+}
+
+// Written by the deployment:
+new demo: DemoLoop(slug = "demo", source = feed, components_dir = components_dir);
+```
+
+The author ships the arrangement; the deployment chooses to stamp it. The `new`
+is where consent lives, and it is always the deployment's line.
+
+**Stamping a packaged assembly accepts everything its body declares**, including
+authority the deployment never spells out. An assembly body admits `grant` and
+`surface` alongside its channels, links and instances, and the declarations-only
+discipline does not look inside one — it refuses those forms at a packaged
+module's top level, where they would take effect on import, and admits them
+inside an assembly, where nothing happens until someone writes `new`. So a
+deployment's one-line `new` may confer grants, and open a surface, that appear
+only in the author's file. Read a packaged assembly before stamping it, the way
+you would read any other thing you are about to authorize.
 
 ### Settings sections
 
@@ -566,25 +637,26 @@ point at the same contradiction.
 abi, the ports, their doctypes, which ports are optional, and the capabilities
 the component needs are statements about the artifact, and only the person who
 builds the artifact is in a position to make them. A deployment does four things
-and no more: it **instantiates**, **wires**, **grants**, and **consents**.
+and no more: it **instantiates**, **wires**, **grants**, and **consents**. The
+first of those carries the other three whenever it stamps a packaged assembly:
+the wiring and the grants may be written in the author's file, and the
+deployment's `new` is the consent to all of it (*Packaged-module imports*).
 
-That division is why a deployment's `specs/` files are **verbatim copies** of
-the authored originals rather than restatements, and why the copy is checked
-instead of trusted: a deployment diffs every spec it carries against the
-authored original in the component's own repo, and any byte of difference fails.
-A spec change lands in the author's repo first and is then recopied. The copy
-step is interim — it exists only until the config language can import a
-component's package directly — but the ownership rule it protects is not.
+That division is why a deployment does not hold the specification at all. It
+**imports the author's module** — `use @<kind>::*;` — from the module root its
+invocation names, which on a deployment host is the tree the release installed
+beside the components themselves. There is nothing to restate and nothing to
+keep in step: the file the configuration compiles against is the file the author
+wrote.
 
-The copy is checked twice, and the second check is the binding one. A shipped
-component travels with the author's specification and a record binding the two
-by content hash (`component-packages.md`). At boot the host compares the hash of
-the specification the running configuration compiled against with the hash that
-record carries, and refuses to start on any difference. So a deployment's CI
-diff catches drift between the copy and the authored original, and the host
-catches drift between the copy and the component actually installed — including
-the case CI cannot see, where the copy is faithful and the installed artifact is
-from another release.
+What binds that file to the artifact is content hash. A shipped component
+travels with the author's specification and a record binding the two
+(`component-packages.md`). At boot the host compares the hash of the
+specification the running configuration compiled against with the hash that
+record carries, and refuses to start on any difference. So a module root holding
+another release's modules is caught at boot, including the case no earlier check
+can see, where the module is a faithful copy of *some* release and the installed
+artifact is from another one.
 
 This holds at **both placements**. A backend component's carrier is the package
 beside its `.wasm`; a surface-placed component's is the record its build emits
@@ -603,8 +675,9 @@ most a pointer to this page plus whatever delta is local to it.
   deployment-specific channels, and the `new` statements that say what runs.
   Definitions live in modules beside it.
 - One module per subsystem, not per syntax kind. Component specifications are
-  the exception and get one class per file, under `specs/` — a spec is owned by
-  the component's author and travels as a unit (see below).
+  the exception and get one class per file — a spec is owned by the component's
+  author and travels as a unit, imported with `@` rather than kept in the tree
+  (see below).
 - An assembly earns its place at the second stamping within one document; a
   single stamping stays longhand.
 - A shape lives in a shared module only if it is identical for every root that
@@ -620,13 +693,16 @@ most a pointer to this page plus whatever delta is local to it.
 What a specification *says* is *Component classes* and *Doctypes* above; who
 owns it is *Ownership*. What is left is where the file goes:
 
-- One class per file, `specs/<kind>.brenn`, named for the wire kind the class
-  folds to — a spec travels as a unit, so it is never grouped with others.
-- A deployment carries copies of exactly the specs it instantiates, and no
-  others. A copy nobody imports is an orphan.
+- One class per file, `<kind>.brenn` under the authoring repo's `config/specs/`,
+  named for the wire kind the class folds to — a spec travels as a unit, so it
+  is never grouped with others, and the filename is the name importers spell
+  after the `@`.
+- A deployment imports exactly the modules whose components it instantiates. An
+  installed module nobody imports is never loaded; it is inert declaration text,
+  not an orphan to prune.
 - The rationale for a port, an `optional` mark, or a required capability is a
-  `///` comment on the class, written by its author and carried into the copies
-  unchanged.
+  `///` comment on the class, written by its author and read by everyone who
+  imports it.
 
 ## Superseded conventions
 

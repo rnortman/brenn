@@ -15,16 +15,16 @@ in-tree only — the last section says why.
 A component's specification — its abi, its ports, their doctypes, which ports
 are optional, the capabilities it needs — is a statement about the artifact, and
 only the artifact's author is in a position to make it (`config-dsl.md`,
-*Ownership*). A deployment carries a **verbatim copy** of that specification and
-compiles its configuration against the copy.
+*Ownership*). A deployment does not restate it: it imports the author's file
+(`use @<kind>::*;`) from a module root the release installed, and compiles its
+configuration against those bytes.
 
-Two files in two repositories, expected to be identical, with a release cycle
-in between. The copy going stale — a spec change that shipped in the component
-but was never re-copied, or a configuration written for a newer component than
-the host has installed — is a configuration that compiled cleanly against a
-contract the running artifact does not honour. Nothing in the artifact's own
-load path catches it: the loader reflects imports and enforces grants, which
-says nothing about ports or doctypes.
+The bytes still have to be the ones the installed artifact was built with. A
+module root left behind by an earlier release, or a configuration written for a
+newer component than the host has installed, is a configuration that compiled
+cleanly against a contract the running artifact does not honour. Nothing in the
+artifact's own load path catches it: the loader reflects imports and enforces
+grants, which says nothing about ports or doctypes.
 
 The package closes that window by making the author's specification travel with
 the artifact, and by making the host check that the specification the
@@ -48,6 +48,15 @@ The packaged specification is renamed to the artifact's stem rather than keeping
 the authored filename (`processor-demo.brenn`), so that every file in the
 package follows from the artifact's basename with no lookup. The rename costs
 nothing: the binding is over bytes, and the bytes are unchanged.
+
+That file is the component's **packaged module**, not merely its spec. It is the
+authored file entire, so besides the component class it may carry the
+assemblies and constants its author ships as the vocabulary for using the
+component — everything a deployment imports when it writes `use @<kind>::*;`.
+What it may never carry is instantiation; the discipline is in `config-dsl.md`,
+*Packaged-module imports*. The `spec`/`spec_sha256` record fields and the
+`.spec.brenn` extension keep their names: they are v1 contract vocabulary, and
+what they denote — the authored source file and its hash — has not changed.
 
 A **replay-world** component packages as two files, artifact and record, with no
 specification. It has no component class, no ports and no grants; a
@@ -187,6 +196,31 @@ Downstream of that, the release tree stages all three files into `lib/`,
 `bazel/release/package_check.sh` re-computes both hashes over the staged tree so
 the tarball is proven internally bound before it ships, and the deploy script
 installs the sidecars beside each artifact.
+
+## The module root
+
+A release also carries the authored modules themselves, as a flat `modules/`
+tree:
+
+```
+modules/processor-demo.brenn        the backend component's authored module
+modules/mode-clock.brenn            a dom kind's, harvested from surface/
+modules/protobar.brenn
+```
+
+That is the directory a deployment's `--modules` names and its `use @<name>::…`
+imports resolve against (`config-dsl.md`, *Packaged-module imports*), so the
+staged name is the authored basename — the wire kind — rather than the
+artifact's stem. Every component the release ships contributes one, backend and
+surface alike, so a deployment can import whatever it instantiates; the backend
+half is staged from the same `COMPONENT_PACKAGES` dict that builds the packages,
+and the surface half is harvested out of the staged surface tree, whose records
+name their kinds.
+
+`package_check.sh` holds the root to its packages in both directions: every
+shipped specification has a byte-identical module staged, and every staged
+module is byte-identical to a shipped specification. A file that is neither is a
+module a deployment could import and the host would refuse at boot.
 
 ## Surface packages
 

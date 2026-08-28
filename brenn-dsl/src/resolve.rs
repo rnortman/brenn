@@ -55,12 +55,21 @@ const ROOT_KEY: &str = "";
 /// The extension a module file takes.
 const MODULE_EXT: &str = "brenn";
 
+/// What leads a packaged module's key, and the sigil that spells it in source.
+///
+/// A tree module key is `::`-joined path segments, and the grammar admits no
+/// `@` in a name, so no tree import can ever produce a key in this namespace.
+const PKG_SIGIL: &str = "@";
+
 /// Compile a document tree, starting from its root file.
 ///
-/// The root file's directory is the module root: `use wiring::deskbar;` reads
-/// `<root_dir>/wiring/deskbar.brenn`.
-pub fn compile(root: &Path) -> Result<DerivedConfig, Vec<Diagnostic>> {
-    let files = load(root)?;
+/// The root file's directory is the tree root: `use wiring::deskbar;` reads
+/// `<root_dir>/wiring/deskbar.brenn`. `module_root`, where one is supplied, is
+/// the flat directory packaged-module imports resolve against:
+/// `use @deskbar::*;` reads `<module_root>/deskbar.brenn`. A document with no
+/// packaged-module import is unaffected by it.
+pub fn compile(root: &Path, module_root: Option<&Path>) -> Result<DerivedConfig, Vec<Diagnostic>> {
+    let files = load(root, module_root)?;
     let config = resolve_files(files, ROOT_KEY)?;
     crate::derive::derive(config)
 }
@@ -83,6 +92,7 @@ pub fn resolve_files(
         "the root key names one of the files"
     );
     let mut errors = Vec::new();
+    check_packaged_discipline(&files, &mut errors);
     let mut index = Index::build(&files, &mut errors);
     index.resolve_constants(&files, &mut errors);
     if !errors.is_empty() {
@@ -98,15 +108,83 @@ pub fn resolve_files(
     Ok(config)
 }
 
+// ── the packaged-module discipline ───────────────────────────────────────────
+
+/// What a packaged module is refused with when it carries anything else.
+const DISCIPLINE_REFUSAL: &str = "a packaged module declares vocabulary — component classes, \
+     assemblies, constants — and instantiates nothing";
+
+/// Refuse anything effectful in a module whose author is not the deployer.
+///
+/// Loading a module instantiates its top-level `new` statements and effects its
+/// top-level channels, wherever it was written. That is right for a module the
+/// deployer wrote and wrong for one that shipped inside a component package: an
+/// import would otherwise inject instances, channels or grants into a document
+/// whose author consented to none of them. So a packaged module may declare
+/// component classes, assemblies and constants — vocabulary, which stamps
+/// nothing until someone writes `new` against it — and nothing else.
+///
+/// Its `use` statements are held to the same line: a packaged module may build
+/// on other packaged modules, but can know nothing of any deployment's tree.
+///
+/// The walk stops at the item level on purpose: an assembly body may declare
+/// grants and a surface, and this pass does not look inside one. Nothing in an
+/// assembly happens until someone writes `new` against it, and that `new` is
+/// the consent — a deployer who stamps a packaged assembly accepts the whole
+/// arrangement it declares, authority included. Refusing the same forms one
+/// level down would ban shipping any arrangement that wires its own parameters.
+///
+/// Runs in the I/O-free core rather than in the loader so the in-memory path
+/// exercises it identically.
+fn check_packaged_discipline(files: &[(String, File)], errors: &mut Vec<Diagnostic>) {
+    for (key, file) in files {
+        if !is_packaged(key) {
+            continue;
+        }
+        for stmt in &file.uses {
+            if !stmt.pkg {
+                errors.push(Diagnostic::at(
+                    "a packaged module imports only packaged modules: `use @<module>::<Item>;`",
+                    stmt.path.head.span().clone(),
+                ));
+            }
+        }
+        for item in &file.items {
+            match item.value() {
+                Item::ConstDef(_) | Item::Component(_) | Item::Assembly(_) => {}
+                _ => errors.push(Diagnostic::at(DISCIPLINE_REFUSAL, item.span().clone())),
+            }
+        }
+    }
+}
+
 // ── pass 1: load ─────────────────────────────────────────────────────────────
 
 /// Parse the root file and, transitively, every module it reaches.
 ///
 /// Returns the modules in the order they were reached.
-fn load(root: &Path) -> Result<Vec<(String, File)>, Vec<Diagnostic>> {
+fn load(root: &Path, module_root: Option<&Path>) -> Result<Vec<(String, File)>, Vec<Diagnostic>> {
     let root_dir = root.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // An operator typo must not pass silently, so the module root is checked
+    // for what it claims to be whether or not the document reaches for it. The
+    // probe is a read, not a stat: a directory nothing may list answers every
+    // import with an absence, and "no packaged module" sends its reader hunting
+    // the release staging for a file that is sitting right there.
+    if let Some(dir) = module_root
+        && let Err(error) = std::fs::read_dir(dir)
+    {
+        return Err(vec![Diagnostic::unpositioned(
+            format!(
+                "--modules {}: not a readable directory: {error}",
+                dir.display()
+            ),
+            root.display().to_string(),
+        )]);
+    }
     let mut loader = Loader {
         root_dir,
+        module_root: module_root.map(Path::to_path_buf),
+        reported_missing_module_root: false,
         files: Vec::new(),
         seen: HashMap::new(),
         loaded: HashMap::new(),
@@ -121,6 +199,14 @@ fn load(root: &Path) -> Result<Vec<(String, File)>, Vec<Diagnostic>> {
 
 struct Loader {
     root_dir: PathBuf,
+    /// Where `@` imports resolve, where the caller supplied one. Absent is not
+    /// a default: a document that reaches for a packaged module without one is
+    /// refused naming the flag.
+    module_root: Option<PathBuf>,
+    /// Whether the absent module root has already been reported. It is one
+    /// fact about the invocation, not about any module, so a document importing
+    /// nine packaged modules gets one sentence naming the flag.
+    reported_missing_module_root: bool,
     /// Modules in the order they were reached, root first.
     files: Vec<(String, File)>,
     /// Module key to the path it was read from — also the "already visited" set.
@@ -152,10 +238,16 @@ impl Loader {
             self.loaded.insert(canonical, key.clone());
         }
         self.seen.insert(key.clone(), path);
+        // A packaged module's tree imports are refused by the discipline pass;
+        // following one here would report a missing module in front of the
+        // refusal that is the real answer.
+        let packaged = is_packaged(&key);
         let imports: Vec<(String, Span)> = file
             .uses
             .iter()
-            .filter_map(|stmt| self.import_module(stmt))
+            .filter(|stmt| !packaged || stmt.pkg)
+            .filter_map(|stmt| use_target(stmt).and_then(Result::ok))
+            .map(|target| (target.module, target.span))
             .collect();
         self.files.push((key.clone(), file));
 
@@ -169,15 +261,25 @@ impl Loader {
             if self.seen.contains_key(&module) {
                 continue;
             }
-            let path = self.module_path(&module);
+            let path = match self.module_path(&module) {
+                Some(path) => path,
+                None => {
+                    if !self.reported_missing_module_root {
+                        self.reported_missing_module_root = true;
+                        self.errors.push(Diagnostic::at(
+                            "this document imports packaged modules; pass `--modules <dir>`",
+                            span,
+                        ));
+                    }
+                    // Poison it under a path that cannot exist, so a second
+                    // `use` of this module is not a second walk of it.
+                    self.seen.insert(module, PathBuf::new());
+                    continue;
+                }
+            };
             if !path.is_file() {
-                self.errors.push(Diagnostic::at(
-                    format!(
-                        "no module `{module}`: expected `{}`",
-                        display_relative(&path, &self.root_dir)
-                    ),
-                    span,
-                ));
+                self.errors
+                    .push(Diagnostic::at(self.missing_module(&module, &path), span));
                 // Poison it so a second `use` of the same missing module is not
                 // a second report of the same absence.
                 self.seen.insert(module, path);
@@ -206,32 +308,88 @@ impl Loader {
         stack.pop();
     }
 
-    /// Which module a `use` names, if its path has a shape that names one.
+    /// Where a module key reads from, or nothing where it names a packaged
+    /// module and no module root was supplied.
     ///
-    /// A named import (`use a::b::Thing;`) names module `a::b`; a glob
-    /// (`use a::b::*;`) names module `a::b` whole. A path that names no module
-    /// at all is refused by the index pass, which is the one pass every entry
-    /// point runs; reporting it here too would report it twice.
-    fn import_module(&self, stmt: &UseStmt) -> Option<(String, Span)> {
-        let span = stmt.path.head.span().clone();
-        let mut segments = module_segments(stmt)?;
-        if !stmt.glob {
-            segments.pop();
-        }
-        Some((segments.join("::"), span))
-    }
-
-    /// Where a module key reads from: segments under the root directory, plus
-    /// the extension. The grammar admits neither `..` nor an absolute head, so
-    /// a module path cannot escape the root by construction.
-    fn module_path(&self, key: &str) -> PathBuf {
-        let mut path = self.root_dir.clone();
-        for segment in key.split("::") {
+    /// A tree key is its segments under the root directory, plus the extension.
+    /// The grammar admits neither `..` nor an absolute head, so a tree module
+    /// path cannot escape the root by construction. A packaged key is its one
+    /// name directly under the module root, which is flat.
+    fn module_path(&self, key: &str) -> Option<PathBuf> {
+        let mut path = if is_packaged(key) {
+            self.module_root.clone()?
+        } else {
+            self.root_dir.clone()
+        };
+        for segment in module_name(key).split("::") {
             path.push(segment);
         }
         path.set_extension(MODULE_EXT);
-        path
+        Some(path)
     }
+
+    /// What a module that is not on disk is reported as.
+    ///
+    /// A tree module is named against the root file's directory, which the
+    /// reader has in front of them. A packaged module's root is an environment
+    /// fact the document does not state, so the message spells it out whole:
+    /// "under which root" is the question the reader is actually asking.
+    fn missing_module(&self, key: &str, path: &Path) -> String {
+        if is_packaged(key) {
+            format!(
+                "no packaged module `{}`: expected `{}`",
+                module_name(key),
+                path.display()
+            )
+        } else {
+            format!(
+                "no module `{key}`: expected `{}`",
+                display_relative(path, &self.root_dir)
+            )
+        }
+    }
+}
+
+fn is_packaged(key: &str) -> bool {
+    key.starts_with(PKG_SIGIL)
+}
+
+fn module_name(key: &str) -> &str {
+    key.strip_prefix(PKG_SIGIL).unwrap_or(key)
+}
+
+struct UseTarget {
+    module: String,
+    span: Span,
+    item: Option<String>,
+}
+
+/// What a `use` names, or why it names nothing.
+///
+/// `None` is a path that names no module at all, and `Err` is a packaged import
+/// written deeper than the one level a module root has. Both are reported by the
+/// index pass, which is the one pass every entry point runs; the loader reads
+/// this too and stays silent about them so neither is reported twice.
+fn use_target(stmt: &UseStmt) -> Option<Result<UseTarget, Diagnostic>> {
+    let span = stmt.path.head.span().clone();
+    let mut segments = module_segments(stmt)?;
+    let item = if stmt.glob {
+        None
+    } else {
+        Some(segments.pop().expect("a named use has two segments"))
+    };
+    if stmt.pkg && segments.len() != 1 {
+        return Some(Err(Diagnostic::at(
+            "a packaged module is one level: `use @<module>::<Item>;`",
+            span,
+        )));
+    }
+    let module = if stmt.pkg {
+        format!("{PKG_SIGIL}{}", segments.join("::"))
+    } else {
+        segments.join("::")
+    };
+    Some(Ok(UseTarget { module, span, item }))
 }
 
 /// A path as written against the root directory, for a message a reader can act
@@ -394,17 +552,18 @@ impl Index {
         errors: &mut Vec<Diagnostic>,
     ) {
         for stmt in &file.uses {
-            let span = stmt.path.head.span().clone();
-            let Some(segments) = module_segments(stmt) else {
-                errors.push(use_shape_error(stmt));
-                continue;
+            let target = match use_target(stmt) {
+                None => {
+                    errors.push(use_shape_error(stmt));
+                    continue;
+                }
+                Some(Err(error)) => {
+                    errors.push(error);
+                    continue;
+                }
+                Some(Ok(target)) => target,
             };
-            let (module, item) = if stmt.glob {
-                (segments.join("::"), None)
-            } else {
-                let (last, head) = segments.split_last().expect("a named use has two segments");
-                (head.join("::"), Some(last.clone()))
-            };
+            let UseTarget { module, span, item } = target;
             let Some(&source) = self.by_key.get(&module) else {
                 // The load pass already reported why this module is absent.
                 continue;

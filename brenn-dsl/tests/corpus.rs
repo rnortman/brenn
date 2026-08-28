@@ -25,7 +25,7 @@ fn the_lexical_corpus_deserializes() {
     let src = read("lexical.brenn");
     let file = parse_str(&src, "lexical.brenn").expect("the corpus must parse");
 
-    assert_eq!(file.uses.len(), 2);
+    assert_eq!(file.uses.len(), 4);
     assert_eq!(file.uses[0].path.head.value(), "wiring");
     assert!(!file.uses[0].glob);
     assert!(file.uses[1].glob);
@@ -33,6 +33,16 @@ fn the_lexical_corpus_deserializes() {
         panic!("one `::`-qualified segment");
     };
     assert_eq!(segment.name.value(), "bob");
+
+    // `pkg` records whether `@` was written, in both the named and glob forms.
+    assert!(!file.uses[0].pkg);
+    assert!(!file.uses[1].pkg);
+    assert!(file.uses[2].pkg);
+    assert!(!file.uses[2].glob);
+    assert_eq!(file.uses[2].path.head.value(), "deskbar");
+    assert!(file.uses[3].pkg);
+    assert!(file.uses[3].glob);
+    assert_eq!(file.uses[3].path.head.value(), "clock");
 }
 
 /// An import tolerates whitespace before its terminator, the way every other
@@ -46,6 +56,23 @@ fn an_import_tolerates_whitespace_before_its_terminator_and_its_glob() {
     let file = parse_str("use a ::*;\n", "t.brenn").expect("a space before the glob");
     assert!(file.uses[0].glob);
     assert!(file.uses[0].path.segs.is_empty());
+}
+
+/// The sigil is glued to the module name and nothing else in the statement is:
+/// `@deskbar` is one token to a reader, so the grammar admits no whitespace
+/// between the two, while the glob keeps the tolerance every other statement
+/// has at its one optional-whitespace position.
+#[test]
+fn a_packaged_import_admits_no_space_after_its_sigil_and_still_admits_one_before_its_glob() {
+    assert!(
+        parse_str("use @ deskbar::*;\n", "t.brenn").is_err(),
+        "a space after the sigil is not this language"
+    );
+
+    let file = parse_str("use @deskbar ::*;\n", "t.brenn").expect("a space before the glob");
+    assert!(file.uses[0].pkg);
+    assert!(file.uses[0].glob);
+    assert_eq!(file.uses[0].path.head.value(), "deskbar");
 }
 
 #[test]

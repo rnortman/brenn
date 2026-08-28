@@ -64,6 +64,26 @@ fn dump_prints_the_expanded_grants() {
 }
 
 #[test]
+fn a_tree_of_packaged_modules_compiles_when_the_flag_names_their_root() {
+    let modules = support::corpus_dir()
+        .join("trees")
+        .join("pkg-ok")
+        .join("modules");
+    let output = check("pkg-ok", &["--modules", &modules.display().to_string()]);
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn the_same_tree_without_the_flag_names_it() {
+    // The module root is an environment fact, so a document that reaches for
+    // one and is given none is refused rather than defaulted somewhere.
+    let output = check("pkg-ok", &[]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pass `--modules <dir>`"), "{stderr}");
+}
+
+#[test]
 fn a_tree_refused_in_derivation_reports_and_exits_nonzero() {
     let output = check("derive-error", &[]);
     assert!(!output.status.success(), "{output:?}");

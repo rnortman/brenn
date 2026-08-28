@@ -1,0 +1,9 @@
+// A root importing packaged modules: one whole, one by name. Neither file is
+// under this directory — they resolve against the module root instead.
+
+use @widget::*;
+use @base::Drain;
+
+const host = "example.com";
+
+new alice_desk: Bench(slug = "alice-desk");

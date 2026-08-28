@@ -89,7 +89,7 @@ pub fn lower_document(document: &str) -> Result<BrennConfig, Vec<Diagnostic>> {
     let dir = tempfile::tempdir().expect("a tempdir");
     let root = dir.path().join("main.brenn");
     std::fs::write(&root, document).expect("write the root module");
-    let compiled = brenn_dsl::compile(&root)?;
+    let compiled = brenn_dsl::compile(&root, None)?;
     crate::config::dsl_lower::lower(compiled)
 }
 

@@ -194,6 +194,11 @@ tail_attr := key:name , %"=" , value:value , %";" , ;
 // `use a::b::C;` names one declaration, `use a::b::*;` names all of them. The
 // glob is a labeled literal, so the model reads it as "was it written?".
 //
+// The `@` sigil leads a packaged-module import — `use @clock::*;` — and is a
+// labeled literal for the same reason the glob is. It is glued to the path with
+// `.` so no whitespace may sit between the sigil and the name it leads: the two
+// are one token to a reader.
+//
 // The two separators differ on purpose. The `,` before the glob group is what
 // gives this statement the whitespace tolerance every other one has: it is the
 // last optional-whitespace position in the rule, so `use a::b ;` parses like
@@ -201,7 +206,7 @@ tail_attr := key:name , %"=" , value:value , %";" , ;
 // takes `.`, because at an optional-whitespace position the formatter re-emits a
 // suppressed terminator after the trivia it finds there — the blank line after
 // the last import would end up above a lone `;`. Both edges are pinned by tests.
-use_stmt := %"use" : path:path , (%"::" . glob:"*")? . %";" , ;
+use_stmt := %"use" : pkg:"@"? . path:path , (%"::" . glob:"*")? . %";" , ;
 
 // A generic section: `server { ... }`, `webhook w { ... }`, and every named
 // sub-block inside an entity body. The kindword is data, not a keyword, so what

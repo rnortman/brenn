@@ -3588,3 +3588,242 @@ fn a_file_built_without_a_source_hash_is_refused_at_class_resolution() {
         "",
     );
 }
+
+// ── packaged modules ─────────────────────────────────────────────────────────
+//
+// A module key led by `@` is one the loader read from the module root — a file
+// whose author is not the deployer. What that changes is the discipline it is
+// held to, and the discipline is checked in the I/O-free core, so these spell
+// the keys inline the way every other tree here does.
+
+/// A packaged module's whole legal vocabulary: classes, an assembly, constants,
+/// and an import of another packaged module.
+const PKG_WIRING: &str = "\
+use @spec::Sink;
+
+const wiring_skin = \"bench\";
+
+component Local {
+    abi = processor;
+    requires = [];
+    in messages;
+}
+
+assembly Bench(slug: String) {
+    channel feed at f\"brenn:{slug}.feed\" { push_depth = 4; retain_depth = 16; \
+standing_retain_depth = 64; }
+    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- feed; }
+    new local: Local { component_path = \"/lib/local.wasm\"; in messages <- feed; }
+}
+";
+
+/// The module `@wiring` builds on: one class, shipped by someone else.
+const PKG_SPEC: &str = "component Sink { abi = processor; requires = []; in messages; }\n";
+
+#[test]
+fn a_packaged_assembly_stamps_across_two_packages() {
+    let config = resolved_tree(&[
+        (
+            "",
+            "use @wiring::Bench;\n\nnew alice: Bench(slug = \"alice\");\n",
+        ),
+        ("@wiring", PKG_WIRING),
+        ("@spec", PKG_SPEC),
+    ]);
+    let stamped: Vec<&str> = config
+        .consumers
+        .iter()
+        .map(|consumer| consumer.slug.value().as_str())
+        .collect();
+    assert_eq!(stamped, ["alice.sink", "alice.local"]);
+}
+
+#[test]
+fn each_instance_a_packaged_assembly_stamps_carries_its_own_classs_file_hash() {
+    // The binding follows the class, not the assembly that stamped it: one
+    // assembly stamps two instances whose classes were declared in different
+    // packages, and each instance binds to the package its class shipped in.
+    let config = resolved_tree(&[
+        (
+            "",
+            "use @wiring::Bench;\n\nnew alice: Bench(slug = \"alice\");\n",
+        ),
+        ("@wiring", PKG_WIRING),
+        ("@spec", PKG_SPEC),
+    ]);
+    for consumer in &config.consumers {
+        let expected = match consumer.class.name.value().as_str() {
+            "Sink" => brenn_dsl::source_sha256(PKG_SPEC),
+            "Local" => brenn_dsl::source_sha256(PKG_WIRING),
+            other => panic!("unexpected class {other}"),
+        };
+        assert_eq!(
+            consumer.class.spec_sha256,
+            expected,
+            "{} binds to another package",
+            consumer.slug.value()
+        );
+    }
+    assert_eq!(config.consumers.len(), 2);
+}
+
+#[test]
+fn a_packaged_module_may_declare_no_class_at_all() {
+    // A library of assemblies over another package's class is a legitimate
+    // shape: the discipline bans effects, not shapes.
+    let library = "\
+use @spec::Sink;
+
+assembly Pair(slug: String) {
+    channel feed at f\"brenn:{slug}.feed\" { push_depth = 4; retain_depth = 16; \
+standing_retain_depth = 64; }
+    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- feed; }
+}
+";
+    let config = resolved_tree(&[
+        (
+            "",
+            "use @library::Pair;\n\nnew alice: Pair(slug = \"alice\");\n",
+        ),
+        ("@library", library),
+        ("@spec", PKG_SPEC),
+    ]);
+    assert_eq!(config.consumers.len(), 1);
+    assert_eq!(
+        config.consumers[0].class.spec_sha256,
+        brenn_dsl::source_sha256(PKG_SPEC)
+    );
+}
+
+#[test]
+fn a_packaged_module_may_declare_more_than_one_class() {
+    // Two classes in one file share that file's hash, which is right: they
+    // shipped together, so they bind together.
+    let pair = "\
+component Sink { abi = processor; requires = []; in messages; }
+component Drain { abi = processor; requires = []; in messages; }
+";
+    let root = "\
+use @pair::*;
+
+channel feed at \"brenn:bench.feed\" { push_depth = 4; retain_depth = 16; \
+standing_retain_depth = 64; }
+
+new one: Sink { component_path = \"/lib/sink.wasm\"; in messages <- feed; }
+new two: Drain { component_path = \"/lib/drain.wasm\"; in messages <- feed; }
+";
+    let config = resolved_tree(&[("", root), ("@pair", pair)]);
+    assert_eq!(config.consumers.len(), 2);
+    for consumer in &config.consumers {
+        assert_eq!(
+            consumer.class.spec_sha256,
+            brenn_dsl::source_sha256(pair),
+            "{} carries another file's hash",
+            consumer.slug.value()
+        );
+    }
+}
+
+/// The one text every effectful declaration in a packaged module is refused
+/// with. Stated once here because the point is that the discipline answers with
+/// one rule rather than with a rule per item kind.
+const NOT_VOCABULARY: &str = "a packaged module declares vocabulary — component classes, \
+     assemblies, constants — and instantiates nothing";
+
+/// What a document holding one packaged module carrying `item` is refused with.
+fn packaged_refusals(item: &str) -> Vec<String> {
+    refusals_tree(&[("", "use @widget::*;\n"), ("@widget", item)])
+}
+
+#[test]
+fn a_packaged_module_instantiates_nothing() {
+    // Loading a module effects its top-level statements wherever they were
+    // written, so every one of these would otherwise reach a deployment whose
+    // author consented to none of it.
+    //
+    // Every item form the discipline does not allow appears here. The pass
+    // refuses through a catch-all, so a new item kind inherits refusal and
+    // nothing else records which forms the refusal is *for*: an edit that moved
+    // `grant` or `acl` into the allowed arm would be an author writing authority
+    // about a deployer's principals, and this list is what objects.
+    let effects = [
+        "channel feed at \"brenn:bench.feed\" { push_depth = 4; retain_depth = 16; \
+         standing_retain_depth = 64; }\n",
+        "component Sink { abi = processor; requires = []; in messages; }\n\
+         new sink: Sink { component_path = \"/lib/sink.wasm\"; }\n",
+        "agent Assistant() { name = \"Assistant\"; }\n",
+        "surface alice_desk { grants = [subscribe]; }\n",
+        "remote pod { token_file = \"/etc/brenn/pod.token\"; grants = [publish]; }\n",
+        "webhook hook { mount = \"/webhooks/hook\"; }\n",
+        "repo notes { remote = \"git@example.com:alice/notes.git\"; }\n",
+        "mqtt_client broker { url = \"mqtt://broker.example.com:1883\"; }\n",
+        "mcp_server tools { command = \"/usr/bin/tools\"; }\n",
+        "uuid_pins { alice = \"00000000-0000-4000-8000-000000000000\"; }\n",
+        "server { bind = \"127.0.0.1:3000\"; }\n",
+        "link relay;\n",
+        "acl subscribe [prefix \"brenn:alice-desk.\"];\n",
+        "grant alice_pa publish exact wasm_demo_out;\n",
+    ];
+    for effect in effects {
+        let refusals = packaged_refusals(effect);
+        assert!(
+            refusals.contains(&NOT_VOCABULARY.to_string()),
+            "{effect}: {refusals:?}"
+        );
+    }
+}
+
+#[test]
+fn a_packaged_module_imports_only_packaged_modules() {
+    // It can know nothing of any deployment's tree: the file is written once by
+    // its author and imported into every deployment that installs it.
+    assert_eq!(
+        packaged_refusals("use wiring::deskbar::Deskbar;\n"),
+        ["a packaged module imports only packaged modules: `use @<module>::<Item>;`"]
+    );
+}
+
+#[test]
+fn a_packaged_import_names_one_module_and_one_item() {
+    // The module root is flat, so there is no second level for a path to name.
+    assert_eq!(
+        refusal_tree(&[
+            ("", "use @wiring::inner::Bench;\n"),
+            ("@wiring", "const wiring_skin = \"bench\";\n"),
+        ]),
+        "a packaged module is one level: `use @<module>::<Item>;`"
+    );
+    assert_eq!(
+        refusal_tree(&[
+            ("", "use @wiring::inner::*;\n"),
+            ("@wiring", "const wiring_skin = \"bench\";\n"),
+        ]),
+        "a packaged module is one level: `use @<module>::<Item>;`"
+    );
+}
+
+#[test]
+fn a_packaged_import_names_an_item_like_any_other_import() {
+    assert_eq!(
+        refusal_tree(&[
+            ("", "use @wiring;\n"),
+            ("@wiring", "const wiring_skin = \"bench\";\n"),
+        ]),
+        "a `use` names an item: `use module::Item;`, or `use module::*;` for all of them"
+    );
+}
+
+#[test]
+fn a_glob_of_a_packaged_module_binds_its_whole_vocabulary() {
+    // The assembly comes across with the class: shipping the arrangement is the
+    // point of the module being more than a spec.
+    let config = resolved_tree(&[
+        (
+            "",
+            "use @wiring::*;\n\nnew alice: Bench(slug = \"alice\");\n",
+        ),
+        ("@wiring", PKG_WIRING),
+        ("@spec", PKG_SPEC),
+    ]);
+    assert_eq!(config.consumers.len(), 2);
+}

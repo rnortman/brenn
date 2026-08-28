@@ -70,6 +70,27 @@ native_test(
     target_compatible_with = HOST_ONLY,
 )
 
+# The workspace install tree, over the real staged files: the rule declares its
+# outputs, so a half-populated tree is a green build whose only symptom is a
+# boot panic in the e2e suite.
+native_test(
+    name = "install_tree_test",
+    size = "small",
+    src = "install_tree_test.sh",
+    args = [
+        "$(rootpath //bazel/wasm:package_names.sh)",
+        "$(rootpath //bazel/wasm:record_lib.sh)",
+        "$(rootpaths //brenn-wasm:install_tree)",
+    ],
+    data = [
+        "//bazel/wasm:package_names.sh",
+        "//bazel/wasm:record_lib.sh",
+        "//brenn-wasm:install_tree",
+    ],
+    out = "install_tree_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
 # The package's file grammar, on the same footing as the manifest's below: four
 # readers derive the two sidecar names from an artifact basename, and the order
 # the two are printed in is the join between them — a swap mis-files every

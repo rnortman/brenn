@@ -1,0 +1,26 @@
+// Everything a packaged module may not do, in one file: it imports a module in
+// the deployment's tree, stamps an instance and effects a channel.
+//
+// Nothing named `shared` exists in the tree beside this fixture's root, so a
+// loader that followed the tree import would report its absence as a fourth
+// diagnostic.
+
+use shared::*;
+
+component Widget {
+    abi = processor;
+    requires = [];
+    in messages;
+}
+
+channel bench_status at "brenn:bench.status" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+new p1: Widget {
+    component_path = "/lib/widget.wasm";
+    grants = [ports];
+    in messages <- bench_status;
+}

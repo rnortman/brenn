@@ -25,6 +25,11 @@
 # The host re-computes them once more at boot; this gate is what keeps that
 # check from being the first one anybody runs.
 #
+# `modules/` is the module root a deployment's `use @<name>::…` imports resolve
+# against. Every file in it is checked against the packaged specification it
+# copies, in both directions, so the root holds exactly the authored modules of
+# the components this release installs.
+#
 # The surface asset tree carries the same kind of binding in two shapes: a dom
 # kind's record sits flat beside its module pair, a processor kind's inside its
 # transpile directory. Both are re-hashed here, every name they state is held to
@@ -115,6 +120,32 @@ check_recorded_file() {
         return
     fi
     check_recorded_hash "$dir/$name" "$label" "$record" "$hash_field" "$dir/$name"
+}
+
+# One surface kind's staged module: the file `use @<kind>::…` resolves to must
+# be the packaged copy that kind's record binds, byte for byte, since the host
+# compares the configuration's hash against that record at boot.
+#
+# Called from the surface loops, which is where a kind and the name of its
+# packaged copy are already in hand. A tree with no module root at all has been
+# refused once by then, so this says nothing more about it.
+#
+# `$1` is the packaged copy, `$2` the kind, `$3` the copy's label in messages.
+check_staged_module() {
+    local packaged="$1" kind="$2" shown="$3" module
+    [ "$modules_root" -eq 1 ] || return 0
+    module="$pkg/modules/$kind.brenn"
+    if [ ! -s "$module" ]; then
+        fail "modules/$kind.brenn is missing or empty, but the release ships kind $kind"
+        return
+    fi
+    if [ ! -s "$packaged" ]; then
+        fail "$shown is missing or empty, so modules/$kind.brenn stands for nothing"
+        return
+    fi
+    if ! cmp -s "$module" "$packaged"; then
+        fail "modules/$kind.brenn differs from $shown; a configuration compiled against it binds to no installed component"
+    fi
 }
 
 # The paths deploy.sh copies out of bin/. Hard-coded, because they are the
@@ -220,12 +251,24 @@ done
 # line for exactly this reader (see the record library).
 # ---------------------------------------------------------------------------
 
+# The module root, first half. `modules/<name>.brenn` is what a deployment's
+# `use @<name>::…` imports resolve against, and every file in it must be the
+# authored module of a component this release ships — byte for byte, because
+# that is what the host binds at boot. Its presence is settled here so the
+# surface loops below can check each kind's staged module where they stand,
+# holding the record, the kind and the packaged copy's derived name already.
+modules_root=1
+if [ ! -d "$pkg/modules" ]; then
+    fail "modules/ is missing; a deployment importing @<name> has nothing to resolve against"
+    modules_root=0
+fi
+
 if [ -d "$pkg/surface" ]; then
     # Chrome is a dom kind and every surface has one, so a tree with no dom
     # record at all was built before surface components carried records. It
     # would install cleanly and be refused at the bounce, which is later and
     # worse than here.
-    dom_records="$(find -L "$pkg/surface" -maxdepth 1 -name 'brenn_*.manifest.json' | LC_ALL=C sort)"
+    dom_records="$(surface_dom_records "$pkg/surface")"
     if [ -z "$dom_records" ]; then
         fail "surface/ holds no brenn_<kind>.manifest.json; the host refuses every dom component kind whose record did not ship"
     else
@@ -257,6 +300,7 @@ if [ -d "$pkg/surface" ]; then
                 module_wasm module_wasm_sha256 "$want_module_wasm"
             check_recorded_file "$record" "$label" "$pkg/surface" \
                 spec spec_sha256 "$want_spec"
+            check_staged_module "$pkg/surface/$want_spec" "$kind" "surface/$want_spec"
         done <<< "$dom_records"
     fi
 
@@ -283,6 +327,67 @@ if [ -d "$pkg/surface" ]; then
             "surface/processor/$kind/$kind.component.wasm"
         check_recorded_file "$record" "$label" "$kind_dir" \
             spec spec_sha256 "$kind.spec.brenn"
+        check_staged_module "$kind_dir/$kind.spec.brenn" "$kind" \
+            "surface/processor/$kind/$kind.spec.brenn"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# The module root, second half. Each surface kind's staged module was checked
+# against its packaged copy in the loops above; what is left is the backend half
+# and the closing direction — a stray or tampered module is text no package
+# stands behind.
+# ---------------------------------------------------------------------------
+
+if [ "$modules_root" -eq 1 ]; then
+    # A backend package's record carries no kind, so its module is joined by
+    # content: the sidecar and the staged module are two copies of one authored
+    # file, which makes byte identity the whole of the correspondence.
+    for sidecar in "$pkg"/lib/*.spec.brenn; do
+        [ -f "$sidecar" ] || continue
+        found=""
+        for module in "$pkg"/modules/*.brenn; do
+            [ -f "$module" ] || continue
+            if cmp -s "$sidecar" "$module"; then
+                found="$module"
+                break
+            fi
+        done
+        if [ -z "$found" ]; then
+            fail "lib/$(basename "$sidecar") matches no file in modules/; the component ships a specification no deployment can import"
+        fi
+    done
+
+    # The reverse direction, which is what makes the root a closed set: a file
+    # nobody packaged is a module a deployment could import and the host would
+    # never bind.
+    shopt -s nullglob
+    staged_modules=("$pkg"/modules/*)
+    shopt -u nullglob
+    if [ "${#staged_modules[@]}" -eq 0 ]; then
+        fail "modules/ holds no files; every release ships components, so this root was never staged"
+    fi
+    for module in "${staged_modules[@]}"; do
+        name="$(basename "$module")"
+        case "$name" in
+            *.brenn) ;;
+            *)
+                fail "modules/$name is not a .brenn module; the root holds authored modules and nothing else"
+                continue
+                ;;
+        esac
+        found=""
+        for candidate in "$pkg"/lib/*.spec.brenn "$pkg"/surface/*.spec.brenn \
+            "$pkg"/surface/processor/*/*.spec.brenn; do
+            [ -f "$candidate" ] || continue
+            if cmp -s "$module" "$candidate"; then
+                found="$candidate"
+                break
+            fi
+        done
+        if [ -z "$found" ]; then
+            fail "modules/$name is byte-identical to no packaged specification in this release; it is text nothing installed stands behind"
+        fi
     done
 fi
 

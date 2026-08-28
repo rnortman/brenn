@@ -1,0 +1,3 @@
+use @widget::inner::Bench;
+
+const host = "example.com";

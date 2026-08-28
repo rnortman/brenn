@@ -1,5 +1,34 @@
 # TODOs
 
+## `config-document-inputs`
+
+Loading or checking a document now takes two adjacent `Option<&Path>`
+positionals — the root path and the module root — threaded unchanged through
+seven signatures (`load_config`, `load_config_from`, `check_config`, `read_dsl`,
+`compile`, `run_config_check`, `run_config_diff`) and read at ~30 call sites.
+`load_config_from(path, module_root, fallback_dir)` is the sharp one: the two
+options mean entirely different things, swapping them compiles, and the
+resulting failure is either "no packaged module X" against the wrong root or
+nothing at all for a document with no `@` import.
+
+The module root is the first of a class the design names but defers: environment
+facts a document must not state. The next one — a module-store URL, a pinned
+release id, a provenance root — repeats the same seven-signature edit and widens
+the same swap hazard by one more anonymous positional.
+
+The shape that fixes it is a named struct threaded instead, e.g.
+`DocumentInputs { root, module_root }`, built once from the CLI and passed down.
+What makes it more than a refactor is that the current signatures are the ones
+the slice-4 design specifies, and the struct's field set is a decision about how
+the *deferred* environment facts arrive — so it wants to be settled with the
+module-store work rather than guessed at ahead of it.
+
+Code site (`TODO(config-document-inputs)`): `brenn-lib/src/config/brenn.rs`, on
+`load_config_from`.
+
+Done = one named input value carries the root and the module root from the CLI
+to `compile`, and no signature in that chain takes two bare `Option<&Path>`.
+
 ## `dsl-vocabulary-config-parity`
 
 `brenn-dsl`'s attr vocabularies and rule tables were hand transcriptions of

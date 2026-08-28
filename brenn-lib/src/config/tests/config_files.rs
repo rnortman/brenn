@@ -11,10 +11,9 @@ use super::*;
 use crate::config::brenn::check_config;
 
 fn load_config_file(filename: &str) -> BrennConfig {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(filename);
-    check_config(&path).unwrap_or_else(|report| panic!("{filename} must load: {report}"))
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    check_config(&root.join(filename), Some(&root.join("config/specs")))
+        .unwrap_or_else(|report| panic!("{filename} must load: {report}"))
 }
 
 // Full validation needs host-side paths to exist, so it runs only at server
