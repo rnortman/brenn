@@ -123,7 +123,6 @@ new alice_desk: Deskbar(slug = "alice-desk", driver = alice_pa);
 // sink's budget rides the entry's tail rather than a block of its own.
 new consume_demo: EchoStub {
     slug = "consume-demo";
-    component_path = f"{components_dir}/brenn_echo_stub.wasm";
     grants = [ports, mqtt];
 
     in inbound <- "webhook:push-alice" { push_depth = 50; noise = alarm; }
@@ -133,7 +132,6 @@ new consume_demo: EchoStub {
 
 new reserved_demo: Reserved {
     slug = "reserved-demo";
-    component_path = f"{components_dir}/brenn_reserved.wasm";
     grants = [ports];
 
     in in <- relay { push_depth = 4; retain_depth = 8; }
@@ -157,7 +155,7 @@ webhook push_alice {
         secret_file = f"{secrets}/push-alice.secret";
     }
     replay_protection {
-        component_path = f"{components_dir}/brenn_replay_generic.wasm";
+        component = "replay-generic";
         store_path = f"{state}/replay-push-alice.db";
     }
 }

@@ -1295,13 +1295,14 @@ vocabulary! {
         req secret_file: V,
     }
 
-    /// `replay_protection { component_path = …; store_path = …; }`.
+    /// `replay_protection { component = "replay-generic"; store_path = …; }`.
     ///
-    /// `component_path` is a plain attr, not a class reference: the replay guard
-    /// is webhook plumbing the system instantiates itself — no ports, no
-    /// bindings.
+    /// `component` is a plain attr naming an installed component package, not a
+    /// class reference: the replay guard is webhook plumbing the system
+    /// instantiates itself — no ports, no bindings, and so no module to import
+    /// the name from.
     struct ReplayProtectionAttrs<V> {
-        req component_path: V,
+        req component: V,
         req store_path: V,
         opt store_size_limit: V,
         opt config: V,

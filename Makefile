@@ -163,10 +163,12 @@ build:
 	bazel build $(BAZEL_CONFIG) //...
 
 # What a running server reads: the binary, the two asset trees the configs name,
-# and the guest components. `build` stays the everything verb; this is the
-# subset `launchdev` and `e2e` need, so starting a dev server does not first
-# compile and link every test binary in the graph.
-RUN_TARGETS := //brenn:brenn //frontend:dist //surface:dist //brenn-wasm:components //brenn-wasm:install_tree
+# and the components root it resolves packages against — which stages the
+# artifact of every package a config can name, so the test-only guests are not
+# built. `build` stays the everything verb; this is the subset `launchdev` and
+# `e2e` need, so starting a dev server does not first compile and link every
+# test binary in the graph.
+RUN_TARGETS := //brenn:brenn //frontend:dist //surface:dist //brenn-wasm:install_tree
 
 run-artifacts:
 	bazel build $(BAZEL_CONFIG) $(RUN_TARGETS)
@@ -255,7 +257,8 @@ e2e: run-artifacts e2e/node_modules
 	    echo "ERROR: $(E2E_BASE_URL) is already serving before we started — a leaked e2e server or a port clash on 3100. Kill it before running make e2e."; exit 1; \
 	fi; \
 	invite=$$($(E2E_BIN) --config brenn.e2e.brenn --modules config/specs invite); \
-	$(E2E_BIN) --config brenn.e2e.brenn --modules config/specs serve & \
+	$(E2E_BIN) --config brenn.e2e.brenn --modules config/specs serve \
+	    --components $(BAZEL_BIN)/brenn-wasm/install_tree & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null || true' EXIT INT TERM; \
 	echo "e2e: server PID $$srv; polling $(E2E_BASE_URL)/auth/login ..."; \
@@ -276,7 +279,8 @@ launchdev: run-artifacts
 	@if [ -f $(DEV_PIDFILE) ] && kill -0 $$(cat $(DEV_PIDFILE)) 2>/dev/null; then \
 		echo "Dev server already running (PID $$(cat $(DEV_PIDFILE)))"; \
 	else \
-		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn --modules config/specs serve & \
+		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn --modules config/specs serve \
+		    --components $(BAZEL_BIN)/brenn-wasm/install_tree & \
 		echo $$! > $(DEV_PIDFILE); \
 		echo "Dev server started (PID $$!)"; \
 		sleep 1; \

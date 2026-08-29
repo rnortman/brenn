@@ -57,6 +57,19 @@ fn assert_build_id_valid(build_id: &str) {
     );
 }
 
+/// What a server refuses to start on, before any of it is used.
+///
+/// The components root is checked here rather than where a consumer resolves
+/// against it, so a flag pointed at nothing is an operator error reported at
+/// startup instead of one that hides until some later release happens to
+/// configure a consumer.
+fn assert_boot_preconditions(build_id: &str, components_root: Option<&std::path::Path>) {
+    assert_build_id_valid(build_id);
+    if let Some(root) = components_root {
+        brenn_lib::wasm_package::assert_components_root(root);
+    }
+}
+
 /// The environment-free half of a `[[wasm_consumer]]`'s `ProcessorLoadSpec`:
 /// everything derivable from the resolved consumer alone. The remaining fields
 /// (alerter, store path, MQTT egress callback, tool host) depend on process-wide
@@ -174,8 +187,13 @@ pub(crate) fn lower_consumer_load_parts(
     }
 }
 
-pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build_id: &'static str) {
-    assert_build_id_valid(build_id);
+pub async fn run_server(
+    config: BrennConfig,
+    config_path: Option<PathBuf>,
+    components_root: Option<PathBuf>,
+    build_id: &'static str,
+) {
+    assert_boot_preconditions(build_id, components_root.as_deref());
 
     let obs_config = obs_config::build(&config, config_path.as_ref());
     obs::install_pending_panic_hook(&obs_config);
@@ -637,7 +655,8 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                 if let Some(ref rp) = ep.replay_protection {
                     let component = load_verified_replay(
                         &ep.slug,
-                        &rp.component_path,
+                        components_root.as_deref(),
+                        &rp.component,
                         &rp.store_path,
                         rp.max_page_count,
                         rp.config.clone(),
@@ -646,7 +665,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                     locks.insert(ep.slug.clone(), Arc::new(tokio::sync::Mutex::new(())));
                     info!(
                         endpoint = %ep.slug,
-                        component_path = %rp.component_path.display(),
+                        component = %rp.component,
                         store_path = %rp.store_path.display(),
                         "replay protection loaded"
                     );
@@ -746,10 +765,14 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
             } else {
                 None
             };
-            let component = load_verified_consumer(
+            let (component, artifact_path) = load_verified_consumer(
+                components_root.as_deref(),
+                &consumer.package,
+                &consumer.slug,
                 &consumer.spec_sha256,
                 brenn_wasm::ProcessorLoadSpec {
-                    component_path: &consumer.component_path,
+                    // Placeholder; the callee owns this field.
+                    component_path: std::path::Path::new(""),
                     slug: &consumer.slug,
                     output_ports,
                     input_amplification_mt,
@@ -768,7 +791,8 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
             let store_path_present = consumer.store_path.is_some();
             info!(
                 slug = %consumer.slug,
-                component_path = %consumer.component_path.display(),
+                package = %consumer.package,
+                component_path = %artifact_path.display(),
                 store_path_present,
                 store_path = consumer.store_path.as_deref().map(|p| p.display().to_string()),
                 "WASM processor component loaded"
@@ -1180,37 +1204,57 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
     drop(guard);
 }
 
-/// Verify a replay component's package, then load it.
+/// Resolve a replay endpoint's package, verify it, then load what it names.
 ///
-/// The pair is one function because the order is the point: a component whose
+/// The three are one function because the order is the point: a component whose
 /// package does not bind it must never reach the loader, where it would be
-/// instantiated on its own say-so. Separating them puts a `load` one edit away
-/// from running unverified.
+/// instantiated on its own say-so. The resolution step is what makes that
+/// structural rather than conventional — the configuration carries a package
+/// name and no path, so the only way to obtain an artifact path at all is to
+/// have verified the package it came out of.
 fn load_verified_replay(
     slug: &str,
-    component_path: &std::path::Path,
+    components_root: Option<&std::path::Path>,
+    package: &str,
     store_path: &std::path::Path,
     max_page_count: u32,
     config: std::collections::HashMap<String, String>,
 ) -> brenn_wasm::ReplayComponent {
-    brenn_lib::wasm_package::verify_replay(component_path, slug);
-    brenn_wasm::ReplayComponent::load(slug, component_path, store_path, max_page_count, config)
+    let root = brenn_lib::wasm_package::require_components_root(
+        components_root,
+        &format!("webhook endpoint {slug:?} replay protection"),
+    );
+    let component_path = brenn_lib::wasm_package::verify_replay(root, package, slug);
+    brenn_wasm::ReplayComponent::load(slug, &component_path, store_path, max_page_count, config)
 }
 
-/// Verify a top-level consumer's package against the configuration that drives
-/// it, then load it.
+/// Resolve a consumer's package, verify it, then load what it names.
 ///
-/// `config_spec_sha256` is the consumer's lowered class hash — the bytes the
-/// configuration compiled against, which the packaged specification must equal.
-/// Same ordering rule as [`load_verified_replay`], plus the binding: an empty
-/// hash here would match nothing a package can carry, so a lowering that stopped
-/// filling the field fails loudly rather than silently accepting any component.
+/// Same ordering rule as [`load_verified_replay`], and one function for the
+/// same reason: the resolution is the only source of an artifact path, so a
+/// component whose package does not bind it cannot reach the loader. The
+/// caller assembles the dozen wired fields of the load spec but never its
+/// `component_path` — whatever it staged there is discarded for the artifact
+/// the package bound. The artifact's path is handed back for the caller's log.
 fn load_verified_consumer(
+    components_root: Option<&std::path::Path>,
+    package: &str,
+    slug: &str,
     config_spec_sha256: &str,
     spec: brenn_wasm::ProcessorLoadSpec<'_>,
-) -> brenn_wasm::ProcessorComponent {
-    brenn_lib::wasm_package::verify_consumer(spec.component_path, spec.slug, config_spec_sha256);
-    brenn_wasm::ProcessorComponent::load(spec)
+) -> (brenn_wasm::ProcessorComponent, std::path::PathBuf) {
+    let root = brenn_lib::wasm_package::require_components_root(
+        components_root,
+        &format!("consumer {slug:?}"),
+    );
+    let artifact =
+        brenn_lib::wasm_package::verify_consumer(root, package, slug, config_spec_sha256);
+    // The spec's borrows outlive this call; narrowing them to the artifact's
+    // scope is what lets the path the verification produced be the one loaded.
+    let mut spec: brenn_wasm::ProcessorLoadSpec<'_> = spec;
+    spec.component_path = &artifact;
+    let component = brenn_wasm::ProcessorComponent::load(spec);
+    (component, artifact)
 }
 
 /// Assert that all replay store paths and consumer store paths are unique across
@@ -1321,39 +1365,41 @@ mod tests {
             fn alert(&self, _severity: brenn_wasm::GuestAlertSeverity, _title: &str, _body: &str) {}
         }
 
-        /// A package on disk: the artifact's bytes, and a record binding
-        /// whatever `artifact_bytes` and `spec` are given here. The record is
-        /// written by hand — not by the emitter — because these cases need
-        /// records the emitter refuses to write.
-        fn package(dir: &Path, stem: &str, artifact_bytes: &[u8], spec: Option<&str>) -> PathBuf {
-            let artifact = dir.join(format!("{stem}.wasm"));
+        /// A components root holding one package directory, with a record
+        /// binding whatever `artifact_bytes` and `spec` are given here. The
+        /// record is written by hand — not by the emitter — because these cases
+        /// need records the emitter refuses to write.
+        fn package(root: &Path, name: &str, artifact_bytes: &[u8], spec: Option<&str>) -> PathBuf {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).expect("create package dir");
+            let artifact = dir.join(format!("{name}.wasm"));
             std::fs::write(&artifact, artifact_bytes).expect("write artifact");
             let artifact_sha = brenn_lib::util::sha256_hex(artifact_bytes);
             let record = match spec {
                 Some(text) => {
-                    std::fs::write(dir.join(format!("{stem}.spec.brenn")), text)
-                        .expect("write spec");
+                    std::fs::write(dir.join(format!("{name}.brenn")), text).expect("write spec");
                     format!(
-                        "{{\n  \"v\": 1,\n  \"name\": \"{stem}\",\n  \"world\": \
-                         \"brenn:processor\",\n  \"artifact\": \"{stem}.wasm\",\n  \
+                        "{{\n  \"v\": 2,\n  \"name\": \"{name}\",\n  \"world\": \
+                         \"brenn:processor\",\n  \"artifact\": \"{name}.wasm\",\n  \
                          \"artifact_sha256\": \"{artifact_sha}\",\n  \"spec\": \
-                         \"{stem}.spec.brenn\",\n  \"spec_sha256\": \"{}\"\n}}\n",
+                         \"{name}.brenn\",\n  \"spec_sha256\": \"{}\"\n}}\n",
                         brenn_lib::util::sha256_hex(text.as_bytes()),
                     )
                 }
                 None => format!(
-                    "{{\n  \"v\": 1,\n  \"name\": \"{stem}\",\n  \"world\": \
-                     \"brenn:replay\",\n  \"artifact\": \"{stem}.wasm\",\n  \
+                    "{{\n  \"v\": 2,\n  \"name\": \"{name}\",\n  \"world\": \
+                     \"brenn:replay\",\n  \"artifact\": \"{name}.wasm\",\n  \
                      \"artifact_sha256\": \"{artifact_sha}\"\n}}\n",
                 ),
             };
-            std::fs::write(dir.join(format!("{stem}.package.json")), record).expect("write record");
+            std::fs::write(dir.join("package.json"), record).expect("write record");
             artifact
         }
 
-        fn load_spec<'a>(artifact: &'a Path, slug: &'a str) -> brenn_wasm::ProcessorLoadSpec<'a> {
+        fn load_spec(slug: &str) -> brenn_wasm::ProcessorLoadSpec<'_> {
             brenn_wasm::ProcessorLoadSpec {
-                component_path: artifact,
+                // Placeholder; the callee owns this field.
+                component_path: Path::new(""),
                 slug,
                 output_ports: Default::default(),
                 input_amplification_mt: Default::default(),
@@ -1368,6 +1414,25 @@ mod tests {
                 mqtt_publish: None,
                 tool_host: None,
             }
+        }
+
+        /// Resolve, verify, and load a consumer's package by calling the boot
+        /// path itself, so these cases cover the sequence `run_server` runs
+        /// rather than a copy of it.
+        ///
+        /// `root` is an `Option` because a host started without `--components`
+        /// has no root to resolve against, and the refusal that fact earns is
+        /// part of the path under test.
+        fn verify_then_load(
+            root: Option<&Path>,
+            package: &str,
+            slug: &str,
+            config_spec_sha256: &str,
+            fill: impl FnOnce(&mut brenn_wasm::ProcessorLoadSpec<'_>),
+        ) -> brenn_wasm::ProcessorComponent {
+            let mut spec = load_spec(slug);
+            fill(&mut spec);
+            super::super::load_verified_consumer(root, package, slug, config_spec_sha256, spec).0
         }
 
         const SPEC: &str = "component Demo {\n  abi = processor;\n}\n";
@@ -1388,21 +1453,22 @@ mod tests {
         #[test]
         fn a_consumer_whose_package_binds_it_loads() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = package(
+            package(
                 dir.path(),
                 "demo",
                 &fixture_bytes("brenn_processor_demo"),
                 Some(SPEC),
             );
-            let mut spec = load_spec(&artifact, "demo");
-            // processor-demo imports `ports`; the load is a real one, so the
-            // grant it needs is the real one too.
-            spec.grants = [brenn_wasm::Capability::Ports].into_iter().collect();
             // Returning at all is the assertion: verification passed and the
             // loader instantiated the artifact behind it. Both would panic.
-            let component = super::super::load_verified_consumer(
+            let component = verify_then_load(
+                Some(dir.path()),
+                "demo",
+                "demo",
                 &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                spec,
+                // processor-demo imports `ports`; the load is a real one, so
+                // the grant it needs is the real one too.
+                |spec| spec.grants = [brenn_wasm::Capability::Ports].into_iter().collect(),
             );
             drop(component);
         }
@@ -1410,13 +1476,14 @@ mod tests {
         #[test]
         fn a_replay_endpoint_whose_package_binds_it_loads() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = package(dir.path(), "replay", &fixture_bytes("brenn_replay"), None);
+            package(dir.path(), "replay", &fixture_bytes("brenn_replay"), None);
             // A real page budget, unlike the refusal cases below: this load
             // reaches the KV store, which cannot lay out its schema in one
             // page.
             let component = super::super::load_verified_replay(
                 "endpoint",
-                &artifact,
+                Some(dir.path()),
+                "replay",
                 &dir.path().join("replay.sqlite"),
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
                 Default::default(),
@@ -1431,8 +1498,8 @@ mod tests {
             // would produce, and every hand-built fixture in the tree defaults
             // it to one. It must match nothing rather than match everything.
             let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = package(dir.path(), "demo", b"not a component", Some(SPEC));
-            super::super::load_verified_consumer("", load_spec(&artifact, "demo"));
+            package(dir.path(), "demo", b"not a component", Some(SPEC));
+            verify_then_load(Some(dir.path()), "demo", "demo", "", |_| {});
         }
 
         #[test]
@@ -1441,9 +1508,12 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let artifact = package(dir.path(), "demo", b"not a component", Some(SPEC));
             std::fs::write(&artifact, b"tampered").expect("tamper");
-            super::super::load_verified_consumer(
+            verify_then_load(
+                Some(dir.path()),
+                "demo",
+                "demo",
                 &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                load_spec(&artifact, "demo"),
+                |_| {},
             );
         }
 
@@ -1451,22 +1521,55 @@ mod tests {
         #[should_panic(expected = "was configured against a specification that hashes to")]
         fn a_consumer_whose_config_spec_is_not_the_packaged_one_never_reaches_the_loader() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = package(dir.path(), "demo", b"not a component", Some(SPEC));
-            super::super::load_verified_consumer(
+            package(dir.path(), "demo", b"not a component", Some(SPEC));
+            verify_then_load(
+                Some(dir.path()),
+                "demo",
+                "demo",
                 &brenn_lib::util::sha256_hex(b"component Demo {}\n"),
-                load_spec(&artifact, "demo"),
+                |_| {},
             );
         }
 
         #[test]
-        #[should_panic(expected = "has no readable package record")]
+        #[should_panic(expected = "has no readable record")]
         fn a_consumer_with_no_record_never_reaches_the_loader() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = dir.path().join("demo.wasm");
-            std::fs::write(&artifact, b"not a component").expect("write artifact");
-            super::super::load_verified_consumer(
+            std::fs::create_dir(dir.path().join("demo")).expect("create package dir");
+            std::fs::write(dir.path().join("demo/demo.wasm"), b"not a component")
+                .expect("write artifact");
+            verify_then_load(
+                Some(dir.path()),
+                "demo",
+                "demo",
                 &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                load_spec(&artifact, "demo"),
+                |_| {},
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "is not an installed package directory")]
+        fn a_consumer_naming_a_package_that_is_not_installed_never_reaches_the_loader() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            package(dir.path(), "demo", b"not a component", Some(SPEC));
+            verify_then_load(
+                Some(dir.path()),
+                "panel",
+                "demo",
+                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
+                |_| {},
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "without --components")]
+        fn a_consumer_configured_on_a_host_started_without_the_flag_never_reaches_the_loader() {
+            verify_then_load(
+                None,
+                "demo",
+                "demo",
+                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
+                |_| {},
             );
         }
 
@@ -1478,7 +1581,8 @@ mod tests {
             std::fs::write(&artifact, b"tampered").expect("tamper");
             super::super::load_verified_replay(
                 "endpoint",
-                &artifact,
+                Some(dir.path()),
+                "replay",
                 &dir.path().join("replay.sqlite"),
                 1,
                 Default::default(),
@@ -1489,10 +1593,11 @@ mod tests {
         #[should_panic(expected = "declares world")]
         fn a_replay_endpoint_handed_a_processor_package_never_reaches_the_loader() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = package(dir.path(), "replay", b"not a component", Some(SPEC));
+            package(dir.path(), "replay", b"not a component", Some(SPEC));
             super::super::load_verified_replay(
                 "endpoint",
-                &artifact,
+                Some(dir.path()),
+                "replay",
                 &dir.path().join("replay.sqlite"),
                 1,
                 Default::default(),
@@ -1518,7 +1623,7 @@ mod tests {
         }
         brenn_lib::messaging::config::ResolvedWasmConsumer {
             slug: "tooler".to_string(),
-            component_path: "/tmp/tooler.wasm".into(),
+            package: "tooler".to_string(),
             spec_sha256: String::new(),
             grants: grants.iter().copied().collect(),
             store_path: None,
@@ -1608,6 +1713,24 @@ mod tests {
     fn valid_build_id_no_panic() {
         assert_build_id_valid("test-build");
         assert_build_id_valid(&"x".repeat(64));
+    }
+
+    #[test]
+    fn boot_preconditions_pass_on_a_real_components_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_boot_preconditions("test-build", Some(dir.path()));
+        assert_boot_preconditions("test-build", None);
+    }
+
+    /// The root is checked at startup, with no consumer configured and nothing
+    /// yet resolved against it.
+    #[test]
+    #[should_panic(expected = "which is not a directory")]
+    fn boot_preconditions_refuse_a_components_root_that_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("brenn_demo.wasm");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert_boot_preconditions("test-build", Some(&file));
     }
 
     /// An empty build id must panic: it would produce a zero-length WS

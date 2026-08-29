@@ -21,7 +21,9 @@ fn channels(config: &ResolvedConfig) -> Vec<String> {
 
 /// The acid test: one assembly, two instantiations, two disjoint entity sets.
 const PODS: &str = "\
+// ── packaged ──
 component Panel { abi = dom; requires = []; in messages; }
+// ── packaged ──
 
 assembly Pod(slug: String, owner: Agent) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
@@ -145,7 +147,9 @@ new alice: Outer(slug = \"alice\");
 fn a_body_names_a_channel_a_nested_instantiation_stamped() {
     let config = resolved(
         "\
+// ── packaged ──
 component Panel { abi = dom; requires = []; in messages; }
+// ── packaged ──
 
 assembly Inner(addr: String) {
     channel messages at f\"{addr}\";
@@ -170,14 +174,16 @@ new alice: Outer(slug = \"alice\");
 fn a_reference_from_outside_reaches_a_stamped_channel_through_the_instance() {
     let config = resolved(
         "\
+// ── packaged ──
 component Sink { abi = processor; requires = []; in messages; }
+// ── packaged ──
 
 assembly Pod(slug: String) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
 }
 
 new alice: Pod(slug = \"alice\");
-new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- alice.messages; }
+new sink: Sink { in messages <- alice.messages; }
 ",
     );
     let binding = &config.consumers[0].bindings[0];
@@ -332,12 +338,14 @@ new alice: Pod(source = bench);
 fn a_channel_parameter_carries_the_channel_into_the_body() {
     let config = resolved(
         "\
+// ── packaged ──
 component Sink { abi = processor; requires = []; in messages; }
+// ── packaged ──
 
 channel bench_status at \"brenn:bench.status\";
 
 assembly Pod(source: Channel) {
-    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- source; }
+    new sink: Sink { in messages <- source; }
 }
 
 new alice: Pod(source = bench_status);
@@ -426,7 +434,9 @@ fn a_channel_and_an_instance_under_one_name_in_an_assembly_body_are_refused() {
     // channel would both be emitted and `alice.panel` would name one of them.
     let messages = refusals(
         "\
+// ── packaged ──
 component Panel { abi = dom; requires = []; }
+// ── packaged ──
 
 assembly Pod() {
     channel panel at \"brenn:alice.panel\";
@@ -466,14 +476,16 @@ fn a_channel_named_through_an_instance_that_stamped_none_is_refused() {
     assert_eq!(
         refusal(
             "\
+// ── packaged ──
 component Sink { abi = processor; requires = []; in messages; }
+// ── packaged ──
 
 assembly Pod(slug: String) {
     channel messages at f\"brenn:{slug}.in.p1.messages\";
 }
 
 new alice: Pod(slug = \"alice\");
-new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- alice.nope; }
+new sink: Sink { in messages <- alice.nope; }
 "
         ),
         "`alice` stamps no channel `alice.nope`"
@@ -485,11 +497,13 @@ fn a_dotted_tail_on_a_channel_names_nothing() {
     assert_eq!(
         refusal(
             "\
+// ── packaged ──
 component Sink { abi = processor; requires = []; in messages; }
+// ── packaged ──
 
 channel bench_status at \"brenn:bench.status\";
 
-new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- bench_status.tail; }
+new sink: Sink { in messages <- bench_status.tail; }
 "
         ),
         "`bench_status` is not an instance, so `.tail` names nothing"
@@ -501,12 +515,14 @@ fn a_dotted_tail_on_a_channel_parameter_names_nothing() {
     assert_eq!(
         refusal(
             "\
+// ── packaged ──
 component Sink { abi = processor; requires = []; in messages; }
+// ── packaged ──
 
 channel bench_status at \"brenn:bench.status\";
 
 assembly Pod(source: Channel) {
-    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- source.tail; }
+    new sink: Sink { in messages <- source.tail; }
 }
 
 new alice: Pod(source = bench_status);
@@ -559,10 +575,12 @@ fn a_string_parameter_subscribed_to_says_what_it_names() {
     assert_eq!(
         refusal(
             "\
+// ── packaged ──
 component Sink { abi = processor; requires = []; in messages; }
+// ── packaged ──
 
 assembly Pod(slug: String) {
-    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- slug; }
+    new sink: Sink { in messages <- slug; }
 }
 
 new alice: Pod(slug = \"alice\");
@@ -599,16 +617,18 @@ new alice: Pod(name = \"alice-pa\", ws = notes);
 fn a_table_parameter_reaches_a_stamped_components_config() {
     let config = resolved(
         "\
+// ── packaged ──
 component Sink { abi = processor; requires = []; }
+// ── packaged ──
 
 assembly Pod(tuning: Table) {
-    new sink: Sink { component_path = \"/lib/sink.wasm\"; config = tuning; }
+    new sink: Sink { config = tuning; }
 }
 
 new alice: Pod(tuning = { soft_pct = 80 });
 ",
     );
-    let (key, config_attr) = &config.consumers[0].attrs[1];
+    let (key, config_attr) = &config.consumers[0].attrs[0];
     assert_eq!(key, "config");
     match config_attr.value() {
         RValue::Table(fields) => {
@@ -1090,14 +1110,16 @@ new use_it: Use(ws = alice.panel);
 #[test]
 fn two_instantiations_stamp_two_links() {
     let config = resolved(
-        "component Duplex { abi = processor; requires = [ports]; io feed; }\n\
+        "// ── packaged ──\n\
+         component Duplex { abi = processor; requires = [ports]; io feed; }\n\
+         // ── packaged ──\n\
          assembly Pod(slug: String) {\n    \
              link relay;\n    \
              new left: Duplex {\n        slug = f\"{slug}-left\";\n        \
-             component_path = \"/tmp/d.wasm\";\n        \
+             \n        \
              io feed <-> relay { push_depth = 4; retain_depth = 4; }\n    }\n    \
              new right: Duplex {\n        slug = f\"{slug}-right\";\n        \
-             component_path = \"/tmp/d.wasm\";\n        \
+             \n        \
              io feed <-> relay { push_depth = 4; retain_depth = 4; }\n    }\n}\n\
          new a: Pod(slug = \"a\");\n\
          new b: Pod(slug = \"b\");\n",
@@ -1127,15 +1149,19 @@ fn two_instantiations_stamp_two_links() {
 #[test]
 fn a_stamped_link_is_reached_by_its_dotted_handle() {
     let config = resolved(
-        "component Duplex { abi = processor; requires = [ports]; io feed; }\n\
-         component Sink { abi = processor; requires = []; in quiet; }\n\
+        "// ── packaged ──\n\
+         component Duplex { abi = processor; requires = [ports]; io feed; }\n\
+         // ── packaged ──\n\
+         // ── packaged ──\n\
+          component Sink { abi = processor; requires = []; in quiet; }\n\
+          // ── packaged ──\n\
          assembly Pod() {\n    link relay;\n    \
          new inner: Duplex {\n        slug = \"inner\";\n        \
-         component_path = \"/tmp/d.wasm\";\n        \
+         \n        \
          io feed <-> relay { push_depth = 4; retain_depth = 4; }\n    }\n}\n\
          new pod: Pod();\n\
          new outer: Sink {\n    slug = \"outer\";\n    \
-         component_path = \"/tmp/s.wasm\";\n    \
+         \n    \
          in quiet <- pod.relay { push_depth = 2; retain_depth = 2; }\n}\n",
     );
     assert_eq!(
@@ -1170,10 +1196,12 @@ fn a_stamped_link_is_reached_by_its_dotted_handle() {
 #[test]
 fn top_level_and_stamped_links_share_one_id_space() {
     let config = resolved(
-        "component Duplex { abi = processor; requires = [ports]; io feed; optional io spare; }\n\
+        "// ── packaged ──\n\
+         component Duplex { abi = processor; requires = [ports]; io feed; optional io spare; }\n\
+         // ── packaged ──\n\
          assembly Pod(slug: String) {\n    link inner;\n    \
          new node: Duplex {\n        slug = f\"{slug}-node\";\n        \
-         component_path = \"/tmp/d.wasm\";\n        \
+         \n        \
          io feed <-> inner { push_depth = 4; retain_depth = 4; }\n        \
          io spare <-> shared { push_depth = 4; retain_depth = 4; }\n    }\n}\n\
          link shared;\n\
@@ -1207,8 +1235,10 @@ fn top_level_and_stamped_links_share_one_id_space() {
 #[test]
 fn a_binding_naming_no_declaration_is_refused() {
     let refusal = refusal(
-        "component Sink { abi = processor; requires = [ports]; io feed; }\n\
-         new s: Sink {\n    slug = \"s\";\n    component_path = \"/tmp/s.wasm\";\n    \
+        "// ── packaged ──\n\
+         component Sink { abi = processor; requires = [ports]; io feed; }\n\
+         // ── packaged ──\n\
+         new s: Sink {\n    slug = \"s\";\n    \n    \
          io feed <-> relay { push_depth = 1; retain_depth = 1; }\n}\n",
     );
     assert!(refusal.contains("relay"), "{refusal}");

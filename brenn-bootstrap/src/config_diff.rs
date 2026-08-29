@@ -211,7 +211,6 @@ channel replies at "brenn:alice.replies" {{
 }}
 
 new alice_sink: Sink {{
-    component_path = "sink.wasm";
     grants = [ports];
     in messages <- feed;
     out events -> replies;
@@ -271,6 +270,7 @@ channel alerts at "brenn:alice-alerts" {
                 r#"
 channel acks at "ephemeral:sink.acks" { push_depth = 1; retain_depth = 2; }
 
+// ── packaged ──
 component Sink {
     "#,
                 processor_any!(),
@@ -278,9 +278,9 @@ component Sink {
     io tick;
     out done;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     slug = "sink";
     grants = [ports];
 
@@ -593,14 +593,15 @@ channel outbox at "brenn:{channel_b}" {{
     standing_retain_depth = 8;
 }}
 
+// ── packaged ──
 component Sink {{
     {PROCESSOR}
     in inbound;
     out outbound;
 }}
+// ── packaged ──
 
 new sink: Sink {{
-    component_path = "/lib/brenn_sink.wasm";
     slug = "sink";
     grants = [log, config, ports, mqtt];
 

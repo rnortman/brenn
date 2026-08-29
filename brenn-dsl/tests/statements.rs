@@ -462,15 +462,11 @@ fn a_component_class_body_is_a_closed_vocabulary() {
     assert_eq!(class.attrs.abi.value.as_str(), "dom");
 
     let error = parse_str(
-        "component Sink {\n    abi = processor; requires = [];\n    component_path = \"/lib/s.wasm\";\n}\n",
+        "component Sink {\n    abi = processor; requires = [];\n    slug = \"s\";\n}\n",
         "t.brenn",
     )
-    .expect_err("`component_path` is an instance's key, not a class's");
-    assert!(
-        error.message.contains("component_path"),
-        "{}",
-        error.message
-    );
+    .expect_err("`slug` is an instance's key, not a class's");
+    assert!(error.message.contains("slug"), "{}", error.message);
 
     let error = parse_str("component Protobar {\n    in messages;\n}\n", "t.brenn")
         .expect_err("`abi` is required");

@@ -846,7 +846,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
     // WASM consumer whose slug equals the app slug below ("pa").
     let colliding = WasmConsumerConfigRaw {
         slug: "pa".to_string(),
-        component_path: dir.path().join("c.wasm"),
+        package: "colliding".to_string(),
         spec_sha256: String::new(),
         grants: vec![ComponentGrant::Mqtt],
         store_path: None,
@@ -1540,10 +1540,10 @@ fn validate_acl_unconfigured_mqtt_client_panics() {
 #[cfg(test)]
 fn wasm_consumer_with_sub(
     slug: &str,
-    component_path: std::path::PathBuf,
+    package: &str,
     channel: &str,
 ) -> crate::messaging::config::WasmConsumerConfigRaw {
-    crate::messaging::config::WasmConsumerConfigRaw::minimal(slug, component_path, &[channel])
+    crate::messaging::config::WasmConsumerConfigRaw::minimal(slug, package, &[channel])
 }
 
 /// A `[[wasm_consumer.subscription]]` naming an `mqtt:<client>:<topic>` channel
@@ -1563,7 +1563,7 @@ fn validate_resolves_wasm_consumer_mqtt_ingress_channel() {
         }],
         wasm_consumers: vec![wasm_consumer_with_sub(
             "consume",
-            dir.path().join("c.wasm"),
+            "consume",
             "mqtt:ha:home/+/state",
         )],
         mqtt_clients: vec![ingress_test_broker("ha")],
@@ -1608,7 +1608,7 @@ fn validate_app_and_wasm_same_mqtt_channel_dedup_to_one() {
         }],
         wasm_consumers: vec![wasm_consumer_with_sub(
             "consume",
-            dir.path().join("c.wasm"),
+            "consume",
             "mqtt:ha:home/+/state",
         )],
         mqtt_clients: vec![ingress_test_broker("ha")],
@@ -1645,7 +1645,7 @@ fn validate_wasm_non_mqtt_subscription_derives_no_ingress_channel() {
         }],
         wasm_consumers: vec![wasm_consumer_with_sub(
             "consume",
-            dir.path().join("c.wasm"),
+            "consume",
             "brenn:some-channel",
         )],
         ..Default::default()
@@ -1681,7 +1681,7 @@ fn validate_wasm_mqtt_subscription_unknown_client_panics() {
         }],
         wasm_consumers: vec![wasm_consumer_with_sub(
             "consume",
-            dir.path().join("c.wasm"),
+            "consume",
             "mqtt:nonexistent:home/+/state",
         )],
         ..Default::default()
@@ -1709,7 +1709,7 @@ fn validate_wasm_mqtt_subscription_malformed_filter_panics() {
         }],
         wasm_consumers: vec![wasm_consumer_with_sub(
             "consume",
-            dir.path().join("c.wasm"),
+            "consume",
             "mqtt:ha:home/#/state",
         )],
         mqtt_clients: vec![ingress_test_broker("ha")],

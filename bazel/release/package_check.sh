@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # Assert the staged release tree satisfies what the deploy script reads from it.
 #
-# Usage: package_check.sh <names-tool> <package-names-tool> <record-lib>
-#                         <dom-names-tool> <package-dir> <manifest>
-#                         <static|dynamic>
+# Usage: package_check.sh <names-tool> <record-lib> <dom-names-tool>
+#                         <package-dir> <manifest> <static|dynamic>
 #
 # `<names-tool>` is `manifest_names.sh`, which states the manifest's grammar for
-# every reader of it; `<package-names-tool>` is `package_names.sh`, which states
-# a package's file grammar the same way; `<dom-names-tool>` is `dom_names.sh`,
-# which does it for a surface dom kind; `<record-lib>` is `record_lib.sh`, which
+# every reader of it; `<dom-names-tool>` is `dom_names.sh`, which states a
+# surface dom kind's file grammar; `<record-lib>` is `record_lib.sh`, which
 # states how a binding record's fields are read.
 #
 # `deploy.sh` lives in the deploying repo, so nothing in this tree can be held
 # equal to it mechanically. This is the in-repo statement of the contract it
-# reads: the two binary paths it copies, the MCP stub, the manifest, and one
-# component package per manifest entry. A packaging change that breaks any of
-# them produces a green build and a deploy that fails on the target host,
-# halfway through, with the service already stopped.
+# reads: the two binary paths it copies, the MCP stub, the manifest, the
+# manifest grammar it execs, and one component package per manifest entry. A
+# packaging change that breaks any of them produces a green build and a deploy
+# that fails on the target host, halfway through, with the service already
+# stopped.
 #
-# A package is the artifact, its `.package.json` binding record, and — for a
-# processor-world component — the `.spec.brenn` copy of its specification. The
-# hashes in the record are re-computed here, so the tarball is proven internally
-# bound before it ships and `deploy.sh` can install the sidecars by presence.
-# The host re-computes them once more at boot; this gate is what keeps that
-# check from being the first one anybody runs.
+# A package is a directory named for the component, holding its `package.json`
+# binding record, the artifact that record names, and — for a processor-world
+# component — the `<name>.brenn` copy of its specification. The hashes in the
+# record are re-computed here, so the tarball is proven internally bound before
+# it ships and `deploy.sh` can install a package directory wholesale. The host
+# re-computes them once more at boot; this gate is what keeps that check from
+# being the first one anybody runs.
 #
 # `modules/` is the module root a deployment's `use @<name>::…` imports resolve
 # against. Every file in it is checked against the packaged specification it
@@ -45,23 +45,22 @@
 # either. The static arm rejects any named loader, not just the glibc one.
 set -euo pipefail
 
-if [ "$#" -ne 7 ]; then
-    echo "usage: $0 <names-tool> <package-names-tool> <record-lib> <dom-names-tool>" \
+if [ "$#" -ne 6 ]; then
+    echo "usage: $0 <names-tool> <record-lib> <dom-names-tool>" \
          "<package-dir> <manifest> <static|dynamic>" >&2
     exit 2
 fi
 names="$1"
-package_names="$2"
-record_lib="$3"
-dom_names="$4"
-pkg="$5"
-manifest="$6"
-linkage="$7"
+record_lib="$2"
+dom_names="$3"
+pkg="$4"
+manifest="$5"
+linkage="$6"
 
 case "$linkage" in
     static|dynamic) ;;
     *)
-        echo "usage: $0 <names-tool> <package-names-tool> <record-lib> <dom-names-tool>" \
+        echo "usage: $0 <names-tool> <record-lib> <dom-names-tool>" \
              "<package-dir> <manifest> <static|dynamic>" >&2
         exit 2
         ;;
@@ -122,29 +121,29 @@ check_recorded_file() {
     check_recorded_hash "$dir/$name" "$label" "$record" "$hash_field" "$dir/$name"
 }
 
-# One surface kind's staged module: the file `use @<kind>::…` resolves to must
-# be the packaged copy that kind's record binds, byte for byte, since the host
+# One component's staged module: the file `use @<name>::…` resolves to must be
+# the packaged copy that component's record binds, byte for byte, since the host
 # compares the configuration's hash against that record at boot.
 #
-# Called from the surface loops, which is where a kind and the name of its
-# packaged copy are already in hand. A tree with no module root at all has been
-# refused once by then, so this says nothing more about it.
+# Called from the package loop and the surface loops, which is where a name and
+# its packaged copy are already in hand. A tree with no module root at all has
+# been refused once by then, so this says nothing more about it.
 #
-# `$1` is the packaged copy, `$2` the kind, `$3` the copy's label in messages.
+# `$1` is the packaged copy, `$2` the name, `$3` the copy's label in messages.
 check_staged_module() {
-    local packaged="$1" kind="$2" shown="$3" module
+    local packaged="$1" name="$2" shown="$3" module
     [ "$modules_root" -eq 1 ] || return 0
-    module="$pkg/modules/$kind.brenn"
+    module="$pkg/modules/$name.brenn"
     if [ ! -s "$module" ]; then
-        fail "modules/$kind.brenn is missing or empty, but the release ships kind $kind"
+        fail "modules/$name.brenn is missing or empty, but the release ships $name"
         return
     fi
     if [ ! -s "$packaged" ]; then
-        fail "$shown is missing or empty, so modules/$kind.brenn stands for nothing"
+        fail "$shown is missing or empty, so modules/$name.brenn stands for nothing"
         return
     fi
     if ! cmp -s "$module" "$packaged"; then
-        fail "modules/$kind.brenn differs from $shown; a configuration compiled against it binds to no installed component"
+        fail "modules/$name.brenn differs from $shown; a configuration compiled against it binds to no installed component"
     fi
 }
 
@@ -176,59 +175,118 @@ if [ ! -s "$pkg/lib/noop_mcp.py" ]; then
     fail "lib/noop_mcp.py is missing or empty"
 fi
 
-installed_manifest="$pkg/lib/deployed-components.txt"
-if [ ! -f "$installed_manifest" ]; then
-    fail "lib/deployed-components.txt is missing; deploy.sh reads it to decide what to install"
-elif ! cmp -s "$installed_manifest" "$manifest"; then
-    fail "lib/deployed-components.txt differs from $manifest"
+# The module root's presence, settled before anything reads it.
+# `modules/<name>.brenn` is what a deployment's `use @<name>::…` imports resolve
+# against, and every file in it must be the authored module of a component this
+# release ships — byte for byte, because that is what the host binds at boot.
+# Settled here so the package loop and the surface loops below can each check a
+# staged module where they stand, holding the packaged copy and its name
+# already.
+modules_root=1
+if [ ! -d "$pkg/modules" ]; then
+    fail "modules/ is missing; a deployment importing @<name> has nothing to resolve against"
+    modules_root=0
 fi
 
-# What the manifest names, and only that: an artifact nobody asked for is a
+# The manifest grammar the deploying repo's preflight execs instead of
+# transcribing. A tarball missing it deploys a preflight that cannot read the
+# manifest at all.
+staged_names="$pkg/scripts/manifest_names.sh"
+if [ ! -s "$staged_names" ]; then
+    fail "scripts/manifest_names.sh is missing or empty; preflight execs it to read the manifest"
+elif [ ! -x "$staged_names" ]; then
+    fail "scripts/manifest_names.sh is not executable; preflight execs it"
+fi
+
+installed_manifest="$pkg/components/deployed-components.txt"
+if [ ! -f "$installed_manifest" ]; then
+    fail "components/deployed-components.txt is missing; deploy.sh reads it to decide what to install"
+elif ! cmp -s "$installed_manifest" "$manifest"; then
+    fail "components/deployed-components.txt differs from $manifest"
+fi
+
+# What the manifest names, and only that: a package nobody asked for is a
 # test-only component reaching a deployment.
 expected=""
 if [ -f "$installed_manifest" ]; then
     expected="$("$names" "$installed_manifest" | LC_ALL=C sort)"
 fi
 if [ -z "$expected" ]; then
-    fail "lib/deployed-components.txt names no components"
+    fail "components/deployed-components.txt names no components"
 else
     while read -r name; do
-        if [ ! -s "$pkg/lib/$name" ]; then
-            fail "lib/$name is missing or empty, but the manifest ships it"
-            continue
-        fi
-
-        # Assigned before being read: a names-tool failure inside a process
-        # substitution is invisible to `set -e`, and the loop would go on to
-        # look for a sidecar under an empty name.
-        sidecars="$("$package_names" "$name")"
-        { read -r record_name; read -r spec_name; } <<< "$sidecars"
-        record="$pkg/lib/$record_name"
+        dir="$pkg/components/$name"
+        record="$dir/package.json"
         if [ ! -s "$record" ]; then
-            fail "lib/$record_name is missing or empty; the host refuses a component with no binding record"
+            fail "components/$name/package.json is missing or empty; the host resolves a package by its directory and refuses one with no record"
             continue
         fi
+        label="components/$name/package.json"
 
-        check_recorded_file "$record" "lib/$record_name" "$pkg/lib" \
-            artifact artifact_sha256 "$name"
+        # The naming rules are the record library's, shared with the gate over
+        # the workspace components root; what is left here is what only a
+        # staged tree can be asked — that every file the record names shipped
+        # and hashes to what it states.
+        artifact=""
+        spec=""
+        recorded_files=("package.json")
+        while IFS="$(printf '\t')" read -r kind value; do
+            case "$kind" in
+                fail) fail "$label: $value" ;;
+                artifact) artifact="$value" ;;
+                spec) spec="$value" ;;
+            esac
+        done < <(package_shape "$dir")
 
-        # Spec-iff-named, both directions, which is the one thing the shared
-        # helper cannot say: a record naming a spec that did not ship deploys a
+        if [ -n "$artifact" ]; then
+            recorded_files+=("$artifact")
+            check_recorded_hash "$dir/$artifact" "$label" "$record" artifact_sha256 \
+                "components/$name/$artifact"
+        fi
+
+        # Spec-iff-named, both directions, which is the one thing the shape
+        # rules cannot say: a record naming a spec that did not ship deploys a
         # component that cannot be verified, and a spec beside a record that
         # names none is a file the host will never read.
-        if [ -n "$(record_field "$record" spec)" ]; then
-            check_recorded_file "$record" "lib/$record_name" "$pkg/lib" \
-                spec spec_sha256 "$spec_name"
-        elif [ -e "$pkg/lib/$spec_name" ]; then
-            fail "lib/$spec_name shipped, but lib/$record_name names no spec"
+        if [ -n "$spec" ]; then
+            recorded_files+=("$spec")
+            check_recorded_hash "$dir/$spec" "$label" "$record" spec_sha256 \
+                "components/$name/$spec"
+            # The import and the package share a name, so the two copies are
+            # compared where both are in hand.
+            check_staged_module "$dir/$spec" "$name" "components/$name/$spec"
+        elif [ -z "$(record_field "$record" spec)" ] && [ -e "$dir/$name.brenn" ]; then
+            fail "components/$name/$name.brenn shipped, but $label names no spec"
+        fi
+
+        # A package directory holds what its record binds and nothing else: a
+        # leftover file is a second artifact or a second spec the host would
+        # never open, and the deploy sync would install it all the same. Every
+        # entry counts, at any depth and of any type — a nested directory or a
+        # link whose target never shipped is content no gate looked at, and the
+        # sync installs those wholesale too.
+        staged_files="$(cd "$dir" && find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort)"
+        want_files="$(printf '%s\n' "${recorded_files[@]}" | LC_ALL=C sort)"
+        if [ "$staged_files" != "$want_files" ]; then
+            fail "components/$name/ does not hold exactly the files its record binds."
+            diff -u <(echo "$want_files") <(echo "$staged_files") \
+                --label "$label" --label "components/$name/" || true
         fi
     done <<< "$expected"
 
-    actual="$(cd "$pkg/lib" && find -L . -maxdepth 1 -name '*.wasm' -printf '%P\n' | LC_ALL=C sort)"
+    # The manifest's set, and only it. A directory nobody listed is a component
+    # the deploy sync installs and the manifest never mentioned; a loose file is
+    # one no package stands behind.
+    actual="$(cd "$pkg/components" && find -L . -mindepth 1 -maxdepth 1 -type d -printf '%P\n' | LC_ALL=C sort)"
     if [ "$actual" != "$expected" ]; then
-        fail "lib/ does not hold exactly the components the manifest names."
+        fail "components/ does not hold exactly the packages the manifest names."
         diff -u <(echo "$expected") <(echo "$actual") \
-            --label "manifest" --label "lib/" || true
+            --label "manifest" --label "components/" || true
+    fi
+    stray="$(cd "$pkg/components" && find -L . -mindepth 1 -maxdepth 1 -type f \
+        ! -name deployed-components.txt -printf '%P\n' | LC_ALL=C sort)"
+    if [ -n "$stray" ]; then
+        fail "components/ holds files beside the manifest: $(echo "$stray" | tr '\n' ' ')"
     fi
 fi
 
@@ -250,18 +308,6 @@ done
 # The records are scraped, not parsed: both emitters write one scalar field per
 # line for exactly this reader (see the record library).
 # ---------------------------------------------------------------------------
-
-# The module root, first half. `modules/<name>.brenn` is what a deployment's
-# `use @<name>::…` imports resolve against, and every file in it must be the
-# authored module of a component this release ships — byte for byte, because
-# that is what the host binds at boot. Its presence is settled here so the
-# surface loops below can check each kind's staged module where they stand,
-# holding the record, the kind and the packaged copy's derived name already.
-modules_root=1
-if [ ! -d "$pkg/modules" ]; then
-    fail "modules/ is missing; a deployment importing @<name> has nothing to resolve against"
-    modules_root=0
-fi
 
 if [ -d "$pkg/surface" ]; then
     # Chrome is a dom kind and every surface has one, so a tree with no dom
@@ -333,32 +379,14 @@ if [ -d "$pkg/surface" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# The module root, second half. Each surface kind's staged module was checked
-# against its packaged copy in the loops above; what is left is the backend half
-# and the closing direction — a stray or tampered module is text no package
-# stands behind.
+# The module root, closing direction. Every shipped specification was compared
+# against its staged module in the loops above — the backend half in the package
+# loop, the surface half in the surface loops — so what is left is the other
+# way round: a stray or tampered module is text no package stands behind.
 # ---------------------------------------------------------------------------
 
 if [ "$modules_root" -eq 1 ]; then
-    # A backend package's record carries no kind, so its module is joined by
-    # content: the sidecar and the staged module are two copies of one authored
-    # file, which makes byte identity the whole of the correspondence.
-    for sidecar in "$pkg"/lib/*.spec.brenn; do
-        [ -f "$sidecar" ] || continue
-        found=""
-        for module in "$pkg"/modules/*.brenn; do
-            [ -f "$module" ] || continue
-            if cmp -s "$sidecar" "$module"; then
-                found="$module"
-                break
-            fi
-        done
-        if [ -z "$found" ]; then
-            fail "lib/$(basename "$sidecar") matches no file in modules/; the component ships a specification no deployment can import"
-        fi
-    done
-
-    # The reverse direction, which is what makes the root a closed set: a file
+    # The direction that makes the root a closed set: a file
     # nobody packaged is a module a deployment could import and the host would
     # never bind.
     shopt -s nullglob
@@ -377,7 +405,7 @@ if [ "$modules_root" -eq 1 ]; then
                 ;;
         esac
         found=""
-        for candidate in "$pkg"/lib/*.spec.brenn "$pkg"/surface/*.spec.brenn \
+        for candidate in "$pkg"/components/*/*.brenn "$pkg"/surface/*.spec.brenn \
             "$pkg"/surface/processor/*/*.spec.brenn; do
             [ -f "$candidate" ] || continue
             if cmp -s "$module" "$candidate"; then
@@ -399,4 +427,4 @@ fi
 # Named, so the test log says which arm ran: the linkage mode is selected on a
 # build flag, and a release that quietly took the dev arm would pass this gate
 # over a glibc binary.
-echo "release package: $linkage linkage, $(echo "$expected" | grep -c '') component(s)"
+echo "release package: $linkage linkage, $(echo "$expected" | grep -c '') package(s)"

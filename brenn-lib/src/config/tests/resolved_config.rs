@@ -157,7 +157,7 @@ fn app_owned_endpoint_stamps_resolved_wake_min() {
         ],
         wasm_consumers: vec![crate::messaging::config::WasmConsumerConfigRaw::minimal(
             "myconsumer",
-            dir.path().join("dummy.wasm"),
+            "myconsumer",
             &["webhook:hook-wasm"],
         )],
         apps: vec![AppConfigRaw {
@@ -383,7 +383,7 @@ fn git_pipeline_reference_config_resolves() {
         // both endpoints (Rule 9 sole-wasm-owner).
         wasm_consumers: vec![crate::messaging::config::WasmConsumerConfigRaw::minimal(
             "git-forge-parser",
-            dir.path().join("brenn_git_forge_parser.wasm"),
+            "git-forge-parser",
             &["webhook:git-forgejo", "webhook:git-github"],
         )],
         // The resolver requires at least one app; the pipeline itself is app-less

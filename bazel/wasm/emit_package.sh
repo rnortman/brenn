@@ -9,13 +9,20 @@
 # WIT_LIB names the shared WIT-scraping library; unset, it is read from its path
 # relative to the execroot.
 #
-# A shipped component is three sibling files sharing the artifact's stem: the
-# `.wasm`, the `.spec.brenn` copy of the specification its author wrote, and the
-# `.package.json` record emitted here. The record is the statement that those
-# files were produced together — `artifact_sha256` and `spec_sha256` are what
-# the host re-computes at boot, so an artifact installed beside a spec it was
-# not built with is a refusal to boot rather than a component running against a
-# contract nobody checked.
+# A shipped component is a directory named for the package, holding the
+# artifact under its built basename, the `<name>.brenn` copy of the
+# specification its author wrote, and the `package.json` record emitted here.
+# The record is the statement that those files were produced together —
+# `artifact_sha256` and `spec_sha256` are what the host re-computes at boot, so
+# an artifact installed beside a spec it was not built with is a refusal to boot
+# rather than a component running against a contract nobody checked.
+#
+# `name` is the package name, which the host holds equal to the directory's own
+# basename. The packaged spec is named from it, and the authored file it copies
+# must already carry that basename: the same bytes ship a second time in the
+# release's module root as `<name>.brenn`, and the two copies are byte-compared
+# there, so a spec authored under any other name would put the import under one
+# name and the package under another.
 #
 # The record is an external contract: an out-of-tree component ships one too, in
 # this shape, or it does not load. `v` is the whole compatibility story — there
@@ -71,6 +78,24 @@ if [ "$world" = brenn:replay ] && [ -n "$spec_in" ]; then
     exit 1
 fi
 
+# The package's own name states the spec's, so the authored file has to carry
+# it: deriving the packaged basename from the package while the module root
+# stages the authored one would file one deployment import under two names.
+if [ -n "$spec_in" ]; then
+    authored="$(basename "$spec_in")"
+    if [ "$authored" != "$name.brenn" ]; then
+        echo "emit_package: package $name packages the specification $authored, but a" \
+             "package's spec is its own name — the release stages the authored file into" \
+             "the module root as $name.brenn and byte-compares the two copies." >&2
+        exit 1
+    fi
+    if [ "$(basename "$spec_out")" != "$name.brenn" ]; then
+        echo "emit_package: package $name would write its packaged spec as" \
+             "$(basename "$spec_out"); the host reads $name.brenn and no other file." >&2
+        exit 1
+    fi
+fi
+
 if [ ! -f "$artifact" ]; then
     echo "emit_package: $artifact is not a readable file" >&2
     exit 1
@@ -110,7 +135,7 @@ done <<< "$imports"
 
 {
     printf '{\n'
-    printf '  "v": 1,\n'
+    printf '  "v": 2,\n'
     printf '  "name": "%s",\n' "$(json_escape "$name")"
     printf '  "world": "%s",\n' "$(json_escape "$world")"
     printf '  "artifact": "%s",\n' "$(json_escape "$artifact_name")"
@@ -125,9 +150,8 @@ done <<< "$imports"
     printf '}\n'
 } > "$record_out"
 
-# The packaged copy is byte-for-byte the author's file under the artifact's
-# stem, so every package file is derivable from the artifact's basename and the
-# hash in the record is the hash of what boot reads.
+# The packaged copy is byte-for-byte the author's file under the package's own
+# name, so the hash in the record is the hash of what boot reads.
 if [ -n "$spec_in" ]; then
     cp -L "$spec_in" "$spec_out"
 fi

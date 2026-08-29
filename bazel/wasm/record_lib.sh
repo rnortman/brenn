@@ -33,3 +33,53 @@ record_field() {
 surface_dom_records() {
     find -L "$1" -maxdepth 1 -name 'brenn_*.manifest.json' | LC_ALL=C sort
 }
+
+# The naming rules a component package's record is held to, as a stream of
+# facts one per line, `<kind><TAB><value>`:
+#
+#   fail <message>   a rule the package breaks, in the caller's own voice
+#   artifact <name>  the artifact basename the record states
+#   spec <name>      the specification basename, absent when it states none
+#
+# Usage: package_shape <package-dir>
+#
+# Stated here because three readers hold a package to these rules — the host at
+# boot, the workspace components root's gate, and the staged release tree's —
+# and only the two shell ones can share a statement of them. A rule added to the
+# host's reader that reaches one gate and not the other ships a tree one gate
+# passed and the deploy target refuses. Presence and hashes are the caller's:
+# one gate re-computes them, the other only asserts the files are there.
+package_shape() {
+    _shape_dir="$1"
+    _shape_name="$(basename "$_shape_dir")"
+    _shape_record="$_shape_dir/package.json"
+
+    # The directory's basename is the name a configuration states, and the
+    # record repeats it: a package under any other name is one the host refuses.
+    _shape_stated="$(record_field "$_shape_record" name)"
+    if [ "$_shape_stated" != "$_shape_name" ]; then
+        printf 'fail\t%s\n' "the record calls itself $_shape_stated, but the package is named $_shape_name"
+    fi
+
+    # The artifact keeps the stem the build gave it, so its name is the
+    # record's to state rather than the host's to derive — which makes the
+    # separator and the extension the only things holding it to the directory.
+    _shape_artifact="$(record_field "$_shape_record" artifact)"
+    case "$_shape_artifact" in
+        "") printf 'fail\t%s\n' "the record states no artifact" ;;
+        */*) printf 'fail\t%s\n' "the record names the artifact $_shape_artifact, which reaches outside the package directory" ;;
+        *.wasm) printf 'artifact\t%s\n' "$_shape_artifact" ;;
+        *) printf 'fail\t%s\n' "the record names $_shape_artifact as its artifact, which is not a component" ;;
+    esac
+
+    # A specification, where the record names one, is read under the package's
+    # own name and under no other.
+    _shape_spec="$(record_field "$_shape_record" spec)"
+    if [ -n "$_shape_spec" ]; then
+        if [ "$_shape_spec" = "$_shape_name.brenn" ]; then
+            printf 'spec\t%s\n' "$_shape_spec"
+        else
+            printf 'fail\t%s\n' "the record names $_shape_spec as its spec, but the host derives that name as $_shape_name.brenn and reads no other file"
+        fi
+    fi
+}

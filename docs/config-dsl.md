@@ -80,10 +80,9 @@ Assemblies are welcome there precisely because declaring one effects nothing:
 
 ```
 // Shipped by the author, in @processor-demo:
-assembly DemoLoop(slug: String, source: Channel, components_dir: String) {
+assembly DemoLoop(slug: String, source: Channel) {
   channel out at f"ephemeral:{slug}.out" { push_depth = 8; retain_depth = 8; }
   new consume: ProcessorDemo {
-    component_path = f"{components_dir}/brenn_processor_demo.wasm";
     grants = [ports];
     in in <- source;
     out out -> out;
@@ -91,7 +90,7 @@ assembly DemoLoop(slug: String, source: Channel, components_dir: String) {
 }
 
 // Written by the deployment:
-new demo: DemoLoop(slug = "demo", source = feed, components_dir = components_dir);
+new demo: DemoLoop(slug = "demo", source = feed);
 ```
 
 The author ships the arrangement; the deployment chooses to stamp it. The `new`
@@ -292,11 +291,20 @@ component Chrome {
   must agree with. See below.
 - `requires` and `optional` are the capability lists. See *Authority* below.
 
-The class carries the contract; **instances never restate it**. Where the
-artifact lives on a given host is a fact of the placement, not the class: a
-top-level instance (a consumer) states `component_path`, while a surface-placed
-instance has no path to author — its module is derived from its kind
-(`brenn-<kind>`).
+The class carries the contract; **instances never restate it**. Neither does the
+deployment restate where the artifact lives: a top-level instance is resolved
+from the package its class's module names, and a surface-placed instance from
+its kind (`brenn-<kind>`).
+
+**A top-level instance's class comes from a packaged module.** A consumer is
+loaded from an installed component package, and the package is the module the
+class was declared in — so a class declared anywhere in the deployment's own
+tree cannot be instantiated at the top level, and the refusal says to declare it
+in a module imported as `use @<name>::*;`. The declaring module is the one that
+counts: an assembly in one package over a class another package declares yields
+the declaring package, which is the one that ships the artifact. Surface
+placements are untouched — a surface-placed component is served by kind and
+resolves against no package.
 
 ### Doctypes
 
@@ -374,7 +382,6 @@ the top level runs in the backend, and is called a **consumer**:
 
 ```
 new consume-demo: ProcessorDemo {
-  component_path = f"{components_dir}/brenn_processor_demo.wasm";
   grants = [ports];
   activation_burst = 60;
   activation_min_period_ms = 1000;
@@ -383,8 +390,8 @@ new consume-demo: ProcessorDemo {
 }
 ```
 
-Each placement admits its own body keys — a consumer states its artifact path,
-store, and activation budget; a surface-placed instance states its send budget
+Each placement admits its own body keys — a consumer states its store and
+activation budget; a surface-placed instance states its send budget
 and whether it is the page's chrome — and an unknown key is refused naming the
 set that placement admits.
 
@@ -396,7 +403,6 @@ top-level instance body:
 
 ```
 new puller: Syncer {
-  component_path = f"{components_dir}/brenn_syncer.wasm";
   grants = [ports, tools];
 
   tool git-repo-pull {
@@ -536,7 +542,11 @@ Five more declarations, each a body of attrs:
 - `remote <name> { … }` — a native daemon that attaches to the bus over the
   wire, with a token file, transport grants, and ACLs.
 - `webhook <name> { … }` — an HTTP ingress endpoint: mount path, content type,
-  and named sub-blocks for `signature`, `key`, and `replay_protection`.
+  and named sub-blocks for `signature`, `key`, and `replay_protection`. The
+  replay block names its guard by installed package —
+  `component = "replay-generic";` — and, unlike a consumer's, that name is
+  anchored by no import: a replay component ships no module, so a typo surfaces
+  at boot rather than at compile.
 - `mqtt_client <name> { … }` — a broker connection; `mqtt:<client>:<topic>`
   addresses name channels through it.
 - `repo <name> { remote = …; }` — a git remote plus a slug, mounted by whichever
@@ -713,10 +723,12 @@ describes the old shape, the three rules below were true and are not any more.
   was, and instances were free to bind whichever ports they used. Ports are now
   required unless the class marks them `optional`, so the class states which
   ports an instance may skip rather than leaving it to each instance.
-- **`component_path` on the class.** The artifact path used to be a class attr,
-  which made a specification deployment-specific — the one fact in it that
-  cannot be an author's statement. It is now a key on the consumer instance,
-  and the class carries no path at all.
+- **`component_path`, on the class and then on the instance.** The artifact path
+  used to be a class attr, which made a specification deployment-specific — the
+  one fact in it that cannot be an author's statement. It moved to the consumer
+  instance, and then off the vocabulary entirely: the package name is the whole
+  reference and the host resolves it against the root `serve --components`
+  names. A document that still states it is refused as an unknown key.
 - **Component grants were a backend-only notion.** A surface-placed component
   held no capability list of its own; its page's transport grants were the whole
   authority statement, and the grant vocabulary differed between the two ABIs.

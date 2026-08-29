@@ -1,7 +1,8 @@
 //! Shared fixture loading for the corpus suites.
 
-// Each suite uses a subset of these.
-#![allow(dead_code)]
+// Each suite uses a subset of these; the macro re-export is unused wherever the
+// suite writes no packaged fence.
+#![allow(dead_code, unused_imports)]
 
 use std::path::PathBuf;
 
@@ -103,18 +104,62 @@ fn refusal_of<T>(result: Result<T, Vec<Diagnostic>>) -> String {
 // `(module key, source)` pairs with `""` for the root, goes through the I/O-free
 // core, and comes back as either the config or the messages it was refused with.
 
+/// The fence a fixture writes around the class declarations that have to live
+/// in a packaged module.
+///
+/// A top-level instance's class is declared in an installed component package,
+/// and most suites here are about authority or expansion rather than about
+/// module structure. The line is written twice, opening and closing; what sits
+/// between the two becomes the packaged module every fixture in the file
+/// shares, and the document keeps the import in its place.
+///
+/// The substitution is line-for-line in both halves —
+/// blank lines stand in for the text that moved — so every span a suite asserts
+/// reads the same line and column it reads in the fixture as written; [`at`] is
+/// what knows about the one line the document gains.
+macro_rules! packaged {
+    () => {
+        brenn_dsl::packaged_fence!()
+    };
+}
+pub(crate) use packaged;
+
+/// The fence as a value, for the fixtures that build their text with `format!`.
+pub const PACKAGED: &str = packaged!();
+
+/// The module key the fenced half is loaded under.
+const PACKAGED_KEY: &str = concat!("@", brenn_dsl::packaged_module!());
+
 /// Resolve a tree of modules; the entry keyed `""` is the root.
 pub fn compile_tree(modules: &[(&str, &str)]) -> Result<ResolvedConfig, Vec<Diagnostic>> {
-    let files = modules
-        .iter()
-        .map(|(key, source)| {
-            let filename = if key.is_empty() { "main" } else { key };
-            let file = parse_str(source, &format!("{filename}.brenn"))
-                .unwrap_or_else(|error| panic!("{error}"));
-            ((*key).to_string(), file)
-        })
-        .collect();
+    let mut files: Vec<(String, File)> = Vec::new();
+    for (key, source) in modules {
+        let filename = if key.is_empty() { "main" } else { key };
+        match brenn_dsl::fixture_text::split_packaged(source) {
+            Some((module, document)) => {
+                assert!(
+                    key.is_empty(),
+                    "only the root fixture splits into a packaged module"
+                );
+                files.push((
+                    PACKAGED_KEY.to_string(),
+                    parsed(&module, &format!("{PACKAGED_KEY}.brenn")),
+                ));
+                files.push(((*key).to_string(), parsed(&document, "main.brenn")));
+            }
+            None => files.push((
+                (*key).to_string(),
+                parsed(source, &format!("{filename}.brenn")),
+            )),
+        }
+    }
     resolve_files(files, "")
+}
+
+/// One fixture source, parsed. A fixture that does not parse is a broken test
+/// input.
+fn parsed(source: &str, name: &str) -> File {
+    parse_str(source, name).unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// Resolve a one-file document, named as the root module.
@@ -198,7 +243,22 @@ pub fn at(source: &str, needle: &str) -> Option<(i64, i64)> {
     let index = source.find(needle).expect("the token is in the fixture");
     let line = source[..index].matches('\n').count() + 1;
     let column = index - source[..index].rfind('\n').map_or(0, |start| start + 1) + 1;
-    Some((line as i64, column as i64))
+    // The document half carries the import as an extra first line; the packaged
+    // half does not, so a token inside a fence keeps the fixture's numbering.
+    let shift = usize::from(source.contains(PACKAGED) && !packaged_at(source, index));
+    Some(((line + shift) as i64, column as i64))
+}
+
+/// Is the byte at `index` inside one of the fixture's fenced regions?
+fn packaged_at(source: &str, index: usize) -> bool {
+    let mut offset = 0;
+    for (line, half) in brenn_dsl::fixture_text::fenced(source) {
+        if (offset..offset + line.len()).contains(&index) {
+            return half.unwrap_or(false);
+        }
+        offset += line.len();
+    }
+    false
 }
 
 /// The diagnostics a one-file document is refused with in resolution, whole —

@@ -290,12 +290,16 @@ fn wasm_consumer_inherits_channel_noise() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:inherit-test", NoiseLevel::Alarm);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-a".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        // Deliberately unlike the slug: the package name is the only thing
+        // that tells boot which installed component to resolve, and a
+        // resolution that substituted the slug would look plausible.
+        package: "processor-demo".to_string(),
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
     }];
     let result = resolve(&raw, &dir);
     assert_eq!(result.len(), 1);
+    assert_eq!(result[0].package, "processor-demo");
     assert_eq!(result[0].inputs.len(), 1);
     assert_eq!(result[0].inputs[0].sub.noise, NoiseLevel::Alarm);
 }
@@ -306,7 +310,7 @@ fn wasm_consumer_explicit_noise_overrides_channel() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:override-test", NoiseLevel::Alarm);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-b".to_string(),
-        component_path: "/tmp/b.wasm".into(),
+        package: "b".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             push_depth: Some(Depth::Bounded(5)),
             noise: Some(NoiseLevel::Metered),
@@ -325,7 +329,7 @@ fn wasm_consumer_explicit_noise_on_pull_only_panics() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:pullonly-panic-test", NoiseLevel::Silent);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-c".to_string(),
-        component_path: "/tmp/c.wasm".into(),
+        package: "c".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             push_depth: Some(Depth::Bounded(0)),
             noise: Some(NoiseLevel::Alarm),
@@ -344,7 +348,7 @@ fn wasm_consumer_explicit_fatal_noise_panics() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:fatal-explicit", NoiseLevel::Silent);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-fatal-x".to_string(),
-        component_path: "/tmp/fx.wasm".into(),
+        package: "fx".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             push_depth: Some(Depth::Bounded(4)),
             noise: Some(NoiseLevel::Fatal),
@@ -363,7 +367,7 @@ fn wasm_consumer_inherited_fatal_noise_panics() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:fatal-inherited", NoiseLevel::Fatal);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-fatal-i".to_string(),
-        component_path: "/tmp/fi.wasm".into(),
+        package: "fi".to_string(),
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
     }];
@@ -380,7 +384,7 @@ fn wasm_consumer_explicit_wake_min_panics() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:wakemin-panic-test", NoiseLevel::Silent);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-wm".to_string(),
-        component_path: "/tmp/wm.wasm".into(),
+        package: "wm".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             push_depth: Some(Depth::Bounded(5)),
             wake_min: Some(brenn_lib::messaging::WakeMin::High),
@@ -403,7 +407,7 @@ fn wasm_consumer_all_sampled_inputs_panics() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:pullonly-dead-test", NoiseLevel::Alarm);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-d".to_string(),
-        component_path: "/tmp/d.wasm".into(),
+        package: "d".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             push_depth: Some(Depth::Bounded(0)),
             // retain_depth inherits channel's Unbounded — sampled port, not dead-port.
@@ -423,7 +427,7 @@ fn wasm_consumer_dead_port_both_depths_zero_panics() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:dead-port-test", NoiseLevel::Alarm);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-dead-port".to_string(),
-        component_path: "/tmp/dp.wasm".into(),
+        package: "dp".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             push_depth: Some(Depth::Bounded(0)),
             retain_depth: Some(Depth::Bounded(0)),
@@ -445,7 +449,7 @@ fn wasm_consumer_explicit_noise_on_channel_pull_only_panics() {
     );
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-e".to_string(),
-        component_path: "/tmp/e.wasm".into(),
+        package: "e".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             noise: Some(NoiseLevel::Alarm),
             ..sub_raw(&chan_addr, "in")
@@ -464,7 +468,7 @@ fn duplicate_input_port_names_panic() {
     let dir = dir_of(vec![brenn_entry("brenn:ch1"), brenn_entry("brenn:ch2")]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "dup-in".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![
             sub_raw("brenn:ch1", "same-port"),
             sub_raw("brenn:ch2", "same-port"), // duplicate
@@ -484,7 +488,7 @@ fn input_output_port_name_collision_panics() {
     ]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "dup-io".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("brenn:in-ch", "shared-port")],
         outputs: vec![out_raw("shared-port", "brenn:out-ch")], // collides with input port
         ..minimal_wasm_consumer()
@@ -501,7 +505,7 @@ fn reserved_tool_results_input_port_panics() {
     let dir = dir_of(vec![brenn_entry("brenn:ch1")]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "reserved-in".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw(
             "brenn:ch1",
             brenn_tool_registry::bus_wiring::TOOL_RESULT_INPUT_PORT,
@@ -521,7 +525,7 @@ fn reserved_tool_results_output_port_panics() {
     ]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "reserved-out".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw(
             brenn_tool_registry::bus_wiring::TOOL_RESULT_INPUT_PORT,
@@ -544,7 +548,7 @@ fn egress_scheme_output_channel_panics() {
     let dir = dir_of(vec![brenn_entry("brenn:in-ch"), wh]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "bad-out".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw("out", "webhook:wh")], // must panic
         ..minimal_wasm_consumer()
@@ -565,7 +569,7 @@ fn ephemeral_output_resolves_with_ephemeral_publish_acl() {
     let dir = dir_of(vec![in_e, eph]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "eph-pub".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports],
         ephemeral_publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
             "eph-out".to_string(),
@@ -600,7 +604,7 @@ fn ephemeral_output_without_acl_panics() {
     let dir = dir_of(vec![brenn_entry("brenn:in-ch"), eph]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "eph-noacl".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw("out", "ephemeral:eph-out")], // must panic
@@ -622,7 +626,7 @@ fn local_output_resolves_with_local_publish_acl() {
     let dir = dir_of(vec![in_e, loc]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "loc-pub".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports],
         local_publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
             "loc-out".to_string(),
@@ -657,7 +661,7 @@ fn local_output_without_acl_panics() {
     let dir = dir_of(vec![brenn_entry("brenn:in-ch"), loc]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "loc-noacl".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw("out", "local:loc-out")], // must panic
@@ -673,7 +677,7 @@ fn outputs_without_inputs_panics() {
     let (dir, out_addr) = make_brenn_dir("brenn:out-only");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "dead-config".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![], // no inputs
         outputs: vec![out_raw("out", &out_addr)],
         ..minimal_wasm_consumer()
@@ -692,7 +696,7 @@ fn resolved_consumer_carries_port_and_channel_info() {
     let dir = dir_of(vec![in_e, out_e]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "my-consumer".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports],
         // Bound output port requires a covering publish_acl; without it
         // resolution panics (bound-ports + empty publish_acl).
@@ -738,7 +742,7 @@ fn bound_output_with_empty_publish_acl_panics() {
     // publish_acl empty (from minimal) + bound output below → must panic.
     let raw = vec![WasmConsumerConfigRaw {
         slug: "bound-empty-acl".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw("brenn:bound-in", "in")],
         outputs: vec![out_raw("out", "brenn:bound-out")],
@@ -756,7 +760,7 @@ fn ports_grant_no_outputs_empty_publish_acl_resolves() {
     let (dir, chan_addr) = make_brenn_dir("brenn:no-outputs-ch");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "ports-no-outputs".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports],
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer() // empty publish_acl, no bound outputs → must not panic
@@ -782,7 +786,7 @@ fn non_empty_publish_acl_without_ports_grant_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:dead-acl-ch");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "dead-publish-acl".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         publish_acl: vec![ChannelMatcherRaw::Exact("events".to_string())], // non-empty
         // no Ports grant → matchers can never authorize a publish.
         subscriptions: vec![sub_raw(&chan_addr, "in")],
@@ -802,7 +806,7 @@ fn duplicate_output_port_names_panic() {
     ]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "dup-out".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![
             out_raw("same-out", "brenn:out-ch1"),
@@ -820,7 +824,7 @@ fn empty_port_name_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:empty-port-ch");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "empty-port".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw(&chan_addr, "")], // empty → must panic
         ..minimal_wasm_consumer()
     }];
@@ -834,7 +838,7 @@ fn reserved_char_port_name_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:reserved-port-ch");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "reserved-port".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw(&chan_addr, "port:x")], // colon is reserved → must panic
         ..minimal_wasm_consumer()
     }];
@@ -848,7 +852,7 @@ fn missing_store_path_parent_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:no-parent-ch");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "no-parent".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Store],
         store_path: Some(std::path::PathBuf::from(
             "/nonexistent_dir_xyz_brenn_test/store.sqlite",
@@ -877,7 +881,7 @@ fn wasm_consumer_config_carried_through() {
 
     let raw = vec![WasmConsumerConfigRaw {
         slug: "cfg-consumer".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Config],
         config: Some(config_table),
         subscriptions: vec![sub_raw(&chan_addr, "in")],
@@ -923,7 +927,7 @@ fn duplicate_grant_entry_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:dup-grant-test");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "dup-grant".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Ports, ComponentGrant::Ports], // duplicate
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
@@ -940,7 +944,7 @@ fn a_page_only_grant_on_a_consumer_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:page-grant-test");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "page-grant".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Takeover],
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
@@ -960,7 +964,7 @@ fn outputs_without_ports_grant_panics() {
     ]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "out-no-ports".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![], // Ports absent
         subscriptions: vec![sub_raw("brenn:out-no-ports-in", "in")],
         outputs: vec![out_raw("out", "brenn:out-no-ports-out")],
@@ -979,7 +983,7 @@ fn config_table_without_config_grant_panics() {
     config_table.insert("key".to_string(), toml::Value::String("val".to_string()));
     let raw = vec![WasmConsumerConfigRaw {
         slug: "cfg-no-grant".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         config: Some(config_table), // Config grant absent
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
@@ -994,7 +998,7 @@ fn store_path_without_store_grant_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:store-path-no-grant-test");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "store-path-no-grant".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         store_path: Some(std::path::PathBuf::from("/nonexistent/x.sqlite")), // Store grant absent; path never read (grant check precedes store validation)
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
@@ -1009,7 +1013,7 @@ fn store_size_limit_without_store_grant_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:store-limit-no-grant-test");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "store-limit-no-grant".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         store_size_limit: Some("32MiB".to_string()), // Store grant absent
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
@@ -1024,7 +1028,7 @@ fn store_grant_without_store_path_panics() {
     let (dir, chan_addr) = make_brenn_dir("brenn:store-grant-no-path-test");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "store-grant-no-path".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         grants: vec![ComponentGrant::Store],
         store_path: None, // absent — panic
         subscriptions: vec![sub_raw(&chan_addr, "in")],
@@ -1387,7 +1391,7 @@ fn an_ingress_channel_named_auto_resolves() {
     let dir = dir_of(vec![wh]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "hooks".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("webhook:auto.github", "in")],
         webhook_acl: vec![brenn_lib::access::raw::WebhookMatcherRaw {
             endpoint: "auto.github".to_string(),
@@ -1413,7 +1417,7 @@ fn pwa_push_input_channel_panics() {
     let dir = dir_of(vec![push]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "pusher".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("pwa_push:phone", "in")],
         ..minimal_wasm_consumer()
     }];
@@ -1431,7 +1435,7 @@ fn scheme_less_input_channel_panics() {
     let dir = dir_of(vec![bare]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "bare".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("noscheme", "in")],
         ..minimal_wasm_consumer()
     }];
@@ -1450,7 +1454,7 @@ fn an_mqtt_input_channel_resolves() {
     let dir = dir_of(vec![topic]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "sensors".to_string(),
-        component_path: "/tmp/a.wasm".into(),
+        package: "a".to_string(),
         subscriptions: vec![sub_raw("mqtt:home:sensors/temp", "in")],
         mqtt_subscribe_acl: vec![brenn_lib::access::raw::MqttSubMatcherRaw {
             client: "home".to_string(),

@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# The workspace install tree holds what a host reads.
+# The workspace components root holds what a host resolves.
 #
-# A server run from the workspace names this directory as a `component_path`
-# and loads a component through the same package verification a deployment
-# does: the artifact, its record and the packaged module, flat and side by side.
-# The rule that stages them declares its outputs, so a tree missing half of
-# them builds green, and the only thing that would notice is a boot panic in
-# `make e2e` — a target skipped locally, reporting a configuration error for
-# what is a staging bug. So the shape is asserted here instead, over the built
-# tree, with the same names the gate on the release tree derives.
+# A server run from the workspace passes this directory as `--components` and
+# resolves a package by name through the same verification a deployment does:
+# `<root>/<name>/` holding the record, the artifact the record names, and — for
+# a processor world — `<name>.brenn`. The rule that stages them declares its
+# outputs, so a tree missing half of them builds green, and the only thing that
+# would notice is a boot panic in `make e2e` — a target skipped locally,
+# reporting a configuration error for what is a staging bug. So the shape is
+# asserted here instead, over the built tree.
 set -uo pipefail
 
-package_names="$1"
-record_lib="$2"
-shift 2
+record_lib="$1"
+shift
 # shellcheck source=/dev/null
 . "$record_lib"
 failures=0
@@ -23,36 +22,33 @@ fail() {
     failures=$((failures + 1))
 }
 
-artifacts=0
+packages=0
 for path in "$@"; do
-    case "$path" in
-        *.wasm) ;;
-        *) continue ;;
-    esac
-    artifacts=$((artifacts + 1))
+    [ "$(basename "$path")" = package.json ] || continue
+    packages=$((packages + 1))
     dir="$(dirname "$path")"
-    { read -r record_name; read -r spec_name; } <<< "$("$package_names" "$(basename "$path")")"
-    record="$dir/$record_name"
-    if [ ! -s "$record" ]; then
-        fail "$path has no $record_name beside it; the host refuses an artifact whose record did not travel with it"
+    if [ ! -s "$path" ]; then
+        fail "$dir/package.json is empty; the host refuses a package whose record did not travel with it"
         continue
     fi
-    # A record that names a specification requires that file beside it in the
-    # `component_path` directory.
-    stated="$(record_field "$record" spec)"
-    if [ -z "$stated" ]; then
-        continue
-    fi
-    if [ "$stated" != "$spec_name" ]; then
-        fail "$record_name names $stated as its spec, but the host derives that name as $spec_name and reads no other file"
-        continue
-    fi
-    [ -s "$dir/$spec_name" ] || fail "$record_name binds $spec_name, which is not staged beside it"
+
+    # The naming rules are the record library's, shared with the staged
+    # release tree's gate; what is asked here is that every file they name is
+    # actually in the directory a server would resolve.
+    while IFS="$(printf '\t')" read -r kind value; do
+        case "$kind" in
+            fail) fail "$dir/package.json: $value" ;;
+            artifact | spec)
+                [ -s "$dir/$value" ] ||
+                    fail "$dir/package.json binds $value, which is not staged beside it"
+                ;;
+        esac
+    done < <(package_shape "$dir")
 done
 
 # An empty tree passes every assertion above by having nothing to assert.
-if [ "$artifacts" -eq 0 ]; then
-    fail "the install tree stages no component artifact at all"
+if [ "$packages" -eq 0 ]; then
+    fail "the components root stages no package at all"
 fi
 
 if [ "$failures" -ne 0 ]; then

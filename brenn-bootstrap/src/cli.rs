@@ -23,7 +23,14 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start the web server (default if no subcommand given).
-    Serve,
+    Serve {
+        /// Directory holding the installed component packages, one directory
+        /// per package, named by the package. A boot fact only: config
+        /// validation never resolves artifacts, so a document checks without
+        /// components installed.
+        #[arg(long, value_name = "DIR")]
+        components: Option<PathBuf>,
+    },
     /// Generate an invite code and print it to stdout.
     Invite,
     /// Compare two `.brenn` config documents as configurations, not as
@@ -65,6 +72,32 @@ mod tests {
             Cli::try_parse_from(["brenn", "config-check", "--modules", "/srv/modules", "x"])
                 .is_err(),
             "a subcommand of its own does not take the flag"
+        );
+    }
+
+    #[test]
+    fn the_components_root_is_a_serve_flag_and_not_a_config_tool_flag() {
+        let cli = Cli::try_parse_from(["brenn", "serve", "--components", "/srv/components"])
+            .expect("serve takes the flag");
+        let Some(Commands::Serve { components }) = cli.command else {
+            panic!("the subcommand parses");
+        };
+        assert_eq!(components.as_deref(), Some(Path::new("/srv/components")));
+
+        assert!(
+            Cli::try_parse_from([
+                "brenn",
+                "config-check",
+                "--components",
+                "/srv/components",
+                "x"
+            ])
+            .is_err(),
+            "config-check does not take the flag"
+        );
+        assert!(
+            Cli::try_parse_from(["brenn", "--components", "/srv/components", "serve"]).is_err(),
+            "the flag belongs to the subcommand, not the root parser"
         );
     }
 }

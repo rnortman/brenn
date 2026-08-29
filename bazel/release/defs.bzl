@@ -1,7 +1,7 @@
 """The deploy tarball's staged tree.
 
 What ships is one directory: the two host binaries, the two served asset trees,
-and the WASM components the deploy manifest names. Assembling it here rather
+and the WASM component packages the deploy manifest names. Assembling it here rather
 than in the deploying repo's workflow is what makes the layout a build output
 with declared inputs — a dropped asset fails a test instead of arriving as a
 404 on the deploy target.
@@ -51,10 +51,6 @@ def _release_package_impl(ctx):
     out = ctx.actions.declare_directory(ctx.label.name)
 
     binaries = [_sole_file(t, "executable") for t in ctx.attr.binaries]
-    components = ctx.files.components
-    for component in components:
-        if component.extension != "wasm":
-            fail("components must be .wasm artifacts, got %s" % component.path)
     frontend = _sole_directory(ctx.attr.frontend)
     surface = _sole_directory(ctx.attr.surface)
 
@@ -62,21 +58,19 @@ def _release_package_impl(ctx):
     args.add("--out", out.path)
     args.add("--manifest", ctx.file.manifest)
     args.add("--names", ctx.file._manifest_names)
-    args.add("--package-names", ctx.file._package_names)
     args.add("--dom-names", ctx.file._dom_names)
     args.add("--record-lib", ctx.file._record_lib)
     args.add("--frontend", frontend.path)
     args.add("--surface", surface.path)
     args.add_all(binaries, before_each = "--bin")
     args.add_all(ctx.files.lib_files, before_each = "--lib")
-    args.add_all(components, before_each = "--component")
     args.add_all(ctx.files.packages, before_each = "--package")
     args.add_all(ctx.files.modules, before_each = "--module")
 
     ctx.actions.run(
         outputs = [out],
         inputs = depset(
-            binaries + components + ctx.files.packages + ctx.files.modules +
+            binaries + ctx.files.packages + ctx.files.modules +
             ctx.files.lib_files + [ctx.file.manifest],
             transitive = [
                 ctx.attr.frontend[DefaultInfo].files,
@@ -86,7 +80,6 @@ def _release_package_impl(ctx):
         executable = ctx.file._assemble,
         tools = [
             ctx.file._manifest_names,
-            ctx.file._package_names,
             ctx.file._dom_names,
             ctx.file._record_lib,
         ],
@@ -114,12 +107,6 @@ _release_package = rule(
             mandatory = True,
             doc = "Host binaries, installed to `bin/`.",
         ),
-        "components": attr.label_list(
-            allow_empty = False,
-            allow_files = [".wasm"],
-            mandatory = True,
-            doc = "Every component artifact; the manifest picks the shipped ones.",
-        ),
         "frontend": attr.label(
             mandatory = True,
             doc = "The frontend asset tree, copied to `frontend/`.",
@@ -142,7 +129,7 @@ _release_package = rule(
         "packages": attr.label_list(
             allow_empty = False,
             mandatory = True,
-            doc = "The package sidecars; the manifest picks the shipped ones.",
+            doc = "The built package directories; the manifest picks the shipped ones.",
         ),
         "surface": attr.label(
             mandatory = True,
@@ -160,10 +147,6 @@ _release_package = rule(
             allow_single_file = True,
             default = Label("//bazel/wasm:manifest_names.sh"),
         ),
-        "_package_names": attr.label(
-            allow_single_file = True,
-            default = Label("//bazel/wasm:package_names.sh"),
-        ),
         "_record_lib": attr.label(
             allow_single_file = True,
             default = Label("//bazel/wasm:record_lib.sh"),
@@ -171,7 +154,7 @@ _release_package = rule(
     },
 )
 
-def release_package(name, manifest, binaries, components, packages, modules, frontend, surface, lib_files = [], visibility = None):
+def release_package(name, manifest, binaries, packages, modules, frontend, surface, lib_files = [], visibility = None):
     """The staged release tree, plus the gate on the contract `deploy.sh` reads.
 
     Pairing them here makes the gate structural: the tree cannot be added to
@@ -181,9 +164,8 @@ def release_package(name, manifest, binaries, components, packages, modules, fro
 
     Args:
         name: target name; also the staging directory's name.
-        manifest: the deploy manifest naming the components that ship.
+        manifest: the deploy manifest naming the packages that ship.
         binaries: host binaries, installed to `bin/`.
-        components: every `wasm_component` target in the tree.
         packages: every `component_package` target in the tree.
         modules: the authored module of every backend component that ships.
         frontend: the frontend asset tree.
@@ -194,7 +176,6 @@ def release_package(name, manifest, binaries, components, packages, modules, fro
     _release_package(
         name = name,
         binaries = binaries,
-        components = components,
         frontend = frontend,
         lib_files = lib_files,
         manifest = manifest,
@@ -211,7 +192,6 @@ def release_package(name, manifest, binaries, components, packages, modules, fro
         src = "//bazel/release:package_check.sh",
         args = [
             "$(rootpath //bazel/wasm:manifest_names.sh)",
-            "$(rootpath //bazel/wasm:package_names.sh)",
             "$(rootpath //bazel/wasm:record_lib.sh)",
             "$(rootpath //bazel/surface:dom_names.sh)",
             "$(rootpath :%s)" % name,
@@ -224,7 +204,6 @@ def release_package(name, manifest, binaries, components, packages, modules, fro
             manifest,
             "//bazel/surface:dom_names.sh",
             "//bazel/wasm:manifest_names.sh",
-            "//bazel/wasm:package_names.sh",
             "//bazel/wasm:record_lib.sh",
             ":" + name,
         ],

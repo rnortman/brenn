@@ -10,8 +10,8 @@ use brenn_dsl::resolved::{ChanId, MatcherKind, RChanRef, RMatcherVal, RTail, RVa
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use support::{
-    at, compile, compile_tree, refusal, refusal_tree, refusals, refusals_tree, resolve_errors,
-    resolved, resolved_tree,
+    at, compile, compile_tree, packaged, refusal, refusal_tree, refusals, refusals_tree,
+    resolve_errors, resolved, resolved_tree,
 };
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -294,9 +294,10 @@ fn the_push_scheme_is_not_spellable_in_a_pin_either() {
 fn the_push_scheme_is_not_spellable_as_a_binding_target_either() {
     assert_eq!(
         refusal(concat!(
+            packaged!(),
             "component Sink {\n    abi = processor; requires = [];\n    out events;\n}\n",
+            packaged!(),
             "new alice_sink: Sink {\n",
-            "    component_path = \"sink.wasm\";\n",
             "    out events -> \"pwa_push:alerts\";\n",
             "}\n",
         )),
@@ -1337,14 +1338,15 @@ fn a_port_bound_twice_is_refused_with_both_sites() {
 fn a_port_bound_to_both_a_link_and_a_channel_is_refused() {
     let errors = refusals(concat!(
         "channel feed at \"brenn:alice.in.feed\";\n",
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [ports];\n",
         "    io events;\n",
         "}\n",
+        packaged!(),
         "link relay;\n",
         "new alice_sink: Sink {\n",
         "    slug = \"alice-sink\";\n",
-        "    component_path = \"sink.wasm\";\n",
         "    io events <-> relay { push_depth = 2; retain_depth = 2; }\n",
         "    io events <-> feed;\n",
         "}\n",
@@ -1361,13 +1363,14 @@ fn a_port_bound_to_both_a_link_and_a_channel_is_refused() {
 #[test]
 fn a_consumer_leaving_a_required_port_unconnected_is_refused() {
     let errors = refusals(concat!(
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [];\n",
         "    out events;\n",
         "    optional in commands;\n",
         "}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
-        "    component_path = \"sink.wasm\";\n",
         "}\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -1491,9 +1494,10 @@ fn a_processor_class_may_need_a_backend_only_capability() {
 #[test]
 fn a_backend_only_requirement_reaches_the_instance_that_carries_it() {
     let config = resolved(concat!(
+        packaged!(),
         "component Sink {\n    abi = processor; requires = [store]; optional = [mqtt];\n}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    grants = [store];\n",
         "}\n",
     ));
@@ -1637,13 +1641,14 @@ fn a_surface_contains_components_and_not_assemblies() {
 fn a_top_level_instance_is_a_consumer() {
     let config = resolved(concat!(
         "channel out_chan at \"brenn:alice.out.events\";\n",
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [];\n",
         "    out events;\n",
         "}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
         "    slug = \"alice-sink\";\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    grants = [ports];\n",
         "    acl publish [prefix \"brenn:alice.out.\"];\n",
         "    out events -> out_chan;\n",
@@ -1654,19 +1659,22 @@ fn a_top_level_instance_is_a_consumer() {
     assert_eq!(consumer.slug.value(), "alice-sink");
     assert_eq!(consumer.acls[0].plane.value(), "publish");
     assert_eq!(consumer.bindings[0].chan, Some(RChanRef::Decl(ChanId(0))));
-    let path = consumer
-        .attrs
-        .iter()
-        .find(|(key, _)| key == "component_path")
-        .map(|(_, value)| value.value());
-    assert_eq!(path, Some(&RValue::Str("/lib/brenn_sink.wasm".to_string())));
+    assert!(
+        consumer
+            .attrs
+            .iter()
+            .all(|(key, _)| key != "component_path")
+    );
+    assert_eq!(consumer.class.package.as_deref(), Some("fixtures"));
 }
 
 #[test]
 fn a_dom_component_has_nowhere_to_render_at_top_level() {
     assert_eq!(
         refusal(concat!(
+            packaged!(),
             "component Panel {\n    abi = dom; requires = [];\n}\n",
+            packaged!(),
             "new alice_panel: Panel {}\n",
         )),
         "`Panel` is a dom component, which runs inside a surface; \
@@ -1675,26 +1683,32 @@ fn a_dom_component_has_nowhere_to_render_at_top_level() {
 }
 
 #[test]
-fn a_top_level_instance_needs_an_artifact_to_load() {
+fn a_consumer_stating_where_its_artifact_lives_names_the_legal_set() {
     assert_eq!(
         refusal(concat!(
+            packaged!(),
             "component Sink {\n    abi = processor; requires = [];\n}\n",
-            "new alice_sink: Sink {}\n",
+            packaged!(),
+            "new alice_sink: Sink {\n",
+            "    component_path = \"/lib/brenn_sink.wasm\";\n",
+            "}\n",
         )),
-        "a top-level instance is loaded from an artifact, and this instance of `Sink` \
-         states no `component_path`"
+        "`component_path` is not a key of a consumer; expected one of \
+         slug, grants, store_path, store_size_limit, activation_burst, \
+         activation_min_period_ms, config"
     );
 }
 
 #[test]
 fn a_literal_address_binds_where_no_channel_is_declared() {
     let config = resolved(concat!(
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [];\n",
         "    out events;\n",
         "}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    out events -> \"local:brenn/takeover\";\n",
         "}\n",
     ));
@@ -1781,12 +1795,13 @@ fn a_mount_reports_its_repo_and_its_tail_together() {
 fn a_binding_whose_tail_value_is_unresolvable_is_withheld() {
     let errors = refusals(concat!(
         "channel messages at \"brenn:alice-desk.in.messages\";\n",
+        packaged!(),
         "component Panel {\n",
         "    abi = processor; requires = [];\n",
         "    in messages;\n",
         "}\n",
+        packaged!(),
         "new p1: Panel {\n",
-        "    component_path = \"/lib/brenn_panel.wasm\";\n",
         "    grants = [];\n",
         "    in messages <- messages { amplification = nowhere; }\n",
         "}\n",
@@ -2512,16 +2527,17 @@ fn a_prefix_matcher_over_a_declared_address_is_a_family_and_stands() {
 fn every_carrier_of_a_literal_address_is_held_to_the_one_spelling_rule() {
     let messages = refusals(concat!(
         "channel alice_cmd at \"brenn:alice.cmd\";\n",
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [];\n",
         "    out events;\n",
         "}\n",
+        packaged!(),
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    acl subscribe [exact \"brenn:alice.cmd\"];\n",
         "}\n",
         "new alice_sink: Sink {\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    grants = [ports];\n",
         "    acl publish [exact \"brenn:alice.cmd\"];\n",
         "    out events -> \"brenn:alice.cmd\";\n",
@@ -2550,9 +2566,10 @@ fn a_matcher_in_an_attribute_value_is_outside_the_one_spelling_rule() {
 #[test]
 fn a_literal_address_no_channel_declares_is_how_a_local_plane_is_named() {
     let config = resolved(concat!(
+        packaged!(),
         "component Sink {\n    abi = processor; requires = [];\n    out events;\n}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
-        "    component_path = \"sink.wasm\";\n",
         "    out events -> \"local:brenn/takeover\";\n",
         "}\n",
     ));
@@ -2645,17 +2662,17 @@ fn a_consumer_whose_body_was_refused_is_not_in_the_model() {
     // reaches a later pass, so the two consumers sharing one identity is not
     // reported and the one real mistake is.
     let errors = refusals(concat!(
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [];\n",
         "}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
         "    slug = \"sink\";\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    store_path = nowhere;\n",
         "}\n",
         "new bob_sink: Sink {\n",
         "    slug = \"sink\";\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "}\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -2668,15 +2685,15 @@ fn a_consumer_with_a_refused_slug_value_does_not_fall_back_to_its_handle() {
     // is a different identity — here one another consumer already holds. The
     // refusal is the only diagnostic; no invented collision.
     let errors = refusals(concat!(
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [];\n",
         "}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    slug = nowhere;\n",
         "}\n",
         "new bob_sink: Sink {\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    slug = \"alice_sink\";\n",
         "}\n",
     ));
@@ -2931,11 +2948,12 @@ fn a_grant_to_a_withheld_entity_is_not_a_missing_principal() {
     // reporting its grants as naming nothing would fan one bad value out into
     // one false diagnostic per grant.
     let errors = refusals(concat!(
+        packaged!(),
         "component Sink {\n",
         "    abi = processor; requires = [];\n",
         "}\n",
+        packaged!(),
         "new alice_sink: Sink {\n",
-        "    component_path = \"/lib/brenn_sink.wasm\";\n",
         "    store_path = nowhere;\n",
         "}\n",
         "grant alice_sink subscribe prefix \"brenn:alice-desk.\";\n",
@@ -3340,9 +3358,10 @@ fn an_unresolvable_value_in_an_attachment_target_is_reported() {
 fn tool_doc(statements: &str) -> String {
     format!(
         concat!(
+            packaged!(),
             "component Sink {{\n    abi = processor; requires = []; optional = [tools];\n}}\n",
+            packaged!(),
             "new alice_sink: Sink {{\n",
-            "    component_path = \"sink.wasm\";\n",
             "    grants = [tools];\n",
             "{}",
             "}}\n",
@@ -3467,12 +3486,12 @@ fn spec_module(comment: &str) -> String {
 /// The root of a two-module tree: a channel, and an instance of the class the
 /// module declares.
 const SPEC_ROOT: &str = "\
-use spec::Sink;
+use @spec::Sink;
 
 channel messages at \"brenn:bench.status\" { push_depth = 4; retain_depth = 16; \
 standing_retain_depth = 64; }
 
-new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- messages; }
+new sink: Sink { in messages <- messages; }
 ";
 
 #[test]
@@ -3495,7 +3514,7 @@ fn a_comment_changes_the_source_hash() {
 #[test]
 fn a_class_carries_its_declaring_files_hash() {
     let module = spec_module("");
-    let config = resolved_tree(&[("", SPEC_ROOT), ("spec", &module)]);
+    let config = resolved_tree(&[("", SPEC_ROOT), ("@spec", &module)]);
     assert_eq!(
         config.consumers[0].class.spec_sha256,
         brenn_dsl::source_sha256(&module)
@@ -3522,13 +3541,13 @@ fn two_modules_holding_verbatim_copies_carry_one_hash() {
     // string twice would assert nothing — what is under test is that the hash
     // is of the text and not of the module it arrived under.
     let module = spec_module("");
-    let under_spec = resolved_tree(&[("", SPEC_ROOT), ("spec", &module)]);
+    let under_spec = resolved_tree(&[("", SPEC_ROOT), ("@spec", &module)]);
     let under_vendor = resolved_tree(&[
         (
             "",
-            &SPEC_ROOT.replace("use spec::Sink;", "use vendor::Sink;"),
+            &SPEC_ROOT.replace("use @spec::Sink;", "use @vendor::Sink;"),
         ),
-        ("vendor", &module),
+        ("@vendor", &module),
     ]);
     assert_eq!(
         under_spec.consumers[0].class.spec_sha256,
@@ -3548,16 +3567,16 @@ fn each_class_carries_its_own_modules_hash() {
     let sink = spec_module("");
     let drain = "component Drain { abi = processor; requires = []; in messages; }\n";
     let root = "\
-use sink::Sink;
-use drain::Drain;
+use @sink::Sink;
+use @drain::Drain;
 
 channel messages at \"brenn:bench.status\" { push_depth = 4; retain_depth = 16; \
 standing_retain_depth = 64; }
 
-new one: Sink { component_path = \"/lib/sink.wasm\"; in messages <- messages; }
-new two: Drain { component_path = \"/lib/drain.wasm\"; in messages <- messages; }
+new one: Sink { in messages <- messages; }
+new two: Drain { in messages <- messages; }
 ";
-    let config = resolved_tree(&[("", root), ("sink", &sink), ("drain", drain)]);
+    let config = resolved_tree(&[("", root), ("@sink", &sink), ("@drain", drain)]);
     for consumer in &config.consumers {
         let expected = match consumer.class.name.value().as_str() {
             "Sink" => brenn_dsl::source_sha256(&sink),
@@ -3584,7 +3603,7 @@ fn a_file_built_without_a_source_hash_is_refused_at_class_resolution() {
     module.source_sha256 = String::new();
     let root = brenn_dsl::parse_str(SPEC_ROOT, "main.brenn").expect("the root parses");
     let _ = brenn_dsl::resolve_files(
-        vec![(String::new(), root), ("spec".to_string(), module)],
+        vec![(String::new(), root), ("@spec".to_string(), module)],
         "",
     );
 }
@@ -3612,8 +3631,8 @@ component Local {
 assembly Bench(slug: String) {
     channel feed at f\"brenn:{slug}.feed\" { push_depth = 4; retain_depth = 16; \
 standing_retain_depth = 64; }
-    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- feed; }
-    new local: Local { component_path = \"/lib/local.wasm\"; in messages <- feed; }
+    new sink: Sink { in messages <- feed; }
+    new local: Local { in messages <- feed; }
 }
 ";
 
@@ -3677,7 +3696,7 @@ use @spec::Sink;
 assembly Pair(slug: String) {
     channel feed at f\"brenn:{slug}.feed\" { push_depth = 4; retain_depth = 16; \
 standing_retain_depth = 64; }
-    new sink: Sink { component_path = \"/lib/sink.wasm\"; in messages <- feed; }
+    new sink: Sink { in messages <- feed; }
 }
 ";
     let config = resolved_tree(&[
@@ -3709,8 +3728,8 @@ use @pair::*;
 channel feed at \"brenn:bench.feed\" { push_depth = 4; retain_depth = 16; \
 standing_retain_depth = 64; }
 
-new one: Sink { component_path = \"/lib/sink.wasm\"; in messages <- feed; }
-new two: Drain { component_path = \"/lib/drain.wasm\"; in messages <- feed; }
+new one: Sink { in messages <- feed; }
+new two: Drain { in messages <- feed; }
 ";
     let config = resolved_tree(&[("", root), ("@pair", pair)]);
     assert_eq!(config.consumers.len(), 2);
@@ -3722,6 +3741,96 @@ new two: Drain { component_path = \"/lib/drain.wasm\"; in messages <- feed; }
             consumer.slug.value()
         );
     }
+}
+
+// ── the package a class comes from ───────────────────────────────────────────
+
+/// What a top-level instance of a class the configuration tree declares is
+/// refused with.
+const NOT_PACKAGED: &str = "a top-level instance is loaded from an installed component package, \
+     and the class `Sink` is declared in the configuration tree, not in a packaged module — \
+     declare it in a module imported as `use @<name>::*;`";
+
+#[test]
+fn a_top_level_instance_of_a_tree_declared_class_is_refused() {
+    // The host resolves a component's package by the class's module name, so a
+    // class the deployment tree declares names no package and nothing can be
+    // loaded for it.
+    assert_eq!(
+        refusal(concat!(
+            "component Sink { abi = processor; requires = []; in messages; }\n",
+            "new sink: Sink { }\n",
+        )),
+        NOT_PACKAGED
+    );
+}
+
+#[test]
+fn a_class_a_tree_module_declares_is_no_more_packaged_than_the_root() {
+    // One indirection is still the deployment's own tree: `use` of a tree
+    // module is not an import of a package.
+    assert_eq!(
+        refusal_tree(&[
+            ("", "use wiring::Sink;\n\nnew sink: Sink { }\n"),
+            ("wiring", PKG_SPEC),
+        ]),
+        NOT_PACKAGED
+    );
+}
+
+#[test]
+fn a_surface_placement_of_a_tree_declared_class_is_untouched() {
+    // A surface-placed component is served by kind and resolves against no
+    // package, so the rule is a top-level one and says nothing here.
+    let config = resolved(concat!(
+        "component Panel { abi = dom; requires = []; in messages; }\n",
+        "surface desk {\n    grants = [];\n    \
+         new p1: Panel { grants = []; in messages <- \"local:desk.m\"; }\n}\n",
+    ));
+    assert_eq!(config.surfaces[0].components[0].class.package, None);
+}
+
+#[test]
+fn a_consumers_package_is_the_module_that_declares_its_class() {
+    let config = resolved_tree(&[
+        (
+            "",
+            "use @spec::*;\n\nchannel feed at \"brenn:bench.feed\" { push_depth = 4; \
+             retain_depth = 16; standing_retain_depth = 64; }\n\
+             new sink: Sink { in messages <- feed; }\n",
+        ),
+        ("@spec", PKG_SPEC),
+    ]);
+    assert_eq!(
+        config.consumers[0].class.package.as_deref(),
+        Some("spec"),
+        "the package is the module name, sigil stripped"
+    );
+}
+
+#[test]
+fn a_package_is_the_declaring_module_not_the_one_that_instantiates() {
+    // An assembly in one package over a class another package declares: the
+    // artifact ships with the class, so the package the host resolves is the
+    // declaring one.
+    let library = "\
+use @spec::Sink;
+
+assembly Pair(slug: String) {
+    channel feed at f\"brenn:{slug}.feed\" { push_depth = 4; retain_depth = 16; \
+standing_retain_depth = 64; }
+    new sink: Sink { in messages <- feed; }
+}
+";
+    let config = resolved_tree(&[
+        (
+            "",
+            "use @library::Pair;\n\nnew alice: Pair(slug = \"alice\");\n",
+        ),
+        ("@library", library),
+        ("@spec", PKG_SPEC),
+    ]);
+    assert_eq!(config.consumers[0].class.package.as_deref(), Some("spec"));
 }
 
 /// The one text every effectful declaration in a packaged module is refused
@@ -3750,7 +3859,7 @@ fn a_packaged_module_instantiates_nothing() {
         "channel feed at \"brenn:bench.feed\" { push_depth = 4; retain_depth = 16; \
          standing_retain_depth = 64; }\n",
         "component Sink { abi = processor; requires = []; in messages; }\n\
-         new sink: Sink { component_path = \"/lib/sink.wasm\"; }\n",
+         new sink: Sink { }\n",
         "agent Assistant() { name = \"Assistant\"; }\n",
         "surface alice_desk { grants = [subscribe]; }\n",
         "remote pod { token_file = \"/etc/brenn/pod.token\"; grants = [publish]; }\n",

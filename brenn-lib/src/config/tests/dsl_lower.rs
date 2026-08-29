@@ -38,7 +38,7 @@ use crate::config::server::{DatabaseConfig, ServerConfig};
 use crate::config::surface_description::SurfaceDescriptionConfig;
 use crate::config::wasm::WasmConfig;
 use crate::config::watchdog::WatchdogConfig;
-use crate::config::{BrennConfig, config_from_dsl, lower_document, sole_refusal};
+use crate::config::{BrennConfig, PACKAGED_MODULE, config_from_dsl, lower_document, sole_refusal};
 use crate::messaging::AttachGrant;
 use crate::messaging::ComponentGrant;
 use crate::messaging::Urgency;
@@ -69,11 +69,11 @@ use brenn_envelope::grants::AppCapability;
 /// Every consumer's `spec_sha256` is checked against the document's own hash
 /// first and then cleared, so the structural comparison below is written
 /// against `expected` literals that state nothing about content hashes. A
-/// one-file document declares its classes in itself, so the document's hash is
-/// what every class in it carries.
+/// document that fences no packaged module declares its classes in itself, so
+/// the document's own hash is what every class in it carries.
 fn assert_lowers(document: &str, expected: BrennConfig) {
     let mut actual = config_from_dsl(document);
-    let document_hash = brenn_dsl::source_sha256(document);
+    let document_hash = brenn_dsl::source_sha256(&crate::config::declaring_text(document));
     for consumer in &mut actual.wasm_consumers {
         assert_eq!(
             consumer.spec_sha256, document_hash,
@@ -199,8 +199,11 @@ fn bearer_token_endpoint(slug: &str) -> WebhookEndpointConfigRaw {
     }
 }
 
-fn consumer(slug: &str, component_path: &str) -> WasmConsumerConfigRaw {
-    WasmConsumerConfigRaw::minimal(slug, PathBuf::from(component_path), &[])
+/// A raw consumer expectation. Every consumer fixture here declares its class
+/// in the fenced packaged half, so the package the lowering carries is that
+/// module's name for all of them.
+fn consumer(slug: &str) -> WasmConsumerConfigRaw {
+    WasmConsumerConfigRaw::minimal(slug, PACKAGED_MODULE, &[])
 }
 
 fn attrless_subscription(port: &str, channel: &str) -> WasmConsumerSubscriptionRaw {
@@ -1442,9 +1445,10 @@ fn an_mqtt_sink_override_is_lowered_per_budgeted_entry() {
             "channel feed at \"brenn:feed\" {{\n",
             "    push_depth = 1; retain_depth = 1; standing_retain_depth = 1;\n",
             "}}\n",
+            "// ── packaged ──\n",
             "component Sink {{\n{}\n    in feed;\n    out echo;\n}}\n",
+            "// ── packaged ──\n",
             "new sink: Sink {{\n",
-            "    component_path = \"/lib/sink.wasm\";\n",
             "    grants = [ports, mqtt];\n",
             "    acl subscribe [ exact feed ];\n",
             "    in feed <- feed {{ push_depth = 1; retain_depth = 1; }}\n",
@@ -2300,15 +2304,16 @@ channel cmd at "brenn:alice.cmd" {
     standing_retain_depth = 64;
 }
 
+// ── packaged ──
 component Router {
     "#,
         processor_any!(),
         r#"
     in inbound;
 }
+// ── packaged ──
 
 new router: Router {
-    component_path = "/lib/brenn_router.wasm";
     grants = [];
     store_path = exact "alice.";
 
@@ -2319,7 +2324,7 @@ new router: Router {
     assert_eq!(error.message, "`store_path`: a matcher is not a value here");
     assert_eq!(
         error.line_col(),
-        Some((16, 18)),
+        Some((18, 18)),
         "the span is the matcher's own token: {}",
         error.render()
     );
@@ -2572,6 +2577,7 @@ webhook push_alice {
     token phone { secret_file = "/home/alice/.secrets/push-alice.token"; }
 }
 
+// ── packaged ──
 component Router {
     "#,
             processor_any!(),
@@ -2585,9 +2591,9 @@ component Router {
     io acks;
     io tick;
 }
+// ── packaged ──
 
 new router: Router {
-    component_path = "/lib/brenn_router.wasm";
     slug = "router";
     grants = [ports, store, log, config, mqtt];
     store_path = "/state/router.db";
@@ -2799,7 +2805,7 @@ new router: Router {
                 ])),
                 activation_burst: Some(4),
                 activation_min_period_ms: Some(250),
-                ..consumer("router", "/lib/brenn_router.wasm")
+                ..consumer("router")
             }],
             ..Default::default()
         },
@@ -2817,15 +2823,16 @@ channel utterance at "ephemeral:alice-pod.utterance" {
     retain_depth = 16;
 }
 
+// ── packaged ──
 component Logger {
     "#,
         processor_any!(),
         r#"
     in heard;
 }
+// ── packaged ──
 
 new logger: Logger {
-    component_path = "/lib/brenn_logger.wasm";
     grants = [log];
 
     in heard <- utterance;
@@ -2835,7 +2842,7 @@ new logger: Logger {
     let config = config_from_dsl(document);
     assert_eq!(
         config.wasm_consumers[0].spec_sha256,
-        brenn_dsl::source_sha256(document)
+        brenn_dsl::source_sha256(&crate::config::declaring_text(document))
     );
     // A comment-only edit to the declaring file is a different hash: the
     // binding is byte identity, not semantic equality.
@@ -2908,15 +2915,16 @@ channel utterance at "ephemeral:alice-pod.utterance" {
     retain_depth = 16;
 }
 
+// ── packaged ──
 component Logger {
     "#,
             processor_any!(),
             r#"
     in heard;
 }
+// ── packaged ──
 
 new logger: Logger {
-    component_path = "/lib/brenn_logger.wasm";
     grants = [log];
 
     in heard <- utterance;
@@ -2938,7 +2946,7 @@ new logger: Logger {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.utterance".to_string(),
                 )],
-                ..consumer("logger", "/lib/brenn_logger.wasm")
+                ..consumer("logger")
             }],
             ..Default::default()
         },
@@ -2964,6 +2972,7 @@ channel notes at "ephemeral:alice-pod.notes" {
     retain_depth = 16;
 }
 
+// ── packaged ──
 component Reserved {
     "#,
             processor_any!(),
@@ -2971,9 +2980,9 @@ component Reserved {
     in in;
     out out;
 }
+// ── packaged ──
 
 new reserved: Reserved {
-    component_path = "/lib/brenn_reserved.wasm";
     grants = [log, ports];
 
     in in <- utterance;
@@ -3010,7 +3019,7 @@ new reserved: Reserved {
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.notes".to_string(),
                 )],
-                ..consumer("reserved", "/lib/brenn_reserved.wasm")
+                ..consumer("reserved")
             }],
             ..Default::default()
         },
@@ -3029,15 +3038,16 @@ fn a_consumers_config_map_carries_typed_scalars() {
     assert_lowers(
         concat!(
             r#"
+// ── packaged ──
 component Sink {
     "#,
             processor_any!(),
             r#"
     io tick;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [ports, config];
     config = {
         mode = "fast",
@@ -3058,7 +3068,7 @@ new sink: Sink {
                     ("window_secs".to_string(), toml::Value::Integer(30)),
                     ("strict".to_string(), toml::Value::Boolean(true)),
                 ])),
-                ..consumer("sink", "/lib/brenn_sink.wasm")
+                ..consumer("sink")
             }],
             ..Default::default()
         },
@@ -3078,15 +3088,16 @@ channel acks at "ephemeral:alice-pod.acks" {
     retain_depth = 4;
 }
 
+// ── packaged ──
 component Sink {
     "#,
             processor_any!(),
             r#"
     io acks;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [ports];
 
     io acks <-> acks {
@@ -3127,7 +3138,7 @@ new sink: Sink {
                     "alice-pod.acks".to_string(),
                 )],
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact("alice-pod.acks".to_string())],
-                ..consumer("sink", "/lib/brenn_sink.wasm")
+                ..consumer("sink")
             }],
             ..Default::default()
         },
@@ -3144,15 +3155,16 @@ channel acks at "ephemeral:alice-pod.acks" {
     retain_depth = 4;
 }
 
+// ── packaged ──
 component Sink {
     "#,
             processor_any!(),
             r#"
     io acks;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [ports];
 
     io acks <-> acks;
@@ -3179,7 +3191,7 @@ new sink: Sink {
                     "alice-pod.acks".to_string(),
                 )],
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact("alice-pod.acks".to_string())],
-                ..consumer("sink", "/lib/brenn_sink.wasm")
+                ..consumer("sink")
             }],
             ..Default::default()
         },
@@ -3207,29 +3219,31 @@ channel presence at "ephemeral:alice-desk.presence" {
     retain_depth = 16;
 }
 
+// ── packaged ──
 component Router {
     "#,
             processor_any!(),
             r#"
     in inbound;
 }
+// ── packaged ──
 
+// ── packaged ──
 component Sink {
     "#,
             processor_any!(),
             r#"
     in feed;
 }
+// ── packaged ──
 
 new router: Router {
-    component_path = "/lib/brenn_router.wasm";
     grants = [log];
 
     in inbound <- alerts { push_depth = 4; retain_depth = 8; }
 }
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [store, config];
     store_path = "/state/sink.db";
 
@@ -3261,7 +3275,7 @@ new sink: Sink {
                         ..attrless_subscription("inbound", "brenn:alice-alerts")
                     }],
                     subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
-                    ..consumer("router", "/lib/brenn_router.wasm")
+                    ..consumer("router")
                 },
                 WasmConsumerConfigRaw {
                     grants: vec![ComponentGrant::Store, ComponentGrant::Config],
@@ -3274,7 +3288,7 @@ new sink: Sink {
                     ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                         "alice-desk.presence".to_string(),
                     )],
-                    ..consumer("sink", "/lib/brenn_sink.wasm")
+                    ..consumer("sink")
                 },
             ],
             ..Default::default()
@@ -3293,15 +3307,16 @@ fn a_consumers_config_map_transcribes_floats_lists_and_nested_tables() {
     assert_lowers(
         concat!(
             r#"
+// ── packaged ──
 component Sink {
     "#,
             processor_any!(),
             r#"
     io tick;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [ports, config];
     config = {
         rate = 1.5,
@@ -3334,7 +3349,7 @@ new sink: Sink {
                         ])),
                     ),
                 ])),
-                ..consumer("sink", "/lib/brenn_sink.wasm")
+                ..consumer("sink")
             }],
             ..Default::default()
         },
@@ -3346,15 +3361,16 @@ new sink: Sink {
 fn a_matcher_nested_in_a_config_list_is_refused_at_the_inner_token() {
     let refusal = refusal(concat!(
         r#"
+// ── packaged ──
 component Sink {
     "#,
         processor_any!(),
         r#"
     io tick;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [ports, config];
     config = { tags = ["fast", exact "alice."] };
 
@@ -3376,15 +3392,16 @@ new sink: Sink {
 fn a_non_number_in_a_budget_position_is_refused() {
     let refusal = refusal(concat!(
         r#"
+// ── packaged ──
 component Sink {
     "#,
         processor_any!(),
         r#"
     io tick;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [ports, log];
 
     io tick { push_depth = 1; retain_depth = 2; amplification = "fast"; }
@@ -3404,15 +3421,16 @@ new sink: Sink {
 fn a_matcher_in_a_consumers_config_map_is_refused() {
     let refusal = refusal(concat!(
         r#"
+// ── packaged ──
 component Sink {
     "#,
         processor_any!(),
         r#"
     io tick;
 }
+// ── packaged ──
 
 new sink: Sink {
-    component_path = "/lib/brenn_sink.wasm";
     grants = [ports, config];
     config = { mode = exact "alice." };
 
@@ -4382,7 +4400,7 @@ webhook alice_inbox {
     key rotated { secret_file = "/home/alice/.secrets/inbox-rotated.key"; }
 
     replay_protection {
-        component_path = "/opt/brenn/lib/replay.wasm";
+        component = "replay-generic";
         store_path = "/var/lib/brenn/alice-inbox-replay.sqlite";
         store_size_limit = "128MiB";
         config = { window_secs = 300, strict = true };
@@ -4408,7 +4426,7 @@ webhook alice_inbox {
                 ],
                 tokens: vec![],
                 replay_protection: Some(ReplayProtectionConfigRaw {
-                    component_path: PathBuf::from("/opt/brenn/lib/replay.wasm"),
+                    component: "replay-generic".to_string(),
                     store_path: PathBuf::from("/var/lib/brenn/alice-inbox-replay.sqlite"),
                     store_size_limit: Some("128MiB".to_string()),
                     config: Some(toml::Table::from_iter([
@@ -5001,9 +5019,10 @@ new alice: Assistant();
 #[test]
 fn a_consumers_tool_statements_lower_to_raw_grants() {
     let config = config_from_dsl(concat!(
+        "// ── packaged ──\n",
         "component Sink {\n    abi = processor; requires = []; optional = [tools];\n}\n",
+        "// ── packaged ──\n",
         "new alice_sink: Sink {\n",
-        "    component_path = \"sink.wasm\";\n",
         "    grants = [tools];\n",
         "    tool git-repo-pull {\n",
         "        allow { repo = \"ws\"; }\n",
@@ -5038,8 +5057,12 @@ fn a_consumers_tool_statements_lower_to_raw_grants() {
 fn a_link_lowers_to_its_endpoint_set() {
     let document = format!(
         concat!(
+            "// ── packaged ──\n",
             "component Feeder {{\n{}\n    out events;\n}}\n",
+            "// ── packaged ──\n",
+            "// ── packaged ──\n",
             "component Panel {{\n{}\n    in feed;\n    io chatter;\n}}\n",
+            "// ── packaged ──\n",
             "/// Frames the feeder hands the panel.\n",
             // The description an operator reads keeps the author's shape:
             // a deeper indent inside the doc block survives lowering.
@@ -5056,7 +5079,6 @@ fn a_link_lowers_to_its_endpoint_set() {
             "    }}\n",
             "}}\n",
             "new feeder: Feeder {{\n",
-            "    component_path = \"/lib/feeder.wasm\";\n",
             "    grants = [ports];\n",
             "    out events -> relay;\n",
             "}}\n",

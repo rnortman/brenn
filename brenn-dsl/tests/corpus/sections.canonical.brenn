@@ -20,7 +20,7 @@ webhook push_alice {
     secret_file = f"{secrets}/push-alice.secret";
   }
   replay_protection {
-    component_path = "/home/alice/lib/brenn_replay_generic.wasm";
+    component = "replay-generic";
     store_path = "/home/alice/state/replay-push-alice.db";
     store_size_limit = "128MiB";
   }
@@ -88,7 +88,6 @@ agent PersonalAssistant(slug: String) {
 // which invocations it reaches, and the bucket throttles what is left.
 new pull_bot: Syncer {
   slug = "pull-bot";
-  component_path = "/home/alice/lib/brenn_syncer.wasm";
   grants = [ports, tools]
 
   ;

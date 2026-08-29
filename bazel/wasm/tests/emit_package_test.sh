@@ -6,7 +6,8 @@
 # artifacts — the hashes it writes are what the host will re-compute, so ground
 # truth is `sha256sum` and nothing else — and then over the ways a package can
 # be wrong: a world tag the artifact's own imports contradict, a world nobody
-# links, and a spec present or absent against the world's rule about it.
+# links, a spec present or absent against the world's rule about it, and a spec
+# authored or packaged under a name that is not the package's own.
 set -uo pipefail
 
 emit="$1"
@@ -32,7 +33,11 @@ field() {
     record_field "$1" "$2"
 }
 
-spec="$tmp/spec.brenn"
+# The authored file carries the package's name, because that is what the
+# emitter asserts: the release stages this same file into the module root as
+# `<name>.brenn`, and one component cannot be imported under two names.
+mkdir -p "$tmp/src" "$tmp/pkg"
+spec="$tmp/src/demo.brenn"
 cat > "$spec" <<'EOF'
 component Demo {
   abi = processor;
@@ -41,21 +46,21 @@ component Demo {
 EOF
 
 # --- A processor package: every field, against sha256sum ground truth. ---
-record="$tmp/proc.package.json"
-packaged_spec="$tmp/brenn_demo.spec.brenn"
-if ! "$emit" brenn_demo brenn:processor "$processor_wasm" "$record" "$spec" "$packaged_spec" \
+record="$tmp/pkg/package.json"
+packaged_spec="$tmp/pkg/demo.brenn"
+if ! "$emit" demo brenn:processor "$processor_wasm" "$record" "$spec" "$packaged_spec" \
         > "$tmp/proc.log" 2>&1; then
     fail "a processor package should be emitted: $(cat "$tmp/proc.log")"
 else
     artifact_sha="$(sha256sum "$processor_wasm" | awk '{print $1}')"
     spec_sha="$(sha256sum "$spec" | awk '{print $1}')"
     for pair in \
-        "v:1" \
-        "name:brenn_demo" \
+        "v:2" \
+        "name:demo" \
         "world:brenn:processor" \
         "artifact:$(basename "$processor_wasm")" \
         "artifact_sha256:$artifact_sha" \
-        "spec:brenn_demo.spec.brenn" \
+        "spec:demo.brenn" \
         "spec_sha256:$spec_sha"; do
         key="${pair%%:*}"
         want="${pair#*:}"
@@ -78,8 +83,8 @@ else
 fi
 
 # --- A replay package: artifact only, and no spec fields at all. ---
-replay_record="$tmp/replay.package.json"
-if ! "$emit" brenn_replay brenn:replay "$replay_wasm" "$replay_record" \
+replay_record="$tmp/replay-package.json"
+if ! "$emit" replay brenn:replay "$replay_wasm" "$replay_record" \
         > "$tmp/replay.log" 2>&1; then
     fail "a replay package should be emitted: $(cat "$tmp/replay.log")"
 else
@@ -109,27 +114,40 @@ reject() {
 # can be stapled to it. This is the failure a component moved between worlds
 # would otherwise carry silently into a release.
 reject "a stale world tag" "imports from" \
-    "$emit" brenn_demo brenn:replay "$processor_wasm" "$tmp/stale.package.json"
+    "$emit" demo brenn:replay "$processor_wasm" "$tmp/stale.json"
 
 reject "a world nobody links" "not one this host" \
-    "$emit" brenn_demo brenn:invented "$processor_wasm" "$tmp/invented.package.json" \
-    "$spec" "$tmp/invented.spec.brenn"
+    "$emit" demo brenn:invented "$processor_wasm" "$tmp/invented.json" \
+    "$spec" "$tmp/invented/demo.brenn"
 
 # Spec-iff-processor, both directions.
 reject "a processor package with no spec" "must package the specification" \
-    "$emit" brenn_demo brenn:processor "$processor_wasm" "$tmp/nospec.package.json"
+    "$emit" demo brenn:processor "$processor_wasm" "$tmp/nospec.json"
 
 reject "a replay package carrying a spec" "no component class" \
-    "$emit" brenn_replay brenn:replay "$replay_wasm" "$tmp/replayspec.package.json" \
-    "$spec" "$tmp/replayspec.spec.brenn"
+    "$emit" replay brenn:replay "$replay_wasm" "$tmp/replayspec.json" \
+    "$spec" "$tmp/replayspec/replay.brenn"
 
 reject "an artifact that is not there" "not a readable file" \
-    "$emit" brenn_demo brenn:processor "$tmp/absent.wasm" "$tmp/absent.package.json" \
-    "$spec" "$tmp/absent.spec.brenn"
+    "$emit" demo brenn:processor "$tmp/absent.wasm" "$tmp/absent.json" \
+    "$spec" "$tmp/absent/demo.brenn"
 
 reject "a spec that is not there" "not a readable file" \
-    "$emit" brenn_demo brenn:processor "$processor_wasm" "$tmp/nofile.package.json" \
-    "$tmp/absent.brenn" "$tmp/nofile.spec.brenn"
+    "$emit" demo brenn:processor "$processor_wasm" "$tmp/nofile.json" \
+    "$tmp/src/demo.brenn.gone/demo.brenn" "$tmp/nofile/demo.brenn"
+
+# The package's name states the spec's, in both copies. An authored file under
+# another name would ship the module root a `<other>.brenn` the package's own
+# `<name>.brenn` is never compared against; a packaged copy under another name
+# is one the host does not open.
+printf 'component Other {}\n' > "$tmp/src/other.brenn"
+reject "a spec authored under another name" "a package's spec is its own name" \
+    "$emit" demo brenn:processor "$processor_wasm" "$tmp/mismatch.json" \
+    "$tmp/src/other.brenn" "$tmp/mismatch/demo.brenn"
+
+reject "a packaged copy written under another name" "reads demo.brenn and no other file" \
+    "$emit" demo brenn:processor "$processor_wasm" "$tmp/misnamed.json" \
+    "$spec" "$tmp/misnamed/elsewhere.brenn"
 
 # An import line the scrape cannot read fully is the failure that would
 # otherwise be silent: the world cross-check finds nothing to contradict and
@@ -156,18 +174,20 @@ world processor {
   import an-inline-interface;
 }')"
 WASM_TOOLS="$unreadable_import" reject "an import the scrape cannot read" "fully-qualified" \
-    "$emit" brenn_demo brenn:processor "$processor_wasm" "$tmp/unreadable.package.json" \
-    "$spec" "$tmp/unreadable.spec.brenn"
+    "$emit" demo brenn:processor "$processor_wasm" "$tmp/unreadable.json" \
+    "$spec" "$tmp/unreadable/demo.brenn"
 
 # The escaping, through the emitter. Most values are toolchain-controlled
 # basenames, but the record is an external contract and a name that broke the
 # JSON literal would first be noticed by `serde_json` on the deploy host. The
 # order of the two substitutions is the easy thing to get wrong — escaping the
 # quote before the backslash doubles the escape it just wrote — so the case
-# carries both characters and pins the exact bytes the record must hold.
-escaped_record="$tmp/escaped.package.json"
-if ! "$emit" 'brenn"de\mo' brenn:processor "$processor_wasm" "$escaped_record" \
-        "$spec" "$tmp/escaped.spec.brenn" > "$tmp/escaped.log" 2>&1; then
+# carries both characters and pins the exact bytes the record must hold. A
+# replay package, so the spec-name assertion has nothing to say about a name no
+# author would write.
+escaped_record="$tmp/escaped.json"
+if ! "$emit" 'brenn"de\mo' brenn:replay "$replay_wasm" "$escaped_record" \
+        > "$tmp/escaped.log" 2>&1; then
     fail "a name holding JSON metacharacters should still be emitted: $(cat "$tmp/escaped.log")"
 elif ! grep -qF '  "name": "brenn\"de\\mo",' "$escaped_record"; then
     fail "the name is not escaped as a JSON string literal: $(grep name "$escaped_record")"

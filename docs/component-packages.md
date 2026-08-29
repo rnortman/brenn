@@ -30,72 +30,85 @@ The package closes that window by making the author's specification travel with
 the artifact, and by making the host check that the specification the
 configuration used is byte-for-byte the one the component was built with.
 
-## The three files
+## The package directory
 
-Flat, beside each other, sharing the artifact's stem:
+A package is a directory under the host's components root, named by the
+**package name**:
 
 ```
-brenn_processor_demo.wasm            the artifact
-brenn_processor_demo.spec.brenn      the author's specification, verbatim
-brenn_processor_demo.package.json    the binding record
+processor-demo/
+  package.json               the binding record
+  processor-demo.brenn       the author's specification, verbatim
+  brenn_processor_demo.wasm  the artifact, under its built basename
 ```
 
-The configuration names only the `.wasm`, as `component_path` on the consumer
-instance. The siblings are derived from it by extension, so a package needs no
-separate declaration anywhere in the configuration.
+The package name is the whole reference. A configuration states no location at
+all: it imports the author's vocabulary as `use @processor-demo::*;`, and the
+host resolves `<components root>/processor-demo/` from that same name when it
+loads an instance of a class the module declares. The components root is named
+once on the command line, `serve --components <dir>`.
 
-The packaged specification is renamed to the artifact's stem rather than keeping
-the authored filename (`processor-demo.brenn`), so that every file in the
-package follows from the artifact's basename with no lookup. The rename costs
-nothing: the binding is over bytes, and the bytes are unchanged.
+So the package name, the module name and the directory's basename are one name,
+and the packaged specification carries it too. Only the artifact keeps its own
+built basename — the record names it, and renaming it would buy nothing.
 
-That file is the component's **packaged module**, not merely its spec. It is the
-authored file entire, so besides the component class it may carry the
+`<name>.brenn` is the component's **packaged module**, not merely its spec. It
+is the authored file entire, so besides the component class it may carry the
 assemblies and constants its author ships as the vocabulary for using the
-component — everything a deployment imports when it writes `use @<kind>::*;`.
+component — everything a deployment imports when it writes `use @<name>::*;`.
 What it may never carry is instantiation; the discipline is in `config-dsl.md`,
-*Packaged-module imports*. The `spec`/`spec_sha256` record fields and the
-`.spec.brenn` extension keep their names: they are v1 contract vocabulary, and
-what they denote — the authored source file and its hash — has not changed.
+*Packaged-module imports*.
 
-A **replay-world** component packages as two files, artifact and record, with no
-specification. It has no component class, no ports and no grants; a
-specification for one would be vocabulary with nothing to say. The record's
-`world` field is what keeps the two shapes from being confused.
+A **replay-world** component packages as a directory holding two files, artifact
+and record, with no specification. It has no component class, no ports and no
+grants; a specification for one would be vocabulary with nothing to say. The
+record's `world` field is what keeps the two shapes from being confused. Its
+name is therefore not anchored by an import — a replay component ships no
+module — so a webhook endpoint states the package outright, as
+`component = "replay-generic";` on its `replay_protection` block, and a typo
+surfaces at boot rather than at compile.
 
-## The record, v1
+## The record, v2
+
+The record's basename is fixed: `package.json` in the package directory. There
+is no shared stem left for it to derive one from.
 
 ```json
 {
-  "v": 1,
-  "name": "brenn_processor_demo",
+  "v": 2,
+  "name": "processor-demo",
   "world": "brenn:processor",
   "artifact": "brenn_processor_demo.wasm",
   "artifact_sha256": "<64 lowercase hex>",
-  "spec": "brenn_processor_demo.spec.brenn",
+  "spec": "processor-demo.brenn",
   "spec_sha256": "<64 lowercase hex>"
 }
 ```
 
 | field | meaning |
 |---|---|
-| `v` | Record schema version. This host reads `1` and refuses anything else. |
-| `name` | The component's name — the artifact's stem. |
+| `v` | Record schema version. This host reads `2` and refuses anything else. |
+| `name` | The package's name — the directory's basename, and the module name a configuration imports. |
 | `world` | The WIT package the artifact targets: `brenn:processor` or `brenn:replay`. |
-| `artifact` | The artifact's basename, beside the record. |
+| `artifact` | The artifact's basename within the package directory. No path separator; must end `.wasm`. |
 | `artifact_sha256` | SHA-256 of the artifact's bytes, lowercase hex. |
-| `spec` | The packaged specification's basename. Present **iff** `world` is `brenn:processor`. |
+| `spec` | The packaged specification's basename, always `<name>.brenn`. Present **iff** `world` is `brenn:processor`. |
 | `spec_sha256` | SHA-256 of the packaged specification's bytes. Present iff `spec` is. |
+
+**v1 → v2 is a breaking change.** v1 was a flat trio of sidecar files sharing
+the artifact's stem, and its `name` was that stem; v2 is a directory and its
+`name` is the package. A v2 host refuses a v1 record outright, naming the
+version skew. There is no shim and no dual-read window — see the stance below.
 
 Spec-fields-iff-processor is enforced in both directions, at the emitter and at
 the reader: a replay record carrying a specification and a processor record
 carrying none both describe a component shape that does not exist.
 
-The three names — `name`, `artifact`, `spec` — are checked against the files
-they sit beside, not trusted. The host derives all of them from the artifact's
-path, so a record naming another component's artifact, or a specification that
-is not the one beside it, is a package that was assembled wrong and is refused
-at boot. State them as the emitter does; a field the reader ignored would be a
+The three names — `name`, `artifact`, `spec` — are checked against the layout,
+not trusted: `name` must equal the directory's basename, `spec` must equal
+`<name>.brenn`, and `artifact` must be a plain `.wasm` basename inside the
+directory. A record naming another package, or a specification that is not the
+one beside it, is a package that was assembled wrong and is refused at boot. State them as the emitter does; a field the reader ignored would be a
 guarantee this contract does not actually carry.
 
 **There is no `imports` field.** The host reflects a component's imports from
@@ -119,9 +132,20 @@ were built together.
 
 Immediately before loading a component, per instance:
 
-1. Read `<stem>.package.json`. Missing, unreadable, unparseable, wrong `v`,
-   unknown field, unknown world, spec fields inconsistent with the world, or a
-   `name`/`artifact`/`spec` that is not the file it sits beside — each is a
+0. Resolve `<components root>/<package name>/`. The name must be one plain
+   directory name that does not begin with `.`: an empty name, a path
+   separator, `.` or `..` names a location rather than a package, and a
+   dot-named directory is one no release installs and one a glob-driven
+   install sweep would leave behind — all refused before the name resolves to
+   anything. A name with no directory there
+   is a panic naming the resolved path and the instantiation. A configuration
+   may import any module the module root ships, but only a component the
+   release ships as a backend package is top-level loadable — a surface kind
+   ships its module and no package, and this is where instantiating one lands.
+   A host started without `--components` panics naming the flag.
+1. Read `package.json` in that directory. Missing, unreadable, unparseable,
+   wrong `v`, unknown field, unknown world, spec fields inconsistent with the
+   world, or a `name`/`artifact`/`spec` the layout contradicts — each is a
    panic naming the path and the remedy.
 2. Assert the record's `world` matches the way this instance is being loaded: a
    top-level consumer demands `brenn:processor`, a webhook replay endpoint
@@ -147,11 +171,9 @@ Two consequences worth stating plainly:
   any backend component a configuration loads. A component without a record does
   not load.
 - **A class declared inline in a deployment's configuration cannot drive a
-  top-level consumer**, unless the file declaring it happens to be byte-identical
-  to the packaged specification — that is, unless it *is* the author's file,
-  standing alone. A file holding a class plus other items, or two classes, can
-  match no package. This is the ownership rule made mechanical at boot rather
-  than only at a deployment's CI.
+  top-level consumer.** That is now a compile refusal rather than a boot one:
+  a top-level instance's class must come from a packaged module, because the
+  module's name is the only thing the host has to resolve a package with.
 
 Verification reads the artifact and the loader then reads it again, so there is
 a window in which the bytes could change. Accepted deliberately: this binding is
@@ -162,40 +184,39 @@ operator-installed beside the operator's configuration, and the trust table in
 
 ## Authoring an out-of-tree component
 
-To be loadable, ship the three files above into the host's components directory,
-with the record's hashes matching the bytes beside it. Concretely:
+To be loadable, ship a package directory as above into the host's components
+root, with the record's hashes matching the bytes beside it. Concretely:
 
-1. Build the component and hash it: `sha256sum <artifact>`.
-2. Copy your specification next to the artifact as `<stem>.spec.brenn` and hash
-   that too. Processor world only.
-3. Write `<stem>.package.json` in the shape above.
-4. Give the deployment the same specification bytes to copy into its own
-   configuration tree, and have it `use` them there. If the two copies differ by
+1. Pick the package name. It is the name a deployment writes in
+   `use @<name>::*;`, the directory's basename, and the packaged
+   specification's basename.
+2. Build the component and hash it: `sha256sum <artifact>`.
+3. Copy your specification into the directory as `<name>.brenn` and hash that
+   too. Processor world only.
+4. Write `package.json` in the shape above.
+5. Install the same specification bytes into the host's module root as
+   `<name>.brenn`, so a deployment can import them. If the two copies differ by
    so much as a comment, the host refuses to boot and says so.
-
-A specification must be a file declaring exactly one component class and nothing
-else — that is the authoring convention anyway (`config-dsl.md`), and the
-binding makes it load-bearing.
 
 ## In-tree packaging
 
 In this repository packages are built, not written. `component_package` in
 `bazel/wasm/defs.bzl` runs `bazel/wasm/emit_package.sh` over a built component
-and its authored `config/specs/<kind>.brenn`, emitting the record and the
-renamed copy. The world is declared on the target and cross-checked against the
+and its authored `config/specs/<name>.brenn`, emitting the record and the
+packaged copy. The world is declared on the target and cross-checked against the
 artifact's own `brenn:` imports, so a component that moved between worlds cannot
 keep a stale tag.
 
-Adding a shipped component means two entries, not one: the artifact's basename
-in `brenn-wasm/deployed-components.txt`, and a `component_package` in
+Adding a shipped component means two entries, not one: the package name in
+`brenn-wasm/deployed-components.txt`, and a `component_package` in
 `brenn-wasm/BUILD.bazel`'s `COMPONENT_PACKAGES`. `//brenn-wasm:deployed_components_test`
 holds both directions — a manifest entry with no package target fails there
 rather than shipping a component the host will refuse.
 
-Downstream of that, the release tree stages all three files into `lib/`,
+Downstream of that, the release tree stages each package directory,
 `bazel/release/package_check.sh` re-computes both hashes over the staged tree so
 the tarball is proven internally bound before it ships, and the deploy script
-installs the sidecars beside each artifact.
+syncs the package directories into the host's components root.
 
 ## The module root
 

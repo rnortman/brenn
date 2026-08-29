@@ -139,8 +139,9 @@ pub struct WebhookTokenConfigRaw {
 /// when the sub-table is present.
 #[derive(Debug, PartialEq)]
 pub struct ReplayProtectionConfigRaw {
-    /// Path to the WASM replay component artifact (must exist at startup).
-    pub component_path: PathBuf,
+    /// Name of the installed component package holding the WASM replay
+    /// artifact. Resolved against the components root at boot.
+    pub component: String,
     /// Path to the SQLite store file. Created by the host if absent; must not
     /// be shared with another endpoint.
     pub store_path: PathBuf,
@@ -178,13 +179,15 @@ pub struct AppWebhookSubscriptionRaw {
 
 /// Resolved replay-protection binding for one endpoint.
 ///
-/// `component_path` and `store_path` are canonicalized (symlinks resolved,
-/// `./` and `..` segments collapsed). The canonical `store_path` is guaranteed
-/// unique across all endpoints — any duplicate triggers a startup panic.
+/// `store_path` is canonicalized (symlinks resolved, `./` and `..` segments
+/// collapsed) and guaranteed unique across all endpoints — any duplicate
+/// triggers a startup panic. `component` is carried through untouched: where a
+/// package is installed is a boot fact, and config resolution never sees the
+/// components root.
 #[derive(Debug, Clone)]
 pub struct ResolvedReplayProtection {
-    /// Absolute canonical path to the WASM component artifact.
-    pub component_path: PathBuf,
+    /// The installed component package's name.
+    pub component: String,
     /// Absolute canonical path to the SQLite store file.
     pub store_path: PathBuf,
     /// Host-enforced SQLite `PRAGMA max_page_count` value for this store.
@@ -283,7 +286,6 @@ pub struct ResolvedWebhookSubscription {
 
 /// Validate and canonicalize a `[webhook_endpoint.replay_protection]` sub-table.
 ///
-/// - `component_path` must exist as a regular file; panics if absent.
 /// - `store_path` parent directory must exist; the file itself is created if
 ///   absent (KvStore::open calls `Connection::open` which creates it).
 ///   The file is touched (created if needed) then canonicalized so the
@@ -294,9 +296,10 @@ pub struct ResolvedWebhookSubscription {
 ///
 /// # Panics
 ///
-/// Panics when `component_path` is missing/unreadable or when `store_path`'s
-/// parent directory does not exist, or when the effective size limit string is
-/// unparseable or below the floor.
+/// Panics when `store_path`'s parent directory does not exist, or when the
+/// effective size limit string is unparseable or below the floor. The component
+/// package's existence is not checked here: it is resolved and verified at boot
+/// against the components root, which resolution has no access to.
 ///
 /// Pure validator: no write side-effects. The store file is created (touched)
 /// lazily by `KvStore::open` at first use.
@@ -306,27 +309,6 @@ fn resolve_replay_protection(
     global_store_size_limit: &str,
 ) -> Option<ResolvedReplayProtection> {
     let raw = raw?;
-
-    // component_path must be a regular file.
-    let component_meta = std::fs::metadata(&raw.component_path).unwrap_or_else(|e| {
-        panic!(
-            "[[webhook_endpoint]] {:?}: replay_protection.component_path {:?} \
-             cannot be accessed: {e}",
-            endpoint_slug, raw.component_path,
-        )
-    });
-    assert!(
-        component_meta.is_file(),
-        "[[webhook_endpoint]] {:?}: replay_protection.component_path {:?} is not a regular file",
-        endpoint_slug,
-        raw.component_path,
-    );
-    let component_path = std::fs::canonicalize(&raw.component_path).unwrap_or_else(|e| {
-        panic!(
-            "[[webhook_endpoint]] {:?}: failed to canonicalize component_path {:?}: {e}",
-            endpoint_slug, raw.component_path,
-        )
-    });
 
     // store_path parent dir must exist; file itself is auto-created by KvStore::open.
     let store_parent = raw.store_path.parent().unwrap_or_else(|| Path::new("."));
@@ -363,7 +345,7 @@ fn resolve_replay_protection(
     let config = resolve_component_config(raw.config.as_ref(), &field_name);
 
     Some(ResolvedReplayProtection {
-        component_path,
+        component: raw.component.clone(),
         store_path,
         max_page_count,
         config,
@@ -1031,6 +1013,11 @@ mod tests {
 
     use super::*;
 
+    /// The replay package name these endpoints name. Resolution never looks it
+    /// up — where a package is installed is a boot fact — so any name a build
+    /// could ship serves.
+    const REPLAY_PACKAGE: &str = "replay-generic";
+
     // Helper: create a temp file with given contents, return path.
     fn secret_file(contents: &[u8]) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -1143,11 +1130,7 @@ mod tests {
             .map(|ep| format!("webhook:{ep}"))
             .collect();
         let channel_refs: Vec<&str> = channels.iter().map(String::as_str).collect();
-        crate::messaging::config::WasmConsumerConfigRaw::minimal(
-            slug,
-            std::path::PathBuf::from("/dev/null"),
-            &channel_refs,
-        )
+        crate::messaging::config::WasmConsumerConfigRaw::minimal(slug, "echo-stub", &channel_refs)
     }
 
     // --- Address tests ---
@@ -2027,11 +2010,11 @@ mod tests {
     // --- Replay protection: dup-store-path panic tests ---
 
     /// Build a `WebhookEndpointConfigRaw` with replay_protection pointing to
-    /// `component_path` (a real file) and `store_path` (a real path).
+    /// `component` (a package name) and `store_path` (a real path).
     fn raw_hmac_endpoint_with_replay(
         slug: &str,
         keys: Vec<WebhookKeyConfigRaw>,
-        component_path: std::path::PathBuf,
+        component: &str,
         store_path: std::path::PathBuf,
     ) -> WebhookEndpointConfigRaw {
         WebhookEndpointConfigRaw {
@@ -2049,7 +2032,7 @@ mod tests {
             keys,
             tokens: vec![],
             replay_protection: Some(ReplayProtectionConfigRaw {
-                component_path,
+                component: component.to_string(),
                 store_path,
                 store_size_limit: None,
                 config: None,
@@ -2064,7 +2047,6 @@ mod tests {
         // store file. File creation is KvStore::open's responsibility. A regression
         // that re-adds a touch() here would silently create SQLite files during config
         // validation, which runs before the WASM runtime is ready.
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store_path = temp_dir.path().join("should-not-be-created.sqlite");
         assert!(
@@ -2076,7 +2058,7 @@ mod tests {
         let ep = raw_hmac_endpoint_with_replay(
             "ep",
             vec![raw_key("k1", &s)],
-            component_file.path().to_owned(),
+            REPLAY_PACKAGE,
             store_path.clone(),
         );
         let app = app_raw_with_sub("myapp", "ep");
@@ -2095,19 +2077,17 @@ mod tests {
         let s1 = secret_file(b"secret1");
         let s2 = secret_file(b"secret2");
         // Use a single NamedTempFile as both the component artifact (real file) and store.
-        // We need a real file for component_path; reuse a dummy temp file.
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_file = tempfile::NamedTempFile::new().unwrap();
         let ep1 = raw_hmac_endpoint_with_replay(
             "ep1",
             vec![raw_key("k1", &s1)],
-            component_file.path().to_owned(),
+            REPLAY_PACKAGE,
             store_file.path().to_owned(),
         );
         let ep2 = raw_hmac_endpoint_with_replay(
             "ep2",
             vec![raw_key("k1", &s2)],
-            component_file.path().to_owned(),
+            REPLAY_PACKAGE,
             store_file.path().to_owned(), // same store path → must panic
         );
         let app1 = app_raw_with_sub("app1", "ep1");
@@ -2140,15 +2120,10 @@ mod tests {
         // 128 MiB override vs 64 MiB global → resolved max_page_count must come from 128 MiB.
         use crate::config::wasm::byte_size_to_max_page_count;
         let s = secret_file(b"secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
-        let mut ep = raw_hmac_endpoint_with_replay(
-            "ep",
-            vec![raw_key("k", &s)],
-            component_file.path().to_owned(),
-            store_path,
-        );
+        let mut ep =
+            raw_hmac_endpoint_with_replay("ep", vec![raw_key("k", &s)], REPLAY_PACKAGE, store_path);
         // Set per-store override to 128 MiB.
         if let Some(ref mut rp) = ep.replay_protection {
             rp.store_size_limit = Some("128MiB".to_string());
@@ -2171,16 +2146,11 @@ mod tests {
         // AC-5: when no per-store override, global default is used.
         use crate::config::wasm::byte_size_to_max_page_count;
         let s = secret_file(b"secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
         // No per-store override (store_size_limit: None).
-        let ep = raw_hmac_endpoint_with_replay(
-            "ep",
-            vec![raw_key("k", &s)],
-            component_file.path().to_owned(),
-            store_path,
-        );
+        let ep =
+            raw_hmac_endpoint_with_replay("ep", vec![raw_key("k", &s)], REPLAY_PACKAGE, store_path);
         let app = app_raw_with_sub("myapp", "ep");
         let wasm = WasmConfig {
             store_size_limit: "256MiB".to_string(),
@@ -2201,15 +2171,10 @@ mod tests {
     fn store_size_limit_bad_per_store_value_panics_with_slug() {
         // AC-6: unparseable per-store value → fatal panic; message must contain slug.
         let s = secret_file(b"secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
-        let mut ep = raw_hmac_endpoint_with_replay(
-            "ep",
-            vec![raw_key("k", &s)],
-            component_file.path().to_owned(),
-            store_path,
-        );
+        let mut ep =
+            raw_hmac_endpoint_with_replay("ep", vec![raw_key("k", &s)], REPLAY_PACKAGE, store_path);
         if let Some(ref mut rp) = ep.replay_protection {
             rp.store_size_limit = Some("notasize".to_string());
         }
@@ -2224,15 +2189,10 @@ mod tests {
         // "99KB" uses decimal-SI (rejected); "99MiB" would pass. Expect panic containing the
         // string "store_size_limit" (the config key name embedded in the field_name argument).
         let s = secret_file(b"secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
-        let ep = raw_hmac_endpoint_with_replay(
-            "ep",
-            vec![raw_key("k", &s)],
-            component_file.path().to_owned(),
-            store_path,
-        );
+        let ep =
+            raw_hmac_endpoint_with_replay("ep", vec![raw_key("k", &s)], REPLAY_PACKAGE, store_path);
         let app = app_raw_with_sub("myapp", "ep");
         let wasm = WasmConfig {
             store_size_limit: "99KB".to_string(), // decimal SI, rejected
@@ -2247,7 +2207,7 @@ mod tests {
     fn timestamped_endpoint_with_replay(
         slug: &str,
         max_skew_secs: u64,
-        component_path: std::path::PathBuf,
+        component: &str,
         store_path: std::path::PathBuf,
         replay_config: Option<toml::Table>,
         secret: &tempfile::NamedTempFile,
@@ -2273,7 +2233,7 @@ mod tests {
             }],
             tokens: vec![],
             replay_protection: Some(ReplayProtectionConfigRaw {
-                component_path,
+                component: component.to_string(),
                 store_path,
                 store_size_limit: None,
                 config: replay_config,
@@ -2286,22 +2246,20 @@ mod tests {
     #[test]
     fn hmac_timestamped_injects_max_skew_secs() {
         let secret = secret_file(b"test-secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
-        let ep = timestamped_endpoint_with_replay(
-            "ep",
-            300,
-            component_file.path().to_owned(),
-            store_path,
-            None,
-            &secret,
-        );
+        let ep =
+            timestamped_endpoint_with_replay("ep", 300, REPLAY_PACKAGE, store_path, None, &secret);
         let app = app_raw_with_sub("myapp", "ep");
         let result = resolve(&[ep], &[app]);
 
         let rp = result["ep"].replay_protection.as_ref().unwrap();
+        assert_eq!(
+            rp.component, REPLAY_PACKAGE,
+            "the package name is the whole reference to the replay component, and boot resolves \
+             what resolution carried — not the endpoint's slug"
+        );
         assert_eq!(
             rp.config.get("brenn.max-skew-secs").map(String::as_str),
             Some("300"),
@@ -2313,16 +2271,11 @@ mod tests {
     #[test]
     fn hmac_raw_body_does_not_inject_max_skew_secs() {
         let s = secret_file(b"secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
-        let ep = raw_hmac_endpoint_with_replay(
-            "ep",
-            vec![raw_key("k", &s)],
-            component_file.path().to_owned(),
-            store_path,
-        );
+        let ep =
+            raw_hmac_endpoint_with_replay("ep", vec![raw_key("k", &s)], REPLAY_PACKAGE, store_path);
         let app = app_raw_with_sub("myapp", "ep");
         let result = resolve(&[ep], &[app]);
 
@@ -2337,7 +2290,6 @@ mod tests {
     #[test]
     fn operator_keys_coexist_with_injected_skew() {
         let secret = secret_file(b"test-secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2347,7 +2299,7 @@ mod tests {
         let ep = timestamped_endpoint_with_replay(
             "ep",
             60,
-            component_file.path().to_owned(),
+            REPLAY_PACKAGE,
             store_path,
             Some(operator_config),
             &secret,
@@ -2371,7 +2323,6 @@ mod tests {
     #[test]
     fn hmac_stripe_injects_max_skew_secs() {
         let secret = secret_file(b"stripe-secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2390,7 +2341,7 @@ mod tests {
             keys: vec![raw_key("main", &secret)],
             tokens: vec![],
             replay_protection: Some(ReplayProtectionConfigRaw {
-                component_path: component_file.path().to_owned(),
+                component: REPLAY_PACKAGE.to_string(),
                 store_path,
                 store_size_limit: None,
                 config: None,
@@ -2412,7 +2363,6 @@ mod tests {
     #[test]
     fn bearer_token_does_not_inject_max_skew_secs() {
         let token_secret = secret_file(b"bearer-token");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2429,7 +2379,7 @@ mod tests {
             keys: vec![],
             tokens: vec![raw_token("t1", &token_secret)],
             replay_protection: Some(ReplayProtectionConfigRaw {
-                component_path: component_file.path().to_owned(),
+                component: REPLAY_PACKAGE.to_string(),
                 store_path,
                 store_size_limit: None,
                 config: None,
@@ -2451,7 +2401,6 @@ mod tests {
     #[should_panic(expected = "reserved prefix")]
     fn operator_brenn_prefix_in_replay_config_panics() {
         let secret = secret_file(b"test-secret");
-        let component_file = tempfile::NamedTempFile::new().unwrap();
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2464,7 +2413,7 @@ mod tests {
         let ep = timestamped_endpoint_with_replay(
             "ep",
             300,
-            component_file.path().to_owned(),
+            REPLAY_PACKAGE,
             store_path,
             Some(operator_config),
             &secret,

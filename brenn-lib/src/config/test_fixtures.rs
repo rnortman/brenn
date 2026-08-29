@@ -87,10 +87,49 @@ pub fn repo_sync_at(dir: &std::path::Path) -> RepoSyncConfig {
 /// not a property a test states.
 pub fn lower_document(document: &str) -> Result<BrennConfig, Vec<Diagnostic>> {
     let dir = tempfile::tempdir().expect("a tempdir");
-    let root = dir.path().join("main.brenn");
-    std::fs::write(&root, document).expect("write the root module");
-    let compiled = brenn_dsl::compile(&root, None)?;
+    let (root, module_root) = stage_fixture(dir.path(), "main.brenn", document);
+    let compiled = brenn_dsl::compile(&root, module_root.as_deref())?;
     crate::config::dsl_lower::lower(compiled)
+}
+
+/// Write a fixture document into `dir` as the root `name`, splitting its fenced
+/// half out as a module root beside it.
+///
+/// Returns the root document's path and the module root to compile it against; the
+/// module root is `None` for a fixture that fences nothing. Stated once because
+/// every caller that compiles a fixture from disk — lowering here, the
+/// config-check report in `brenn-bootstrap` — has to stage it the same way, and
+/// a rule added to the fence transform has to reach both.
+pub fn stage_fixture(dir: &Path, name: &str, document: &str) -> (PathBuf, Option<PathBuf>) {
+    let root = dir.join(name);
+    match split_packaged(document) {
+        Some((module, rest)) => {
+            let modules = dir.join("modules");
+            std::fs::create_dir(&modules).expect("a module root");
+            std::fs::write(modules.join(format!("{PACKAGED_MODULE}.brenn")), module)
+                .expect("write the module");
+            std::fs::write(&root, rest).expect("write the root module");
+            (root, Some(modules))
+        }
+        None => {
+            std::fs::write(&root, document).expect("write the root module");
+            (root, None)
+        }
+    }
+}
+
+/// The fence a fixture writes around the class declarations a packaged module
+/// has to hold, and the split it drives.
+///
+/// A top-level instance's class is declared in an installed component package,
+/// and these fixtures are about lowering rather than about module structure.
+/// Re-exported here so a lowering test names one module for its fixtures.
+pub use brenn_dsl::fixture_text::{PACKAGED, PACKAGED_MODULE, split_packaged};
+
+/// The text whose hash every class in a fixture carries: the packaged module
+/// where the fixture writes one, and the document itself otherwise.
+pub fn declaring_text(document: &str) -> String {
+    split_packaged(document).map_or_else(|| document.to_string(), |(module, _)| module)
 }
 
 /// The config a document loads to, panicking on any diagnostic.

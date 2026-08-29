@@ -1257,7 +1257,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
     // no covering matcher, so allows_channel_access("brenn:boot-acl-wasm") is false.
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "deadwasm".to_string(),
-        component_path: "/tmp/deadwasm.wasm".into(),
+        package: "deadwasm".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
@@ -1329,7 +1329,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
     // No `[[mqtt_client]]` is declared, but the matcher names client `home`.
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "undeclared".to_string(),
-        component_path: "/tmp/undeclared.wasm".into(),
+        package: "undeclared".to_string(),
         spec_sha256: String::new(),
         grants: vec![ComponentGrant::Mqtt],
         subscribe_acl: vec![],
@@ -1402,7 +1402,7 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
     // Without the grant the matcher can never authorize a publish — dead config.
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "aclless".to_string(),
-        component_path: "/tmp/aclless.wasm".into(),
+        package: "aclless".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
@@ -1475,7 +1475,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
     let (mut config, _channel_uuid) = config_with_one_brenn_channel(subscribed);
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "scoped-wasm".to_string(),
-        component_path: "/tmp/scoped-wasm.wasm".into(),
+        package: "scoped-wasm".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         // Non-empty ⇒ MessagingSubscribe grant is derived, but the matcher names
@@ -1550,7 +1550,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
     let (mut config, _channel_uuid) = config_with_one_brenn_channel(subscribed);
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "covered-wasm".to_string(),
-        component_path: "/tmp/covered-wasm.wasm".into(),
+        package: "covered-wasm".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![ChannelMatcherRaw::Exact(subscribed.to_string())],
@@ -1661,7 +1661,7 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
     // No `[[mqtt_client]]` is declared, but the matcher names client `home`.
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "undeclared-sub".to_string(),
-        component_path: "/tmp/undeclared-sub.wasm".into(),
+        package: "undeclared-sub".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
@@ -1727,7 +1727,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
     let (mut config, _uuid) = config_with_one_brenn_channel("wasm-demo-out");
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-demo-alice".to_string(),
-        component_path: "/tmp/brenn_processor_demo.wasm".into(),
+        package: "processor-demo".to_string(),
         spec_sha256: String::new(),
         grants: vec![ComponentGrant::Ports],
         subscribe_acl: vec![],
@@ -1821,7 +1821,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
     let (mut config, _uuid) = config_with_one_brenn_channel("unused");
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-demo-alice".to_string(),
-        component_path: "/tmp/brenn_processor_demo.wasm".into(),
+        package: "processor-demo".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
@@ -1906,7 +1906,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
     };
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-mqtt".to_string(),
-        component_path: "/tmp/consume-mqtt.wasm".into(),
+        package: "consume-mqtt".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
@@ -2013,7 +2013,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
     };
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-mqtt".to_string(),
-        component_path: "/tmp/consume-mqtt.wasm".into(),
+        package: "consume-mqtt".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         subscribe_acl: vec![],
@@ -2309,7 +2309,7 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
-        component_path: "/tmp/watcher.wasm".into(),
+        package: "watcher".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             channel: Some("ephemeral:sensors".to_string()),
             port: "in".to_string(),
@@ -2406,7 +2406,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
 
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
-        component_path: "/tmp/watcher.wasm".into(),
+        package: "watcher".to_string(),
         subscriptions: vec![sub("brenn:durable-in", "d"), sub("ephemeral:ring-in", "r")],
         subscribe_acl: vec![ChannelMatcherRaw::Exact("durable-in".to_string())],
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("ring-in".to_string())],
@@ -2496,7 +2496,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
-        component_path: "/tmp/watcher.wasm".into(),
+        package: "watcher".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             channel: Some("local:scratch".to_string()),
             port: "in".to_string(),
@@ -2593,7 +2593,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
 
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
-        component_path: "/tmp/ticker.wasm".into(),
+        package: "ticker".to_string(),
         grants: vec![ComponentGrant::Ports],
         io_ports: vec![WasmConsumerIoPortRaw {
             port: "timer".to_string(),
@@ -2718,7 +2718,7 @@ async fn build_messaging_gives_a_named_brenn_io_port_channel_a_db_row() {
 
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
-        component_path: "/tmp/ticker.wasm".into(),
+        package: "ticker".to_string(),
         grants: vec![ComponentGrant::Ports],
         io_ports: vec![WasmConsumerIoPortRaw {
             port: "timer".to_string(),
@@ -2789,7 +2789,7 @@ async fn auto_channels_list_as_their_durability_says() {
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "ticker".to_string(),
-        component_path: "/tmp/ticker.wasm".into(),
+        package: "ticker".to_string(),
         grants: vec![ComponentGrant::Ports],
         io_ports: vec![
             io_port("anon", None),
@@ -2982,7 +2982,7 @@ fn warm_brenn_priming_configs(
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
-        component_path: "/tmp/watcher.wasm".into(),
+        package: "watcher".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             channel: Some(format!("brenn:{address}")),
             port: "in".to_string(),
@@ -3173,7 +3173,7 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
     };
     let consumer = WasmConsumerConfigRaw {
         slug: "watcher".to_string(),
-        component_path: "/tmp/watcher.wasm".into(),
+        package: "watcher".to_string(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             channel: Some("ephemeral:sensors".to_string()),
             port: "in".to_string(),

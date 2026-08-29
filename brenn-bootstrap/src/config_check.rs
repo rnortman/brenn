@@ -143,10 +143,10 @@ mod tests {
     /// `boot_gate_refusal` for those.
     fn check(name: &str, contents: &str) -> (bool, String) {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join(name);
-        std::fs::write(&file, contents).unwrap();
-        let ok = run_config_check(&file, None);
-        let config = check_config(&file, None);
+        let (file, module_root) = brenn_lib::config::stage_fixture(dir.path(), name, contents);
+        let module_root = module_root.as_deref();
+        let ok = run_config_check(&file, module_root);
+        let config = check_config(&file, module_root);
         assert!(
             config.is_ok() || !ok,
             "the report refused the document but the verdict passed it",
@@ -305,7 +305,6 @@ channel replies at "brenn:alice.replies" {
 }
 
 new alice_sink: Sink {
-    component_path = "sink.wasm";
     grants = [ports];
     in messages <- feed;
     out events -> replies;
@@ -532,16 +531,17 @@ mqtt_client broker {
     ca_file = "/nonexistent/alice/broker-ca.pem";
 }
 
+// ── packaged ──
 component Sink {
     "#,
                 processor_any!(),
                 r#"
     in inbound;
 }
+// ── packaged ──
 
 new sink: Sink {
     slug = "sink";
-    component_path = "/nonexistent/alice/brenn_sink.wasm";
     grants = [];
 
     in inbound <- feed { push_depth = 4; }

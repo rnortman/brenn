@@ -10,13 +10,12 @@ set -uo pipefail
 
 names="$1"
 check="$2"
-package_names="$3"
-record_lib="$4"
-emit="$5"
-export WIT_LIB="$6"
-emit_dom="$7"
-emit_processor="$8"
-dom_names="$9"
+record_lib="$3"
+emit="$4"
+export WIT_LIB="$5"
+emit_dom="$6"
+emit_processor="$7"
+dom_names="$8"
 export DOM_NAMES="$dom_names"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
 failures=0
@@ -28,16 +27,17 @@ fail() {
 
 manifest="$tmp/manifest.txt"
 cat > "$manifest" <<'EOF'
-# Components shipped to deployments.
-shipped.wasm
+# Component packages shipped to deployments.
+shipped
 
-also_shipped.wasm
+also_shipped
 EOF
 
 build_tree() {
     local pkg="$1"
     rm -rf "$pkg"
-    mkdir -p "$pkg/bin" "$pkg/frontend" "$pkg/surface" "$pkg/lib"
+    mkdir -p "$pkg/bin" "$pkg/frontend" "$pkg/surface" "$pkg/lib" "$pkg/scripts" \
+        "$pkg/components/shipped" "$pkg/components/also_shipped"
     printf 'ELF static\n' > "$pkg/bin/brenn"
     printf 'ELF static\n' > "$pkg/bin/brenn-cli"
     chmod +x "$pkg/bin/brenn" "$pkg/bin/brenn-cli"
@@ -46,18 +46,25 @@ build_tree() {
     printf 'shell\n' > "$pkg/surface/brenn_kernel.js"
     build_surface_tree "$pkg"
     printf 'stub\n' > "$pkg/lib/noop_mcp.py"
-    cp "$manifest" "$pkg/lib/deployed-components.txt"
-    printf '\0asm\1\0\0\0' > "$pkg/lib/shipped.wasm"
-    printf '\0asm\1\0\0\0' > "$pkg/lib/also_shipped.wasm"
+    cp "$names" "$pkg/scripts/manifest_names.sh"
+    chmod +x "$pkg/scripts/manifest_names.sh"
+    cp "$manifest" "$pkg/components/deployed-components.txt"
+
+    # The artifact basenames are deliberately unrelated to the package names:
+    # the record states the artifact and the directory states the package, so a
+    # gate that derived one from the other would pass a tree the host refuses.
+    printf '\0asm\1\0\0\0' > "$pkg/components/shipped/brenn_one.wasm"
+    printf '\0asm\1\0\0\0' > "$pkg/components/also_shipped/brenn_two.wasm"
 
     # The records are written by the build's own emitter, over the fixtures'
     # own bytes. Hand-written ones would prove the gate against a format
     # nothing holds equal to what ships, and a record whose hashes were made up
     # would pass a gate that re-computed nothing.
-    "$emit" shipped brenn:processor "$pkg/lib/shipped.wasm" \
-        "$pkg/lib/shipped.package.json" "$authored_spec" "$pkg/lib/shipped.spec.brenn"
-    "$emit" also_shipped brenn:replay "$pkg/lib/also_shipped.wasm" \
-        "$pkg/lib/also_shipped.package.json"
+    "$emit" shipped brenn:processor "$pkg/components/shipped/brenn_one.wasm" \
+        "$pkg/components/shipped/package.json" "$authored_spec" \
+        "$pkg/components/shipped/shipped.brenn"
+    "$emit" also_shipped brenn:replay "$pkg/components/also_shipped/brenn_two.wasm" \
+        "$pkg/components/also_shipped/package.json"
 }
 
 # The module root a deployment imports against: a surface kind's module under
@@ -105,7 +112,10 @@ echo "package brenn:fixture;"
 EOF
 chmod +x "$WASM_TOOLS"
 
-authored_spec="$tmp/authored.brenn"
+# Named for the package it belongs to: the emitter holds a package's spec to its
+# own name, because the release stages this file into the module root under it.
+mkdir -p "$tmp/authored"
+authored_spec="$tmp/authored/shipped.brenn"
 printf 'component Shipped {}\n' > "$authored_spec"
 dom_spec="$tmp/authored-dom.brenn"
 printf 'component Protobar {}\n' > "$dom_spec"
@@ -115,16 +125,16 @@ printf 'component Transplant {}\n' > "$processor_spec"
 pkg="$tmp/pkg"
 build_tree "$pkg"
 
-if ! "$check" "$names" "$package_names" "$record_lib" "$dom_names" "$pkg" "$manifest" dynamic > "$tmp/ok.log" 2>&1; then
+if ! "$check" "$names" "$record_lib" "$dom_names" "$pkg" "$manifest" dynamic > "$tmp/ok.log" 2>&1; then
     fail "a complete tree should pass: $(cat "$tmp/ok.log")"
 fi
-if ! "$check" "$names" "$package_names" "$record_lib" "$dom_names" "$pkg" "$manifest" static > "$tmp/ok-static.log" 2>&1; then
+if ! "$check" "$names" "$record_lib" "$dom_names" "$pkg" "$manifest" static > "$tmp/ok-static.log" 2>&1; then
     fail "a complete tree with no loader named should pass static: $(cat "$tmp/ok-static.log")"
 fi
 
 reject() {
     local label="$1" needle="$2" linkage="${3:-dynamic}" out
-    if out=$("$check" "$names" "$package_names" "$record_lib" "$dom_names" "$pkg" "$manifest" "$linkage" 2>&1); then
+    if out=$("$check" "$names" "$record_lib" "$dom_names" "$pkg" "$manifest" "$linkage" 2>&1); then
         fail "$label should be rejected, exited 0: $out"
     elif ! printf '%s' "$out" | grep -qF "$needle"; then
         fail "$label: the rejection does not name the problem: $out"
@@ -151,71 +161,124 @@ reject "a missing MCP stub" "lib/noop_mcp.py is missing"
 for loader in /lib64/ld-linux-x86-64.so.2 /lib/ld-musl-x86_64.so.1; do
     build_tree "$pkg"; printf 'ELF %s\n' "$loader" > "$pkg/bin/brenn"
     reject "a binary naming $loader in a static build" "not a static build" static
-    if ! "$check" "$names" "$package_names" "$record_lib" "$dom_names" "$pkg" "$manifest" dynamic > "$tmp/dyn.log" 2>&1; then
+    if ! "$check" "$names" "$record_lib" "$dom_names" "$pkg" "$manifest" dynamic > "$tmp/dyn.log" 2>&1; then
         fail "the same binary should pass in dynamic mode: $(cat "$tmp/dyn.log")"
     fi
 done
 
-# The manifest and the artifacts beside it.
-build_tree "$pkg"; rm "$pkg/lib/deployed-components.txt"
-reject "a missing manifest" "lib/deployed-components.txt is missing"
+# The manifest, the grammar tool beside it, and the packages it names.
+build_tree "$pkg"; rm "$pkg/components/deployed-components.txt"
+reject "a missing manifest" "components/deployed-components.txt is missing"
 
-build_tree "$pkg"; printf 'shipped.wasm\n' > "$pkg/lib/deployed-components.txt"
+build_tree "$pkg"; printf 'shipped\n' > "$pkg/components/deployed-components.txt"
 reject "a manifest that is not the one checked against" "differs from"
 
-build_tree "$pkg"; rm "$pkg/lib/shipped.wasm"
-reject "a component the manifest ships but the tree lacks" "lib/shipped.wasm is missing"
+build_tree "$pkg"; rm "$pkg/scripts/manifest_names.sh"
+reject "a tarball with no manifest grammar" "scripts/manifest_names.sh is missing"
 
-build_tree "$pkg"; printf '\0asm\1\0\0\0' > "$pkg/lib/test_only.wasm"
-reject "a component nothing listed" "test_only.wasm"
+build_tree "$pkg"; chmod -x "$pkg/scripts/manifest_names.sh"
+reject "a manifest grammar preflight cannot exec" "scripts/manifest_names.sh is not executable"
+
+build_tree "$pkg"; rm -rf "$pkg/components/shipped"
+reject "a package the manifest ships but the tree lacks" \
+    "components/shipped/package.json is missing"
+
+build_tree "$pkg"; mkdir -p "$pkg/components/test_only"
+reject "a package nothing listed" "test_only"
+
+build_tree "$pkg"; printf 'notes\n' > "$pkg/components/README.txt"
+reject "a loose file in the components root" "holds files beside the manifest"
 
 # ---------------------------------------------------------------------------
 # The component packages. Each of these reaches the deploy host as a component
-# the service refuses to load, with the service already stopped.
+# the service refuses to resolve, with the service already stopped.
 # ---------------------------------------------------------------------------
-build_tree "$pkg"; rm "$pkg/lib/shipped.package.json"
-reject "a component with no binding record" "lib/shipped.package.json is missing"
+build_tree "$pkg"; rm "$pkg/components/shipped/package.json"
+reject "a package with no binding record" "components/shipped/package.json is missing"
 
-build_tree "$pkg"; printf '\0asm\1\0\0\1' > "$pkg/lib/shipped.wasm"
+build_tree "$pkg"; printf '\0asm\1\0\0\1' > "$pkg/components/shipped/brenn_one.wasm"
 reject "an artifact its record does not bind" "hashes to"
 
-build_tree "$pkg"; printf 'component Shipped { abi = processor; }\n' > "$pkg/lib/shipped.spec.brenn"
-reject "a spec its record does not bind" "lib/shipped.spec.brenn hashes to"
+build_tree "$pkg"; rm "$pkg/components/shipped/brenn_one.wasm"
+reject "an artifact that did not ship" "components/shipped/brenn_one.wasm is missing or empty"
 
-build_tree "$pkg"; rm "$pkg/lib/shipped.spec.brenn"
-reject "a record naming a spec that did not ship" "lib/shipped.spec.brenn is missing or empty"
+build_tree "$pkg"; printf 'component Shipped { abi = processor; }\n' > "$pkg/components/shipped/shipped.brenn"
+reject "a spec its record does not bind" "components/shipped/shipped.brenn hashes to"
 
-build_tree "$pkg"; printf 'component Stray {}\n' > "$pkg/lib/also_shipped.spec.brenn"
+build_tree "$pkg"; rm "$pkg/components/shipped/shipped.brenn"
+reject "a record naming a spec that did not ship" "components/shipped/shipped.brenn is missing or empty"
+
+build_tree "$pkg"; printf 'component Stray {}\n' > "$pkg/components/also_shipped/also_shipped.brenn"
 reject "a spec beside a record that names none" "names no spec"
 
+build_tree "$pkg"; printf 'stray\n' > "$pkg/components/shipped/notes.txt"
+reject "a file the record does not bind" \
+    "components/shipped/ does not hold exactly the files its record binds"
+
+# Not only loose files: a nested directory is content the deploy sync installs
+# and no record binds, so the same comparison has to see entries of every type.
+build_tree "$pkg"; mkdir -p "$pkg/components/shipped/extra"
+printf 'stray\n' > "$pkg/components/shipped/extra/notes.txt"
+reject "a directory nested inside a package" \
+    "components/shipped/ does not hold exactly the files its record binds"
+
+build_tree "$pkg"; ln -s did-not-ship.wasm "$pkg/components/shipped/dangling.wasm"
+reject "a link inside a package whose target did not ship" \
+    "components/shipped/ does not hold exactly the files its record binds"
+
 build_tree "$pkg"
-sed -i '/spec_sha256/d' "$pkg/lib/shipped.package.json"
-sed -i 's/"spec": "shipped.spec.brenn",/"spec": "shipped.spec.brenn"/' "$pkg/lib/shipped.package.json"
+sed -i '/spec_sha256/d' "$pkg/components/shipped/package.json"
+sed -i 's/"spec": "shipped.brenn",/"spec": "shipped.brenn"/' "$pkg/components/shipped/package.json"
 reject "a record naming a spec with no hash" "states no spec_sha256"
 
-# The host reads the stem-derived name and compares the record's `spec` field
-# against it, so a record naming any other file is one it refuses — even when
-# the file is there and hashes correctly, which is what would otherwise walk
-# past this gate.
+# The host reads the name derived from the package and compares the record's
+# `spec` field against it, so a record naming any other file is one it refuses —
+# even when the file is there and hashes correctly, which is what would
+# otherwise walk past this gate.
 build_tree "$pkg"
-cp "$pkg/lib/shipped.spec.brenn" "$pkg/lib/elsewhere.brenn"
-sed -i 's/"spec": "shipped.spec.brenn"/"spec": "elsewhere.brenn"/' "$pkg/lib/shipped.package.json"
-reject "a record naming a spec that is not the stem-derived one" "the host derives that name as shipped.spec.brenn"
+cp "$pkg/components/shipped/shipped.brenn" "$pkg/components/shipped/elsewhere.brenn"
+sed -i 's/"spec": "shipped.brenn"/"spec": "elsewhere.brenn"/' "$pkg/components/shipped/package.json"
+reject "a record naming a spec that is not the package's own name" \
+    "the host derives that name as shipped.brenn"
+
+# The directory is the name a configuration states; the record repeats it, and
+# the host holds the two equal.
+build_tree "$pkg"
+sed -i 's/"name": "shipped"/"name": "elsewhere"/' "$pkg/components/shipped/package.json"
+reject "a record staged under another package's name" "calls itself elsewhere"
+
+# The artifact is the one name the record states rather than the host derives,
+# so it is held inside the package directory here and nowhere else.
+build_tree "$pkg"
+sed -i 's|"artifact": "brenn_one.wasm"|"artifact": "../also_shipped/brenn_two.wasm"|' \
+    "$pkg/components/shipped/package.json"
+reject "a record naming an artifact outside its package" "reaches outside the package directory"
 
 build_tree "$pkg"
-sed -i '/artifact_sha256/d' "$pkg/lib/also_shipped.package.json"
-sed -i 's/"artifact": "also_shipped.wasm",/"artifact": "also_shipped.wasm"/' "$pkg/lib/also_shipped.package.json"
+sed -i 's/"artifact": "brenn_one.wasm"/"artifact": "brenn_one.txt"/' \
+    "$pkg/components/shipped/package.json"
+reject "a record naming an artifact that is not a component" "which is not a component"
+
+build_tree "$pkg"
+sed -i 's/"artifact": "brenn_one.wasm"/"artifact": ""/' \
+    "$pkg/components/shipped/package.json"
+reject "a record stating no artifact at all" "states no artifact"
+
+build_tree "$pkg"
+sed -i '/artifact_sha256/d' "$pkg/components/also_shipped/package.json"
+sed -i 's/"artifact": "brenn_two.wasm",/"artifact": "brenn_two.wasm"/' \
+    "$pkg/components/also_shipped/package.json"
 reject "a record stating no artifact hash" "states no artifact_sha256"
 
 build_tree "$pkg"
-printf '# nothing\n' > "$pkg/lib/deployed-components.txt"
-cp "$pkg/lib/deployed-components.txt" "$manifest"
+printf '# nothing\n' > "$pkg/components/deployed-components.txt"
+cp "$pkg/components/deployed-components.txt" "$manifest"
 reject "a manifest naming no components" "names no components"
 cat > "$manifest" <<'EOF'
-# Components shipped to deployments.
-shipped.wasm
+# Component packages shipped to deployments.
+shipped
 
-also_shipped.wasm
+also_shipped
 EOF
 
 # The served trees.
@@ -301,7 +364,7 @@ build_tree "$pkg"; rm -rf "$pkg/modules"
 reject "a tree with no module root" "modules/ is missing"
 # An absent module root must not abort the gate early; later checks and the
 # summary must still run.
-out=$("$check" "$names" "$package_names" "$record_lib" "$dom_names" "$pkg" "$manifest" dynamic 2>&1 || true)
+out=$("$check" "$names" "$record_lib" "$dom_names" "$pkg" "$manifest" dynamic 2>&1 || true)
 if ! printf '%s' "$out" | grep -qF "problem(s) with the staged release tree"; then
     fail "a tree with no module root: the gate stopped before its summary: $out"
 fi
@@ -319,7 +382,11 @@ reject "a surface processor kind whose module did not stage" \
 
 build_tree "$pkg"; rm "$pkg/modules/shipped.brenn"
 reject "a backend package whose module did not stage" \
-    "lib/shipped.spec.brenn matches no file in modules/"
+    "modules/shipped.brenn is missing or empty"
+
+build_tree "$pkg"; printf 'component Shipped { abi = processor; }\n' > "$pkg/modules/shipped.brenn"
+reject "a backend module that differs from its packaged copy" \
+    "modules/shipped.brenn differs from components/shipped/shipped.brenn"
 
 # The staged module is fine and the copy it stands for is not: a module root is
 # only worth what the packaged copies behind it are, so an empty one is named
@@ -337,12 +404,12 @@ reject "a file in the module root that is not a module" \
     "modules/README.txt is not a .brenn module"
 
 # And the gate's own preconditions.
-if out=$("$check" "$names" "$package_names" "$record_lib" "$dom_names" "$tmp/absent" "$manifest" dynamic 2>&1); then
+if out=$("$check" "$names" "$record_lib" "$dom_names" "$tmp/absent" "$manifest" dynamic 2>&1); then
     fail "a package dir that does not exist should be rejected, exited 0: $out"
 elif ! printf '%s' "$out" | grep -qF "not a directory"; then
     fail "the rejection does not say what went wrong: $out"
 fi
-if "$check" "$names" "$package_names" "$record_lib" "$dom_names" "$pkg" "$manifest" sideways > /dev/null 2>&1; then
+if "$check" "$names" "$record_lib" "$dom_names" "$pkg" "$manifest" sideways > /dev/null 2>&1; then
     fail "an unrecognized linkage mode should be rejected"
 fi
 

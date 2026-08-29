@@ -1019,6 +1019,7 @@ fn link_bound_ports_resolve_with_no_operator_acls() {
 #[test]
 fn a_document_link_places_the_channel_its_ports_resolve_to() {
     let config = brenn_lib::config::config_from_dsl(concat!(
+        "// ── packaged ──\n",
         "component Etl {\n",
         "    abi = processor; requires = [ports];\n",
         "    in ticks;\n",
@@ -1028,18 +1029,17 @@ fn a_document_link_places_the_channel_its_ports_resolve_to() {
         "    abi = processor; requires = [ports];\n",
         "    io feed;\n",
         "}\n",
+        "// ── packaged ──\n",
         "channel ticks at \"brenn:ticks\" {\n",
         "    push_depth = 1; retain_depth = 1; standing_retain_depth = 1;\n",
         "}\n",
         "link relay;\n",
         "new etl: Etl {\n",
-        "    component_path = \"/lib/etl.wasm\";\n",
         "    grants = [ports];\n",
         "    in ticks <- ticks { push_depth = 1; retain_depth = 1; }\n",
         "    out events -> relay;\n",
         "}\n",
         "new indexer: Indexer {\n",
-        "    component_path = \"/lib/indexer.wasm\";\n",
         "    grants = [ports];\n",
         "    io feed <-> relay { push_depth = 2; retain_depth = 6; }\n",
         "}\n",

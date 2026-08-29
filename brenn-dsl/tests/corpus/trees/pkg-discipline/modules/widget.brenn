@@ -20,7 +20,6 @@ channel bench_status at "brenn:bench.status" {
 }
 
 new p1: Widget {
-    component_path = "/lib/widget.wasm";
     grants = [ports];
     in messages <- bench_status;
 }

@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # Stage the deploy tarball's directory tree.
 #
-# Usage: assemble.sh --out DIR --manifest FILE --names FILE --package-names FILE
+# Usage: assemble.sh --out DIR --manifest FILE --names FILE
 #                    --dom-names FILE --record-lib FILE
 #                    --frontend DIR --surface DIR
-#                    [--bin FILE]... [--lib FILE]... [--component FILE]...
+#                    [--bin FILE]... [--lib FILE]...
 #                    [--package FILE]... [--module FILE]...
 #
 # `--names` is `manifest_names.sh`, which states the manifest's grammar for
-# every reader of it; `--package-names` is `package_names.sh`, which states a
-# package's file grammar the same way; `--dom-names` is `dom_names.sh`, which
-# does it for a surface dom kind; `--record-lib` is `record_lib.sh`, which
+# every reader of it; `--dom-names` is `dom_names.sh`, which states a surface
+# dom kind's file grammar the same way; `--record-lib` is `record_lib.sh`, which
 # states how a binding record's fields are read.
 #
 # The layout is the one `deploy.sh` unpacks and reads: `bin/` for the two host
-# binaries, `frontend/` and `surface/` for the served asset trees, `lib/`
-# for the MCP stub, the deploy manifest, and the WASM components the manifest
-# names with their package sidecars, and `modules/` for the authored module of
-# every component the release ships. `VERSION` and `deploy.sh` itself are not
-# here: the script lives in the deploying repo and the version is the pin that
-# repo resolved, so both are added there.
+# binaries, `frontend/` and `surface/` for the served asset trees, `lib/` for
+# the MCP stub, `components/` for the deploy manifest and one package directory
+# per entry, `modules/` for the authored module of every component the release
+# ships, and `scripts/` for the manifest grammar the deploying repo's preflight
+# execs instead of transcribing. `VERSION` and `deploy.sh` itself are not here:
+# the script lives in the deploying repo and the version is the pin that repo
+# resolved, so both are added there.
 #
 # `modules/` is what a deployment's `use @<name>::…` imports resolve against:
 # one file per component, named `<name>.brenn` for the wire kind, which is the
@@ -29,34 +29,34 @@
 # rather than listing keeps the staged set equal to the shipped set by
 # construction.
 #
-# A shipped component is three flat sibling files sharing the artifact's stem —
-# the `.wasm`, its `.package.json` binding record, and, for a processor-world
-# component, the `.spec.brenn` copy of its specification. The host refuses to
-# load an artifact whose record is absent, so a manifest entry reaching here
-# with no record fails the build rather than the deploy target's next boot.
+# A shipped component is a package directory named for the component, holding
+# the artifact, its `package.json` binding record, and, for a processor-world
+# component, the `<name>.brenn` copy of its specification. The host resolves the
+# directory by the name a configuration states and refuses a package with no
+# record, so a manifest entry reaching here with no package fails the build
+# rather than the deploy target's next boot.
 #
-# Nothing here sets file modes. Bazel normalizes a declared output directory to
-# read-only after the action runs, so any mode this script chose would be
-# overwritten; the consumer is responsible for restoring owner-write before
-# archiving.
+# Nothing here sets file modes except the staged grammar tool's executable bit,
+# which the deploying repo's preflight execs. Bazel normalizes a declared output
+# directory to read-only after the action runs, so any write mode this script
+# chose would be overwritten; the consumer is responsible for restoring
+# owner-write before archiving.
 #
 # Which components ship is decided by the manifest at assembly time, not by the
-# caller's list — every component in the tree is offered and only the listed
-# ones are copied, which is what makes the manifest the single statement of the
+# caller's list — every package in the tree is offered and only the listed ones
+# are copied, which is what makes the manifest the single statement of the
 # deployed set. A name it holds that nothing produces is a hard failure.
 set -euo pipefail
 
 out=""
 manifest=""
 names=""
-package_names=""
 dom_names=""
 record_lib=""
 frontend=""
 surface=""
 bins=()
 libs=()
-components=()
 packages=()
 modules=()
 
@@ -65,12 +65,10 @@ while [ "$#" -gt 0 ]; do
         --out) out="$2"; shift 2 ;;
         --manifest) manifest="$2"; shift 2 ;;
         --names) names="$2"; shift 2 ;;
-        --package-names) package_names="$2"; shift 2 ;;
         --frontend) frontend="$2"; shift 2 ;;
         --surface) surface="$2"; shift 2 ;;
         --bin) bins+=("$2"); shift 2 ;;
         --lib) libs+=("$2"); shift 2 ;;
-        --component) components+=("$2"); shift 2 ;;
         --package) packages+=("$2"); shift 2 ;;
         --module) modules+=("$2"); shift 2 ;;
         --dom-names) dom_names="$2"; shift 2 ;;
@@ -86,10 +84,6 @@ for required in out manifest names frontend surface; do
     fi
 done
 # Named apart from the loop above: their flags spell the underscore as a hyphen.
-if [ -z "$package_names" ]; then
-    echo "ERROR: --package-names is required" >&2
-    exit 2
-fi
 if [ -z "$dom_names" ]; then
     echo "ERROR: --dom-names is required" >&2
     exit 2
@@ -107,7 +101,8 @@ if [ "${#bins[@]}" -eq 0 ]; then
     exit 2
 fi
 
-mkdir -p "$out/bin" "$out/frontend" "$out/surface" "$out/lib" "$out/modules"
+mkdir -p "$out/bin" "$out/frontend" "$out/surface" "$out/lib" "$out/modules" \
+    "$out/components" "$out/scripts"
 
 for bin in "${bins[@]}"; do
     # -L throughout: an input tree or file reaches a sandboxed action as a
@@ -136,54 +131,55 @@ for lib in "${libs[@]}"; do
     cp -L "$lib" "$out/lib/$(basename "$lib")"
 done
 
-# Shipped beside the artifacts it names so the deploy step can resolve them.
-cp -L "$manifest" "$out/lib/deployed-components.txt"
+# Shipped beside the packages it names so the deploy step can resolve them.
+cp -L "$manifest" "$out/components/deployed-components.txt"
 
-# Basename → path, so a manifest entry is resolved by the name it states. The
-# sidecars share the index: their basenames are the artifact's stem plus a
-# second extension, so a manifest entry resolves all three by name alone.
-declare -A by_name=()
-for file in "${components[@]}" "${packages[@]}"; do
-    name="$(basename "$file")"
-    if [ -n "${by_name[$name]:-}" ]; then
-        echo "ERROR: two inputs share the basename $name: ${by_name[$name]} and $file" >&2
+# The manifest's grammar travels with the manifest. The deploying repo's
+# preflight reads the same file on the target host, and a transcription of the
+# grammar there is one that goes stale the release the format grows an
+# annotation; execing this copy is what keeps the readers at one.
+cp -L "$names" "$out/scripts/manifest_names.sh"
+chmod +x "$out/scripts/manifest_names.sh"
+
+# Package name → the files of its directory, so a manifest entry resolves a
+# whole package by the name it states. The build declares each package's files
+# under `<something>/<name>/`, so the parent directory's basename is the name.
+declare -A pkg_files=()
+declare -A pkg_dir=()
+for file in "${packages[@]}"; do
+    dir="$(dirname "$file")"
+    name="$(basename "$dir")"
+    if [ -n "${pkg_dir[$name]:-}" ] && [ "${pkg_dir[$name]}" != "$dir" ]; then
+        echo "ERROR: two package directories are named $name: ${pkg_dir[$name]} and $dir" >&2
         exit 1
     fi
-    by_name["$name"]="$file"
+    pkg_dir["$name"]="$dir"
+    pkg_files["$name"]="${pkg_files[$name]:-}$file"$'\n'
 done
 
 shipped=0
 listed="$("$names" "$manifest")"
 while read -r line; do
     [ -n "$line" ] || continue
-    src="${by_name[$line]:-}"
-    if [ -z "$src" ]; then
-        echo "ERROR: $manifest lists $line, which no component target produces" >&2
-        exit 1
-    fi
-    cp -L "$src" "$out/lib/$line"
-    shipped=$((shipped + 1))
-
-    # The record is mandatory: without it the artifact is unloadable, so a
-    # tarball missing one deploys a host that panics on the component it was
-    # built to ship.
-    # Assigned before being read: a names-tool failure inside a process
-    # substitution is invisible to `set -e`, and a manifest entry that is not a
-    # component artifact would surface as "no component_package target packages"
-    # rather than as the name grammar refusing it.
-    sidecars="$("$package_names" "$line")"
-    { read -r record_name; read -r spec_name; } <<< "$sidecars"
-    record="${by_name[$record_name]:-}"
-    if [ -z "$record" ]; then
+    if [ -z "${pkg_dir[$line]:-}" ]; then
         echo "ERROR: $manifest lists $line, which no component_package target packages" >&2
         exit 1
     fi
-    cp -L "$record" "$out/lib/$record_name"
+    dest="$out/components/$line"
+    mkdir -p "$dest"
+    while read -r file; do
+        [ -n "$file" ] || continue
+        cp -L "$file" "$dest/$(basename "$file")"
+    done <<< "${pkg_files[$line]}"
 
-    spec="${by_name[$spec_name]:-}"
-    if [ -n "$spec" ]; then
-        cp -L "$spec" "$out/lib/$spec_name"
+    # The record is mandatory: without it the package is unresolvable, so a
+    # tarball missing one deploys a host that panics on the component it was
+    # built to ship.
+    if [ ! -f "$dest/package.json" ]; then
+        echo "ERROR: $manifest lists $line, whose package holds no package.json" >&2
+        exit 1
     fi
+    shipped=$((shipped + 1))
 done <<< "$listed"
 
 # A manifest that yields nothing is a manifest that stopped being read, and the

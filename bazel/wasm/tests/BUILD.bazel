@@ -78,30 +78,14 @@ native_test(
     size = "small",
     src = "install_tree_test.sh",
     args = [
-        "$(rootpath //bazel/wasm:package_names.sh)",
         "$(rootpath //bazel/wasm:record_lib.sh)",
         "$(rootpaths //brenn-wasm:install_tree)",
     ],
     data = [
-        "//bazel/wasm:package_names.sh",
         "//bazel/wasm:record_lib.sh",
         "//brenn-wasm:install_tree",
     ],
     out = "install_tree_test.run",
-    target_compatible_with = HOST_ONLY,
-)
-
-# The package's file grammar, on the same footing as the manifest's below: four
-# readers derive the two sidecar names from an artifact basename, and the order
-# the two are printed in is the join between them — a swap mis-files every
-# record under its spec's name with nothing else noticing.
-native_test(
-    name = "package_names_test",
-    size = "small",
-    src = "package_names_test.sh",
-    args = ["$(rootpath //bazel/wasm:package_names.sh)"],
-    data = ["//bazel/wasm:package_names.sh"],
-    out = "package_names_test.run",
     target_compatible_with = HOST_ONLY,
 )
 

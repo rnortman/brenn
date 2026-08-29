@@ -120,7 +120,7 @@ pub(super) fn resolved_ingress_sub(
 pub fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw {
         slug: "probe".to_string(),
-        component_path: std::path::PathBuf::from("/nonexistent/probe.wasm"),
+        package: "probe".to_string(),
         spec_sha256: String::new(),
         grants: vec![],
         store_path: None,
@@ -227,12 +227,12 @@ pub(super) fn out_raw(port: &str, channel: &str) -> WasmConsumerOutputRaw {
 /// a store or specific grants build on `minimal_wasm_consumer()` directly.
 pub(super) fn minimal_wasm_consumer_raw(
     slug: &str,
-    component_path: &str,
+    package: &str,
     chan_addr: &str,
 ) -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw {
         slug: slug.to_string(),
-        component_path: component_path.into(),
+        package: package.to_string(),
         subscriptions: vec![sub_raw(chan_addr, "in")],
         ..minimal_wasm_consumer()
     }

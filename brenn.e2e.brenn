@@ -155,12 +155,7 @@ assembly BarSurface(slug: String, skin: String) {
 /// republished on the assembly's own ephemeral channel, so the flag, the
 /// packaged module, the assembly expansion and the boot-time package binding
 /// are all on the path of a plain `make e2e`.
-///
-/// `components_dir` is the workspace's staged install tree, reached through
-/// bazel's convenience symlink like the two asset trees above.
-new demo: DemoLoop(slug = "e2e-demo",
-  source = bar_a,
-  components_dir = ".bazel-bin/brenn-wasm/install_tree");
+new demo: DemoLoop(slug = "e2e-demo", source = bar_a);
 
 new bar: BarSurface(slug = "bar", skin = "bench");
 new bar_pixel: BarSurface(slug = "bar-pixel", skin = "foundry");

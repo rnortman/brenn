@@ -173,7 +173,7 @@ fn an_attachers_acl_view_holds_exactly_its_families() {
 fn a_consumers_config_holds_exactly_its_families() {
     let fields = field_names!(WasmConsumerConfigRaw {
         slug,
-        component_path,
+        package,
         spec_sha256,
         grants,
         store_path,
@@ -203,7 +203,7 @@ fn a_consumers_config_holds_exactly_its_families() {
         AclShape::ConsumerConfig,
         &[
             "slug",
-            "component_path",
+            "package",
             "spec_sha256",
             "grants",
             "store_path",

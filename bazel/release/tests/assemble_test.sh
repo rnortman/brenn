@@ -5,10 +5,9 @@
 # nothing about whether the script would notice its inputs going wrong. Here
 # every input is a fixture: the happy path is checked layout entry by layout
 # entry, and each way the packaging can be handed something broken — a manifest
-# naming an artifact nobody built, a manifest naming a component nothing
-# packaged, a manifest that reads as empty, an asset tree that was never built,
-# two components with one basename — is checked to fail rather than to ship a
-# tarball missing a piece.
+# naming a package nobody built, a package with no record, a manifest that reads
+# as empty, an asset tree that was never built, two package directories with one
+# name — is checked to fail rather than to ship a tarball missing a piece.
 #
 # The module root gets the same treatment: the backend modules arrive as
 # arguments and the surface ones are harvested off the staged tree, so both
@@ -17,9 +16,8 @@ set -uo pipefail
 
 names="$1"
 assemble="$2"
-package_names="$3"
-dom_names="$4"
-record_lib="$5"
+dom_names="$3"
+record_lib="$4"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
 failures=0
 
@@ -28,7 +26,7 @@ fail() {
     failures=$((failures + 1))
 }
 
-mkdir -p "$tmp/in/frontend/skins" "$tmp/in/surface/processor" "$tmp/in/bin" "$tmp/in/wasm"
+mkdir -p "$tmp/in/frontend/skins" "$tmp/in/surface/processor" "$tmp/in/bin"
 printf 'binary\n' > "$tmp/in/bin/brenn"
 printf 'binary\n' > "$tmp/in/bin/brenn-cli"
 chmod +x "$tmp/in/bin/brenn" "$tmp/in/bin/brenn-cli"
@@ -51,35 +49,44 @@ printf '{\n  "kind": "transplant"\n}\n' > "$tmp/in/surface/processor/transplant/
 mkdir -p "$tmp/in/modules"
 printf 'component Shipped {}\n' > "$tmp/in/modules/shipped-component.brenn"
 printf 'stub\n' > "$tmp/in/noop_mcp.py"
-for name in shipped.wasm also_shipped.wasm test_only.wasm; do
-    printf '\0asm\1\0\0\0' > "$tmp/in/wasm/$name"
-done
 
-mkdir -p "$tmp/in/pkg"
-printf '{"v": 1, "artifact": "shipped.wasm"}\n' > "$tmp/in/pkg/shipped.package.json"
-printf 'component Shipped {}\n' > "$tmp/in/pkg/shipped.spec.brenn"
-printf '{"v": 1, "artifact": "also_shipped.wasm"}\n' > "$tmp/in/pkg/also_shipped.package.json"
-printf '{"v": 1, "artifact": "test_only.wasm"}\n' > "$tmp/in/pkg/test_only.package.json"
+# The build declares each package's files under `<target>/<name>/`, so the
+# fixtures do the same: the parent directory's basename is the package name, and
+# that is all the assembly reads to group them.
+mkdir -p "$tmp/in/pkg/a/shipped" "$tmp/in/pkg/b/also_shipped" "$tmp/in/pkg/c/test_only"
+printf '{"v": 2, "name": "shipped", "artifact": "brenn_shipped.wasm"}\n' \
+    > "$tmp/in/pkg/a/shipped/package.json"
+printf 'component Shipped {}\n' > "$tmp/in/pkg/a/shipped/shipped.brenn"
+printf '\0asm\1\0\0\0' > "$tmp/in/pkg/a/shipped/brenn_shipped.wasm"
+printf '{"v": 2, "name": "also_shipped", "artifact": "brenn_also_shipped.wasm"}\n' \
+    > "$tmp/in/pkg/b/also_shipped/package.json"
+printf '\0asm\1\0\0\0' > "$tmp/in/pkg/b/also_shipped/brenn_also_shipped.wasm"
+printf '{"v": 2, "name": "test_only", "artifact": "brenn_test_only.wasm"}\n' \
+    > "$tmp/in/pkg/c/test_only/package.json"
+printf '\0asm\1\0\0\0' > "$tmp/in/pkg/c/test_only/brenn_test_only.wasm"
 
 # Repeated at every invocation below, because a package is not optional: the
-# host refuses an artifact whose record did not travel with it.
+# host resolves a component by the directory it installs as.
 packages=(
-    --package "$tmp/in/pkg/shipped.package.json"
-    --package "$tmp/in/pkg/shipped.spec.brenn"
-    --package "$tmp/in/pkg/also_shipped.package.json"
-    --package "$tmp/in/pkg/test_only.package.json"
+    --package "$tmp/in/pkg/a/shipped/package.json"
+    --package "$tmp/in/pkg/a/shipped/shipped.brenn"
+    --package "$tmp/in/pkg/a/shipped/brenn_shipped.wasm"
+    --package "$tmp/in/pkg/b/also_shipped/package.json"
+    --package "$tmp/in/pkg/b/also_shipped/brenn_also_shipped.wasm"
+    --package "$tmp/in/pkg/c/test_only/package.json"
+    --package "$tmp/in/pkg/c/test_only/brenn_test_only.wasm"
 )
 
 cat > "$tmp/in/manifest.txt" <<'EOF'
-# Components shipped to deployments.
-shipped.wasm
+# Component packages shipped to deployments.
+shipped
 
-also_shipped.wasm
+also_shipped
 EOF
 
 run() {
     "$assemble" \
-        --names "$names" --package-names "$package_names" \
+        --names "$names" \
         --dom-names "$dom_names" --record-lib "$record_lib" \
         --module "$tmp/in/modules/shipped-component.brenn" \
         --out "$1" \
@@ -89,9 +96,6 @@ run() {
         --bin "$tmp/in/bin/brenn" \
         --bin "$tmp/in/bin/brenn-cli" \
         --lib "$tmp/in/noop_mcp.py" \
-        --component "$tmp/in/wasm/shipped.wasm" \
-        --component "$tmp/in/wasm/also_shipped.wasm" \
-        --component "$tmp/in/wasm/test_only.wasm" \
         "${packages[@]}"
 }
 
@@ -107,27 +111,26 @@ for path in \
     surface/brenn_kernel.js \
     surface/processor/one.js \
     lib/noop_mcp.py \
-    lib/deployed-components.txt \
-    lib/shipped.wasm \
-    lib/shipped.package.json \
-    lib/shipped.spec.brenn \
-    lib/also_shipped.wasm \
-    lib/also_shipped.package.json \
+    scripts/manifest_names.sh \
+    components/deployed-components.txt \
+    components/shipped/package.json \
+    components/shipped/shipped.brenn \
+    components/shipped/brenn_shipped.wasm \
+    components/also_shipped/package.json \
+    components/also_shipped/brenn_also_shipped.wasm \
     modules/shipped-component.brenn \
     modules/mode-clock.brenn \
     modules/transplant.brenn; do
     [ -f "$tmp/out/$path" ] || fail "the staged tree is missing $path"
 done
 
-# The manifest is what decides; a component nobody listed must not ride along —
-# nor may its record, which would name an artifact that is not there.
-[ ! -e "$tmp/out/lib/test_only.wasm" ] || fail "an unlisted component reached lib/"
-[ ! -e "$tmp/out/lib/test_only.package.json" ] || fail "an unlisted component's record reached lib/"
+# The manifest is what decides; a package nobody listed must not ride along.
+[ ! -e "$tmp/out/components/test_only" ] \
+    || fail "an unlisted package reached components/"
 
-# A replay-world package is two files; a spec beside it is a file the host would
-# never read.
-[ ! -e "$tmp/out/lib/also_shipped.spec.brenn" ] \
-    || fail "a spec-less package staged a spec"
+# The grammar tool travels executable, because preflight execs it.
+[ -x "$tmp/out/scripts/manifest_names.sh" ] \
+    || fail "the staged manifest grammar is not executable"
 
 # Staged under the authored basename and the record's kind respectively, and
 # byte-identical to what they copy: an import resolves to these bytes and the
@@ -140,7 +143,7 @@ cmp -s "$tmp/in/surface/processor/transplant/transplant.spec.brenn" "$tmp/out/mo
     || fail "a processor kind's module was not harvested from its packaged copy"
 
 [ -x "$tmp/out/bin/brenn" ] || fail "bin/brenn is not executable"
-cmp -s "$tmp/in/manifest.txt" "$tmp/out/lib/deployed-components.txt" \
+cmp -s "$tmp/in/manifest.txt" "$tmp/out/components/deployed-components.txt" \
     || fail "the shipped manifest is not the one that was read"
 
 # ---------------------------------------------------------------------------
@@ -157,20 +160,23 @@ expect_failure() {
     fi
 }
 
-# The shipping failure mode: a name in the manifest that nothing produces.
-printf 'shipped.wasm\nabsent.wasm\n' > "$tmp/in/bad-name.txt"
-expect_failure "a manifest naming an unbuilt artifact" "absent.wasm" \
+# The shipping failure mode: a name in the manifest that nothing packages. The
+# component would be resolvable by nothing on the host.
+printf 'shipped\nabsent\n' > "$tmp/in/bad-name.txt"
+expect_failure "a manifest naming an unpackaged component" "no component_package target packages" \
     run "$tmp/out-bad-name" "$tmp/in/bad-name.txt"
 
-# The other shipping failure mode: a manifest entry whose record nobody emitted.
-# The artifact would install and the host would refuse it.
-expect_failure "a manifest entry with no package" "no component_package target packages" \
-    "$assemble" --names "$names" --package-names "$package_names" --dom-names "$dom_names" --record-lib "$record_lib" --out "$tmp/out-nopkg" --manifest "$tmp/in/manifest.txt" \
+# A package directory that holds no record. The host resolves the directory and
+# refuses it for want of the one file that binds its contents.
+mkdir -p "$tmp/in/pkg-norecord/shipped"
+printf '\0asm\1\0\0\0' > "$tmp/in/pkg-norecord/shipped/brenn_shipped.wasm"
+expect_failure "a package with no record" "holds no package.json" \
+    "$assemble" --names "$names" --dom-names "$dom_names" --record-lib "$record_lib" \
+    --out "$tmp/out-norecord" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" \
-    --package "$tmp/in/pkg/also_shipped.package.json"
+    --package "$tmp/in/pkg-norecord/shipped/brenn_shipped.wasm" \
+    --package "$tmp/in/pkg/b/also_shipped/package.json"
 
 # A manifest that yields nothing has stopped being read.
 printf '# only a comment\n\n' > "$tmp/in/empty.txt"
@@ -180,37 +186,37 @@ expect_failure "an empty manifest" "names no components" \
 # An asset tree that was never built.
 mkdir -p "$tmp/in/unbuilt"
 expect_failure "an empty asset tree" "holds no files" \
-    "$assemble" --names "$names" --package-names "$package_names" --dom-names "$dom_names" --record-lib "$record_lib" --out "$tmp/out-unbuilt" --manifest "$tmp/in/manifest.txt" \
+    "$assemble" --names "$names" --dom-names "$dom_names" --record-lib "$record_lib" \
+    --out "$tmp/out-unbuilt" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/unbuilt" --surface "$tmp/in/surface" \
-    --bin "$tmp/in/bin/brenn" --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    --bin "$tmp/in/bin/brenn" "${packages[@]}"
 
 expect_failure "a non-directory asset tree" "not a directory" \
-    "$assemble" --names "$names" --package-names "$package_names" --dom-names "$dom_names" --record-lib "$record_lib" --out "$tmp/out-notdir" --manifest "$tmp/in/manifest.txt" \
+    "$assemble" --names "$names" --dom-names "$dom_names" --record-lib "$record_lib" \
+    --out "$tmp/out-notdir" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/noop_mcp.py" --surface "$tmp/in/surface" \
-    --bin "$tmp/in/bin/brenn" --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    --bin "$tmp/in/bin/brenn" "${packages[@]}"
 
-# Two components with one basename: the manifest names basenames, so one of the
-# two would silently win.
-mkdir -p "$tmp/in/wasm-dup"
-printf '\0asm\1\0\0\0' > "$tmp/in/wasm-dup/shipped.wasm"
-expect_failure "two components sharing a basename" "share the basename" \
-    "$assemble" --names "$names" --package-names "$package_names" --dom-names "$dom_names" --record-lib "$record_lib" --out "$tmp/out-dup" --manifest "$tmp/in/manifest.txt" \
+# Two package directories with one name: the manifest names packages, so one of
+# the two would silently win.
+mkdir -p "$tmp/in/pkg-dup/shipped"
+printf '{"v": 2, "name": "shipped", "artifact": "other.wasm"}\n' \
+    > "$tmp/in/pkg-dup/shipped/package.json"
+expect_failure "two package directories sharing a name" "two package directories are named shipped" \
+    "$assemble" --names "$names" --dom-names "$dom_names" --record-lib "$record_lib" \
+    --out "$tmp/out-dup" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm-dup/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    --package "$tmp/in/pkg-dup/shipped/package.json" "${packages[@]}"
 
 expect_failure "no binaries at all" "no --bin given" \
-    "$assemble" --names "$names" --package-names "$package_names" --dom-names "$dom_names" --record-lib "$record_lib" --out "$tmp/out-nobin" --manifest "$tmp/in/manifest.txt" \
-    --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    "$assemble" --names "$names" --dom-names "$dom_names" --record-lib "$record_lib" \
+    --out "$tmp/out-nobin" --manifest "$tmp/in/manifest.txt" \
+    --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" "${packages[@]}"
 
 expect_failure "an unrecognized argument" "unrecognized argument" \
-    "$assemble" --names "$names" --package-names "$package_names" --dom-names "$dom_names" --record-lib "$record_lib" --out "$tmp/out-badarg" --whatever
+    "$assemble" --names "$names" --dom-names "$dom_names" --record-lib "$record_lib" \
+    --out "$tmp/out-badarg" --whatever
 
 # Each required flag in turn. A rule wired without one of these still fails
 # somewhere downstream, but as a `mkdir: cannot create directory '/bin'` or a
@@ -218,35 +224,31 @@ expect_failure "an unrecognized argument" "unrecognized argument" \
 required_args=(
     --out "$tmp/out-required"
     --manifest "$tmp/in/manifest.txt"
-    --names "$names" --package-names "$package_names"
+    --names "$names"
     --dom-names "$dom_names" --record-lib "$record_lib"
     --frontend "$tmp/in/frontend"
     --surface "$tmp/in/surface"
 )
-for dropped in out manifest names package-names dom-names record-lib frontend surface; do
+for dropped in out manifest names dom-names record-lib frontend surface; do
     argv=()
     for ((i = 0; i < ${#required_args[@]}; i += 2)); do
         [ "${required_args[i]}" = "--$dropped" ] && continue
         argv+=("${required_args[i]}" "${required_args[i + 1]}")
     done
     expect_failure "a missing --$dropped" "--$dropped is required" \
-        "$assemble" "${argv[@]}" --bin "$tmp/in/bin/brenn" \
-        --component "$tmp/in/wasm/shipped.wasm" \
-        --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+        "$assemble" "${argv[@]}" --bin "$tmp/in/bin/brenn" "${packages[@]}"
 done
 
 # Two modules claiming one import: the root is flat, so one would silently win.
 mkdir -p "$tmp/in/modules-dup"
 printf 'component Other {}\n' > "$tmp/in/modules-dup/mode-clock.brenn"
 expect_failure "a module name claimed twice" "a module root is flat" \
-    "$assemble" --names "$names" --package-names "$package_names" \
+    "$assemble" --names "$names" \
     --dom-names "$dom_names" --record-lib "$record_lib" \
     --out "$tmp/out-dupmod" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" \
-    --module "$tmp/in/modules-dup/mode-clock.brenn" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    --module "$tmp/in/modules-dup/mode-clock.brenn" "${packages[@]}"
 
 # A surface kind whose packaged copy did not ship: the tree names the kind, so
 # the module a deployment would import is the one thing missing.
@@ -254,13 +256,11 @@ mkdir -p "$tmp/in/surface-nospec/processor"
 cp -R "$tmp/in/surface/." "$tmp/in/surface-nospec/"
 rm "$tmp/in/surface-nospec/brenn_mode_clock.spec.brenn"
 expect_failure "a surface kind with no packaged module" "did not ship" \
-    "$assemble" --names "$names" --package-names "$package_names" \
+    "$assemble" --names "$names" \
     --dom-names "$dom_names" --record-lib "$record_lib" \
     --out "$tmp/out-nospec" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface-nospec" \
-    --bin "$tmp/in/bin/brenn" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    --bin "$tmp/in/bin/brenn" "${packages[@]}"
 
 # A record the kind cannot be scraped out of. A missing kind must be a hard
 # error; silent absence would let a module root ship without its dom kinds.
@@ -268,13 +268,11 @@ mkdir -p "$tmp/in/surface-nokind/processor"
 cp -R "$tmp/in/surface/." "$tmp/in/surface-nokind/"
 printf '{\n  "version": "1.4.0"\n}\n' > "$tmp/in/surface-nokind/brenn_mode_clock.manifest.json"
 expect_failure "a surface record stating no kind" "states no kind" \
-    "$assemble" --names "$names" --package-names "$package_names" \
+    "$assemble" --names "$names" \
     --dom-names "$dom_names" --record-lib "$record_lib" \
     --out "$tmp/out-nokind" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface-nokind" \
-    --bin "$tmp/in/bin/brenn" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    --bin "$tmp/in/bin/brenn" "${packages[@]}"
 
 # A record stating a kind outside the frozen charset: the names tool refuses it,
 # and the module a deployment would import can be named by nothing else.
@@ -282,13 +280,11 @@ mkdir -p "$tmp/in/surface-badkind/processor"
 cp -R "$tmp/in/surface/." "$tmp/in/surface-badkind/"
 printf '{\n  "kind": "Mode_Clock"\n}\n' > "$tmp/in/surface-badkind/brenn_mode_clock.manifest.json"
 expect_failure "a surface record stating an impossible kind" "no dom kind can be named" \
-    "$assemble" --names "$names" --package-names "$package_names" \
+    "$assemble" --names "$names" \
     --dom-names "$dom_names" --record-lib "$record_lib" \
     --out "$tmp/out-badkind" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface-badkind" \
-    --bin "$tmp/in/bin/brenn" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}"
+    --bin "$tmp/in/bin/brenn" "${packages[@]}"
 
 # ---------------------------------------------------------------------------
 # Symlinked inputs, as a sandboxed action's are
@@ -298,11 +294,10 @@ ln -s "$tmp/in/frontend/main.js" "$tmp/in/linked-frontend/main.js"
 ln -s "$tmp/in/frontend/skins/dark.css" "$tmp/in/linked-frontend/skins/dark.css"
 ln -s "$tmp/in/bin/brenn" "$tmp/in/linked-brenn"
 
-if ! "$assemble" --names "$names" --package-names "$package_names" --dom-names "$dom_names" --record-lib "$record_lib" --out "$tmp/out-linked" --manifest "$tmp/in/manifest.txt" \
+if ! "$assemble" --names "$names" --dom-names "$dom_names" --record-lib "$record_lib" \
+    --out "$tmp/out-linked" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/linked-frontend" --surface "$tmp/in/surface" \
-    --bin "$tmp/in/linked-brenn" \
-    --component "$tmp/in/wasm/shipped.wasm" \
-    --component "$tmp/in/wasm/also_shipped.wasm" "${packages[@]}" > "$tmp/linked.log" 2>&1; then
+    --bin "$tmp/in/linked-brenn" "${packages[@]}" > "$tmp/linked.log" 2>&1; then
     fail "symlinked inputs should assemble: $(cat "$tmp/linked.log")"
 fi
 # A copied link rather than its target leaves a dangling path in the tarball,

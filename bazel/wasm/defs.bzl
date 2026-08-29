@@ -233,32 +233,41 @@ def wasm_component(name, module, visibility = None):
 # Component packages
 # ---------------------------------------------------------------------------
 
-# A package's file grammar, on the Starlark side. `bazel/wasm/package_names.sh`
-# is the same statement for the shell readers — the release assembly and the
-# staged-tree gate — and the two are held together by the gates that run over
-# the tree both of them produced. The extensions are named rather than spelled
-# at each site because the flat layout is provisional: a package becomes a
-# directory when configuration resolves components by name.
-_RECORD_EXT = ".package.json"
+# A package's file grammar, on the Starlark side. A package is a directory named
+# for the package, holding the record under a fixed basename, the artifact under
+# its built basename, and — for a processor world — the packaged specification
+# under `<name>.brenn`. The record states the artifact's basename, so nothing
+# outside this file has to derive it.
+_RECORD_NAME = "package.json"
 
-_SPEC_EXT = ".spec.brenn"
-
-_ARTIFACT_EXT = ".wasm"
+ComponentPackageInfo = provider(
+    doc = "One built component package: the name it resolves under, and its files.",
+    fields = {
+        "files": "depset of the files in the package directory",
+        "package": "the package name, which is the directory's basename",
+    },
+)
 
 def _component_package_impl(ctx):
     artifact = _module_file(ctx.attr.component)
-    stem = artifact.basename[:-len(_ARTIFACT_EXT)]
+    package = ctx.attr.package
 
-    # Package-relative outputs under the target's own name: two packages of one
-    # component would otherwise declare the same files, and the stem is the
-    # artifact's, not the target's.
-    record = ctx.actions.declare_file("%s/%s%s" % (ctx.label.name, stem, _RECORD_EXT))
+    # Package-relative outputs under the target's own name: two targets
+    # packaging one component would otherwise declare the same files.
+    prefix = "%s/%s" % (ctx.label.name, package)
+    record = ctx.actions.declare_file("%s/%s" % (prefix, _RECORD_NAME))
+
+    # The artifact is staged into the directory rather than left in its own
+    # output tree: the package is what a host resolves, so every file the record
+    # names has to be reachable from the directory alone.
+    staged = ctx.actions.declare_file("%s/%s" % (prefix, artifact.basename))
+    ctx.actions.symlink(output = staged, target_file = artifact)
+
     outputs = [record]
-
-    args = [stem, ctx.attr.world, artifact.path, record.path]
+    args = [package, ctx.attr.world, artifact.path, record.path]
     inputs = [artifact]
     if ctx.file.spec:
-        packaged_spec = ctx.actions.declare_file("%s/%s%s" % (ctx.label.name, stem, _SPEC_EXT))
+        packaged_spec = ctx.actions.declare_file("%s/%s.brenn" % (prefix, package))
         outputs.append(packaged_spec)
         inputs.append(ctx.file.spec)
         args += [ctx.file.spec.path, packaged_spec.path]
@@ -274,22 +283,30 @@ def _component_package_impl(ctx):
         },
         arguments = args,
         mnemonic = "ComponentPackage",
-        progress_message = "Packaging %s" % stem,
+        progress_message = "Packaging %s" % package,
     )
-    return [DefaultInfo(files = depset(outputs))]
+    files = depset(outputs + [staged])
+    return [
+        DefaultInfo(files = files),
+        ComponentPackageInfo(package = package, files = files),
+    ]
 
 _component_package = rule(
     implementation = _component_package_impl,
-    doc = """The sidecar half of a shipped component: its binding record and its spec.
+    doc = """A shipped component's package directory: artifact, record, spec.
 
-    The artifact itself is not re-emitted — it ships from its own target — so
-    the release tree holds three files per component and the build holds one
-    copy of the bytes.
+    The directory's basename is the name a configuration resolves the component
+    by, and the record repeats it, so a directory renamed in transit is a
+    refusal at boot rather than a component loaded under the wrong name.
     """,
     attrs = {
         "component": attr.label(
             mandatory = True,
             doc = "The `wasm_component` target producing the artifact.",
+        ),
+        "package": attr.string(
+            mandatory = True,
+            doc = "The package name; also the directory's basename.",
         ),
         "spec": attr.label(
             allow_single_file = [".brenn"],
@@ -316,20 +333,23 @@ _component_package = rule(
     },
 )
 
-def component_package(name, component, world, spec = None, visibility = None):
+def component_package(name, package, component, world, spec = None, visibility = None):
     """See `_component_package`.
 
     Args:
         name: target name; also the directory its outputs are declared under.
+        package: the package name a configuration resolves the component by.
         component: the `wasm_component` target producing the artifact.
         world: `brenn:processor` or `brenn:replay`.
         spec: the authored specification; required iff the world is
-            `brenn:processor`, and refused otherwise.
+            `brenn:processor`, and refused otherwise. Its authored basename must
+            be `<package>.brenn`, which the emitter asserts.
         visibility: target visibility.
     """
     _component_package(
         name = name,
         component = component,
+        package = package,
         spec = spec,
         world = world,
         target_compatible_with = HOST_ONLY,
@@ -343,50 +363,45 @@ def component_package(name, component, world, spec = None, visibility = None):
 def _component_install_tree_impl(ctx):
     outs = []
     seen = {}
-    artifacts = [_module_file(target) for target in ctx.attr.components]
-    for src in artifacts + ctx.files.packages:
-        if src.basename in seen:
-            fail("two inputs are named %s; an install tree is flat" % src.basename)
-        seen[src.basename] = True
-        out = ctx.actions.declare_file(ctx.label.name + "/" + src.basename)
-        ctx.actions.symlink(output = out, target_file = src)
-        outs.append(out)
+    for target in ctx.attr.packages:
+        info = target[ComponentPackageInfo]
+        if info.package in seen:
+            fail("two targets package the name %s; a components root holds one directory per package" % info.package)
+        seen[info.package] = True
+        for src in info.files.to_list():
+            out = ctx.actions.declare_file("%s/%s/%s" % (ctx.label.name, info.package, src.basename))
+            ctx.actions.symlink(output = out, target_file = src)
+            outs.append(out)
     return [DefaultInfo(files = depset(outs), runfiles = ctx.runfiles(files = outs))]
 
 _component_install_tree = rule(
     implementation = _component_install_tree_impl,
-    doc = """Each artifact beside its own sidecars, in one flat directory.
+    doc = """A components root: one package directory per shipped component.
 
-    The build keeps an artifact and its package in separate output directories;
-    a host reads them as `<stem>.wasm` plus `<stem>.package.json` plus
-    `<stem>.spec.brenn` in the directory a `component_path` names. This is that
-    directory, so a server started from the workspace loads a component the way
-    a deployment does — package verification included.
+    The build declares each package under its own target's output directory, and
+    a host resolves `<root>/<name>/` from the name a configuration states. This
+    is that root, so a server started from the workspace resolves a component
+    the way a deployment does — package verification included.
     """,
     attrs = {
-        "components": attr.label_list(
-            mandatory = True,
-            doc = "The `wasm_component` targets whose artifacts to stage.",
-        ),
         "packages": attr.label_list(
             mandatory = True,
-            doc = "Their `component_package` targets.",
+            providers = [ComponentPackageInfo],
+            doc = "The `component_package` targets to stage.",
         ),
     },
 )
 
-def component_install_tree(name, components, packages, visibility = None):
+def component_install_tree(name, packages, visibility = None):
     """See `_component_install_tree`.
 
     Args:
         name: target name; also the directory its outputs are declared under.
-        components: the `wasm_component` targets whose artifacts to stage.
-        packages: the `component_package` targets for those artifacts.
+        packages: the `component_package` targets to stage.
         visibility: target visibility.
     """
     _component_install_tree(
         name = name,
-        components = components,
         packages = packages,
         target_compatible_with = HOST_ONLY,
         visibility = visibility,
@@ -486,16 +501,7 @@ _wasi_import_test = rule(
 )
 
 def _deployed_components_test_impl(ctx):
-    components = [_module_file(t) for t in ctx.attr.components]
-
-    # A package is identified by the artifact it binds: the record's stem is the
-    # artifact's, so the manifest's own vocabulary — basenames — is what the two
-    # lists are compared in.
-    packaged = [
-        f.basename[:-len(_RECORD_EXT)] + _ARTIFACT_EXT
-        for f in ctx.files.packages
-        if f.basename.endswith(_RECORD_EXT)
-    ]
+    packaged = [t[ComponentPackageInfo].package for t in ctx.attr.packages]
     check = ctx.file._check
     names = ctx.file._names
     script = _check_wrapper(
@@ -503,7 +509,6 @@ def _deployed_components_test_impl(ctx):
         check,
         [
             names.short_path,
-            " ".join(sorted([c.basename for c in components])),
             " ".join(sorted(packaged)),
             ctx.file.manifest.short_path,
             str(ctx.attr.manifest.label),
@@ -518,25 +523,22 @@ _deployed_components_test = rule(
     implementation = _deployed_components_test_impl,
     doc = """Hold the deploy manifest and the packaged set equal, both directions.
 
-    The manifest is what the packaging step ships; a name in it that no target
-    produces ships nothing, and one no target packages ships an artifact the
-    host refuses for want of its binding record. Both failures would first
-    appear on the deploy target. The other direction is the release's module
-    root: a package the manifest omits stages its authored module there with no
-    component installed beside it, which the release contract test refuses far
-    from the manifest that caused it.
+    The manifest names packages, and a package is what a host resolves a
+    component by, so a name in it that no `component_package` target produces
+    ships nothing and the failure would first appear on the deploy target. The
+    other direction is the release's module root: a package the manifest omits
+    stages its authored module there with no component installed beside it,
+    which the release contract test refuses far from the manifest that caused
+    it.
     """,
     attrs = {
-        "components": attr.label_list(
-            mandatory = True,
-            doc = "Every `wasm_component` target in the tree, deployed or not.",
-        ),
         "manifest": attr.label(
             allow_single_file = True,
             mandatory = True,
         ),
         "packages": attr.label_list(
             mandatory = True,
+            providers = [ComponentPackageInfo],
             doc = "Every `component_package` target in the tree.",
         ),
         "_check": attr.label(
@@ -551,18 +553,16 @@ _deployed_components_test = rule(
     test = True,
 )
 
-def deployed_components_test(name, manifest, components, packages):
+def deployed_components_test(name, manifest, packages):
     """See `_deployed_components_test`.
 
     Args:
         name: target name.
-        manifest: the deploy manifest listing artifact basenames.
-        components: every `wasm_component` target in the tree.
+        manifest: the deploy manifest listing the package names that ship.
         packages: every `component_package` target in the tree.
     """
     _deployed_components_test(
         name = name,
-        components = components,
         manifest = manifest,
         packages = packages,
         size = "small",

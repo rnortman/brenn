@@ -487,6 +487,13 @@ pub struct ClassRef {
     /// identity a deployment's spec copy is bound to the shipped artifact by.
     /// Never empty: class resolution refuses a file with no hash.
     pub spec_sha256: String,
+    /// The packaged module the class was declared in, or `None` for a class
+    /// declared somewhere in the configuration tree.
+    ///
+    /// The declaring file's module, not the importing one: a class reached
+    /// through an assembly in another module still names the module that
+    /// declares it, which is the one whose component the host installs.
+    pub package: Option<String>,
 }
 
 /// One port a class declares.

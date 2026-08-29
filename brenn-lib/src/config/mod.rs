@@ -52,8 +52,9 @@ pub use server::*;
 pub use surface_description::*;
 #[cfg(any(test, feature = "testutils"))]
 pub use test_fixtures::{
-    config_from_dsl, lower_document, remote_exact_ceiling, remote_fleet, remote_prefix_ceiling,
-    remote_raw, repo_sync_at, sole_refusal, test_app_config,
+    PACKAGED, PACKAGED_MODULE, config_from_dsl, declaring_text, lower_document,
+    remote_exact_ceiling, remote_fleet, remote_prefix_ceiling, remote_raw, repo_sync_at,
+    sole_refusal, split_packaged, stage_fixture, test_app_config,
 };
 pub use watchdog::*;
 

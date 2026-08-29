@@ -11,7 +11,10 @@ use brenn_dsl::derived::{DAclSet, DMatcher};
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::{dom_any, processor_any};
 use fltk_serde_core::Spanned;
-use support::{at, derive_errors, derive_refusal, derive_refusals, derived, durable, nondurable};
+use support::{
+    PACKAGED, at, derive_errors, derive_refusal, derive_refusals, derived, durable, nondurable,
+    packaged,
+};
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -27,12 +30,14 @@ use support::{at, derive_errors, derive_refusal, derive_refusals, derived, durab
 /// is about without the spec fit answering it first. The fit contract itself is
 /// asserted below.
 const SINK: &str = concat!(
+    packaged!(),
     "component Sink {\n",
     "    ",
     processor_any!(),
     "\n",
     "    optional out events;\n",
     "}\n",
+    packaged!(),
 );
 
 // Every fixture takes the rights it grants, because agreement is checked in both
@@ -55,7 +60,7 @@ fn surface(statements: &str) -> String {
 /// the statements written into it.
 fn consumer(grants: &str, statements: &str) -> String {
     format!(
-        "{SINK}new alice_sink: Sink {{\n    component_path = \"sink.wasm\";\n    \
+        "{SINK}new alice_sink: Sink {{\n    \n    \
          grants = [{grants}];\n{statements}}}\n"
     )
 }
@@ -769,6 +774,7 @@ const PANEL: &str = concat!(
 /// A processor class a top-level instance is made of. Every port is `optional`
 /// for the reason `SINK` states.
 const RELAY: &str = concat!(
+    packaged!(),
     "component Relay {\n",
     "    ",
     processor_any!(),
@@ -777,6 +783,7 @@ const RELAY: &str = concat!(
     "    optional out outbound;\n",
     "    optional io acks;\n",
     "}\n",
+    packaged!(),
 );
 
 /// A surface holding the statements written into it and one `Panel` holding the
@@ -813,7 +820,7 @@ fn placed_panel(grants: &str, body: &str) -> String {
 /// statements and bindings written into it.
 fn relay_with(grants: &str, body: &str) -> String {
     format!(
-        "{RELAY}new alice_relay: Relay {{\n    component_path = \"relay.wasm\";\n    \
+        "{RELAY}new alice_relay: Relay {{\n    \n    \
          grants = [{grants}];\n{body}}}\n"
     )
 }
@@ -826,6 +833,7 @@ fn relay(body: &str) -> String {
 /// A component whose every port is inbound, for the cases that need two
 /// positions on one ingress address.
 const FAN_IN: &str = concat!(
+    packaged!(),
     "component FanIn {\n",
     "    ",
     processor_any!(),
@@ -834,12 +842,13 @@ const FAN_IN: &str = concat!(
     "    optional in second;\n",
     "    optional in third;\n",
     "}\n",
+    packaged!(),
 );
 
 /// A top-level `FanIn` instance holding the bindings written into it.
 fn fan_in(body: &str) -> String {
     format!(
-        "{FAN_IN}new alice_fan_in: FanIn {{\n    component_path = \"fan-in.wasm\";\n    \
+        "{FAN_IN}new alice_fan_in: FanIn {{\n    \n    \
          grants = [];\n{body}}}\n"
     )
 }
@@ -1736,9 +1745,7 @@ fn an_mqtt_right_with_no_broker_entry_is_refused() {
 #[test]
 fn a_consumer_states_its_grants() {
     assert_eq!(
-        derive_refusal(&format!(
-            "{SINK}new alice_sink: Sink {{\n    component_path = \"sink.wasm\";\n}}\n"
-        )),
+        derive_refusal(&format!("{SINK}new alice_sink: Sink {{\n    \n}}\n")),
         "consumer `alice_sink` states no `grants`: what a component is given is \
          deny-by-default, so an empty list is written `grants = [];` rather than left out"
     );
@@ -2151,7 +2158,9 @@ fn an_undeclared_channel_under_a_placed_instance_is_refused_once() {
 /// with the grants named.
 fn needy_panel(needs: &str, grants: &str) -> String {
     format!(
-        "component Needy {{\n    abi = dom; {needs};\n    optional in messages;\n}}\n\
+        "// ── packaged ──\n\
+         component Needy {{\n    abi = dom; {needs};\n    optional in messages;\n}}\n\
+         // ── packaged ──\n\
          surface alice_desk {{\n    grants = [];\n    \
          new p1: Needy {{\n        grants = [{grants}];\n    }}\n}}\n"
     )
@@ -2161,8 +2170,8 @@ fn needy_panel(needs: &str, grants: &str) -> String {
 /// the grants named.
 fn needy_sink(needs: &str, grants: &str) -> String {
     format!(
-        "component Needy {{\n    abi = processor; {needs};\n    optional in inbound;\n}}\n\
-         new alice_sink: Needy {{\n    component_path = \"needy.wasm\";\n    \
+        "{PACKAGED}component Needy {{\n    abi = processor; {needs};\n    \
+         optional in inbound;\n}}\n{PACKAGED}new alice_sink: Needy {{\n    \n    \
          grants = [{grants}];\n}}\n"
     )
 }

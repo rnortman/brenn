@@ -666,7 +666,7 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
 
     let worker = WasmConsumerConfigRaw {
         slug: "worker".to_string(),
-        component_path: "/nonexistent/worker.wasm".into(),
+        package: "worker".to_string(),
         grants: vec![ComponentGrant::Ports],
         io_ports: vec![io_port_raw(
             LINK_PORT,

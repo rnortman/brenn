@@ -1999,9 +1999,12 @@ fn emit_entities(
 ) -> Emitted {
     // Taken before the files are consumed into their item lists: a class's
     // identity is its declaring file's, and only the file carries it.
-    let hashes: Vec<String> = files
+    let declaring: Vec<Declaring> = files
         .iter()
-        .map(|(_, file)| file.source_sha256.clone())
+        .map(|(key, file)| Declaring {
+            spec_sha256: file.source_sha256.clone(),
+            package: is_packaged(key).then(|| module_name(key).to_string()),
+        })
         .collect();
     let modules: Vec<Vec<Spanned<Item>>> = files.into_iter().map(|(_, file)| file.items).collect();
     let mut config = Emitted::default();
@@ -2034,7 +2037,9 @@ fn emit_entities(
             config.withhold_stamps(inst.handle.value());
         }
     }
-    let classes = component_classes(index, &modules, &hashes, &channels, &links, &stamps, errors);
+    let classes = component_classes(
+        index, &modules, &declaring, &channels, &links, &stamps, errors,
+    );
     let agents = agent_classes(&modules);
 
     // Section multiplicity is decided over the whole document before any body
@@ -3021,24 +3026,20 @@ const COMPONENT_GRANTS: &str = "grants";
 /// The key of a consumer body that states its wire identity.
 const CONSUMER_SLUG: &str = "slug";
 
-/// The key of a consumer body that states where its artifact is loaded from.
-const CONSUMER_PATH: &str = "component_path";
-
 /// The keys a top-level component instance admits.
 ///
 /// The consumer's scalar fields, minus what statements carry: its ports are
-/// bindings and its nine authority lists are `acl` statements. `component_path`
-/// is one of them: where the artifact lives on this host is a fact of this
-/// deployment of this instance, not of the class, which several instances share.
+/// bindings and its nine authority lists are `acl` statements. Where the
+/// artifact lives is not among them: the host resolves the package from the
+/// class's own module name, so the deployment states no location at all.
 /// Unspellable in this version, for want of a statement form: `mqtt_output` and
 /// `tool_grant`.
 ///
 /// Public for the same reason as [`SURFACE_COMPONENT_KEYS`]: the parity gate
 /// over `WasmConsumerConfigRaw` reads it.
-pub const CONSUMER_KEYS: [&str; 8] = [
+pub const CONSUMER_KEYS: [&str; 7] = [
     CONSUMER_SLUG,
     COMPONENT_GRANTS,
-    CONSUMER_PATH,
     "store_path",
     "store_size_limit",
     "activation_burst",
@@ -3064,6 +3065,17 @@ impl ClassTable {
     }
 }
 
+/// What the file a class was declared in contributes to every class in it.
+struct Declaring {
+    /// The declaring file's content hash, which the class's `spec_sha256` is.
+    spec_sha256: String,
+    /// The packaged module it is, or `None` for a file of the configuration
+    /// tree. A class declared in a packaged module names the package the host
+    /// resolves its component under, and that name is the only reference a
+    /// configuration ever states for it.
+    package: Option<String>,
+}
+
 /// Resolve every component class into the facts an instance carries away.
 ///
 /// Classes resolve before instances for the same reason addresses resolve
@@ -3072,7 +3084,7 @@ impl ClassTable {
 fn component_classes(
     index: &Index,
     modules: &[Vec<Spanned<Item>>],
-    hashes: &[String],
+    declaring: &[Declaring],
     channels: &ChannelTable,
     links: &LinkTable,
     stamps: &StampTable,
@@ -3085,7 +3097,7 @@ fn component_classes(
             let Item::Component(class) = item.value() else {
                 continue;
             };
-            if let Some(reference) = class_ref(class, &hashes[position], &scope, errors) {
+            if let Some(reference) = class_ref(class, &declaring[position], &scope, errors) {
                 table.by_site.insert((position, offset), reference);
             }
         }
@@ -3096,10 +3108,14 @@ fn component_classes(
 /// One component class, resolved to what an instance of it needs to know.
 fn class_ref(
     class: &ComponentClass,
-    spec_sha256: &str,
+    declaring: &Declaring,
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<ClassRef> {
+    let Declaring {
+        spec_sha256,
+        package,
+    } = declaring;
     // The empty hash is the hole `File::source_sha256`'s `serde(skip)` opens: a
     // `File` built anywhere but `parse_str` carries one. Refused here rather
     // than flowed onward, where two empty hashes would spuriously bind.
@@ -3160,7 +3176,8 @@ fn class_ref(
         requires: needs.requires,
         optional: needs.optional,
         ports,
-        spec_sha256: spec_sha256.to_string(),
+        spec_sha256: spec_sha256.clone(),
+        package: package.clone(),
     })
 }
 
@@ -3510,13 +3527,6 @@ fn parked_depth(
     }
 }
 
-/// Asked before the body's values resolve, because a top-level instance without
-/// a path is refused whole: its artifact location is deny-by-default deployment
-/// consent, and an instance nothing loads is not a configuration.
-fn states_component_path(body: Option<&Spanned<InstBody>>) -> bool {
-    body.is_some_and(|body| body.value().attrs.get(CONSUMER_PATH).is_some())
-}
-
 /// An instance's `grants`, projected out of the body before its values resolve.
 fn instance_grants(
     body: Option<&Spanned<InstBody>>,
@@ -3605,11 +3615,12 @@ fn resolve_class(
             ));
             return None;
         }
-        if !states_component_path(inst.body.as_ref()) {
+        if class.package.is_none() {
             errors.push(two_site(
                 format!(
-                    "a top-level instance is loaded from an artifact, and this instance \
-                     of `{name}` states no `component_path`"
+                    "a top-level instance is loaded from an installed component package, and \
+                     the class `{name}` is declared in the configuration tree, not in a \
+                     packaged module — declare it in a module imported as `use @<name>::*;`"
                 ),
                 span,
                 "declared here",

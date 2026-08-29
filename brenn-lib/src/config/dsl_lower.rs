@@ -2239,12 +2239,17 @@ fn consumer(
     let bindings = wasm_bindings(resolved, instance, endpoints, errors);
     let raw = WasmConsumerConfigRaw {
         slug: label.clone(),
-        // Required, and refused before lowering runs where it is absent, so an
-        // empty path here is a resolve-vs-lowering parity break rather than a
-        // document state.
-        component_path: body
-            .required_path("component_path", errors)
-            .unwrap_or_default(),
+        // A class fact, not a body key: the packaged module the class was
+        // declared in is the package the host resolves the artifact from.
+        // Resolution refuses a top-level instance of a class no package
+        // declares, so an absent package here is a resolve-vs-lowering parity
+        // break and not a document state — die at the break rather than emit a
+        // nameless package the host would blame the configuration for.
+        package: instance
+            .class
+            .package
+            .clone()
+            .expect("a top-level consumer's class is declared in a packaged module"),
         // A class fact, not a body key: carried from the declaring file.
         spec_sha256: instance.class.spec_sha256.clone(),
         grants: authority
@@ -3232,12 +3237,12 @@ fn secret_file(
 /// The `replay_protection` block. Its `config` map is one of the two positions a
 /// raw field literally stores a `toml::Table` in.
 fn replay(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<ReplayProtectionConfigRaw> {
-    let component_path = body.required_path("component_path", errors);
+    let component = body.required_str("component", errors);
     let store_path = body.required_path("store_path", errors);
     let store_size_limit = body.str("store_size_limit", errors);
     let config = body.config("config", errors);
     Some(ReplayProtectionConfigRaw {
-        component_path: component_path?,
+        component: component?,
         store_path: store_path?,
         store_size_limit,
         config,

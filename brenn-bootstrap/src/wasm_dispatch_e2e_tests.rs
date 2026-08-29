@@ -1225,7 +1225,7 @@ fn demo_consumer_raw(slug: &str) -> brenn_lib::messaging::config::WasmConsumerCo
 
     WasmConsumerConfigRaw {
         slug: slug.to_string(),
-        component_path: std::path::PathBuf::from(DEMO_WASM),
+        package: "processor-demo".to_string(),
         grants: vec![ComponentGrant::Ports],
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             channel: Some("brenn:e2e-trigger".to_string()),
@@ -1296,7 +1296,10 @@ async fn boot_dispatch(
                 output_acl,
             } = lower_consumer_load_parts(consumer);
             let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-                component_path: &consumer.component_path,
+                // The dispatch harness loads the built artifact straight from
+                // the workspace: what it exercises is the wiring above the
+                // loader, not the package resolution boot does.
+                component_path: std::path::Path::new(DEMO_WASM),
                 slug: &consumer.slug,
                 output_ports,
                 input_amplification_mt,
@@ -1494,7 +1497,7 @@ fn link_config() -> brenn_lib::config::BrennConfig {
     };
     let reader = WasmConsumerConfigRaw {
         slug: "reader".to_string(),
-        component_path: std::path::PathBuf::from(DEMO_WASM),
+        package: "processor-demo".to_string(),
         grants: vec![ComponentGrant::Ports],
         subscriptions: vec![free_input_raw("in")],
         ..brenn_messaging_boot::test_fixtures::minimal_wasm_consumer()

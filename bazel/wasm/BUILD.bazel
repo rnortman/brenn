@@ -11,11 +11,6 @@ policy_srcs()
 # `manifest_names.sh` is the deploy manifest's grammar, exported because the
 # release packaging in `//bazel/release` reads the same manifest: one
 # implementation, three callers, so a format change cannot reach two of them.
-# `package_names.sh` is the package's file grammar, on the same footing as the
-# manifest's: the assembly, the staged-tree gate and the emitter's rule all
-# derive the same two sidecar names from an artifact, and the flat layout they
-# derive is provisional.
-#
 # `record_lib.sh` is the binding record's field scrape, exported for the same
 # reason as the two grammars above: the staged-tree gate and the emitter's own
 # test both read records, and a scrape that reaches one and not the other goes
@@ -29,7 +24,6 @@ exports_files([
     "deployed_components_check.sh",
     "emit_package.sh",
     "manifest_names.sh",
-    "package_names.sh",
     "record_lib.sh",
     "wasi_import_check.sh",
     "wit_lib.sh",

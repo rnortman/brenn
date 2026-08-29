@@ -2992,17 +2992,40 @@ fn fold_component_kinds(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) -
 /// positions in the source and one contract on the wire. `spec_sha256` is
 /// excluded for the same reason: two copies differing only in comments state
 /// the same contract, and whether their bytes bind to an artifact is a
-/// deployment question this fold does not ask.
+/// deployment question this fold does not ask. `package` is excluded on the
+/// same grounds — which packaged module declared a class is where it was
+/// found, not what it states.
+///
+/// Both sides are destructured so a field added to [`ClassRef`] does not join
+/// the comparison, or stay out of it, by nobody's decision: it is a compile
+/// error here until someone makes one.
 fn same_class_facts(left: &ClassRef, right: &ClassRef) -> bool {
-    left.name.value() == right.name.value()
-        && left.abi.value() == right.abi.value()
-        && same_words(&left.requires, &right.requires)
-        && same_words(&left.optional, &right.optional)
-        && left.ports.len() == right.ports.len()
-        && left
-            .ports
+    let ClassRef {
+        name: left_name,
+        abi: left_abi,
+        requires: left_requires,
+        optional: left_optional,
+        ports: left_ports,
+        spec_sha256: _,
+        package: _,
+    } = left;
+    let ClassRef {
+        name: right_name,
+        abi: right_abi,
+        requires: right_requires,
+        optional: right_optional,
+        ports: right_ports,
+        spec_sha256: _,
+        package: _,
+    } = right;
+    left_name.value() == right_name.value()
+        && left_abi.value() == right_abi.value()
+        && same_words(left_requires, right_requires)
+        && same_words(left_optional, right_optional)
+        && left_ports.len() == right_ports.len()
+        && left_ports
             .iter()
-            .zip(&right.ports)
+            .zip(right_ports)
             .all(|(left, right)| same_port(left, right))
 }
 

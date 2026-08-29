@@ -23,10 +23,13 @@ async fn main() -> ExitCode {
 
     let config = brenn_lib::config::load_config(cli.config.as_deref(), cli.modules.as_deref());
 
-    match cli.command.unwrap_or(cli::Commands::Serve) {
+    match cli
+        .command
+        .unwrap_or(cli::Commands::Serve { components: None })
+    {
         cli::Commands::Invite => bootstrap::run_invite(&config).await,
-        cli::Commands::Serve => {
-            bootstrap::run_server(config, cli.config, build_info::BUILD_ID).await;
+        cli::Commands::Serve { components } => {
+            bootstrap::run_server(config, cli.config, components, build_info::BUILD_ID).await;
         }
         cli::Commands::ConfigDiff { .. } | cli::Commands::ConfigCheck { .. } => {
             unreachable!("handled above, before the config loads")

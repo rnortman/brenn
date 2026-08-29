@@ -483,16 +483,19 @@ pub struct MessagingSubscriptionRaw {
 
 /// Top-level `[[wasm_consumer]]` block.
 ///
-/// Declares a WASM processing component as a bus subscriber. The component
-/// at `component_path` is loaded at bootstrap; a missing or unloadable
-/// component is a fail-fast bootstrap panic (config is host-authored).
+/// Declares a WASM processing component as a bus subscriber. The installed
+/// package named by `package` is resolved and loaded at bootstrap; a missing or
+/// unloadable component is a fail-fast bootstrap panic (config is
+/// host-authored).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WasmConsumerConfigRaw {
     /// Globally unique slug; becomes `wasm:<slug>` as the participant identity.
     /// Charset: `[A-Za-z0-9._~-]+`, no `:` or `@`.
     pub slug: String,
-    /// Path to the WASM component artifact (must exist at startup).
-    pub component_path: std::path::PathBuf,
+    /// The installed component package the artifact is resolved from — the
+    /// packaged module the instance's class was declared in. Not a body key:
+    /// the class's fact, carried through lowering.
+    pub package: String,
     /// Lowercase hex SHA-256 of the spec file this instance's class was
     /// declared in. Not a body key — the class's fact, carried through lowering
     /// so boot can bind it to the spec packaged beside the artifact.
@@ -632,10 +635,10 @@ impl WasmConsumerConfigRaw {
     /// everything else defaulted/empty. Shared across this crate's test modules
     /// and the boot crates above it so a new field on this struct lands in one
     /// place instead of every hand-written literal.
-    pub fn minimal(slug: &str, component_path: std::path::PathBuf, channels: &[&str]) -> Self {
+    pub fn minimal(slug: &str, package: &str, channels: &[&str]) -> Self {
         WasmConsumerConfigRaw {
             slug: slug.to_string(),
-            component_path,
+            package: package.to_string(),
             spec_sha256: String::new(),
             grants: vec![],
             store_path: None,
@@ -1402,10 +1405,10 @@ pub struct WasmOutputPort {
 #[derive(Debug, Clone)]
 pub struct ResolvedWasmConsumer {
     pub slug: String,
-    pub component_path: PathBuf,
+    /// The installed component package the artifact is resolved from.
+    pub package: String,
     /// Lowercase hex SHA-256 of the spec file this consumer's class was
-    /// declared in — what boot compares against the record packaged beside the
-    /// artifact at `component_path`.
+    /// declared in — what boot compares against the record in that package.
     pub spec_sha256: String,
     /// Granted capability interfaces for this component (deny-by-default).
     /// Determines which host functions are linked at component load time.
@@ -4080,15 +4083,16 @@ channel demo at "ephemeral:protobar-demo" {
     fn a_wake_min_on_a_consumer_io_binding_is_refused() {
         let diag = sole_refusal(concat!(
             r#"
+// ── packaged ──
 component Router {
     "#,
             processor_any!(),
             r#"
     io tick;
 }
+// ── packaged ──
 
 new router: Router {
-    component_path = "/lib/r.wasm";
     grants = [ports];
     io tick { push_depth = 1; retain_depth = 2; wake_min = normal; }
 }
@@ -5187,15 +5191,16 @@ channel digests at "brenn:alice-digests" {
     standing_retain_depth = 32;
 }
 
+// ── packaged ──
 component Router {
     "#,
             processor_any!(),
             r#"
     out digest;
 }
+// ── packaged ──
 
 new router: Router {
-    component_path = "/lib/r.wasm";
     grants = [ports, store, log, alert, config, mqtt];
     store_path = "/state/router.db";
 
@@ -5225,11 +5230,13 @@ new router: Router {
     fn an_unknown_consumer_grant_word_is_refused() {
         let diag = sole_refusal(concat!(
             r#"
+// ── packaged ──
 component Router { "#,
             processor_any!(),
             r#" io tick; }
+// ── packaged ──
 
-new router: Router { component_path = "/lib/r.wasm"; grants = [not_a_real_grant]; io tick {} }
+new router: Router { grants = [not_a_real_grant]; io tick {} }
 "#
         ));
         assert!(
@@ -5247,12 +5254,13 @@ new router: Router { component_path = "/lib/r.wasm"; grants = [not_a_real_grant]
             r#"
 channel feed at "ephemeral:alice-feed" { push_depth = 4; retain_depth = 8; }
 
+// ── packaged ──
 component Router { "#,
             processor_any!(),
             r#" in inbound; }
+// ── packaged ──
 
 new router: Router {
-    component_path = "/lib/r.wasm";
     grants = [];
 
     in inbound <- feed;
@@ -5272,11 +5280,13 @@ new router: Router {
     fn a_stray_consumer_key_is_refused() {
         let diag = sole_refusal(concat!(
             r#"
+// ── packaged ──
 component Router { "#,
             processor_any!(),
             r#" io tick; }
+// ── packaged ──
 
-new router: Router { component_path = "/lib/r.wasm"; grants = []; subscribe_acls = []; io tick {} }
+new router: Router { grants = []; subscribe_acls = []; io tick {} }
 "#
         ));
         assert!(

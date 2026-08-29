@@ -12,8 +12,8 @@ use brenn_dsl::derived::DAclSet;
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::{dom_any, processor_any};
 use support::{
-    derive_errors, derive_refusal, derive_refusals, derived, durable, nondurable, prefix_tuning,
-    tuning,
+    derive_errors, derive_refusal, derive_refusals, derived, derived_tree, durable, nondurable,
+    packaged, prefix_tuning, tuning,
 };
 
 /// A fixture class's header: its abi, and grant declarations permitting
@@ -615,10 +615,12 @@ fn a_surface_instance_carries_the_kind_its_class_folds_to() {
 #[test]
 fn a_top_level_instance_takes_no_kind() {
     let config = derived(concat!(
+        packaged!(),
         "component ModeClock { ",
         processor_any!(),
-        " }\n\
-             new clock: ModeClock { component_path = \"clock.wasm\"; grants = []; }\n",
+        " }\n",
+        packaged!(),
+        "new clock: ModeClock { grants = []; }\n",
     ));
     assert_eq!(config.resolved.consumers.len(), 1);
     assert!(config.surface_component_kinds.is_empty());
@@ -647,6 +649,39 @@ fn two_panels(first_body: &str, second_body: &str) -> Vec<(&'static str, String)
             ),
         ),
     ]
+}
+
+/// Two byte-identical copies of one class, shipped as two packages and placed
+/// on two surfaces.
+///
+/// The wire-kind fold asks whether two classes state the same contract. Which
+/// package a copy arrived in is a deployment question — the way its source hash
+/// already is — so the two still fold to one kind.
+#[test]
+fn the_package_a_class_arrived_in_is_not_one_of_its_wire_facts() {
+    let panel = concat!(
+        "component Panel { ",
+        dom_any!(),
+        " optional in messages; }\n"
+    );
+    let placing = |package: &str, marker: &str, handle: &str| {
+        format!(
+            "use @{package}::Panel;\n\nconst {marker} = 1;\n\
+             surface {handle} {{\n    grants = [];\n    \
+             new view: Panel {{ grants = []; }}\n}}\n"
+        )
+    };
+    let config = derived_tree(&[
+        ("", "use one::marker_one;\nuse two::marker_two;\n"),
+        ("one", &placing("alpha", "marker_one", "first")),
+        ("two", &placing("beta", "marker_two", "second")),
+        ("@alpha", panel),
+        ("@beta", panel),
+    ]);
+    assert_eq!(
+        config.surface_component_kinds,
+        vec![vec!["panel".to_string()], vec!["panel".to_string()]]
+    );
 }
 
 /// The class body every same-facts fixture uses on both sides. Its port is
@@ -1036,9 +1071,11 @@ fn a_consumers_ports_participate() {
     // channel on either side of the wire.
     let source = format!(
         "channel m at \"ephemeral:alice.m\" {{\n    push_depth = 4;\n    retain_depth = 16;\n}}\n\
-         component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+         // ── packaged ──\n\
+          component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+          // ── packaged ──\n\
          {}surface page {{\n    grants = [subscribe];\n{}}}\n\
-         new sink: Sink {{\n    slug = \"sink\";\n    component_path = \"/tmp/sink.wasm\";\n    \
+         new sink: Sink {{\n    slug = \"sink\";\n    \n    \
          grants = [];\n    in messages <- m;\n}}\n",
         tagged_class("Panel", ": \"alice.panel@1\""),
         tagged_inst("panel", "Panel"),
@@ -1084,10 +1121,12 @@ fn a_page_local_name_and_a_server_local_name_are_two_channels() {
     // component and a page component naming one `local:` address are describing
     // two private channels, not disagreeing about one.
     let source = format!(
-        "component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+        "// ── packaged ──\n\
+         component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+         // ── packaged ──\n\
          {}surface page {{\n    grants = [];\n    \
          new panel: Panel {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n\
-         new sink: Sink {{\n    slug = \"sink\";\n    component_path = \"/tmp/sink.wasm\";\n    \
+         new sink: Sink {{\n    slug = \"sink\";\n    \n    \
          grants = [];\n    in messages <- \"local:alice.m\";\n}}\n",
         tagged_class("Panel", ": \"alice.panel@1\""),
     );
@@ -1248,24 +1287,35 @@ fn two_modules_wiring_one_plane_are_checked_against_each_other() {
     // the plane they share is where the disagreement surfaces. Both components
     // are backend-placed, which is what makes the `local:` name they both wrote
     // one channel.
-    let module = |key: &'static str, marker: &str, class: &str, tag: &str, inst: &str| {
+    // The classes ship as packages, which is where a top-level instance's class
+    // has to be declared; the wiring of both is the deployer's, in the root.
+    let module = |key: &'static str, marker: &str, class: &str, tag: &str| {
         (
             key,
             format!(
                 "const {marker} = 1;\ncomponent {class} {{ {PROCESSOR} in messages: \"{tag}\"; \
-                 }}\nnew {inst}: {class} {{\n    slug = \"{inst}\";\n    \
-                 component_path = \"/tmp/{inst}.wasm\";\n    grants = [];\n    \
-                 in messages <- \"local:alice.m\";\n}}\n"
+                 }}\n"
             ),
+        )
+    };
+    let wiring = |inst: &str, class: &str| {
+        format!(
+            "new {inst}: {class} {{\n    slug = \"{inst}\";\n    \
+             \n    grants = [];\n    \
+             in messages <- \"local:alice.m\";\n}}\n"
         )
     };
     let modules = vec![
         (
             "",
-            "use one::marker_one;\nuse two::marker_two;\n".to_string(),
+            format!(
+                "use @one::*;\nuse @two::*;\n{}{}",
+                wiring("panel", "Panel"),
+                wiring("board", "Board")
+            ),
         ),
-        module("one", "marker_one", "Panel", "alice.panel@1", "panel"),
-        module("two", "marker_two", "Board", "alice.board@1", "board"),
+        module("@one", "marker_one", "Panel", "alice.panel@1"),
+        module("@two", "marker_two", "Board", "alice.board@1"),
     ];
     let errors = support::derive_tree(&borrow(&modules)).expect_err("one plane, two documents");
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -1276,8 +1326,8 @@ fn two_modules_wiring_one_plane_are_checked_against_each_other() {
         "{}",
         errors[0].message
     );
-    assert_eq!(errors[0].related[0].1.filename_inner(), Some("one.brenn"));
-    assert_eq!(errors[0].related[1].1.filename_inner(), Some("two.brenn"));
+    assert_eq!(errors[0].related[0].1.filename_inner(), Some("@one.brenn"));
+    assert_eq!(errors[0].related[1].1.filename_inner(), Some("@two.brenn"));
 }
 
 #[test]
@@ -1341,13 +1391,17 @@ new bob: Pod(slug = \"bob\");
 fn linked(collector: &str, indexer: &str, doctypes: (&str, &str)) -> String {
     let (source, sink) = doctypes;
     format!(
-        "component Source {{ {PROCESSOR} optional out events{source}; }}\n\
-         component Sink {{ {PROCESSOR} optional io feed{sink}; optional in quiet; }}\n\
+        "// ── packaged ──\n\
+         component Source {{ {PROCESSOR} optional out events{source}; }}\n\
+         // ── packaged ──\n\
+         // ── packaged ──\n\
+          component Sink {{ {PROCESSOR} optional io feed{sink}; optional in quiet; }}\n\
+          // ── packaged ──\n\
          link relay;\n\
          new collector: Source {{\n    slug = \"collector\";\n    \
-         component_path = \"/tmp/c.wasm\";\n{collector}}}\n\
+         \n{collector}}}\n\
          new indexer: Sink {{\n    slug = \"indexer\";\n    \
-         component_path = \"/tmp/i.wasm\";\n{indexer}}}\n"
+         \n{indexer}}}\n"
     )
 }
 
@@ -1493,17 +1547,21 @@ fn doctypes_across_a_link_must_agree() {
 #[test]
 fn a_link_named_where_a_channel_is_required_says_it_names_a_link() {
     let matcher = format!(
-        "component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+        "// ── packaged ──\n\
+         component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+         // ── packaged ──\n\
          link relay;\n\
          new indexer: Sink {{\n    slug = \"indexer\";\n    \
-         component_path = \"/tmp/i.wasm\";\n    grants = [subscribe];\n    \
+         \n    grants = [subscribe];\n    \
          acl subscribe [exact relay];\n}}\n"
     );
     let argument = format!(
-        "component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+        "// ── packaged ──\n\
+         component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+         // ── packaged ──\n\
          assembly Pod(ch: Channel) {{\n    \
          new inner: Sink {{\n        slug = \"inner\";\n        \
-         component_path = \"/tmp/i.wasm\";\n        grants = [];\n        \
+         \n        grants = [];\n        \
          in quiet <- ch {{ push_depth = 1; retain_depth = 1; }}\n    }}\n}}\n\
          link relay;\n\
          new pod: Pod(ch = relay);\n"
@@ -1525,10 +1583,12 @@ fn a_link_named_where_a_channel_is_required_says_it_names_a_link() {
 #[test]
 fn a_stamped_link_named_where_a_channel_is_required_says_it_names_a_link() {
     let refusals = support::refusals(&format!(
-        "component Sink {{ {PROCESSOR} optional io feed; }}\n\
+        "// ── packaged ──\n\
+         component Sink {{ {PROCESSOR} optional io feed; }}\n\
+         // ── packaged ──\n\
          assembly Pod() {{\n    link relay;\n    \
          new inner: Sink {{\n        slug = \"inner\";\n        \
-         component_path = \"/tmp/i.wasm\";\n        grants = [subscribe, ports];\n        \
+         \n        grants = [subscribe, ports];\n        \
          acl subscribe [exact relay];\n        \
          io feed <-> relay {{ push_depth = 1; retain_depth = 1; }}\n    }}\n}}\n\
          new pod: Pod();\n"

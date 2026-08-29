@@ -1,6 +1,6 @@
 """The deploy tarball's staged tree.
 
-Which binaries, which asset trees, and which components ship is decided here,
+Which binaries, which asset trees, and which packages ship is decided here,
 under gates. `VERSION` and `deploy.sh` are deliberately absent — the consumer
 adds them before archiving.
 
@@ -21,11 +21,6 @@ release_package(
         "//brenn",
         "//brenn-cli",
     ],
-    # Every component in the tree is offered; `deployed-components.txt` decides
-    # which of them ship. Passing the deployed subset here instead would make
-    # the manifest a second list to keep in step with this one, and the drift
-    # would ship a component nobody listed or drop one everybody expects.
-    components = ["//brenn-wasm:components"],
     frontend = "//frontend:dist",
     lib_files = ["//:noop_mcp.py"],
     manifest = "//brenn-wasm:deployed-components.txt",
@@ -33,8 +28,11 @@ release_package(
     # Only the backend half: a surface kind's module is harvested from the
     # staged surface tree, which already carries it per kind.
     modules = ["//brenn-wasm:deployed_modules"],
-    # The sidecars, offered the same way the artifacts are: the manifest decides
-    # which of them ship, and an entry whose package is missing fails assembly.
+    # Every package in the tree is offered; `deployed-components.txt` decides
+    # which of them ship. Passing the deployed subset here instead would make
+    # the manifest a second list to keep in step with this one, and the drift
+    # would ship a component nobody listed or drop one everybody expects. An
+    # entry whose package is missing fails assembly.
     packages = ["//brenn-wasm:packages"],
     surface = "//surface:dist",
     visibility = ["//visibility:public"],
