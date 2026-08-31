@@ -2,7 +2,101 @@
 
 All notable changes to Brenn are documented here.
 
-## [Unreleased]
+## [0.18.0] — 2026-08-31
+
+The story here is that a component now ships as a **package** — the artifact,
+the specification its author wrote, and a record binding the two — and the host
+re-computes that binding at boot and refuses to start when anything disagrees.
+Around that, the processor/DOM split is gone: one component vocabulary, one
+artifact shape, and page access is a capability rather than an ABI. Two new
+command-line flags tell the server where the installed modules and packages
+live, so the same document checks on a workstation and boots on a host. And the
+TOML config front end is gone, which makes the config DSL the only notation.
+
+Nearly everything below is breaking. Budget a config edit and a unit-file edit
+for this upgrade, not a binary swap. `docs/config-dsl.md` is the new prose
+reference for the configuration language, and `docs/component-packages.md` the
+normative contract for out-of-tree component authors.
+
+### Added
+
+- **Component packages.** A backend WASM component is no longer a bare `.wasm`.
+  It is a directory named for the package, holding `package.json` (record v2),
+  the artifact, and — for a processor-world component — a verbatim copy of the
+  author's `<name>.brenn` specification. Before loading an instance the host
+  resolves `<components root>/<package name>/`, re-hashes the artifact and the
+  packaged specification against the record, and compares the packaged
+  specification's hash to the hash of the specification the *configuration*
+  compiled against. Byte-identical or refuse. Every failure is a panic naming
+  the path and the remedy.
+  **Operator action:** install one package directory per component and point
+  the server at their parent with the new `serve --components <DIR>`. A host
+  started without it panics naming the flag as soon as a configuration loads a
+  component.
+- **`brenn --modules <DIR>` and packaged-module imports.** A deployment no
+  longer restates a component's specification; it imports the author's file:
+  `use @processor-demo::*;`, resolved as `<module root>/processor-demo.brenn`.
+  The root is an environment fact, so it is named on the command line and never
+  in the document — the same document checks against a source checkout on a
+  workstation and boots against the installed tree on a host. `--modules` is a
+  global flag and must precede the subcommand; a document with an `@` import and
+  no `--modules` is refused naming the flag.
+  **Operator action:** the release now stages a flat `modules/` tree beside the
+  packages; pass it as `--modules`. Surface kinds are imported this way too, so
+  a deployment needs the module root whether or not it runs backend components.
+- **Page capabilities and the sync channel.** `dom` gives a component a handle
+  table over its own subtree and nothing else; `page-dom` — held by exactly one
+  instance per surface, its chrome — is the separate authority to reach outside
+  it. The element and attribute vocabularies are fixed allow-lists, admitting
+  nothing that can navigate, fetch, or execute; `docs/security-posture.md`
+  carries the admission rule. Alongside them, an activation may now carry a
+  **sync** port: a live request the component answers in the same turn, which is
+  how a DOM event listener gets to cancel or proceed in band.
+
+### Changed
+
+- **BREAKING: one component vocabulary at both placements.** The
+  processor/DOM component split is gone. `abi = dom;` no longer exists —
+  `abi = processor;` is the one artifact shape both hosts load, and where an
+  instance runs is decided by where it is placed and what it is granted. What
+  this costs a configuration, concretely:
+  - Every component instance now carries a required `grants` list, at both
+    placements, in one vocabulary. A surface-placed component that renders needs
+    `dom`; a chrome needs `page-dom` as well. `takeover` moved off the `surface`
+    block and onto the instance that requests the overlay.
+  - Every class writes `requires` (a component that needs nothing writes
+    `requires = [];`). Spec fit is checked in both directions: a required word
+    the instance was not granted is refused, and so is a granted word the class
+    never asked for.
+  - Ports are required unless the class marks them `optional`. An unbound port
+    is no longer legal by default.
+  - `component_path` is gone from the vocabulary entirely; a document that still
+    states it is refused as an unknown key. The package name is the whole
+    reference.
+  - A webhook's `replay_protection` names its guard by installed package:
+    `component = "replay-generic";` in place of the old artifact path.
+- **BREAKING: the release tree changed shape.** Components moved out of `lib/`:
+  the deploy manifest is now `components/deployed-components.txt` and each entry
+  is a `components/<name>/` package directory. New alongside it are `modules/`
+  (the module root) and `scripts/manifest_names.sh` (the manifest grammar, which
+  a deploying repo's preflight execs rather than transcribing). Deploy tooling
+  that copied `lib/*.wasm` will not find them.
+- **BREAKING: surface components ship as jco-transpiled directories.** The
+  wasm-bindgen `brenn_<kind>.js` / `_bg.wasm` quadruple is replaced by
+  `surface/processor/<kind>/`, carrying a v2 `manifest.json` with the kind's
+  packaged specification and its hash. Boot re-derives every stated filename,
+  re-hashes each, and binds per instance against the specification the
+  configuration compiled against. **Operator action:** install the surface asset
+  tree wholesale rather than overlaying it — a file from a prior release
+  surviving beside a fresh record is a boot refusal. The same holds for the
+  module root and the components root: sync them, never overlay.
+- **BREAKING for component authors: `receive` changed shape.** It now returns
+  `result<option<string>, receive-error>`; `activation` gains a `sync` field
+  naming the live port when the activation is a sync call. `ok(none)` on every
+  ordinary activation, `ok(some(reply))` only on a sync call, and a reply to a
+  cause that asked nothing is a trap. The `processor` world also imports the new
+  `dom` and `page-dom` interfaces. There is no compatibility shim: a component
+  built against the 0.17 world does not load.
 
 ### Removed
 
