@@ -14,6 +14,8 @@ use chrono::{TimeZone, Utc};
 
 use super::{StatusReport, derive_health, expected_pumps, geometry_body, status_body};
 use crate::bindings::AppliedBindings;
+use crate::logic::{KernelAction, KernelCore};
+use crate::session::Event;
 
 const WIRE: &str = "brenn:site.bar.in";
 
@@ -242,6 +244,30 @@ fn counters_naming_an_undeclared_instance_are_refused() {
     assert!(err.contains("ghost"), "{err}");
 }
 
+/// A counters row created by an activation failure is checked against the
+/// wiring like every other row. Nothing reachable today creates one for an
+/// instance the bindings do not declare — an activation exists only for an
+/// admitted instance, and a wiring change reloads the page rather than rewiring
+/// it in place — so this pins the refusal as a decision: a row that outlived
+/// its declaration takes the status publish down rather than attributing
+/// traffic to a principal the wiring disowns.
+#[test]
+fn a_failure_row_for_an_undeclared_instance_is_refused() {
+    let bindings = applied(&doc());
+    let instances = healthy();
+    let mut counters = counters();
+    counters.instances.insert(
+        "ghost".to_string(),
+        InstanceCounters {
+            activation_failures: 3,
+            ..InstanceCounters::default()
+        },
+    );
+    let err = status_body("sess-1", &bindings, &report(&instances, &counters, None))
+        .expect_err("a failure-created row for an undeclared instance is refused");
+    assert!(err.contains("ghost"), "{err}");
+}
+
 #[test]
 fn an_overlay_holder_the_surface_does_not_declare_is_refused() {
     let bindings = applied(&doc());
@@ -269,4 +295,69 @@ fn a_rule_of_the_document_schema_reaches_the_caller() {
     let err = status_body("sess-1", &bindings, &report(&instances, &counters, None))
         .expect_err("a repeated instance is refused");
     assert!(err.contains("more than once"), "{err}");
+}
+
+/// Health, composed end to end from the kill path rather than from a table a
+/// test wrote by hand: a real `KernelCore`, wired with a real document, told
+/// that an instance died. The retained document an operator reads has to stop
+/// saying `ok` the moment that happens, and has to say which instance and why.
+#[test]
+fn a_death_the_kernel_folded_shows_up_as_degraded_with_its_reason() {
+    // No bound inputs, so a mounted table is healthy on mounts alone and the
+    // only thing moving health here is the death.
+    let mut wiring = doc();
+    wiring.subscriptions.clear();
+    let bindings = applied(&wiring);
+
+    let mut core = KernelCore::new();
+    core.on_event(&Event::Connected {
+        bindings: wiring,
+        participant_id: "surface:bar".to_string(),
+        session_id: "sess-1".to_string(),
+        max_body_bytes: 65_536,
+        alert_granted: false,
+    });
+    core.on_processor_register("chrome");
+    core.on_processor_register("p1");
+
+    let healthy = status_instances(&core.on_status_tick());
+    let counters = StatusCounters::default();
+    let body = status_body("sess-1", &bindings, &report(&healthy, &counters, None))
+        .expect("a report consistent with its wiring");
+    assert_eq!(
+        StatusDocument::parse(&body)
+            .expect("the composed body parses")
+            .health,
+        Health::Ok
+    );
+
+    core.on_event(&Event::InstanceFailed {
+        instance: "p1".to_string(),
+        reason: "component trapped: boom".to_string(),
+    });
+
+    let after = status_instances(&core.on_status_tick());
+    let body = status_body("sess-1", &bindings, &report(&after, &counters, None))
+        .expect("a report consistent with its wiring");
+    let doc = StatusDocument::parse(&body).expect("the composed body parses");
+    assert_eq!(doc.health, Health::Degraded);
+    let p1 = doc
+        .instances
+        .iter()
+        .find(|i| i.instance == "p1")
+        .expect("p1 row");
+    assert_eq!(p1.state, InstanceState::Failed);
+    assert_eq!(p1.reason.as_deref(), Some("component trapped: boom"));
+}
+
+/// The instance table within a kernel action slice; panics if it carries no
+/// status.
+fn status_instances(actions: &[KernelAction]) -> Vec<InstanceReport> {
+    actions
+        .iter()
+        .find_map(|a| match a {
+            KernelAction::SendStatus { instances } => Some(instances.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a SendStatus in {actions:?}"))
 }

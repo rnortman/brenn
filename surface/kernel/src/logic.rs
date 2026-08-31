@@ -5,17 +5,19 @@
 //! host target; the wasm effect executor consumes the [`KernelAction`]s it
 //! emits.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use brenn_attach_proto::AlertSeverity;
 use brenn_envelope::grants::ComponentGrant;
 
 use crate::PublishStatus;
+use crate::outbound::truncate_report_field;
 use crate::schema::bindings::BindingsDocument;
-use crate::schema::telemetry::InstanceReport;
+use crate::schema::telemetry::{InstanceReport, MAX_INSTANCE_REASON_BYTES};
 use crate::schema::{
     CONTROL_PLANE_VERSION, InstanceState, LOCAL_LINK_STATE_CHANNEL, LOCAL_SURFACE_STATE_CHANNEL,
-    LinkState, LinkStateBody, LogLevel, SurfaceStateBody, SurfaceStateInstance,
+    LinkState, LinkStateBody, LogLevel, MAX_LOG_MESSAGE_BYTES, SurfaceStateBody,
+    SurfaceStateInstance,
 };
 use crate::session::Event;
 use crate::{contract, schema};
@@ -330,6 +332,19 @@ pub enum KernelAction {
     /// the DOM executor fills page uptime and the lifetime counters it owns
     /// before handing the report over.
     SendStatus { instances: Vec<InstanceReport> },
+    /// Add one to the instance's `activation_failures` column in the lifetime
+    /// counters the executor owns. No console line, no publish, no status
+    /// publish of its own — the heartbeat carries the value.
+    ///
+    /// Emitted for every activation failure, whatever level the accompanying
+    /// `Report` went out at: the report dedup governs what an operator reads,
+    /// and letting it govern the count too would re-open the blindness this
+    /// counter exists to remove — a live instance failing every delivery is
+    /// otherwise indistinguishable from one that failed once.
+    // TODO(surface-instance-counter-column-action): the column is hardcoded in
+    // the variant, so each further per-instance column costs another variant and
+    // another executor arm; one generic counting action would cost a match once.
+    CountActivationFailure { instance: String },
 }
 
 /// What a page-hosted processor's registration attempt decided.
@@ -492,7 +507,9 @@ pub struct KernelCore {
     /// registration as a duplicate while the page still holds the old detached
     /// host's entry. Clearing must be wired with the kernel-driven instance-death
     /// path, distinguishing death (deregister + clear) from Phase-3 reparent
-    /// (preserve delivery, never deregister).
+    /// (preserve delivery, never deregister). `activation_error_memo` is
+    /// keyed the same way and must be cleared on the same path, or the
+    /// remount's first failure is silently demoted to `Debug`.
     registered: HashSet<String>,
     /// The singleton chrome instance the bindings document names, or `None` when
     /// the surface declares no chrome. Read in exactly two places: the connect
@@ -509,6 +526,18 @@ pub struct KernelCore {
     /// processor instances. True from the first mount plan that saw any, for the
     /// page's life: instantiation is per page, not per connect.
     processors_started: bool,
+    /// Instance → the last activation-failure text reported at
+    /// [`LogLevel::Error`] for it. A repeat of the same text is reported at
+    /// [`LogLevel::Debug`] instead, so a component failing every delivery does
+    /// not fill the error channel with copies of one fact.
+    ///
+    /// Entries are never removed: the key set is bounded by the surface's own
+    /// configuration, and a terminal instance receives no further activations,
+    /// so its entry simply goes cold. A remount under one page life therefore
+    /// inherits its predecessor's memo, and its first failure is demoted to
+    /// `Debug` whenever the text matches
+    /// (`TODO(kernel-registration-gate-lifecycle)`).
+    activation_error_memo: BTreeMap<String, String>,
 }
 
 impl KernelCore {
@@ -526,6 +555,7 @@ impl KernelCore {
             chrome_instance: None,
             connect_indicator_active: true,
             processors_started: false,
+            activation_error_memo: BTreeMap::new(),
         }
     }
 
@@ -624,9 +654,14 @@ impl KernelCore {
     ///
     /// The headless counterpart of the mount plan's error card: there is no wrapper
     /// to card, so the `failed` status row plus its `surface-state` publish *is* the
-    /// observable, alongside the death report. An unknown or already-identically-
-    /// failed instance emits nothing (the `mark_instance_failed` no-op), so a
-    /// loader that reports twice does not double-report.
+    /// observable, alongside the death report. An already-identically-failed
+    /// instance emits nothing, so a loader that reports twice does not
+    /// double-report.
+    ///
+    /// An instance the status table never heard of has no row to fail and no card
+    /// to draw, so it gets the one thing left: an Error report naming it. Silence
+    /// there would leave a bring-up that failed an undeclared instance with no
+    /// console line, no counter and no status row.
     ///
     /// A currently-registered instance is *never* failed here. The loader reports
     /// `load_failed` for a refused registration, and one refusal reason is a
@@ -646,6 +681,16 @@ impl KernelCore {
                 subject: Some(instance.to_string()),
             }];
         }
+        if !self.instances.iter().any(|s| s.instance == instance) {
+            return vec![KernelAction::Report {
+                level: LogLevel::Error,
+                message: format!(
+                    "processor load failure for unknown instance {instance} ({detail}): no status \
+                     row was ever declared for it"
+                ),
+                subject: Some(instance.to_string()),
+            }];
+        }
         let reason = format!("processor load failed: {detail}");
         if !self.mark_instance_failed(instance, &reason) {
             return Vec::new();
@@ -655,15 +700,16 @@ impl KernelCore {
             message: format!("processor instance {instance} failed to load: {detail}"),
             subject: Some(instance.to_string()),
         }];
+        // The table actions go on the wire first either way: a reload request is
+        // applied as a navigation, so anything queued behind it may never leave.
+        actions.extend(self.instance_table_actions());
         // A page with no layout engine is not a page to keep: the capped
-        // bootstrap reload replaces the status row.
+        // bootstrap reload follows the corrected status.
         if self.chrome_instance.as_deref() == Some(instance) {
             actions.push(KernelAction::RequestReload {
                 reason: "chrome mount failed".to_string(),
             });
-            return actions;
         }
-        actions.extend(self.instance_table_actions());
         actions
     }
 
@@ -673,6 +719,11 @@ impl KernelCore {
     /// was drawing: the card replaces its content. A headless instance has no
     /// wrapper, so its `failed` status row on `surface-state` is the whole
     /// observable.
+    ///
+    /// The reason is capped the way every other sink caps it: a trap reason is
+    /// unbounded component text, and the card writes it into the page, so an
+    /// uncapped one is a multi-megabyte text node rendered in exactly the
+    /// degraded state the card exists to survive.
     fn error_card_for_dead_instance(&self, instance: &str, reason: &str) -> Vec<KernelAction> {
         if !self.instance_granted(instance, ComponentGrant::Dom) {
             return Vec::new();
@@ -683,7 +734,7 @@ impl KernelCore {
         vec![KernelAction::ErrorCard {
             instance: instance.to_string(),
             kind: status.kind.clone(),
-            reason: reason.to_string(),
+            reason: truncate_report_field(reason.to_string(), MAX_LOG_MESSAGE_BYTES),
         }]
     }
 
@@ -879,22 +930,71 @@ impl KernelCore {
                 });
                 actions
             }
-            // A non-terminal activation error leaves the instance alive: nothing
-            // to do here (the diagnostic is on the EventStream). A terminal
-            // trap is contained per-instance for every component — except the
-            // singleton chrome, whose death is fatal: there is no
-            // layout engine left to continue with, so the kernel triggers the
-            // capped bootstrap reload instead of an error card. Non-chrome
-            // containment is unchanged.
-            Event::ActivationFailed { .. } => Vec::new(),
-            Event::InstanceFailed { instance, reason } => {
-                if self.chrome_instance.as_deref() == Some(instance.as_str()) {
-                    vec![KernelAction::RequestReload {
-                        reason: "chrome died".to_string(),
-                    }]
-                } else {
-                    self.error_card_for_dead_instance(instance, reason)
+            // The instance is still alive unless something else took it
+            // terminal, so a deterministic failure recurs once per delivery.
+            // Dedup identical consecutive texts per instance to keep the error
+            // channel useful.
+            Event::ActivationFailed { instance, message } => {
+                // Truncated before it is memoed, so the compare, the memo and
+                // the emitted line are the same text: two failures differing
+                // only past the cap are one fact to every sink downstream.
+                let message = truncate_report_field(
+                    format!("activation failed on '{instance}': {message}"),
+                    MAX_LOG_MESSAGE_BYTES,
+                );
+                let repeat = self.activation_error_memo.get(instance) == Some(&message);
+                if !repeat {
+                    self.activation_error_memo
+                        .insert(instance.clone(), message.clone());
                 }
+                vec![
+                    KernelAction::Report {
+                        level: if repeat {
+                            LogLevel::Debug
+                        } else {
+                            LogLevel::Error
+                        },
+                        message,
+                        subject: Some(instance.clone()),
+                    },
+                    // Counted at every level, so the retained status document
+                    // keeps a per-occurrence signal the demoted repeats no
+                    // longer put on the error channel.
+                    KernelAction::CountActivationFailure {
+                        instance: instance.clone(),
+                    },
+                ]
+            }
+            // A terminal instance is contained per-instance for every component
+            // — except the singleton chrome, whose death is fatal: there is no
+            // layout engine left to continue with, so the kernel triggers the
+            // capped bootstrap reload instead of an error card. Either way the
+            // reason is reported separately: the reload reason is a fixed
+            // discriminant, not a detail carrier.
+            //
+            // On the chrome arm the status-table update must precede the reload
+            // request, which navigates the page as soon as it is applied.
+            Event::InstanceFailed { instance, reason } => {
+                let is_chrome = self.chrome_instance.as_deref() == Some(instance.as_str());
+                let mut actions = vec![KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: if is_chrome {
+                        format!("chrome instance '{instance}' failed: {reason}")
+                    } else {
+                        format!("instance '{instance}' failed: {reason}")
+                    },
+                    subject: Some(instance.clone()),
+                }];
+                if !is_chrome {
+                    actions.extend(self.error_card_for_dead_instance(instance, reason));
+                }
+                actions.extend(self.note_instance_failed(instance, reason));
+                if is_chrome {
+                    actions.push(KernelAction::RequestReload {
+                        reason: "chrome died".to_string(),
+                    });
+                }
+                actions
             }
             Event::PublishResult {
                 instance,
@@ -1146,15 +1246,22 @@ impl KernelCore {
     /// whether this was a transition (the row existed and was not already failed
     /// with the same reason), so a caller can emit an immediate status report only
     /// on a real change. A no-op for an unknown instance.
+    ///
+    /// The reason is truncated to [`MAX_INSTANCE_REASON_BYTES`] through the
+    /// crate's one truncation policy: reasons are unbounded component text and
+    /// must fit within the document schema's bound or the command loop panics.
+    /// The marker that policy appends is the point — an operator reading a
+    /// `failed` row can tell a clipped reason from a short one.
     fn mark_instance_failed(&mut self, instance: &str, reason: &str) -> bool {
+        let reason = truncate_report_field(reason.to_string(), MAX_INSTANCE_REASON_BYTES);
         let Some(status) = self.instances.iter_mut().find(|s| s.instance == instance) else {
             return false;
         };
-        if status.state == InstanceState::Failed && status.reason.as_deref() == Some(reason) {
+        if status.state == InstanceState::Failed && status.reason.as_deref() == Some(&reason) {
             return false;
         }
         status.state = InstanceState::Failed;
-        status.reason = Some(reason.to_string());
+        status.reason = Some(reason);
         true
     }
 
@@ -1208,10 +1315,11 @@ impl KernelCore {
         vec![self.status_action()]
     }
 
-    /// Record a terminal failure of `instance` (a terminal port event error-carded
-    /// it) in the status table, emitting an immediate status report on a real
-    /// transition, so a headless instance's terminal failure is reported like any
-    /// other.
+    /// Record a terminal failure of `instance` in the status table, emitting an
+    /// immediate off-tick status report on a real transition, so a death reaches
+    /// the retained status document within one turn rather than at the next
+    /// heartbeat — and so a headless instance's terminal failure is reported like
+    /// any other. An unknown instance or an identical repeat emits nothing.
     pub fn note_instance_failed(&mut self, instance: &str, reason: &str) -> Vec<KernelAction> {
         if self.mark_instance_failed(instance, reason) {
             self.instance_table_actions()
@@ -1295,6 +1403,44 @@ mod tests {
 
     // ── connect indicator + chrome-death-is-fatal (kernel pixel classes) ──
 
+    /// One expected instance-table row: instance, kind, state, reason.
+    type ExpectedRow<'a> = (&'a str, &'a str, InstanceState, Option<&'a str>);
+
+    /// The `surface-state` control body a table of `rows` renders to. Spelled out
+    /// from the expected rows rather than read off the core, so a test pins what
+    /// the plane should say and not merely that it agrees with itself.
+    fn surface_state_body(rows: &[ExpectedRow]) -> SurfaceStateBody {
+        SurfaceStateBody {
+            v: CONTROL_PLANE_VERSION,
+            instances: rows
+                .iter()
+                .map(|(instance, kind, state, reason)| SurfaceStateInstance {
+                    instance: (*instance).to_string(),
+                    kind: (*kind).to_string(),
+                    state: *state,
+                    reason: reason.map(str::to_string),
+                })
+                .collect(),
+        }
+    }
+
+    /// The [`KernelAction::SendStatus`] a table of `rows` renders to, with no pumps
+    /// attached — the shape every death test here works in.
+    fn status_action_for(rows: &[ExpectedRow]) -> KernelAction {
+        KernelAction::SendStatus {
+            instances: rows
+                .iter()
+                .map(|(instance, kind, state, reason)| InstanceReport {
+                    instance: (*instance).to_string(),
+                    kind: (*kind).to_string(),
+                    state: *state,
+                    reason: reason.map(str::to_string),
+                    ports_attached: 0,
+                })
+                .collect(),
+        }
+    }
+
     /// A `Connected` naming `chrome_instance` as the singleton chrome. All
     /// components are otherwise the ordinary defined-element shape.
     fn connected_event_chrome(components: Vec<ComponentEntry>, chrome_instance: &str) -> Event {
@@ -1317,19 +1463,56 @@ mod tests {
         });
         assert_eq!(
             reload,
-            vec![KernelAction::RequestReload {
-                reason: "chrome died".to_string(),
-            }],
-            "chrome's death is fatal — reload, no error card"
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "chrome instance 'chrome' failed: trap".to_string(),
+                    subject: Some("chrome".to_string()),
+                },
+                control_action(
+                    LOCAL_SURFACE_STATE_CHANNEL,
+                    &surface_state_body(&[
+                        ("chrome", "chrome", InstanceState::Failed, Some("trap")),
+                        ("protobar", "protobar", InstanceState::Pending, None),
+                    ]),
+                ),
+                status_action_for(&[
+                    ("chrome", "chrome", InstanceState::Failed, Some("trap")),
+                    ("protobar", "protobar", InstanceState::Pending, None),
+                ]),
+                KernelAction::RequestReload {
+                    reason: "chrome died".to_string(),
+                }
+            ],
+            "chrome's death is fatal — the reason is reported and the table corrected \
+             before the reload is requested, and there is no error card"
         );
 
         let sibling = core.on_event(&Event::InstanceFailed {
             instance: "protobar".to_string(),
             reason: "trap".to_string(),
         });
-        assert!(
-            sibling.is_empty(),
-            "a non-chrome death is contained per-instance, unchanged"
+        assert_eq!(
+            sibling,
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "instance 'protobar' failed: trap".to_string(),
+                    subject: Some("protobar".to_string()),
+                },
+                control_action(
+                    LOCAL_SURFACE_STATE_CHANNEL,
+                    &surface_state_body(&[
+                        ("chrome", "chrome", InstanceState::Failed, Some("trap")),
+                        ("protobar", "protobar", InstanceState::Failed, Some("trap")),
+                    ]),
+                ),
+                status_action_for(&[
+                    ("chrome", "chrome", InstanceState::Failed, Some("trap")),
+                    ("protobar", "protobar", InstanceState::Failed, Some("trap")),
+                ]),
+            ],
+            "a non-chrome death is contained per-instance, and still says why"
         );
     }
 
@@ -1401,6 +1584,9 @@ mod tests {
     use brenn_attach_proto::VersionRange;
 
     use crate::schema::bindings::{BINDINGS_DOCUMENT_VERSION, PlatformSection};
+    use crate::schema::telemetry::{
+        Health, StatusCounters, StatusDocument, TELEMETRY_DOCUMENT_VERSION,
+    };
     use crate::schema::{Binding, ComponentEntry};
     use crate::{PublishStatus, Urgency};
 
@@ -2154,6 +2340,28 @@ mod tests {
             }),
             "chrome's bring-up failure is fatal for the page, got {actions:?}"
         );
+        let reload = actions
+            .iter()
+            .position(|a| matches!(a, KernelAction::RequestReload { .. }))
+            .expect("the reload request");
+        let status = actions
+            .iter()
+            .position(|a| matches!(a, KernelAction::SendStatus { .. }))
+            .expect("a dead chrome corrects the status table before it reloads");
+        assert!(
+            status < reload,
+            "the table must go on the wire ahead of the navigation, got {actions:?}"
+        );
+        let failed = status_within(&actions)
+            .iter()
+            .find(|i| i.instance == "chrome")
+            .expect("chrome row")
+            .clone();
+        assert_eq!(failed.state, InstanceState::Failed);
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("processor load failed: instantiate threw")
+        );
 
         let sibling = core.on_processor_load_failed("panel-a", "instantiate threw");
         assert!(
@@ -2162,6 +2370,189 @@ mod tests {
                 .any(|a| matches!(a, KernelAction::RequestReload { .. })),
             "a sibling's bring-up failure is contained, got {sibling:?}"
         );
+    }
+
+    /// An activation error is not terminal, but it is not silent either: the
+    /// message is the only answer an operator has to "failed *how*?".
+    #[test]
+    fn an_activation_failure_reports_the_message_against_its_instance() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![granted_entry(
+            "panel-a",
+            "panel",
+            &["dom"],
+        )]));
+
+        let actions = core.on_event(&Event::ActivationFailed {
+            instance: "panel-a".to_string(),
+            message: "TypeError: expected a string".to_string(),
+        });
+        assert_eq!(
+            actions,
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "activation failed on 'panel-a': TypeError: expected a string"
+                        .to_string(),
+                    subject: Some("panel-a".to_string()),
+                },
+                KernelAction::CountActivationFailure {
+                    instance: "panel-a".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_identical_activation_failure_repeat_is_demoted_to_debug() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![granted_entry(
+            "panel-a",
+            "panel",
+            &["dom"],
+        )]));
+
+        let failure = Event::ActivationFailed {
+            instance: "panel-a".to_string(),
+            message: "TypeError: expected a string".to_string(),
+        };
+        assert_eq!(levels(&core.on_event(&failure)), vec![LogLevel::Error]);
+        assert_eq!(
+            core.on_event(&failure),
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Debug,
+                    message: "activation failed on 'panel-a': TypeError: expected a string"
+                        .to_string(),
+                    subject: Some("panel-a".to_string()),
+                },
+                KernelAction::CountActivationFailure {
+                    instance: "panel-a".to_string(),
+                },
+            ],
+            "the demoted repeat still counts"
+        );
+    }
+
+    /// The memo holds the last text, not the first.
+    #[test]
+    fn a_different_activation_failure_reports_at_error_and_becomes_the_memo() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![granted_entry(
+            "panel-a",
+            "panel",
+            &["dom"],
+        )]));
+
+        let first = Event::ActivationFailed {
+            instance: "panel-a".to_string(),
+            message: "cannot parse config".to_string(),
+        };
+        let second = Event::ActivationFailed {
+            instance: "panel-a".to_string(),
+            message: "TypeError: expected a string".to_string(),
+        };
+        core.on_event(&first);
+        assert_eq!(
+            core.on_event(&second),
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "activation failed on 'panel-a': TypeError: expected a string"
+                        .to_string(),
+                    subject: Some("panel-a".to_string()),
+                },
+                KernelAction::CountActivationFailure {
+                    instance: "panel-a".to_string(),
+                },
+            ],
+            "the new text goes out, not the memoed one"
+        );
+        assert_eq!(levels(&core.on_event(&second)), vec![LogLevel::Debug]);
+        // The memo holds one text, so a component alternating between two
+        // distinct failures reports every flip at Error. Each flip is a
+        // distinct fact; this pins that as intended, not as a leak.
+        assert_eq!(levels(&core.on_event(&first)), vec![LogLevel::Error]);
+    }
+
+    /// The arm truncates before it memoes, so the compared, memoed and emitted
+    /// texts are one value: two failures differing only past the cap are one
+    /// fact, and no unbounded component text is retained per instance.
+    #[test]
+    fn activation_failures_differing_only_past_the_cap_are_one_fact() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![granted_entry(
+            "panel-a",
+            "panel",
+            &["dom"],
+        )]));
+
+        let shared = "b".repeat(MAX_LOG_MESSAGE_BYTES);
+        let failure = |tail: &str| Event::ActivationFailed {
+            instance: "panel-a".to_string(),
+            message: format!("{shared}{tail}"),
+        };
+
+        let actions = core.on_event(&failure("first tail"));
+        let KernelAction::Report { level, message, .. } = &actions[0] else {
+            panic!("an activation failure reports, got {actions:?}");
+        };
+        assert_eq!(*level, LogLevel::Error);
+        assert_eq!(message.len(), MAX_LOG_MESSAGE_BYTES);
+        assert!(
+            message.ends_with("…[truncated]"),
+            "a clipped message says so, got {message}"
+        );
+
+        assert_eq!(
+            levels(&core.on_event(&failure("second tail"))),
+            vec![LogLevel::Debug],
+            "the tails differ past the cap, so both lines are the same fact"
+        );
+    }
+
+    #[test]
+    fn the_same_activation_failure_on_another_instance_reports_at_error() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![
+            granted_entry("panel-a", "panel", &["dom"]),
+            granted_entry("panel-b", "panel", &["dom"]),
+        ]));
+
+        let message = "TypeError: expected a string".to_string();
+        core.on_event(&Event::ActivationFailed {
+            instance: "panel-a".to_string(),
+            message: message.clone(),
+        });
+        let actions = core.on_event(&Event::ActivationFailed {
+            instance: "panel-b".to_string(),
+            message,
+        });
+        assert_eq!(
+            actions,
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "activation failed on 'panel-b': TypeError: expected a string"
+                        .to_string(),
+                    subject: Some("panel-b".to_string()),
+                },
+                KernelAction::CountActivationFailure {
+                    instance: "panel-b".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// The levels of every `Report` in an action vector, in order.
+    fn levels(actions: &[KernelAction]) -> Vec<LogLevel> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                KernelAction::Report { level, .. } => Some(*level),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A rendering instance that dies — a trap in its mount activation or in any
@@ -2179,23 +2570,103 @@ mod tests {
             instance: "panel-a".to_string(),
             reason: "trapped building its UI".to_string(),
         });
+        let after_panel = [
+            (
+                "panel-a",
+                "panel",
+                InstanceState::Failed,
+                Some("trapped building its UI"),
+            ),
+            ("counter-a", "counter", InstanceState::Pending, None),
+        ];
         assert_eq!(
             carded,
-            vec![KernelAction::ErrorCard {
-                instance: "panel-a".to_string(),
-                kind: "panel".to_string(),
-                reason: "trapped building its UI".to_string(),
-            }]
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "instance 'panel-a' failed: trapped building its UI".to_string(),
+                    subject: Some("panel-a".to_string()),
+                },
+                KernelAction::ErrorCard {
+                    instance: "panel-a".to_string(),
+                    kind: "panel".to_string(),
+                    reason: "trapped building its UI".to_string(),
+                },
+                control_action(
+                    LOCAL_SURFACE_STATE_CHANNEL,
+                    &surface_state_body(&after_panel)
+                ),
+                status_action_for(&after_panel),
+            ]
         );
 
         let headless = core.on_event(&Event::InstanceFailed {
             instance: "counter-a".to_string(),
             reason: "trapped".to_string(),
         });
-        assert!(
-            headless.is_empty(),
-            "nothing to card for an instance that never drew, got {headless:?}"
+        let after_counter = [
+            (
+                "panel-a",
+                "panel",
+                InstanceState::Failed,
+                Some("trapped building its UI"),
+            ),
+            (
+                "counter-a",
+                "counter",
+                InstanceState::Failed,
+                Some("trapped"),
+            ),
+        ];
+        assert_eq!(
+            headless,
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "instance 'counter-a' failed: trapped".to_string(),
+                    subject: Some("counter-a".to_string()),
+                },
+                control_action(
+                    LOCAL_SURFACE_STATE_CHANNEL,
+                    &surface_state_body(&after_counter)
+                ),
+                status_action_for(&after_counter),
+            ],
+            "nothing to card for an instance that never drew — the report and the \
+             corrected table are its whole observable"
         );
+    }
+
+    /// A trap reason is unbounded component text and the card writes it into the
+    /// page. Every other sink caps it; the card caps it too, or a guest that
+    /// throws a stringified object graph renders it whole in the degraded state
+    /// the card exists to survive.
+    #[test]
+    fn a_card_caps_the_reason_it_renders() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![granted_entry(
+            "panel-a",
+            "panel",
+            &["dom"],
+        )]));
+
+        let reason = "b".repeat(MAX_LOG_MESSAGE_BYTES * 2);
+        let actions = core.on_event(&Event::InstanceFailed {
+            instance: "panel-a".to_string(),
+            reason: reason.clone(),
+        });
+        let carded = actions
+            .iter()
+            .find_map(|a| match a {
+                KernelAction::ErrorCard { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .expect("a dom-granted death is carded");
+        assert_eq!(carded.len(), MAX_LOG_MESSAGE_BYTES);
+        let head = carded
+            .strip_suffix("…[truncated]")
+            .expect("a clipped reason says so");
+        assert!(reason.starts_with(head), "the head of the real reason");
     }
 
     #[test]
@@ -2307,6 +2778,28 @@ mod tests {
             core.on_processor_load_failed("counter-a", "instantiate threw")
                 .is_empty()
         );
+    }
+
+    /// A load failure for an instance the table never declared has no row to
+    /// flip and no wrapper to card. Reporting it is the whole of what is left:
+    /// silence would leave a bring-up bug with no console line, no counter and
+    /// no status row.
+    #[test]
+    fn processor_load_failure_for_an_unknown_instance_is_still_reported() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![entry("counter-a", "counter")]));
+
+        let actions = core.on_processor_load_failed("ghost", "instantiate threw");
+        assert!(matches!(
+            &actions[..],
+            [KernelAction::Report { subject: Some(s), message, level: LogLevel::Error }]
+                if s == "ghost" && message.contains("unknown instance")
+        ));
+        assert!(
+            !publishes_control(&actions, LOCAL_SURFACE_STATE_CHANNEL),
+            "there is no row to publish"
+        );
+        assert_eq!(core.instances[0].state, InstanceState::Pending);
     }
 
     #[test]
@@ -3088,6 +3581,77 @@ mod tests {
             .expect("m1 row");
         assert_eq!(m1.state, InstanceState::Failed);
         assert_eq!(m1.reason.as_deref(), Some("component trapped: boom"));
+    }
+
+    /// The kill path, not the helper: a death folded through `InstanceFailed` is
+    /// what a trap actually takes, and it has to reach the status table or the
+    /// retained document keeps asserting a mount that is gone.
+    #[test]
+    fn a_death_folded_through_the_event_flips_the_status_row() {
+        let mut core = connect(vec![entry("m1", "meeting")], false);
+        let event = Event::InstanceFailed {
+            instance: "m1".to_string(),
+            reason: "component trapped: boom".to_string(),
+        };
+
+        let actions = core.on_event(&event);
+        let m1 = status_within(&actions)
+            .iter()
+            .find(|i| i.instance == "m1")
+            .expect("m1 row");
+        assert_eq!(m1.state, InstanceState::Failed);
+        assert_eq!(m1.reason.as_deref(), Some("component trapped: boom"));
+
+        assert_eq!(
+            core.on_event(&event),
+            vec![KernelAction::Report {
+                level: LogLevel::Error,
+                message: "instance 'm1' failed: component trapped: boom".to_string(),
+                subject: Some("m1".to_string()),
+            }],
+        );
+    }
+
+    /// A trap reason is component-supplied text of any length, and a status
+    /// document carrying an over-long one is refused — which is fatal to the
+    /// command loop. Truncation on a char boundary is what keeps a chatty trap
+    /// from taking the page down a second time.
+    #[test]
+    fn an_over_long_trap_reason_is_stored_at_a_length_a_status_document_admits() {
+        let mut core = connect(vec![entry("m1", "meeting")], false);
+        // One ASCII byte then two-byte chars, so the byte at the cap lands
+        // mid-char: a naive slice here would panic.
+        let reason = format!("x{}", "é".repeat(MAX_INSTANCE_REASON_BYTES));
+
+        let actions = core.on_event(&Event::InstanceFailed {
+            instance: "m1".to_string(),
+            reason: reason.clone(),
+        });
+        let instances = status_within(&actions);
+        let stored = instances
+            .iter()
+            .find(|i| i.instance == "m1")
+            .expect("m1 row")
+            .reason
+            .clone()
+            .expect("a failed row carries its reason");
+        assert!(stored.len() <= MAX_INSTANCE_REASON_BYTES);
+        let head = stored
+            .strip_suffix("…[truncated]")
+            .expect("a clipped reason says so");
+        assert!(reason.starts_with(head), "the head of the real reason");
+
+        let doc = StatusDocument {
+            v: TELEMETRY_DOCUMENT_VERSION,
+            session: "sess-1".to_string(),
+            health: Health::Degraded,
+            uptime_secs: 0,
+            instances: instances.to_vec(),
+            counters: StatusCounters::default(),
+            overlay: None,
+        };
+        doc.validate()
+            .expect("the truncated reason passes the document's own bound");
     }
 
     #[test]

@@ -1339,7 +1339,7 @@ mod tests {
             .iter()
             .find(|window| window.port == "press")
             .and_then(|window| window.envelopes.last())
-            .map(|envelope| envelope.body.clone())
+            .map(|json| brenn_surface_test_fixtures::parse_envelope(json).body)
             .expect("the sync window carries the request");
         let body: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
         assert_eq!(body[GESTURE_EVENT_FIELD], "click");

@@ -78,8 +78,8 @@ thread_local! {
     static DELIVERIES: Cell<u64> = const { Cell::new(0) };
     /// Lifetime count of publishes the kernel queued — the report's `publishes`.
     static PUBLISHES: Cell<u64> = const { Cell::new(0) };
-    /// Lifetime count of error cards rendered (missing modules, terminal port
-    /// events, component panics) — the report's `errors`.
+    /// Lifetime count of Error-level reports emitted — the report's `errors`.
+    /// Not a count of deaths: one death emits a varying number of Error reports.
     static ERRORS: Cell<u64> = const { Cell::new(0) };
     /// Per-instance lifetime totals — the report's `counters.instances`. Keyed by
     /// instance id, the principal grain the bus meters at, so a status reader
@@ -90,6 +90,10 @@ thread_local! {
     /// wants after it dies, and the key set is bounded by the surface's own
     /// config. A `RefCell` rather than a `Cell` because the value is a map;
     /// wasm is single-threaded, and no borrow spans a call out.
+    // TODO(surface-counters-host-testable): nothing here touches web-sys, but
+    // living in a wasm-only module puts every "this trigger moves that column"
+    // assertion behind a browser runner no gate drives, so a column's whole
+    // write path can break unnoticed.
     static INSTANCE_COUNTERS: RefCell<BTreeMap<String, InstanceCounters>> =
         const { RefCell::new(BTreeMap::new()) };
 }
@@ -133,12 +137,13 @@ fn read_counters() -> StatusCounters {
 /// One instance's counters read from [`read_counters`], or zero when it has
 /// counted nothing yet.
 ///
-/// The counters are page-lifetime thread-locals and wasm tests share one thread,
-/// so a counter assertion is a *delta* against a snapshot rather than an
-/// absolute: an absolute would couple the tests to each other's execution order
-/// and to every other test that happens to publish. Lives here rather than in
-/// this module's test mod because the publish-counting test needs a live
-/// `SurfaceHandle`, whose rig is in `entry`.
+/// The map is page-lifetime and the browser suite shares one thread, but
+/// `fresh_root` clears it through [`forget_instance_counters`] before each
+/// test, so a per-instance assertion reads an absolute. The surface-wide
+/// scalars beside it are *not* cleared that way, so those stay delta
+/// assertions against a snapshot taken in the test. Defined beside the counters
+/// rather than in the test mod so it reads them without widening the
+/// thread-locals' own visibility.
 #[cfg(test)]
 pub(crate) fn instance_counters(instance: &str) -> InstanceCounters {
     read_counters()
@@ -168,9 +173,9 @@ fn bump(counter: &'static std::thread::LocalKey<Cell<u64>>) {
 
 /// Add `n` to one instance's counter, creating its entry on first sight.
 ///
-/// `field` picks the column, so the two call sites cannot transpose a publish
-/// count into the drop column: each names its own field and passes nothing else
-/// that could be mistaken for the other.
+/// `field` picks the column, so no call site can transpose one column into
+/// another: each names its own field and passes nothing else that could be
+/// mistaken for a sibling column.
 fn bump_instance(instance: &str, field: fn(&mut InstanceCounters) -> &mut u64, n: u64) {
     INSTANCE_COUNTERS.with(|c| {
         let mut map = c.borrow_mut();
@@ -260,6 +265,11 @@ pub(crate) fn apply_action(action: &KernelAction, handle: &SurfaceHandle) {
         KernelAction::SendStatus { instances } => {
             handle.send_status(instances.clone(), page_uptime_secs(), read_counters());
         }
+        // Counter-only: the next heartbeat carries the value, so a component
+        // failing every delivery moves a number instead of a publish.
+        KernelAction::CountActivationFailure { instance } => {
+            bump_instance(instance, |c| &mut c.activation_failures, 1);
+        }
     }
 }
 
@@ -276,6 +286,11 @@ fn report(
     message: &str,
     subject_instance: Option<&str>,
 ) {
+    // Sole bump site for ERRORS: the count and the report are the same act
+    // and cannot drift apart.
+    if level == LogLevel::Error {
+        bump(&ERRORS);
+    }
     let console_msg = JsValue::from_str(message);
     match level {
         LogLevel::Error => web_sys::console::error_1(&console_msg),
@@ -483,7 +498,6 @@ pub fn mount_host(instance: &str, kind: &str) {
 /// exactly as it arranges a live one — a panel naming a dead instance shows its
 /// card in that panel's slot.
 pub fn render_error_card(instance: &str, kind: &str, reason: &str) {
-    bump(&ERRORS);
     let doc = document();
     let wrapper = mount_wrapper(instance, kind);
     // The card replaces the instance's whole subtree, and the instance is
@@ -826,7 +840,7 @@ mod tests {
             .map(|(port, new, dropped)| crate::contract::PortWindow {
                 port: (*port).to_string(),
                 envelopes: (0..*new)
-                    .map(|i| brenn_surface_test_fixtures::sample_envelope(&format!("m{i}")))
+                    .map(|i| brenn_surface_test_fixtures::sample_envelope_json(&format!("m{i}")))
                     .collect(),
                 new_from: 0,
                 dropped: *dropped,
@@ -854,7 +868,7 @@ mod tests {
         crate::contract::Activation {
             ports: vec![crate::contract::PortWindow {
                 port: "messages".to_string(),
-                envelopes: vec![brenn_surface_test_fixtures::sample_envelope("m")],
+                envelopes: vec![brenn_surface_test_fixtures::sample_envelope_json("m")],
                 new_from: 0,
                 dropped: 0,
             }],
@@ -1234,68 +1248,316 @@ mod tests {
 
     // ── activation counting ───────────────────────────────────────────────
 
-    /// A window's `dropped` count accrues to the instance whose port dropped —
-    /// per activation, summed across the activation's windows, not one per
-    /// message. The window carries the loss as a counter (the per-message drop
-    /// marker is gone), so an activation losing on two ports counts the total.
-    #[wasm_bindgen_test]
-    fn drops_count_per_instance_by_window_dropped() {
-        fresh_root();
-        let instance = "wbt-ctr-drops-i";
-        mount_host(instance, "wbt-ctr-drops");
-        let before = instance_counters(instance);
-
-        count_activation(instance, &[("p", 0, 3), ("other", 0, 4)]);
-
-        let after = instance_counters(instance);
-        assert_eq!(
-            after.drops - before.drops,
-            7,
-            "both ports' dropped counts accrue to the instance"
-        );
-        assert_eq!(after.publishes, before.publishes, "drops are not publishes");
+    /// The sum of every column of one instance's row, written as an exhaustive
+    /// destructure so a new column cannot join [`InstanceCounters`] without
+    /// being listed in the "nothing else moved" assertions below.
+    fn column_sum(counters: &InstanceCounters) -> u64 {
+        let InstanceCounters {
+            publishes,
+            drops,
+            activation_failures,
+        } = *counters;
+        publishes + drops + activation_failures
     }
 
-    /// Counters are per instance: a sibling's drops never land on this one's
-    /// column. The property the whole per-instance grain exists for — an
-    /// operator asking "which component is losing messages?" gets an answer, not
-    /// a surface-wide total.
+    /// Each per-instance column moves on its own trigger and on nothing else:
+    /// one case per column of [`InstanceCounters`], asserting the named column
+    /// moves by the named amount on the named instance while every other column
+    /// on that instance, the whole of a sibling's row, and the surface-wide
+    /// error total all stand still. The per-instance grain exists so an operator
+    /// asking "which component is losing messages?" gets an answer rather than a
+    /// surface-wide total, and counting a per-instance fact is never reporting
+    /// one. A new column joins by adding a case.
+    ///
+    /// The drops case carries two lossy ports because that column takes an
+    /// activation's whole loss summed across its windows, not one per message.
+    /// `fresh_root` clears the counter map, so each case reads absolutes.
+    ///
+    /// The common surface-wide assertion is `errors` alone, because two of the
+    /// cases legitimately move a surface-wide total of their own (a publish
+    /// moves `publishes`, a lossy activation moves `deliveries`). The full
+    /// "no surface-wide total moved" claim for the failure count is
+    /// [`counting_an_activation_failure_is_counter_only`].
     #[wasm_bindgen_test]
-    fn instance_counters_do_not_bleed_across_siblings() {
-        fresh_root();
-        let (a, b) = ("wbt-ctr-sib-a", "wbt-ctr-sib-b");
-        mount_host(a, "wbt-ctr-sib");
-        mount_host(b, "wbt-ctr-sib");
-        let (before_a, before_b) = (instance_counters(a), instance_counters(b));
+    fn each_instance_column_moves_only_on_its_own_trigger() {
+        type Trigger = fn(&str, &SurfaceHandle);
+        type Column = fn(&InstanceCounters) -> u64;
+        let cases: [(&str, Trigger, Column, u64); 3] = [
+            // Called directly rather than through the real publish path, which
+            // needs a live wasm slot this suite cannot rig. This case pins
+            // the column and its isolation, not the attribution of a real
+            // publish to the instance that asked for it.
+            (
+                "publishes",
+                |instance, _handle| count_publish(instance),
+                |c| c.publishes,
+                1,
+            ),
+            (
+                "drops",
+                |instance, _handle| count_activation(instance, &[("p", 0, 3), ("other", 0, 4)]),
+                |c| c.drops,
+                7,
+            ),
+            (
+                "activation_failures",
+                |instance, handle| {
+                    apply_action(
+                        &KernelAction::CountActivationFailure {
+                            instance: instance.to_string(),
+                        },
+                        handle,
+                    );
+                },
+                |c| c.activation_failures,
+                1,
+            ),
+        ];
 
-        count_activation(a, &[("p", 0, 2)]);
+        for (column, trigger, read, expected) in cases {
+            fresh_root();
+            let (handle, _events, _channels) = crate::front::new();
+            let (a, b) = ("wbt-ctr-col-a", "wbt-ctr-col-b");
+            let before_errors = errors_now();
 
-        assert_eq!(instance_counters(a).drops - before_a.drops, 2);
-        assert_eq!(
-            instance_counters(b).drops,
-            before_b.drops,
-            "the sibling's column is untouched"
-        );
+            trigger(a, &handle);
+
+            let (moved, sibling) = (instance_counters(a), instance_counters(b));
+            assert_eq!(read(&moved), expected, "{column} moved on its own instance");
+            assert_eq!(
+                column_sum(&moved),
+                expected,
+                "{column} is the only column of its own instance that moved"
+            );
+            assert_eq!(
+                column_sum(&sibling),
+                0,
+                "the sibling's row is untouched by {column}"
+            );
+            assert_eq!(
+                errors_now(),
+                before_errors,
+                "counting {column} is not reporting an error"
+            );
+        }
     }
 
-    /// A message delivery is not a drop: the columns are distinct, so a
-    /// busy-but-healthy instance (new messages, nothing dropped) never reads as
-    /// lossy.
+    /// A delivery moves the surface-wide total and no per-instance column at
+    /// all, so a busy-but-healthy instance (new messages, nothing dropped) never
+    /// reads as lossy.
     #[wasm_bindgen_test]
-    fn deliveries_are_not_counted_as_drops() {
+    fn deliveries_move_no_per_instance_column() {
         fresh_root();
         let instance = "wbt-ctr-msg-i";
-        mount_host(instance, "wbt-ctr-msg");
-        let before = instance_counters(instance);
+        let before = read_counters().deliveries;
 
         count_activation(instance, &[("p", 2, 0)]);
 
-        let after = instance_counters(instance);
-        assert_eq!(after.drops, before.drops, "a delivery is not a drop");
         assert_eq!(
-            after.publishes, before.publishes,
-            "a delivery is not a publish"
+            read_counters().deliveries - before,
+            2,
+            "both new envelopes are counted in the surface-wide total"
         );
+        assert_eq!(
+            column_sum(&instance_counters(instance)),
+            0,
+            "a delivery is neither a drop, a publish, nor a failure"
+        );
+    }
+
+    /// Counting an activation failure is counter-only: the instance's column
+    /// moves, and no surface-wide total, control statement, publish, alert or
+    /// telemetry document goes with it. The absence is the contract — an
+    /// instance failing on every delivery must not put a per-message write back
+    /// on any channel — so it is asserted where a reader looks for it.
+    #[wasm_bindgen_test]
+    fn counting_an_activation_failure_is_counter_only() {
+        fresh_root();
+        let (handle, _events, mut channels) = crate::front::new();
+        let instance = "wbt-ctr-only-i";
+        let before = read_counters();
+
+        apply_action(
+            &KernelAction::CountActivationFailure {
+                instance: instance.to_string(),
+            },
+            &handle,
+        );
+
+        let after = read_counters();
+        assert_eq!(instance_counters(instance).activation_failures, 1);
+        assert_eq!(
+            (
+                after.deliveries,
+                after.publishes,
+                after.errors,
+                after.telemetry_dropped
+            ),
+            (
+                before.deliveries,
+                before.publishes,
+                before.errors,
+                before.telemetry_dropped
+            ),
+            "a per-instance failure count moves no surface-wide total"
+        );
+        assert!(
+            channels.control_rx.try_recv().is_err(),
+            "no control statement"
+        );
+        assert!(channels.publish_rx.try_recv().is_err(), "no publish");
+        assert!(channels.alert_rx.try_recv().is_err(), "no alert");
+        assert!(
+            channels.telemetry_rx.try_recv().is_err(),
+            "no telemetry document"
+        );
+    }
+
+    // ── error counting ────────────────────────────────────────────────────
+
+    /// The surface-wide error total. A delta assertion, like every counter
+    /// assertion here: the counters are page-lifetime and the suite shares a
+    /// thread.
+    fn errors_now() -> u64 {
+        read_counters().errors
+    }
+
+    /// A front door whose wiring declares an error channel at `floor`, so a
+    /// report clearing it is published as well as written to the console. The
+    /// bare [`crate::front::new`] door declares none and publishes nothing.
+    fn reporting_front(
+        floor: LogLevel,
+    ) -> (
+        crate::front::SurfaceHandle,
+        crate::front::EventStream,
+        crate::front::FrontChannels,
+    ) {
+        use crate::test_support::{bindings as fixtures, pages};
+
+        let mut doc = fixtures::doc(
+            vec![fixtures::component(fixtures::CHROME)],
+            vec![],
+            vec![],
+            vec![],
+        );
+        doc.platform.error_channel = Some("brenn:site.surface.wbt.errors".to_string());
+        doc.platform.error_report_floor = Some(floor);
+        let page = pages::configured_page(
+            "ephemeral:site.surface.wbt.bindings",
+            uuid::Uuid::from_u128(0xe_44_09),
+            pages::facts(),
+            &[],
+            &doc,
+            brenn_attach_client::Millis(1_000),
+        );
+
+        let (handle, events, channels) = crate::front::new();
+        channels
+            .gate
+            .lock()
+            .expect("surface client: the publish gate mutex is poisoned")
+            .refresh(&page);
+        (handle, events, channels)
+    }
+
+    /// A counted error is a reported error, and the count follows the console
+    /// write rather than the channel publish. A
+    /// surface declaring no error channel publishes nothing and still counts —
+    /// the console copy is the report — so a bump that drifted below the
+    /// publish gate fails here.
+    #[wasm_bindgen_test]
+    fn an_error_report_counts_whether_or_not_the_channel_takes_it() {
+        for with_channel in [false, true] {
+            let (handle, _events, mut channels) = if with_channel {
+                reporting_front(LogLevel::Error)
+            } else {
+                crate::front::new()
+            };
+            let before = errors_now();
+            apply_action(
+                &KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: "wbt: a kernel error".to_string(),
+                    subject: Some("wbt-errctr-gate-i".to_string()),
+                },
+                &handle,
+            );
+            assert_eq!(errors_now() - before, 1, "with_channel={with_channel}");
+            assert_eq!(
+                channels.publish_rx.try_recv().is_ok(),
+                with_channel,
+                "the publish happens only where a channel is declared, and the \
+                 counter moved either way"
+            );
+        }
+    }
+
+    /// `counters.errors` means "Error-level reports emitted", so it moves exactly
+    /// when a line goes to the console and is offered to the error channel — for
+    /// the kernel's own reports and a component's alike — and not at all below
+    /// Error.
+    #[wasm_bindgen_test]
+    fn an_error_report_counts_and_a_lesser_level_does_not() {
+        let (handle, _events, _channels) = crate::front::new();
+        let instance = "wbt-errctr-i";
+        let before = errors_now();
+
+        apply_action(
+            &KernelAction::Report {
+                level: LogLevel::Error,
+                message: "wbt: a kernel error".to_string(),
+                subject: Some(instance.to_string()),
+            },
+            &handle,
+        );
+        assert_eq!(errors_now() - before, 1);
+
+        apply_action(
+            &KernelAction::Report {
+                level: LogLevel::Warn,
+                message: "wbt: a kernel warning".to_string(),
+                subject: Some(instance.to_string()),
+            },
+            &handle,
+        );
+        apply_action(
+            &KernelAction::ComponentLog {
+                instance: instance.to_string(),
+                level: LogLevel::Warn,
+                message: "wbt: a component warning".to_string(),
+            },
+            &handle,
+        );
+        assert_eq!(
+            errors_now() - before,
+            1,
+            "nothing below Error is an error, whoever wrote it"
+        );
+
+        apply_action(
+            &KernelAction::ComponentLog {
+                instance: instance.to_string(),
+                level: LogLevel::Error,
+                message: "wbt: a component error".to_string(),
+            },
+            &handle,
+        );
+        assert_eq!(
+            errors_now() - before,
+            2,
+            "a component's Error reaches the same console and the same channel"
+        );
+    }
+
+    /// Rendering a card is not itself a report: the death that caused it emits
+    /// one, and counting the card too would put a number in the status document
+    /// that no line in the console accounts for.
+    #[wasm_bindgen_test]
+    fn rendering_an_error_card_does_not_count_on_its_own() {
+        fresh_root();
+        let before = errors_now();
+        render_error_card("wbt-errctr-card-i", "wbt-errctr-card", "boom");
+        assert_eq!(errors_now(), before);
     }
 
     // ── window seam ───────────────────────────────────────────────────────

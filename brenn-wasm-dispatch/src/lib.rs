@@ -483,10 +483,7 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId) {
             let envelopes: Vec<String> = snap
                 .entries
                 .iter()
-                .map(|(_, env)| {
-                    serde_json::to_string(env)
-                        .unwrap_or_else(|e| panic!("wasm_dispatch: serialize MessageEnvelope: {e}"))
-                })
+                .map(|(_, env)| env.to_envelope_json())
                 .collect();
 
             ProcessorPortWindow {

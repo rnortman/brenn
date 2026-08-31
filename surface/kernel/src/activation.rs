@@ -97,7 +97,10 @@ struct InstanceSchedule {
     mount: MountDebt,
     /// Activations whose entry returned err, lifetime. An err is a failed
     /// activation, not a death.
-    activation_failures: u64,
+    ///
+    /// Not the status document's `activation_failures` column, which also
+    /// counts traps.
+    entry_err_activations: u64,
     /// Per-output-port millitokens carried between activations, clamped to the
     /// port's `capacity_mt` when the next activation is seeded — the clamp is the
     /// seeding side's job, since only it knows an activation is starting.
@@ -413,10 +416,12 @@ impl Schedules {
     }
 
     /// Lifetime count of activations of `instance` whose entry returned err.
-    pub fn activation_failures(&self, instance: &str) -> u64 {
+    /// Err outcomes only, so it is not the status document's
+    /// `activation_failures` column, which also counts traps.
+    pub fn entry_err_activations(&self, instance: &str) -> u64 {
         self.instances
             .get(instance)
-            .map_or(0, |s| s.activation_failures)
+            .map_or(0, |s| s.entry_err_activations)
     }
 
     /// Lifetime `metered`-rung drops charged against one input binding. Zero for
@@ -627,7 +632,7 @@ impl Schedules {
             // context, and nothing can have been passed unserved.
             ports.push(PortWindow {
                 port: port.to_string(),
-                envelopes: vec![request],
+                envelopes: vec![request.to_envelope_json()],
                 new_from: 0,
                 dropped: 0,
             });
@@ -814,7 +819,7 @@ impl Schedules {
         let schedule = self.schedule_mut(instance);
         schedule.in_flight = false;
         schedule.carry_mt = carry;
-        schedule.activation_failures += 1;
+        schedule.entry_err_activations += 1;
     }
 
     /// The instance is terminal: nothing is in flight any more. Its counters stay
@@ -897,11 +902,21 @@ fn window_ports<P>(
                 announced: served.dropped,
             });
         }
+        // The kernel holds decoded envelopes upstream of windowing and encodes
+        // here, at the one point a window is built, so a component is handed the
+        // `envelope-json` its world declares rather than a nested object.
+        // TODO(surface-envelope-json-memo): a served window is retained context
+        // followed by what is new, so the retained prefix is re-encoded on every
+        // activation and once per subscribing instance.
         ports.push(PortWindow {
             port,
             new_from: u32::try_from(served.new_from)
                 .expect("surface client: a window's depth is a config-bounded page-memory value"),
-            envelopes: served.envelopes,
+            envelopes: served
+                .envelopes
+                .iter()
+                .map(MessageEnvelope::to_envelope_json)
+                .collect(),
             dropped: served.dropped,
         });
     }

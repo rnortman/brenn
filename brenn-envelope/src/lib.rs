@@ -587,6 +587,22 @@ pub struct MessageEnvelope {
     pub envelope_type: ChannelScheme,
 }
 
+impl MessageEnvelope {
+    /// This envelope as the canonical JSON text a component is handed: the
+    /// `envelope-json` of `processor.wit`.
+    ///
+    /// The one lowering, called by every host that windows envelopes for a
+    /// guest, so the text a component reads is the same at every placement.
+    ///
+    /// # Panics
+    ///
+    /// If the envelope does not serialize. No field of this struct can refuse,
+    /// so a failure is a serde bug and the window would be wrong either way.
+    pub fn to_envelope_json(&self) -> String {
+        serde_json::to_string(self).expect("a MessageEnvelope serializes to JSON")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

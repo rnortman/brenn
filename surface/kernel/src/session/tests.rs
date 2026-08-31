@@ -14,11 +14,12 @@ use brenn_attach_proto::{PublishBatchOutcome, PublishOutcome, VersionRange, nego
 use brenn_envelope::Urgency;
 use brenn_surface_contract::ActivationError;
 use brenn_surface_schema::bindings::BindingsDocument;
-use brenn_surface_schema::{LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TOAST_CHANNEL, ToastBody};
+use brenn_surface_schema::{LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TOAST_CHANNEL, LogLevel, ToastBody};
 use uuid::Uuid;
 
 use crate::activation::DropAnnouncement;
 use crate::flush::PlaneRefusal;
+use crate::logic::{KernelAction, KernelCore};
 use crate::outbound::{PortPublish, TelemetryKind, resolve_output};
 use crate::test_support::bindings as fixtures;
 use crate::test_support::bindings::output;
@@ -885,12 +886,114 @@ fn a_trap_completion_reports_its_instance_terminal_in_its_own_words() {
         );
     });
 
-    assert_eq!(effects[0], Effect::SetRetryWakeup(TimerChange::Disarm));
+    // The whole vector, in order: the trap's own reason goes out first, the
+    // discarded queue frees its timer, and the terminal announcement closes.
+    assert_eq!(
+        effects,
+        vec![
+            Effect::EmitEvent(Event::ActivationFailed {
+                instance: "p1".to_string(),
+                message: "unreachable executed".to_string(),
+            }),
+            Effect::SetRetryWakeup(TimerChange::Disarm),
+            Effect::EmitEvent(Event::InstanceFailed {
+                instance: "p1".to_string(),
+                reason: "unreachable executed".to_string(),
+            }),
+        ]
+    );
+}
+
+/// The fold emits a trap's reason as `ActivationFailed`; the logic arm's memo
+/// decides the level. A repeated trap reason is demoted like any other
+/// identical activation failure, and the reason text reaches the report
+/// regardless of level. The second pass runs the `killed.first == false`
+/// branch — a trap on an instance something else already took terminal — which
+/// announces nothing of its own, so this event is the only carrier of its
+/// reason.
+#[test]
+fn a_trap_reason_is_reported_at_the_level_the_memo_dictates() {
+    let mut core = KernelCore::new();
+    let mut reports = Vec::new();
+    for first in [true, false] {
+        let mut page = page();
+        let effects = fold(&mut page, |r, page| {
+            r.completion(
+                page,
+                Completion {
+                    killed: Some(crate::flush::Killed {
+                        first,
+                        discarded: 0,
+                        retry_wakeup: None,
+                    }),
+                    ..Completion::nothing(
+                        "p1".to_string(),
+                        ActivationOutcome::Trap("unreachable executed".to_string()),
+                    )
+                },
+                NOW,
+                NOW_MS,
+            );
+        });
+        for event in events(&effects) {
+            if matches!(event, Event::ActivationFailed { .. }) {
+                reports.extend(core.on_event(event));
+            }
+        }
+    }
+
+    let report = |level| KernelAction::Report {
+        level,
+        message: "activation failed on 'p1': unreachable executed".to_string(),
+        subject: Some("p1".to_string()),
+    };
+    let count = || KernelAction::CountActivationFailure {
+        instance: "p1".to_string(),
+    };
+    assert_eq!(
+        reports,
+        vec![
+            report(LogLevel::Error),
+            count(),
+            report(LogLevel::Debug),
+            count(),
+        ],
+        "the trap reason travels to both reports; only the level moves, and the \
+         count is level-independent"
+    );
+}
+
+/// A trap on an instance something else already took terminal still says why.
+/// `killed.first` gates the terminal announcement to one per instance, so
+/// without its own event the trap's reason would surface nowhere.
+#[test]
+fn a_trap_on_an_already_terminal_instance_still_reports_its_reason() {
+    let mut page = page();
+    let killed = crate::flush::Killed {
+        first: false,
+        discarded: 0,
+        retry_wakeup: None,
+    };
+    let effects = fold(&mut page, |r, page| {
+        r.completion(
+            page,
+            Completion {
+                killed: Some(killed),
+                ..Completion::nothing(
+                    "p1".to_string(),
+                    ActivationOutcome::Trap("second trap".to_string()),
+                )
+            },
+            NOW,
+            NOW_MS,
+        );
+    });
+
     assert_eq!(
         events(&effects),
-        vec![&Event::InstanceFailed {
+        vec![&Event::ActivationFailed {
             instance: "p1".to_string(),
-            reason: "unreachable executed".to_string(),
+            message: "second trap".to_string(),
         }]
     );
 }

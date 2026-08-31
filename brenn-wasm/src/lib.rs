@@ -1104,7 +1104,7 @@ fn compute_grant_input_mt(
 ///
 /// This host carries an envelope as its JSON text: that is what crosses the WIT
 /// boundary into the guest.
-pub type ProcessorPortWindow = brenn_activation::PortWindow<String>;
+pub type ProcessorPortWindow = brenn_activation::ProcessorPortWindow;
 
 /// One output port's deferred-message view handed to `ProcessorComponent::handle`.
 ///
@@ -1122,7 +1122,7 @@ pub type ProcessorDeferredEntry = brenn_activation::DeferredEntry;
 /// order. Every bound port appears in every activation; ports without pending rows
 /// arrive as pure-context windows (`new_from == envelopes.len()`). Guests must not
 /// assume `ports.len() == 1`.
-pub type ProcessorActivation = brenn_activation::Activation<String>;
+pub type ProcessorActivation = brenn_activation::ProcessorActivation;
 
 /// Outcome of one `ProcessorComponent::handle` invocation.
 #[derive(Debug)]

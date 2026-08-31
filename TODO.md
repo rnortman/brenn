@@ -467,14 +467,19 @@ rejects the remount as a duplicate while the core still holds the old detached
 host's entry (whose `Publisher` dispatches can no longer bubble to
 `#surface-root`).
 
-Done when instance-death teardown clears the gate and calls
-`deregister_activation`, distinguishing death (deregister + clear) from Phase-3
-chrome reparent (preserve delivery, never deregister). Wire it with the
-kernel-driven death path, which is a later increment / Phase-3 concern.
+Done when instance-death teardown clears the gate, clears the dying instance's
+`KernelCore.activation_error_memo` entry, and calls `deregister_activation`,
+distinguishing death (deregister + clear) from Phase-3 chrome reparent (preserve
+delivery, never deregister). Wire it with the kernel-driven death path, which is
+a later increment / Phase-3 concern.
 
-The sync seam is a second consumer of the gate: a sync request is refused until
-the requesting instance's entry is registered, so a remount the gate wrongly
-rejects loses its gestures as well as its deliveries.
+Two further consumers of that death path. The sync seam is a second consumer of
+the gate: a sync request is refused until the requesting instance's entry is
+registered, so a remount the gate wrongly rejects loses its gestures as well as
+its deliveries. The activation-failure memo is keyed by instance id the same
+way: a remount inheriting its predecessor's entry has its first failure demoted
+to `Debug` whenever the text matches, so it reaches neither the error channel
+nor `counters.errors`.
 
 Code site (`TODO(kernel-registration-gate-lifecycle)`):
 `surface/kernel/src/logic.rs`, the `KernelCore.registered` field.
@@ -538,6 +543,35 @@ contributors are not asked to install a browser driver.
 Code site (`TODO(surface-wasm-test-in-ci)`): `surface/kernel/src/dom_host.rs`,
 the browser suite over the live DOM capability host, which is the whole of what
 the five migrated kinds render through and is compiled by nothing in CI.
+
+---
+
+## `surface-counters-host-testable`
+
+The kernel's lifetime counters — the `DELIVERIES`/`PUBLISHES`/`ERRORS` scalars,
+the `INSTANCE_COUNTERS` map, and `bump`/`bump_instance`/`read_counters` — live
+in `surface/kernel/src/dom.rs`, which is `#[cfg(target_arch = "wasm32")]`. None
+of them touches web-sys, but that placement puts every "this trigger moves that
+column" assertion behind the browser runner `surface-wasm-test-in-ci` says does
+not exist. It is not only unrun but uncompiled, so a rewritten counter test can
+fail to build and nothing says so.
+
+The consequence is sharpest for `counters.activation_failures`, whose *entire*
+write path — the `CountActivationFailure` executor arm — is wasm-only: naming
+the wrong column there, or dropping the arm from the match, ships green while
+the status column reads zero forever.
+
+Two ways out, and the choice is a layering decision rather than an edit: land
+the wasm runner (`surface-wasm-test-in-ci`, blocked on runner provisioning), or
+move the counters into a host-compilable module so the column-selection tests
+run in the host sweep and only the DOM-touching cases stay behind the browser
+gate. The second moves counter ownership out of the executor layer the kernel
+currently pins it to.
+
+Done = every "this trigger moves that column" assertion runs under `make check`.
+
+Code sites (`TODO(surface-counters-host-testable)`):
+`surface/kernel/src/dom.rs`, at the counter thread-locals.
 
 ---
 
@@ -2334,3 +2368,57 @@ Code sites (`TODO(surface-guest-mount-idiom)`):
 
 Done = one home for the mount lifecycle in the SDK, and the five kinds' copies
 of the `Option<View>`/`expect`/mount-arm idiom deleted.
+
+---
+
+## `surface-envelope-json-memo`
+
+A served window is retained context followed by what is new, so encoding
+envelopes at window assembly re-encodes the retained prefix on every activation,
+and re-encodes the same envelope once per subscribing instance. The envelope was
+itself decoded from JSON at frame parse and that wire text was discarded. The
+steady-state cost per envelope is one decode plus (retain_depth × activations ×
+subscribers) encodes, on the browser's delivery hot path — work that grows with
+the product of retain depth and message rate rather than with new messages. It
+is invisible at today's depths and shows up as main-thread jank exactly when
+someone widens a retain window to survive a longer outage, which is the sizing
+knob the message-bus doc tells them to reach for.
+
+The fix is memoisation: keep the JSON beside the envelope in the channel store
+entry (an `Rc<str>` computed at insert, or the wire text the frame already
+carried), and clone it at window assembly. That changes `attach/client`'s store
+entry and `ServedWindow`, which is vocabulary shared with the non-surface attach
+client and which the envelope-lowering design deliberately left holding decoded
+envelopes — so it wants a design cycle, not a drive-by.
+
+Code site (`TODO(surface-envelope-json-memo)`):
+`surface/kernel/src/activation.rs`, at `window_ports`.
+
+Done = an envelope is encoded once per page lifetime, and a wider retain depth
+costs no extra encoding.
+
+---
+
+## `surface-instance-counter-column-action`
+
+`InstanceCounters` has three columns and is documented as a struct that admits
+new ones on a stated rule, but the kernel action that reaches the counters names
+its column in the variant: `KernelAction::CountActivationFailure { instance }`,
+executed as `bump_instance(instance, |c| &mut c.activation_failures, 1)`. The
+executor re-supplies a field selector the action could have carried. Every
+further column decided host-side therefore costs a new variant, a new executor
+arm, and an appended action in every pinned effect vector in the kernel's logic
+and session tests — while the generic form,
+`CountInstance { instance, column: InstanceColumn }` with one enum-to-selector
+match in the executor, costs that match once and nothing per column after.
+
+Deferred rather than done in place because the action's name and its executor
+line are what the counter's design specifies, and there is no second host-side
+column pending: the generic shape is worth deciding with the column that needs
+it, not speculatively ahead of it.
+
+Code sites (`TODO(surface-instance-counter-column-action)`):
+`surface/kernel/src/logic.rs`, at `KernelAction::CountActivationFailure`.
+
+Done = one counting action carrying its column, one executor arm, and a new
+per-instance column reachable from the kernel core without a new variant.

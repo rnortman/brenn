@@ -5,11 +5,12 @@
 //! Both hosts mint it — the wasmtime host on the backend, the kernel on the
 //! surface — and a component sees the same shape under either.
 //!
-//! The two hosts differ in exactly one respect: what an envelope *is* to them.
-//! The wasmtime host lowers windows across the WIT boundary, where an envelope
-//! is its JSON text; the surface kernel hands components the canonical typed
-//! carrier. That is the generic parameter `E`, and it is the only thing this
-//! crate declines to decide.
+//! An envelope is its canonical JSON text — the `envelope-json` of
+//! `processor.wit` — at both placements, and [`ProcessorActivation`] /
+//! [`ProcessorPortWindow`] are that one carrier, named here so neither host
+//! re-declares it. The generic parameter `E` survives only so this crate's own
+//! tests can window `&'static str` bodies; it has exactly one production
+//! instantiation.
 
 /// One activation: every bound input port of one instance, windowed.
 ///
@@ -134,6 +135,15 @@ pub struct PortWindow<E> {
     /// so can never be passed.
     pub dropped: u64,
 }
+
+/// One input port's window as both hosts carry it: the element is one canonical
+/// `MessageEnvelope` serialized as JSON, the `envelope-json` of
+/// `processor.wit`.
+pub type ProcessorPortWindow = PortWindow<String>;
+
+/// One activation as both hosts carry it — the carrier a component is handed at
+/// either placement. See [`ProcessorPortWindow`] for what an element is.
+pub type ProcessorActivation = Activation<String>;
 
 impl<E> PortWindow<E> {
     /// The new messages on this port: `envelopes[new_from..]`. Empty for a

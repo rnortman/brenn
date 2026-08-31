@@ -310,7 +310,7 @@ fn a_reader_owed_a_message_is_assembled_and_left_in_flight() {
         window
             .envelopes
             .iter()
-            .map(|e| e.body.clone())
+            .map(|e| brenn_surface_test_fixtures::parse_envelope(e).body)
             .collect::<Vec<_>>(),
         vec!["hello".to_string()]
     );
@@ -492,7 +492,7 @@ fn an_err_completion_discards_the_work_and_counts_the_failure() {
         )
     );
     assert!(retained(&page, NOTES).is_empty());
-    assert_eq!(page.schedules.activation_failures("p1"), 1);
+    assert_eq!(page.schedules.entry_err_activations("p1"), 1);
     assert!(!page.schedules.in_flight("p1"));
 }
 

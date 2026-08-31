@@ -322,16 +322,17 @@ native_test(
 # ---------------------------------------------------------------------------
 # vitest
 # ---------------------------------------------------------------------------
-# One test file reads two things from outside the frontend tree — the transpiled
-# processor the surface deploys and the transcript fixture it is checked
-# against — by resolving them against the directory above its working one. So
-# the working directory is a staged repo root holding them at the paths the test
-# already names, and no test learns that it is running under Bazel.
+# Two test files read things from outside the frontend tree — the transpiled
+# processor the surface deploys, the transcript fixture it is checked against,
+# and the golden activation the kernel serializes — by resolving them against
+# the directory above their working one. So the working directory is a staged
+# repo root holding them at the paths the tests already name, and no test learns
+# that it is running under Bazel.
 #
-# It runs as its own target, because `//surface:dist` is downstream of every
+# They run as their own target, because `//surface:dist` is downstream of every
 # surface crate, the wasm-bindgen CLI and the transpiler: carried by the whole
 # suite, any surface edit would rerun all 572 tests. Split, the wide closure
-# belongs to the three tests that need it and the main suite reruns on frontend
+# belongs to the tests that need it and the main suite reruns on frontend
 # sources alone.
 
 copy_to_directory(
@@ -345,10 +346,11 @@ copy_to_directory(
 )
 
 copy_to_directory(
-    name = "vitest_transplant_root",
+    name = "vitest_transpiled_root",
     srcs = [
         "//brenn-wasm/components/processor-transplant:transplant.json",
         "//surface:dist",
+        "//surface/test-fixtures:activation.json",
         ":ts_src",
     ],
     replace_prefixes = {"frontend/ts_src": "frontend"},
@@ -356,17 +358,26 @@ copy_to_directory(
     target_compatible_with = HOST_ONLY,
 )
 
-TRANSPLANT_TEST = "src/processor-transplant.test.ts"
+TRANSPILED_TESTS = [
+    "src/processor-transplant.test.ts",
+    "src/surface-activation-golden.test.ts",
+]
 
 vitest_bin.vitest_test(
     name = "vitest",
     size = "medium",
-    # The transplant file has no skip path — absent its tree it fails naming the
-    # command that builds it — so it is excluded here rather than left to bail.
+    # Neither file has a skip path — absent its tree each fails naming the
+    # command that builds it — so both are excluded here rather than left to
+    # bail.
     args = [
         "run",
-        "--exclude",
-        "**/" + TRANSPLANT_TEST,
+    ] + [
+        arg
+        for test in TRANSPILED_TESTS
+        for arg in [
+            "--exclude",
+            "**/" + test,
+        ]
     ],
     chdir = package_name() + "/vitest_root/frontend",
     data = [
@@ -377,16 +388,15 @@ vitest_bin.vitest_test(
 )
 
 vitest_bin.vitest_test(
-    name = "vitest_transplant",
+    name = "vitest_transpiled",
     size = "medium",
     args = [
         "run",
-        TRANSPLANT_TEST,
-    ],
-    chdir = package_name() + "/vitest_transplant_root/frontend",
+    ] + TRANSPILED_TESTS,
+    chdir = package_name() + "/vitest_transpiled_root/frontend",
     data = [
         ":node_modules",
-        ":vitest_transplant_root",
+        ":vitest_transpiled_root",
     ],
     target_compatible_with = HOST_ONLY,
 )

@@ -646,7 +646,10 @@ fn a_trapped_completion_takes_its_instance_terminal() {
     );
     assert!(matches!(
         events(&effects).as_slice(),
-        [Event::InstanceFailed { instance, .. }] if instance == "p1"
+        [
+            Event::ActivationFailed { instance, .. },
+            Event::InstanceFailed { instance: terminal, .. }
+        ] if instance == "p1" && terminal == "p1"
     ));
     assert!(page.registrations.is_failed("p1"));
 }
@@ -805,7 +808,7 @@ fn a_ready_instance_is_handed_over_in_flight() {
         notes
             .new_envelopes()
             .iter()
-            .map(|envelope| envelope.body.clone())
+            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
             .collect::<Vec<_>>(),
         ["one"]
     );
@@ -889,7 +892,7 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
         notes
             .new_envelopes()
             .iter()
-            .map(|envelope| envelope.body.as_str())
+            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
             .collect::<Vec<_>>(),
         ["queued"]
     );
@@ -900,6 +903,7 @@ fn a_sync_activation_carries_the_full_worldview_and_the_request() {
     let [envelope] = &request.envelopes[..] else {
         panic!("a sync window is exactly the one live request: {request:?}");
     };
+    let envelope = brenn_surface_test_fixtures::parse_envelope(envelope);
     assert_eq!(envelope.channel, "local:brenn/sync/ack");
     assert_eq!(envelope.envelope_type, brenn_envelope::ChannelScheme::Local);
     assert_eq!(envelope.sender, "p2");
@@ -1196,7 +1200,7 @@ fn drain(page: &mut SurfacePage) -> Vec<(String, Vec<String>)> {
             .ports
             .iter()
             .flat_map(|window| window.new_envelopes())
-            .map(|envelope| envelope.body.clone())
+            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
             .collect();
         taken.push((ready.instance.clone(), bodies));
         feed(

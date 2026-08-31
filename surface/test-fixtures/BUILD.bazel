@@ -5,12 +5,18 @@ load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
 
 policy_srcs()
 
-exports_files(["Cargo.toml"])
+exports_files([
+    "Cargo.toml",
+    # The golden activation, read by the kernel's serialization pin through
+    # `include_str!` and by the frontend lift test as a staged file.
+    "activation.json",
+])
 
 # Shared by every surface suite on both sides.
 rust_library(
     name = "test-fixtures",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["activation.json"],
     crate_name = "brenn_surface_test_fixtures",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),

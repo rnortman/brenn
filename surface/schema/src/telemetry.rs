@@ -196,7 +196,8 @@ pub struct StatusCounters {
     pub deliveries: u64,
     /// Publishes the kernel has sent.
     pub publishes: u64,
-    /// Component errors/panics the kernel has observed.
+    /// Error-level reports emitted. Each count is one console line an operator
+    /// can read; not a count of deaths (one death emits a varying number).
     pub errors: u64,
     /// Telemetry documents the peer refused — rate-limited or over the body cap.
     ///
@@ -218,12 +219,15 @@ pub struct StatusCounters {
 
 /// One instance's lifetime totals within [`StatusCounters`].
 ///
-/// Deliberately not a copy of the surface-wide triple. `deliveries` would
-/// duplicate what [`InstanceReport::ports_attached`] already tells an operator
-/// about a live instance, and `errors` is bounded at one per instance (an
-/// error-carded instance is dead and stops counting), so neither earns a
-/// per-instance column. What varies per instance without bound, and so answers
-/// a question the totals cannot, is what it *sent* and what it *lost*.
+/// Deliberately not a copy of the surface-wide triple. A column earns its place
+/// here by varying per instance without bound *and* answering a question the
+/// surface totals cannot. `deliveries` would duplicate what
+/// [`InstanceReport::ports_attached`] already tells an operator about a live
+/// instance, and `errors` is the surface-wide report-count invariant's number —
+/// every count there is one Error-level line an operator can read — which is a
+/// property of the reporting path, not a per-instance fact. What each instance
+/// *sent*, what it *lost*, and how often its activations *failed* are the
+/// per-instance facts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceCounters {
     /// Publishes the kernel queued on this instance's behalf. Counted at the seam
@@ -235,6 +239,21 @@ pub struct InstanceCounters {
     /// (drop-oldest, counted). Sustained non-zero drops mean the component is
     /// not keeping up with its bindings' `push_depth`.
     pub drops: u64,
+    /// Activation failures reported for this instance, one per occurrence: both
+    /// `Err` outcomes and traps, whatever level the failure was reported at.
+    ///
+    /// Traps are included deliberately — the killing trap is a correct part of
+    /// the instance's history, and the counting site cannot distinguish the two
+    /// cases anyway. A climbing count on a `mounted` instance is a live,
+    /// continuing failure the surface's own `health` cannot express; a frozen
+    /// one means the failures stopped.
+    ///
+    /// The count is here; the failure *text* is not, and is not meant to be.
+    /// This field carries numbers a reader compares across ticks. The text
+    /// travels a separate path with its own dedup and retention, so the count
+    /// may climb faster than reason lines appear; a reader cannot assume 1:1
+    /// correspondence between this counter and the error reports.
+    pub activation_failures: u64,
 }
 
 /// The held-overlay fact a [`StatusDocument`] carries.
@@ -534,6 +553,7 @@ mod tests {
                     InstanceCounters {
                         publishes: 2,
                         drops: 5,
+                        activation_failures: 4,
                     },
                 )]),
             },
@@ -668,7 +688,7 @@ mod tests {
         // would be counting for nobody.
         assert_eq!(
             v["counters"]["instances"],
-            json!({ "p1": { "publishes": 2, "drops": 5 } })
+            json!({ "p1": { "publishes": 2, "drops": 5, "activation_failures": 4 } })
         );
         assert_eq!(v["overlay"]["holder"], json!("p1"));
         assert_eq!(v["overlay"]["since"], json!("1970-01-01T00:00:00Z"));

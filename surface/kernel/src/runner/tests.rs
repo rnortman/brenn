@@ -662,7 +662,10 @@ where
     Box::new(move |activation, buffer| {
         for window in &activation.ports {
             for envelope in window.new_envelopes() {
-                seen.0.lock().unwrap().push(envelope.body.clone());
+                seen.0
+                    .lock()
+                    .unwrap()
+                    .push(brenn_surface_test_fixtures::parse_envelope(envelope).body);
             }
         }
         act(activation, buffer)
@@ -697,7 +700,7 @@ fn windowing(windows: &Windows) -> ActivationEntry {
             .ports
             .iter()
             .flat_map(|window| window.new_envelopes())
-            .map(|envelope| envelope.body.clone())
+            .map(|envelope| brenn_surface_test_fixtures::parse_envelope(envelope).body)
             .collect();
         windows.0.lock().unwrap().push(bodies);
         Ok(None)
@@ -1347,6 +1350,10 @@ async fn a_trapped_entry_takes_its_instance_terminal() {
 
     assert!(matches!(
         running.event().await,
+        Event::ActivationFailed { instance, message } if instance == "p1" && message.contains("fell over")
+    ));
+    assert!(matches!(
+        running.event().await,
         Event::InstanceFailed { instance, reason } if instance == "p1" && reason.contains("fell over")
     ));
 
@@ -1359,6 +1366,11 @@ async fn a_trapped_entry_takes_its_instance_terminal() {
     feed.unbounded_send(TransportEvent::Text(deliver(WIRE_TWO, "hello")))
         .unwrap();
 
+    assert!(matches!(
+        running.event().await,
+        Event::ActivationFailed { instance, message }
+            if instance == "p2" && message == "the component fell over at rung 7"
+    ));
     assert!(matches!(
         running.event().await,
         Event::InstanceFailed { instance, reason }
@@ -1393,6 +1405,11 @@ async fn a_reply_to_an_async_activation_traps_at_the_native_seam() {
         }),
     );
 
+    assert!(matches!(
+        running.event().await,
+        Event::ActivationFailed { instance, message }
+            if instance == "p1" && message.contains("no sync port")
+    ));
     assert!(matches!(
         running.event().await,
         Event::InstanceFailed { instance, reason }
@@ -2129,6 +2146,11 @@ async fn a_trap_in_the_mount_activation_kills_the_instance() {
         Box::new(|_, _| panic!("the component fell over building its UI")),
     );
 
+    assert!(matches!(
+        running.event().await,
+        Event::ActivationFailed { instance, message }
+            if instance == "p1" && message.contains("building its UI")
+    ));
     assert!(matches!(
         running.event().await,
         Event::InstanceFailed { instance, reason }

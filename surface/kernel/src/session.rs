@@ -465,6 +465,14 @@ impl Reactions {
             }),
             ActivationOutcome::Trap(reason) => {
                 let killed = killed.expect("surface client: a trap takes its instance terminal");
+                // Announced before the kill and independently of it: `killed`
+                // speaks once per instance, so a trap landing on an instance
+                // already terminal from another cause would otherwise carry its
+                // reason nowhere.
+                self.emit(Event::ActivationFailed {
+                    instance: instance.clone(),
+                    message: reason.clone(),
+                });
                 self.killed(&instance, reason, killed);
             }
         }

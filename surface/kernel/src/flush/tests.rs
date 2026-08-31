@@ -724,7 +724,7 @@ fn an_err_discards_the_work_and_counts_the_failure() {
     discard_err(&mut page.ctx(), "p1", buffer);
 
     assert!(!page.schedules.in_flight("p1"));
-    assert_eq!(page.schedules.activation_failures("p1"), 1);
+    assert_eq!(page.schedules.entry_err_activations("p1"), 1);
     assert!(
         !page.owed("p2", "notes"),
         "nothing left the failed activation"

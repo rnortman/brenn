@@ -1114,8 +1114,25 @@ describe("surface processor bring-up", () => {
             importModule as unknown as ModuleImporter,
         );
 
+        // A realistic envelope, hand-written, rather than an empty object: this
+        // window is the one thing the lift passes through untouched, so the pin
+        // is worth making on text shaped like what a kernel emits. Nothing
+        // compares it against the kernel's real bytes — those are pinned
+        // separately, in `surface-activation-golden.test.ts`.
+        const envelope = JSON.stringify({
+            message_id: "00000000-0000-0000-0000-0000901d0001",
+            source: "src",
+            channel: "brenn:site.bar.in",
+            sender: "surface:deskbar",
+            publish_ts: "2023-11-14T22:13:20Z",
+            body: "the retained one",
+            urgency: "normal",
+            envelope_type: "brenn",
+        });
         const activation = JSON.stringify({
-            ports: [{ port: "in", envelopes: ["{}"], new_from: 1, dropped: 2 }],
+            ports: [
+                { port: "in", envelopes: [envelope], new_from: 1, dropped: 2 },
+            ],
             deferred: [
                 {
                     port: "out",
@@ -1139,7 +1156,9 @@ describe("surface processor bring-up", () => {
         // omitted rather than set to `undefined` fails here — the two are the
         // same to `toEqual` and are not the same to the lowering.
         expect(seen[0]).toStrictEqual({
-            ports: [{ port: "in", envelopes: ["{}"], newFrom: 1, dropped: 2 }],
+            ports: [
+                { port: "in", envelopes: [envelope], newFrom: 1, dropped: 2 },
+            ],
             deferred: [
                 {
                     port: "out",

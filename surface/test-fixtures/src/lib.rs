@@ -54,6 +54,26 @@ pub fn sample_envelope(body: &str) -> MessageEnvelope {
         .expect("surface test fixture: sample envelope JSON deserializes")
 }
 
+/// The golden serialized kernel `Activation`, shared by the two suites that pin
+/// the kernel→page serialization seam: the kernel's own byte-equality test and
+/// the frontend lift test that drives these bytes into a real transpiled guest.
+///
+/// The trailing newline the file carries is not part of the serialization, so it
+/// is trimmed here rather than at each reader.
+pub fn golden_activation_json() -> &'static str {
+    include_str!("../activation.json").trim_end()
+}
+
+/// One port-window element parsed back into a [`MessageEnvelope`].
+///
+/// # Panics
+///
+/// If `json` is not valid envelope JSON — a window element that does not parse
+/// is the defect under test.
+pub fn parse_envelope(json: &str) -> MessageEnvelope {
+    serde_json::from_str(json).expect("surface test fixture: a window element is envelope JSON")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

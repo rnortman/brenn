@@ -7,10 +7,10 @@ description = "The processor.wit activation carrier — one shape, every host"
 
 # Dependency-free and std-only, deliberately: both hosts depend on this crate,
 # and one of them (the surface kernel, via `brenn-surface-contract`) compiles to
-# wasm32. The envelope representation is the generic parameter precisely so this
-# crate needs no opinion about it — the wasmtime host carries envelope JSON
-# strings across the WIT boundary, the surface kernel carries typed
-# `MessageEnvelope`s.
+# wasm32. An envelope is its JSON text at both placements, and a `String` needs
+# no dependency; the generic parameter is what keeps the envelope type out of
+# this crate's dependency list even so, and this crate's own tests are its only
+# other instantiation.
 #
 # One optional dependency: `serde`, off by default. The surface's `dom` profile
 # crosses a JS module boundary per activation, and JSON is the codec that boundary

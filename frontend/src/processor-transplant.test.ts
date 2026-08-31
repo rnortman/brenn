@@ -21,6 +21,10 @@
 // `surface.test.ts`); what is under test here is the guest on the transpiled
 // hosting, which is the half the wasmtime run cannot reach.
 //
+// The envelopes here are fabricated JSON strings, not bytes the kernel
+// produced. The golden activation (`surface-activation-golden.test.ts`) pins
+// the kernel's serialized bytes against this same transpiled tree.
+//
 // Wire class: the script is `brenn:`-bound throughout. That is an owner scoping
 // decision, not doctrine — backend WASM consumers cannot bind `ephemeral:`
 // channels yet (a registry fork, never a decision), and closing that gap is its
@@ -28,27 +32,18 @@
 // fixture is that effort's standing obligation and extends this criterion with
 // no further ratification. Nothing in this harness is class-aware, so the
 // deferral costs the criterion nothing beyond coverage of the backend hosting.
-//
-// TODO(processor-transplant-browser-engine): this harness resolves the
-// transpiled tree by filesystem path — it dynamic-imports a `file://` URL and
-// reads the core wasm bytes with `readFileSync` — so the guest runs under
-// node's WebAssembly engine, not a browser one.
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
+import { activationEntry, type KernelActivation } from "./surface.js";
 import {
-    activationEntry,
-    type KernelActivation,
-    type ProcessorInstance,
-} from "./surface.js";
+    REPO_ROOT,
+    instantiateTranspiled,
+    requireTranspiledTree,
+} from "./test-helpers/transpiled-processor.js";
 
-// vitest runs with its config root (`frontend/`) as cwd, so the repo root is one
-// level up. Both inputs are build/source artifacts outside the frontend tree:
-// the transpiled output the surface deploys, and the fixture's shared script.
-const REPO_ROOT = resolve(process.cwd(), "..");
-const DIST = resolve(REPO_ROOT, "surface/dist/processor/processor-transplant");
+const KIND = "processor-transplant";
 const SCRIPT = resolve(
     REPO_ROOT,
     "brenn-wasm/components/processor-transplant/transplant.json",
@@ -101,12 +96,6 @@ interface Script {
     activations: ScriptActivation[];
     transcript: TranscriptEntry[];
 }
-
-/** The transpiled module's `--instantiation async` entry point. */
-type Instantiate = (
-    getCoreModule: (name: string) => Promise<WebAssembly.Module>,
-    imports: Record<string, Record<string, unknown>>,
-) => Promise<ProcessorInstance>;
 
 const script: Script = JSON.parse(readFileSync(SCRIPT, "utf8"));
 
@@ -173,64 +162,55 @@ interface Harness {
  * read the outcome off the same seam the page reads it off.
  */
 async function harness(): Promise<Harness> {
-    const { instantiate } = (await import(
-        /* @vite-ignore */ pathToFileURL(
-            resolve(DIST, "processor-transplant.js"),
-        ).href
-    )) as { instantiate: Instantiate };
-
     let buffer = emptyBuffer();
-    const instance = await instantiate(
-        (name) => WebAssembly.compile(readFileSync(resolve(DIST, name))),
-        {
-            "brenn:processor/config": {
-                get: (key: string): string | undefined =>
-                    hasOwn(script.config, key) ? script.config[key] : undefined,
+    const instance = await instantiateTranspiled(KIND, {
+        "brenn:processor/config": {
+            get: (key: string): string | undefined =>
+                hasOwn(script.config, key) ? script.config[key] : undefined,
+        },
+        // The log plane has no class-blind canonical form (tracing
+        // backend-side, the kernel component-log plane browser-side), so it
+        // is absent from the transcript. The import must still be satisfied:
+        // an unsatisfiable `log` would fail instantiation outright.
+        "brenn:processor/log": { log: () => {} },
+        "brenn:processor/ports": {
+            publish: (_port: string, payload: string) => {
+                buffer.publishes.push(payload);
             },
-            // The log plane has no class-blind canonical form (tracing
-            // backend-side, the kernel component-log plane browser-side), so it
-            // is absent from the transcript. The import must still be satisfied:
-            // an unsatisfiable `log` would fail instantiation outright.
-            "brenn:processor/log": { log: () => {} },
-            "brenn:processor/ports": {
-                publish: (_port: string, payload: string) => {
-                    buffer.publishes.push(payload);
-                },
-                publishDeferred: (
-                    _port: string,
-                    payload: string,
-                    deliverAfter: bigint,
-                ) => {
-                    buffer.deferredPublishes.push({
-                        body: payload,
-                        deliver_after: Number(deliverAfter),
-                    });
-                },
-                deferCancel: (port: string, index: number) => {
-                    buffer.ops.push({ op: "cancel", port, index });
-                },
-                deferEdit: (
-                    port: string,
-                    index: number,
-                    payload: string | undefined,
-                    deliverAfter: bigint | undefined,
-                ) => {
-                    buffer.ops.push({
-                        op: "edit",
-                        port,
-                        index,
-                        // `undefined` is the absent half; the transcript spells
-                        // absence `null`, which is what JSON can carry.
-                        payload: payload === undefined ? null : payload,
-                        deliver_after:
-                            deliverAfter === undefined
-                                ? null
-                                : Number(deliverAfter),
-                    });
-                },
+            publishDeferred: (
+                _port: string,
+                payload: string,
+                deliverAfter: bigint,
+            ) => {
+                buffer.deferredPublishes.push({
+                    body: payload,
+                    deliver_after: Number(deliverAfter),
+                });
+            },
+            deferCancel: (port: string, index: number) => {
+                buffer.ops.push({ op: "cancel", port, index });
+            },
+            deferEdit: (
+                port: string,
+                index: number,
+                payload: string | undefined,
+                deliverAfter: bigint | undefined,
+            ) => {
+                buffer.ops.push({
+                    op: "edit",
+                    port,
+                    index,
+                    // `undefined` is the absent half; the transcript spells
+                    // absence `null`, which is what JSON can carry.
+                    payload: payload === undefined ? null : payload,
+                    deliver_after:
+                        deliverAfter === undefined
+                            ? null
+                            : Number(deliverAfter),
+                });
             },
         },
-    );
+    });
     return {
         entry: activationEntry(instance),
         reset: () => {
@@ -307,12 +287,7 @@ describe("processor transplant — surface hosting", () => {
         // Mirrors the wasmtime half's posture on a missing artifact: fail with
         // the command that fixes it, never skip. A silently skipped parity test
         // asserts the invariant on one host while reporting green.
-        if (!existsSync(resolve(DIST, "processor-transplant.js"))) {
-            throw new Error(
-                `the transpiled processor-transplant tree is missing at ${DIST} — ` +
-                    "build it with `make surface-transpile`",
-            );
-        }
+        requireTranspiledTree(KIND);
         transcript = await runScript();
     });
 

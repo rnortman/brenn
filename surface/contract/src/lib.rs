@@ -388,8 +388,6 @@
 //! one instantiation per instance, page-lifetime, so a module-level static is
 //! per instance too and cannot bleed across siblings.
 
-use brenn_envelope::MessageEnvelope;
-
 // ── Activation delivery (kernel → component) ───────────────────────────────
 
 /// One activation: every bound input port of one instance, windowed.
@@ -407,13 +405,17 @@ use brenn_envelope::MessageEnvelope;
 /// Semantics are `processor.wit`'s, verbatim, and so is the carrier: this is
 /// `brenn_activation::Activation` at the envelope type a surface component is
 /// handed. The same shape reaches a component under wasmtime on the backend,
-/// where the host names it `ProcessorActivation` and carries envelope JSON.
-pub type Activation = brenn_activation::Activation<MessageEnvelope>;
+/// where the host names it `ProcessorActivation` and carries the same envelope
+/// JSON.
+pub type Activation = brenn_activation::ProcessorActivation;
 
 /// One input port's view onto its channel at activation time: retained context
 /// followed by new messages. See [`brenn_activation::PortWindow`] for what the
 /// fields mean — the port is a view, not a pipe.
-pub type PortWindow = brenn_activation::PortWindow<MessageEnvelope>;
+///
+/// An element is one canonical [`brenn_envelope::MessageEnvelope`] serialized as
+/// JSON — the `envelope-json` of `processor.wit`, not a decoded struct.
+pub type PortWindow = brenn_activation::ProcessorPortWindow;
 
 /// The address family the kernel mints a sync-call activation's request envelope
 /// on: `local:brenn/sync/<port>`.

@@ -220,7 +220,7 @@ fn bodies(activation: &Activation, port: &str) -> Vec<String> {
         .expect("the activation windows the port")
         .envelopes
         .iter()
-        .map(|e| e.body.clone())
+        .map(|e| brenn_surface_test_fixtures::parse_envelope(e).body)
         .collect()
 }
 
@@ -254,7 +254,7 @@ fn forgetting_an_untracked_instance_panics() {
 fn an_untracked_instance_reports_zero_everywhere() {
     let schedules = Schedules::new();
     assert!(!schedules.in_flight("p1"));
-    assert_eq!(schedules.activation_failures("p1"), 0);
+    assert_eq!(schedules.entry_err_activations("p1"), 0);
     assert_eq!(schedules.metered_drops("p1", "in"), 0);
     assert_eq!(schedules.deferred_dropped("p1"), 0);
     assert_eq!(schedules.deferred_races("p1"), 0);
@@ -1110,7 +1110,7 @@ fn an_err_counts_the_failure_and_still_returns_the_carry() {
         .publish("out", "spent".into())
         .expect("the fill funds one publish");
     page.schedules.finish_err("p1", ready.buffer.into_carry());
-    assert_eq!(page.schedules.activation_failures("p1"), 1);
+    assert_eq!(page.schedules.entry_err_activations("p1"), 1);
     assert!(!page.schedules.in_flight("p1"));
     // What the component spent is a fact about the activation that happened: the
     // next one is funded by the fill alone.
@@ -1132,7 +1132,7 @@ fn a_terminal_completion_clears_the_flight_and_keeps_the_counters() {
     assert!(!page.schedules.in_flight("p1"));
     assert_eq!(page.schedules.metered_drops("p1", "in"), 1);
     assert_eq!(page.schedules.deferred_races("p1"), 1);
-    assert_eq!(page.schedules.activation_failures("p1"), 0);
+    assert_eq!(page.schedules.entry_err_activations("p1"), 0);
 }
 
 #[test]
@@ -1153,4 +1153,214 @@ fn the_buffer_carries_the_attachments_body_cap() {
         ready.buffer.publish("out", "far too long a body".into()),
         Err(PublishError::InvalidPayload)
     );
+}
+
+// ── The golden activation ──────────────────────────────────────────────────
+//
+// One serialized `Activation`, checked in at `surface/test-fixtures/activation.json`
+// and read by two suites: this one, which pins the kernel's own bytes, and
+// `frontend/src/surface-activation-golden.test.ts`, which drives the same bytes
+// through the production lift into a real transpiled guest. The class of defect
+// they close is a Rust serialization on one side and a TypeScript `as` assertion
+// on the other with no artifact in common — neither side alone can see the
+// disagreement.
+
+/// The sync port the golden activation's request arrives on.
+const GOLDEN_SYNC_PORT: &str = "brenn:mount";
+
+/// The clock the golden activation is assembled at.
+const GOLDEN_NOW_MS: u64 = 1_700_000_000_000;
+
+/// One delivered envelope of the golden windows: the shared sample envelope
+/// addressed to `channel`, with an identity of its own so every envelope in the
+/// fixture is distinguishable.
+fn golden_envelope(message_id: u128, channel: &str, body: &str) -> MessageEnvelope {
+    MessageEnvelope {
+        message_id: Uuid::from_u128(message_id),
+        channel: channel.into(),
+        envelope_type: if channel.starts_with("local:") {
+            ChannelScheme::Local
+        } else {
+            ChannelScheme::Brenn
+        },
+        ..brenn_surface_test_fixtures::sample_envelope(body)
+    }
+}
+
+/// Put `envelope` on its own channel's store.
+fn insert(page: &mut Page, channel: &str, envelope: MessageEnvelope) {
+    page.stores
+        .get_mut(channel)
+        .unwrap_or_else(|| panic!("the fixture hosts {channel}"))
+        .insert(envelope);
+}
+
+/// The activation the golden fixture is the serialization of, assembled through
+/// the real windowing rather than written out by hand.
+///
+/// Every field of the record is populated, and every window *shape* a component
+/// can be handed appears once, so the seam is crossed by each of them:
+///
+/// - `in` — retained context followed by one new envelope, so `new_from` is
+///   neither zero nor the length. Its new envelope carries the optional fields a
+///   minimal one omits, pinning both arms of the envelope's
+///   `skip_serializing_if` optionals.
+/// - `lossy` — a one-deep window that two arrivals rolled past, so `dropped` is
+///   non-zero: the only signal a component has that it lost messages, and a
+///   silent zero here is the difference between visible and invisible loss.
+/// - `context` — a sampled port holding no position, so the window is pure
+///   context (`new_from == envelopes.len()`).
+/// - `silent` — a bound port with nothing on its channel, so the window is
+///   empty: the shape the contract calls ubiquitous, every bound port appearing
+///   in every activation.
+///
+/// Plus the sync window holding the kernel-minted request, a deferred window
+/// with a parked entry, `now`, and `sync`. The request's body is the
+/// transplant guest's `__reply__` marker, so the frontend half drives the reply
+/// arm of the lift — the one field whose loss silently turns a sync call into a
+/// fire-and-forget activation.
+fn golden_activation() -> Activation {
+    let mut page = Page::new(applied(
+        vec![
+            subscription("p1", "in", WIRE, 2, 1),
+            subscription("p1", "lossy", PEEK, 1, 0),
+            subscription("p1", "context", LOCAL, 0, 2),
+            subscription("p1", "silent", OUT, 0, 1),
+        ],
+        vec![output("p1", "out", OUT)],
+    ));
+
+    // Delivered once and left retained, so it is context in the golden window.
+    insert(
+        &mut page,
+        WIRE,
+        golden_envelope(0x901d_0001, WIRE, "the retained one"),
+    );
+    // Served to the sampled `context` port and never advanced over: a sampled
+    // reader holds no position, so this stays pure context forever.
+    insert(
+        &mut page,
+        LOCAL,
+        golden_envelope(0x901d_0020, LOCAL, "context only"),
+    );
+    // `lossy` advances over this one, which is what leaves a cursor for the two
+    // arrivals below to roll past.
+    insert(
+        &mut page,
+        PEEK,
+        golden_envelope(0x901d_0010, PEEK, "seen and advanced over"),
+    );
+    page.assemble("p1");
+    page.schedules.finish_ok("p1", HashMap::new());
+
+    insert(
+        &mut page,
+        WIRE,
+        MessageEnvelope {
+            reply_to: Some(PEEK.into()),
+            urgency: Urgency::High,
+            ..golden_envelope(0x901d_0002, WIRE, "the new one")
+        },
+    );
+    // Two arrivals on a window one deep: the older is rolled past unseen, so the
+    // golden window carries `dropped: 1`.
+    insert(
+        &mut page,
+        PEEK,
+        golden_envelope(0x901d_0011, PEEK, "lost to overflow"),
+    );
+    insert(
+        &mut page,
+        PEEK,
+        golden_envelope(0x901d_0012, PEEK, "the survivor"),
+    );
+
+    page.views.on_view(
+        OUT.to_string(),
+        Some("p1".to_string()),
+        vec![DeferredViewEntry {
+            message_id: Uuid::from_u128(0x901d_0003),
+            body: "parked for later".into(),
+            deliver_after: GOLDEN_NOW_MS + 60_000,
+        }],
+    );
+
+    let request = MessageEnvelope {
+        message_id: Uuid::from_u128(0x901d_0004),
+        source: "p1".into(),
+        channel: brenn_surface_contract::sync_channel(GOLDEN_SYNC_PORT),
+        sender: "p1".into(),
+        body: "__reply__".into(),
+        envelope_type: ChannelScheme::Local,
+        ..brenn_surface_test_fixtures::sample_envelope("__reply__")
+    };
+    let generation = page
+        .registrations
+        .generation("p1")
+        .expect("the fixture registered p1");
+    let mut ctx = ActivationCtx {
+        bindings: &page.bindings,
+        stores: &mut page.stores,
+        router: &page.router,
+        views: &page.views,
+        max_body_bytes: 4_096,
+        now_ms: GOLDEN_NOW_MS,
+    };
+    page.schedules
+        .assemble_sync("p1", generation, GOLDEN_SYNC_PORT, request, &mut ctx)
+        .activation
+}
+
+#[test]
+fn the_serialized_activation_is_the_golden_fixture() {
+    let serialized =
+        serde_json::to_string(&golden_activation()).expect("an activation serializes to JSON");
+    assert_eq!(
+        serialized,
+        brenn_surface_test_fixtures::golden_activation_json(),
+        "the kernel's serialization moved. If that was deliberate, regenerate \
+         the fixture from the `left` value this failure printed:\n  \
+         printf '%s\\n' '<left>' > surface/test-fixtures/activation.json\n\
+         and check the frontend lift test still passes — both sides read this file."
+    );
+}
+
+/// What the golden is *for*: every window shape a component can be handed
+/// crosses the seam once. A regeneration that flattened one of them — every
+/// window non-empty, every `dropped` zero — would still pin bytes, and would
+/// stop pinning the shapes those bytes exist to carry.
+#[test]
+fn the_golden_activation_carries_every_window_shape() {
+    let activation = golden_activation();
+    let window = |port: &str| {
+        activation
+            .ports
+            .iter()
+            .find(|w| w.port == port)
+            .unwrap_or_else(|| panic!("the golden binds {port}"))
+            .clone()
+    };
+
+    let mixed = window("in");
+    assert_eq!((mixed.envelopes.len(), mixed.new_from), (2, 1));
+
+    let lossy = window("lossy");
+    assert!(lossy.dropped > 0, "the golden carries visible loss");
+
+    let context = window("context");
+    assert_eq!(
+        context.new_from as usize,
+        context.envelopes.len(),
+        "a sampled port's window is pure context"
+    );
+    assert!(!context.envelopes.is_empty());
+
+    assert!(
+        window("silent").envelopes.is_empty(),
+        "a bound port with nothing on its channel still appears, empty"
+    );
+
+    let sync = window(GOLDEN_SYNC_PORT);
+    assert_eq!(activation.sync.as_deref(), Some(GOLDEN_SYNC_PORT));
+    assert_eq!(sync.envelopes.len(), 1);
 }
