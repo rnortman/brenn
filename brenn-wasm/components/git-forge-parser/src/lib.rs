@@ -98,7 +98,7 @@ fn extract_remotes(payload: &ForgePayload) -> Vec<String> {
 }
 
 impl Processor for GitForgeParser {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         for window in activation.port_windows() {
             let in_port = InPort::of(window)?;
             let port = in_port.name();
@@ -156,7 +156,7 @@ impl Processor for GitForgeParser {
                 spec::push_events().publish(&event)?;
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

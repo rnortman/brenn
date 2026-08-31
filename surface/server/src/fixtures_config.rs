@@ -40,11 +40,7 @@ impl SurfaceFixture {
                 // binding hash has nothing to bind to.
                 components: vec![ResolvedComponent {
                     chrome: true,
-                    ..ResolvedComponent::minimal(
-                        component,
-                        component,
-                        brenn_surface_schema::Abi::Dom,
-                    )
+                    ..ResolvedComponent::minimal(component, component)
                 }],
                 subscriptions: vec![],
                 wire_subscriptions: vec![],
@@ -75,7 +71,7 @@ impl SurfaceFixture {
                 [brenn_lib::messaging::ComponentGrant::Config].into()
             },
             config,
-            ..ResolvedComponent::minimal(instance, kind, brenn_surface_schema::Abi::Processor)
+            ..ResolvedComponent::minimal(instance, kind)
         });
         self
     }

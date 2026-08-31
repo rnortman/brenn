@@ -51,16 +51,39 @@ printf '%s' "$$matched" > $@
 
 # Kinds whose component artifacts are transpiled for browser hosting. An
 # explicit list, not a wildcard and not a read of server config: making a
-# processor surface-hostable is a deliberate addition.
-surface_processor_assets(
-    name = "processor-transplant",
-    component = "//brenn-wasm/components/processor-transplant:component",
-    jco_version = ":jco_version",
-    kind = "processor-transplant",
-    spec = "//:config/specs/processor-transplant.brenn",
-)
+# processor surface-hostable is a deliberate addition. A kind's crate lives in
+# its own package under `components/`, which stages its documentation; the
+# artifact, the transpiled tree and the manifest that binds them to the authored
+# specification are staged here, because the transpiler and the jco version pin
+# are this package's.
+#
+# One list, driving both the asset targets and the stages they are served
+# through. Two lists could disagree, and the way they would disagree is silent:
+# a kind whose assets build and never reach the served tree.
+_PROCESSOR_KINDS = [
+    ("processor-transplant", "//brenn-wasm/components/processor-transplant:component"),
+    ("echo-stub", "//surface/components/echo-stub:echo-stub_component"),
+    ("mode-clock", "//surface/components/mode-clock:mode-clock_component"),
+    ("protobar", "//surface/components/protobar:protobar_component"),
+    ("meeting", "//surface/components/meeting:meeting_component"),
+    ("chrome", "//surface/chrome:chrome_component"),
+]
 
-# Derived, not retyped. `surface_component()` mints `<kind>_dist` in every
+# `<kind>_assets`, never `<kind>`: a staging target's output directory is its
+# name, and the chrome kind's crate is the sibling package `surface/chrome`,
+# whose own output paths a target named `chrome` here would sit inside.
+[
+    surface_processor_assets(
+        name = kind + "_assets",
+        component = component,
+        jco_version = ":jco_version",
+        kind = kind,
+        spec = "//:config/specs/{kind}.brenn".format(kind = kind),
+    )
+    for (kind, component) in _PROCESSOR_KINDS
+]
+
+# Derived, not retyped. `surface_processor_component()` mints `<kind>_dist` in every
 # component package, and a hand-written list here is a second edit a mechanical
 # component addition would not know to make — the component would build, lint
 # and test green while its `.js`, `.wasm` and `help.md` never reached the served
@@ -72,7 +95,8 @@ _COMPONENT_STAGES = [
 ]
 
 # The two crates that are not under `components/`: the in-tree default chrome,
-# and the shell, which is not a component at all.
+# whose documentation sidecars stage like any other kind's, and the shell, which
+# is not a component at all.
 _FIXED_STAGES = [
     "//surface/chrome:chrome_dist",
     "//surface/kernel:kernel_dist",
@@ -82,7 +106,7 @@ surface_dist(
     name = "dist",
     dirname = "dist",
     target_compatible_with = HOST_ONLY,
-    stages = [":processor-transplant"] + _FIXED_STAGES + _COMPONENT_STAGES,
+    stages = [":" + kind + "_assets" for (kind, _) in _PROCESSOR_KINDS] + _FIXED_STAGES + _COMPONENT_STAGES,
     visibility = ["//visibility:public"],
 )
 

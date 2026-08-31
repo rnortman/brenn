@@ -1,9 +1,9 @@
 //! The canonical delivered-envelope fixture shared by the surface test suites.
 //!
-//! Chrome, component-support, the in-tree components and the kernel all parse
-//! the same delivered `MessageEnvelope` in their tests. Keeping one copy here
-//! means a struct/serde change breaks exactly one place, loudly, instead of
-//! silently rotting a hand-copied literal. The envelope is kept as JSON text on
+//! Chrome, the in-tree components and the kernel all parse the same delivered
+//! `MessageEnvelope` in their tests. Keeping one copy here means a struct/serde
+//! change breaks exactly one place, loudly, instead of silently rotting a
+//! hand-copied literal. The envelope is kept as JSON text on
 //! purpose: the tests exercise the parse boundary, so they read the same bytes a
 //! delivery would carry.
 //!
@@ -13,11 +13,6 @@
 //! shared test obligation.
 
 use brenn_envelope::MessageEnvelope;
-
-/// The shared browser-suite harness for the in-tree components. Browser-only:
-/// it drives real DOM seams, so it exists only where those do.
-#[cfg(target_arch = "wasm32")]
-pub mod browser;
 
 mod help_sidecar;
 

@@ -341,14 +341,20 @@ impl SurfaceHandle {
     /// document is still in flight — and wired in by the reconcile that document
     /// runs.
     ///
+    /// `mount` asks for the mount activation: a rendering instance is invoked
+    /// once, on the reserved sync port, the moment its entry is installed, and
+    /// that call is where it builds its UI. Headless instances pass `false` and
+    /// wait for input like anything else.
+    ///
     /// # Panics
     ///
     /// If the control channel is full (an unbounded synchronous burst) or closed
     /// (the run is over).
-    pub fn register_activation(&self, instance: &str, entry: ActivationEntry) {
+    pub fn register_activation(&self, instance: &str, entry: ActivationEntry, mount: bool) {
         self.control(RunnerCommand::RegisterActivation {
             instance: instance.to_owned(),
             entry,
+            mount,
         });
     }
 

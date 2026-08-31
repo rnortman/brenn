@@ -7,8 +7,7 @@ policy_srcs()
 
 exports_files(["Cargo.toml"])
 
-# Shared by every surface suite on both sides. The browser half is cfg-gated
-# and its deps come from the hub's wasm32 arm.
+# Shared by every surface suite on both sides.
 rust_library(
     name = "test-fixtures",
     srcs = glob(["src/**/*.rs"]),

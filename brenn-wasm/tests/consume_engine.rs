@@ -2,8 +2,8 @@
 // processor-exhaust fixtures.
 //
 // All tests load the WASM fixtures via `ProcessorComponent::load` and drive
-// `handle` directly. Covers design §2.2, §2.4, §2.6, and resource limits
-// including the fuel/memory exhaustion bound.
+// `handle` directly, including resource limits and the fuel/memory exhaustion
+// bound.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -735,6 +735,87 @@ fn multi_port_publishes_routed_independently() {
     }
 }
 
+// ── The synchronous channel, on a host that mints none ───────────────────────
+
+/// This host always lowers `sync: none`, because a headless component has no
+/// cause that could be synchronous. The world carries the field anyway — one
+/// world, two hostings — so the guest can always answer, and the rule that only
+/// a sync-call activation may be answered has to hold here as well as in the
+/// page. It holds as a trap: reading an unasked-for ok would flush a buffer the
+/// component built while confused about why it was running.
+///
+/// The fixture publishes before it replies, so the discard is what is under
+/// test and not just the outcome variant: an arm that flushed and then trapped,
+/// or a `some` match placed below the flush, would put that publish on the bus.
+/// `Trap` carries no publishes, so the outcome type is the assertion — which is
+/// only worth anything with a non-empty buffer behind it.
+#[test]
+fn a_reply_to_an_activation_that_asked_nothing_traps() {
+    let comp = load_multiport();
+    let activation = ProcessorActivation {
+        ports: vec![ProcessorPortWindow {
+            port: "in".to_string(),
+            envelopes: vec![envelope_json("brenn:test", "__reply__")],
+            new_from: 0,
+            dropped: 0,
+        }],
+        deferred: vec![],
+        now: None,
+        sync: None,
+    };
+    match comp.handle(activation) {
+        ProcessorOutcome::Trap(message) => assert!(
+            message.contains("asked nothing"),
+            "trap must name the cause: {message}"
+        ),
+        other => panic!("an unasked-for reply must trap and flush nothing, got {other:?}"),
+    }
+}
+
+/// The other half of the rule: `ok(none)` is the only ok shape this host reads,
+/// and an ordinary activation reaching an ordinary guest produces it.
+#[test]
+fn an_ordinary_activation_returns_the_only_ok_this_host_reads() {
+    let comp = load_multiport();
+    let activation = ProcessorActivation {
+        ports: vec![ProcessorPortWindow {
+            port: "in".to_string(),
+            envelopes: vec![envelope_json("brenn:test", "plain")],
+            new_from: 0,
+            dropped: 0,
+        }],
+        deferred: vec![],
+        now: None,
+        sync: None,
+    };
+    match comp.handle(activation) {
+        ProcessorOutcome::Ok { publishes, .. } => {
+            assert_eq!(publishes.len(), 1, "multiport publishes its summary")
+        }
+        other => panic!("an ordinary activation must return ok, got {other:?}"),
+    }
+}
+
+/// A sync-call activation is a shape this host cannot honestly deliver: there is
+/// no element, no gesture, and no caller waiting on a stack. It is refused where
+/// it is built rather than degraded into an asynchronous one.
+#[test]
+#[should_panic(expected = "cannot be lowered into the processor world")]
+fn lowering_a_sync_call_activation_is_refused() {
+    let comp = load_multiport();
+    let _ = comp.handle(ProcessorActivation {
+        ports: vec![ProcessorPortWindow {
+            port: "in".to_string(),
+            envelopes: vec![envelope_json("brenn:test", "click")],
+            new_from: 0,
+            dropped: 0,
+        }],
+        deferred: vec![],
+        now: None,
+        sync: Some("in".to_string()),
+    });
+}
+
 // ── Context/new split via context_envelopes() ────────────────────────────────
 
 /// Exercises `context_envelopes()` through observable WASM output using the
@@ -1178,10 +1259,10 @@ fn instance_table_and_memory_count_caps_reach_the_limiter() {
 ///   type-only — it needs no grant.
 /// - The core module: the memory and bump `realloc` the canonical ABI needs in
 ///   order to lower an activation, plus `receive` whose core signature is the
-///   flattened form of `func(activation) -> result<_, receive-error>` — the
-///   record's three fields flatten to (list ptr, list len) twice and (option
-///   discriminant, u64), and the result exceeds one flat value so it comes back
-///   as a pointer.
+///   flattened form of `func(activation) -> result<option<string>, receive-error>`
+///   — the record's four fields flatten to (list ptr, list len) twice, (option
+///   discriminant, u64), and (option discriminant, string ptr, string len); the
+///   result exceeds one flat value so it comes back as a pointer.
 /// - The lift, whose declared type must match the world's `receive` exactly.
 ///
 /// The core body accepts those lowered parameters opaquely and never decodes
@@ -1219,10 +1300,12 @@ fn wat_processor_component_with(body: &str, extra_core_defs: &str) -> String {
       (type $ports-list (list $port-window-e))
       (type $deferred-list (list $deferred-window-e))
       (type $now (option u64))
+      (type $sync (option string))
       (type $activation-t (record
         (field "ports" $ports-list)
         (field "deferred" $deferred-list)
-        (field "now" $now)))
+        (field "now" $now)
+        (field "sync" $sync)))
       (export "activation" (type $activation-e (eq $activation-t)))
       (type $receive-error-t (variant
         (case "malformed-envelope" string)
@@ -1244,6 +1327,7 @@ fn wat_processor_component_with(body: &str, extra_core_defs: &str) -> String {
       (local.get $ret))
     (func (export "receive")
       (param i32) (param i32) (param i32) (param i32) (param i32) (param i64)
+      (param i32) (param i32) (param i32)
       (result i32)
       {body}
       (i32.const 0))
@@ -1253,7 +1337,7 @@ fn wat_processor_component_with(body: &str, extra_core_defs: &str) -> String {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
   (alias core export $i "receive" (core func $cf))
-  (type $rt (result (error $receive-error)))
+  (type $rt (result (option string) (error $receive-error)))
   (type $ft (func (param "a" $activation) (result $rt)))
   (func $lifted (type $ft)
     (canon lift (core func $cf) (memory $mem) (realloc $realloc) string-encoding=utf8))

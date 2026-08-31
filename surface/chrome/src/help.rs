@@ -14,7 +14,8 @@ use std::fmt::Write as _;
 
 use brenn_surface_contract::HELP_SIDECAR_HEADER;
 use brenn_surface_schema as proto;
-use brenn_surface_schema::layout::{
+
+use crate::layout::{
     ALL_KINDS, LAYOUT_DOC_VERSION, LayoutDoc, LayoutKind, Panel, RATIO_MAX, RATIO_MIN,
 };
 
@@ -61,9 +62,9 @@ every *other* mounted instance into a layout section; it never places itself.
 const OVERLAY_STATE_PROSE: &str = "\
 Chrome publishes it on every overlay transition and only on a transition:
 `holder` names the instance that took the overlay, or is `null` when the overlay
-popped; `since_stamp` is the page-monotonic millisecond reading of the fold. The
-kernel reads the plane and reports the holder in the surface's status document,
-which is where a fullscreen-wedged surface becomes visible.
+popped; `since_stamp` is the wall-clock millisecond reading of the activation the
+fold ran in. The kernel reads the plane and reports the holder in the surface's
+status document, which is where a fullscreen-wedged surface becomes visible.
 
 Bind it on every surface holding the `takeover` grant. A surface that leaves the
 port unbound still renders identically, but its status document reports no

@@ -1,14 +1,14 @@
-//! The processor scaffold goldens, compiled.
+//! The scaffold goldens, compiled.
 //!
-//! The dom half compiles on the host (`scaffold_goldens_compile.rs`); this half
-//! names the guest SDK, which builds for wasm32 alone, so it is reached through
-//! a transition instead. Both exist for the same reason: every other gate on a
-//! golden is a byte comparison, which says the emitter is stable and nothing
-//! about whether what it emits is Rust the toolchain accepts.
+//! The emission names the guest SDK, which builds for wasm32 alone, so this is
+//! reached through a transition. It exists because every other gate on a golden
+//! is a byte comparison, which says the emitter is stable and nothing about
+//! whether what it emits is Rust the toolchain accepts.
 //!
-//! The uninhabited-inbound shape is the one that needs it most — no in-tree
-//! processor has zero inbound ports, so nothing else ever compiles a `name`
-//! that is `match self {}` or a `from_name` that returns `None` outright.
+//! The uninhabited-inbound shapes are the ones that need it most — no in-tree
+//! component has zero inbound ports or no ports at all, so nothing else ever
+//! compiles a `name` that is `match self {}` or a `from_name` that returns
+//! `None` outright.
 
 #[path = "corpus/scaffold/processor-full.rs"]
 pub mod processor_full;
@@ -18,6 +18,9 @@ pub mod no_inbound;
 
 #[path = "corpus/scaffold/no-outbound.rs"]
 pub mod no_outbound;
+
+#[path = "corpus/scaffold/no-ports.rs"]
+pub mod no_ports;
 
 /// The payload binding the generated publish handles exist for, exercised in
 /// both shapes a guest writes.

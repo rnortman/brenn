@@ -1,31 +1,30 @@
-//! `brenn-echo-stub` — the minimal surface component.
+//! Brenn surface echo-stub component.
 //!
-//! A deliberately tiny dev/test fixture, not a product: the first consumer of
-//! component contract v0 ([`brenn_surface_contract`]) and of the shell's
-//! multi-module loading path, so that path is exercised before `brenn-protobar`
-//! exists. Its element is `brenn-echo-stub` (kind `echo-stub`).
+//! A deliberately tiny dev/test fixture, not a product: the page-hosted seam's
+//! conformance component, exercising every part of it a kind can reach from one
+//! place.
 //!
-//! Behavior (all browser-only): it renders each `brenn-port-message`'s
-//! `envelope_json` as text into a scrollback list, shows running drop and gap
-//! counters from `brenn-port-drops`/`brenn-port-gap`, starts in an "awaiting
-//! data" state, offers a "send" button that dispatches `brenn-port-publish` on
-//! its host element (the contract's dispatch-origin rule) with a fixed counter
-//! body, a free-form field plus a "send custom" button that publishes the
-//! field's value verbatim (the path a test drives to publish a structured or
-//! markdown body), and a "panic" button that panics — the latter exercising the
-//! module panic hook → `brenn-component-panic` → shell error-card plumbing from
-//! a real component.
+//! It renders each delivered envelope's JSON as text into a bounded scrollback,
+//! shows the summed `dropped` in a status line, offers a "send" button that
+//! publishes a fixed counter body, a free-form field plus a "send custom"
+//! button that publishes the field's value verbatim (the path a test drives to
+//! publish a structured or markdown body), and a "panic" button that traps —
+//! the last exercising the trap → error-card path from a real component.
 //!
-//! Every behavior lives behind `cfg(target_arch = "wasm32")`: the component is
-//! DOM-bound, so the wasm build carries the whole module and the host build
-//! carries only the help-sidecar generator.
+//! Its `messages` port is optional: a feeder instance binds only `out` and
+//! renders nothing but its own controls.
+//!
+//! Everything that touches the page lives behind `cfg(target_arch = "wasm32")`:
+//! the guest SDK is a wasm32 crate, and the host build carries only the
+//! help-sidecar generator and the specification module's port names.
 
+/// The help sidecar's generator. Host-only: it depends on the contract crate,
+/// which is not available in the wasm32 build.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod help;
 
 /// Port names and types from this component's specification.
 pub mod spec;
 
-/// The browser-only component: custom-element registration, DOM rendering,
-/// contract-event listeners, publish/panic buttons, and the module panic hook.
 #[cfg(target_arch = "wasm32")]
 mod component;

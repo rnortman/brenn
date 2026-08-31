@@ -6,11 +6,7 @@
 
 use crate::contract::ActivationError;
 use crate::contract::{
-    ACTIVATION_REGISTER, ACTIVATION_SYNC, COMPONENT_ALERT, COMPONENT_LOG, COMPONENT_PANIC,
-    CONFIG_ANSWERED_FIELD, CONFIG_GET, CONFIG_VALUE_FIELD, DEFER_STATUS_FIELD, ENTRY_REPLY_FIELD,
-    PORT_DEFER, PORT_PUBLISH, PROCESSOR_START, PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY,
-    SURFACE_RELOAD, SURFACE_ROOT_ID, SYNC_ERROR_FIELD, SYNC_REPLY_FIELD, SYNC_STATUS_FIELD,
-    element_name_for_instance, publish_status_str, sync_status_str,
+    ENTRY_REPLY_FIELD, PROCESSOR_START, SURFACE_READY, SURFACE_RELOAD, SURFACE_ROOT_ID,
 };
 use crate::front::SurfaceHandle;
 use crate::schema::LogLevel;
@@ -22,11 +18,11 @@ use std::rc::Rc;
 use js_sys::{Object, Reflect};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{CustomEvent, CustomEventInit, Document, Element, Event, HtmlElement, Window};
+use web_sys::{CustomEvent, CustomEventInit, Document, Element, HtmlElement, Window};
 
 use crate::schema::telemetry::{InstanceCounters, StatusCounters};
 
-use crate::logic::{ConnectIndicatorState, DeferDetail, KernelAction, OptionalField};
+use crate::logic::{ConnectIndicatorState, KernelAction};
 
 /// The `source` reported alongside kernel-originated log messages.
 const KERNEL_LOG_SOURCE: &str = "kernel";
@@ -44,10 +40,9 @@ thread_local! {
     /// The live mounted element for each component **instance**, keyed by instance
     /// id. wasm is single-threaded, so a thread-local map is the executor's whole
     /// shared state. This is the single source of truth for "is this instance
-    /// mounted": the `is_mounted` predicate and [`instance_for_target`] both read
-    /// it, so DOM and registry cannot disagree. An
-    /// instance is present, mapped to the element the kernel created, between
-    /// [`mount_component`] and the [`render_error_card`] that removes its element.
+    /// mounted", so the DOM and the registry cannot disagree. An instance is
+    /// present, mapped to the host element the kernel created, between
+    /// [`mount_host`] and the [`render_error_card`] that removes its element.
     /// One component kind may back several instances, each its own entry.
     static MOUNTED: RefCell<HashMap<String, Element>> = RefCell::new(HashMap::new());
 }
@@ -56,6 +51,20 @@ thread_local! {
 /// panic path's per-instance liveness check (`KernelCore::on_component_panic`).
 pub fn is_mounted(instance: &str) -> bool {
     MOUNTED.with(|m| m.borrow().contains_key(instance))
+}
+
+/// The element the kernel created for `instance`, or `None` when it is not
+/// mounted. The DOM host resolves `dom.root` through this, so a component's own
+/// subtree is exactly the element the kernel gave it and never one it named.
+pub(crate) fn mounted_element(instance: &str) -> Option<Element> {
+    MOUNTED.with(|m| m.borrow().get(instance).cloned())
+}
+
+/// The kernel-owned wrapper element for `instance`, or `None` when the kernel
+/// has not created one. Backs `page-dom.instance-wrapper`, whose `none` is the
+/// ordinary transient of a sibling that has not registered yet.
+pub(crate) fn wrapper_element(instance: &str) -> Option<Element> {
+    document().get_element_by_id(&wrapper_id(instance))
 }
 
 thread_local! {
@@ -171,24 +180,6 @@ fn bump_instance(instance: &str, field: fn(&mut InstanceCounters) -> &mut u64, n
     });
 }
 
-/// Resolve the retargeted event `target` element to the mounted component
-/// instance whose element it is, by element identity over the [`MOUNTED`]
-/// registry — the routing identity for a delegated `brenn-port-publish` /
-/// `brenn-log` / `brenn-alert`. `None` when `target` is not a mounted instance's
-/// own element (a non-conformant module dispatching on an inner light-DOM node, a
-/// non-component node, or an already-error-carded instance). The registry holds a
-/// handful of entries, so a linear `is_same_node` scan is cheap and keeps identity
-/// exact — two instances of one kind share a tag name, so only node identity
-/// distinguishes them.
-pub fn instance_for_target(target: &Element) -> Option<String> {
-    MOUNTED.with(|m| {
-        m.borrow()
-            .iter()
-            .find(|(_, element)| element.is_same_node(Some(target.as_ref())))
-            .map(|(instance, _)| instance.clone())
-    })
-}
-
 /// Apply the [`KernelAction`]s the decision core emitted, in order, dispatching
 /// each to its effect primitive. This is the one bridge from the DOM-free core's
 /// `Vec<KernelAction>` output to the web-sys effects above; the core decides,
@@ -197,14 +188,8 @@ pub fn instance_for_target(target: &Element) -> Option<String> {
 /// `handle` is the surface client handle the client-touching actions need:
 /// `PublishControl` queues the kernel's own control-plane statement, and
 /// `Report` is the console-log + leveled-`log` treatment for the
-/// transient/component-fault class (rejected publish, misrouted
-/// `brenn-port-publish`) at `Warn`, and for a component-panic report at `Error`.
-///
-/// Nothing routes a `Publish` here: a component's publishes are all its
-/// activations', and the publish listener consumes the router's `Publish`
-/// itself — buffering it or refusing it — handing this executor only the
-/// drop-and-report arms. The `Publish` arm is `unreachable!` so that stays true
-/// under a future route site rather than resurrecting the unbuffered path.
+/// transient/component-fault class (a rejected or refused publish) at `Warn`,
+/// and for a component death at `Error`.
 pub fn apply_actions(actions: &[KernelAction], handle: &SurfaceHandle) {
     for action in actions {
         apply_action(action, handle);
@@ -228,19 +213,9 @@ pub(crate) fn apply_action(action: &KernelAction, handle: &SurfaceHandle) {
             kind,
             reason,
         } => render_error_card(instance, kind, reason),
-        KernelAction::MountComponent { instance, kind } => mount_component(instance, kind),
+        KernelAction::MountHost { instance, kind } => mount_host(instance, kind),
         KernelAction::EmitReady => emit_ready(),
         KernelAction::StartProcessors { instances } => start_processors(instances),
-        // A component's publishes are all its activations', buffered by the
-        // publish listener or refused there; the listener consumes the router's
-        // `Publish` and never forwards it. Executing one here would be an
-        // unbuffered publish outside every activation — the path this executor
-        // must not offer a way back to — so the impossible state is a panic
-        // rather than a faithfully-served request.
-        KernelAction::Publish { instance, port, .. } => unreachable!(
-            "no caller routes a component publish to the executor: {instance}/{port} must be \
-             buffered by the in-flight activation or refused"
-        ),
         // The kernel writes the line; `subject` names the component it is *about*,
         // which the server stamps the report with. A breadcrumb with no component
         // subject carries the bare surface identity.
@@ -454,40 +429,46 @@ fn mount_wrapper(instance: &str, kind: &str) -> HtmlElement {
     wrapper
         .set_attribute(WRAPPER_KIND_ATTR, kind)
         .expect("set data-kind on the wrapper");
+    // Paint containment: the wrapper becomes the containing block for any
+    // `position: fixed` descendant and clips its painting to the wrapper's box.
+    // Declared here so no instance can exist without it.
+    wrapper
+        .style()
+        .set_property("contain", "paint")
+        .expect("set paint containment on the wrapper");
     staging()
         .append_child(&wrapper)
         .expect("append the new wrapper into staging");
     wrapper
 }
 
-/// Mount an instance: create its `brenn-<kind>--<instance>` custom element and
-/// append it as the sole content of the instance's wrapper. Clears any prior
-/// content (e.g. an earlier error card) first so mounting is idempotent.
+/// Mount a page-hosted processor instance: create the plain host `div` its
+/// `dom.root` resolves to and append it as the sole content of the instance's
+/// wrapper. Clears any prior content first, so mounting is idempotent.
 ///
-/// The tag is the *instance's*, not the kind's: each instance's module evaluation
-/// defines its own element, which is what gives it its own linear memory. The
-/// element is still stamped with `data-instance` — identity rides the attribute,
-/// never a parsed tag — so delegation and retargeting are unchanged.
-pub fn mount_component(instance: &str, kind: &str) {
+/// The host element carries no identity of its own. Identity lives one level up,
+/// on the kernel-owned wrapper the component cannot reach: the host element is
+/// handed to the component, whose allow-list admits every `data-` name, so a
+/// stamp here would be a stamp the component could rewrite. Nothing needs one —
+/// routing resolves instances by node identity through [`MOUNTED`], and page
+/// styling selects the wrapper.
+pub fn mount_host(instance: &str, kind: &str) {
     let doc = document();
     let wrapper = mount_wrapper(instance, kind);
+    // The clear destroys whatever the instance built, so its handles go with it
+    // — and so do any handle another instance minted into this subtree, which is why
+    // the sweep runs beside the table drop, and before the clear, while the tree
+    // can still say what is under the wrapper.
+    crate::entry::reclaim_dom_subtree(&wrapper, false);
+    crate::entry::forget_dom_instance(instance);
     wrapper.set_text_content(None);
-    let element = doc
-        .create_element(&element_name_for_instance(kind, instance))
-        .expect("document creates the component's custom element");
-    element
-        .set_attribute("data-instance", instance)
-        .expect("set data-instance on the component element");
-    // Register the element before appending it: append_child synchronously runs
-    // the custom element's connectedCallback — the earliest instant it may
-    // dispatch brenn-port-publish — so instance_for_target must already resolve
-    // that element for the publish to route. A house-style panic between here and
-    // a successful append kills the kernel, so no stale entry can outlive the
-    // failure.
+    let element = doc.create_element("div").expect("document creates a div");
+    // Must precede the append: `dom.root` must resolve when the mount
+    // activation fires.
     MOUNTED.with(|m| m.borrow_mut().insert(instance.to_string(), element.clone()));
     wrapper
         .append_child(&element)
-        .expect("append component element into its wrapper");
+        .expect("append the host element into its wrapper");
 }
 
 /// Replace the instance's wrapper content with an error card carrying `reason`.
@@ -505,6 +486,12 @@ pub fn render_error_card(instance: &str, kind: &str, reason: &str) {
     bump(&ERRORS);
     let doc = document();
     let wrapper = mount_wrapper(instance, kind);
+    // The card replaces the instance's whole subtree, and the instance is
+    // terminal, so nothing will ever reclaim its handles the ordinary way. The
+    // sweep runs first, and before the clear: it frees every table's handles to
+    // what is about to die, including a sibling's, while the tree still answers.
+    crate::entry::reclaim_dom_subtree(&wrapper, false);
+    crate::entry::forget_dom_instance(instance);
     wrapper.set_text_content(None);
     let card = doc
         .create_element("div")
@@ -593,298 +580,6 @@ fn try_dispatch_reload(reason: &str) -> Result<(), JsValue> {
     let event = CustomEvent::new_with_event_init_dict(SURFACE_RELOAD, &init)?;
     window.dispatch_event(&event)?;
     Ok(())
-}
-
-/// Extract `N` named string fields from an event's `detail`, the untrusted-input
-/// parsing shared by every contract-event listener. Returns `None` for a field
-/// that is missing or non-string, and all-`None` for a non-`CustomEvent`, so a
-/// malformed detail is never coerced into well-formed values — the single home
-/// for the kernel↔component trust-boundary parse.
-fn custom_event_string_fields<const N: usize>(
-    event: Event,
-    keys: [&str; N],
-) -> [Option<String>; N] {
-    match event.dyn_into::<CustomEvent>() {
-        Ok(ce) => {
-            let detail = ce.detail();
-            std::array::from_fn(|i| {
-                Reflect::get(&detail, &JsValue::from_str(keys[i]))
-                    .ok()
-                    .and_then(|v| v.as_string())
-            })
-        }
-        Err(_) => std::array::from_fn(|_| None),
-    }
-}
-
-/// Read one **optional** string field from an event's `detail`, distinguishing
-/// "the component omitted it" from "the component set it to something that is
-/// not a string".
-///
-/// [`custom_event_string_fields`] folds both into `None`, which is right for a
-/// required field — either way it is malformed — but wrong for an optional one:
-/// omitting `urgency` is a component saying "use the port's default", while
-/// setting it to `7` is a component bug. Collapsing the two would answer the bug
-/// with the default and hide it, which is the coercion the trust-boundary parse
-/// exists to refuse.
-///
-/// `undefined`/`null` ⇒ `Absent`; a string ⇒ `Present`; anything else ⇒
-/// `Malformed`. A non-`CustomEvent` reports `Malformed`: the contract admits no
-/// such dispatch, so it is a broken event rather than an omitted field.
-fn custom_event_optional_string(event: &Event, key: &str) -> OptionalField {
-    let Some(ce) = event.dyn_ref::<CustomEvent>() else {
-        return OptionalField::Malformed;
-    };
-    let detail = ce.detail();
-    match Reflect::get(&detail, &JsValue::from_str(key)) {
-        Ok(v) if v.is_undefined() || v.is_null() => OptionalField::Absent,
-        Ok(v) => match v.as_string() {
-            Some(s) => OptionalField::Present(s),
-            None => OptionalField::Malformed,
-        },
-        // A throwing property getter on a component's own detail object.
-        Err(_) => OptionalField::Malformed,
-    }
-}
-
-/// The delegated component→kernel listener scaffold: one listener on
-/// `#surface-root` for a bubbling, composed contract event, resolving the
-/// trust-boundary facts every such event shares and handing the raw event on.
-///
-/// The root-delegated component events — `brenn-port-publish`, `brenn-log`,
-/// `brenn-alert` — share one shape: a component
-/// dispatches the event on its mounted element (or from within its shadow root)
-/// with `bubbles: true, composed: true`, it bubbles up to this single root
-/// listener, and the listener resolves the retargeted `event.target` host element
-/// to its mounted **instance** id (by element identity, [`instance_for_target`])
-/// — the routing identity — plus that element's tag name (for the drop
-/// breadcrumb). A target that does not resolve to a mounted instance forwards
-/// `None` for the instance, which routes to the drop-and-report path. It makes no
-/// routing decision itself.
-///
-/// This is the lowest rung: it owns the retargeting and identity resolution, and
-/// leaves the detail read to the caller, because the events do not agree on that
-/// half ([`install_root_component_listener`] reads N required string fields;
-/// `brenn-port-publish` additionally needs a three-state optional read). Keeping
-/// the scaffold here means a fix to retargeting or instance resolution lands once
-/// for every event that crosses this boundary.
-///
-/// The listener is installed once for the page lifetime, so its `Closure` is
-/// `forget`-leaked deliberately.
-fn install_root_event_listener(
-    event_name: &'static str,
-    callback: impl Fn(Option<&str>, &str, Event) + 'static,
-) {
-    let doc = document();
-    let root = doc
-        .get_element_by_id(SURFACE_ROOT_ID)
-        .expect("backend page renders #surface-root");
-    let closure = Closure::<dyn Fn(Event)>::new(move |event: Event| {
-        let target = event.target().and_then(|t| t.dyn_into::<Element>().ok());
-        let target_tag = target.as_ref().map(|el| el.tag_name()).unwrap_or_default();
-        let instance = target.as_ref().and_then(instance_for_target);
-        callback(instance.as_deref(), &target_tag, event);
-    });
-    root.add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())
-        .unwrap_or_else(|err| {
-            panic!("add {event_name} listener on #surface-root: {err:?}");
-        });
-    closure.forget();
-}
-
-/// Install a delegated component→kernel listener for an event carrying `N` named
-/// **required** string detail fields, forwarding the resolved instance, the
-/// retargeted tag, and those fields to `callback` (wired at `start()` to the
-/// matching DOM-free router, which decides route-vs-drop).
-///
-/// Component-supplied detail is untrusted (all modules are same-origin and
-/// operator-deployed, but a buggy or hostile one must never crash the kernel nor
-/// launder malformed input onto the bus / log / alert planes). A missing or
-/// non-string field, or a non-`CustomEvent` event, forwards `None` for that field
-/// rather than coercing to an empty string, so the router drops and reports it as
-/// malformed instead of manufacturing a well-formed frame.
-fn install_root_component_listener<const N: usize>(
-    event_name: &'static str,
-    keys: [&'static str; N],
-    callback: impl Fn(Option<&str>, &str, [Option<String>; N]) + 'static,
-) {
-    install_root_event_listener(event_name, move |instance, tag, event| {
-        let fields = custom_event_string_fields(event, keys);
-        callback(instance, tag, fields);
-    });
-}
-
-/// Install the delegated `brenn-port-publish` listener: forwards the resolved
-/// instance, the retargeted tag, the `{ port, body }` detail, and the optional
-/// `urgency` to `callback`, wired to [`crate::logic::route_publish_intent`].
-///
-/// Built on [`install_root_event_listener`] rather than
-/// [`install_root_component_listener`]: that rung reads a fixed set of *required*
-/// string fields, and `urgency` is optional — it needs the three-state read
-/// ([`custom_event_optional_string`]) so an omitted field and a non-string one
-/// take different paths. Only the detail read differs; the scaffold is shared.
-/// The publish callback additionally receives the event's `detail` object: a
-/// publish the kernel routes into an in-flight activation's buffer is answered
-/// synchronously by writing [`PUBLISH_STATUS_FIELD`] onto it (see
-/// [`set_publish_status`]), which is the only channel a synchronous answer can
-/// take back across the module boundary.
-pub fn install_publish_listener(
-    callback: impl Fn(Option<&str>, &str, Option<&str>, Option<&str>, OptionalField, &JsValue) + 'static,
-) {
-    install_root_event_listener(PORT_PUBLISH, move |instance, tag, event| {
-        let urgency = custom_event_optional_string(&event, "urgency");
-        let detail = event
-            .dyn_ref::<CustomEvent>()
-            .map(|ce| ce.detail())
-            .unwrap_or(JsValue::UNDEFINED);
-        let [port, body] = custom_event_string_fields(event, ["port", "body"]);
-        callback(
-            instance,
-            tag,
-            port.as_deref(),
-            body.as_deref(),
-            urgency,
-            &detail,
-        );
-    });
-}
-
-/// Write a publish's answer onto the dispatching event's `detail`, where the
-/// component's SDK reads it as `publish` returns.
-///
-/// Every publish the kernel's listener heard gets one — the buffer's verdict, or
-/// `not-permitted` for a publish made with no activation of that instance in
-/// flight. A detail that refuses the write is a non-conformant dispatcher — some
-/// caller sending a frozen or primitive detail — so the answer is simply dropped
-/// rather than panicking the kernel on a component's malformed event.
-pub fn set_publish_status(detail: &JsValue, status: Result<(), PublishError>) {
-    let _ = Reflect::set(
-        detail,
-        &JsValue::from_str(PUBLISH_STATUS_FIELD),
-        &JsValue::from_str(publish_status_str(status)),
-    );
-}
-
-/// Install the delegated `brenn-port-defer` listener: forwards the resolved
-/// instance, the retargeted tag, the untrusted [`DeferDetail`], and the event's
-/// `detail` object to `callback`, wired to
-/// [`crate::logic::route_defer_intent`].
-///
-/// Built on [`install_root_event_listener`]: three of the five detail fields are
-/// optional, so they need the
-/// three-state read ([`custom_event_optional_string`]) that distinguishes an
-/// omitted field from a non-string one. The `detail` object rides along because
-/// every op on this event is answered synchronously on it (see
-/// [`set_defer_status`]).
-pub fn install_defer_listener(
-    callback: impl Fn(Option<&str>, &str, DeferDetail, &JsValue) + 'static,
-) {
-    install_root_event_listener(PORT_DEFER, move |instance, tag, event| {
-        let index = custom_event_optional_string(&event, "index");
-        let body = custom_event_optional_string(&event, "body");
-        let deliver_after = custom_event_optional_string(&event, "deliver_after");
-        let detail = event
-            .dyn_ref::<CustomEvent>()
-            .map(|ce| ce.detail())
-            .unwrap_or(JsValue::UNDEFINED);
-        let [op, port] = custom_event_string_fields(event, ["op", "port"]);
-        callback(
-            instance,
-            tag,
-            DeferDetail {
-                op,
-                port,
-                index,
-                body,
-                deliver_after,
-            },
-            &detail,
-        );
-    });
-}
-
-/// Write a buffered deferred-message op's answer onto the dispatching event's
-/// `detail`, where the component's SDK reads it as its call returns.
-///
-/// `status` is already the contract's wire string, because the vocabulary is the
-/// op's: a deferred publish answers in `publish-error` spellings and a
-/// cancel/edit in `defer-error` ones (see
-/// [`crate::contract::DEFER_STATUS_FIELD`]).
-///
-/// A detail that refuses the write is a non-conformant dispatcher, so the answer
-/// is dropped rather than panicking the kernel on a component's malformed event.
-pub fn set_defer_status(detail: &JsValue, status: &str) {
-    let _ = Reflect::set(
-        detail,
-        &JsValue::from_str(DEFER_STATUS_FIELD),
-        &JsValue::from_str(status),
-    );
-}
-
-/// Install the delegated `brenn-activation-sync` listener: forwards the resolved
-/// instance, the retargeted tag, the `{ port, body }` detail and the event's
-/// `detail` object to `callback`, wired to
-/// [`crate::logic::route_sync_intent`] and the sync door behind it.
-///
-/// Built on [`install_root_event_listener`] rather than
-/// [`install_root_component_listener`] for the reason the publish listener is:
-/// the answer has to reach back across the module boundary, and the `detail`
-/// object is the only channel a synchronous one can take (see
-/// [`set_sync_status`]).
-///
-/// The whole activation the callback causes runs inside this listener, which runs
-/// inside the component's own `dispatchEvent`. That is what keeps the browser's
-/// user-activation token live for the entry.
-pub fn install_sync_listener(
-    callback: impl Fn(Option<&str>, &str, Option<&str>, Option<&str>, &JsValue) + 'static,
-) {
-    install_root_event_listener(ACTIVATION_SYNC, move |instance, tag, event| {
-        let detail = event
-            .dyn_ref::<CustomEvent>()
-            .map(|ce| ce.detail())
-            .unwrap_or(JsValue::UNDEFINED);
-        let [port, body] = custom_event_string_fields(event, ["port", "body"]);
-        callback(instance, tag, port.as_deref(), body.as_deref(), &detail);
-    });
-}
-
-/// Write a sync-call request's answer onto the dispatching event's `detail`,
-/// where the component's SDK reads it as its `dispatchEvent` returns.
-///
-/// [`SYNC_STATUS_FIELD`] is written for every request the kernel heard, whatever
-/// became of it — a missing status is not an outcome, and the SDK faults on one.
-/// The reply rides alongside on ok when the entry answered with one, and the
-/// entry's own account rides alongside on err.
-///
-/// A detail that refuses the write is a non-conformant dispatcher — a frozen or
-/// primitive detail — so the answer is dropped rather than panicking the kernel
-/// on a component's malformed event. The requester then sees no status and faults
-/// on that, which is the same verdict reached one layer out.
-pub fn set_sync_status(
-    detail: &JsValue,
-    status: crate::contract::SyncStatus,
-    reply: Option<&str>,
-    error: Option<&str>,
-) {
-    let _ = Reflect::set(
-        detail,
-        &JsValue::from_str(SYNC_STATUS_FIELD),
-        &JsValue::from_str(sync_status_str(status)),
-    );
-    if let Some(reply) = reply {
-        let _ = Reflect::set(
-            detail,
-            &JsValue::from_str(SYNC_REPLY_FIELD),
-            &JsValue::from_str(reply),
-        );
-    }
-    if let Some(error) = error {
-        let _ = Reflect::set(
-            detail,
-            &JsValue::from_str(SYNC_ERROR_FIELD),
-            &JsValue::from_str(error),
-        );
-    }
 }
 
 /// Count one publish for `instance` — the lifetime totals a status report carries.
@@ -987,148 +682,6 @@ fn js_error_message(thrown: &JsValue) -> String {
     thrown
         .as_string()
         .unwrap_or_else(|| format!("{:?}", thrown))
-}
-
-/// Install the delegated `brenn-activation-register` listener: forwards the
-/// resolved instance, the retargeted tag, and the component's `entry` function to
-/// `callback`, wired to [`crate::logic::KernelCore::on_activation_register`].
-///
-/// Built on [`install_root_event_listener`] rather than
-/// [`install_root_component_listener`]: the detail carries a *function*, not
-/// strings. That is the point of the seam — the event is in-page and never
-/// serialized, so it can carry the one thing an event cannot carry over a wire.
-/// A detail with no callable `entry` is a non-conformant module; it forwards
-/// `None` so the caller drops and reports it rather than registering a
-/// nothing.
-pub fn install_activation_register_listener(
-    callback: impl Fn(Option<&str>, &str, Option<js_sys::Function>) + 'static,
-) {
-    install_root_event_listener(ACTIVATION_REGISTER, move |instance, tag, event| {
-        let entry = event
-            .dyn_ref::<CustomEvent>()
-            .and_then(|ce| Reflect::get(&ce.detail(), &JsValue::from_str("entry")).ok())
-            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
-        callback(instance, tag, entry);
-    });
-}
-
-/// Install the delegated `brenn-log` listener (see
-/// [`install_root_component_listener`]): forwards the resolved instance, the
-/// retargeted tag, and the `{ level, message }` detail to `callback`, wired to
-/// [`crate::logic::route_log`], which gates the forward on the resolved
-/// component's own `log` grant and stamps the `component:<instance>` source.
-pub fn install_log_listener(
-    callback: impl Fn(Option<&str>, &str, Option<&str>, Option<&str>) + 'static,
-) {
-    install_root_component_listener(
-        COMPONENT_LOG,
-        ["level", "message"],
-        move |instance, tag, [level, message]| {
-            callback(instance, tag, level.as_deref(), message.as_deref());
-        },
-    );
-}
-
-/// Install the delegated `brenn-alert` listener (see
-/// [`install_root_component_listener`]): forwards the resolved instance, the
-/// retargeted tag, and the `{ severity, title, body }` detail to `callback`, wired
-/// to [`crate::logic::route_alert`], which gates the forward on the resolved
-/// component's own `alert` grant.
-pub fn install_alert_listener(
-    callback: impl Fn(Option<&str>, &str, Option<&str>, Option<&str>, Option<&str>) + 'static,
-) {
-    install_root_component_listener(
-        COMPONENT_ALERT,
-        ["severity", "title", "body"],
-        move |instance, tag, [severity, title, body]| {
-            callback(
-                instance,
-                tag,
-                severity.as_deref(),
-                title.as_deref(),
-                body.as_deref(),
-            );
-        },
-    );
-}
-
-/// Install the delegated `brenn-config-get` listener: forwards the resolved
-/// instance, the retargeted tag, the `{ key }` detail, and the event's `detail`
-/// object to `callback`, wired to [`crate::logic::route_config_get`] and
-/// [`crate::logic::KernelCore::component_config_get`] behind it.
-///
-/// Built on [`install_root_event_listener`] rather than
-/// [`install_root_component_listener`] for the reason the publish listener is:
-/// the answer has to reach back across the module boundary, and the `detail`
-/// object is the only channel a synchronous one can take (see
-/// [`set_config_answer`]).
-pub fn install_config_get_listener(
-    callback: impl Fn(Option<&str>, &str, Option<&str>, &JsValue) + 'static,
-) {
-    install_root_event_listener(CONFIG_GET, move |instance, tag, event| {
-        let detail = event
-            .dyn_ref::<CustomEvent>()
-            .map(|ce| ce.detail())
-            .unwrap_or(JsValue::UNDEFINED);
-        let [key] = custom_event_string_fields(event, ["key"]);
-        callback(instance, tag, key.as_deref(), &detail);
-    });
-}
-
-/// Write a config read's answer onto the dispatching event's `detail`, where the
-/// component's SDK reads it as its call returns.
-///
-/// [`CONFIG_ANSWERED_FIELD`] is written for every read the kernel heard, whatever
-/// became of it, and [`CONFIG_VALUE_FIELD`] only when there is a value: an
-/// unknown key, an ungranted instance and an unwired page all answer absence, and
-/// a reader must not have to tell those apart from a page whose kernel listener
-/// never ran.
-///
-/// A detail that refuses the write is a non-conformant dispatcher — a frozen or
-/// primitive detail — so the answer is dropped rather than panicking the kernel
-/// on a component's malformed event. The reader then sees no answer and faults on
-/// that, which is the same verdict reached one layer out.
-pub fn set_config_answer(detail: &JsValue, value: Option<&str>) {
-    let _ = Reflect::set(
-        detail,
-        &JsValue::from_str(CONFIG_ANSWERED_FIELD),
-        &JsValue::TRUE,
-    );
-    if let Some(value) = value {
-        let _ = Reflect::set(
-            detail,
-            &JsValue::from_str(CONFIG_VALUE_FIELD),
-            &JsValue::from_str(value),
-        );
-    }
-}
-
-/// Install the one `brenn-component-panic` listener on `window`.
-///
-/// A component module's panic hook dispatches `brenn-component-panic
-/// { instance, message }` on `window` (per-instance memory means the hook
-/// names the one instance it backs). This primitive reads the
-/// `{ instance, message }` string
-/// detail and hands both to `callback`. It makes no policy decision itself —
-/// `callback` (wired at `start()`) error-cards that component's mount section
-/// and reports it.
-///
-/// Component-supplied detail is untrusted (a buggy or hostile module must never
-/// crash the kernel). A missing or non-string `instance`/`message` field, or a
-/// non-`CustomEvent` event, forwards `None` for that field rather than coercing
-/// to an empty string, so the wiring can drop an unattributable panic rather
-/// than error-card the wrong instance. The listener is installed once for the
-/// page lifetime, so its `Closure` is `forget`-leaked deliberately.
-pub fn install_component_panic_listener(callback: impl Fn(Option<&str>, Option<&str>) + 'static) {
-    let window = web_sys::window().expect("kernel runs in a browser with a window");
-    let closure = Closure::<dyn Fn(Event)>::new(move |event: Event| {
-        let [instance, message] = custom_event_string_fields(event, ["instance", "message"]);
-        callback(instance.as_deref(), message.as_deref());
-    });
-    window
-        .add_event_listener_with_callback(COMPONENT_PANIC, closure.as_ref().unchecked_ref())
-        .expect("add brenn-component-panic listener on window");
-    closure.forget();
 }
 
 /// Construct and dispatch a kernel → bootstrap seam CustomEvent on `window`. The
@@ -1250,34 +803,17 @@ pub fn install_status_timer(interval_secs: u32, callback: impl Fn() + 'static) {
 // wasm-bindgen-test under a headless WebDriver browser; excluded from the
 // host sweep (the whole module is wasm32-only). Isolation: every test that
 // touches `#surface-root` starts from `fresh_root`, and every test that touches
-// `MOUNTED`/`customElements` uses a unique `wbt-*` kind (both are page-lifetime).
+// `MOUNTED` uses a unique `wbt-*` instance id (it is page-lifetime).
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::contract::Activation;
-    use crate::wasm_test_util::{capture_window_event, define_test_element, fresh_root, str_field};
+    use crate::wasm_test_util::{capture_window_event, fresh_root, str_field};
     use std::cell::RefCell;
     use std::rc::Rc;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
-
-    /// Define `instance`'s instance-scoped element so it upgrades on insertion,
-    /// delegating each `connectedCallback` to `connected`.
-    ///
-    /// The kernel creates instance-scoped elements (`brenn-<kind>--<instance>`); a
-    /// test that needs the element to actually upgrade (so `connectedCallback`
-    /// fires) defines its tag through this bare `HTMLElement` subclass. Tests that
-    /// only dispatch from the element and read its `data-instance` need no
-    /// definition at all — an undefined custom element still carries attributes and
-    /// a tag name.
-    fn define_instance_element(
-        instance: &str,
-        kind: &str,
-        connected: impl Fn(HtmlElement) + 'static,
-    ) {
-        define_test_element(&element_name_for_instance(kind, instance), connected);
-    }
 
     /// Drive `instance`'s activation counting the way the kernel does: build the
     /// wrapped entry and invoke it with an activation whose windows carry the given
@@ -1302,76 +838,6 @@ mod tests {
             now: None,
             sync: None,
         });
-    }
-
-    /// Sink for a listener forwarding a resolved instance, a retargeted tag, and
-    /// two string fields (`install_log_listener`).
-    type TagPairSink = Rc<RefCell<Vec<(Option<String>, String, Option<String>, Option<String>)>>>;
-    /// Sink for `install_publish_listener`: instance + tag + `{ port, body }` plus
-    /// the three-state optional `urgency` read, which is what distinguishes this
-    /// listener from the required-fields rung.
-    type PublishSink = Rc<
-        RefCell<
-            Vec<(
-                Option<String>,
-                String,
-                Option<String>,
-                Option<String>,
-                OptionalField,
-            )>,
-        >,
-    >;
-    /// Sink for `install_defer_listener`: instance + tag + the untrusted
-    /// [`DeferDetail`].
-    type DeferSink = Rc<RefCell<Vec<(Option<String>, String, DeferDetail)>>>;
-    /// Sink for `install_alert_listener`: instance + tag + three string fields.
-    type AlertSink = Rc<
-        RefCell<
-            Vec<(
-                Option<String>,
-                String,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            )>,
-        >,
-    >;
-    /// Sink for `install_component_panic_listener`: two string fields, no tag.
-    type PanicSink = Rc<RefCell<Vec<(Option<String>, Option<String>)>>>;
-
-    // ── local dispatch helpers ────────────────────────────────────────────
-
-    /// Dispatch a bubbling + composed `CustomEvent` from `target` (the
-    /// component-side dispatch shape the root-delegated listeners expect).
-    fn dispatch_bubbling(target: &Element, name: &str, detail: &Object) {
-        let init = CustomEventInit::new();
-        init.set_detail(detail);
-        init.set_bubbles(true);
-        init.set_composed(true);
-        let event =
-            CustomEvent::new_with_event_init_dict(name, &init).expect("construct bubbling event");
-        target
-            .dispatch_event(&event)
-            .expect("dispatch bubbling event");
-    }
-
-    /// Dispatch `name` on `window`, as a `CustomEvent` with `detail` or, when
-    /// `detail` is `None`, a plain non-`CustomEvent` `Event`.
-    fn dispatch_window(name: &str, detail: Option<&Object>) {
-        let window = web_sys::window().expect("window");
-        match detail {
-            Some(detail) => {
-                let init = CustomEventInit::new();
-                init.set_detail(detail);
-                let event = CustomEvent::new_with_event_init_dict(name, &init)
-                    .expect("construct window CustomEvent");
-                window.dispatch_event(&event).expect("dispatch on window");
-            }
-            None => {
-                let event = Event::new(name).expect("construct plain Event");
-                window.dispatch_event(&event).expect("dispatch on window");
-            }
-        }
     }
 
     // ── activation entry call convention ──────────────────────────────────
@@ -1585,7 +1051,7 @@ mod tests {
         fresh_root();
         let instance = "wbt-nodrag-i";
         let kind = "wbt-nodrag";
-        mount_component(instance, kind);
+        mount_host(instance, kind);
         // Arrange the wrapper the way chrome would: create a section under
         // #surface-root and reparent the instance's wrapper into it. The kernel
         // only mounts; it owns no layout engine.
@@ -1600,7 +1066,7 @@ mod tests {
             .append_child(&wrapper_of(instance).expect("wrapper exists"))
             .expect("reparent wrapper into section");
 
-        mount_component(instance, kind);
+        mount_host(instance, kind);
         render_error_card(instance, kind, "boom");
 
         let wrapper = wrapper_of(instance).expect("wrapper survives");
@@ -1614,47 +1080,127 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn mount_component_registers_before_append_and_is_idempotent() {
+    fn mount_host_gives_the_instance_a_plain_div_it_can_build_in() {
         fresh_root();
-        let instance = "wbt-mount-i";
-        let kind = "wbt-mount";
-        let observed: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
-        {
-            let observed = Rc::clone(&observed);
-            define_instance_element(instance, kind, move |_host| {
-                observed.borrow_mut().push(is_mounted(instance));
-            });
-        }
-        mount_component(instance, kind);
+        let instance = "wbt-host-i";
+        let kind = "wbt-host";
+        mount_host(instance, kind);
+
+        let element = mounted_element(instance).expect("the host element is registered");
         assert_eq!(
-            *observed.borrow(),
-            vec![true],
-            "connectedCallback saw is_mounted == true (registered before append)"
+            element.tag_name().to_lowercase(),
+            "div",
+            "the host element is a plain div"
         );
-        let wrapper = wrapper_of(instance).expect("wrapper");
+        let wrapper = wrapper_of(instance).expect("the wrapper exists");
+        // Identity is the wrapper's, not the host element's: the component can
+        // write any `data-` name on the element it is handed, so a stamp there
+        // would be forgeable.
+        assert_eq!(element.get_attribute("data-instance"), None);
+        assert_eq!(element.get_attribute(WRAPPER_KIND_ATTR), None);
         assert_eq!(
-            wrapper.child_element_count(),
-            1,
-            "exactly the component element"
-        );
-        let child = wrapper.first_element_child().expect("component element");
-        assert_eq!(
-            child.tag_name().to_lowercase(),
-            element_name_for_instance(kind, instance)
+            wrapper.get_attribute("data-instance").as_deref(),
+            Some(instance)
         );
         assert_eq!(
-            child.get_attribute("data-instance").as_deref(),
-            Some(instance),
-            "element stamped with its instance id"
+            wrapper.get_attribute(WRAPPER_KIND_ATTR).as_deref(),
+            Some(kind)
+        );
+        assert!(
+            element
+                .parent_element()
+                .expect("the host element has a parent")
+                .is_same_node(Some(wrapper.as_ref())),
+            "the host element is the sole content of the instance's wrapper"
         );
 
-        mount_component(instance, kind);
+        // Idempotent: a second call clears the wrapper and leaves exactly one
+        // host element.
+        mount_host(instance, kind);
+        assert_eq!(wrapper.child_element_count(), 1);
+        let again = mounted_element(instance).expect("still registered");
+        assert!(again.is_same_node(wrapper.first_element_child().as_deref()));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_wrapper_declares_paint_containment() {
+        fresh_root();
+        let instance = "wbt-contain-i";
+        let wrapper = mount_wrapper(instance, "wbt-contain");
         assert_eq!(
-            wrapper.child_element_count(),
-            1,
-            "re-mount clears prior content"
+            computed(wrapper.as_ref(), "contain"),
+            "paint",
+            "declared at creation, so no instance can exist without it"
         );
-        assert_eq!(observed.borrow().len(), 2, "re-mount re-connects");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_fixed_position_descendant_paints_inside_its_wrapper() {
+        // The behavioural half: `contain: paint` makes the wrapper the
+        // containing block for a `position: fixed` descendant and clips its
+        // painting to the wrapper's box, so a component that positions itself
+        // `fixed` covers its own region rather than the surface.
+        let root = fresh_root();
+        let wrapper = mount_wrapper("wbt-contain-fixed-i", "wbt-contain-fixed");
+        // Out of the hidden staging pen: a `display: none` subtree has no boxes
+        // to compare, which would make the assertions below vacuous.
+        root.append_child(&wrapper)
+            .expect("arrange the wrapper into the visible root");
+        wrapper
+            .style()
+            .set_property("width", "120px")
+            .expect("size the wrapper");
+        wrapper
+            .style()
+            .set_property("height", "60px")
+            .expect("size the wrapper");
+        let escapee = document()
+            .create_element("div")
+            .expect("document creates a div")
+            .dyn_into::<HtmlElement>()
+            .expect("created div is an HtmlElement");
+        for (name, value) in [
+            ("position", "fixed"),
+            ("top", "0"),
+            ("left", "0"),
+            ("right", "0"),
+            ("bottom", "0"),
+        ] {
+            escapee
+                .style()
+                .set_property(name, value)
+                .expect("stretch the descendant over its containing block");
+        }
+        wrapper
+            .append_child(&escapee)
+            .expect("append the descendant");
+
+        assert_eq!(
+            (wrapper.offset_width(), wrapper.offset_height()),
+            (120, 60),
+            "the wrapper is laid out, so the comparison below is not two empty boxes"
+        );
+        assert_eq!(
+            (escapee.offset_width(), escapee.offset_height()),
+            (wrapper.offset_width(), wrapper.offset_height()),
+            "the descendant's containing block is the wrapper, not the viewport"
+        );
+        assert_eq!(
+            (escapee.offset_left(), escapee.offset_top()),
+            (0, 0),
+            "and it is positioned from the wrapper's own corner"
+        );
+    }
+
+    /// One element's computed value for `property`.
+    fn computed(element: &Element, property: &str) -> String {
+        web_sys::window()
+            .expect("kernel runs in a browser with a window")
+            .get_computed_style(element)
+            .expect("computed style is readable")
+            .expect("the element has a computed style")
+            .get_property_value(property)
+            .expect("the property is readable")
     }
 
     #[wasm_bindgen_test]
@@ -1696,7 +1242,7 @@ mod tests {
     fn drops_count_per_instance_by_window_dropped() {
         fresh_root();
         let instance = "wbt-ctr-drops-i";
-        mount_component(instance, "wbt-ctr-drops");
+        mount_host(instance, "wbt-ctr-drops");
         let before = instance_counters(instance);
 
         count_activation(instance, &[("p", 0, 3), ("other", 0, 4)]);
@@ -1718,8 +1264,8 @@ mod tests {
     fn instance_counters_do_not_bleed_across_siblings() {
         fresh_root();
         let (a, b) = ("wbt-ctr-sib-a", "wbt-ctr-sib-b");
-        mount_component(a, "wbt-ctr-sib");
-        mount_component(b, "wbt-ctr-sib");
+        mount_host(a, "wbt-ctr-sib");
+        mount_host(b, "wbt-ctr-sib");
         let (before_a, before_b) = (instance_counters(a), instance_counters(b));
 
         count_activation(a, &[("p", 0, 2)]);
@@ -1739,7 +1285,7 @@ mod tests {
     fn deliveries_are_not_counted_as_drops() {
         fresh_root();
         let instance = "wbt-ctr-msg-i";
-        mount_component(instance, "wbt-ctr-msg");
+        mount_host(instance, "wbt-ctr-msg");
         let before = instance_counters(instance);
 
         count_activation(instance, &[("p", 2, 0)]);
@@ -1775,479 +1321,18 @@ mod tests {
         assert_eq!(str_field(&reload[0], "reason"), Some("boom".into()));
     }
 
-    // ── untrusted-detail parse + listeners ────────────────────────────────
-
-    #[wasm_bindgen_test]
-    fn custom_event_string_fields_parse() {
-        let detail = detail_object(&[("a", JsValue::from_str("x")), ("n", JsValue::from_f64(5.0))]);
-        let init = CustomEventInit::new();
-        init.set_detail(&detail);
-        let ce = CustomEvent::new_with_event_init_dict("wbt-parse", &init).expect("custom event");
-        let [a, b, n] = custom_event_string_fields(ce.into(), ["a", "b", "n"]);
-        assert_eq!(a.as_deref(), Some("x"), "string field");
-        assert_eq!(b, None, "missing field");
-        assert_eq!(n, None, "non-string field");
-
-        let plain = Event::new("wbt-plain").expect("plain event");
-        let [pa] = custom_event_string_fields(plain, ["a"]);
-        assert_eq!(pa, None, "non-CustomEvent yields all None");
-    }
-
-    /// Mount an instance of `kind` under a fresh root and return its host element
-    /// — the shape the delegated listeners resolve to an instance id. The element
-    /// is the retargeted `event.target` when a `dispatch_bubbling` fires from it.
-    fn mount_probe(instance: &str, kind: &'static str) -> Element {
-        // No element definition needed: these tests dispatch from the element and
-        // read its `data-instance`/tag name, which an undefined custom element
-        // carries just as well. Identity rides `data-instance`, never a defined
-        // upgrade.
-        mount_component(instance, kind);
-        MOUNTED
-            .with(|m| m.borrow().get(instance).cloned())
-            .expect("mounted element")
-    }
-
-    /// The uppercase tag the delegated listeners report for `instance` of `kind`
-    /// — the element's own instance-scoped tag name.
-    fn probe_tag(instance: &str, kind: &str) -> String {
-        element_name_for_instance(kind, instance).to_uppercase()
-    }
-
-    #[wasm_bindgen_test]
-    fn install_publish_listener_resolves_instance_tag_and_fields() {
-        fresh_root();
-        let element = mount_probe("wbt-pub-i", "wbt-pub");
-        let sink: PublishSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_publish_listener(move |instance, tag, port, body, urgency, _detail| {
-                sink.borrow_mut().push((
-                    instance.map(String::from),
-                    tag.to_string(),
-                    port.map(String::from),
-                    body.map(String::from),
-                    urgency,
-                ));
-            });
-        }
-        dispatch_bubbling(
-            &element,
-            PORT_PUBLISH,
-            &detail_object(&[
-                ("port", JsValue::from_str("out")),
-                ("body", JsValue::from_str("hello")),
-            ]),
-        );
-        dispatch_bubbling(
-            &element,
-            PORT_PUBLISH,
-            &detail_object(&[("port", JsValue::from_str("out"))]),
-        );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0.as_deref(), Some("wbt-pub-i"), "resolved instance");
-        assert_eq!(
-            got[0].1,
-            probe_tag("wbt-pub-i", "wbt-pub"),
-            "retargeted tag"
-        );
-        assert_eq!(got[0].2.as_deref(), Some("out"));
-        assert_eq!(got[0].3.as_deref(), Some("hello"));
-        assert_eq!(got[1].3, None, "missing body field forwards None");
-    }
-
-    #[wasm_bindgen_test]
-    fn install_publish_listener_reads_urgency_as_three_states_across_the_dom_seam() {
-        // The `OptionalField` reader's four reachable branches, exercised through
-        // a real dispatch — the only place the DOM value and the three-state read
-        // meet. `route_publish_intent`'s tests take an already-constructed
-        // `OptionalField`, so nothing else pins that a component's `urgency: 3`
-        // reaches the router as `Malformed` rather than being coerced to `Absent`
-        // and published at the port's default — a level the component never chose.
-        fresh_root();
-        let element = mount_probe("wbt-urg-i", "wbt-urg");
-        let sink: PublishSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_publish_listener(move |instance, tag, port, body, urgency, _detail| {
-                sink.borrow_mut().push((
-                    instance.map(String::from),
-                    tag.to_string(),
-                    port.map(String::from),
-                    body.map(String::from),
-                    urgency,
-                ));
-            });
-        }
-        let port = ("port", JsValue::from_str("out"));
-        let body = ("body", JsValue::from_str("hello"));
-        // No `urgency` key at all: the component asks for the port's default.
-        dispatch_bubbling(
-            &element,
-            PORT_PUBLISH,
-            &detail_object(&[port.clone(), body.clone()]),
-        );
-        // Explicit null: same meaning as omitted, not a malformed value.
-        dispatch_bubbling(
-            &element,
-            PORT_PUBLISH,
-            &detail_object(&[port.clone(), body.clone(), ("urgency", JsValue::NULL)]),
-        );
-        // A string: forwarded verbatim, still untrusted (the router parses it).
-        dispatch_bubbling(
-            &element,
-            PORT_PUBLISH,
-            &detail_object(&[
-                port.clone(),
-                body.clone(),
-                ("urgency", JsValue::from_str("high")),
-            ]),
-        );
-        // A number: a component bug, and it must not read as "use the default".
-        dispatch_bubbling(
-            &element,
-            PORT_PUBLISH,
-            &detail_object(&[
-                port.clone(),
-                body.clone(),
-                ("urgency", JsValue::from_f64(3.0)),
-            ]),
-        );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 4);
-        assert_eq!(got[0].4, OptionalField::Absent, "omitted urgency is Absent");
-        assert_eq!(got[1].4, OptionalField::Absent, "null urgency is Absent");
-        assert_eq!(
-            got[2].4,
-            OptionalField::Present("high".to_string()),
-            "a string urgency is forwarded verbatim for the router to parse"
-        );
-        assert_eq!(
-            got[3].4,
-            OptionalField::Malformed,
-            "a non-string urgency is Malformed, never coerced to Absent"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn install_defer_listener_reads_every_field_of_an_op_across_the_dom_seam() {
-        // The reader's whole job on this event: five untrusted fields, three of them
-        // three-state. `route_defer_intent`'s tests take an already-built
-        // `DeferDetail`, so nothing else pins that an omitted `body` reaches the
-        // router as `Absent` (leave it alone) while a number-typed `index` reaches it
-        // as `Malformed` rather than being coerced into an absence — which for a
-        // cancel would silently become malformed-detail wording about the wrong
-        // field, and for an edit a rewrite of a message the component never named.
-        fresh_root();
-        let element = mount_probe("wbt-defer-i", "wbt-defer");
-        let sink: DeferSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_defer_listener(move |instance, tag, detail, _js_detail| {
-                sink.borrow_mut()
-                    .push((instance.map(String::from), tag.to_string(), detail));
-            });
-        }
-        dispatch_bubbling(
-            &element,
-            PORT_DEFER,
-            &detail_object(&[
-                ("op", JsValue::from_str("publish")),
-                ("port", JsValue::from_str("out")),
-                ("body", JsValue::from_str("hello")),
-                ("deliver_after", JsValue::from_str("1770000000000")),
-            ]),
-        );
-        dispatch_bubbling(
-            &element,
-            PORT_DEFER,
-            &detail_object(&[
-                ("op", JsValue::from_str("edit")),
-                ("port", JsValue::from_str("out")),
-                ("index", JsValue::from_f64(2.0)),
-            ]),
-        );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 2);
-        assert_eq!(
-            got[0].0.as_deref(),
-            Some("wbt-defer-i"),
-            "resolved instance"
-        );
-        assert_eq!(
-            got[0].1,
-            probe_tag("wbt-defer-i", "wbt-defer"),
-            "retargeted tag"
-        );
-        assert_eq!(
-            got[0].2,
-            DeferDetail {
-                op: Some("publish".to_string()),
-                port: Some("out".to_string()),
-                index: OptionalField::Absent,
-                body: OptionalField::Present("hello".to_string()),
-                deliver_after: OptionalField::Present("1770000000000".to_string()),
-            }
-        );
-        assert_eq!(
-            got[1].2,
-            DeferDetail {
-                op: Some("edit".to_string()),
-                port: Some("out".to_string()),
-                index: OptionalField::Malformed,
-                body: OptionalField::Absent,
-                deliver_after: OptionalField::Absent,
-            },
-            "a non-string index is Malformed and an omitted body is Absent"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn set_defer_status_answers_on_the_dispatching_detail() {
-        // The synchronous answer's only channel back across the module boundary is
-        // the detail the component dispatched, so the write must land on that same
-        // object — and a detail that refuses the write (a primitive from a
-        // non-conformant dispatcher) must be dropped rather than panicking the
-        // kernel.
-        fresh_root();
-        let element = mount_probe("wbt-defst-i", "wbt-defst");
-        let answered: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        {
-            let answered = Rc::clone(&answered);
-            install_defer_listener(move |_instance, _tag, _detail, js_detail| {
-                set_defer_status(js_detail, "out-of-range");
-                *answered.borrow_mut() = Reflect::get(
-                    js_detail,
-                    &JsValue::from_str(crate::contract::DEFER_STATUS_FIELD),
-                )
-                .ok()
-                .and_then(|v| v.as_string());
-            });
-        }
-        let detail = detail_object(&[
-            ("op", JsValue::from_str("cancel")),
-            ("port", JsValue::from_str("out")),
-            ("index", JsValue::from_str("0")),
-        ]);
-        dispatch_bubbling(&element, PORT_DEFER, &detail);
-        assert_eq!(
-            answered.borrow().as_deref(),
-            Some("out-of-range"),
-            "the status is readable off the dispatching detail"
-        );
-        assert_eq!(
-            Reflect::get(
-                &detail,
-                &JsValue::from_str(crate::contract::DEFER_STATUS_FIELD)
-            )
-            .ok()
-            .and_then(|v| v.as_string())
-            .as_deref(),
-            Some("out-of-range"),
-            "and the dispatcher's own reference sees it"
-        );
-        // A frozen/primitive detail: the write fails and is swallowed.
-        set_defer_status(&JsValue::from_str("not an object"), "ok");
-    }
-
-    #[wasm_bindgen_test]
-    fn install_publish_listener_forwards_none_instance_for_non_component_target() {
-        // A dispatch from a plain node that is not a mounted instance element
-        // resolves to `None`, which routes to the drop-and-report path.
-        let root = fresh_root();
-        let sink: PublishSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_publish_listener(move |instance, tag, port, body, urgency, _detail| {
-                sink.borrow_mut().push((
-                    instance.map(String::from),
-                    tag.to_string(),
-                    port.map(String::from),
-                    body.map(String::from),
-                    urgency,
-                ));
-            });
-        }
-        let child = document().create_element("span").expect("child");
-        root.append_child(&child).expect("append child");
-        dispatch_bubbling(
-            &child,
-            PORT_PUBLISH,
-            &detail_object(&[("port", JsValue::from_str("out"))]),
-        );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, None, "unmounted target resolves to no instance");
-        assert_eq!(got[0].1, "SPAN");
-    }
-
-    #[wasm_bindgen_test]
-    fn publish_listener_disambiguates_two_instances_of_one_kind() {
-        // Two instances of one kind — the whole reason `instance_for_target` scans
-        // `MOUNTED` by `is_same_node` (node identity) rather than parsing the tag.
-        // A regression that returned the first `MOUNTED` entry would resolve both
-        // dispatches to the same instance; this pins each to its own element.
-        fresh_root();
-        let kind = "wbt-two";
-        mount_component("wbt-two-p1", kind);
-        mount_component("wbt-two-p2", kind);
-        let p1 = MOUNTED
-            .with(|m| m.borrow().get("wbt-two-p1").cloned())
-            .expect("p1 mounted");
-        let p2 = MOUNTED
-            .with(|m| m.borrow().get("wbt-two-p2").cloned())
-            .expect("p2 mounted");
-        let sink: PublishSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_publish_listener(move |instance, tag, port, body, urgency, _detail| {
-                sink.borrow_mut().push((
-                    instance.map(String::from),
-                    tag.to_string(),
-                    port.map(String::from),
-                    body.map(String::from),
-                    urgency,
-                ));
-            });
-        }
-        dispatch_bubbling(
-            &p1,
-            PORT_PUBLISH,
-            &detail_object(&[("port", JsValue::from_str("out"))]),
-        );
-        dispatch_bubbling(
-            &p2,
-            PORT_PUBLISH,
-            &detail_object(&[("port", JsValue::from_str("out"))]),
-        );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 2);
-        assert_eq!(
-            got[0].0.as_deref(),
-            Some("wbt-two-p1"),
-            "dispatch from p1's element resolves to p1"
-        );
-        assert_eq!(
-            got[1].0.as_deref(),
-            Some("wbt-two-p2"),
-            "dispatch from p2's element resolves to p2 — not the first MOUNTED entry"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn install_log_listener_resolves_instance_tag_and_fields() {
-        fresh_root();
-        let element = mount_probe("wbt-log-i", "wbt-log");
-        let sink: TagPairSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_log_listener(move |instance, tag, level, message| {
-                sink.borrow_mut().push((
-                    instance.map(String::from),
-                    tag.to_string(),
-                    level.map(String::from),
-                    message.map(String::from),
-                ));
-            });
-        }
-        dispatch_bubbling(
-            &element,
-            COMPONENT_LOG,
-            &detail_object(&[
-                ("level", JsValue::from_str("warn")),
-                ("message", JsValue::from_str("hi")),
-            ]),
-        );
-        dispatch_bubbling(
-            &element,
-            COMPONENT_LOG,
-            &detail_object(&[("level", JsValue::from_str("warn"))]),
-        );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0.as_deref(), Some("wbt-log-i"));
-        assert_eq!(got[0].1, probe_tag("wbt-log-i", "wbt-log"));
-        assert_eq!(got[0].2.as_deref(), Some("warn"));
-        assert_eq!(got[0].3.as_deref(), Some("hi"));
-        assert_eq!(got[1].3, None, "missing message field forwards None");
-    }
-
-    #[wasm_bindgen_test]
-    fn install_alert_listener_resolves_instance_tag_and_fields() {
-        fresh_root();
-        let element = mount_probe("wbt-alert-i", "wbt-alert");
-        let sink: AlertSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_alert_listener(move |instance, tag, severity, title, body| {
-                sink.borrow_mut().push((
-                    instance.map(String::from),
-                    tag.to_string(),
-                    severity.map(String::from),
-                    title.map(String::from),
-                    body.map(String::from),
-                ));
-            });
-        }
-        dispatch_bubbling(
-            &element,
-            COMPONENT_ALERT,
-            &detail_object(&[
-                ("severity", JsValue::from_str("page")),
-                ("title", JsValue::from_str("t")),
-                ("body", JsValue::from_str("b")),
-            ]),
-        );
-        dispatch_bubbling(
-            &element,
-            COMPONENT_ALERT,
-            &detail_object(&[
-                ("severity", JsValue::from_str("page")),
-                ("title", JsValue::from_str("t")),
-            ]),
-        );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0.as_deref(), Some("wbt-alert-i"));
-        assert_eq!(got[0].1, probe_tag("wbt-alert-i", "wbt-alert"));
-        assert_eq!(got[0].2.as_deref(), Some("page"));
-        assert_eq!(got[0].3.as_deref(), Some("t"));
-        assert_eq!(got[0].4.as_deref(), Some("b"));
-        assert_eq!(got[1].4, None, "missing body field forwards None");
-    }
-
-    #[wasm_bindgen_test]
-    fn instance_for_target_distinguishes_two_instances_of_one_kind() {
-        // Two instances of one kind, each with its own instance-scoped element.
-        // Resolution is by element identity over `MOUNTED`, never by parsing the
-        // tag: each element resolves to its own instance; a never-mounted element
-        // resolves to `None`.
-        fresh_root();
-        mount_component("wbt-ift-a", "wbt-ift");
-        mount_component("wbt-ift-b", "wbt-ift");
-        let a = MOUNTED
-            .with(|m| m.borrow().get("wbt-ift-a").cloned())
-            .expect("instance a mounted");
-        let b = MOUNTED
-            .with(|m| m.borrow().get("wbt-ift-b").cloned())
-            .expect("instance b mounted");
-        assert_eq!(instance_for_target(&a).as_deref(), Some("wbt-ift-a"));
-        assert_eq!(instance_for_target(&b).as_deref(), Some("wbt-ift-b"));
-        let stray = document().create_element("div").expect("stray");
-        assert_eq!(instance_for_target(&stray), None);
-    }
+    // ── identity under arrangement ────────────────────────────────────────
 
     #[wasm_bindgen_test]
     fn identity_survives_arrangement() {
-        // Reparenting preserves element identity, so the MOUNTED registry and the
-        // delegated-listener resolution keep working after chrome moves a wrapper.
-        // This is the property that lets chrome arrange at all: a publish
-        // dispatched from the component's element after the move still resolves to
-        // its instance.
+        // Reparenting preserves element identity, so the MOUNTED registry keeps
+        // working after chrome moves a wrapper. This is the property that lets
+        // chrome arrange at all: the host element a component's `dom.root`
+        // resolves to is the same element after the move.
         fresh_root();
         let instance = "wbt-arr-i";
         let kind = "wbt-arr";
-        mount_component(instance, kind);
+        mount_host(instance, kind);
         let element = MOUNTED
             .with(|m| m.borrow().get(instance).cloned())
             .expect("mounted element");
@@ -2264,69 +1349,20 @@ mod tests {
             .append_child(&wrapper_of(instance).expect("wrapper exists"))
             .expect("reparent wrapper");
 
-        assert_eq!(
-            instance_for_target(&element).as_deref(),
-            Some(instance),
+        assert!(
+            mounted_element(instance)
+                .expect("still mounted")
+                .is_same_node(Some(element.as_ref())),
             "identity survives the move"
         );
-
-        let sink: PublishSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_publish_listener(move |instance, tag, port, body, urgency, _detail| {
-                sink.borrow_mut().push((
-                    instance.map(String::from),
-                    tag.to_string(),
-                    port.map(String::from),
-                    body.map(String::from),
-                    urgency,
-                ));
-            });
-        }
-        dispatch_bubbling(
-            &element,
-            PORT_PUBLISH,
-            &detail_object(&[("port", JsValue::from_str("out"))]),
+        assert!(
+            element
+                .parent_element()
+                .expect("host has a parent")
+                .parent_element()
+                .expect("wrapper has a parent")
+                .is_same_node(Some(section.as_ref())),
+            "the host element travelled with its wrapper"
         );
-        let got = sink.borrow();
-        assert_eq!(got.len(), 1);
-        assert_eq!(
-            got[0].0.as_deref(),
-            Some(instance),
-            "a publish from the moved element still routes to its instance"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn install_component_panic_listener_forwards_and_tolerates_malformed() {
-        let sink: PanicSink = Rc::new(RefCell::new(Vec::new()));
-        {
-            let sink = Rc::clone(&sink);
-            install_component_panic_listener(move |component, message| {
-                sink.borrow_mut()
-                    .push((component.map(String::from), message.map(String::from)));
-            });
-        }
-        dispatch_window(
-            COMPONENT_PANIC,
-            Some(&detail_object(&[
-                ("instance", JsValue::from_str("wbt-panic")),
-                ("message", JsValue::from_str("kaboom")),
-            ])),
-        );
-        dispatch_window(
-            COMPONENT_PANIC,
-            Some(&detail_object(&[(
-                "instance",
-                JsValue::from_str("wbt-panic"),
-            )])),
-        );
-        dispatch_window(COMPONENT_PANIC, None);
-        let got = sink.borrow();
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].0.as_deref(), Some("wbt-panic"));
-        assert_eq!(got[0].1.as_deref(), Some("kaboom"));
-        assert_eq!(got[1].1, None, "missing message field forwards None");
-        assert_eq!(got[2], (None, None), "non-CustomEvent forwards all None");
     }
 }

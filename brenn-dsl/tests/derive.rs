@@ -11,18 +11,16 @@ use brenn_dsl::derive::wire_kind;
 use brenn_dsl::derived::DAclSet;
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::fixture_text::processor_header;
-use brenn_dsl::{dom_any, processor_needs};
+use brenn_dsl::{processor_needs, surface_any};
 use support::{
     derive_errors, derive_refusal, derive_refusals, derived, derived_tree, durable, nondurable,
     packaged, prefix_tuning, tuning,
 };
 
-/// A fixture class's header: its abi, and grant declarations answering nothing
-/// this suite asks. The dom form permits everything a surface admits; the
-/// processor form has no `optional` to permit with, so it needs nothing and the
-/// instances beside it grant nothing.
-const DOM: &str = dom_any!();
-const PROCESSOR: &str = processor_needs!("");
+/// A fixture class's header, declaring grants that answer nothing this suite
+/// asks: it needs nothing, and the instances beside it grant nothing.
+const OPEN: &str = surface_any!();
+const NEEDS_NOTHING: &str = processor_needs!("");
 
 // ── roles: which blocks declare and which tune ───────────────────────────────
 
@@ -601,10 +599,10 @@ fn the_goldens_are_class_names_the_runtime_accepts_the_fold_of() {
 fn a_surface_instance_carries_the_kind_its_class_folds_to() {
     let config = derived(concat!(
         "component ModeClock { ",
-        dom_any!(),
+        surface_any!(),
         " optional in messages; }\n\
              component P1Panel { ",
-        dom_any!(),
+        surface_any!(),
         " optional in messages; }\n\
              surface desk {\n    grants = [];\n    new clock: ModeClock { grants = []; }\n    \
              new panel: P1Panel { grants = []; }\n}\n",
@@ -629,9 +627,15 @@ fn a_top_level_instance_takes_no_kind() {
     assert!(config.surface_component_kinds.is_empty());
 }
 
-/// Two modules, each with a `Panel` class and a surface placing it. The class
-/// bodies are what the two spell differently.
-fn two_panels(first_body: &str, second_body: &str) -> Vec<(&'static str, String)> {
+/// Two modules, each with a `Panel` class and a surface placing it, both
+/// instances granting the words named. The class bodies are what the two spell
+/// differently.
+fn two_panels_granting(
+    first_body: &str,
+    second_body: &str,
+    grants: (&str, &str),
+) -> Vec<(&'static str, String)> {
+    let (first_grants, second_grants) = grants;
     vec![
         (
             "",
@@ -641,17 +645,24 @@ fn two_panels(first_body: &str, second_body: &str) -> Vec<(&'static str, String)
             "one",
             format!(
                 "const marker_one = 1;\ncomponent Panel {{ {first_body} }}\n\
-                 surface first {{\n    grants = [];\n    new view: Panel {{ grants = []; }}\n}}\n"
+                 surface first {{\n    grants = [];\n    \
+                 new view: Panel {{ grants = [{first_grants}]; }}\n}}\n"
             ),
         ),
         (
             "two",
             format!(
                 "const marker_two = 2;\ncomponent Panel {{ {second_body} }}\n\
-                 surface second {{\n    grants = [];\n    new view: Panel {{ grants = []; }}\n}}\n"
+                 surface second {{\n    grants = [];\n    \
+                 new view: Panel {{ grants = [{second_grants}]; }}\n}}\n"
             ),
         ),
     ]
+}
+
+/// [`two_panels_granting`] where neither instance grants anything.
+fn two_panels(first_body: &str, second_body: &str) -> Vec<(&'static str, String)> {
+    two_panels_granting(first_body, second_body, ("", ""))
 }
 
 /// Two byte-identical copies of one class, shipped as two packages and placed
@@ -664,7 +675,7 @@ fn two_panels(first_body: &str, second_body: &str) -> Vec<(&'static str, String)
 fn the_package_a_class_arrived_in_is_not_one_of_its_wire_facts() {
     let panel = concat!(
         "component Panel { ",
-        dom_any!(),
+        surface_any!(),
         " optional in messages; }\n"
     );
     let placing = |package: &str, marker: &str, handle: &str| {
@@ -689,7 +700,7 @@ fn the_package_a_class_arrived_in_is_not_one_of_its_wire_facts() {
 
 /// The class body every same-facts fixture uses on both sides. Its port is
 /// `optional` because the instances the helper writes bind nothing.
-const DOM_PANEL: &str = concat!(dom_any!(), " optional in messages;");
+const OPEN_PANEL: &str = concat!(surface_any!(), " optional in messages;");
 
 /// The tree helper takes borrowed sources; the fixtures build owned ones.
 fn borrow<'a>(modules: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
@@ -704,39 +715,45 @@ fn two_classes_folding_to_one_kind_with_different_facts_are_refused() {
     // Every fact the wire contract is made of: one differing fact is enough, and
     // each is asserted on its own so dropping one conjunct fails a test rather
     // than silently serving two contracts under one kind.
-    for (first, second) in [
-        // the abi the browser instantiates against
+    for (first, second, grants) in [
+        // which capabilities the spec permits
         (
-            format!("{PROCESSOR} optional in messages;"),
-            format!("{DOM} optional in messages;"),
+            format!("{NEEDS_NOTHING} optional in messages;"),
+            format!("{OPEN} optional in messages;"),
+            ("", ""),
         ),
         // a port's name and direction
         (
-            format!("{DOM} optional in messages;"),
-            format!("{DOM} optional out results;"),
+            format!("{OPEN} optional in messages;"),
+            format!("{OPEN} optional out results;"),
+            ("", ""),
         ),
         // how many ports there are
         (
-            format!("{DOM} optional in messages;"),
-            format!("{DOM} optional in messages; optional in extra;"),
+            format!("{OPEN} optional in messages;"),
+            format!("{OPEN} optional in messages; optional in extra;"),
+            ("", ""),
         ),
-        // which capabilities the spec permits
+        // which capabilities the spec demands
         (
-            "abi = dom; requires = []; optional = [ports]; optional in messages;".to_string(),
-            "abi = dom; requires = []; optional = [log]; optional in messages;".to_string(),
+            "abi = processor; requires = [log]; optional in messages;".to_string(),
+            "abi = processor; requires = [alert]; optional in messages;".to_string(),
+            ("log", "alert"),
         ),
         // what a port carries
         (
-            format!("{DOM} optional in messages: \"alice.panel@1\";"),
-            format!("{DOM} optional in messages;"),
+            format!("{OPEN} optional in messages: \"alice.panel@1\";"),
+            format!("{OPEN} optional in messages;"),
+            ("", ""),
         ),
         // the order the spec's words are written in, which the comparison keeps
         (
-            "abi = dom; requires = []; optional = [ports, log]; optional in messages;".to_string(),
-            "abi = dom; requires = []; optional = [log, ports]; optional in messages;".to_string(),
+            "abi = processor; requires = [log, alert]; optional in messages;".to_string(),
+            "abi = processor; requires = [alert, log]; optional in messages;".to_string(),
+            ("log, alert", "log, alert"),
         ),
     ] {
-        let modules = two_panels(&first, &second);
+        let modules = two_panels_granting(&first, &second, grants);
         let errors = support::derive_tree(&borrow(&modules)).expect_err("one kind, two contracts");
         assert_eq!(errors.len(), 1, "{first} / {second}: {errors:?}");
         assert_eq!(
@@ -760,7 +777,7 @@ fn two_classes_disagreeing_on_optionality_are_refused() {
         (
             module,
             format!(
-                "const {marker} = 1;\ncomponent Panel {{ {DOM} {port} }}\n\
+                "const {marker} = 1;\ncomponent Panel {{ {OPEN} {port} }}\n\
                  surface {surface} {{\n    grants = [];\n    \
                  new view: Panel {{ grants = []; in messages <- \"local:brenn/m\"; }}\n}}\n"
             ),
@@ -794,7 +811,7 @@ fn two_classes_disagreeing_on_declared_needs_are_refused() {
         (
             module,
             format!(
-                "const {marker} = 1;\ncomponent Panel {{ abi = dom; {needs} \
+                "const {marker} = 1;\ncomponent Panel {{ abi = processor; {needs} \
                  optional in messages; }}\n\
                  surface {surface} {{\n    grants = [];\n    \
                  new view: Panel {{ grants = [log]; }}\n}}\n"
@@ -811,7 +828,7 @@ fn two_classes_disagreeing_on_declared_needs_are_refused() {
             "two",
             "marker_two",
             "second",
-            "requires = []; optional = [log];",
+            "requires = [log]; optional = [takeover];",
         ),
     ];
     let errors = support::derive_tree(&borrow(&modules)).expect_err("one kind, two contracts");
@@ -825,7 +842,7 @@ fn two_classes_disagreeing_on_declared_needs_are_refused() {
 
 #[test]
 fn two_byte_identical_classes_folding_to_one_kind_stand() {
-    let modules = two_panels(DOM_PANEL, DOM_PANEL);
+    let modules = two_panels(OPEN_PANEL, OPEN_PANEL);
     let config = support::derived_tree(&borrow(&modules));
     assert_eq!(
         config.surface_component_kinds,
@@ -850,7 +867,7 @@ fn planes(classes: &str, instances: &str) -> String {
 
 /// One class with one `in messages` port, tagged or not.
 fn tagged_class(name: &str, doctype: &str) -> String {
-    format!("component {name} {{ {DOM} in messages{doctype}; }}\n")
+    format!("component {name} {{ {OPEN} in messages{doctype}; }}\n")
 }
 
 /// One instance of `class`, binding `messages` to the declared channel.
@@ -1014,7 +1031,7 @@ fn two_ports_of_one_class_on_one_channel_must_agree() {
     let source = planes(
         concat!(
             "component Panel { ",
-            dom_any!(),
+            processor_needs!("ports"),
             " in messages: \"alice.panel@1\"; out results: \"alice.board@1\"; }\n",
         ),
         "    new panel: Panel { grants = [ports]; in messages <- m; out results -> m; }\n",
@@ -1053,10 +1070,10 @@ fn a_free_io_port_claims_nothing() {
     let source = planes(
         concat!(
             "component Panel { ",
-            dom_any!(),
+            processor_needs!("ports"),
             " io tick: \"alice.tick@1\"; in messages: \"alice.panel@1\"; }\n\
              component Board { ",
-            dom_any!(),
+            processor_needs!("ports"),
             " io tick: \"alice.board@1\"; }\n",
         ),
         "    new panel: Panel { grants = [ports]; io tick { push_depth = 1; retain_depth = 2; } \
@@ -1075,7 +1092,7 @@ fn a_consumers_ports_participate() {
     let source = format!(
         "channel m at \"ephemeral:alice.m\" {{\n    push_depth = 4;\n    retain_depth = 16;\n}}\n\
          // ── packaged ──\n\
-          component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+          component Sink {{ {NEEDS_NOTHING} in messages: \"alice.sink@1\"; }}\n\
           // ── packaged ──\n\
          {}surface page {{\n    grants = [subscribe];\n{}}}\n\
          new sink: Sink {{\n    slug = \"sink\";\n    \n    \
@@ -1125,7 +1142,7 @@ fn a_page_local_name_and_a_server_local_name_are_two_channels() {
     // two private channels, not disagreeing about one.
     let source = format!(
         "// ── packaged ──\n\
-         component Sink {{ {PROCESSOR} in messages: \"alice.sink@1\"; }}\n\
+         component Sink {{ {NEEDS_NOTHING} in messages: \"alice.sink@1\"; }}\n\
          // ── packaged ──\n\
          {}surface page {{\n    grants = [];\n    \
          new panel: Panel {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n\
@@ -1296,7 +1313,7 @@ fn two_modules_wiring_one_plane_are_checked_against_each_other() {
         (
             key,
             format!(
-                "const {marker} = 1;\ncomponent {class} {{ {PROCESSOR} in messages: \"{tag}\"; \
+                "const {marker} = 1;\ncomponent {class} {{ {NEEDS_NOTHING} in messages: \"{tag}\"; \
                  }}\n"
             ),
         )
@@ -1340,10 +1357,10 @@ fn a_stamped_channel_is_checked_per_stamping() {
     // one declaration in the assembly body.
     let source = concat!(
         "component Panel { ",
-        dom_any!(),
+        surface_any!(),
         " in messages: \"alice.panel@1\"; }\n\
 component Board { ",
-        dom_any!(),
+        surface_any!(),
         " in messages: \"alice.board@1\"; }
 
 assembly Pod(slug: String) {
@@ -1571,7 +1588,7 @@ fn doctypes_across_a_link_must_agree() {
 fn a_link_named_where_a_channel_is_required_says_it_names_a_link() {
     let matcher = format!(
         "// ── packaged ──\n\
-         component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+         component Sink {{ {NEEDS_NOTHING} optional in quiet; }}\n\
          // ── packaged ──\n\
          link relay;\n\
          new indexer: Sink {{\n    slug = \"indexer\";\n    \
@@ -1580,7 +1597,7 @@ fn a_link_named_where_a_channel_is_required_says_it_names_a_link() {
     );
     let argument = format!(
         "// ── packaged ──\n\
-         component Sink {{ {PROCESSOR} optional in quiet; }}\n\
+         component Sink {{ {NEEDS_NOTHING} optional in quiet; }}\n\
          // ── packaged ──\n\
          assembly Pod(ch: Channel) {{\n    \
          new inner: Sink {{\n        slug = \"inner\";\n        \

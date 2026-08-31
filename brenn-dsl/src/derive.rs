@@ -2634,6 +2634,34 @@ fn derive_grants(
             word.span().clone(),
         ));
     }
+    // Not an agreement rule either, and the placement-grain half of the pair the
+    // class-grain rule refuses in a specification's lists: page-DOM authority
+    // arranges other instances' elements and mutates them through the scoped
+    // word, and only the scoped word makes an instance mountable. A class may
+    // list both optional, so the lists agreeing does not make every grant set
+    // drawn from them coherent — this is where the set itself is checked.
+    if let Some(word) = rights.iter().find_map(|right| match right {
+        Right::Capability(Capability::Grant(ComponentGrant::PageDom), word) => Some(word),
+        _ => None,
+    }) && !rights.iter().any(|right| {
+        matches!(
+            right,
+            Right::Capability(Capability::Grant(ComponentGrant::Dom), _)
+        )
+    }) {
+        errors.push(Diagnostic::at(
+            format!(
+                "{} `{label}` grants `{}` and not `{}`: the page-wide capability arranges \
+                 other instances' elements and mutates them through the scoped one, and only \
+                 the scoped one makes an instance mountable, so the pair is granted together \
+                 or not at all",
+                kind.label(),
+                ComponentGrant::PageDom.word(),
+                ComponentGrant::Dom.word(),
+            ),
+            word.span().clone(),
+        ));
+    }
     if !stated.refused && !refused {
         check_agreement(kind, label, &rights, stated, errors);
     }

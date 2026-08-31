@@ -126,7 +126,8 @@ fn refusal_text(payload: Box<dyn Any + Send>) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use brenn_dsl::{dom_any, processor_needs};
+    use brenn_dsl::fixture_text::processor_header;
+    use brenn_dsl::processor_needs;
 
     use super::*;
 
@@ -362,34 +363,39 @@ new alice_sink: Sink {
         message
     }
 
-    const PREAMBLE: &str = concat!(
-        r#"
-channel feed at "brenn:alice.feed" {
+    /// The channel, and the two classes every surface fixture below places. The
+    /// widget requires exactly what its instance grants: an interface word
+    /// cannot be optional, so the class states what the case gives it.
+    fn preamble(widget_requires: &str) -> String {
+        format!(
+            r#"
+channel feed at "brenn:alice.feed" {{
     push_depth = 8;
     retain_depth = 64;
     standing_retain_depth = 64;
-}
+}}
 
-component Widget {
-    "#,
-        dom_any!(),
-        r#"
+component Widget {{
+    {}
+    optional = [takeover];
     in messages;
     optional out takeover;
-}
+}}
 
-component Shell {
-    "#,
-        dom_any!(),
-        r#"
-}
-"#
-    );
+component Shell {{
+    {}
+}}
+"#,
+            processor_header(widget_requires),
+            processor_header("dom, page-dom"),
+        )
+    }
 
     /// Every surface needs exactly one chrome; these fixtures are about other
-    /// gates, so theirs binds nothing and is granted nothing.
+    /// gates, so theirs binds nothing and is granted only the page authority a
+    /// chrome designation requires.
     const CHROME: &str = r#"    new shell: Shell {
-        grants = [];
+        grants = [dom, page-dom];
         chrome = true;
     }
 "#;
@@ -397,7 +403,7 @@ component Shell {
     #[test]
     fn a_takeover_binding_without_the_instance_grant_is_refused() {
         let message = boot_gate_refusal(&format!(
-            r#"{PREAMBLE}
+            r#"{preamble}
 surface panel {{
     grants = [subscribe];
     new w: Widget {{
@@ -406,7 +412,8 @@ surface panel {{
         out takeover -> "local:brenn/takeover";
     }}
 {CHROME}}}
-"#
+"#,
+            preamble = preamble("ports, log")
         ));
         assert!(message.contains("takeover"), "{message}");
         assert!(
@@ -418,7 +425,7 @@ surface panel {{
     #[test]
     fn an_instance_alert_grant_on_an_alertless_surface_is_refused() {
         let message = boot_gate_refusal(&format!(
-            r#"{PREAMBLE}
+            r#"{preamble}
 surface panel {{
     grants = [subscribe];
     new w: Widget {{
@@ -426,7 +433,8 @@ surface panel {{
         in messages <- feed {{ push_depth = 4; }}
     }}
 {CHROME}}}
-"#
+"#,
+            preamble = preamble("log, alert")
         ));
         assert!(message.contains("is granted \"alert\""), "{message}");
         assert!(
@@ -442,7 +450,7 @@ surface panel {{
     #[test]
     fn a_config_map_without_the_config_grant_is_refused() {
         let message = boot_gate_refusal(&format!(
-            r#"{PREAMBLE}
+            r#"{preamble}
 surface panel {{
     grants = [subscribe];
     new w: Widget {{
@@ -451,7 +459,8 @@ surface panel {{
         in messages <- feed {{ push_depth = 4; }}
     }}
 {CHROME}}}
-"#
+"#,
+            preamble = preamble("log")
         ));
         assert!(message.contains("declares a `config` map"), "{message}");
         assert!(message.contains("\"w\""), "{message}");

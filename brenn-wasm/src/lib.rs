@@ -44,7 +44,7 @@ use brenn_common::sanitize_untrusted_str;
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
 /// building a `ProcessorLoadSpec` names them without reaching past this crate.
-pub use brenn_envelope::grants::ComponentGrant;
+pub use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 
 /// Grace period added on top of SKEW_WINDOW_MS when computing the `last` namespace prune cutoff.
 ///
@@ -2219,6 +2219,15 @@ fn add_capability_to_linker(
         >(linker, |d| d),
         // Callers must not pass a word that names no interface.
         ComponentGrant::Takeover => unreachable!("`takeover` links no interface"),
+        // Callers must not pass a word this host cannot implement. Both are
+        // refused on a top-level placement by the config front end, so reaching
+        // here means that refusal was bypassed.
+        ComponentGrant::Dom | ComponentGrant::PageDom => {
+            unreachable!(
+                "`{}` is a page capability and no backend host links it",
+                grant.word()
+            )
+        }
     }
 }
 
@@ -2354,13 +2363,18 @@ impl ProcessorComponent {
         // Deny-by-default is structural — an ungranted import makes instantiate_pre fail.
         let mut linker: Linker<ProcessorData> = Linker::new(&engine);
         for grant in &spec.grants {
-            // A word naming no interface is a page capability, consented to at a
-            // binding on a surface. A backend component has no page, so a load
-            // spec carrying one is a caller that built its grant set wrong.
+            // Hosting legality first, from its one home: a page capability in a
+            // backend load spec is a caller that built its grant set wrong,
+            // whether the word names an interface no backend host implements or
+            // no interface at all.
+            if let Some(why) = grant.illegal_on(ComponentHost::TopLevel) {
+                panic!("component {}: {why}", spec.slug);
+            }
+            // Then the linker's own precondition. Every word legal here names an
+            // interface, and the map below has an arm only for words that do.
             assert!(
                 grant.wit_import().is_some(),
-                "component {}: granted `{}`, which names no WIT interface — it is a page \
-                 capability consented to at a binding, and a backend component has no page",
+                "component {}: granted `{}`, which names no WIT interface",
                 spec.slug,
                 grant.word(),
             );
@@ -2443,8 +2457,8 @@ impl ProcessorComponent {
         });
 
         // Import-reflection check: name each capability violation before
-        // instantiate_pre's opaque error (§3.4). instantiate_pre remains as
-        // the structural backstop (defense in depth).
+        // instantiate_pre's opaque error. instantiate_pre remains as the
+        // structural backstop (defense in depth).
         Self::enforce_grants(spec.slug, &engine, &component, &spec.grants);
 
         let instance_pre = linker.instantiate_pre(&component).unwrap_or_else(|e| {
@@ -2750,11 +2764,12 @@ impl ProcessorComponent {
         carry: &mut HashMap<SinkKey, u64>,
     ) -> ProcessorOutcome {
         let activation_now = activation.now;
-        // The world this host lowers into has no sync vocabulary, and a headless
-        // processor has no cause that could ever be sync — no element, no DOM
-        // event, and a timer is an ordinary deferred self-publish. So a sync-call
-        // activation reaching here is not a shape to degrade into an async one; it
-        // is a caller that built something this host cannot honestly deliver.
+        // A headless processor has no cause that could ever be sync — no element,
+        // no DOM event, and a timer is an ordinary deferred self-publish. So a
+        // sync-call activation reaching here is not a shape to degrade into an
+        // async one; it is a caller that built something this host cannot
+        // honestly deliver. The world carries the field, and this host always
+        // lowers `none` into it.
         assert!(
             activation.sync.is_none(),
             "wasm host: a sync-call activation cannot be lowered into the processor world"
@@ -2805,6 +2820,7 @@ impl ProcessorComponent {
             ports: wit_ports,
             deferred: wit_deferred,
             now: activation_now,
+            sync: None,
         };
         let instance = match processor_pre.instantiate(&mut store) {
             Ok(i) => i,
@@ -2815,7 +2831,15 @@ impl ProcessorComponent {
             Err(e) => return ProcessorOutcome::Trap(format!("instantiation failed: {e:#}")),
         };
         let outcome = match instance.call_receive(&mut store, &wit_activation) {
-            Ok(Ok(())) => {
+            // A reply answers a sync-call activation, and this host mints none:
+            // `sync` is asserted `None` above. So a `some` here is a guest that
+            // answered a cause that asked nothing, and reading its ok would flush
+            // a buffer built under a misapprehension — the same rule the page
+            // host applies, applied where it can only ever fire one way.
+            Ok(Ok(Some(_))) => ProcessorOutcome::Trap(String::from(
+                "receive replied to an activation that asked nothing",
+            )),
+            Ok(Ok(None)) => {
                 // All buffers flush together, on Ok only. On Err/Trap this arm is
                 // never taken, so the buffers drop with the store below — a trapped
                 // activation therefore fires no port publish, no tool call, and no

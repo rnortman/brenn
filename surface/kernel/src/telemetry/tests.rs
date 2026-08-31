@@ -9,7 +9,7 @@ use brenn_surface_schema::telemetry::{
 use brenn_surface_schema::telemetry::{
     InstanceCounters, InstanceReport, OverlayReport, StatusCounters,
 };
-use brenn_surface_schema::{Abi, Binding, ComponentEntry, InstanceState, NoiseLevel};
+use brenn_surface_schema::{Binding, ComponentEntry, InstanceState, NoiseLevel};
 use chrono::{TimeZone, Utc};
 
 use super::{StatusReport, derive_health, expected_pumps, geometry_body, status_body};
@@ -21,7 +21,6 @@ fn component(instance: &str) -> ComponentEntry {
     ComponentEntry {
         instance: instance.to_string(),
         kind: "protobar".to_string(),
-        abi: Abi::Dom,
         parked_batch_depth: 4,
         config: BTreeMap::new(),
         grants: vec![],

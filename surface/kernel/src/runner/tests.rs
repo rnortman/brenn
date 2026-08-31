@@ -462,8 +462,12 @@ impl Running {
     /// control plane as a test states it.
     fn send(&mut self, command: RunnerCommand) {
         match command {
-            RunnerCommand::RegisterActivation { instance, entry } => {
-                self.handle.register_activation(&instance, entry);
+            RunnerCommand::RegisterActivation {
+                instance,
+                entry,
+                mount,
+            } => {
+                self.handle.register_activation(&instance, entry, mount);
             }
             RunnerCommand::DeregisterActivation { instance } => {
                 self.handle.deregister_activation(&instance);
@@ -700,6 +704,26 @@ fn windowing(windows: &Windows) -> ActivationEntry {
     })
 }
 
+/// The `sync` port of every activation an entry was handed, in order.
+#[derive(Clone, Default)]
+struct Syncs(Arc<Mutex<Vec<Option<String>>>>);
+
+impl Syncs {
+    fn ports(&self) -> Vec<Option<String>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// An entry that records which port — if any — each of its activations was a
+/// sync call on.
+fn recording_sync(syncs: &Syncs) -> ActivationEntry {
+    let syncs = syncs.clone();
+    Box::new(move |activation: &Activation, _: &mut PublishBuffer| {
+        syncs.0.lock().unwrap().push(activation.sync.clone());
+        Ok(None)
+    })
+}
+
 /// An entry that publishes `body` on its output `port` every time it runs.
 fn publishing(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
     let (port, body) = (port.to_string(), body.to_string());
@@ -744,11 +768,22 @@ fn erring(seen: &Seen) -> ActivationEntry {
     })
 }
 
-/// Register `instance`'s entry.
+/// Register `instance`'s entry, headless: no mount activation.
 fn mount(running: &mut Running, instance: &str, entry: ActivationEntry) {
     running.send(RunnerCommand::RegisterActivation {
         instance: instance.to_string(),
         entry,
+        mount: false,
+    });
+}
+
+/// Register `instance`'s entry as a rendering instance: the loop owes it one
+/// mount activation as soon as the entry is installed.
+fn mount_rendering(running: &mut Running, instance: &str, entry: ActivationEntry) {
+    running.send(RunnerCommand::RegisterActivation {
+        instance: instance.to_string(),
+        entry,
+        mount: true,
     });
 }
 
@@ -904,6 +939,7 @@ async fn a_mount_subscribes_its_channel_and_an_unmount_closes_it() {
     running.send(RunnerCommand::RegisterActivation {
         instance: "p1".to_string(),
         entry: Box::new(|_, _| Ok(None)),
+        mount: false,
     });
     wait_until(|| controls.subscribed().contains(&WIRE_ONE.to_string())).await;
 
@@ -981,6 +1017,7 @@ async fn a_write_failure_mid_batch_drops_the_rest_of_it_and_reconnects() {
         running.send(RunnerCommand::RegisterActivation {
             instance: instance.to_string(),
             entry: Box::new(|_, _| Ok(None)),
+            mount: false,
         });
     }
     wait_until(|| controls.connects() == 1).await;
@@ -1892,4 +1929,210 @@ async fn the_best_effort_planes_are_absorbed_after_the_attachment_ended() {
         "nothing is composed against an attachment that has ended"
     );
     assert!(controls.publishes().is_empty());
+}
+
+/// A rendering instance's registration is answered with one mount activation on
+/// the reserved port, before anything else is delivered. The mount settles the
+/// scheduler's debt, so no redundant empty activation follows.
+#[tokio::test(start_paused = true)]
+async fn a_rendering_registration_is_answered_with_the_mount_activation() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let syncs = Syncs::default();
+    mount_rendering(&mut running, "p1", recording_sync(&syncs));
+
+    wait_until(|| !syncs.ports().is_empty()).await;
+    assert_eq!(
+        syncs.ports(),
+        vec![Some(MOUNT_SYNC_PORT.to_string())],
+        "the first call is the mount, and it is the only call so far"
+    );
+
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+    wait_until(|| syncs.ports().len() > 1).await;
+    assert_eq!(
+        syncs.ports(),
+        vec![Some(MOUNT_SYNC_PORT.to_string()), None],
+        "the delivery is an ordinary activation, and the mount did not repeat"
+    );
+    running.task.abort();
+}
+
+/// A rendering instance may register before the page's first bindings document —
+/// registration is admitted with the wiring still in flight — and its mount is
+/// owed, not dropped. The document that lands settles the debt, so the UI is
+/// built before any delivery reaches the component.
+#[tokio::test(start_paused = true)]
+async fn a_mount_owed_before_the_wiring_is_settled_by_the_document() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+
+    // Everything of the handshake except the document, so the page is attached
+    // and has no wiring.
+    for text in [server_hello(), welcome(), subscribe_result(CONFIG, 1)] {
+        feed.unbounded_send(TransportEvent::Text(text)).unwrap();
+    }
+    wait_until(|| controls.subscribed() == vec![CONFIG.to_string()]).await;
+
+    let syncs = Syncs::default();
+    mount_rendering(&mut running, "p1", recording_sync(&syncs));
+    // Served before the document is fed, so the mount is genuinely attempted
+    // against a page with no wiring — which is the window under test, and which
+    // the loop's socket-first bias would otherwise close.
+    settle().await;
+    assert!(
+        syncs.ports().is_empty(),
+        "there is nothing to window against yet, so nothing was called"
+    );
+
+    feed.unbounded_send(TransportEvent::Text(deliver(CONFIG, &doc().to_body())))
+        .unwrap();
+    assert!(matches!(running.event().await, Event::Connected { .. }));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+
+    wait_until(|| syncs.ports().len() > 1).await;
+    assert_eq!(
+        syncs.ports(),
+        vec![Some(MOUNT_SYNC_PORT.to_string()), None],
+        "the owed mount is the instance's first call, ahead of the delivery"
+    );
+    running.task.abort();
+}
+
+/// The other arm of the owed-mount rule: an instance that was withdrawn while
+/// its mount was owed is owed nothing, so the document that lands drops the debt
+/// instead of re-queueing it against an instance with no entry.
+///
+/// The re-registration afterwards is the other half of the claim — the drop is a
+/// drop of one debt, not of the loop's willingness to mount.
+#[tokio::test(start_paused = true)]
+async fn a_mount_owed_by_a_withdrawn_instance_is_dropped_not_retried() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+
+    // Attached with no document, so the registration's mount is owed rather
+    // than served.
+    for text in [server_hello(), welcome(), subscribe_result(CONFIG, 1)] {
+        feed.unbounded_send(TransportEvent::Text(text)).unwrap();
+    }
+    wait_until(|| controls.subscribed() == vec![CONFIG.to_string()]).await;
+
+    let syncs = Syncs::default();
+    mount_rendering(&mut running, "p1", recording_sync(&syncs));
+    settle().await;
+    assert!(syncs.ports().is_empty(), "the mount is owed, not served");
+
+    running.send(RunnerCommand::DeregisterActivation {
+        instance: "p1".to_string(),
+    });
+    // Served before the document is fed: the loop's socket-first bias would
+    // otherwise let the owed mount run against the entry still installed, and the
+    // withdrawal under test would never be the state the mount met.
+    settle().await;
+
+    feed.unbounded_send(TransportEvent::Text(deliver(CONFIG, &doc().to_body())))
+        .unwrap();
+    assert!(matches!(running.event().await, Event::Connected { .. }));
+    settle().await;
+    assert!(
+        syncs.ports().is_empty(),
+        "the withdrawn instance holds no entry, so its owed mount is dropped"
+    );
+
+    // The debt was dropped, not the mechanism: a fresh registration mounts.
+    mount_rendering(&mut running, "p1", recording_sync(&syncs));
+    wait_until(|| !syncs.ports().is_empty()).await;
+    assert_eq!(syncs.ports(), vec![Some(MOUNT_SYNC_PORT.to_string())]);
+    running.task.abort();
+}
+
+/// A headless registration asks for no mount activation.
+#[tokio::test(start_paused = true)]
+async fn a_headless_registration_gets_no_mount_activation() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let syncs = Syncs::default();
+    mount(&mut running, "p1", recording_sync(&syncs));
+
+    wait_until(|| !syncs.ports().is_empty()).await;
+    assert_eq!(
+        syncs.ports(),
+        vec![None],
+        "nothing in a headless instance's first call names a sync port"
+    );
+    running.task.abort();
+}
+
+/// The mount activation is a pass like any other: input already pending when the
+/// instance registers is windowed *in* the mount call, beside the request.
+///
+/// A component that assumed an empty mount would silently drop that input, which
+/// is why the contract forbids assuming why you woke.
+#[tokio::test(start_paused = true)]
+async fn the_mount_activation_windows_the_input_already_pending() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    // `p1` publishes before `p2` registers, so its output is already in the
+    // store when `p2`'s mount fires.
+    let writer = Seen::default();
+    mount(&mut running, "p1", publishing(&writer, "notes", "waiting"));
+
+    let seen = Seen::default();
+    let syncs = Syncs::default();
+    let recorder = {
+        let syncs = syncs.clone();
+        entry(&seen, move |activation, _| {
+            syncs.0.lock().unwrap().push(activation.sync.clone());
+            Ok(None)
+        })
+    };
+    mount_rendering(&mut running, "p2", recorder);
+
+    wait_until(|| !seen.bodies().is_empty()).await;
+    assert_eq!(syncs.ports(), vec![Some(MOUNT_SYNC_PORT.to_string())]);
+    assert_eq!(
+        seen.bodies(),
+        vec!["waiting".to_string(), MOUNT_REQUEST_BODY.to_string()],
+        "the mount call carries the input the instance already had, and the \
+         synthesized request rides as one more window beside it"
+    );
+    running.task.abort();
+}
+
+/// A trap inside the mount activation is an ordinary trap: terminal for the
+/// instance, contained to it, and reported as the instance's own death.
+#[tokio::test(start_paused = true)]
+async fn a_trap_in_the_mount_activation_kills_the_instance() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    mount_rendering(
+        &mut running,
+        "p1",
+        Box::new(|_, _| panic!("the component fell over building its UI")),
+    );
+
+    assert!(matches!(
+        running.event().await,
+        Event::InstanceFailed { instance, reason }
+            if instance == "p1" && reason.contains("building its UI")
+    ));
+    running.task.abort();
 }

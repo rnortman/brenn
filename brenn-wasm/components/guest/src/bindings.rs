@@ -13,6 +13,10 @@
 //
 // The `component-type` custom section emitted by `generate!` travels through
 // the rlib into the final cdylib, so componentization works from a dependency.
+// The generated `receive` lowering takes one flattened argument per canonical-ABI
+// field, which is more than the lint's threshold. Nothing here is hand-written.
+#![allow(clippy::too_many_arguments)]
+
 wit_bindgen::generate!({
     world: "processor",
     path: "../../wit/processor.wit",

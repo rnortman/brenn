@@ -23,11 +23,80 @@ use brenn_envelope::MessageEnvelope;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use brenn_surface_component_support::parse_delivery;
-pub use brenn_surface_component_support::{ContractViolation, FaultReport};
-use brenn_surface_contract::PortWindow;
-
 use crate::spec::port::{ACKS, AGENDA};
+
+// TODO(surface-fault-report): the malformed-body log line below is spelled here
+// because every kind spells its own copy. The home for it is guest-side.
+
+/// A rejected port delivery: the wire boundary itself was violated. Either is
+/// host/guest skew or operator misconfig, and the glue fails the activation on
+/// it rather than carrying on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContractViolation {
+    /// A window arrived on a port this component does not bind.
+    WrongPort { port: String },
+    /// The delivered envelope did not parse as a [`MessageEnvelope`].
+    BadEnvelope(String),
+}
+
+/// Everything the glue needs to emit the operator-visible malformed-body log
+/// line, extracted from the envelope so all formatting stays host-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultReport {
+    pub channel: String,
+    pub sender: String,
+    pub message_id: String,
+    pub reason: String,
+}
+
+impl FaultReport {
+    /// Build a report from the delivering envelope and a validation reason.
+    pub fn new(envelope: &MessageEnvelope, reason: String) -> Self {
+        FaultReport {
+            channel: envelope.channel.clone(),
+            sender: envelope.sender.clone(),
+            message_id: envelope.message_id.to_string(),
+            reason,
+        }
+    }
+
+    /// The operator log line. `context` names what was malformed, so a buggy
+    /// publisher is identifiable.
+    pub fn log_message(&self, context: &str) -> String {
+        format!(
+            "malformed {} on {} from {} (message_id {}): {}",
+            context, self.channel, self.sender, self.message_id, self.reason
+        )
+    }
+}
+
+/// Parse one delivered envelope, refusing a port this component does not bind.
+fn parse_delivery(
+    port: &str,
+    expected_ports: &[&str],
+    envelope_json: &str,
+) -> Result<MessageEnvelope, ContractViolation> {
+    if !expected_ports.contains(&port) {
+        return Err(ContractViolation::WrongPort {
+            port: port.to_string(),
+        });
+    }
+    serde_json::from_str(envelope_json).map_err(|e| ContractViolation::BadEnvelope(e.to_string()))
+}
+
+/// One activation window on a bound input port, in the terms this state machine
+/// reads it by: the port it arrived on, the new envelope documents it carries
+/// (oldest first, as delivered JSON), and how many passed unserved.
+///
+/// A borrowed view rather than either host's own window type: this module
+/// compiles for the host, where it is unit-tested, and for wasm32 against the
+/// guest SDK, whose window is a different type in a different crate universe.
+/// The glue borrows one into the other.
+pub struct ActivationWindow<'a> {
+    pub port: &'a str,
+    pub new_raw: &'a [String],
+    pub dropped: u64,
+}
 
 /// Escalation ladder defaults (seconds), used when a meeting carries no
 /// `escalation` override or an invalid one. `takeover > critical` is the ordering
@@ -69,6 +138,9 @@ pub enum DisplayState {
 
 /// The escalating states in the order a meeting passes through them, ascending.
 /// `Idle` is excluded: it is the no-meeting state, not a rung.
+///
+/// Read by the help generator, which the guest universe does not carry.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const ESCALATION_LADDER: [DisplayState; 4] = [
     DisplayState::Ambient,
     DisplayState::Takeover,
@@ -405,25 +477,31 @@ impl MeetingState {
     /// new message — an idle turn must not be the turn that lets the skew through.
     pub fn on_window(
         &mut self,
-        window: &PortWindow,
+        window: ActivationWindow<'_>,
         now: DateTime<Utc>,
     ) -> Result<Vec<IngestWarning>, ContractViolation> {
         if window.port != AGENDA && window.port != ACKS {
             return Err(ContractViolation::WrongPort {
-                port: window.port.clone(),
+                port: window.port.to_string(),
             });
         }
         let mut notes = Vec::new();
         if window.port == AGENDA {
-            if let Some(message) = window.latest_wins_misconfiguration() {
-                notes.push(IngestWarning::error(message));
+            if window.new_raw.len() > 1 {
+                notes.push(IngestWarning::error(format!(
+                    "latest-wins port {:?} presented {} new messages; its binding's push_depth \
+                     should be 1 — coalescing to the latest is the subscription's job, not the \
+                     component's",
+                    window.port,
+                    window.new_raw.len(),
+                )));
             }
-            if let Some(envelope) = window.latest_new() {
-                notes.extend(self.ingest(&window.port, envelope, now)?);
+            if let Some(envelope_json) = window.new_raw.last() {
+                notes.extend(self.ingest(window.port, envelope_json, now)?);
             }
             return Ok(notes);
         }
-        if window.port == ACKS && window.dropped > 0 {
+        if window.dropped > 0 {
             notes.push(IngestWarning::warn(format!(
                 "meeting port {:?} dropped {} ack(s); a dismissal or snooze made \
                  elsewhere may keep escalating here until its meeting leaves the \
@@ -431,8 +509,8 @@ impl MeetingState {
                 window.port, window.dropped
             )));
         }
-        for envelope in window.new_envelopes() {
-            notes.extend(self.ingest(&window.port, envelope, now)?);
+        for envelope_json in window.new_raw {
+            notes.extend(self.ingest(window.port, envelope_json, now)?);
         }
         Ok(notes)
     }
@@ -441,12 +519,10 @@ impl MeetingState {
     fn ingest(
         &mut self,
         port: &str,
-        envelope: &MessageEnvelope,
+        envelope_json: &str,
         now: DateTime<Utc>,
     ) -> Result<Vec<IngestWarning>, ContractViolation> {
-        let envelope_json =
-            serde_json::to_string(envelope).expect("a MessageEnvelope serializes to JSON");
-        Ok(match self.on_message(port, &envelope_json, now)? {
+        Ok(match self.on_message(port, envelope_json, now)? {
             IngestOutcome::Accepted { warnings } => warnings,
             IngestOutcome::Malformed(report) => {
                 vec![IngestWarning::error(report.log_message("meeting body"))]
@@ -777,61 +853,6 @@ impl AckAction {
     }
 }
 
-/// The request body a Dismiss/Snooze press encodes for its sync activation.
-///
-/// The press names the occurrence that was on screen when it happened, not
-/// whatever is on screen when the entry runs: the two are the same task apart,
-/// but a press is an act on what the user saw. `target` is `None` when the panel
-/// showed no meeting — the buttons are hidden then, so this is only reachable
-/// through a programmatic click, and it resolves to a no-op rather than a fault.
-///
-/// A private dialect between this component's wiring and its own entry, and
-/// deliberately not the ack body the `acks` port carries: an ack is a decision
-/// this component publishes, a request is a press it has not acted on yet.
-pub fn ack_request_body(kind: AckKind, target: Option<&AckTarget>) -> String {
-    match target {
-        Some(target) => serde_json::json!({
-            "kind": kind.as_str(),
-            "meeting_id": target.meeting_id,
-            "start": target.start.to_rfc3339(),
-        })
-        .to_string(),
-        None => serde_json::json!({ "kind": kind.as_str() }).to_string(),
-    }
-}
-
-/// Read a press back. `Ok(None)` is a press with no meeting on screen; `Err` is
-/// this component's two halves speaking different dialects, which the glue
-/// panics on rather than dropping a user's dismissal.
-pub fn parse_ack_request(body: &str) -> Result<Option<(AckKind, AckTarget)>, String> {
-    let raw: RawAckRequest =
-        serde_json::from_str(body).map_err(|e| format!("unparseable ack request: {e}"))?;
-    let Some(kind) = AckKind::parse(&raw.kind) else {
-        return Err(format!("unknown ack request kind {:?}", raw.kind));
-    };
-    let (Some(meeting_id), Some(start)) = (raw.meeting_id, raw.start) else {
-        return Ok(None);
-    };
-    Ok(Some((
-        kind,
-        AckTarget {
-            meeting_id,
-            start: parse_ts("start", &start)?,
-        },
-    )))
-}
-
-/// A press as serde sees it. Both occurrence fields are absent together for a
-/// press that landed on an idle panel.
-#[derive(Deserialize)]
-struct RawAckRequest {
-    kind: String,
-    #[serde(default)]
-    meeting_id: Option<String>,
-    #[serde(default)]
-    start: Option<String>,
-}
-
 /// The ack body a Dismiss button publishes for `target`.
 pub fn dismiss_body(target: &AckTarget) -> String {
     serde_json::json!({
@@ -853,6 +874,58 @@ pub fn snooze_body(target: &AckTarget, until: DateTime<Utc>) -> String {
         "until": until.to_rfc3339(),
     })
     .to_string()
+}
+
+/// The control-plane version every takeover body carries.
+pub const CONTROL_PLANE_VERSION: u8 = 1;
+
+/// The action a [`TakeoverBody`] asks chrome to take on the overlay.
+///
+/// Spelled here rather than taken from the host crate that defines the takeover
+/// plane: this module compiles for wasm32 against the guest crate universe,
+/// which that crate is not built for today.
+/// `the_takeover_body_is_the_shared_shape` holds the two equal on the host side.
+///
+/// TODO(surface-guest-wire-crate): the second build the sharing would need is a
+/// mechanism this repo already has for `brenn-envelope`; nobody has tried it for
+/// the surface schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeoverAction {
+    Request,
+    Release,
+}
+
+impl TakeoverAction {
+    /// The `TakeoverBody.action` wire value.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            TakeoverAction::Request => "request",
+            TakeoverAction::Release => "release",
+        }
+    }
+}
+
+/// The body published on the `takeover` port.
+///
+/// `instance` is always empty here: the kernel's local router overwrites it with
+/// the publishing instance's authenticated identity, so a value this component
+/// supplied would never be trusted on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct TakeoverBody {
+    pub v: u8,
+    pub action: &'static str,
+    pub instance: &'static str,
+}
+
+impl TakeoverBody {
+    /// The body asking chrome for `action`.
+    pub fn of(action: TakeoverAction) -> TakeoverBody {
+        TakeoverBody {
+            v: CONTROL_PLANE_VERSION,
+            action: action.as_wire_str(),
+            instance: "",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1063,43 +1136,6 @@ mod tests {
         assert_eq!(
             state.recompute(at("2026-07-12T15:01:00Z")).state,
             DisplayState::Overdue
-        );
-    }
-
-    /// The press dialect round-trips: the wiring encodes what the entry decodes.
-    /// The two halves are written apart — one in a DOM listener, one in the entry
-    /// — and a disagreement would drop every dismissal on the floor.
-    #[test]
-    fn an_ack_request_round_trips_through_its_dialect() {
-        let target = target("m1", "2026-07-12T15:00:00Z");
-        for kind in [AckKind::Dismiss, AckKind::Snooze] {
-            let body = ack_request_body(kind, Some(&target));
-            assert_eq!(
-                parse_ack_request(&body),
-                Ok(Some((kind, target.clone()))),
-                "the press names its kind and the occurrence it was made against"
-            );
-        }
-    }
-
-    /// A press with no meeting on screen names no occurrence, and the entry must
-    /// read it as nothing to ack rather than as a malformed request — the buttons
-    /// are hidden in the idle state, so this is the programmatic-click case.
-    #[test]
-    fn a_press_with_no_active_meeting_names_no_occurrence() {
-        let body = ack_request_body(AckKind::Dismiss, None);
-        assert_eq!(parse_ack_request(&body), Ok(None));
-    }
-
-    /// Anything outside the dialect is an error the glue faults on. Reading an
-    /// unknown kind as a dismiss would turn a snooze into a permanent removal.
-    #[test]
-    fn a_request_outside_the_dialect_is_an_error() {
-        assert!(parse_ack_request("not json").is_err());
-        assert!(parse_ack_request(r#"{"kind":"delete"}"#).is_err());
-        assert!(
-            parse_ack_request(r#"{"kind":"dismiss","meeting_id":"m1","start":"noon"}"#).is_err(),
-            "an unparseable occurrence must not silently become a press on nothing"
         );
     }
 
@@ -1688,21 +1724,19 @@ mod tests {
 
     // ── The activation-window fold ──────────────────────────────────────────
 
-    /// A window on `port` whose first `context.len()` bodies are retained
-    /// context and the rest new.
-    fn window(port: &str, context: &[String], new: &[String]) -> PortWindow {
-        let envelopes = context
+    /// The delivered envelope JSON for each of `bodies` — a window's `new_raw`.
+    fn new_raws(bodies: &[String]) -> Vec<String> {
+        bodies
             .iter()
-            .chain(new.iter())
-            .map(|body| {
-                serde_json::from_str(&envelope_json(body, "2026-07-12T00:00:00Z"))
-                    .expect("the fixture envelope parses")
-            })
-            .collect();
-        PortWindow {
-            port: port.to_string(),
-            envelopes,
-            new_from: context.len() as u32,
+            .map(|body| envelope_json(body, "2026-07-12T00:00:00Z"))
+            .collect()
+    }
+
+    /// A window on `port` carrying `new_raw` and no drops.
+    fn window<'a>(port: &'a str, new_raw: &'a [String]) -> ActivationWindow<'a> {
+        ActivationWindow {
+            port,
+            new_raw,
             dropped: 0,
         }
     }
@@ -1725,14 +1759,13 @@ mod tests {
         let now = at("2026-07-12T14:00:00Z");
         let notes = state
             .on_window(
-                &window(
+                window(
                     "agenda",
-                    &[],
-                    &[
+                    &new_raws(&[
                         snapshot("2026-07-12T15:00:00Z", "First"),
                         snapshot("2026-07-12T16:00:00Z", "Second"),
                         snapshot("2026-07-12T17:00:00Z", "Third"),
-                    ],
+                    ]),
                 ),
                 now,
             )
@@ -1751,16 +1784,15 @@ mod tests {
 
     #[test]
     fn a_single_new_snapshot_is_applied_silently() {
-        // The healthy shape under `push_depth = 1`: context plus one new
-        // snapshot. Applied, with nothing reported and no re-fold of context.
+        // The healthy shape under `push_depth = 1`: one new snapshot. Applied,
+        // with nothing reported.
         let mut state = MeetingState::new();
         let now = at("2026-07-12T14:00:00Z");
         let notes = state
             .on_window(
-                &window(
+                window(
                     "agenda",
-                    &[snapshot("2026-07-12T15:00:00Z", "Old")],
-                    &[snapshot("2026-07-12T16:00:00Z", "Current")],
+                    &new_raws(&[snapshot("2026-07-12T16:00:00Z", "Current")]),
                 ),
                 now,
             )
@@ -1779,13 +1811,12 @@ mod tests {
         feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Good"), now);
         let notes = state
             .on_window(
-                &window(
+                window(
                     "agenda",
-                    &[],
-                    &[
+                    &new_raws(&[
                         snapshot("2026-07-12T16:00:00Z", "Older"),
                         "{ not a snapshot }".to_string(),
-                    ],
+                    ]),
                 ),
                 now,
             )
@@ -1804,10 +1835,16 @@ mod tests {
         // this very window supersedes.
         let mut state = MeetingState::new();
         let now = at("2026-07-12T14:00:00Z");
-        let mut w = window("agenda", &[], &[snapshot("2026-07-12T15:00:00Z", "Only")]);
-        w.dropped = 4;
+        let raws = new_raws(&[snapshot("2026-07-12T15:00:00Z", "Only")]);
         let notes = state
-            .on_window(&w, now)
+            .on_window(
+                ActivationWindow {
+                    port: "agenda",
+                    new_raw: &raws,
+                    dropped: 4,
+                },
+                now,
+            )
             .expect("the agenda port satisfies the contract");
         assert_eq!(notes, Vec::new());
     }
@@ -1832,13 +1869,12 @@ mod tests {
 
         let notes = state
             .on_window(
-                &window(
+                window(
                     "acks",
-                    &[],
-                    &[
+                    &new_raws(&[
                         ack_body("m1", "2026-07-12T15:00:00Z"),
                         ack_body("m2", "2026-07-12T16:00:00Z"),
-                    ],
+                    ]),
                 ),
                 now,
             )
@@ -1855,10 +1891,16 @@ mod tests {
         // so the meeting keeps escalating here with no other evidence.
         let mut state = MeetingState::new();
         let now = at("2026-07-12T14:00:00Z");
-        let mut w = window("acks", &[], &[ack_body("m1", "2026-07-12T15:00:00Z")]);
-        w.dropped = 2;
+        let raws = new_raws(&[ack_body("m1", "2026-07-12T15:00:00Z")]);
         let notes = state
-            .on_window(&w, now)
+            .on_window(
+                ActivationWindow {
+                    port: "acks",
+                    new_raw: &raws,
+                    dropped: 2,
+                },
+                now,
+            )
             .expect("the acks port satisfies the contract");
         match notes.as_slice() {
             [note] => {
@@ -1874,7 +1916,10 @@ mod tests {
         let mut state = MeetingState::new();
         assert_eq!(
             state.on_window(
-                &window("messages", &[], &[snapshot("2026-07-12T15:00:00Z", "X")],),
+                window(
+                    "messages",
+                    &new_raws(&[snapshot("2026-07-12T15:00:00Z", "X")]),
+                ),
                 at("2026-07-12T14:00:00Z"),
             ),
             Err(ContractViolation::WrongPort {
@@ -1892,10 +1937,7 @@ mod tests {
         // skew through until it does.
         let mut state = MeetingState::new();
         assert_eq!(
-            state.on_window(
-                &window("messages", &[snapshot("2026-07-12T15:00:00Z", "X")], &[],),
-                at("2026-07-12T14:00:00Z"),
-            ),
+            state.on_window(window("messages", &[]), at("2026-07-12T14:00:00Z"),),
             Err(ContractViolation::WrongPort {
                 port: "messages".to_string()
             })
@@ -2002,12 +2044,6 @@ mod tests {
             assert_eq!(got_target.start, start);
             assert_eq!(action.kind(), kind);
             assert_eq!(action.as_str(), kind.as_str());
-
-            let request = ack_request_body(kind, Some(&target("m1", "2026-07-12T15:00:00Z")));
-            let (got_kind, _) = parse_ack_request(&request)
-                .expect("a minted request body parses")
-                .expect("a request naming an occurrence");
-            assert_eq!(got_kind, kind);
         }
         assert_eq!(AckKind::parse("postpone"), None);
         let bogus = serde_json::json!({
@@ -2015,6 +2051,48 @@ mod tests {
         })
         .to_string();
         assert!(parse_ack(&bogus).is_err());
-        assert!(parse_ack_request(&serde_json::json!({ "kind": "postpone" }).to_string()).is_err());
+    }
+
+    /// The takeover body this module spells serializes to what chrome's parser
+    /// reads, field for field. The two live in different crate universes — this
+    /// module compiles for wasm32 against the guest SDK's — so the equality is
+    /// asserted rather than had by construction.
+    #[test]
+    fn the_takeover_body_is_the_shared_shape() {
+        for action in [TakeoverAction::Request, TakeoverAction::Release] {
+            let shared = brenn_surface_schema::TakeoverBody {
+                v: brenn_surface_schema::CONTROL_PLANE_VERSION,
+                action: match action {
+                    TakeoverAction::Request => brenn_surface_schema::TakeoverAction::Request,
+                    TakeoverAction::Release => brenn_surface_schema::TakeoverAction::Release,
+                },
+                instance: String::new(),
+            };
+            assert_eq!(
+                serde_json::to_string(&TakeoverBody::of(action))
+                    .expect("a takeover body serializes"),
+                serde_json::to_string(&shared).expect("a TakeoverBody serializes"),
+            );
+        }
+    }
+
+    /// The malformed-body log line, pinned where it is spelled.
+    ///
+    /// The spelling is duplicated across the surface components on purpose and
+    /// for now (`TODO(surface-fault-report)`), so each copy carries its own
+    /// assertion: an operator greps one vocabulary, and a copy that drifts
+    /// silently drops its kind out of that grep.
+    #[test]
+    fn the_fault_line_names_the_publisher_the_message_and_the_context() {
+        let envelope: MessageEnvelope =
+            serde_json::from_str(&envelope_json("{}", "2026-07-12T00:00:00Z"))
+                .expect("the fixture envelope parses");
+        let line =
+            FaultReport::new(&envelope, "trailing garbage".to_string()).log_message("meeting body");
+        assert!(line.contains("malformed meeting body"), "{line}");
+        assert!(line.contains(&envelope.channel), "{line}");
+        assert!(line.contains(&envelope.sender), "{line}");
+        assert!(line.contains(&envelope.message_id.to_string()), "{line}");
+        assert!(line.contains("trailing garbage"), "{line}");
     }
 }

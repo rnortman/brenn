@@ -86,7 +86,7 @@ use brenn_attach_client::TransportConnector;
 use brenn_attach_client::conn::ConnConfig;
 use brenn_attach_client::driver::{AttachDriver, DriverStep, IoEvent};
 use brenn_attach_client::transport::clock::{checked_epoch_ms, epoch_ms, wall_now};
-use brenn_surface_contract::Activation;
+use brenn_surface_contract::{Activation, MOUNT_SYNC_PORT};
 
 use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::command::Command;
@@ -95,11 +95,17 @@ use crate::front::{
     PublishSlot, ReportCommand, SurfaceGate, TelemetryCommand,
 };
 use crate::outbound::PortPublish;
-use crate::outward::{self, Completed};
+use crate::outward::{self, Completed, SyncRefusal};
 use crate::page::SurfacePage;
 use crate::publish_buffer::PublishBuffer;
 use crate::session::{Effect, Event};
-use crate::turn::{self, Input};
+use crate::turn::{self, Input, SyncDispatch};
+
+/// The body of the kernel-synthesized mount request.
+///
+/// Empty: a mount asks nothing. Still valid JSON, because every envelope body
+/// on this bus is.
+const MOUNT_REQUEST_BODY: &str = "{}";
 
 /// What the platform half asks of a running page over the control channel.
 ///
@@ -109,9 +115,13 @@ use crate::turn::{self, Input};
 pub enum RunnerCommand {
     /// Register `instance`'s activation entry. The entry is a callback and
     /// lives in the runner, not the page.
+    ///
+    /// `mount` is the rendering instance's first call: the loop invokes the
+    /// entry once on the reserved mount port as soon as it is installed.
     RegisterActivation {
         instance: String,
         entry: ActivationEntry,
+        mount: bool,
     },
     /// Withdraw `instance`'s activation entry.
     DeregisterActivation { instance: String },
@@ -212,6 +222,15 @@ pub struct SurfaceRunner<C: TransportConnector> {
     /// The handle's publish pre-check, refreshed here at every edge that moves
     /// what it answers. Shared with the platform half, which only reads it.
     gate: Arc<Mutex<SurfaceGate>>,
+    /// Rendering instances that registered before the page had wiring, and so
+    /// could not be handed their mount activation yet.
+    ///
+    /// A mount is not droppable: it is the one call in which a rendering instance
+    /// builds its UI, and every activation after it assumes that call happened.
+    /// Registration is admitted before the first bindings document on purpose, so
+    /// the debt is carried here and settled from the drive loop the moment the
+    /// wiring the mount windows against is in force.
+    owed_mounts: Vec<String>,
     /// Whether the device clock can timestamp at all. False only after the boot
     /// check refused it, which is terminal — the turns that follow the diagnosis
     /// resolve nothing against a clock, and reading a broken one would panic
@@ -268,6 +287,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             effects_rx,
             effects_tx,
             gate,
+            owed_mounts: Vec::new(),
             clock_usable: true,
         }
     }
@@ -351,6 +371,10 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 Some(url) => self.run_connect(url).await,
                 None => self.run_select().await,
             }
+            // Ahead of the activation pass: a rendering instance whose wiring has
+            // just landed must build its UI in the mount call, not discover it was
+            // never made when an ordinary delivery arrives first.
+            self.owed_mount_pass().await;
             // After the turn, not inside it: everything that turn delivered is
             // already in the positions an assembly windows, which is what makes
             // one turn's deliveries one activation rather than N.
@@ -675,6 +699,80 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         // `fatal` binding's kill — ride in these effects, and the kill is why there
         // may be no entry to run.
         let Some(ready) = ready else { return effects };
+        self.invoke_and_complete(&mut page, ready, &mut effects, now, now_ms);
+        effects
+    }
+
+    /// Deliver `instance`'s **mount activation**: the one invocation a rendering
+    /// instance is given the moment its entry is installed, on the reserved
+    /// [`MOUNT_SYNC_PORT`], where it builds its UI.
+    ///
+    /// An ordinary pass: already-pending input is windowed alongside the
+    /// synthesized request, and the mount settles the scheduler's debt so no
+    /// redundant empty activation follows.
+    async fn mount_pass(&mut self, instance: &str) {
+        let now = self.driver.now();
+        let now_ms = self.now_ms();
+        let (effects, owed) = self.mount_activation(instance, now, now_ms);
+        if owed {
+            self.owed_mounts.push(instance.to_string());
+        }
+        self.execute(effects).await;
+    }
+
+    /// Settle every mount the wiring was missing for, once it is in force.
+    ///
+    /// Held rather than retried blind: without a document there is nothing to
+    /// window against, and a mount refused for any other reason — the instance
+    /// died or was withdrawn in the interim — is not owed at all.
+    async fn owed_mount_pass(&mut self) {
+        if self.owed_mounts.is_empty() || self.page.borrow().bindings().is_none() {
+            return;
+        }
+        for instance in std::mem::take(&mut self.owed_mounts) {
+            self.mount_pass(&instance).await;
+        }
+    }
+
+    /// Assemble, invoke, and complete one mount activation synchronously.
+    ///
+    /// Answers the effects and whether the mount is still owed.
+    fn mount_activation(&self, instance: &str, now: Millis, now_ms: u64) -> (Vec<Effect>, bool) {
+        let mut page = self.page.borrow_mut();
+        let (dispatch, mut effects) = turn::dispatch_sync(
+            &mut page,
+            instance,
+            MOUNT_SYNC_PORT,
+            MOUNT_REQUEST_BODY.to_string(),
+            self.driver.new_stamp(),
+            now,
+            now_ms,
+        );
+        let owed = match dispatch {
+            // The page has no wiring yet: the debt stands, and the drive loop
+            // settles it from the document that lands.
+            SyncDispatch::Refused(SyncRefusal::Unwired) => true,
+            // A dead or withdrawn instance is owed nothing — there is no UI left
+            // for a mount call to build.
+            SyncDispatch::Refused(_) | SyncDispatch::Killed => false,
+            SyncDispatch::Ready(ready) => {
+                self.invoke_and_complete(&mut page, *ready, &mut effects, now, now_ms);
+                false
+            }
+        };
+        (effects, owed)
+    }
+
+    /// Call an assembled activation's entry and fold its completion into the
+    /// page, appending the completion turn's effects to `effects`.
+    fn invoke_and_complete(
+        &self,
+        page: &mut SurfacePage,
+        ready: ReadyActivation,
+        effects: &mut Vec<Effect>,
+        now: Millis,
+        now_ms: u64,
+    ) {
         let ReadyActivation {
             instance,
             generation,
@@ -689,7 +787,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         // only the page resolves which channel a port names.
         let stamps = self.driver.flush_stamps(buffer.len());
         effects.extend(turn::on_input(
-            &mut page,
+            page,
             Input::ActivationDone(Completed {
                 instance,
                 generation,
@@ -700,7 +798,6 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             now,
             now_ms,
         ));
-        effects
     }
 
     /// Call one instance's entry and classify how it finished.
@@ -866,13 +963,23 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// a minted identity — and feed it the turn.
     async fn control(&mut self, command: RunnerCommand) {
         match command {
-            RunnerCommand::RegisterActivation { instance, entry } => {
+            RunnerCommand::RegisterActivation {
+                instance,
+                entry,
+                mount,
+            } => {
                 // Stored before the page is told, so an activation dispatched on
                 // the strength of this registration always finds its entry. The
                 // page panics on a double registration, so a silent overwrite
                 // here is unreachable.
                 self.entries.borrow_mut().insert(instance.clone(), entry);
-                self.turn(Input::ActivationRegistered { instance }).await;
+                self.turn(Input::ActivationRegistered {
+                    instance: instance.clone(),
+                })
+                .await;
+                if mount {
+                    self.mount_pass(&instance).await;
+                }
             }
             RunnerCommand::DeregisterActivation { instance } => {
                 self.entries.borrow_mut().remove(&instance);

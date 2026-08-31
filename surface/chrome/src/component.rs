@@ -1,318 +1,356 @@
-//! The chrome component's browser (wasm32) half.
+//! The chrome component's page glue.
 //!
-//! Registers the chrome custom element via the shared component-support helpers
-//! and drives the DOM from the [`ChromeAction`]s the DOM-free
-//! [`crate::logic::ChromeCore`] emits. Chrome is an ordinary contract-v1 `dom`
-//! component: the kernel activates it like any other, once per activation with
-//! every bound input port windowed. Each delivered message body is extracted
-//! from its envelope and folded into the core; the actions the fold returns are
-//! applied here.
+//! Applies the [`ChromeAction`]s the DOM-free [`crate::logic::ChromeCore`]
+//! emits. Chrome is an ordinary page-hosted component: the kernel activates it
+//! like any other, once per activation with every bound input port windowed.
 //!
-//! Chrome holds the page-DOM-authority grant: it reparents the kernel's
-//! `display:contents` wrappers into its own layout sections and stamps
-//! `data-theme`/`data-takeover`, but only from this module — the decision logic
-//! is DOM-free and host-tested.
+//! It is the one instance holding `page-dom`, and that is the whole difference:
+//! it builds the connection banner and the toast container under the surface
+//! root, arranges every *other* instance's kernel-owned wrapper into a layout
+//! section, and stamps `data-theme` on `<body>` and the layout/takeover
+//! attributes on the surface root. Nothing it renders lives inside its own host
+//! element, which stays empty — that is what lets a takeover overlay fill the
+//! surface without covering the banner.
+//!
+//! Every text run reaches the page through [`dom::set_text`], which writes inert
+//! text and never parses markup, so a layout label, a banner line and a toast
+//! are inert regardless of content.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use brenn_surface_component_support::{
-    Activation, Publisher, append, boot, claim_initialized, component_log, create_div, document,
-    publish_or_fault, read_monotonic_ms, register_component, repark_tick, wire_gesture,
+use brenn_envelope::MessageEnvelope;
+use brenn_guest::{Activation, Error, Processor, dom, log, page_dom, publish, repark};
+
+use crate::layout::LayoutKind;
+use crate::logic::{
+    ActivationWindow, BannerState, ChromeAction, ChromeCore, LayoutPlacement, LogLevel, fold_window,
 };
-use brenn_surface_contract::SURFACE_ROOT_ID;
-use brenn_surface_schema::layout::LayoutKind;
-use brenn_surface_schema::{ToastSeverity, ToastSource};
-use wasm_bindgen::JsCast;
-use wasm_bindgen::prelude::wasm_bindgen;
-use web_sys::{Document, Element, Event, HtmlElement};
+use crate::spec::{
+    InPort,
+    port::{OVERLAY_STATE, TOAST_TICK},
+};
+use crate::wire::{SurfaceStateBody, ToastSeverity, ToastSource};
 
-use crate::logic::{BannerState, ChromeAction, ChromeCore, LayoutPlacement, Theme, fold_window};
-use crate::spec::port::{OVERLAY_STATE, TOAST_TICK};
+/// The body of an expiry wake. The tick's payload is irrelevant — the wake is
+/// the message — but every body on this bus is JSON.
+const TICK_BODY: &str = "{}";
 
-/// This component's kind — its config `kind`, its element-tag stem
-/// (`brenn-<kind>`), and the `component` field of its panic events.
-const KIND: &str = "chrome";
+/// The sync port a click anywhere in the toast container arrives on.
+const TOAST_DISMISS_PORT: dom::SyncPort = dom::SyncPort("toast-dismiss");
 
-/// The `#surface-root` attribute naming the active layout, targeted by skin CSS
+/// The surface-root attribute naming the active layout, targeted by skin CSS
 /// grid templates.
 const LAYOUT_ATTR: &str = "data-layout";
-/// The per-section attribute naming the layout slot a section fills (`a`/`b`/`c`);
-/// absent on an unassigned section, which the base CSS hides.
+/// The per-section attribute naming the layout slot a section fills
+/// (`a`/`b`/`c`); absent on an unassigned section, which the base CSS hides.
 const PANEL_ATTR: &str = "data-panel";
-/// The `#surface-root` CSS custom property carrying the layout split fraction.
+/// The per-section attribute naming the instance the section holds.
+const SECTION_INSTANCE_ATTR: &str = "data-instance";
+/// The surface-root CSS custom property carrying the layout split fraction.
 const RATIO_PROP: &str = "--surface-ratio";
 /// The marker attribute on a section's chrome-rendered panel-label `<header>`.
 const PANEL_LABEL_ATTR: &str = "data-panel-label";
 /// The `<body>` attribute carrying the runtime theme axis.
 const THEME_ATTR: &str = "data-theme";
-/// The `#surface-root` attribute set while a takeover overlay is active.
+/// The surface-root attribute set while a takeover overlay is active.
 const TAKEOVER_ATTR: &str = "data-takeover";
-/// The id of chrome's single connection-banner element.
-const BANNER_ID: &str = "brenn-surface-banner";
-/// The id of chrome's toast container under `#surface-root`.
-const TOAST_CONTAINER_ID: &str = "brenn-surface-toasts";
-/// The sync port a click on a rendered toast arrives on, carrying the toast's id
-/// as its request body.
-const TOAST_DISMISS_PORT: &str = "toast-dismiss";
-
-/// The attribute each rendered toast carries its core-assigned id on. The
-/// container's one delegated click listener reads the id back off it, so no toast
-/// needs a listener of its own.
+/// The marker attribute identifying chrome's single connection banner. Every
+/// banner rule in `surface.css` and both skins selects on it, so dropping the
+/// stamp unstyles the banner with nothing raising an error.
+const BANNER_MARKER: &str = "data-surface-banner";
+/// The banner's styling hook carrying its rendered state.
+const BANNER_STATE_ATTR: &str = "data-banner-state";
+/// The marker attribute on chrome's toast container.
+const TOAST_CONTAINER_MARKER: &str = "data-surface-toasts";
+/// The marker attribute on each rendered toast.
+const TOAST_MARKER: &str = "data-surface-toast";
+/// The attribute a rendered toast carries its core-assigned id on.
 const TOAST_ID_ATTR: &str = "data-toast-id";
+/// The attribute a rendered toast carries its severity on.
+const TOAST_SEVERITY_ATTR: &str = "data-toast-severity";
+/// The attribute a rendered toast carries its raiser on.
+const TOAST_SOURCE_ATTR: &str = "data-toast-source";
+/// The attribute hiding the banner between states.
+const HIDDEN_ATTRIBUTE: &str = "hidden";
 
-/// The timestamp the core folds toast expiry against: whole milliseconds on the
-/// page's monotonic clock, not the wall clock. A toast lifetime is a duration,
-/// and an NTP step or a suspend/resume jump on the wall clock would otherwise
-/// expire every live toast on the next tick — the operator never reading it.
-fn now_ms() -> u64 {
-    read_monotonic_ms()
-}
-
-/// The kernel-owned wrapper id scheme. Chrome reparents these into its sections;
-/// the kernel creates and owns them (its element and everything inside it). The
-/// scheme is a cross-crate contract with the kernel and must match its writer.
-fn wrapper_id(instance: &str) -> String {
-    format!("brenn-surface-wrapper-{instance}")
-}
-
-/// Chrome's per-instance layout section id.
-fn section_id(instance: &str) -> String {
-    format!("brenn-surface-section-{instance}")
-}
-
+// One instantiation backs one instance for the page's lifetime, so the decision
+// core and every element handle chrome holds are ordinary interior-mutable
+// module state.
 thread_local! {
-    /// The shared decision core and its rendered toast elements. wasm is
-    /// single-threaded, so a thread-local is the module's whole shared state; one
-    /// module record backs one chrome instance, so this is that instance's alone.
-    static STATE: RefCell<Option<ChromeState>> = const { RefCell::new(None) };
+    static CHROME: RefCell<Chrome> = RefCell::new(Chrome::new());
 }
 
-/// Chrome's page-lifetime state: the decision core, the host element to log
-/// against, and the live toast elements keyed by the core's toast id.
-struct ChromeState {
+/// Chrome's page-lifetime state.
+struct Chrome {
     core: ChromeCore,
-    host: Option<HtmlElement>,
-    toasts: HashMap<u64, HtmlElement>,
+    /// The page elements chrome owns, built by the mount activation.
+    view: Option<View>,
+    /// Whether the core has been told which instance chrome runs as.
+    identified: bool,
+    /// The live toast elements, keyed by the core's page-lifetime toast id.
+    toasts: HashMap<u64, dom::Node>,
+    /// One layout section per arrangeable instance, built on first arrange.
+    sections: HashMap<String, dom::Node>,
+    /// A section's panel-label header, where one is rendered.
+    labels: HashMap<String, dom::Node>,
 }
 
-/// The loader's entry, called once after this module's `default` init with the
-/// instance this module record was loaded for. Boots the panic hook and builds
-/// the core keyed on this instance (so chrome excludes itself from arrangement),
-/// then registers the element and its activation entry.
-#[wasm_bindgen]
-pub fn brenn_bind_instance(instance: String) {
-    boot(&instance);
-    STATE.with(|s| {
-        *s.borrow_mut() = Some(ChromeState {
-            core: ChromeCore::new(instance.clone()),
-            host: None,
+/// The page furniture chrome builds once and writes into thereafter.
+struct View {
+    /// The surface root, which holds every instance wrapper.
+    page_root: dom::Node,
+    /// The document body, where the theme axis is stamped.
+    body: dom::Node,
+    /// Chrome's own kernel wrapper — the handle that says which surface-state
+    /// row is chrome's own.
+    own_wrapper: Option<dom::Node>,
+    banner: dom::Node,
+    toast_container: dom::Node,
+}
+
+impl Chrome {
+    fn new() -> Chrome {
+        Chrome {
+            // The instance name is not known until the first surface-state
+            // roster arrives; nothing is arrangeable before then.
+            core: ChromeCore::new(String::new()),
+            view: None,
+            identified: false,
             toasts: HashMap::new(),
-        });
-    });
-    register_component(
-        KIND,
-        on_connected,
-        move |activation: &Activation, publisher: &mut Publisher| {
-            on_activation(activation, publisher);
-            Ok(None)
-        },
-    );
-}
-
-/// Record the host element on the element's first `connectedCallback`. Chrome
-/// builds no UI inside its own element — it drives `#surface-root`, `<body>`,
-/// and the kernel wrappers — so this only stashes the host for `brenn-log`
-/// forwarding and claims the one-time init guard.
-fn on_connected(host: HtmlElement) {
-    if !claim_initialized(&host, KIND) {
-        return;
+            sections: HashMap::new(),
+            labels: HashMap::new(),
+        }
     }
-    STATE.with(|s| {
-        s.borrow_mut()
-            .as_mut()
-            .expect("brenn_bind_instance runs before the first connectedCallback")
-            .host = Some(host);
-    });
+
+    /// The view, which every activation after the mount one has.
+    fn view(&self) -> &View {
+        self.view
+            .as_ref()
+            .expect("the mount activation builds the view before any other call")
+    }
 }
 
-/// Act on a toast dismissal if this activation is one, fold each window's new
-/// messages into the core, sweep expired toasts, and park the next expiry wake.
+struct ChromeComponent;
+
+impl Processor for ChromeComponent {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+        CHROME.with(|chrome| on_activation(&activation, &mut chrome.borrow_mut()))?;
+        // Mount is answered with nothing, and a click on a toast cancels no
+        // default action worth cancelling.
+        Ok(None)
+    }
+}
+
+brenn_guest::export_processor!(ChromeComponent);
+
+/// Build the page furniture when this is the mount call, dismiss a toast when a
+/// click asked for one, fold each delivered window into the core, sweep expired
+/// toasts, and park the next expiry wake.
 ///
 /// The expiry sweep runs on every activation, not only on the wake's own: it is
-/// an idempotent recompute from the clock, and running it wherever chrome is
-/// already awake means a toast that outlived its wake by a delivery still goes.
-fn on_activation(activation: &Activation, publisher: &mut Publisher) {
-    STATE.with(|s| {
-        let mut guard = s.borrow_mut();
-        let state = guard
-            .as_mut()
-            .expect("brenn_bind_instance runs before the first activation");
-        // The entry is registered only after `connectedCallback` records the host,
-        // so an activation without one is a kernel that called an unregistered
-        // component.
-        let host = state
-            .host
-            .clone()
-            .expect("connectedCallback records the host before the entry is registered");
-        let now_mono = now_ms();
+/// an idempotent recompute from the clock, so a toast that outlived its wake by
+/// a delivery still goes.
+fn on_activation(activation: &Activation, chrome: &mut Chrome) -> Result<(), Error> {
+    let now_ms = activation
+        .now()
+        .ok_or_else(|| Error::failed("chrome: the host stamped no wall clock"))?;
 
-        if let Some((_, click)) = activation.sync_request() {
-            on_toast_click(state, &click.body, publisher);
-        }
-        for window in activation.delivered_windows() {
+    if activation.sync_is(dom::MOUNT) {
+        chrome.view = Some(build_view());
+    } else if let Some(port) = activation.sync() {
+        on_gesture(port, activation, chrome)?;
+    }
+    for window in activation.delivered_windows() {
+        match InPort::of(window)? {
             // The wake's payload is irrelevant — the wake is the message.
-            if window.port == TOAST_TICK {
-                continue;
-            }
-            let actions = fold_window(&mut state.core, window, now_mono);
-            apply_actions(state, &actions, publisher);
+            InPort::ToastTick => continue,
+            InPort::SurfaceState => identify_self(chrome, window.new_raw()),
+            _ => {}
         }
-        let expired = state.core.tick(now_mono);
-        apply_actions(state, &expired, publisher);
+        let actions = fold_window(
+            &mut chrome.core,
+            &ActivationWindow {
+                port: window.port(),
+                context_raw: window.context_raw(),
+                new_raw: window.new_raw(),
+            },
+            now_ms,
+        );
+        apply_actions(chrome, &actions);
+    }
+    let expired = chrome.core.tick(now_ms);
+    apply_actions(chrome, &expired);
 
-        let now_wall = activation
-            .now
-            .expect("the surface kernel stamps every activation with its wall clock");
-        let release_at = state.core.next_wake(now_mono, now_wall);
-        repark_tick(activation, publisher, &host, TOAST_TICK, release_at);
-    });
+    repark(
+        activation,
+        TOAST_TICK,
+        TICK_BODY,
+        chrome.core.next_wake(now_ms),
+    );
+    Ok(())
 }
 
-/// Dismiss the toast one click asked for, naming it by the id its wiring encoded.
+/// Dismiss the toast the click landed on.
+fn on_gesture(port: &str, activation: &Activation, chrome: &mut Chrome) -> Result<(), Error> {
+    if port != TOAST_DISMISS_PORT {
+        return Err(Error::failed(format!(
+            "chrome wired no gesture to sync port {port:?}"
+        )));
+    }
+    let (_, request) = activation
+        .sync_request()
+        .ok_or_else(|| Error::failed("chrome: a sync-call activation carried no request"))?;
+    let gesture: dom::Gesture = serde_json::from_str(&request?.body)
+        .map_err(|e| Error::failed(format!("chrome: the gesture body did not parse: {e}")))?;
+    // The container's one delegated listener covers every toast and the gaps
+    // between them, so a click that landed on no toast dismisses nothing.
+    let Some(id) = chrome
+        .toasts
+        .iter()
+        .find(|(_, node)| **node == gesture.target)
+        .map(|(id, _)| *id)
+    else {
+        return Ok(());
+    };
+    let actions = chrome.core.dismiss_toast(id);
+    apply_actions(chrome, &actions);
+    Ok(())
+}
+
+/// Tell the core which instance chrome runs as, the first time a surface-state
+/// roster names one whose wrapper is chrome's own.
 ///
-/// An empty body is a click that landed on the toast container but on no toast —
-/// the delegated listener covers the whole container — and dismisses nothing.
-fn on_toast_click(state: &mut ChromeState, click: &str, publisher: &mut Publisher) {
-    if click.is_empty() {
+/// There is no instance-identity import, deliberately: what chrome needs is not
+/// its name but which row to leave out of the arrangement, and element identity
+/// answers that directly. Handles are canonical per element within an instance,
+/// so the wrapper chrome's own host element hangs under is the same handle
+/// `page-dom` returns for chrome's row and for no other.
+fn identify_self(chrome: &mut Chrome, new_raw: &[String]) {
+    if chrome.identified {
         return;
     }
-    let id: u64 = click.parse().unwrap_or_else(|_| {
-        panic!("chrome's own toast wiring encoded {click:?}, which is not a toast id")
-    });
-    let actions = state.core.dismiss_toast(id);
-    apply_actions(state, &actions, publisher);
+    let Some(own_wrapper) = chrome.view().own_wrapper else {
+        return;
+    };
+    // Latest-wins, as the fold reads it: the newest roster is the whole current
+    // set, so an older one can only name a subset of it.
+    let Some(raw) = new_raw.last() else {
+        return;
+    };
+    let Ok(envelope) = serde_json::from_str::<MessageEnvelope>(raw) else {
+        return;
+    };
+    let Ok(body) = serde_json::from_str::<SurfaceStateBody>(&envelope.body) else {
+        return;
+    };
+    for row in &body.instances {
+        if page_dom::instance_wrapper(&row.instance) == Some(own_wrapper) {
+            chrome.core.set_self_instance(row.instance.clone());
+            chrome.identified = true;
+            return;
+        }
+    }
 }
 
-/// Apply the core's actions in order. `state` is borrowed so a `ShowToast`/
-/// `DismissToast` can record or drop the toast element.
-fn apply_actions(state: &mut ChromeState, actions: &[ChromeAction], publisher: &mut Publisher) {
+fn apply_actions(chrome: &mut Chrome, actions: &[ChromeAction]) {
     for action in actions {
         match action {
-            ChromeAction::SetTheme(theme) => set_theme(*theme),
-            ChromeAction::SetBanner(banner) => render_banner(*banner),
-            ChromeAction::SetTakeover(on) => set_takeover(*on),
+            ChromeAction::SetTheme(theme) => {
+                dom::set_attribute(chrome.view().body, THEME_ATTR, theme.as_wire_str());
+            }
+            ChromeAction::SetBanner(banner) => render_banner(chrome.view(), *banner),
+            ChromeAction::SetTakeover(on) => {
+                dom::set_attribute_present(chrome.view().page_root, TAKEOVER_ATTR, *on);
+            }
             ChromeAction::ApplyLayout {
                 kind,
                 ratio,
                 panels,
                 instances,
-            } => apply_layout(*kind, ratio.as_deref(), panels, instances),
+            } => apply_layout(chrome, *kind, ratio.as_deref(), panels, instances),
             ChromeAction::ShowToast {
                 id,
                 severity,
                 text,
                 source,
-            } => show_toast(state, *id, *severity, text, *source),
-            ChromeAction::DismissToast { id } => dismiss_toast(state, *id),
-            ChromeAction::Log { level, message } => {
-                if let Some(host) = state.host.as_ref() {
-                    component_log(host, *level, message);
+            } => show_toast(chrome, *id, *severity, text, *source),
+            ChromeAction::DismissToast { id } => {
+                if let Some(node) = chrome.toasts.remove(id) {
+                    dom::remove(node);
                 }
             }
-            ChromeAction::PublishOverlayState { body } => {
-                let host = state
-                    .host
-                    .clone()
-                    .expect("connectedCallback records the host before the first activation");
-                // Retained state: a refusal nobody acted on would leave every
-                // consumer of `overlay-state` reading a page that has moved on.
-                publish_or_fault(publisher, &host, OVERLAY_STATE, body);
-            }
+            ChromeAction::Log { level, message } => match level {
+                LogLevel::Debug => log::debug(message),
+                LogLevel::Warn => log::warn(message),
+                LogLevel::Error => log::error(message),
+            },
+            ChromeAction::PublishOverlayState { body } => publish_overlay_state(body),
         }
     }
 }
 
-/// The live `Document`.
-fn doc() -> Document {
-    document()
-}
-
-/// Chrome's DOM root (`#surface-root`), rendered by the backend page.
-fn surface_root() -> Element {
-    doc()
-        .get_element_by_id(SURFACE_ROOT_ID)
-        .expect("backend page renders #surface-root")
-}
-
-/// Find the existing `#id` element, or create a `<tag>` with that id and append
-/// it under `parent`.
-fn find_or_create_child(parent: &Element, id: &str, tag: &str) -> HtmlElement {
-    match doc().get_element_by_id(id) {
-        Some(el) => el
-            .dyn_into::<HtmlElement>()
-            .expect("existing element is an HtmlElement"),
-        None => {
-            let el = doc()
-                .create_element(tag)
-                .expect("document creates an element")
-                .dyn_into::<HtmlElement>()
-                .expect("created element is an HtmlElement");
-            el.set_id(id);
-            parent
-                .append_child(&el)
-                .expect("append created child under its parent");
-            el
-        }
+/// Publish chrome's overlay holdership.
+///
+/// The refusal taxonomy, not `?`: failing the activation would discard the whole
+/// buffer, including the wake repark, and stop the page expiring toasts. A
+/// structural refusal is a deployment fault and traps; a quota refusal is
+/// transient, and the next transition publishes again.
+fn publish_overlay_state(body: &str) {
+    if let Err(err) = publish(OVERLAY_STATE, body) {
+        assert!(
+            err.is_quota(),
+            "chrome: the overlay-state publish on {OVERLAY_STATE:?} was refused: {err:?}"
+        );
+        log::error(format!(
+            "overlay-state publish on {OVERLAY_STATE:?} refused: quota exceeded"
+        ));
     }
 }
 
-/// Write the runtime theme axis to `<body>` (`data-theme`) — the token scope the
-/// skin and theme stamps share, so a themed token override cascades to every
-/// component identically.
-fn set_theme(theme: Theme) {
-    doc()
-        .body()
-        .expect("backend page renders a <body>")
-        .set_attribute(THEME_ATTR, theme.as_wire_str())
-        .expect("set data-theme on <body>");
-}
-
-/// Set or clear the takeover chrome flag on `#surface-root`. The synthesized
-/// overlay layout is applied by a sibling [`ChromeAction::ApplyLayout`]; this
-/// only carries the flag.
-fn set_takeover(on: bool) {
-    let root = surface_root();
-    if on {
-        root.set_attribute(TAKEOVER_ATTR, "true")
-            .expect("set data-takeover on #surface-root");
-    } else {
-        root.remove_attribute(TAKEOVER_ATTR)
-            .expect("remove data-takeover from #surface-root");
+/// Build the page furniture chrome owns: the connection banner and the toast
+/// container, both under the surface root rather than under chrome's own host
+/// element.
+///
+/// Called once, from the mount activation. The container's single delegated
+/// click listener is the kernel's and is page-lifetime — one listener for the
+/// page rather than one per toast, which is what keeps a long-lived kiosk from
+/// accumulating one listener per notice it ever showed.
+fn build_view() -> View {
+    let page_root = page_dom::root();
+    let banner = dom::marked("div", BANNER_MARKER);
+    dom::set_attribute(banner, HIDDEN_ATTRIBUTE, "");
+    let toast_container = dom::marked("div", TOAST_CONTAINER_MARKER);
+    dom::append(page_root, banner);
+    dom::append(page_root, toast_container);
+    dom::listen(toast_container, "click", TOAST_DISMISS_PORT);
+    View {
+        page_root,
+        body: page_dom::body(),
+        own_wrapper: page_dom::parent(dom::root()),
+        banner,
+        toast_container,
     }
 }
 
 /// Render the connection banner to reflect `state`. Server-supplied text never
-/// reaches the DOM as markup (`textContent` only); `Hidden` hides the node
-/// without removing it, so a later change re-shows the same element.
-fn render_banner(state: BannerState) {
-    let banner = find_or_create_child(&surface_root(), BANNER_ID, "div");
+/// reaches the page as markup; `Hidden` hides the node without removing it, so a
+/// later change re-shows the same element.
+fn render_banner(view: &View, state: BannerState) {
     match state {
         BannerState::Hidden => {
-            banner.set_hidden(true);
-            banner.set_text_content(None);
+            dom::set_attribute(view.banner, HIDDEN_ATTRIBUTE, "");
+            dom::set_text(view.banner, "");
         }
         _ => {
-            banner.set_hidden(false);
-            banner.set_text_content(Some(banner_text(state)));
+            dom::remove_attribute(view.banner, HIDDEN_ATTRIBUTE);
+            dom::set_text(view.banner, banner_text(state));
         }
     }
-    banner
-        .set_attribute("data-banner-state", banner_state_name(state))
-        .expect("set data-banner-state attribute");
+    dom::set_attribute(view.banner, BANNER_STATE_ATTR, banner_state_name(state));
 }
 
-/// The user-facing banner text for a state, as `textContent`.
+/// The user-facing banner text for a state, as inert text.
 fn banner_text(state: BannerState) -> &'static str {
     match state {
         BannerState::Connecting => "Connecting…",
@@ -323,7 +361,7 @@ fn banner_text(state: BannerState) -> &'static str {
     }
 }
 
-/// The stable state name written to `data-banner-state`.
+/// The stable state name written to the banner's styling hook.
 fn banner_state_name(state: BannerState) -> &'static str {
     match state {
         BannerState::Connecting => "connecting",
@@ -334,428 +372,120 @@ fn banner_state_name(state: BannerState) -> &'static str {
     }
 }
 
-/// Find (or create, on first arrange) an instance's layout section under
-/// `#surface-root`. Chrome's element: it carries the layout state (`data-panel`,
-/// the label header) and holds the instance's kernel wrapper.
-fn panel_section(instance: &str) -> HtmlElement {
-    let section = find_or_create_child(&surface_root(), &section_id(instance), "section");
-    section
-        .set_attribute("data-instance", instance)
-        .expect("set data-instance on the layout section");
-    section
-}
-
-/// Apply a layout atomically: set the root's `data-layout` (and `--surface-ratio`
-/// when present, else remove it), then place each of the surface's `instances` —
-/// one named in `panels` gets its `data-panel` slot and label header; every other
-/// has both cleared.
+/// Apply a layout atomically: set the root's layout attribute (and the ratio
+/// custom property when present, else clear it), then place each of the
+/// surface's `instances` — one named in `panels` gets its slot and label header;
+/// every other has both cleared.
 ///
 /// The one place that exercises chrome's page-DOM authority: it reparents each
-/// instance's kernel-owned wrapper into that instance's layout section and stamps
-/// layout attributes on the section — never inside the wrapper. Reparenting
-/// preserves element identity, so the kernel's registry and per-element dispatch
-/// are untouched; a wrapper already in its section is left alone, so a slot or
-/// label change moves no node and re-runs no `connectedCallback`.
+/// instance's kernel-owned wrapper into that instance's layout section and
+/// stamps layout attributes on the section — never inside the wrapper.
+/// Reparenting preserves element identity, so the kernel's registry and its
+/// per-element dispatch are untouched.
 fn apply_layout(
+    chrome: &mut Chrome,
     kind: LayoutKind,
     ratio: Option<&str>,
     panels: &[LayoutPlacement],
     instances: &[String],
 ) {
-    let root = surface_root();
-    root.set_attribute(LAYOUT_ATTR, kind.as_wire_str())
-        .expect("set data-layout on #surface-root");
-    let style = root
-        .dyn_ref::<HtmlElement>()
-        .expect("#surface-root is an HtmlElement")
-        .style();
+    let page_root = chrome.view().page_root;
+    dom::set_attribute(page_root, LAYOUT_ATTR, kind.as_wire_str());
     match ratio {
-        Some(value) => style
-            .set_property(RATIO_PROP, value)
-            .expect("set --surface-ratio custom property"),
-        None => {
-            style
-                .remove_property(RATIO_PROP)
-                .expect("remove --surface-ratio custom property");
-        }
+        Some(value) => dom::set_style_property(page_root, RATIO_PROP, value),
+        None => dom::remove_style_property(page_root, RATIO_PROP),
     }
 
     for instance in instances {
-        let section = panel_section(instance);
-        adopt_wrapper(&section, instance);
+        let section = section_for(chrome, instance);
         match panels.iter().find(|p| &p.instance == instance) {
             Some(placement) => {
-                section
-                    .set_attribute(PANEL_ATTR, &placement.slot)
-                    .expect("set data-panel on assigned section");
-                set_panel_label(section.as_ref(), placement.label.as_deref());
+                dom::set_attribute(section, PANEL_ATTR, &placement.slot);
+                set_panel_label(chrome, instance, section, placement.label.as_deref());
             }
             None => {
-                section
-                    .remove_attribute(PANEL_ATTR)
-                    .expect("remove data-panel from unassigned section");
-                set_panel_label(section.as_ref(), None);
+                dom::remove_attribute(section, PANEL_ATTR);
+                set_panel_label(chrome, instance, section, None);
             }
         }
+        adopt_wrapper(section, instance);
     }
+}
+
+/// The instance's layout section, built under the surface root on first arrange.
+/// Chrome's element: it carries the layout state and holds the instance's
+/// kernel-owned wrapper.
+fn section_for(chrome: &mut Chrome, instance: &str) -> dom::Node {
+    if let Some(section) = chrome.sections.get(instance) {
+        return *section;
+    }
+    let section = dom::create_element("section");
+    dom::set_attribute(section, SECTION_INSTANCE_ATTR, instance);
+    dom::append(chrome.view().page_root, section);
+    chrome.sections.insert(instance.to_string(), section);
+    section
 }
 
 /// Reparent `instance`'s kernel wrapper into its layout section, unless it is
-/// already there. The already-there check is not an optimization: moving a node
-/// re-runs the component's `connectedCallback`, so an unneeded reparent would
-/// re-connect it. In steady state a wrapper moves exactly once — out of staging,
-/// into its section, on the first arrange.
+/// already there. The already-there check keeps a slot or label change from
+/// moving any node.
 ///
-/// Panics if the wrapper does not exist: the kernel creates one per instance
-/// before any layout is applied, and every layout carries the instance table
-/// those wrappers were built from, so a missing wrapper is an invariant
-/// violation, not a condition to route around.
-fn adopt_wrapper(section: &HtmlElement, instance: &str) {
-    let wrapper = doc()
-        .get_element_by_id(&wrapper_id(instance))
-        .expect("every instance chrome arranges has a kernel-mounted wrapper");
-    let placed = wrapper
-        .parent_element()
-        .is_some_and(|parent| parent.is_same_node(Some(section.as_ref())));
-    if !placed {
-        section
-            .append_child(&wrapper)
-            .expect("reparent the instance's wrapper into its layout section");
+/// A wrapper that is not there yet is the ordinary transient of a page still
+/// coming up: registration emits a surface-state message, so the next delivery
+/// re-runs the arrangement and finds it.
+fn adopt_wrapper(section: dom::Node, instance: &str) {
+    let Some(wrapper) = page_dom::instance_wrapper(instance) else {
+        return;
+    };
+    if page_dom::parent(wrapper) != Some(section) {
+        dom::append(section, wrapper);
     }
 }
 
-/// Render (or clear) a section's panel-label `<header>`. Label text is
-/// `textContent` only — operator/LLM-supplied text never renders as markup.
-fn set_panel_label(section: &Element, label: Option<&str>) {
-    let existing = section
-        .query_selector(&format!(":scope > header[{PANEL_LABEL_ATTR}]"))
-        .expect("query panel-label header");
+/// Render (or clear) a section's panel-label header. Label text is inert text
+/// only — operator/LLM-supplied text never renders as markup.
+///
+/// A new header is inserted before the instance's wrapper where the wrapper is
+/// already adopted, so the label always sits above the panel it names. The
+/// capability has no child traversal by design; the wrapper is the only other
+/// child the section can have, and `page-dom` names it directly.
+fn set_panel_label(chrome: &mut Chrome, instance: &str, section: dom::Node, label: Option<&str>) {
     match label {
         Some(text) => {
-            let header = match existing {
-                Some(header) => header,
+            let header = match chrome.labels.get(instance) {
+                Some(header) => *header,
                 None => {
-                    let header = doc()
-                        .create_element("header")
-                        .expect("document creates a header");
-                    header
-                        .set_attribute(PANEL_LABEL_ATTR, "")
-                        .expect("set data-panel-label attribute");
-                    section
-                        .insert_before(&header, section.first_child().as_ref())
-                        .expect("insert panel-label header as first child");
+                    let header = dom::marked("header", PANEL_LABEL_ATTR);
+                    dom::insert_before(section, header, page_dom::instance_wrapper(instance));
+                    chrome.labels.insert(instance.to_string(), header);
                     header
                 }
             };
-            header.set_text_content(Some(text));
+            dom::set_text(header, text);
         }
         None => {
-            if let Some(header) = existing {
-                header.remove();
+            if let Some(header) = chrome.labels.remove(instance) {
+                dom::remove(header);
             }
         }
     }
 }
 
 /// Render a new toast into the toast container and record its element under the
-/// core's page-lifetime id, stamped on the element so the container's delegated
-/// listener can read it back. A click on the toast dismisses it (folding through
-/// the core so the id is dropped everywhere). Toast text is `textContent` only.
+/// core's page-lifetime id. A click on it dismisses it, folded through the core
+/// so the id is dropped everywhere. Toast text is inert text only.
 fn show_toast(
-    state: &mut ChromeState,
+    chrome: &mut Chrome,
     id: u64,
     severity: ToastSeverity,
     text: &str,
     source: ToastSource,
 ) {
-    let host = state
-        .host
-        .clone()
-        .expect("connectedCallback records the host before the first toast is shown");
-    let container = toast_container(&host);
-    let toast = create_div(&doc(), "data-surface-toast");
-    toast
-        .set_attribute(TOAST_ID_ATTR, &id.to_string())
-        .expect("set data-toast-id");
-    toast
-        .set_attribute("data-toast-severity", toast_severity_str(severity))
-        .expect("set data-toast-severity");
-    toast
-        .set_attribute("data-toast-source", toast_source_str(source))
-        .expect("set data-toast-source");
-    toast.set_text_content(Some(text));
-    append(&container, &toast);
-    state.toasts.insert(id, toast);
-}
-
-/// The toast container under `#surface-root`, built on first use and wired then
-/// with the one delegated dismiss listener every toast is read through.
-///
-/// One listener for the container's life, not one per toast: an SDK listener
-/// closure is page-lifetime and never reclaimed, so wiring each toast element
-/// would leak one closure per toast a long-lived page ever shows. The container
-/// is created and never removed, which is the lifetime the wiring wants.
-fn toast_container(host: &HtmlElement) -> HtmlElement {
-    let already_built = doc().get_element_by_id(TOAST_CONTAINER_ID).is_some();
-    let container = find_or_create_child(&surface_root(), TOAST_CONTAINER_ID, "div");
-    if !already_built {
-        wire_gesture(
-            host,
-            container.as_ref(),
-            "click",
-            TOAST_DISMISS_PORT,
-            clicked_toast_id,
-        );
-    }
-    container
-}
-
-/// The id of the toast a click landed inside, or an empty body when it landed on
-/// the container itself rather than on any toast.
-fn clicked_toast_id(event: &Event) -> String {
-    let Some(target) = event
-        .target()
-        .and_then(|target| target.dyn_into::<Element>().ok())
-    else {
-        return String::new();
-    };
-    target
-        .closest(&format!("[{TOAST_ID_ATTR}]"))
-        .expect("closest runs with a well-formed attribute selector")
-        .and_then(|toast| toast.get_attribute(TOAST_ID_ATTR))
-        .unwrap_or_default()
-}
-
-/// Remove a rendered toast by its core-assigned id. A no-op for an id with no
-/// live element (already dismissed).
-fn dismiss_toast(state: &mut ChromeState, id: u64) {
-    if let Some(toast) = state.toasts.remove(&id) {
-        toast.remove();
-    }
-}
-
-/// The `data-toast-severity` value for a severity.
-fn toast_severity_str(severity: ToastSeverity) -> &'static str {
-    match severity {
-        ToastSeverity::Info => "info",
-        ToastSeverity::Warning => "warning",
-        ToastSeverity::Error => "error",
-    }
-}
-
-/// The `data-toast-source` value for a source.
-fn toast_source_str(source: ToastSource) -> &'static str {
-    match source {
-        ToastSource::Kernel => "kernel",
-    }
-}
-
-/// Browser tests for the DOM glue, run under wasm-bindgen-test via
-/// the browser test runner. wasm32-only, matching the glue itself.
-///
-/// The decision core is host-tested next door in `logic.rs`; what only a browser
-/// can answer is the wiring between them — that a delivered toast reaches the
-/// DOM with the attribute its own dismiss path reads back, that the container's
-/// single delegated listener resolves a click to that toast, and that the wake
-/// chain is actually re-parked from the activation rather than merely computable.
-#[cfg(all(test, target_arch = "wasm32"))]
-mod tests {
-    use super::*;
-
-    use crate::logic::TOAST_TTL_MS;
-    use crate::spec::port::TOAST;
-    use brenn_surface_schema::{CONTROL_PLANE_VERSION, ToastBody};
-    use brenn_surface_test_fixtures::browser::{activation_json, mount, record_ops, take_recorded};
-    use wasm_bindgen::JsValue;
-    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    /// The instance this test binary binds its one module record to.
-    const TEST_INSTANCE: &str = "wbt-chrome";
-
-    /// The activation wall clock. The toast lifetime is judged monotonically, so
-    /// this only has to be a plausible instant far from the monotonic origin —
-    /// which is exactly what makes the parked wake's arithmetic worth asserting.
-    const NOW_MS: u64 = 1_770_000_123_456;
-
-    /// One toast payload as the bus carries it.
-    fn toast_body(text: &str) -> String {
-        serde_json::to_string(&ToastBody {
-            v: CONTROL_PLANE_VERSION,
-            severity: ToastSeverity::Info,
-            text: text.to_string(),
-            source: ToastSource::Kernel,
-        })
-        .expect("the toast body serializes")
-    }
-
-    /// Build the `#surface-root` the backend page renders, which chrome's DOM
-    /// half drives and the harness's bare `<body>` does not have.
-    fn build_surface_root() {
-        let root = create_div(&doc(), "data-surface-root");
-        root.set_id(SURFACE_ROOT_ID);
-        doc()
-            .body()
-            .expect("the document has a body")
-            .append_child(&root)
-            .expect("append #surface-root");
-    }
-
-    /// The live toast elements, in document order.
-    fn rendered_toast_ids() -> Vec<String> {
-        let nodes = doc()
-            .query_selector_all(&format!("[{TOAST_ID_ATTR}]"))
-            .expect("query the rendered toasts");
-        (0..nodes.length())
-            .filter_map(|i| nodes.get(i))
-            .filter_map(|node| node.dyn_into::<Element>().ok())
-            .filter_map(|el| el.get_attribute(TOAST_ID_ATTR))
-            .collect()
-    }
-
-    /// Click a rendered element from the page's own event loop.
-    fn click(selector: &str) {
-        doc()
-            .query_selector(selector)
-            .expect("the selector is well-formed")
-            .expect("the element under the selector is in the document")
-            .dyn_into::<HtmlElement>()
-            .expect("a clickable HtmlElement")
-            .click();
-    }
-
-    /// Call the entry with one activation's JSON.
-    fn activate(entry: &js_sys::Function, json: &str) {
-        entry
-            .call1(&JsValue::NULL, &JsValue::from_str(json))
-            .expect("the entry returns ok");
-    }
-
-    /// The whole toast lifecycle through chrome's own seams: a delivered toast
-    /// renders and parks its expiry wake, a click on it resolves to a sync
-    /// request naming its id, a click that misses every toast names none, and the
-    /// dismissal activation removes exactly the toast the id names.
-    ///
-    /// One test rather than five: the bind is once-per-binary, so a test binary
-    /// gets exactly one mount.
-    #[wasm_bindgen_test]
-    fn a_toast_renders_parks_its_expiry_and_is_dismissed_by_its_own_click() {
-        build_surface_root();
-        // Installed before the mount: a connect-time publish, park or sync
-        // request lands here, where silence is the assertion.
-        let ops = record_ops();
-        let (entry, _host) = mount(KIND, TEST_INSTANCE, brenn_bind_instance);
-        assert_eq!(
-            ops.length(),
-            0,
-            "connect-time code records the host only, and reaches no kernel seam"
-        );
-
-        // The mount activation: nothing live, so nothing to sweep and no wake to
-        // aim. A page with no expiring toast never wakes.
-        activate(&entry, &activation_json(&[], None, NOW_MS));
-        assert_eq!(
-            take_recorded(&ops),
-            Vec::<Vec<String>>::new(),
-            "an empty mount activation neither publishes nor parks"
-        );
-
-        activate(
-            &entry,
-            &activation_json(&[(TOAST, &toast_body("under test"))], None, NOW_MS),
-        );
-        let ids = rendered_toast_ids();
-        let [toast_id] = &ids[..] else {
-            panic!("exactly one toast is rendered, stamped with its id: {ids:?}")
-        };
-        assert_eq!(
-            take_recorded(&ops),
-            vec![vec![
-                "defer".to_string(),
-                "publish".to_string(),
-                TOAST_TICK.to_string(),
-                "{}".to_string(),
-                (NOW_MS + TOAST_TTL_MS).to_string(),
-            ]],
-            "the expiry wake is parked on the in/out port, aimed a full TTL past \
-             this activation's wall reading"
-        );
-
-        // A click on the toast asks for a sync naming its id.
-        click(&format!("[{TOAST_ID_ATTR}='{toast_id}']"));
-        assert_eq!(
-            take_recorded(&ops),
-            vec![vec![
-                "sync".to_string(),
-                String::new(),
-                TOAST_DISMISS_PORT.to_string(),
-                toast_id.clone(),
-                String::new(),
-            ]],
-            "the click asks for the activation and encodes the toast it landed on"
-        );
-
-        // A click on the container but on no toast encodes nothing.
-        click(&format!("#{TOAST_CONTAINER_ID}"));
-        assert_eq!(
-            take_recorded(&ops),
-            vec![vec![
-                "sync".to_string(),
-                String::new(),
-                TOAST_DISMISS_PORT.to_string(),
-                String::new(),
-                String::new(),
-            ]],
-            "the delegated listener covers the whole container, and a miss is empty"
-        );
-
-        // The empty request dismisses nothing, and the toast still standing keeps
-        // its wake aimed — every activation re-aims it at the remaining lifetime.
-        activate(
-            &entry,
-            &activation_json(
-                &[(TOAST_DISMISS_PORT, "")],
-                Some(TOAST_DISMISS_PORT),
-                NOW_MS,
-            ),
-        );
-        assert_eq!(
-            rendered_toast_ids(),
-            vec![toast_id.clone()],
-            "a click that named no toast removes none"
-        );
-        let missed = take_recorded(&ops);
-        let [wake] = &missed[..] else {
-            panic!("a live toast keeps exactly one wake aimed at it: {missed:?}")
-        };
-        assert_eq!((wake[0].as_str(), wake[2].as_str()), ("defer", TOAST_TICK));
-        let release: u64 = wake[4].parse().expect("a decimal release instant");
-        assert!(
-            release > NOW_MS && release <= NOW_MS + TOAST_TTL_MS,
-            "the re-aimed wake carries what is left of the lifetime, not a fresh \
-             one: {release} against {NOW_MS}"
-        );
-
-        // The named request dismisses exactly that toast, and with nothing live
-        // left there is no wake to re-park.
-        activate(
-            &entry,
-            &activation_json(
-                &[(TOAST_DISMISS_PORT, toast_id)],
-                Some(TOAST_DISMISS_PORT),
-                NOW_MS,
-            ),
-        );
-        assert_eq!(
-            rendered_toast_ids(),
-            Vec::<String>::new(),
-            "the dismissal removes the toast the id names"
-        );
-        assert_eq!(
-            take_recorded(&ops),
-            Vec::<Vec<String>>::new(),
-            "with nothing live expiring, the wake chain stops"
-        );
-    }
+    let toast = dom::marked("div", TOAST_MARKER);
+    dom::set_attribute(toast, TOAST_ID_ATTR, &id.to_string());
+    dom::set_attribute(toast, TOAST_SEVERITY_ATTR, severity.as_wire_str());
+    dom::set_attribute(toast, TOAST_SOURCE_ATTR, source.as_wire_str());
+    dom::set_text(toast, text);
+    dom::append(chrome.view().toast_container, toast);
+    chrome.toasts.insert(id, toast);
 }

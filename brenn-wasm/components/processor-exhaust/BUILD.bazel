@@ -9,6 +9,9 @@ load(
 
 policy_srcs()
 
+# TODO(shared-processor-bindings): three sibling fixtures carry a byte-identical
+# copy of this target's output; one generation of the world should be committed
+# once.
 wit_bindgen_rust(
     name = "bindings",
     wit = "//brenn-wasm:wit/processor.wit",

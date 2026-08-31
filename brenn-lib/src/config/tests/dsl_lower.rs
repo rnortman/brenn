@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use brenn_dsl::diag::{Diagnostic, render_all};
-use brenn_dsl::{dom_any, processor_needs};
+use brenn_dsl::{processor_needs, surface_any};
 use brenn_surface_schema::LogLevel;
 
 use crate::access::raw::{
@@ -253,9 +253,9 @@ fn surface(slug: &str, grants: Vec<AttachGrant>) -> SurfaceConfigRaw {
     }
 }
 
-/// A `dom` component instance whose instance id is its kind — what a `new`
-/// handle that matches the class's lowercased name lowers to.
-fn dom_component(kind: &str) -> SurfaceComponentRaw {
+/// A surface-placed component instance whose instance id is its kind — what a
+/// `new` handle that matches the class's lowercased name lowers to.
+fn placed_component(kind: &str) -> SurfaceComponentRaw {
     // The hash `minimal` leaves empty is cleared by `assert_lowers` after it
     // checks the real one, like every consumer's.
     SurfaceComponentRaw {
@@ -2871,7 +2871,7 @@ channel acks at "ephemeral:alice-desk.acks" {
 
 component Panel {
     "#,
-        dom_any!(),
+        processor_needs!("ports"),
         r#"
     io acks;
 }
@@ -3470,7 +3470,7 @@ channel presence at "ephemeral:alice-desk.presence" {
 
 component Panel {
     "#,
-            dom_any!(),
+            processor_needs!("ports"),
             r#"
     in messages;
     out outbound;
@@ -3480,7 +3480,7 @@ component Panel {
 
 component Chrome {
     "#,
-            dom_any!(),
+            processor_needs!("dom, page-dom"),
             r#"
     in state;
 }
@@ -3526,7 +3526,7 @@ surface alice_desk {
     }
 
     new chrome: Chrome {
-        grants = [];
+        grants = [dom, page-dom];
         chrome = true;
 
         in state <- presence { push_depth = 1; }
@@ -3574,11 +3574,12 @@ surface alice_desk {
                             ("layout".to_string(), "wide".to_string()),
                         ])),
                         grants: vec![ComponentGrant::Ports],
-                        ..dom_component("panel")
+                        ..placed_component("panel")
                     },
                     SurfaceComponentRaw {
                         chrome: true,
-                        ..dom_component("chrome")
+                        grants: vec![ComponentGrant::Dom, ComponentGrant::PageDom],
+                        ..placed_component("chrome")
                     },
                 ],
                 subscriptions: vec![
@@ -3646,7 +3647,7 @@ channel cmd at "ephemeral:alice-desk.cmd" {
 
 component Panel {
     "#,
-            dom_any!(),
+            surface_any!(),
             r#"
     in messages;
 }
@@ -3671,7 +3672,7 @@ surface alice_desk {
             }],
             surfaces: vec![SurfaceConfigRaw {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Prefix("alice-desk.".to_string())],
-                components: vec![dom_component("panel")],
+                components: vec![placed_component("panel")],
                 subscriptions: vec![surface_input(
                     "panel",
                     "messages",
@@ -3698,7 +3699,7 @@ channel acks at "ephemeral:alice-desk.acks" {
 
 component Panel {
     "#,
-            dom_any!(),
+            processor_needs!("ports"),
             r#"
     io acks;
 }
@@ -3735,7 +3736,7 @@ surface alice_desk {
                 )],
                 components: vec![SurfaceComponentRaw {
                     grants: vec![ComponentGrant::Ports],
-                    ..dom_component("panel")
+                    ..placed_component("panel")
                 }],
                 subscriptions: vec![SurfaceSubscriptionRaw {
                     push_depth: Some(Depth::Bounded(1)),
@@ -3774,7 +3775,7 @@ channel acks at "ephemeral:alice-desk.acks" {
 
 component Panel {
     "#,
-            dom_any!(),
+            processor_needs!("ports"),
             r#"
     io acks;
 }
@@ -3804,7 +3805,7 @@ surface alice_desk {
                 )],
                 components: vec![SurfaceComponentRaw {
                     grants: vec![ComponentGrant::Ports],
-                    ..dom_component("panel")
+                    ..placed_component("panel")
                 }],
                 subscriptions: vec![surface_input("panel", "acks", "ephemeral:alice-desk.acks")],
                 outputs: vec![surface_output("panel", "acks", "ephemeral:alice-desk.acks")],
@@ -3841,7 +3842,7 @@ channel messages at "ephemeral:alice-desk.messages" {
 
 component Panel {
     "#,
-            dom_any!(),
+            surface_any!(),
             r#"
     in messages;
     optional out outbound;
@@ -3868,7 +3869,7 @@ surface alice_desk {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-desk.messages".to_string(),
                 )],
-                components: vec![dom_component("panel")],
+                components: vec![placed_component("panel")],
                 subscriptions: vec![surface_input(
                     "panel",
                     "messages",
@@ -3897,7 +3898,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 
 component Widget {
     "#,
-            dom_any!(),
+            surface_any!(),
             r#"
     in heard;
 }
@@ -3922,7 +3923,7 @@ surface alice_pod {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.utterance".to_string(),
                 )],
-                components: vec![dom_component("widget")],
+                components: vec![placed_component("widget")],
                 subscriptions: vec![SurfaceSubscriptionRaw {
                     push_depth: Some(Depth::Bounded(2)),
                     ..surface_input("widget", "heard", "ephemeral:alice-pod.utterance")
@@ -3956,14 +3957,14 @@ channel presence at "ephemeral:alice-desk.presence" {
 
 component Panel {
     "#,
-            dom_any!(),
+            surface_any!(),
             r#"
     in messages;
 }
 
 component Board {
     "#,
-            dom_any!(),
+            surface_any!(),
             r#"
     in feed;
 }
@@ -4008,7 +4009,7 @@ surface bob_desk {
                 SurfaceConfigRaw {
                     skin: Some("bench".to_string()),
                     subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
-                    components: vec![dom_component("panel")],
+                    components: vec![placed_component("panel")],
                     subscriptions: vec![SurfaceSubscriptionRaw {
                         push_depth: Some(Depth::Bounded(4)),
                         ..surface_input("panel", "messages", "brenn:alice-alerts")
@@ -4020,7 +4021,7 @@ surface bob_desk {
                     ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                         "alice-desk.presence".to_string(),
                     )],
-                    components: vec![dom_component("board")],
+                    components: vec![placed_component("board")],
                     subscriptions: vec![SurfaceSubscriptionRaw {
                         push_depth: Some(Depth::Bounded(2)),
                         ..surface_input("board", "feed", "ephemeral:alice-desk.presence")
@@ -4048,7 +4049,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 
 component Widget {
     "#,
-        dom_any!(),
+        surface_any!(),
         r#"
     in heard;
 }
@@ -4089,7 +4090,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 
 component Widget {
     "#,
-        dom_any!(),
+        processor_needs!("ports"),
         r#"
     in heard;
     io tick;
@@ -4133,7 +4134,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 
 component Widget {
     "#,
-        dom_any!(),
+        surface_any!(),
         r#"
     in heard;
 }
@@ -4170,7 +4171,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 
 component Widget {
     "#,
-        dom_any!(),
+        surface_any!(),
         r#"
     in heard;
 }
@@ -4206,7 +4207,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 
 component Widget {
     "#,
-        dom_any!(),
+        surface_any!(),
         r#"
     in heard;
 }
@@ -5084,7 +5085,7 @@ fn a_link_lowers_to_its_endpoint_set() {
             "}}\n",
         ),
         processor_needs!("ports"),
-        dom_any!(),
+        processor_needs!("ports"),
     );
     let config = config_from_dsl(&document);
     assert_eq!(

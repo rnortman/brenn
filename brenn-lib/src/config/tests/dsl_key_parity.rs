@@ -38,7 +38,6 @@ fn surface_component_keys_account_for_every_field() {
     let fields = field_names!(SurfaceComponentRaw {
         kind,
         instance,
-        abi,
         spec_sha256,
         send_burst,
         send_refill_secs,
@@ -50,7 +49,6 @@ fn surface_component_keys_account_for_every_field() {
     let omitted = [
         ("kind", "folds from the class name an instance names"),
         ("instance", "is the `new` handle"),
-        ("abi", "is the class's artifact shape"),
         (
             "spec_sha256",
             "is the class's declaring file's content hash",

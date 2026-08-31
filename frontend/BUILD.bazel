@@ -38,6 +38,19 @@ exports_files([
 
 npm_link_all_packages(name = "node_modules")
 
+# The surface stylesheets, read as compile data by the component tests that pin
+# a glue-stamped marker attribute to the selectors dressing it. A selector that
+# matches nothing is silent in every other gate.
+filegroup(
+    name = "surface_stylesheets",
+    srcs = [
+        "skins/bench.css",
+        "skins/foundry.css",
+        "src/surface.css",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "embedded_assets",
     srcs = [

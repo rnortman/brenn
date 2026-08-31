@@ -118,25 +118,25 @@ assembly BarSurface(slug: String, skin: String) {
     grants = [subscribe];
     skin = skin;
     new p1: Protobar {
-      grants = [ports, log];
+      grants = [ports, log, dom];
       in messages <- bar_a;
       io tick { push_depth = 1; retain_depth = 2; }
 
     }
     new p2: Protobar {
-      grants = [ports, log];
+      grants = [ports, log, dom];
       in messages <- bar_b;
       io tick { push_depth = 1; retain_depth = 2; }
 
     }
     new p3: Protobar {
-      grants = [ports, log];
+      grants = [ports, log, dom];
       in messages <- bar_c;
       io tick { push_depth = 1; retain_depth = 2; }
 
     }
     new chrome: Chrome {
-      grants = [ports, log];
+      grants = [ports, log, dom, page-dom];
       chrome = true;
       in layout <- bar_layout { push_depth = 1; }
       in theme <- "local:brenn/theme" { push_depth = 1; }
@@ -172,23 +172,23 @@ new bar_pixel: BarSurface(slug = "bar-pixel", skin = "foundry");
 surface bar-feeder {
   grants = [publish];
   new feed-a: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_a;
   }
   new feed-b: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_b;
   }
   new feed-c: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_c;
   }
   new feed-layout: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_layout;
   }
   new chrome: Chrome {
-    grants = [ports, log];
+    grants = [ports, log, dom, page-dom];
     chrome = true;
     in theme <- "local:brenn/theme" { push_depth = 1; }
     in link-state <- "local:brenn/link-state" { push_depth = 1; }

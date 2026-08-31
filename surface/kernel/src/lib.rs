@@ -110,6 +110,21 @@ pub mod logic;
 #[cfg(target_arch = "wasm32")]
 pub mod dom;
 
+/// The `u64` encoding a DOM capability handle carries. DOM-free, so it compiles
+/// and is natively tested on every target the crate builds for.
+pub mod dom_handle;
+
+/// Per-instance DOM capability handle tables: slot reuse, generations, and
+/// reclamation. DOM-free — containment arrives as a predicate — so it compiles
+/// and is natively tested on every target the crate builds for.
+pub mod dom_table;
+
+/// The DOM capability host: per-instance element handles, the operations the
+/// `dom` and `page-dom` imports run, and the kernel-owned gesture listeners.
+/// Browser target only.
+#[cfg(target_arch = "wasm32")]
+pub mod dom_host;
+
 /// The synchronous side door onto a running page: the seam a component's gesture
 /// reaches an activation through. Browser target only, for the same reason the
 /// in-flight slot is — nothing else can be mid-dispatch on the loop's own thread.

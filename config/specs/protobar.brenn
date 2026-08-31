@@ -1,7 +1,11 @@
 /// A bar panel: renders what arrives on `messages`, wakes itself on `tick`.
+///
+/// It holds `dom` because it draws: a message area rebuilt from the block tree
+/// its body convention parses to, and a status line carrying the drop and
+/// malformed-body counters.
 component Protobar {
-  abi = dom;
-  requires = [ports, log];
+  abi = processor;
+  requires = [ports, log, dom];
   in messages: "brenn.panel.message@1";
   io tick;
 }

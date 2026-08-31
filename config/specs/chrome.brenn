@@ -2,9 +2,12 @@
 /// overlay-holdership reporting. A surface with no layout channel renders the
 /// default layout, and one with no takeover plane has no overlay to hold, so
 /// those three ports are optional.
+/// Draws the connection banner and the toast container, so it holds `dom`; it
+/// also arranges every other instance's wrapper and stamps the page's theme and
+/// takeover state, which is what `page-dom` is for.
 component Chrome {
-  abi = dom;
-  requires = [ports, log];
+  abi = processor;
+  requires = [ports, log, dom, page-dom];
   optional = [takeover];
   optional in layout;
   in theme: "brenn.surface.theme@1";

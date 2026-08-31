@@ -176,11 +176,7 @@ pub fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
         skin: "bench".to_string(),
         // Never run through asset validation, so `minimal`'s empty binding
         // hash has nothing to bind to.
-        components: vec![ResolvedComponent::minimal(
-            "writer",
-            "writer",
-            brenn_surface_schema::Abi::Dom,
-        )],
+        components: vec![ResolvedComponent::minimal("writer", "writer")],
         subscriptions: vec![],
         wire_subscriptions: vec![],
         local_channels: vec![],

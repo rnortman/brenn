@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # Stage the deploy tarball's directory tree.
 #
-# Usage: assemble.sh --out DIR --manifest FILE --names FILE
-#                    --dom-names FILE --record-lib FILE
+# Usage: assemble.sh --out DIR --manifest FILE --names FILE --record-lib FILE
 #                    --frontend DIR --surface DIR
 #                    [--bin FILE]... [--lib FILE]...
 #                    [--package FILE]... [--module FILE]...
 #
 # `--names` is `manifest_names.sh`, which states the manifest's grammar for
-# every reader of it; `--dom-names` is `dom_names.sh`, which states a surface
-# dom kind's file grammar the same way; `--record-lib` is `record_lib.sh`, which
-# states how a binding record's fields are read.
+# every reader of it; `--record-lib` is `record_lib.sh`, which states how a
+# binding record's fields are read.
 #
 # The layout is the one `deploy.sh` unpacks and reads: `bin/` for the two host
 # binaries, `frontend/` and `surface/` for the served asset trees, `lib/` for
@@ -25,7 +23,7 @@
 # one file per component, named `<name>.brenn` for the wire kind, which is the
 # authored basename. The backend half arrives as `--module` arguments; the
 # surface half is harvested out of the staged surface tree, whose per-kind
-# records already carry each kind's packaged copy and name the kind. Harvesting
+# directories already carry each kind's packaged copy. Harvesting
 # rather than listing keeps the staged set equal to the shipped set by
 # construction.
 #
@@ -51,7 +49,6 @@ set -euo pipefail
 out=""
 manifest=""
 names=""
-dom_names=""
 record_lib=""
 frontend=""
 surface=""
@@ -71,7 +68,6 @@ while [ "$#" -gt 0 ]; do
         --lib) libs+=("$2"); shift 2 ;;
         --package) packages+=("$2"); shift 2 ;;
         --module) modules+=("$2"); shift 2 ;;
-        --dom-names) dom_names="$2"; shift 2 ;;
         --record-lib) record_lib="$2"; shift 2 ;;
         *) echo "ERROR: unrecognized argument: $1" >&2; exit 2 ;;
     esac
@@ -83,11 +79,7 @@ for required in out manifest names frontend surface; do
         exit 2
     fi
 done
-# Named apart from the loop above: their flags spell the underscore as a hyphen.
-if [ -z "$dom_names" ]; then
-    echo "ERROR: --dom-names is required" >&2
-    exit 2
-fi
+# Named apart from the loop above: its flag spells the underscore as a hyphen.
 if [ -z "$record_lib" ]; then
     echo "ERROR: --record-lib is required" >&2
     exit 2
@@ -210,31 +202,8 @@ for module in "${modules[@]}"; do
     stage_module "$module" "$(basename "$module")"
 done
 
-# The surface half, read off the staged tree. A dom kind's record sits flat and
-# its files hang off wasm-bindgen's stem, so the packaged copy's name is derived
-# through the names tool and never by pattern: kind `mode-clock` files itself
-# under `brenn_mode_clock`, which no textual match on the kind would find.
-while read -r record; do
-    [ -n "$record" ] || continue
-    kind="$(record_field "$record" kind)"
-    if [ -z "$kind" ]; then
-        echo "ERROR: $record states no kind; its packaged module cannot be named" >&2
-        exit 1
-    fi
-    if ! dom_files="$("$dom_names" "$kind" 2>&1)"; then
-        echo "ERROR: $record states kind $kind, which no dom kind can be named: $dom_files" >&2
-        exit 1
-    fi
-    { read -r _module; read -r _module_wasm; read -r _record; read -r spec_name; } <<< "$dom_files"
-    if [ ! -f "$out/surface/$spec_name" ]; then
-        echo "ERROR: $record names kind $kind, whose packaged module $spec_name did not ship" >&2
-        exit 1
-    fi
-    stage_module "$out/surface/$spec_name" "$kind.brenn"
-done <<< "$(surface_dom_records "$out/surface")"
-
-# A processor kind's record is directory-keyed, and its packaged copy sits
-# beside it under the kind itself.
+# The surface half, read off the staged tree: a kind's record is
+# directory-keyed, and its packaged copy sits beside it under the kind itself.
 for kind_dir in "$out"/surface/processor/*/; do
     [ -f "$kind_dir/manifest.json" ] || continue
     kind="$(basename "$kind_dir")"

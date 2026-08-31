@@ -2,25 +2,19 @@
 //! vocabulary they spell, and the fence that splits a fixture into a packaged
 //! module and the document that imports it.
 //!
-//! A dom test's `component` class is written to stay out of the way: it permits
-//! every capability a surface admits, so each case grants what the case is
-//! about and the spec fit answers nothing else. That is a transcription of
-//! [`ComponentGrant::ALL`] minus what
-//! [`ComponentGrant::illegal_on`](brenn_envelope::grants::ComponentGrant::illegal_on)
-//! rejects, and a transcription per fixture is the hand table the vocabulary is
-//! single-sourced to avoid: an eighth variant would mean hunting every fixture
-//! that permits everything and deciding, one by one, whether it still does.
+//! A class states the words its instances grant and nothing else: `optional` is
+//! refused for a capability that names a WIT import, because a component reaches
+//! it through an import the host links only where the instance grants it. So the
+//! forms here take that list rather than hold one.
 //!
-//! A processor class cannot be written that way, because `optional` is refused
-//! on the abi: a processor reaches a capability through a WIT import the host
-//! links only where the instance grants it. So a processor fixture states the
-//! words its instance grants and nothing else, and the two forms here take that
-//! list rather than hold one.
+//! [`surface_any!`](crate::surface_any) is the exception, for the fixture that
+//! grants nothing and is about something else: it permits exactly the words a
+//! class may leave optional, which is every capability naming no interface.
 //!
 //! ```
 //! const PANEL: &str = concat!(
 //!     "component Panel {\n    ",
-//!     brenn_dsl::dom_any!(),
+//!     brenn_dsl::surface_any!(),
 //!     "\n    optional in messages;\n}\n",
 //! );
 //!
@@ -33,8 +27,8 @@
 //!
 //! A `concat!` position cannot hold a `const`, and a `format!` position cannot
 //! hold a macro call as an inline argument, so a suite that needs both writes
-//! `const DOM: &str = dom_any!();` and uses whichever fits. Where the word list
-//! is only known at runtime — a case parameterized over what it grants —
+//! `const ANY: &str = surface_any!();` and uses whichever fits. Where the word
+//! list is only known at runtime — a case parameterized over what it grants —
 //! [`processor_header`] builds the same text.
 //!
 //! The module is public unconditionally, and that is a choice rather than an
@@ -45,23 +39,26 @@
 //! text is unaffected by a change here, and one that expands these is holding a
 //! test fixture.
 
-/// A surface-hosted fixture class's header, permitting everything a surface
-/// admits:
-/// `abi = dom; requires = []; optional = [ports, log, alert, config, takeover];`
+/// A fixture class's header for a case that grants nothing, permitting
+/// everything a class may leave optional:
+/// `abi = processor; requires = []; optional = [takeover];`
+///
+/// Every other capability names a WIT import and so cannot be optional; a
+/// fixture whose instance grants one states it with [`processor_needs`].
 #[macro_export]
-macro_rules! dom_any {
+macro_rules! surface_any {
     () => {
-        "abi = dom; requires = []; optional = [ports, log, alert, config, takeover];"
+        "abi = processor; requires = []; optional = [takeover];"
     };
 }
 
-/// A backend-hosted fixture class's header, requiring exactly the words named:
+/// A fixture class's header, requiring exactly the words named:
 /// `processor_needs!("ports, log")` is
 /// `abi = processor; requires = [ports, log];`.
 ///
-/// The list is written out rather than defaulted because a processor class has
-/// no `optional`, so the words here are the words its instance grants — no more
-/// and no fewer, which is both halves of the spec fit.
+/// The list is written out rather than defaulted because an interface word
+/// cannot be optional, so the words here are the words its instance grants — no
+/// more and no fewer, which is both halves of the spec fit.
 #[macro_export]
 macro_rules! processor_needs {
     ($words:literal) => {
@@ -184,15 +181,16 @@ pub fn fenced(source: &str) -> impl Iterator<Item = (&str, Option<bool>)> {
 mod tests {
     use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 
-    /// The header a dom class permitting everything a surface admits states.
+    /// The header a class permitting every word it may leave optional states.
     fn any_header() -> String {
         let words: Vec<&str> = ComponentGrant::ALL
             .into_iter()
             .filter(|grant| grant.illegal_on(ComponentHost::Surface).is_none())
+            .filter(|grant| grant.wit_import().is_none())
             .map(ComponentGrant::word)
             .collect();
         format!(
-            "abi = dom; requires = []; optional = [{}];",
+            "abi = processor; requires = []; optional = [{}];",
             words.join(", ")
         )
     }
@@ -205,7 +203,7 @@ mod tests {
         let fixture = concat!(
             "const before = 1;\n",
             packaged_fence!(),
-            "component Panel { abi = dom; }\n",
+            "component Panel { abi = processor; }\n",
             packaged_fence!(),
             "const after = 2;\n",
         );
@@ -232,15 +230,15 @@ mod tests {
         let fixture = concat!(
             "const before = 1;\n",
             packaged_fence!(),
-            "component Panel { abi = dom; }\n",
+            "component Panel { abi = processor; }\n",
         );
         let _ = crate::fixture_text::split_packaged(fixture);
     }
 
     #[test]
-    fn the_dom_header_permits_exactly_what_a_surface_admits() {
+    fn the_open_header_permits_exactly_what_a_class_may_leave_optional() {
         assert_eq!(
-            crate::dom_any!(),
+            crate::surface_any!(),
             any_header(),
             "a grant word joined or left the vocabulary; the fixture header says otherwise"
         );

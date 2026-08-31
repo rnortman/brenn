@@ -58,7 +58,6 @@ def _release_package_impl(ctx):
     args.add("--out", out.path)
     args.add("--manifest", ctx.file.manifest)
     args.add("--names", ctx.file._manifest_names)
-    args.add("--dom-names", ctx.file._dom_names)
     args.add("--record-lib", ctx.file._record_lib)
     args.add("--frontend", frontend.path)
     args.add("--surface", surface.path)
@@ -80,7 +79,6 @@ def _release_package_impl(ctx):
         executable = ctx.file._assemble,
         tools = [
             ctx.file._manifest_names,
-            ctx.file._dom_names,
             ctx.file._record_lib,
         ],
         arguments = [args],
@@ -139,10 +137,6 @@ _release_package = rule(
             allow_single_file = True,
             default = Label("//bazel/release:assemble.sh"),
         ),
-        "_dom_names": attr.label(
-            allow_single_file = True,
-            default = Label("//bazel/surface:dom_names.sh"),
-        ),
         "_manifest_names": attr.label(
             allow_single_file = True,
             default = Label("//bazel/wasm:manifest_names.sh"),
@@ -193,7 +187,6 @@ def release_package(name, manifest, binaries, packages, modules, frontend, surfa
         args = [
             "$(rootpath //bazel/wasm:manifest_names.sh)",
             "$(rootpath //bazel/wasm:record_lib.sh)",
-            "$(rootpath //bazel/surface:dom_names.sh)",
             "$(rootpath :%s)" % name,
             "$(rootpath %s)" % manifest,
         ] + select({
@@ -202,7 +195,6 @@ def release_package(name, manifest, binaries, packages, modules, frontend, surfa
         }),
         data = [
             manifest,
-            "//bazel/surface:dom_names.sh",
             "//bazel/wasm:manifest_names.sh",
             "//bazel/wasm:record_lib.sh",
             ":" + name,

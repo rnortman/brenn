@@ -39,6 +39,7 @@ impl InPort {
     /// artifact is hash-bound to the specification that generated this
     /// module, so an undeclared port means the host handed over a window it
     /// could not have been configured to produce. The activation fails.
+    #[cfg(target_arch = "wasm32")]
     pub fn of(window: &brenn_guest::PortWindow) -> Result<InPort, brenn_guest::Error> {
         InPort::from_name(window.port()).ok_or_else(|| {
             brenn_guest::Error::failed(format!(
@@ -57,4 +58,5 @@ pub mod port {
 // One re-export per capability the specification declares. Reaching a
 // capability through this module is what makes deleting its word from the
 // specification break the guest compile.
+#[cfg(target_arch = "wasm32")]
 pub use brenn_guest::log;

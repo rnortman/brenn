@@ -12,24 +12,20 @@ load("//bazel/policy:defs.bzl", "policy_srcs")
 policy_srcs()
 
 # Both gates harvest the surface kinds' modules out of the staged tree, so both
-# are handed the scripts that state a dom kind's file grammar and a record's
-# field shape.
+# are handed the script that states a record's field shape.
 # `package_check` reads the binding records, so its fixtures are written by the
 # build's own emitter rather than by hand: a gate proven against a record shape
 # nothing holds equal to the emitted one is a gate that can drift green.
 # `assemble` only copies the files, so its fixtures stay opaque.
 _EXTRA = {
     "assemble": [
-        "//bazel/surface:dom_names.sh",
         "//bazel/wasm:record_lib.sh",
     ],
     "package_check": [
         "//bazel/wasm:record_lib.sh",
         "//bazel/wasm:emit_package.sh",
         "//bazel/wasm:wit_lib.sh",
-        "//bazel/surface:emit_dom_manifest.sh",
         "//surface:emit-processor-manifest.sh",
-        "//bazel/surface:dom_names.sh",
     ],
 }
 

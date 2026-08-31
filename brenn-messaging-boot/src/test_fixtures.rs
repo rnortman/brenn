@@ -289,7 +289,11 @@ pub fn minimal_surface_raw() -> SurfaceConfigRaw {
                 ..SurfaceComponentRaw::minimal("protobar")
             },
             SurfaceComponentRaw {
-                grants: vec![ComponentGrant::Ports],
+                grants: vec![
+                    ComponentGrant::Ports,
+                    ComponentGrant::Dom,
+                    ComponentGrant::PageDom,
+                ],
                 chrome: true,
                 ..SurfaceComponentRaw::minimal("chrome")
             },

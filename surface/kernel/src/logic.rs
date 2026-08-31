@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use brenn_attach_proto::AlertSeverity;
 use brenn_envelope::grants::ComponentGrant;
 
+use crate::PublishStatus;
 use crate::schema::bindings::BindingsDocument;
 use crate::schema::telemetry::InstanceReport;
 use crate::schema::{
@@ -17,7 +18,6 @@ use crate::schema::{
     LinkState, LinkStateBody, LogLevel, SurfaceStateBody, SurfaceStateInstance,
 };
 use crate::session::Event;
-use crate::{PublishStatus, Urgency};
 use crate::{contract, schema};
 
 /// Derive the surface's whole connect URL from the page's `location` and its
@@ -66,487 +66,20 @@ fn hex_upper(nibble: u8) -> char {
     }
 }
 
-/// Resolve the mounted component `instance` a delegated contract event targets,
-/// or the drop-and-report `KernelAction` for a target that does not resolve to a
-/// currently-mounted instance element. `instance` is the id the DOM executor
-/// resolved from the retargeted target element by element identity over the
-/// mounted-instance registry (`None` when the target is not a mounted instance
-/// element — a non-component node, or a bug). `target_tag` is that element's tag
-/// name, carried only for the drop breadcrumb; `event_name` names the contract
-/// event. Shared by every `route_*` entry point so the `Publish`/`Log`/`Alert`
-/// paths keep identical mounted-target semantics and drop wording — a divergence
-/// here would silently differ between the routing planes.
-fn require_mounted_instance<'a>(
-    instance: Option<&'a str>,
-    target_tag: &str,
-    event_name: &str,
-) -> Result<&'a str, KernelAction> {
-    match instance {
-        Some(instance) => Ok(instance),
-        // The target resolved to no mounted instance, so there is no subject to
-        // name: this drop is unattributable by construction.
-        None => Err(KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!("dropped {event_name} from non-component target <{target_tag}>"),
-            subject: None,
-        }),
-    }
-}
-
-/// The drop-and-report for a `brenn-activation-register` whose detail carries no
-/// callable `entry`: a non-conformant module, contained exactly like a malformed
-/// publish. Kept out of [`KernelCore::on_activation_register`] so the gate's one
-/// registration per instance is not spent answering a malformed event.
-pub fn malformed_registration(instance: Option<&str>, target_tag: &str) -> KernelAction {
-    KernelAction::Report {
-        level: LogLevel::Warn,
-        message: format!(
-            "dropped malformed {} from <{target_tag}>: detail.entry must be a function",
-            contract::ACTIVATION_REGISTER
-        ),
-        subject: instance.map(str::to_string),
-    }
-}
-
-/// The three states an **optional** contract detail field can be in, as read at
-/// the kernel↔component trust boundary.
-///
-/// A required field needs only `Option`: missing and non-string are both
-/// malformed. An optional one must tell them apart — omitting `urgency` is a
-/// component saying "use the port's configured default", while setting it to a
-/// number is a component bug. Answering the bug with the default would hide it,
-/// so the two carry different variants and take different paths.
-///
-/// DOM-free (the executor in `dom.rs` constructs it from the event detail) so
-/// the routers here stay testable without a browser.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OptionalField {
-    /// The component omitted the field: the contract's documented default applies.
-    Absent,
-    /// The component supplied a string. Still untrusted — the value itself may
-    /// not parse.
-    Present(String),
-    /// The component supplied a non-string, or the event was not a `CustomEvent`.
-    Malformed,
-}
-
-/// Route a component's `brenn-port-publish` intent to a publish action.
-///
-/// `instance` is the mounted-instance id the DOM executor resolved from the
-/// event's target — the component's host element after shadow retargeting, per
-/// the contract's dispatch-origin rule — by element identity over the
-/// mounted-instance registry. `None` means the target did not resolve to a
-/// mounted instance element (a non-conformant module dispatching on an inner
-/// light-DOM node, or a bug): drop it with `Report` rather than guess at
-/// attribution. `target_tag` is that element's tag name, carried for the drop
-/// breadcrumb only.
-///
-/// `port` and `body` are `None` when the component's event detail omitted them
-/// or carried a non-string value. Malformed detail from an otherwise-valid
-/// mounted instance is dropped-and-reported as malformed — never coerced into a
-/// well-formed publish, which would launder a component bug into a real message
-/// on the bus. Only a fully-formed detail from a mounted instance emits
-/// `Publish`.
-///
-/// `urgency` is the component's optional per-message override: the untrusted
-/// lowercase RFC 8030 wire string, parsed via [`Urgency::parse`].
-/// [`OptionalField::Absent`] means the component stated no preference and the
-/// port's configured default applies — the server resolves it, so the kernel
-/// simply sends no urgency. A present-but-unparseable value is dropped and
-/// reported as malformed, exactly like an unrecognized `level` on `brenn-log`:
-/// silently downgrading a component's stated intent to the default would publish
-/// at an urgency the component never chose, and hide the typo that caused it.
-pub fn route_publish_intent(
-    instance: Option<&str>,
-    target_tag: &str,
-    port: Option<&str>,
-    body: Option<&str>,
-    urgency: OptionalField,
-) -> KernelAction {
-    let instance = match require_mounted_instance(instance, target_tag, contract::PORT_PUBLISH) {
-        Ok(instance) => instance,
-        Err(drop) => return drop,
-    };
-    let malformed = |detail: &str| KernelAction::Report {
-        level: LogLevel::Warn,
-        message: format!(
-            "dropped malformed {} from <{target_tag}>: {detail}",
-            contract::PORT_PUBLISH
-        ),
-        subject: Some(instance.to_string()),
-    };
-    let urgency = match urgency {
-        OptionalField::Absent => None,
-        OptionalField::Present(raw) => match Urgency::parse(&raw) {
-            Some(u) => Some(u),
-            None => return malformed("urgency must be a known urgency level"),
-        },
-        OptionalField::Malformed => return malformed("urgency must be a string"),
-    };
-    match (port, body) {
-        (Some(port), Some(body)) => KernelAction::Publish {
-            instance: instance.to_string(),
-            port: port.to_string(),
-            body: body.to_string(),
-            urgency,
-        },
-        _ => malformed("port and body must be strings"),
-    }
-}
-
-/// The drop-and-report for a well-formed publish the kernel could not buffer: no
-/// activation of the dispatching instance is on the stack.
-///
-/// The component is *also* answered `not-permitted` on the event's status field,
-/// so this is the operator's copy rather than the component's. Both exist because
-/// the two audiences differ: the SDK turns the status into a panic at the call
-/// site, and a non-SDK dispatcher — page script, a hand-rolled module — leaves no
-/// other trace.
-///
-/// There is no second publish path for it to take. Every component-origin publish
-/// is an activation's, buffered and flushed iff the activation returns ok; a
-/// publish made outside one has no flush boundary to belong to and is refused
-/// rather than sent on its own.
-pub fn unbuffered_publish_refused(instance: &str, port: &str) -> KernelAction {
-    KernelAction::Report {
-        level: LogLevel::Warn,
-        message: format!(
-            "refused {} of port {port:?} from component {instance}: no activation of it is in \
-             flight, and a publish has no path outside one",
-            contract::PORT_PUBLISH
-        ),
-        subject: Some(instance.to_string()),
-    }
-}
-
-/// A `brenn-port-defer` event's untrusted detail, as read at the
-/// kernel↔component trust boundary.
-///
-/// Every field arrives as the DOM executor read it and nothing more: `op`/`port`
-/// are `None` for a missing or non-string value, and the three string-typed
-/// numerics keep their [`OptionalField`] three-state because which of them an op
-/// requires is the router's decision, not the reader's. Grouped into a struct
-/// rather than spread across the listener's callback because five untrusted
-/// fields on one event is where a positional argument list stops being readable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeferDetail {
-    /// Which op: [`contract::DEFER_OP_PUBLISH`], [`contract::DEFER_OP_CANCEL`] or
-    /// [`contract::DEFER_OP_EDIT`].
-    pub op: Option<String>,
-    /// The output port the op names.
-    pub port: Option<String>,
-    /// Decimal-string position in the port's deferred window (cancel, edit).
-    pub index: OptionalField,
-    /// The message body (publish), or its replacement (edit).
-    pub body: OptionalField,
-    /// Decimal-string epoch-millisecond release time (publish), or its
-    /// replacement (edit).
-    pub deliver_after: OptionalField,
-}
-
-/// One well-formed deferred-message op, resolved to the instance that dispatched
-/// it and ready for the in-flight activation's buffer.
-///
-/// Not a [`KernelAction`], unlike a publish, because there is no effect to apply
-/// outside an activation: every op here is buffered-only
-/// ([`contract::PORT_DEFER`]), so the only two outcomes are "hand it to the
-/// buffer" and "drop and report", and the router returns them as the two arms of a
-/// `Result`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeferIntent {
-    /// Park `body` on the port's channel until `deliver_after` (epoch ms UTC).
-    Publish {
-        instance: String,
-        port: String,
-        body: String,
-        deliver_after: u64,
-    },
-    /// Unpark the message at `index` in the port's deferred window.
-    Cancel {
-        instance: String,
-        port: String,
-        index: u32,
-    },
-    /// Rewrite the message at `index`: its body, its release time, or both. `None`
-    /// leaves that half alone.
-    Edit {
-        instance: String,
-        port: String,
-        index: u32,
-        body: Option<String>,
-        deliver_after: Option<u64>,
-    },
-}
-
-impl DeferIntent {
-    /// The op's contract name, for the breadcrumb a refused op leaves.
-    pub fn op_name(&self) -> &'static str {
-        match self {
-            DeferIntent::Publish { .. } => contract::DEFER_OP_PUBLISH,
-            DeferIntent::Cancel { .. } => contract::DEFER_OP_CANCEL,
-            DeferIntent::Edit { .. } => contract::DEFER_OP_EDIT,
-        }
-    }
-
-    /// The instance that dispatched the op — the routing identity the DOM
-    /// executor resolved, never anything the detail claimed.
-    pub fn instance(&self) -> &str {
-        match self {
-            DeferIntent::Publish { instance, .. }
-            | DeferIntent::Cancel { instance, .. }
-            | DeferIntent::Edit { instance, .. } => instance,
-        }
-    }
-}
-
-/// Read one of [`DeferDetail`]'s decimal-string numerics: `Ok(None)` for an
-/// omitted field, `Err(())` for a non-string one or one that is not a decimal
-/// integer in range. Callers that require the field turn `None` into malformed
-/// themselves, so absence stays the router's judgement.
-fn optional_number<T: std::str::FromStr>(field: &OptionalField) -> Result<Option<T>, ()> {
-    match field {
-        OptionalField::Absent => Ok(None),
-        OptionalField::Present(raw) => raw.parse::<T>().map(Some).map_err(|_| ()),
-        OptionalField::Malformed => Err(()),
-    }
-}
-
-/// The drop-and-report for a `brenn-port-defer` whose detail does not spell a
-/// well-formed op. Malformed detail from a mounted instance is never coerced into
-/// an op: a guessed index names another message, and a guessed release time
-/// schedules a message for a moment the component never chose.
-fn malformed_defer(instance: &str, target_tag: &str, detail: &str) -> KernelAction {
-    KernelAction::Report {
-        level: LogLevel::Warn,
-        message: format!(
-            "dropped malformed {} from <{target_tag}>: {detail}",
-            contract::PORT_DEFER
-        ),
-        subject: Some(instance.to_string()),
-    }
-}
-
-/// The drop-and-report for a well-formed op the kernel could not buffer: no
-/// activation of the dispatching instance is on the stack.
-///
-/// Not a status a component can read — by the time the kernel knows, the dispatch
-/// is the only thing that happened — and deliberately not an immediate effect
-/// either: the whole point of the buffered-only rule is that a schedule staged
-/// outside the flush boundary must not exist.
-pub fn unbuffered_defer_refused(intent: &DeferIntent) -> KernelAction {
-    KernelAction::Report {
-        level: LogLevel::Warn,
-        message: format!(
-            "dropped {} {} from component {}: no activation of it is in flight, and a \
-             deferred-message op has no unbuffered path",
-            contract::PORT_DEFER,
-            intent.op_name(),
-            intent.instance()
-        ),
-        subject: Some(intent.instance().to_string()),
-    }
-}
-
-/// Route a component's `brenn-port-defer` intent to the op the in-flight
-/// activation's buffer should be offered, or to the drop-and-report for a detail
-/// that does not spell one.
-///
-/// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
-/// the DOM-resolved mounted-instance id for the retargeted target, and a target
-/// that does not resolve to a mounted instance element is dropped with `Report`.
-/// `target_tag` is carried for the breadcrumb.
-///
-/// What each op requires of the detail is stated here and nowhere else: a publish
-/// needs a body and a release time and no index; a cancel needs an index; an edit
-/// needs an index and takes the other two as present-to-change / absent-to-leave.
-/// Fields an op does not read are ignored rather than rejected, matching every
-/// other event on this seam.
-pub fn route_defer_intent(
-    instance: Option<&str>,
-    target_tag: &str,
-    detail: DeferDetail,
-) -> Result<DeferIntent, KernelAction> {
-    let instance = require_mounted_instance(instance, target_tag, contract::PORT_DEFER)?;
-    let Some(port) = detail.port else {
-        return Err(malformed_defer(
-            instance,
-            target_tag,
-            "port must be a string",
-        ));
-    };
-    // Each field is read — and so judged — only by the ops that use it. Parsing
-    // them all up front would reject a publish carrying a stray malformed
-    // `index`, which is precisely the "ignored rather than rejected" this seam
-    // promises, and would blame a field the op never looks at.
-    let index = || {
-        optional_number::<u32>(&detail.index)
-            .map_err(|()| malformed_defer(instance, target_tag, "index must be a decimal u32"))
-    };
-    let deliver_after = || {
-        optional_number::<u64>(&detail.deliver_after).map_err(|()| {
-            malformed_defer(
-                instance,
-                target_tag,
-                "deliver_after must be decimal epoch milliseconds",
-            )
-        })
-    };
-    let body = || match &detail.body {
-        OptionalField::Absent => Ok(None),
-        OptionalField::Present(body) => Ok(Some(body.clone())),
-        OptionalField::Malformed => Err(malformed_defer(
-            instance,
-            target_tag,
-            "body must be a string",
-        )),
-    };
-    match detail.op.as_deref() {
-        Some(contract::DEFER_OP_PUBLISH) => {
-            let (body, deliver_after) = (body()?, deliver_after()?);
-            let instance = instance.to_string();
-            match (body, deliver_after) {
-                (Some(body), Some(deliver_after)) => Ok(DeferIntent::Publish {
-                    instance,
-                    port,
-                    body,
-                    deliver_after,
-                }),
-                _ => Err(malformed_defer(
-                    &instance,
-                    target_tag,
-                    "a deferred publish needs both body and deliver_after",
-                )),
-            }
-        }
-        Some(contract::DEFER_OP_CANCEL) => {
-            let index = index()?;
-            let instance = instance.to_string();
-            match index {
-                Some(index) => Ok(DeferIntent::Cancel {
-                    instance,
-                    port,
-                    index,
-                }),
-                None => Err(malformed_defer(
-                    &instance,
-                    target_tag,
-                    "a cancel needs an index",
-                )),
-            }
-        }
-        Some(contract::DEFER_OP_EDIT) => {
-            let (index, body, deliver_after) = (index()?, body()?, deliver_after()?);
-            let instance = instance.to_string();
-            match index {
-                Some(index) => Ok(DeferIntent::Edit {
-                    instance,
-                    port,
-                    index,
-                    body,
-                    deliver_after,
-                }),
-                None => Err(malformed_defer(
-                    &instance,
-                    target_tag,
-                    "an edit needs an index",
-                )),
-            }
-        }
-        _ => Err(malformed_defer(
-            instance,
-            target_tag,
-            "op must be publish, cancel or edit",
-        )),
-    }
-}
-
-/// One well-formed sync-call request, resolved to the instance that dispatched
-/// it.
-///
-/// Not a [`KernelAction`], for [`DeferIntent`]'s reason: there is no effect to
-/// apply outside an activation. The only two outcomes are "ask the sync door for
-/// an activation" and "drop and report", which the router returns as the two arms
-/// of a `Result`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncIntent {
-    /// The dispatching instance — the routing identity the DOM executor resolved,
-    /// never anything the detail claimed.
-    pub instance: String,
-    /// The sync port the request arrives on, chosen by the component.
-    pub port: String,
-    /// The request payload, opaque to the kernel.
-    pub body: String,
-}
-
-/// Route a component's `brenn-activation-sync` intent to the request the sync
-/// door should run, or to the drop-and-report for a detail that does not spell
-/// one.
-///
-/// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
-/// the DOM-resolved mounted-instance id for the retargeted target, and a target
-/// that does not resolve to a mounted instance element is dropped with `Report`.
-/// `target_tag` is carried for the breadcrumb.
-///
-/// `port` and `body` are `None` when the detail omitted them or carried a
-/// non-string value. Malformed detail is never coerced into a request: a guessed
-/// port name would activate the component on a port it never asked for, and the
-/// entry has no way to tell that apart from a real one.
-pub fn route_sync_intent(
-    instance: Option<&str>,
-    target_tag: &str,
-    port: Option<&str>,
-    body: Option<&str>,
-) -> Result<SyncIntent, KernelAction> {
-    let instance = require_mounted_instance(instance, target_tag, contract::ACTIVATION_SYNC)?;
-    match (port, body) {
-        (Some(port), Some(body)) => Ok(SyncIntent {
-            instance: instance.to_string(),
-            port: port.to_string(),
-            body: body.to_string(),
-        }),
-        _ => Err(KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!(
-                "dropped malformed {} from <{target_tag}>: port and body must be strings",
-                contract::ACTIVATION_SYNC
-            ),
-            subject: Some(instance.to_string()),
-        }),
-    }
-}
-
-/// The drop-and-report for a well-formed request the kernel would not admit.
-///
-/// Every refusal is a bug — see [`crate::outward::SyncRefusal`] — so the sentence
-/// is the operator's account of which one, alongside the `refused` status the
-/// requester itself faults on.
-///
-/// A refusal is reported by instance and port alone, never by payload content.
-pub fn sync_refused(
-    instance: &str,
-    port: &str,
-    refusal: &crate::outward::SyncRefusal,
-) -> KernelAction {
-    KernelAction::Report {
-        level: LogLevel::Warn,
-        message: refusal.describe(instance, port),
-        subject: Some(instance.to_string()),
-    }
-}
+/// The WIT entries a suppression breadcrumb names, so an operator reads the same
+/// vocabulary the component's own world spells. The `dom`/`page-dom` family
+/// names its own in `dom_host.rs`, where each entry is one function.
+const LOG_ENTRY: &str = "log.log";
+const ALERT_ENTRY: &str = "alert.alert";
+const CONFIG_ENTRY: &str = "config.get";
 
 impl KernelCore {
     /// Route a component's log intent to a component-log action, gated on that
     /// component's own `log` grant.
     ///
-    /// One router for both ABIs, because the only difference between them is how the
-    /// call arrived — the same shape [`Self::route_alert`] takes. `target_tag` states which
-    /// seam it came through: `Some(tag)` is a `dom` component's delegated
-    /// `brenn-log` event, whose `instance` is the DOM-resolved mounted-instance id
-    /// for the retargeted target — a target that resolves to no mounted instance is
-    /// dropped with a `Report` rather than attributed by guess. `None` is a headless
-    /// processor's `log.*` import, whose identity is the loader's closure over the
-    /// instance it instantiated for; there is no element to resolve and nothing to
-    /// check it against.
+    /// `instance` is the identity the loader closed over when it instantiated the
+    /// module — never anything the component states — so there is nothing to
+    /// resolve and nothing to check it against.
     ///
     /// The gate is the instance's own right, read here off
     /// [`instance_grants`](Self::instance_grants) rather than taken from the
@@ -555,51 +88,26 @@ impl KernelCore {
     /// ungranted instance's log is dropped with a suppression breadcrumb naming
     /// it, never forwarded as a `Log` frame.
     ///
-    /// `level` and `message` are `None` when a `dom` component's event detail omitted
-    /// them or carried a non-string value (untrusted component-supplied detail); a
-    /// processor's WIT call always states both. `level` is additionally the untrusted
-    /// lowercase log-level wire string, parsed via [`proto::LogLevel::from_wire_str`].
-    /// A missing/non-string field or an unrecognized `level` is dropped-and-reported
-    /// as malformed — never coerced into a well-formed `Log` frame, which would
-    /// launder a component bug into a server log line at a level the component never
-    /// chose. For a processor an unrecognized level is transpile-glue drift rather
-    /// than a component typo, but the answer is the same.
-    ///
-    /// # Panics
-    ///
-    /// On a `None` instance with no `target_tag`: a processor log carries the
-    /// identity its loader closed over, so an absent one is a kernel bug rather than
-    /// component input.
-    pub fn route_log(
-        &self,
-        instance: Option<&str>,
-        target_tag: Option<&str>,
-        level: Option<&str>,
-        message: Option<&str>,
-    ) -> KernelAction {
-        let instance = match target_tag {
-            Some(tag) => match require_mounted_instance(instance, tag, contract::COMPONENT_LOG) {
-                Ok(instance) => instance,
-                Err(drop) => return drop,
-            },
-            None => instance.expect("a processor log names the instance its loader closed over"),
-        };
+    /// `level` is the untrusted lowercase log-level wire string, parsed via
+    /// [`proto::LogLevel::from_wire_str`]; an unrecognized one is
+    /// dropped-and-reported as malformed rather than coerced into a well-formed
+    /// `Log` frame, which would launder transpile-glue drift into a server log
+    /// line at a level the component never chose.
+    pub fn route_log(&self, instance: &str, level: &str, message: &str) -> KernelAction {
         if !self.instance_granted(instance, ComponentGrant::Log) {
-            return ungranted_capability(instance, ComponentGrant::Log, contract::COMPONENT_LOG);
+            return ungranted_capability(instance, ComponentGrant::Log, LOG_ENTRY);
         }
-        match (level.and_then(LogLevel::from_wire_str), message) {
-            (Some(level), Some(message)) => KernelAction::ComponentLog {
+        match LogLevel::from_wire_str(level) {
+            Some(level) => KernelAction::ComponentLog {
                 instance: instance.to_string(),
                 level,
                 message: message.to_string(),
             },
-            _ => KernelAction::Report {
+            None => KernelAction::Report {
                 level: LogLevel::Warn,
                 message: format!(
-                    "dropped malformed {} from {}: level must be a known log \
-                     level and message a string",
-                    contract::COMPONENT_LOG,
-                    component_origin(instance, target_tag)
+                    "dropped malformed {LOG_ENTRY} from processor {instance}: \
+                     level must be a known log level"
                 ),
                 subject: Some(instance.to_string()),
             },
@@ -609,14 +117,9 @@ impl KernelCore {
     /// Route a component's alert intent to an alert action, gated on that
     /// component's own `alert` grant.
     ///
-    /// One router for both ABIs, because the only difference between them is how the
-    /// call arrived. `target_tag` states which seam it came through: `Some(tag)` is a
-    /// `dom` component's delegated `brenn-alert` event, whose `instance` is the
-    /// DOM-resolved mounted-instance id for the retargeted target — a target that
-    /// resolves to no mounted instance is dropped with a `Report` rather than
-    /// attributed by guess. `None` is a headless processor's `alert.*` import, whose
-    /// identity is the loader's closure over the instance it instantiated for; there
-    /// is no element to resolve and nothing to check it against.
+    /// `instance` is the identity the loader closed over when it instantiated the
+    /// module — never anything the component states — exactly as for
+    /// [`Self::route_log`].
     ///
     /// The gate is the *instance's* right, read here off its own grants
     /// ([`instance_grants`](Self::instance_grants)) rather than taken from the
@@ -628,93 +131,36 @@ impl KernelCore {
     /// it: a conforming kernel never emits an alert the server would judge a
     /// violation. The component's own logs are unaffected.
     ///
-    /// `severity`/`title`/`body` are `None` when a `dom` component's event detail
-    /// omitted them or carried a non-string value (untrusted component-supplied
-    /// detail); a processor's WIT call always states all three. `severity` is
-    /// additionally the untrusted lowercase severity wire string, parsed via
-    /// [`AlertSeverity::from_wire_str`]. A missing/non-string field or an
-    /// unrecognized `severity` is dropped-and-reported as malformed — never coerced
-    /// into a well-formed `Alert`.
-    ///
-    /// # Panics
-    ///
-    /// On a `None` instance with no `target_tag`: a processor alert carries the
-    /// identity its loader closed over, so an absent one is a kernel bug rather than
-    /// component input.
+    /// `severity` is the untrusted lowercase severity wire string, parsed via
+    /// [`AlertSeverity::from_wire_str`]; an unrecognized one is
+    /// dropped-and-reported as malformed rather than coerced into a well-formed
+    /// `Alert`.
     pub fn route_alert(
         &self,
-        instance: Option<&str>,
-        target_tag: Option<&str>,
-        severity: Option<&str>,
-        title: Option<&str>,
-        body: Option<&str>,
+        instance: &str,
+        severity: &str,
+        title: &str,
+        body: &str,
     ) -> KernelAction {
-        let instance = match target_tag {
-            Some(tag) => match require_mounted_instance(instance, tag, contract::COMPONENT_ALERT) {
-                Ok(instance) => instance,
-                Err(drop) => return drop,
-            },
-            None => instance.expect("a processor alert names the instance its loader closed over"),
-        };
         if !self.instance_granted(instance, ComponentGrant::Alert) {
-            return ungranted_capability(
-                instance,
-                ComponentGrant::Alert,
-                contract::COMPONENT_ALERT,
-            );
+            return ungranted_capability(instance, ComponentGrant::Alert, ALERT_ENTRY);
         }
-        match (severity.and_then(AlertSeverity::from_wire_str), title, body) {
-            (Some(severity), Some(title), Some(body)) => KernelAction::Alert {
+        match AlertSeverity::from_wire_str(severity) {
+            Some(severity) => KernelAction::Alert {
                 attribution: Some(instance.to_string()),
                 severity,
                 title: title.to_string(),
                 body: body.to_string(),
             },
-            _ => KernelAction::Report {
+            None => KernelAction::Report {
                 level: LogLevel::Warn,
                 message: format!(
-                    "dropped malformed {} from {}: severity must be a known severity \
-                     and title and body strings",
-                    contract::COMPONENT_ALERT,
-                    component_origin(instance, target_tag)
+                    "dropped malformed {ALERT_ENTRY} from processor {instance}: \
+                     severity must be a known severity"
                 ),
                 subject: Some(instance.to_string()),
             },
         }
-    }
-}
-
-/// Route a component's config read to the instance and key it names, or to the
-/// drop-and-report for a detail that does not spell one.
-///
-/// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
-/// the DOM-resolved mounted-instance id for the retargeted target, and a target
-/// that does not resolve to a mounted instance element is dropped with `Report`.
-/// `target_tag` is carried for the breadcrumb.
-///
-/// `key` is `None` when the detail omitted it or carried a non-string value. A
-/// guessed key would answer a read the component never made, so it is dropped
-/// and reported instead. Either way the seam still writes the absence answer:
-/// the reader faults on a missing one.
-///
-/// The grant is not read here — [`KernelCore::component_config_get`] holds that
-/// gate, because it is the thing that would otherwise serve the value.
-pub fn route_config_get<'a>(
-    instance: Option<&'a str>,
-    target_tag: &str,
-    key: Option<&'a str>,
-) -> Result<(&'a str, &'a str), KernelAction> {
-    let instance = require_mounted_instance(instance, target_tag, contract::CONFIG_GET)?;
-    match key {
-        Some(key) => Ok((instance, key)),
-        None => Err(KernelAction::Report {
-            level: LogLevel::Warn,
-            message: format!(
-                "dropped malformed {} from <{target_tag}>: key must be a string",
-                contract::CONFIG_GET
-            ),
-            subject: Some(instance.to_string()),
-        }),
     }
 }
 
@@ -733,15 +179,6 @@ pub fn ungranted_capability(instance: &str, grant: ComponentGrant, what: &str) -
             grant.word()
         ),
         subject: Some(instance.to_string()),
-    }
-}
-
-/// How a dropped intent names where it came from: the dispatching element for a
-/// `dom` component, the instance itself for a headless one that has no element.
-fn component_origin(instance: &str, target_tag: Option<&str>) -> String {
-    match target_tag {
-        Some(tag) => format!("<{tag}>"),
-        None => format!("processor {instance}"),
     }
 }
 
@@ -810,9 +247,9 @@ pub enum KernelAction {
         kind: String,
         reason: String,
     },
-    /// Create the instance's `brenn-<kind>` custom element and append it inside
-    /// the instance's kernel-owned wrapper.
-    MountComponent { instance: String, kind: String },
+    /// Create the plain host `div` a page-hosted processor instance's `dom.root`
+    /// resolves to, inside that instance's kernel-owned wrapper.
+    MountHost { instance: String, kind: String },
     /// Ask the bootstrap loader to bring up the named headless processor
     /// instances (dispatched as the `brenn-processor-start` seam event).
     ///
@@ -825,26 +262,10 @@ pub enum KernelAction {
     /// Dispatch `brenn-surface-ready` on `window` (first successful connect):
     /// the bootstrap resets its capped-reload counter on this signal.
     EmitReady,
-    /// Resolve the instance's output `port` to a channel and publish `body`. A
-    /// synchronous rejection is handled by the executor as a `Report`, matching a
-    /// non-`Ok` `PublishResult`.
-    ///
-    /// `urgency` is the component's per-message override; `None` sends no urgency
-    /// on the frame, which the server reads as "the port's configured default".
-    /// The kernel deliberately does not substitute the default itself: the
-    /// authoritative value is the wiring the page is running on, which this core
-    /// does not resolve ports against.
-    Publish {
-        instance: String,
-        port: String,
-        body: String,
-        urgency: Option<Urgency>,
-    },
     /// Log `message` to the browser console (at `level`) and forward it to the
     /// server as a leveled `log` frame. Covers the transient/component-fault
-    /// breadcrumb class at `Warn` (a non-`Ok` publish outcome, a rejected publish,
-    /// or a misrouted `brenn-port-publish` dropped by [`route_publish_intent`])
-    /// and a component-panic report at `Error`. The level is fixed at each call
+    /// breadcrumb class at `Warn` (a non-`Ok` publish outcome or a refused
+    /// publish) and a component death at `Error`. The level is fixed at each call
     /// site, never derived.
     ///
     /// `subject` is the instance the report is *about*, which the executor sends
@@ -909,6 +330,31 @@ pub enum KernelAction {
     /// the DOM executor fills page uptime and the lifetime counters it owns
     /// before handing the report over.
     SendStatus { instances: Vec<InstanceReport> },
+}
+
+/// What a page-hosted processor's registration attempt decided.
+///
+/// Carries the mount decision rather than leaving it to be re-derived: the
+/// caller forwards it to the runner, so the host element this admission asks for
+/// and the mount activation that draws into it rest on one reading of one grant.
+pub struct ProcessorRegistration {
+    /// Whether the caller may forward the entry to the page.
+    pub admitted: bool,
+    /// Whether the forwarded entry is owed its mount activation.
+    pub mount: bool,
+    /// What to apply, admitted or not.
+    pub actions: Vec<KernelAction>,
+}
+
+impl ProcessorRegistration {
+    /// A refusal: nothing forwarded, nothing mounted, the report applied.
+    fn refused(actions: Vec<KernelAction>) -> Self {
+        ProcessorRegistration {
+            admitted: false,
+            mount: false,
+            actions,
+        }
+    }
 }
 
 /// A browser viewport reading, tracked for no-change suppression.
@@ -1094,57 +540,6 @@ impl KernelCore {
         }
     }
 
-    /// Gate a component's `brenn-activation-register`: decide whether the kernel
-    /// may be handed this entry.
-    ///
-    /// `instance` is the mounted-instance id the DOM executor resolved from the
-    /// retargeted target — the component never claims an instance, exactly as on
-    /// every other delegated event. Returns the instance to register, plus the
-    /// actions to apply; `None` means the registration is refused and the caller
-    /// must not forward it.
-    ///
-    /// Refused in two cases, both in-page component bugs and both reported rather
-    /// than forwarded into the core's fail-fast panic:
-    ///
-    /// - the target resolves to no mounted instance (unknown, unmounted, or a
-    ///   non-conformant dispatch site);
-    /// - the instance already registered — never silently replaced, which would
-    ///   let a component swap another's delivery seam out from under it.
-    pub fn on_activation_register(
-        &mut self,
-        instance: Option<&str>,
-        target_tag: &str,
-    ) -> (Option<String>, Vec<KernelAction>) {
-        let instance =
-            match require_mounted_instance(instance, target_tag, contract::ACTIVATION_REGISTER) {
-                Ok(instance) => instance.to_string(),
-                Err(drop) => return (None, vec![drop]),
-            };
-        if !self.registered.insert(instance.clone()) {
-            return (
-                None,
-                vec![KernelAction::Report {
-                    level: LogLevel::Warn,
-                    message: format!(
-                        "dropped duplicate {} from <{target_tag}>: instance {instance} already \
-                         registered an activation entry",
-                        contract::ACTIVATION_REGISTER
-                    ),
-                    subject: Some(instance),
-                }],
-            );
-        }
-        // Chrome's first successful mount is the connect-indicator handoff: from
-        // here chrome owns connection pixels via its banner, so the kernel drops
-        // its indicator and never renders it again.
-        let actions = if self.chrome_instance.as_deref() == Some(instance.as_str()) {
-            self.retire_connect_indicator()
-        } else {
-            Vec::new()
-        };
-        (Some(instance), actions)
-    }
-
     /// Gate a headless processor instance's activation registration — the tag-free
     /// sibling of [`KernelCore::on_activation_register`].
     ///
@@ -1155,7 +550,13 @@ impl KernelCore {
     /// trust shape as the DOM path's executor-resolved instance: kernel-derived,
     /// never component-claimed.
     ///
-    /// Returns whether the caller may forward the entry, plus the actions to apply.
+    /// Returns the [`ProcessorRegistration`] the caller enacts: whether it may
+    /// forward the entry, whether that entry is owed a mount activation, and the
+    /// actions to apply. Mountability is decided here and nowhere else — it is
+    /// the same fact as the host element this emits, and two readings of it could
+    /// disagree into a host `div` nothing draws in or a mount call with no
+    /// element under it.
+    ///
     /// Refused, reported rather than forwarded into the client core's fail-fast
     /// bound, in two cases mirroring the DOM gate's refusal posture:
     ///
@@ -1166,40 +567,56 @@ impl KernelCore {
     /// On admission the instance's row transitions `Pending → Mounted` (for a
     /// headless instance that *is* what mounted means) and a status report follows,
     /// so `surface-state` carries the transition.
-    pub fn on_processor_register(&mut self, instance: &str) -> (bool, Vec<KernelAction>) {
-        if !self.is_processor_instance(instance) {
-            return (
-                false,
-                vec![KernelAction::Report {
-                    level: LogLevel::Warn,
-                    message: format!(
-                        "dropped processor activation registration: {instance} is not a declared \
-                         processor instance"
-                    ),
-                    subject: None,
-                }],
-            );
+    pub fn on_processor_register(&mut self, instance: &str) -> ProcessorRegistration {
+        if !self.is_configured_instance(instance) {
+            return ProcessorRegistration::refused(vec![KernelAction::Report {
+                level: LogLevel::Warn,
+                message: format!(
+                    "dropped processor activation registration: {instance} is not a declared \
+                     processor instance"
+                ),
+                subject: None,
+            }]);
         }
         if !self.registered.insert(instance.to_string()) {
-            return (
-                false,
-                vec![KernelAction::Report {
-                    level: LogLevel::Warn,
-                    message: format!(
-                        "dropped duplicate processor activation registration: instance {instance} \
-                         already registered an activation entry"
-                    ),
-                    subject: Some(instance.to_string()),
-                }],
-            );
+            return ProcessorRegistration::refused(vec![KernelAction::Report {
+                level: LogLevel::Warn,
+                message: format!(
+                    "dropped duplicate processor activation registration: instance {instance} \
+                     already registered an activation entry"
+                ),
+                subject: Some(instance.to_string()),
+            }]);
         }
-        let mut actions = Vec::new();
+        // One read of the one fact: an instance holding `dom` draws, so it gets a
+        // host element and the mount call that fills it.
+        let mount = self.instance_granted(instance, ComponentGrant::Dom);
+        // Chrome's first successful registration is the connect-indicator
+        // handoff: from here chrome owns connection pixels via its banner, so the
+        // kernel drops its indicator and never renders it again.
+        let mut actions = if self.chrome_instance.as_deref() == Some(instance) {
+            self.retire_connect_indicator()
+        } else {
+            Vec::new()
+        };
         if let Some(status) = self.instances.iter_mut().find(|s| s.instance == instance) {
+            // The host element must exist before the mount activation fires, so
+            // `dom.root` resolves when the component's first call runs.
+            if mount {
+                actions.push(KernelAction::MountHost {
+                    instance: instance.to_string(),
+                    kind: status.kind.clone(),
+                });
+            }
             status.state = InstanceState::Mounted;
             status.reason = None;
         }
         actions.extend(self.instance_table_actions());
-        (true, actions)
+        ProcessorRegistration {
+            admitted: true,
+            mount,
+            actions,
+        }
     }
 
     /// Fail a processor instance the bootstrap loader could not bring up — a module
@@ -1238,21 +655,39 @@ impl KernelCore {
             message: format!("processor instance {instance} failed to load: {detail}"),
             subject: Some(instance.to_string()),
         }];
+        // A page with no layout engine is not a page to keep: the capped
+        // bootstrap reload replaces the status row.
+        if self.chrome_instance.as_deref() == Some(instance) {
+            actions.push(KernelAction::RequestReload {
+                reason: "chrome mount failed".to_string(),
+            });
+            return actions;
+        }
         actions.extend(self.instance_table_actions());
         actions
     }
 
-    /// Whether `instance` is a declared `processor` component in the stored
-    /// wiring. `false` before the page is first configured.
-    fn is_processor_instance(&self, instance: &str) -> bool {
-        self.bindings.as_ref().is_some_and(|b| {
-            b.components
-                .iter()
-                .any(|c| c.instance == instance && c.abi == schema::Abi::Processor)
-        })
+    /// The card a dead page-hosted instance is owed, if it renders at all.
+    ///
+    /// A `dom`-granted instance has a wrapper, so its death is visible where it
+    /// was drawing: the card replaces its content. A headless instance has no
+    /// wrapper, so its `failed` status row on `surface-state` is the whole
+    /// observable.
+    fn error_card_for_dead_instance(&self, instance: &str, reason: &str) -> Vec<KernelAction> {
+        if !self.instance_granted(instance, ComponentGrant::Dom) {
+            return Vec::new();
+        }
+        let Some(status) = self.instances.iter().find(|s| s.instance == instance) else {
+            return Vec::new();
+        };
+        vec![KernelAction::ErrorCard {
+            instance: instance.to_string(),
+            kind: status.kind.clone(),
+            reason: reason.to_string(),
+        }]
     }
 
-    /// Serve one config read for an instance of either ABI from the map its
+    /// Serve one config read for an instance from the map its
     /// component entry carries, gated on that instance's `config` grant.
     ///
     /// Fixed for the page's lifetime, matching the backend's process-lifetime map:
@@ -1272,7 +707,7 @@ impl KernelCore {
             return Err(ungranted_capability(
                 instance,
                 ComponentGrant::Config,
-                contract::CONFIG_GET,
+                CONFIG_ENTRY,
             ));
         }
         Ok(self.bindings.as_ref().and_then(|bindings| {
@@ -1357,20 +792,7 @@ impl KernelCore {
 
     /// Fold one control-plane [`Event`] into the core, returning the actions
     /// the DOM executor must apply in order.
-    ///
-    /// `is_element_defined` takes `(kind, instance)` and reports whether that
-    /// instance's custom element is registered
-    /// (`customElements.get("brenn-<kind>--<instance>")`); it keeps this core
-    /// DOM-free while letting the first-connect mount plan decide mount vs. error
-    /// card per instance. Per-instance, not per-kind: each instance's module
-    /// defines only its own element, so one instance's module failing to load
-    /// error-cards that instance and leaves its siblings mountable. It is
-    /// consulted only on the first connect.
-    pub fn on_event(
-        &mut self,
-        event: &Event,
-        is_element_defined: impl Fn(&str, &str) -> bool,
-    ) -> Vec<KernelAction> {
+    pub fn on_event(&mut self, event: &Event) -> Vec<KernelAction> {
         match event {
             Event::Disconnected { .. } => {
                 let mut actions = self.set_link_state(LinkState::Reconnecting);
@@ -1443,7 +865,7 @@ impl KernelCore {
                 ..
             } => {
                 self.alert_granted = *alert_granted;
-                self.on_connected(bindings, is_element_defined)
+                self.on_connected(bindings)
             }
             // The wiring in force changed under a running page: the components it
             // mounted and the ports it attached were built against a description
@@ -1457,12 +879,6 @@ impl KernelCore {
                 });
                 actions
             }
-            // The kernel mounts only `dom` components, and every one of them still
-            // rides the condemned per-message dialect — nothing this kernel mounts
-            // is activation-registered, so neither event can reach it. They are
-            // matched rather than wildcarded so that porting the components off
-            // the dialect fails to compile here, forcing the error-card and
-            // `surface-state` wiring to be a decision rather than an omission.
             // A non-terminal activation error leaves the instance alive: nothing
             // to do here (the diagnostic is on the EventStream). A terminal
             // trap is contained per-instance for every component — except the
@@ -1471,13 +887,13 @@ impl KernelCore {
             // capped bootstrap reload instead of an error card. Non-chrome
             // containment is unchanged.
             Event::ActivationFailed { .. } => Vec::new(),
-            Event::InstanceFailed { instance, .. } => {
+            Event::InstanceFailed { instance, reason } => {
                 if self.chrome_instance.as_deref() == Some(instance.as_str()) {
                     vec![KernelAction::RequestReload {
                         reason: "chrome died".to_string(),
                     }]
                 } else {
-                    Vec::new()
+                    self.error_card_for_dead_instance(instance, reason)
                 }
             }
             Event::PublishResult {
@@ -1551,27 +967,26 @@ impl KernelCore {
         }
     }
 
-    /// First-connect handling: store the bindings, produce the mount plan — one
-    /// `MountComponent` per component whose element is defined, an `ErrorCard`
-    /// for one whose module never registered its element — publish the connected
-    /// link state, and emit `EmitReady` **last**.
+    /// First-connect handling: store the bindings, build the instance-status
+    /// table, hand the loader this page's instances, publish the connected link
+    /// state, and emit `EmitReady` **last**.
+    ///
+    /// Nothing mounts here. Every configured component is a page-hosted
+    /// processor whose element, if it draws at all, is created when its
+    /// registration is admitted ([`Self::on_processor_register`]), so a row
+    /// starts `Pending` and this pass only records that it exists.
     ///
     /// `EmitReady` is ordered last on purpose: the bootstrap resets its
-    /// capped-reload counter on it, so a panic anywhere in mount-plan
-    /// application (e.g. a component constructor that panics the kernel) must
-    /// increment the counter without an intervening reset — otherwise a
-    /// deterministic mount panic reloads forever, never converging to the
+    /// capped-reload counter on it, so a panic anywhere in the application of
+    /// these actions must increment the counter without an intervening reset —
+    /// otherwise a deterministic failure reloads forever, never converging to the
     /// static failure message the cap guarantees.
     ///
     /// On a reconnect (a document already stored) the page has already reconciled
     /// its stores and resubscribed with resume, so this republishes the connected
     /// link state and nothing else. A document that differs from the one in force
     /// arrives as its own [`Event::WiringChanged`], which is what reloads.
-    fn on_connected(
-        &mut self,
-        bindings: &BindingsDocument,
-        is_element_defined: impl Fn(&str, &str) -> bool,
-    ) -> Vec<KernelAction> {
+    fn on_connected(&mut self, bindings: &BindingsDocument) -> Vec<KernelAction> {
         if self.bindings.is_some() {
             return self.set_link_state(LinkState::Connected);
         }
@@ -1603,99 +1018,39 @@ impl KernelCore {
             Some(bindings.chrome_instance.clone())
         };
         // Rebuild the instance-status table from this bindings set: one row per
-        // configured component, `mounted` when its element is defined or `failed`
-        // when its module never registered — the same decision the mount plan
-        // makes. Headless instances (a component in no layout slot) are tracked
-        // identically; the table has no slot concept.
+        // configured component, every one `Pending` until its own registration is
+        // admitted. The table has no slot concept — an instance in no layout slot
+        // is tracked identically to one that draws.
         self.instances = Vec::with_capacity(bindings.components.len());
         let mut actions = Vec::new();
         actions.extend(self.dark_overlay_instrument_report(bindings));
-        // instance → kind for the instances that actually mounted (element
-        // defined), so a subscription's pump can carry the kind for its terminal
-        // error card without re-scanning the component list.
-        let mut mounted: HashMap<&str, &str> = HashMap::new();
-        // Headless instances that took the processor arm. They have no element and
-        // so cannot be in `mounted`, but their ports are real and their windows are
-        // assembled exactly like a `dom` instance's, so `ports_attached` must count
-        // them or the status report would understate a working surface.
-        let mut headless: HashSet<&str> = HashSet::new();
+        // Every configured instance, for the ports count below and the loader's
+        // start list. Ports are real whether or not the instance draws, so a
+        // headless one must be counted or the status report would understate a
+        // working surface.
+        let mut configured: HashSet<&str> = HashSet::new();
         for entry in &bindings.components {
-            // Chrome mount failure is fatal: a chrome whose element
-            // never registers (bad ABI or missing module) has no error card — a
-            // page with no layout engine is not a page to keep, so reload. The
-            // capped bootstrap path bounds the retry.
-            let is_chrome = self.chrome_instance.as_deref() == Some(entry.instance.as_str());
-            let mountable =
-                entry.abi == schema::Abi::Dom && is_element_defined(&entry.kind, &entry.instance);
-            if is_chrome && !mountable {
-                return vec![KernelAction::RequestReload {
-                    reason: "chrome mount failed".to_string(),
-                }];
-            }
-            // The one thing the ABI still decides in this core: a `dom` component
-            // renders into an element and a headless one has nowhere to render.
-            // DOM-forced. Every other per-instance decision — grants, config,
-            // ports, logs, alerts — reads the same entry the same way for both.
-            let (state, reason) = if entry.abi == schema::Abi::Processor {
-                // Headless by construction: no element to check, no wrapper, no
-                // mount. The bootstrap loader instantiates the transpiled module
-                // and registers the instance's `receive`; the row sits `Pending`
-                // until `on_processor_register` admits that registration, and
-                // becomes `Failed` if the loader reports the instantiation or
-                // registration failed. Chrome is a `dom` component by definition,
-                // so the is_chrome check above can never select this arm.
-                headless.insert(entry.instance.as_str());
-                (InstanceState::Pending, None)
-            } else if entry.abi != schema::Abi::Dom {
-                // The remaining ABIs are reserved and unloadable. Boot rejects
-                // them, so this is peer input the server should never send —
-                // error-carded, not panicked, because that is the containment this
-                // loop already gives every other unloadable instance: one dead
-                // card, the rest of the surface alive.
-                let reason = format!("unsupported component abi: {}", entry.abi.as_str());
-                actions.push(KernelAction::ErrorCard {
-                    instance: entry.instance.clone(),
-                    kind: entry.kind.clone(),
-                    reason: reason.clone(),
-                });
-                (InstanceState::Failed, Some(reason))
-            } else if is_element_defined(&entry.kind, &entry.instance) {
-                mounted.insert(entry.instance.as_str(), entry.kind.as_str());
-                actions.push(KernelAction::MountComponent {
-                    instance: entry.instance.clone(),
-                    kind: entry.kind.clone(),
-                });
-                (InstanceState::Mounted, None)
-            } else {
-                actions.push(KernelAction::ErrorCard {
-                    instance: entry.instance.clone(),
-                    kind: entry.kind.clone(),
-                    reason: "component module missing".to_string(),
-                });
-                (
-                    InstanceState::Failed,
-                    Some("component module missing".to_string()),
-                )
-            };
+            // No element to check and no wrapper: the bootstrap loader
+            // instantiates the transpiled module and registers the instance's
+            // `receive`, the row sits `Pending` until `on_processor_register`
+            // admits that registration, and it becomes `Failed` if the loader
+            // reports the instantiation or registration failed.
+            configured.insert(entry.instance.as_str());
             self.instances.push(InstanceStatus {
                 instance: entry.instance.clone(),
                 kind: entry.kind.clone(),
-                state,
-                reason,
+                state: InstanceState::Pending,
+                reason: None,
                 ports_attached: 0,
             });
         }
-        // Count each live instance's bound input ports for the status table.
+        // Count each configured instance's bound input ports for the status table.
         // Nothing is wired here: the kernel delivers off the instance's own
-        // registration — which a `dom` instance's element makes from
-        // `connectedCallback` and a processor instance's loader makes after
-        // `instantiate`. A subscription on an error-carded instance (element never
-        // defined, or a reserved ABI) or on an instance absent from `components`
-        // is in neither set and is not counted — that instance will never register
-        // and nothing will ever be delivered to it.
+        // registration, which its loader makes after `instantiate`. A subscription
+        // naming an instance absent from `components` is not counted — nothing
+        // will ever register under that name, so nothing will ever be delivered.
         for binding in &bindings.subscriptions {
-            if (mounted.contains_key(binding.instance.as_str())
-                || headless.contains(binding.instance.as_str()))
+            if configured.contains(binding.instance.as_str())
                 && let Some(status) = self
                     .instances
                     .iter_mut()
@@ -1706,11 +1061,11 @@ impl KernelCore {
         }
         // Hand the loader this page's processor instances, once. Ordered after the
         // status rows exist so a load failure reported straight back finds its row.
-        if !headless.is_empty() && !self.processors_started {
+        if !configured.is_empty() && !self.processors_started {
             self.processors_started = true;
-            let mut instances: Vec<String> = headless.iter().map(|i| (*i).to_string()).collect();
-            // `headless` is a set, and the loader's report ordering is observable in
-            // tests; sort so the plan is a function of the bindings alone.
+            let mut instances: Vec<String> = configured.iter().map(|i| (*i).to_string()).collect();
+            // `configured` is a set, and the loader's report ordering is observable
+            // in tests; sort so the plan is a function of the bindings alone.
             instances.sort();
             actions.push(KernelAction::StartProcessors { instances });
         }
@@ -1724,8 +1079,8 @@ impl KernelCore {
         // A booted surface always declares exactly one chrome (the singleton is a
         // boot-time panic), so this branch is a defensive fallback: with no chrome
         // to hand off to, nothing will ever mount to remove the indicator, so
-        // retire it now. A chrome surface keeps the indicator until chrome's first
-        // mount (see `on_activation_register`).
+        // retire it now. A chrome surface keeps the indicator until chrome's
+        // registration is admitted (see `on_processor_register`).
         if self.chrome_instance.is_none() {
             actions.extend(self.retire_connect_indicator());
         }
@@ -1780,103 +1135,11 @@ impl KernelCore {
     }
 
     /// Whether `instance` is a component this surface configured (from the stored
-    /// wiring) — the membership check the panic-subject filter needs. `false`
-    /// before the page is first configured.
+    /// wiring). `false` before the page is first configured.
     fn is_configured_instance(&self, instance: &str) -> bool {
         self.bindings
             .as_ref()
             .is_some_and(|b| b.components.iter().any(|c| c.instance == instance))
-    }
-
-    /// Decide the kernel's response to a `brenn-component-panic { instance,
-    /// message }` seam event a component module's panic hook dispatched on
-    /// `window`.
-    ///
-    /// **One panic, one subject.** The detail names the panicked **instance**,
-    /// because a module backs exactly one instance's linear memory: its poisoning
-    /// is that instance's death and nobody else's. One error card, one `failed`
-    /// transition, one report — and a sibling of the same kind keeps running on
-    /// its own memory, untouched.
-    ///
-    /// `instance`/`message` are `None` when the event detail omitted them or
-    /// carried a non-string value (untrusted component-supplied detail). An
-    /// instance that is not currently mounted — unattributable (`None`), never
-    /// configured, or already error-carded — is dropped and reported once under
-    /// the bare surface identity, never error-carding a mount the panic does not
-    /// own.
-    ///
-    /// A component panic is the one client-side event that pages: on an
-    /// alert-granted surface ([`KernelCore::alert_granted`]) an attributed panic
-    /// additionally emits one `Alert { None, Warning, "component panic:
-    /// <instance>", <detail> }`. On an ungranted surface it stays error-cards +
-    /// `log(error)` only — a conforming kernel never emits an ungranted `Alert`
-    /// (the server treats one as a protocol violation). An unattributable panic
-    /// never pages regardless of the grant.
-    ///
-    /// `is_mounted` reports whether an `instance` currently has a mounted element;
-    /// the DOM executor owns that registry, keeping this core DOM-free.
-    pub fn on_component_panic(
-        &mut self,
-        instance: Option<&str>,
-        message: Option<&str>,
-        is_mounted: impl Fn(&str) -> bool,
-    ) -> Vec<KernelAction> {
-        let detail = message.unwrap_or("component panicked");
-        // The subject must be a live mount of a configured instance: `is_mounted`
-        // alone would accept an instance this surface never declared, and the
-        // detail is component-supplied.
-        let subject = instance.filter(|i| self.is_configured_instance(i) && is_mounted(i));
-        let Some(subject) = subject else {
-            return vec![KernelAction::Report {
-                level: LogLevel::Error,
-                message: format!(
-                    "dropped unattributable {}: instance={instance:?}",
-                    contract::COMPONENT_PANIC
-                ),
-                subject: None,
-            }];
-        };
-        let kind = self
-            .instances
-            .iter()
-            .find(|s| s.instance == subject)
-            .map(|s| s.kind.clone())
-            .expect("a configured, mounted instance has a status row");
-        let reason = format!("component panicked: {detail}");
-        let mut actions = vec![
-            KernelAction::ErrorCard {
-                instance: subject.to_string(),
-                kind,
-                reason: reason.clone(),
-            },
-            // The report follows the card, under the dead instance's own
-            // sub-identity: it is the principal that failed, so it reports its own
-            // failure and draws its own budget. (Budget-exempt as a death report;
-            // the server caps it at one per instance per connection.)
-            KernelAction::Report {
-                level: LogLevel::Error,
-                message: format!("component instance {subject} panicked: {detail}"),
-                subject: Some(subject.to_string()),
-            },
-        ];
-        if self.alert_granted {
-            actions.push(KernelAction::Alert {
-                // The kernel's own statement, not the dead component's: a panicked
-                // instance is in no position to hold a capability, and the operator
-                // must hear about the death whatever the instance was granted.
-                attribution: None,
-                severity: AlertSeverity::Warning,
-                title: format!("component panic: {subject}"),
-                body: detail.to_string(),
-            });
-        }
-        // Fail the instance in the status table, then emit an immediate status
-        // report (a transition into `failed` reports at once, not on the next
-        // tick). The report rides after the error card so the executor's error
-        // counter already reflects it.
-        self.mark_instance_failed(subject, &reason);
-        actions.extend(self.instance_table_actions());
-        actions
     }
 
     /// Set `instance`'s status-table row to `failed` with `reason`. Returns
@@ -2043,18 +1306,15 @@ mod tests {
     #[test]
     fn chrome_death_reloads_while_a_sibling_death_is_contained() {
         let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event_chrome(entries(&["chrome", "protobar"]), "chrome"),
-            |_, _| true,
-        );
+        core.on_event(&connected_event_chrome(
+            entries(&["chrome", "protobar"]),
+            "chrome",
+        ));
 
-        let reload = core.on_event(
-            &Event::InstanceFailed {
-                instance: "chrome".to_string(),
-                reason: "trap".to_string(),
-            },
-            |_, _| true,
-        );
+        let reload = core.on_event(&Event::InstanceFailed {
+            instance: "chrome".to_string(),
+            reason: "trap".to_string(),
+        });
         assert_eq!(
             reload,
             vec![KernelAction::RequestReload {
@@ -2063,13 +1323,10 @@ mod tests {
             "chrome's death is fatal — reload, no error card"
         );
 
-        let sibling = core.on_event(
-            &Event::InstanceFailed {
-                instance: "protobar".to_string(),
-                reason: "trap".to_string(),
-            },
-            |_, _| true,
-        );
+        let sibling = core.on_event(&Event::InstanceFailed {
+            instance: "protobar".to_string(),
+            reason: "trap".to_string(),
+        });
         assert!(
             sibling.is_empty(),
             "a non-chrome death is contained per-instance, unchanged"
@@ -2077,49 +1334,34 @@ mod tests {
     }
 
     #[test]
-    fn chrome_mount_failure_reloads_instead_of_error_carding() {
+    fn connect_indicator_retired_on_chrome_registration() {
         let mut core = KernelCore::new();
-        // chrome's element never registered: is_element_defined is false for it.
-        let actions = core.on_event(
-            &connected_event_chrome(entries(&["chrome"]), "chrome"),
-            |kind, _| kind != "chrome",
-        );
-        assert_eq!(
-            actions,
-            vec![KernelAction::RequestReload {
-                reason: "chrome mount failed".to_string(),
-            }],
-            "a chrome that cannot mount reloads the page, no error card"
-        );
-    }
+        core.on_event(&connected_event_chrome(
+            entries(&["chrome", "protobar"]),
+            "chrome",
+        ));
 
-    #[test]
-    fn connect_indicator_retired_on_chrome_first_mount() {
-        let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event_chrome(entries(&["chrome", "protobar"]), "chrome"),
-            |_, _| true,
-        );
-
-        // A non-chrome mount leaves the indicator alone.
-        let (_, sib) = core.on_activation_register(Some("protobar"), "BRENN-PROTOBAR");
+        // A sibling's registration leaves the indicator alone.
+        let sib = core.on_processor_register("protobar");
         assert!(
-            !sib.contains(&KernelAction::RemoveConnectIndicator),
-            "a sibling's mount does not touch the indicator"
+            !sib.actions.contains(&KernelAction::RemoveConnectIndicator),
+            "a sibling's registration does not touch the indicator"
         );
 
-        // Chrome's first mount is the handoff: the indicator is removed once.
-        let (_, first) = core.on_activation_register(Some("chrome"), "BRENN-CHROME");
+        // Chrome's is the handoff: the indicator is removed once.
+        let first = core.on_processor_register("chrome");
         assert!(
-            first.contains(&KernelAction::RemoveConnectIndicator),
-            "chrome's first mount retires the indicator"
+            first
+                .actions
+                .contains(&KernelAction::RemoveConnectIndicator),
+            "chrome's registration retires the indicator"
         );
     }
 
     #[test]
     fn connect_indicator_retired_at_connect_on_a_chromeless_surface() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(&connected_event(entries(&["protobar"])), |_, _| true);
+        let actions = core.on_event(&connected_event(entries(&["protobar"])));
         assert!(
             actions.contains(&KernelAction::RemoveConnectIndicator),
             "no chrome to hand off to — retire the indicator at connect"
@@ -2130,12 +1372,9 @@ mod tests {
     fn disconnected_drives_the_indicator_only_while_it_is_live() {
         let mut core = KernelCore::new();
         // Live indicator: a drop drives it to Reconnecting.
-        let live = core.on_event(
-            &Event::Disconnected {
-                reason: DetachReason::LivenessTimeout,
-            },
-            |_, _| true,
-        );
+        let live = core.on_event(&Event::Disconnected {
+            reason: DetachReason::LivenessTimeout,
+        });
         assert!(
             live.contains(&KernelAction::SetConnectIndicator(
                 ConnectIndicatorState::Reconnecting
@@ -2144,13 +1383,10 @@ mod tests {
         );
 
         // After a chrome-less connect retires it, a further drop is silent.
-        core.on_event(&connected_event(entries(&["protobar"])), |_, _| true);
-        let after = core.on_event(
-            &Event::Disconnected {
-                reason: DetachReason::LivenessTimeout,
-            },
-            |_, _| true,
-        );
+        core.on_event(&connected_event(entries(&["protobar"])));
+        let after = core.on_event(&Event::Disconnected {
+            reason: DetachReason::LivenessTimeout,
+        });
         assert!(
             !after
                 .iter()
@@ -2161,98 +1397,12 @@ mod tests {
 
     // ── the activation registration gate ──────────────────────────────────
 
-    #[test]
-    fn a_mounted_instance_registers_exactly_once() {
-        // The gate's whole job. The client core panics on a duplicate
-        // `RegisterActivation` — the right backstop for a kernel bug, and a page
-        // death for what is really an in-page component bug. So the second
-        // registration must stop here, as a report naming the offender, and must
-        // never be silently *accepted* either: replacing a live entry would swap a
-        // component's delivery seam out from under it.
-        let mut core = KernelCore::new();
-
-        let (admitted, actions) = core.on_activation_register(Some("p1"), "BRENN-PROTOBAR");
-        assert_eq!(admitted.as_deref(), Some("p1"));
-        assert!(
-            actions.is_empty(),
-            "an admitted registration reports nothing"
-        );
-        assert!(core.is_registered("p1"));
-
-        let (admitted, actions) = core.on_activation_register(Some("p1"), "BRENN-PROTOBAR");
-        assert_eq!(admitted, None, "the duplicate never reaches the core");
-        assert!(matches!(
-            actions.as_slice(),
-            [KernelAction::Report { level: LogLevel::Warn, message, subject: Some(s) }]
-                if message.contains("already registered") && s == "p1"
-        ));
-        assert!(
-            core.is_registered("p1"),
-            "the first registration still stands"
-        );
-    }
-
-    #[test]
-    fn a_registration_from_an_unmounted_target_is_dropped_not_forwarded() {
-        // `None` is the DOM half saying the retargeted target is no mounted
-        // instance's element — unknown, already dead, or a non-conformant dispatch
-        // site. There is no subject to name and nothing to register.
-        let mut core = KernelCore::new();
-        let (admitted, actions) = core.on_activation_register(None, "DIV");
-        assert_eq!(admitted, None);
-        assert!(matches!(
-            actions.as_slice(),
-            [KernelAction::Report { message, subject: None, .. }]
-                if message.contains("non-component target")
-        ));
-    }
-
-    #[test]
-    fn registrations_are_gated_per_instance_not_per_kind() {
-        // Two instances of one kind are two principals with two entries. A gate
-        // keyed on kind would let the first sibling to register lock the second
-        // out of delivery entirely.
-        let mut core = KernelCore::new();
-        assert_eq!(
-            core.on_activation_register(Some("p1"), "BRENN-PROTOBAR")
-                .0
-                .as_deref(),
-            Some("p1")
-        );
-        assert_eq!(
-            core.on_activation_register(Some("p2"), "BRENN-PROTOBAR")
-                .0
-                .as_deref(),
-            Some("p2")
-        );
-    }
-
-    #[test]
-    fn a_malformed_registration_does_not_spend_the_instance_s_one_claim() {
-        // The entry-less detail is reported *before* the gate, so a component that
-        // dispatched a malformed registration can still register a real one. A
-        // report is a breadcrumb, not a sentence.
-        let mut core = KernelCore::new();
-        assert!(matches!(
-            malformed_registration(Some("p1"), "BRENN-PROTOBAR"),
-            KernelAction::Report { message, subject: Some(s), .. }
-                if message.contains("must be a function") && s == "p1"
-        ));
-        assert!(!core.is_registered("p1"));
-        assert_eq!(
-            core.on_activation_register(Some("p1"), "BRENN-PROTOBAR")
-                .0
-                .as_deref(),
-            Some("p1"),
-        );
-    }
-
     use brenn_attach_client::conn::DetachReason;
     use brenn_attach_proto::VersionRange;
 
-    use crate::PublishStatus;
     use crate::schema::bindings::{BINDINGS_DOCUMENT_VERSION, PlatformSection};
-    use crate::schema::{Abi, Binding, ComponentEntry};
+    use crate::schema::{Binding, ComponentEntry};
+    use crate::{PublishStatus, Urgency};
 
     // ── shared builders ───────────────────────────────────────────────────
 
@@ -2261,7 +1411,6 @@ mod tests {
         ComponentEntry {
             instance: instance.to_string(),
             kind: kind.to_string(),
-            abi: Abi::Dom,
             parked_batch_depth: 8,
             config: Default::default(),
             grants: vec![],
@@ -2345,12 +1494,16 @@ mod tests {
     /// A connected core carrying `components` (element defined for all) and the
     /// given grant — the fixture the panic tests build on, since
     /// `on_component_panic` reads stored bindings + the grant.
+    /// A configured core with every instance's registration already admitted —
+    /// the steady state a test about a running surface wants, since a row is
+    /// `Pending` until its own module registers.
     fn connect(components: Vec<ComponentEntry>, alert_granted: bool) -> KernelCore {
         let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event_granted(components, vec![], alert_granted),
-            |_, _| true,
-        );
+        let instances: Vec<String> = components.iter().map(|c| c.instance.clone()).collect();
+        core.on_event(&connected_event_granted(components, vec![], alert_granted));
+        for instance in &instances {
+            core.on_processor_register(instance);
+        }
         core
     }
 
@@ -2414,609 +1567,15 @@ mod tests {
 
     // ── route_publish_intent ──────────────────────────────────────────────
 
-    #[test]
-    fn publish_intent_from_mounted_instance_routes_to_publish() {
-        // No urgency in the detail: the kernel sends none, so the port's
-        // configured default applies server-side.
-        let action = route_publish_intent(
-            Some("p1"),
-            "brenn-protobar",
-            Some("out"),
-            Some("42"),
-            OptionalField::Absent,
-        );
-        assert_eq!(
-            action,
-            KernelAction::Publish {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                body: "42".to_string(),
-                urgency: None,
-            }
-        );
-    }
-
-    #[test]
-    fn publish_intent_carries_a_stated_urgency_through() {
-        // Every rung of the ladder round-trips from the wire string the component
-        // dispatched to the typed override the frame carries.
-        for (raw, expected) in [
-            ("very-low", Urgency::VeryLow),
-            ("low", Urgency::Low),
-            ("normal", Urgency::Normal),
-            ("high", Urgency::High),
-        ] {
-            let action = route_publish_intent(
-                Some("p1"),
-                "brenn-protobar",
-                Some("out"),
-                Some("42"),
-                OptionalField::Present(raw.to_string()),
-            );
-            assert_eq!(
-                action,
-                KernelAction::Publish {
-                    instance: "p1".to_string(),
-                    port: "out".to_string(),
-                    body: "42".to_string(),
-                    urgency: Some(expected),
-                },
-                "urgency {raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn publish_intent_with_an_absent_urgency_is_not_the_same_as_normal() {
-        // The distinction the whole `OptionalField` three-state exists for:
-        // "absent" must reach the frame as `None` (defer to the port's default),
-        // not as `Some(Normal)`. Collapsing them would silently pin every publish
-        // to `normal` and make the config knob dead.
-        let absent = route_publish_intent(
-            Some("p1"),
-            "brenn-protobar",
-            Some("out"),
-            Some("42"),
-            OptionalField::Absent,
-        );
-        let stated = route_publish_intent(
-            Some("p1"),
-            "brenn-protobar",
-            Some("out"),
-            Some("42"),
-            OptionalField::Present("normal".to_string()),
-        );
-        assert_ne!(absent, stated);
-    }
-
-    #[test]
-    fn publish_intent_with_an_unknown_urgency_is_dropped_as_malformed() {
-        // A typo'd or non-string urgency is a component bug. Reporting it beats
-        // coercing to the default, which would publish at a level the component
-        // never chose and hide the typo. Mirrors the unknown-`level` rule on
-        // `brenn-log`.
-        for urgency in [
-            OptionalField::Present("urgent".to_string()),
-            OptionalField::Present("NORMAL".to_string()),
-            OptionalField::Present(String::new()),
-            OptionalField::Malformed,
-        ] {
-            let action = route_publish_intent(
-                Some("p1"),
-                "brenn-protobar",
-                Some("out"),
-                Some("42"),
-                urgency.clone(),
-            );
-            let KernelAction::Report { level, message, .. } = action else {
-                panic!("expected Report for {urgency:?}, got {action:?}");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert!(message.contains("malformed"), "message: {message}");
-            assert!(message.contains("urgency"), "message: {message}");
-        }
-    }
-
-    #[test]
-    fn publish_intent_from_unresolved_target_is_dropped_and_reported() {
-        // The DOM executor could not resolve the target to a mounted instance
-        // (unmounted element, or a non-component node): drop-and-report, never
-        // guess attribution. The breadcrumb names the offending tag.
-        for tag in ["brenn-protobar", "button"] {
-            let action =
-                route_publish_intent(None, tag, Some("out"), Some("42"), OptionalField::Absent);
-            let KernelAction::Report { level, message, .. } = action else {
-                panic!("expected Report for <{tag}>, got {action:?}");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert!(message.contains(tag), "message: {message}");
-        }
-    }
-
-    #[test]
-    fn publish_intent_with_malformed_detail_from_mounted_instance_is_dropped_as_malformed() {
-        // A missing/non-string port or body from an otherwise-valid mounted
-        // instance must be reported as malformed, not coerced into a well-formed
-        // publish (which would launder a component bug onto the bus).
-        for (port, body) in [(None, Some("42")), (Some("out"), None), (None, None)] {
-            let action = route_publish_intent(
-                Some("p1"),
-                "brenn-protobar",
-                port,
-                body,
-                OptionalField::Absent,
-            );
-            let KernelAction::Report { level, message, .. } = action else {
-                panic!("expected Report for ({port:?}, {body:?}), got {action:?}");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert!(message.contains("malformed"), "message: {message}");
-            assert!(message.contains("brenn-protobar"), "message: {message}");
-        }
-    }
-
     // ── route_sync_intent ─────────────────────────────────────────────────
 
-    #[test]
-    fn sync_intent_from_mounted_instance_carries_port_and_body_through() {
-        let intent =
-            route_sync_intent(Some("p1"), "brenn-protobar", Some("ack"), Some("{\"i\":2}"))
-                .expect("a well-formed request from a mounted instance routes");
-        assert_eq!(
-            intent,
-            SyncIntent {
-                instance: "p1".to_string(),
-                port: "ack".to_string(),
-                body: "{\"i\":2}".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn sync_intent_from_unresolved_target_is_dropped_and_reported() {
-        // Identical posture to every other event on this seam: the instance is
-        // the DOM executor's answer, and a target that resolves to nothing is
-        // unattributable rather than guessed at.
-        for tag in ["brenn-protobar", "button"] {
-            let drop = route_sync_intent(None, tag, Some("ack"), Some("{}"))
-                .expect_err("an unresolved target does not route");
-            let KernelAction::Report {
-                level,
-                message,
-                subject,
-            } = drop
-            else {
-                panic!("expected Report for <{tag}>");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert_eq!(subject, None);
-            assert!(message.contains(tag), "message: {message}");
-            assert!(
-                message.contains(contract::ACTIVATION_SYNC),
-                "message: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn sync_intent_with_malformed_detail_is_dropped_as_malformed() {
-        // A guessed port would activate the component on a port it never asked
-        // for, which its entry cannot tell apart from a real request.
-        for (port, body) in [(None, Some("{}")), (Some("ack"), None), (None, None)] {
-            let drop = route_sync_intent(Some("p1"), "brenn-protobar", port, body)
-                .expect_err("malformed detail does not route");
-            let KernelAction::Report {
-                level,
-                message,
-                subject,
-            } = drop
-            else {
-                panic!("expected Report for ({port:?}, {body:?})");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert_eq!(subject, Some("p1".to_string()));
-            assert!(message.contains("malformed"), "message: {message}");
-            assert!(message.contains("brenn-protobar"), "message: {message}");
-        }
-    }
-
-    #[test]
-    fn a_refusal_reports_its_own_sentence_against_the_requesting_instance() {
-        let action = sync_refused("p1", "ack", &crate::outward::SyncRefusal::ReEntrant);
-        let KernelAction::Report {
-            level,
-            message,
-            subject,
-        } = action
-        else {
-            panic!("a refusal reports");
-        };
-        assert_eq!(level, LogLevel::Warn);
-        assert_eq!(subject, Some("p1".to_string()));
-        assert!(message.contains("in flight"), "{message}");
-        assert!(
-            message.contains("p1") && message.contains("ack"),
-            "{message}"
-        );
-    }
-
     // ── route_defer_intent ────────────────────────────────────────────────
-
-    /// A `brenn-port-defer` detail with everything omitted but the op and the
-    /// port — the shape each case below fills in only what it is about.
-    fn defer_detail(op: &str, port: &str) -> DeferDetail {
-        DeferDetail {
-            op: Some(op.to_string()),
-            port: Some(port.to_string()),
-            index: OptionalField::Absent,
-            body: OptionalField::Absent,
-            deliver_after: OptionalField::Absent,
-        }
-    }
-
-    #[test]
-    fn a_deferred_publish_carries_its_body_and_release_time() {
-        let intent = route_defer_intent(
-            Some("p1"),
-            "brenn-protobar",
-            DeferDetail {
-                body: OptionalField::Present("42".to_string()),
-                deliver_after: OptionalField::Present("1770000000000".to_string()),
-                ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
-            },
-        );
-        assert_eq!(
-            intent,
-            Ok(DeferIntent::Publish {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                body: "42".to_string(),
-                deliver_after: 1_770_000_000_000,
-            })
-        );
-    }
-
-    #[test]
-    fn a_cancel_and_an_edit_resolve_their_snapshot_index() {
-        assert_eq!(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    index: OptionalField::Present("2".to_string()),
-                    ..defer_detail(contract::DEFER_OP_CANCEL, "out")
-                }
-            ),
-            Ok(DeferIntent::Cancel {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                index: 2,
-            })
-        );
-        assert_eq!(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    index: OptionalField::Present("0".to_string()),
-                    body: OptionalField::Present("later".to_string()),
-                    deliver_after: OptionalField::Present("7".to_string()),
-                    ..defer_detail(contract::DEFER_OP_EDIT, "out")
-                }
-            ),
-            Ok(DeferIntent::Edit {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                index: 0,
-                body: Some("later".to_string()),
-                deliver_after: Some(7),
-            })
-        );
-    }
-
-    #[test]
-    fn an_edit_omits_the_half_it_leaves_alone() {
-        // Absent is the contract's "do not touch", and it must not collapse into an
-        // empty body or a zero release time — either would rewrite the parked
-        // message with something the component never said.
-        assert_eq!(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    index: OptionalField::Present("1".to_string()),
-                    deliver_after: OptionalField::Present("9".to_string()),
-                    ..defer_detail(contract::DEFER_OP_EDIT, "out")
-                }
-            ),
-            Ok(DeferIntent::Edit {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                index: 1,
-                body: None,
-                deliver_after: Some(9),
-            })
-        );
-        // Both halves absent is a well-formed no-op edit, not malformed detail: the
-        // WIT lets a guest ask for one, and refusing it here would be the kernel
-        // inventing a rule the seam does not have.
-        assert_eq!(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    index: OptionalField::Present("1".to_string()),
-                    ..defer_detail(contract::DEFER_OP_EDIT, "out")
-                }
-            ),
-            Ok(DeferIntent::Edit {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                index: 1,
-                body: None,
-                deliver_after: None,
-            })
-        );
-    }
-
-    /// Assert an op was dropped as malformed and attributed to its instance, with
-    /// `needle` naming the field at fault.
-    fn assert_malformed_defer(intent: Result<DeferIntent, KernelAction>, needle: &str) {
-        let Err(KernelAction::Report {
-            level,
-            message,
-            subject,
-        }) = intent
-        else {
-            panic!("expected a malformed Report, got {intent:?}");
-        };
-        assert_eq!(level, LogLevel::Warn);
-        assert_eq!(subject.as_deref(), Some("p1"));
-        assert!(message.contains("malformed"), "message: {message}");
-        assert!(message.contains(needle), "message: {message}");
-    }
-
-    #[test]
-    fn a_numeric_field_that_is_not_a_decimal_integer_is_malformed() {
-        // The seam's numerics are decimal strings, so junk is a component bug and
-        // must not be coerced: a guessed index names another message and a guessed
-        // release time schedules a moment the component never chose.
-        for index in [
-            OptionalField::Present("1.5".to_string()),
-            OptionalField::Present("-1".to_string()),
-            OptionalField::Present(String::new()),
-            OptionalField::Present("4294967296".to_string()),
-            OptionalField::Malformed,
-        ] {
-            assert_malformed_defer(
-                route_defer_intent(
-                    Some("p1"),
-                    "brenn-protobar",
-                    DeferDetail {
-                        index: index.clone(),
-                        ..defer_detail(contract::DEFER_OP_CANCEL, "out")
-                    },
-                ),
-                "index",
-            );
-        }
-        for deliver_after in [
-            OptionalField::Present("soon".to_string()),
-            OptionalField::Present("1e12".to_string()),
-            OptionalField::Malformed,
-        ] {
-            assert_malformed_defer(
-                route_defer_intent(
-                    Some("p1"),
-                    "brenn-protobar",
-                    DeferDetail {
-                        body: OptionalField::Present("42".to_string()),
-                        deliver_after: deliver_after.clone(),
-                        ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
-                    },
-                ),
-                "deliver_after",
-            );
-        }
-    }
-
-    #[test]
-    fn each_op_needs_the_fields_it_reads() {
-        // A publish with no release time is not a publish, and a control op with no
-        // index names nothing. Each op states its own requirement, so each is
-        // pinned.
-        assert_malformed_defer(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    body: OptionalField::Present("42".to_string()),
-                    ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
-                },
-            ),
-            "deferred publish",
-        );
-        assert_malformed_defer(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    deliver_after: OptionalField::Present("7".to_string()),
-                    ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
-                },
-            ),
-            "deferred publish",
-        );
-        assert_malformed_defer(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                defer_detail(contract::DEFER_OP_CANCEL, "out"),
-            ),
-            "cancel",
-        );
-        assert_malformed_defer(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                defer_detail(contract::DEFER_OP_EDIT, "out"),
-            ),
-            "edit",
-        );
-        // A missing port is malformed for every op: the seam names ports, and there
-        // is no default one.
-        assert_malformed_defer(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    port: None,
-                    index: OptionalField::Present("0".to_string()),
-                    ..defer_detail(contract::DEFER_OP_CANCEL, "out")
-                },
-            ),
-            "port",
-        );
-    }
-
-    #[test]
-    fn a_field_an_op_does_not_read_is_ignored_however_malformed() {
-        // The seam's stated convention, both directions. A dispatcher that emits a
-        // stray field a given op ignores must not have its op dropped — and the
-        // drop would name a field the op never looks at, which is a diagnosis
-        // dead end on top of the lost work.
-        assert_eq!(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    body: OptionalField::Present("42".to_string()),
-                    deliver_after: OptionalField::Present("7".to_string()),
-                    index: OptionalField::Present("not-a-number".to_string()),
-                    ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
-                },
-            ),
-            Ok(DeferIntent::Publish {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                body: "42".to_string(),
-                deliver_after: 7,
-            }),
-            "a publish reads no index, so a junk one is ignored"
-        );
-        assert_eq!(
-            route_defer_intent(
-                Some("p1"),
-                "brenn-protobar",
-                DeferDetail {
-                    index: OptionalField::Present("2".to_string()),
-                    deliver_after: OptionalField::Present("later".to_string()),
-                    body: OptionalField::Malformed,
-                    ..defer_detail(contract::DEFER_OP_CANCEL, "out")
-                },
-            ),
-            Ok(DeferIntent::Cancel {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                index: 2,
-            }),
-            "a cancel reads neither body nor release time"
-        );
-    }
-
-    #[test]
-    fn an_unknown_op_is_dropped_as_malformed() {
-        // The op selector is the only thing that says what the rest of the detail
-        // means, so an unrecognized one cannot be guessed at.
-        for op in [None, Some("park"), Some("PUBLISH"), Some("")] {
-            let mut detail = defer_detail(contract::DEFER_OP_CANCEL, "out");
-            detail.op = op.map(str::to_string);
-            detail.index = OptionalField::Present("0".to_string());
-            assert_malformed_defer(
-                route_defer_intent(Some("p1"), "brenn-protobar", detail),
-                "op must be",
-            );
-        }
-    }
-
-    #[test]
-    fn a_defer_op_from_an_unresolved_target_is_dropped_and_reported() {
-        // Same rule as every other event on this seam: a target that resolves to no
-        // mounted instance has no subject to name, so nothing is attributed by
-        // guess.
-        let intent = route_defer_intent(
-            None,
-            "button",
-            defer_detail(contract::DEFER_OP_CANCEL, "out"),
-        );
-        let Err(KernelAction::Report {
-            level,
-            message,
-            subject,
-        }) = intent
-        else {
-            panic!("expected a Report, got {intent:?}");
-        };
-        assert_eq!(level, LogLevel::Warn);
-        assert_eq!(subject, None);
-        assert!(message.contains("button"), "message: {message}");
-        assert!(message.contains(contract::PORT_DEFER), "message: {message}");
-    }
-
-    #[test]
-    fn a_publish_the_buffer_cannot_take_is_reported_against_its_instance() {
-        // The component reads `not-permitted` off the detail; this is the
-        // operator's copy, and the only trace a non-SDK dispatcher leaves. It names
-        // the instance so a looping component draws down its own report budget.
-        let action = unbuffered_publish_refused("p1", "out");
-        let KernelAction::Report {
-            level,
-            message,
-            subject,
-        } = action
-        else {
-            panic!("expected a Report, got {action:?}");
-        };
-        assert_eq!(level, LogLevel::Warn);
-        assert_eq!(subject.as_deref(), Some("p1"));
-        assert!(message.contains("\"out\""), "message: {message}");
-        assert!(message.contains("in flight"), "message: {message}");
-        assert!(
-            message.contains(contract::PORT_PUBLISH),
-            "message: {message}"
-        );
-    }
-
-    #[test]
-    fn an_op_the_buffer_cannot_take_is_reported_against_its_instance() {
-        // The buffered-only rule's other half: there is no immediate path, so an op
-        // dispatched with no activation of its instance in flight is dropped with a
-        // breadcrumb naming the instance and the op.
-        let action = unbuffered_defer_refused(&DeferIntent::Cancel {
-            instance: "p1".to_string(),
-            port: "out".to_string(),
-            index: 0,
-        });
-        let KernelAction::Report {
-            level,
-            message,
-            subject,
-        } = action
-        else {
-            panic!("expected a Report, got {action:?}");
-        };
-        assert_eq!(level, LogLevel::Warn);
-        assert_eq!(subject.as_deref(), Some("p1"));
-        assert!(message.contains("cancel"), "message: {message}");
-        assert!(message.contains("in flight"), "message: {message}");
-    }
 
     // ── route_log ─────────────────────────────────────────────────────────
 
     #[test]
     fn component_log_from_mounted_instance_forwards_with_instance() {
-        let action =
-            routing_core().route_log(Some("p1"), Some("brenn-protobar"), Some("warn"), Some("hi"));
+        let action = routing_core().route_log("p1", "warn", "hi");
         assert_eq!(
             action,
             KernelAction::ComponentLog {
@@ -3037,7 +1596,7 @@ mod tests {
             ("warn", LogLevel::Warn),
             ("error", LogLevel::Error),
         ] {
-            let action = core.route_log(Some("p1"), Some("brenn-protobar"), Some(wire), Some("m"));
+            let action = core.route_log("p1", wire, "m");
             assert_eq!(
                 action,
                 KernelAction::ComponentLog {
@@ -3050,66 +1609,40 @@ mod tests {
     }
 
     #[test]
-    fn component_log_from_unresolved_target_is_dropped_and_reported() {
-        let core = routing_core();
-        for tag in ["brenn-protobar", "button"] {
-            let action = core.route_log(None, Some(tag), Some("warn"), Some("m"));
-            let KernelAction::Report { level, message, .. } = action else {
-                panic!("expected Report for <{tag}>, got {action:?}");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert!(message.contains(tag), "message: {message}");
-        }
-    }
-
-    #[test]
-    fn component_log_with_malformed_detail_is_dropped_as_malformed() {
-        let cases = [
-            (None, Some("m")),
-            (Some("warn"), None),
-            (Some("fatal"), Some("m")),
-            (None, None),
-        ];
-        for (level, message) in cases {
-            let action =
-                routing_core().route_log(Some("p1"), Some("brenn-protobar"), level, message);
+    fn component_log_at_an_unknown_level_is_dropped_as_malformed() {
+        for level in ["fatal", "", "WARN"] {
+            let action = routing_core().route_log("p1", level, "m");
             let KernelAction::Report {
                 level: report_level,
                 message: report_message,
                 ..
             } = action
             else {
-                panic!("expected Report for ({level:?}, {message:?}), got {action:?}");
+                panic!("expected Report for {level:?}, got {action:?}");
             };
             assert_eq!(report_level, LogLevel::Warn);
             assert!(report_message.contains("malformed"), "{report_message}");
-            assert!(
-                report_message.contains("brenn-protobar"),
-                "{report_message}"
-            );
+            assert!(report_message.contains("processor p1"), "{report_message}");
         }
     }
 
     /// An ungranted instance's well-formed log is a breadcrumb, never a `Log`
     /// frame carrying its name.
     #[test]
-    fn an_ungranted_instance_logs_nothing_at_either_seam() {
-        for target_tag in [Some("brenn-protobar"), None] {
-            let action =
-                ungranted_core().route_log(Some("p1"), target_tag, Some("warn"), Some("hi"));
-            let KernelAction::Report {
-                level,
-                message,
-                subject,
-            } = action
-            else {
-                panic!("expected a Report for {target_tag:?}, got {action:?}");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert_eq!(subject.as_deref(), Some("p1"));
-            assert!(message.contains("suppressed"), "message: {message}");
-            assert!(message.contains("log capability"), "message: {message}");
-        }
+    fn an_ungranted_instance_logs_nothing() {
+        let action = ungranted_core().route_log("p1", "warn", "hi");
+        let KernelAction::Report {
+            level,
+            message,
+            subject,
+        } = action
+        else {
+            panic!("expected a Report, got {action:?}");
+        };
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(subject.as_deref(), Some("p1"));
+        assert!(message.contains("suppressed"), "message: {message}");
+        assert!(message.contains("log capability"), "message: {message}");
     }
 
     /// The gate is read before the detail: an ungranted instance is told it is
@@ -3117,81 +1650,14 @@ mod tests {
     /// from a capability it does not hold.
     #[test]
     fn the_log_grant_is_checked_ahead_of_the_detail() {
-        let action =
-            ungranted_core().route_log(Some("p1"), Some("brenn-protobar"), Some("shout"), None);
+        let action = ungranted_core().route_log("p1", "shout", "m");
         assert!(matches!(
             action,
             KernelAction::Report { message, .. } if message.contains("not granted")
         ));
     }
 
-    /// One router, two seams: the headless one names the instance where the DOM
-    /// one names the element, and nothing else differs.
-    #[test]
-    fn a_headless_log_names_the_instance_in_its_drop() {
-        let action = routing_core().route_log(Some("counter-a"), None, Some("shout"), Some("m"));
-        let KernelAction::Report { message, .. } = action else {
-            panic!("expected a Report, got {action:?}");
-        };
-        assert!(
-            message.contains("processor counter-a"),
-            "message: {message}"
-        );
-        assert!(message.contains("malformed"), "message: {message}");
-    }
-
-    #[test]
-    #[should_panic(expected = "names the instance its loader closed over")]
-    fn a_headless_log_with_no_instance_is_a_kernel_bug() {
-        let _ = routing_core().route_log(None, None, Some("warn"), Some("m"));
-    }
-
-    #[test]
-    #[should_panic(expected = "names the instance its loader closed over")]
-    fn a_headless_alert_with_no_instance_is_a_kernel_bug() {
-        // The alert twin of the log panic: a softened identity here would page
-        // the backend under an empty attribution, which it judges undeclared and
-        // kills the session for.
-        let _ = routing_core().route_alert(None, None, Some("warning"), Some("t"), Some("b"));
-    }
-
     // ── route_config_get ──────────────────────────────────────────────────
-
-    #[test]
-    fn a_config_read_resolves_its_instance_and_key() {
-        assert_eq!(
-            route_config_get(Some("p1"), "brenn-protobar", Some("mode")),
-            Ok(("p1", "mode"))
-        );
-    }
-
-    #[test]
-    fn a_config_read_from_an_unresolved_target_is_dropped_and_reported() {
-        let Err(KernelAction::Report {
-            level,
-            message,
-            subject,
-        }) = route_config_get(None, "button", Some("mode"))
-        else {
-            panic!("expected a Report");
-        };
-        assert_eq!(level, LogLevel::Warn);
-        assert_eq!(subject, None);
-        assert!(message.contains("button"), "message: {message}");
-        assert!(message.contains(contract::CONFIG_GET), "message: {message}");
-    }
-
-    #[test]
-    fn a_config_read_with_no_key_is_dropped_as_malformed() {
-        let Err(KernelAction::Report {
-            message, subject, ..
-        }) = route_config_get(Some("p1"), "brenn-protobar", None)
-        else {
-            panic!("expected a Report");
-        };
-        assert_eq!(subject.as_deref(), Some("p1"));
-        assert!(message.contains("key must be a string"), "{message}");
-    }
 
     // ── per-instance grants ───────────────────────────────────────────────
 
@@ -3228,14 +1694,11 @@ mod tests {
     #[test]
     fn a_document_naming_an_unknown_capability_is_refused_whole() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event_granted(
-                vec![granted_entry("p1", "protobar", &["ports", "telepathy"])],
-                vec![],
-                true,
-            ),
-            |_, _| true,
-        );
+        let actions = core.on_event(&connected_event_granted(
+            vec![granted_entry("p1", "protobar", &["ports", "telepathy"])],
+            vec![],
+            true,
+        ));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -3258,7 +1721,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, KernelAction::MountComponent { .. })),
+                .any(|a| matches!(a, KernelAction::StartProcessors { .. })),
             "no instance is configured from a refused document: {actions:?}"
         );
     }
@@ -3269,17 +1732,14 @@ mod tests {
     #[test]
     fn a_document_declaring_one_instance_twice_is_refused_whole() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event_granted(
-                vec![
-                    granted_entry("p1", "protobar", &["ports"]),
-                    granted_entry("p1", "protobar", &["ports", "alert"]),
-                ],
-                vec![],
-                true,
-            ),
-            |_, _| true,
-        );
+        let actions = core.on_event(&connected_event_granted(
+            vec![
+                granted_entry("p1", "protobar", &["ports"]),
+                granted_entry("p1", "protobar", &["ports", "alert"]),
+            ],
+            vec![],
+            true,
+        ));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -3311,13 +1771,7 @@ mod tests {
             ("warning", AlertSeverity::Warning),
             ("critical", AlertSeverity::Critical),
         ] {
-            let action = core.route_alert(
-                Some("p1"),
-                Some("brenn-protobar"),
-                Some(wire),
-                Some("t"),
-                Some("b"),
-            );
+            let action = core.route_alert("p1", wire, "t", "b");
             assert_eq!(
                 action,
                 KernelAction::Alert {
@@ -3332,13 +1786,7 @@ mod tests {
 
     #[test]
     fn component_alert_from_an_ungranted_instance_is_suppressed_with_breadcrumb() {
-        let action = ungranted_core().route_alert(
-            Some("p1"),
-            Some("brenn-protobar"),
-            Some("warning"),
-            Some("t"),
-            Some("b"),
-        );
+        let action = ungranted_core().route_alert("p1", "warning", "t", "b");
         let KernelAction::Report { level, message, .. } = action else {
             panic!("expected Report suppression breadcrumb, got {action:?}");
         };
@@ -3348,195 +1796,20 @@ mod tests {
     }
 
     #[test]
-    fn component_alert_from_unresolved_target_is_dropped_and_reported() {
+    fn component_alert_at_an_unknown_severity_is_dropped_as_malformed() {
         let core = routing_core();
-        for tag in ["brenn-protobar", "button"] {
-            let action = core.route_alert(None, Some(tag), Some("warning"), Some("t"), Some("b"));
+        for severity in ["warn", "", "WARNING"] {
+            let action = core.route_alert("p1", severity, "t", "b");
             let KernelAction::Report { level, message, .. } = action else {
-                panic!("expected Report for <{tag}>, got {action:?}");
-            };
-            assert_eq!(level, LogLevel::Warn);
-            assert!(message.contains(tag), "message: {message}");
-        }
-    }
-
-    #[test]
-    fn component_alert_with_malformed_detail_from_a_granted_instance_is_dropped_as_malformed() {
-        let core = routing_core();
-        let cases = [
-            (None, Some("t"), Some("b")),
-            (Some("warning"), None, Some("b")),
-            (Some("warning"), Some("t"), None),
-            (Some("warn"), Some("t"), Some("b")),
-            (None, None, None),
-        ];
-        for (severity, title, body) in cases {
-            let action =
-                core.route_alert(Some("p1"), Some("brenn-protobar"), severity, title, body);
-            let KernelAction::Report { level, message, .. } = action else {
-                panic!("expected Report for ({severity:?}, {title:?}, {body:?}), got {action:?}");
+                panic!("expected Report for {severity:?}, got {action:?}");
             };
             assert_eq!(level, LogLevel::Warn);
             assert!(message.contains("malformed"), "message: {message}");
-            assert!(message.contains("brenn-protobar"), "message: {message}");
+            assert!(message.contains("processor p1"), "message: {message}");
         }
     }
 
     // ── on_component_panic ────────────────────────────────────────────────
-
-    #[test]
-    fn component_panic_on_ungranted_surface_error_cards_and_reports_without_paging() {
-        let mut core = connect(vec![entry("e1", "echo-stub")], false);
-        let actions = core.on_component_panic(Some("e1"), Some("boom"), |i| i == "e1");
-        let shown = without_platform_planes(&actions);
-        let [
-            KernelAction::ErrorCard {
-                instance,
-                kind,
-                reason,
-            },
-            KernelAction::Report { level, message, .. },
-        ] = shown.as_slice()
-        else {
-            panic!("expected exactly ErrorCard + Report, got {actions:?}");
-        };
-        assert_eq!(instance, "e1");
-        assert_eq!(kind, "echo-stub");
-        assert!(reason.contains("boom"), "reason: {reason}");
-        assert_eq!(*level, LogLevel::Error);
-        assert!(message.contains("e1"), "message: {message}");
-        assert!(message.contains("boom"), "message: {message}");
-    }
-
-    #[test]
-    fn component_panic_on_granted_surface_also_pages() {
-        let mut core = connect(vec![entry("e1", "echo-stub")], true);
-        let actions = core.on_component_panic(Some("e1"), Some("boom"), |i| i == "e1");
-        let shown = without_platform_planes(&actions);
-        let [
-            KernelAction::ErrorCard { .. },
-            KernelAction::Report {
-                level: LogLevel::Error,
-                ..
-            },
-            KernelAction::Alert {
-                attribution,
-                severity,
-                title,
-                body,
-            },
-        ] = shown.as_slice()
-        else {
-            panic!("expected ErrorCard + Report + Alert, got {actions:?}");
-        };
-        assert_eq!(
-            *attribution, None,
-            "the kernel pages about the death; the dead instance states nothing"
-        );
-        assert_eq!(*severity, AlertSeverity::Warning);
-        assert_eq!(title, "component panic: e1");
-        assert_eq!(body, "boom");
-    }
-
-    #[test]
-    fn component_panic_error_cards_only_its_own_instance_leaving_siblings_alive() {
-        // Two protobar instances plus one of another kind. A module backs exactly
-        // one instance's linear memory, so a panic naming p1 is p1's death and
-        // nobody else's: p1 is error-carded, its sibling p2 (same kind, own memory)
-        // and q1 are untouched, and the page fires once for the one subject. The
-        // §8 two-siblings isolation pin.
-        let mut core = connect(
-            vec![
-                entry("p1", "protobar"),
-                entry("p2", "protobar"),
-                entry("q1", "other"),
-            ],
-            true,
-        );
-        let actions = core.on_component_panic(Some("p1"), Some("boom"), |_| true);
-        let carded: Vec<&str> = actions
-            .iter()
-            .filter_map(|a| match a {
-                KernelAction::ErrorCard { instance, kind, .. } => {
-                    assert_eq!(kind, "protobar");
-                    Some(instance.as_str())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(carded, vec!["p1"], "only the panicked instance is carded");
-        // One report, under the dead instance's own subject: it is the principal
-        // that failed, so it reports under itself and draws its own send budget.
-        let subjects: Vec<Option<&str>> = actions
-            .iter()
-            .filter_map(|a| match a {
-                KernelAction::Report { subject, .. } => Some(subject.as_deref()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(subjects, vec![Some("p1")], "one report, naming itself");
-        assert_eq!(
-            actions
-                .iter()
-                .filter(|a| matches!(a, KernelAction::Alert { .. }))
-                .count(),
-            1,
-            "one page for the one dead instance",
-        );
-    }
-
-    #[test]
-    fn component_panic_naming_an_unmounted_instance_is_dropped() {
-        // p2 is not mounted (currently error-carded). A panic naming it owns no
-        // live mount, so it is dropped and reported once under the bare surface
-        // identity — it never error-cards a mount it does not own.
-        let mut core = connect(
-            vec![entry("p1", "protobar"), entry("p2", "protobar")],
-            false,
-        );
-        let actions = core.on_component_panic(Some("p2"), Some("boom"), |i| i == "p1");
-        let [
-            KernelAction::Report {
-                message, subject, ..
-            },
-        ] = actions.as_slice()
-        else {
-            panic!("expected a single drop Report, got {actions:?}");
-        };
-        assert!(message.contains("unattributable"), "message: {message}");
-        assert_eq!(*subject, None);
-    }
-
-    #[test]
-    fn component_panic_missing_message_uses_fallback_reason() {
-        let mut core = connect(vec![entry("e1", "echo-stub")], false);
-        let actions = core.on_component_panic(Some("e1"), None, |_| true);
-        let KernelAction::ErrorCard { reason, .. } = &actions[0] else {
-            panic!("expected ErrorCard, got {actions:?}");
-        };
-        assert!(reason.contains("component panicked"), "reason: {reason}");
-    }
-
-    #[test]
-    fn component_panic_with_no_mounted_instance_never_pages_even_when_granted() {
-        // No kind named, a kind this surface never configured, or a configured
-        // kind whose instances are all unmounted: drop-and-report only, never
-        // error-card a mount the panic does not own, never page.
-        let mut core = connect(vec![entry("e1", "echo-stub")], true);
-        let cases: [(Option<&str>, bool); 3] = [
-            (None, true),               // unattributable
-            (Some("ghost"), true),      // kind never configured
-            (Some("echo-stub"), false), // configured kind, its instance unmounted
-        ];
-        for (kind, mounted) in cases {
-            let actions = core.on_component_panic(kind, Some("boom"), move |_| mounted);
-            let [KernelAction::Report { level, message, .. }] = actions.as_slice() else {
-                panic!("expected a single Report for {kind:?}, got {actions:?}");
-            };
-            assert_eq!(*level, LogLevel::Error);
-            assert!(message.contains("unattributable"), "message: {message}");
-        }
-    }
 
     // ── banner / connect / reconnect ──────────────────────────────────────
 
@@ -3559,36 +1832,27 @@ mod tests {
         // pins the body the kernel emits, and the client-core test pins that the
         // terminal publish still reaches a bound port.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::Disconnected {
-                reason: DetachReason::LivenessTimeout,
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::Disconnected {
+            reason: DetachReason::LivenessTimeout,
+        });
         assert_eq!(
             control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
             r#"{"v":1,"state":"reconnecting"}"#
         );
 
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::ReloadRequired {
-                server_build: "abc".to_string(),
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::ReloadRequired {
+            server_build: "abc".to_string(),
+        });
         assert_eq!(
             control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
             r#"{"v":1,"state":"reloading"}"#
         );
 
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::Fatal {
-                detail: "bad frame".to_string(),
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::Fatal {
+            detail: "bad frame".to_string(),
+        });
         // No detail on the plane: the payload is fixed at `{v, state}` and a
         // consumer renders its own chrome. The `Event::Fatal` detail rides the
         // separate `Report` breadcrumb, not the plane.
@@ -3598,7 +1862,7 @@ mod tests {
         );
 
         let mut core = KernelCore::new();
-        let actions = core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| true);
+        let actions = core.on_event(&connected_event(entries(&["echo-stub"])));
         assert_eq!(
             control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
             r#"{"v":1,"state":"connected"}"#
@@ -3614,35 +1878,35 @@ mod tests {
             reason: DetachReason::LivenessTimeout,
         };
         assert!(publishes_control(
-            &core.on_event(&event, |_, _| false),
+            &core.on_event(&event),
             LOCAL_LINK_STATE_CHANNEL
         ));
         assert!(!publishes_control(
-            &core.on_event(&event, |_, _| false),
+            &core.on_event(&event),
             LOCAL_LINK_STATE_CHANNEL
         ));
     }
 
     #[test]
-    fn connect_publishes_the_mount_table_on_the_surface_state_plane() {
-        // chrome learns the instance set from this plane and never by
-        // querying the DOM — so the set must be complete at connect, including the
-        // instance that failed its mount: chrome arranges it too, placing its
-        // error card in a panel exactly as the pre-rewrite kernel did.
+    fn connect_publishes_the_instance_table_on_the_surface_state_plane() {
+        // chrome learns the instance set from this plane and never by querying the
+        // DOM — so the set must be complete at connect, before any module has
+        // registered: chrome arranges a row it has not seen mount yet, and the
+        // registration that follows republishes the table.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event(vec![entry("ok", "good"), entry("bad", "missing")]),
-            |kind, _| kind == "good",
-        );
+        let actions = core.on_event(&connected_event(vec![
+            entry("ok", "good"),
+            entry("bad", "missing"),
+        ]));
         assert_eq!(
             control_body(&actions, LOCAL_SURFACE_STATE_CHANNEL),
-            r#"{"v":1,"instances":[{"instance":"ok","kind":"good","state":"mounted"},{"instance":"bad","kind":"missing","state":"failed","reason":"component module missing"}]}"#
+            r#"{"v":1,"instances":[{"instance":"ok","kind":"good","state":"pending"},{"instance":"bad","kind":"missing","state":"pending"}]}"#
         );
     }
 
     #[test]
-    fn a_component_panic_marks_only_its_own_instance_failed_on_the_surface_state_plane() {
-        // The plane mirrors the kernel's instance table. A panic is one instance's
+    fn a_dead_instance_is_marked_alone_on_the_surface_state_plane() {
+        // The plane mirrors the kernel's instance table. A trap is one instance's
         // death: p1 shows failed while its same-kind sibling p2 keeps running on
         // its own memory. A chrome that stopped arranging p2 here would be exactly
         // the false-death bug the one-subject model prevents.
@@ -3650,7 +1914,7 @@ mod tests {
             vec![entry("p1", "protobar"), entry("p2", "protobar")],
             false,
         );
-        let actions = core.on_component_panic(Some("p1"), Some("boom"), |_| true);
+        let actions = core.note_instance_failed("p1", "boom");
         let body = control_body(&actions, LOCAL_SURFACE_STATE_CHANNEL);
         assert!(
             body.contains(r#"{"instance":"p1","kind":"protobar","state":"failed""#),
@@ -3665,12 +1929,9 @@ mod tests {
     #[test]
     fn disconnect_shows_reconnecting() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::Disconnected {
-                reason: DetachReason::LivenessTimeout,
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::Disconnected {
+            reason: DetachReason::LivenessTimeout,
+        });
         assert_eq!(
             without_platform_planes(&actions),
             vec![
@@ -3684,12 +1945,9 @@ mod tests {
     #[test]
     fn reload_required_publishes_reloading_and_requests_reload() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::ReloadRequired {
-                server_build: "abc123".to_string(),
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::ReloadRequired {
+            server_build: "abc123".to_string(),
+        });
         assert_eq!(
             without_platform_planes(&actions),
             vec![KernelAction::RequestReload {
@@ -3706,12 +1964,9 @@ mod tests {
     #[test]
     fn fatal_publishes_terminal_link_state_without_reload() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::Fatal {
-                detail: "bad frame".to_string(),
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::Fatal {
+            detail: "bad frame".to_string(),
+        });
         // A fatal publishes the plane and does not reload; chrome draws the
         // terminal banner from the plane. The `Report` breadcrumb keeps the
         // server-supplied detail in the console/error-report path (it is
@@ -3747,13 +2002,10 @@ mod tests {
         // the first Connected), a fatal must not re-touch the indicator: chrome's
         // banner from the link-state plane is the sole post-mount fatal rendering.
         let mut core = KernelCore::new();
-        core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| true);
-        let actions = core.on_event(
-            &Event::Fatal {
-                detail: "bad frame".to_string(),
-            },
-            |_, _| false,
-        );
+        core.on_event(&connected_event(entries(&["echo-stub"])));
+        let actions = core.on_event(&Event::Fatal {
+            detail: "bad frame".to_string(),
+        });
         assert!(
             !actions
                 .iter()
@@ -3766,27 +2018,27 @@ mod tests {
     #[test]
     fn connected_stores_alert_granted_from_welcome() {
         let mut core = KernelCore::new();
-        core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| true);
+        core.on_event(&connected_event(entries(&["echo-stub"])));
         assert!(!core.alert_granted());
 
         let mut granted = KernelCore::new();
-        granted.on_event(
-            &connected_event_granted(entries(&["echo-stub"]), vec![], true),
-            |_, _| true,
-        );
+        granted.on_event(&connected_event_granted(
+            entries(&["echo-stub"]),
+            vec![],
+            true,
+        ));
         assert!(granted.alert_granted());
     }
 
     #[test]
-    fn first_connect_emits_ready_mounts_defined_and_publishes_connected() {
+    fn first_connect_starts_the_loader_and_publishes_connected() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| true);
+        let actions = core.on_event(&connected_event(entries(&["echo-stub"])));
         assert_eq!(
             without_platform_planes(&actions),
             vec![
-                KernelAction::MountComponent {
-                    instance: "echo-stub".to_string(),
-                    kind: "echo-stub".to_string(),
+                KernelAction::StartProcessors {
+                    instances: vec!["echo-stub".to_string()],
                 },
                 KernelAction::RemoveConnectIndicator,
                 KernelAction::EmitReady,
@@ -3796,85 +2048,17 @@ mod tests {
     }
 
     #[test]
-    fn first_connect_error_cards_undefined_element() {
-        let mut core = KernelCore::new();
-        let actions = core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| false);
-        assert_eq!(
-            without_platform_planes(&actions),
-            vec![
-                KernelAction::ErrorCard {
-                    instance: "echo-stub".to_string(),
-                    kind: "echo-stub".to_string(),
-                    reason: "component module missing".to_string(),
-                },
-                KernelAction::RemoveConnectIndicator,
-                KernelAction::EmitReady,
-            ]
-        );
-    }
-
-    #[test]
-    fn first_connect_error_cards_an_abi_the_kernel_cannot_load() {
-        // Boot rejects the reserved ABIs, so this frame is one no conforming
-        // server sends. The kernel still must not mount it, must not panic on it
-        // (peer input), and must not let it take the surface down with it: one
-        // error card, and the rest of the page lives.
-        let mut core = KernelCore::new();
-        let mut components = entries(&["protobar"]);
-        components.push(processor_entry("reserved", "counter"));
-        components[1].abi = Abi::DomTs;
-        // Element defined for *every* kind: the rejection must come from the ABI
-        // and nothing else, so the missing-module path cannot explain the card.
-        let actions = core.on_event(&connected_event(components), |_, _| true);
-        assert!(actions.contains(&KernelAction::MountComponent {
-            instance: "protobar".to_string(),
-            kind: "protobar".to_string(),
-        }));
-        assert!(actions.contains(&KernelAction::ErrorCard {
-            instance: "reserved".to_string(),
-            kind: "counter".to_string(),
-            reason: "unsupported component abi: dom-ts".to_string(),
-        }));
-        assert!(!actions.iter().any(|a| matches!(
-            a,
-            KernelAction::MountComponent { instance, .. } if instance == "reserved"
-        )));
-        let status = core.instances.iter().find(|i| i.instance == "reserved");
-        let status = status.expect("a rejected instance still has a status row");
-        assert_eq!(status.state, InstanceState::Failed);
-        assert_eq!(
-            status.reason.as_deref(),
-            Some("unsupported component abi: dom-ts")
-        );
-    }
-
-    /// A declared `processor` component entry with an empty config map.
-    fn processor_entry(instance: &str, kind: &str) -> ComponentEntry {
-        ComponentEntry {
-            instance: instance.to_string(),
-            kind: kind.to_string(),
-            abi: Abi::Processor,
-            parked_batch_depth: 8,
-            config: Default::default(),
-            grants: vec![],
-        }
-    }
-
-    #[test]
-    fn processor_entry_is_headless_and_pending_with_no_wrapper() {
-        // The whole shape of the processor arm in one assertion set: no mount, no
+    fn a_configured_instance_is_pending_with_no_element() {
+        // The whole shape of the wiring pass in one assertion set: no mount, no
         // error card, and a `Pending` row — the state that exists precisely because
-        // a headless instance's wiring completes later, at registration.
+        // an instance's wiring completes later, at registration.
         let mut core = KernelCore::new();
         let mut components = entries(&["protobar"]);
-        components.push(processor_entry("counter-a", "counter"));
-        // `is_element_defined` answers false for everything: a processor must not
-        // consult it at all, so protobar cards while the processor still goes
-        // Pending rather than "component module missing".
-        let actions = core.on_event(&connected_event(components), |_, _| false);
+        components.push(entry("counter-a", "counter"));
+        let actions = core.on_event(&connected_event(components));
         assert!(!actions.iter().any(|a| matches!(
             a,
-            KernelAction::MountComponent { instance, .. } | KernelAction::ErrorCard { instance, .. }
+            KernelAction::MountHost { instance, .. } | KernelAction::ErrorCard { instance, .. }
                 if instance == "counter-a"
         )));
         let status = core
@@ -3886,14 +2070,139 @@ mod tests {
         assert_eq!(status.reason, None);
     }
 
+    // ── grant-keyed mountability ──────────────────────────────────────────
+
+    /// The `dom` grant is what makes a page-hosted instance render: its host
+    /// element is created when its registration is admitted, and an instance
+    /// without the grant gets none.
+    #[test]
+    fn the_dom_grant_is_what_earns_a_host_element_at_registration() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![
+            granted_entry("panel-a", "panel", &["dom"]),
+            granted_entry("counter-a", "counter", &["config"]),
+        ]));
+
+        let ProcessorRegistration {
+            admitted,
+            mount,
+            actions,
+        } = core.on_processor_register("panel-a");
+        assert!(admitted);
+        assert!(
+            actions.contains(&KernelAction::MountHost {
+                instance: "panel-a".to_string(),
+                kind: "panel".to_string(),
+            }),
+            "a dom-granted instance gets its host element, got {actions:?}"
+        );
+        assert!(mount, "and the mount call that draws into it");
+
+        let ProcessorRegistration {
+            admitted,
+            mount,
+            actions,
+        } = core.on_processor_register("counter-a");
+        assert!(admitted);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, KernelAction::MountHost { .. })),
+            "an instance with no dom grant is headless, got {actions:?}"
+        );
+        assert!(!mount, "and is owed no mount call");
+    }
+
+    /// A page-hosted chrome is not judged at wiring time: it has no element to
+    /// look for, and the mount plan must not read its absence as a failure.
+    #[test]
+    fn a_page_hosted_chrome_is_not_failed_by_the_mount_plan() {
+        let mut core = KernelCore::new();
+        let mut bindings = document(
+            vec![granted_entry("chrome", "chrome", &["dom", "page-dom"])],
+            vec![],
+        );
+        bindings.chrome_instance = "chrome".to_string();
+        let actions = core.on_event(&connected(bindings, false));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, KernelAction::RequestReload { .. })),
+            "no element is expected of a page-hosted chrome yet, got {actions:?}"
+        );
+    }
+
+    /// A page-hosted chrome the loader could not bring up is fatal: there is no
+    /// layout engine to carry on with, so the capped bootstrap reload fires.
+    #[test]
+    fn a_page_hosted_chrome_that_never_loads_reloads_the_page() {
+        let mut core = KernelCore::new();
+        let mut bindings = document(
+            vec![
+                granted_entry("chrome", "chrome", &["dom", "page-dom"]),
+                granted_entry("panel-a", "panel", &["dom"]),
+            ],
+            vec![],
+        );
+        bindings.chrome_instance = "chrome".to_string();
+        core.on_event(&connected(bindings, false));
+
+        let actions = core.on_processor_load_failed("chrome", "instantiate threw");
+        assert!(
+            actions.contains(&KernelAction::RequestReload {
+                reason: "chrome mount failed".to_string(),
+            }),
+            "chrome's bring-up failure is fatal for the page, got {actions:?}"
+        );
+
+        let sibling = core.on_processor_load_failed("panel-a", "instantiate threw");
+        assert!(
+            !sibling
+                .iter()
+                .any(|a| matches!(a, KernelAction::RequestReload { .. })),
+            "a sibling's bring-up failure is contained, got {sibling:?}"
+        );
+    }
+
+    /// A rendering instance that dies — a trap in its mount activation or in any
+    /// later one — is carded where it was drawing. A headless one has no wrapper
+    /// and no pixels, so its status row is the whole observable.
+    #[test]
+    fn a_dead_rendering_instance_is_carded_and_a_headless_one_is_not() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![
+            granted_entry("panel-a", "panel", &["dom"]),
+            granted_entry("counter-a", "counter", &["config"]),
+        ]));
+
+        let carded = core.on_event(&Event::InstanceFailed {
+            instance: "panel-a".to_string(),
+            reason: "trapped building its UI".to_string(),
+        });
+        assert_eq!(
+            carded,
+            vec![KernelAction::ErrorCard {
+                instance: "panel-a".to_string(),
+                kind: "panel".to_string(),
+                reason: "trapped building its UI".to_string(),
+            }]
+        );
+
+        let headless = core.on_event(&Event::InstanceFailed {
+            instance: "counter-a".to_string(),
+            reason: "trapped".to_string(),
+        });
+        assert!(
+            headless.is_empty(),
+            "nothing to card for an instance that never drew, got {headless:?}"
+        );
+    }
+
     #[test]
     fn processor_instances_are_handed_to_the_loader_once_per_page() {
         let mut core = KernelCore::new();
-        let components = vec![
-            processor_entry("counter-b", "counter"),
-            processor_entry("counter-a", "counter"),
-        ];
-        let actions = core.on_event(&connected_event(components.clone()), |_, _| false);
+        let components = vec![entry("counter-b", "counter"), entry("counter-a", "counter")];
+        let actions = core.on_event(&connected_event(components.clone()));
         let named: Vec<&Vec<String>> = actions
             .iter()
             .filter_map(|a| match a {
@@ -3910,7 +2219,7 @@ mod tests {
         // A reconnect re-runs the mount plan, but instantiation is per page: a
         // second ask would have the loader re-instantiate live instances, and
         // `on_processor_register` would refuse each as a duplicate.
-        let again = core.on_event(&connected_event(components), |_, _| false);
+        let again = core.on_event(&connected_event(components));
         assert!(
             !again
                 .iter()
@@ -3919,25 +2228,13 @@ mod tests {
     }
 
     #[test]
-    fn a_dom_only_surface_never_asks_the_loader_for_processors() {
-        let mut core = KernelCore::new();
-        let actions = core.on_event(&connected_event(entries(&["protobar"])), |_, _| true);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, KernelAction::StartProcessors { .. }))
-        );
-    }
-
-    #[test]
     fn processor_register_admits_once_and_mounts_the_row() {
         let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event(vec![processor_entry("counter-a", "counter")]),
-            |_, _| false,
-        );
+        core.on_event(&connected_event(vec![entry("counter-a", "counter")]));
 
-        let (admitted, actions) = core.on_processor_register("counter-a");
+        let ProcessorRegistration {
+            admitted, actions, ..
+        } = core.on_processor_register("counter-a");
         assert!(admitted, "the first registration is admitted");
         assert!(core.is_registered("counter-a"));
         assert_eq!(
@@ -3951,7 +2248,9 @@ mod tests {
 
         // A second registration is refused and reported, never silently replacing
         // the live delivery seam.
-        let (admitted, actions) = core.on_processor_register("counter-a");
+        let ProcessorRegistration {
+            admitted, actions, ..
+        } = core.on_processor_register("counter-a");
         assert!(!admitted);
         assert!(matches!(
             &actions[..],
@@ -3962,41 +2261,28 @@ mod tests {
     }
 
     #[test]
-    fn processor_register_refuses_unknown_and_non_processor_instances() {
+    fn processor_register_refuses_an_undeclared_instance() {
         let mut core = KernelCore::new();
-        let mut components = entries(&["protobar"]);
-        components.push(processor_entry("counter-a", "counter"));
-        core.on_event(&connected_event(components), |_, _| true);
+        core.on_event(&connected_event(entries(&["protobar"])));
 
         // Not declared at all.
-        let (admitted, actions) = core.on_processor_register("ghost");
+        let ProcessorRegistration {
+            admitted, actions, ..
+        } = core.on_processor_register("ghost");
         assert!(!admitted);
         assert!(matches!(
             &actions[..],
             [KernelAction::Report { message, .. }] if message.contains("not a declared processor")
         ));
-
-        // Declared, but a `dom` instance: the headless door is not a second way in
-        // for a component that already has the DOM one.
-        let (admitted, actions) = core.on_processor_register("protobar");
-        assert!(!admitted);
-        assert!(matches!(
-            &actions[..],
-            [KernelAction::Report { message, .. }] if message.contains("not a declared processor")
-        ));
-        assert!(!core.is_registered("protobar"));
     }
 
     #[test]
     fn processor_load_failure_fails_the_row_once_with_a_death_report() {
         let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event(vec![
-                processor_entry("counter-a", "counter"),
-                processor_entry("counter-b", "counter"),
-            ]),
-            |_, _| false,
-        );
+        core.on_event(&connected_event(vec![
+            entry("counter-a", "counter"),
+            entry("counter-b", "counter"),
+        ]));
 
         let actions = core.on_processor_load_failed("counter-a", "instantiate threw");
         assert!(actions.iter().any(|a| matches!(
@@ -4026,13 +2312,10 @@ mod tests {
     #[test]
     fn processor_load_failure_never_fails_a_live_registered_row() {
         let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event(vec![processor_entry("counter-a", "counter")]),
-            |_, _| false,
-        );
+        core.on_event(&connected_event(vec![entry("counter-a", "counter")]));
 
         // The instance is registered and delivering.
-        let (admitted, _) = core.on_processor_register("counter-a");
+        let admitted = core.on_processor_register("counter-a").admitted;
         assert!(admitted);
         assert_eq!(core.instances[0].state, InstanceState::Mounted);
 
@@ -4061,16 +2344,13 @@ mod tests {
         // just as real, and an uncounted one would report a working surface as
         // having nothing attached.
         let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event_full(
-                vec![processor_entry("counter-a", "counter")],
-                vec![
-                    binding("brenn:ticks", "counter-a", "ticks"),
-                    binding("brenn:other", "counter-a", "other"),
-                ],
-            ),
-            |_, _| false,
-        );
+        core.on_event(&connected_event_full(
+            vec![entry("counter-a", "counter")],
+            vec![
+                binding("brenn:ticks", "counter-a", "ticks"),
+                binding("brenn:other", "counter-a", "other"),
+            ],
+        ));
         assert_eq!(core.instances[0].ports_attached, 2);
     }
 
@@ -4080,7 +2360,7 @@ mod tests {
     #[test]
     fn config_get_answers_from_welcome_for_both_abis_and_misses_are_none() {
         let mut core = KernelCore::new();
-        let mut headless = processor_entry("counter-a", "counter");
+        let mut headless = entry("counter-a", "counter");
         headless
             .config
             .insert("mode".to_string(), "loud".to_string());
@@ -4089,11 +2369,9 @@ mod tests {
         placed
             .config
             .insert("mode".to_string(), "quiet".to_string());
-        let mut sibling = processor_entry("counter-b", "counter");
+        let mut sibling = entry("counter-b", "counter");
         sibling.grants = vec!["config".to_string()];
-        core.on_event(&connected_event(vec![headless, placed, sibling]), |_, _| {
-            false
-        });
+        core.on_event(&connected_event(vec![headless, placed, sibling]));
 
         assert_eq!(
             core.component_config_get("counter-a", "mode"),
@@ -4114,9 +2392,9 @@ mod tests {
     #[test]
     fn an_ungranted_instance_reads_no_config() {
         let mut core = KernelCore::new();
-        let mut entry = processor_entry("counter-a", "counter");
+        let mut entry = entry("counter-a", "counter");
         entry.config.insert("mode".to_string(), "loud".to_string());
-        core.on_event(&connected_event(vec![entry]), |_, _| false);
+        core.on_event(&connected_event(vec![entry]));
 
         for instance in ["counter-a", "ghost"] {
             let Err(KernelAction::Report {
@@ -4134,23 +2412,20 @@ mod tests {
     }
 
     /// Every entry of the publish/defer family asks one question of one
-    /// authority. The six seams themselves are browser-only, but the decision
-    /// they share is not: an instance granted `ports` is admitted whichever
-    /// family it arrives on, and one that is not — declared or not — is refused
-    /// with a breadcrumb naming the family and the capability.
+    /// authority. The four entries themselves are browser-only, but the decision
+    /// they share is not: an instance granted `ports` is admitted whichever entry
+    /// it arrives on, and one that is not — declared or not — is refused with a
+    /// breadcrumb naming the entry and the capability.
     #[test]
     fn every_ports_entry_shares_one_verdict() {
         let granted = connect(vec![granted_entry("p1", "protobar", &["ports"])], true);
         let ungranted = ungranted_core();
-        // The seam, and the event family it asks under: the two DOM listeners,
-        // then the four headless exports.
+        // The kernel export, and the WIT entry it asks under.
         let seams = [
-            ("dom publish listener", contract::PORT_PUBLISH),
-            ("dom defer listener", contract::PORT_DEFER),
-            ("brenn_processor_publish", contract::PORT_PUBLISH),
-            ("brenn_processor_publish_deferred", contract::PORT_DEFER),
-            ("brenn_processor_defer_cancel", contract::PORT_DEFER),
-            ("brenn_processor_defer_edit", contract::PORT_DEFER),
+            ("brenn_processor_publish", "ports.publish"),
+            ("brenn_processor_publish_deferred", "ports.publish-deferred"),
+            ("brenn_processor_defer_cancel", "ports.defer-cancel"),
+            ("brenn_processor_defer_edit", "ports.defer-edit"),
         ];
         for (seam, what) in seams {
             assert_eq!(
@@ -4179,7 +2454,7 @@ mod tests {
     fn processor_log_and_alert_route_without_an_element() {
         let core = routing_core();
         assert_eq!(
-            core.route_log(Some("counter-a"), None, Some("warn"), Some("hi")),
+            core.route_log("counter-a", "warn", "hi"),
             KernelAction::ComponentLog {
                 instance: "counter-a".to_string(),
                 level: LogLevel::Warn,
@@ -4187,18 +2462,12 @@ mod tests {
             }
         );
         assert!(matches!(
-            core.route_log(Some("counter-a"), None, Some("shout"), Some("hi")),
+            core.route_log("counter-a", "shout", "hi"),
             KernelAction::Report { .. }
         ));
 
         assert_eq!(
-            core.route_alert(
-                Some("counter-a"),
-                None,
-                Some("warning"),
-                Some("t"),
-                Some("b")
-            ),
+            core.route_alert("counter-a", "warning", "t", "b"),
             KernelAction::Alert {
                 attribution: Some("counter-a".to_string()),
                 severity: AlertSeverity::Warning,
@@ -4209,17 +2478,11 @@ mod tests {
         // Ungranted: a suppression breadcrumb, never an `Alert` the server would
         // treat as a protocol violation.
         assert!(matches!(
-            ungranted_core().route_alert(
-                Some("counter-a"),
-                None,
-                Some("warning"),
-                Some("t"),
-                Some("b")
-            ),
+            ungranted_core().route_alert("counter-a", "warning", "t", "b"),
             KernelAction::Report { message, .. } if message.contains("suppressed")
         ));
         assert!(matches!(
-            core.route_alert(Some("counter-a"), None, Some("loud"), Some("t"), Some("b")),
+            core.route_alert("counter-a", "loud", "t", "b"),
             KernelAction::Report { .. }
         ));
     }
@@ -4243,7 +2506,7 @@ mod tests {
     #[test]
     fn first_connect_with_no_components_still_emits_ready_and_publishes_connected() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(&connected_event(vec![]), |_, _| false);
+        let actions = core.on_event(&connected_event(vec![]));
         assert_eq!(
             without_platform_planes(&actions),
             vec![
@@ -4255,79 +2518,20 @@ mod tests {
     }
 
     #[test]
-    fn first_connect_mounts_two_instances_of_one_kind() {
-        // Two protobar instances on one surface: distinct instance ids, one shared
-        // kind. Both mount (element defined for the kind) in declaration order.
-        let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event(vec![entry("p1", "protobar"), entry("p2", "protobar")]),
-            |_, _| true,
-        );
-        assert_eq!(
-            without_platform_planes(&actions),
-            vec![
-                KernelAction::MountComponent {
-                    instance: "p1".to_string(),
-                    kind: "protobar".to_string(),
-                },
-                KernelAction::MountComponent {
-                    instance: "p2".to_string(),
-                    kind: "protobar".to_string(),
-                },
-                KernelAction::RemoveConnectIndicator,
-                KernelAction::EmitReady,
-            ]
-        );
-    }
-
-    #[test]
-    fn first_connect_mount_plan_follows_binding_order_and_definedness() {
-        let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event(entries(&["alpha", "beta", "gamma"])),
-            |kind, _| kind != "beta",
-        );
-        assert_eq!(
-            without_platform_planes(&actions),
-            vec![
-                KernelAction::MountComponent {
-                    instance: "alpha".to_string(),
-                    kind: "alpha".to_string(),
-                },
-                KernelAction::ErrorCard {
-                    instance: "beta".to_string(),
-                    kind: "beta".to_string(),
-                    reason: "component module missing".to_string(),
-                },
-                KernelAction::MountComponent {
-                    instance: "gamma".to_string(),
-                    kind: "gamma".to_string(),
-                },
-                KernelAction::RemoveConnectIndicator,
-                KernelAction::EmitReady,
-            ]
-        );
-    }
-
-    #[test]
-    fn first_connect_mounts_instance_and_counts_its_subscription() {
-        // A mounted instance with a bound subscription produces MountComponent and
+    fn first_connect_counts_an_instances_subscription() {
+        // A configured instance with a bound subscription starts the loader and
         // nothing else — the registration model wires no pump; the subscription is
         // only counted into the status table's `ports_attached`.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event_full(
-                entries(&["echo-stub"]),
-                vec![binding("ephemeral:dev-stub", "echo-stub", "messages")],
-            ),
-            |_, _| true,
-        );
+        let actions = core.on_event(&connected_event_full(
+            entries(&["echo-stub"]),
+            vec![binding("ephemeral:dev-stub", "echo-stub", "messages")],
+        ));
         assert_eq!(
             without_platform_planes(&actions),
             vec![
-                KernelAction::MountComponent {
-                    instance: "echo-stub".to_string(),
-                    kind: "echo-stub".to_string(),
+                KernelAction::StartProcessors {
+                    instances: vec!["echo-stub".to_string()],
                 },
                 KernelAction::RemoveConnectIndicator,
                 KernelAction::EmitReady,
@@ -4337,63 +2541,32 @@ mod tests {
     }
 
     #[test]
-    fn first_connect_counts_subscriptions_per_mounted_instance() {
-        // Two protobar instances, each with its own channels: each mounted
-        // instance's bound input ports are counted into `ports_attached`, keyed on
-        // instance. No attach action is emitted — the component registers itself.
+    fn first_connect_counts_subscriptions_per_instance() {
+        // Two protobar instances, each with its own channels: each instance's bound
+        // input ports are counted into `ports_attached`, keyed on instance. No
+        // attach action is emitted — the component registers itself.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event_full(
-                vec![entry("p1", "protobar"), entry("p2", "protobar")],
-                vec![
-                    binding("ephemeral:one", "p2", "in"),
-                    binding("ephemeral:two", "p1", "feed"),
-                    binding("ephemeral:three", "p2", "aux"),
-                ],
-            ),
-            |_, _| true,
-        );
+        let actions = core.on_event(&connected_event_full(
+            vec![entry("p1", "protobar"), entry("p2", "protobar")],
+            vec![
+                binding("ephemeral:one", "p2", "in"),
+                binding("ephemeral:two", "p1", "feed"),
+                binding("ephemeral:three", "p2", "aux"),
+            ],
+        ));
         let counts: Vec<(&str, u32)> = core
             .instances
             .iter()
             .map(|s| (s.instance.as_str(), s.ports_attached))
             .collect();
         assert_eq!(counts, vec![("p1", 1u32), ("p2", 2u32)]);
-        // Both mounted, so the plan is two MountComponents plus the
-        // indicator/ready tail — no per-subscription action.
-        assert_eq!(
-            without_platform_planes(&actions)
-                .iter()
-                .filter(|a| matches!(a, KernelAction::MountComponent { .. }))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn first_connect_error_carded_instance_gets_no_attach() {
-        let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event_full(
-                entries(&["alpha", "beta"]),
-                vec![
-                    binding("ephemeral:a", "alpha", "feed"),
-                    binding("ephemeral:b", "beta", "feed"),
-                ],
-            ),
-            |kind, _| kind != "beta",
-        );
+        // The plan is one loader start naming both, plus the indicator/ready tail
+        // — no per-subscription action.
         assert_eq!(
             without_platform_planes(&actions),
             vec![
-                KernelAction::MountComponent {
-                    instance: "alpha".to_string(),
-                    kind: "alpha".to_string(),
-                },
-                KernelAction::ErrorCard {
-                    instance: "beta".to_string(),
-                    kind: "beta".to_string(),
-                    reason: "component module missing".to_string(),
+                KernelAction::StartProcessors {
+                    instances: vec!["p1".to_string(), "p2".to_string()],
                 },
                 KernelAction::RemoveConnectIndicator,
                 KernelAction::EmitReady,
@@ -4404,45 +2577,33 @@ mod tests {
     #[test]
     fn first_connect_subscription_for_unlisted_instance_gets_no_attach() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event_full(
-                entries(&["echo-stub"]),
-                vec![binding("ephemeral:ghost", "ghost", "feed")],
-            ),
-            |_, _| true,
-        );
+        let actions = core.on_event(&connected_event_full(
+            entries(&["echo-stub"]),
+            vec![binding("ephemeral:ghost", "ghost", "feed")],
+        ));
         assert_eq!(
             without_platform_planes(&actions),
             vec![
-                KernelAction::MountComponent {
-                    instance: "echo-stub".to_string(),
-                    kind: "echo-stub".to_string(),
+                KernelAction::StartProcessors {
+                    instances: vec!["echo-stub".to_string()],
                 },
                 KernelAction::RemoveConnectIndicator,
                 KernelAction::EmitReady,
             ]
         );
+        assert_eq!(core.instances[0].ports_attached, 0);
     }
 
     #[test]
     fn reconnect_with_equal_bindings_republishes_connected() {
         let subs = vec![binding("ephemeral:dev-stub", "echo-stub", "messages")];
         let mut core = KernelCore::new();
-        core.on_event(
-            &connected_event_full(entries(&["echo-stub"]), subs.clone()),
-            |_, _| true,
-        );
-        core.on_event(
-            &Event::Disconnected {
-                reason: DetachReason::LivenessTimeout,
-            },
-            |_, _| true,
-        );
+        core.on_event(&connected_event_full(entries(&["echo-stub"]), subs.clone()));
+        core.on_event(&Event::Disconnected {
+            reason: DetachReason::LivenessTimeout,
+        });
         assert_eq!(core.link_state(), &LinkState::Reconnecting);
-        let actions = core.on_event(
-            &connected_event_full(entries(&["echo-stub"]), subs),
-            |_, _| true,
-        );
+        let actions = core.on_event(&connected_event_full(entries(&["echo-stub"]), subs));
         // The only action is the connected link-state publish (a platform plane).
         assert_eq!(without_platform_planes(&actions), vec![]);
         assert_eq!(
@@ -4453,6 +2614,34 @@ mod tests {
     }
 
     #[test]
+    fn a_reconnect_leaves_the_instance_table_as_the_page_life_made_it() {
+        // Mounting and failing are page-lifetime facts: the loader instantiates
+        // and registers once per page, and a reconnect re-delivers the same
+        // document. A table rebuilt from that document would report every live
+        // instance `Pending` and erase every failure reason for the rest of the
+        // page life, on the surface's own primary health observable.
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(entries(&["echo-stub", "protobar"])));
+        core.on_processor_register("echo-stub");
+        core.on_processor_load_failed("protobar", "instantiate threw");
+        core.on_event(&Event::Disconnected {
+            reason: DetachReason::LivenessTimeout,
+        });
+        core.on_event(&connected_event(entries(&["echo-stub", "protobar"])));
+
+        assert_eq!(core.instances[0].state, InstanceState::Mounted);
+        assert_eq!(core.instances[1].state, InstanceState::Failed);
+        assert!(
+            core.instances[1]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("instantiate threw")),
+            "{:?}",
+            core.instances[1].reason
+        );
+    }
+
+    #[test]
     fn changed_wiring_requests_reload() {
         // Which difference made the wiring change is the page's question — it
         // compares the retained bodies — and this is the whole of the platform
@@ -4460,8 +2649,8 @@ mod tests {
         // draw it, then ask the bootstrap for the (capped) reload. A page cannot
         // re-wire the elements it already mounted.
         let mut core = KernelCore::new();
-        core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| true);
-        let actions = core.on_event(&Event::WiringChanged, |_, _| true);
+        core.on_event(&connected_event(entries(&["echo-stub"])));
+        let actions = core.on_event(&Event::WiringChanged);
         assert_eq!(
             without_platform_planes(&actions),
             vec![KernelAction::RequestReload {
@@ -4481,13 +2670,10 @@ mod tests {
         // bootstrap's cap bounds a genuine incompatibility. Both ranges are
         // reported before the reload, since nothing after it remembers them.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::Incompatible {
-                ours: VersionRange { min: 2, max: 2 },
-                theirs: VersionRange { min: 1, max: 1 },
-            },
-            |_, _| true,
-        );
+        let actions = core.on_event(&Event::Incompatible {
+            ours: VersionRange { min: 2, max: 2 },
+            theirs: VersionRange { min: 1, max: 1 },
+        });
         let rest = without_platform_planes(&actions);
         let [KernelAction::Report { level, message, .. }, reload] = rest.as_slice() else {
             panic!("expected a report then a reload, got {actions:?}");
@@ -4515,15 +2701,12 @@ mod tests {
     #[test]
     fn ok_publish_result_is_noop() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::PublishResult {
-                instance: "echo-stub".to_string(),
-                port: "out".to_string(),
-                correlation: 1,
-                status: PublishStatus::Ok,
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::PublishResult {
+            instance: "echo-stub".to_string(),
+            port: "out".to_string(),
+            correlation: 1,
+            status: PublishStatus::Ok,
+        });
         assert!(actions.is_empty());
         assert_eq!(core.link_state(), &LinkState::Connecting);
     }
@@ -4531,15 +2714,12 @@ mod tests {
     #[test]
     fn non_ok_publish_result_warns_and_reports_without_touching_link_state() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::PublishResult {
-                instance: "echo-stub".to_string(),
-                port: "out".to_string(),
-                correlation: 2,
-                status: PublishStatus::RateLimited,
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::PublishResult {
+            instance: "echo-stub".to_string(),
+            port: "out".to_string(),
+            correlation: 2,
+            status: PublishStatus::RateLimited,
+        });
         let [KernelAction::Report { level, message, .. }] = actions.as_slice() else {
             panic!("expected a single Report, got {actions:?}");
         };
@@ -4575,15 +2755,12 @@ mod tests {
             PublishStatus::Failed,
         ] {
             let mut core = KernelCore::new();
-            let actions = core.on_event(
-                &Event::PublishResult {
-                    instance: "echo-stub".to_string(),
-                    port: "out".to_string(),
-                    correlation: 7,
-                    status,
-                },
-                |_, _| false,
-            );
+            let actions = core.on_event(&Event::PublishResult {
+                instance: "echo-stub".to_string(),
+                port: "out".to_string(),
+                correlation: 7,
+                status,
+            });
             let [KernelAction::Report { subject, .. }] = actions.as_slice() else {
                 panic!("expected a single Report for {status:?}, got {actions:?}");
             };
@@ -4603,15 +2780,12 @@ mod tests {
         // channel — and the buffered path, which answers no publisher, emits only
         // the guard's report. One event, one report, whichever path it took.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::PublishResult {
-                instance: "chrome".to_string(),
-                port: "overlay-state".to_string(),
-                correlation: 3,
-                status: PublishStatus::Refused,
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::PublishResult {
+            instance: "chrome".to_string(),
+            port: "overlay-state".to_string(),
+            correlation: 3,
+            status: PublishStatus::Refused,
+        });
         assert_eq!(actions, Vec::new(), "the guard's own report is the report");
     }
 
@@ -4623,15 +2797,12 @@ mod tests {
         // the publisher, so a looping offender drains its own report budget
         // rather than the kernel's.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::PlaneRefused {
-                instance: "meeting".to_string(),
-                port: "overlay-state".to_string(),
-                channel: schema::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
-                reason: "only the surface's chrome instance may publish it".to_string(),
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::PlaneRefused {
+            instance: "meeting".to_string(),
+            port: "overlay-state".to_string(),
+            channel: schema::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
+            reason: "only the surface's chrome instance may publish it".to_string(),
+        });
         let [
             KernelAction::Report {
                 level,
@@ -4706,10 +2877,10 @@ mod tests {
         // deployed before its config caught up reports `overlay: null` forever and
         // reads exactly like a healthy one.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &connected_event_takeover(entries(&["chrome", "meeting"]), vec![]),
-            |_, _| true,
-        );
+        let actions = core.on_event(&connected_event_takeover(
+            entries(&["chrome", "meeting"]),
+            vec![],
+        ));
         let message = instrument_warn(&actions).expect("a warn about the unbound plane");
         assert!(message.contains("chrome"), "message: {message}");
     }
@@ -4718,22 +2889,19 @@ mod tests {
     fn a_wired_or_takeover_free_surface_says_nothing_about_overlay_state() {
         // Bound: the instrument is live, nothing to say.
         let mut core = KernelCore::new();
-        let wired = core.on_event(
-            &connected_event_takeover(
-                entries(&["chrome", "meeting"]),
-                vec![overlay_state_output()],
-            ),
-            |_, _| true,
-        );
+        let wired = core.on_event(&connected_event_takeover(
+            entries(&["chrome", "meeting"]),
+            vec![overlay_state_output()],
+        ));
         assert_eq!(instrument_warn(&wired), None);
 
         // Nothing wired to the takeover plane: no component can hold an overlay,
         // so an unbound port there is the correct configuration, not a gap.
         let mut core = KernelCore::new();
-        let ungranted = core.on_event(
-            &connected_event_chrome(entries(&["chrome", "meeting"]), "chrome"),
-            |_, _| true,
-        );
+        let ungranted = core.on_event(&connected_event_chrome(
+            entries(&["chrome", "meeting"]),
+            "chrome",
+        ));
         assert_eq!(instrument_warn(&ungranted), None);
     }
 
@@ -4758,31 +2926,25 @@ mod tests {
         };
 
         let mut core = KernelCore::new();
-        let actions = core.on_event(&event(vec![takeover_output.clone()]), |_, _| true);
+        let actions = core.on_event(&event(vec![takeover_output.clone()]));
         let message = instrument_warn(&actions).expect("a warn about the unbound plane");
         assert!(message.contains("chrome"), "message: {message}");
 
         // ...and with chrome's overlay-state output beside it the instrument is
         // live, so nothing is said.
         let mut core = KernelCore::new();
-        let wired = core.on_event(
-            &event(vec![takeover_output, overlay_state_output()]),
-            |_, _| true,
-        );
+        let wired = core.on_event(&event(vec![takeover_output, overlay_state_output()]));
         assert_eq!(instrument_warn(&wired), None);
     }
 
     #[test]
     fn straggler_discarded_emits_single_debug_report() {
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::StragglerDiscarded {
-                channel: "ephemeral:demo".to_string(),
-                seq: 9,
-                dropped: 7,
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::StragglerDiscarded {
+            channel: "ephemeral:demo".to_string(),
+            seq: 9,
+            dropped: 7,
+        });
         let [KernelAction::Report { level, message, .. }] = actions.as_slice() else {
             panic!("expected a single Report, got {actions:?}");
         };
@@ -4799,52 +2961,13 @@ mod tests {
         // tore down, so it carries the bare surface identity. If this ever gains a
         // subject, some component starts paying for the kernel's breadcrumbs.
         let mut core = KernelCore::new();
-        let actions = core.on_event(
-            &Event::StragglerDiscarded {
-                channel: "ephemeral:demo".to_string(),
-                seq: 9,
-                dropped: 7,
-            },
-            |_, _| false,
-        );
+        let actions = core.on_event(&Event::StragglerDiscarded {
+            channel: "ephemeral:demo".to_string(),
+            seq: 9,
+            dropped: 7,
+        });
         let [KernelAction::Report { subject, .. }] = actions.as_slice() else {
             panic!("expected a single Report, got {actions:?}");
-        };
-        assert_eq!(subject.as_deref(), None);
-    }
-
-    #[test]
-    fn a_malformed_publish_intent_from_a_mounted_instance_is_attributed_to_it() {
-        // The drop is a fact about the component that dispatched the malformed
-        // event, and the instance resolved, so the report names it — same rule as
-        // the rejection path, applied at the trust boundary.
-        let action = route_publish_intent(
-            Some("echo-stub"),
-            "BRENN-ECHO-STUB",
-            Some("out"),
-            Some("body"),
-            OptionalField::Malformed,
-        );
-        let KernelAction::Report { subject, .. } = action else {
-            panic!("expected a Report, got {action:?}");
-        };
-        assert_eq!(subject.as_deref(), Some("echo-stub"));
-    }
-
-    #[test]
-    fn a_publish_intent_from_an_unresolved_target_names_no_subject() {
-        // No mounted instance resolved, so there is nothing to attribute to and
-        // guessing would misattribute. The `None` here is the honest answer, not
-        // the oversight the rejection path had.
-        let action = route_publish_intent(
-            None,
-            "SPAN",
-            Some("out"),
-            Some("body"),
-            OptionalField::Absent,
-        );
-        let KernelAction::Report { subject, .. } = action else {
-            panic!("expected a Report, got {action:?}");
         };
         assert_eq!(subject.as_deref(), None);
     }
@@ -4956,37 +3079,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_module_marks_instance_failed_and_connect_emits_initial_status() {
-        let mut core = KernelCore::new();
-        let event =
-            connected_event_full(vec![entry("ok", "good"), entry("bad", "missing")], vec![]);
-        // Only "good" has a defined element; "missing" fails the mount plan.
-        let actions = core.on_event(&event, |kind, _| kind == "good");
-        let instances = status_within(&actions);
-        let bad = instances
-            .iter()
-            .find(|i| i.instance == "bad")
-            .expect("bad row");
-        assert_eq!(bad.state, InstanceState::Failed);
-        assert_eq!(bad.reason.as_deref(), Some("component module missing"));
-        let ok = instances
-            .iter()
-            .find(|i| i.instance == "ok")
-            .expect("ok row");
-        assert_eq!(ok.state, InstanceState::Mounted);
-        assert_eq!(ok.reason, None);
-    }
-
-    #[test]
-    fn component_panic_marks_failed_and_emits_immediate_status() {
+    fn a_dead_instance_is_marked_failed_and_emits_immediate_status() {
         let mut core = connect(vec![entry("m1", "meeting")], false);
-        let actions = core.on_component_panic(Some("m1"), Some("boom"), |_| true);
+        let actions = core.note_instance_failed("m1", "component trapped: boom");
         let m1 = status_within(&actions)
             .iter()
             .find(|i| i.instance == "m1")
             .expect("m1 row");
         assert_eq!(m1.state, InstanceState::Failed);
-        assert_eq!(m1.reason.as_deref(), Some("component panicked: boom"));
+        assert_eq!(m1.reason.as_deref(), Some("component trapped: boom"));
     }
 
     #[test]
@@ -5039,7 +3140,7 @@ mod tests {
             vec![entry("p1", "protobar")],
             vec![binding("ephemeral:x", "p1", "messages")],
         );
-        core.on_event(&event, |_, _| true);
+        core.on_event(&event);
         let actions = core.on_status_tick();
         let p1 = only_status(&actions)
             .iter()

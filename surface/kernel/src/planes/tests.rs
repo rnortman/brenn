@@ -6,9 +6,9 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Abi, CONTROL_PLANE_VERSION, ComponentEntry, LOCAL_LINK_STATE_CHANNEL,
-    LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, LOCAL_THEME_CHANNEL, LocalChannel,
-    OverlayStateBody, TakeoverAction, TakeoverBody,
+    CONTROL_PLANE_VERSION, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_OVERLAY_STATE_CHANNEL,
+    LOCAL_TAKEOVER_CHANNEL, LOCAL_THEME_CHANNEL, LocalChannel, OverlayStateBody, TakeoverAction,
+    TakeoverBody,
 };
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -21,7 +21,6 @@ fn component(instance: &str) -> ComponentEntry {
     ComponentEntry {
         instance: instance.to_string(),
         kind: "protobar".to_string(),
-        abi: Abi::Dom,
         parked_batch_depth: 4,
         config: BTreeMap::new(),
         grants: vec![],

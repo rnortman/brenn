@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Assert the staged release tree satisfies what the deploy script reads from it.
 #
-# Usage: package_check.sh <names-tool> <record-lib> <dom-names-tool>
+# Usage: package_check.sh <names-tool> <record-lib>
 #                         <package-dir> <manifest> <static|dynamic>
 #
 # `<names-tool>` is `manifest_names.sh`, which states the manifest's grammar for
-# every reader of it; `<dom-names-tool>` is `dom_names.sh`, which states a
-# surface dom kind's file grammar; `<record-lib>` is `record_lib.sh`, which
-# states how a binding record's fields are read.
+# every reader of it; `<record-lib>` is `record_lib.sh`, which states how a
+# binding record's fields are read.
 #
 # `deploy.sh` lives in the deploying repo, so nothing in this tree can be held
 # equal to it mechanically. This is the in-repo statement of the contract it
@@ -30,13 +29,9 @@
 # copies, in both directions, so the root holds exactly the authored modules of
 # the components this release installs.
 #
-# The surface asset tree carries the same kind of binding in two shapes: a dom
-# kind's record sits flat beside its module pair, a processor kind's inside its
-# transpile directory. Both are re-hashed here, every name they state is held to
-# the name the host derives, and a tree holding no dom record at all is refused
-# outright — every surface has a chrome, so such a tree was
-# built before surface components carried records and the host would refuse it
-# at the bounce.
+# The surface asset tree carries the same kind of binding: a kind's record sits
+# inside its transpile directory. It is re-hashed here and every name it states
+# is held to the name the host derives.
 #
 # The linkage mode is the packaging config's own claim about the binaries. A
 # musl request that silently resolves to glibc is a real failure mode — a glibc
@@ -45,22 +40,21 @@
 # either. The static arm rejects any named loader, not just the glibc one.
 set -euo pipefail
 
-if [ "$#" -ne 6 ]; then
-    echo "usage: $0 <names-tool> <record-lib> <dom-names-tool>" \
+if [ "$#" -ne 5 ]; then
+    echo "usage: $0 <names-tool> <record-lib>" \
          "<package-dir> <manifest> <static|dynamic>" >&2
     exit 2
 fi
 names="$1"
 record_lib="$2"
-dom_names="$3"
-pkg="$4"
-manifest="$5"
-linkage="$6"
+pkg="$3"
+manifest="$4"
+linkage="$5"
 
 case "$linkage" in
     static|dynamic) ;;
     *)
-        echo "usage: $0 <names-tool> <record-lib> <dom-names-tool>" \
+        echo "usage: $0 <names-tool> <record-lib>" \
              "<package-dir> <manifest> <static|dynamic>" >&2
         exit 2
         ;;
@@ -305,51 +299,11 @@ done
 # the host does at boot is done here, where the tarball is still on the build
 # machine and the service is still running.
 #
-# The records are scraped, not parsed: both emitters write one scalar field per
+# The record is scraped, not parsed: the emitter writes one scalar field per
 # line for exactly this reader (see the record library).
 # ---------------------------------------------------------------------------
 
 if [ -d "$pkg/surface" ]; then
-    # Chrome is a dom kind and every surface has one, so a tree with no dom
-    # record at all was built before surface components carried records. It
-    # would install cleanly and be refused at the bounce, which is later and
-    # worse than here.
-    dom_records="$(surface_dom_records "$pkg/surface")"
-    if [ -z "$dom_records" ]; then
-        fail "surface/ holds no brenn_<kind>.manifest.json; the host refuses every dom component kind whose record did not ship"
-    else
-        while read -r record; do
-            [ -z "$record" ] && continue
-            record_name="$(basename "$record")"
-            label="surface/$record_name"
-            kind="$(record_field "$record" kind)"
-            if [ -z "$kind" ]; then
-                fail "$label states no kind; the host looks a record up by the kind it configures"
-                continue
-            fi
-            # Assigned before being read: a grammar failure inside a process
-            # substitution is invisible to `set -e`, and every name below would
-            # then be compared against empty.
-            if ! dom_files="$("$dom_names" "$kind" 2>&1)"; then
-                fail "$label states kind $kind, which no dom kind can be named: $dom_files"
-                continue
-            fi
-            { read -r want_module; read -r want_module_wasm; read -r want_record
-              read -r want_spec; } <<< "$dom_files"
-            if [ "$record_name" != "$want_record" ]; then
-                fail "$label carries a record for kind $kind, whose record the host reads as $want_record; a record filed under any other name is one it never opens"
-                continue
-            fi
-            check_recorded_file "$record" "$label" "$pkg/surface" \
-                module module_sha256 "$want_module"
-            check_recorded_file "$record" "$label" "$pkg/surface" \
-                module_wasm module_wasm_sha256 "$want_module_wasm"
-            check_recorded_file "$record" "$label" "$pkg/surface" \
-                spec spec_sha256 "$want_spec"
-            check_staged_module "$pkg/surface/$want_spec" "$kind" "surface/$want_spec"
-        done <<< "$dom_records"
-    fi
-
     # A processor kind's record lives inside its transpile directory and binds
     # the component bytes the transpile consumed as well as the specification.
     for kind_dir in "$pkg"/surface/processor/*/; do
@@ -381,7 +335,7 @@ fi
 # ---------------------------------------------------------------------------
 # The module root, closing direction. Every shipped specification was compared
 # against its staged module in the loops above — the backend half in the package
-# loop, the surface half in the surface loops — so what is left is the other
+# loop, the surface half in the surface loop — so what is left is the other
 # way round: a stray or tampered module is text no package stands behind.
 # ---------------------------------------------------------------------------
 

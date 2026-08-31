@@ -16,7 +16,7 @@ import {
     bootstrap,
     cappedReload,
     installGlobalHandlers,
-    loadModules,
+    loadKernel,
     type ManifestComponent,
     processorStartInstances,
     startProcessors,
@@ -371,7 +371,6 @@ describe("surface bootstrap page-input reads", () => {
                                 instance: "echo-stub",
                                 kind: "echo-stub",
                                 module: "/surface-static/brenn_echo_stub.js?v=build-xyz&instance=echo-stub",
-                                abi: "dom",
                             },
                         ],
                     }),
@@ -387,7 +386,6 @@ describe("surface bootstrap page-input reads", () => {
                 instance: "echo-stub",
                 kind: "echo-stub",
                 module: "/surface-static/brenn_echo_stub.js?v=build-xyz&instance=echo-stub",
-                abi: "dom",
             },
         ]);
     });
@@ -456,155 +454,19 @@ describe("surface bootstrap module loading", () => {
         return { kernel: KERNEL_URL, components };
     }
 
-    it("inits the kernel then every component, returns the kernel module", async () => {
-        const inited: string[] = [];
-        const bound: string[] = [];
-        const importModule = vi.fn(async (url: string) => {
-            if (url === KERNEL_URL) {
-                return {
-                    default: async () => {
-                        inited.push("kernel");
-                    },
-                    start: vi.fn(),
-                };
-            }
-            return {
-                default: async () => {
-                    inited.push(url);
-                },
-                brenn_bind_instance: (instance: string) => {
-                    bound.push(`${url}#${instance}`);
-                },
-            };
-        });
-        const kernel = await loadModules(
-            manifest([
-                {
-                    instance: "echo-stub",
-                    kind: "echo-stub",
-                    module: "/surface-static/brenn_echo_stub.js?v=b&instance=echo-stub",
-                    abi: "dom",
-                },
-                {
-                    instance: "other",
-                    kind: "other",
-                    module: "/surface-static/brenn_other.js?v=b&instance=other",
-                    abi: "dom",
-                },
-            ]),
-            importModule,
-        );
-        expect(kernel).not.toBeNull();
-        expect(typeof kernel?.start).toBe("function");
-        expect(inited).toContain("kernel");
-        expect(inited).toContain(
-            "/surface-static/brenn_echo_stub.js?v=b&instance=echo-stub",
-        );
-        expect(inited).toContain(
-            "/surface-static/brenn_other.js?v=b&instance=other",
-        );
-        // Each module is bound to the instance its manifest entry named, after
-        // its own init.
-        expect(bound).toEqual([
-            "/surface-static/brenn_echo_stub.js?v=b&instance=echo-stub#echo-stub",
-            "/surface-static/brenn_other.js?v=b&instance=other#other",
-        ]);
-        expect(reloadSpy).not.toHaveBeenCalled();
-    });
-
-    it("sibling instances of one kind each load and bind their own module", async () => {
-        // The whole point of the per-instance specifier: two declarations of one
-        // kind are two module records, so each owns its linear memory and a trap
-        // in one cannot poison the other. The loader must not dedup them.
-        const bound: string[] = [];
-        const importModule = vi.fn(async (url: string) => {
-            if (url === KERNEL_URL) {
-                return { default: async () => {}, start: vi.fn() };
-            }
-            return {
-                default: async () => {},
-                brenn_bind_instance: (instance: string) => {
-                    bound.push(instance);
-                },
-            };
-        });
-        await loadModules(
-            manifest([
-                {
-                    instance: "p1",
-                    kind: "protobar",
-                    module: "/surface-static/brenn_protobar.js?v=b&instance=p1",
-                    abi: "dom",
-                },
-                {
-                    instance: "p2",
-                    kind: "protobar",
-                    module: "/surface-static/brenn_protobar.js?v=b&instance=p2",
-                    abi: "dom",
-                },
-            ]),
-            importModule,
-        );
-        // Two imports of the same artifact at two specifiers, two binds.
-        expect(importModule).toHaveBeenCalledTimes(3);
-        expect(bound).toEqual(["p1", "p2"]);
-    });
-
-    it("one instance's bind throw is logged and leaves its siblings loaded", async () => {
-        expectConsoleError(/surface component instance 'p1'/);
-        const bound: string[] = [];
-        const importModule = vi.fn(async (url: string) => {
-            if (url === KERNEL_URL) {
-                return { default: async () => {}, start: vi.fn() };
-            }
-            return {
-                default: async () => {},
-                brenn_bind_instance: (instance: string) => {
-                    if (instance === "p1") {
-                        throw new Error("bind exploded");
-                    }
-                    bound.push(instance);
-                },
-            };
-        });
-        const kernel = await loadModules(
-            manifest([
-                {
-                    instance: "p1",
-                    kind: "protobar",
-                    module: "/surface-static/brenn_protobar.js?v=b&instance=p1",
-                    abi: "dom",
-                },
-                {
-                    instance: "p2",
-                    kind: "protobar",
-                    module: "/surface-static/brenn_protobar.js?v=b&instance=p2",
-                    abi: "dom",
-                },
-            ]),
-            importModule,
-        );
-        // The surface survives: p1 never defines its element and the kernel
-        // error-cards it; p2 is untouched.
-        expect(kernel).not.toBeNull();
-        expect(bound).toEqual(["p2"]);
-        expect(reloadSpy).not.toHaveBeenCalled();
-    });
-
     it("kernel import failure → cappedReload, returns null, components not loaded", async () => {
         expectConsoleError(/kernel module load failed/);
         const importModule = vi.fn(async () => {
             throw new Error("404");
         });
-        const kernel = await loadModules(
+        const kernel = await loadKernel(
             manifest([
                 {
                     instance: "echo-stub",
                     kind: "echo-stub",
                     module: "/x.js",
-                    abi: "dom",
                 },
-            ]),
+            ]).kernel,
             importModule,
         );
         expect(kernel).toBeNull();
@@ -626,55 +488,11 @@ describe("surface bootstrap module loading", () => {
             }
             return { default: async () => {} };
         });
-        const kernel = await loadModules(manifest([]), importModule);
+        const kernel = await loadKernel(manifest([]).kernel, importModule);
         expect(kernel).toBeNull();
         expect(reloadSpy).toHaveBeenCalledTimes(1);
     });
 
-    it("a component module failure is logged but does not abort the surface", async () => {
-        expectConsoleError(/surface component instance 'broken'/);
-        const inited: string[] = [];
-        const importModule = vi.fn(async (url: string) => {
-            if (url === KERNEL_URL) {
-                return {
-                    default: async () => {
-                        inited.push("kernel");
-                    },
-                    start: vi.fn(),
-                };
-            }
-            if (url.includes("broken")) {
-                throw new Error("component 404");
-            }
-            return {
-                default: async () => {
-                    inited.push(url);
-                },
-                brenn_bind_instance: () => {},
-            };
-        });
-        const kernel = await loadModules(
-            manifest([
-                {
-                    instance: "broken",
-                    kind: "broken",
-                    module: "/surface-static/brenn_broken.js",
-                    abi: "dom",
-                },
-                {
-                    instance: "ok",
-                    kind: "ok",
-                    module: "/surface-static/brenn_ok.js",
-                    abi: "dom",
-                },
-            ]),
-            importModule,
-        );
-        // Not aborted: the kernel is returned and the healthy component still inited.
-        expect(kernel).not.toBeNull();
-        expect(inited).toContain("/surface-static/brenn_ok.js");
-        expect(reloadSpy).not.toHaveBeenCalled();
-    });
 });
 
 // Placed last: bootstrap() calls installGlobalHandlers(), adding window
@@ -784,7 +602,7 @@ describe("surface bootstrap orchestration", () => {
         await bootstrap(importModule);
 
         expect(start).not.toHaveBeenCalled();
-        // loadModules routed the kernel failure through cappedReload.
+        // loadKernel routed the kernel failure through cappedReload.
         expect(reloadSpy).toHaveBeenCalledTimes(1);
     });
 });
@@ -876,6 +694,44 @@ describe("surface processor bring-up", () => {
                 (_i: string, _e: (a: string) => unknown) => true,
             ),
             brenn_processor_load_failed: vi.fn((_i: string, _d: string) => {}),
+            brenn_dom_root: vi.fn((_i: string) => 1n),
+            brenn_dom_create_element: vi.fn((_i: string, _t: string) => 1n),
+            brenn_dom_set_attribute: vi.fn(
+                (_i: string, _n: bigint, _k: string, _v: string) => {},
+            ),
+            brenn_dom_remove_attribute: vi.fn(
+                (_i: string, _n: bigint, _k: string) => {},
+            ),
+            brenn_dom_set_text: vi.fn(
+                (_i: string, _n: bigint, _t: string) => {},
+            ),
+            brenn_dom_set_style_property: vi.fn(
+                (_i: string, _n: bigint, _k: string, _v: string) => {},
+            ),
+            brenn_dom_remove_style_property: vi.fn(
+                (_i: string, _n: bigint, _k: string) => {},
+            ),
+            brenn_dom_append: vi.fn((_i: string, _p: bigint, _c: bigint) => {}),
+            brenn_dom_insert_before: vi.fn(
+                (_i: string, _p: bigint, _c: bigint, _r?: bigint) => {},
+            ),
+            brenn_dom_remove: vi.fn((_i: string, _n: bigint) => {}),
+            brenn_dom_value: vi.fn((_i: string, _n: bigint) => ""),
+            brenn_dom_set_value: vi.fn(
+                (_i: string, _n: bigint, _v: string) => {},
+            ),
+            brenn_dom_listen: vi.fn(
+                (_i: string, _n: bigint, _e: string, _p: string) => {},
+            ),
+            brenn_dom_utc_offset_minutes: vi.fn(
+                (_i: string, _e: bigint) => 0,
+            ),
+            brenn_dom_page_root: vi.fn((_i: string) => 1n),
+            brenn_dom_page_body: vi.fn((_i: string) => 1n),
+            brenn_dom_instance_wrapper: vi.fn(
+                (_i: string, _of: string) => undefined,
+            ),
+            brenn_dom_parent: vi.fn((_i: string, _n: bigint) => undefined),
         };
     }
 
@@ -893,7 +749,6 @@ describe("surface processor bring-up", () => {
             instance,
             kind: "counter",
             module: PROC_MODULE,
-            abi: "processor",
         };
     }
 
@@ -958,6 +813,152 @@ describe("surface processor bring-up", () => {
         expect(kernel.brenn_processor_config_get).toHaveBeenCalledWith(
             "p1",
             "greeting",
+        );
+    });
+
+    // Every `brenn:processor/dom` and `brenn:processor/page-dom` shim, as
+    // [interface, method, the component's arguments, the kernel export it
+    // forwards to]. Pure argument plumbing is exactly the code that fails by
+    // transposition, and the instance the closure supplies — the whole of the
+    // confinement — is a leading argument no component can reach.
+    const DOM_SHIMS: ReadonlyArray<
+        readonly [string, string, readonly unknown[], string]
+    > = [
+        ["brenn:processor/dom", "root", [], "brenn_dom_root"],
+        [
+            "brenn:processor/dom",
+            "createElement",
+            ["div"],
+            "brenn_dom_create_element",
+        ],
+        [
+            "brenn:processor/dom",
+            "setAttribute",
+            [3n, "data-x", "v"],
+            "brenn_dom_set_attribute",
+        ],
+        [
+            "brenn:processor/dom",
+            "removeAttribute",
+            [3n, "data-x"],
+            "brenn_dom_remove_attribute",
+        ],
+        ["brenn:processor/dom", "setText", [3n, "hi"], "brenn_dom_set_text"],
+        [
+            "brenn:processor/dom",
+            "setStyleProperty",
+            [3n, "color", "red"],
+            "brenn_dom_set_style_property",
+        ],
+        [
+            "brenn:processor/dom",
+            "removeStyleProperty",
+            [3n, "color"],
+            "brenn_dom_remove_style_property",
+        ],
+        ["brenn:processor/dom", "append", [3n, 4n], "brenn_dom_append"],
+        [
+            "brenn:processor/dom",
+            "insertBefore",
+            [3n, 4n, 5n],
+            "brenn_dom_insert_before",
+        ],
+        ["brenn:processor/dom", "remove", [3n], "brenn_dom_remove"],
+        ["brenn:processor/dom", "value", [3n], "brenn_dom_value"],
+        [
+            "brenn:processor/dom",
+            "setValue",
+            [3n, "typed"],
+            "brenn_dom_set_value",
+        ],
+        [
+            "brenn:processor/dom",
+            "listen",
+            [3n, "click", "send"],
+            "brenn_dom_listen",
+        ],
+        [
+            "brenn:processor/dom",
+            "utcOffsetMinutes",
+            [1700000000000n],
+            "brenn_dom_utc_offset_minutes",
+        ],
+        ["brenn:processor/page-dom", "pageRoot", [], "brenn_dom_page_root"],
+        ["brenn:processor/page-dom", "pageBody", [], "brenn_dom_page_body"],
+        [
+            "brenn:processor/page-dom",
+            "instanceWrapper",
+            ["chrome"],
+            "brenn_dom_instance_wrapper",
+        ],
+        ["brenn:processor/page-dom", "parent", [3n], "brenn_dom_parent"],
+    ];
+
+    async function capturedImports(
+        kernel: ReturnType<typeof fakeKernel>,
+        instance = "p1",
+    ): Promise<Record<string, Record<string, unknown>>> {
+        let captured: Record<string, Record<string, unknown>> | undefined;
+        const importModule = vi.fn(async () => ({
+            instantiate: async (
+                _core: unknown,
+                imports: Record<string, Record<string, unknown>>,
+            ) => {
+                captured = imports;
+                return { receive: vi.fn() };
+            },
+        }));
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([processorEntry(instance)]),
+            [instance],
+            importModule as unknown as ModuleImporter,
+        );
+        if (captured === undefined) {
+            throw new Error("the instance was never instantiated");
+        }
+        return captured;
+    }
+
+    it("forwards every dom and page-dom call with the closure's instance first", async () => {
+        const kernel = fakeKernel();
+        const captured = await capturedImports(kernel, "p1");
+
+        for (const [iface, method, args, exportName] of DOM_SHIMS) {
+            const shim = captured[iface]?.[method] as
+                | ((...a: unknown[]) => unknown)
+                | undefined;
+            if (typeof shim !== "function") {
+                throw new Error(`${iface}#${method} is not offered`);
+            }
+            // Arity is the negative case: the component supplies its own
+            // arguments and has no parameter to name an instance with, so it
+            // cannot address the kernel as anybody else.
+            expect(shim.length).toBe(args.length);
+            shim(...args);
+            const forwarded = kernel[
+                exportName as keyof typeof kernel
+            ] as unknown as ReturnType<typeof vi.fn>;
+            expect(forwarded).toHaveBeenCalledWith("p1", ...args);
+        }
+    });
+
+    it("omits an absent insert-before reference rather than inventing one", async () => {
+        const kernel = fakeKernel();
+        const captured = await capturedImports(kernel, "p1");
+        const dom = captured["brenn:processor/dom"] as {
+            insertBefore: (
+                parent: bigint,
+                child: bigint,
+                reference: bigint | undefined,
+            ) => void;
+        };
+        dom.insertBefore(1n, 2n, undefined);
+        expect(kernel.brenn_dom_insert_before).toHaveBeenCalledWith(
+            "p1",
+            1n,
+            2n,
+            undefined,
         );
     });
 
@@ -1083,9 +1084,12 @@ describe("surface processor bring-up", () => {
         ) as unknown as typeof kernel.brenn_processor_register;
 
         const seen: unknown[] = [];
-        let behavior: "ok" | "err" | "trap" = "ok";
-        const receive = (activation: unknown) => {
+        let behavior: "ok" | "reply" | "err" | "trap" = "ok";
+        const receive = (activation: unknown): string | undefined => {
             seen.push(activation);
+            if (behavior === "reply") {
+                return '{"cancel":true}';
+            }
             if (behavior === "err") {
                 // What jco's ComponentError looks like at this boundary.
                 const e = new Error("component error");
@@ -1097,6 +1101,7 @@ describe("surface processor bring-up", () => {
             if (behavior === "trap") {
                 throw new Error("unreachable");
             }
+            return undefined;
         };
         const importModule = vi.fn(async () => ({
             instantiate: async () => ({ receive }),
@@ -1124,13 +1129,16 @@ describe("surface processor bring-up", () => {
                 },
             ],
             now: 1_700_000_000_000,
+            sync: null,
         });
 
         // ok: the kernel reads undefined as "flush the buffer".
         expect(entry?.(activation)).toBeUndefined();
-        // All three fields, with the u64s as BigInts: the canonical ABI traps on
-        // a missing field, not a smaller activation.
-        expect(seen[0]).toEqual({
+        // Every field, with the u64s as BigInts: the canonical ABI traps on a
+        // missing field, not a smaller activation. Strict, so that a `sync` key
+        // omitted rather than set to `undefined` fails here — the two are the
+        // same to `toEqual` and are not the same to the lowering.
+        expect(seen[0]).toStrictEqual({
             ports: [{ port: "in", envelopes: ["{}"], newFrom: 1, dropped: 2 }],
             deferred: [
                 {
@@ -1145,16 +1153,18 @@ describe("surface processor bring-up", () => {
                 },
             ],
             now: 1_700_000_000_000n,
+            sync: undefined,
         });
 
         // Absent `now` serializes as `null`; the shim must lower it to
-        // `undefined`, not to 0n.
+        // `undefined`, not to 0n. Same for the sync port's name.
         expect(
             entry?.(
                 JSON.stringify({
                     ports: [],
                     deferred: [],
                     now: null,
+                    sync: null,
                 }),
             ),
         ).toBeUndefined();
@@ -1162,6 +1172,29 @@ describe("surface processor bring-up", () => {
             ports: [],
             deferred: [],
             now: undefined,
+            sync: undefined,
+        });
+
+        // A sync-call activation carries its port's name, and the guest's
+        // `ok(some(reply))` comes back as the reply object the kernel reads.
+        // Whether a reply was allowed is the kernel's call, not this seam's.
+        behavior = "reply";
+        const syncActivation = JSON.stringify({
+            ports: [
+                { port: "brenn:mount", envelopes: ["{}"], new_from: 0, dropped: 0 },
+            ],
+            deferred: [],
+            now: null,
+            sync: "brenn:mount",
+        });
+        expect(entry?.(syncActivation)).toEqual({ reply: '{"cancel":true}' });
+        expect(seen[2]).toStrictEqual({
+            ports: [
+                { port: "brenn:mount", envelopes: ["{}"], newFrom: 0, dropped: 0 },
+            ],
+            deferred: [],
+            now: undefined,
+            sync: "brenn:mount",
         });
 
         // err: a returned string — buffer discarded, instance lives.
@@ -1211,13 +1244,11 @@ describe("surface processor bring-up", () => {
                         instance: "gone",
                         kind: "counter",
                         module: "/missing.js",
-                        abi: "processor",
                     },
                     {
                         instance: "bad",
                         kind: "counter",
                         module: "/bad.js",
-                        abi: "processor",
                     },
                     processorEntry("refused"),
                 ]),

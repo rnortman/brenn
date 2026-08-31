@@ -5,8 +5,8 @@ pub type Activation = brenn::processor::types::Activation;
 pub type ReceiveError = brenn::processor::types::ReceiveError;
 #[doc(hidden)]
 #[allow(non_snake_case, unused_unsafe)]
-pub unsafe fn _export_receive_cabi<T_: Guest>(arg0: *mut u8,arg1: usize,arg2: *mut u8,arg3: usize,arg4: i32,arg5: i64,) -> *mut u8 { unsafe {#[cfg(target_arch="wasm32")]
-_rt::run_ctors_once();let result24 = {
+pub unsafe fn _export_receive_cabi<T_: Guest>(arg0: *mut u8,arg1: usize,arg2: *mut u8,arg3: usize,arg4: i32,arg5: i64,arg6: i32,arg7: *mut u8,arg8: usize,) -> *mut u8 { unsafe {#[cfg(target_arch="wasm32")]
+_rt::run_ctors_once();let result25 = {
   let base11 = arg0;
   let len11 = arg1;
   let mut result11 = _rt::Vec::with_capacity(len11);
@@ -102,57 +102,95 @@ _rt::run_ctors_once();let result24 = {
       }
       _ => _rt::invalid_enum_discriminant(),
     },
+    sync: match arg6 {
+      0 => None,
+      1 => {
+        let e = {
+          let len24 = arg8;
+          let bytes24 = _rt::Vec::from_raw_parts(arg7.cast(), len24, len24);
+
+          _rt::string_lift(bytes24)
+        };
+        Some(e)
+      }
+      _ => _rt::invalid_enum_discriminant(),
+    },
   })
 };
-let ptr25 = (&raw mut _RET_AREA.0).cast::<u8>();
-match result24 {
-  Ok(_) => { {
-    *ptr25.add(0).cast::<u8>() = (0i32) as u8;
-  } },
-  Err(e) => { {
-    *ptr25.add(0).cast::<u8>() = (1i32) as u8;
-    use brenn::processor::types::ReceiveError as V28;
+let ptr26 = (&raw mut _RET_AREA.0).cast::<u8>();
+match result25 {
+  Ok(e) => { {
+    *ptr26.add(0).cast::<u8>() = (0i32) as u8;
     match e {
-      V28::MalformedEnvelope(e) => {
-        *ptr25.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
-        let vec26 = (e.into_bytes()).into_boxed_slice();
-        let ptr26 = vec26.as_ptr().cast::<u8>();
-        let len26 = vec26.len();
-        ::core::mem::forget(vec26);
-        *ptr25.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len26;
-        *ptr25.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr26.cast_mut();
-      },
-      V28::ProcessingFailed(e) => {
-        *ptr25.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
+      Some(e) => {
+        *ptr26.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
         let vec27 = (e.into_bytes()).into_boxed_slice();
         let ptr27 = vec27.as_ptr().cast::<u8>();
         let len27 = vec27.len();
         ::core::mem::forget(vec27);
-        *ptr25.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len27;
-        *ptr25.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr27.cast_mut();
+        *ptr26.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len27;
+        *ptr26.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr27.cast_mut();
       },
-    }
-  } },
-};ptr25
+      None => {
+        {
+          *ptr26.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
+        }
+      },
+    };} },
+    Err(e) => { {
+      *ptr26.add(0).cast::<u8>() = (1i32) as u8;
+      use brenn::processor::types::ReceiveError as V30;
+      match e {
+        V30::MalformedEnvelope(e) => {
+          *ptr26.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
+          let vec28 = (e.into_bytes()).into_boxed_slice();
+          let ptr28 = vec28.as_ptr().cast::<u8>();
+          let len28 = vec28.len();
+          ::core::mem::forget(vec28);
+          *ptr26.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len28;
+          *ptr26.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr28.cast_mut();
+        },
+        V30::ProcessingFailed(e) => {
+          *ptr26.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
+          let vec29 = (e.into_bytes()).into_boxed_slice();
+          let ptr29 = vec29.as_ptr().cast::<u8>();
+          let len29 = vec29.len();
+          ::core::mem::forget(vec29);
+          *ptr26.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len29;
+          *ptr26.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr29.cast_mut();
+        },
+      }
+    } },
+  };ptr26
 } }
 #[doc(hidden)]
 #[allow(non_snake_case)]
 pub unsafe fn __post_return_receive<T_: Guest>(arg0: *mut u8,) { unsafe {
   let l0 = i32::from(*arg0.add(0).cast::<u8>());
   match l0 {
-    0 => (),
-    _ => {
+    0 => {
       let l1 = i32::from(*arg0.add(::core::mem::size_of::<*const u8>()).cast::<u8>());
       match l1 {
-        0 => {
+        0 => (),
+        _ => {
           let l2 = *arg0.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
           let l3 = *arg0.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>();
           _rt::cabi_dealloc(l2, l3, 1);
         },
+      }
+    },
+    _ => {
+      let l4 = i32::from(*arg0.add(::core::mem::size_of::<*const u8>()).cast::<u8>());
+      match l4 {
+        0 => {
+          let l5 = *arg0.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+          let l6 = *arg0.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>();
+          _rt::cabi_dealloc(l5, l6, 1);
+        },
         _ => {
-          let l4 = *arg0.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
-          let l5 = *arg0.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>();
-          _rt::cabi_dealloc(l4, l5, 1);
+          let l7 = *arg0.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+          let l8 = *arg0.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>();
+          _rt::cabi_dealloc(l7, l8, 1);
         },
       }
     },
@@ -164,8 +202,13 @@ pub trait Guest {
   /// entries as context, and returns one result for the whole activation.
   /// Published messages (via the ports import) are buffered during execution
   /// and flushed atomically iff this returns ok; err/trap discards the buffer.
+  /// A sync-call activation may answer its caller: `ok(some(reply))` is that
+  /// answer, and the reply's dialect belongs to whatever raised the call. An
+  /// ordinary activation must answer `ok(none)`; a `some` on one is a host
+  /// trap, because a component replying to a cause that asked nothing has
+  /// lost track of why it was called.
   #[allow(async_fn_in_trait)]
-  fn receive(a: Activation,) -> Result<(),ReceiveError>;
+  fn receive(a: Activation,) -> Result<Option<_rt::String>,ReceiveError>;
 }
 #[doc(hidden)]
 
@@ -173,8 +216,8 @@ macro_rules! __export_world_processor_cabi{
   ($ty:ident with_types_in $($path_to_types:tt)*) => (const _: () = {
 
     #[unsafe(export_name = "receive")]
-    unsafe extern "C" fn export_receive(arg0: *mut u8,arg1: usize,arg2: *mut u8,arg3: usize,arg4: i32,arg5: i64,) -> *mut u8 {
-      unsafe { $($path_to_types)*::_export_receive_cabi::<$ty>(arg0, arg1, arg2, arg3, arg4, arg5) }
+    unsafe extern "C" fn export_receive(arg0: *mut u8,arg1: usize,arg2: *mut u8,arg3: usize,arg4: i32,arg5: i64,arg6: i32,arg7: *mut u8,arg8: usize,) -> *mut u8 {
+      unsafe { $($path_to_types)*::_export_receive_cabi::<$ty>(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) }
     }
     #[unsafe(export_name = "cabi_post_receive")]
     unsafe extern "C" fn _post_return_receive(arg0: *mut u8,) {
@@ -2022,7 +2065,15 @@ pub mod brenn {
     }
 
     /// External ABI — out-of-tree components are first-class consumers of this
-    /// interface. Evolution is additive-import-only (decisions.md §2 caveats).
+    /// interface.
+    ///
+    /// Evolution policy, in two regimes. Once an out-of-tree population exists,
+    /// evolution is additive-import-only: a new capability is a new interface, and
+    /// no existing shape moves. Until one exists, the world is in-tree vocabulary
+    /// and a shape change is a hard cut updated everywhere at once, with no compat
+    /// shim — the project's standing rule for internal contracts. The synchronous
+    /// channel below (`activation.sync` and `receive`'s reply) landed under the
+    /// second regime, together with the `dom` and `page-dom` interfaces.
     ///
     /// The invariant this interface serves:
     ///
@@ -2063,6 +2114,16 @@ pub mod brenn {
       /// stated above), so an additive new value is safe for out-of-tree
       /// consumers by construction.
       pub type EnvelopeJson = _rt::String;
+      /// Element handle, minted by the host. The same element is always the same
+      /// handle within one instance, and handle tables are per instance: a handle
+      /// another instance minted names nothing here.
+      ///
+      /// A handle lives until its element is destroyed, which `remove` and
+      /// `set-text` are the two ways of doing; using a handle after that traps.
+      /// See the `dom` interface doc.
+      ///
+      /// Lives in `types` because both `dom` and `page-dom` speak it.
+      pub type Node = u64;
       /// Messages delivered on one logical input port for this activation.
       #[derive(Clone)]
       pub struct PortWindow {
@@ -2189,15 +2250,25 @@ pub mod brenn {
       /// only on a host that exposes no UTC wall clock at all; a guest that needs
       /// deferred publish must handle `none` by declining to schedule rather than
       /// inventing an instant.
+      ///
+      /// `sync` names the live sync port when this is a **sync-call** activation:
+      /// an ordinary activation plus a return obligation. It is `none` on every
+      /// asynchronous delivery, which is every activation a message causes, and
+      /// on every activation a backend host mints — a headless component has no
+      /// cause that could be synchronous. The named port appears in `ports`
+      /// carrying exactly one envelope, the live request, so a guest consumes it
+      /// through the same window API as everything else. The obligation is
+      /// `receive`'s reply: only a sync-call activation may answer.
       #[derive(Clone)]
       pub struct Activation {
         pub ports: _rt::Vec::<PortWindow>,
         pub deferred: _rt::Vec::<DeferredWindow>,
         pub now: Option<u64>,
+        pub sync: Option<_rt::String>,
       }
       impl ::core::fmt::Debug for Activation {
         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-          f.debug_struct("Activation").field("ports", &self.ports).field("deferred", &self.deferred).field("now", &self.now).finish()
+          f.debug_struct("Activation").field("ports", &self.ports).field("deferred", &self.deferred).field("now", &self.now).field("sync", &self.sync).finish()
         }
       }
       /// Outcome of processing the batch. A guest trap is a distinct,
@@ -2228,6 +2299,528 @@ pub mod brenn {
       }
 
       impl ::core::error::Error for ReceiveError {}
+
+    }
+
+    /// Scoped DOM: read and mutate the instance's own element subtree.
+    ///
+    /// Element *reach* is confined by construction: every handle derives from
+    /// `root` or from the instance's own `create-element`, and handle tables are
+    /// per instance, so a handle another instance minted is not a handle here.
+    ///
+    /// Element *authority* is confined the same way, by construction rather than
+    /// by inspection: the host creates only the tags listed at the end of this doc
+    /// and sets only the attribute names listed with them, and everything else
+    /// traps as flatly as a foreign handle does. Attribute values are never
+    /// examined, because no name on the list can carry a URL or an event handler.
+    /// The admission rule for any future entry, in tree or out: on every allowed
+    /// tag, the entry must cause no script execution, no navigation, no resource
+    /// fetch, and no effect outside the instance's own subtree. That rule excludes
+    /// `script`, `iframe`, `object`, `embed`, `template`, `meta`, `base`, `style`,
+    /// `link`, `form` and `a` without enumerating them, along with every `on*` and
+    /// URL-bearing attribute name, and along with the element id, which names a
+    /// thing in the page-global namespace a confined subtree does not reach into.
+    /// Growing either list is a reviewed, additive change to this doc and to the
+    /// host constants it mirrors.
+    ///
+    /// This is containment, not a security boundary — the backend is that, and it
+    /// is unchanged. It is here because the alternative is a grant word whose
+    /// documented confinement any holder can step out of in one call, which makes
+    /// the separate page-DOM authority decoration.
+    ///
+    /// # Handle lifetime
+    ///
+    /// A handle lives until the element it names is destroyed, and two operations
+    /// destroy elements. `remove` destroys the node and its whole subtree, which
+    /// invalidates that node's handle and every handle naming an element inside it.
+    /// `set-text` replaces a node's children, which invalidates every handle naming
+    /// an element strictly inside it; the node itself survives. Nothing else
+    /// invalidates: `append` and `insert-before` reparent, and a moved node keeps
+    /// its handle.
+    ///
+    /// Using an invalidated handle traps, exactly as an unknown handle does. There
+    /// is no re-appending a removed subtree; detach-to-hide is what the `hidden`
+    /// attribute is for. Reclamation crosses instances, because it is about what
+    /// the host still holds: if a `page-dom` holder destroys a subtree containing
+    /// an element another instance named, that instance's handle is invalidated
+    /// too, and it traps on next use rather than operating on an orphan.
+    ///
+    /// A component that creates an element and never appends it, then drops the
+    /// handle, leaks that one entry for the page's life. That is the component's
+    /// own bounded self-harm, not a steady state of any rendering pattern.
+    ///
+    /// Allowed tags, matched as exact ASCII lowercase:
+    ///
+    /// `blockquote`, `br`, `button`, `code`, `div`, `em`, `h1`, `h2`, `h3`, `h4`,
+    /// `h5`, `h6`, `header`, `hr`, `input`, `li`, `ol`, `p`, `pre`, `s`,
+    /// `section`, `span`, `strong`, `ul`.
+    ///
+    /// Allowed attribute names, by the same match, and the two inert families
+    /// admitted by prefix:
+    ///
+    /// `class`, `disabled`, `hidden`, `placeholder`, `role`, `start`, `title`,
+    /// `type`, `aria-`, `data-`.
+    #[allow(dead_code, async_fn_in_trait, unused_imports, clippy::all)]
+    pub mod dom {
+      #[used]
+      #[doc(hidden)]
+      static __FORCE_SECTION_REF: fn() =
+      super::super::super::__link_custom_section_describing_imports;
+      
+      use super::super::super::_rt;
+      pub type Node = super::super::super::brenn::processor::types::Node;
+      #[allow(unused_unsafe, clippy::all)]
+      /// The instance's own host element: the root of the subtree it owns.
+      #[allow(async_fn_in_trait)]
+      pub fn root() -> Node{
+        unsafe {
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "root"]
+            fn wit_import0() -> i64;
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import0() -> i64 { unreachable!() }
+          let ret = wit_import0();
+          ret as u64
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Create a detached element. `tag` must be one of the allowed tags above;
+      /// anything else traps.
+      #[allow(async_fn_in_trait)]
+      pub fn create_element(tag: &str,) -> Node{
+        unsafe {
+          let vec0 = tag;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "create-element"]
+            fn wit_import1(_: *mut u8, _: usize, ) -> i64;
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: *mut u8, _: usize, ) -> i64 { unreachable!() }
+          let ret = wit_import1(ptr0.cast_mut(), len0);
+          ret as u64
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Set an attribute. `name` must be one of the allowed attribute names
+      /// above; anything else traps. The value is never inspected.
+      #[allow(async_fn_in_trait)]
+      pub fn set_attribute(n: Node,name: &str,value: &str,) -> (){
+        unsafe {
+          let vec0 = name;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+          let vec1 = value;
+          let ptr1 = vec1.as_ptr().cast::<u8>();
+          let len1 = vec1.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "set-attribute"]
+            fn wit_import2(_: i64, _: *mut u8, _: usize, _: *mut u8, _: usize, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import2(_: i64, _: *mut u8, _: usize, _: *mut u8, _: usize, ) { unreachable!() }
+          wit_import2(_rt::as_i64(n), ptr0.cast_mut(), len0, ptr1.cast_mut(), len1);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      #[allow(async_fn_in_trait)]
+      pub fn remove_attribute(n: Node,name: &str,) -> (){
+        unsafe {
+          let vec0 = name;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "remove-attribute"]
+            fn wit_import1(_: i64, _: *mut u8, _: usize, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: i64, _: *mut u8, _: usize, ) { unreachable!() }
+          wit_import1(_rt::as_i64(n), ptr0.cast_mut(), len0);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Replace the node's children with one inert text node. Text only — this
+      /// never parses markup.
+      ///
+      /// The replaced children are destroyed: every handle naming an element
+      /// strictly inside `n` is invalidated. `n` itself stays valid.
+      #[allow(async_fn_in_trait)]
+      pub fn set_text(n: Node,text: &str,) -> (){
+        unsafe {
+          let vec0 = text;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "set-text"]
+            fn wit_import1(_: i64, _: *mut u8, _: usize, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: i64, _: *mut u8, _: usize, ) { unreachable!() }
+          wit_import1(_rt::as_i64(n), ptr0.cast_mut(), len0);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      #[allow(async_fn_in_trait)]
+      pub fn set_style_property(n: Node,name: &str,value: &str,) -> (){
+        unsafe {
+          let vec0 = name;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+          let vec1 = value;
+          let ptr1 = vec1.as_ptr().cast::<u8>();
+          let len1 = vec1.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "set-style-property"]
+            fn wit_import2(_: i64, _: *mut u8, _: usize, _: *mut u8, _: usize, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import2(_: i64, _: *mut u8, _: usize, _: *mut u8, _: usize, ) { unreachable!() }
+          wit_import2(_rt::as_i64(n), ptr0.cast_mut(), len0, ptr1.cast_mut(), len1);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      #[allow(async_fn_in_trait)]
+      pub fn remove_style_property(n: Node,name: &str,) -> (){
+        unsafe {
+          let vec0 = name;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "remove-style-property"]
+            fn wit_import1(_: i64, _: *mut u8, _: usize, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: i64, _: *mut u8, _: usize, ) { unreachable!() }
+          wit_import1(_rt::as_i64(n), ptr0.cast_mut(), len0);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      #[allow(async_fn_in_trait)]
+      pub fn append(parent: Node,child: Node,) -> (){
+        unsafe {
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "append"]
+            fn wit_import0(_: i64, _: i64, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import0(_: i64, _: i64, ) { unreachable!() }
+          wit_import0(_rt::as_i64(parent), _rt::as_i64(child));
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Insert `child` before `reference`, or append when `reference` is `none`.
+      #[allow(async_fn_in_trait)]
+      pub fn insert_before(parent: Node,child: Node,reference: Option<Node>,) -> (){
+        unsafe {
+          let (result0_0,result0_1,) = match reference {
+            Some(e) => (1i32, _rt::as_i64(e)),
+            None => {
+              (0i32, 0i64)
+            },
+          };
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "insert-before"]
+            fn wit_import1(_: i64, _: i64, _: i32, _: i64, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: i64, _: i64, _: i32, _: i64, ) { unreachable!() }
+          wit_import1(_rt::as_i64(parent), _rt::as_i64(child), result0_0, result0_1);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Destroy the node: detach it from its parent, and invalidate `n`'s
+      /// handle along with every handle naming an element inside the removed
+      /// subtree. There is no re-appending it.
+      #[allow(async_fn_in_trait)]
+      pub fn remove(n: Node,) -> (){
+        unsafe {
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "remove"]
+            fn wit_import0(_: i64, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import0(_: i64, ) { unreachable!() }
+          wit_import0(_rt::as_i64(n));
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Read a form control's current value; the empty string for a node that
+      /// has none.
+      #[allow(async_fn_in_trait)]
+      pub fn value(n: Node,) -> _rt::String{
+        unsafe {
+
+          #[cfg_attr(target_pointer_width="64", repr(align(8)))]
+          #[cfg_attr(target_pointer_width="32", repr(align(4)))]
+          struct RetArea([::core::mem::MaybeUninit::<u8>; 2*::core::mem::size_of::<*const u8>()]);
+          let mut ret_area = RetArea([::core::mem::MaybeUninit::uninit(); 2*::core::mem::size_of::<*const u8>()]);
+          let ptr0 = ret_area.0.as_mut_ptr().cast::<u8>();
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "value"]
+            fn wit_import1(_: i64, _: *mut u8, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: i64, _: *mut u8, ) { unreachable!() }
+          wit_import1(_rt::as_i64(n), ptr0);
+          let l2 = *ptr0.add(0).cast::<*mut u8>();
+          let l3 = *ptr0.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+          let len4 = l3;
+          let bytes4 = _rt::Vec::from_raw_parts(l2.cast(), len4, len4);
+          let result5 = _rt::string_lift(bytes4);
+          result5
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      #[allow(async_fn_in_trait)]
+      pub fn set_value(n: Node,value: &str,) -> (){
+        unsafe {
+          let vec0 = value;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "set-value"]
+            fn wit_import1(_: i64, _: *mut u8, _: usize, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: i64, _: *mut u8, _: usize, ) { unreachable!() }
+          wit_import1(_rt::as_i64(n), ptr0.cast_mut(), len0);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Attach a host-owned listener for `event` on the node. The host answers
+      /// the event with a sync-call activation on `port`, carrying a synthesized
+      /// request body naming the event, the listening node and the nearest
+      /// handle-mapped ancestor of the event target.
+      ///
+      /// A listener dies with its element: an element receives no UI events once
+      /// detached, and detaching is what destroys it, so a listener inside a
+      /// removed or `set-text`-cleared subtree is permanently inert.
+      #[allow(async_fn_in_trait)]
+      pub fn listen(n: Node,event: &str,port: &str,) -> (){
+        unsafe {
+          let vec0 = event;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+          let vec1 = port;
+          let ptr1 = vec1.as_ptr().cast::<u8>();
+          let len1 = vec1.len();
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "listen"]
+            fn wit_import2(_: i64, _: *mut u8, _: usize, _: *mut u8, _: usize, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import2(_: i64, _: *mut u8, _: usize, _: *mut u8, _: usize, ) { unreachable!() }
+          wit_import2(_rt::as_i64(n), ptr0.cast_mut(), len0, ptr1.cast_mut(), len1);
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// The page environment's UTC offset, in minutes, at the given instant.
+      /// Not a DOM operation: it is the one page fact a component cannot compute
+      /// from the activation clock, and it rides here rather than earning a grant
+      /// word of its own.
+      #[allow(async_fn_in_trait)]
+      pub fn utc_offset_minutes(epoch_ms: u64,) -> i32{
+        unsafe {
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "utc-offset-minutes"]
+            fn wit_import0(_: i64, ) -> i32;
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import0(_: i64, ) -> i32 { unreachable!() }
+          let ret = wit_import0(_rt::as_i64(&epoch_ms));
+          ret
+        }
+      }
+
+    }
+
+    /// Page-DOM authority: the ability to reach outside one's own subtree.
+    ///
+    /// Separate from `dom` because it is a different capability, not a bigger one.
+    /// A surface designates exactly one instance — its chrome — to arrange the page;
+    /// every other instance is confined to what `dom` alone can reach.
+    #[allow(dead_code, async_fn_in_trait, unused_imports, clippy::all)]
+    pub mod page_dom {
+      #[used]
+      #[doc(hidden)]
+      static __FORCE_SECTION_REF: fn() =
+      super::super::super::__link_custom_section_describing_imports;
+      
+      use super::super::super::_rt;
+      pub type Node = super::super::super::brenn::processor::types::Node;
+      #[allow(unused_unsafe, clippy::all)]
+      /// The surface's root element, which holds every instance wrapper.
+      #[allow(async_fn_in_trait)]
+      pub fn page_root() -> Node{
+        unsafe {
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/page-dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "page-root"]
+            fn wit_import0() -> i64;
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import0() -> i64 { unreachable!() }
+          let ret = wit_import0();
+          ret as u64
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// The page body, where document-level state is stamped.
+      #[allow(async_fn_in_trait)]
+      pub fn page_body() -> Node{
+        unsafe {
+
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/page-dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "page-body"]
+            fn wit_import0() -> i64;
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import0() -> i64 { unreachable!() }
+          let ret = wit_import0();
+          ret as u64
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// The wrapper element the host created for another instance, or `none`
+      /// when that instance has not registered yet. A `none` is the ordinary
+      /// transient of a page still coming up, not an error.
+      #[allow(async_fn_in_trait)]
+      pub fn instance_wrapper(instance: &str,) -> Option<Node>{
+        unsafe {
+
+          #[repr(align(8))]
+          struct RetArea([::core::mem::MaybeUninit::<u8>; 16]);
+          let mut ret_area = RetArea([::core::mem::MaybeUninit::uninit(); 16]);
+          let vec0 = instance;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+          let ptr1 = ret_area.0.as_mut_ptr().cast::<u8>();
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/page-dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "instance-wrapper"]
+            fn wit_import2(_: *mut u8, _: usize, _: *mut u8, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import2(_: *mut u8, _: usize, _: *mut u8, ) { unreachable!() }
+          wit_import2(ptr0.cast_mut(), len0, ptr1);
+          let l3 = i32::from(*ptr1.add(0).cast::<u8>());
+          let result5 = match l3 {
+            0 => None,
+            1 => {
+              let e = {
+                let l4 = *ptr1.add(8).cast::<i64>();
+
+                l4 as u64
+              };
+              Some(e)
+            }
+            _ => _rt::invalid_enum_discriminant(),
+          };
+          result5
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// The node's parent, or `none` when it is detached or is the document
+      /// root. Handle identity substitutes for node identity: the host mints one
+      /// handle per element, so comparing handles compares elements.
+      #[allow(async_fn_in_trait)]
+      pub fn parent(n: Node,) -> Option<Node>{
+        unsafe {
+
+          #[repr(align(8))]
+          struct RetArea([::core::mem::MaybeUninit::<u8>; 16]);
+          let mut ret_area = RetArea([::core::mem::MaybeUninit::uninit(); 16]);
+          let ptr0 = ret_area.0.as_mut_ptr().cast::<u8>();
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/page-dom@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "parent"]
+            fn wit_import1(_: i64, _: *mut u8, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import1(_: i64, _: *mut u8, ) { unreachable!() }
+          wit_import1(_rt::as_i64(n), ptr0);
+          let l2 = i32::from(*ptr0.add(0).cast::<u8>());
+          let result4 = match l2 {
+            0 => None,
+            1 => {
+              let e = {
+                let l3 = *ptr0.add(8).cast::<i64>();
+
+                l3 as u64
+              };
+              Some(e)
+            }
+            _ => _rt::invalid_enum_discriminant(),
+          };
+          result4
+        }
+      }
 
     }
 
@@ -2495,9 +3088,9 @@ pub(crate) use __export_processor_impl as export;
 #[unsafe(link_section = "component-type:wit-bindgen:0.60.0:brenn:processor@0.1.0:processor:encoded world")]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 2324] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x94\x11\x01A\x02\x01\
-A\x17\x01B\x14\x01q\x03\x0dnot-permitted\0\0\x0finvalid-payload\x01s\0\x0equota-\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 2962] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x92\x16\x01A\x02\x01\
+A\x1d\x01B\x14\x01q\x03\x0dnot-permitted\0\0\x0finvalid-payload\x01s\0\x0equota-\
 exceeded\0\0\x04\0\x0dpublish-error\x03\0\0\x01m\x04\x08very-low\x03low\x06norma\
 l\x04high\x04\0\x07urgency\x03\0\x02\x01q\x04\x0dnot-permitted\0\0\x0cout-of-ran\
 ge\0\0\x0equota-exceeded\0\0\x15invalid-deliver-after\0\0\x04\0\x0bdefer-error\x03\
@@ -2533,19 +3126,34 @@ jected\x01s\0\x04\0\x12mqtt-publish-error\x03\0\0\x01p}\x01ks\x01j\0\x01\x01\x01
 rate-limited\0\0\x0bwrong-class\0\0\x08internal\x01s\0\x04\0\x0atool-error\x03\0\
 \0\x01j\x01s\x01\x01\x01@\x02\x04tools\x09args-jsons\0\x02\x04\0\x09call-fast\x01\
 \x03\x01j\0\x01\x01\x01@\x03\x04tools\x09args-jsons\x07call-ids\0\x04\x04\0\x0ac\
-all-async\x01\x05\x03\0\x1bbrenn:processor/tools@0.1.0\x05\x06\x01B\x11\x01s\x04\
-\0\x0denvelope-json\x03\0\0\x01p\x01\x01r\x04\x04ports\x09envelopes\x02\x08new-f\
-romy\x07droppedy\x04\0\x0bport-window\x03\0\x03\x01r\x03\x05indexy\x07payloads\x0d\
-deliver-afterw\x04\0\x0edeferred-entry\x03\0\x05\x01p\x06\x01r\x02\x04ports\x07e\
-ntries\x07\x04\0\x0fdeferred-window\x03\0\x08\x01p\x04\x01p\x09\x01kw\x01r\x03\x05\
-ports\x0a\x08deferred\x0b\x03now\x0c\x04\0\x0aactivation\x03\0\x0d\x01q\x02\x12m\
-alformed-envelope\x01s\0\x11processing-failed\x01s\0\x04\0\x0dreceive-error\x03\0\
-\x0f\x03\0\x1bbrenn:processor/types@0.1.0\x05\x07\x02\x03\0\x07\x0aactivation\x03\
-\0\x0aactivation\x03\0\x08\x02\x03\0\x07\x0dreceive-error\x03\0\x0dreceive-error\
-\x03\0\x0a\x01j\0\x01\x0b\x01@\x01\x01a\x09\0\x0c\x04\0\x07receive\x01\x0d\x04\0\
-\x1fbrenn:processor/processor@0.1.0\x04\0\x0b\x0f\x01\0\x09processor\x03\0\0\0G\x09\
-producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.254.0\x10wit-bindgen-rus\
-t\x060.60.0";
+all-async\x01\x05\x03\0\x1bbrenn:processor/tools@0.1.0\x05\x06\x01B\x14\x01s\x04\
+\0\x0denvelope-json\x03\0\0\x01w\x04\0\x04node\x03\0\x02\x01p\x01\x01r\x04\x04po\
+rts\x09envelopes\x04\x08new-fromy\x07droppedy\x04\0\x0bport-window\x03\0\x05\x01\
+r\x03\x05indexy\x07payloads\x0ddeliver-afterw\x04\0\x0edeferred-entry\x03\0\x07\x01\
+p\x08\x01r\x02\x04ports\x07entries\x09\x04\0\x0fdeferred-window\x03\0\x0a\x01p\x06\
+\x01p\x0b\x01kw\x01ks\x01r\x04\x05ports\x0c\x08deferred\x0d\x03now\x0e\x04sync\x0f\
+\x04\0\x0aactivation\x03\0\x10\x01q\x02\x12malformed-envelope\x01s\0\x11processi\
+ng-failed\x01s\0\x04\0\x0dreceive-error\x03\0\x12\x03\0\x1bbrenn:processor/types\
+@0.1.0\x05\x07\x02\x03\0\x07\x04node\x01B\x1d\x02\x03\x02\x01\x08\x04\0\x04node\x03\
+\0\0\x01@\0\0\x01\x04\0\x04root\x01\x02\x01@\x01\x03tags\0\x01\x04\0\x0ecreate-e\
+lement\x01\x03\x01@\x03\x01n\x01\x04names\x05values\x01\0\x04\0\x0dset-attribute\
+\x01\x04\x01@\x02\x01n\x01\x04names\x01\0\x04\0\x10remove-attribute\x01\x05\x01@\
+\x02\x01n\x01\x04texts\x01\0\x04\0\x08set-text\x01\x06\x04\0\x12set-style-proper\
+ty\x01\x04\x04\0\x15remove-style-property\x01\x05\x01@\x02\x06parent\x01\x05chil\
+d\x01\x01\0\x04\0\x06append\x01\x07\x01k\x01\x01@\x03\x06parent\x01\x05child\x01\
+\x09reference\x08\x01\0\x04\0\x0dinsert-before\x01\x09\x01@\x01\x01n\x01\x01\0\x04\
+\0\x06remove\x01\x0a\x01@\x01\x01n\x01\0s\x04\0\x05value\x01\x0b\x01@\x02\x01n\x01\
+\x05values\x01\0\x04\0\x09set-value\x01\x0c\x01@\x03\x01n\x01\x05events\x04ports\
+\x01\0\x04\0\x06listen\x01\x0d\x01@\x01\x08epoch-msw\0z\x04\0\x12utc-offset-minu\
+tes\x01\x0e\x03\0\x19brenn:processor/dom@0.1.0\x05\x09\x01B\x0a\x02\x03\x02\x01\x08\
+\x04\0\x04node\x03\0\0\x01@\0\0\x01\x04\0\x09page-root\x01\x02\x04\0\x09page-bod\
+y\x01\x02\x01k\x01\x01@\x01\x08instances\0\x03\x04\0\x10instance-wrapper\x01\x04\
+\x01@\x01\x01n\x01\0\x03\x04\0\x06parent\x01\x05\x03\0\x1ebrenn:processor/page-d\
+om@0.1.0\x05\x0a\x02\x03\0\x07\x0aactivation\x03\0\x0aactivation\x03\0\x0b\x02\x03\
+\0\x07\x0dreceive-error\x03\0\x0dreceive-error\x03\0\x0d\x01ks\x01j\x01\x0f\x01\x0e\
+\x01@\x01\x01a\x0c\0\x10\x04\0\x07receive\x01\x11\x04\0\x1fbrenn:processor/proce\
+ssor@0.1.0\x04\0\x0b\x0f\x01\0\x09processor\x03\0\0\0G\x09producers\x01\x0cproce\
+ssed-by\x02\x0dwit-component\x070.254.0\x10wit-bindgen-rust\x060.60.0";
 
 #[inline(never)]
 #[doc(hidden)]

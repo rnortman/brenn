@@ -299,10 +299,10 @@ fn fenced_blocks(doc: &str) -> Vec<String> {
 
 #[test]
 fn a_fenced_block_is_read_without_its_fence_or_indent() {
-    let doc = "prose\n\n  ```brenn\n  component A {\n    abi = dom;\n  }\n  ```\n\nmore\n";
+    let doc = "prose\n\n  ```brenn\n  component A {\n    abi = processor;\n  }\n  ```\n\nmore\n";
     assert_eq!(
         fenced_blocks(doc),
-        vec!["component A {\n  abi = dom;\n}\n".to_string()]
+        vec!["component A {\n  abi = processor;\n}\n".to_string()]
     );
 }
 

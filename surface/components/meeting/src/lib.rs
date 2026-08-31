@@ -12,9 +12,13 @@
 //! pushes a fullscreen overlay.
 //!
 //! Split into a DOM-free, host-tested state machine (`logic`) and a thin
-//! `cfg(target_arch = "wasm32")` DOM/timer glue module.
+//! `cfg(target_arch = "wasm32")` page glue module.
 
+/// The help sidecar's generator. Host-only: it depends on the contract and
+/// schema crates, which are not available in the wasm32 build.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod help;
+
 pub mod logic;
 
 /// Port names and types from this component's specification.
@@ -22,3 +26,8 @@ pub mod spec;
 
 #[cfg(target_arch = "wasm32")]
 mod component;
+
+/// The styling seam between the glue's marker attributes and the stylesheets
+/// that select on them. Host-only, and tests alone.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod css_parity;

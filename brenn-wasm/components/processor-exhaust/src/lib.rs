@@ -36,7 +36,7 @@ fn spin_forever() {
 }
 
 impl Guest for ProcessorExhaust {
-    fn receive(a: Activation) -> Result<(), ReceiveError> {
+    fn receive(a: Activation) -> Result<Option<String>, ReceiveError> {
         for port_window in &a.ports {
             let new_from = port_window.new_from as usize;
             if new_from < port_window.envelopes.len() {
@@ -46,7 +46,7 @@ impl Guest for ProcessorExhaust {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 

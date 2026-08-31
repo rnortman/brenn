@@ -3,7 +3,8 @@
 //! This crate holds the payload schemas of the surface application layer: the
 //! [`bindings`] document a surface learns its wiring from, the [`telemetry`]
 //! documents it writes about itself, the reserved `local:brenn/*` control-plane
-//! bodies, the [`layout`] document, and the contract constants both ends share.
+//! bodies, and the contract constants both ends share. The layout document is
+//! not here: `brenn-chrome` is its only reader and owns it.
 //! Both ends compile against it: the Rust/Axum backend and the
 //! `brenn-surface-kernel` crate (which builds to `wasm32-unknown-unknown` for
 //! the kernel and to native for tests). It is kept free of I/O, tokio, and
@@ -37,61 +38,7 @@ pub use brenn_envelope::Urgency;
 use serde::{Deserialize, Serialize};
 
 pub mod bindings;
-pub mod layout;
 pub mod telemetry;
-
-/// Which toolchain artifact backs a component instance, and how the kernel loads
-/// it.
-///
-/// A **build/loading fact only** — never an execution mode, never a capability
-/// statement. What a component is allowed to reach is its import profile: a
-/// component importing `store`/`mqtt`/`tools` is backend-only, and one importing
-/// DOM capability is surface-only. Those are the same rule reading a different
-/// profile, not a property of the value below.
-///
-/// The set is open the way `ChannelScheme` is open: a named value per artifact
-/// shape, extended additively. The kernel loads `Dom` and `Processor`; boot
-/// rejects the reserved values by name rather than half-supporting them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Abi {
-    /// A wasm-bindgen module defining a custom element (`brenn-<kind>`),
-    /// speaking the `brenn-surface-contract` DOM-event seam. Surface-only by
-    /// profile: it imports DOM capability via wasm-bindgen/web-sys.
-    Dom,
-    /// A `brenn:processor` component-model artifact — the same artifact that
-    /// deploys backend-side under `[[wasm_consumer]]`. Headless by profile: its
-    /// world has no DOM imports, so it gets no element, no mount, and no layout
-    /// slot, and the kernel calls its exports directly rather than through the
-    /// event seam.
-    Processor,
-    /// Reserved: a TypeScript/Lit component kind.
-    DomTs,
-    /// Reserved: server-rendered HTML with declarative actions.
-    Html,
-}
-
-impl Abi {
-    /// Every value, so enumerating tests and validators cannot hand-list the set
-    /// and silently skip a new one (the `ChannelScheme::ALL` pattern).
-    pub const ALL: [Abi; 4] = [Abi::Dom, Abi::Processor, Abi::DomTs, Abi::Html];
-
-    /// The config/wire string for this ABI.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Abi::Dom => "dom",
-            Abi::Processor => "processor",
-            Abi::DomTs => "dom-ts",
-            Abi::Html => "html",
-        }
-    }
-
-    /// The ABI for a config/wire string, or `None` when the string names no ABI
-    /// this contract defines.
-    pub fn parse(s: &str) -> Option<Abi> {
-        Abi::ALL.into_iter().find(|abi| abi.as_str() == s)
-    }
-}
 
 /// Mount state of one component instance, serialized lowercase
 /// (`"mounted"`/`"failed"`/`"pending"`).
@@ -225,19 +172,13 @@ pub struct LocalChannel {
     pub ring_depth: u64,
 }
 
-/// One declared component instance: its routing/mount `instance` id, the
-/// component `kind` that backs it, and the `abi` that says what shape that
-/// backing artifact is. Several instances may share a kind (one wasm module, N
-/// elements).
+/// One declared component instance: its routing `instance` id and the component
+/// `kind` that backs it. Several instances may share a kind — one compiled
+/// module, N instantiations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentEntry {
     pub instance: String,
     pub kind: String,
-    /// How the kernel loads this instance's artifact. Advertised rather than
-    /// inferred from the kind: the same logic may ship as more than one artifact
-    /// shape over its life, and the page must never guess which one it is
-    /// holding.
-    pub abi: Abi,
     /// How many of this instance's activation flushes the kernel parks while the
     /// link is down, before dropping the oldest whole batch. Resolved at boot;
     /// bounded and `>= 1`.
@@ -250,10 +191,9 @@ pub struct ComponentEntry {
     /// canonical `ComponentGrant::word()` spellings, sorted and deduplicated.
     ///
     /// Enforced page-side: the kernel gates every privileged entry a component
-    /// reaches on this list, identically for both ABIs — the publish/defer
-    /// family, the log router, the alert router, and config reads. A word this
-    /// build cannot parse means server/kernel skew and refuses the whole
-    /// document.
+    /// reaches on this list — the publish/defer family, the log router, the alert
+    /// router, config reads, and the two DOM capabilities. A word this build
+    /// cannot parse means server/kernel skew and refuses the whole document.
     ///
     /// The backend judges the same grants again, at boot against a processor's
     /// imports and the surface's own grants, and per frame for an attributed
@@ -265,9 +205,7 @@ pub struct ComponentEntry {
     /// instead of a reparse obligation on every reader.
     pub grants: Vec<String>,
     /// This instance's static config map, read through the component's `config`
-    /// capability. Empty unless the instance declares one. Independent of the
-    /// ABI: a `dom` component reads it over the contract's config-get event, a
-    /// `processor` through its `config` import.
+    /// import. Empty unless the instance declares one.
     ///
     /// Fixed for the page's lifetime — the backend's process-lifetime config
     /// map, at the page's grain. A changed map arrives only with a redelivered
@@ -439,7 +377,7 @@ pub struct ReservedLocalChannel {
     pub kernel_publish_only: bool,
     /// Whether binding this channel — in either direction — requires the
     /// binding *component's* `takeover` grant. Capability-as-binding: the grant
-    /// gates the wiring rather than a runtime DOM-event check. A component's
+    /// gates the wiring rather than a runtime check at the publish. A component's
     /// grants are its own; its surface holds no page capabilities.
     pub requires_takeover_grant: bool,
 }
@@ -901,37 +839,5 @@ mod tests {
         // The floor admission predicate the kernel uses.
         assert!(LogLevel::Error >= LogLevel::Warn);
         assert!(LogLevel::Info < LogLevel::Warn);
-    }
-
-    #[test]
-    fn every_abi_round_trips_its_wire_string() {
-        // Driven off `ALL` rather than a hand-listed set: a new ABI joins this
-        // test by existing, which is the point of `ALL`.
-        for abi in Abi::ALL {
-            assert_eq!(Abi::parse(abi.as_str()), Some(abi));
-        }
-    }
-
-    #[test]
-    fn abi_wire_strings_are_pinned() {
-        // Operator config and the wire share these spellings; they are contract.
-        assert_eq!(Abi::Dom.as_str(), "dom");
-        assert_eq!(Abi::Processor.as_str(), "processor");
-        assert_eq!(Abi::DomTs.as_str(), "dom-ts");
-        assert_eq!(Abi::Html.as_str(), "html");
-        assert_eq!(Abi::parse("nonesuch"), None);
-        assert_eq!(Abi::parse("Dom"), None);
-    }
-
-    #[test]
-    fn abi_serde_matches_its_config_spelling() {
-        // The bindings-document encoding and the config string must be the same
-        // word: an operator reading a delivered document in the console must not
-        // find a second spelling of the value they wrote.
-        for abi in Abi::ALL {
-            let json = serde_json::to_value(abi).unwrap();
-            assert_eq!(json, json!(abi.as_str()));
-            assert_eq!(serde_json::from_value::<Abi>(json).unwrap(), abi);
-        }
     }
 }

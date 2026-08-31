@@ -54,7 +54,7 @@ const CONDEMNED: &[Condemned] = &[
     },
     Condemned {
         token: "GapReason",
-        scopes: &["surface/component-support", "surface/components"],
+        scopes: &["surface/components"],
         tests_exempt: true,
         why: "gap classification never reaches the component seam; survives \
               in brenn-lib's resume layer, in surface/schema as the wire \

@@ -1,7 +1,15 @@
 package brenn:processor@0.1.0;
 
 /// External ABI — out-of-tree components are first-class consumers of this
-/// interface. Evolution is additive-import-only (decisions.md §2 caveats).
+/// interface.
+///
+/// Evolution policy, in two regimes. Once an out-of-tree population exists,
+/// evolution is additive-import-only: a new capability is a new interface, and
+/// no existing shape moves. Until one exists, the world is in-tree vocabulary
+/// and a shape change is a hard cut updated everywhere at once, with no compat
+/// shim — the project's standing rule for internal contracts. The synchronous
+/// channel below (`activation.sync` and `receive`'s reply) landed under the
+/// second regime, together with the `dom` and `page-dom` interfaces.
 ///
 /// The invariant this interface serves:
 ///
@@ -36,6 +44,17 @@ interface types {
     /// stated above), so an additive new value is safe for out-of-tree
     /// consumers by construction.
     type envelope-json = string;
+
+    /// Element handle, minted by the host. The same element is always the same
+    /// handle within one instance, and handle tables are per instance: a handle
+    /// another instance minted names nothing here.
+    ///
+    /// A handle lives until its element is destroyed, which `remove` and
+    /// `set-text` are the two ways of doing; using a handle after that traps.
+    /// See the `dom` interface doc.
+    ///
+    /// Lives in `types` because both `dom` and `page-dom` speak it.
+    type node = u64;
 
     /// Messages delivered on one logical input port for this activation.
     record port-window {
@@ -151,10 +170,20 @@ interface types {
     /// only on a host that exposes no UTC wall clock at all; a guest that needs
     /// deferred publish must handle `none` by declining to schedule rather than
     /// inventing an instant.
+    ///
+    /// `sync` names the live sync port when this is a **sync-call** activation:
+    /// an ordinary activation plus a return obligation. It is `none` on every
+    /// asynchronous delivery, which is every activation a message causes, and
+    /// on every activation a backend host mints — a headless component has no
+    /// cause that could be synchronous. The named port appears in `ports`
+    /// carrying exactly one envelope, the live request, so a guest consumes it
+    /// through the same window API as everything else. The obligation is
+    /// `receive`'s reply: only a sync-call activation may answer.
     record activation {
         ports: list<port-window>,
         deferred: list<deferred-window>,
         now: option<u64>,
+        sync: option<string>,
     }
 
     /// Outcome of processing the batch. A guest trap is a distinct,
@@ -510,6 +539,146 @@ interface config {
     get: func(key: string) -> option<string>;
 }
 
+/// Scoped DOM: read and mutate the instance's own element subtree.
+///
+/// Element *reach* is confined by construction: every handle derives from
+/// `root` or from the instance's own `create-element`, and handle tables are
+/// per instance, so a handle another instance minted is not a handle here.
+///
+/// Element *authority* is confined the same way, by construction rather than
+/// by inspection: the host creates only the tags listed at the end of this doc
+/// and sets only the attribute names listed with them, and everything else
+/// traps as flatly as a foreign handle does. Attribute values are never
+/// examined, because no name on the list can carry a URL or an event handler.
+/// The admission rule for any future entry, in tree or out: on every allowed
+/// tag, the entry must cause no script execution, no navigation, no resource
+/// fetch, and no effect outside the instance's own subtree. That rule excludes
+/// `script`, `iframe`, `object`, `embed`, `template`, `meta`, `base`, `style`,
+/// `link`, `form` and `a` without enumerating them, along with every `on*` and
+/// URL-bearing attribute name, and along with the element id, which names a
+/// thing in the page-global namespace a confined subtree does not reach into.
+/// Growing either list is a reviewed, additive change to this doc and to the
+/// host constants it mirrors.
+///
+/// This is containment, not a security boundary — the backend is that, and it
+/// is unchanged. It is here because the alternative is a grant word whose
+/// documented confinement any holder can step out of in one call, which makes
+/// the separate page-DOM authority decoration.
+///
+/// # Handle lifetime
+///
+/// A handle lives until the element it names is destroyed, and two operations
+/// destroy elements. `remove` destroys the node and its whole subtree, which
+/// invalidates that node's handle and every handle naming an element inside it.
+/// `set-text` replaces a node's children, which invalidates every handle naming
+/// an element strictly inside it; the node itself survives. Nothing else
+/// invalidates: `append` and `insert-before` reparent, and a moved node keeps
+/// its handle.
+///
+/// Using an invalidated handle traps, exactly as an unknown handle does. There
+/// is no re-appending a removed subtree; detach-to-hide is what the `hidden`
+/// attribute is for. Reclamation crosses instances, because it is about what
+/// the host still holds: if a `page-dom` holder destroys a subtree containing
+/// an element another instance named, that instance's handle is invalidated
+/// too, and it traps on next use rather than operating on an orphan.
+///
+/// A component that creates an element and never appends it, then drops the
+/// handle, leaks that one entry for the page's life. That is the component's
+/// own bounded self-harm, not a steady state of any rendering pattern.
+///
+/// Allowed tags, matched as exact ASCII lowercase:
+///
+/// `blockquote`, `br`, `button`, `code`, `div`, `em`, `h1`, `h2`, `h3`, `h4`,
+/// `h5`, `h6`, `header`, `hr`, `input`, `li`, `ol`, `p`, `pre`, `s`,
+/// `section`, `span`, `strong`, `ul`.
+///
+/// Allowed attribute names, by the same match, and the two inert families
+/// admitted by prefix:
+///
+/// `class`, `disabled`, `hidden`, `placeholder`, `role`, `start`, `title`,
+/// `type`, `aria-`, `data-`.
+interface dom {
+    use types.{node};
+
+    /// The instance's own host element: the root of the subtree it owns.
+    root: func() -> node;
+
+    /// Create a detached element. `tag` must be one of the allowed tags above;
+    /// anything else traps.
+    create-element: func(tag: string) -> node;
+
+    /// Set an attribute. `name` must be one of the allowed attribute names
+    /// above; anything else traps. The value is never inspected.
+    set-attribute: func(n: node, name: string, value: string);
+    remove-attribute: func(n: node, name: string);
+
+    /// Replace the node's children with one inert text node. Text only — this
+    /// never parses markup.
+    ///
+    /// The replaced children are destroyed: every handle naming an element
+    /// strictly inside `n` is invalidated. `n` itself stays valid.
+    set-text: func(n: node, text: string);
+
+    set-style-property: func(n: node, name: string, value: string);
+    remove-style-property: func(n: node, name: string);
+
+    append: func(parent: node, child: node);
+
+    /// Insert `child` before `reference`, or append when `reference` is `none`.
+    insert-before: func(parent: node, child: node, reference: option<node>);
+
+    /// Destroy the node: detach it from its parent, and invalidate `n`'s
+    /// handle along with every handle naming an element inside the removed
+    /// subtree. There is no re-appending it.
+    remove: func(n: node);
+
+    /// Read a form control's current value; the empty string for a node that
+    /// has none.
+    value: func(n: node) -> string;
+    set-value: func(n: node, value: string);
+
+    /// Attach a host-owned listener for `event` on the node. The host answers
+    /// the event with a sync-call activation on `port`, carrying a synthesized
+    /// request body naming the event, the listening node and the nearest
+    /// handle-mapped ancestor of the event target.
+    ///
+    /// A listener dies with its element: an element receives no UI events once
+    /// detached, and detaching is what destroys it, so a listener inside a
+    /// removed or `set-text`-cleared subtree is permanently inert.
+    listen: func(n: node, event: string, port: string);
+
+    /// The page environment's UTC offset, in minutes, at the given instant.
+    /// Not a DOM operation: it is the one page fact a component cannot compute
+    /// from the activation clock, and it rides here rather than earning a grant
+    /// word of its own.
+    utc-offset-minutes: func(epoch-ms: u64) -> s32;
+}
+
+/// Page-DOM authority: the ability to reach outside one's own subtree.
+///
+/// Separate from `dom` because it is a different capability, not a bigger one.
+/// A surface designates exactly one instance — its chrome — to arrange the page;
+/// every other instance is confined to what `dom` alone can reach.
+interface page-dom {
+    use types.{node};
+
+    /// The surface's root element, which holds every instance wrapper.
+    page-root: func() -> node;
+
+    /// The page body, where document-level state is stamped.
+    page-body: func() -> node;
+
+    /// The wrapper element the host created for another instance, or `none`
+    /// when that instance has not registered yet. A `none` is the ordinary
+    /// transient of a page still coming up, not an error.
+    instance-wrapper: func(instance: string) -> option<node>;
+
+    /// The node's parent, or `none` when it is detached or is the document
+    /// root. Handle identity substitutes for node identity: the host mints one
+    /// handle per element, so comparing handles compares elements.
+    parent: func(n: node) -> option<node>;
+}
+
 world processor {
     use types.{activation, receive-error};
     import ports;
@@ -519,11 +688,18 @@ world processor {
     import config;
     import mqtt;
     import tools;
+    import dom;
+    import page-dom;
 
     /// Receive one activation (one or more port-windows of messages). The
     /// component processes the new portions of each port-window using earlier
     /// entries as context, and returns one result for the whole activation.
     /// Published messages (via the ports import) are buffered during execution
     /// and flushed atomically iff this returns ok; err/trap discards the buffer.
-    export receive: func(a: activation) -> result<_, receive-error>;
+    /// A sync-call activation may answer its caller: `ok(some(reply))` is that
+    /// answer, and the reply's dialect belongs to whatever raised the call. An
+    /// ordinary activation must answer `ok(none)`; a `some` on one is a host
+    /// trap, because a component replying to a cause that asked nothing has
+    /// lost track of why it was called.
+    export receive: func(a: activation) -> result<option<string>, receive-error>;
 }

@@ -1,18 +1,17 @@
 //! Component contract v1 — the kernel ↔ component seam.
 //!
-//! These names and shapes never cross the WS wire; they are the DOM-CustomEvent
-//! contract between the surface kernel and the component modules it mounts, plus
-//! the `window`-event seam between the kernel and the TS bootstrap. They live in
+//! These names and shapes never cross the WS wire; they are the contract between
+//! the surface kernel and the component instances it hosts, plus the
+//! `window`-event seam between the kernel and the TS bootstrap. They live in
 //! their own crate because they are the seam: contract surface as load-bearing
 //! as the wire frames, which both the kernel and every component crate compile
 //! against, and which out-of-tree component authors depend on directly. The wire
 //! frames themselves are `brenn-surface-schema`; this crate depends on it for the
 //! types the seam's details carry as JSON strings, never the other way round.
 //!
-//! Envelopes cross the kernel↔component boundary as CustomEvents carrying JSON
-//! **strings** and other **primitives only** — no structured objects — so the
-//! boundary stays serialization-clean across independently-built wasm modules.
-//! All rendered text reaches the DOM as `textContent`, never `innerHTML`.
+//! Envelopes cross the kernel↔component boundary as JSON **strings**, so the
+//! boundary stays serialization-clean across independently-built components. All
+//! rendered text reaches the DOM as `textContent`, never `innerHTML`.
 //!
 //! # The invariant
 //!
@@ -26,25 +25,6 @@
 //! this seam serves — is surface-only. Both are the *same* rule reading a
 //! different import profile, not two kinds of thing. Components see exactly one
 //! mechanism: **messages on named ports**.
-//!
-//! # Component ABIs
-//!
-//! A component instance's `abi` is a **build/loading fact only** — which
-//! toolchain artifact the kernel loads and how. It is never an execution mode and
-//! never a capability statement; hosting eligibility is the import profile
-//! above. The set (`brenn_surface_schema::Abi`):
-//!
-//! - `dom` — a wasm-bindgen module defining a custom element, speaking the seam
-//!   this crate defines. Imports DOM capability via wasm-bindgen/web-sys, hence
-//!   surface-only by profile.
-//! - `processor` — a `brenn:processor` component-model artifact: the same
-//!   artifact that deploys backend-side under `[[wasm_consumer]]`. Headless by
-//!   profile (its world has no DOM imports), so it uses no DOM events at all —
-//!   its imports are direct host-supplied calls. Two transports, one vocabulary.
-//! - `dom-ts`, `html` — reserved names, so v1 does not freeze them out.
-//!
-//! `dom` and `processor` are loadable; `dom-ts` and `html` are reserved names
-//! that resolve to a named boot panic rather than a value that half-works.
 //!
 //! # Delivery: the activation is the only shape
 //!
@@ -137,10 +117,11 @@
 //!   usual, the deferred windows ride along, `now` is set, publishes buffer and
 //!   flush iff the entry returns ok. A sync activation consumes queued input like
 //!   any other, so no async activation follows it for input it already drained.
-//! - **Kernel-originated, gestures-only in v1.** The one caller is the kernel's own
-//!   DOM seam, on behalf of a component's gesture wiring: the reason the class
-//!   exists is the same-task reply (a live gesture token, and the chance to
-//!   suppress the browser's default action), which nothing but a gesture needs.
+//! - **Kernel-originated in v1.** The two callers are the kernel's own gesture
+//!   listeners, installed by a component's `dom.listen`, and the mount call
+//!   ([`MOUNT_SYNC_PORT`]). A gesture is why the class exists: the same-task
+//!   reply gives a live gesture token and the chance to suppress the browser's
+//!   default action.
 //!   Component-to-component sync bindings are not representable — the bindings
 //!   document has no class field and no sync vocabulary — and are reserved for the
 //!   follow-on that builds them.
@@ -163,9 +144,9 @@
 //! There is no timer concept on this seam, and no arming API. **A timer is a
 //! deferred self-publish**: a component declares an in/out port
 //! (`[[surface.io_port]]`, whose two halves resolve to one channel by
-//! construction), publishes its next tick to itself with a `deliver_after` computed
-//! from the activation's own `now` ([`PORT_DEFER`]), and the tick arrives as an
-//! ordinary message on an ordinary input port. Rescheduling and cancelling are the
+//! construction), publishes its next tick to itself with a `deliver_after`
+//! computed from the activation's own `now`, and the tick arrives as an ordinary
+//! message on an ordinary input port. Rescheduling and cancelling are the
 //! cancel/edit ops against the [`DeferredWindow`] the activation is handed, so they
 //! ride the same flush rule: an entry that errs schedules nothing.
 //!
@@ -189,100 +170,60 @@
 //!   course just render or read. Publishing from a listener is impossible — no API
 //!   exists — and a listener must not fire during an activation (a programmatic
 //!   `element.click()` from inside an entry is refused as re-entrant).
-//! - **Connect-time (`connectedCallback`)**: render and set up only. Build the UI,
-//!   install listeners, install gesture wirings. **No publish, no deferred op, no
-//!   sync request** — the entry is not registered until connect-time code returns,
-//!   so a sync request from there is refused and the requester faults. The mount
-//!   activation is where a component's first output belongs.
+//! - **Instantiation**: nothing. A component's module-level initialization runs
+//!   before its registration is admitted, so it has no ports, no DOM handles and
+//!   no kernel to talk to. The mount activation ([`MOUNT_SYNC_PORT`]) is where a
+//!   rendering component builds its UI and where any component's first output
+//!   belongs.
 //!
 //! # The activation seam
 //!
-//! [`ACTIVATION_REGISTER`] is how a `dom` component joins activation delivery:
-//! once per instance, from its element's first `connectedCallback`, it hands the
-//! kernel an entry function; the kernel calls that entry once per activation with
-//! the [`Activation`] as JSON and reads its return for the flush rule. See
-//! [`ACTIVATION_REGISTER`] for the call convention.
+//! A component joins activation delivery through its host, not through this
+//! crate: the page's loader instantiates the component once per instance and
+//! registers its `receive` export with the kernel, which then calls it once per
+//! activation with the [`Activation`] as JSON and reads its return for the flush
+//! rule. [`ENTRY_REPLY_FIELD`] is the one name that convention needs here — the
+//! key a sync reply rides back on.
 //!
-//! [`ACTIVATION_SYNC`] is how a browser event becomes an activation of the
-//! instance whose element it fired on — the sync port class above, dispatched
-//! synchronously so the whole activation completes inside the event handler.
+//! The kernel mints a sync-call activation for two things: a gesture the
+//! component asked for with `dom.listen`, and the mount call
+//! ([`MOUNT_SYNC_PORT`]) a rendering instance gets as its first invocation. Both
+//! run synchronously, so a gesture's whole activation completes inside the
+//! browser's event handler.
 //!
-//! Publishes made from inside an entry are **buffered**: they ride the ordinary
-//! [`PORT_PUBLISH`] event, and the kernel routes one to the in-flight buffer iff
-//! the dispatching instance is the one whose entry is on the stack — activations
-//! are serialized per instance and synchronous on the one JS thread, so exactly
-//! one instance can be mid-activation. A buffered publish is answered
-//! synchronously on the event detail's [`PUBLISH_STATUS_FIELD`]. A publish
-//! dispatched from any other context is answered `not-permitted` there: it is a
-//! publish with no activation to belong to, and there is no second path for it.
+//! Publishes made from inside an entry are **buffered**: the component's
+//! `ports.*` imports route into the in-flight activation's buffer, which flushes
+//! iff the entry returns ok. A publish outside an activation has no buffer to
+//! join and is refused; a component's world gives it no way to try.
 //!
 //! The deferred-message ops — park a message for later, cancel one, edit one —
-//! ride [`PORT_DEFER`] on the same routing rule and are buffered the same way,
-//! because a schedule that escaped the flush-iff-ok boundary would outlive the
-//! activation that failed to stage it.
+//! are buffered the same way, because a schedule that escaped the flush-iff-ok
+//! boundary would outlive the activation that failed to stage it.
 //!
-//! # Component-contract events (kernel ↔ component)
+//! # The privileged entries (component → kernel)
 //!
-//! Delivery is not on this list: it is the direct entry call described above, not
-//! an event. What rides events is the fire-and-forget plumbing.
+//! Delivery is not on this list: it is the direct entry call described above.
+//! What a component reaches the other way is its own world's imports, each gated
+//! on that instance's own grant word and each answered by the kernel:
 //!
-//! Component → kernel:
+//! - `ports.*` — publish, publish-with-urgency, publish-deferred, defer-cancel,
+//!   defer-edit. Components see **ports only** — logical config names — never
+//!   channel addresses, mirroring the backend WASM port model for exact policy
+//!   symmetry. Buffered into the in-flight activation, as above.
+//! - `log.log` — one leveled line. The kernel stamps `source =
+//!   "component:<instance>"` and forwards a `Log` frame.
+//! - `alert.alert` — a page to an operator, forwarded as an `Alert` frame **only**
+//!   for an instance granted `alert`; an ungranted one is dropped with a `warn`
+//!   breadcrumb naming it.
+//! - `config.get` — one key of the instance's own static config map, gated on
+//!   `config`. The map is fixed for the page's lifetime, so a component may read
+//!   it once at mount and keep the answer.
+//! - `dom.*` / `page-dom.*` — the DOM capability. Element vocabulary is an
+//!   allow-list ([`DOM_ALLOWED_TAGS`], [`DOM_ALLOWED_ATTRIBUTES`]); misuse traps.
 //!
-//! - [`PORT_PUBLISH`] — a component's intent to publish. **Must be dispatched
-//!   with `bubbles: true, composed: true` AND on the component's mounted element
-//!   itself or from within its shadow root.** The kernel derives component
-//!   identity from `event.target` at a delegated `#surface-root` listener; after
-//!   shadow retargeting that target is the host element in both permitted cases.
-//!   Publishes dispatched elsewhere (e.g. on an inner light-DOM button) present
-//!   the wrong target, are unroutable, and are dropped and reported. `detail =
-//!   { port, body, urgency? }`; `body` is a string. Components see **ports
-//!   only** — logical config names — never channel addresses, mirroring the
-//!   backend WASM port model for exact policy symmetry.
-//! - [`PORT_DEFER`] — a component's intent to park a message for later, or to
-//!   cancel or edit one it already parked. Same dispatch rule and same identity
-//!   resolution as [`PORT_PUBLISH`]; `detail = { op, port, index?, body?,
-//!   deliver_after? }`, all strings. Buffered only — see [`PORT_DEFER`].
-//! - [`ACTIVATION_SYNC`] — a component's request for a sync-call activation of
-//!   itself. Same dispatch rule and same identity resolution as [`PORT_PUBLISH`],
-//!   and answered synchronously on the detail. SDK↔kernel internal: a component
-//!   author reaches it through a gesture wiring and never dispatches it by hand.
-//! - [`COMPONENT_LOG`] — a component's intent to log. Same dispatch rule as
-//!   [`PORT_PUBLISH`] (`bubbles: true, composed: true`, on the mounted element
-//!   or from within its shadow root), so the kernel derives component identity
-//!   from the retargeted `event.target` at the delegated `#surface-root`
-//!   listener. `detail = { level, message }`; `level` is a lowercase log-level
-//!   wire string (`"trace"`…`"error"`, see
-//!   [`brenn_surface_schema::LogLevel::from_wire_str`]) fixed at the component
-//!   call site, `message` a string. The kernel stamps `source =
-//!   "component:<kind>"` and forwards a `Log` frame; a missing/non-string field
-//!   or an unrecognized `level` is dropped and reported as malformed rather than
-//!   coerced.
-//! - [`COMPONENT_ALERT`] — a component's intent to page an operator. Same
-//!   dispatch rule as [`PORT_PUBLISH`] (`bubbles: true, composed: true`, on the
-//!   mounted element or from within its shadow root), so the kernel derives
-//!   component identity from the retargeted `event.target`. `detail =
-//!   { severity, title, body }`; `severity` is a lowercase alert-severity wire
-//!   string (`"info"`/`"warning"`/`"critical"`, see
-//!   [`brenn_surface_schema::AlertSeverity::from_wire_str`]) fixed at the
-//!   component call site, `title`/`body` strings. Forwarded as an `Alert` frame
-//!   **only** for a component granted `alert`; an ungranted one is dropped with
-//!   a `warn` breadcrumb naming it, never sent as an ungranted `Alert`. A missing/non-string field or an unrecognized
-//!   `severity` is dropped and reported as malformed rather than coerced.
-//! - [`CONFIG_GET`] — a component's read of one key from its own static config
-//!   map. Same dispatch rule and same identity resolution as [`PORT_PUBLISH`],
-//!   and answered synchronously on the detail: `detail = { key }` going in,
-//!   [`CONFIG_ANSWERED_FIELD`] always written and [`CONFIG_VALUE_FIELD`] written
-//!   only when the map holds that key. The kernel answers only an instance
-//!   granted `config`; an ungranted one gets the absence answer and a `warn`
-//!   breadcrumb. The map is fixed for the page's lifetime, so a component may
-//!   read it once at mount and keep the answer.
-//! - [`COMPONENT_PANIC`] — dispatched on `window` from the component module's
-//!   panic hook, which knows its own kind but not its element. `detail =
-//!   { component, message }`, both strings. A module-level panic hook cannot
-//!   know which instance panicked, and a poisoned wasm module poisons every
-//!   instance it backs, so the kernel error-cards **every** mounted instance of
-//!   that kind and reports each one under its own identity — not just one
-//!   section.
+//! A component's death is not on this list either: it panics, the host catches
+//! the trap, and the kernel error-cards that one instance. There is no way for a
+//! component to report anyone else's death.
 //!
 //! # Bootstrap-seam events (kernel → bootstrap, on `window`)
 //!
@@ -294,23 +235,18 @@
 //!   kernel's panic hook dispatches this with the panic message as `reason`.
 //! - [`SURFACE_READY`] — no detail. First successful connect after load; the
 //!   bootstrap resets its reload-loop counter on this.
+//! - [`PROCESSOR_START`] — `detail = { instances }` (an array of instance-id
+//!   strings). The kernel names this page's component instances once its first
+//!   bindings land, and the loader instantiates and registers each one.
 //!
-//! # Why DOM events are the transport
+//! # Why the seam is imports and one entry call
 //!
-//! Each component is its own wasm module, because that is what contains a panic
-//! to one component. Separate modules cannot call each other in Rust, so every
-//! cross-module hop pays the JS boundary regardless of what rides it —
-//! CustomEvents are then the framework-neutral choice that hands us delegation
-//! and retargeting-based element identity for free. That is the whole argument:
-//! events are **transport**, never vocabulary. Components reason about ports and
-//! messages; the event names below are the plumbing underneath, and a component
-//! is never asked to understand them as anything else.
-//!
-//! The corollary matters as much: the transport is replaceable. `processor`-abi
-//! instances already use none of it (the kernel holds their call handles, so it
-//! calls them directly), and even this seam could become direct calls via a
-//! registration API if events ever became a problem. Swapping it would not
-//! change one word of the vocabulary.
+//! Each component is its own wasm component, because that is what contains a
+//! trap to one component. The host holds every instance's call handles, so the
+//! kernel calls a component's `receive` directly and a component calls the
+//! kernel's entries directly; nothing rides an in-page message bus. Vocabulary is
+//! ports and messages, and the import list underneath is plumbing a component is
+//! never asked to understand as anything else.
 //!
 //! # The side-effect gradient
 //!
@@ -370,13 +306,12 @@
 //!
 //! # Light DOM and skinning
 //!
-//! Components render into the light DOM. Shadow DOM is permitted internally, but
-//! it opts a component out of skinning: `data-*` hooks plus global stylesheets
-//! are exactly what make "new skin = one CSS file" cheap, and a shadow root is
-//! opaque to them. The event seam survives shadow DOM either way (`composed:
-//! true` plus host-element retargeting), which is why this is a skinning
-//! trade-off and not a contract violation. CSS collisions in the light DOM are
-//! managed by component-prefixed naming.
+//! Components render into the light DOM: the `dom` capability creates elements
+//! under the instance's own host element and offers no way to attach a shadow
+//! root. That is deliberate — `data-*` hooks plus global stylesheets are exactly
+//! what make "new skin = one CSS file" cheap, and a shadow root is opaque to
+//! them. CSS collisions in the light DOM are managed by component-prefixed
+//! naming.
 //!
 //! # In-page separation is never a security boundary
 //!
@@ -385,9 +320,10 @@
 //! WS channel, every other component's ports and rendered data. It is *not*
 //! capability-gated the way a backend wasmtime guest is, so installing an
 //! out-of-tree component trusts it with that full authority. Everything this
-//! seam enforces — identity from `event.target`, the ungranted-alert drop, the
-//! reserved names — is **bug containment**: it keeps an honest component's bug
-//! inside that component, and it stops nothing a malicious module wants to do.
+//! seam enforces — identity from the loader's own closure, the ungranted-alert
+//! drop, the element allow-list, the reserved names — is **bug containment**: it
+//! keeps an honest component's bug inside that component, and it stops nothing a
+//! malicious module wants to do.
 //!
 //! Real enforcement is server-side, without exception: every effect a component
 //! can have off this page travels through the kernel → WS → server gates, which
@@ -395,89 +331,62 @@
 //!
 //! # Naming conventions
 //!
-//! A component's config `kind` determines its element tag and module artifact:
+//! A component's config `kind` names its slice of the served asset tree:
+//! `processor/<kind>/` holds the transpiled module, its binding record and its
+//! packaged specification (see [`processor_module_path`]), and the kind's
+//! documentation sidecar ships flat beside it.
 //!
-//! - `kind` ↦ custom element `brenn-<kind>` (see [`element_name`]).
-//! - `kind` ↦ module artifact `brenn_<kind with - → _>.js` (see
-//!   [`module_artifact`]) — wasm-bindgen derives artifact names from crate names,
-//!   so crate `brenn-protobar` → element `brenn-protobar` → `brenn_protobar.js`.
-//!
-//! `kind` is boot-validated to `^[a-z0-9][a-z0-9-]*$`, which is a valid custom
-//! element name stem and a valid filename stem.
-//!
-//! # Module shape
-//!
-//! Each `dom`-abi component is its own wasm-bindgen `--target web` module whose
-//! init registers its custom element(s) and installs its panic hook (dispatching
-//! [`COMPONENT_PANIC`]). The recommended — not mandated — pattern for the
-//! custom-element class shim is a few lines of `#[wasm_bindgen(inline_js)]`
-//! defining an `HTMLElement` subclass whose lifecycle callbacks delegate to
-//! exported Rust functions. The `brenn-surface-component-support` crate is an
-//! optional in-tree implementation of this pattern (panic hook, element
-//! registration, DOM helpers, untrusted-detail readers, conformant publish);
-//! in-tree components use it, but it is a convenience, not contract surface —
-//! an out-of-tree component may implement the shape directly against this crate.
-//!
-//! `connectedCallback` fires on **every** insertion of the element into a
-//! connected tree, not once per element, so a component's build-the-UI step
-//! must guard against re-entry (e.g. a marker attribute set before building)
-//! or a reparent will duplicate its UI and listeners.
+//! `kind` is boot-validated to `^[a-z0-9][a-z0-9-]*$`, which is a valid filename
+//! stem.
 //!
 //! # Instances
 //!
-//! One component `kind` may be mounted several times on one surface, each mount
-//! a distinct **instance** with its own id, its own element, and its own port
+//! One component `kind` may be hosted several times on one surface, each an
+//! **instance** with its own id, its own module instantiation, and its own port
 //! bindings. The instance is the principal: it owns the bindings, the send
 //! budget, and the attribution, exactly as a backend `[[app]]` slug does. The
 //! kind is the manifest — what the module needs — and holds no authority.
 //!
-//! The kernel stamps the instance id on the mounted element and its wrapper as a
-//! `data-instance` attribute; a component MAY read it (e.g. for debugging) but
-//! MUST NOT need it — its activation entry is its own, and everything it
-//! dispatches goes out on its own element, so identity is already implicit on
-//! both sides of the seam.
+//! Identity is never something a component states. The loader closes over the
+//! instance it instantiated for and supplies it to every kernel entry; a
+//! component has no way to name another instance and no need to name itself.
 //!
 //! # Mount and arrange
 //!
 //! Mounting and arranging are two jobs with two owners, and the boundary between
 //! them is one element:
 //!
-//! - **The kernel mounts.** It creates one **wrapper** element per `dom`
-//!   instance — `data-instance="<instance>"`, `data-kind="<kind>"` — and mounts
-//!   the component's custom element inside it. The kernel owns the wrapper and
-//!   everything in it: the element while the instance lives, an error card once
-//!   it dies. Wrappers are born in a hidden kernel-owned staging container under
-//!   `#surface-root`, and the kernel never moves one again.
+//! - **The kernel mounts.** It creates one **wrapper** element per instance —
+//!   `data-instance="<instance>"`, `data-kind="<kind>"` — and, for an instance
+//!   granted `dom`, one plain host `div` inside it, which is what that
+//!   instance's `dom.root` resolves to. The kernel owns the wrapper: the host
+//!   element while the instance lives, an error card once it dies. The host
+//!   element carries no stamp of its own, because it is handed to the component,
+//!   which may write any `data-` name on it. Wrappers are born in a hidden
+//!   kernel-owned staging container under `#surface-root`, and the kernel never
+//!   moves one again. A wrapper declares `contain: paint`, which bounds an
+//!   instance's own style declarations to its own box.
 //! - **Chrome arranges.** Chrome reparents wrappers into its own layout sections
 //!   and stamps layout state (`data-panel`, a panel label header) on wrappers and
 //!   sections — **never inside a wrapper**. An instance no layout places is
-//!   mounted, warm, and pumping, with no pixels; whether that is expressed by
+//!   live, warm, and pumping, with no pixels; whether that is expressed by
 //!   leaving it staged or by a section chrome hides is chrome's business, not the
 //!   contract's.
 //!
-//! Reparenting preserves element identity, so a component's registered activation
-//! entry, its delegated events, and its mounted-instance identity survive
-//! arrangement untouched — a reparent never deregisters, and the registration
-//! fires once per instance lifetime regardless of how often the element moves.
-//! But `connectedCallback` fires again on each move, which is why the
-//! re-entry guard above is a requirement rather than a nicety. A component MUST
-//! NOT assume it is arranged only once, and MUST NOT assume it is ever arranged
-//! at all: it may be mounted with no pixels for the whole page's life.
+//! Reparenting preserves element identity, so an instance's host element and
+//! every DOM handle it holds survive arrangement untouched. A component MUST NOT
+//! assume it is arranged only once, and MUST NOT assume it is ever arranged at
+//! all: it may run with no pixels for the whole page's life.
 //!
-//! Chrome holds a **page-DOM authority grant**: it is the one component allowed
-//! to touch DOM outside its own subtree (`body` attributes, `#surface-root`
-//! attributes, and other components' wrappers). The grant is named here so the
-//! authority is contract rather than folklore, and so review can hold every
-//! non-chrome component to never exercising it. It is not mechanically
-//! enforceable: in-page separation is never a security boundary, and a component
-//! that reaches outside its subtree is a bug the page cannot prevent, only
-//! contain.
+//! Chrome holds a **page-DOM authority grant** (`page-dom`): it is the one
+//! component that can touch DOM outside its own subtree — `body` attributes,
+//! `#surface-root` attributes, and other instances' wrappers. Every other
+//! instance is confined by construction: its handles all descend from its own
+//! `dom.root`, and handle tables are per instance, so a foreign handle traps.
 //!
-//! Because one wasm module backs every instance of its kind, a component's
-//! per-element state **must** live per element (constructed in the element's
-//! own lifecycle, e.g. `connectedCallback`), never in module-level statics.
-//! Module-level mutable state is shared across every instance and will corrupt
-//! a multi-instance surface. This is a hard requirement, not a suggestion.
+//! Per-instance state is ordinary state in the component's own linear memory:
+//! one instantiation per instance, page-lifetime, so a module-level static is
+//! per instance too and cannot bleed across siblings.
 
 use brenn_envelope::MessageEnvelope;
 
@@ -608,70 +517,21 @@ pub struct ActivationError {
 
 // ── The activation seam (component ↔ kernel) ───────────────────────────────
 
-/// Component → kernel, on the component's mounted element. Must be
-/// `bubbles: true, composed: true`, dispatched once per instance from the
-/// element's first `connectedCallback`. `detail = { entry }` where `entry` is a
-/// JS function — an in-page event, never serialized, so carrying a function is
-/// exactly what this seam is for.
+/// The field an activation entry's **return object** carries its sync reply on.
 ///
-/// The kernel resolves *which* instance registered from the retargeted
-/// `event.target` over its mounted-instance registry, never from the detail: a
-/// component cannot claim an instance the kernel did not mount it as. A
-/// registration whose target resolves to no mounted instance, or to an instance
-/// already registered, is dropped and reported — an in-page component bug, never
-/// a page-killing panic.
-///
-/// **Call convention.** The kernel invokes `entry` once per activation with one
-/// argument: the serde-JSON string of the [`Activation`]. The return value says
-/// what happened, in four shapes:
-///
-/// - `undefined`/`null` → **ok**, with no reply. Every publish the entry
-///   buffered is flushed, in call order.
-/// - an object carrying a string [`ENTRY_REPLY_FIELD`] → **ok** with that reply,
-///   flushed the same way. Legal only on an activation whose `sync` field names
-///   a port: a reply on an async activation is an answer nobody asked for and is
-///   read as a trap, since an entry that answered a question it was not asked
-///   did not tell us it succeeded.
-/// - a string → **err**, the string being the component's own account. The
-///   buffer is discarded, a failure is counted, the instance keeps running.
-/// - a thrown exception → **trap**. The buffer is discarded and the instance is
-///   terminal — error card, `failed`, one death report. One subject, never the
-///   page.
-///
-/// One encode/decode per activation, not per message: the JS boundary is paid
-/// regardless, and paying it once per activation is strictly cheaper than the
-/// per-envelope events this replaces.
-pub const ACTIVATION_REGISTER: &str = "brenn-activation-register";
-
-/// The field an activation entry's **return object** carries its sync reply on,
-/// per [`ACTIVATION_REGISTER`]'s call convention.
-///
-/// The reply is an opaque string the kernel never parses; it hands it straight
-/// back to the requester on [`SYNC_REPLY_FIELD`]. An object carrying no string
-/// under this key is a non-conformant return and reads as a trap: a returned
-/// object means "here is my answer", and one with no answer in it is gibberish
-/// rather than an ok.
+/// The entry is a JS function the loader registers with the kernel; it returns
+/// `undefined` for ok-with-no-reply, this object for ok-with-a-reply, a string
+/// for err, and throws for a trap. The reply is an opaque string the kernel never
+/// parses; it hands it straight back to whoever asked. An object carrying no
+/// string under this key is a non-conformant return and reads as a trap: a
+/// returned object means "here is my answer", and one with no answer in it is
+/// gibberish rather than an ok.
 pub const ENTRY_REPLY_FIELD: &str = "reply";
 
-/// The [`PORT_PUBLISH`] detail field the kernel writes the publish's answer into,
-/// synchronously, before the dispatch returns.
-///
-/// Present on every publish the kernel heard. The dispatching instance is the one
-/// whose entry is currently on the stack ⇒ the publish was routed into that
-/// activation's buffer and this is the buffer's verdict; it is any other instance,
-/// or none ⇒ [`PublishError::NotPermitted`], because a publish outside an
-/// activation has no buffer to join and no path of its own. A *missing* status
-/// means the event never reached the kernel's listener, which is a broken page
-/// rather than an outcome.
-///
-/// The value is [`publish_status_str`]'s wire string: `"ok"`, or one of the
-/// [`PublishError`] triple's spellings.
-pub const PUBLISH_STATUS_FIELD: &str = "status";
-
-/// The [`PUBLISH_STATUS_FIELD`] wire string for a buffered publish's answer. The
+/// The WIT `publish-error` wire string for a buffered publish's answer. The
 /// single executable definition of the values, shared by the kernel that writes
-/// them and the SDK that reads them, so the seam cannot drift by hand-copied
-/// literal.
+/// them and the guest glue that reads them, so the seam cannot drift by
+/// hand-copied literal.
 pub fn publish_status_str(status: Result<(), PublishError>) -> &'static str {
     match status {
         Ok(()) => "ok",
@@ -681,50 +541,138 @@ pub fn publish_status_str(status: Result<(), PublishError>) -> &'static str {
     }
 }
 
-/// The inverse of [`publish_status_str`]: parse a [`PUBLISH_STATUS_FIELD`] value,
-/// or `None` for a string this contract never spells.
-pub fn parse_publish_status(status: &str) -> Option<Result<(), PublishError>> {
-    match status {
-        "ok" => Some(Ok(())),
-        "not-permitted" => Some(Err(PublishError::NotPermitted)),
-        "invalid-payload" => Some(Err(PublishError::InvalidPayload)),
-        "quota-exceeded" => Some(Err(PublishError::QuotaExceeded)),
-        _ => None,
-    }
+// ── The gesture seam (kernel → component, and back) ─────────────────────────
+
+/// The gesture request's field naming the DOM event type that fired.
+///
+/// A gesture request is a body the kernel synthesizes and the guest SDK parses,
+/// so its field names are a seam between two crates that cannot share a type:
+/// the SDK is built for wasm32 and links none of this. They are spelled here,
+/// pinned to their literals by `gesture_body_field_names_frozen`, and spelled
+/// once more on the guest's `Gesture` struct.
+pub const GESTURE_EVENT_FIELD: &str = "event";
+
+/// The gesture request's field naming the node whose listener fired, as that
+/// instance's own handle.
+pub const GESTURE_LISTENER_FIELD: &str = "listener";
+
+/// The gesture request's field naming the nearest handle-mapped ancestor of the
+/// event's target — how a delegated listener tells apart which child was hit.
+pub const GESTURE_TARGET_FIELD: &str = "target";
+
+/// The one key a gesture reply has: `true` asks the kernel to `preventDefault`
+/// the event that caused the activation, `false` lets it proceed.
+///
+/// A reply outside this dialect — including an empty object — is a component
+/// talking to itself in two languages, and the reader faults on it rather than
+/// reading it as "do not cancel". No reply at all is the other way to let the
+/// event proceed.
+pub const GESTURE_CANCEL_FIELD: &str = "cancel";
+
+/// The port a mount activation names — the sync-call activation the kernel
+/// mints for a `dom`-granted instance's first invocation, where it builds its
+/// UI.
+///
+/// Reserved by its colon: no specification identifier can spell one, so the
+/// name cannot collide with a bound input port. The guest SDK spells the same
+/// string as `dom::MOUNT`, held to this constant by
+/// `the_guest_half_of_the_mount_port_spells_the_same_string`.
+pub const MOUNT_SYNC_PORT: &str = "brenn:mount";
+
+// ── The `dom` element vocabulary ────────────────────────────────────────────
+
+/// Every tag a `dom`-granted component may create. Anything else traps.
+///
+/// An allow-list, not a filter: containment is by construction, so the question
+/// asked of a candidate entry is not "can this be abused" but "does this cause
+/// script execution, navigation, a resource fetch, or any effect outside the
+/// instance's own subtree" — a `no` on all four admits it, and nothing else
+/// does. That rule excludes `script`, `iframe`, `object`, `embed`, `template`,
+/// `meta`, `base`, `style`, `link`, `form` and `a` without enumerating them.
+///
+/// Growing the list is a one-line, reviewed change that travels with the WIT
+/// doc, which is what an out-of-tree author reads.
+pub const DOM_ALLOWED_TAGS: &[&str] = &[
+    "blockquote",
+    "br",
+    "button",
+    "code",
+    "div",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "input",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "s",
+    "section",
+    "span",
+    "strong",
+    "ul",
+];
+
+/// Every attribute name a `dom`-granted component may set, beyond the prefixes
+/// of [`DOM_ALLOWED_ATTRIBUTE_PREFIXES`]. Anything else traps.
+///
+/// Admitted by the same rule as [`DOM_ALLOWED_TAGS`], which is why no
+/// URL-bearing name and no `on*` name is here — and why attribute *values* are
+/// never inspected: with no name that can carry a URL or a handler, there is
+/// nothing in a value to parse.
+///
+/// `id` is absent deliberately. Ids live in the page-global namespace and the
+/// surface's chrome resolves its own furniture through it, so an id set inside
+/// a confined subtree is an effect outside that subtree.
+pub const DOM_ALLOWED_ATTRIBUTES: &[&str] = &[
+    "class",
+    "disabled",
+    "hidden",
+    "placeholder",
+    "role",
+    "start",
+    "title",
+    "type",
+];
+
+/// The attribute-name prefixes a `dom`-granted component may set: the two
+/// families that are inert by specification.
+pub const DOM_ALLOWED_ATTRIBUTE_PREFIXES: &[&str] = &["aria-", "data-"];
+
+/// Whether the host will create `tag`.
+///
+/// Exact ASCII-lowercase match against [`DOM_ALLOWED_TAGS`] — no case folding,
+/// so a guest sending `DIV` traps rather than being quietly repaired. One
+/// spelling per element keeps the contract's list and the DOM the component
+/// gets in the same vocabulary.
+pub fn dom_tag_allowed(tag: &str) -> bool {
+    DOM_ALLOWED_TAGS.contains(&tag)
+}
+
+/// Whether the host will set an attribute named `name`, by the same exact-match
+/// rule as [`dom_tag_allowed`] plus the allowed prefixes.
+pub fn dom_attribute_allowed(name: &str) -> bool {
+    DOM_ALLOWED_ATTRIBUTES.contains(&name)
+        || DOM_ALLOWED_ATTRIBUTE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 // ── The deferred-message ops (component → kernel) ───────────────────────────
 
-/// The [`PORT_DEFER`] detail's `op` field for a deferred publish: park `body` on
-/// the port's channel until `deliver_after`.
-pub const DEFER_OP_PUBLISH: &str = "publish";
-
-/// The [`PORT_DEFER`] detail's `op` field for a cancel: unpark the message the
-/// `index` names.
-pub const DEFER_OP_CANCEL: &str = "cancel";
-
-/// The [`PORT_DEFER`] detail's `op` field for an edit: rewrite the body and/or
-/// the release time of the message the `index` names.
-pub const DEFER_OP_EDIT: &str = "edit";
-
-/// The [`PORT_DEFER`] detail field the kernel writes the op's answer into,
-/// synchronously, before the dispatch returns — the deferred family's twin of
-/// [`PUBLISH_STATUS_FIELD`].
+/// The WIT `defer-error` wire string for a cancel's or an edit's answer.
 ///
-/// Unlike the publish seam, the *vocabulary* on this field depends on the op,
-/// because the WIT's does: a [`DEFER_OP_PUBLISH`] answers in
-/// [`publish_status_str`]'s spellings (a deferred publish is a publish and adds no
-/// error vocabulary), while [`DEFER_OP_CANCEL`] and [`DEFER_OP_EDIT`] answer in
-/// [`defer_status_str`]'s. A caller knows which op it dispatched, so it knows
-/// which parser to read the answer with.
+/// A deferred *publish* is a publish and adds no error vocabulary, so it answers
+/// in [`publish_status_str`]'s spellings instead; a caller knows which op it made,
+/// so it knows which vocabulary to read the answer in.
 ///
-/// Absent means the kernel did not route the op into an in-flight activation's
-/// buffer. For this event that is not a second path but a refusal: every op here
-/// is buffered-only, so the kernel drops and reports it (see [`PORT_DEFER`]).
-pub const DEFER_STATUS_FIELD: &str = "status";
-
-/// The [`DEFER_STATUS_FIELD`] wire string for a cancel's or an edit's answer. The
-/// single executable definition of the values, shared by the kernel that writes
+/// The single executable definition of the values, shared by the kernel that writes
 /// them and the SDK that reads them, so the seam cannot drift by hand-copied
 /// literal.
 pub fn defer_status_str(status: Result<(), DeferError>) -> &'static str {
@@ -736,217 +684,6 @@ pub fn defer_status_str(status: Result<(), DeferError>) -> &'static str {
         Err(DeferError::InvalidDeliverAfter) => "invalid-deliver-after",
     }
 }
-
-/// The inverse of [`defer_status_str`]: parse a [`DEFER_STATUS_FIELD`] value from
-/// a cancel or an edit, or `None` for a string this contract never spells.
-pub fn parse_defer_status(status: &str) -> Option<Result<(), DeferError>> {
-    match status {
-        "ok" => Some(Ok(())),
-        "not-permitted" => Some(Err(DeferError::NotPermitted)),
-        "out-of-range" => Some(Err(DeferError::OutOfRange)),
-        "quota-exceeded" => Some(Err(DeferError::QuotaExceeded)),
-        "invalid-deliver-after" => Some(Err(DeferError::InvalidDeliverAfter)),
-        _ => None,
-    }
-}
-
-// ── The sync-call seam (component → kernel) ─────────────────────────────────
-
-/// Component → kernel, dispatched **synchronously** on the component's mounted
-/// element. Must be `bubbles: true, composed: true`, exactly as
-/// [`PORT_PUBLISH`]. `detail = { port, body }`, both strings: `port` names the
-/// sync port the request arrives on, `body` is the component's own payload.
-///
-/// The kernel resolves *which* instance from the retargeted `event.target` over
-/// its mounted-instance registry, never from the detail — the trust posture
-/// [`ACTIVATION_REGISTER`] takes. A component cannot sync-activate any instance
-/// but itself.
-///
-/// **What it causes.** One ordinary activation of that instance, assembled and
-/// invoked inside this `dispatchEvent` call: every bound input port windowed as
-/// usual, plus the minted request as the window named by
-/// `Activation::sync`. Publishes and deferred-message ops buffer and flush on
-/// the same terms as any other activation. Because the whole activation
-/// completes before the dispatch returns, the browser's gesture token is still
-/// live for the entry, and the caller can still `preventDefault()` on the
-/// originating event afterwards.
-///
-/// **The answer** is written onto the same `detail` object before the dispatch
-/// returns: [`SYNC_STATUS_FIELD`] always, plus [`SYNC_REPLY_FIELD`] on `ok` when
-/// the entry answered with one and [`SYNC_ERROR_FIELD`] on `err`. There is no
-/// second path and no unanswered case — a request the kernel would not admit is
-/// answered [`SyncStatus::Refused`], which is always a bug in the requester or
-/// the kernel.
-///
-/// SDK↔kernel internal: component authors reach this through the SDK's gesture
-/// wiring and never dispatch it themselves.
-pub const ACTIVATION_SYNC: &str = "brenn-activation-sync";
-
-/// The [`ACTIVATION_SYNC`] detail field the kernel writes the request's outcome
-/// into, synchronously, before the dispatch returns.
-///
-/// Always present on a request the kernel heard at all; the value is
-/// [`sync_status_str`]'s wire string. A *missing* one means the event never
-/// reached the kernel's listener, which is a broken page rather than an outcome.
-pub const SYNC_STATUS_FIELD: &str = "status";
-
-/// The [`ACTIVATION_SYNC`] detail field carrying the entry's reply, present only
-/// alongside a [`SyncStatus::Ok`] status and only when the entry answered with
-/// one. An opaque string: the kernel never parses it, and what it means is a
-/// dialect between a component and its own gesture wiring.
-pub const SYNC_REPLY_FIELD: &str = "reply";
-
-/// The [`ACTIVATION_SYNC`] detail field carrying the [`ActivationError`] message,
-/// present only alongside a [`SyncStatus::Err`] status.
-///
-/// Informational: the entry already saw its own error and the kernel already
-/// counted the failed activation. It exists so a requester's diagnostic can name
-/// what the entry said rather than only that it said something.
-pub const SYNC_ERROR_FIELD: &str = "error";
-
-/// How a sync-call request finished, as written on [`SYNC_STATUS_FIELD`].
-///
-/// Four values because the fourth is not an activation outcome at all: `Ok`,
-/// `Err` and `Trap` are the three [`ActivationError`]-adjacent shapes an entry can
-/// finish in, and `Refused` says no entry ran.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncStatus {
-    /// The entry returned ok. Its buffer flushed, and [`SYNC_REPLY_FIELD`] carries
-    /// the reply if it answered with one.
-    Ok,
-    /// The entry returned err. The buffer was discarded, a failure was counted,
-    /// and the instance keeps running; [`SYNC_ERROR_FIELD`] carries its account.
-    Err,
-    /// The instance is terminal without having answered — its entry trapped, or
-    /// the assembly's own loud-rung verdict killed it before the entry could run.
-    ///
-    /// Answered explicitly because the requesting closure survives the dispatch:
-    /// the wasm instance is not torn down mid-stack even though the kernel has
-    /// already marked it dead, so it has to be told to stop.
-    Trap,
-    /// The request was not admissible and nothing was assembled: it arrived from
-    /// inside an activation, or named an instance that is unregistered, terminal
-    /// or unwired, or its port name collides with a bound input port. Every one of
-    /// those is a bug, never a configured outcome.
-    Refused,
-}
-
-/// The [`SYNC_STATUS_FIELD`] wire string. The single executable definition of the
-/// values, shared by the kernel that writes them and the SDK that reads them, so
-/// the seam cannot drift by hand-copied literal.
-pub fn sync_status_str(status: SyncStatus) -> &'static str {
-    match status {
-        SyncStatus::Ok => "ok",
-        SyncStatus::Err => "err",
-        SyncStatus::Trap => "trap",
-        SyncStatus::Refused => "refused",
-    }
-}
-
-/// The inverse of [`sync_status_str`]: parse a [`SYNC_STATUS_FIELD`] value, or
-/// `None` for a string this contract never spells.
-pub fn parse_sync_status(status: &str) -> Option<SyncStatus> {
-    match status {
-        "ok" => Some(SyncStatus::Ok),
-        "err" => Some(SyncStatus::Err),
-        "trap" => Some(SyncStatus::Trap),
-        "refused" => Some(SyncStatus::Refused),
-        _ => None,
-    }
-}
-
-// ── Component-contract events (kernel ↔ component) ──────────────────────────
-
-/// Component → kernel. Must be `bubbles: true, composed: true` and dispatched on
-/// the mounted element or from within its shadow root. `detail = { port, body,
-/// urgency? }`; `port`/`body` are strings.
-///
-/// `urgency` is optional: a lowercase RFC 8030 urgency wire string
-/// (`"very-low"`/`"low"`/`"normal"`/`"high"`, parsed by
-/// [`brenn_surface_schema::Urgency::parse`]), the component's per-message
-/// override. Absent ⇒ the port's configured default applies, which the server
-/// resolves. An unrecognized value is dropped and reported as malformed rather
-/// than coerced — same rule as every other enum-valued detail field on this seam
-/// (`level`, `severity`): silently downgrading a component's stated intent to
-/// `normal` would be a fallback that hides the bug.
-pub const PORT_PUBLISH: &str = "brenn-port-publish";
-
-/// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
-/// composed: true`, on the mounted element or from within its shadow root). One
-/// event for the whole deferred-message family: park a message for later, cancel
-/// one already parked, or edit one already parked.
-///
-/// `detail = { op, port, index?, body?, deliver_after? }`, every field a string:
-///
-/// - `op` — [`DEFER_OP_PUBLISH`], [`DEFER_OP_CANCEL`] or [`DEFER_OP_EDIT`].
-/// - `port` — a bound output port of this instance, as everywhere on this seam.
-/// - `index` — required by cancel and edit, unused by publish: the position of
-///   the message in the [`DeferredWindow`] *this activation* delivered for the
-///   port. Snapshot-relative, so an index from another activation is out of range
-///   here, not a wrong message.
-/// - `body` — required by publish; on an edit, present to replace the body and
-///   absent to leave it alone.
-/// - `deliver_after` — required by publish; on an edit, present to reschedule and
-///   absent to leave the release time alone.
-///
-/// `index` and `deliver_after` are **decimal strings**, not JS numbers:
-/// `deliver_after` is epoch milliseconds UTC as a `u64`, and every other value on
-/// this seam is already a string, so a string keeps the boundary uniform and the
-/// integer exact rather than routed through a float. An unparseable one is
-/// malformed detail, dropped and reported like any other.
-///
-/// **Buffered only, with no second path.** Each op is answered synchronously on
-/// [`DEFER_STATUS_FIELD`] by the in-flight activation's buffer: a schedule staged
-/// outside an activation would escape the flush-iff-ok rule that makes a failed
-/// activation schedule nothing. Dispatched with no activation of this instance in
-/// flight, the op is dropped and reported.
-///
-/// **The timer idiom lives here.** A component's own periodic wakeup is a
-/// deferred publish to itself on an in/out port, rescheduled or cancelled through
-/// [`DEFER_OP_EDIT`] / [`DEFER_OP_CANCEL`] against the [`DeferredWindow`] the
-/// activation delivered. See the crate-level timer idiom section for what that
-/// buys and the one behavioral difference from a `setTimeout`.
-pub const PORT_DEFER: &str = "brenn-port-defer";
-
-/// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
-/// composed: true`, on the mounted element or from within its shadow root).
-/// `detail = { level, message }` where `level` is a lowercase log-level wire
-/// string (see [`brenn_surface_schema::LogLevel::from_wire_str`]) and `message` a
-/// string.
-pub const COMPONENT_LOG: &str = "brenn-log";
-
-/// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
-/// composed: true`, on the mounted element or from within its shadow root).
-/// `detail = { severity, title, body }` where `severity` is a lowercase
-/// alert-severity wire string (see
-/// [`brenn_surface_schema::AlertSeverity::from_wire_str`]) and `title`/`body` are
-/// strings. Forwarded as an `Alert` frame only on an alert-granted surface.
-pub const COMPONENT_ALERT: &str = "brenn-alert";
-
-/// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
-/// composed: true`, on the mounted element or from within its shadow root).
-/// `detail = { key }`, a string naming one entry of this instance's static
-/// config map. Answered synchronously on the same detail before the dispatch
-/// returns (see [`CONFIG_ANSWERED_FIELD`] and [`CONFIG_VALUE_FIELD`]).
-pub const CONFIG_GET: &str = "brenn-config-get";
-
-/// The [`CONFIG_GET`] detail field the kernel writes `true` into for every read
-/// it heard, whatever the answer was.
-///
-/// The absence marker the answer needs: a key the map does not hold, and an
-/// instance not granted `config`, both leave [`CONFIG_VALUE_FIELD`] unwritten,
-/// and a reader cannot tell that apart from a page whose kernel listener is
-/// absent without this. Missing means the event never reached the kernel, which
-/// is a broken page rather than an answer.
-pub const CONFIG_ANSWERED_FIELD: &str = "answered";
-
-/// The [`CONFIG_GET`] detail field the kernel writes the value into, written
-/// only when the instance is granted `config` and its map holds the key.
-pub const CONFIG_VALUE_FIELD: &str = "value";
-
-/// Component → kernel, dispatched on `window` from the component's panic hook.
-/// `detail = { component, message }` (both strings).
-pub const COMPONENT_PANIC: &str = "brenn-component-panic";
 
 // ── Bootstrap-seam events (kernel → bootstrap, on `window`) ─────────────────
 
@@ -972,110 +709,11 @@ pub const PROCESSOR_START: &str = "brenn-processor-start";
 
 // ── Naming conventions ─────────────────────────────────────────────────────
 
-/// The `brenn-` prefix shared by every component's custom-element tag. The one
-/// home for this literal: [`element_name`] and [`element_name_for_instance`]
-/// prepend it when building a tag.
-pub const ELEMENT_PREFIX: &str = "brenn-";
-
 /// The id of the surface DOM root element. A page ↔ kernel contract point: the
 /// backend page renders `<div id="surface-root">`, the kernel mounts components
 /// and its banner inside it, and the TS bootstrap renders pre-kernel failures
 /// into it. One definition all Rust consumers compile against.
 pub const SURFACE_ROOT_ID: &str = "surface-root";
-
-/// The custom element tag stem for a component `kind`: `brenn-<kind>`.
-///
-/// `kind` is boot-validated to [`is_valid_kind`], so the result is always a valid
-/// custom-element name. This is the *kind's* name and is not a tag any element
-/// carries: every mounted element is an instance, and instances are tagged by
-/// [`element_name_for_instance`]. It survives as the stem that mapping builds on
-/// and as the module-artifact key.
-pub fn element_name(kind: &str) -> String {
-    format!("{ELEMENT_PREFIX}{kind}")
-}
-
-/// The custom element tag for one declared instance: `brenn-<kind>--<instance>`.
-///
-/// One instance, one module evaluation, one linear memory, one element
-/// definition — the tag is per-instance because the module behind it is. The
-/// `--` separator is unambiguous by validation, not by luck: [`is_valid_kind`]
-/// rejects `--` anywhere in a kind or an instance id, so the split point is the
-/// only `--` in the tag and the mapping is collision-free and deterministic.
-///
-/// Both halves are boot-validated to [`is_valid_kind`], so the result is always a
-/// valid custom-element name (a `-`-containing name with an ASCII-lowercase
-/// first character).
-pub fn element_name_for_instance(kind: &str, instance: &str) -> String {
-    format!("{ELEMENT_PREFIX}{kind}--{instance}")
-}
-
-/// The name of the wasm-bindgen export every `dom` component module carries: the
-/// loader calls it once, immediately after the module's `default` init, passing
-/// the manifest entry's instance id.
-///
-/// Identity has to arrive this way. A wasm-bindgen `--target web` module cannot
-/// read the glue module's `import.meta.url` from Rust — an `inline_js` shim is
-/// emitted as its own snippet module, whose `import.meta.url` is the snippet's,
-/// so the specifier's `?instance=` query is invisible in-module. The query's only
-/// job is forcing the browser to mint distinct module records; the identity
-/// itself is handed over by this call. It is a loading-shim parameter — the TS
-/// layer moves one string from the manifest into the module it just loaded — and
-/// carries no message logic.
-pub const BIND_INSTANCE_EXPORT: &str = "brenn_bind_instance";
-
-/// The wasm-bindgen `--target web` module artifact for a component `kind`:
-/// `brenn_<kind with - → _>.js`, matching wasm-bindgen's crate-name-derived
-/// artifact naming.
-pub fn module_artifact(kind: &str) -> String {
-    format!("brenn_{}.js", kind.replace('-', "_"))
-}
-
-/// The stem every one of a dom kind's files is named from
-/// (`mode-clock` → `brenn_mode_clock`): the module pair, the packaged
-/// specification, the binding record and the documentation sidecars all take
-/// it. Derived from [`module_artifact`] so the hyphen→underscore mapping has
-/// one definition.
-pub fn module_stem(kind: &str) -> String {
-    let js = module_artifact(kind);
-    js.strip_suffix(".js")
-        .unwrap_or_else(|| panic!("module_artifact({kind:?}) = {js:?} lacks a .js suffix"))
-        .to_string()
-}
-
-/// The `_bg.wasm` half of a wasm-bindgen `--target web` module pair, given the
-/// `.js` half's artifact name. Named here because the kernel is a fixed
-/// artifact rather than a kind, so its sibling cannot come from
-/// [`module_wasm_artifact`].
-pub fn module_wasm_sibling(js_artifact: &str) -> String {
-    let stem = js_artifact
-        .strip_suffix(".js")
-        .unwrap_or_else(|| panic!("surface artifact name {js_artifact:?} lacks a .js suffix"));
-    format!("{stem}_bg.wasm")
-}
-
-/// The `_bg.wasm` half of a dom kind's module pair: `brenn_<kind>_bg.wasm`.
-pub fn module_wasm_artifact(kind: &str) -> String {
-    format!("{}_bg.wasm", module_stem(kind))
-}
-
-/// A dom kind's binding record in the surface asset root:
-/// `brenn_<kind>.manifest.json`.
-///
-/// This function and its two siblings are the single home for the dom file
-/// grammar on the Rust side; `bazel/surface/dom_names.sh` is the same statement
-/// for the shell readers — the record emitter and the staged-tree gate. The
-/// layout is provisional (a dom kind becomes a directory when out-of-tree
-/// components arrive), and readers that agree only by inspection disagree the
-/// first time it moves.
-pub fn dom_record_artifact(kind: &str) -> String {
-    format!("{}.manifest.json", module_stem(kind))
-}
-
-/// The packaged copy of a dom kind's authored specification in the surface
-/// asset root: `brenn_<kind>.spec.brenn`.
-pub fn dom_spec_artifact(kind: &str) -> String {
-    format!("{}.spec.brenn", module_stem(kind))
-}
 
 /// First line of every in-tree help sidecar, which is generated rather than
 /// hand-written: an HTML comment, so it is invisible in rendered markdown and
@@ -1085,37 +723,43 @@ pub fn dom_spec_artifact(kind: &str) -> String {
 pub const HELP_SIDECAR_HEADER: &str =
     "<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit. -->\n";
 
-/// The jco-transpiled module path for a processor `kind`, relative to the
+/// The jco-transpiled module path for a component `kind`, relative to the
 /// surface asset root: `processor/<kind>/<kind>.js`.
 ///
-/// Unlike [`module_artifact`]'s flat wasm-bindgen naming, a transpiled component
-/// is a directory — the entry JS plus one or more core wasm files jco emits
-/// beside it, whose exact set is jco-version-dependent. The entry module resolves
-/// its siblings relative to its own URL, so the directory is the unit and this
-/// names only its entry point. The single home for the layout the transpile rule
-/// writes and the page manifest reads.
+/// A transpiled component is a directory — the entry JS plus one or more core
+/// wasm files jco emits beside it, whose exact set is jco-version-dependent. The
+/// entry module resolves its siblings relative to its own URL, so the directory
+/// is the unit and this names only its entry point. The single home for the
+/// layout the transpile rule writes and the page manifest reads.
 pub fn processor_module_path(kind: &str) -> String {
     format!("processor/{kind}/{kind}.js")
 }
 
+/// The `brenn_<kind with - → _>` stem a kind's documentation sidecars ship
+/// under, flat in the surface asset root.
+///
+/// Documentation is served by kind-derived name and lives beside the kernel
+/// rather than inside the kind's transpile directory, so the generator, the
+/// staging rule and the description reader all derive it here.
+pub fn sidecar_stem(kind: &str) -> String {
+    format!("brenn_{}", kind.replace('-', "_"))
+}
+
 /// The kernel's own wasm-bindgen `--target web` module artifact. Unlike component
-/// modules (keyed by `kind` via [`module_artifact`]), the kernel is a single fixed
-/// artifact every surface page references; this is its one canonical name, shared
-/// by the page manifest and the boot asset-existence check.
+/// modules (keyed by `kind` under [`processor_module_path`]), the kernel is a
+/// single fixed artifact every surface page references; this is its one canonical
+/// name, shared by the page manifest and the boot asset-existence check.
 pub const KERNEL_ARTIFACT: &str = "brenn_surface_kernel.js";
 
 /// Whether a component `kind` or instance id matches the frozen
 /// `^[a-z0-9][a-z0-9-]*$` charset **with no `--` run** — the invariant
-/// [`element_name`]/[`element_name_for_instance`]/[`module_artifact`] depend on to
-/// emit a valid custom-element name and filename. The single executable
-/// definition of the rule the crate docs describe; callers enforcing it at boot
-/// call here.
+/// [`processor_module_path`] depends on to emit a valid path segment and
+/// filename. The single executable definition of the rule the crate docs
+/// describe; callers enforcing it at boot call here.
 ///
-/// The `--` rejection is what makes [`element_name_for_instance`]'s separator
-/// unambiguous: with consecutive hyphens permitted, `brenn-a--b--c` could split
-/// two ways and the kind↦tag mapping would not be a function. No in-tree name
-/// uses `--` and zero out-of-tree components exist, so the charset tightens
-/// freely.
+/// The `--` rejection survives because a name with a `--` run reads as a
+/// compound and nothing needs one: no in-tree name uses it and zero out-of-tree
+/// components exist.
 pub fn is_valid_kind(kind: &str) -> bool {
     let mut chars = kind.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
@@ -1129,100 +773,180 @@ mod tests {
 
     #[test]
     fn event_names_frozen() {
-        assert_eq!(PORT_PUBLISH, "brenn-port-publish");
-        assert_eq!(COMPONENT_LOG, "brenn-log");
-        assert_eq!(COMPONENT_ALERT, "brenn-alert");
-        assert_eq!(CONFIG_GET, "brenn-config-get");
-        assert_eq!(COMPONENT_PANIC, "brenn-component-panic");
         assert_eq!(SURFACE_RELOAD, "brenn-surface-reload");
         assert_eq!(SURFACE_READY, "brenn-surface-ready");
-        assert_eq!(ACTIVATION_REGISTER, "brenn-activation-register");
-        assert_eq!(PORT_DEFER, "brenn-port-defer");
+        assert_eq!(PROCESSOR_START, "brenn-processor-start");
+        assert_eq!(ENTRY_REPLY_FIELD, "reply");
     }
 
     #[test]
-    fn dom_file_grammar_is_one_stem() {
-        // The shell statement of this grammar is `bazel/surface/dom_names.sh`;
-        // the two are held together by the gates running over the tree the
-        // emitter writes and this reads.
-        assert_eq!(module_stem("mode-clock"), "brenn_mode_clock");
-        assert_eq!(module_artifact("mode-clock"), "brenn_mode_clock.js");
+    fn defer_status_strings_are_frozen() {
+        // Same argument as the publish status: the kernel writes these and the
+        // guest glue lifts them across the component boundary, so the two halves
+        // agree only if the mapping is one function.
+        assert_eq!(defer_status_str(Ok(())), "ok");
         assert_eq!(
-            module_wasm_artifact("mode-clock"),
-            "brenn_mode_clock_bg.wasm"
+            defer_status_str(Err(DeferError::NotPermitted)),
+            "not-permitted"
         );
         assert_eq!(
-            dom_record_artifact("mode-clock"),
-            "brenn_mode_clock.manifest.json"
+            defer_status_str(Err(DeferError::OutOfRange)),
+            "out-of-range"
         );
         assert_eq!(
-            dom_spec_artifact("mode-clock"),
-            "brenn_mode_clock.spec.brenn"
+            defer_status_str(Err(DeferError::QuotaExceeded)),
+            "quota-exceeded"
         );
         assert_eq!(
-            module_wasm_sibling(KERNEL_ARTIFACT),
-            "brenn_surface_kernel_bg.wasm"
+            defer_status_str(Err(DeferError::InvalidDeliverAfter)),
+            "invalid-deliver-after"
         );
     }
 
     #[test]
-    fn defer_status_strings_round_trip() {
-        // Same argument as the publish status: the kernel writes these and the SDK
-        // reads them across a wasm-module boundary, so the halves agree only if the
-        // mapping is one function.
-        for status in [
-            Ok(()),
-            Err(DeferError::NotPermitted),
-            Err(DeferError::OutOfRange),
-            Err(DeferError::QuotaExceeded),
-            Err(DeferError::InvalidDeliverAfter),
+    fn gesture_body_field_names_frozen() {
+        // The kernel writes this body and a guest SDK it cannot link parses it;
+        // a rename on one side alone is a gesture that silently stops carrying
+        // its target.
+        assert_eq!(GESTURE_EVENT_FIELD, "event");
+        assert_eq!(GESTURE_LISTENER_FIELD, "listener");
+        assert_eq!(GESTURE_TARGET_FIELD, "target");
+        assert_eq!(GESTURE_CANCEL_FIELD, "cancel");
+    }
+
+    /// The other half of the seam, which cannot assert itself.
+    ///
+    /// The guest SDK is built for wasm32, links none of this crate, and has no
+    /// test target of its own, so its `Gesture` field names and its cancel key
+    /// are independent literals held to these constants by nothing but prose.
+    /// Its source is compile data here, and the needles are built from the
+    /// constants: rename either side alone and this fails, instead of every
+    /// gesture body silently losing a field the day the kernel synthesizer
+    /// lands.
+    #[test]
+    fn the_guest_half_of_the_gesture_seam_spells_the_same_names() {
+        const GUEST: &str = include_str!("../../../brenn-wasm/components/guest/src/lib.rs");
+        for field in [
+            GESTURE_EVENT_FIELD,
+            GESTURE_LISTENER_FIELD,
+            GESTURE_TARGET_FIELD,
         ] {
-            assert_eq!(
-                parse_defer_status(defer_status_str(status.clone())),
-                Some(status)
+            let needle = format!("pub {field}: ");
+            assert!(
+                GUEST.contains(&needle),
+                "the guest's `Gesture` declares no `{needle}`; the two halves of the gesture                  body have drifted"
             );
         }
-        assert_eq!(DEFER_STATUS_FIELD, "status");
-        assert_eq!(parse_defer_status("nope"), None);
-        assert_eq!(parse_defer_status(""), None);
-        // The two vocabularies share a field and overlap on two spellings, so each
-        // parser must refuse the other's exclusive ones rather than mapping them to
-        // a neighbouring variant.
-        assert_eq!(parse_defer_status("invalid-payload"), None);
-        assert_eq!(parse_publish_status("out-of-range"), None);
-        assert_eq!(parse_publish_status("invalid-deliver-after"), None);
+        let key = format!("const CANCEL_KEY: &str = \"{GESTURE_CANCEL_FIELD}\";");
+        assert!(
+            GUEST.contains(&key),
+            "the guest spells no `{key}`; the two halves of the reply dialect have drifted"
+        );
     }
 
     #[test]
-    fn defer_op_names_frozen() {
-        // The op selector is read by the kernel's router and written by every SDK;
-        // a rename on one side alone is a component whose schedules silently become
-        // malformed detail.
-        assert_eq!(DEFER_OP_PUBLISH, "publish");
-        assert_eq!(DEFER_OP_CANCEL, "cancel");
-        assert_eq!(DEFER_OP_EDIT, "edit");
+    fn the_guest_half_of_the_mount_port_spells_the_same_string() {
+        // The kernel mints mount activations on this port and the guest matches
+        // on its own copy; a drift means every migrated UI kind renders nothing,
+        // silently, in the stack CI does not run.
+        const GUEST: &str = include_str!("../../../brenn-wasm/components/guest/src/lib.rs");
+        let needle = format!("pub const MOUNT: SyncPort = SyncPort(\"{MOUNT_SYNC_PORT}\");");
+        assert!(
+            GUEST.contains(&needle),
+            "the guest spells no `{needle}`; the two halves of the mount port have drifted"
+        );
+        // The colon is what reserves it: `assemble_sync` panics on a sync port
+        // that collides with a bound input port, and no specification identifier
+        // can spell one.
+        assert!(MOUNT_SYNC_PORT.contains(':'));
     }
 
     #[test]
-    fn publish_status_strings_round_trip() {
-        // The kernel writes these and the SDK reads them across a wasm-module
-        // boundary, so the two halves only agree if the mapping is one function.
-        for status in [
-            Ok(()),
-            Err(PublishError::NotPermitted),
-            Err(PublishError::InvalidPayload),
-            Err(PublishError::QuotaExceeded),
+    fn the_dom_vocabulary_admits_only_what_it_lists() {
+        assert!(dom_tag_allowed("div"));
+        assert!(dom_tag_allowed("h6"));
+        // Exact ASCII-lowercase, not case-folded: a guest that shouts traps.
+        assert!(!dom_tag_allowed("DIV"));
+        for refused in [
+            "script", "iframe", "object", "embed", "template", "meta", "base", "style", "link",
+            "form", "a", "",
         ] {
-            assert_eq!(
-                parse_publish_status(publish_status_str(status.clone())),
-                Some(status)
-            );
+            assert!(!dom_tag_allowed(refused), "`{refused}` is creatable");
         }
-        assert_eq!(PUBLISH_STATUS_FIELD, "status");
-        assert_eq!(CONFIG_ANSWERED_FIELD, "answered");
-        assert_eq!(CONFIG_VALUE_FIELD, "value");
-        assert_eq!(parse_publish_status("nope"), None);
-        assert_eq!(parse_publish_status(""), None);
+        assert!(dom_attribute_allowed("class"));
+        assert!(dom_attribute_allowed("data-instance"));
+        assert!(dom_attribute_allowed("aria-label"));
+        // The prefix is a prefix, not a substring.
+        assert!(!dom_attribute_allowed("x-data-instance"));
+        for refused in [
+            "onclick", "ONCLICK", "srcdoc", "href", "src", "id", "style", "",
+        ] {
+            assert!(!dom_attribute_allowed(refused), "`{refused}` is settable");
+        }
+    }
+
+    /// The lists are contract vocabulary an out-of-tree author reads off the WIT
+    /// interface doc, so the doc is data of this test rather than prose beside
+    /// the constants: the two cannot drift.
+    #[test]
+    fn the_wit_doc_carries_the_dom_vocabulary_verbatim() {
+        const WIT: &str = include_str!("../../../brenn-wasm/wit/processor.wit");
+        const TAGS_MARKER: &str = "Allowed tags";
+        const ATTRS_MARKER: &str = "Allowed attribute names";
+        const END_MARKER: &str = "interface dom {";
+
+        fn quoted(region: &str) -> Vec<&str> {
+            region.split('`').skip(1).step_by(2).collect()
+        }
+        fn region<'a>(wit: &'a str, from: &str, to: &str) -> &'a str {
+            let start = wit.find(from).unwrap_or_else(|| {
+                panic!("the WIT carries no `{from}` heading for the dom vocabulary")
+            });
+            let rest = &wit[start..];
+            let end = rest
+                .find(to)
+                .unwrap_or_else(|| panic!("no `{to}` after `{from}` in the WIT"));
+            &rest[..end]
+        }
+
+        let mut tags = quoted(region(WIT, TAGS_MARKER, ATTRS_MARKER));
+        tags.sort_unstable();
+        let mut expected_tags = DOM_ALLOWED_TAGS.to_vec();
+        expected_tags.sort_unstable();
+        assert_eq!(
+            tags, expected_tags,
+            "the WIT's tag list and DOM_ALLOWED_TAGS have drifted"
+        );
+
+        let mut names = quoted(region(WIT, ATTRS_MARKER, END_MARKER));
+        names.sort_unstable();
+        let mut expected_names = DOM_ALLOWED_ATTRIBUTES.to_vec();
+        expected_names.extend_from_slice(DOM_ALLOWED_ATTRIBUTE_PREFIXES);
+        expected_names.sort_unstable();
+        assert_eq!(
+            names, expected_names,
+            "the WIT's attribute list and DOM_ALLOWED_ATTRIBUTE{{S,_PREFIXES}} have drifted"
+        );
+    }
+
+    #[test]
+    fn publish_status_strings_are_frozen() {
+        // The kernel writes these and the guest glue lifts them across the
+        // component boundary, so the two halves only agree if the mapping is one
+        // function.
+        assert_eq!(publish_status_str(Ok(())), "ok");
+        assert_eq!(
+            publish_status_str(Err(PublishError::NotPermitted)),
+            "not-permitted"
+        );
+        assert_eq!(
+            publish_status_str(Err(PublishError::InvalidPayload)),
+            "invalid-payload"
+        );
+        assert_eq!(
+            publish_status_str(Err(PublishError::QuotaExceeded)),
+            "quota-exceeded"
+        );
     }
 
     #[test]
@@ -1240,28 +964,45 @@ mod tests {
         );
     }
 
-    /// The four values are the seam's whole vocabulary and the SDK panics on a
-    /// string it cannot parse, so writer and reader must agree letter for letter.
     #[test]
-    fn every_sync_status_round_trips_through_its_wire_string() {
-        for status in [
-            SyncStatus::Ok,
-            SyncStatus::Err,
-            SyncStatus::Trap,
-            SyncStatus::Refused,
-        ] {
-            assert_eq!(parse_sync_status(sync_status_str(status)), Some(status));
-        }
-        assert_eq!(sync_status_str(SyncStatus::Ok), "ok");
-        assert_eq!(sync_status_str(SyncStatus::Refused), "refused");
-        assert_eq!(parse_sync_status("not-permitted"), None);
-        assert_eq!(parse_sync_status(""), None);
+    fn sidecar_stem_underscores_a_hyphenated_kind() {
+        // The generator, the staging rule and the description reader all reach a
+        // kind's documentation by this name; the served tree spells it by hand.
+        assert_eq!(sidecar_stem("chrome"), "brenn_chrome");
+        assert_eq!(sidecar_stem("mode-clock"), "brenn_mode_clock");
+        assert_eq!(sidecar_stem("echo-stub"), "brenn_echo_stub");
     }
 
+    /// The other half of the sidecar seam, which the function cannot assert.
+    ///
+    /// A kind's `help.md` is staged under a basename spelled by hand at its
+    /// stage, and resolved at serve time through [`sidecar_stem`]. A
+    /// disagreement is a warning and a stub help page, not a failure, so the
+    /// served file set is data of this test: a staged name no kind's stem
+    /// spells fails here instead of silently unpublishing that kind's
+    /// documentation.
     #[test]
-    fn element_name_prefixes_kind() {
-        assert_eq!(element_name("protobar"), "brenn-protobar");
-        assert_eq!(element_name("echo-stub"), "brenn-echo-stub");
+    fn every_served_sidecar_is_named_for_the_kind_it_documents() {
+        const PATHS: &str = include_str!("../../dist-paths.txt");
+        let kinds: Vec<&str> = PATHS
+            .lines()
+            .filter_map(|line| line.strip_prefix("processor/"))
+            .filter_map(|rest| rest.split('/').next())
+            .collect();
+        assert!(kinds.contains(&"mode-clock"), "{kinds:?}");
+        let mut documented = 0;
+        for line in PATHS.lines() {
+            let Some(stem) = line.strip_suffix(".help.md") else {
+                continue;
+            };
+            documented += 1;
+            assert!(
+                kinds.iter().any(|kind| sidecar_stem(kind) == stem),
+                "`{line}` is served under a stem no staged kind spells; the \
+                 description endpoint resolves it for nobody"
+            );
+        }
+        assert!(documented > 0, "no sidecar is served at all");
     }
 
     #[test]
@@ -1279,12 +1020,6 @@ mod tests {
     }
 
     #[test]
-    fn module_artifact_maps_dashes_to_underscores() {
-        assert_eq!(module_artifact("protobar"), "brenn_protobar.js");
-        assert_eq!(module_artifact("echo-stub"), "brenn_echo_stub.js");
-    }
-
-    #[test]
     fn is_valid_kind_matches_frozen_charset() {
         assert!(is_valid_kind("protobar"));
         assert!(is_valid_kind("echo-stub"));
@@ -1297,38 +1032,8 @@ mod tests {
         assert!(!is_valid_kind("-echo"));
         assert!(!is_valid_kind("echo.stub"));
         assert!(!is_valid_kind("echo~stub"));
-        // Rejected: a `--` run anywhere. This is what makes
-        // `element_name_for_instance`'s separator the only `--` in a tag, so the
-        // instance tag splits exactly one way.
+        // Rejected: a `--` run anywhere.
         assert!(!is_valid_kind("echo--stub"));
         assert!(!is_valid_kind("a--"));
-    }
-
-    #[test]
-    fn element_name_for_instance_is_collision_free() {
-        assert_eq!(
-            element_name_for_instance("protobar", "p1"),
-            "brenn-protobar--p1"
-        );
-        assert_eq!(
-            element_name_for_instance("echo-stub", "echo-stub"),
-            "brenn-echo-stub--echo-stub"
-        );
-        // The pair every hyphen-based scheme gets wrong when `--` is legal:
-        // ("a-b", "c") and ("a", "b-c") are distinct declarations and must not
-        // share a tag. `is_valid_kind` forbids the `--` that would make them
-        // collide, and the mapping keeps them apart regardless.
-        assert_ne!(
-            element_name_for_instance("a-b", "c"),
-            element_name_for_instance("a", "b-c")
-        );
-    }
-
-    #[test]
-    fn bind_instance_export_name_frozen() {
-        // The TS loader looks this up on the module object by name; a rename here
-        // that the loader does not make is a component that never learns its
-        // identity.
-        assert_eq!(BIND_INSTANCE_EXPORT, "brenn_bind_instance");
     }
 }

@@ -234,18 +234,19 @@ pub fn build_wasm_policy(
 
     let mut grant_set = GrantSet::default();
     for grant in grants {
-        // Two grants name no capability. `tools` is authority the resolved
+        // Four grants name no capability. `tools` is authority the resolved
         // tool-grant map carries key by key, so there is nothing to insert here.
-        // `takeover` is a page capability and this is the backend consumer path,
-        // which has no page; the DSL refuses the word on a top-level instance,
-        // so reaching here means that refusal was bypassed.
+        // `takeover`, `dom` and `page-dom` are page capabilities and this is the
+        // backend consumer path, which has no page; the DSL refuses all three on
+        // a top-level instance, so reaching here means that refusal was bypassed.
         let Some(cap) = grant.app_capability() else {
             if grant == crate::messaging::ComponentGrant::Tools {
                 continue;
             }
             panic!(
-                "wasm component {slug:?}: granted `takeover`, which is a page capability — \
+                "wasm component {slug:?}: granted `{}`, which is a page capability — \
                  a top-level consumer has no page, and the config front end refuses the word",
+                grant.word(),
             )
         };
         // Fail-fast on a duplicate grant, mirroring `build_app_policy` above. The

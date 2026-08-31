@@ -9,6 +9,7 @@
 
 #![allow(dead_code, unused_imports)]
 
+#[cfg(target_arch = "wasm32")]
 use brenn_guest::serde;
 
 /// The ports the specification declares as inbound — `in` and `io`.
@@ -35,6 +36,7 @@ impl InPort {
     /// artifact is hash-bound to the specification that generated this
     /// module, so an undeclared port means the host handed over a window it
     /// could not have been configured to produce. The activation fails.
+    #[cfg(target_arch = "wasm32")]
     pub fn of(window: &brenn_guest::PortWindow) -> Result<InPort, brenn_guest::Error> {
         InPort::from_name(window.port()).ok_or_else(|| {
             brenn_guest::Error::failed(format!(
@@ -48,6 +50,7 @@ impl InPort {
 /// The payload types this guest publishes on the `beats` port. Bind a type to
 /// the port once, as an impl:
 /// `impl spec::BeatsPayload for Body<'_> {}`
+#[cfg(target_arch = "wasm32")]
 pub trait BeatsPayload: serde::Serialize {}
 
 /// A typed publish handle for the `beats` port, over any payload bound to it
@@ -55,6 +58,7 @@ pub trait BeatsPayload: serde::Serialize {}
 /// `const OUT: OutPort<Body> = spec::beats();`
 /// A borrowed payload cannot be named in one, so publish it inline:
 /// `spec::beats().publish(&body)?`.
+#[cfg(target_arch = "wasm32")]
 pub const fn beats<T: BeatsPayload>() -> brenn_guest::OutPort<T> {
     brenn_guest::OutPort::new("beats")
 }

@@ -949,22 +949,17 @@ pub struct SurfaceConfigRaw {
 /// A component module to mount on a surface (`[[surface.component]]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceComponentRaw {
-    /// Component module kind to mount. Must match `^[a-z0-9][a-z0-9-]*$` — the
-    /// kind becomes a custom-element name (`brenn-<kind>`) and module filename.
-    /// Several instances may share one kind (one wasm module, N elements).
+    /// The component kind that names the artifact the page instantiates. Must
+    /// match `^[a-z0-9][a-z0-9-]*$` — the kind is a directory name and a URL
+    /// path segment under `processor/<kind>/`, and the stem of the kind's
+    /// documentation sidecars. Several instances may share one kind (one
+    /// transpiled tree, N instances).
     pub kind: String,
     /// Instance id: the routing/mount key that bindings reference. Absent ⇒
     /// defaults to `kind` (single-instance ergonomics). Must match the same
     /// charset as `kind` and be unique within the surface (enforced at
     /// resolution).
     pub instance: Option<String>,
-    /// Which artifact shape backs this instance (`"dom"`, `"processor"`,
-    /// `"dom-ts"`, `"html"`) — a build/loading fact the page must not have to
-    /// guess, never a statement about what the component may reach. Required:
-    /// the operator states the artifact shape explicitly, exactly as they state
-    /// grants, because a default would silently pick a toolchain for them.
-    /// Resolution rejects any value the shell cannot load.
-    pub abi: String,
     /// Lowercase hex SHA-256 of the spec file this instance's class was
     /// declared in. Not a body key — the class's fact, carried through lowering
     /// so boot can bind it to the spec packaged in the dist tree.
@@ -1011,7 +1006,6 @@ pub struct SurfaceComponentRaw {
     /// Static key/value configuration handed to this instance, read through its
     /// `config` capability. Absent ⇒ empty map.
     ///
-    /// ABI-agnostic: a `dom` component reads the same map a `processor` does.
     /// Readable only when the instance holds the `config` grant — resolution
     /// requires both a map and the grant; either alone is dead config. Keys must
     /// not start with `brenn.`, which is the host-reserved namespace.
@@ -1028,7 +1022,7 @@ pub struct SurfaceComponentRaw {
 
 #[cfg(any(test, feature = "testutils"))]
 impl SurfaceComponentRaw {
-    /// Minimal raw `dom` component of `kind`, with a defaulted instance id, no
+    /// Minimal raw component of `kind`, with a defaulted instance id, no
     /// grants, no overrides and an empty specification hash. Shared across this
     /// crate's test modules and the boot crates above it so a new field on this
     /// struct lands in one place instead of every hand-written literal; a test
@@ -1037,7 +1031,6 @@ impl SurfaceComponentRaw {
         SurfaceComponentRaw {
             kind: kind.to_string(),
             instance: None,
-            abi: "dom".to_string(),
             spec_sha256: String::new(),
             send_burst: None,
             send_refill_secs: None,
@@ -1445,19 +1438,16 @@ pub struct ResolvedWasmConsumer {
 ///
 /// Populated by `resolve_surfaces` after boot-time
 /// cross-validation. Carried on `MessagingResult` alongside `wasm_consumers`.
-/// One resolved mounted component instance: its routing/mount `instance` id and
-/// the component `kind` that backs it. Several instances may share a kind (one
-/// wasm module, N elements).
+/// One resolved component instance: its routing `instance` id and the component
+/// `kind` that backs it. Several instances may share a kind — one compiled
+/// module, N instantiations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedComponent {
     /// Routing/mount key that bindings reference. Defaults to `kind` when the
     /// config omits it.
     pub instance: String,
-    /// Component module kind: the custom-element tag and wasm module.
+    /// Component module kind: the name of the wasm component the page loads.
     pub kind: String,
-    /// Resolved artifact shape, validated at boot against the ABIs the shell can
-    /// actually load. Carried to the page in the bindings document.
-    pub abi: brenn_surface_schema::Abi,
     /// Lowercase hex SHA-256 of the spec file this instance's class was declared
     /// in. Must match the hash in the record packaged with this kind's artifacts.
     pub spec_sha256: String,
@@ -1499,11 +1489,10 @@ impl ResolvedComponent {
     /// The empty hash is what a fixture that never runs asset validation wants —
     /// there is nothing installed for it to bind to. A fixture that does run it
     /// overrides the hash with the one its tree packages.
-    pub fn minimal(instance: &str, kind: &str, abi: brenn_surface_schema::Abi) -> Self {
+    pub fn minimal(instance: &str, kind: &str) -> Self {
         ResolvedComponent {
             instance: instance.to_string(),
             kind: kind.to_string(),
-            abi,
             spec_sha256: String::new(),
             send_budget: AttachSendBudget::default(),
             parked_batch_depth: DEFAULT_PARKED_BATCH_DEPTH,

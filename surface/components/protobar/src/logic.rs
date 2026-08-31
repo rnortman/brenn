@@ -20,7 +20,6 @@
 //! counter, and is reported to the operator log — never a panic.
 
 use brenn_envelope::{MessageEnvelope, Urgency};
-use brenn_surface_component_support::FaultReport;
 use chrono::{DateTime, Utc};
 
 use crate::markdown::{self, Block};
@@ -43,6 +42,40 @@ pub struct Display {
     /// `None` in the "awaiting data" and all-slots-empty/expired states, where
     /// no message occupies the bar.
     pub priority: Option<Urgency>,
+}
+
+// TODO(surface-fault-report): the malformed-body log line below is spelled here
+// because every kind spells its own copy. The home for it is guest-side.
+
+/// Everything the glue needs to emit the operator-visible malformed-body log
+/// line, extracted from the envelope so all formatting stays host-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultReport {
+    pub channel: String,
+    pub sender: String,
+    pub message_id: String,
+    pub reason: String,
+}
+
+impl FaultReport {
+    /// Build a report from the delivering envelope and a validation reason.
+    pub fn new(envelope: &MessageEnvelope, reason: String) -> Self {
+        FaultReport {
+            channel: envelope.channel.clone(),
+            sender: envelope.sender.clone(),
+            message_id: envelope.message_id.to_string(),
+            reason,
+        }
+    }
+
+    /// The operator log line. `context` names what was malformed, so a buggy
+    /// publisher is identifiable.
+    pub fn log_message(&self, context: &str) -> String {
+        format!(
+            "malformed {} on {} from {} (message_id {}): {}",
+            context, self.channel, self.sender, self.message_id, self.reason
+        )
+    }
 }
 
 /// A rejected port event. The DOM glue panics on any of these.

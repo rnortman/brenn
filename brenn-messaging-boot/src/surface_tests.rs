@@ -308,7 +308,11 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
             },
             SurfaceComponentRaw {
                 spec_sha256: spec_hash("chrome"),
-                grants: vec![ComponentGrant::Ports],
+                grants: vec![
+                    ComponentGrant::Ports,
+                    ComponentGrant::Dom,
+                    ComponentGrant::PageDom,
+                ],
                 chrome: true,
                 ..SurfaceComponentRaw::minimal("chrome")
             },
@@ -473,18 +477,23 @@ fn surface_resolves_happy_path() {
             ResolvedComponent {
                 spec_sha256: spec_hash("protobar"),
                 grants: [ComponentGrant::Ports].into(),
-                ..ResolvedComponent::minimal("protobar", "protobar", brenn_surface_schema::Abi::Dom)
+                ..ResolvedComponent::minimal("protobar", "protobar")
             },
             ResolvedComponent {
                 spec_sha256: spec_hash("sidecar"),
                 grants: [ComponentGrant::Ports].into(),
-                ..ResolvedComponent::minimal("sidecar", "sidecar", brenn_surface_schema::Abi::Dom)
+                ..ResolvedComponent::minimal("sidecar", "sidecar")
             },
             ResolvedComponent {
                 spec_sha256: spec_hash("chrome"),
-                grants: [ComponentGrant::Ports].into(),
+                grants: [
+                    ComponentGrant::Ports,
+                    ComponentGrant::Dom,
+                    ComponentGrant::PageDom,
+                ]
+                .into(),
                 chrome: true,
-                ..ResolvedComponent::minimal("chrome", "chrome", brenn_surface_schema::Abi::Dom)
+                ..ResolvedComponent::minimal("chrome", "chrome")
             },
         ]
     );
@@ -523,7 +532,6 @@ fn every_field_of_a_resolved_component_is_pinned() {
     let ResolvedComponent {
         instance,
         kind,
-        abi,
         spec_sha256,
         send_budget,
         parked_batch_depth,
@@ -534,7 +542,6 @@ fn every_field_of_a_resolved_component_is_pinned() {
 
     assert_eq!(instance, "protobar");
     assert_eq!(kind, "protobar");
-    assert_eq!(*abi, brenn_surface_schema::Abi::Dom);
     assert_eq!(*spec_sha256, spec_hash("protobar"));
     assert_eq!(
         *send_budget,
@@ -1560,6 +1567,9 @@ fn surface_zero_chrome_panics() {
     let mut raw = valid_surface_raw();
     for comp in &mut raw.components {
         comp.chrome = false;
+        // Page authority travels with the designation, so dropping the flag
+        // drops the grant with it — otherwise the uniqueness rule speaks first.
+        comp.grants.retain(|g| *g != ComponentGrant::PageDom);
     }
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
@@ -1571,9 +1581,50 @@ fn surface_zero_chrome_panics() {
 fn surface_two_chrome_panics() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
-    // The fixture already carries one chrome; mark a second.
+    // The fixture already carries one chrome; mark a second, with the page
+    // authority its designation requires.
     raw.components[0].chrome = true;
+    raw.components[0].grants.push(ComponentGrant::Dom);
+    raw.components[0].grants.push(ComponentGrant::PageDom);
     resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// `page-dom` on any component but the chrome is a boot panic: page authority —
+/// the body, the surface root, every sibling's wrapper — is the chrome's alone,
+/// and the kernel's overlay handling assumes exactly one holder.
+#[test]
+#[should_panic(expected = "which only the surface's chrome may hold")]
+fn surface_page_dom_on_a_non_chrome_component_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    let non_chrome = raw
+        .components
+        .iter_mut()
+        .find(|c| !c.chrome)
+        .expect("the fixture has a non-chrome component");
+    non_chrome.grants.push(ComponentGrant::PageDom);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// The same grant on the designated chrome resolves — the other leg of the
+/// uniqueness rule, so the refusal above cannot be read as a blanket ban.
+#[test]
+fn surface_page_dom_on_the_chrome_resolves() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    let chrome = raw
+        .components
+        .iter_mut()
+        .find(|c| c.chrome)
+        .expect("the fixture has a chrome component");
+    assert!(chrome.grants.contains(&ComponentGrant::PageDom));
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    let holder = resolved[0]
+        .components
+        .iter()
+        .find(|c| c.grants.contains(&ComponentGrant::PageDom))
+        .expect("the chrome holds the grant it was given");
+    assert!(holder.chrome, "only the chrome holds page authority");
 }
 
 /// A second component sharing a kind but with a distinct explicit instance id
@@ -2425,84 +2476,7 @@ fn local_empty_channel_name_panics() {
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
-/// A surface whose one component's ABI is `abi`, ready to resolve.
-fn surface_with_abi(abi: &str) -> brenn_lib::messaging::config::SurfaceConfigRaw {
-    let mut raw = minimal_surface_raw();
-    raw.components[0].abi = abi.to_string();
-    raw
-}
-
-#[test]
-fn component_abi_dom_resolves() {
-    let resolved = resolve_surfaces(&[surface_with_abi("dom")], &dir_of(vec![]), &test_globals());
-    // The declared component carries its resolved ABI to the page: the shell is
-    // told what it is loading rather than inferring it from the kind.
-    assert_eq!(
-        resolved[0].components[0].abi,
-        brenn_surface_schema::Abi::Dom
-    );
-}
-
-#[test]
-fn component_abi_processor_resolves() {
-    // Headless component-model hosting: the kernel loads a jco-transpiled
-    // `brenn:processor` artifact, so the ABI resolves and rides the bindings
-    // document beside `dom`. What the artifact may import is a separate, asset-level check.
-    let resolved = resolve_surfaces(
-        &[surface_with_abi("processor")],
-        &dir_of(vec![]),
-        &test_globals(),
-    );
-    assert_eq!(
-        resolved[0].components[0].abi,
-        brenn_surface_schema::Abi::Processor
-    );
-}
-
-#[test]
-#[should_panic(expected = "reserved but not yet supported")]
-fn component_abi_dom_ts_panics() {
-    // The reserved-but-unbuilt ABIs are admitted by the contract's name set and
-    // refused by the loader, so a config written early keeps its meaning.
-    resolve_surfaces(
-        &[surface_with_abi("dom-ts")],
-        &dir_of(vec![]),
-        &test_globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "reserved but not yet supported")]
-fn component_abi_html_panics() {
-    resolve_surfaces(
-        &[surface_with_abi("html")],
-        &dir_of(vec![]),
-        &test_globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "names no component ABI")]
-fn component_abi_unknown_panics() {
-    // Distinct from the reserved case on purpose: an unknown string is a typo,
-    // or config written against something that does not exist, and the operator
-    // is told which mistake they made.
-    resolve_surfaces(
-        &[surface_with_abi("wasm")],
-        &dir_of(vec![]),
-        &test_globals(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "names no component ABI")]
-fn component_abi_is_case_sensitive() {
-    // The ABI set is a fixed vocabulary, not a string the resolver normalizes:
-    // accepting "DOM" would mean the config had two spellings of one value.
-    resolve_surfaces(&[surface_with_abi("DOM")], &dir_of(vec![]), &test_globals());
-}
-
-// --- depth-0: the bus's rule set, one set for every ABI and class ---
+// --- depth-0: the bus's rule set, one set for every class ---
 //
 // Every surface component rides activations, so depth 0 always has a window to
 // be read as context on. What remains are the bus's own two rules: no `noise`
@@ -2511,16 +2485,14 @@ fn component_abi_is_case_sensitive() {
 
 // --- the processor config map ---
 
-/// Turn the fixture's first component into one of `abi` carrying `config` and
-/// the grant that reads it, and resolve. Returns the resolved surfaces so a
-/// caller can read the map back.
+/// Turn the fixture's first component into one carrying `config` and the grant
+/// that reads it, and resolve. Returns the resolved surfaces so a caller can
+/// read the map back.
 fn resolve_with_component_config(
     config: Option<std::collections::BTreeMap<String, String>>,
-    abi: &str,
 ) -> Vec<brenn_lib::messaging::config::ResolvedSurface> {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
-    raw.components[0].abi = abi.to_string();
     if config.as_ref().is_some_and(|m| !m.is_empty()) {
         raw.components[0].grants.push(ComponentGrant::Config);
     }
@@ -2537,7 +2509,7 @@ fn processor_component_config_resolves() {
         ("horizon-days".to_string(), "30".to_string()),
         ("mode".to_string(), "digest".to_string()),
     ]);
-    let resolved = resolve_with_component_config(Some(map.clone()), "processor");
+    let resolved = resolve_with_component_config(Some(map.clone()));
     assert_eq!(resolved[0].components[0].config, map);
 }
 
@@ -2545,17 +2517,8 @@ fn processor_component_config_resolves() {
 /// `config = {}` to say "nothing to configure".
 #[test]
 fn absent_component_config_resolves_empty() {
-    let resolved = resolve_with_component_config(None, "processor");
+    let resolved = resolve_with_component_config(None);
     assert!(resolved[0].components[0].config.is_empty());
-}
-
-/// A `dom` component's map resolves identically to a `processor`'s — config
-/// is ABI-agnostic.
-#[test]
-fn dom_component_config_resolves() {
-    let map = std::collections::BTreeMap::from([("k".to_string(), "v".to_string())]);
-    let resolved = resolve_with_component_config(Some(map.clone()), "dom");
-    assert_eq!(resolved[0].components[0].config, map);
 }
 
 /// A map no one is granted to read is configuration with no reader — the dead
@@ -2621,6 +2584,47 @@ fn a_backend_only_grant_on_a_placed_instance_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
+/// The same table, read the other way: the page capabilities are legal exactly
+/// where there is a page, and a surface placement is that. Pinned beside the
+/// refusal because a legality-table edit or a resolve-side filter that dropped
+/// the words would otherwise show up as headless UI instances at deploy time
+/// rather than as a failing test.
+#[test]
+fn the_page_capabilities_resolve_onto_a_placed_instance() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    // On the chrome, which is the only instance page authority is legal on.
+    let chrome = raw
+        .components
+        .iter_mut()
+        .find(|c| c.chrome)
+        .expect("the fixture has a chrome component");
+    let instance = chrome
+        .instance
+        .clone()
+        .unwrap_or_else(|| chrome.kind.clone());
+    chrome.grants = vec![
+        ComponentGrant::Ports,
+        ComponentGrant::Dom,
+        ComponentGrant::PageDom,
+    ];
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    let resolved_chrome = resolved[0]
+        .components
+        .iter()
+        .find(|c| c.instance == instance)
+        .expect("the chrome resolved");
+    assert_eq!(
+        resolved_chrome.grants,
+        [
+            ComponentGrant::Ports,
+            ComponentGrant::Dom,
+            ComponentGrant::PageDom
+        ]
+        .into(),
+    );
+}
+
 /// An output binding is a publish the component intends to make; without the
 /// ports capability it can make none, so the pair is refused as dead config —
 /// the surface twin of the `[[wasm_consumer]]` rule.
@@ -2663,14 +2667,19 @@ fn an_instance_alert_grant_under_an_alert_granted_surface_resolves() {
     );
 }
 
-/// Chrome renders the shell; a headless component has nowhere to render it.
+/// Chrome arranges the whole page; without page authority it reaches nothing
+/// outside its own subtree, and the surface comes up with no shell.
 #[test]
-#[should_panic(expected = "chrome renders the shell")]
-fn a_headless_chrome_panics() {
+#[should_panic(expected = "is not granted \"page-dom\"")]
+fn a_chrome_without_page_authority_panics() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
-    let chrome = raw.components.len() - 1;
-    raw.components[chrome].abi = "processor".to_string();
+    let chrome = raw
+        .components
+        .iter_mut()
+        .find(|c| c.chrome)
+        .expect("the fixture has a chrome component");
+    chrome.grants.retain(|g| *g != ComponentGrant::PageDom);
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
@@ -2680,7 +2689,7 @@ fn a_headless_chrome_panics() {
 #[should_panic(expected = "host-reserved namespace")]
 fn component_config_brenn_prefixed_key_panics() {
     let map = std::collections::BTreeMap::from([("brenn.instance".to_string(), "x".to_string())]);
-    resolve_with_component_config(Some(map), "processor");
+    resolve_with_component_config(Some(map));
 }
 
 /// A depth-0 port with retained context is the bus's ordinary

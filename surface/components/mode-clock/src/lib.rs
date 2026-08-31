@@ -14,8 +14,13 @@
 //! self-publishes on the `tick` in/out port, parked from inside the activation
 //! that recomputed.
 
-pub mod help;
 pub mod logic;
+
+/// The help sidecar's generator, which the build runs on the host. It reads the
+/// crates that define the theme axis, none of which the guest crate universe
+/// carries, so it compiles where the generator runs and nowhere else.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod help;
 
 /// Port names and types from this component's specification.
 pub mod spec;

@@ -14,7 +14,7 @@
 //! validation's threat model. In-page separation is bug containment, not a
 //! security boundary; the server-side gates on what a page *does* are unchanged,
 //! and the browser-side backstop is structural (the kernel supplies only the
-//! four surface imports, so a lying manifest yields an instantiation failure,
+//! surface-profile imports, so a lying manifest yields an instantiation failure,
 //! never a capability).
 
 use std::collections::BTreeSet;
@@ -34,21 +34,24 @@ const MANIFEST_VERSION: u32 = 2;
 const PROCESSOR_PACKAGE: &str = "brenn:processor";
 
 /// The WIT interfaces a surface-hosted processor may import: the transpilable
-/// profile. `store`/`mqtt`/`tools` are backend-only in v1.
+/// profile. `store`/`mqtt`/`tools` are backend-only in v1; `dom`/`page-dom` run
+/// the other way and are surface-only, because only a page has a DOM.
 ///
 /// `types` is in the set but is not a capability: it defines the shared record
 /// and enum shapes the other interfaces speak, so every processor imports it and
 /// no host implements it (jco resolves it structurally). It is listed here
 /// because the manifest reports the world's imports truthfully, and a
 /// type-carrying import must not read as an unsatisfiable one.
-const SURFACE_IMPORTS: [&str; 5] = ["types", "ports", "log", "alert", "config"];
+const SURFACE_IMPORTS: [&str; 7] = [
+    "types", "ports", "log", "alert", "config", "dom", "page-dom",
+];
 
 /// Every WIT interface name `processor.wit` defines. An import outside this set
 /// is manifest/toolchain drift (the build wrote a name no world declares), which
 /// is a different operator problem from declaring a backend-only component on a
 /// surface — and gets its own panic.
-const KNOWN_IMPORTS: [&str; 8] = [
-    "types", "ports", "log", "alert", "config", "store", "mqtt", "tools",
+const KNOWN_IMPORTS: [&str; 10] = [
+    "types", "ports", "log", "alert", "config", "store", "mqtt", "tools", "dom", "page-dom",
 ];
 
 /// The build manifest emitted beside a transpiled processor kind.
@@ -347,36 +350,6 @@ pub fn assert_imports_granted(
     }
 }
 
-/// Assert no kind is declared under two different ABIs anywhere in the config.
-///
-/// A kind names one artifact; two ABIs for one kind means two different build
-/// outputs claiming one name, and whichever the loader picked would be a coin
-/// flip. Swept across all surfaces at once, so a cross-surface collision is
-/// caught too.
-///
-/// # Panics
-///
-/// When one kind appears under more than one ABI.
-pub fn assert_kind_abi_unique(
-    declarations: impl IntoIterator<Item = (String, brenn_surface_schema::Abi)>,
-) {
-    let mut seen: std::collections::BTreeMap<String, BTreeSet<&'static str>> =
-        std::collections::BTreeMap::new();
-    for (kind, abi) in declarations {
-        seen.entry(kind).or_default().insert(abi.as_str());
-    }
-    for (kind, abis) in seen {
-        assert!(
-            abis.len() == 1,
-            "config: component kind {kind:?} is declared under {} different ABIs ({}) — a kind \
-             names one build artifact, so two ABIs for one kind means two artifacts claiming one \
-             name. Give them distinct kinds. Refusing to start (fail-fast on invalid config).",
-            abis.len(),
-            abis.into_iter().collect::<Vec<_>>().join(", "),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use brenn_envelope::grants::{ComponentGrant, ComponentHost};
@@ -389,6 +362,32 @@ mod tests {
 
     /// The grant that names no interface, so no import list can hold it.
     const NO_INTERFACE: ComponentGrant = ComponentGrant::Takeover;
+
+    /// The interface names the world defines and only a surface host links.
+    /// [`KNOWN_IMPORTS`] is "every interface `processor.wit` defines", so it
+    /// carries them; a top-level component may not be granted them. That is the
+    /// mirror image of `store`/`mqtt`/`tools`, which the world defines and only
+    /// the backend links.
+    const SURFACE_ONLY: [&str; 2] = ["dom", "page-dom"];
+
+    /// One host's link profile, derived from the world's interfaces rather than
+    /// hand-listed: every interface the world defines, minus the ones this host
+    /// refuses the word for. [`KNOWN_IMPORTS`] answers "what does the world
+    /// define", which is a different question from "what does this host link",
+    /// and deriving the second from the first is what keeps them one statement.
+    fn link_profile(host: ComponentHost) -> Vec<&'static str> {
+        KNOWN_IMPORTS
+            .iter()
+            .copied()
+            .filter(|import| {
+                *import == TYPES
+                    || ComponentGrant::parse(import)
+                        .unwrap_or_else(|| panic!("{import} names an interface and no grant word"))
+                        .illegal_on(host)
+                        .is_none()
+            })
+            .collect()
+    }
 
     /// Each host's import list and the words that host admits are two statements
     /// of one policy, written in two crates. They are held equal here, with
@@ -417,6 +416,32 @@ mod tests {
         }
     }
 
+    /// The surface-only words are the one place the two lists can silently
+    /// diverge: the top-level profile derives them away, so nothing else would
+    /// notice either list losing them.
+    #[test]
+    fn the_surface_only_words_are_in_both_import_lists() {
+        for word in SURFACE_ONLY {
+            assert!(
+                SURFACE_IMPORTS.contains(&word),
+                "`{word}` is a surface-only word and the surface links it nowhere"
+            );
+            assert!(
+                KNOWN_IMPORTS.contains(&word),
+                "`{word}` is a surface-only word and the world defines it nowhere"
+            );
+            let grant = ComponentGrant::parse(word).expect("a surface-only word is a grant word");
+            assert!(
+                grant.illegal_on(ComponentHost::TopLevel).is_some(),
+                "`{word}` is a surface-only word and is legal at the top level"
+            );
+            assert!(
+                !link_profile(ComponentHost::TopLevel).contains(&word),
+                "`{word}` is refused at the top level and its profile links it"
+            );
+        }
+    }
+
     #[test]
     fn the_surface_profile_matches_what_a_surface_component_may_be_granted() {
         assert_pinned(ComponentHost::Surface, &SURFACE_IMPORTS);
@@ -424,6 +449,9 @@ mod tests {
 
     #[test]
     fn the_world_matches_what_a_top_level_component_may_be_granted() {
-        assert_pinned(ComponentHost::TopLevel, &KNOWN_IMPORTS);
+        assert_pinned(
+            ComponentHost::TopLevel,
+            &link_profile(ComponentHost::TopLevel),
+        );
     }
 }

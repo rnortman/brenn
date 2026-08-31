@@ -1,5 +1,4 @@
-# Reading a component package's binding records: one field out of one record,
-# and the set of dom-kind records a staged surface tree holds.
+# Reading a component package's binding records: one field out of one record.
 #
 # Sourced, not executed: `RECORD_LIB` names this file for the callers that take
 # it as an argument.
@@ -20,18 +19,6 @@
 # Usage: record_field <record> <key>
 record_field() {
     sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\\(.*\\)\"[[:space:]]*,\\{0,1\\}[[:space:]]*$/\\1/p" "$1"
-}
-
-# Every dom-kind record in a staged surface tree, one path per line, sorted.
-#
-# A dom kind's record sits flat in the tree under wasm-bindgen's stem for the
-# kind, so the set is a directory listing and not a list anything states. Stated
-# once here because both the release assembler and the staged-tree gate walk it,
-# for staging and for verifying the same files.
-#
-# Usage: surface_dom_records <surface-dir>
-surface_dom_records() {
-    find -L "$1" -maxdepth 1 -name 'brenn_*.manifest.json' | LC_ALL=C sort
 }
 
 # The naming rules a component package's record is held to, as a stream of

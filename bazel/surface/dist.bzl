@@ -1,9 +1,8 @@
 """Assembly of `surface/dist`, the browser asset tree.
 
 What the server serves and the deploy tarball carries is one directory: the
-wasm-bindgen bundles under their frozen `brenn_*` names, each component's
-documentation sidecars renamed to match, each dom kind's binding record and
-packaged specification beside its bundle, and one jco-transpiled tree per
+kernel's wasm-bindgen bundle under its frozen `brenn_*` name, each component's
+documentation sidecars renamed to match, and one jco-transpiled tree per
 processor kind beside the boot-validation manifest that binds it to the
 component bytes it came from.
 
@@ -25,8 +24,7 @@ def surface_crate_stage(name, bundle, artifact, sidecars = [], visibility = ["//
             files land at the root of the tree.
         artifact: the bundle's `brenn_*` basename, which the sidecars take too.
         sidecars: the crate's files that ship flat beside the bundle — its
-            documentation, and for a component the binding record and packaged
-            specification. Hand-authored ones (`schema.json`) are renamed here;
+            documentation. Hand-authored ones (`schema.json`) are renamed here;
             generated ones arrive already named for the artifact.
         visibility: visibility of the staging directory.
     """
@@ -47,152 +45,6 @@ def surface_crate_stage(name, bundle, artifact, sidecars = [], visibility = ["//
             package + "/" + bundle,
             package,
         ],
-        target_compatible_with = HOST_ONLY,
-        visibility = visibility,
-    )
-
-# ---------------------------------------------------------------------------
-# dom records
-# ---------------------------------------------------------------------------
-
-# A dom kind's file grammar, on the Starlark side. `bazel/surface/dom_names.sh`
-# is the same statement for the shell readers — the record emitter and the
-# staged-tree gate — and `brenn_surface_contract` states it for the host. The
-# emitter is handed these paths and holds every one of them to the grammar, so
-# the two sides are checked against each other on every build rather than by
-# inspection.
-_MODULE_EXT = ".js"
-
-_MODULE_WASM_EXT = "_bg.wasm"
-
-_RECORD_EXT = ".manifest.json"
-
-_SPEC_EXT = ".spec.brenn"
-
-def _dom_package_impl(ctx):
-    bundle_files = ctx.attr.bundle[DefaultInfo].files.to_list()
-    module_name = ctx.attr.artifact + _MODULE_EXT
-    wasm_name = ctx.attr.artifact + _MODULE_WASM_EXT
-    module = None
-    module_wasm = None
-    # Selection is by basename, so a bundle emitting a second file under either
-    # name — a snippet, a nested copy — would make the choice depend on
-    # iteration order and could hash a file the tree never serves. Two matches
-    # is a build failure, not a coin flip.
-    for file in bundle_files:
-        if file.basename == module_name:
-            if module != None:
-                fail("%s: bundle %s emits two files named %s (%s, %s); the record can bind only the one served from the asset root" % (
-                    ctx.label,
-                    ctx.attr.bundle.label,
-                    module_name,
-                    module.path,
-                    file.path,
-                ))
-            module = file
-        elif file.basename == wasm_name:
-            if module_wasm != None:
-                fail("%s: bundle %s emits two files named %s (%s, %s); the record can bind only the one served from the asset root" % (
-                    ctx.label,
-                    ctx.attr.bundle.label,
-                    wasm_name,
-                    module_wasm.path,
-                    file.path,
-                ))
-            module_wasm = file
-    if module == None or module_wasm == None:
-        fail("%s: bundle %s emits no %s/%s pair; got %s" % (
-            ctx.label,
-            ctx.attr.bundle.label,
-            module_name,
-            wasm_name,
-            [f.basename for f in bundle_files],
-        ))
-
-    record = ctx.actions.declare_file(ctx.attr.artifact + _RECORD_EXT)
-    spec = ctx.actions.declare_file(ctx.attr.artifact + _SPEC_EXT)
-
-    args = ctx.actions.args()
-    args.add(ctx.attr.kind)
-    args.add(module)
-    args.add(module_wasm)
-    args.add(ctx.file.spec)
-    args.add(record)
-    args.add(spec)
-
-    ctx.actions.run(
-        outputs = [record, spec],
-        inputs = [module, module_wasm, ctx.file.spec, ctx.file._wit_lib, ctx.file._dom_names],
-        executable = ctx.file._emitter,
-        arguments = [args],
-        env = {
-            "DOM_NAMES": ctx.file._dom_names.path,
-            "WIT_LIB": ctx.file._wit_lib.path,
-        },
-        mnemonic = "SurfaceDomPackage",
-        progress_message = "Emitting surface dom record for %s" % ctx.attr.kind,
-    )
-    return [DefaultInfo(files = depset([record, spec]))]
-
-_dom_package = rule(
-    implementation = _dom_package_impl,
-    doc = """`brenn_<kind>.manifest.json` + `brenn_<kind>.spec.brenn`.
-
-    The dom analog of the processor kind's manifest: the record binds the served
-    module pair to the specification the component was authored against, and the
-    packaged specification is the author's file verbatim. Both land flat in the
-    asset root beside the pair, because that is where a wasm-bindgen bundle
-    ships.
-    """,
-    attrs = {
-        "artifact": attr.string(
-            mandatory = True,
-            doc = "The bundle's `brenn_*` basename, which the record's files take too.",
-        ),
-        "bundle": attr.label(
-            mandatory = True,
-            doc = "The `rust_wasm_bindgen` target whose module pair is hashed.",
-        ),
-        "kind": attr.string(mandatory = True),
-        "spec": attr.label(
-            allow_single_file = [".brenn"],
-            mandatory = True,
-            doc = "The component's authored specification, copied into the tree.",
-        ),
-        "_dom_names": attr.label(
-            allow_single_file = True,
-            default = Label("//bazel/surface:dom_names.sh"),
-        ),
-        "_emitter": attr.label(
-            allow_single_file = True,
-            default = Label("//bazel/surface:emit_dom_manifest.sh"),
-        ),
-        "_wit_lib": attr.label(
-            allow_single_file = True,
-            default = Label("//bazel/wasm:wit_lib.sh"),
-        ),
-    },
-)
-
-def surface_dom_package(name, kind, artifact, bundle, spec, visibility = ["//visibility:public"]):
-    """Emit one dom kind's binding record and packaged specification.
-
-    Args:
-        name: target name.
-        kind: the component kind, which the record states and boot looks it up by.
-        artifact: the bundle's `brenn_*` basename.
-        bundle: the `rust_wasm_bindgen` target holding the served module pair.
-        spec: the component's authored specification under `config/specs`. Its
-            hash is the record's binding to the configuration that names this
-            kind, so a kind whose spec is unauthored has no build.
-        visibility: visibility of the emitted files.
-    """
-    _dom_package(
-        name = name,
-        artifact = artifact,
-        bundle = bundle,
-        kind = kind,
-        spec = spec,
         target_compatible_with = HOST_ONLY,
         visibility = visibility,
     )

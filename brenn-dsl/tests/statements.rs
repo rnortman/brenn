@@ -274,7 +274,7 @@ fn a_binding_tail_is_typed_by_its_direction() {
         format!(
             concat!(
                 "component Panel {{\n",
-                "    abi = dom; requires = [];\n",
+                "    abi = processor; requires = [];\n",
                 "    in messages;\n",
                 "    out outbound;\n",
                 "    io tick;\n",
@@ -454,12 +454,12 @@ fn an_assembly_body_refuses_what_it_has_no_semantics_for() {
 #[test]
 fn a_component_class_body_is_a_closed_vocabulary() {
     let file = parse_str(
-        "component Protobar {\n    abi = dom; requires = [];\n    in messages;\n}\n",
+        "component Protobar {\n    abi = processor; requires = [];\n    in messages;\n}\n",
         "t.brenn",
     )
     .expect("a parse");
     let class = file.components().next().expect("a component class");
-    assert_eq!(class.attrs.abi.value.as_str(), "dom");
+    assert_eq!(class.attrs.abi.value.as_str(), "processor");
 
     let error = parse_str(
         "component Sink {\n    abi = processor; requires = [];\n    slug = \"s\";\n}\n",
@@ -473,7 +473,7 @@ fn a_component_class_body_is_a_closed_vocabulary() {
     assert!(error.message.contains("abi"), "{}", error.message);
 
     let error = parse_str(
-        "component Protobar {\n    abi = dom; requires = [];\n    kind = panel;\n}\n",
+        "component Protobar {\n    abi = processor; requires = [];\n    kind = panel;\n}\n",
         "t.brenn",
     )
     .expect_err("`kind` is not a class key");
@@ -657,9 +657,9 @@ fn a_class_name_refuses_consecutive_uppercase() {
     );
 
     for accepted in [
-        "component HttpProxy {\n    abi = dom; requires = [];\n}\n",
-        "component A {\n    abi = dom; requires = [];\n}\n",
-        "component HttpA {\n    abi = dom; requires = [];\n}\n",
+        "component HttpProxy {\n    abi = processor; requires = [];\n}\n",
+        "component A {\n    abi = processor; requires = [];\n}\n",
+        "component HttpA {\n    abi = processor; requires = [];\n}\n",
     ] {
         let file = parse_str(accepted, "t.brenn").expect("a parse");
         assert!(
@@ -705,7 +705,7 @@ fn an_acl_matcher_may_carry_an_attribute_tail() {
 #[test]
 fn a_duplicate_key_in_an_entity_body_is_refused() {
     let error = parse_str(
-        "component Alice {\n  abi = dom; requires = [];\n  abi = processor; requires = [];\n}\n",
+        "component Alice {\n  abi = processor; requires = [];\n  abi = processor; requires = [];\n}\n",
         "t.brenn",
     )
     .expect_err("the second `abi` has no home");

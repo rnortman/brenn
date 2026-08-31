@@ -14,13 +14,13 @@
 //! for, because the activation itself is the answer — and everything below it is
 //! the same code the loop runs.
 //!
-//! # Why only a `dom` component has one
+//! # Why only a `dom`-granted instance has one
 //!
 //! The gesture is the whole reason: a user-activation token exists because a
 //! browser event fired on an element. A headless instance has no element and no
 //! gesture, so there is nothing for a synchronous pass to preserve. DOM-forced,
-//! not an ABI difference the kernel chose to keep — every other privileged entry
-//! is one router serving both.
+//! not a distinction the kernel chose to keep — every other privileged entry
+//! serves every instance the same way.
 //!
 //! # What the door does not do
 //!
@@ -46,7 +46,7 @@ use futures_channel::mpsc;
 
 use brenn_attach_client::driver::{flush_stamps, new_stamp};
 use brenn_attach_client::transport::clock::{Clock, epoch_ms, wall_now};
-use brenn_surface_contract::{ActivationError, SyncStatus};
+use brenn_surface_contract::ActivationError;
 
 use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::front::InFlightSlot;
@@ -56,11 +56,9 @@ use crate::runner::{SharedEntries, SharedPage, invoke_shared};
 use crate::session::Effect;
 use crate::turn::{self, Input, SyncDispatch};
 
-/// How one sync-call request finished, in the kernel's own vocabulary.
-///
-/// The contract's [`SyncStatus`] is this minus everything a caller inside the
-/// kernel still wants: the reply on ok, the component's account on err, and which
-/// refusal it was for the breadcrumb.
+/// How one sync-call request finished, in the kernel's own vocabulary: the reply
+/// on ok, the component's account on err, and which refusal it was for the
+/// breadcrumb.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncAnswer {
     /// The entry returned ok, with the reply it answered its caller with (or
@@ -78,19 +76,7 @@ pub enum SyncAnswer {
     Refused(SyncRefusal),
 }
 
-impl SyncAnswer {
-    /// The contract status this answer is written onto the request's detail as.
-    pub fn status(&self) -> SyncStatus {
-        match self {
-            Self::Ok(_) => SyncStatus::Ok,
-            Self::Err(_) => SyncStatus::Err,
-            Self::Trap => SyncStatus::Trap,
-            Self::Refused(_) => SyncStatus::Refused,
-        }
-    }
-}
-
-/// The seam a `brenn-activation-sync` request runs through.
+/// The seam a gesture's sync-call request runs through.
 ///
 /// Holds exactly what a whole activation needs and nothing else: the page to turn,
 /// the entries to call, the in-flight slot a buffered publish routes through, and

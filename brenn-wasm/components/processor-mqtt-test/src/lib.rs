@@ -92,20 +92,21 @@ const CLASSIFY: &str = "CLASSIFY";
 /// separate generations of the same WIT, so the types do not convert).
 fn rendered(e: brenn_guest::Error) -> String {
     match e {
-        brenn_guest::Error::MalformedEnvelope(m) => m,
-        brenn_guest::Error::ProcessingFailed(m) => m,
+        brenn_guest::Error::MalformedEnvelope(m)
+        | brenn_guest::Error::ProcessingFailed(m)
+        | brenn_guest::Error::QuotaExceeded(m) => m,
     }
 }
 
 impl Guest for ProcessorMqttTest {
-    fn receive(a: Activation) -> Result<(), ReceiveError> {
+    fn receive(a: Activation) -> Result<Option<String>, ReceiveError> {
         // Only act when there is at least one new envelope.
         let has_new = a
             .ports
             .iter()
             .any(|pw| (pw.new_from as usize) < pw.envelopes.len());
         if !has_new {
-            return Ok(());
+            return Ok(None);
         }
 
         // The first new envelope, as a string (for the sentinel check) and bytes
@@ -154,7 +155,7 @@ impl Guest for ProcessorMqttTest {
                 0,
                 false,
             ) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(None),
                 Err(e) => Err(ReceiveError::ProcessingFailed(rendered(e))),
             };
         }
@@ -167,7 +168,7 @@ impl Guest for ProcessorMqttTest {
                 0,
                 false,
             ) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(None),
                 Err(e) => Err(ReceiveError::ProcessingFailed(rendered(e))),
             };
         }
@@ -209,7 +210,7 @@ impl Guest for ProcessorMqttTest {
                     "transient={transient} {message}"
                 )));
             }
-            return Ok(());
+            return Ok(None);
         }
 
         // Publish repeatedly, stopping at the first error. A callback that errors
@@ -236,7 +237,7 @@ impl Guest for ProcessorMqttTest {
         }
         // Every publish succeeded (always-Ok callback that somehow never tripped
         // the cap — should not happen given PUBLISH_ATTEMPTS > the cap).
-        Ok(())
+        Ok(None)
     }
 }
 

@@ -98,7 +98,7 @@ fn round_trip() -> Result<(), Error> {
 }
 
 impl Processor for ProcessorStoreRt {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         for window in activation.port_windows() {
             for env in window.new_envelopes() {
                 let env = env?;
@@ -115,7 +115,7 @@ impl Processor for ProcessorStoreRt {
         }
 
         // No sentinel: run the full round-trip.
-        round_trip()
+        round_trip().map(|()| None)
     }
 }
 

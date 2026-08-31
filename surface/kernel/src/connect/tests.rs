@@ -10,7 +10,7 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Abi, Binding, ComponentEntry, LOCAL_THEME_CHANNEL, LocalChannel, NoiseLevel, Urgency,
+    Binding, ComponentEntry, LOCAL_THEME_CHANNEL, LocalChannel, NoiseLevel, Urgency,
     reserved_local_channel,
 };
 
@@ -67,7 +67,6 @@ fn doc(kind: &str) -> BindingsDocument {
         components: vec![ComponentEntry {
             instance: "chrome".to_string(),
             kind: kind.to_string(),
-            abi: Abi::Dom,
             parked_batch_depth: 4,
             config: BTreeMap::new(),
             grants: vec![],

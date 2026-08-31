@@ -162,7 +162,6 @@ filegroup(
         "//scrub:policy_srcs",
         "//surface:policy_srcs",
         "//surface/chrome:policy_srcs",
-        "//surface/component-support:policy_srcs",
         "//surface/components/echo-stub:policy_srcs",
         "//surface/components/meeting:policy_srcs",
         "//surface/components/mode-clock:policy_srcs",

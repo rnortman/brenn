@@ -16,7 +16,7 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Abi, Binding, ComponentEntry, LocalChannel, NoiseLevel, OutputBinding, Urgency,
+    Binding, ComponentEntry, LocalChannel, NoiseLevel, OutputBinding, Urgency,
 };
 
 /// The chrome instance every fixture document names, declared like any other
@@ -46,7 +46,6 @@ pub(crate) fn component_with_grants(instance: &str, kind: &str, grants: &[&str])
     ComponentEntry {
         instance: instance.to_string(),
         kind: kind.to_string(),
-        abi: Abi::Dom,
         parked_batch_depth: 2,
         config: BTreeMap::new(),
         grants: grants.iter().map(|g| (*g).to_string()).collect(),

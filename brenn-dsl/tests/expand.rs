@@ -22,7 +22,7 @@ fn channels(config: &ResolvedConfig) -> Vec<String> {
 /// The acid test: one assembly, two instantiations, two disjoint entity sets.
 const PODS: &str = "\
 // ── packaged ──
-component Panel { abi = dom; requires = []; in messages; }
+component Panel { abi = processor; requires = []; in messages; }
 // ── packaged ──
 
 assembly Pod(slug: String, owner: Agent) {
@@ -148,7 +148,7 @@ fn a_body_names_a_channel_a_nested_instantiation_stamped() {
     let config = resolved(
         "\
 // ── packaged ──
-component Panel { abi = dom; requires = []; in messages; }
+component Panel { abi = processor; requires = []; in messages; }
 // ── packaged ──
 
 assembly Inner(addr: String) {
@@ -435,7 +435,7 @@ fn a_channel_and_an_instance_under_one_name_in_an_assembly_body_are_refused() {
     let messages = refusals(
         "\
 // ── packaged ──
-component Panel { abi = dom; requires = []; }
+component Panel { abi = processor; requires = []; }
 // ── packaged ──
 
 assembly Pod() {
@@ -926,7 +926,7 @@ fn two_instantiations_that_stamp_one_address_cite_both() {
 fn a_stamped_channel_is_named_rather_than_spelled_out() {
     assert_eq!(
         refusal(concat!(
-            "component Panel { abi = dom; requires = []; in messages; }\n",
+            "component Panel { abi = processor; requires = []; in messages; }\n",
             "assembly Pod(slug: String) {\n",
             "    channel messages at f\"brenn:{slug}.in.messages\";\n",
             "    surface panel {\n",

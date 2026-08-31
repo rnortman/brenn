@@ -449,22 +449,23 @@ pub struct RConsumer {
 }
 
 /// The artifact shapes a component class may declare.
+///
+/// One shape, and the enum stays because the word is authored vocabulary: a
+/// component-model artifact, hosted on the backend or inside a surface. A second
+/// shape would join here and at every match on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Abi {
-    /// Served to the browser and rendered inside a surface.
-    Dom,
-    /// Loaded from an artifact and run outside any surface.
+    /// Loaded from an artifact and run wherever its capabilities are legal.
     Processor,
 }
 
 impl Abi {
     /// Every abi a class may declare.
-    pub const ALL: [Abi; 2] = [Abi::Dom, Abi::Processor];
+    pub const ALL: [Abi; 1] = [Abi::Processor];
 
     /// The word this abi is written with.
     pub fn as_str(self) -> &'static str {
         match self {
-            Abi::Dom => "dom",
             Abi::Processor => "processor",
         }
     }

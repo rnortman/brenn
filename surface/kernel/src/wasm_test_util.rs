@@ -1,11 +1,10 @@
 //! Shared browser-test helpers for the kernel's wasm-bindgen test suites.
 //!
-//! `dom.rs` and `entry.rs` run their `#[wasm_bindgen_test]` fns in one browser
-//! page per test binary, so the helpers here give every test a fresh
-//! `#surface-root`, parse CustomEvent detail the way the kernel does, capture
-//! `console.warn`, and watch window/element events through a guard that removes
-//! its listener on drop — a leaked listener firing in a later test would break
-//! the shared-page suite.
+//! `dom.rs`, `dom_host.rs` and `entry.rs` run their `#[wasm_bindgen_test]` fns
+//! in one browser page per test binary, so the helpers here give every test a
+//! fresh `#surface-root`, read event detail, and watch window events through a
+//! guard that removes its listener on drop — a leaked listener firing in a later
+//! test would break the shared-page suite.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,30 +14,7 @@ use js_sys::Reflect;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
-use web_sys::{CustomEvent, Document, Element, Event, EventTarget, HtmlElement};
-
-/// Define a custom element named `tag` whose `connectedCallback` calls
-/// `connected` with the upgraded host, so an inserted element actually upgrades
-/// and fires. Idempotent: a tag already defined is left alone. This is the one
-/// place the inline-JS element shim and its closure plumbing live; tests that
-/// need a specific `connectedCallback` behaviour layer it on top of this.
-pub(crate) fn define_test_element(tag: &str, connected: impl Fn(HtmlElement) + 'static) {
-    let closure = Closure::<dyn Fn(HtmlElement)>::new(connected);
-    let define = js_sys::Function::new_with_args(
-        "tag, connected",
-        "if (customElements.get(tag)) { return; }\n\
-         class E extends HTMLElement { connectedCallback() { connected(this); } }\n\
-         customElements.define(tag, E);",
-    );
-    define
-        .call2(
-            &JsValue::NULL,
-            &JsValue::from_str(tag),
-            closure.as_ref().unchecked_ref(),
-        )
-        .expect("define the test custom element");
-    closure.forget();
-}
+use web_sys::{CustomEvent, Document, Element, Event, EventTarget};
 
 /// The live document. The kernel only runs in a browser, so both `window` and
 /// `document` are always present.
@@ -76,31 +52,6 @@ pub(crate) fn str_field(detail: &JsValue, key: &str) -> Option<String> {
     Reflect::get(detail, &JsValue::from_str(key))
         .ok()
         .and_then(|v| v.as_string())
-}
-
-/// Swap `console.warn` for a capturing closure for the duration of `body`,
-/// restore it after, and return the captured single-arg messages.
-/// `web_sys::console::warn_1` calls the live global `console.warn`, so the swap
-/// is observed.
-pub(crate) fn capture_console_warn<F: FnOnce()>(body: F) -> Vec<String> {
-    let console = Reflect::get(js_sys::global().as_ref(), &JsValue::from_str("console"))
-        .expect("global console");
-    let original = Reflect::get(&console, &JsValue::from_str("warn")).expect("console.warn");
-    let captured: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let sink = Rc::clone(&captured);
-    let closure = Closure::<dyn Fn(JsValue)>::new(move |msg: JsValue| {
-        sink.borrow_mut().push(msg.as_string().unwrap_or_default());
-    });
-    Reflect::set(
-        &console,
-        &JsValue::from_str("warn"),
-        closure.as_ref().unchecked_ref(),
-    )
-    .expect("install console.warn capture");
-    body();
-    Reflect::set(&console, &JsValue::from_str("warn"), &original).expect("restore console.warn");
-    drop(closure);
-    captured.borrow().clone()
 }
 
 /// Removes an event listener when dropped and holds its backing `Closure`, so a

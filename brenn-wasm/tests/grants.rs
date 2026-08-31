@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::sync::Arc;
 
-use brenn_envelope::grants::ComponentGrant;
+use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 use brenn_wasm::{
     ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, capability_for_import,
     store::DEFAULT_MAX_PAGE_COUNT,
@@ -293,11 +293,14 @@ fn degenerate_empty_grants_invoke_succeeds() {
 /// Linker holds extra definitions that the component never imports; loads ok.
 #[test]
 fn superset_grants_loads() {
-    // Every linkable word: `takeover` names no interface and a backend
-    // component granted it is refused at load.
+    // Every word a backend host can link: the page capabilities are refused at
+    // load, `takeover` because it names no interface and `dom`/`page-dom`
+    // because no backend host implements them.
     let grants: BTreeSet<ComponentGrant> = ComponentGrant::ALL
         .into_iter()
-        .filter(|grant| grant.wit_import().is_some())
+        .filter(|grant| {
+            grant.wit_import().is_some() && grant.illegal_on(ComponentHost::TopLevel).is_none()
+        })
         .collect();
     let db = tempfile::NamedTempFile::new().unwrap();
     let _comp = ProcessorComponent::load(ProcessorLoadSpec {
@@ -320,20 +323,9 @@ fn superset_grants_loads() {
     });
 }
 
-/// A load spec carrying a word that names no WIT interface is a caller that
-/// built its grant set wrong, and `load` refuses it by name.
-///
-/// The collapse of the linker's own capability enum into [`ComponentGrant`]
-/// widened `grants` to the authored vocabulary, which contains `takeover` — a
-/// page capability consented to at a binding on a surface, which no backend
-/// linker can bind. The named assert in `load` is the only thing standing
-/// between that word and the `unreachable!()` inside the linker loop, and
-/// `superset_grants_loads` deliberately filters it out, so without this nothing
-/// exercises the guard at all.
-#[test]
-#[should_panic(expected = "names no WIT interface")]
-fn a_page_capability_in_a_load_spec_is_refused() {
-    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Ports, ComponentGrant::Takeover].into();
+/// Load with `ports` and one more word, for the refusals below.
+fn load_with(extra: ComponentGrant) {
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Ports, extra].into();
     let _comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-page-capability",
@@ -350,6 +342,39 @@ fn a_page_capability_in_a_load_spec_is_refused() {
         mqtt_publish: None,
         tool_host: None,
     });
+}
+
+// A load spec carrying a page capability is a caller that built its grant set
+// wrong, and `load` refuses it by name.
+//
+// The authored vocabulary contains three words no backend linker can bind:
+// `takeover`, consented to at a binding and naming no interface at all, and
+// `dom`/`page-dom`, naming interfaces only a page host implements. The named
+// refusal in `load` is the only thing standing between those words and the
+// `unreachable!()` inside the linker loop, and `superset_grants_loads`
+// deliberately filters them out, so without these nothing exercises the guard at
+// all. One test per word, each pinned to the message its own word raises: a
+// single test over one word proves nothing about the other two, and a guard
+// reordered after the linker loop would reach the `unreachable!` instead.
+
+#[test]
+#[should_panic(expected = "`takeover` is a page capability; a top-level consumer has no page")]
+fn a_takeover_grant_in_a_load_spec_is_refused() {
+    load_with(ComponentGrant::Takeover);
+}
+
+#[test]
+#[should_panic(expected = "`dom` is a page capability; a top-level consumer has no page to mutate")]
+fn a_dom_grant_in_a_load_spec_is_refused() {
+    load_with(ComponentGrant::Dom);
+}
+
+#[test]
+#[should_panic(
+    expected = "`page-dom` is a page capability; a top-level consumer has no page to arrange"
+)]
+fn a_page_dom_grant_in_a_load_spec_is_refused() {
+    load_with(ComponentGrant::PageDom);
 }
 
 // ── Item 8: drift guard ──────────────────────────────────────────────────────

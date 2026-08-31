@@ -7,7 +7,7 @@
  * page (meta tags + the manifest JSON), not a build-time define.
  *
  * The `bootstrap()` sequence, in order: install the global error handlers, read
- * the page inputs, load the wasm modules, install the two kernel-to-bootstrap
+ * the page inputs, load the kernel module, install the two kernel-to-bootstrap
  * seam listeners on `window`, then call the kernel's `start()` and record its
  * handle. It runs automatically on a real surface page (guarded on the manifest
  * `<script>`) and is exported so tests can drive it with an injected importer.
@@ -321,19 +321,15 @@ export function installGlobalHandlers(): void {
  * `page.rs`'s `ManifestComponent` — backend-produced, bootstrap-consumed, never
  * a WS frame and never touched by ts-rs.
  *
- * One entry per instance, not per kind: sibling instances of one kind carry
- * distinct `module` URLs (they differ in an `instance=` query) precisely so the
- * browser evaluates each as its own module record with its own linear memory.
+ * One entry per instance, not per kind: sibling instances of one kind name the
+ * same transpiled module and differ in the `instantiate` built on it, which is
+ * where the per-instance linear memory comes from.
  */
 export interface ManifestComponent {
     instance: string;
     kind: string;
     module: string;
-    abi: string;
 }
-
-/** The `abi` value of a headless component-model instance (`page.rs`'s `Abi`). */
-const ABI_PROCESSOR = "processor";
 
 /**
  * The component-module manifest embedded in the page. Shape mirrored from
@@ -362,8 +358,7 @@ function isSurfaceManifest(value: unknown): value is SurfaceManifest {
         return (
             typeof entry.instance === "string" &&
             typeof entry.kind === "string" &&
-            typeof entry.module === "string" &&
-            typeof entry.abi === "string"
+            typeof entry.module === "string"
         );
     });
 }
@@ -418,25 +413,9 @@ interface WasmModule {
 }
 
 /**
- * A component module: wasm-bindgen's `default` init plus the contract's
- * instance-bind export (`brenn_surface_contract::BIND_INSTANCE_EXPORT`). The
- * loader calls the bind immediately after init, handing the module the instance
- * id from the manifest entry it was loaded for.
- *
- * This is the identity channel because it is the only one available: Rust in a
- * `--target web` module cannot read the glue module's `import.meta.url`, so the
- * `instance=` query that forced the distinct module record is invisible in-module.
- * Moving one string from the manifest into the module it just loaded is loading —
- * the TS layer gains no message logic from it.
- */
-interface ComponentModule extends WasmModule {
-    brenn_bind_instance(instance: string): void;
-}
-
-/**
  * The kernel module additionally exports `start()`, which brings the kernel online
  * (owns the WS connection, mounts components) and returns the handle the
- * post-kernel error path forwards over. Returned by `loadModules` so the
+ * post-kernel error path forwards over. Returned by `loadKernel` so the
  * bootstrap sequence can call `start()` after installing the seam listeners.
  */
 export interface KernelModule extends WasmModule {
@@ -488,6 +467,61 @@ export interface KernelModule extends WasmModule {
         entry: (activation: string) => void,
     ): boolean;
     brenn_processor_load_failed(instance: string, detail: string): void;
+    /**
+     * The DOM capability seam. Node handles are the WIT `u64`, so they cross as
+     * `bigint`. Every one of these throws on a refusal — an unknown handle, a tag
+     * or attribute off the host's allow-list, an ungranted instance — which the
+     * component takes as a trap.
+     */
+    brenn_dom_root(instance: string): bigint;
+    brenn_dom_create_element(instance: string, tag: string): bigint;
+    brenn_dom_set_attribute(
+        instance: string,
+        node: bigint,
+        name: string,
+        value: string,
+    ): void;
+    brenn_dom_remove_attribute(
+        instance: string,
+        node: bigint,
+        name: string,
+    ): void;
+    brenn_dom_set_text(instance: string, node: bigint, text: string): void;
+    brenn_dom_set_style_property(
+        instance: string,
+        node: bigint,
+        name: string,
+        value: string,
+    ): void;
+    brenn_dom_remove_style_property(
+        instance: string,
+        node: bigint,
+        name: string,
+    ): void;
+    brenn_dom_append(instance: string, parent: bigint, child: bigint): void;
+    brenn_dom_insert_before(
+        instance: string,
+        parent: bigint,
+        child: bigint,
+        reference: bigint | undefined,
+    ): void;
+    brenn_dom_remove(instance: string, node: bigint): void;
+    brenn_dom_value(instance: string, node: bigint): string;
+    brenn_dom_set_value(instance: string, node: bigint, value: string): void;
+    brenn_dom_listen(
+        instance: string,
+        node: bigint,
+        event: string,
+        port: string,
+    ): void;
+    brenn_dom_utc_offset_minutes(instance: string, epochMs: bigint): number;
+    brenn_dom_page_root(instance: string): bigint;
+    brenn_dom_page_body(instance: string): bigint;
+    brenn_dom_instance_wrapper(
+        instance: string,
+        of: string,
+    ): bigint | undefined;
+    brenn_dom_parent(instance: string, node: bigint): bigint | undefined;
 }
 
 /**
@@ -505,7 +539,7 @@ interface ProcessorModule {
 
 /** What a transpiled `world processor` exports: the activation entry point. */
 export interface ProcessorInstance {
-    receive(activation: WitActivation): void;
+    receive(activation: WitActivation): string | undefined;
 }
 
 /**
@@ -529,6 +563,7 @@ interface WitActivation {
         }[];
     }[];
     now: bigint | undefined;
+    sync: string | undefined;
 }
 
 /**
@@ -553,6 +588,7 @@ export interface KernelActivation {
         }[];
     }[];
     now: number | null;
+    sync: string | null;
 }
 
 /** How the bootstrap dynamically imports a module URL; overridable in tests. */
@@ -561,31 +597,28 @@ export type ModuleImporter = (url: string) => Promise<unknown>;
 const defaultImporter: ModuleImporter = (url) => import(/* @vite-ignore */ url);
 
 /**
- * Load and initialize the wasm modules named in the manifest: the kernel first,
- * then one module per declared component instance in parallel (each is bound to
- * its instance and registers that instance's custom element). Returns the initialized kernel module — whose `start()` the bootstrap
- * sequence calls after installing the seam listeners — or null when the kernel
- * itself failed to load.
+ * Load and initialize the kernel module at `kernelUrl`. Returns the initialized
+ * kernel module — whose `start()` the bootstrap sequence calls after installing
+ * the seam listeners — or null when it failed to load.
  *
- * Failure handling differs by module class:
- * - Kernel import/init failure (deploy-window fetch failure, 404, wasm init
- *   throw) routes through `cappedReload` — the transient/deploy-race class the
- *   reload guard exists for — and returns null. Without this a page loading
- *   during a deploy would wedge on a static error page.
- * - Component module load/init/bind failure is logged and does NOT abort the
- *   surface: the kernel error-cards any instance whose element never got defined,
- *   so partial availability beats a dead kiosk. One instance's failure is one
- *   instance's — its siblings have their own module records.
+ * Component instances are not brought up here: their config map and bindings row
+ * arrive with `Welcome`, which is after `start()`, so the kernel names them on
+ * `brenn-processor-start` and `startProcessors` answers.
+ *
+ * Kernel import/init failure (deploy-window fetch failure, 404, wasm init throw)
+ * routes through `cappedReload` — the transient/deploy-race class the reload
+ * guard exists for. Without this a page loading during a deploy would wedge on a
+ * static error page.
  *
  * Exported for the bootstrap sequence and the unit tests.
  */
-export async function loadModules(
-    manifest: SurfaceManifest,
+export async function loadKernel(
+    kernelUrl: string,
     importModule: ModuleImporter = defaultImporter,
 ): Promise<KernelModule | null> {
     let kernel: KernelModule;
     try {
-        kernel = (await importModule(manifest.kernel)) as KernelModule;
+        kernel = (await importModule(kernelUrl)) as KernelModule;
         await kernel.default();
     } catch (err) {
         console.error(
@@ -594,31 +627,6 @@ export async function loadModules(
         cappedReload("kernel load failed");
         return null;
     }
-    await Promise.all(
-        manifest.components
-            // Processor instances are brought up later, on the kernel's
-            // `brenn-processor-start`: their config map and bindings row arrive
-            // with `Welcome`, which is after `start()`.
-            .filter((component) => component.abi !== ABI_PROCESSOR)
-            .map(async (component) => {
-                try {
-                    const mod = (await importModule(
-                        component.module,
-                    )) as ComponentModule;
-                    await mod.default();
-                    // Bind before the element is ever created: the module derives its
-                    // instance-scoped tag from this, so it defines nothing until it
-                    // knows which instance it is.
-                    mod.brenn_bind_instance(component.instance);
-                } catch (err) {
-                    console.error(
-                        `surface component instance '${component.instance}' ` +
-                            `(kind '${component.kind}') module load failed: ` +
-                            describeError(err),
-                    );
-                }
-            }),
-    );
     return kernel;
 }
 
@@ -669,7 +677,7 @@ class ProcessorKindCache {
  * it.
  *
  * The transpiled glue keys imports by unversioned interface name and pulls only
- * the interfaces the artifact actually imports, so offering all four is safe for
+ * the interfaces the artifact actually imports, so offering all six is safe for
  * any transpilable-profile component. They are offered unconditionally on
  * purpose: a kind that does not import one never reads the key, boot proved
  * every import a kind does take against that instance's own grants, and each
@@ -755,6 +763,49 @@ function processorImports(
             get: (key: string) =>
                 kernel.brenn_processor_config_get(instance, key),
         },
+        "brenn:processor/dom": {
+            root: () => kernel.brenn_dom_root(instance),
+            createElement: (tag: string) =>
+                kernel.brenn_dom_create_element(instance, tag),
+            setAttribute: (node: bigint, name: string, value: string) =>
+                kernel.brenn_dom_set_attribute(instance, node, name, value),
+            removeAttribute: (node: bigint, name: string) =>
+                kernel.brenn_dom_remove_attribute(instance, node, name),
+            setText: (node: bigint, text: string) =>
+                kernel.brenn_dom_set_text(instance, node, text),
+            setStyleProperty: (node: bigint, name: string, value: string) =>
+                kernel.brenn_dom_set_style_property(instance, node, name, value),
+            removeStyleProperty: (node: bigint, name: string) =>
+                kernel.brenn_dom_remove_style_property(instance, node, name),
+            append: (parent: bigint, child: bigint) =>
+                kernel.brenn_dom_append(instance, parent, child),
+            insertBefore: (
+                parent: bigint,
+                child: bigint,
+                reference: bigint | undefined,
+            ) =>
+                kernel.brenn_dom_insert_before(
+                    instance,
+                    parent,
+                    child,
+                    reference,
+                ),
+            remove: (node: bigint) => kernel.brenn_dom_remove(instance, node),
+            value: (node: bigint) => kernel.brenn_dom_value(instance, node),
+            setValue: (node: bigint, value: string) =>
+                kernel.brenn_dom_set_value(instance, node, value),
+            listen: (node: bigint, event: string, port: string) =>
+                kernel.brenn_dom_listen(instance, node, event, port),
+            utcOffsetMinutes: (epochMs: bigint) =>
+                kernel.brenn_dom_utc_offset_minutes(instance, epochMs),
+        },
+        "brenn:processor/page-dom": {
+            pageRoot: () => kernel.brenn_dom_page_root(instance),
+            pageBody: () => kernel.brenn_dom_page_body(instance),
+            instanceWrapper: (of: string) =>
+                kernel.brenn_dom_instance_wrapper(instance, of),
+            parent: (node: bigint) => kernel.brenn_dom_parent(instance, node),
+        },
     };
 }
 
@@ -762,10 +813,11 @@ function processorImports(
  * Wrap a transpiled instance's `receive` in the activation entry the kernel
  * registers: it takes the kernel's serialized activation, hands the component
  * the lifted record, and answers in the kernel's own vocabulary — return
- * `undefined` for ok, return an error string for err, throw for trap.
+ * `undefined` for ok with no reply, `{ reply }` for a sync-call activation's
+ * answer, an error string for err, throw for trap.
  *
  * The one discrimination rule of this seam lives here. jco lifts the `err` arm
- * of `receive`'s `result<_, receive-error>` into a **throw** (a `ComponentError`
+ * of `receive`'s `result<option<string>, receive-error>` into a **throw** (a `ComponentError`
  * carrying the variant on an own `payload` property), so at this boundary err
  * and trap both arrive as exceptions. They are told apart by that property
  * rather than by class, because the generated `ComponentError` is private to the
@@ -778,7 +830,7 @@ function processorImports(
  */
 export function activationEntry(
     instance: ProcessorInstance,
-): (activation: string) => string | undefined {
+): (activation: string) => string | { reply: string } | undefined {
     return (json: string) => {
         const parsed = JSON.parse(json) as KernelActivation;
         const lifted: WitActivation = {
@@ -788,7 +840,7 @@ export function activationEntry(
                 newFrom: window.new_from,
                 dropped: window.dropped,
             })),
-            // All three fields, always: the canonical ABI traps on a missing one,
+            // Every field, always: the canonical ABI traps on a missing one,
             // not a degraded activation.
             deferred: parsed.deferred.map((window) => ({
                 port: window.port,
@@ -801,9 +853,12 @@ export function activationEntry(
             // option<u64>: null must lower to `undefined`, not BigInt(null) (0n —
             // present zero, not absence).
             now: parsed.now === null ? undefined : BigInt(parsed.now),
+            // option<string>: the sync port's name on a sync-call activation.
+            sync: parsed.sync === null ? undefined : parsed.sync,
         };
+        let reply: string | undefined;
         try {
-            instance.receive(lifted);
+            reply = instance.receive(lifted);
         } catch (err) {
             if (
                 typeof err === "object" &&
@@ -817,7 +872,11 @@ export function activationEntry(
             }
             throw err;
         }
-        return undefined;
+        // `ok(none)` lifts to `undefined`, which is the kernel's own "ok, no
+        // reply". `ok(some(reply))` becomes the reply object the kernel reads;
+        // whether a reply was allowed at all is the kernel's call, made against
+        // the activation's own `sync`.
+        return reply === undefined ? undefined : { reply };
     };
 }
 
@@ -899,7 +958,7 @@ export async function startProcessors(
     await Promise.all(
         instances.map(async (instance) => {
             const component = manifest.components.find(
-                (c) => c.instance === instance && c.abi === ABI_PROCESSOR,
+                (c) => c.instance === instance,
             );
             if (component === undefined) {
                 kernel.brenn_processor_load_failed(
@@ -1018,7 +1077,7 @@ function installSeamListeners(
  * (so an error anywhere in the rest of boot is caught), page-input reads, module
  * loading, seam-listener installation, then `start()`. A null return from
  * `readPageInputs` (broken deploy — static failure already rendered) or
- * `loadModules` (kernel load failed — `cappedReload` already fired) aborts the
+ * `loadKernel` (kernel load failed — `cappedReload` already fired) aborts the
  * sequence without calling `start()`.
  *
  * Exported so tests drive it with an injected importer; production calls it via
@@ -1032,7 +1091,7 @@ export async function bootstrap(
     if (manifest === null) {
         return;
     }
-    const kernel = await loadModules(manifest, importModule);
+    const kernel = await loadKernel(manifest.kernel, importModule);
     if (kernel === null) {
         return;
     }

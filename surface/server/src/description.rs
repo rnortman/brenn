@@ -32,7 +32,7 @@ use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency, is_unreserved_name};
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_messaging::{Messenger, PublishResult};
-use brenn_surface_contract::module_artifact;
+use brenn_surface_contract::processor_module_path;
 use brenn_surface_schema::bindings::{STATUS_INTERVAL_SECS_MAX, STATUS_INTERVAL_SECS_MIN};
 use serde::Deserialize;
 use serde_json::json;
@@ -410,7 +410,7 @@ fn build_kind_help(
     surface_dist_dir: &Path,
     ts: &str,
 ) -> String {
-    let module = module_artifact(kind);
+    let module = processor_module_path(kind);
     let mut md = String::new();
     let _ = writeln!(md, "# Component kind `{kind}`");
     let _ = writeln!(md);
@@ -529,7 +529,7 @@ fn dimensions_sidecar_filename(kind: &str) -> String {
 
 /// The `brenn_<kind_underscored>` stem shared by the module and its sidecars.
 fn sidecar_stem(kind: &str) -> String {
-    brenn_surface_contract::module_stem(kind)
+    brenn_surface_contract::sidecar_stem(kind)
 }
 
 /// Read the kind's markdown help sidecar (any valid UTF-8 accepted). `None` +

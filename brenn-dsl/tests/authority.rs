@@ -9,7 +9,6 @@ mod support;
 
 use brenn_dsl::derived::{DAclSet, DMatcher};
 use brenn_dsl::diag::Diagnostic;
-use brenn_dsl::dom_any;
 use brenn_dsl::fixture_text::processor_header;
 use fltk_serde_core::Spanned;
 use support::{
@@ -765,18 +764,17 @@ fn each_authority_belongs_to_the_entity_at_its_own_index() {
 
 // ── what a binding derives ───────────────────────────────────────────────────
 
-/// A dom class with a port facing each way and one facing both. Every port is
+/// A surface-placed class with a port facing each way and one facing both,
+/// requiring exactly the words its instance grants — an interface word cannot be
+/// optional, so the class states what the case gives it. Every port is
 /// `optional` for the reason `SINK` states.
-const PANEL: &str = concat!(
-    "component Panel {\n",
-    "    ",
-    dom_any!(),
-    "\n",
-    "    optional in messages;\n",
-    "    optional out acks;\n",
-    "    optional io tick;\n",
-    "}\n",
-);
+fn panel_class(requires: &str) -> String {
+    format!(
+        "component Panel {{\n    {}\n    optional in messages;\n    \
+         optional out acks;\n    optional io tick;\n}}\n",
+        processor_header(requires)
+    )
+}
 
 /// A processor class a top-level instance is made of. Every port is `optional`
 /// for the reason `sink` states.
@@ -800,8 +798,9 @@ fn panel_surface_with(grants: &str, statements: &str, bindings: &str) -> String 
     let sends = bindings.contains("out ") || bindings.contains("io ");
     let ports = if sends { "ports" } else { "" };
     format!(
-        "{PANEL}surface alice_desk {{\n    grants = [{grants}];\n{statements}    \
-         new p1: Panel {{\n        grants = [{ports}];\n{bindings}    }}\n}}\n"
+        "{}surface alice_desk {{\n    grants = [{grants}];\n{statements}    \
+         new p1: Panel {{\n        grants = [{ports}];\n{bindings}    }}\n}}\n",
+        panel_class(ports)
     )
 }
 
@@ -814,9 +813,10 @@ fn panel_surface(statements: &str, bindings: &str) -> String {
 /// whatever statements and bindings it holds.
 fn placed_panel(grants: &str, body: &str) -> String {
     format!(
-        "{PANEL}surface alice_desk {{\n    grants = [subscribe, publish];\n    \
+        "{}surface alice_desk {{\n    grants = [subscribe, publish];\n    \
          acl subscribe [prefix \"brenn:alice.\"];\n    acl publish [prefix \"brenn:alice.\"];\n    \
-         new p1: Panel {{\n        grants = [{grants}];\n{body}    }}\n}}\n"
+         new p1: Panel {{\n        grants = [{grants}];\n{body}    }}\n}}\n",
+        panel_class(grants)
     )
 }
 
@@ -908,7 +908,7 @@ fn two_positions_on_one_channel_derive_one_entry() {
     let config = derived(&format!(
         "{}{}{}",
         durable("cmd", "brenn:alice.cmd"),
-        PANEL,
+        panel_class(""),
         concat!(
             "surface alice_desk {\n",
             "    grants = [subscribe];\n",
@@ -1553,6 +1553,14 @@ fn a_word_that_names_no_right_is_refused_with_the_ones_that_do() {
             consumer_needing("", "takeover", ""),
             "`takeover` is a page capability; a top-level consumer has no page",
         ),
+        (
+            consumer_needing("", "dom", ""),
+            "`dom` is a page capability; a top-level consumer has no page to mutate",
+        ),
+        (
+            consumer_needing("", "page-dom", ""),
+            "`page-dom` is a page capability; a top-level consumer has no page to arrange",
+        ),
     ] {
         assert_eq!(derive_refusal(&source), expected);
     }
@@ -1968,8 +1976,10 @@ fn a_tail_that_carries_nothing_points_at_the_value_written() {
 
 #[test]
 fn a_placed_instance_states_its_grants_or_is_refused() {
-    let source =
-        format!("{PANEL}surface alice_desk {{\n    grants = [];\n    new p1: Panel {{}}\n}}\n");
+    let source = format!(
+        "{}surface alice_desk {{\n    grants = [];\n    new p1: Panel {{}}\n}}\n",
+        panel_class("")
+    );
     assert_eq!(
         derive_refusal(&source),
         "component `alice_desk.p1` states no `grants`: what a component is given is \
@@ -1989,7 +1999,11 @@ fn a_backend_only_capability_is_refused_on_a_placed_instance() {
             "`mqtt` is backend-only in v1; a surface-hosted component cannot be granted it",
         ),
     ] {
-        assert_eq!(derive_refusal(&placed_panel(word, "")), expected);
+        assert!(
+            derive_refusals(&placed_panel(word, "")).contains(&expected.to_string()),
+            "{:?}",
+            derive_refusals(&placed_panel(word, ""))
+        );
     }
 }
 
@@ -2003,6 +2017,61 @@ fn a_page_capability_is_a_placed_instances_to_hold() {
             .map(|word| word.value().as_str())
             .collect::<Vec<_>>(),
         ["takeover"]
+    );
+}
+
+/// The two DOM capabilities travel the same path as `takeover`: the placement
+/// is what grants them, and they reach the instance's resolved list as written.
+#[test]
+fn the_dom_capabilities_are_a_placed_instances_to_hold() {
+    assert_eq!(
+        granted(&derived(&placed_panel("dom", "")).surface_components[0][0].grants),
+        ["dom"]
+    );
+    assert_eq!(
+        granted(&derived(&placed_panel("dom, page-dom", "")).surface_components[0][0].grants),
+        ["dom", "page-dom"]
+    );
+}
+
+/// The pair, at grant grain: the class-grain rule holds the two lists together,
+/// and this is the grant-grain half of the same rule, which is what answers a
+/// placement that consents to one word of a pair its class states both of.
+/// Page-wide authority with no scoped capability under it is an instance that
+/// cannot mutate what it arranges and is not mountable at all.
+#[test]
+fn page_dom_granted_without_dom_is_refused() {
+    let source = format!(
+        "{}surface alice_desk {{\n    grants = [];\n    \
+         new p1: Panel {{\n        grants = [page-dom];\n    }}\n}}\n",
+        panel_class("dom, page-dom")
+    );
+    assert!(
+        derive_refusals(&source).contains(
+            &"component `alice_desk.p1` grants `page-dom` and not `dom`: the page-wide capability \
+         arranges other instances' elements and mutates them through the scoped one, and only \
+         the scoped one makes an instance mountable, so the pair is granted together or not \
+         at all"
+                .to_string()
+        ),
+        "{:?}",
+        derive_refusals(&source)
+    );
+}
+
+/// And the spec is still the vocabulary: a placement cannot grant a DOM
+/// capability the class named in neither list.
+#[test]
+fn a_dom_grant_no_spec_permits_is_refused() {
+    assert_eq!(
+        derive_refusal(concat!(
+            "component Needy {\n    abi = processor; requires = []; optional = [takeover];\n",
+            "    optional in messages;\n}\n",
+            "surface alice_desk {\n    grants = [];\n",
+            "    new p1: Needy {\n        grants = [dom];\n    }\n}\n",
+        )),
+        "component `alice_desk.p1` grants `dom`, which `Needy` neither requires nor lists \
+         optional: the spec is the vocabulary"
     );
 }
 
@@ -2159,12 +2228,12 @@ fn an_undeclared_channel_under_a_placed_instance_is_refused_once() {
 // fixtures here name `log` rather than `ports` so no agreement rule answers the
 // case before the fit does.
 
-/// A dom class needing one capability, and a surface holding one instance of it
-/// with the grants named.
+/// A surface-placed class needing one capability, and a surface holding one
+/// instance of it with the grants named.
 fn needy_panel(needs: &str, grants: &str) -> String {
     format!(
         "// ── packaged ──\n\
-         component Needy {{\n    abi = dom; {needs};\n    optional in messages;\n}}\n\
+         component Needy {{\n    abi = processor; {needs};\n    optional in messages;\n}}\n\
          // ── packaged ──\n\
          surface alice_desk {{\n    grants = [];\n    \
          new p1: Needy {{\n        grants = [{grants}];\n    }}\n}}\n"
@@ -2247,8 +2316,8 @@ fn a_consumers_undeclared_grant_is_refused() {
 /// What `optional` means: the deployment decides, and both decisions compile.
 #[test]
 fn an_optional_capability_may_be_granted_or_left_out() {
-    for grants in ["", "log"] {
-        let config = derived(&needy_panel("requires = []; optional = [log]", grants));
+    for grants in ["", "takeover"] {
+        let config = derived(&needy_panel("requires = []; optional = [takeover]", grants));
         assert_eq!(config.surface_components[0].len(), 1, "granting {grants:?}");
     }
 }
@@ -2288,7 +2357,7 @@ fn a_surface_placement_of_a_backend_only_requirement_is_refused_twice() {
 #[test]
 fn a_missing_grants_list_is_not_followed_by_fit_refusals() {
     let source = concat!(
-        "component Needy {\n    abi = dom; requires = [log, alert];\n    optional in messages;\n}\n",
+        "component Needy {\n    abi = processor; requires = [log, alert];\n    optional in messages;\n}\n",
         "surface alice_desk {\n    grants = [];\n    new p1: Needy {}\n}\n",
     );
     assert_eq!(
@@ -2305,7 +2374,7 @@ fn a_missing_grants_list_is_not_followed_by_fit_refusals() {
 #[test]
 fn a_takeover_grant_no_spec_permits_is_refused_even_with_the_wiring() {
     let errors = derive_refusals(concat!(
-        "component Needy {\n    abi = dom; requires = [ports];\n",
+        "component Needy {\n    abi = processor; requires = [ports];\n",
         "    optional in messages;\n    out takeover;\n}\n",
         "surface alice_desk {\n    grants = [];\n",
         "    new p1: Needy {\n        grants = [ports, takeover];\n",
@@ -2325,7 +2394,7 @@ fn a_takeover_grant_no_spec_permits_is_refused_even_with_the_wiring() {
 #[test]
 fn a_permitted_takeover_grant_needs_no_takeover_binding() {
     let config = derived(concat!(
-        "component Needy {\n    abi = dom; requires = []; optional = [takeover];\n",
+        "component Needy {\n    abi = processor; requires = []; optional = [takeover];\n",
         "    optional in messages;\n    optional out takeover;\n}\n",
         "surface alice_desk {\n    grants = [];\n",
         "    new p1: Needy {\n        grants = [takeover];\n    }\n}\n",

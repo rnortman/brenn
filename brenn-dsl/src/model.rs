@@ -268,7 +268,7 @@ pub struct UuidPin {
     pub uuid: Spanned<StrLit>,
 }
 
-/// `component Protobar { abi = dom; in messages; }`.
+/// `component Protobar { abi = processor; in messages; }`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentClass {
@@ -1958,7 +1958,7 @@ fn value_kind(value: &Value) -> &'static str {
     }
 }
 
-/// A bare identifier written where a value goes: `abi = dom;`, `access =
+/// A bare identifier written where a value goes: `abi = processor;`, `access =
 /// container;`, a plane word, a matcher kind.
 ///
 /// A token context is what makes sigil-free references safe — in these

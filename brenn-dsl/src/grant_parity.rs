@@ -77,10 +77,10 @@ pub fn compare(requires: &[ComponentGrant], imports: &[String]) -> Result<(), Mi
     let mut unimported: Vec<ComponentGrant> = Vec::new();
     for grant in requires {
         // A grant naming no interface has nothing on the import side to be
-        // equal to. `required_grants` refuses such a word before it reaches
-        // here, so this is a guard on the direct callers of `compare` rather
-        // than a path the check takes; skipping is the only answer that does
-        // not invent an interface for a word that names none.
+        // equal to. `required_grants` drops such a word before it reaches here,
+        // so this is a guard on the direct callers of `compare`; skipping is the
+        // only answer that does not invent an interface for a word that names
+        // none.
         let Some(interface) = grant.wit_import() else {
             continue;
         };
@@ -141,33 +141,30 @@ pub fn check_class(class: &ComponentClass, imports: &[String]) -> Result<(), Dia
 
 /// A class's `requires` words, parsed, with the span each was written at.
 ///
-/// The abi is checked first. A dom class's grants are enforced at a binding in
-/// the page, not by a linker over an import list, so holding one against an
-/// artifact's imports would compare two unrelated things and call the result
-/// drift.
+/// The abi is checked first: a word naming no artifact shape this build links is
+/// a class whose imports there is no statement to hold against.
 ///
-/// A word naming no WIT interface is refused rather than skipped. The resolver
-/// admits it — a processor class's words are host-checked at the instance, not
-/// at the class — so it reaches here, and dropping it silently would make the
-/// set equality partial over exactly the word the author got wrong.
+/// A word naming no WIT interface is skipped, not refused: `takeover` is consent
+/// to a binding the page gates, with no interface behind it, and a page-hosted
+/// class that draws a panel and blacks out the screen legitimately requires both
+/// it and the interfaces beside it. The set equality is over interfaces, and a
+/// word that names none has nothing on the import side to be equal to. Nothing
+/// is silently dropped: an unknown word is refused above, so only the capability
+/// vocabulary's own bindings-gated members reach the skip.
 fn required_grants(
     class: &ComponentClass,
 ) -> Result<Vec<(ComponentGrant, crate::Span)>, Diagnostic> {
     let word = &class.attrs.abi.value.name;
-    match Abi::parse(word.value()) {
-        Some(Abi::Processor) => {}
-        _ => {
-            return Err(Diagnostic::at(
-                format!(
-                    "`{}` states `abi = {}`; only a processor class's needs are linked as WIT \
-                     imports, so only a processor class can be held against an artifact's \
-                     import list",
-                    class.name.value(),
-                    word.value()
-                ),
-                word.span().clone(),
-            ));
-        }
+    if Abi::parse(word.value()).is_none() {
+        return Err(Diagnostic::at(
+            format!(
+                "`{}` states `abi = {}`, which names no artifact shape this build links; only a \
+                 class whose needs are WIT imports can be held against an artifact's import list",
+                class.name.value(),
+                word.value()
+            ),
+            word.span().clone(),
+        ));
     }
     let Some(attr) = class.attrs.requires.as_ref() else {
         return Err(Diagnostic::at(
@@ -191,15 +188,7 @@ fn required_grants(
             ));
         };
         if grant.wit_import().is_none() {
-            return Err(Diagnostic::at(
-                format!(
-                    "`{}` names no WIT interface, so a processor class cannot require it: it \
-                     is a page capability, consented to at a binding, and no artifact can \
-                     import it",
-                    word.name.value()
-                ),
-                word.name.span().clone(),
-            ));
+            continue;
         }
         grants.push((grant, word.name.span().clone()));
     }
@@ -410,6 +399,14 @@ mod tests {
             .message
     }
 
+    /// The class-level entry point over a specification that is supposed to
+    /// pass.
+    fn accepts(source: &str, imports: &[&str]) {
+        let file = crate::parse_str(source, "spec.brenn").expect("the fixture parses");
+        let class = select_class(&file, None, "spec.brenn").expect("one class");
+        check_class(class, &names(imports)).expect("this fixture is supposed to be accepted");
+    }
+
     #[test]
     fn a_spec_matching_its_artifact_passes_through_the_class() {
         let file = crate::parse_str(
@@ -422,15 +419,15 @@ mod tests {
         assert!(check_class(class, &imports).is_ok());
     }
 
-    /// A dom class's grants are gated at a binding in the page, not linked as
-    /// imports, so there is nothing here to hold an artifact against.
+    /// A class whose abi word this build does not spell states nothing an
+    /// import list can be held against.
     #[test]
-    fn a_dom_class_is_not_held_against_an_import_list() {
+    fn a_class_with_an_unknown_abi_is_not_held_against_an_import_list() {
         let message = refusal(
-            "component Panel {\n    abi = dom; requires = [ports];\n}\n",
+            "component Panel {\n    abi = html; requires = [ports];\n}\n",
             &["brenn:processor/ports@0.1.0"],
         );
-        assert!(message.contains("`abi = dom`"), "{message}");
+        assert!(message.contains("`abi = html`"), "{message}");
     }
 
     #[test]
@@ -457,17 +454,14 @@ mod tests {
         assert!(message.contains("add `tools`"), "{message}");
     }
 
-    /// A word naming no WIT interface is refused rather than silently dropped,
-    /// so the set equality is never partial.
+    /// A word naming no WIT interface is not held against the import list: it is
+    /// consent to a binding, gated in the page, and a page-hosted class that
+    /// draws a panel requires it beside the interfaces it does import.
     #[test]
-    fn a_required_word_naming_no_interface_is_refused() {
-        let message = refusal(
-            "component Sink {\n    abi = processor; requires = [ports, takeover];\n}\n",
+    fn a_required_word_naming_no_interface_is_not_an_import() {
+        accepts(
+            "component Panel {\n    abi = processor; requires = [ports, takeover];\n}\n",
             &["brenn:processor/ports@0.1.0", "brenn:processor/types@0.1.0"],
-        );
-        assert!(
-            message.contains("`takeover` names no WIT interface"),
-            "{message}"
         );
     }
 

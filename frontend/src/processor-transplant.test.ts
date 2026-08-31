@@ -152,14 +152,27 @@ function emptyBuffer(): Buffer {
 }
 
 /**
- * Drive the whole script against one instance and return the transcript.
+ * One instantiated guest behind the production `activationEntry`, with the
+ * buffer its publishes land in.
  *
- * Err vs trap is discriminated by the production `activationEntry`, not here: it
- * answers in the kernel's vocabulary — `undefined` for ok, a diagnostic string
- * for the err arm, a rethrow for a trap — so this harness reads the outcome off
- * the same seam the page reads it off.
+ * Shared by the transcript run and the reply pin, so both drive the same real
+ * transpiled tree through the same seam.
  */
-async function runScript(): Promise<TranscriptEntry[]> {
+interface Harness {
+    entry: (activation: string) => string | { reply: string } | undefined;
+    reset: () => void;
+    buffer: () => Buffer;
+}
+
+/**
+ * Instantiate the transpiled guest and wrap it in the production entry.
+ *
+ * Err vs trap is discriminated by that entry, not here: it answers in the
+ * kernel's vocabulary — `undefined` for ok, a reply object for an answered sync
+ * call, a diagnostic string for the err arm, a rethrow for a trap — so callers
+ * read the outcome off the same seam the page reads it off.
+ */
+async function harness(): Promise<Harness> {
     const { instantiate } = (await import(
         /* @vite-ignore */ pathToFileURL(
             resolve(DIST, "processor-transplant.js"),
@@ -218,10 +231,21 @@ async function runScript(): Promise<TranscriptEntry[]> {
             },
         },
     );
-    const entry = activationEntry(instance);
+    return {
+        entry: activationEntry(instance),
+        reset: () => {
+            buffer = emptyBuffer();
+        },
+        buffer: () => buffer,
+    };
+}
+
+/** Drive the whole script against one instance and return the transcript. */
+async function runScript(): Promise<TranscriptEntry[]> {
+    const { entry, reset, buffer } = await harness();
 
     return script.activations.map((activation) => {
-        buffer = emptyBuffer();
+        reset();
         const record: KernelActivation = {
             ports: activation.ports.map((p) => ({
                 port: p.port,
@@ -231,12 +255,33 @@ async function runScript(): Promise<TranscriptEntry[]> {
             })),
             deferred: activation.deferred,
             now: activation.now,
+            // The transcript scripts asynchronous deliveries only: nothing on
+            // the backend side of the parity can be a sync call, so there is
+            // nothing for the surface side to mirror.
+            sync: null,
         };
         let outcome: TranscriptEntry["outcome"];
+        let answer: string | { reply: string } | undefined;
+        let trapped = false;
         try {
-            outcome = entry(JSON.stringify(record)) === undefined ? "ok" : "err";
+            answer = entry(JSON.stringify(record));
         } catch {
+            trapped = true;
+        }
+        if (trapped) {
             outcome = "trap";
+        } else if (answer === undefined) {
+            outcome = "ok";
+        } else if (typeof answer === "string") {
+            // The kernel reads a returned string as the err arm.
+            outcome = "err";
+        } else {
+            // A reply is neither outcome, and folding it into one would report
+            // green on an invariant nothing asserted: the script carries no sync
+            // call, so a reply here is the fixture or the seam having changed.
+            throw new Error(
+                `scripted activation answered a reply: ${JSON.stringify(answer)}`,
+            );
         }
         if (outcome !== "ok") {
             return {
@@ -248,9 +293,9 @@ async function runScript(): Promise<TranscriptEntry[]> {
         }
         return {
             outcome,
-            publishes: buffer.publishes,
-            deferred_publishes: buffer.deferredPublishes,
-            ops: buffer.ops,
+            publishes: buffer().publishes,
+            deferred_publishes: buffer().deferredPublishes,
+            ops: buffer().ops,
         };
     });
 }
@@ -273,6 +318,70 @@ describe("processor transplant — surface hosting", () => {
 
     it("produces the canonical transcript", () => {
         expect(transcript).toEqual(script.transcript);
+    });
+
+    it("carries a sync port in and a reply back out of a real guest", async () => {
+        // The transcript cannot cover this: no backend activation is a sync
+        // call, so the scripted half of the parity has nothing to mirror. What
+        // is under test is jco's own lift of the world's `option<string>` in
+        // both directions — `sync` reaching the guest as a port name, and
+        // `ok(some(..))` arriving as the reply object the kernel reads — on the
+        // real transpiled tree rather than a hand-written mock of it.
+        //
+        // The activation carries an ordinary delivery beside the request, which
+        // is what makes the guest SDK's sync accessors observable: the request
+        // is windowed on its own port and excluded from the delivered windows,
+        // so a fold over deliveries never sees it. Every migrated UI kind's
+        // handler is built from those accessors, and this is the only place
+        // they run.
+        const { entry, reset } = await harness();
+        reset();
+        const port = "brenn:mount";
+        const answered = entry(
+            JSON.stringify({
+                ports: [
+                    {
+                        port,
+                        envelopes: [envelope({
+                            id: "9a1d0a3e-0000-4000-8000-00000000f1ed",
+                            body: "__reply__",
+                        })],
+                        new_from: 0,
+                        dropped: 0,
+                    },
+                    {
+                        port: "in",
+                        envelopes: [envelope({
+                            id: "9a1d0a3e-0000-4000-8000-00000000f1ee",
+                            body: "delivered",
+                        })],
+                        new_from: 0,
+                        dropped: 0,
+                    },
+                ],
+                deferred: [],
+                now: null,
+                sync: port,
+            } satisfies KernelActivation),
+        );
+        expect(answered).toEqual({
+            reply: `replied:${port}:mount=true:request=__reply__:delivered=[in]`,
+        });
+
+        // And the other arm from the same instance: an activation naming no
+        // sync port answers nothing at all, which is a bare `undefined` and not
+        // a reply object carrying a null.
+        reset();
+        expect(
+            entry(
+                JSON.stringify({
+                    ports: [],
+                    deferred: [],
+                    now: null,
+                    sync: null,
+                } satisfies KernelActivation),
+            ),
+        ).toBeUndefined();
     });
 
     it("survives err and dies on trap", () => {

@@ -13,7 +13,6 @@ use brenn_lib::messaging::{
     ChannelScheme, ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, Urgency,
     bindable_schemes,
 };
-use brenn_surface_schema::Abi;
 use indexmap::IndexMap;
 
 use super::auto::AutoWiring;
@@ -205,33 +204,6 @@ pub(super) fn assert_instance_can_activate(slug: &str, instance: &str, push_dept
          context windows are never read; at least one of its bindings must have push_depth > 0",
         push_depths.len(),
     );
-}
-
-/// Resolve a declared component's `abi` — which artifact shape backs it, and so
-/// how the shell loads it.
-///
-/// `dom` (wasm-bindgen module) and `processor` (jco-transpiled component-model
-/// artifact) both load. `dom-ts`/`html` are reserved names and are named boot
-/// panics rather than values that resolve and then fail somewhere less obvious.
-/// The message distinguishes the two cases, because they are different operator
-/// mistakes: a defined-but-unsupported ABI is early, an unknown string is a typo
-/// or a config written against something that does not exist.
-fn resolve_abi(slug: &str, instance: &str, abi: &str) -> Abi {
-    let Some(parsed) = Abi::parse(abi) else {
-        panic!(
-            "config: [[surface]] {slug:?}: component {instance:?} declares abi = {abi:?}, which \
-             names no component ABI. Known: {}",
-            Abi::ALL.map(Abi::as_str).join(", "),
-        )
-    };
-    assert!(
-        matches!(parsed, Abi::Dom | Abi::Processor),
-        "config: [[surface]] {slug:?}: component {instance:?} declares abi = {abi:?}, which is \
-         reserved but not yet supported — the shell loads abi = \"dom\" and abi = \"processor\" \
-         today. The name is reserved so this config keeps its meaning when the loader learns it; \
-         it is rejected now rather than half-honoured.",
-    );
-    parsed
 }
 
 /// Assert one resolved backstop burst covers a maximal conforming activation
@@ -428,7 +400,6 @@ fn resolve_component_grants(
 /// analogue of the backend's process-lifetime map seeded from host config and read
 /// through the `config` import.
 ///
-/// ABI-agnostic: a `dom` component reads the same map a `processor` does.
 /// Absent means the empty map — an operator need not write `config = {}`.
 /// Readability is gated by the instance's `config` grant, checked against the
 /// map's presence in both directions by the caller.
@@ -566,8 +537,8 @@ fn resolve_wire_subscription(
 ///    satisfies `ParticipantId::for_surface`'s asserts by construction — this
 ///    *enforces* the charset a wasm-consumer slug only documents.
 /// 2. `component.kind` empty / not matching `^[a-z0-9][a-z0-9-]*$` (the
-///    tightened charset makes the kind a valid custom-element name
-///    (`brenn-<kind>`) and module filename); the resolved `instance` id
+///    tightened charset makes the kind a valid directory name, URL path
+///    segment and sidecar filename stem); the resolved `instance` id
 ///    (defaults to `kind`) not matching that charset, or duplicate within the
 ///    surface. Instances — not kinds — are unique per surface: one kind may
 ///    back several instances.
@@ -640,16 +611,17 @@ pub(crate) fn resolve_surfaces(
              declared component and subscriptions are static-only); dead config",
         );
 
-        // Item 2: component kind + instance resolution. The kind becomes a
-        // custom-element name (`brenn-<kind>`) and a module filename
-        // (`brenn_<kind>.js`), so it is tightened beyond the general unreserved
-        // charset to the `^[a-z0-9][a-z0-9-]*$` rule owned by
-        // `contract::is_valid_kind` (lowercase ASCII per the PCEN custom-element
-        // grammar; no leading `-`; no `--` run, reserved as the instance-tag
-        // separator in `element_name_for_instance`). The instance id (the routing/mount key that
-        // bindings reference) defaults to the kind and shares its charset;
-        // instances — not kinds — must be unique within the surface, so one kind
-        // may back several instances (one wasm module, N elements).
+        // Item 2: component kind + instance resolution. The kind is a directory
+        // name and a URL path segment in the served tree
+        // (`processor/<kind>/<kind>.js`) and the stem of the kind's flat
+        // documentation sidecars, so it is tightened beyond the general
+        // unreserved charset to the `^[a-z0-9][a-z0-9-]*$` rule owned by
+        // `contract::is_valid_kind` (lowercase ASCII, no leading `-`, no `--`
+        // run — that function states why each clause holds). The instance id
+        // (the routing key that bindings reference) defaults to the kind and
+        // shares its charset; instances — not kinds — must be unique within the
+        // surface, so one kind may back several instances (one transpiled tree,
+        // N instances).
         let mut instances: HashSet<&str> = HashSet::new();
         let mut resolved_components: Vec<ResolvedComponent> =
             Vec::with_capacity(surface.components.len());
@@ -662,9 +634,9 @@ pub(crate) fn resolve_surfaces(
                 brenn_surface_contract::is_valid_kind(&comp.kind),
                 "config: [[surface]] {slug:?}: component kind {:?} must match \
                  ^[a-z0-9][a-z0-9-]*$ (lowercase ASCII, digits, and hyphens; no \
-                 leading hyphen) and must not contain consecutive hyphens (`--` is \
-                 reserved as the instance-tag separator) — it becomes a \
-                 custom-element name and module filename",
+                 leading hyphen) and must not contain consecutive hyphens (a `--` \
+                 run reads as a compound and nothing needs one) — it is a \
+                 directory name, a URL path segment and a sidecar filename stem",
                 comp.kind,
             );
             let instance = comp.instance.as_deref().unwrap_or(&comp.kind);
@@ -672,8 +644,7 @@ pub(crate) fn resolve_surfaces(
                 brenn_surface_contract::is_valid_kind(instance),
                 "config: [[surface]] {slug:?}: component instance {instance:?} must match \
                  ^[a-z0-9][a-z0-9-]*$ (same charset as kind) and must not contain \
-                 consecutive hyphens (`--` is reserved as the instance-tag separator) — \
-                 it is the routing/mount key",
+                 consecutive hyphens — it is the routing key bindings name",
             );
             assert!(
                 instances.insert(instance),
@@ -681,24 +652,33 @@ pub(crate) fn resolve_surfaces(
                  instance ids must be unique within a surface (a kind may repeat, an instance \
                  may not)",
             );
-            let abi = resolve_abi(slug, instance, &comp.abi);
-            // The chrome renders the shell — layout, theme, banner, the takeover
-            // stack — so it needs an element to render into. A headless instance
-            // named as the chrome leaves the page with no shell at all, which
-            // today surfaces as a mount failure and a reload loop rather than as
-            // the config error it is.
-            assert!(
-                !comp.chrome || abi == Abi::Dom,
-                "config: [[surface]] {slug:?}: component {instance:?} sets `chrome = true` but \
-                 declares abi = {:?} — chrome renders the shell, and a headless component has \
-                 nowhere to render it; make the chrome a `dom` component or move the flag",
-                abi.as_str(),
-            );
             let grants = resolve_component_grants(slug, instance, comp);
+            // The chrome renders the shell — layout, theme, banner, the takeover
+            // stack — across the whole page, which is what `page-dom` grants.
+            // An instance named as the chrome without it reaches nothing outside
+            // its own subtree, so the page comes up with no shell at all: a
+            // mount failure and a reload loop rather than the config error it is.
+            assert!(
+                !comp.chrome || grants.contains(&ComponentGrant::PageDom),
+                "config: [[surface]] {slug:?}: component {instance:?} sets `chrome = true` but \
+                 is not granted {:?} — the chrome arranges the whole page, and without that \
+                 grant it reaches nothing outside its own subtree; grant it or move the flag",
+                ComponentGrant::PageDom.word(),
+            );
+            // Page-DOM authority is unique to the surface's chrome: `page-dom`
+            // reaches every sibling's wrapper, the body and the surface root,
+            // and the kernel's overlay/takeover handling assumes exactly one
+            // holder. A second holder is a config error, not a layered grant.
+            assert!(
+                comp.chrome || !grants.contains(&ComponentGrant::PageDom),
+                "config: [[surface]] {slug:?}: component {instance:?} is granted \
+                 {:?}, which only the surface's chrome may hold — set `chrome = \
+                 true` on this component or remove the grant",
+                ComponentGrant::PageDom.word(),
+            );
             resolved_components.push(ResolvedComponent {
                 instance: instance.to_string(),
                 kind: comp.kind.clone(),
-                abi,
                 // Carried, not checked here: validated at boot by the surface
                 // asset gate.
                 spec_sha256: comp.spec_sha256.clone(),

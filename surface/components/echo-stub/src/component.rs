@@ -1,434 +1,226 @@
-//! The echo-stub component — browser target only.
+//! The echo-stub component — page-hosted target only.
 //!
-//! Registers the `brenn-echo-stub` custom element and installs the module panic
-//! hook via [`brenn_surface_component_support`], then joins activation delivery:
-//! the kernel calls its entry once per activation with every bound port
-//! windowed, and its buttons ask for a sync-call activation of their own so the
-//! publish they cause is made from inside one.
+//! Builds its UI in the mount activation and joins activation delivery: the
+//! kernel calls `receive` once per activation with every bound port windowed,
+//! and its buttons ask for a sync-call activation of their own, so the publish
+//! a press causes is made from inside one.
 //!
-//! The conformance fixture for the seam: its scrollback shows each activation's
-//! new envelopes and its status line the summed `dropped`.
+//! The conformance fixture for the page-hosted seam: its scrollback shows each
+//! activation's new envelopes, its status line the summed `dropped`, and its
+//! third button traps, which is how the error-card path is exercised from a
+//! real component.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::VecDeque;
 
-use brenn_surface_component_support::{
-    Activation, Publisher, add_listener, append, boot, claim_initialized, create_button,
-    create_div, create_input, document, publish_or_fault, register_component, wire_gesture,
-};
-use wasm_bindgen::prelude::wasm_bindgen;
-use web_sys::HtmlElement;
+use brenn_guest::{Activation, Error, Processor, dom, log, publish};
 
-use crate::spec::port::OUT;
+use crate::spec::{InPort, port::OUT};
 
-/// This component's kind — its config `kind`, its element-tag stem
-/// (`brenn-<kind>`), and the `component` field of the panic event it dispatches.
-const KIND: &str = "echo-stub";
+/// The sync port the counter button's press arrives on. Not bound to any
+/// input port; must not collide with one.
+const SEND_PORT: dom::SyncPort = dom::SyncPort("send");
 
-/// The sync port the counter button's press arrives on. Chosen by this component
-/// at request time and bound to nothing: it must only avoid colliding with an
-/// input port name, which the kernel refuses.
-const SEND_PORT: &str = "send";
+/// The sync port the free-form field's send button arrives on.
+const SEND_CUSTOM_PORT: dom::SyncPort = dom::SyncPort("send-custom");
 
-/// The sync port the free-form field's press arrives on, carrying the field's
-/// value as the request body.
-const SEND_CUSTOM_PORT: &str = "send-custom";
+/// The sync port the panic button arrives on. Answering it traps.
+const PANIC_PORT: dom::SyncPort = dom::SyncPort("panic");
 
-/// Cap on retained scrollback entries: once exceeded, the oldest `<div>` is
-/// dropped so the DOM node set stays bounded for the page lifetime.
-const MAX_SCROLLBACK_ENTRIES: u32 = 100;
+/// Cap on retained scrollback entries: once exceeded, the oldest entry is
+/// removed, which bounds what the page renders, what this component holds, and
+/// what the host holds — `dom::remove` destroys the entry's subtree and reclaims
+/// every handle in it.
+const MAX_SCROLLBACK_ENTRIES: usize = 100;
 
-/// The loader's entry, called once after this module's `default` init with the
-/// instance this module record was loaded for. The whole boot sequence lives
-/// here rather than in `#[wasm_bindgen(start)]`: the panic hook's subject and the
-/// element's tag are both this instance's, and neither exists until the bind.
-#[wasm_bindgen]
-pub fn brenn_bind_instance(instance: String) {
-    boot(&instance);
-    // The scrollback and status line this instance's activations write to. Built
-    // here, captured by both closures: one module record backs one instance, so
-    // this is that instance's state and nobody else's.
-    let view: Rc<RefCell<Option<View>>> = Rc::new(RefCell::new(None));
-    let state = Rc::new(RefCell::new(EchoState::default()));
-    register_component(
-        KIND,
-        {
-            let view = Rc::clone(&view);
-            let state = Rc::clone(&state);
-            move |host| on_connected(host, &view, &state)
-        },
-        {
-            let view = Rc::clone(&view);
-            let state = Rc::clone(&state);
-            move |activation: &Activation, publisher: &mut Publisher| {
-                on_activation(activation, &view, &state, publisher);
-                Ok(None)
-            }
-        },
-    );
+const AWAITING: &str = "awaiting data";
+
+// One instantiation backs one instance for the page's lifetime, so the view
+// handles and the counters are ordinary interior-mutable module state. Handles
+// are page-lifetime too: the element a handle names on the mount activation is
+// the same element on every activation after it.
+thread_local! {
+    static ECHO: RefCell<EchoStub> = const { RefCell::new(EchoStub::new()) };
 }
 
-/// The elements an activation writes to, published by `on_connected` once the UI
-/// exists. `None` only before that: `register_component` hands the kernel the
-/// entry after `on_connected` returns, so every activation finds a view.
-struct View {
-    /// The element a report is logged against.
-    host: HtmlElement,
-    status: HtmlElement,
-    scrollback: HtmlElement,
-}
-
-/// Per-instance counters shown in the status line.
-#[derive(Default)]
-struct EchoState {
+struct EchoStub {
+    /// The elements an activation writes to, built by the mount activation.
+    view: Option<View>,
+    /// Scrollback entries oldest-first, so the cap detaches from the front.
+    ///
+    /// The component's own bookkeeping rather than a read of the DOM: the
+    /// capability offers no traversal, and a component that built the subtree
+    /// knows what is in it.
+    entries: VecDeque<dom::Node>,
     drops: u64,
     sent: u64,
 }
 
-/// Build the element's UI and wire its listeners, invoked from the element's
-/// `connectedCallback` with the host element as `this`.
-fn on_connected(
-    host: HtmlElement,
-    view: &Rc<RefCell<Option<View>>>,
-    state: &Rc<RefCell<EchoState>>,
-) {
-    // Build exactly once per element: `connectedCallback` fires on every
-    // insertion, so a re-insertion must not duplicate the UI or listeners.
-    if !claim_initialized(&host, KIND) {
-        return;
-    }
-
-    let doc = document();
-
-    let status = create_div(&doc, "data-echo-status");
-    status.set_text_content(Some("awaiting data"));
-    let scrollback = create_div(&doc, "data-echo-scrollback");
-    let send = create_button(&doc, "data-echo-send", "send");
-    // A free-form body field plus its own send button: the counter "send" above
-    // publishes a fixed body, this one publishes whatever the field holds
-    // verbatim — the path a test drives to publish a structured/markdown body.
-    let custom_input = create_input(&doc, "data-echo-input");
-    let send_custom = create_button(&doc, "data-echo-send-custom", "send custom");
-    let panic_btn = create_button(&doc, "data-echo-panic", "panic");
-
-    append(&host, &status);
-    append(&host, &scrollback);
-    append(&host, &send);
-    append(&host, custom_input.as_ref());
-    append(&host, &send_custom);
-    append(&host, &panic_btn);
-
-    // Publish the view: from here an activation has somewhere to render.
-    *view.borrow_mut() = Some(View {
-        host: host.clone(),
-        status: status.clone(),
-        scrollback,
-    });
-    update_status(&status, &state.borrow());
-
-    // The counter button carries no payload — its body is the counter the entry
-    // keeps — so it encodes nothing.
-    wire_gesture(&host, send.as_ref(), "click", SEND_PORT, |_event| {
-        String::new()
-    });
-    // The kernel never looks inside an element, so the read happens here — a
-    // test feeds the bus an arbitrary body through this field.
-    wire_gesture(
-        &host,
-        send_custom.as_ref(),
-        "click",
-        SEND_CUSTOM_PORT,
-        move |_event| custom_input.value(),
-    );
-    // Exercise the panic path from a real component module.
-    add_listener(panic_btn.as_ref(), "click", |_event| {
-        panic!("echo-stub panic button pressed");
-    });
+struct View {
+    status: dom::Node,
+    scrollback: dom::Node,
+    /// The free-form body field, read at press time through [`dom::value`].
+    input: dom::Node,
 }
 
-/// Render one activation: publish whatever a button press asked for, append every
-/// window's **new** envelopes to the scrollback, and fold the windows' `dropped`
-/// deltas into the status line.
-///
-/// The context ahead of `new_from` is deliberately not rendered: it is messages
-/// this instance has already seen and already scrolled back, still in the view
-/// only because retention has not displaced them. Rendering it would redraw the
-/// scrollback's own history on every activation.
-fn on_activation(
-    activation: &Activation,
-    view: &Rc<RefCell<Option<View>>>,
-    state: &Rc<RefCell<EchoState>>,
-    publisher: &mut Publisher,
-) {
-    let view = view.borrow();
-    let view = view
-        .as_ref()
-        .expect("on_connected builds the view before the entry is registered");
-    if let Some((port, press)) = activation.sync_request() {
-        on_gesture(port, &press.body, view, state, publisher);
+impl EchoStub {
+    const fn new() -> EchoStub {
+        EchoStub {
+            view: None,
+            entries: VecDeque::new(),
+            drops: 0,
+            sent: 0,
+        }
     }
-    let doc = document();
-    let dropped = activation.total_dropped();
+
+    /// The view, which every activation after the mount one has.
+    fn view(&self) -> &View {
+        self.view
+            .as_ref()
+            .expect("the mount activation builds the view before any other call")
+    }
+}
+
+struct EchoStubComponent;
+
+impl Processor for EchoStubComponent {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
+        ECHO.with(|echo| on_activation(&activation, &mut echo.borrow_mut()))?;
+        // Mount and both send gestures are answered with nothing: the mount
+        // call has no reply dialect, and neither button's default action is
+        // one this component cancels.
+        Ok(None)
+    }
+}
+
+brenn_guest::export_processor!(EchoStubComponent);
+
+/// Handle one activation: build the UI when this is the mount call, publish
+/// what a press asked for, then fold every delivered window into the scrollback
+/// and the counters.
+///
+/// A mount activation windows whatever input was already pending, so the build
+/// and the fold both run on it — a component is never told why it woke.
+fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<(), Error> {
+    if activation.sync_is(dom::MOUNT) {
+        echo.view = Some(build_view());
+    } else if let Some(port) = activation.sync() {
+        on_gesture(port, echo)?;
+    }
+    let mut new_entries = 0usize;
     for window in activation.delivered_windows() {
-        for envelope in window.new_envelopes() {
-            let entry = create_div(&doc, "data-echo-message");
-            entry.set_text_content(Some(
-                &serde_json::to_string(envelope).expect("a MessageEnvelope serializes to JSON"),
-            ));
-            append(&view.scrollback, &entry);
+        // Matched through the specification enum so a rename fails at build
+        // time rather than at runtime on the page.
+        let InPort::Messages = InPort::of(window)?;
+        echo.drops += u64::from(window.dropped());
+        for envelope in window.new_raw() {
+            // Only new envelopes are rendered: the context is what this
+            // instance already scrolled back, still in the window only because
+            // retention has not displaced it.
+            let entry = dom::create_element("div");
+            dom::set_attribute(entry, "data-echo-message", "");
+            dom::set_text(entry, envelope);
+            dom::append(echo.view().scrollback, entry);
+            echo.entries.push_back(entry);
+            new_entries += 1;
         }
     }
-    // Bound the scrollback: drop the oldest entries once past the cap so the DOM
-    // node set cannot grow without limit for the page lifetime.
-    while view.scrollback.child_element_count() > MAX_SCROLLBACK_ENTRIES {
-        let oldest = view
-            .scrollback
-            .first_child()
-            .expect("child_element_count > 0 implies a first child");
-        view.scrollback
-            .remove_child(&oldest)
-            .expect("remove the oldest scrollback entry");
+    if new_entries > 0 {
+        trim_scrollback(echo);
     }
-    if dropped > 0 {
-        state.borrow_mut().drops += dropped;
-    }
-    update_status(&view.status, &state.borrow());
+    update_status(echo);
+    Ok(())
 }
 
-/// Publish for one button press, from inside the activation the press caused.
+/// Destroy the oldest entries past the cap, dropping this component's handles
+/// with them — `remove` reclaims a handle along with the node it names, so a
+/// retained one would only trap on its next use.
+fn trim_scrollback(echo: &mut EchoStub) {
+    while echo.entries.len() > MAX_SCROLLBACK_ENTRIES {
+        let oldest = echo
+            .entries
+            .pop_front()
+            .expect("a deque longer than the cap has a front");
+        dom::remove(oldest);
+    }
+}
+
+/// The counter is bumped where the publish either happens or does not: a
+/// refusal that left it advanced would make the status line claim a message the
+/// bus never saw.
+fn on_gesture(port: &str, echo: &mut EchoStub) -> Result<(), Error> {
+    let body = if port == SEND_PORT {
+        format!("echo-stub message #{}", echo.sent + 1)
+    } else if port == SEND_CUSTOM_PORT {
+        // The sync-call body carries no element content, so the field must be
+        // read here. The sync call runs on the press's own event stack, so
+        // this is the field's value at press time.
+        dom::value(echo.view().input)
+    } else if port == PANIC_PORT {
+        panic!("echo-stub panic button pressed");
+    } else {
+        return Err(Error::failed(format!(
+            "echo-stub wired no gesture to sync port {port:?}"
+        )));
+    };
+    match publish(OUT, &body) {
+        Ok(()) => echo.sent += 1,
+        // Quota is the one refusal a conforming deployment produces transiently,
+        // and the counter stays where it was so the status line never claims a
+        // message the bus did not see. Anything else — an unbound port, a body
+        // over the cap — is structural: no later press repairs it, so the first
+        // one is the detection and the instance takes its error card.
+        Err(err) => {
+            assert!(
+                err.is_quota(),
+                "echo-stub: the publish on {OUT:?} was refused: {err:?}"
+            );
+            log::error(format!("publish on {OUT:?} refused: quota exceeded"));
+        }
+    }
+    Ok(())
+}
+
+/// Build the UI under this instance's host element and wire its three gestures.
 ///
-/// The counter is bumped here rather than in the wiring closure because this is
-/// where the publish either happens or does not: a refusal that left the counter
-/// advanced would make the status line claim a message the bus never saw.
-fn on_gesture(
-    port: &str,
-    press: &str,
-    view: &View,
-    state: &Rc<RefCell<EchoState>>,
-    publisher: &mut Publisher,
-) {
-    let body = match port {
-        SEND_PORT => {
-            let n = state.borrow().sent + 1;
-            format!("echo-stub message #{n}")
-        }
-        SEND_CUSTOM_PORT => press.to_string(),
-        other => panic!("echo-stub wired no gesture to sync port {other:?}"),
-    };
-    if publish_or_fault(publisher, &view.host, OUT, &body) {
-        state.borrow_mut().sent += 1;
+/// Called once, from the mount activation. Listeners are the kernel's and are
+/// page-lifetime: each press arrives as a sync-call activation on its port.
+fn build_view() -> View {
+    let root = dom::root();
+
+    let status = dom::marked("div", "data-echo-status");
+    dom::set_text(status, AWAITING);
+    let scrollback = dom::marked("div", "data-echo-scrollback");
+    let send = button("data-echo-send", "send");
+    let input = dom::marked("input", "data-echo-input");
+    dom::set_attribute(input, "type", "text");
+    let send_custom = button("data-echo-send-custom", "send custom");
+    let panic_button = button("data-echo-panic", "panic");
+
+    for child in [status, scrollback, send, input, send_custom, panic_button] {
+        dom::append(root, child);
     }
-    update_status(&view.status, &state.borrow());
+
+    dom::listen(send, "click", SEND_PORT);
+    dom::listen(send_custom, "click", SEND_CUSTOM_PORT);
+    dom::listen(panic_button, "click", PANIC_PORT);
+
+    View {
+        status,
+        scrollback,
+        input,
+    }
 }
 
-/// Update the status line with the running counters.
-fn update_status(status: &HtmlElement, state: &EchoState) {
-    status.set_text_content(Some(&format!(
-        "sent: {}  drops: {}",
-        state.sent, state.drops
-    )));
+fn button(marker: &str, label: &str) -> dom::Node {
+    let node = dom::marked("button", marker);
+    dom::set_text(node, label);
+    node
 }
 
-// No host-testable half — this is a DOM fixture, exercised in a real browser.
-#[cfg(all(test, target_arch = "wasm32"))]
-mod tests {
-    use super::*;
-
-    use brenn_surface_contract::{PublishError, element_name_for_instance, publish_status_str};
-    use brenn_surface_test_fixtures::browser::{
-        activation_json, answer_publishes_with, mount, record_ops, take_recorded,
-    };
-    use wasm_bindgen::JsValue;
-    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    const TEST_INSTANCE: &str = "wbt-echo-stub";
-
-    /// The activation clock. Nothing here reads it; it is present because every
-    /// activation carries one.
-    const NOW_MS: u64 = 1_770_000_123_456;
-
-    /// The body the free-form field is filled with before its button is clicked.
-    const CUSTOM_BODY: &str = "a body only the field knows";
-
-    /// Click a button inside the mounted element the way a user does, from page
-    /// script.
-    fn click(instance: &str, marker: &str) {
-        js_sys::Function::new_with_args("selector", "document.querySelector(selector).click();")
-            .call1(
-                &JsValue::NULL,
-                &JsValue::from_str(&format!(
-                    "{} [{marker}]",
-                    element_name_for_instance(KIND, instance)
-                )),
-            )
-            .expect("click the button");
-    }
-
-    /// Type into the free-form field from page script, so the encoder reads a
-    /// value the test never handed it.
-    fn fill_custom_input(instance: &str, value: &str) {
-        js_sys::Function::new_with_args(
-            "selector, value",
-            "document.querySelector(selector).value = value;",
-        )
-        .call2(
-            &JsValue::NULL,
-            &JsValue::from_str(&format!(
-                "{} [data-echo-input]",
-                element_name_for_instance(KIND, instance)
-            )),
-            &JsValue::from_str(value),
-        )
-        .expect("fill the custom-body field");
-    }
-
-    /// The status line's current text.
-    fn status_text(instance: &str) -> String {
-        document()
-            .query_selector(&format!(
-                "{} [data-echo-status]",
-                element_name_for_instance(KIND, instance)
-            ))
-            .expect("query the status line")
-            .expect("the status line is in the document")
-            .text_content()
-            .unwrap_or_default()
-    }
-
-    /// The whole component through its own seams: connect-time code renders and
-    /// wires only, the mount activation publishes nothing, each button asks for a
-    /// sync activation rather than publishing, the publish happens inside the
-    /// activation the press caused, and a refused publish leaves the counter
-    /// where it was.
-    ///
-    /// One test rather than five: the bind is once-per-binary, so a test binary
-    /// gets exactly one mount. The acting halves are what make the two silences
-    /// worth asserting — they are the proof that a publish and a sync request
-    /// reaching these seams do land in this array.
-    #[wasm_bindgen_test]
-    fn connecting_is_silent_and_a_press_publishes_from_its_own_activation() {
-        let ops = record_ops();
-        let (entry, _host) = mount(KIND, TEST_INSTANCE, brenn_bind_instance);
-        assert_eq!(
-            ops.length(),
-            0,
-            "connect-time code builds the UI and installs listeners, and reaches no kernel seam"
-        );
-
-        entry
-            .call1(
-                &JsValue::NULL,
-                &JsValue::from_str(&activation_json(&[], None, NOW_MS)),
-            )
-            .expect("the entry returns ok on the mount activation");
-        assert_eq!(
-            ops.length(),
-            0,
-            "the mount activation delivered nothing and no press caused it, so nothing is published"
-        );
-
-        entry
-            .call1(
-                &JsValue::NULL,
-                &JsValue::from_str(&activation_json(
-                    &[(SEND_PORT, "")],
-                    Some(SEND_PORT),
-                    NOW_MS,
-                )),
-            )
-            .expect("the entry returns ok on the press");
-
-        click(TEST_INSTANCE, "data-echo-send");
-
-        assert_eq!(
-            take_recorded(&ops),
-            vec![
-                vec![
-                    "publish".to_string(),
-                    String::new(),
-                    OUT.to_string(),
-                    "echo-stub message #1".to_string(),
-                    String::new(),
-                ],
-                vec![
-                    "sync".to_string(),
-                    String::new(),
-                    SEND_PORT.to_string(),
-                    String::new(),
-                    String::new(),
-                ],
-            ],
-            "the press publishes once from the entry's publisher, and the button itself only asks \
-             for the activation"
-        );
-        assert_eq!(status_text(TEST_INSTANCE), "sent: 1  drops: 0");
-
-        // The custom-body path: the entry forwards the field's value verbatim.
-        fill_custom_input(TEST_INSTANCE, CUSTOM_BODY);
-        click(TEST_INSTANCE, "data-echo-send-custom");
-        assert_eq!(
-            take_recorded(&ops),
-            vec![vec![
-                "sync".to_string(),
-                String::new(),
-                SEND_CUSTOM_PORT.to_string(),
-                CUSTOM_BODY.to_string(),
-                String::new(),
-            ]],
-            "the custom button encodes the field's value into the request body"
-        );
-
-        entry
-            .call1(
-                &JsValue::NULL,
-                &JsValue::from_str(&activation_json(
-                    &[(SEND_CUSTOM_PORT, CUSTOM_BODY)],
-                    Some(SEND_CUSTOM_PORT),
-                    NOW_MS,
-                )),
-            )
-            .expect("the entry returns ok on the custom press");
-        assert_eq!(
-            take_recorded(&ops),
-            vec![vec![
-                "publish".to_string(),
-                String::new(),
-                OUT.to_string(),
-                CUSTOM_BODY.to_string(),
-                String::new(),
-            ]],
-            "the custom press publishes the request body unchanged"
-        );
-        assert_eq!(status_text(TEST_INSTANCE), "sent: 2  drops: 0");
-
-        // A quota-refused publish: the message did not reach the bus, so the
-        // status line must not claim it did.
-        answer_publishes_with(&ops, publish_status_str(Err(PublishError::QuotaExceeded)));
-        entry
-            .call1(
-                &JsValue::NULL,
-                &JsValue::from_str(&activation_json(
-                    &[(SEND_PORT, "")],
-                    Some(SEND_PORT),
-                    NOW_MS,
-                )),
-            )
-            .expect("a refused publish is an answer, not a failed activation");
-        let refused = take_recorded(&ops);
-        assert_eq!(
-            refused
-                .iter()
-                .map(|row| (row[0].as_str(), row[2].as_str()))
-                .collect::<Vec<_>>(),
-            vec![("publish", OUT), ("log", "")],
-            "the refusal is attempted once and reported once"
-        );
-        assert_eq!(
-            status_text(TEST_INSTANCE),
-            "sent: 2  drops: 0",
-            "a refused publish leaves the counter where it was"
-        );
-    }
+fn update_status(echo: &EchoStub) {
+    dom::set_text(
+        echo.view().status,
+        &format!("sent: {}  drops: {}", echo.sent, echo.drops),
+    );
 }

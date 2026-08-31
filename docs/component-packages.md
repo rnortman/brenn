@@ -229,7 +229,7 @@ tree:
 
 ```
 modules/processor-demo.brenn        the backend component's authored module
-modules/mode-clock.brenn            a dom kind's, harvested from surface/
+modules/mode-clock.brenn            a surface kind's, harvested from surface/
 modules/protobar.brenn
 ```
 
@@ -239,8 +239,8 @@ staged name is the authored basename — the wire kind — rather than the
 artifact's stem. Every component the release ships contributes one, backend and
 surface alike, so a deployment can import whatever it instantiates; the backend
 half is staged from the same `COMPONENT_PACKAGES` dict that builds the packages,
-and the surface half is harvested out of the staged surface tree, whose records
-name their kinds.
+and the surface half is harvested out of the staged surface tree, whose kind
+directories carry it.
 
 `package_check.sh` holds the root to its packages in both directions: every
 shipped specification has a byte-identical module staged, and every staged
@@ -250,41 +250,19 @@ module a deployment could import and the host would refuse at boot.
 ## Surface packages
 
 Surface-placed components are bound the same way, with a different carrier. A
-surface artifact is not one file: a `dom` kind ships as a wasm-bindgen module
-pair flat in the surface asset root, a surface-hosted `processor` kind as a
-jco-transpiled directory. So the record takes the shape each already affords.
-The vocabulary is the backend's — a packaged verbatim copy of the author's
-specification, a content hash of it in a versioned `deny_unknown_fields`
-record, and byte-hash equality checked at boot — and only the carrier differs.
+surface kind is not one file: it ships as a jco-transpiled directory. So the
+record takes the shape that already affords. The vocabulary is the backend's — a
+packaged verbatim copy of the author's specification, a content hash of it in a
+versioned `deny_unknown_fields` record, and byte-hash equality checked at boot —
+and only the carrier differs.
 
-**A dom kind**, flat in the asset root, sharing the artifact stem:
-
-```
-brenn_mode_clock.js                 the module
-brenn_mode_clock_bg.wasm            its wasm
-brenn_mode_clock.spec.brenn         the author's specification, verbatim
-brenn_mode_clock.manifest.json      the binding record, v1
-```
-
-The record states the kind, each of the three named files, and a hash of each.
-The module-pair hashes make the dom path's own staleness detectable for the
-first time; the shared `snippets/` tree, the `.d.ts` files and the help and
-schema sidecars are deliberately unhashed — nothing per-kind can state
-`snippets/` truthfully, and the rest are not load-bearing at boot.
-
-**A surface-hosted processor kind** already had a record, so the record grew
-rather than gaining a sibling. `processor/<kind>/manifest.json` is v2: the
-pre-existing `source_sha256`, `jco_version`, `imports` and `files` plus `spec`
-and `spec_sha256`, with the packaged copy in the kind directory as
-`<kind>.spec.brenn`. Both new fields are required; there is no spec-less
-surface kind.
-
-Neither record states the abi. Its location and shape is that statement — a
-record in the asset root and a record under `processor/<kind>/` cannot be
-confused — and the configuration's abi decides which lookup runs.
+`processor/<kind>/manifest.json` is v2: `source_sha256`, `jco_version`,
+`imports` and `files` plus `spec` and `spec_sha256`, with the packaged copy in
+the kind directory as `<kind>.spec.brenn`. The spec fields are required; there
+is no spec-less surface kind.
 
 At boot `validate_surface_assets` reads the record for every configured kind,
-re-derives each stated filename from the stem, re-hashes each named file, and
+re-derives each stated filename from the kind, re-hashes each named file, and
 then binds **per instance**: the specification hash the configuration compiled
 against must equal the record's. Per instance rather than per kind because the
 compiler's kind fold admits comment-divergent copies of one class under one
@@ -292,10 +270,8 @@ kind; at most one of those copies is the bytes the tree was built from, and the
 one that is not now refuses at boot. The surface kernel is exempt: it is not a
 component, so it has no kind, no class and no specification to bind.
 
-In-tree, the records are emitted by the build. `surface_component` derives its
-kind's specification label from the package path — `//:config/specs/<kind>.brenn`
-— so a dom component with no authored specification does not build at all;
-`surface_processor_assets` names the spec at its call site. `package_check.sh`
+In-tree, the records are emitted by the build: `surface_processor_assets` names
+the spec at its call site. `package_check.sh`
 re-verifies every surface record over the staged release tree, and the deploy
 installs the asset tree as a whole rather than overlaying it, so no file from a
 prior release survives beside a fresh record.

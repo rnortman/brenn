@@ -277,7 +277,7 @@ body {
  * A single global element (only one skin loads per page, so an unscoped id
  * selector is unambiguous).
  */
-#brenn-surface-banner {
+[data-surface-banner] {
     font-family: "B612", system-ui, sans-serif;
     padding: 0.5rem 0.9rem;
     font-size: 0.85rem;
@@ -288,11 +288,11 @@ body {
     border-bottom: 3px solid var(--accent);
 }
 
-#brenn-surface-banner[data-banner-state="reloading"] {
+[data-surface-banner][data-banner-state="reloading"] {
     border-bottom-color: var(--countdown);
 }
 
-#brenn-surface-banner[data-banner-state="fatal"] {
+[data-surface-banner][data-banner-state="fatal"] {
     background: var(--fatal-bg);
     color: var(--alarm-color);
     border-bottom-color: var(--alarm-border);

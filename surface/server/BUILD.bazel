@@ -51,13 +51,11 @@ rust_test(
     # One asset-validation test reads the shipped store-rt component to pin its
     # own premise — that the artifact really does import `brenn:processor/store`.
     # Tests reach guest components at `brenn-wasm/target/components/`, relative
-    # to the runfiles root. The emitter-parity tests reach the two record
-    # emitters and the libraries they source the same way, and hand what they
-    # write to the boot readers. TODO(bazel-fixture-list-guard): this list is
+    # to the runfiles root. The emitter-parity test reaches the record emitter
+    # and the library it sources the same way, and hands what it writes to the
+    # boot reader. TODO(bazel-fixture-list-guard): this list is
     # hand-held against the source, like the other fifteen.
     data = [
-        "//bazel/surface:dom_names.sh",
-        "//bazel/surface:emit_dom_manifest.sh",
         "//bazel/wasm:wit_lib.sh",
         "//brenn-wasm:fixture_processor_store_rt",
         "//surface:emit-processor-manifest.sh",

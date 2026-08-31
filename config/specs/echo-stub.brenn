@@ -1,9 +1,13 @@
 /// The browser-driven echo fixture: publishes what was typed, renders what
 /// arrives. A feeder instance publishes and never renders, so `messages` is
 /// optional; every instance drives `out`.
+///
+/// It holds `dom` because it draws: a status line, a scrollback of the
+/// envelopes each activation delivered, and the three buttons whose presses
+/// arrive as sync-call activations.
 component EchoStub {
-  abi = dom;
-  requires = [ports, log];
+  abi = processor;
+  requires = [ports, log, dom];
   optional in messages;
   out out;
 }

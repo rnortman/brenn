@@ -8,7 +8,7 @@
  *
  * It styles only the DOM the shell's dom.rs executor produces:
  *   #surface-root[data-layout][data-skin]     — the shell's DOM root (the grid)
- *   #brenn-surface-banner[data-banner-state]  — the connection banner (overlay)
+ *   [data-surface-banner][data-banner-state]  — the connection banner (overlay)
  *   #brenn-surface-staging[hidden]             — the kernel's wrapper holding pen
  *   section[data-instance]                     — a per-instance layout section
  *   section[data-panel="a|b|c"]                — an assigned panel (grid slot)
@@ -22,7 +22,7 @@
  *   --surface-bg      field background
  *   --surface-gap     gutter between panels
  *   --surface-pad     chrome padding around the panel grid
- *   --panel-pad       interior pad the base applies to escalated brenn-meeting
+ *   --panel-pad       interior pad the base applies to escalated meeting
  *                     states; must match the skin's section padding
  */
 
@@ -166,7 +166,7 @@ header[data-panel-label] {
  * operation keeps it hidden. Skins dress it; base fixes only its placement.
  */
 
-#brenn-surface-banner {
+[data-surface-banner] {
     position: fixed;
     top: 0;
     left: 0;
@@ -175,7 +175,7 @@ header[data-panel-label] {
     text-align: center;
 }
 
-#brenn-surface-banner[hidden] {
+[data-surface-banner][hidden] {
     display: none;
 }
 
@@ -215,10 +215,9 @@ header[data-panel-label] {
  * the flex actions row hidden outside the takeover phases, where the component
  * toggles the `hidden` attribute; skins add only dressing.
  *
- * Anchored on the `data-meeting-root` marker the component stamps on its host,
- * NOT a `brenn-meeting` type selector: the kernel names the element
- * `brenn-meeting--<instance>` (per-instance tag), so a bare kind tag matches
- * nothing.
+ * Anchored on the `data-meeting-root` marker the component stamps on its host
+ * element: the kernel names that element nothing a stylesheet could select, and
+ * the wrapper above it may hold an error card rather than this component.
  */
 
 [data-meeting-root] {

@@ -57,8 +57,9 @@ pub struct BindingsDocument {
     /// build can read.
     pub v: u32,
     /// Mounted component instances, declaration order. Each names its `instance`
-    /// id (the routing/mount key) and its component `kind` (the element tag and
-    /// wasm module). One kind may back several instances.
+    /// id (the routing/mount key) and its component `kind` — the component kind
+    /// that names the artifact the page instantiates. One kind may back several
+    /// instances.
     pub components: Vec<ComponentEntry>,
     /// Channel → instance/port.
     pub subscriptions: Vec<Binding>,
@@ -358,13 +359,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::{Abi, LOCAL_THEME_CHANNEL, NoiseLevel, Urgency};
+    use crate::{LOCAL_THEME_CHANNEL, NoiseLevel, Urgency};
 
     fn component(instance: &str) -> ComponentEntry {
         ComponentEntry {
             instance: instance.to_string(),
             kind: "protobar".to_string(),
-            abi: Abi::Dom,
             parked_batch_depth: 4,
             config: BTreeMap::new(),
             grants: vec![],

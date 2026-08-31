@@ -1096,7 +1096,7 @@ fn surface_doc(class_body: &str, inst_body: &str) -> String {
 #[test]
 fn a_surface_carries_its_components_and_their_bindings() {
     let config = resolved(&surface_doc(
-        "    abi = dom; requires = [];\n    in messages;\n",
+        "    abi = processor; requires = [];\n    in messages;\n",
         "        chrome = \"bare\";\n        in messages <- messages { push_depth = 4; }\n",
     ));
     let surface = &config.surfaces[0];
@@ -1122,7 +1122,7 @@ fn a_surface_carries_its_components_and_their_bindings() {
 #[test]
 fn a_components_parked_depth_is_projected() {
     let config = resolved(&surface_doc(
-        "    abi = dom; requires = [];\n    in messages;\n",
+        "    abi = processor; requires = [];\n    in messages;\n",
         "        parked_batch_depth = unbounded;\n        in messages <- messages;\n",
     ));
     let component = &config.surfaces[0].components[0];
@@ -1141,7 +1141,7 @@ fn a_components_parked_depth_is_projected() {
 
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom; requires = [];\n    optional in messages;\n",
+            "    abi = processor; requires = [];\n    optional in messages;\n",
             "        parked_batch_depth = \"unbounded\";\n",
         )),
         "expected an integer or a bare word, found a string"
@@ -1152,7 +1152,7 @@ fn a_components_parked_depth_is_projected() {
 fn an_unknown_instance_key_names_the_legal_set() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom; requires = [];\n    optional in messages;\n",
+            "    abi = processor; requires = [];\n    optional in messages;\n",
             "        component_path = \"/lib/panel.wasm\";\n",
         )),
         "`component_path` is not a key of a component instance; expected one of \
@@ -1163,7 +1163,7 @@ fn an_unknown_instance_key_names_the_legal_set() {
 #[test]
 fn a_component_states_its_own_authority() {
     let config = resolved(&surface_doc(
-        "    abi = dom; requires = [];\n    optional in messages;\n",
+        "    abi = processor; requires = [];\n    optional in messages;\n",
         "        acl subscribe [prefix \"brenn:alice-desk.\"];\n",
     ));
     let instance = &config.surfaces[0].components[0];
@@ -1175,7 +1175,7 @@ fn a_component_states_its_own_authority() {
 fn a_port_a_class_does_not_declare_names_the_ones_it_does() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom; requires = [];\n    optional in messages;\n    optional io tick;\n",
+            "    abi = processor; requires = [];\n    optional in messages;\n    optional io tick;\n",
             "        in mesages <- messages;\n",
         )),
         "`Panel` declares no port `mesages`; it declares `in messages`, `io tick`"
@@ -1186,7 +1186,7 @@ fn a_port_a_class_does_not_declare_names_the_ones_it_does() {
 fn a_port_bound_the_wrong_way_says_which_way_it_faces() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom; requires = [];\n    io messages;\n",
+            "    abi = processor; requires = [];\n    io messages;\n",
             "        in messages <- messages;\n",
         )),
         "port `messages` is an `io` port, bound as `in`"
@@ -1197,7 +1197,7 @@ fn a_port_bound_the_wrong_way_says_which_way_it_faces() {
 fn a_free_io_binding_needs_a_declared_io_port() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom; requires = [];\n    in messages;\n",
+            "    abi = processor; requires = [];\n    in messages;\n",
             "        io messages { push_depth = 1; }\n",
         )),
         "port `messages` is an `in` port, bound as `io`"
@@ -1208,7 +1208,7 @@ fn a_free_io_binding_needs_a_declared_io_port() {
 fn a_class_declares_each_port_once() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom; requires = [];\n    optional in messages;\n    optional out messages;\n",
+            "    abi = processor; requires = [];\n    optional in messages;\n    optional out messages;\n",
             "",
         )),
         "port `messages` is declared twice"
@@ -1219,7 +1219,10 @@ fn a_class_declares_each_port_once() {
 
 #[test]
 fn an_instance_leaving_a_required_port_unconnected_is_refused() {
-    let source = surface_doc("    abi = dom; requires = [];\n    in messages;\n", "");
+    let source = surface_doc(
+        "    abi = processor; requires = [];\n    in messages;\n",
+        "",
+    );
     let errors = resolve_errors(&source);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(
@@ -1242,7 +1245,7 @@ fn an_instance_leaving_a_required_port_unconnected_is_refused() {
 #[test]
 fn a_misspelled_binding_leaves_the_required_port_unconnected() {
     let source = surface_doc(
-        "    abi = dom; requires = [];\n    in messages;\n",
+        "    abi = processor; requires = [];\n    in messages;\n",
         "        in mesages <- messages;\n",
     );
     let errors = resolve_errors(&source);
@@ -1261,7 +1264,7 @@ fn a_misspelled_binding_leaves_the_required_port_unconnected() {
 #[test]
 fn an_optional_port_may_be_left_unconnected() {
     let config = resolved(&surface_doc(
-        "    abi = dom; requires = [];\n    optional in messages;\n    in theme;\n",
+        "    abi = processor; requires = [];\n    optional in messages;\n    in theme;\n",
         "        in theme <- messages;\n",
     ));
     let component = &config.surfaces[0].components[0];
@@ -1275,7 +1278,7 @@ fn an_optional_port_may_be_left_unconnected() {
 #[test]
 fn a_free_io_tuning_counts_as_connecting_the_port() {
     let config = resolved(&surface_doc(
-        "    abi = dom; requires = [];\n    io tick;\n",
+        "    abi = processor; requires = [];\n    io tick;\n",
         "        io tick { push_depth = 1; }\n",
     ));
     assert_eq!(config.surfaces[0].components[0].bindings.len(), 1);
@@ -1286,7 +1289,7 @@ fn a_free_io_tuning_counts_as_connecting_the_port() {
 #[test]
 fn a_bodyless_instance_is_refused_once_per_required_port() {
     let errors = refusals(&surface_doc(
-        "    abi = dom; requires = [];\n    in messages;\n    out acks;\n    optional io tick;\n",
+        "    abi = processor; requires = [];\n    in messages;\n    out acks;\n    optional io tick;\n",
         "",
     ));
     assert_eq!(errors.len(), 2, "{errors:?}");
@@ -1300,7 +1303,7 @@ fn a_bodyless_instance_is_refused_once_per_required_port() {
 #[test]
 fn a_binding_that_did_not_resolve_still_claims_its_port() {
     let errors = refusals(&surface_doc(
-        "    abi = dom; requires = [];\n    in messages;\n",
+        "    abi = processor; requires = [];\n    in messages;\n",
         "        in messages <- \"alice.cmd\";\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -1313,7 +1316,7 @@ fn a_binding_that_did_not_resolve_still_claims_its_port() {
 #[test]
 fn a_port_bound_twice_is_refused_with_both_sites() {
     let source = surface_doc(
-        "    abi = dom; requires = [];\n    in messages;\n",
+        "    abi = processor; requires = [];\n    in messages;\n",
         "        in messages <- messages;\n        in messages <- messages;\n",
     );
     let errors = resolve_errors(&source);
@@ -1385,7 +1388,7 @@ fn a_consumer_leaving_a_required_port_unconnected_is_refused() {
 fn an_abi_is_one_of_the_shapes_the_runtime_loads() {
     assert_eq!(
         refusal(&surface_doc("    abi = wasm;\n", "")),
-        "`wasm` is not an abi; expected one of dom, processor"
+        "`wasm` is not an abi; expected one of processor"
     );
 }
 
@@ -1395,20 +1398,16 @@ fn an_abi_is_one_of_the_shapes_the_runtime_loads() {
 // whether or not this deployment uses it. What an *instance* grants against
 // these lists is the authority suite's.
 
-/// The spec side of deny-by-default, at either abi: a class that says nothing
-/// about what it needs is refused where it is declared.
+/// The spec side of deny-by-default: a class that says nothing about what it
+/// needs is refused where it is declared.
 #[test]
 fn a_class_states_what_it_requires() {
-    for abi in ["dom", "processor"] {
-        let source = format!("component Panel {{\n    abi = {abi};\n}}\n");
-        assert_eq!(
-            refusal(&source),
-            "component `Panel` states no `requires`: what a component needs is \
-             deny-by-default, so a class needing nothing is written `requires = [];` \
-             rather than left out",
-            "at abi {abi}"
-        );
-    }
+    assert_eq!(
+        refusal("component Panel {\n    abi = processor;\n}\n"),
+        "component `Panel` states no `requires`: what a component needs is \
+         deny-by-default, so a class needing nothing is written `requires = [];` \
+         rather than left out"
+    );
 }
 
 /// One vocabulary for the spec and the grant, so a word neither side spells is
@@ -1416,21 +1415,42 @@ fn a_class_states_what_it_requires() {
 #[test]
 fn a_need_names_a_capability() {
     assert_eq!(
-        refusal("component Panel {\n    abi = dom; requires = [frobnicate];\n}\n"),
+        refusal("component Panel {\n    abi = processor; requires = [frobnicate];\n}\n"),
         "`frobnicate` is not a capability a component holds; a spec's `requires` names \
          the same words a `grants` list does: `ports`, `store`, `log`, `alert`, \
-         `config`, `mqtt`, `tools` or `takeover`"
+         `config`, `mqtt`, `tools`, `takeover`, `dom` or `page-dom`"
     );
     assert!(
-        refusal("component Panel {\n    abi = dom; requires = []; optional = [subscribe];\n}\n")
-            .starts_with("`subscribe` is not a capability a component holds"),
+        refusal(
+            "component Panel {\n    abi = processor; requires = []; optional = [subscribe];\n}\n"
+        )
+        .starts_with("`subscribe` is not a capability a component holds"),
         "a transport plane is not a capability on either list"
+    );
+}
+
+/// The page-wide capability is the one word whose whole purpose is leaving the
+/// instance's own subtree, and it does that by mutating what it finds — through
+/// the scoped word. Holding it alone is a class that can arrange the page and
+/// change nothing on it, and that cannot be mounted at all.
+#[test]
+fn page_dom_authority_needs_the_scoped_capability_under_it() {
+    assert_eq!(
+        refusal("component Chrome {\n    abi = processor; requires = [ports, page-dom];\n}\n"),
+        "`page-dom` without `dom`: the page-wide capability arranges other instances' elements \
+         and mutates them through the scoped one, and only the scoped one makes an instance \
+         mountable, so a class naming this names both"
+    );
+    assert!(
+        compile("component Chrome {\n    abi = processor; requires = [ports, dom, page-dom];\n}\n")
+            .is_ok(),
+        "the pair together is the combination chrome holds"
     );
 }
 
 #[test]
 fn a_need_is_listed_once() {
-    let source = "component Panel {\n    abi = dom; requires = [ports, ports];\n}\n";
+    let source = "component Panel {\n    abi = processor; requires = [ports, ports];\n}\n";
     let errors = resolve_errors(source);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(
@@ -1444,41 +1464,20 @@ fn a_need_is_listed_once() {
 /// answers at once.
 #[test]
 fn a_word_is_required_or_optional_and_not_both() {
-    let source = "component Panel {\n    abi = dom; requires = [ports]; optional = [ports];\n}\n";
+    let source = "component Panel {\n    abi = processor; requires = [takeover]; optional = [takeover];\n}\n";
     let errors = resolve_errors(source);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(
         errors[0].message,
-        "`ports` is both required and optional; it is one or the other"
+        "`takeover` is both required and optional; it is one or the other"
     );
     assert_eq!(errors[0].related[0].0, "listed optional here");
 }
 
-/// A dom class runs on a surface and nowhere else, so a word the surface cannot
-/// implement is a need no legal placement satisfies — refused at the class
-/// rather than at whichever surface happened to instantiate it.
+/// A class admits both hosts, so no class-side host question applies to it: an
+/// instance's own words are host-checked where they are written.
 #[test]
-fn a_dom_class_cannot_need_what_no_surface_admits() {
-    for lists in ["requires = [{word}]", "requires = []; optional = [{word}]"] {
-        for word in ["store", "mqtt"] {
-            let lists = lists.replace("{word}", word);
-            let source = format!("component Panel {{\n    abi = dom; {lists};\n}}\n");
-            assert_eq!(
-                refusal(&source),
-                format!(
-                    "`{word}` is backend-only in v1; a surface-hosted component cannot be \
-                     granted it, and a dom class runs nowhere else, so `{word}` cannot be \
-                     satisfied at any placement"
-                )
-            );
-        }
-    }
-}
-
-/// A processor class admits both hosts, so no class-side host question applies
-/// to it: an instance's own words are host-checked where they are written.
-#[test]
-fn a_processor_class_may_need_a_backend_only_capability() {
+fn a_class_may_need_a_backend_only_capability() {
     let config = resolved("component Sink {\n    abi = processor; requires = [store, mqtt];\n}\n");
     assert!(
         config.consumers.is_empty(),
@@ -1491,7 +1490,7 @@ fn a_processor_class_may_need_a_backend_only_capability() {
 /// conditionally — so an optional grant is a promise the runtime cannot keep in
 /// either direction, and the word is refused where it is written.
 #[test]
-fn a_processor_class_has_no_optional_grants() {
+fn a_processor_class_has_no_optional_interface_grants() {
     let errors = refusals(
         "component Sink {\n    abi = processor; requires = [ports]; optional = [store, log];\n}\n",
     );
@@ -1509,12 +1508,15 @@ fn a_processor_class_has_no_optional_grants() {
     }
 }
 
-/// The refusal is the abi's, not the vocabulary's: a dom class keeps `optional`,
-/// because a surface grant is not an import the linker decides.
+/// A word that names no interface has nothing to link conditionally, so the
+/// refusal does not reach it: `takeover` is consent to a binding the page gates,
+/// and a surface where nothing requests the overlay hands its chrome no takeover
+/// plane to bind.
 #[test]
-fn a_dom_class_keeps_its_optional_grants() {
-    let config =
-        resolved("component Panel {\n    abi = dom; requires = []; optional = [log];\n}\n");
+fn a_processor_class_may_make_an_interfaceless_word_optional() {
+    let config = resolved(
+        "component Shell {\n    abi = processor; requires = [ports]; optional = [takeover];\n}\n",
+    );
     assert!(
         config.consumers.is_empty(),
         "declaring is not instantiating"
@@ -1566,11 +1568,14 @@ fn a_backend_only_requirement_reaches_the_instance_that_carries_it() {
 #[test]
 fn every_bad_word_in_a_spec_is_reported_at_once() {
     let errors = refusals(
-        "component Panel {\n    abi = dom; requires = [frobnicate, store]; optional = [gibber];\n}\n",
+        "component Panel {\n    abi = processor; requires = [frobnicate]; optional = [store, gibber];\n}\n",
     );
     assert_eq!(errors.len(), 3, "{errors:?}");
-    assert!(errors[0].starts_with("`frobnicate` is not"), "{errors:?}");
-    assert!(errors[1].contains("`store` cannot be"), "{errors:?}");
+    assert!(
+        errors[0].contains("`store` cannot be optional"),
+        "{errors:?}"
+    );
+    assert!(errors[1].starts_with("`frobnicate` is not"), "{errors:?}");
     assert!(errors[2].starts_with("`gibber` is not"), "{errors:?}");
 }
 
@@ -1580,7 +1585,7 @@ fn every_bad_word_in_a_spec_is_reported_at_once() {
 #[test]
 fn an_instance_of_a_spec_refused_class_reports_nothing_further() {
     let errors = refusals(concat!(
-        "component Panel {\n    abi = dom;\n    in messages;\n}\n",
+        "component Panel {\n    abi = processor;\n    in messages;\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    new p1: Panel {}\n",
@@ -1593,7 +1598,7 @@ fn an_instance_of_a_spec_refused_class_reports_nothing_further() {
 #[test]
 fn a_component_instantiation_takes_no_arguments() {
     let source = concat!(
-        "component Panel {\n    abi = dom; requires = [];\n}\n",
+        "component Panel {\n    abi = processor; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    new p1: Panel(skin = \"bench\");\n",
@@ -1610,7 +1615,7 @@ fn a_component_instantiation_takes_no_arguments() {
 fn an_instance_name_is_what_the_runtime_calls_the_component() {
     assert_eq!(
         refusal(
-            &surface_doc("    abi = dom; requires = [];\n", "")
+            &surface_doc("    abi = processor; requires = [];\n", "")
                 .replace("new p1:", "new panel_one:")
         ),
         "`panel_one` is not a legal component instance name (lowercase, digits and \
@@ -1621,7 +1626,7 @@ fn an_instance_name_is_what_the_runtime_calls_the_component() {
 #[test]
 fn one_surface_has_one_component_of_each_name() {
     let source = concat!(
-        "component Panel {\n    abi = dom; requires = [];\n}\n",
+        "component Panel {\n    abi = processor; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    new p1: Panel {}\n",
@@ -1694,20 +1699,6 @@ fn a_top_level_instance_is_a_consumer() {
             .all(|(key, _)| key != "component_path")
     );
     assert_eq!(consumer.class.package.as_deref(), Some("fixtures"));
-}
-
-#[test]
-fn a_dom_component_has_nowhere_to_render_at_top_level() {
-    assert_eq!(
-        refusal(concat!(
-            packaged!(),
-            "component Panel {\n    abi = dom; requires = [];\n}\n",
-            packaged!(),
-            "new alice_panel: Panel {}\n",
-        )),
-        "`Panel` is a dom component, which runs inside a surface; \
-         a top-level instance has nowhere to render"
-    );
 }
 
 #[test]
@@ -1982,12 +1973,13 @@ fn a_consumer_whose_class_is_unknown_is_still_a_principal() {
 fn a_consumer_refused_its_placement_is_still_a_principal() {
     assert_eq!(
         refusal(concat!(
-            "component Panel { abi = dom; requires = []; }\n",
+            "component Panel { abi = processor; requires = []; }\n",
             "new alice_box: Panel { };\n",
             "grant alice_box subscribe exact \"local:alice.cmd\";\n",
         )),
-        "`Panel` is a dom component, which runs inside a surface; a top-level \
-         instance has nowhere to render"
+        "a top-level instance is loaded from an installed component package, and the class \
+         `Panel` is declared in the configuration tree, not in a packaged module — declare it \
+         in a module imported as `use @<name>::*;`"
     );
 }
 
@@ -2289,7 +2281,7 @@ fn a_slug_of_nothing_legal_is_told_to_write_a_name() {
 fn a_component_instance_name_carries_no_double_hyphen() {
     assert_eq!(
         refusal(
-            &surface_doc("    abi = dom; requires = [];\n", "")
+            &surface_doc("    abi = processor; requires = [];\n", "")
                 .replace("new p1:", "new panel--one:")
         ),
         "`panel--one` is not a legal component instance name (lowercase, digits and \
@@ -2405,7 +2397,7 @@ fn a_prefix_on_a_declaration_is_refused() {
     let source = concat!(
         "channel alice at prefix \"brenn:alice.\" {\n    push_depth = 4;\n}\n",
         "channel bob at \"brenn:bob.in.messages\";\n",
-        "component Panel {\n    abi = dom; requires = [];\n    in messages;\n}\n",
+        "component Panel {\n    abi = processor; requires = [];\n    in messages;\n}\n",
         "surface alice_desk {\n    grants = [subscribe];\n",
         "    new p1: Panel {\n        in messages <- alice;\n    }\n}\n",
     );
@@ -2498,7 +2490,7 @@ fn every_repeat_of_an_identity_is_reported_against_the_first_holder() {
 fn a_binding_names_a_declared_channel_rather_than_its_address() {
     assert_eq!(
         refusal(&surface_doc(
-            "    abi = dom; requires = [];\n    in messages;\n",
+            "    abi = processor; requires = [];\n    in messages;\n",
             "        in messages <- \"brenn:alice-desk.in.messages\";\n",
         )),
         "`brenn:alice-desk.in.messages` is the address channel `messages` declares; \
@@ -2735,7 +2727,7 @@ fn a_refused_component_body_withholds_its_surface() {
     // leaves the surface half-resolved, so the identity collision it would
     // have raised is not reported.
     let errors = refusals(concat!(
-        "component Panel {\n    abi = dom; requires = [];\n}\n",
+        "component Panel {\n    abi = processor; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    slug = \"panel\";\n",
@@ -3493,7 +3485,7 @@ fn an_unknown_kindword_in_an_instance_body_is_refused_by_name() {
 #[test]
 fn a_tool_statement_on_a_surface_placed_instance_is_refused() {
     let errors = refusals(&surface_doc(
-        "    abi = dom; requires = []; optional = [];\n",
+        "    abi = processor; requires = []; optional = [];\n",
         "        grants = [];\n        tool git-repo-pull { allow { repo = \"ws\"; } }\n",
     ));
     assert!(
@@ -3811,7 +3803,7 @@ fn a_surface_placement_of_a_tree_declared_class_is_untouched() {
     // A surface-placed component is served by kind and resolves against no
     // package, so the rule is a top-level one and says nothing here.
     let config = resolved(concat!(
-        "component Panel { abi = dom; requires = []; in messages; }\n",
+        "component Panel { abi = processor; requires = []; in messages; }\n",
         "surface desk {\n    grants = [];\n    \
          new p1: Panel { grants = []; in messages <- \"local:desk.m\"; }\n}\n",
     ));

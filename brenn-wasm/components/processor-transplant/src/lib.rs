@@ -23,6 +23,16 @@
 //                                   activation with nothing flushed.
 //   "__trap__"                    — trap after the same buffering. Same
 //                                   discard, plus the instance is terminal.
+//   "__reply__"                   — answer the activation, reporting the sync
+//                                   port it arrived on, that port compared
+//                                   against the mount item, the request body,
+//                                   and the ports the activation delivered.
+//                                   Only a sync-call activation may be
+//                                   answered, and no backend activation is one,
+//                                   so the script never carries this: the
+//                                   surface half drives it directly to pin how a
+//                                   reply crosses the transpiled seam and what
+//                                   the sync accessors read on either side of it.
 //   "__park__:<delay_ms>"         — publish-deferred "parked:<delay_ms>" at
 //                                   `now + delay_ms`.
 //   "__cancel__:<index>"          — defer-cancel that index of "out"'s window.
@@ -94,6 +104,7 @@ struct ActivationSummary<'a> {
 enum Marker {
     Err,
     Trap,
+    Reply,
     Park { delay_ms: u64 },
     Cancel { index: u32 },
     Edit { index: u32, delay_ms: u64 },
@@ -118,6 +129,7 @@ fn parse_marker(body: &str) -> Result<Option<Marker>, Error> {
     let marker = match name {
         "__err__" => Marker::Err,
         "__trap__" => Marker::Trap,
+        "__reply__" => Marker::Reply,
         "__park__" => Marker::Park { delay_ms: arg(0)? },
         "__cancel__" => Marker::Cancel {
             index: arg(0)? as u32,
@@ -138,7 +150,7 @@ fn parse_marker(body: &str) -> Result<Option<Marker>, Error> {
 struct ProcessorTransplant;
 
 impl Processor for ProcessorTransplant {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         let windows: Vec<_> = activation.port_windows().collect();
 
         let mut ports = Vec::with_capacity(windows.len());
@@ -157,7 +169,7 @@ impl Processor for ProcessorTransplant {
                 ids.push(env.message_id.to_string());
                 match parse_marker(&env.body)? {
                     None => markers.push(format!("{}:{}", window.port(), env.body)),
-                    Some(m @ (Marker::Err | Marker::Trap)) => sentinel = Some(m),
+                    Some(m @ (Marker::Err | Marker::Trap | Marker::Reply)) => sentinel = Some(m),
                     Some(m) => actions.push(m),
                 }
             }
@@ -227,14 +239,37 @@ impl Processor for ProcessorTransplant {
                 Marker::Retime { index, delay_ms } => {
                     defer_edit(OUT, *index, None, Some(release_at(*delay_ms)?))?
                 }
-                Marker::Err | Marker::Trap => unreachable!("err/trap are sentinels, not actions"),
+                Marker::Err | Marker::Trap | Marker::Reply => {
+                    unreachable!("err/trap/reply are sentinels, not actions")
+                }
             }
         }
 
         match sentinel {
             Some(Marker::Err) => Err(Error::failed("transplant: deliberate err sentinel")),
             Some(Marker::Trap) => unreachable!("transplant: deliberate trap sentinel"),
-            _ => Ok(()),
+            // The reply reports every sync accessor at once: the port the
+            // request names, that port read back as an item rather than a
+            // literal, the request body, and the ports this activation
+            // *delivered* — which is the whole list minus the request's own. A
+            // host that lost `sync` on the way in shows it here, and so does an
+            // exclusion that stopped excluding.
+            Some(Marker::Reply) => {
+                let (port, request) = activation.sync_request().ok_or_else(|| {
+                    Error::failed("__reply__ on an activation that is no sync call")
+                })?;
+                let delivered: Vec<&str> = activation
+                    .delivered_windows()
+                    .map(|window| window.port())
+                    .collect();
+                Ok(Some(format!(
+                    "replied:{port}:mount={}:request={}:delivered=[{}]",
+                    activation.sync_is(brenn_guest::dom::MOUNT),
+                    request?.body,
+                    delivered.join(","),
+                )))
+            }
+            _ => Ok(None),
         }
     }
 }

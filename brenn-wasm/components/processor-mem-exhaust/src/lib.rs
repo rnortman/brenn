@@ -60,7 +60,7 @@ fn try_exhaust_memory() {
 }
 
 impl Guest for ProcessorMemExhaust {
-    fn receive(a: Activation) -> Result<(), ReceiveError> {
+    fn receive(a: Activation) -> Result<Option<String>, ReceiveError> {
         let has_new = a
             .ports
             .iter()
@@ -73,7 +73,7 @@ impl Guest for ProcessorMemExhaust {
             try_exhaust_memory();
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 

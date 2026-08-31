@@ -138,9 +138,29 @@ deployed_components_test(
     for name in COMPONENT_NAMES
 ]
 
+# The fixtures that are not guest crates of this tree: the page-hosted surface
+# kinds, staged here because the wasmtime-driven transcript suite that drives
+# their DOM behaviour lives beside the other wasmtime suites. Named on their own
+# rather than folded into `COMPONENT_NAMES`, which is the list of components
+# *this* directory builds.
+_SURFACE_FIXTURES = {
+    "echo-stub": "//surface/components/echo-stub:echo-stub_component",
+    "meeting": "//surface/components/meeting:meeting_component",
+    "chrome": "//surface/chrome:chrome_component",
+}
+
+[
+    component_fixtures(
+        name = "fixture_" + kind.replace("-", "_"),
+        components = [component],
+        visibility = ["//visibility:public"],
+    )
+    for kind, component in _SURFACE_FIXTURES.items()
+]
+
 FIXTURES = {
     name: "//brenn-wasm:fixture_" + name.replace("-", "_")
-    for name in COMPONENT_NAMES
+    for name in COMPONENT_NAMES + _SURFACE_FIXTURES.keys()
 }
 
 exports_files([
@@ -233,7 +253,27 @@ rust_test(
 # component it no longer opens keeps the invalidation edge and nothing reports
 # it, so these lists drift back toward all-to-all one commit at a time. The
 # other direction is loud — a missing fixture is a missing runfile.
+#
+# `(suite, fixtures, extra_data, extra_deps, extra_compile_data)`: the last two
+# carry what one suite needs and the others must not inherit, for the same
+# reason `extra_data` does. A suite reading the WIT at macro-expansion time
+# names `:wit` itself, so a `processor.wit` edit re-runs that suite alone.
 WASM_TEST_SUITES = [
+    (
+        "surface_dom",
+        [
+            "chrome",
+            "echo-stub",
+            "meeting",
+        ],
+        [],
+        [
+            "//surface/chrome",
+            "//surface/components/meeting",
+            "//surface/contract",
+        ],
+        [":wit"],
+    ),
     (
         "consume_engine",
         [
@@ -245,8 +285,10 @@ WASM_TEST_SUITES = [
             "processor-store-rt",
         ],
         [],
+        [],
+        [],
     ),
-    ("feature_envelope", ["processor-demo", "replay"], []),
+    ("feature_envelope", ["processor-demo", "replay"], [], [], []),
     (
         "grants",
         [
@@ -260,26 +302,31 @@ WASM_TEST_SUITES = [
             "processor-store-rt",
         ],
         [],
+        [],
+        [],
     ),
-    ("instantiation_fail", ["processor-exhaust"], []),
-    ("processor_config", ["processor-config"], []),
-    ("processor_log", ["processor-log"], []),
-    ("processor_mqtt", ["processor-mqtt-test"], []),
+    ("instantiation_fail", ["processor-exhaust"], [], [], []),
+    ("processor_config", ["processor-config"], [], [], []),
+    ("processor_log", ["processor-log"], [], [], []),
+    ("processor_mqtt", ["processor-mqtt-test"], [], [], []),
     (
         "processor_transplant",
         ["processor-transplant"],
         ["//brenn-wasm/components/processor-transplant:transplant.json"],
+        [],
+        [],
     ),
-    ("replay_engine", ["replay"], []),
-    ("replay_engine_bounds", ["replay", "replay-fault-test"], []),
-    ("replay_generic_engine", ["replay-generic"], []),
-    ("store_round_trip", ["replay-fault-test"], []),
+    ("replay_engine", ["replay"], [], [], []),
+    ("replay_engine_bounds", ["replay", "replay-fault-test"], [], [], []),
+    ("replay_generic_engine", ["replay-generic"], [], [], []),
+    ("store_round_trip", ["replay-fault-test"], [], [], []),
 ]
 
 [
     rust_test(
         name = suite,
         srcs = ["tests/{}.rs".format(suite)] + glob(["tests/common/*.rs"]),
+        compile_data = extra_compile_data,
         crate_root = "tests/{}.rs".format(suite),
         data = [FIXTURES[c] for c in fixtures] + extra_data,
         edition = "2024",
@@ -298,9 +345,9 @@ WASM_TEST_SUITES = [
             "//brenn-cal",
             "//brenn-common",
             "//brenn-envelope",
-        ],
+        ] + extra_deps,
     )
-    for suite, fixtures, extra_data in WASM_TEST_SUITES
+    for suite, fixtures, extra_data, extra_deps, extra_compile_data in WASM_TEST_SUITES
 ]
 
 rust_doc_test(

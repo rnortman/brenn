@@ -9,7 +9,7 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::telemetry::ErrorReportDocument;
-use brenn_surface_schema::{Abi, ComponentEntry, LocalChannel, OutputBinding};
+use brenn_surface_schema::{ComponentEntry, LocalChannel, OutputBinding};
 use uuid::Uuid;
 
 use super::*;
@@ -28,7 +28,6 @@ fn component(instance: &str, parked_batch_depth: u64) -> ComponentEntry {
     ComponentEntry {
         instance: instance.to_string(),
         kind: "protobar".to_string(),
-        abi: Abi::Dom,
         parked_batch_depth,
         config: BTreeMap::new(),
         grants: vec![],

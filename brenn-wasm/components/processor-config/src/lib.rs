@@ -26,14 +26,14 @@ use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor, config, publ
 struct ProcessorConfig;
 
 impl Processor for ProcessorConfig {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         let windows: Vec<_> = activation.port_windows().collect();
         if windows.is_empty() {
             // Legacy path: no port windows → read "test-key" directly.
             let value = config::get("test-key").unwrap_or_else(|| "absent".to_string());
             publish("out", &value)
                 .unwrap_or_else(|e| panic!("processor-config: publish failed: {e:?}"));
-            return Ok(());
+            return Ok(None);
         }
         for window in &windows {
             for result in window.new_envelopes() {
@@ -58,7 +58,7 @@ impl Processor for ProcessorConfig {
                     .unwrap_or_else(|e| panic!("processor-config: publish failed: {e:?}"));
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

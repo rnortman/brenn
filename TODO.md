@@ -535,11 +535,9 @@ Landing the CI step before that turns main red on every push, which is also
 the auto-deploy-to-staging path. The local gate must stay opt-in regardless:
 contributors are not asked to install a browser driver.
 
-Code site (`TODO(surface-wasm-test-in-ci)`): `surface/component-support/BUILD.bazel`,
-the note on the untargeted `tests/prebind_panic.rs`; `surface/kernel/src/entry.rs`,
-the buffered-publish `None` arm (absent host slot → `"not-permitted"`), which
-depends on the live wasm host slot and can only be pinned by the browser test
-runner.
+Code site (`TODO(surface-wasm-test-in-ci)`): `surface/kernel/src/dom_host.rs`,
+the browser suite over the live DOM capability host, which is the whole of what
+the five migrated kinds render through and is compiled by nothing in CI.
 
 ---
 
@@ -604,24 +602,21 @@ Code site (`TODO(e2e-in-ci)`): `Makefile`, the `e2e` target.
 
 ## `e2e-tag-scheme-tie`
 
-`e2e/tests/bar.spec.ts` (`publishVia`) locates a mounted component by its
-custom-element tag, `` `brenn-echo-stub--${instance}` ``, re-encoding in
-TypeScript a scheme whose only home is `element_name_for_instance`
-(`surface/contract/src/lib.rs`). Nothing mechanical ties the two — a comment is
-the whole link, and a comment does not break a build. That drift already
+`e2e/tests/bar.spec.ts` (`publishVia`) locates a mounted component by the
+attributes the kernel stamps on its host element, `data-kind` and
+`data-instance`, re-encoding in TypeScript a naming whose only home is
+`mount_host` (`surface/kernel/src/dom.rs`). Nothing mechanical ties the two — a
+comment is the whole link, and a comment does not break a build. That drift already
 happened once and cost four specs a 20-second `toBeAttached` timeout each, with
 no diagnosis beyond "it times out".
 
-Selecting on something other than the tag does not fix it. Three elements carry
-`data-instance="<instance>"` for a placed instance — chrome's layout `section`,
-the kernel's wrapper `div`, and the component element itself — and only the
-last routes, because `instance_for_target` (`surface/kernel/src/dom.rs`)
-resolves by node identity over the mounted-element registry, so a publish event
-dispatched from the wrapper reaches nothing. Every selector that picks the right
-one of the three re-encodes some Rust-side literal (the tag, or `wrapper_id`'s
+Selecting on something else does not fix it. Two elements carry
+`data-instance="<instance>"` for a placed instance — chrome's layout `section`
+and the kernel's wrapper `div` — and every selector that picks the right one
+re-encodes some Rust-side literal (the attribute pair, or `wrapper_id`'s
 `brenn-surface-wrapper-` prefix): one unlinked literal traded for another.
 
-Done when a Rust-side change to the tag scheme fails the TypeScript build
+Done when a Rust-side change to the attribute scheme fails the TypeScript build
 rather than a Playwright wait — the scheme emitted into a generated constant the
 spec imports. Needs a design call first: the e2e/TS side deliberately has no
 bundler and no `ts-rs` bridge, so who emits the constant, when it runs, and
@@ -2221,3 +2216,121 @@ gates the one block.
 Done = every block in `docs/config-dsl.md` that is presented as compilable is
 compiled by `make check`, and the blocks that are not are marked as fragments in
 the prose.
+
+## `shared-processor-bindings`
+
+Four raw-WIT fixture components — `processor-exhaust`, `processor-mem-exhaust`,
+`processor-mqtt-test`, `processor-tool-test` — each carry their own
+`wit_bindgen_rust` target and their own committed `src/bindings.rs`, and the
+four files are byte-identical: the same generation of the same
+`brenn:processor` world, ~3,100 lines apiece. Every world change costs a 4×
+regenerated-file churn that buries the hand-written half of the diff, and the
+four `generated_parity_test`s can only ever fail together.
+
+The two candidate shapes differ in what coverage survives, which is why this is
+not a mechanical edit: one shared `wit_bindgen_rust` target with a single
+committed copy keeps the fixtures' raw-WIT independence (they exist to exercise
+the world without the guest SDK) but has to decide where a bindings file that
+belongs to no crate lives; moving the fixtures onto `brenn-guest` deletes the
+committed copies entirely and with them the only in-tree coverage of the
+non-SDK path.
+
+Code site (`TODO(shared-processor-bindings)`):
+`brenn-wasm/components/processor-exhaust/BUILD.bazel`, on the `bindings`
+target.
+
+Done = one generation of the processor world's bindings is committed once, and
+a world change regenerates one file.
+
+## `surface-fault-report`
+
+Every surface component state machine takes the same two steps on a port
+delivery it does not like: it reports a malformed body as one operator log line
+naming channel, sender and message id, and it reports a latest-wins window
+carrying more than one new message as a `push_depth` misconfiguration. Both
+lines are deliberately identical across components so a buggy publisher is
+grep-able the same way whichever component caught it.
+
+They used to live in one place, `surface/component-support`, which is gone with
+the dom carrier. Each migrated kind spells both itself, because a page-hosted
+component compiles for wasm32 against the guest crate universe and the shared
+home was a root-workspace crate with host-only dependencies. Five copies of a
+line whose whole point is being one line is the failure mode this exists to
+prevent.
+
+The shape is a guest-side home — the guest SDK, or a small crate in the guest
+workspace beside it — holding the report struct, its `log_message`, and the
+latest-wins window report, taking the raw envelope JSON the SDK's window hands
+over.
+
+Code sites (`TODO(surface-fault-report)`):
+`surface/components/mode-clock/src/logic.rs`, above the two local copies;
+`surface/components/protobar/src/logic.rs` and
+`surface/components/meeting/src/logic.rs`, above each one's own copy of the
+report; and `surface/chrome/src/logic.rs`, above chrome's latest-wins copy.
+
+Done = one spelling of each line, reachable from a page-hosted component, and
+every migrated kind's copies deleted.
+
+## `surface-guest-wire-crate`
+
+A page-hosted kind cannot name `brenn-surface-schema`, so every wire shape it
+touches is re-typed inside its own crate and held to the real one by a host-side
+parity test: mode-clock re-spells `ThemeBody`, `CONTROL_PLANE_VERSION` and the
+`"dark"`/`"light"` strings (`the_wire_strings_are_the_shared_ones`,
+`the_theme_body_is_the_shared_shape`), and `FaultReport`/`ContractViolation` are
+duplicated per kind (see `surface-fault-report`). The tax scales with how much
+vocabulary a kind touches, and each parity test only catches drift on the fields
+somebody remembered to pin. chrome is the worst case ahead: theme, layout,
+`surface-state`, the toast and panel bodies.
+
+The mechanism this reaches for already exists and is unexplored for this crate:
+`brenn-envelope` is built twice, once per crate universe, as
+`//brenn-envelope:brenn-envelope` and `//brenn-envelope:brenn-envelope_wasm`,
+with a `brenn-wasm/components/host-crates/` symlink so the guest workspace can
+resolve it as a path dependency. `surface/schema`'s dependency set (envelope,
+chrono, serde, serde_json, uuid) is guest-shaped. What is unresolved, and is why
+this is not a mechanical change: adding it makes the guest workspace resolve a
+new first-party crate and repins the guest hub, and the alternative — carving a
+small wire-only crate out of `surface/schema` rather than twinning the whole of
+it — is a different cut of the same seam.
+
+The gate this entry set — decide it before meeting and chrome migrate — was
+crossed unresolved: both kinds migrated with their own re-spellings. The bill is
+now five kinds, roughly fifteen wire shapes and ten host-side parity tests, and
+`surface/chrome/src/wire.rs` alone is 278 lines of it held by six of those
+tests.
+
+Code sites (`TODO(surface-guest-wire-crate)`):
+`surface/components/mode-clock/src/logic.rs`, above the re-spelled control-plane
+vocabulary; `surface/components/meeting/src/logic.rs`, above its takeover
+vocabulary; and `surface/chrome/src/wire.rs`, at the head of the module.
+
+Done = a page-hosted kind imports the shared wire shapes, and the re-spellings
+and their parity tests are deleted.
+
+## `surface-guest-mount-idiom`
+
+Every page-hosted UI kind hand-copies the same ~25 lines of mount bookkeeping:
+an `Option<View>` field, a `view()` accessor whose `expect` string is
+byte-identical in four crates, and a mount arm in the activation handler that
+builds the view. The design's promise is that a UI kind is a `Processor` impl;
+what a kind actually reproduces from an example is a `Processor` impl plus that
+idiom, and an out-of-tree author gets no help with it from the SDK.
+
+Two shapes, and choosing between them is the work: a `dom::Mounted<V>` cell in
+the guest SDK (a data type; every kind keeps its own mount arm), or a
+`Processor::mount()` trait method that `export_processor!` dispatches to when
+the activation names `dom::MOUNT`, leaving `receive` to see only deliveries and
+gestures. The second is the better shape and is a change to the guest SDK's
+`Processor` trait — the first-class out-of-tree extension surface — so it wants
+a design cycle rather than a drive-by: it moves what a component author must
+implement, and neither the SDK nor the kernel can name the instance or the kind
+in the panic message today, which is the other half of what makes the copied
+`expect` unhelpful.
+
+Code sites (`TODO(surface-guest-mount-idiom)`):
+`brenn-wasm/components/guest/src/lib.rs`, at `dom::MOUNT`.
+
+Done = one home for the mount lifecycle in the SDK, and the five kinds' copies
+of the `Option<View>`/`expect`/mount-arm idiom deleted.

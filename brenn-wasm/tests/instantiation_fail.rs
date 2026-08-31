@@ -92,7 +92,7 @@ fn spec_for_test<'a>(component_path: &'a std::path::Path, slug: &'a str) -> Proc
 ///
 /// Note: The WAT below uses `(func (export "receive") ...)` which exports a
 /// component-level function with no parameters — incompatible with the WIT
-/// `receive: func(a: activation) -> result<_, receive-error>` signature.
+/// `receive: func(a: activation) -> result<option<string>, receive-error>` signature.
 /// An oversized-memory WAT would also panic here, but for the same reason
 /// (the type check fires before memory allocation) — no separate test is needed
 /// to "isolate" the two because `#[should_panic]` cannot distinguish call sites.
@@ -102,7 +102,7 @@ fn spec_for_test<'a>(component_path: &'a std::path::Path, slug: &'a str) -> Proc
 )]
 fn wit_type_mismatch_panics_at_load() {
     // `receive` exported as func() — zero params, no return — not the WIT
-    // signature `receive: func(a: activation) -> result<_, receive-error>`.
+    // signature `receive: func(a: activation) -> result<option<string>, receive-error>`.
     // This causes ProcessorPre::new to fail; load panics.
     let wat_src = r#"(component
   (core module $m

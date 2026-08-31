@@ -30,7 +30,7 @@ channel at prefix "mqtt:broker:alice/" {
 link relay;
 
 component Protobar {
-  abi = dom;
+  abi = processor;
   requires = [ports, log];
   in messages: "brenn.panel.message@1";
 }

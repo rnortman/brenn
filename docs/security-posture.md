@@ -840,6 +840,24 @@ untrusted-HTML parse. The `'wasm-unsafe-eval'` analysis (§10.1) is unaffected �
 no new CSP relaxation and no external fetch (images create no element and load
 nothing).
 
+**The `dom` capability's element vocabulary.** A page-hosted component reaches
+the DOM through the `brenn:processor/dom` imports, and that reach is confined
+twice over. *Which elements* it may touch is the per-instance handle table:
+every handle derives from its own host element or its own `create-element`, and
+a handle another instance minted names nothing. *What it may build* is an
+allow-list, in the same construction-not-sanitization shape as the markdown path
+above: a fixed set of tags and a fixed set of attribute names (plus the `data-`
+and `aria-` prefixes), matched exactly, everything else a trap. Attribute values
+are never inspected, because no admitted name can carry a URL or an event
+handler. The admission rule for a new entry is that on every allowed tag it
+causes no script execution, no navigation, no resource fetch, and no effect
+outside the instance's subtree — which excludes `script`, `iframe`, `object`,
+`embed`, `template`, `meta`, `base`, `style`, `link`, `form`, `a`, every `on*`
+attribute and the element id, without enumerating them. Reaching outside one's
+own subtree at all is a second capability, `page-dom`, which exactly one
+instance per surface — its chrome — holds. This remains containment, not a
+security boundary: the backend is the boundary, and it is unchanged.
+
 ### 10.1 `'wasm-unsafe-eval'` on surface documents
 
 The strict Content-Security-Policy pins `script-src 'self'` site-wide. Surface

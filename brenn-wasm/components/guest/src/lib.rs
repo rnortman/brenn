@@ -7,6 +7,7 @@
 // - `store::Transaction` RAII guard — eliminates the leaked-tx trap footgun
 // - `log` / `alert` modules — fire-and-forget diagnostics
 // - `config` module — operator config access
+// - `dom` module — element handles and mutators, for a page-hosted component
 // - `export_processor!` macro — wires `Processor` impl to the WIT export
 //
 // Host-enforced limits (documented, not re-implemented here):
@@ -52,6 +53,16 @@ pub enum Error {
     MalformedEnvelope(String),
     /// Guest-defined processing failure with a diagnostic message.
     ProcessingFailed(String),
+    /// A host refusal for want of quota: the activation's publish or defer bucket
+    /// is empty, and buckets refill per activation.
+    ///
+    /// Named apart from the rest because it is the *only* refusal a conforming
+    /// deployment produces transiently. Every other one — an unbound port, an
+    /// unrepresentable instant, an index this activation's window never carried —
+    /// is structural: no later activation repairs it, so a component that logs
+    /// and carries on from it has hidden a permanent fault. Deciding between the
+    /// two needs the variant, not a diagnostic string.
+    QuotaExceeded(String),
 }
 
 impl Error {
@@ -64,13 +75,24 @@ impl Error {
     pub fn failed(msg: impl core::fmt::Display) -> Self {
         Error::ProcessingFailed(format!("{msg}"))
     }
+
+    /// Whether this is the transient refusal — a bucket that refills — rather
+    /// than a structural one.
+    pub fn is_quota(&self) -> bool {
+        matches!(self, Error::QuotaExceeded(_))
+    }
 }
 
 impl From<Error> for bindings::ReceiveError {
     fn from(e: Error) -> Self {
         match e {
             Error::MalformedEnvelope(msg) => bindings::ReceiveError::MalformedEnvelope(msg),
-            Error::ProcessingFailed(msg) => bindings::ReceiveError::ProcessingFailed(msg),
+            // The host has one failure arm for both: the distinction is the
+            // guest's, drawn so a component can decide, and the diagnostic text
+            // already names the variant.
+            Error::ProcessingFailed(msg) | Error::QuotaExceeded(msg) => {
+                bindings::ReceiveError::ProcessingFailed(msg)
+            }
         }
     }
 }
@@ -83,12 +105,18 @@ impl From<Error> for bindings::ReceiveError {
 /// diagnostics are actionable ("publish to out1: not-permitted").
 fn publish_error(port: &str, e: bindings::brenn::processor::ports::PublishError) -> Error {
     use bindings::brenn::processor::ports::PublishError;
+    let quota = matches!(e, PublishError::QuotaExceeded);
     let variant = match e {
         PublishError::NotPermitted => String::from("not-permitted"),
         PublishError::InvalidPayload(m) => format!("invalid-payload: {m}"),
         PublishError::QuotaExceeded => String::from("quota-exceeded"),
     };
-    Error::ProcessingFailed(format!("publish to {port}: {variant}"))
+    let diagnostic = format!("publish to {port}: {variant}");
+    if quota {
+        Error::QuotaExceeded(diagnostic)
+    } else {
+        Error::ProcessingFailed(diagnostic)
+    }
 }
 
 // ── activation / dispatch ─────────────────────────────────────────────────────
@@ -97,7 +125,13 @@ fn publish_error(port: &str, e: bindings::brenn::processor::ports::PublishError)
 pub trait Processor {
     /// Process one activation. Published messages are buffered and flushed
     /// atomically iff this returns `Ok`; `Err` discards all buffered publishes.
-    fn receive(activation: Activation) -> Result<(), Error>;
+    ///
+    /// The `Ok` payload is the reply to a **sync-call** activation — one whose
+    /// [`Activation::sync`] names a port. Answer `Some` only there: a reply on
+    /// an ordinary activation is a host trap, because a component replying to a
+    /// cause that asked nothing has lost track of why it was called. Ordinary
+    /// activations return `Ok(None)`.
+    fn receive(activation: Activation) -> Result<Option<String>, Error>;
 }
 
 /// One activation: a snapshot of all bound input ports.
@@ -110,6 +144,7 @@ pub struct Activation {
     windows: Vec<PortWindow>,
     deferred: Vec<DeferredWindow>,
     now: Option<u64>,
+    sync: Option<String>,
 }
 
 impl Activation {
@@ -136,6 +171,84 @@ impl Activation {
     /// rather than invent an instant.
     pub fn now(&self) -> Option<u64> {
         self.now
+    }
+
+    /// The live sync port's name when this is a sync-call activation, `None`
+    /// otherwise — which is every activation a message delivery causes, and
+    /// every activation a backend host mints.
+    ///
+    /// The named port is in [`Activation::port_windows`] like any other,
+    /// carrying exactly the one live request. Answering it is the `Ok(Some(..))`
+    /// return of [`Processor::receive`].
+    pub fn sync(&self) -> Option<&str> {
+        self.sync.as_deref()
+    }
+
+    /// Is this a sync-call activation on `port`?
+    ///
+    /// The comparison a handler writes against the same [`dom::SyncPort`] item
+    /// it passed to [`dom::listen`], so the two halves of a gesture share one
+    /// spelling instead of two string literals.
+    pub fn sync_is(&self, port: dom::SyncPort) -> bool {
+        self.sync() == Some(port.name())
+    }
+
+    /// The live request's window on a sync-call activation — the [`Self::sync`]
+    /// port's entry among the windows — or `None` on an asynchronous one.
+    ///
+    /// Panics when `sync` names a port the activation does not carry. The host
+    /// assembles both halves together, so their disagreement is a host bug, and
+    /// windowing a request that is not there is not a state to carry on from.
+    pub fn sync_window(&self) -> Option<&PortWindow> {
+        let port = self.sync.as_deref()?;
+        Some(
+            self.windows
+                .iter()
+                .find(|window| window.port() == port)
+                .expect("a sync-call activation carries the window of the port it names"),
+        )
+    }
+
+    /// The live request on a sync-call activation — the sync port's name and the
+    /// one envelope carrying the request — or `None` on an asynchronous one.
+    ///
+    /// This is half of the gesture idiom; [`Self::delivered_windows`] is the
+    /// other half. A handler reads the request here and folds deliveries there,
+    /// and never sees the request twice.
+    ///
+    /// Panics when the window carries other than exactly one new envelope. The
+    /// host mints the request and windows it alone, so any other count is a host
+    /// bug, and answering a gesture from the wrong request — or from none — is
+    /// not a state to carry on from.
+    pub fn sync_request(&self) -> Option<(&str, Result<MessageEnvelope, Error>)> {
+        let window = self.sync_window()?;
+        assert_eq!(
+            window.new_raw().len(),
+            1,
+            "a sync-call activation's window on port {:?} carries the one live request, not {} \
+             of them",
+            window.port(),
+            window.new_raw().len(),
+        );
+        let request = window
+            .new_envelopes()
+            .next()
+            .expect("the window carries one new envelope");
+        Some((window.port(), request))
+    }
+
+    /// Every window this activation *delivered*: its ports, minus the sync
+    /// request's. The request is not a message anyone published, so it belongs
+    /// in no delivery fold.
+    ///
+    /// The whole window list on an asynchronous activation, so a handler that
+    /// folds through this reads the same worldview either way and cannot forget
+    /// the exclusion the day it grows a gesture.
+    pub fn delivered_windows(&self) -> impl Iterator<Item = &PortWindow> {
+        let sync = self.sync.as_deref();
+        self.windows
+            .iter()
+            .filter(move |window| Some(window.port()) != sync)
     }
 }
 
@@ -286,6 +399,7 @@ pub fn build_activation(raw: bindings::Activation) -> Result<Activation, Error> 
         windows,
         deferred,
         now: raw.now,
+        sync: raw.sync,
     })
 }
 
@@ -295,9 +409,9 @@ pub fn build_activation(raw: bindings::Activation) -> Result<Activation, Error> 
 /// ```rust,ignore
 /// struct MyProcessor;
 /// impl brenn_guest::Processor for MyProcessor {
-///     fn receive(a: brenn_guest::Activation) -> Result<(), brenn_guest::Error> {
+///     fn receive(a: brenn_guest::Activation) -> Result<Option<String>, brenn_guest::Error> {
 ///         // ...
-///         Ok(())
+///         Ok(None)
 ///     }
 /// }
 /// brenn_guest::export_processor!(MyProcessor);
@@ -309,7 +423,10 @@ macro_rules! export_processor {
         impl $crate::bindings::Guest for __BrennGuestShim {
             fn receive(
                 a: $crate::bindings::Activation,
-            ) -> ::core::result::Result<(), $crate::bindings::ReceiveError> {
+            ) -> ::core::result::Result<
+                ::core::option::Option<::std::string::String>,
+                $crate::bindings::ReceiveError,
+            > {
                 let activation = match $crate::build_activation(a) {
                     Ok(a) => a,
                     Err(e) => return ::core::result::Result::Err($crate::bindings::ReceiveError::from(e)),
@@ -412,7 +529,12 @@ fn defer_error(port: &str, e: bindings::brenn::processor::ports::DeferError) -> 
         DeferError::QuotaExceeded => "quota-exceeded",
         DeferError::InvalidDeliverAfter => "invalid-deliver-after",
     };
-    Error::ProcessingFailed(format!("defer control on {port}: {variant}"))
+    let diagnostic = format!("defer control on {port}: {variant}");
+    if matches!(e, DeferError::QuotaExceeded) {
+        Error::QuotaExceeded(diagnostic)
+    } else {
+        Error::ProcessingFailed(diagnostic)
+    }
 }
 
 /// Cancel one of this component's own parked messages on `port`, named by its
@@ -441,6 +563,56 @@ pub fn defer_edit(
 ) -> Result<(), Error> {
     bindings::brenn::processor::ports::defer_edit(port, index, payload, deliver_after)
         .map_err(|e| defer_error(port, e))
+}
+
+/// Cancel every standing wake this activation's window carries on `port`, and
+/// park the next one where there is one.
+///
+/// The timer idiom in one call: a component that wakes itself keeps at most one
+/// parked message on its own port, so it cancels what the window shows before it
+/// parks the next. `release_at` is `None` where there is no next instant — a
+/// fixed mode with no boundary, a display with no expiry — and then nothing is
+/// parked.
+///
+/// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
+///
+/// # Panics
+///
+/// On any refusal but an exhausted quota. A ticker that fails to re-park stops
+/// ticking, and for every reason but the quota it stops *forever*: the port is
+/// not a bound output of this instance, or the index is not one this
+/// activation's own window carried, or the release instant is not
+/// representable. Each is a deployment or a component fault that no later
+/// activation repairs, and a log line on a page that then silently stops
+/// tracking time is that fault hidden rather than reported. A quota is the one
+/// refusal a conforming deployment produces transiently — buckets refill per
+/// activation — so it is logged and the activation carries on.
+pub fn repark(activation: &Activation, port: &str, payload: &str, release_at: Option<u64>) {
+    if let Some(window) = activation.deferred_for(port) {
+        for entry in window.entries() {
+            if let Err(err) = defer_cancel(port, entry.index()) {
+                assert!(
+                    err.is_quota(),
+                    "brenn-guest: the stale tick on {port:?} could not be cancelled: {err:?}"
+                );
+                log::error(format!(
+                    "stale tick on {port:?} could not be cancelled: quota exceeded"
+                ));
+            }
+        }
+    }
+    let Some(deliver_after) = release_at else {
+        return;
+    };
+    if let Err(err) = publish_deferred(port, payload, deliver_after) {
+        assert!(
+            err.is_quota(),
+            "brenn-guest: the tick on {port:?} could not be scheduled: {err:?}"
+        );
+        log::error(format!(
+            "tick on {port:?} could not be scheduled: quota exceeded"
+        ));
+    }
 }
 
 /// Convert `brenn_envelope::Urgency` to WIT urgency exhaustively.
@@ -936,5 +1108,322 @@ pub mod tools {
         let args_json = serde_json::to_string(args)
             .map_err(|e| Error::failed(format!("serialize args: {e}")))?;
         call_async(tool, &args_json, call_id)
+    }
+}
+
+// ── dom ───────────────────────────────────────────────────────────────────────
+
+pub mod dom {
+    //! Element handles and mutators, for a component the page hosts.
+    //!
+    //! **Requires grant:** `"dom"`. The page-wide reads and the wrappers of
+    //! other instances are [`crate::page_dom`], a capability of its own that
+    //! only a surface's designated chrome instance holds.
+    //!
+    //! A [`Node`] is a handle the host mints, canonical per element within one
+    //! instance: the same element is always the same handle, so comparing
+    //! handles compares elements. Handle tables are per instance, so a handle is
+    //! meaningless anywhere but where it was minted.
+    //!
+    //! **A handle lives until its element is destroyed.** [`remove`] destroys
+    //! the node and its subtree; [`set_text`] destroys the children of the node
+    //! it clears. Every handle naming a destroyed element is invalidated, in
+    //! every instance's table — a chrome removing page furniture invalidates
+    //! whatever another instance named inside it. Moves do not invalidate:
+    //! [`append`] and [`insert_before`] reparent, and the handle stays good.
+    //!
+    //! **Misuse traps.** An unknown handle, a handle another instance minted, a
+    //! handle whose element was destroyed, a tag the host will not create — none
+    //! of these is a runtime condition a component could recover from, so none
+    //! of them is an error variant. The instance dies with an error card,
+    //! exactly as it would on any other trap.
+    //!
+    //! **What the host will create.** Reach is confined to the subtree by the
+    //! handle table; authority is confined by an allow-list, because markup can
+    //! name script and script in this page runs with the page's authority.
+    //! [`create_element`] takes only a listed tag and [`set_attribute`] only a
+    //! listed attribute name; anything else traps. The lists themselves live on
+    //! the `brenn:processor/dom` interface doc, which is the one place they are
+    //! written for a component author to read. A kind reaching for something off
+    //! them is reaching for the page, which is not what this capability is.
+    //!
+    //! State between activations is ordinary struct state: the component is
+    //! instantiated once per instance and lives for the page, so a handle held
+    //! in a field is still that element on the next activation.
+
+    use crate::bindings::brenn::processor::dom as raw;
+
+    /// A page element this instance may act on.
+    ///
+    /// `Copy`, and compared by identity: the host mints one handle per element,
+    /// so equality here is element equality.
+    ///
+    /// Serializes as the bare handle: the host synthesizes and reads handles as
+    /// integers, and the newtype is the guest's own typing of them.
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        serde::Serialize,
+        serde::Deserialize,
+    )]
+    #[serde(transparent)]
+    pub struct Node(pub(crate) u64);
+
+    impl Node {
+        /// Wrap a handle the host minted. For the page-wide capability and for a
+        /// component bridging to hand-written bindings.
+        pub fn from_raw(handle: u64) -> Node {
+            Node(handle)
+        }
+
+        /// The raw host handle. For a component bridging to hand-written
+        /// bindings; ordinary code never needs it.
+        pub fn raw(self) -> u64 {
+            self.0
+        }
+    }
+
+    /// This instance's own host element — the root of the subtree it owns.
+    pub fn root() -> Node {
+        Node(raw::root())
+    }
+
+    /// Create a detached element with the given tag. A tag the host refuses
+    /// traps.
+    pub fn create_element(tag: &str) -> Node {
+        Node(raw::create_element(tag))
+    }
+
+    /// Create an element carrying a bare marker attribute — the house pattern for
+    /// a stylesheet or test anchor, since `id` and `style` are off the
+    /// allow-list and a `data-` marker is what a rule selects on.
+    pub fn marked(tag: &str, marker: &str) -> Node {
+        let node = create_element(tag);
+        set_attribute(node, marker, "");
+        node
+    }
+
+    /// Set an attribute. An empty value is the idiom for a boolean attribute
+    /// (`hidden`, `disabled`). A name or value the host refuses traps.
+    pub fn set_attribute(node: Node, name: &str, value: &str) {
+        raw::set_attribute(node.0, name, value);
+    }
+
+    /// Remove an attribute. Removing one that is not present is a no-op.
+    pub fn remove_attribute(node: Node, name: &str) {
+        raw::remove_attribute(node.0, name);
+    }
+
+    /// Set a boolean attribute's presence in one call.
+    pub fn set_attribute_present(node: Node, name: &str, present: bool) {
+        if present {
+            set_attribute(node, name, "");
+        } else {
+            remove_attribute(node, name);
+        }
+    }
+
+    /// Replace the node's children with one inert text node. Text only — this
+    /// never parses markup, so there is no markup-injection surface here.
+    ///
+    /// The replaced children are destroyed: every handle naming an element
+    /// strictly inside `node` is invalidated. `node` itself stays valid.
+    pub fn set_text(node: Node, text: &str) {
+        raw::set_text(node.0, text);
+    }
+
+    /// Set one inline style property.
+    pub fn set_style_property(node: Node, name: &str, value: &str) {
+        raw::set_style_property(node.0, name, value);
+    }
+
+    /// Remove one inline style property.
+    pub fn remove_style_property(node: Node, name: &str) {
+        raw::remove_style_property(node.0, name);
+    }
+
+    /// Append `child` as `parent`'s last child, detaching it from wherever it
+    /// was.
+    pub fn append(parent: Node, child: Node) {
+        raw::append(parent.0, child.0);
+    }
+
+    /// Insert `child` before `reference` under `parent`, or append when
+    /// `reference` is `None`.
+    pub fn insert_before(parent: Node, child: Node, reference: Option<Node>) {
+        raw::insert_before(parent.0, child.0, reference.map(|n| n.0));
+    }
+
+    /// Destroy the node: detach it from its parent, and invalidate its handle
+    /// along with every handle naming an element inside the removed subtree.
+    /// There is no re-appending it — to hide a node and keep it, use the
+    /// `hidden` attribute.
+    pub fn remove(node: Node) {
+        raw::remove(node.0);
+    }
+
+    /// A form control's current value; the empty string for a node that has
+    /// none.
+    pub fn value(node: Node) -> String {
+        raw::value(node.0)
+    }
+
+    /// Set a form control's value.
+    pub fn set_value(node: Node, value: &str) {
+        raw::set_value(node.0, value);
+    }
+
+    /// A reserved port a sync-call activation can name.
+    ///
+    /// Gesture ports are sync-only vocabulary — no specification declares them,
+    /// so nothing generates them. Naming one as a `const` of this type is how a
+    /// kind keeps [`listen`] and its
+    /// [`crate::Activation::sync_is`] match on one item rather than two
+    /// literals that can drift apart silently.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub struct SyncPort(pub &'static str);
+
+    impl SyncPort {
+        /// The port name as the host spells it.
+        pub fn name(self) -> &'static str {
+            self.0
+        }
+    }
+
+    /// Compare a host-spelled port name against a declared port, so a kind
+    /// dispatching on [`crate::Activation::sync`] matches on the same item it
+    /// wired with [`listen`] rather than unwrapping the newtype at every arm.
+    impl PartialEq<&str> for SyncPort {
+        fn eq(&self, other: &&str) -> bool {
+            self.0 == *other
+        }
+    }
+
+    impl PartialEq<SyncPort> for &str {
+        fn eq(&self, other: &SyncPort) -> bool {
+            *self == other.0
+        }
+    }
+
+    // TODO(surface-guest-mount-idiom): every UI kind hand-copies the same mount
+    // bookkeeping around this constant — an `Option<View>` field, an identical
+    // `expect`, and a mount arm in its handler. The SDK should own the
+    // lifecycle; which shape it takes is a `Processor`-trait decision.
+
+    /// The port a mount activation names: the instance's first call, where it
+    /// builds its UI. Reserved by its colon, which no specification identifier
+    /// can spell.
+    pub const MOUNT: SyncPort = SyncPort("brenn:mount");
+
+    /// Wire a gesture: the host listens for `event` on the node and answers it
+    /// with a sync-call activation on `port`.
+    ///
+    /// A listener dies with its element: a detached element receives no UI
+    /// events, and detaching is what destroys it. The activation runs on the
+    /// event's own stack, so what the handler reads through [`value`] is the
+    /// state at event time.
+    pub fn listen(node: Node, event: &str, port: SyncPort) {
+        raw::listen(node.0, event, port.name());
+    }
+
+    /// The page environment's UTC offset in minutes at `epoch_ms` — the one
+    /// page fact a component cannot compute from the activation clock.
+    pub fn utc_offset_minutes(epoch_ms: u64) -> i32 {
+        raw::utc_offset_minutes(epoch_ms)
+    }
+
+    /// The synthesized body of a gesture's sync-call request.
+    ///
+    /// The host names the event, the node whose listener fired, and the nearest
+    /// handle-mapped ancestor of the event target — which is how a delegated
+    /// listener on a container tells apart which child was hit.
+    ///
+    /// The three field names are a wire contract with the host that synthesizes
+    /// them, spelled once on each side: `GESTURE_*_FIELD` in
+    /// `brenn-surface-contract` is the host's half, pinned to these literals
+    /// there.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Gesture {
+        /// The DOM event type, as passed to [`listen`].
+        pub event: String,
+        /// The node the listener is attached to.
+        pub listener: Node,
+        /// The nearest handle-mapped ancestor of the event target.
+        pub target: Node,
+    }
+
+    /// The one key the gesture reply dialect has: whether the host should call
+    /// `preventDefault()` on the event that caused the activation.
+    const CANCEL_KEY: &str = "cancel";
+
+    /// The reply that asks the host to `preventDefault` the gesture's event.
+    ///
+    /// A gesture's reply dialect is exactly this one field: present and true
+    /// cancels, present and false does not. Returned as the `Ok` payload of
+    /// [`crate::Processor::receive`] on a sync-call activation.
+    pub fn cancel_reply() -> String {
+        format!("{{\"{CANCEL_KEY}\":true}}")
+    }
+
+    /// The reply that lets the gesture's event proceed.
+    ///
+    /// A handler that has no opinion answers `Ok(None)` instead — no reply at
+    /// all, which the host also reads as "do not cancel". This is the one that
+    /// has decided, so it is spelled in the dialect rather than as an empty
+    /// object the reader would refuse.
+    pub fn proceed_reply() -> String {
+        format!("{{\"{CANCEL_KEY}\":false}}")
+    }
+}
+
+// ── page-dom ──────────────────────────────────────────────────────────────────
+
+pub mod page_dom {
+    //! Page-wide reads and mutations, for the one instance that arranges the
+    //! page.
+    //!
+    //! **Requires grant:** `"page-dom"`, and `"dom"` with it — every function
+    //! here reaches outside the calling instance's own subtree, which is the
+    //! whole reason it is a separate capability rather than more of the same
+    //! one, and an instance that arranges the page also mutates what it finds.
+    //!
+    //! Its own module, not a submodule of [`crate::dom`], because the generated
+    //! `pub use brenn_guest::<module>;` re-export is what holds a class's
+    //! declared capabilities and the code it can write equal at compile time. A
+    //! class granted only `"dom"` cannot name anything here.
+
+    use crate::bindings::brenn::processor::page_dom as raw;
+    use crate::dom::Node;
+
+    /// The surface root, which holds every instance wrapper.
+    pub fn root() -> Node {
+        Node::from_raw(raw::page_root())
+    }
+
+    /// The document body, where page-level state is stamped.
+    pub fn body() -> Node {
+        Node::from_raw(raw::page_body())
+    }
+
+    /// The wrapper element the host created for another instance, or `None`
+    /// when that instance has not registered yet.
+    ///
+    /// A `None` is the ordinary transient of a page still coming up, not an
+    /// error: registration emits a state message, so the next delivery is the
+    /// cue to look again.
+    pub fn instance_wrapper(instance: &str) -> Option<Node> {
+        raw::instance_wrapper(instance).map(Node::from_raw)
+    }
+
+    /// The node's parent, or `None` when it is detached or is the document
+    /// root.
+    pub fn parent(node: Node) -> Option<Node> {
+        raw::parent(node.raw()).map(Node::from_raw)
     }
 }

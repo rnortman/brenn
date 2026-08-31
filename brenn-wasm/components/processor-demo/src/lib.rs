@@ -35,7 +35,7 @@ use brenn_guest::{
 struct ProcessorDemo;
 
 impl Processor for ProcessorDemo {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         for window in activation.port_windows() {
             for env in window.new_envelopes() {
                 let env = env?;
@@ -95,7 +95,7 @@ impl Processor for ProcessorDemo {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 

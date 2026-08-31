@@ -17,7 +17,7 @@
 //! in one document are all reported.
 
 use brenn_envelope::addressing::is_unreserved_name;
-use brenn_envelope::grants::{ComponentGrant, ComponentHost};
+use brenn_envelope::grants::ComponentGrant;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -3122,7 +3122,7 @@ fn class_ref(
         return None;
     };
     let abi = Spanned::new(parsed, word.span().clone());
-    let needs = class_grants(class, abi.value(), errors)?;
+    let needs = class_grants(class, errors)?;
     let mut ports: Vec<RPort> = Vec::new();
     for decl in &class.ports {
         if let Some(prior) = ports
@@ -3178,11 +3178,7 @@ struct ClassGrants {
 /// say what it needs is answered once here rather than at every instantiation.
 /// Every refusal the pair can hold is reported before returning, so an author
 /// fixing one word does not discover the next on the following build.
-fn class_grants(
-    class: &ComponentClass,
-    abi: &Abi,
-    errors: &mut Vec<Diagnostic>,
-) -> Option<ClassGrants> {
+fn class_grants(class: &ComponentClass, errors: &mut Vec<Diagnostic>) -> Option<ClassGrants> {
     let before = errors.len();
     let list = |attr: Option<&Attr<WordList>>| -> Vec<Spanned<String>> {
         attr.map(|attr| {
@@ -3207,34 +3203,38 @@ fn class_grants(
             class.name.span().clone(),
         ));
     }
-    // A processor's capabilities are WIT imports, and the host links an
+    // Most of a processor's capabilities are WIT imports, and the host links an
     // interface only where the instance was granted it. An artifact cannot
     // import conditionally, so an optional grant is unexercisable in both
     // directions: an artifact that imports the interface panics at load under
     // an instance that omits the word, and one that does not import it is
     // unchanged by holding it. The word is refused rather than recorded as
     // meaningless.
-    if matches!(abi, Abi::Processor) {
-        for word in &optional {
-            errors.push(Diagnostic::at(
-                format!(
-                    "`{}` cannot be optional on a processor class: a processor reaches a \
-                     capability through a WIT import the host links only where the instance \
-                     grants it, and an artifact cannot import conditionally, so the word is \
-                     either in `requires` or not in the spec",
-                    word.value()
-                ),
-                word.span().clone(),
-            ));
+    //
+    // A word naming no interface is exempt: `takeover` is consent to a binding
+    // the page gates, with nothing to import and so nothing to link
+    // conditionally. Optional is exactly right for it — a surface where nothing
+    // requests the overlay hands its chrome no takeover plane to bind.
+    for word in &optional {
+        let imports =
+            ComponentGrant::parse(word.value()).is_some_and(|grant| grant.wit_import().is_some());
+        if !imports {
+            continue;
         }
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` cannot be optional on a processor class: a processor reaches a \
+                 capability through a WIT import the host links only where the instance \
+                 grants it, and an artifact cannot import conditionally, so the word is \
+                 either in `requires` or not in the spec",
+                word.value()
+            ),
+            word.span().clone(),
+        ));
     }
-    // A dom class can only ever be surface-placed, so a word no surface admits
-    // is a spec no legal placement satisfies. A processor class admits both
-    // hosts, and its instances' words are host-checked where they are written.
-    let host = match abi {
-        Abi::Dom => Some(ComponentHost::Surface),
-        Abi::Processor => None,
-    };
+    // A class admits both hosts, and its instances' words are host-checked
+    // where they are written.
+    //
     // Every word is parsed into its grant variant here; nothing downstream
     // re-decides it from text.
     let mut parsed: [Vec<Spanned<ComponentGrant>>; 2] = [Vec::new(), Vec::new()];
@@ -3272,18 +3272,34 @@ fn class_grants(
                 continue;
             };
             parsed[slot].push(Spanned::new(grant, word.span().clone()));
-            if let Some(host) = host
-                && let Some(message) = grant.illegal_on(host)
-            {
-                errors.push(Diagnostic::at(
-                    format!(
-                        "{message}, and a dom class runs nowhere else, so `{}` cannot be \
-                         satisfied at any placement",
-                        word.value()
-                    ),
-                    word.span().clone(),
-                ));
-            }
+        }
+    }
+    // Page-DOM authority reaches outside a subtree the holder must first have:
+    // every arrangement it performs is a mutation, and the instance is mountable
+    // only on the scoped word. A class naming one word and not the other names a
+    // combination no placement can make coherent, so it is refused here — at
+    // class grain, over both lists together. A class that lists both optional
+    // passes this and can still be granted one alone, which is why the grant set
+    // itself is checked again where a placement builds it (`derive.rs`).
+    let declared: Vec<&Spanned<ComponentGrant>> = parsed.iter().flatten().collect();
+    if !declared
+        .iter()
+        .any(|word| *word.value() == ComponentGrant::Dom)
+    {
+        for word in declared
+            .iter()
+            .filter(|word| *word.value() == ComponentGrant::PageDom)
+        {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{}` without `{}`: the page-wide capability arranges other instances' \
+                     elements and mutates them through the scoped one, and only the scoped one \
+                     makes an instance mountable, so a class naming this names both",
+                    ComponentGrant::PageDom.word(),
+                    ComponentGrant::Dom.word(),
+                ),
+                word.span().clone(),
+            ));
         }
     }
     for word in &requires {
@@ -3607,32 +3623,18 @@ fn resolve_class(
     // A class the prepass refused: the instance would only report the same
     // thing again, one indirection further from where it was written.
     let class = classes.get((symbol.file, symbol.item))?;
-    if place == Placement::TopLevel {
-        if *class.abi.value() == Abi::Dom {
-            errors.push(two_site(
-                format!(
-                    "`{name}` is a dom component, which runs inside a surface; \
-                     a top-level instance has nowhere to render"
-                ),
-                span,
-                "declared dom here",
-                class.abi.span().clone(),
-            ));
-            return None;
-        }
-        if class.package.is_none() {
-            errors.push(two_site(
-                format!(
-                    "a top-level instance is loaded from an installed component package, and \
-                     the class `{name}` is declared in the configuration tree, not in a \
-                     packaged module — declare it in a module imported as `use @<name>::*;`"
-                ),
-                span,
-                "declared here",
-                class.name.span().clone(),
-            ));
-            return None;
-        }
+    if place == Placement::TopLevel && class.package.is_none() {
+        errors.push(two_site(
+            format!(
+                "a top-level instance is loaded from an installed component package, and the \
+                 class `{name}` is declared in the configuration tree, not in a packaged \
+                 module — declare it in a module imported as `use @<name>::*;`"
+            ),
+            span,
+            "declared here",
+            class.name.span().clone(),
+        ));
+        return None;
     }
     Some(class.clone())
 }

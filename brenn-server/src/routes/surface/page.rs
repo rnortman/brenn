@@ -13,10 +13,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use brenn_db::auth::session::Session;
-use brenn_surface_contract::{
-    KERNEL_ARTIFACT, SURFACE_ROOT_ID, module_artifact, processor_module_path,
-};
-use brenn_surface_schema::Abi;
+use brenn_surface_contract::{KERNEL_ARTIFACT, SURFACE_ROOT_ID, processor_module_path};
 use serde::Serialize;
 
 use super::authorize_surface;
@@ -30,9 +27,8 @@ use crate::state::AppState;
 ///
 /// Produced by the backend, consumed only by the TS bootstrap; never a WS frame
 /// and never touched by ts-rs. Two fields: `kernel` is the fixed kernel artifact
-/// URL, `components` maps each configured component `kind` to its module URL by
-/// the frozen naming convention (`brenn_<kind _>.js`). All URLs carry `?v=` set
-/// to the serving build id.
+/// URL, `components` maps each configured instance to its kind's transpiled
+/// module URL. All URLs carry `?v=` set to the serving build id.
 #[derive(Serialize)]
 struct SurfaceManifest {
     kernel: String,
@@ -43,41 +39,20 @@ struct SurfaceManifest {
 struct ManifestComponent {
     instance: String,
     kind: String,
-    abi: Abi,
     module: String,
 }
 
-/// The module URL for one declared instance, by ABI.
+/// The transpiled module URL for one declared instance.
 ///
-/// `Dom` carries an `instance=` query: distinct resolved URLs are distinct module
-/// records to the browser, which is what forces one ES-module evaluation — and so
-/// one wasm-bindgen singleton and one linear memory — per instance, while the
-/// HTTP and bytecode caches still share the kind's bytes.
-///
-/// `Processor` carries no such query, and must not: the jco `--instantiation`
+/// It carries no per-instance query, and must not: the jco `--instantiation`
 /// module instantiates nothing at evaluation, so one evaluation per kind is
 /// correct and per-instance isolation comes from calling its `instantiate` once
 /// per instance. Forcing extra evaluations would only duplicate glue.
-///
-/// The reserved ABIs never reach here — `resolve_abi` panics on them at boot.
 fn module_url(entry: &brenn_lib::messaging::config::ResolvedComponent, build_id: &str) -> String {
-    match entry.abi {
-        Abi::Dom => format!(
-            "/surface-static/{}?v={build_id}&instance={}",
-            module_artifact(&entry.kind),
-            entry.instance
-        ),
-        Abi::Processor => format!(
-            "/surface-static/{}?v={build_id}",
-            processor_module_path(&entry.kind)
-        ),
-        Abi::DomTs | Abi::Html => panic!(
-            "surface page: instance {:?} declares reserved abi {:?} — boot validation rejects \
-             these before a page can be served",
-            entry.instance,
-            entry.abi.as_str()
-        ),
-    }
+    format!(
+        "/surface-static/{}?v={build_id}",
+        processor_module_path(&entry.kind)
+    )
 }
 
 /// GET /surface/{slug} — the surface page a browser tab loads.
@@ -102,10 +77,9 @@ pub async fn surface_page(
     //    JSON-encoded manifest cannot break out of its `<script>` container
     //    regardless of future field additions; the metas are HTML-escaped.
     let build_id = state.build_id;
-    // One entry per declared instance: whatever the ABI, a trap poisons one
-    // instance and never its siblings of the same kind. How that isolation is
-    // bought differs by ABI — see `module_url` — so the entry carries the `abi`
-    // the bootstrap loader branches on.
+    // One entry per declared instance: a trap poisons one instance and never its
+    // siblings of the same kind, because each is its own `instantiate` of the
+    // kind's one evaluated module.
     let manifest_components: Vec<ManifestComponent> = runtime
         .resolved
         .components
@@ -113,7 +87,6 @@ pub async fn surface_page(
         .map(|entry| ManifestComponent {
             instance: entry.instance.clone(),
             kind: entry.kind.clone(),
-            abi: entry.abi,
             module: module_url(entry, build_id),
         })
         .collect();
@@ -301,9 +274,7 @@ mod tests {
             ),
             "missing surface-config-channel meta: {body}"
         );
-        // Manifest: kernel + the echo-stub module by the naming convention,
-        // build-ID-stamped, with the per-instance `?instance=` specifier that
-        // forces a distinct module record (one evaluation, one linear memory).
+        // Manifest: kernel + the echo-stub transpiled tree, build-ID-stamped.
         assert!(
             body.contains(&format!(
                 r#""kernel":"/surface-static/brenn_surface_kernel.js?v={TEST_BUILD_ID}""#
@@ -312,7 +283,7 @@ mod tests {
         );
         assert!(
             body.contains(&format!(
-                r#""module":"/surface-static/brenn_echo_stub.js?v={TEST_BUILD_ID}&instance=echo-stub""#
+                r#""module":"/surface-static/processor/echo-stub/echo-stub.js?v={TEST_BUILD_ID}""#
             )),
             "missing manifest echo-stub module URL: {body}"
         );
@@ -323,11 +294,6 @@ mod tests {
         assert!(
             body.contains(r#""kind":"echo-stub""#),
             "missing manifest component kind: {body}"
-        );
-        // The loader branches on `abi`, so it must be on the entry.
-        assert!(
-            body.contains(r#""abi":"dom""#),
-            "missing manifest component abi: {body}"
         );
         // Stylesheet + bootstrap, build-ID-stamped.
         assert!(
@@ -401,16 +367,15 @@ mod tests {
         );
     }
 
-    /// A processor instance's manifest entry names the transpiled tree's entry
-    /// module and carries **no** `instance=` query.
+    /// Two instances of two kinds each name their own kind's transpiled tree
+    /// entry module, and neither carries an `instance=` query.
     ///
     /// The absence is the load-bearing half: the jco `--instantiation` module
     /// instantiates nothing at evaluation, so per-instance isolation comes from
-    /// calling its `instantiate` once per instance, not from minting a module
-    /// record per instance the way `dom` must. An `instance=` query here would buy
-    /// nothing and duplicate the glue.
+    /// calling its `instantiate` once per instance. An `instance=` query here
+    /// would buy nothing and duplicate the glue.
     #[tokio::test]
-    async fn processor_instance_gets_the_transpiled_tree_url_without_an_instance_query() {
+    async fn every_instance_gets_its_kinds_tree_url_without_an_instance_query() {
         let resolved = SurfaceFixture::new("deskbar", "echo-stub")
             .processor("counter-a", "counter", Default::default())
             .subscribe("ephemeral:dev-stub", "echo-stub", "messages")
@@ -430,18 +395,17 @@ mod tests {
 
         assert!(
             body.contains(&format!(
-                r#""abi":"processor","module":"/surface-static/processor/counter/counter.js?v={TEST_BUILD_ID}""#
+                r#""module":"/surface-static/processor/counter/counter.js?v={TEST_BUILD_ID}""#
             )),
-            "missing processor module URL: {body}"
+            "missing counter module URL: {body}"
         );
-        // The dom sibling keeps its per-instance specifier, so the branch is real
-        // and not a blanket change.
         assert!(
             body.contains(&format!(
-                r#""module":"/surface-static/brenn_echo_stub.js?v={TEST_BUILD_ID}&instance=echo-stub""#
+                r#""module":"/surface-static/processor/echo-stub/echo-stub.js?v={TEST_BUILD_ID}""#
             )),
-            "the dom sibling keeps its instance-scoped specifier: {body}"
+            "missing echo-stub module URL: {body}"
         );
+        assert!(!body.contains("instance=echo-stub"), "{body}");
     }
 
     #[tokio::test]

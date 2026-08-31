@@ -122,7 +122,7 @@ pub fn generate(
         // Each port's payload marker trait has `Serialize` as its supertrait,
         // and the SDK re-exports that trait so a guest crate needs no serde
         // dependency of its own to compile the module.
-        out.push_str("\nuse brenn_guest::serde;\n");
+        let _ = write!(out, "\n{GUEST_ONLY}use brenn_guest::serde;\n");
     }
     write_in_port(&mut out, &ports, abi);
     if abi == Abi::Processor {
@@ -487,8 +487,14 @@ fn is_keyword(identifier: &str) -> bool {
 ///
 /// Exhaustive over the vocabulary rather than a lookup table with a default, so
 /// a capability added to [`ComponentGrant`] is answered here or the crate does
-/// not compile. `Ports` is embodied by the publish handles themselves and `Takeover`
-/// is dom vocabulary with no interface behind it, so neither names a module.
+/// not compile. `Ports` is embodied by the publish handles themselves and
+/// `Takeover` is consent to a binding with no interface behind it, so neither
+/// names a module.
+///
+/// One module per capability, never shared: the re-export is what holds a
+/// class's declared words and the code it can write equal at compile time, so a
+/// module two words could reach would hand the narrower word the wider
+/// authority.
 fn sdk_module(grant: ComponentGrant) -> Option<&'static str> {
     match grant {
         ComponentGrant::Store => Some("store"),
@@ -497,6 +503,8 @@ fn sdk_module(grant: ComponentGrant) -> Option<&'static str> {
         ComponentGrant::Config => Some("config"),
         ComponentGrant::Mqtt => Some("mqtt"),
         ComponentGrant::Tools => Some("tools"),
+        ComponentGrant::Dom => Some("dom"),
+        ComponentGrant::PageDom => Some("page_dom"),
         ComponentGrant::Ports | ComponentGrant::Takeover => None,
     }
 }
@@ -540,6 +548,16 @@ fn grant_modules(class: &ComponentClass) -> Result<Vec<&'static str>, Diagnostic
 }
 
 // ── emission ─────────────────────────────────────────────────────────────────
+
+/// The attribute every item naming `brenn_guest` carries.
+///
+/// The SDK is a wasm32 crate, and a component whose DOM-free half is host-tested
+/// compiles this same module for the host to reach its port names. Gating the
+/// items that name the SDK — the payload traits, the publish handles, the window
+/// classifier, the capability re-exports — is what lets one generated module
+/// serve both builds; the port names and the inbound enum are plain Rust and
+/// carry no gate.
+const GUEST_ONLY: &str = "#[cfg(target_arch = \"wasm32\")]\n";
 
 fn write_header(out: &mut String, spec_basename: &str, doc: Option<&DocComment>) {
     let _ = writeln!(out, "// Generated from {spec_basename} — do not edit.");
@@ -642,6 +660,7 @@ fn write_in_port(out: &mut String, ports: &PortNames, abi: Abi) {
              \x20   /// artifact is hash-bound to the specification that generated this\n\
              \x20   /// module, so an undeclared port means the host handed over a window it\n\
              \x20   /// could not have been configured to produce. The activation fails.\n\
+             \x20   #[cfg(target_arch = \"wasm32\")]\n\
              \x20   pub fn of(window: &brenn_guest::PortWindow) -> Result<InPort, brenn_guest::Error> {\n\
              \x20       InPort::from_name(window.port()).ok_or_else(|| {\n\
              \x20           brenn_guest::Error::failed(format!(\n\
@@ -670,8 +689,8 @@ fn write_publish_handles(out: &mut String, ports: &PortNames) {
             "\n/// The payload types this guest publishes on the `{}` port. Bind a type to\n\
              /// the port once, as an impl:\n\
              /// `impl spec::{} for Body<'_> {{}}`\n\
-             pub trait {}: serde::Serialize {{}}\n",
-            port.raw, port.payload_trait, port.payload_trait
+             {}pub trait {}: serde::Serialize {{}}\n",
+            port.raw, port.payload_trait, GUEST_ONLY, port.payload_trait
         );
         let _ = write!(
             out,
@@ -687,10 +706,10 @@ fn write_publish_handles(out: &mut String, ports: &PortNames) {
         }
         let _ = write!(
             out,
-            "pub const fn {}<T: {}>() -> brenn_guest::OutPort<T> {{\n\
+            "{}pub const fn {}<T: {}>() -> brenn_guest::OutPort<T> {{\n\
              \x20   brenn_guest::OutPort::new(\"{}\")\n\
              }}\n",
-            port.handle, port.payload_trait, port.raw
+            GUEST_ONLY, port.handle, port.payload_trait, port.raw
         );
     }
 }
@@ -721,7 +740,7 @@ fn write_grant_reexports(out: &mut String, modules: &[&'static str]) {
          // specification break the guest compile.\n",
     );
     for module in modules {
-        let _ = writeln!(out, "pub use brenn_guest::{module};");
+        let _ = writeln!(out, "{GUEST_ONLY}pub use brenn_guest::{module};");
     }
 }
 

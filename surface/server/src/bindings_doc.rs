@@ -105,7 +105,6 @@ pub fn build_bindings_document(
             .map(|c| ComponentEntry {
                 instance: c.instance.clone(),
                 kind: c.kind.clone(),
-                abi: c.abi,
                 parked_batch_depth: c.parked_batch_depth,
                 grants: c.grants.iter().map(|g| g.word().to_string()).collect(),
                 config: c.config.clone(),

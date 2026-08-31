@@ -73,12 +73,10 @@ brenn-surface-test-fixtures = { path = "../test-fixtures" }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1.50.0", features = ["rt", "time", "macros", "test-util"] }
 
-# Browser-level unit tests (dom.rs, entry.rs) run under wasm-bindgen-test via
-# the browser test runner; wasm32-only so a host test sweep never
-# pulls them. futures-channel scripts the fake connector's transport events; the
-# component-support path dep lets the entry integration test register a real
-# custom element.
+# Browser-level unit tests (dom.rs, entry.rs, dom_host.rs) run under
+# wasm-bindgen-test via the browser test runner; wasm32-only so a host test
+# sweep never pulls them. futures-channel scripts the fake connector's transport
+# events.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = { workspace = true }
 futures-channel = { workspace = true }
-brenn-surface-component-support = { path = "../component-support" }

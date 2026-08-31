@@ -4,9 +4,8 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Abi, Binding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL,
-    LOCAL_TOAST_CHANNEL, LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency,
-    reserved_local_channel,
+    Binding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL, LOCAL_TOAST_CHANNEL,
+    LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency, reserved_local_channel,
 };
 
 use super::AppliedBindings;
@@ -18,7 +17,6 @@ fn component(instance: &str) -> ComponentEntry {
     ComponentEntry {
         instance: instance.to_string(),
         kind: "protobar".to_string(),
-        abi: Abi::Dom,
         parked_batch_depth: 4,
         config: BTreeMap::new(),
         grants: vec![],

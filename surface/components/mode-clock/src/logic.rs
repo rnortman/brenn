@@ -1,8 +1,8 @@
 //! DOM-free mode-clock state machine.
 //!
-//! Every branch here is host-tested. The wasm glue converts each `Err` into a
-//! panic (operator misconfig or shell/proto skew), which the module's panic hook
-//! turns into an error card. A well-formed delivery whose *body* violates the
+//! Every branch here is host-tested. The glue turns each `Err` into a failed
+//! activation (operator misconfig or host/guest skew). A well-formed delivery
+//! whose *body* violates the
 //! config convention is a semi-trusted publisher fault: it keeps the current
 //! config, bumps a page-lifetime counter, and is reported to the operator log —
 //! never a panic. Same posture as protobar's malformed body.
@@ -13,14 +13,56 @@
 //! recompute derives the theme from the current wall time, so a suspend/resume,
 //! NTP step, or DST transition self-corrects on the next boundary recompute.
 
-use brenn_surface_contract::PortWindow;
-use brenn_surface_schema::{THEME_DARK, THEME_LIGHT};
+use brenn_envelope::MessageEnvelope;
 use serde::Deserialize;
 
-use brenn_surface_component_support::parse_delivery;
-pub use brenn_surface_component_support::{ContractViolation, FaultReport};
-
 use crate::spec::port::CONFIG;
+
+// TODO(surface-fault-report): the malformed-body log line and the latest-wins
+// push_depth report below are spelled here because every kind spells its own
+// copies. The home for them is guest-side.
+
+/// A rejected port delivery: the wire boundary itself was violated. Either is
+/// host/guest skew or operator misconfig, and the glue fails the activation on
+/// it rather than carrying on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContractViolation {
+    /// A window arrived on a port this component does not bind.
+    WrongPort { port: String },
+    /// The delivered envelope did not parse as a [`MessageEnvelope`].
+    BadEnvelope(String),
+}
+
+/// Everything the glue needs to emit the operator-visible malformed-body log
+/// line, extracted from the envelope so all formatting stays host-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultReport {
+    pub channel: String,
+    pub sender: String,
+    pub message_id: String,
+    pub reason: String,
+}
+
+impl FaultReport {
+    /// Build a report from the delivering envelope and a validation reason.
+    pub fn new(envelope: &MessageEnvelope, reason: String) -> Self {
+        FaultReport {
+            channel: envelope.channel.clone(),
+            sender: envelope.sender.clone(),
+            message_id: envelope.message_id.to_string(),
+            reason,
+        }
+    }
+
+    /// The operator log line. `context` names what was malformed, so a buggy
+    /// publisher is identifiable.
+    pub fn log_message(&self, context: &str) -> String {
+        format!(
+            "malformed {} on {} from {} (message_id {}): {}",
+            context, self.channel, self.sender, self.message_id, self.reason
+        )
+    }
+}
 
 /// Minutes in a wall-clock day. Membership and boundary math are done in
 /// minutes-since-local-midnight, so no timezone arithmetic is ever needed.
@@ -31,8 +73,7 @@ const MINUTES_PER_DAY: u16 = 24 * 60;
 pub(crate) const DEFAULT_LIGHT_START: u16 = 7 * 60;
 pub(crate) const DEFAULT_DARK_START: u16 = 19 * 60;
 
-/// The computed theme. The wire strings come from the shared `proto::THEME_*`
-/// constants, so the `ThemeBody.theme` values cannot drift from chrome's parser.
+/// The computed theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
     Dark,
@@ -41,10 +82,20 @@ pub enum Theme {
 
 impl Theme {
     /// The `ThemeBody.theme` wire value.
+    ///
+    /// Spelled here rather than shared with the host crate that defines the
+    /// theme axis: this module compiles for wasm32 against the guest crate
+    /// universe, which that crate is not built for today.
+    /// `the_wire_strings_are_the_shared_ones` holds the two spellings equal on
+    /// the host side.
+    ///
+    /// TODO(surface-guest-wire-crate): the second build the sharing would need
+    /// is a mechanism this repo already has for `brenn-envelope`; nobody has
+    /// tried it for the surface schema.
     pub fn as_wire_str(self) -> &'static str {
         match self {
-            Theme::Dark => THEME_DARK,
-            Theme::Light => THEME_LIGHT,
+            Theme::Dark => "dark",
+            Theme::Light => "light",
         }
     }
 }
@@ -169,6 +220,45 @@ pub enum ConfigNote {
     Malformed(FaultReport),
 }
 
+/// One activation window on the `config` port, in the terms this state machine
+/// reads it by: the port it arrived on, and the new envelope documents it
+/// carries, oldest first.
+///
+/// A borrowed view rather than the host's own window type: this module compiles
+/// for the host, where it is unit-tested, and for wasm32 against the guest SDK,
+/// whose window is a different type in a different crate universe. The glue
+/// borrows one into the other.
+pub struct ConfigWindow<'a> {
+    pub port: &'a str,
+    pub new_raw: &'a [String],
+}
+
+/// The body published on the `theme` port: the control-plane version and the
+/// active theme's wire value.
+///
+/// Spelled here rather than taken from the host crate that defines it, for the
+/// crate-universe reason [`Theme::as_wire_str`] gives — including its
+/// TODO(surface-guest-wire-crate); `the_theme_body_is_the_shared_shape` holds
+/// the two equal on the host side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ThemeBody {
+    pub v: u8,
+    pub theme: &'static str,
+}
+
+/// The control-plane version every theme body carries.
+pub const CONTROL_PLANE_VERSION: u8 = 1;
+
+impl ThemeBody {
+    /// The body announcing `theme`.
+    pub fn of(theme: Theme) -> ThemeBody {
+        ThemeBody {
+            v: CONTROL_PLANE_VERSION,
+            theme: theme.as_wire_str(),
+        }
+    }
+}
+
 /// The result of a recompute: what to dispatch now and when to wake next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickPlan {
@@ -255,7 +345,9 @@ fn parse_hhmm(s: &str) -> Option<u16> {
 
 /// Render minutes since midnight as the `HH:MM` wall-clock string
 /// [`parse_hhmm`] accepts — the inverse, so a schedule default stated in the
-/// help sidecar is computed from the constant rather than retyped.
+/// help sidecar is computed from the constant rather than retyped. The sidecar
+/// is generated on the host, which is the only build that has a reader for it.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn fmt_hhmm(minutes: u16) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
@@ -289,7 +381,13 @@ impl ModeClock {
         port: &str,
         envelope_json: &str,
     ) -> Result<ConfigOutcome, ContractViolation> {
-        let envelope = parse_delivery(port, &[CONFIG], envelope_json)?;
+        if port != CONFIG {
+            return Err(ContractViolation::WrongPort {
+                port: port.to_string(),
+            });
+        }
+        let envelope: MessageEnvelope = serde_json::from_str(envelope_json)
+            .map_err(|e| ContractViolation::BadEnvelope(e.to_string()))?;
         match parse_config(&envelope.body) {
             Ok(config) => {
                 self.config = config;
@@ -322,23 +420,27 @@ impl ModeClock {
     /// new message — an idle turn must not be the turn that lets the skew through.
     pub fn on_config_window(
         &mut self,
-        window: &PortWindow,
+        window: ConfigWindow<'_>,
     ) -> Result<Vec<ConfigNote>, ContractViolation> {
         if window.port != CONFIG {
             return Err(ContractViolation::WrongPort {
-                port: window.port.clone(),
+                port: window.port.to_string(),
             });
         }
         let mut notes = Vec::new();
-        if let Some(message) = window.latest_wins_misconfiguration() {
-            notes.push(ConfigNote::Misconfigured(message));
+        if window.new_raw.len() > 1 {
+            notes.push(ConfigNote::Misconfigured(format!(
+                "latest-wins port {:?} presented {} new messages; its binding's push_depth \
+                 should be 1 — coalescing to the latest is the subscription's job, not the \
+                 component's",
+                window.port,
+                window.new_raw.len(),
+            )));
         }
-        let Some(envelope) = window.latest_new() else {
+        let Some(envelope_json) = window.new_raw.last() else {
             return Ok(notes);
         };
-        let envelope_json =
-            serde_json::to_string(envelope).expect("a MessageEnvelope serializes to JSON");
-        if let ConfigOutcome::Malformed(report) = self.on_config(&window.port, &envelope_json)? {
+        if let ConfigOutcome::Malformed(report) = self.on_config(window.port, envelope_json)? {
             notes.push(ConfigNote::Malformed(report));
         }
         Ok(notes)
@@ -442,6 +544,28 @@ mod tests {
             Mode::Dark => Some(Mode::Light),
             Mode::Light => None,
         }
+    }
+
+    /// The malformed-body log line, pinned where it is spelled.
+    ///
+    /// The spelling is duplicated across the surface components on purpose and
+    /// for now (`TODO(surface-fault-report)`), so each copy carries its own
+    /// assertion: an operator greps one vocabulary, and a copy that drifts
+    /// silently drops its kind out of that grep.
+    #[test]
+    fn the_fault_line_names_the_publisher_the_message_and_the_context() {
+        let envelope: MessageEnvelope =
+            serde_json::from_str(&sample_envelope_json("x")).expect("the fixture envelope parses");
+        let line = FaultReport::new(&envelope, "trailing garbage".to_string())
+            .log_message("mode-clock config");
+        assert!(line.contains("malformed mode-clock config"), "{line}");
+        assert!(line.contains("ephemeral:demo"), "{line}");
+        assert!(line.contains("surface:deskbar"), "{line}");
+        assert!(
+            line.contains("00000000-0000-0000-0000-000000000001"),
+            "{line}"
+        );
+        assert!(line.contains("trailing garbage"), "{line}");
     }
 
     /// `ALL` must list every variant exactly once: it is the accepted vocabulary
@@ -703,19 +827,19 @@ mod tests {
 
     // ── The activation-window fold ──────────────────────────────────────────
 
-    /// A `config` window whose first `context.len()` envelopes are retained
-    /// context and the rest new.
-    fn config_window(context: &[serde_json::Value], new: &[serde_json::Value]) -> PortWindow {
-        let envelopes = context
-            .iter()
-            .chain(new.iter())
-            .map(|body| brenn_surface_test_fixtures::sample_envelope(&body.to_string()))
-            .collect();
-        PortWindow {
-            port: CONFIG.to_string(),
-            envelopes,
-            new_from: context.len() as u32,
-            dropped: 0,
+    /// The new envelope documents of a `config` window, oldest first. Retained
+    /// context is not part of the fold, so the window is exactly this list.
+    fn new_raws(new: &[serde_json::Value]) -> Vec<String> {
+        new.iter()
+            .map(|body| sample_envelope_json(&body.to_string()))
+            .collect()
+    }
+
+    /// The window over those documents.
+    fn config_window(new_raw: &[String]) -> ConfigWindow<'_> {
+        ConfigWindow {
+            port: CONFIG,
+            new_raw,
         }
     }
 
@@ -727,14 +851,11 @@ mod tests {
         // is evidence the binding's push_depth is wrong.
         let mut clock = ModeClock::new();
         let notes = clock
-            .on_config_window(&config_window(
-                &[],
-                &[
-                    serde_json::json!({ "mode": "light" }),
-                    serde_json::json!({ "mode": "auto" }),
-                    serde_json::json!({ "mode": "dark" }),
-                ],
-            ))
+            .on_config_window(config_window(&new_raws(&[
+                serde_json::json!({ "mode": "light" }),
+                serde_json::json!({ "mode": "auto" }),
+                serde_json::json!({ "mode": "dark" }),
+            ])))
             .expect("the config port satisfies the contract");
         match notes.as_slice() {
             [ConfigNote::Misconfigured(message)] => {
@@ -755,10 +876,9 @@ mod tests {
         // new snapshot. The context is not re-applied and nothing is reported.
         let mut clock = ModeClock::new();
         let notes = clock
-            .on_config_window(&config_window(
-                &[serde_json::json!({ "mode": "dark" })],
-                &[serde_json::json!({ "mode": "light" })],
-            ))
+            .on_config_window(config_window(&new_raws(&[
+                serde_json::json!({ "mode": "light" }),
+            ])))
             .expect("the config port satisfies the contract");
         assert_eq!(notes, Vec::new());
         assert_eq!(clock.tick(m(23, 0)).dispatch, Some(Theme::Light));
@@ -768,10 +888,7 @@ mod tests {
     fn a_pure_context_config_window_changes_nothing() {
         let mut clock = ModeClock::new();
         let notes = clock
-            .on_config_window(&config_window(
-                &[serde_json::json!({ "mode": "dark" })],
-                &[],
-            ))
+            .on_config_window(config_window(&new_raws(&[])))
             .expect("the config port satisfies the contract");
         assert_eq!(notes, Vec::new());
         // Default `auto` still holds: the context config was never applied.
@@ -788,13 +905,10 @@ mod tests {
             .on_config("config", &config_msg(serde_json::json!({ "mode": "dark" })))
             .unwrap();
         let notes = clock
-            .on_config_window(&config_window(
-                &[],
-                &[
-                    serde_json::json!({ "mode": "light" }),
-                    serde_json::json!({ "mode": "sepia" }),
-                ],
-            ))
+            .on_config_window(config_window(&new_raws(&[
+                serde_json::json!({ "mode": "light" }),
+                serde_json::json!({ "mode": "sepia" }),
+            ])))
             .expect("the config port satisfies the contract");
         assert!(
             matches!(
@@ -808,27 +922,44 @@ mod tests {
         assert_eq!(clock.tick(m(12, 0)).dispatch, Some(Theme::Dark));
     }
 
+    /// The wire strings this module spells are the ones the surface control
+    /// plane defines. The two live in different crate universes — this module
+    /// compiles for wasm32 against the guest SDK's — so the equality is asserted
+    /// rather than had by construction.
     #[test]
-    fn a_dropped_config_is_not_reported() {
-        // Coalescing on a retained latest-wins channel is the subscription
-        // doing its job, not a degradation: the superseded config that passed
-        // the position unserved is exactly the one this window supersedes too.
-        let mut clock = ModeClock::new();
-        let mut window = config_window(&[], &[serde_json::json!({ "mode": "dark" })]);
-        window.dropped = 7;
-        let notes = clock
-            .on_config_window(&window)
-            .expect("the config port satisfies the contract");
-        assert_eq!(notes, Vec::new());
+    fn the_wire_strings_are_the_shared_ones() {
+        assert_eq!(Theme::Dark.as_wire_str(), brenn_surface_schema::THEME_DARK);
+        assert_eq!(
+            Theme::Light.as_wire_str(),
+            brenn_surface_schema::THEME_LIGHT
+        );
+    }
+
+    /// And the body carrying them serializes to what chrome's parser reads,
+    /// field for field, for the same reason.
+    #[test]
+    fn the_theme_body_is_the_shared_shape() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let shared = brenn_surface_schema::ThemeBody {
+                v: brenn_surface_schema::CONTROL_PLANE_VERSION,
+                theme: theme.as_wire_str().to_string(),
+            };
+            assert_eq!(
+                serde_json::to_string(&ThemeBody::of(theme)).expect("a theme body serializes"),
+                serde_json::to_string(&shared).expect("a ThemeBody serializes"),
+            );
+        }
     }
 
     #[test]
     fn a_window_on_a_wrong_port_is_a_contract_violation() {
         let mut clock = ModeClock::new();
-        let mut window = config_window(&[], &[serde_json::json!({ "mode": "dark" })]);
-        window.port = "messages".to_string();
+        let raws = new_raws(&[serde_json::json!({ "mode": "dark" })]);
         assert_eq!(
-            clock.on_config_window(&window),
+            clock.on_config_window(ConfigWindow {
+                port: "messages",
+                new_raw: &raws,
+            }),
             Err(ContractViolation::WrongPort {
                 port: "messages".to_string()
             })
@@ -843,10 +974,11 @@ mod tests {
         // the window happens to carry a new message is a check that lets the
         // skew through until it does.
         let mut clock = ModeClock::new();
-        let mut window = config_window(&[serde_json::json!({ "mode": "dark" })], &[]);
-        window.port = "messages".to_string();
         assert_eq!(
-            clock.on_config_window(&window),
+            clock.on_config_window(ConfigWindow {
+                port: "messages",
+                new_raw: &[],
+            }),
             Err(ContractViolation::WrongPort {
                 port: "messages".to_string()
             })

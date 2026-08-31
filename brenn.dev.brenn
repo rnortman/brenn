@@ -210,12 +210,12 @@ new pfin: Pfin;
 surface dev-stub {
   grants = [subscribe, publish, alert];
   new echo-stub: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in messages <- dev_stub { push_depth = 8; noise = alarm; }
     out out -> dev_stub;
   }
   new chrome: Chrome {
-    grants = [ports, log];
+    grants = [ports, log, dom, page-dom];
     chrome = true;
     in theme <- "local:brenn/theme" { push_depth = 1; }
     in link-state <- "local:brenn/link-state" { push_depth = 1; }
@@ -232,32 +232,32 @@ surface bar {
   grants = [subscribe, publish];
   skin = "bench";
   new p1: Protobar {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
   new p2: Protobar {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in messages <- bar_b;
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
   new p3: Protobar {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in messages <- bar_c;
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
   new mode: ModeClock {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in config <- bar_mode { push_depth = 1; }
     out theme -> "local:brenn/theme";
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
   new meeting: Meeting {
-    grants = [ports, log, takeover];
+    grants = [ports, log, takeover, dom];
     in agenda <- bar_agenda { push_depth = 1; }
     io acks <-> bar_acks;
     out takeover -> "local:brenn/takeover";
@@ -265,7 +265,7 @@ surface bar {
 
   }
   new chrome: Chrome {
-    grants = [ports, log, takeover];
+    grants = [ports, log, dom, page-dom, takeover];
     chrome = true;
     in layout <- bar_layout { push_depth = 1; }
     in theme <- "local:brenn/theme" { push_depth = 1; }
@@ -286,25 +286,25 @@ surface bar-pixel {
   grants = [subscribe, publish];
   skin = "foundry";
   new p1: Protobar {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
   new p2: Protobar {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in messages <- bar_b;
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
   new p3: Protobar {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     in messages <- bar_c;
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
   new meeting: Meeting {
-    grants = [ports, log, takeover];
+    grants = [ports, log, takeover, dom];
     in agenda <- bar_agenda { push_depth = 1; }
     io acks <-> bar_acks;
     out takeover -> "local:brenn/takeover";
@@ -312,7 +312,7 @@ surface bar-pixel {
 
   }
   new chrome: Chrome {
-    grants = [ports, log, takeover];
+    grants = [ports, log, dom, page-dom, takeover];
     chrome = true;
     in layout <- bar_layout { push_depth = 1; }
     in theme <- "local:brenn/theme" { push_depth = 1; }
@@ -335,35 +335,35 @@ surface bar-pixel {
 surface bar-feeder {
   grants = [publish];
   new feed-a: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_a;
   }
   new feed-b: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_b;
   }
   new feed-c: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_c;
   }
   new feed-layout: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_layout;
   }
   new feed-mode: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_mode;
   }
   new feed-agenda: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_agenda;
   }
   new feed-acks: EchoStub {
-    grants = [ports, log];
+    grants = [ports, log, dom];
     out out -> bar_acks;
   }
   new chrome: Chrome {
-    grants = [ports, log];
+    grants = [ports, log, dom, page-dom];
     chrome = true;
     in theme <- "local:brenn/theme" { push_depth = 1; }
     in link-state <- "local:brenn/link-state" { push_depth = 1; }

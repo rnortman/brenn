@@ -226,27 +226,6 @@ fn outbound_ports_colliding_only_as_payload_traits_are_refused() {
     assert_eq!(error.related.len(), 1, "{}", error.render());
 }
 
-/// A dom class writes neither publish handle nor payload trait, so neither
-/// spelling can collide there: `in foo-payload; out foo;` mints one
-/// `FooPayload` under the processor abi and none under dom. The refusal follows
-/// what the emitter writes, not what the mapping could name.
-#[test]
-fn a_dom_class_is_not_refused_for_a_spelling_it_never_emits() {
-    let source = "component Fixture {\n  abi = dom;\n  requires = [ports];\n  \
-                  in foo-payload;\n  out foo;\n  out match;\n}\n";
-    let module = module(source, None);
-    assert!(module.contains("InPort::FooPayload"), "{module}");
-    assert!(
-        module.contains("pub const MATCH: &str = \"match\";"),
-        "{module}"
-    );
-    assert!(!module.contains("pub trait"), "{module}");
-    assert!(!module.contains("pub const fn foo"), "{module}");
-    // The serde import exists for the trait's supertrait alone, so its absence
-    // is the other half of the same branch.
-    assert!(!module.contains("use brenn_guest::serde"), "{module}");
-}
-
 #[test]
 fn an_outbound_port_spelling_a_keyword_is_refused() {
     let error = refusal(&processor("  out match;\n"), None);
@@ -293,6 +272,29 @@ fn declared_capabilities_are_re_exported() {
     assert!(!module.contains("brenn_guest::ports"), "{module}");
 }
 
+/// A UI kind is a processor class that requires the page capabilities, and it
+/// reaches them through the same generated re-export as every other capability.
+/// The two words name two modules: page-DOM authority is reachable only where it
+/// was granted, which is the whole point of it being its own word.
+#[test]
+fn the_page_capabilities_name_a_module_each() {
+    let source = "component Chrome {\n  abi = processor;\n  requires = [ports, dom, page-dom];\n  \
+                  in layout;\n}\n";
+    let chrome = module(source, None);
+    assert!(chrome.contains("pub use brenn_guest::dom;"), "{chrome}");
+    assert!(
+        chrome.contains("pub use brenn_guest::page_dom;"),
+        "{chrome}"
+    );
+
+    // A class granted only the scoped word cannot name the page-wide module.
+    let scoped = "component Panel {\n  abi = processor;\n  requires = [ports, dom];\n  \
+                  in layout;\n}\n";
+    let scoped = module(scoped, None);
+    assert!(scoped.contains("pub use brenn_guest::dom;"), "{scoped}");
+    assert!(!scoped.contains("page_dom"), "{scoped}");
+}
+
 #[test]
 fn an_unknown_grant_word_is_refused() {
     let source = "component Fixture {\n  abi = processor;\n  requires = [ports, telepathy];\n  \
@@ -317,24 +319,6 @@ fn an_unknown_abi_word_is_refused() {
         "{}",
         error.message
     );
-}
-
-// ── what each abi emits ──────────────────────────────────────────────────────
-
-#[test]
-fn the_dom_emission_names_no_guest_sdk() {
-    let source = "component Fixture {\n  abi = dom;\n  requires = [ports, log];\n  in theme;\n  \
-                  out overlay-state;\n}\n";
-    let module = module(source, None);
-    // No window classifier, no publish handles, no capability re-exports: the
-    // dom SDK is free functions over `&str`, so there is nothing to name.
-    assert!(!module.contains("brenn_guest"), "{module}");
-    assert!(!module.contains("pub const fn overlay_state"), "{module}");
-    assert!(
-        module.contains("pub const OVERLAY_STATE: &str = \"overlay-state\";"),
-        "{module}"
-    );
-    assert!(module.contains("pub fn from_name("), "{module}");
 }
 
 #[test]
@@ -415,12 +399,94 @@ fn a_class_with_no_inbound_port_yields_an_uninhabited_enum() {
     );
 }
 
+// ── the host/guest split ─────────────────────────────────────────────────────
+
+/// Every item naming the guest SDK carries the wasm32 gate, and nothing else
+/// does.
+///
+/// A component whose DOM-free half is host-tested compiles this same module for
+/// the host to reach its port names, and the SDK is a wasm32 crate. The goldens
+/// pin the gate by example on the shapes they happen to have; this states the
+/// rule over the whole emission, line by line, so an item added to the emitter
+/// cannot reach the host build ungated.
+#[test]
+fn every_item_naming_the_sdk_is_gated_to_wasm32() {
+    let module = module(
+        &processor("  in orders;\n  out results;\n")
+            .replace("requires = [ports]", "requires = [ports, log, dom]"),
+        None,
+    );
+    let gate = "#[cfg(target_arch = \"wasm32\")]";
+    let mut host_half = String::new();
+    let mut lines = module.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_start() != gate {
+            host_half.push_str(line);
+            host_half.push('\n');
+            continue;
+        }
+        // Drop the item the gate applies to: everything up to the line that
+        // closes it, which is the first balanced `}` for a braced item and the
+        // `;` for a `use`.
+        let mut depth: i32 = 0;
+        let mut braced = false;
+        for item_line in lines.by_ref() {
+            depth += item_line.matches('{').count() as i32;
+            depth -= item_line.matches('}').count() as i32;
+            braced = braced || item_line.contains('{');
+            if braced {
+                if depth <= 0 {
+                    break;
+                }
+            } else if item_line.trim_end().ends_with(';') {
+                break;
+            }
+        }
+    }
+    assert!(
+        !host_half.contains("brenn_guest"),
+        "the host half of the emission names the SDK:\n{host_half}"
+    );
+    assert!(
+        !host_half.contains("serde"),
+        "the host half of the emission names the SDK's serde:\n{host_half}"
+    );
+    assert!(
+        host_half.contains("pub enum InPort"),
+        "the gate stripping ate the port enum:\n{host_half}"
+    );
+}
+
+/// The port names are plain Rust and reach both builds, which is what lets a
+/// host-tested state machine and its help generator name their ports through
+/// the specification rather than by literal.
+#[test]
+fn the_port_names_reach_the_host_build() {
+    let module = module(&processor("  in orders;\n  out results;\n"), None);
+    let (_, names) = module
+        .split_once("pub mod port {")
+        .expect("the emission carries a port-name module");
+    let names = names
+        .split_once("\n}")
+        .expect("the port-name module closes")
+        .0;
+    assert!(!names.contains("cfg(target_arch"), "{module}");
+    assert!(
+        names.contains("pub const ORDERS: &str = \"orders\";"),
+        "{module}"
+    );
+    assert!(
+        names.contains("pub const RESULTS: &str = \"results\";"),
+        "{module}"
+    );
+}
+
 /// The corpus fixtures the goldens are built from parse and generate here too,
 /// so a fixture that stops being generatable fails as a test rather than as a
 /// build action nobody reads.
 #[test]
 fn every_golden_fixture_generates() {
-    for name in ["processor-full", "dom-full", "no-inbound", "no-outbound"] {
+    for name in ["processor-full", "no-inbound", "no-outbound", "no-ports"] {
         let source = support::corpus_text(&format!("scaffold/{name}.brenn"));
         let file = parse_str(&source, name).unwrap_or_else(|error| panic!("{}", error.render()));
         generate(&file, None, name, name)

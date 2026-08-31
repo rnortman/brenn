@@ -17,19 +17,77 @@
 //! messages the router routes, so no other vantage point on the page can report
 //! which overlay is up.
 
-use brenn_surface_contract::PortWindow;
-use brenn_surface_schema as proto;
-use brenn_surface_schema::layout::{LayoutDoc, LayoutKind, Panel};
-use brenn_surface_schema::{
-    InstanceState, LinkState, LinkStateBody, LogLevel, SurfaceStateBody, TakeoverAction,
-    TakeoverBody, ThemeBody, ToastBody, ToastSeverity, ToastSource,
+use brenn_envelope::MessageEnvelope;
+
+use crate::layout::{LayoutDoc, LayoutKind, Panel};
+use crate::wire::{
+    CONTROL_PLANE_VERSION, InstanceState, LinkState, LinkStateBody, OverlayStateBody,
+    SurfaceStateBody, THEME_DARK, THEME_LIGHT, TakeoverAction, TakeoverBody, ThemeBody, ToastBody,
+    ToastSeverity, ToastSource,
 };
+
+/// The severity of a breadcrumb [`ChromeAction::Log`] carries.
+///
+/// Chrome's own three rungs, not the kernel's five: this is the argument to a
+/// guest-SDK log call, not a wire body, so it is spelled for what chrome emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Debug,
+    Warn,
+    Error,
+}
+
+/// One activation window on a bound input port, in the terms this core reads it
+/// by: the port it arrived on, the retained context it rode in with, and the new
+/// envelope documents it carries — each oldest first, as delivered JSON.
+///
+/// A borrowed view rather than either host's own window type: this module
+/// compiles for the host, where it is unit-tested, and for wasm32 against the
+/// guest SDK, whose window is a different type in a different crate universe.
+/// The glue borrows one into the other.
+///
+/// `context_raw` is carried and never folded. Holding it makes the skip a
+/// decision this core takes and a host test can pin, rather than something the
+/// caller happened not to hand over.
+pub struct ActivationWindow<'a> {
+    pub port: &'a str,
+    pub context_raw: &'a [String],
+    pub new_raw: &'a [String],
+}
+
+impl ActivationWindow<'_> {
+    // TODO(surface-fault-report): the latest-wins report below is spelled here
+    // because the shared home was a host-only crate the guest universe cannot
+    // link; a guest-side home takes this copy and the four others with it.
+
+    /// The operator-facing report for a latest-wins port handed more than one
+    /// new message, or `None` when this window carries at most one.
+    ///
+    /// More than one new message on a latest-wins port means the binding's
+    /// `push_depth` exceeds 1: coalescing to the latest is the subscription's
+    /// job, and a binding that declines to do it makes every consumer redo it.
+    /// Chrome applies the latest and keeps working, so this is a normal error to
+    /// the operator — the only place the fault is detectable, since latest-wins
+    /// is component semantics no config layer knows.
+    fn latest_wins_misconfiguration(&self) -> Option<String> {
+        if self.new_raw.len() <= 1 {
+            return None;
+        }
+        Some(format!(
+            "latest-wins port {:?} presented {} new messages; its binding's \
+             push_depth should be 1 — coalescing to the latest is the \
+             subscription's job, not the component's",
+            self.port,
+            self.new_raw.len()
+        ))
+    }
+}
 
 /// The runtime theme axis — a device-local cosmetic override orthogonal to the
 /// config-time skin. Chrome writes it as `data-theme` on `<body>`; skins that
 /// opt in compose per-theme token overrides against it.
 ///
-/// The wire strings are the frozen `proto::THEME_*` constants, shared with any
+/// The wire strings are the frozen `THEME_*` constants, shared with any
 /// theme-driving component so a theme published on `local:brenn/theme` carries
 /// the same vocabulary chrome parses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +103,8 @@ impl Theme {
     /// The frozen wire string written to the `data-theme` attribute.
     pub fn as_wire_str(self) -> &'static str {
         match self {
-            Theme::Dark => proto::THEME_DARK,
-            Theme::Light => proto::THEME_LIGHT,
+            Theme::Dark => THEME_DARK,
+            Theme::Light => THEME_LIGHT,
         }
     }
 
@@ -54,8 +112,8 @@ impl Theme {
     /// malformed theme is dropped-and-reported, never coerced.
     pub fn from_wire_str(s: &str) -> Option<Self> {
         match s {
-            proto::THEME_DARK => Some(Theme::Dark),
-            proto::THEME_LIGHT => Some(Theme::Light),
+            THEME_DARK => Some(Theme::Dark),
+            THEME_LIGHT => Some(Theme::Light),
             _ => None,
         }
     }
@@ -148,7 +206,7 @@ pub enum ChromeAction {
     /// the component-log plane; chrome never panics on a bad plane payload.
     Log { level: LogLevel, message: String },
     /// Publish chrome's overlay holdership on [`OVERLAY_STATE`]. `body` is
-    /// the serialized [`proto::OverlayStateBody`] for the transition that just
+    /// the serialized [`OverlayStateBody`] for the transition that just
     /// folded — emitted on every transition and only on a transition, so the
     /// plane carries no heartbeat.
     PublishOverlayState { body: String },
@@ -317,6 +375,16 @@ impl ChromeCore {
             toasts: Vec::new(),
             next_toast_id: 0,
         }
+    }
+
+    /// Name the instance this core runs as, which it excludes from every
+    /// arrangement.
+    ///
+    /// The page glue learns the name by matching its own kernel wrapper against
+    /// the surface-state roster, so it is known only once the first roster
+    /// arrives — before which there is nothing to arrange anyway.
+    pub fn set_self_instance(&mut self, instance: String) {
+        self.self_instance = instance;
     }
 
     /// The current banner state.
@@ -616,23 +684,16 @@ impl ChromeCore {
         self.toasts.iter().filter_map(|t| t.expires_at).min()
     }
 
-    /// The wall-clock instant the DOM half parks its next expiry wake at, given
-    /// this activation's reading of both clocks — or `None` when nothing live
-    /// expires, which is why a page with no expiring toast never wakes.
+    /// The instant the glue parks its next expiry wake at, or `None` when
+    /// nothing live expires — which is why a page with no expiring toast never
+    /// wakes.
     ///
-    /// Two clocks meet here. A toast lifetime is a *duration*, judged on the
-    /// page's monotonic clock so an NTP step or a suspend/resume jump cannot
-    /// expire every live toast at once; the kernel parks against the wall clock.
-    /// So what crosses is the remaining duration, aimed from the wall reading of
-    /// the same activation. A wall-clock jump between park and release then fires
-    /// the wake early or late, and the sweep still judges monotonically: an early
-    /// wake dismisses nothing and re-parks, a late one is a toast that lingered.
-    ///
-    /// An expiry already past yields the activation's own wall instant — a wake
-    /// due immediately, which is what an unswept expiry deserves.
-    pub fn next_wake(&self, now_mono: u64, now_wall: u64) -> Option<u64> {
-        self.next_expiry()
-            .map(|expires_at| now_wall + expires_at.saturating_sub(now_mono))
+    /// One clock: every instant here is the activation's own wall-clock reading,
+    /// which is what the kernel parks a deferred publish against. An expiry
+    /// already past yields that reading unchanged — a wake due immediately,
+    /// which is what an unswept expiry deserves.
+    pub fn next_wake(&self, now_ms: u64) -> Option<u64> {
+        self.next_expiry().map(|expires_at| expires_at.max(now_ms))
     }
 
     /// The active toast ids, in show order.
@@ -649,14 +710,13 @@ impl ChromeCore {
     }
 
     /// The overlay-state publish for the transition just folded: the post-fold
-    /// [`Self::overlay`] value, stamped with the page-monotonic reading of the
-    /// fold.
+    /// [`Self::overlay`] value, stamped with the activation reading of the fold.
     ///
-    /// Built here rather than in the DOM half so the payload chrome puts on the
-    /// bus is host-tested like every other decision.
+    /// Built here rather than in the page glue so the payload chrome puts on
+    /// the bus is host-tested like every other decision.
     fn overlay_state_action(&self, now_ms: u64) -> ChromeAction {
-        let body = proto::OverlayStateBody {
-            v: proto::CONTROL_PLANE_VERSION,
+        let body = OverlayStateBody {
+            v: CONTROL_PLANE_VERSION,
             holder: self.overlay.clone(),
             since_stamp: now_ms,
         };
@@ -667,7 +727,10 @@ impl ChromeCore {
 }
 
 use crate::spec::InPort;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::spec::port::OVERLAY_STATE;
+#[cfg(not(target_arch = "wasm32"))]
+use brenn_surface_schema as proto;
 
 /// How a chrome port's new slice is folded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,6 +774,10 @@ fn fold_class(port: Option<InPort>) -> FoldClass {
 }
 
 /// What to bind a chrome port to.
+///
+/// The help generator is this type's only reader, and it runs on the host: the
+/// plane addresses below come from `brenn-surface-schema`, a host-graph crate.
+#[cfg(not(target_arch = "wasm32"))]
 pub enum PortChannel {
     /// A fixed reserved plane address, named exactly.
     Address(&'static str),
@@ -724,6 +791,7 @@ pub enum PortChannel {
 /// The `port` and `channel` fields hold the same constants the code binds and
 /// parses, so a rename reaches the published doc as a compile error rather than
 /// as silence.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct PortDoc {
     /// The port name, as declared in config on the chrome instance.
     pub port: &'static str,
@@ -739,6 +807,7 @@ pub struct PortDoc {
 /// Exhaustive over [`InPort`], which the specification generates: a port added
 /// to the specification fails to compile here until it is given a row or
 /// explicitly refused one.
+#[cfg(not(target_arch = "wasm32"))]
 fn input_port_doc(port: InPort) -> Option<PortDoc> {
     let (channel, carries) = match port {
         InPort::Layout => (
@@ -778,11 +847,13 @@ fn input_port_doc(port: InPort) -> Option<PortDoc> {
 }
 
 /// Chrome's operator-bindable input ports, in specification order.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn input_port_docs() -> Vec<PortDoc> {
     InPort::ALL.into_iter().filter_map(input_port_doc).collect()
 }
 
 /// Chrome's one output port row.
+#[cfg(not(target_arch = "wasm32"))]
 pub const OUTPUT_PORT_DOC: PortDoc = PortDoc {
     port: OVERLAY_STATE,
     channel: PortChannel::Address(proto::LOCAL_OVERLAY_STATE_CHANNEL),
@@ -827,9 +898,13 @@ pub fn fold(core: &mut ChromeCore, port: &str, body: &str, now_ms: u64) -> Vec<C
 /// misconfiguration — an error, because the binding's `push_depth` is wrong and
 /// only the operator can fix it, and chrome carries on with the latest either
 /// way.
-pub fn fold_window(core: &mut ChromeCore, window: &PortWindow, now_ms: u64) -> Vec<ChromeAction> {
+pub fn fold_window(
+    core: &mut ChromeCore,
+    window: &ActivationWindow<'_>,
+    now_ms: u64,
+) -> Vec<ChromeAction> {
     let mut actions = Vec::new();
-    match fold_class(InPort::from_name(&window.port)) {
+    match fold_class(InPort::from_name(window.port)) {
         FoldClass::LatestWins => {
             if let Some(message) = window.latest_wins_misconfiguration() {
                 actions.push(ChromeAction::Log {
@@ -837,17 +912,38 @@ pub fn fold_window(core: &mut ChromeCore, window: &PortWindow, now_ms: u64) -> V
                     message,
                 });
             }
-            if let Some(envelope) = window.latest_new() {
-                actions.extend(fold(core, &window.port, &envelope.body, now_ms));
+            if let Some(raw) = window.new_raw.last() {
+                fold_delivery(core, window.port, raw, now_ms, &mut actions);
             }
         }
         FoldClass::EventStream => {
-            for envelope in window.new_envelopes() {
-                actions.extend(fold(core, &window.port, &envelope.body, now_ms));
+            for raw in window.new_raw {
+                fold_delivery(core, window.port, raw, now_ms, &mut actions);
             }
         }
     }
     actions
+}
+
+/// Fold one delivered envelope's body, or report the envelope as malformed.
+///
+/// A delivery that does not parse as an envelope is host/guest skew, not
+/// untrusted content — but chrome renders the page, so it reports and carries on
+/// rather than trapping and taking the whole surface's shell down with it.
+fn fold_delivery(
+    core: &mut ChromeCore,
+    port: &str,
+    raw: &str,
+    now_ms: u64,
+    actions: &mut Vec<ChromeAction>,
+) {
+    match serde_json::from_str::<MessageEnvelope>(raw) {
+        Ok(envelope) => actions.extend(fold(core, port, &envelope.body, now_ms)),
+        Err(err) => actions.push(ChromeAction::Log {
+            level: LogLevel::Error,
+            message: format!("chrome could not read a delivery on port {port:?}: {err}"),
+        }),
+    }
 }
 
 // Host-only: native `#[test]`s run in every `make check`. Excluded from the
@@ -858,10 +954,11 @@ mod tests {
     use crate::spec::port::{
         LAYOUT, LINK_STATE, SURFACE_STATE, TAKEOVER, THEME, TOAST, TOAST_TICK,
     };
-    use brenn_surface_schema::{CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, SurfaceStateInstance};
+    use crate::wire::SurfaceStateInstance;
+    use brenn_surface_schema::LOCAL_TOAST_CHANNEL;
     use serde_json::json;
 
-    /// The monotonic reading every fold in this suite is given. Fixed: only the
+    /// The clock reading every fold in this suite is given. Fixed: only the
     /// overlay-state stamp reads it, and no test here asserts on elapsed time.
     const NOW: u64 = 1_000;
 
@@ -1274,17 +1371,38 @@ mod tests {
 
     /// A window on `port` whose first `context.len()` envelopes are retained
     /// context and the rest new.
-    fn port_window(port: &str, context: &[String], new: &[String]) -> PortWindow {
-        let envelopes = context
-            .iter()
-            .chain(new.iter())
-            .map(|body| brenn_surface_test_fixtures::sample_envelope(body))
-            .collect();
-        PortWindow {
+    fn port_window(port: &str, context: &[String], new: &[String]) -> OwnedWindow {
+        let wrap = |bodies: &[String]| -> Vec<String> {
+            bodies
+                .iter()
+                .map(|body| {
+                    serde_json::to_string(&brenn_surface_test_fixtures::sample_envelope(body))
+                        .expect("the sample envelope serializes")
+                })
+                .collect()
+        };
+        OwnedWindow {
             port: port.to_string(),
-            envelopes,
-            new_from: context.len() as u32,
-            dropped: 0,
+            context_raw: wrap(context),
+            new_raw: wrap(new),
+        }
+    }
+
+    /// The owned backing of an [`ActivationWindow`], since the core's view
+    /// borrows its slices.
+    struct OwnedWindow {
+        port: String,
+        context_raw: Vec<String>,
+        new_raw: Vec<String>,
+    }
+
+    impl OwnedWindow {
+        fn view(&self) -> ActivationWindow<'_> {
+            ActivationWindow {
+                port: &self.port,
+                context_raw: &self.context_raw,
+                new_raw: &self.new_raw,
+            }
         }
     }
 
@@ -1297,7 +1415,7 @@ mod tests {
         let mut c = core();
         seed_three(&mut c);
         let window = port_window(TAKEOVER, &[takeover(TakeoverAction::Release, "p2")], &[]);
-        assert_eq!(fold_window(&mut c, &window, 0), Vec::new());
+        assert_eq!(fold_window(&mut c, &window.view(), 0), Vec::new());
     }
 
     #[test]
@@ -1319,7 +1437,7 @@ mod tests {
         assert!(c.overlay.is_none());
 
         let window = port_window(TAKEOVER, &[takeover(TakeoverAction::Request, "p2")], &[]);
-        assert_eq!(fold_window(&mut c, &window, 0), Vec::new());
+        assert_eq!(fold_window(&mut c, &window.view(), 0), Vec::new());
         assert!(c.overlay.is_none());
     }
 
@@ -1336,14 +1454,95 @@ mod tests {
         // Chrome starts dark; the window's context is a light value it has
         // already seen and its new slice restates dark.
         let window = port_window(THEME, std::slice::from_ref(&light), &[dark]);
-        assert_eq!(fold_window(&mut c, &window, NOW), Vec::new());
+        assert_eq!(fold_window(&mut c, &window.view(), NOW), Vec::new());
         assert_eq!(c.theme(), Theme::Dark);
 
         // And the new slice still reaches the page, on this port as on takeover.
         let window = port_window(THEME, &[], &[light]);
         assert_eq!(
-            fold_window(&mut c, &window, NOW),
+            fold_window(&mut c, &window.view(), NOW),
             vec![ChromeAction::SetTheme(Theme::Light)]
+        );
+    }
+
+    /// A window whose new slice is handed over verbatim, so the fold meets a
+    /// document that is not a `MessageEnvelope`.
+    fn unwrapped_window(port: &str, new: &[&str]) -> OwnedWindow {
+        OwnedWindow {
+            port: port.to_string(),
+            context_raw: Vec::new(),
+            new_raw: new.iter().map(|raw| (*raw).to_string()).collect(),
+        }
+    }
+
+    /// The one error log in `actions`, or a panic naming what was there instead.
+    fn only_error(actions: &[ChromeAction]) -> &str {
+        let mut errors = actions.iter().filter_map(|action| match action {
+            ChromeAction::Log {
+                level: LogLevel::Error,
+                message,
+            } => Some(message.as_str()),
+            _ => None,
+        });
+        let first = errors
+            .next()
+            .unwrap_or_else(|| panic!("no error log in {actions:?}"));
+        assert!(errors.next().is_none(), "more than one error: {actions:?}");
+        first
+    }
+
+    #[test]
+    fn a_latest_wins_delivery_that_is_not_an_envelope_is_reported_and_folds_nothing() {
+        // Chrome is the one kind that does not fail its activation on a bad
+        // envelope: it renders the page, and trapping would take the shell down
+        // with it. So the arm is a report, and the page it was rendering is
+        // untouched — the theme it already holds still stands.
+        let mut c = core();
+        let window = unwrapped_window(THEME, &["{"]);
+        let actions = fold_window(&mut c, &window.view(), NOW);
+        assert!(only_error(&actions).contains(THEME), "{actions:?}");
+        assert_eq!(c.theme(), Theme::Dark);
+        assert!(actions.iter().all(|action| matches!(
+            action,
+            ChromeAction::Log {
+                level: LogLevel::Error,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_well_formed_json_document_that_is_not_an_envelope_is_reported_too() {
+        // The layer under test is the envelope, not the body: a document with
+        // every other field and no `body` parses as JSON and still is not a
+        // delivery, so it must not reach the layout parser.
+        let mut c = core();
+        let window = unwrapped_window(LAYOUT, &[&json!({ "v": 1, "kind": "single" }).to_string()]);
+        let actions = fold_window(&mut c, &window.view(), NOW);
+        assert!(only_error(&actions).contains(LAYOUT), "{actions:?}");
+        assert!(
+            placed(&actions).is_empty(),
+            "the layout parser never saw it: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_delivery_does_not_stop_its_siblings_in_the_same_window() {
+        // An event-stream port folds every new message, so one skewed publisher
+        // must cost its own message and nothing else in the window.
+        let mut c = core();
+        let good = serde_json::to_string(&brenn_surface_test_fixtures::sample_envelope(
+            &toast_body(ToastSeverity::Warning, "still shown"),
+        ))
+        .expect("the sample envelope serializes");
+        let window = unwrapped_window(TOAST, &["not an envelope", &good]);
+        let actions = fold_window(&mut c, &window.view(), NOW);
+        assert!(only_error(&actions).contains(TOAST), "{actions:?}");
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ChromeAction::ShowToast { text, .. } if text == "still shown")),
+            "{actions:?}"
         );
     }
 
@@ -1391,7 +1590,7 @@ mod tests {
             &[],
             &[layout_doc("p1"), layout_doc("p2"), layout_doc("p3")],
         );
-        let actions = fold_window(&mut c, &window, NOW);
+        let actions = fold_window(&mut c, &window.view(), NOW);
         assert_eq!(placed(&actions), vec![vec!["p3".to_string()]]);
 
         // And the window itself is the report: three new messages on a
@@ -1415,7 +1614,7 @@ mod tests {
             &[layout_doc("p1"), layout_doc("p2")],
             &[layout_doc("p3")],
         );
-        let actions = fold_window(&mut c, &window, NOW);
+        let actions = fold_window(&mut c, &window.view(), NOW);
         assert_eq!(placed(&actions), vec![vec!["p3".to_string()]]);
         assert_eq!(logs_at(&actions, LogLevel::Error), Vec::<String>::new());
     }
@@ -1435,7 +1634,7 @@ mod tests {
         );
 
         let window = port_window(LAYOUT, &[], &[layout_doc("p1"), layout_doc("ghost")]);
-        let actions = fold_window(&mut c, &window, NOW);
+        let actions = fold_window(&mut c, &window.view(), NOW);
         assert!(placed(&actions).is_empty(), "{actions:?}");
         assert_eq!(c.base_layout.as_ref().unwrap().panels["a"].instance, "p2");
         // Two reports: the misconfigured depth and the rejected doc.
@@ -1457,7 +1656,7 @@ mod tests {
                 takeover(TakeoverAction::Release, "p2"),
             ],
         );
-        let actions = fold_window(&mut c, &window, 0);
+        let actions = fold_window(&mut c, &window.view(), 0);
         let takeovers: Vec<bool> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1511,7 +1710,7 @@ mod tests {
         // Chrome starts dark, so a fold-all would flip the page light and back:
         // one SetTheme(Light) this assertion would see.
         let window = port_window(THEME, &[], &[light, dark]);
-        let actions = fold_window(&mut c, &window, NOW);
+        let actions = fold_window(&mut c, &window.view(), NOW);
         assert_eq!(
             actions
                 .iter()
@@ -1538,7 +1737,7 @@ mod tests {
                 toast_body(ToastSeverity::Info, "second"),
             ],
         );
-        let actions = fold_window(&mut c, &window, NOW);
+        let actions = fold_window(&mut c, &window.view(), NOW);
         let shown: Vec<String> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1562,7 +1761,7 @@ mod tests {
             &[json!({}).to_string()],
             &[json!({}).to_string(), json!({}).to_string()],
         );
-        let actions = fold_window(&mut c, &window, NOW);
+        let actions = fold_window(&mut c, &window.view(), NOW);
         let warns = logs_at(&actions, LogLevel::Warn);
         assert_eq!(warns.len(), 2, "{actions:?}");
         assert!(warns[0].contains("unbound port"), "{}", warns[0]);
@@ -1571,7 +1770,7 @@ mod tests {
     // ── Overlay-state publishes ─────────────────────────────────────────────
 
     /// The overlay-state bodies a fold published, parsed.
-    fn overlay_states(actions: &[ChromeAction]) -> Vec<proto::OverlayStateBody> {
+    fn overlay_states(actions: &[ChromeAction]) -> Vec<OverlayStateBody> {
         actions
             .iter()
             .filter_map(|a| match a {
@@ -1778,9 +1977,7 @@ mod tests {
     #[test]
     fn the_wake_is_the_soonest_live_expiry_and_absent_while_nothing_expires() {
         let mut c = core();
-        // Same instant on both clocks here, so the arithmetic is visible; the
-        // conversion itself is pinned below.
-        let wake = |c: &ChromeCore, now: u64| c.next_wake(now, now);
+        let wake = |c: &ChromeCore, now: u64| c.next_wake(now);
         assert_eq!(wake(&c, 0), None, "nothing live, nothing to wake for");
         // An error toast never expires, so it warrants no wake.
         c.on_toast(&toast_body(ToastSeverity::Error, "e"), 0);
@@ -1803,28 +2000,19 @@ mod tests {
         assert_eq!(wake(&c, 500), Some(500 + TOAST_TTL_MS));
     }
 
-    /// The wake is a monotonic *duration* aimed from the activation's wall
-    /// reading. The two clocks share no origin, so treating an expiry instant as
-    /// a wall instant would park every wake decades off with nothing else
-    /// noticing — the page would simply stop expiring toasts.
+    /// An expiry the sweep has not reached yet parks a wake at the activation's
+    /// own instant, never behind it: a park in the past is a park the kernel
+    /// releases immediately, and one arithmetic slip the other way would stop
+    /// the page expiring toasts at all with nothing else noticing.
     #[test]
-    fn the_wake_carries_the_remaining_duration_onto_the_wall_clock() {
+    fn an_overdue_expiry_wakes_now_rather_than_in_the_past() {
         let mut c = core();
-        // Page has been up 30 s; the wall clock is an epoch reading that shares
-        // no origin with it.
         let wall = 1_770_000_000_000;
-        c.on_toast(&toast_body(ToastSeverity::Info, "i"), 30_000);
-        // A second into the toast's life: a TTL less that second remains.
+        c.on_toast(&toast_body(ToastSeverity::Info, "i"), wall);
+        assert_eq!(c.next_wake(wall + 1_000), Some(wall + TOAST_TTL_MS));
         assert_eq!(
-            c.next_wake(31_000, wall + 1_000),
-            Some(wall + 1_000 + TOAST_TTL_MS - 1_000)
-        );
-        // An expiry already behind the reading is due now, not in the past: the
-        // saturating floor is what keeps an unswept toast from parking a wake
-        // before the instant it is parked at.
-        assert_eq!(
-            c.next_wake(30_000 + TOAST_TTL_MS * 2, wall),
-            Some(wall),
+            c.next_wake(wall + TOAST_TTL_MS * 2),
+            Some(wall + TOAST_TTL_MS * 2),
             "an overdue expiry wakes immediately"
         );
     }
@@ -1900,9 +2088,9 @@ mod tests {
     fn an_expired_toast_leaves_no_wake_behind() {
         let mut c = core();
         c.on_toast(&toast_body(ToastSeverity::Warning, "w"), 0);
-        assert_eq!(c.next_wake(0, 0), Some(TOAST_TTL_MS));
+        assert_eq!(c.next_wake(0), Some(TOAST_TTL_MS));
         c.tick(TOAST_TTL_MS);
-        assert_eq!(c.next_wake(TOAST_TTL_MS, TOAST_TTL_MS), None);
+        assert_eq!(c.next_wake(TOAST_TTL_MS), None);
     }
 
     #[test]

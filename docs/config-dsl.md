@@ -263,9 +263,12 @@ instance may leave unwired, and the capabilities the component needs:
 /// overlay-holdership reporting. A surface with no layout channel renders the
 /// default layout, and one with no takeover plane has no overlay to hold, so
 /// those three ports are optional.
+/// Draws the connection banner and the toast container, so it holds `dom`; it
+/// also arranges every other instance's wrapper and stamps the page's theme and
+/// takeover state, which is what `page-dom` is for.
 component Chrome {
-  abi = dom;
-  requires = [ports, log];
+  abi = processor;
+  requires = [ports, log, dom, page-dom];
   optional = [takeover];
   optional in layout;
   in theme: "brenn.surface.theme@1";
@@ -278,11 +281,9 @@ component Chrome {
 }
 ```
 
-- `abi` is `dom` (runs in a page, against the DOM) or `processor` (headless).
-  One thing in the class vocabulary is conditioned on it — the `optional`
-  capability list, which only a dom class may write (see *Authority* below).
-  Everything else a dom component declares, a processor one declares the same
-  way.
+- `abi` is `processor`, the one artifact shape both hosts load. Where an
+  instance runs is decided by where it is placed and what it is granted, not by
+  the word.
 - A port is `in` (the component receives on it), `out` (it publishes on it), or
   `io` (both).
 - `optional` before the direction is the author saying an instance may
@@ -291,14 +292,14 @@ component Chrome {
   otherwise, pointing at the `new` statement and at the port's declaration.
 - `: "<tag>"` on a port is its **doctype** — the document contract a binding
   must agree with. See below.
-- `requires` and `optional` are the capability lists. `optional` is a dom-only
-  list; a processor class states everything it needs in `requires`. See
-  *Authority* below.
+- `requires` and `optional` are the capability lists. A class states every
+  capability it reaches through a WIT import in `requires`; only a word with no
+  interface behind it may be optional. See *Authority* below.
 
 The class carries the contract; **instances never restate it**. Neither does the
 deployment restate where the artifact lives: a top-level instance is resolved
 from the package its class's module names, and a surface-placed instance from
-its kind (`brenn-<kind>`).
+its kind, which names the transpiled tree the page instantiates.
 
 **A top-level instance's class comes from a packaged module.** A consumer is
 loaded from an installed component package, and the package is the module the
@@ -638,22 +639,22 @@ what it needs; an instance states what it is given; both directions are checked:
 - every granted word must appear in `requires ∪ optional` — a grant the class
   never asked for is refused, because the spec is the vocabulary.
 
-`requires` is written by every class, both abis: a component that needs nothing
-writes `requires = [];`. **`optional` is a dom-only list.** A processor reaches
-a capability through a WIT import, and the host links that interface only where
-the instance was granted the word; an artifact cannot import conditionally. So
-an optional grant on a processor class is unexercisable in both directions — an
-artifact that imports the interface panics at load under an instance that omits
-the word, and an artifact that does not import it is unchanged by holding it.
-The word is refused where it is written, and the fix is to move it into
-`requires` or drop it from the spec. A dom class keeps `optional`, because a
-surface grant is not an import the linker decides.
+`requires` is written by every class: a component that needs nothing writes
+`requires = [];`. **Only a word with no interface behind it may be optional.** A
+component reaches a capability through a WIT import, and the host links that
+interface only where the instance was granted the word; an artifact cannot
+import conditionally. So an optional *interface* grant is unexercisable in both
+directions — an artifact that imports the interface panics at load under an
+instance that omits the word, and an artifact that does not import it is
+unchanged by holding it. The word is refused where it is written, and the fix is
+to move it into `requires` or drop it from the spec. `takeover` is the exception
+that shows the rule: it names no interface, being consent to a binding the page
+gates, so nothing links conditionally and a surface where no component requests
+the overlay hands its chrome no takeover plane to bind.
 
-A dom class may not require a word that no page can
-implement — that spec would be unsatisfiable at every legal placement — and a
-processor class requiring `store` placed on a surface refuses twice, once for
-host legality and once for the missing grant. Both diagnostics are true and
-point at the same contradiction.
+A class requiring `store` placed on a surface refuses twice, once for host
+legality and once for the missing grant. Both diagnostics are true and point at
+the same contradiction.
 
 ## Ownership
 
@@ -684,7 +685,7 @@ artifact is from another one.
 
 This holds at **both placements**. A backend component's carrier is the package
 beside its `.wasm`; a surface-placed component's is the record its build emits
-into the surface asset tree, per kind and per abi. One practical consequence,
+into the surface asset tree, per kind. One practical consequence,
 also at both placements: a class declared inline in a deployment's own
 configuration cannot drive a component instance, because its file is not the
 author's file byte for byte.

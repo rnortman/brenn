@@ -38,9 +38,7 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
             .iter()
             // Never run through asset validation, so `minimal`'s empty binding
             // hash has nothing to bind to.
-            .map(|(instance, kind)| {
-                ResolvedComponent::minimal(instance, kind, brenn_surface_schema::Abi::Dom)
-            })
+            .map(|(instance, kind)| ResolvedComponent::minimal(instance, kind))
             .collect(),
         subscriptions,
         wire_subscriptions: vec![],
@@ -282,7 +280,7 @@ fn kind_help_embeds_sidecar_verbatim_under_header() {
     let help = build_kind_help("protobar", &surfaces, dir.path(), "2026-07-13T00:00:00Z");
     // Generated header names the kind, module, and mounting surface/channel.
     assert!(help.contains("Component kind `protobar`"));
-    assert!(help.contains("brenn_protobar.js"));
+    assert!(help.contains("processor/protobar/protobar.js"));
     assert!(help.contains("surface `bar`"));
     assert!(help.contains("brenn:bar-p1"));
     // Sidecar body verbatim.

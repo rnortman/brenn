@@ -175,44 +175,25 @@ format_goldens(name = "config")
 
 scaffold_goldens(name = "processor-full")
 
-scaffold_goldens(name = "dom-full")
-
 scaffold_goldens(name = "no-inbound")
 
 scaffold_goldens(name = "no-outbound")
 
-scaffold_goldens(name = "dom-no-inbound")
+scaffold_goldens(name = "no-ports")
 
-scaffold_goldens(name = "dom-no-ports")
-
-# The dom goldens, compiled. A golden is otherwise only ever diffed, so nothing
-# asks rustc or clippy whether the emitter's output is valid Rust — and the
-# shapes no in-tree component has (an uninhabited port enum, a class with no
-# ports) are exactly the ones an out-of-tree author would meet first. The dom
-# emission needs no wasm32 target and no component hub: it names no guest SDK.
-rust_library(
-    name = "scaffold_goldens_compile",
-    srcs = [
-        "tests/corpus/scaffold/dom-full.rs",
-        "tests/corpus/scaffold/dom-no-inbound.rs",
-        "tests/corpus/scaffold/dom-no-ports.rs",
-        "tests/scaffold_goldens_compile.rs",
-    ],
-    crate_root = "tests/scaffold_goldens_compile.rs",
-    edition = "2024",
-)
-
-# The processor goldens, compiled the only way they can be: against the guest
-# SDK, for wasm32. The in-tree components cover the shapes they happen to have,
-# and no in-tree processor has zero inbound ports — so the uninhabited enum with
-# its `match self {}` name function and its always-`None` `from_name` would
-# otherwise be diffed and never built, and the first deferred-only component
-# would be where the emitter's mistake surfaced.
+# The goldens, compiled the only way they can be: against the guest SDK, for
+# wasm32. A golden is otherwise only ever diffed, so nothing asks rustc or clippy
+# whether the emitter's output is valid Rust. The in-tree components cover the
+# shapes they happen to have, and none has zero inbound ports or no ports at all
+# — so the uninhabited enum with its `match self {}` name function and its
+# always-`None` `from_name` would otherwise be diffed and never built, and the
+# first component of either shape would be where the emitter's mistake surfaced.
 rust_library(
     name = "scaffold_processor_goldens",
     srcs = [
         "tests/corpus/scaffold/no-inbound.rs",
         "tests/corpus/scaffold/no-outbound.rs",
+        "tests/corpus/scaffold/no-ports.rs",
         "tests/corpus/scaffold/processor-full.rs",
         "tests/scaffold_processor_goldens.rs",
     ],

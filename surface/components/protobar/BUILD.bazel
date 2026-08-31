@@ -1,16 +1,19 @@
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/surface:defs.bzl", "surface_component")
+load("//bazel/surface:defs.bzl", "surface_processor_component")
 
 policy_srcs()
 
 exports_files(["Cargo.toml"])
 
-surface_component(
+surface_processor_component(
     deps = [
         "//brenn-envelope",
-        "//surface/component-support",
         "//surface/contract",
     ],
     test_deps = ["//surface/test-fixtures"],
-    wasm_deps = ["//surface/schema"],
+    wasm_deps = [
+        "//brenn-envelope:brenn-envelope_wasm",
+        "@crates//:pulldown-cmark",
+        "@wasm_crates//:chrono",
+    ],
 )

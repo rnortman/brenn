@@ -1,8 +1,12 @@
 /// Headless theme driver: no layout slot, so it mounts hidden. Its only
 /// output is a `ThemeBody` on `theme` carrying the active theme choice.
+///
+/// It holds `dom` for one function on that interface and draws nothing: the
+/// theme follows the *browser-local* day, and only the page can say what the
+/// local zone offset is.
 component ModeClock {
-  abi = dom;
-  requires = [ports, log];
+  abi = processor;
+  requires = [ports, log, dom];
   in config;
   out theme: "brenn.surface.theme@1";
   io tick;

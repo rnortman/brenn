@@ -6,7 +6,7 @@
 /// what the golden pins.
 component ScaffoldFull {
   abi = processor;
-  requires = [ports, store, log, alert, config, mqtt, tools];
+  requires = [ports, store, log, alert, config, mqtt, tools, dom, page-dom];
   in commands: "brenn.scaffold.commands@1";
   optional in retries;
   out results: "brenn.scaffold.results@1";

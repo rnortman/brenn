@@ -6,8 +6,12 @@
 // order — then returns Ok.
 //
 // Sentinels in new envelope bodies (checked before the summary publish):
-//   "__trap__" — traps (unreachable!); no output produced.
-//   "__err__"  — returns Err(ProcessingFailed); no output produced.
+//   "__trap__"  — traps (unreachable!); no output produced.
+//   "__err__"   — returns Err(ProcessingFailed); no output produced.
+//   "__reply__" — buffers one publish, then answers the activation. Only a
+//                 sync-call activation may be answered and no backend
+//                 activation is one, so a host that reads this ok flushes a
+//                 buffer it should have discarded.
 //
 // This fixture makes activation count and multi-port window composition directly
 // assertable from the output channel: one summary per activation, with per-port
@@ -32,7 +36,7 @@ struct PortSummary<'a> {
 struct ProcessorMultiport;
 
 impl Processor for ProcessorMultiport {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         // Check sentinels and collect summary entries.
         let windows: Vec<_> = activation.port_windows().collect();
 
@@ -47,6 +51,15 @@ impl Processor for ProcessorMultiport {
                     return Err(Error::failed(
                         "processor-multiport: deliberate err on __err__ sentinel",
                     ));
+                }
+                if env.body == "__reply__" {
+                    // A reply answers a sync-call activation, and no backend
+                    // activation is one. The host must trap this rather than
+                    // read it as an ok and flush the buffer — so the buffer is
+                    // deliberately non-empty when the reply is returned, which
+                    // is what makes the discard observable rather than vacuous.
+                    publish("out", "buffered-before-reply")?;
+                    return Ok(Some(String::from("unasked-for reply")));
                 }
             }
             // Count context envelopes through `context_envelopes()` to exercise
@@ -67,7 +80,7 @@ impl Processor for ProcessorMultiport {
         let json = serde_json::to_string(&summary_parts)
             .map_err(|e| Error::failed(format!("serialize summary: {e}")))?;
         publish("out", &json)?;
-        Ok(())
+        Ok(None)
     }
 }
 

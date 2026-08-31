@@ -80,17 +80,8 @@ The abi is read from the class's `abi` attribute, not passed as a flag.
   breaks the guest compile. It is a nudge and not a wall: a guest can still
   `use brenn_guest::store` directly, and what actually enforces the
   specification against the artifact is the grant-parity check below. `ports`
-  is embodied by the handles themselves; `takeover` is dom-only vocabulary.
-
-### Dom only
-
-The dom emission is deliberately lighter, because the dom SDK surface is free
-functions over `&str` and its activation type is a plain serde struct: the
-enum and the `port` module, no window classifier (dom components match on
-`window.port` directly), no publish handles (there is no dom `OutPort`), and no
-capability re-exports (dom capabilities are free functions, not modules). That
-asymmetry is recorded rather than papered over; it is revisited if the dom SDK
-grows capability modules.
+  is embodied by the handles themselves; `takeover` names no SDK module, being
+  consent to a binding the page gates.
 
 ## Identifier mapping
 
@@ -122,10 +113,8 @@ Each refusal is a diagnostic with a span into the specification.
   only in `-` versus `_`), or whose mapped identifier would be a Rust keyword.
   Both checks are per *emitted* identifier, not per port: an inbound port named
   `in` emits `InPort::In` and `port::IN` and no function, so the keyword its
-  handle would have been is never written; and a dom class emits no publish
-  handle and no payload trait at all, so `in foo-payload; out foo;` is one
-  `FooPayload` under the processor abi and a collision only there. There is no
-  raw-identifier escape hatch — refusal keeps names boring.
+  handle would have been is never written. There is no raw-identifier escape
+  hatch — refusal keeps names boring.
 
 The generator's validation stops there, deliberately. The compiler — class
 resolution, the grant lists, the spec fit check — remains the sole authority on
@@ -141,12 +130,12 @@ and declares `src/spec.rs` as its output. Crates take it through the
 `generated_srcs` parameter — `{"src/spec.rs": ":spec"}`, the path a generated
 module occupies in the crate mapped to the target producing it — which filters
 that path out of the source glob and appends the generated file:
-`wasm_guest_cdylib` for backend components, `surface_wasm_crate` for surface
-ones, feeding both its host `rust_library` and its wasm32
+`wasm_guest_cdylib` for backend components, `surface_processor_component` for
+surface ones, feeding both its host `rust_library` and its wasm32
 `rust_shared_library`, since the generated module is plain Rust. A raw-WIT
-crate's `src/bindings.rs` rides the same parameter. A dom kind's specification
-label is derived from its package directory, so `surface_component` wires this
-with no per-component editing.
+crate's `src/bindings.rs` rides the same parameter. A surface kind's
+specification label is derived from its package directory, so
+`surface_processor_component` wires this with no per-component editing.
 
 **The output is untracked.** `.gitignore` covers `src/spec.rs` under both
 component trees. Bazel's dependency tracking replaces a drift gate: the
@@ -162,9 +151,8 @@ Layout is rustfmt's, not the emitter's: the build rule formats the generator's
 output, so the emitter states the code and the toolchain states how it looks.
 The goldens are additionally compiled, which is what puts rustc and clippy on
 the shapes no in-tree component has — an uninhabited port enum, a class with no
-ports at all. The dom half builds on the host
-(`//brenn-dsl:scaffold_goldens_compile`); the processor half names the guest SDK
-and so builds for wasm32, reached from a host command line through
+ports at all. The emission names the guest SDK and so builds for wasm32,
+reached from a host command line through
 `//brenn-dsl:scaffold_processor_goldens_wasm32`.
 
 One consequence to expect while working in a checkout: `rustfmt` cannot be run
@@ -213,16 +201,16 @@ With this in place the triangle closes on all three edges — specification
 against instance at compile, instance against artifact at boot, specification
 against artifact in CI.
 
-### A processor specification has no optional grants
+### A specification has no optional interface grants
 
 The check formalizes a consequence worth stating on its own. Under the host's
 link-only-when-granted policy, importing an ungranted interface is a load-time
-panic, and an artifact cannot import conditionally. So an `optional` grant on a
-processor class is unexercisable: if the artifact imports the interface, an
+panic, and an artifact cannot import conditionally. So an `optional` grant
+naming an interface is unexercisable: if the artifact imports the interface, an
 instance omitting the word — which the fit check permits for `optional` — is a
 guaranteed boot panic; if the artifact does not import it, granting it does
-nothing. The resolver refuses the word where it is written. Dom classes keep
-`optional`, because a surface grant is not an import the linker decides. See
+nothing. The resolver refuses the word where it is written. `takeover` keeps
+`optional`, because it names no interface the linker decides. See
 `config-dsl.md`, *Authority*.
 
 ## Status

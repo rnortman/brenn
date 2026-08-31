@@ -51,7 +51,7 @@ const TRAP_MARKER: &str = "TRAP_AFTER_CALL";
 struct ProcessorToolTest;
 
 impl Guest for ProcessorToolTest {
-    fn receive(a: Activation) -> Result<(), ReceiveError> {
+    fn receive(a: Activation) -> Result<Option<String>, ReceiveError> {
         for pw in &a.ports {
             let new_from = pw.new_from as usize;
             if new_from >= pw.envelopes.len() {
@@ -83,7 +83,7 @@ impl Guest for ProcessorToolTest {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

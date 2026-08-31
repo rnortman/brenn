@@ -107,7 +107,7 @@ fn execute_directive(dir: &serde_json::Value) -> Result<(), Error> {
 }
 
 impl Processor for ProcessorLog {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         for window in activation.port_windows() {
             for env in window.new_envelopes() {
                 let env = env?;
@@ -116,7 +116,7 @@ impl Processor for ProcessorLog {
                 execute_directive(&dir)?;
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

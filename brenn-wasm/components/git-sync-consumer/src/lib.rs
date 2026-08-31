@@ -271,7 +271,7 @@ fn handle_tool_result(body: &str) -> Result<(), Error> {
 }
 
 impl Processor for GitSyncConsumer {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         // Read once per activation; config is process-lifetime-fixed. A missing
         // remote key fails the whole activation (fail-fast misconfig).
         let repo_map = load_repo_map()?;
@@ -285,7 +285,7 @@ impl Processor for GitSyncConsumer {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

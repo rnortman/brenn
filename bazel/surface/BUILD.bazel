@@ -7,8 +7,6 @@ policy_srcs()
 # Checked-in rather than generated text so `//bazel/surface/tests` can drive
 # them over fixtures. The rules only bind arguments.
 exports_files([
-    "dom_names.sh",
-    "emit_dom_manifest.sh",
     "merge_stages.sh",
     "processor_stage.sh",
 ])

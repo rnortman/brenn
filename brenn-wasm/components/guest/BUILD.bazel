@@ -3,6 +3,12 @@ load("//bazel/wasm:defs.bzl", "wasm_guest_library")
 
 policy_srcs()
 
+# The SDK source, for the gesture-seam pin in `//surface/contract`. That crate
+# spells the kernel's half of the gesture body and this one spells the guest's;
+# a wasm32 crate with no test target cannot assert the pair itself, so the
+# contract's test reads this file.
+exports_files(["src/lib.rs"])
+
 # The guest-side SDK. Every Family B component links this rlib, which owns the
 # `brenn:processor` bindings; `wit_bindgen::generate!` reads the WIT world at
 # macro-expansion time, so it is compile_data rather than a generated source.

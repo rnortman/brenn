@@ -215,7 +215,7 @@ body {
 /* === Connection banner ===
  * Single global element; unscoped id selector is unambiguous (one skin/page).
  */
-#brenn-surface-banner {
+[data-surface-banner] {
     font-family: "Silkscreen", ui-monospace, monospace;
     font-size: 0.8rem;
     padding: 0.5rem 0.9rem;
@@ -224,11 +224,11 @@ body {
     border-bottom: 4px solid #73eff7;
 }
 
-#brenn-surface-banner[data-banner-state="reloading"] {
+[data-surface-banner][data-banner-state="reloading"] {
     border-bottom-color: #38b764;
 }
 
-#brenn-surface-banner[data-banner-state="fatal"] {
+[data-surface-banner][data-banner-state="fatal"] {
     background: #b13e53;
     color: #f4f4f4;
     border-bottom-color: #f4f4f4;

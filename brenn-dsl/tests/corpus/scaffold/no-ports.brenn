@@ -1,0 +1,6 @@
+/// A component with no ports at all: a legal class that talks to nothing, whose
+/// emission is an uninhabited enum and an empty name module.
+component ScaffoldNoPorts {
+  abi = processor;
+  requires = [];
+}

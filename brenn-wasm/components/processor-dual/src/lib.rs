@@ -23,7 +23,7 @@ use brenn_guest::{Activation, Error, Processor, Urgency, publish, publish_with_u
 struct ProcessorDual;
 
 impl Processor for ProcessorDual {
-    fn receive(activation: Activation) -> Result<(), Error> {
+    fn receive(activation: Activation) -> Result<Option<String>, Error> {
         for window in activation.port_windows() {
             // Zip parsed envelopes (for directive inspection) with their raw
             // JSON strings (for raw-passthrough publish in the default case).
@@ -53,7 +53,7 @@ impl Processor for ProcessorDual {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

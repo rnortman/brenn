@@ -43,11 +43,11 @@ use crate::ChannelScheme;
 /// [`ComponentGrant::Takeover`] is the exception: it names a page capability
 /// with no interface behind it, gated at the binding instead.
 ///
-/// Serde `lowercase`, matching [`ComponentGrant::word`] — every variant is one
-/// word, so the two spellings cannot drift apart in shape, and a test pins them
-/// equal.
+/// Serde `kebab-case`, matching [`ComponentGrant::word`] — every word is the
+/// interface name it links, spelled as WIT spells it, so the two spellings
+/// cannot drift apart in shape and a test pins them equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ComponentGrant {
     /// `brenn:processor/ports` — publish and defer through the declared output
     /// ports.
@@ -69,6 +69,14 @@ pub enum ComponentGrant {
     /// interface: the capability is a binding to a takeover-plane channel, and
     /// the grant is what consents to that binding.
     Takeover,
+    /// `brenn:processor/dom` — read and mutate the instance's own element
+    /// subtree, and wire gestures on it. Holding it is also what makes an
+    /// instance mountable: an instance without it is headless.
+    Dom,
+    /// `brenn:processor/page-dom` — reach outside one's own subtree, into the
+    /// surface root, the document body, and other instances' wrappers. A
+    /// surface's designated chrome instance holds it and nothing else may.
+    PageDom,
 }
 
 /// Where a component instance runs.
@@ -86,7 +94,7 @@ pub enum ComponentHost {
 impl ComponentGrant {
     /// Every capability a component may be granted, in the order they are
     /// listed.
-    pub const ALL: [ComponentGrant; 8] = [
+    pub const ALL: [ComponentGrant; 10] = [
         ComponentGrant::Ports,
         ComponentGrant::Store,
         ComponentGrant::Log,
@@ -95,6 +103,8 @@ impl ComponentGrant {
         ComponentGrant::Mqtt,
         ComponentGrant::Tools,
         ComponentGrant::Takeover,
+        ComponentGrant::Dom,
+        ComponentGrant::PageDom,
     ];
 
     /// The word this grant is written as, in configuration and on the wire.
@@ -108,6 +118,8 @@ impl ComponentGrant {
             Self::Mqtt => "mqtt",
             Self::Tools => "tools",
             Self::Takeover => "takeover",
+            Self::Dom => "dom",
+            Self::PageDom => "page-dom",
         }
     }
 
@@ -141,6 +153,8 @@ impl ComponentGrant {
             Self::Config => "brenn:processor/config@0.1.0",
             Self::Mqtt => "brenn:processor/mqtt@0.1.0",
             Self::Tools => "brenn:processor/tools@0.1.0",
+            Self::Dom => "brenn:processor/dom@0.1.0",
+            Self::PageDom => "brenn:processor/page-dom@0.1.0",
             Self::Takeover => return None,
         })
     }
@@ -166,6 +180,12 @@ impl ComponentGrant {
             (ComponentHost::TopLevel, Self::Takeover) => {
                 Some("`takeover` is a page capability; a top-level consumer has no page")
             }
+            (ComponentHost::TopLevel, Self::Dom) => {
+                Some("`dom` is a page capability; a top-level consumer has no page to mutate")
+            }
+            (ComponentHost::TopLevel, Self::PageDom) => {
+                Some("`page-dom` is a page capability; a top-level consumer has no page to arrange")
+            }
             _ => None,
         }
     }
@@ -173,11 +193,13 @@ impl ComponentGrant {
     /// The unified capability this grant becomes once a policy is built, or
     /// `None` for the one grant that names no capability.
     ///
-    /// Two grants name none, for opposite reasons. `Takeover` is consent to a
+    /// Four grants name none, for three reasons. `Takeover` is consent to a
     /// binding, gated at the binding, and no policy grant set carries it.
     /// `Tools` names authority the resolved tool-grant map carries in full, key
-    /// by key, so there is no single capability it becomes. Whether a `None`
-    /// here is a refusal or a skip belongs to the caller.
+    /// by key, so there is no single capability it becomes. `Dom` and `PageDom`
+    /// are gated in the page, by the kernel, on the grant word itself, and the
+    /// backend policy vocabulary has no term for either. Whether a `None` here
+    /// is a refusal or a skip belongs to the caller.
     pub fn app_capability(self) -> Option<AppCapability> {
         Some(match self {
             Self::Ports => AppCapability::MessagingPublish,
@@ -186,7 +208,7 @@ impl ComponentGrant {
             Self::Alert => AppCapability::WasmAlert,
             Self::Config => AppCapability::WasmConfig,
             Self::Mqtt => AppCapability::MqttPublish,
-            Self::Tools | Self::Takeover => return None,
+            Self::Tools | Self::Takeover | Self::Dom | Self::PageDom => return None,
         })
     }
 }
@@ -714,7 +736,9 @@ mod tests {
             | ComponentGrant::Config
             | ComponentGrant::Mqtt
             | ComponentGrant::Tools
-            | ComponentGrant::Takeover => {}
+            | ComponentGrant::Takeover
+            | ComponentGrant::Dom
+            | ComponentGrant::PageDom => {}
         }
         assert!(
             ComponentGrant::ALL.contains(&grant),
@@ -904,11 +928,14 @@ mod tests {
     }
 
     #[test]
-    fn two_component_grants_name_no_capability_and_the_rest_name_one() {
+    fn four_component_grants_name_no_capability_and_the_rest_name_one() {
         for grant in ComponentGrant::ALL {
             let mapped = grant.app_capability();
             match grant {
-                ComponentGrant::Takeover | ComponentGrant::Tools => assert_eq!(mapped, None),
+                ComponentGrant::Takeover
+                | ComponentGrant::Tools
+                | ComponentGrant::Dom
+                | ComponentGrant::PageDom => assert_eq!(mapped, None),
                 _ => assert!(mapped.is_some(), "{grant:?} names no capability"),
             }
         }
@@ -964,6 +991,24 @@ mod tests {
                 .illegal_on(ComponentHost::TopLevel)
                 .is_none()
         );
+    }
+
+    /// The inverse of `tools`: two words a page host links and a backend host
+    /// refuses. Pinned by name because they are the first of their direction,
+    /// and the import-list parity check on the other side of the seam carries a
+    /// deviation class that exists only for them.
+    #[test]
+    fn dom_and_page_dom_are_surface_only_words() {
+        for grant in [ComponentGrant::Dom, ComponentGrant::PageDom] {
+            assert!(
+                grant.illegal_on(ComponentHost::Surface).is_none(),
+                "{grant:?} is refused on the only host that can implement it"
+            );
+            assert!(
+                grant.illegal_on(ComponentHost::TopLevel).is_some(),
+                "{grant:?} is admitted on a host with no page"
+            );
+        }
     }
 
     #[test]
