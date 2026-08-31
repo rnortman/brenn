@@ -3044,7 +3044,7 @@ pub fn build_runtime_directory(
 
 #[cfg(test)]
 mod tests {
-    use brenn_dsl::processor_any;
+    use brenn_dsl::processor_needs;
 
     use super::*;
     use crate::config::{config_from_dsl, sole_refusal};
@@ -4086,7 +4086,7 @@ channel demo at "ephemeral:protobar-demo" {
 // ── packaged ──
 component Router {
     "#,
-            processor_any!(),
+            processor_needs!("ports"),
             r#"
     io tick;
 }
@@ -5194,7 +5194,7 @@ channel digests at "brenn:alice-digests" {
 // ── packaged ──
 component Router {
     "#,
-            processor_any!(),
+            processor_needs!("ports, store, log, alert, config, mqtt"),
             r#"
     out digest;
 }
@@ -5232,7 +5232,7 @@ new router: Router {
             r#"
 // ── packaged ──
 component Router { "#,
-            processor_any!(),
+            processor_needs!(""),
             r#" io tick; }
 // ── packaged ──
 
@@ -5256,7 +5256,7 @@ channel feed at "ephemeral:alice-feed" { push_depth = 4; retain_depth = 8; }
 
 // ── packaged ──
 component Router { "#,
-            processor_any!(),
+            processor_needs!(""),
             r#" in inbound; }
 // ── packaged ──
 
@@ -5282,7 +5282,7 @@ new router: Router {
             r#"
 // ── packaged ──
 component Router { "#,
-            processor_any!(),
+            processor_needs!(""),
             r#" io tick; }
 // ── packaged ──
 

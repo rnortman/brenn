@@ -212,7 +212,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,

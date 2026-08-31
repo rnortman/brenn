@@ -18,10 +18,11 @@ use brenn_surface_schema::LOCAL_TAKEOVER_CHANNEL;
 use chrono::{DateTime, Duration, Utc};
 
 use crate::logic::{
-    ACKS_PORT, AGENDA_PORT, AckTarget, DEFAULT_CRITICAL_SECS, DEFAULT_OVERDUE_SECS,
-    DEFAULT_TAKEOVER_SECS, DisplayState, ESCALATION_LADDER, RETIRE_AFTER_SECS, RawEscalation,
-    RawMeeting, RawSnapshot, SNOOZE_SECS, TAKEOVER_PORT, dismiss_body, snooze_body,
+    AckTarget, DEFAULT_CRITICAL_SECS, DEFAULT_OVERDUE_SECS, DEFAULT_TAKEOVER_SECS, DisplayState,
+    ESCALATION_LADDER, RETIRE_AFTER_SECS, RawEscalation, RawMeeting, RawSnapshot, SNOOZE_SECS,
+    dismiss_body, snooze_body,
 };
+use crate::spec::port::{ACKS, AGENDA, TAKEOVER};
 
 /// Meeting's help sidecar, in full.
 pub fn help_markdown() -> String {
@@ -63,7 +64,7 @@ fn agenda_section(out: &mut String) {
     let _ = writeln!(
         out,
         "\nPublish a full upcoming-meetings snapshot via BrennSend to the instance's \
-         `{AGENDA_PORT}` channel (latest-wins; use a retained channel so it replays on \
+         `{AGENDA}` channel (latest-wins; use a retained channel so it replays on \
          reconnect). Body:\n\n```json\n{}\n```",
         snapshot_sketch(),
     );
@@ -120,7 +121,7 @@ fn ack_section(out: &mut String) {
     };
     let _ = writeln!(
         out,
-        "\nThe panel publishes dismiss/snooze acks to its `{ACKS_PORT}` channel and \
+        "\nThe panel publishes dismiss/snooze acks to its `{ACKS}` channel and \
          subscribes to the same channel so all devices converge. A dismissal is \
          permanent:\n\n```json\n{}\n```",
         dismiss_body(&target),
@@ -161,7 +162,7 @@ fn takeover_section(out: &mut String) {
         "\nTo cancel an alarm from the agent side, drop the meeting from the next \
          snapshot (or publish a dismiss ack). At the `{}` threshold \
          ({DEFAULT_TAKEOVER_SECS} s before start by default) the panel publishes a \
-         takeover request on its `{TAKEOVER_PORT}` output port (bound to \
+         takeover request on its `{TAKEOVER}` output port (bound to \
          `{LOCAL_TAKEOVER_CHANNEL}`); chrome pushes a fullscreen overlay, granted only \
          on a takeover-granted surface. The kernel's router stamps the publishing \
          instance onto the request, so a component cannot request or release \
@@ -204,7 +205,7 @@ mod tests {
             .replace("<string>", "Standup");
         let mut state = MeetingState::new();
         let outcome = state
-            .on_message(AGENDA_PORT, &envelope_json(&body, EXAMPLE_START), now())
+            .on_message(AGENDA, &envelope_json(&body, EXAMPLE_START), now())
             .expect("a well-formed envelope on the agenda port");
         assert_eq!(
             outcome,
@@ -225,7 +226,7 @@ mod tests {
             let mut state = MeetingState::new();
             assert_eq!(
                 state
-                    .on_message(ACKS_PORT, &envelope_json(ack, EXAMPLE_START), now())
+                    .on_message(ACKS, &envelope_json(ack, EXAMPLE_START), now())
                     .expect("a well-formed envelope on the ack port"),
                 IngestOutcome::Accepted { warnings: vec![] },
                 "documented ack body is not accepted: {ack}"
@@ -293,7 +294,7 @@ mod tests {
     #[test]
     fn ports_and_channel_are_interpolated() {
         let doc = help_markdown();
-        for port in [AGENDA_PORT, ACKS_PORT, TAKEOVER_PORT] {
+        for port in [AGENDA, ACKS, TAKEOVER] {
             assert!(
                 doc.contains(&format!("`{port}`")),
                 "generated meeting help does not name port {port}"

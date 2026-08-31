@@ -147,7 +147,7 @@ pub enum ChromeAction {
     /// Log a breadcrumb (untrusted-input rejection). The DOM half forwards it via
     /// the component-log plane; chrome never panics on a bad plane payload.
     Log { level: LogLevel, message: String },
-    /// Publish chrome's overlay holdership on [`PORT_OVERLAY_STATE`]. `body` is
+    /// Publish chrome's overlay holdership on [`OVERLAY_STATE`]. `body` is
     /// the serialized [`proto::OverlayStateBody`] for the transition that just
     /// folded — emitted on every transition and only on a transition, so the
     /// plane carries no heartbeat.
@@ -666,15 +666,8 @@ impl ChromeCore {
     }
 }
 
-/// Chrome's input port names. Config binds each plane to one of these ports on
-/// the chrome instance; the activation seam routes a delivered window to the
-/// core method by matching the window's `port` against these.
-pub const PORT_LAYOUT: &str = "layout";
-pub const PORT_THEME: &str = "theme";
-pub const PORT_LINK_STATE: &str = "link-state";
-pub const PORT_SURFACE_STATE: &str = "surface-state";
-pub const PORT_TAKEOVER: &str = "takeover";
-pub const PORT_TOAST: &str = "toast";
+use crate::spec::InPort;
+use crate::spec::port::OVERLAY_STATE;
 
 /// How a chrome port's new slice is folded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -697,19 +690,25 @@ enum FoldClass {
 /// number of re-renders and warns. `takeover` (request/release pairing) and
 /// `toast` are streams of distinct facts; dropping any of them loses an event.
 ///
-/// An unknown port takes the event-stream path so the unbound-port warn in
-/// [`fold`] fires once per message.
-fn fold_class(port: &str) -> FoldClass {
+/// Exhaustive over [`InPort`], like [`fold`] and [`input_port_doc`]: a port
+/// added to the specification fails to compile here until it is classified,
+/// rather than defaulting to the event stream and replaying stale retained
+/// state on every activation where a latest-wins fold was meant. An unknown
+/// port takes the event-stream path so the unbound-port warn in [`fold`] fires
+/// once per message.
+fn fold_class(port: Option<InPort>) -> FoldClass {
     match port {
-        PORT_LAYOUT | PORT_THEME | PORT_LINK_STATE | PORT_SURFACE_STATE => FoldClass::LatestWins,
-        _ => FoldClass::EventStream,
+        Some(InPort::Layout)
+        | Some(InPort::Theme)
+        | Some(InPort::LinkState)
+        | Some(InPort::SurfaceState) => FoldClass::LatestWins,
+        // Chrome's own deferred self-wake never reaches the fold, and an
+        // unbound name is reported message by message.
+        Some(InPort::Takeover) | Some(InPort::Toast) | Some(InPort::ToastTick) | None => {
+            FoldClass::EventStream
+        }
     }
 }
-
-/// Chrome's one output port: overlay holdership onto
-/// `local:brenn/overlay-state`, where the kernel reads it into the surface's
-/// status report.
-pub const PORT_OVERLAY_STATE: &str = "overlay-state";
 
 /// What to bind a chrome port to.
 pub enum PortChannel {
@@ -734,46 +733,58 @@ pub struct PortDoc {
     pub carries: &'static str,
 }
 
-/// Chrome's input ports, in the order the help table lists them.
+/// The help row for one inbound port, or `None` for a port that is not an
+/// operator binding.
 ///
-/// Invariant: one row per `PORT_*` input constant above. Rust cannot enumerate
-/// consts, so nothing compiles this shut — a new input port needs a row here.
-pub const INPUT_PORT_DOCS: [PortDoc; 6] = [
-    PortDoc {
-        port: PORT_LAYOUT,
-        channel: PortChannel::Described("a `brenn:` layout channel (retained, depth ≥ 1)"),
-        carries: "the layout doc (below)",
-    },
-    PortDoc {
-        port: PORT_THEME,
-        channel: PortChannel::Address(proto::LOCAL_THEME_CHANNEL),
-        carries: "`{ v, theme }` — the runtime theme axis",
-    },
-    PortDoc {
-        port: PORT_LINK_STATE,
-        channel: PortChannel::Address(proto::LOCAL_LINK_STATE_CHANNEL),
-        carries: "`{ v, state }` — the connection banner",
-    },
-    PortDoc {
-        port: PORT_SURFACE_STATE,
-        channel: PortChannel::Address(proto::LOCAL_SURFACE_STATE_CHANNEL),
-        carries: "the mounted-instance set chrome arranges",
-    },
-    PortDoc {
-        port: PORT_TAKEOVER,
-        channel: PortChannel::Address(proto::LOCAL_TAKEOVER_CHANNEL),
-        carries: "a component's fullscreen request/release (needs the surface `takeover` grant)",
-    },
-    PortDoc {
-        port: PORT_TOAST,
-        channel: PortChannel::Address(proto::LOCAL_TOAST_CHANNEL),
-        carries: "transient notices (live-only, retains nothing)",
-    },
-];
+/// Exhaustive over [`InPort`], which the specification generates: a port added
+/// to the specification fails to compile here until it is given a row or
+/// explicitly refused one.
+fn input_port_doc(port: InPort) -> Option<PortDoc> {
+    let (channel, carries) = match port {
+        InPort::Layout => (
+            PortChannel::Described("a `brenn:` layout channel (retained, depth ≥ 1)"),
+            "the layout doc (below)",
+        ),
+        InPort::Theme => (
+            PortChannel::Address(proto::LOCAL_THEME_CHANNEL),
+            "`{ v, theme }` — the runtime theme axis",
+        ),
+        InPort::Takeover => (
+            PortChannel::Address(proto::LOCAL_TAKEOVER_CHANNEL),
+            "a component's fullscreen request/release (needs the surface `takeover` grant)",
+        ),
+        InPort::LinkState => (
+            PortChannel::Address(proto::LOCAL_LINK_STATE_CHANNEL),
+            "`{ v, state }` — the connection banner",
+        ),
+        InPort::SurfaceState => (
+            PortChannel::Address(proto::LOCAL_SURFACE_STATE_CHANNEL),
+            "the mounted-instance set chrome arranges",
+        ),
+        InPort::Toast => (
+            PortChannel::Address(proto::LOCAL_TOAST_CHANNEL),
+            "transient notices (live-only, retains nothing)",
+        ),
+        // Chrome parks its own toast-expiry wake here and nothing else ever
+        // publishes to it, so an operator has nothing to bind and the table
+        // carries no row.
+        InPort::ToastTick => return None,
+    };
+    Some(PortDoc {
+        port: port.name(),
+        channel,
+        carries,
+    })
+}
+
+/// Chrome's operator-bindable input ports, in specification order.
+pub fn input_port_docs() -> Vec<PortDoc> {
+    InPort::ALL.into_iter().filter_map(input_port_doc).collect()
+}
 
 /// Chrome's one output port row.
 pub const OUTPUT_PORT_DOC: PortDoc = PortDoc {
-    port: PORT_OVERLAY_STATE,
+    port: OVERLAY_STATE,
     channel: PortChannel::Address(proto::LOCAL_OVERLAY_STATE_CHANNEL),
     carries: "`{ v, holder, since_stamp }` — which instance holds the fullscreen \
               overlay (needs the surface `takeover` grant)",
@@ -787,16 +798,18 @@ pub const OUTPUT_PORT_DOC: PortDoc = PortDoc {
 /// wasm half's wiring (transposing two arms would compile clean), so it lives in
 /// the core where a host `#[test]` pins each port to its method.
 pub fn fold(core: &mut ChromeCore, port: &str, body: &str, now_ms: u64) -> Vec<ChromeAction> {
-    match port {
-        PORT_LAYOUT => core.on_layout(body),
-        PORT_THEME => core.on_theme(body),
-        PORT_LINK_STATE => core.on_link_state(body),
-        PORT_SURFACE_STATE => core.on_surface_state(body, now_ms),
-        PORT_TAKEOVER => core.on_takeover(body, now_ms),
-        PORT_TOAST => core.on_toast(body, now_ms),
-        other => vec![ChromeAction::Log {
+    match InPort::from_name(port) {
+        Some(InPort::Layout) => core.on_layout(body),
+        Some(InPort::Theme) => core.on_theme(body),
+        Some(InPort::LinkState) => core.on_link_state(body),
+        Some(InPort::SurfaceState) => core.on_surface_state(body, now_ms),
+        Some(InPort::Takeover) => core.on_takeover(body, now_ms),
+        Some(InPort::Toast) => core.on_toast(body, now_ms),
+        // Consumed by the activation seam before reaching fold; arriving
+        // here is unexpected, so treat it as unbound.
+        Some(InPort::ToastTick) | None => vec![ChromeAction::Log {
             level: LogLevel::Warn,
-            message: format!("chrome received on unbound port {other:?}"),
+            message: format!("chrome received on unbound port {port:?}"),
         }],
     }
 }
@@ -816,7 +829,7 @@ pub fn fold(core: &mut ChromeCore, port: &str, body: &str, now_ms: u64) -> Vec<C
 /// way.
 pub fn fold_window(core: &mut ChromeCore, window: &PortWindow, now_ms: u64) -> Vec<ChromeAction> {
     let mut actions = Vec::new();
-    match fold_class(&window.port) {
+    match fold_class(InPort::from_name(&window.port)) {
         FoldClass::LatestWins => {
             if let Some(message) = window.latest_wins_misconfiguration() {
                 actions.push(ChromeAction::Log {
@@ -842,6 +855,9 @@ pub fn fold_window(core: &mut ChromeCore, window: &PortWindow, now_ms: u64) -> V
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::spec::port::{
+        LAYOUT, LINK_STATE, SURFACE_STATE, TAKEOVER, THEME, TOAST, TOAST_TICK,
+    };
     use brenn_surface_schema::{CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, SurfaceStateInstance};
     use serde_json::json;
 
@@ -900,7 +916,7 @@ mod tests {
         // Theme body on the theme port → SetTheme.
         let mut c = core();
         assert_eq!(
-            fold(&mut c, PORT_THEME, &theme, 0),
+            fold(&mut c, THEME, &theme, 0),
             vec![ChromeAction::SetTheme(Theme::Light)]
         );
 
@@ -908,7 +924,7 @@ mod tests {
         // is rejected as a malformed link-state payload, proving the arm is not
         // transposed onto `on_theme`.
         let mut c = core();
-        let actions = fold(&mut c, PORT_LINK_STATE, &theme, 0);
+        let actions = fold(&mut c, LINK_STATE, &theme, 0);
         assert!(
             !actions
                 .iter()
@@ -919,7 +935,7 @@ mod tests {
         // A link-state body on the link-state port → SetBanner.
         let mut c = core();
         assert_eq!(
-            fold(&mut c, PORT_LINK_STATE, &link, 0),
+            fold(&mut c, LINK_STATE, &link, 0),
             vec![ChromeAction::SetBanner(BannerState::Reconnecting)]
         );
     }
@@ -1280,11 +1296,7 @@ mod tests {
         // hold; skipping context is what stops that.
         let mut c = core();
         seed_three(&mut c);
-        let window = port_window(
-            PORT_TAKEOVER,
-            &[takeover(TakeoverAction::Release, "p2")],
-            &[],
-        );
+        let window = port_window(TAKEOVER, &[takeover(TakeoverAction::Release, "p2")], &[]);
         assert_eq!(fold_window(&mut c, &window, 0), Vec::new());
     }
 
@@ -1306,11 +1318,7 @@ mod tests {
         );
         assert!(c.overlay.is_none());
 
-        let window = port_window(
-            PORT_TAKEOVER,
-            &[takeover(TakeoverAction::Request, "p2")],
-            &[],
-        );
+        let window = port_window(TAKEOVER, &[takeover(TakeoverAction::Request, "p2")], &[]);
         assert_eq!(fold_window(&mut c, &window, 0), Vec::new());
         assert!(c.overlay.is_none());
     }
@@ -1327,12 +1335,12 @@ mod tests {
         let dark = json!({ "v": 1, "theme": "dark" }).to_string();
         // Chrome starts dark; the window's context is a light value it has
         // already seen and its new slice restates dark.
-        let window = port_window(PORT_THEME, std::slice::from_ref(&light), &[dark]);
+        let window = port_window(THEME, std::slice::from_ref(&light), &[dark]);
         assert_eq!(fold_window(&mut c, &window, NOW), Vec::new());
         assert_eq!(c.theme(), Theme::Dark);
 
         // And the new slice still reaches the page, on this port as on takeover.
-        let window = port_window(PORT_THEME, &[], &[light]);
+        let window = port_window(THEME, &[], &[light]);
         assert_eq!(
             fold_window(&mut c, &window, NOW),
             vec![ChromeAction::SetTheme(Theme::Light)]
@@ -1379,7 +1387,7 @@ mod tests {
         let mut c = core();
         seed_three(&mut c);
         let window = port_window(
-            PORT_LAYOUT,
+            LAYOUT,
             &[],
             &[layout_doc("p1"), layout_doc("p2"), layout_doc("p3")],
         );
@@ -1403,7 +1411,7 @@ mod tests {
         let mut c = core();
         seed_three(&mut c);
         let window = port_window(
-            PORT_LAYOUT,
+            LAYOUT,
             &[layout_doc("p1"), layout_doc("p2")],
             &[layout_doc("p3")],
         );
@@ -1426,7 +1434,7 @@ mod tests {
             vec![vec!["p2".to_string()]]
         );
 
-        let window = port_window(PORT_LAYOUT, &[], &[layout_doc("p1"), layout_doc("ghost")]);
+        let window = port_window(LAYOUT, &[], &[layout_doc("p1"), layout_doc("ghost")]);
         let actions = fold_window(&mut c, &window, NOW);
         assert!(placed(&actions).is_empty(), "{actions:?}");
         assert_eq!(c.base_layout.as_ref().unwrap().panels["a"].instance, "p2");
@@ -1442,7 +1450,7 @@ mod tests {
         let mut c = core();
         seed_three(&mut c);
         let window = port_window(
-            PORT_TAKEOVER,
+            TAKEOVER,
             &[takeover(TakeoverAction::Release, "p3")],
             &[
                 takeover(TakeoverAction::Request, "p2"),
@@ -1479,15 +1487,16 @@ mod tests {
         // exactly the latest-wins bindings, so the misconfiguration error will
         // not fire to reveal it in dev either.
         for (port, class) in [
-            (PORT_LAYOUT, FoldClass::LatestWins),
-            (PORT_THEME, FoldClass::LatestWins),
-            (PORT_LINK_STATE, FoldClass::LatestWins),
-            (PORT_SURFACE_STATE, FoldClass::LatestWins),
-            (PORT_TAKEOVER, FoldClass::EventStream),
-            (PORT_TOAST, FoldClass::EventStream),
+            (LAYOUT, FoldClass::LatestWins),
+            (THEME, FoldClass::LatestWins),
+            (LINK_STATE, FoldClass::LatestWins),
+            (SURFACE_STATE, FoldClass::LatestWins),
+            (TAKEOVER, FoldClass::EventStream),
+            (TOAST, FoldClass::EventStream),
+            (TOAST_TICK, FoldClass::EventStream),
             ("no-such-port", FoldClass::EventStream),
         ] {
-            assert_eq!(fold_class(port), class, "port {port:?}");
+            assert_eq!(fold_class(InPort::from_name(port)), class, "port {port:?}");
         }
     }
 
@@ -1501,7 +1510,7 @@ mod tests {
         let dark = json!({ "v": 1, "theme": "dark" }).to_string();
         // Chrome starts dark, so a fold-all would flip the page light and back:
         // one SetTheme(Light) this assertion would see.
-        let window = port_window(PORT_THEME, &[], &[light, dark]);
+        let window = port_window(THEME, &[], &[light, dark]);
         let actions = fold_window(&mut c, &window, NOW);
         assert_eq!(
             actions
@@ -1522,7 +1531,7 @@ mod tests {
         // because a depth above 1 is what an event port is for.
         let mut c = core();
         let window = port_window(
-            PORT_TOAST,
+            TOAST,
             &[],
             &[
                 toast_body(ToastSeverity::Info, "first"),

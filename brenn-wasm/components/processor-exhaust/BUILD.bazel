@@ -17,7 +17,7 @@ wit_bindgen_rust(
 
 wasm_guest_cdylib(
     name = "brenn-processor-exhaust",
-    bindings = ":bindings",
+    generated_srcs = {"src/bindings.rs": ":bindings"},
     visibility = ["//visibility:public"],
 )
 

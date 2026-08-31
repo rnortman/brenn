@@ -1,4 +1,4 @@
-// Integration tests for the grant-check mechanism (§8 items 1-10).
+// Integration tests for the grant-check mechanism.
 //
 // Tests cover:
 //   1. Ungranted known capability → named panic at load.
@@ -16,8 +16,9 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::sync::Arc;
 
+use brenn_envelope::grants::ComponentGrant;
 use brenn_wasm::{
-    Capability, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec,
+    ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, capability_for_import,
     store::DEFAULT_MAX_PAGE_COUNT,
 };
 
@@ -166,7 +167,9 @@ fn multiple_violations_names_both_capabilities() {
 /// brenn_processor_log with grants = {log, alert} loads and invokes successfully.
 #[test]
 fn subset_grants_loads_and_invokes() {
-    let grants = [Capability::Log, Capability::Alert].into_iter().collect();
+    let grants = [ComponentGrant::Log, ComponentGrant::Alert]
+        .into_iter()
+        .collect();
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_log"),
         slug: "log-subset",
@@ -290,7 +293,12 @@ fn degenerate_empty_grants_invoke_succeeds() {
 /// Linker holds extra definitions that the component never imports; loads ok.
 #[test]
 fn superset_grants_loads() {
-    let grants: BTreeSet<Capability> = Capability::ALL.iter().copied().collect();
+    // Every linkable word: `takeover` names no interface and a backend
+    // component granted it is refused at load.
+    let grants: BTreeSet<ComponentGrant> = ComponentGrant::ALL
+        .into_iter()
+        .filter(|grant| grant.wit_import().is_some())
+        .collect();
     let db = tempfile::NamedTempFile::new().unwrap();
     let _comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
@@ -312,13 +320,45 @@ fn superset_grants_loads() {
     });
 }
 
+/// A load spec carrying a word that names no WIT interface is a caller that
+/// built its grant set wrong, and `load` refuses it by name.
+///
+/// The collapse of the linker's own capability enum into [`ComponentGrant`]
+/// widened `grants` to the authored vocabulary, which contains `takeover` — a
+/// page capability consented to at a binding on a surface, which no backend
+/// linker can bind. The named assert in `load` is the only thing standing
+/// between that word and the `unreachable!()` inside the linker loop, and
+/// `superset_grants_loads` deliberately filters it out, so without this nothing
+/// exercises the guard at all.
+#[test]
+#[should_panic(expected = "names no WIT interface")]
+fn a_page_capability_in_a_load_spec_is_refused() {
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Ports, ComponentGrant::Takeover].into();
+    let _comp = ProcessorComponent::load(ProcessorLoadSpec {
+        component_path: &component_path("brenn_processor_demo"),
+        slug: "demo-page-capability",
+        output_ports: std::collections::HashMap::new(),
+        input_amplification_mt: common::amp_in(),
+        mqtt_sinks: std::collections::HashMap::new(),
+        config: std::collections::HashMap::new(),
+        grants,
+        store_path: None,
+        max_page_count: DEFAULT_MAX_PAGE_COUNT,
+        max_payload_bytes: 1024 * 1024,
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        mqtt_publish: None,
+        tool_host: None,
+    });
+}
+
 // ── Item 8: drift guard ──────────────────────────────────────────────────────
 
 /// For every built fixture component, every import name either satisfies
-/// `is_types_import` or resolves via `Capability::from_import_name`.
+/// `is_types_import` or resolves via `capability_for_import`.
 ///
-/// This test pins the artifact import strings against the Capability table;
-/// a drift between the built components and the table surfaces here first.
+/// This test pins the artifact import strings against the grant vocabulary; a
+/// drift between the built components and the words surfaces here first.
 ///
 /// Every fixture import sits at exactly `@0.1.0`, so this test only ever exercises
 /// the exact-match path of `semver_compat_match`. The version rules themselves are
@@ -361,11 +401,11 @@ fn drift_guard_all_fixture_imports_recognized() {
         let ct = component.component_type();
         for (name, _item) in ct.imports(&engine) {
             let recognized =
-                brenn_wasm::is_types_import(name) || Capability::from_import_name(name).is_some();
+                brenn_wasm::is_types_import(name) || capability_for_import(name).is_some();
             assert!(
                 recognized,
                 "drift guard: fixture {fixture:?} has unrecognized import {name:?} — \
-                 update Capability::import_name table or WIT"
+                 update `ComponentGrant::wit_import` or the WIT"
             );
         }
     }
@@ -373,23 +413,34 @@ fn drift_guard_all_fixture_imports_recognized() {
 
 // ── Item 9: map round-trip + semver unit tests ───────────────────────────────
 
-/// grant_name / import_name / from_import_name round-trip over ALL capabilities.
+/// Every word that links an interface is recovered from that interface's name.
+///
+/// One direction of the vocabulary: what the host links and what an operator
+/// writes are the same words, so a word whose import the host cannot resolve
+/// back would be authority nothing acts on.
 #[test]
 fn capability_map_round_trip() {
-    for cap in &Capability::ALL {
-        // from_import_name must recover the capability from its own import_name.
-        let recovered = Capability::from_import_name(cap.import_name()).unwrap_or_else(|| {
+    for grant in ComponentGrant::ALL {
+        let Some(import) = grant.wit_import() else {
+            assert_eq!(
+                grant,
+                ComponentGrant::Takeover,
+                "`{}` links no interface; only `takeover` may",
+                grant.word()
+            );
+            continue;
+        };
+        let recovered = capability_for_import(import).unwrap_or_else(|| {
             panic!(
-                "from_import_name failed for {}: {:?}",
-                cap.grant_name(),
-                cap.import_name()
+                "capability_for_import failed for {}: {import:?}",
+                grant.word()
             )
         });
         assert_eq!(
-            *cap,
+            grant,
             recovered,
             "round-trip mismatch for capability {:?}",
-            cap.grant_name()
+            grant.word()
         );
     }
 }
@@ -399,10 +450,10 @@ fn capability_map_round_trip() {
 fn semver_compat_patch_bump_resolves() {
     // Simulate a component built against 0.1.1 on a 0.1.0 host.
     let name_101 = "brenn:processor/ports@0.1.1";
-    let result = Capability::from_import_name(name_101);
+    let result = capability_for_import(name_101);
     assert_eq!(
         result,
-        Some(Capability::Ports),
+        Some(ComponentGrant::Ports),
         "0.1.1 must resolve to Ports against 0.1.0 host (same major.minor)"
     );
 }
@@ -411,7 +462,7 @@ fn semver_compat_patch_bump_resolves() {
 #[test]
 fn semver_incompat_minor_bump_does_not_resolve() {
     let name_020 = "brenn:processor/ports@0.2.0";
-    let result = Capability::from_import_name(name_020);
+    let result = capability_for_import(name_020);
     assert_eq!(
         result, None,
         "0.2.0 must not resolve against 0.1.0 host (different minor under 0.x)"
@@ -422,7 +473,7 @@ fn semver_incompat_minor_bump_does_not_resolve() {
 #[test]
 fn semver_incompat_major_bump_does_not_resolve() {
     let name_100 = "brenn:processor/ports@1.0.0";
-    let result = Capability::from_import_name(name_100);
+    let result = capability_for_import(name_100);
     assert_eq!(
         result, None,
         "1.0.0 must not resolve against 0.1.0 host (different major)"
@@ -483,10 +534,10 @@ fn semver_ge1_same_major_different_minor_resolves() {
 /// Semver rule: build metadata is stripped — @0.1.1+abc resolves against @0.1.0 host.
 #[test]
 fn semver_build_metadata_stripped_and_resolves() {
-    let result = Capability::from_import_name("brenn:processor/ports@0.1.1+fork.1");
+    let result = capability_for_import("brenn:processor/ports@0.1.1+fork.1");
     assert_eq!(
         result,
-        Some(Capability::Ports),
+        Some(ComponentGrant::Ports),
         "0.1.1+fork.1 must resolve to Ports against 0.1.0 host (build metadata ignored, same major.minor)"
     );
 }
@@ -494,7 +545,7 @@ fn semver_build_metadata_stripped_and_resolves() {
 /// Semver rule: prerelease versions do NOT resolve (explicitly rejected).
 #[test]
 fn semver_prerelease_does_not_resolve() {
-    let result = Capability::from_import_name("brenn:processor/ports@0.1.1-rc.1");
+    let result = capability_for_import("brenn:processor/ports@0.1.1-rc.1");
     assert_eq!(
         result, None,
         "0.1.1-rc.1 must not resolve (prerelease versions are incompatible per wasmtime rule)"
@@ -586,19 +637,19 @@ fn semver_mirror_matches_wasmtime_linker() {
 /// a future drift between the map arms surfaces here.
 #[test]
 fn tools_capability_maps_and_is_in_all() {
-    assert_eq!(Capability::Tools.grant_name(), "tools");
+    assert_eq!(ComponentGrant::Tools.word(), "tools");
     assert_eq!(
-        Capability::Tools.import_name(),
-        "brenn:processor/tools@0.1.0"
+        ComponentGrant::Tools.wit_import(),
+        Some("brenn:processor/tools@0.1.0")
     );
     assert_eq!(
-        Capability::from_import_name("brenn:processor/tools@0.1.0"),
-        Some(Capability::Tools),
-        "the canonical tools import must resolve to Capability::Tools"
+        capability_for_import("brenn:processor/tools@0.1.0"),
+        Some(ComponentGrant::Tools),
+        "the canonical tools import must resolve to `tools`"
     );
     assert!(
-        Capability::ALL.contains(&Capability::Tools),
-        "Tools must be in Capability::ALL so enforce_grants/from_import_name see it"
+        ComponentGrant::ALL.contains(&ComponentGrant::Tools),
+        "`tools` must be in the vocabulary so enforce_grants and capability_for_import see it"
     );
 }
 
@@ -609,7 +660,7 @@ fn tools_capability_maps_and_is_in_all() {
     expected = "tool_host seam (None) and Tools grant (granted) must both be set or both absent"
 )]
 fn tools_grant_without_seam_panics() {
-    let grants: BTreeSet<Capability> = [Capability::Tools].into_iter().collect();
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Tools].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_exhaust"),
         slug: "tools-no-seam",
@@ -675,7 +726,7 @@ fn load_store_grant_without_store_path_panics() {
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Store].into_iter().collect(),
+        grants: [ComponentGrant::Store].into_iter().collect(),
         store_path: None, // Store granted but no path
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,

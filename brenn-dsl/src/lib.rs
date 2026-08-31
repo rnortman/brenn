@@ -25,6 +25,7 @@ pub mod derived;
 pub mod diag;
 /// DSL text a test fixture states, single-sourced from the vocabulary it spells.
 pub mod fixture_text;
+pub mod grant_parity;
 pub mod model;
 // `parser` and `unparser` are public because the formatter binary names their
 // types from outside this crate; `cst` is public because their signatures are
@@ -35,6 +36,8 @@ pub mod resolve;
 /// The far side of resolution: what a document means once references, strings,
 /// classes and assemblies are gone.
 pub mod resolved;
+/// Guest source generated from a component specification.
+pub mod scaffold;
 pub mod unparser;
 
 use fltk_serde_core::ParseToTargetError;

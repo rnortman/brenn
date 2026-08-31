@@ -168,7 +168,7 @@ fn loaded_processor() -> ProcessorComponent {
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
-        grants: [brenn_wasm::Capability::Ports].into_iter().collect(),
+        grants: [brenn_wasm::ComponentGrant::Ports].into_iter().collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,

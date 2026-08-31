@@ -157,7 +157,9 @@ async fn build_parser_setup(
         input_amplification_mt: amp,
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports, Capability::Log].into_iter().collect(),
+        grants: [ComponentGrant::Ports, ComponentGrant::Log]
+            .into_iter()
+            .collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,

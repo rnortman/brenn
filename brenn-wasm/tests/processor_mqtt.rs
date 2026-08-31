@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION;
 use brenn_wasm::{
-    Capability, MqttPublishFn, MqttPublishOutcome, ProcessorActivation, ProcessorComponent,
+    ComponentGrant, MqttPublishFn, MqttPublishOutcome, ProcessorActivation, ProcessorComponent,
     ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow, store::DEFAULT_MAX_PAGE_COUNT,
 };
 
@@ -66,7 +66,7 @@ fn trap_after_publish_activation() -> ProcessorActivation {
 
 /// Load the mqtt-test fixture with a given `mqtt_publish` callback.
 fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
-    let grants: BTreeSet<Capability> = [Capability::Mqtt].into_iter().collect();
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Mqtt].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path(),
         slug: "mqtt-test",
@@ -347,4 +347,178 @@ fn mqtt_publish_quota_exceeded_propagates_to_guest() {
          the over-cap call trips quota-exceeded — proving the cap (not an early fixture \
          exit) produced the rejection (test-4)"
     );
+}
+
+// ── the guest SDK's own mqtt surface ─────────────────────────────────────────
+
+/// A single envelope as JSON, with the given `body`.
+fn envelope_with_body(body: &str) -> String {
+    format!(
+        r#"{{"message_id":"00000000-0000-0000-0000-000000000003","source":"test","channel":"brenn:test","sender":"test-sender","publish_ts":"2026-01-01T00:00:00Z","body":"{body}","urgency":"normal","envelope_type":"brenn"}}"#
+    )
+}
+
+fn activation_with_body(body: &str) -> ProcessorActivation {
+    ProcessorActivation {
+        ports: vec![ProcessorPortWindow {
+            port: "in".to_string(),
+            envelopes: vec![envelope_with_body(body)],
+            new_from: 0,
+            dropped: 0,
+        }],
+        deferred: vec![],
+        now: None,
+        sync: None,
+    }
+}
+
+/// Every argument one `mqtt-publish` call reached the host with.
+type PublishArgs = (String, String, Vec<u8>, Option<String>, u8, bool);
+
+/// A callback that records its arguments and reports `outcome`.
+///
+/// The content type is `_content_type` in every other test here, so nothing
+/// reads what a guest sends it. These paths are about exactly that: the SDK
+/// wrappers choose the content type and encode the payload, and a wrong choice
+/// is invisible in the outcome.
+fn recording_callback(
+    outcome: MqttPublishOutcome,
+) -> (MqttPublishFn, Arc<std::sync::Mutex<Vec<PublishArgs>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cb = Arc::clone(&seen);
+    let callback: MqttPublishFn =
+        Arc::new(move |client, topic, payload, content_type, qos, retain| {
+            seen_cb
+                .lock()
+                .expect("the recording callback's lock is never poisoned")
+                .push((client, topic, payload, content_type, qos, retain));
+            outcome.clone()
+        });
+    (callback, seen)
+}
+
+/// `mqtt::publish_json` sends `application/json` and a body that parses back to
+/// the value the guest handed it.
+///
+/// A wrapper that sent the `Debug` form, or labelled it `text/plain`, would be
+/// invisible to every other test: the outcome is `Ok` either way and no other
+/// assertion reads the content type.
+#[test]
+fn publish_json_sends_json_under_the_json_content_type() {
+    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
+    let comp = load_mqtt_test(callback);
+
+    let outcome = comp.handle(activation_with_body("PUBLISH_JSON"));
+    assert!(
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
+        "expected Ok; got {outcome:?}"
+    );
+
+    let calls = seen.lock().expect("not poisoned");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let (client, topic, payload, content_type, qos, retain) = &calls[0];
+    assert_eq!(client, "test-client");
+    assert_eq!(topic, "test/topic");
+    assert_eq!(content_type.as_deref(), Some("application/json"));
+    assert_eq!(*qos, 0);
+    assert!(!*retain);
+    // The fixture publishes the envelope it was handed, so the payload is that
+    // envelope as a JSON string — which is the point: it came back out of
+    // `serde_json`, not out of a `Debug` rendering.
+    let decoded: String =
+        serde_json::from_slice(payload).expect("publish_json sends JSON, not a Debug rendering");
+    assert_eq!(decoded, envelope_with_body("PUBLISH_JSON"));
+}
+
+/// `mqtt::publish_text` sends the bytes as given, under `text/plain`.
+#[test]
+fn publish_text_sends_the_body_under_the_text_content_type() {
+    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
+    let comp = load_mqtt_test(callback);
+
+    let outcome = comp.handle(activation_with_body("PUBLISH_TEXT"));
+    assert!(
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
+        "expected Ok; got {outcome:?}"
+    );
+
+    let calls = seen.lock().expect("not poisoned");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let (_, _, payload, content_type, _, _) = &calls[0];
+    assert_eq!(content_type.as_deref(), Some("text/plain"));
+    assert_eq!(
+        payload.as_slice(),
+        envelope_with_body("PUBLISH_TEXT").as_bytes(),
+        "the text wrapper sends the bytes it was given, unencoded"
+    );
+}
+
+/// Every publish failure the guest SDK can meet, classified and rendered.
+///
+/// `is_transient` is the expensive one to get wrong in the retryable direction:
+/// the bus has no backpressure, so a guest that believes a permanent rejection
+/// may be retried retries it on every activation, forever. Only a broker
+/// disconnect is retryable, and this walks the whole variant set to say so.
+#[test]
+fn the_sdk_classifies_and_renders_every_publish_failure() {
+    for (outcome, expected) in [
+        (
+            MqttPublishOutcome::NotPermitted,
+            "transient=false mqtt publish test-client/test/topic: not-permitted",
+        ),
+        (
+            MqttPublishOutcome::NoConnector,
+            "transient=false mqtt publish test-client/test/topic: no-connector",
+        ),
+        (
+            MqttPublishOutcome::InvalidPayload("too big".to_string()),
+            "transient=false mqtt publish test-client/test/topic: invalid-payload: too big",
+        ),
+        (
+            MqttPublishOutcome::BrokerRejected("topic refused".to_string()),
+            "transient=false mqtt publish test-client/test/topic: broker-rejected: topic refused",
+        ),
+        (
+            MqttPublishOutcome::Broker("disconnected".to_string()),
+            "transient=true mqtt publish test-client/test/topic: broker: disconnected",
+        ),
+    ] {
+        let (callback, _seen) = recording_callback(outcome.clone());
+        let comp = load_mqtt_test(callback);
+
+        let result = comp.handle(activation_with_body("CLASSIFY"));
+
+        match result {
+            ProcessorOutcome::Err(re) => {
+                let msg = re.to_string();
+                assert!(
+                    msg.contains(expected),
+                    "{outcome:?}: expected {expected:?}, got {msg:?}"
+                );
+            }
+            other => panic!("{outcome:?}: expected ProcessorOutcome::Err; got {other:?}"),
+        }
+    }
+}
+
+/// The one failure no callback can produce: the host's own per-activation call
+/// cap. It is permanent for this activation, and the SDK must not offer it as
+/// retryable.
+#[test]
+fn the_sdk_classifies_a_quota_exhaustion_as_permanent() {
+    let (callback, _seen) = recording_callback(MqttPublishOutcome::Ok);
+    let comp = load_mqtt_test(callback);
+
+    let outcome = comp.handle(activation_with_body("CLASSIFY"));
+
+    match outcome {
+        ProcessorOutcome::Err(re) => {
+            let msg = re.to_string();
+            assert!(
+                msg.contains("transient=false mqtt publish test-client/test/topic: quota-exceeded"),
+                "{msg:?}"
+            );
+        }
+        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
+    }
 }

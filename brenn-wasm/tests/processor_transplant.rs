@@ -23,7 +23,7 @@
 mod common;
 
 use brenn_wasm::{
-    Capability, ProcessorActivation, ProcessorComponent, ProcessorDeferredEntry,
+    ComponentGrant, ProcessorActivation, ProcessorComponent, ProcessorDeferredEntry,
     ProcessorDeferredOp, ProcessorDeferredWindow, ProcessorLoadSpec, ProcessorOutcome,
     ProcessorPortWindow, store::DEFAULT_MAX_PAGE_COUNT,
 };
@@ -204,9 +204,13 @@ fn load(config: HashMap<String, String>) -> ProcessorComponent {
         ]),
         mqtt_sinks: HashMap::new(),
         config,
-        grants: [Capability::Ports, Capability::Log, Capability::Config]
-            .into_iter()
-            .collect(),
+        grants: [
+            ComponentGrant::Ports,
+            ComponentGrant::Log,
+            ComponentGrant::Config,
+        ]
+        .into_iter()
+        .collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,

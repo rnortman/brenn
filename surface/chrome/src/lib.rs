@@ -11,5 +11,8 @@
 pub mod help;
 pub mod logic;
 
+/// Port names and types from this component's specification.
+pub mod spec;
+
 #[cfg(target_arch = "wasm32")]
 mod component;

@@ -1479,9 +1479,42 @@ fn a_dom_class_cannot_need_what_no_surface_admits() {
 /// to it: an instance's own words are host-checked where they are written.
 #[test]
 fn a_processor_class_may_need_a_backend_only_capability() {
-    let config = resolved(
-        "component Sink {\n    abi = processor; requires = [store]; optional = [mqtt];\n}\n",
+    let config = resolved("component Sink {\n    abi = processor; requires = [store, mqtt];\n}\n");
+    assert!(
+        config.consumers.is_empty(),
+        "declaring is not instantiating"
     );
+}
+
+/// A processor reaches a capability through a WIT import the host links only
+/// where the instance holds the word, and an artifact cannot import
+/// conditionally — so an optional grant is a promise the runtime cannot keep in
+/// either direction, and the word is refused where it is written.
+#[test]
+fn a_processor_class_has_no_optional_grants() {
+    let errors = refusals(
+        "component Sink {\n    abi = processor; requires = [ports]; optional = [store, log];\n}\n",
+    );
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    for (error, word) in errors.iter().zip(["store", "log"]) {
+        assert_eq!(
+            error,
+            &format!(
+                "`{word}` cannot be optional on a processor class: a processor reaches a \
+                 capability through a WIT import the host links only where the instance grants \
+                 it, and an artifact cannot import conditionally, so the word is either in \
+                 `requires` or not in the spec"
+            )
+        );
+    }
+}
+
+/// The refusal is the abi's, not the vocabulary's: a dom class keeps `optional`,
+/// because a surface grant is not an import the linker decides.
+#[test]
+fn a_dom_class_keeps_its_optional_grants() {
+    let config =
+        resolved("component Panel {\n    abi = dom; requires = []; optional = [log];\n}\n");
     assert!(
         config.consumers.is_empty(),
         "declaring is not instantiating"
@@ -1495,10 +1528,10 @@ fn a_processor_class_may_need_a_backend_only_capability() {
 fn a_backend_only_requirement_reaches_the_instance_that_carries_it() {
     let config = resolved(concat!(
         packaged!(),
-        "component Sink {\n    abi = processor; requires = [store]; optional = [mqtt];\n}\n",
+        "component Sink {\n    abi = processor; requires = [store, mqtt];\n}\n",
         packaged!(),
         "new alice_sink: Sink {\n",
-        "    grants = [store];\n",
+        "    grants = [store, mqtt];\n",
         "}\n",
     ));
     let consumer = &config.consumers[0];
@@ -1509,16 +1542,11 @@ fn a_backend_only_requirement_reaches_the_instance_that_carries_it() {
             .iter()
             .map(|word| word.value().word())
             .collect::<Vec<_>>(),
-        vec!["store"]
+        vec!["store", "mqtt"]
     );
-    assert_eq!(
-        consumer
-            .class
-            .optional
-            .iter()
-            .map(|word| word.value().word())
-            .collect::<Vec<_>>(),
-        vec!["mqtt"]
+    assert!(
+        consumer.class.optional.is_empty(),
+        "a processor class has no optional grants"
     );
     assert_eq!(
         consumer
@@ -1529,7 +1557,7 @@ fn a_backend_only_requirement_reaches_the_instance_that_carries_it() {
             .iter()
             .map(|word| word.name.value().as_str())
             .collect::<Vec<_>>(),
-        vec!["store"]
+        vec!["store", "mqtt"]
     );
 }
 
@@ -3359,7 +3387,7 @@ fn tool_doc(statements: &str) -> String {
     format!(
         concat!(
             packaged!(),
-            "component Sink {{\n    abi = processor; requires = []; optional = [tools];\n}}\n",
+            "component Sink {{\n    abi = processor; requires = [tools];\n}}\n",
             packaged!(),
             "new alice_sink: Sink {{\n",
             "    grants = [tools];\n",

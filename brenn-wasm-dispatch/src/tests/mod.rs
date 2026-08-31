@@ -45,7 +45,7 @@ use brenn_obs::alerting::make_capturing_alerter_with_severity;
 pub use brenn_obs::alerting::noop_alert_dispatcher;
 pub use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 pub use brenn_wasm::{
-    Capability, GuestAlertSeverity, ProcessorAlerter, ProcessorComponent, ProcessorLoadSpec,
+    ComponentGrant, GuestAlertSeverity, ProcessorAlerter, ProcessorComponent, ProcessorLoadSpec,
 };
 #[cfg(test)]
 use chrono::Utc;
@@ -225,7 +225,7 @@ pub fn build_cfg(
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
@@ -316,7 +316,7 @@ pub async fn build_multi_channel_setup(
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
@@ -485,7 +485,7 @@ pub async fn build_multiport_setup_with_depths(
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
@@ -699,7 +699,7 @@ pub async fn build_two_channel_setup(
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,

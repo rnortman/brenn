@@ -6,7 +6,8 @@ the guest crate hub, the globbed sources — so a crate's BUILD.bazel states onl
 what is specific to it.
 
 Above them sits the component pipeline: `wit_bindgen_rust` generates a raw
-crate's bindings, `wasm_component` transitions a core module into the wasm32
+crate's bindings, `guest_spec_scaffold` generates a specification-bearing
+crate's port module, `wasm_component` transitions a core module into the wasm32
 configuration and wraps it with `wasm-tools component new`, and
 `wasi_import_test` asserts the result imports nothing from `wasi:`.
 """
@@ -37,12 +38,31 @@ def wasm_guest_library(name, edition = "2024", deps = [], compile_data = [], vis
         deps = all_crate_deps(normal = True) + deps,
     )
 
+def replace_generated(srcs, generated):
+    """Swap generated modules into a crate's globbed source list.
+
+    One statement of the swap for every generator: a module generated into the
+    crate takes the path it occupies there, and the committed file at that path
+    — where one exists at all — is dropped so the generated one is what
+    compiles. A new generator is a new entry at a call site, not a new keyword
+    argument here.
+
+    Args:
+        srcs: the globbed source list.
+        generated: `{"src/<module>.rs": <label>}` — the path each generated
+            module occupies in the crate, and the target that produces it.
+
+    Returns:
+        The source list with each generated module in its crate path's place.
+    """
+    return [s for s in srcs if s not in generated] + generated.values()
+
 def wasm_guest_cdylib(
         name,
         edition = "2024",
         deps = [],
         compile_data = [],
-        bindings = None,
+        generated_srcs = {},
         visibility = None):
     """A component crate's core WASM module, built for wasm32-unknown-unknown.
 
@@ -54,14 +74,13 @@ def wasm_guest_cdylib(
         edition: Rust edition; must equal the crate's Cargo.toml edition.
         deps: first-party dependencies. Third-party ones come from the hub.
         compile_data: files read at macro-expansion time (WIT worlds).
-        bindings: for a raw-WIT crate, the `wit_bindgen_rust` target supplying
-            `src/bindings.rs`. The committed copy of that file is dropped from
-            the source glob so the generated one is what compiles.
+        generated_srcs: modules generated into this crate, keyed by the path
+            each occupies — `{"src/bindings.rs": ":bindings"}` for a raw-WIT
+            crate, `{"src/spec.rs": ":spec"}` for a specification-bearing one.
+            See `replace_generated`.
         visibility: target visibility.
     """
-    srcs = native.glob(["src/**/*.rs"])
-    if bindings:
-        srcs = [s for s in srcs if s != "src/bindings.rs"] + [bindings]
+    srcs = replace_generated(native.glob(["src/**/*.rs"]), generated_srcs)
 
     rust_shared_library(
         name = name,
@@ -138,6 +157,81 @@ wit_bindgen_rust = rule(
 )
 
 # ---------------------------------------------------------------------------
+# spec scaffolding
+# ---------------------------------------------------------------------------
+
+def _guest_spec_scaffold_impl(ctx):
+    out = ctx.actions.declare_file("src/spec.rs")
+
+    args = ctx.actions.args()
+    args.add(ctx.executable._dsl_cli)
+    args.add(ctx.executable._rustfmt)
+    args.add(out)
+    args.add(ctx.file.spec)
+    args.add(ctx.attr.class_name)
+
+    # The emitter writes valid Rust and rustfmt decides how it is laid out.
+    # Predicting the layout in the emitter instead would put a copy of rustfmt's
+    # heuristics there, one construct at a time, and every shape no fixture
+    # covers would emit code the toolchain reformats.
+    ctx.actions.run_shell(
+        outputs = [out],
+        inputs = [ctx.file.spec],
+        tools = [
+            ctx.attr._dsl_cli[DefaultInfo].files_to_run,
+            ctx.attr._rustfmt[DefaultInfo].files_to_run,
+        ],
+        command = """
+set -eu
+if [ -n "$5" ]; then
+    "$1" scaffold --class "$5" -o "$3" "$4"
+else
+    "$1" scaffold -o "$3" "$4"
+fi
+"$2" --edition 2024 "$3"
+""",
+        arguments = [args],
+        mnemonic = "GuestSpecScaffold",
+        progress_message = "Scaffolding %s from %s" % (ctx.label, ctx.file.spec.basename),
+    )
+    return [DefaultInfo(files = depset([out]))]
+
+guest_spec_scaffold = rule(
+    implementation = _guest_spec_scaffold_impl,
+    doc = """Generate a component crate's `src/spec.rs` from its specification.
+
+    The output is untracked: the specification label is an action input, so
+    editing the specification rebuilds the module and every guest that has not
+    kept up stops compiling. That is the drift gate a committed copy would need
+    a parity test for.
+
+    The label taken here is the same one the component's package embeds and the
+    host hash-binds at boot, so the bytes that generate this code are the bytes
+    the running system checks.
+    """,
+    attrs = {
+        "spec": attr.label(
+            allow_single_file = [".brenn"],
+            mandatory = True,
+            doc = "The authored specification to generate from.",
+        ),
+        "class_name": attr.string(
+            doc = "Which component class to generate from, where the document declares more than one.",
+        ),
+        "_dsl_cli": attr.label(
+            cfg = "exec",
+            default = Label("//brenn-dsl:dsl_cli"),
+            executable = True,
+        ),
+        "_rustfmt": attr.label(
+            cfg = "exec",
+            default = Label("@rules_rust//tools/upstream_wrapper:rustfmt"),
+            executable = True,
+        ),
+    },
+)
+
+# ---------------------------------------------------------------------------
 # wasm-tools component new
 # ---------------------------------------------------------------------------
 
@@ -202,6 +296,32 @@ _wasm_component = rule(
             allow_single_file = True,
             cfg = "exec",
             default = Label("//bazel/tools:wasm-tools"),
+        ),
+    },
+)
+
+def _wasm32_build_impl(ctx):
+    return [DefaultInfo(files = depset(transitive = [
+        target[DefaultInfo].files
+        for target in ctx.attr.target
+    ]))]
+
+wasm32_build = rule(
+    implementation = _wasm32_build_impl,
+    doc = """Build a wasm32-only target from a host-configured command line.
+
+    A crate marked `target_compatible_with = WASM32_ONLY` is skipped, not built,
+    by `bazel build //...` on a host platform — every guest crate in the tree is
+    reached instead through a component's incoming transition. A wasm32 library
+    that no component depends on has no such reacher, so it would sit in the
+    tree compiled by nothing. This is that reacher: it transitions its target
+    into the wasm32 configuration and forwards what the target produced.
+    """,
+    attrs = {
+        "target": attr.label(
+            cfg = _wasm32_transition,
+            mandatory = True,
+            doc = "The wasm32-only target to build.",
         ),
     },
 )
@@ -499,6 +619,98 @@ _wasi_import_test = rule(
     },
     test = True,
 )
+
+def _grant_parity_test_impl(ctx):
+    component = ctx.file.component
+    check = ctx.file._check
+    wit_lib = ctx.file._wit_lib
+    dsl_cli = ctx.executable._dsl_cli
+    script = _check_wrapper(
+        ctx,
+        check,
+        [
+            ctx.file._wasm_tools.short_path,
+            wit_lib.short_path,
+            dsl_cli.short_path,
+            component.short_path,
+            ctx.file.spec.short_path,
+        ],
+    )
+    return [DefaultInfo(
+        executable = script,
+        runfiles = ctx.runfiles(files = [
+            component,
+            ctx.file.spec,
+            ctx.file._wasm_tools,
+            check,
+            wit_lib,
+            dsl_cli,
+        ]).merge(ctx.attr._dsl_cli[DefaultInfo].default_runfiles),
+    )]
+
+_grant_parity_test = rule(
+    implementation = _grant_parity_test_impl,
+    doc = """Hold a specification's `requires` list equal to its artifact's imports.
+
+    The third edge of the triangle. The deployment compile holds an instance's
+    grants against the class's `requires`, and the host holds the artifact's
+    imports against those same grants at load; without this, a specification
+    that misstates its own component reaches a deployment before anything
+    contradicts it, and fails there as the deployer's problem.
+
+    A test rather than a step inside the package emitter: the emit script would
+    have to learn the grant vocabulary, which lives in Rust and is single-sourced
+    with the host's linker gating. `make check` runs the whole test graph and CD
+    re-runs it against the pinned ref, so this gates every release either way.
+    """,
+    attrs = {
+        "component": attr.label(
+            allow_single_file = [".wasm"],
+            mandatory = True,
+            doc = "The built artifact whose imports are read.",
+        ),
+        "spec": attr.label(
+            allow_single_file = [".brenn"],
+            mandatory = True,
+            doc = "The authored specification the component's package carries.",
+        ),
+        "_check": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:grant_parity_check.sh"),
+        ),
+        "_dsl_cli": attr.label(
+            cfg = "exec",
+            default = Label("//brenn-dsl:dsl_cli"),
+            executable = True,
+        ),
+        "_wasm_tools": attr.label(
+            allow_single_file = True,
+            cfg = "exec",
+            default = Label("//bazel/tools:wasm-tools"),
+        ),
+        "_wit_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:wit_lib.sh"),
+        ),
+    },
+    test = True,
+)
+
+def grant_parity_test(name, component, spec):
+    """The specification-against-artifact gate for one processor component.
+
+    Args:
+        name: target name.
+        component: the `wasm_component` target holding the built artifact.
+        spec: the authored `.brenn` specification label.
+    """
+    _grant_parity_test(
+        name = name,
+        component = component,
+        spec = spec,
+        size = "small",
+        target_compatible_with = HOST_ONLY,
+    )
 
 def _deployed_components_test_impl(ctx):
     packaged = [t[ComponentPackageInfo].package for t in ctx.attr.packages]

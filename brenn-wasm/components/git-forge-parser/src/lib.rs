@@ -20,18 +20,13 @@
 //      Malformed JSON or no non-empty URL → warn log, drop.
 //   4. Publish the normalized push event to the `push-events` port.
 
+mod spec;
+
+use crate::spec::{InPort, log};
 use brenn_guest::{
-    Activation, Error, MessageEnvelopeExt, Processor, WebhookEnvelope, log, publish_json,
-    serde_json,
+    Activation, Error, MessageEnvelopeExt, Processor, WebhookEnvelope, serde_json,
 };
 use serde::{Deserialize, Serialize};
-
-/// Output port carrying normalized push events (bound to `brenn:git-repo-sync`).
-const PUSH_EVENTS_PORT: &str = "push-events";
-/// Input port for Forgejo webhooks (bound to `webhook:git-forgejo`).
-const FORGEJO_PORT: &str = "forgejo";
-/// Input port for GitHub webhooks (bound to `webhook:git-github`).
-const GITHUB_PORT: &str = "github";
 
 /// Subset of a forge push payload we extract remotes from. Both Forgejo and
 /// GitHub push payloads carry `repository.ssh_url` / `repository.clone_url`
@@ -61,6 +56,8 @@ struct PushEvent<'a> {
     received_at: String,
 }
 
+impl spec::PushEventsPayload for PushEvent<'_> {}
+
 struct GitForgeParser;
 
 /// Case-insensitive header lookup. `WebhookEnvelope` headers carry lowercased
@@ -72,21 +69,16 @@ fn header<'a>(env: &'a WebhookEnvelope, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Resolve the forge name and event-type header value for an input port.
-/// Returns `Err` for an unbound port name (host-config bug → quarantine).
-fn forge_and_event<'a>(
-    port: &str,
-    env: &'a WebhookEnvelope,
-) -> Result<(&'static str, Option<&'a str>), Error> {
+/// Resolve the forge name and event-type header value for an input port. Total
+/// over the ports the specification declares, which is every port the host can
+/// bind.
+fn forge_and_event(port: InPort, env: &WebhookEnvelope) -> (&'static str, Option<&str>) {
     match port {
-        FORGEJO_PORT => Ok((
+        InPort::Forgejo => (
             "forgejo",
             header(env, "x-forgejo-event").or_else(|| header(env, "x-gitea-event")),
-        )),
-        GITHUB_PORT => Ok(("github", header(env, "x-github-event"))),
-        other => Err(Error::failed(format!(
-            "git-forge-parser: envelope arrived on unknown input port {other}"
-        ))),
+        ),
+        InPort::Github => ("github", header(env, "x-github-event")),
     }
 }
 
@@ -108,7 +100,8 @@ fn extract_remotes(payload: &ForgePayload) -> Vec<String> {
 impl Processor for GitForgeParser {
     fn receive(activation: Activation) -> Result<(), Error> {
         for window in activation.port_windows() {
-            let port = window.port();
+            let in_port = InPort::of(window)?;
+            let port = in_port.name();
             for result in window.new_envelopes() {
                 let msg = result?;
                 // Step 1: an unparseable webhook envelope is a host-side bug. The
@@ -116,7 +109,7 @@ impl Processor for GitForgeParser {
                 let env = msg.webhook_body()?;
 
                 // Step 2: event-type filter.
-                let (forge, event_type) = forge_and_event(port, &env)?;
+                let (forge, event_type) = forge_and_event(in_port, &env);
                 let Some(event_type) = event_type else {
                     log::warn(format!(
                         "git-forge-parser: {port} envelope (endpoint {}) missing event-type \
@@ -160,7 +153,7 @@ impl Processor for GitForgeParser {
                     remotes,
                     received_at: env.received_at.to_rfc3339(),
                 };
-                publish_json(PUSH_EVENTS_PORT, &event)?;
+                spec::push_events().publish(&event)?;
             }
         }
         Ok(())

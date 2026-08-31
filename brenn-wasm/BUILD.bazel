@@ -1,5 +1,5 @@
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "component_fixtures", "component_install_tree", "component_package", "deployed_components_test")
+load("//bazel/wasm:defs.bzl", "component_fixtures", "component_install_tree", "component_package", "deployed_components_test", "grant_parity_test")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
@@ -63,6 +63,23 @@ COMPONENT_PACKAGES = {
 PACKAGES = [
     ":package_" + name.replace("-", "_")
     for name in COMPONENT_PACKAGES
+]
+
+# The third edge of the grant triangle, one target per packaged component that
+# has a specification to be held to. Generated from the same dict the packages
+# are, so a component cannot be packaged without acquiring the gate.
+#
+# Replay-world packages declare no specification and are skipped here as they
+# are everywhere: they have no class, no ports and no grants, so there is no
+# `requires` list to compare an import profile against.
+[
+    grant_parity_test(
+        name = "grant_parity_" + name.replace("-", "_"),
+        component = "//brenn-wasm/components/{}:component".format(name),
+        spec = spec,
+    )
+    for name, (_, spec) in COMPONENT_PACKAGES.items()
+    if spec
 ]
 
 # The same components root a deployment installs, staged in one directory so a

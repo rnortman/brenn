@@ -17,9 +17,9 @@ Chrome reads 6 ports. Bind each to the channel it carries:
 |---|---|---|
 | `layout` | a `brenn:` layout channel (retained, depth ≥ 1) | the layout doc (below) |
 | `theme` | `local:brenn/theme` | `{ v, theme }` — the runtime theme axis |
+| `takeover` | `local:brenn/takeover` | a component's fullscreen request/release (needs the surface `takeover` grant) |
 | `link-state` | `local:brenn/link-state` | `{ v, state }` — the connection banner |
 | `surface-state` | `local:brenn/surface-state` | the mounted-instance set chrome arranges |
-| `takeover` | `local:brenn/takeover` | a component's fullscreen request/release (needs the surface `takeover` grant) |
 | `toast` | `local:brenn/toast` | transient notices (live-only, retains nothing) |
 
 A surface with no `layout` binding renders the default layout: the first three mounted instances in configured order, laid out by count (1 → `single`, 2 → `columns-2`, 3 or more → `columns-3`).

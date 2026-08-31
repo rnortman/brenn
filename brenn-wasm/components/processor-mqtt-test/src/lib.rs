@@ -32,6 +32,13 @@
 // counter in the host callback: the callback is invoked once even though the
 // activation traps.
 //
+// Three further shapes route through the guest SDK (`brenn_guest::mqtt`) rather
+// than the raw import, keyed on their own body sentinels: `PUBLISH_JSON` and
+// `PUBLISH_TEXT` send once through the wrappers that choose a content type, so
+// the host reads what the SDK chose off the callback's arguments; `CLASSIFY`
+// runs the bounded loop through the SDK and reports how it classified and
+// rendered the first failure.
+//
 // The test wires the `mqtt_publish` host callback to return a specific
 // `MqttPublishOutcome` variant, then asserts on the `ProcessorOutcome` the host
 // sees.  This proves the full host path (linker → `do_mqtt_publish` → bootstrap
@@ -65,6 +72,31 @@ const PUBLISH_ATTEMPTS: usize = 513;
 /// once, then panic so the host reports `ProcessorOutcome::Trap`.
 const TRAP_AFTER_PUBLISH: &str = "TRAP_AFTER_PUBLISH";
 
+/// Sentinel selecting `brenn_guest::mqtt::publish_json`: serialize the body and
+/// send it, so the host callback observes the content type and the payload the
+/// SDK chose rather than one this fixture spelled.
+const PUBLISH_JSON: &str = "PUBLISH_JSON";
+
+/// Sentinel selecting `brenn_guest::mqtt::publish_text`.
+const PUBLISH_TEXT: &str = "PUBLISH_TEXT";
+
+/// Sentinel selecting the classification path: publish through the SDK until
+/// something fails, then report how the SDK classified and rendered that
+/// failure. The host picks which failure by what its callback returns — and by
+/// letting the loop run to the per-activation call cap, which produces the one
+/// variant no callback can.
+const CLASSIFY: &str = "CLASSIFY";
+
+/// The message inside a guest-SDK error, for reporting it through this
+/// fixture's own `ReceiveError` (the SDK's bindings and this crate's are
+/// separate generations of the same WIT, so the types do not convert).
+fn rendered(e: brenn_guest::Error) -> String {
+    match e {
+        brenn_guest::Error::MalformedEnvelope(m) => m,
+        brenn_guest::Error::ProcessingFailed(m) => m,
+    }
+}
+
 impl Guest for ProcessorMqttTest {
     fn receive(a: Activation) -> Result<(), ReceiveError> {
         // Only act when there is at least one new envelope.
@@ -90,8 +122,13 @@ impl Guest for ProcessorMqttTest {
         // MQTT publish has already gone to the broker by this point and is not
         // retracted by the trap (§3.1); the test pins this via a host-callback
         // counter that records exactly one invocation despite the trap.
+        //
+        // SDK wrapper here exercises `brenn_guest::mqtt` end to end; the loop
+        // below stays on the raw import because it is about the host's own
+        // error variants.
         if first_new.is_some_and(|s| s.contains(TRAP_AFTER_PUBLISH)) {
-            match mqtt_publish("test-client", "test/topic", &payload, None, 0, false) {
+            match brenn_guest::mqtt::publish("test-client", "test/topic", &payload, None, 0, false)
+            {
                 Ok(()) => panic!("trap-after-publish: publish succeeded, now trapping"),
                 Err(_) => {
                     // The trap-after-publish test wires an always-Ok callback, so
@@ -102,6 +139,77 @@ impl Guest for ProcessorMqttTest {
                     ));
                 }
             }
+        }
+
+        // SDK content-type paths. Each sends exactly once and returns Ok, so
+        // the host test reads the callback's captured arguments rather than an
+        // outcome variant: what is under test is the payload and the content
+        // type the SDK chose, neither of which any other test observes.
+        if first_new.is_some_and(|s| s.contains(PUBLISH_JSON)) {
+            let body = first_new.expect("the sentinel came from a body").as_str();
+            return match brenn_guest::mqtt::publish_json(
+                "test-client",
+                "test/topic",
+                &body,
+                0,
+                false,
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(ReceiveError::ProcessingFailed(rendered(e))),
+            };
+        }
+        if first_new.is_some_and(|s| s.contains(PUBLISH_TEXT)) {
+            let body = first_new.expect("the sentinel came from a body").as_str();
+            return match brenn_guest::mqtt::publish_text(
+                "test-client",
+                "test/topic",
+                body,
+                0,
+                false,
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(ReceiveError::ProcessingFailed(rendered(e))),
+            };
+        }
+
+        // Classification path: the same bounded loop, through the SDK. The
+        // first failure is reported as the SDK saw it — whether a later
+        // activation may retry it, and the diagnostic the SDK renders — so the
+        // host test pins `is_transient` and the error rendering against a real
+        // host outcome instead of trusting the guest crate's own reading of its
+        // variants.
+        if first_new.is_some_and(|s| s.contains(CLASSIFY)) {
+            for _ in 0..PUBLISH_ATTEMPTS {
+                let Err(e) = brenn_guest::mqtt::try_publish(
+                    "test-client",
+                    "test/topic",
+                    &payload,
+                    None,
+                    0,
+                    false,
+                ) else {
+                    continue;
+                };
+                let transient = brenn_guest::mqtt::is_transient(&e);
+                // A second call for the rendered form: the flattening wrapper
+                // keeps no variant, and the callback answers the same way
+                // twice.
+                let message = match brenn_guest::mqtt::publish(
+                    "test-client",
+                    "test/topic",
+                    &payload,
+                    None,
+                    0,
+                    false,
+                ) {
+                    Ok(()) => String::from("second call unexpectedly succeeded"),
+                    Err(e) => rendered(e),
+                };
+                return Err(ReceiveError::ProcessingFailed(format!(
+                    "transient={transient} {message}"
+                )));
+            }
+            return Ok(());
         }
 
         // Publish repeatedly, stopping at the first error. A callback that errors

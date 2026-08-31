@@ -14,6 +14,7 @@ the package that owns the crate, and `surface_dist` merges the stages.
 load("@aspect_bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
 load("@aspect_rules_js//js:defs.bzl", "js_run_binary")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/wasm:defs.bzl", "grant_parity_test")
 
 def surface_crate_stage(name, bundle, artifact, sidecars = [], visibility = ["//visibility:public"]):
     """One crate's slice of the asset tree: its bundle, plus renamed sidecars.
@@ -331,6 +332,17 @@ def surface_processor_assets(name, kind, component, jco_version, spec, visibilit
         target_compatible_with = HOST_ONLY,
         transpiled = ":" + transpiled,
         visibility = visibility,
+    )
+
+    # A surface-hosted kind is packaged here rather than under
+    # `COMPONENT_PACKAGES`, so its edge of the grant triangle is declared here
+    # too. Paired with the staging rule for the same reason the WASI gate is
+    # paired with `wasm_component`: a kind cannot be made surface-hostable
+    # without acquiring the gate.
+    grant_parity_test(
+        name = name + "_grant_parity_test",
+        component = component,
+        spec = spec,
     )
 
 # ---------------------------------------------------------------------------

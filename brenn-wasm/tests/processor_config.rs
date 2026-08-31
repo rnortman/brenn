@@ -13,7 +13,7 @@
 mod common;
 
 use brenn_wasm::{
-    Capability, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
+    ComponentGrant, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
     ProcessorPortWindow,
 };
 use std::collections::HashMap;
@@ -43,7 +43,7 @@ fn load_config_component(config: HashMap<String, String>) -> ProcessorComponent 
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
         config,
-        grants: [Capability::Ports, Capability::Config]
+        grants: [ComponentGrant::Ports, ComponentGrant::Config]
             .into_iter()
             .collect(),
         store_path: None,

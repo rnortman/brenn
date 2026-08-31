@@ -35,13 +35,11 @@ use web_sys::{Document, HtmlElement};
 
 use crate::logic::{Display, Ingest, ProtobarState};
 use crate::markdown::{Block, Inline, Style};
+use crate::spec::port::TICK;
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
 const KIND: &str = "protobar";
-
-/// The expiry-wake port — must match a `[[surface.io_port]] port` declaration.
-const TICK_PORT: &str = "tick";
 
 /// A page-lifetime closure that renders both divs as of a given instant. It
 /// schedules nothing: the next expiry wake is parked from inside the activation,
@@ -140,7 +138,7 @@ fn on_activation(
         .expect("an activation's wall clock is a representable instant");
     for window in &activation.ports {
         // The tick's payload is irrelevant — the wake is the message.
-        if window.port == TICK_PORT {
+        if window.port == TICK {
             continue;
         }
         if window.dropped > 0 {
@@ -176,7 +174,7 @@ fn on_activation(
         .borrow()
         .next_expiry(now)
         .map(|target| target.timestamp_millis().max(0) as u64);
-    repark_tick(activation, publisher, &wiring.host, TICK_PORT, release_at);
+    repark_tick(activation, publisher, &wiring.host, TICK, release_at);
 }
 
 /// Build the page-lifetime render closure: it draws both divs as of the instant it
@@ -316,6 +314,8 @@ fn append_inline(doc: &Document, parent: &HtmlElement, inline: &Inline) {
 mod tests {
     use super::*;
 
+    use crate::spec::port::MESSAGES;
+
     use brenn_surface_test_fixtures::browser::{activation_json, mount, record_ops, recorded};
     use wasm_bindgen::JsValue;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -324,10 +324,6 @@ mod tests {
 
     /// The instance this test binary binds its one module record to.
     const TEST_INSTANCE: &str = "wbt-protobar";
-
-    /// The message port a bar's config binds. Its own name is the operator's, but
-    /// the glue treats every non-tick window alike, so one stands for all.
-    const MESSAGE_PORT: &str = "messages";
 
     /// When the one delivered message stops being live — far enough out that the
     /// expiry is always in this activation's future.
@@ -363,11 +359,11 @@ mod tests {
                 &JsValue::from_str(&activation_json(
                     &[
                         (
-                            MESSAGE_PORT,
+                            MESSAGES,
                             &serde_json::json!({ "text": "live", "expires_at": EXPIRES_AT })
                                 .to_string(),
                         ),
-                        (TICK_PORT, "{}"),
+                        (TICK, "{}"),
                     ],
                     None,
                     now_ms,
@@ -384,7 +380,7 @@ mod tests {
             vec![vec![
                 "defer".to_string(),
                 "publish".to_string(),
-                TICK_PORT.to_string(),
+                TICK.to_string(),
                 "{}".to_string(),
                 expected.to_string(),
             ]],

@@ -19,13 +19,11 @@ use brenn_surface_component_support::{
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 
+use crate::spec::port::OUT;
+
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of the panic event it dispatches.
 const KIND: &str = "echo-stub";
-
-/// The single output port this fixture publishes on, matching the dev-config
-/// `[[surface.output]]` binding.
-const OUTPUT_PORT: &str = "out";
 
 /// The sync port the counter button's press arrives on. Chosen by this component
 /// at request time and bound to nothing: it must only avoid colliding with an
@@ -217,7 +215,7 @@ fn on_gesture(
         SEND_CUSTOM_PORT => press.to_string(),
         other => panic!("echo-stub wired no gesture to sync port {other:?}"),
     };
-    if publish_or_fault(publisher, &view.host, OUTPUT_PORT, &body) {
+    if publish_or_fault(publisher, &view.host, OUT, &body) {
         state.borrow_mut().sent += 1;
     }
     update_status(&view.status, &state.borrow());
@@ -350,7 +348,7 @@ mod tests {
                 vec![
                     "publish".to_string(),
                     String::new(),
-                    OUTPUT_PORT.to_string(),
+                    OUT.to_string(),
                     "echo-stub message #1".to_string(),
                     String::new(),
                 ],
@@ -397,7 +395,7 @@ mod tests {
             vec![vec![
                 "publish".to_string(),
                 String::new(),
-                OUTPUT_PORT.to_string(),
+                OUT.to_string(),
                 CUSTOM_BODY.to_string(),
                 String::new(),
             ]],
@@ -424,7 +422,7 @@ mod tests {
                 .iter()
                 .map(|row| (row[0].as_str(), row[2].as_str()))
                 .collect::<Vec<_>>(),
-            vec![("publish", OUTPUT_PORT), ("log", "")],
+            vec![("publish", OUT), ("log", "")],
             "the refusal is attempted once and reported once"
         );
         assert_eq!(

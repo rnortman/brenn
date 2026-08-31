@@ -37,16 +37,14 @@ use web_sys::HtmlElement;
 
 use crate::logic::dismiss_body;
 use crate::logic::{
-    ACKS_PORT, AckAction, AckKind, AckTarget, MeetingState, Recompute, SNOOZE_SECS, TAKEOVER_PORT,
-    WarningLevel, ack_request_body, parse_ack_request, snooze_body,
+    AckAction, AckKind, AckTarget, MeetingState, Recompute, SNOOZE_SECS, WarningLevel,
+    ack_request_body, parse_ack_request, snooze_body,
 };
+use crate::spec::port::{ACKS, TAKEOVER, TICK};
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
 const KIND: &str = "meeting";
-
-/// The boundary-wake port — must match a `[[surface.io_port]] port` declaration.
-const TICK_PORT: &str = "tick";
 
 /// The sync port a Dismiss/Snooze press arrives on. Not `acks`: that is a bound
 /// input port, and the kernel refuses a sync port that collides with one.
@@ -208,7 +206,7 @@ fn on_activation(
     }
     for window in activation.delivered_windows() {
         // The tick's payload is irrelevant — the wake is the message.
-        if window.port == TICK_PORT {
+        if window.port == TICK {
             continue;
         }
         let notes = state
@@ -232,13 +230,7 @@ fn on_activation(
     // a second near a meeting and relaxes away from one, so the wake that just
     // fired is rarely the wake now wanted.
     let release_at = now_ms + u64::from(view.next_tick_secs) * 1_000;
-    repark_tick(
-        activation,
-        publisher,
-        &wiring.host,
-        TICK_PORT,
-        Some(release_at),
-    );
+    repark_tick(activation, publisher, &wiring.host, TICK, Some(release_at));
 }
 
 /// Publish the ack one button press asked for and apply it locally at once
@@ -270,7 +262,7 @@ fn on_press(
     // The local transition happens whatever the bus says: the user dismissed the
     // meeting, and a quota-refused publish means the other devices keep escalating,
     // not that this one should.
-    publish_or_fault(publisher, &wiring.host, ACKS_PORT, &body);
+    publish_or_fault(publisher, &wiring.host, ACKS, &body);
     state.borrow_mut().apply_local_ack(&target, action, now);
 }
 
@@ -294,7 +286,7 @@ fn announce_takeover(wiring: &Wiring, publisher: &mut Publisher, want_takeover: 
         instance: String::new(),
     })
     .expect("a TakeoverBody serializes to JSON");
-    if publish_or_fault(publisher, &wiring.host, TAKEOVER_PORT, &body) {
+    if publish_or_fault(publisher, &wiring.host, TAKEOVER, &body) {
         *wiring.last_takeover.borrow_mut() = want_takeover;
     }
 }
@@ -513,7 +505,7 @@ mod tests {
                 wake[2].as_str(),
                 wake[3].as_str()
             ),
-            ("defer", "publish", TICK_PORT, "{}"),
+            ("defer", "publish", TICK, "{}"),
         );
         assert!(
             wake[4].parse::<u64>().expect("a decimal release instant") > now_ms,
@@ -540,7 +532,7 @@ mod tests {
         assert!(
             agenda_ops
                 .iter()
-                .any(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT)),
+                .any(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER)),
             "an escalating meeting requests the takeover overlay: {agenda_ops:?}"
         );
 
@@ -567,17 +559,17 @@ mod tests {
         let [ack, takeover, wake] = &press_ops[..] else {
             panic!("expected an ack, a takeover release and a wake: {press_ops:?}")
         };
-        assert_eq!((ack[0].as_str(), ack[2].as_str()), ("publish", ACKS_PORT));
+        assert_eq!((ack[0].as_str(), ack[2].as_str()), ("publish", ACKS));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&ack[3]).expect("the ack body is JSON")["action"],
             "dismiss"
         );
         assert_eq!(
             (takeover[0].as_str(), takeover[2].as_str()),
-            ("publish", TAKEOVER_PORT),
+            ("publish", TAKEOVER),
             "the dismissal drops the panel out of takeover, which must be released"
         );
-        assert_eq!((wake[0].as_str(), wake[2].as_str()), ("defer", TICK_PORT));
+        assert_eq!((wake[0].as_str(), wake[2].as_str()), ("defer", TICK));
         assert_eq!(
             host.get_attribute("data-state").as_deref(),
             Some("idle"),
@@ -601,7 +593,7 @@ mod tests {
         assert_eq!(
             refused_ops
                 .iter()
-                .filter(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT))
+                .filter(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER))
                 .count(),
             1,
             "the transition is announced once: {refused_ops:?}"
@@ -617,17 +609,13 @@ mod tests {
         entry
             .call1(
                 &wasm_bindgen::JsValue::NULL,
-                &wasm_bindgen::JsValue::from_str(&activation_json(
-                    &[(TICK_PORT, "{}")],
-                    None,
-                    now_ms,
-                )),
+                &wasm_bindgen::JsValue::from_str(&activation_json(&[(TICK, "{}")], None, now_ms)),
             )
             .expect("the entry returns ok");
         let retry_ops = take_recorded(&ops);
         let takeover = retry_ops
             .iter()
-            .find(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT))
+            .find(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER))
             .unwrap_or_else(|| {
                 panic!("a refused transition is retried, not dropped: {retry_ops:?}")
             });
@@ -641,18 +629,14 @@ mod tests {
         entry
             .call1(
                 &wasm_bindgen::JsValue::NULL,
-                &wasm_bindgen::JsValue::from_str(&activation_json(
-                    &[(TICK_PORT, "{}")],
-                    None,
-                    now_ms,
-                )),
+                &wasm_bindgen::JsValue::from_str(&activation_json(&[(TICK, "{}")], None, now_ms)),
             )
             .expect("the entry returns ok");
         let settled_ops = take_recorded(&ops);
         assert!(
             !settled_ops
                 .iter()
-                .any(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT)),
+                .any(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER)),
             "a recorded transition is announced once: {settled_ops:?}"
         );
     }

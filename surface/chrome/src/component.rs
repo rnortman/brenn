@@ -27,9 +27,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::{Document, Element, Event, HtmlElement};
 
-use crate::logic::{
-    BannerState, ChromeAction, ChromeCore, LayoutPlacement, PORT_OVERLAY_STATE, Theme, fold_window,
-};
+use crate::logic::{BannerState, ChromeAction, ChromeCore, LayoutPlacement, Theme, fold_window};
+use crate::spec::port::{OVERLAY_STATE, TOAST_TICK};
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
@@ -53,9 +52,6 @@ const TAKEOVER_ATTR: &str = "data-takeover";
 const BANNER_ID: &str = "brenn-surface-banner";
 /// The id of chrome's toast container under `#surface-root`.
 const TOAST_CONTAINER_ID: &str = "brenn-surface-toasts";
-/// The expiry-wake port — must match a `[[surface.io_port]] port` declaration.
-const TOAST_TICK_PORT: &str = "toast-tick";
-
 /// The sync port a click on a rendered toast arrives on, carrying the toast's id
 /// as its request body.
 const TOAST_DISMISS_PORT: &str = "toast-dismiss";
@@ -166,7 +162,7 @@ fn on_activation(activation: &Activation, publisher: &mut Publisher) {
         }
         for window in activation.delivered_windows() {
             // The wake's payload is irrelevant — the wake is the message.
-            if window.port == TOAST_TICK_PORT {
+            if window.port == TOAST_TICK {
                 continue;
             }
             let actions = fold_window(&mut state.core, window, now_mono);
@@ -179,7 +175,7 @@ fn on_activation(activation: &Activation, publisher: &mut Publisher) {
             .now
             .expect("the surface kernel stamps every activation with its wall clock");
         let release_at = state.core.next_wake(now_mono, now_wall);
-        repark_tick(activation, publisher, &host, TOAST_TICK_PORT, release_at);
+        repark_tick(activation, publisher, &host, TOAST_TICK, release_at);
     });
 }
 
@@ -231,7 +227,7 @@ fn apply_actions(state: &mut ChromeState, actions: &[ChromeAction], publisher: &
                     .expect("connectedCallback records the host before the first activation");
                 // Retained state: a refusal nobody acted on would leave every
                 // consumer of `overlay-state` reading a page that has moved on.
-                publish_or_fault(publisher, &host, PORT_OVERLAY_STATE, body);
+                publish_or_fault(publisher, &host, OVERLAY_STATE, body);
             }
         }
     }
@@ -566,7 +562,8 @@ fn toast_source_str(source: ToastSource) -> &'static str {
 mod tests {
     use super::*;
 
-    use crate::logic::{PORT_TOAST, TOAST_TTL_MS};
+    use crate::logic::TOAST_TTL_MS;
+    use crate::spec::port::TOAST;
     use brenn_surface_schema::{CONTROL_PLANE_VERSION, ToastBody};
     use brenn_surface_test_fixtures::browser::{activation_json, mount, record_ops, take_recorded};
     use wasm_bindgen::JsValue;
@@ -666,7 +663,7 @@ mod tests {
 
         activate(
             &entry,
-            &activation_json(&[(PORT_TOAST, &toast_body("under test"))], None, NOW_MS),
+            &activation_json(&[(TOAST, &toast_body("under test"))], None, NOW_MS),
         );
         let ids = rendered_toast_ids();
         let [toast_id] = &ids[..] else {
@@ -677,7 +674,7 @@ mod tests {
             vec![vec![
                 "defer".to_string(),
                 "publish".to_string(),
-                TOAST_TICK_PORT.to_string(),
+                TOAST_TICK.to_string(),
                 "{}".to_string(),
                 (NOW_MS + TOAST_TTL_MS).to_string(),
             ]],
@@ -732,10 +729,7 @@ mod tests {
         let [wake] = &missed[..] else {
             panic!("a live toast keeps exactly one wake aimed at it: {missed:?}")
         };
-        assert_eq!(
-            (wake[0].as_str(), wake[2].as_str()),
-            ("defer", TOAST_TICK_PORT)
-        );
+        assert_eq!((wake[0].as_str(), wake[2].as_str()), ("defer", TOAST_TICK));
         let release: u64 = wake[4].parse().expect("a decimal release instant");
         assert!(
             release > NOW_MS && release <= NOW_MS + TOAST_TTL_MS,

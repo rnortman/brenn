@@ -33,7 +33,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
@@ -658,7 +658,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
@@ -1143,7 +1143,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
 
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,

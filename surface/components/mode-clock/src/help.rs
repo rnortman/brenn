@@ -18,9 +18,9 @@ use brenn_surface_schema::{
 };
 
 use crate::logic::{
-    CONFIG_PORT, DEFAULT_DARK_START, DEFAULT_LIGHT_START, Mode, RawConfig, RawSchedule, THEME_PORT,
-    fmt_hhmm,
+    DEFAULT_DARK_START, DEFAULT_LIGHT_START, Mode, RawConfig, RawSchedule, fmt_hhmm,
 };
+use crate::spec::port::{CONFIG, THEME};
 
 /// Mode-clock's help sidecar, in full.
 pub fn help_markdown() -> String {
@@ -54,7 +54,7 @@ fn config_intro(out: &mut String) {
     let _ = write!(
         out,
         "\nPublish a config body via BrennSend to the channel bound to the instance's \
-         `{CONFIG_PORT}` port — use a retained channel so the last config replays on \
+         `{CONFIG}` port — use a retained channel so the last config replays on \
          reconnect. The body is a JSON object:\n\n"
     );
 }
@@ -118,7 +118,7 @@ fn output_section(out: &mut String) {
     let _ = write!(
         out,
         "\nThe component's only output is a `ThemeBody` — `{example}`, where `theme` is \
-         `{THEME_DARK}` or `{THEME_LIGHT}` — published on its `{THEME_PORT}` output port. \
+         `{THEME_DARK}` or `{THEME_LIGHT}` — published on its `{THEME}` output port. \
          Bind that port to the reserved `{LOCAL_THEME_CHANNEL}` plane with a \
          `[[surface.output]]` block; chrome consumes the plane and writes the resulting \
          `data-theme` on `<body>`.\n",
@@ -155,7 +155,7 @@ mod tests {
             let mut clock = ModeClock::new();
             let body = serde_json::json!({ "mode": mode.as_str() });
             assert_eq!(
-                clock.on_config(CONFIG_PORT, &sample_envelope_json(&body.to_string())),
+                clock.on_config(CONFIG, &sample_envelope_json(&body.to_string())),
                 Ok(ConfigOutcome::Accepted),
                 "documented mode {} is rejected by the parser",
                 mode.as_str()
@@ -191,7 +191,7 @@ mod tests {
             .replacen("<HH:MM>", &fmt_hhmm(DEFAULT_DARK_START), 1);
         let mut clock = ModeClock::new();
         assert_eq!(
-            clock.on_config(CONFIG_PORT, &sample_envelope_json(&filled)),
+            clock.on_config(CONFIG, &sample_envelope_json(&filled)),
             Ok(ConfigOutcome::Accepted),
             "the documented body shape is not accepted: {filled}"
         );

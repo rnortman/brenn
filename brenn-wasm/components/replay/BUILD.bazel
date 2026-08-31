@@ -20,7 +20,7 @@ wit_bindgen_rust(
 # test binary. Done = they run under a gate, or they are deleted.
 wasm_guest_cdylib(
     name = "brenn-replay",
-    bindings = ":bindings",
+    generated_srcs = {"src/bindings.rs": ":bindings"},
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [

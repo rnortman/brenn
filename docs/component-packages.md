@@ -207,6 +207,10 @@ packaged copy. The world is declared on the target and cross-checked against the
 artifact's own `brenn:` imports, so a component that moved between worlds cannot
 keep a stale tag.
 
+The same specification label also generates the component's guest-side port and
+capability module — see `guest-scaffolding.md`, which also covers the CI check
+holding a specification's `requires` equal to its artifact's imports.
+
 Adding a shipped component means two entries, not one: the package name in
 `brenn-wasm/deployed-components.txt`, and a `component_package` in
 `brenn-wasm/BUILD.bazel`'s `COMPONENT_PACKAGES`. `//brenn-wasm:deployed_components_test`

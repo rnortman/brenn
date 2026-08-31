@@ -1,0 +1,8 @@
+/// A dom component nothing publishes to: its inbound enum is uninhabited, and
+/// the name lookup answers no name. Nothing in the tree has this shape, so the
+/// compile gate beside the golden is the only thing that holds it valid.
+component ScaffoldDomNoInbound {
+  abi = dom;
+  requires = [ports];
+  out state: "brenn.scaffold.state@1";
+}

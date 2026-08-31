@@ -1,5 +1,5 @@
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "wasm_component", "wasm_guest_cdylib")
+load("//bazel/wasm:defs.bzl", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
 
 policy_srcs()
 
@@ -9,8 +9,17 @@ exports_files(["transplant.json"])
 
 # Bindings come from the brenn-guest SDK's `generate!`; this crate names no
 # WIT of its own.
+# The port surface, generated from the authored specification this
+# component ships with. Untracked: the specification is the source, and
+# editing it stops this crate compiling until the guest keeps up.
+guest_spec_scaffold(
+    name = "spec",
+    spec = "//:config/specs/processor-transplant.brenn",
+)
+
 wasm_guest_cdylib(
     name = "brenn-processor-transplant",
+    generated_srcs = {"src/spec.rs": ":spec"},
     visibility = ["//visibility:public"],
     deps = [
         "//brenn-wasm/components/guest:brenn-guest",

@@ -23,6 +23,7 @@ policy_srcs()
 exports_files([
     "deployed_components_check.sh",
     "emit_package.sh",
+    "grant_parity_check.sh",
     "manifest_names.sh",
     "record_lib.sh",
     "wasi_import_check.sh",

@@ -126,7 +126,7 @@ fn refusal_text(payload: Box<dyn Any + Send>) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use brenn_dsl::{dom_any, processor_any};
+    use brenn_dsl::{dom_any, processor_needs};
 
     use super::*;
 
@@ -270,7 +270,7 @@ new alice: Assistant();
     const PACKAGED_SINK: &str = concat!(
         "component Sink {\n",
         "    ",
-        processor_any!(),
+        processor_needs!("ports"),
         "\n",
         "    in messages;\n",
         "    out events;\n",
@@ -534,7 +534,7 @@ mqtt_client broker {
 // ── packaged ──
 component Sink {
     "#,
-                processor_any!(),
+                processor_needs!(""),
                 r#"
     in inbound;
 }

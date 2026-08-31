@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use brenn_wasm::{
-    Capability, PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE, PROCESSOR_MAX_INSTANCES,
+    ComponentGrant, PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE, PROCESSOR_MAX_INSTANCES,
     PROCESSOR_MAX_MEMORIES, PROCESSOR_MAX_MEMORY_BYTES, PROCESSOR_MAX_TABLE_ELEMENTS,
     PROCESSOR_MAX_TABLES, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec,
     ProcessorOutcome, ProcessorPortWindow, ProcessorUrgency, store::DEFAULT_MAX_PAGE_COUNT,
@@ -57,7 +57,7 @@ fn load_dual() -> ProcessorComponent {
     ports.insert("out1".to_string(), common::out_spec("brenn:channel-out1"));
     ports.insert("out2".to_string(), common::out_spec("brenn:channel-out2"));
     // processor-dual imports: types + ports
-    let grants = [Capability::Ports].into_iter().collect();
+    let grants = [ComponentGrant::Ports].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_dual"),
         slug: "dual",
@@ -78,7 +78,7 @@ fn load_dual() -> ProcessorComponent {
 
 fn load_demo(output_ports: HashMap<String, brenn_wasm::OutputPortSpec>) -> ProcessorComponent {
     // processor-demo imports: types + ports
-    let grants = [Capability::Ports].into_iter().collect();
+    let grants = [ComponentGrant::Ports].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo",
@@ -111,7 +111,7 @@ fn load_multiport() -> ProcessorComponent {
     let mut ports = HashMap::new();
     ports.insert("out".to_string(), common::out_spec("brenn:multiport-out"));
     // processor-multiport imports: types + ports
-    let grants = [Capability::Ports].into_iter().collect();
+    let grants = [ComponentGrant::Ports].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_multiport"),
         slug: "multiport",
@@ -147,7 +147,7 @@ fn load_store_component(name: &str, slug: &str) -> (ProcessorComponent, tempfile
         output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
-        grants: [Capability::Store].into_iter().collect(),
+        grants: [ComponentGrant::Store].into_iter().collect(),
         store_path: Some(db.path()),
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,
@@ -334,7 +334,7 @@ fn load_demo_out_with_acl(channel: &str, acl: brenn_wasm::OutputAclFn) -> Proces
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,
@@ -404,7 +404,7 @@ fn handle_oversized_payload_returns_processing_failed() {
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1, // 1 byte cap
@@ -491,7 +491,7 @@ fn two_webhook_envelopes_produce_two_buffered_publishes() {
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,
@@ -549,7 +549,7 @@ fn load_demo_budgeted(
         output_ports: ports,
         input_amplification_mt: HashMap::from([("in".to_string(), amp_mt)]),
         mqtt_sinks: HashMap::new(),
-        grants: [Capability::Ports].into_iter().collect(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,

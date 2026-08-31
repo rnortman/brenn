@@ -2974,22 +2974,6 @@ fn check_scheme(text: &str, span: &Span) -> Result<(), Diagnostic> {
 // implies. The two forms with parameters — agents and assemblies — are
 // expansion's, and are skipped here.
 
-/// The artifact shapes a component class may declare.
-///
-/// The two the runtime accepts. Which one a class is decides where an instance
-/// of it may be placed, so an unknown word is refused at the class rather than
-/// carried to a placement rule that cannot read it.
-const ABIS: [&str; 2] = ["dom", "processor"];
-
-/// The abi a word names, or nothing where it names none.
-fn parse_abi(word: &str) -> Option<Abi> {
-    match word {
-        "dom" => Some(Abi::Dom),
-        "processor" => Some(Abi::Processor),
-        _ => None,
-    }
-}
-
 /// The keys a component instance inside a surface admits.
 ///
 /// The scalar fields of the runtime's surface component, minus the three the
@@ -3126,12 +3110,12 @@ fn class_ref(
         class.name.value()
     );
     let word = &class.attrs.abi.value.name;
-    let Some(parsed) = parse_abi(word.value()) else {
+    let Some(parsed) = Abi::parse(word.value()) else {
         errors.push(Diagnostic::at(
             format!(
                 "`{}` is not an abi; expected one of {}",
                 word.value(),
-                ABIS.join(", ")
+                Abi::ALL.map(Abi::as_str).join(", ")
             ),
             word.span().clone(),
         ));
@@ -3222,6 +3206,27 @@ fn class_grants(
             ),
             class.name.span().clone(),
         ));
+    }
+    // A processor's capabilities are WIT imports, and the host links an
+    // interface only where the instance was granted it. An artifact cannot
+    // import conditionally, so an optional grant is unexercisable in both
+    // directions: an artifact that imports the interface panics at load under
+    // an instance that omits the word, and one that does not import it is
+    // unchanged by holding it. The word is refused rather than recorded as
+    // meaningless.
+    if matches!(abi, Abi::Processor) {
+        for word in &optional {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{}` cannot be optional on a processor class: a processor reaches a \
+                     capability through a WIT import the host links only where the instance \
+                     grants it, and an artifact cannot import conditionally, so the word is \
+                     either in `requires` or not in the spec",
+                    word.value()
+                ),
+                word.span().clone(),
+            ));
+        }
     }
     // A dom class can only ever be surface-placed, so a word no surface admits
     // is a spec no legal placement satisfies. A processor class admits both

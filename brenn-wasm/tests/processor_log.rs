@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use brenn_wasm::{
-    Capability, GuestAlertSeverity, PROCESSOR_MAX_ALERT_CALLS_PER_ACTIVATION,
+    ComponentGrant, GuestAlertSeverity, PROCESSOR_MAX_ALERT_CALLS_PER_ACTIVATION,
     PROCESSOR_MAX_ALERT_TITLE_BYTES, PROCESSOR_MAX_LOG_CALLS_PER_ACTIVATION, ProcessorActivation,
     ProcessorAlerter, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
     store::DEFAULT_MAX_PAGE_COUNT,
@@ -38,7 +38,9 @@ fn load_log_component(alerter: Arc<dyn ProcessorAlerter>) -> ProcessorComponent 
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
         config: HashMap::new(),
-        grants: [Capability::Log, Capability::Alert].into_iter().collect(),
+        grants: [ComponentGrant::Log, ComponentGrant::Alert]
+            .into_iter()
+            .collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,

@@ -37,6 +37,7 @@ pub use bindings::export;
 // ── re-exports ────────────────────────────────────────────────────────────────
 
 pub use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency, WebhookEnvelope};
+pub use serde;
 pub use serde_json;
 
 // ── error ─────────────────────────────────────────────────────────────────────
@@ -454,15 +455,31 @@ fn urgency_to_wit(u: Urgency) -> bindings::brenn::processor::ports::Urgency {
     }
 }
 
-/// Typed publish handle. Declare as a `const`; type parameter encodes the
-/// payload type.
+/// Typed publish handle: the type parameter is the payload type, and a handle
+/// publishes nothing else.
 ///
 /// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
+///
+/// An owned payload binds through a `const`:
 ///
 /// ```rust,ignore
 /// const OUT: brenn_guest::OutPort<MyMessage> = brenn_guest::OutPort::new("out");
 /// OUT.publish(&my_message)?;
 /// ```
+///
+/// A payload that borrows cannot be named in a `const` — its lifetime has no
+/// spelling there — so construct the handle at the call instead, where the
+/// lifetime is inferred:
+///
+/// ```rust,ignore
+/// brenn_guest::OutPort::new("out").publish(&MyMessage { text })?;
+/// ```
+///
+/// A guest with a specification-generated module reaches both idioms through
+/// its handle accessors rather than through `new`, and there the type parameter
+/// is bounded by the port's own payload marker trait — so the payload type is
+/// bound to the port once, by an impl, and every publish site is checked
+/// against that binding.
 pub struct OutPort<T> {
     name: &'static str,
     _marker: PhantomData<fn() -> T>,
@@ -743,6 +760,127 @@ pub mod config {
             Some(v) => Ok(v),
             None => Err(Error::failed(format!("config {key}: missing"))),
         }
+    }
+}
+
+// ── mqtt ──────────────────────────────────────────────────────────────────────
+
+pub mod mqtt {
+    //! Direct MQTT publishing.
+    //!
+    //! **Requires grant:** `"mqtt"` in `[[wasm_consumer]]` grants, and an
+    //! `mqtt_publish` ACL listing every client this component may reach. If the
+    //! grant is absent the host does not link the `brenn:processor/mqtt`
+    //! interface and any import of it causes a load-time panic.
+    //!
+    //! **Not transactional with the activation outcome.** A send here goes
+    //! straight to the broker and returns the broker's outcome inline; it is
+    //! NOT discarded by a later err or trap the way a buffered
+    //! [`crate::publish`] is. A guest that needs all-or-nothing semantics
+    //! across MQTT and the bus must not mix the two.
+    //!
+    //! `client` is the `[[mqtt_client]]` slug; `topic` is a concrete topic
+    //! under that client and must contain no wildcard. For QoS >= 1 the call
+    //! awaits the PUBACK before returning.
+
+    use super::Error;
+    use crate::bindings::brenn::processor::mqtt::{self as raw};
+
+    /// The broker outcome of a failed publish, for a guest that classifies
+    /// before it gives up. [`publish`] flattens this into an [`Error`]; reach
+    /// for [`try_publish`] to keep it.
+    pub use crate::bindings::brenn::processor::mqtt::MqttPublishError as PublishError;
+
+    /// Whether a later activation may retry this failure. Only a broker
+    /// disconnect / submit failure / dropped ack is transient; a denial, an
+    /// absent service, a malformed address, an exhausted quota and a
+    /// broker-side rejection are all permanent for this config.
+    pub fn is_transient(e: &PublishError) -> bool {
+        matches!(e, PublishError::Broker(_))
+    }
+
+    /// Human-readable rendering of a `PublishError` for a diagnostic message.
+    fn mqtt_err(client: &str, topic: &str, e: PublishError) -> Error {
+        let variant = match e {
+            PublishError::NotPermitted => String::from("not-permitted"),
+            PublishError::NoConnector => String::from("no-connector"),
+            PublishError::InvalidPayload(m) => format!("invalid-payload: {m}"),
+            PublishError::QuotaExceeded => String::from("quota-exceeded"),
+            PublishError::Broker(m) => format!("broker: {m}"),
+            PublishError::BrokerRejected(m) => format!("broker-rejected: {m}"),
+        };
+        Error::failed(format!("mqtt publish {client}/{topic}: {variant}"))
+    }
+
+    /// Publish `payload` to `topic` on `client`, keeping the broker outcome.
+    ///
+    /// The whole WIT surface, for the guest that needs `content_type` or wants
+    /// to classify the failure with [`is_transient`].
+    pub fn try_publish(
+        client: &str,
+        topic: &str,
+        payload: &[u8],
+        content_type: Option<&str>,
+        qos: u8,
+        retain: bool,
+    ) -> Result<(), PublishError> {
+        raw::mqtt_publish(client, topic, payload, content_type, qos, retain)
+    }
+
+    /// Publish `payload` to `topic` on `client`.
+    ///
+    /// Diagnostic on error: `"mqtt publish {client}/{topic}: {variant}"`.
+    pub fn publish(
+        client: &str,
+        topic: &str,
+        payload: &[u8],
+        content_type: Option<&str>,
+        qos: u8,
+        retain: bool,
+    ) -> Result<(), Error> {
+        try_publish(client, topic, payload, content_type, qos, retain)
+            .map_err(|e| mqtt_err(client, topic, e))
+    }
+
+    /// Publish a UTF-8 body as `text/plain`.
+    pub fn publish_text(
+        client: &str,
+        topic: &str,
+        body: &str,
+        qos: u8,
+        retain: bool,
+    ) -> Result<(), Error> {
+        publish(
+            client,
+            topic,
+            body.as_bytes(),
+            Some("text/plain"),
+            qos,
+            retain,
+        )
+    }
+
+    /// Serialize `value` to JSON and publish it as `application/json`.
+    ///
+    /// A serialization failure is a guest bug, not a broker outcome, and maps
+    /// to `Err(ProcessingFailed("serialize: {e}"))` before anything is sent.
+    pub fn publish_json<T: serde::Serialize>(
+        client: &str,
+        topic: &str,
+        value: &T,
+        qos: u8,
+        retain: bool,
+    ) -> Result<(), Error> {
+        let payload = crate::serde_json::to_vec(value)
+            .map_err(|e| Error::failed(format!("serialize: {e}")))?;
+        publish(
+            client,
+            topic,
+            &payload,
+            Some("application/json"),
+            qos,
+            retain,
+        )
     }
 }
 

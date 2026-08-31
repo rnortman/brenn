@@ -19,7 +19,29 @@
 #
 # Usage: wit_imports <artifact>
 wit_imports() {
+    _wit_imports_impl "$1" _wit_capture
+}
+
+# The same list with each name's `@version` suffix intact.
+#
+# The grant-parity check judges an import against the exact canonical name the
+# host links, version included, so it cannot be fed the stripped list: a name
+# whose version drifted would arrive indistinguishable from one that did not,
+# and the check would answer "these agree" about a component the host refuses at
+# load. The two emitters that judge by interface identity alone keep using
+# `wit_imports`.
+#
+# Usage: wit_imports_versioned <artifact>
+wit_imports_versioned() {
+    _wit_imports_impl "$1" _wit_capture_versioned
+}
+
+# The scrape, the guard over it, and the ordering — parameterized by which
+# capture emits. One implementation so the guard always measures the list that
+# ships.
+_wit_imports_impl() {
     local artifact="$1"
+    local capture="$2"
     local wit raw_count captured_count
     wit="$("${WASM_TOOLS:-wasm-tools}" component wit "$artifact")"
 
@@ -30,7 +52,7 @@ wit_imports() {
     # world was declared. Both failures are silent and survive releases. Refuse
     # to emit instead.
     raw_count=$(printf '%s\n' "$wit" | grep -c '^[[:space:]]*import[[:space:]]' || true)
-    captured_count=$(printf '%s\n' "$wit" | _wit_capture | grep -c . || true)
+    captured_count=$(printf '%s\n' "$wit" | "$capture" | grep -c . || true)
     if [ "$raw_count" -ne "$captured_count" ]; then
         echo "wit_imports: $artifact has $raw_count import lines but only $captured_count are" \
              "fully-qualified \`ns:pkg/iface\` imports." >&2
@@ -45,15 +67,19 @@ wit_imports() {
     # locale, where punctuation weights differ from byte values, so the emitted
     # order — and the parity assertion against the twin — would depend on the
     # machine that ran the build.
-    printf '%s\n' "$wit" | _wit_capture | LC_ALL=C sort -u
+    printf '%s\n' "$wit" | "$capture" | LC_ALL=C sort -u
 }
 
-# The scrape itself, over stdin. One expression, used twice above: the counting
-# pass and the emitting pass must agree on what "captured" means or the guard
-# measures something other than what ships.
+# The scrape itself, over stdin, with each name's version intact. One
+# expression: the counting pass and the emitting pass must agree on what
+# "captured" means or the guard measures something other than what ships.
+_wit_capture_versioned() {
+    sed -n 's/^[[:space:]]*import[[:space:]]\{1,\}\([A-Za-z0-9_-]\{1,\}:[^;[:space:]]*\);.*/\1/p'
+}
+
+# The same scrape with the `@version` suffix dropped.
 _wit_capture() {
-    sed -n 's/^[[:space:]]*import[[:space:]]\{1,\}\([A-Za-z0-9_-]\{1,\}:[^;[:space:]]*\);.*/\1/p' \
-        | sed 's/@[^/]*$//'
+    _wit_capture_versioned | sed 's/@[^/]*$//'
 }
 
 # Escape a string for embedding as a JSON string literal: backslash and

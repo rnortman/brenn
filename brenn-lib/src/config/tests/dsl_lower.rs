@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use brenn_dsl::diag::{Diagnostic, render_all};
-use brenn_dsl::{dom_any, processor_any};
+use brenn_dsl::{dom_any, processor_needs};
 use brenn_surface_schema::LogLevel;
 
 use crate::access::raw::{
@@ -1461,7 +1461,7 @@ fn an_mqtt_sink_override_is_lowered_per_budgeted_entry() {
             "    ];\n",
             "}}\n",
         ),
-        processor_any!(),
+        processor_needs!("ports, mqtt"),
     );
     let config = config_from_dsl(&document);
     assert_eq!(
@@ -2307,7 +2307,7 @@ channel cmd at "brenn:alice.cmd" {
 // ── packaged ──
 component Router {
     "#,
-        processor_any!(),
+        processor_needs!(""),
         r#"
     in inbound;
 }
@@ -2580,7 +2580,7 @@ webhook push_alice {
 // ── packaged ──
 component Router {
     "#,
-            processor_any!(),
+            processor_needs!("ports, store, log, config, mqtt"),
             r#"
     in inbound;
     in feed;
@@ -2826,7 +2826,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 // ── packaged ──
 component Logger {
     "#,
-        processor_any!(),
+        processor_needs!("log"),
         r#"
     in heard;
 }
@@ -2918,7 +2918,7 @@ channel utterance at "ephemeral:alice-pod.utterance" {
 // ── packaged ──
 component Logger {
     "#,
-            processor_any!(),
+            processor_needs!("log"),
             r#"
     in heard;
 }
@@ -2975,7 +2975,7 @@ channel notes at "ephemeral:alice-pod.notes" {
 // ── packaged ──
 component Reserved {
     "#,
-            processor_any!(),
+            processor_needs!("log, ports"),
             r#"
     in in;
     out out;
@@ -3041,7 +3041,7 @@ fn a_consumers_config_map_carries_typed_scalars() {
 // ── packaged ──
 component Sink {
     "#,
-            processor_any!(),
+            processor_needs!("ports, config"),
             r#"
     io tick;
 }
@@ -3091,7 +3091,7 @@ channel acks at "ephemeral:alice-pod.acks" {
 // ── packaged ──
 component Sink {
     "#,
-            processor_any!(),
+            processor_needs!("ports"),
             r#"
     io acks;
 }
@@ -3158,7 +3158,7 @@ channel acks at "ephemeral:alice-pod.acks" {
 // ── packaged ──
 component Sink {
     "#,
-            processor_any!(),
+            processor_needs!("ports"),
             r#"
     io acks;
 }
@@ -3222,7 +3222,7 @@ channel presence at "ephemeral:alice-desk.presence" {
 // ── packaged ──
 component Router {
     "#,
-            processor_any!(),
+            processor_needs!("log"),
             r#"
     in inbound;
 }
@@ -3231,7 +3231,7 @@ component Router {
 // ── packaged ──
 component Sink {
     "#,
-            processor_any!(),
+            processor_needs!("store, config"),
             r#"
     in feed;
 }
@@ -3310,7 +3310,7 @@ fn a_consumers_config_map_transcribes_floats_lists_and_nested_tables() {
 // ── packaged ──
 component Sink {
     "#,
-            processor_any!(),
+            processor_needs!("ports, config"),
             r#"
     io tick;
 }
@@ -3364,7 +3364,7 @@ fn a_matcher_nested_in_a_config_list_is_refused_at_the_inner_token() {
 // ── packaged ──
 component Sink {
     "#,
-        processor_any!(),
+        processor_needs!("ports, config"),
         r#"
     io tick;
 }
@@ -3395,7 +3395,7 @@ fn a_non_number_in_a_budget_position_is_refused() {
 // ── packaged ──
 component Sink {
     "#,
-        processor_any!(),
+        processor_needs!("ports, log"),
         r#"
     io tick;
 }
@@ -3424,7 +3424,7 @@ fn a_matcher_in_a_consumers_config_map_is_refused() {
 // ── packaged ──
 component Sink {
     "#,
-        processor_any!(),
+        processor_needs!("ports, config"),
         r#"
     io tick;
 }
@@ -5020,7 +5020,7 @@ new alice: Assistant();
 fn a_consumers_tool_statements_lower_to_raw_grants() {
     let config = config_from_dsl(concat!(
         "// ── packaged ──\n",
-        "component Sink {\n    abi = processor; requires = []; optional = [tools];\n}\n",
+        "component Sink {\n    abi = processor; requires = [tools];\n}\n",
         "// ── packaged ──\n",
         "new alice_sink: Sink {\n",
         "    grants = [tools];\n",
@@ -5083,7 +5083,7 @@ fn a_link_lowers_to_its_endpoint_set() {
             "    out events -> relay;\n",
             "}}\n",
         ),
-        processor_any!(),
+        processor_needs!("ports"),
         dom_any!(),
     );
     let config = config_from_dsl(&document);

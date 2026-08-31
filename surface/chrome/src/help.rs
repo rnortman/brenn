@@ -19,20 +19,21 @@ use brenn_surface_schema::layout::{
 };
 
 use crate::logic::{
-    INPUT_PORT_DOCS, OUTPUT_PORT_DOC, PortChannel, PortDoc, default_kind_for_count,
+    OUTPUT_PORT_DOC, PortChannel, PortDoc, default_kind_for_count, input_port_docs,
 };
 
 /// Chrome's help sidecar, in full.
 pub fn help_markdown() -> String {
     let mut out = String::from(HELP_SIDECAR_HEADER);
     out.push_str(INTRO);
+    let inputs = input_port_docs();
     let _ = write!(
         out,
         "\n## Inputs (bind these on the chrome instance)\n\nChrome reads {} ports. Bind \
          each to the channel it carries:\n",
-        INPUT_PORT_DOCS.len()
+        inputs.len()
     );
-    port_table(&mut out, INPUT_PORT_DOCS.iter());
+    port_table(&mut out, inputs.iter());
     default_layout_paragraph(&mut out);
     theme_vocabulary(&mut out);
     out.push_str("\n## Output (bind this on the chrome instance)\n");
@@ -106,7 +107,7 @@ fn default_layout_paragraph(out: &mut String) {
         "A surface with no `{layout}` binding renders the default layout: the first \
          three mounted instances in configured order, laid out by count (1 → `{one}`, \
          2 → `{two}`, 3 or more → `{three}`).",
-        layout = crate::logic::PORT_LAYOUT,
+        layout = crate::spec::port::LAYOUT,
         one = kind_for(1),
         two = kind_for(2),
         three = kind_for(3),
@@ -221,7 +222,8 @@ mod tests {
     #[test]
     fn every_port_is_documented() {
         let doc = help_markdown();
-        for row in INPUT_PORT_DOCS.iter().chain([&OUTPUT_PORT_DOC]) {
+        let inputs = input_port_docs();
+        for row in inputs.iter().chain([&OUTPUT_PORT_DOC]) {
             assert!(
                 doc.contains(&format!("| `{}` |", row.port)),
                 "generated chrome help has no table row for port {}",
@@ -235,6 +237,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The exclusion the exhaustive match makes deliberately, pinned. The
+    /// compiler holds that every declared port is *considered*;
+    /// `every_port_is_documented` then asserts over whatever rows it was
+    /// handed, so it stays green if `toast-tick` gains one. It must not: the
+    /// port is chrome's own deferred self-wake, nothing else ever publishes to
+    /// it, and an operator has nothing to bind — a row would be a documented
+    /// binding that cannot exist.
+    #[test]
+    fn the_self_wake_port_is_the_one_port_with_no_row() {
+        let doc = help_markdown();
+        assert!(
+            !doc.contains("| `toast-tick` |"),
+            "the self-wake port gained a help row"
+        );
+        assert_eq!(
+            input_port_docs().len(),
+            crate::spec::InPort::ALL.len() - 1,
+            "every declared inbound port but the self-wake one carries a row"
+        );
     }
 
     #[test]

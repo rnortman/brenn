@@ -15,10 +15,14 @@ wit_bindgen_rust(
     wit_srcs = "//brenn-wasm:wit",
 )
 
+# The fixture is a raw-WIT component on purpose — the loop below asserts on the
+# host's own error variants — and links the SDK for one call, so the guest-side
+# `mqtt` wrapper is exercised against a real host callback.
 wasm_guest_cdylib(
     name = "brenn-processor-mqtt-test",
-    bindings = ":bindings",
+    generated_srcs = {"src/bindings.rs": ":bindings"},
     visibility = ["//visibility:public"],
+    deps = ["//brenn-wasm/components/guest:brenn-guest"],
 )
 
 wasm_component(

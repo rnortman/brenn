@@ -78,7 +78,7 @@ pub(crate) struct ConsumerLoadParts {
     pub output_ports: std::collections::HashMap<String, brenn_wasm::OutputPortSpec>,
     pub input_amplification_mt: std::collections::HashMap<String, u64>,
     pub mqtt_sinks: std::collections::HashMap<String, brenn_wasm::SinkBudget>,
-    pub grants: std::collections::BTreeSet<brenn_wasm::Capability>,
+    pub grants: std::collections::BTreeSet<brenn_wasm::ComponentGrant>,
     pub output_acl: brenn_wasm::OutputAclFn,
 }
 
@@ -88,7 +88,7 @@ pub(crate) fn lower_consumer_load_parts(
 ) -> ConsumerLoadParts {
     use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::Urgency;
-    use brenn_wasm::{Capability, ProcessorUrgency};
+    use brenn_wasm::ProcessorUrgency;
     use std::collections::{BTreeSet, HashMap};
 
     let output_ports: HashMap<String, brenn_wasm::OutputPortSpec> = consumer
@@ -134,34 +134,29 @@ pub(crate) fn lower_consumer_load_parts(
             )
         })
         .collect();
-    // Exhaustive match: a new variant on either side is a compile error.
-    let grants: BTreeSet<Capability> = consumer
+    // `takeover` names no interface and cannot reach a top-level consumer.
+    // Asserted here because a hand-built config reaches this loader without
+    // passing through the config front end's refusal.
+    let grants: BTreeSet<ComponentGrant> = consumer
         .grants
         .iter()
-        .map(|g| match g {
-            ComponentGrant::Ports => Capability::Ports,
-            ComponentGrant::Store => Capability::Store,
-            ComponentGrant::Log => Capability::Log,
-            ComponentGrant::Alert => Capability::Alert,
-            ComponentGrant::Config => Capability::Config,
-            ComponentGrant::Mqtt => Capability::Mqtt,
-            ComponentGrant::Tools => Capability::Tools,
-            // `takeover` names no WIT interface — it is consented to at a page
-            // binding, not linked — and cannot reach this loader: the config
-            // front end refuses the word on a top-level instance.
-            ComponentGrant::Takeover => panic!(
-                "consumer {:?}: granted `takeover`, which names no WIT interface and belongs \
-                 to a page — a top-level consumer has no page, and the config front end \
-                 refuses the word",
+        .inspect(|g| {
+            assert!(
+                g.wit_import().is_some(),
+                "consumer {:?}: granted `{}`, which names no WIT interface and belongs to a \
+                 page — a top-level consumer has no page, and the config front end refuses \
+                 the word",
                 consumer.slug,
-            ),
+                g.word(),
+            )
         })
+        .copied()
         .collect();
     // The word and the statements it consents to are one configuration, refused
     // at derive in either direction. Asserted again here because a hand-built
     // config reaches this loader without passing through that refusal.
     assert_eq!(
-        grants.contains(&Capability::Tools),
+        grants.contains(&ComponentGrant::Tools),
         !consumer.policy.tool_grants.is_empty(),
         "consumer {:?}: `tools` is granted iff the consumer names a tool — a grant with \
          no tool reaches nothing, and a tool with no grant is authority nobody gave",
@@ -1468,7 +1463,7 @@ mod tests {
                 &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
                 // processor-demo imports `ports`; the load is a real one, so
                 // the grant it needs is the real one too.
-                |spec| spec.grants = [brenn_wasm::Capability::Ports].into_iter().collect(),
+                |spec| spec.grants = [brenn_wasm::ComponentGrant::Ports].into_iter().collect(),
             );
             drop(component);
         }
@@ -1649,7 +1644,7 @@ mod tests {
             ],
             &["git-repo-pull"],
         ));
-        assert!(parts.grants.contains(&brenn_wasm::Capability::Tools));
+        assert!(parts.grants.contains(&brenn_wasm::ComponentGrant::Tools));
     }
 
     #[test]

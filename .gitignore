@@ -9,6 +9,10 @@
 /.rules_rust_analyzer/
 brenn-wasm/components/target/
 brenn-wasm/target/
+# Generated guest port modules (Bazel output, not tracked).
+brenn-wasm/components/*/src/spec.rs
+surface/components/*/src/spec.rs
+surface/chrome/src/spec.rs
 /frontend/dist/
 /surface/dist/
 node_modules/

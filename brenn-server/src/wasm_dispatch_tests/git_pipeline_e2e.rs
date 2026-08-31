@@ -312,7 +312,9 @@ async fn build_pipeline() -> Pipeline {
         input_amplification_mt: parser_amp,
         mqtt_sinks: HashMap::new(),
         config: HashMap::new(),
-        grants: [Capability::Ports, Capability::Log].into_iter().collect(),
+        grants: [ComponentGrant::Ports, ComponentGrant::Log]
+            .into_iter()
+            .collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,
@@ -397,12 +399,12 @@ async fn build_pipeline() -> Pipeline {
         mqtt_sinks: HashMap::new(),
         config: consumer_config,
         grants: [
-            Capability::Ports,
-            Capability::Store,
-            Capability::Log,
-            Capability::Alert,
-            Capability::Config,
-            Capability::Tools,
+            ComponentGrant::Ports,
+            ComponentGrant::Store,
+            ComponentGrant::Log,
+            ComponentGrant::Alert,
+            ComponentGrant::Config,
+            ComponentGrant::Tools,
         ]
         .into_iter()
         .collect(),

@@ -20,13 +20,7 @@ use serde::Deserialize;
 use brenn_surface_component_support::parse_delivery;
 pub use brenn_surface_component_support::{ContractViolation, FaultReport};
 
-/// The config-bound input port name. A `[[surface.subscription]] port` must
-/// match this string, or [`ModeClock::on_config`] rejects the delivery.
-pub(crate) const CONFIG_PORT: &str = "config";
-
-/// The theme output port — must match a `[[surface.output]] port` binding to the
-/// reserved [`brenn_surface_schema::LOCAL_THEME_CHANNEL`] plane chrome consumes.
-pub(crate) const THEME_PORT: &str = "theme";
+use crate::spec::port::CONFIG;
 
 /// Minutes in a wall-clock day. Membership and boundary math are done in
 /// minutes-since-local-midnight, so no timezone arithmetic is ever needed.
@@ -295,7 +289,7 @@ impl ModeClock {
         port: &str,
         envelope_json: &str,
     ) -> Result<ConfigOutcome, ContractViolation> {
-        let envelope = parse_delivery(port, &[CONFIG_PORT], envelope_json)?;
+        let envelope = parse_delivery(port, &[CONFIG], envelope_json)?;
         match parse_config(&envelope.body) {
             Ok(config) => {
                 self.config = config;
@@ -330,7 +324,7 @@ impl ModeClock {
         &mut self,
         window: &PortWindow,
     ) -> Result<Vec<ConfigNote>, ContractViolation> {
-        if window.port != CONFIG_PORT {
+        if window.port != CONFIG {
             return Err(ContractViolation::WrongPort {
                 port: window.port.clone(),
             });
@@ -718,7 +712,7 @@ mod tests {
             .map(|body| brenn_surface_test_fixtures::sample_envelope(&body.to_string()))
             .collect();
         PortWindow {
-            port: CONFIG_PORT.to_string(),
+            port: CONFIG.to_string(),
             envelopes,
             new_from: context.len() as u32,
             dropped: 0,

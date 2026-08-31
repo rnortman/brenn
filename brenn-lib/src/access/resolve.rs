@@ -161,8 +161,8 @@ pub fn build_app_policy(
 /// The grant layer maps each `ComponentGrant` onto its unified `AppCapability`
 /// (`Ports → MessagingPublish`, `Store → WasmStore`, `Log → WasmLog`,
 /// `Alert → WasmAlert`, `Config → WasmConfig`, `Mqtt → MqttPublish`).
-/// This is a **separate** mapping from the `brenn-wasm::Capability` conversion at
-/// the bootstrap linker seam (which Phase 0–1 do not touch); it exists so the
+/// This is a **separate** mapping from the WIT interface each grant links at the
+/// bootstrap linker seam (which Phase 0–1 do not touch); it exists so the
 /// unified policy model spans both app kinds. WASM publishes to / subscribes from
 /// `brenn:` channels (`brenn_subscribe`/`brenn_publish`, validated identically to
 /// the LLM side via `resolve_channel`); with the `mqtt` grant, publishes MQTT

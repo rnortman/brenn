@@ -458,12 +458,20 @@ pub enum Abi {
 }
 
 impl Abi {
+    /// Every abi a class may declare.
+    pub const ALL: [Abi; 2] = [Abi::Dom, Abi::Processor];
+
     /// The word this abi is written with.
     pub fn as_str(self) -> &'static str {
         match self {
             Abi::Dom => "dom",
             Abi::Processor => "processor",
         }
+    }
+
+    /// The abi a word names, or nothing where it names none.
+    pub fn parse(word: &str) -> Option<Abi> {
+        Abi::ALL.into_iter().find(|abi| abi.as_str() == word)
     }
 }
 

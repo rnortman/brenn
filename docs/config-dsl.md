@@ -279,8 +279,10 @@ component Chrome {
 ```
 
 - `abi` is `dom` (runs in a page, against the DOM) or `processor` (headless).
-  Nothing else in the class vocabulary is conditioned on it: a dom component
-  declares its needs exactly as a processor one does.
+  One thing in the class vocabulary is conditioned on it — the `optional`
+  capability list, which only a dom class may write (see *Authority* below).
+  Everything else a dom component declares, a processor one declares the same
+  way.
 - A port is `in` (the component receives on it), `out` (it publishes on it), or
   `io` (both).
 - `optional` before the direction is the author saying an instance may
@@ -289,7 +291,9 @@ component Chrome {
   otherwise, pointing at the `new` statement and at the port's declaration.
 - `: "<tag>"` on a port is its **doctype** — the document contract a binding
   must agree with. See below.
-- `requires` and `optional` are the capability lists. See *Authority* below.
+- `requires` and `optional` are the capability lists. `optional` is a dom-only
+  list; a processor class states everything it needs in `requires`. See
+  *Authority* below.
 
 The class carries the contract; **instances never restate it**. Neither does the
 deployment restate where the artifact lives: a top-level instance is resolved
@@ -635,7 +639,17 @@ what it needs; an instance states what it is given; both directions are checked:
   never asked for is refused, because the spec is the vocabulary.
 
 `requires` is written by every class, both abis: a component that needs nothing
-writes `requires = [];`. A dom class may not require a word that no page can
+writes `requires = [];`. **`optional` is a dom-only list.** A processor reaches
+a capability through a WIT import, and the host links that interface only where
+the instance was granted the word; an artifact cannot import conditionally. So
+an optional grant on a processor class is unexercisable in both directions — an
+artifact that imports the interface panics at load under an instance that omits
+the word, and an artifact that does not import it is unchanged by holding it.
+The word is refused where it is written, and the fix is to move it into
+`requires` or drop it from the spec. A dom class keeps `optional`, because a
+surface grant is not an import the linker decides.
+
+A dom class may not require a word that no page can
 implement — that spec would be unsatisfiable at every legal placement — and a
 processor class requiring `store` placed on a surface refuses twice, once for
 host legality and once for the missing grant. Both diagnostics are true and

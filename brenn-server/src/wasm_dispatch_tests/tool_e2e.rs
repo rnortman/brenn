@@ -172,7 +172,9 @@ async fn tool_harness(
         input_amplification_mt: tool_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
-        grants: [Capability::Ports, Capability::Tools].into_iter().collect(),
+        grants: [ComponentGrant::Ports, ComponentGrant::Tools]
+            .into_iter()
+            .collect(),
         store_path: None,
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,

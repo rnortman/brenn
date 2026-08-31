@@ -26,18 +26,12 @@
 //   - `tool-results`: parse the result; log/alert per repo outcome; republish
 //     the per-repo array as an outcome event on `outcomes` (ok outcomes only).
 
-use brenn_guest::{
-    Activation, Error, Processor, alert, config, log, publish_json, serde_json, store, tools,
-};
+mod spec;
+
+use crate::spec::{InPort, alert, config, log, store, tools};
+use brenn_guest::{Activation, Error, Processor, serde_json};
 use serde::{Deserialize, Serialize};
 
-/// Input port carrying normalized push events (bound to `brenn:git-repo-sync`).
-const PUSH_EVENTS_PORT: &str = "push-events";
-/// Input port carrying async tool results (the derived tool-result inbox).
-const TOOL_RESULTS_PORT: &str = "tool-results";
-/// Output port carrying pull outcome events (bound to
-/// `brenn:git-repo-sync-outcomes`).
-const OUTCOMES_PORT: &str = "outcomes";
 /// The async tool this consumer holds a grant for.
 const TOOL: &str = "git-repo-pull";
 
@@ -107,6 +101,8 @@ struct OutcomeEvent<'a> {
     call_id: &'a str,
     repos: &'a [serde_json::Value],
 }
+
+impl spec::OutcomesPayload for OutcomeEvent<'_> {}
 
 /// Args for the `git-repo-pull` async tool.
 #[derive(Serialize)]
@@ -264,14 +260,11 @@ fn handle_tool_result(body: &str) -> Result<(), Error> {
             for repo in &ok.repos {
                 report_repo(repo)?;
             }
-            publish_json(
-                OUTCOMES_PORT,
-                &OutcomeEvent {
-                    v: 1,
-                    call_id: &result.call_id,
-                    repos: &ok.repos,
-                },
-            )?;
+            spec::outcomes().publish(&OutcomeEvent {
+                v: 1,
+                call_id: &result.call_id,
+                repos: &ok.repos,
+            })?;
         }
     }
     Ok(())
@@ -283,17 +276,12 @@ impl Processor for GitSyncConsumer {
         // remote key fails the whole activation (fail-fast misconfig).
         let repo_map = load_repo_map()?;
         for window in activation.port_windows() {
-            let port = window.port();
+            let port = InPort::of(window)?;
             for result in window.new_envelopes() {
                 let env = result?;
                 match port {
-                    PUSH_EVENTS_PORT => handle_push_event(&repo_map, &env.body)?,
-                    TOOL_RESULTS_PORT => handle_tool_result(&env.body)?,
-                    other => {
-                        return Err(Error::failed(format!(
-                            "git-sync-consumer: envelope on unknown input port {other}"
-                        )));
-                    }
+                    InPort::PushEvents => handle_push_event(&repo_map, &env.body)?,
+                    InPort::ToolResults => handle_tool_result(&env.body)?,
                 }
             }
         }

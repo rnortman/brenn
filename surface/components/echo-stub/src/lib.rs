@@ -22,6 +22,9 @@
 
 pub mod help;
 
+/// Port names and types from this component's specification.
+pub mod spec;
+
 /// The browser-only component: custom-element registration, DOM rendering,
 /// contract-event listeners, publish/panic buttons, and the module panic hook.
 #[cfg(target_arch = "wasm32")]

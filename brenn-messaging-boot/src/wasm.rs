@@ -740,7 +740,7 @@ pub(crate) fn resolve_wasm_consumers(
         // subscribe_acl/publish_acl channel matchers. This maps each
         // ComponentGrant onto its unified AppCapability and validates+converts the
         // channel matchers (fail-fast on a malformed matcher). It is a *separate*
-        // mapping from the brenn-wasm::Capability linker conversion. The
+        // mapping from the WIT interface each grant links at the linker. The
         // `subscribe_acl` matchers (plus the derived `MessagingSubscribe` grant)
         // ARE enforced at delivery time over `Wasm` subscribers; the broader WASM
         // enforcement surface (linker-seam capabilities, publish_acl) is not yet

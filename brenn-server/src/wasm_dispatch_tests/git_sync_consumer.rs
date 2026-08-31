@@ -202,12 +202,12 @@ async fn consumer_harness(
         mqtt_sinks: HashMap::new(),
         config,
         grants: [
-            Capability::Ports,
-            Capability::Store,
-            Capability::Log,
-            Capability::Alert,
-            Capability::Config,
-            Capability::Tools,
+            ComponentGrant::Ports,
+            ComponentGrant::Store,
+            ComponentGrant::Log,
+            ComponentGrant::Alert,
+            ComponentGrant::Config,
+            ComponentGrant::Tools,
         ]
         .into_iter()
         .collect(),

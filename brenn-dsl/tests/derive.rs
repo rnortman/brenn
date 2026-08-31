@@ -10,16 +10,19 @@ mod support;
 use brenn_dsl::derive::wire_kind;
 use brenn_dsl::derived::DAclSet;
 use brenn_dsl::diag::Diagnostic;
-use brenn_dsl::{dom_any, processor_any};
+use brenn_dsl::fixture_text::processor_header;
+use brenn_dsl::{dom_any, processor_needs};
 use support::{
     derive_errors, derive_refusal, derive_refusals, derived, derived_tree, durable, nondurable,
     packaged, prefix_tuning, tuning,
 };
 
-/// A fixture class's header: its abi, and grant declarations permitting
-/// everything its host admits so the spec fit answers nothing this suite asks.
+/// A fixture class's header: its abi, and grant declarations answering nothing
+/// this suite asks. The dom form permits everything a surface admits; the
+/// processor form has no `optional` to permit with, so it needs nothing and the
+/// instances beside it grant nothing.
 const DOM: &str = dom_any!();
-const PROCESSOR: &str = processor_any!();
+const PROCESSOR: &str = processor_needs!("");
 
 // ── roles: which blocks declare and which tune ───────────────────────────────
 
@@ -617,7 +620,7 @@ fn a_top_level_instance_takes_no_kind() {
     let config = derived(concat!(
         packaged!(),
         "component ModeClock { ",
-        processor_any!(),
+        processor_needs!(""),
         " }\n",
         packaged!(),
         "new clock: ModeClock { grants = []; }\n",
@@ -1383,19 +1386,27 @@ new bob: Pod(slug = \"bob\");
 
 // ── links ────────────────────────────────────────────────────────────────────
 
+/// An instance body and the words its class must require: a processor class
+/// needs exactly what its instance grants, and a case states that list once.
+type Consumer<'a> = (&'a str, &'a str);
+
 /// A document with one link and two consumers whose bodies are written per case.
 ///
 /// Every port is `optional`, so a case that binds nothing is answered by the
 /// link rule it asked about rather than by the unconnected-port rule; and each
 /// body carries its own `grants`, so a case can leave a consumer inert.
-fn linked(collector: &str, indexer: &str, doctypes: (&str, &str)) -> String {
+fn linked(collector: Consumer<'_>, indexer: Consumer<'_>, doctypes: (&str, &str)) -> String {
     let (source, sink) = doctypes;
+    let (collector, collector_words) = collector;
+    let (indexer, indexer_words) = indexer;
+    let source_class = processor_header(collector_words);
+    let sink_class = processor_header(indexer_words);
     format!(
         "// ── packaged ──\n\
-         component Source {{ {PROCESSOR} optional out events{source}; }}\n\
+         component Source {{ {source_class} optional out events{source}; }}\n\
          // ── packaged ──\n\
          // ── packaged ──\n\
-          component Sink {{ {PROCESSOR} optional io feed{sink}; optional in quiet; }}\n\
+          component Sink {{ {sink_class} optional io feed{sink}; optional in quiet; }}\n\
           // ── packaged ──\n\
          link relay;\n\
          new collector: Source {{\n    slug = \"collector\";\n    \
@@ -1406,10 +1417,12 @@ fn linked(collector: &str, indexer: &str, doctypes: (&str, &str)) -> String {
 }
 
 /// The canonical shape: an `out` and an `io`, no address written anywhere.
-const PUBLISHER: &str = "    grants = [ports];\n    out events -> relay;\n";
-const SUBSCRIBER: &str =
-    "    grants = [ports];\n    io feed <-> relay { push_depth = 8; retain_depth = 8; }\n";
-const INERT: &str = "    grants = [];\n";
+const PUBLISHER: Consumer<'static> = ("    grants = [ports];\n    out events -> relay;\n", "ports");
+const SUBSCRIBER: Consumer<'static> = (
+    "    grants = [ports];\n    io feed <-> relay { push_depth = 8; retain_depth = 8; }\n",
+    "ports",
+);
+const INERT: Consumer<'static> = ("    grants = [];\n", "");
 
 #[test]
 fn a_link_derives_no_acl_entry_on_either_side() {
@@ -1449,8 +1462,10 @@ fn a_lone_io_port_on_a_link_is_told_to_drop_the_link() {
 
 #[test]
 fn a_link_every_port_of_which_faces_one_way_is_refused() {
-    const SUBSCRIBE_ONLY: &str =
-        "    grants = [ports];\n    in quiet <- relay { push_depth = 2; retain_depth = 2; }\n";
+    const SUBSCRIBE_ONLY: Consumer<'static> = (
+        "    grants = [ports];\n    in quiet <- relay { push_depth = 2; retain_depth = 2; }\n",
+        "ports",
+    );
     // Both instances take the same class where the case needs the same port
     // twice; `Source` has no `in`, so the subscriber case writes `Sink` on both
     // sides by naming a port only it declares. Each case states the class swap
@@ -1458,7 +1473,7 @@ fn a_link_every_port_of_which_faces_one_way_is_refused() {
     for (collector, indexer, (from, to), missing) in [
         (
             PUBLISHER,
-            "    grants = [ports];\n    out events -> relay;\n",
+            ("    grants = [ports];\n    out events -> relay;\n", "ports"),
             ("new indexer: Sink", "new indexer: Source"),
             "has no subscriber",
         ),
@@ -1484,11 +1499,17 @@ fn a_link_bound_subscriber_states_its_own_window() {
     // the depths and no default to fall back on. Both subscribing shapes answer
     // to the rule: an `io` port and a plain `in` read the same ring.
     for tail in ["", " { push_depth = 8; }", " { retain_depth = 8; }"] {
-        for binding in [
-            format!("    grants = [ports];\n    io feed <-> relay{tail}\n"),
-            format!("    grants = [];\n    in quiet <- relay{tail}\n"),
+        for (binding, words) in [
+            (
+                format!("    grants = [ports];\n    io feed <-> relay{tail}\n"),
+                "ports",
+            ),
+            (
+                format!("    grants = [];\n    in quiet <- relay{tail}\n"),
+                "",
+            ),
         ] {
-            let refusals = derive_refusals(&linked(PUBLISHER, &binding, ("", "")));
+            let refusals = derive_refusals(&linked(PUBLISHER, (&binding, words), ("", "")));
             assert!(
                 refusals
                     .iter()
@@ -1503,7 +1524,7 @@ fn a_link_bound_subscriber_states_its_own_window() {
 /// somewhere the component publishes, so the `ports` rule counts it.
 #[test]
 fn a_link_bound_publisher_must_grant_ports() {
-    let collector = "    grants = [];\n    out events -> relay;\n";
+    let collector = ("    grants = [];\n    out events -> relay;\n", "");
     let refusals = derive_refusals(&linked(collector, SUBSCRIBER, ("", "")));
     assert!(
         refusals
@@ -1517,8 +1538,10 @@ fn a_link_bound_publisher_must_grant_ports() {
 /// component that only subscribes reaches nothing.
 #[test]
 fn a_link_bound_subscriber_that_grants_ports_reaches_nothing() {
-    let indexer =
-        "    grants = [ports];\n    in quiet <- relay { push_depth = 2; retain_depth = 2; }\n";
+    let indexer = (
+        "    grants = [ports];\n    in quiet <- relay { push_depth = 2; retain_depth = 2; }\n",
+        "ports",
+    );
     let refusals = derive_refusals(&linked(PUBLISHER, indexer, ("", "")));
     assert!(
         refusals
@@ -1584,14 +1607,15 @@ fn a_link_named_where_a_channel_is_required_says_it_names_a_link() {
 fn a_stamped_link_named_where_a_channel_is_required_says_it_names_a_link() {
     let refusals = support::refusals(&format!(
         "// ── packaged ──\n\
-         component Sink {{ {PROCESSOR} optional io feed; }}\n\
+         component Sink {{ {} optional io feed; }}\n\
          // ── packaged ──\n\
          assembly Pod() {{\n    link relay;\n    \
          new inner: Sink {{\n        slug = \"inner\";\n        \
          \n        grants = [subscribe, ports];\n        \
          acl subscribe [exact relay];\n        \
          io feed <-> relay {{ push_depth = 1; retain_depth = 1; }}\n    }}\n}}\n\
-         new pod: Pod();\n"
+         new pod: Pod();\n",
+        processor_needs!("ports")
     ));
     assert!(
         refusals

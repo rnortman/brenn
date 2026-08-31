@@ -1,0 +1,8 @@
+/// A component nothing publishes to: it is activated only for its own deferred
+/// views, so its inbound enum is uninhabited and classifying a window always
+/// fails.
+component ScaffoldNoInbound {
+  abi = processor;
+  requires = [ports];
+  out beats;
+}

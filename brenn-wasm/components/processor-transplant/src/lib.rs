@@ -43,13 +43,12 @@
 // carried a counter would pin that divergence into the transcript and fail for
 // a reason the contract never claimed.
 
-use brenn_guest::{
-    Activation, Error, Processor, config, defer_cancel, defer_edit, log, publish, publish_deferred,
-};
+mod spec;
 
-/// The one output port this fixture is bound to, and the only port its deferral
-/// markers name.
-const OUT: &str = "out";
+use crate::spec::{config, log, port::OUT};
+use brenn_guest::{
+    Activation, Error, Processor, defer_cancel, defer_edit, publish, publish_deferred,
+};
 
 #[derive(serde::Serialize)]
 struct PortSummary<'a> {

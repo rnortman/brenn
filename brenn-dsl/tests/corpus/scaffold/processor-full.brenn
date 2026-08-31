@@ -1,0 +1,14 @@
+/// A specification exercising the whole generated processor surface: both port
+/// directions, an `io` port, an optional port, doctypes, and every capability
+/// word that names an SDK module.
+///
+/// The prose is carried into the generated module, so this paragraph is part of
+/// what the golden pins.
+component ScaffoldFull {
+  abi = processor;
+  requires = [ports, store, log, alert, config, mqtt, tools];
+  in commands: "brenn.scaffold.commands@1";
+  optional in retries;
+  out results: "brenn.scaffold.results@1";
+  io tick;
+}

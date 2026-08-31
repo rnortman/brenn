@@ -9,7 +9,8 @@ mod support;
 
 use brenn_dsl::derived::{DAclSet, DMatcher};
 use brenn_dsl::diag::Diagnostic;
-use brenn_dsl::{dom_any, processor_any};
+use brenn_dsl::dom_any;
+use brenn_dsl::fixture_text::processor_header;
 use fltk_serde_core::Spanned;
 use support::{
     PACKAGED, at, derive_errors, derive_refusal, derive_refusals, derived, durable, nondurable,
@@ -25,20 +26,19 @@ use support::{
 /// case with an unconnected-port refusal instead of the one it asked for. The
 /// required-port contract itself is asserted in the resolve suite.
 ///
-/// Its grant declarations are read the same way: `requires` is empty and
-/// `optional` is every word this host admits, so each case grants what the case
-/// is about without the spec fit answering it first. The fit contract itself is
-/// asserted below.
-const SINK: &str = concat!(
-    packaged!(),
-    "component Sink {\n",
-    "    ",
-    processor_any!(),
-    "\n",
-    "    optional out events;\n",
-    "}\n",
-    packaged!(),
-);
+/// Its grant declaration cannot be read the same way — a processor class has no
+/// `optional` — so the class states exactly what its instance grants and the
+/// caller passes that list in. A case whose grant word is refused before it
+/// becomes a right passes an empty list, so the fit check has nothing to say
+/// about it and the case's own refusal is the sole one.
+fn sink(requires: &str) -> String {
+    format!(
+        "{}component Sink {{\n    {}\n    optional out events;\n}}\n{}",
+        PACKAGED,
+        processor_header(requires),
+        PACKAGED,
+    )
+}
 
 // Every fixture takes the rights it grants, because agreement is checked in both
 // directions: a right over an empty list is refused just as an entry no right
@@ -59,9 +59,16 @@ fn surface(statements: &str) -> String {
 /// A top-level component instance granting the capabilities named and holding
 /// the statements written into it.
 fn consumer(grants: &str, statements: &str) -> String {
+    consumer_needing(grants, grants, statements)
+}
+
+/// The same, where the class's needs and the instance's grants differ — which
+/// they do exactly where the granted word is not a capability the fit check
+/// ever sees.
+fn consumer_needing(requires: &str, grants: &str, statements: &str) -> String {
     format!(
-        "{SINK}new alice_sink: Sink {{\n    \n    \
-         grants = [{grants}];\n{statements}}}\n"
+        "{}new alice_sink: Sink {{\n    \n    grants = [{grants}];\n{statements}}}\n",
+        sink(requires)
     )
 }
 
@@ -772,19 +779,16 @@ const PANEL: &str = concat!(
 );
 
 /// A processor class a top-level instance is made of. Every port is `optional`
-/// for the reason `SINK` states.
-const RELAY: &str = concat!(
-    packaged!(),
-    "component Relay {\n",
-    "    ",
-    processor_any!(),
-    "\n",
-    "    optional in inbound;\n",
-    "    optional out outbound;\n",
-    "    optional io acks;\n",
-    "}\n",
-    packaged!(),
-);
+/// for the reason `sink` states.
+fn relay_class(requires: &str) -> String {
+    format!(
+        "{}component Relay {{\n    {}\n    optional in inbound;\n    \
+         optional out outbound;\n    optional io acks;\n}}\n{}",
+        PACKAGED,
+        processor_header(requires),
+        PACKAGED,
+    )
+}
 
 /// A surface holding the statements written into it and one `Panel` holding the
 /// bindings.
@@ -820,8 +824,8 @@ fn placed_panel(grants: &str, body: &str) -> String {
 /// statements and bindings written into it.
 fn relay_with(grants: &str, body: &str) -> String {
     format!(
-        "{RELAY}new alice_relay: Relay {{\n    \n    \
-         grants = [{grants}];\n{body}}}\n"
+        "{}new alice_relay: Relay {{\n    \n    grants = [{grants}];\n{body}}}\n",
+        relay_class(grants)
     )
 }
 
@@ -836,7 +840,7 @@ const FAN_IN: &str = concat!(
     packaged!(),
     "component FanIn {\n",
     "    ",
-    processor_any!(),
+    brenn_dsl::processor_needs!(""),
     "\n",
     "    optional in first;\n",
     "    optional in second;\n",
@@ -1546,7 +1550,7 @@ fn a_word_that_names_no_right_is_refused_with_the_ones_that_do() {
              or `alert`",
         ),
         (
-            consumer("takeover", ""),
+            consumer_needing("", "takeover", ""),
             "`takeover` is a page capability; a top-level consumer has no page",
         ),
     ] {
@@ -1610,7 +1614,7 @@ fn a_raw_scheme_compound_token_is_refused_by_name() {
 #[test]
 fn a_plane_word_on_a_wasm_list_is_refused() {
     assert_eq!(
-        derive_refusal(&consumer("subscribe", "")),
+        derive_refusal(&consumer_needing("", "subscribe", "")),
         "consumer `alice_sink` states no `subscribe` right: a component's grants name the \
          capability interfaces it is given, and its transport rights are read off its bindings \
          and acl statements"
@@ -1745,7 +1749,7 @@ fn an_mqtt_right_with_no_broker_entry_is_refused() {
 #[test]
 fn a_consumer_states_its_grants() {
     assert_eq!(
-        derive_refusal(&format!("{SINK}new alice_sink: Sink {{\n    \n}}\n")),
+        derive_refusal(&format!("{}new alice_sink: Sink {{\n    \n}}\n", sink(""))),
         "consumer `alice_sink` states no `grants`: what a component is given is \
          deny-by-default, so an empty list is written `grants = [];` rather than left out"
     );
@@ -1802,7 +1806,8 @@ fn a_refused_grants_word_is_not_followed_by_a_refusal_about_its_consequence() {
         (
             "no grants key at all beside an output that demands `ports`",
             format!(
-                "{RELAY}new alice_relay: Relay {{\n    out outbound -> \"local:alice/out\";\n}}\n"
+                "{}new alice_relay: Relay {{\n    out outbound -> \"local:alice/out\";\n}}\n",
+                relay_class("")
             ),
         ),
     ] {

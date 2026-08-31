@@ -116,6 +116,35 @@ impl ComponentGrant {
         Self::ALL.into_iter().find(|grant| grant.word() == word)
     }
 
+    /// The WIT interface this grant links, at the host's version, or `None` for
+    /// the one grant that links no interface.
+    ///
+    /// The single statement of the grant→import correspondence. Three readers
+    /// need it and none of them may hold a table of its own: the host's linker
+    /// gating, which decides whether an interface is added at all; the
+    /// boot-time reflection check, which reads what an artifact actually
+    /// imports; and the build-time parity check, which holds a specification's
+    /// `requires` list equal to that same artifact's imports.
+    ///
+    /// `Takeover` is the exception for the reason it is everywhere else: it is
+    /// consent to a binding, gated at the binding, with no interface behind it.
+    ///
+    /// The version suffix is the host's, so a reader comparing against a name
+    /// scraped from an artifact built at a different version must strip both
+    /// sides or match by semver rather than by bytes.
+    pub fn wit_import(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Ports => "brenn:processor/ports@0.1.0",
+            Self::Store => "brenn:processor/store@0.1.0",
+            Self::Log => "brenn:processor/log@0.1.0",
+            Self::Alert => "brenn:processor/alert@0.1.0",
+            Self::Config => "brenn:processor/config@0.1.0",
+            Self::Mqtt => "brenn:processor/mqtt@0.1.0",
+            Self::Tools => "brenn:processor/tools@0.1.0",
+            Self::Takeover => return None,
+        })
+    }
+
     /// Why this host cannot implement this capability, where it cannot.
     ///
     /// The one home for hosting legality, and deliberately the same split as
@@ -366,8 +395,8 @@ pub fn bindable_schemes(kind: EntityKind, plane: Plane) -> &'static [ChannelSche
 /// This is the **unified** capability enum spanning LLM conversations and WASM
 /// components. The full variant set is defined now so later phases need not
 /// widen it. Named `AppCapability` — **not** `Capability` — to avoid colliding
-/// with `brenn-wasm`'s own `Capability` enum and with the DSL's own narrower
-/// `Capability`.
+/// with the DSL's own narrower `Capability`, which spans the words an entity of
+/// any kind may hold.
 ///
 /// `Ord` is derived so a `GrantSet` (a `BTreeSet<AppCapability>`) iterates in a
 /// stable order once a later phase's logging needs it.
@@ -883,6 +912,44 @@ mod tests {
                 _ => assert!(mapped.is_some(), "{grant:?} names no capability"),
             }
         }
+    }
+
+    /// Every grant but one links an interface, and the one that does not is
+    /// `Takeover` — the same exception `app_capability` makes, for the same
+    /// reason. A word added to the vocabulary without an import decision would
+    /// pass the compiler (the match is exhaustive but a new arm can return
+    /// `None` by hand) and silently leave the build-time parity check unable to
+    /// see it, so the totality is asserted rather than assumed.
+    #[test]
+    fn every_grant_but_takeover_links_an_interface() {
+        for grant in ComponentGrant::ALL {
+            let import = grant.wit_import();
+            if grant == ComponentGrant::Takeover {
+                assert_eq!(import, None, "takeover names no interface");
+                continue;
+            }
+            let import = import.unwrap_or_else(|| panic!("{grant:?} links no interface"));
+            assert_eq!(
+                import,
+                format!("brenn:processor/{}@0.1.0", grant.word()),
+                "{grant:?}'s interface is not named for its word"
+            );
+        }
+    }
+
+    /// Two grants naming one interface would make the parity check's set
+    /// comparison lossy in one direction: a spec requiring either word would
+    /// satisfy an artifact importing the shared interface.
+    #[test]
+    fn no_two_grants_link_the_same_interface() {
+        let mut imports: Vec<&str> = ComponentGrant::ALL
+            .iter()
+            .filter_map(|grant| grant.wit_import())
+            .collect();
+        let count = imports.len();
+        imports.sort_unstable();
+        imports.dedup();
+        assert_eq!(imports.len(), count, "two grants share an interface");
     }
 
     #[test]

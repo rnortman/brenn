@@ -27,12 +27,7 @@ use brenn_surface_component_support::parse_delivery;
 pub use brenn_surface_component_support::{ContractViolation, FaultReport};
 use brenn_surface_contract::PortWindow;
 
-/// The agenda-subscription input port name.
-pub(crate) const AGENDA_PORT: &str = "agenda";
-/// The ack subscribe-and-publish port name.
-pub(crate) const ACKS_PORT: &str = "acks";
-/// The takeover-request output port name.
-pub(crate) const TAKEOVER_PORT: &str = "takeover";
+use crate::spec::port::{ACKS, AGENDA};
 
 /// Escalation ladder defaults (seconds), used when a meeting carries no
 /// `escalation` override or an invalid one. `takeover > critical` is the ordering
@@ -362,9 +357,9 @@ impl MeetingState {
         envelope_json: &str,
         now: DateTime<Utc>,
     ) -> Result<IngestOutcome, ContractViolation> {
-        let envelope = parse_delivery(port, &[AGENDA_PORT, ACKS_PORT], envelope_json)?;
+        let envelope = parse_delivery(port, &[AGENDA, ACKS], envelope_json)?;
 
-        let outcome = if port == AGENDA_PORT {
+        let outcome = if port == AGENDA {
             match parse_snapshot(&envelope.body) {
                 Ok((meetings, warnings)) => {
                     self.meetings = meetings;
@@ -413,13 +408,13 @@ impl MeetingState {
         window: &PortWindow,
         now: DateTime<Utc>,
     ) -> Result<Vec<IngestWarning>, ContractViolation> {
-        if window.port != AGENDA_PORT && window.port != ACKS_PORT {
+        if window.port != AGENDA && window.port != ACKS {
             return Err(ContractViolation::WrongPort {
                 port: window.port.clone(),
             });
         }
         let mut notes = Vec::new();
-        if window.port == AGENDA_PORT {
+        if window.port == AGENDA {
             if let Some(message) = window.latest_wins_misconfiguration() {
                 notes.push(IngestWarning::error(message));
             }
@@ -428,7 +423,7 @@ impl MeetingState {
             }
             return Ok(notes);
         }
-        if window.port == ACKS_PORT && window.dropped > 0 {
+        if window.port == ACKS && window.dropped > 0 {
             notes.push(IngestWarning::warn(format!(
                 "meeting port {:?} dropped {} ack(s); a dismissal or snooze made \
                  elsewhere may keep escalating here until its meeting leaves the \

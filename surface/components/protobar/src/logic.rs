@@ -24,10 +24,7 @@ use brenn_surface_component_support::FaultReport;
 use chrono::{DateTime, Utc};
 
 use crate::markdown::{self, Block};
-
-/// The config-bound input port name. A `[[surface.subscription]] port` must
-/// match this string, or `on_message` rejects the delivery.
-const INPUT_PORT: &str = "messages";
+use crate::spec::port::MESSAGES;
 
 /// Number of priority slots — one per [`Urgency`] level, derived from
 /// [`Urgency::ALL`] so the two never drift.
@@ -345,7 +342,7 @@ impl ProtobarState {
     }
 
     fn check_port(&self, port: &str) -> Result<(), ContractViolation> {
-        if port == INPUT_PORT {
+        if port == MESSAGES {
             Ok(())
         } else {
             Err(ContractViolation::WrongPort {

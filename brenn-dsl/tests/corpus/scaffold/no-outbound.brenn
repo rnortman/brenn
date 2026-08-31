@@ -1,0 +1,7 @@
+/// A component that publishes nothing: no publish handles, and the port-name
+/// module carries its inbound names alone.
+component ScaffoldNoOutbound {
+  abi = processor;
+  requires = [ports, log];
+  in reports;
+}

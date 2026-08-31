@@ -2,18 +2,20 @@
 //! vocabulary they spell, and the fence that splits a fixture into a packaged
 //! module and the document that imports it.
 //!
-//! A test's `component` class is written to stay out of the way: it permits
-//! every capability its host admits, so each case grants what the case is about
-//! and the spec fit answers nothing else. That is a transcription of
+//! A dom test's `component` class is written to stay out of the way: it permits
+//! every capability a surface admits, so each case grants what the case is
+//! about and the spec fit answers nothing else. That is a transcription of
 //! [`ComponentGrant::ALL`] minus what
 //! [`ComponentGrant::illegal_on`](brenn_envelope::grants::ComponentGrant::illegal_on)
 //! rejects, and a transcription per fixture is the hand table the vocabulary is
 //! single-sourced to avoid: an eighth variant would mean hunting every fixture
 //! that permits everything and deciding, one by one, whether it still does.
 //!
-//! So the two headers live here once and the tests below pin them to the enum.
-//! A macro rather than a `const` because a fixture is `concat!`-built from
-//! literals, and `concat!` takes a macro that expands to one.
+//! A processor class cannot be written that way, because `optional` is refused
+//! on the abi: a processor reaches a capability through a WIT import the host
+//! links only where the instance grants it. So a processor fixture states the
+//! words its instance grants and nothing else, and the two forms here take that
+//! list rather than hold one.
 //!
 //! ```
 //! const PANEL: &str = concat!(
@@ -21,19 +23,27 @@
 //!     brenn_dsl::dom_any!(),
 //!     "\n    optional in messages;\n}\n",
 //! );
+//!
+//! const SINK: &str = concat!(
+//!     "component Sink {\n    ",
+//!     brenn_dsl::processor_needs!("ports, log"),
+//!     "\n    optional out events;\n}\n",
+//! );
 //! ```
 //!
 //! A `concat!` position cannot hold a `const`, and a `format!` position cannot
 //! hold a macro call as an inline argument, so a suite that needs both writes
-//! `const DOM: &str = dom_any!();` and uses whichever fits.
+//! `const DOM: &str = dom_any!();` and uses whichever fits. Where the word list
+//! is only known at runtime — a case parameterized over what it grants —
+//! [`processor_header`] builds the same text.
 //!
 //! The module is public unconditionally, and that is a choice rather than an
 //! oversight: `brenn-lib` and `brenn-bootstrap` tests need these fragments, they
 //! link the ordinary library, and no `cfg` spells "a downstream crate's tests
-//! only". So two macros of fixture prose are visible to every consumer,
-//! in-tree and out. They promise nothing: an out-of-tree component that spells
-//! its own class text is unaffected by a change here, and one that expands these
-//! is holding a test fixture.
+//! only". So a little fixture prose is visible to every consumer, in-tree and
+//! out. It promises nothing: an out-of-tree component that spells its own class
+//! text is unaffected by a change here, and one that expands these is holding a
+//! test fixture.
 
 /// A surface-hosted fixture class's header, permitting everything a surface
 /// admits:
@@ -45,15 +55,27 @@ macro_rules! dom_any {
     };
 }
 
-/// A backend-hosted fixture class's header, permitting everything a top-level
-/// host admits:
-/// `abi = processor; requires = []; optional = [ports, store, log, alert, config, mqtt,
-/// tools];`
+/// A backend-hosted fixture class's header, requiring exactly the words named:
+/// `processor_needs!("ports, log")` is
+/// `abi = processor; requires = [ports, log];`.
+///
+/// The list is written out rather than defaulted because a processor class has
+/// no `optional`, so the words here are the words its instance grants — no more
+/// and no fewer, which is both halves of the spec fit.
 #[macro_export]
-macro_rules! processor_any {
-    () => {
-        "abi = processor; requires = []; optional = [ports, store, log, alert, config, mqtt, tools];"
+macro_rules! processor_needs {
+    ($words:literal) => {
+        concat!("abi = processor; requires = [", $words, "];")
     };
+}
+
+/// [`processor_needs`] where the word list is a value rather than a literal.
+///
+/// A case parameterized over what it grants has to state the same list twice —
+/// once as the class's need and once as the instance's grant — and a `concat!`
+/// cannot hold a variable.
+pub fn processor_header(words: &str) -> String {
+    format!("abi = processor; requires = [{words}];")
 }
 
 /// The fence a fixture writes around the class declarations that have to live
@@ -162,15 +184,15 @@ pub fn fenced(source: &str) -> impl Iterator<Item = (&str, Option<bool>)> {
 mod tests {
     use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 
-    /// The header a class permitting everything this host admits states.
-    fn any_header(abi: &str, host: ComponentHost) -> String {
+    /// The header a dom class permitting everything a surface admits states.
+    fn any_header() -> String {
         let words: Vec<&str> = ComponentGrant::ALL
             .into_iter()
-            .filter(|grant| grant.illegal_on(host).is_none())
+            .filter(|grant| grant.illegal_on(ComponentHost::Surface).is_none())
             .map(ComponentGrant::word)
             .collect();
         format!(
-            "abi = {abi}; requires = []; optional = [{}];",
+            "abi = dom; requires = []; optional = [{}];",
             words.join(", ")
         )
     }
@@ -216,16 +238,25 @@ mod tests {
     }
 
     #[test]
-    fn each_header_permits_exactly_what_its_host_admits() {
+    fn the_dom_header_permits_exactly_what_a_surface_admits() {
         assert_eq!(
             crate::dom_any!(),
-            any_header("dom", ComponentHost::Surface),
+            any_header(),
             "a grant word joined or left the vocabulary; the fixture header says otherwise"
         );
+    }
+
+    /// The literal form and the runtime form are the same text, so a fixture
+    /// that has to state its needs both ways states them once.
+    #[test]
+    fn a_processor_header_is_the_same_text_either_way() {
         assert_eq!(
-            crate::processor_any!(),
-            any_header("processor", ComponentHost::TopLevel),
-            "a grant word joined or left the vocabulary; the fixture header says otherwise"
+            crate::processor_needs!("ports, log"),
+            crate::fixture_text::processor_header("ports, log")
+        );
+        assert_eq!(
+            crate::processor_needs!(""),
+            crate::fixture_text::processor_header("")
         );
     }
 }

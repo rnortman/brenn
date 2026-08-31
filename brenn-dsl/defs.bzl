@@ -9,6 +9,11 @@ load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_test")
 
+# The toolchain's own rustfmt, reached directly rather than through the aspect:
+# the aspect formats what a target compiles, and what needs formatting here is a
+# generator's output on its way to a byte comparison.
+_RUSTFMT = "@rules_rust//tools/upstream_wrapper:rustfmt"
+
 def dsl_test(name):
     """An integration-test suite over the fixtures in this package.
 
@@ -130,3 +135,44 @@ def format_check(name, src):
         file1 = ":{}_config_formatted".format(name),
         file2 = src,
     )
+
+def scaffold_goldens(name, class_name = None):
+    """The generated guest module for one specification, pinned to a golden.
+
+    The golden IS the definition of what a component crate compiles: editing the
+    emitter fails this until the golden is regenerated deliberately. The
+    generator's output is run through rustfmt exactly as `guest_spec_scaffold`
+    does before it is compared, so the golden is what a real component gets,
+    byte for byte, and the emitter is never in the business of guessing layout.
+
+    Args:
+        name: the fixture basename, for `tests/corpus/scaffold/<name>.brenn`
+            and its `<name>.rs` golden.
+        class_name: which component class to generate from, where the fixture
+            declares more than one.
+    """
+    spec = "tests/corpus/scaffold/{}.brenn".format(name)
+    golden = "tests/corpus/scaffold/{}.rs".format(name)
+    select = " --class {}".format(class_name) if class_name else ""
+
+    native.genrule(
+        name = "{}_scaffold_generated".format(name),
+        srcs = [spec],
+        outs = ["{}.scaffold-generated.rs".format(name)],
+        cmd = "$(location //brenn-dsl:dsl_cli) scaffold{} -o $@ $(location {}) && $(location {}) --edition 2024 $@".format(
+            select,
+            spec,
+            _RUSTFMT,
+        ),
+        tools = [
+            "//brenn-dsl:dsl_cli",
+            _RUSTFMT,
+        ],
+    )
+
+    diff_test(
+        name = "{}_scaffold_test".format(name),
+        file1 = ":{}_scaffold_generated".format(name),
+        file2 = golden,
+    )
+

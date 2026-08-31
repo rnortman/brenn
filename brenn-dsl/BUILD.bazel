@@ -1,8 +1,10 @@
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@fltk//:rust.bzl", "generate_rust_parser")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test")
+load("//bazel/platforms:defs.bzl", "WASM32_ONLY")
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load(":defs.bzl", "dsl_test", "format_goldens")
+load("//bazel/wasm:defs.bzl", "wasm32_build")
+load(":defs.bzl", "dsl_test", "format_goldens", "scaffold_goldens")
 
 policy_srcs()
 
@@ -79,6 +81,8 @@ dsl_test(name = "expand")
 
 dsl_test(name = "multifile")
 
+dsl_test(name = "scaffold")
+
 # The CLI suite is not a `dsl_test`: it runs the binary rather than the library,
 # so the tool is a declared runfile and the fixtures come along with it.
 rust_test(
@@ -148,6 +152,10 @@ rust_binary(
     srcs = ["src/bin/dsl_cli.rs"],
     crate_root = "src/bin/dsl_cli.rs",
     edition = "2024",
+    # `guest_spec_scaffold` runs this from every specification-bearing
+    # component's package, and `grant_parity_test` from every packaged
+    # processor component.
+    visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
         ":brenn-dsl",
@@ -164,3 +172,59 @@ format_goldens(name = "sections")
 format_goldens(name = "entities")
 
 format_goldens(name = "config")
+
+scaffold_goldens(name = "processor-full")
+
+scaffold_goldens(name = "dom-full")
+
+scaffold_goldens(name = "no-inbound")
+
+scaffold_goldens(name = "no-outbound")
+
+scaffold_goldens(name = "dom-no-inbound")
+
+scaffold_goldens(name = "dom-no-ports")
+
+# The dom goldens, compiled. A golden is otherwise only ever diffed, so nothing
+# asks rustc or clippy whether the emitter's output is valid Rust — and the
+# shapes no in-tree component has (an uninhabited port enum, a class with no
+# ports) are exactly the ones an out-of-tree author would meet first. The dom
+# emission needs no wasm32 target and no component hub: it names no guest SDK.
+rust_library(
+    name = "scaffold_goldens_compile",
+    srcs = [
+        "tests/corpus/scaffold/dom-full.rs",
+        "tests/corpus/scaffold/dom-no-inbound.rs",
+        "tests/corpus/scaffold/dom-no-ports.rs",
+        "tests/scaffold_goldens_compile.rs",
+    ],
+    crate_root = "tests/scaffold_goldens_compile.rs",
+    edition = "2024",
+)
+
+# The processor goldens, compiled the only way they can be: against the guest
+# SDK, for wasm32. The in-tree components cover the shapes they happen to have,
+# and no in-tree processor has zero inbound ports — so the uninhabited enum with
+# its `match self {}` name function and its always-`None` `from_name` would
+# otherwise be diffed and never built, and the first deferred-only component
+# would be where the emitter's mistake surfaced.
+rust_library(
+    name = "scaffold_processor_goldens",
+    srcs = [
+        "tests/corpus/scaffold/no-inbound.rs",
+        "tests/corpus/scaffold/no-outbound.rs",
+        "tests/corpus/scaffold/processor-full.rs",
+        "tests/scaffold_processor_goldens.rs",
+    ],
+    crate_root = "tests/scaffold_processor_goldens.rs",
+    edition = "2024",
+    target_compatible_with = WASM32_ONLY,
+    deps = ["//brenn-wasm/components/guest:brenn-guest"],
+)
+
+# What reaches the library above from a host-configured build; without it the
+# wasm32-only target is skipped rather than compiled.
+wasm32_build(
+    name = "scaffold_processor_goldens_wasm32",
+    target = ":scaffold_processor_goldens",
+)

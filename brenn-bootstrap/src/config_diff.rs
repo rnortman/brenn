@@ -81,15 +81,16 @@ mod tests {
 
     use super::*;
 
-    use brenn_dsl::{dom_any, processor_any};
+    use brenn_dsl::{dom_any, processor_needs};
     use brenn_lib::access::raw::{AppAclRaw, ChannelMatcherRaw, WebhookMatcherRaw};
     use brenn_lib::config::config_from_dsl;
 
-    /// A fixture class's header: its abi, and grant declarations permitting
-    /// everything its host admits, so no case's grants meet a spec that refuses
-    /// them.
+    /// A fixture class's header: its abi, and grant declarations no case's own
+    /// grants meet a refusal from. The dom form permits everything a surface
+    /// admits; a processor class has no `optional` to permit with, so each
+    /// processor fixture states the words its instance is given.
     const DOM: &str = dom_any!();
-    const PROCESSOR: &str = processor_any!();
+    const PROCESSOR: &str = processor_needs!("log, config, ports, mqtt");
 
     /// A config with one durable channel at `address`, everything else default.
     fn one_channel(address: &str) -> BrennConfig {
@@ -186,7 +187,7 @@ channel alerts at "brenn:alice-alerts" {
             concat!(
                 "component Sink {\n",
                 "    ",
-                processor_any!(),
+                processor_needs!("ports"),
                 "\n",
                 "    in messages;\n",
                 "    out events;\n",
@@ -273,7 +274,7 @@ channel acks at "ephemeral:sink.acks" { push_depth = 1; retain_depth = 2; }
 // ── packaged ──
 component Sink {
     "#,
-                processor_any!(),
+                processor_needs!("ports"),
                 r#"
     io tick;
     out done;

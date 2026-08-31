@@ -18,6 +18,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library
 load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
 load("//bazel/gencode:defs.bzl", "generated_parity_test")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY", "WASM32_ONLY")
+load("//bazel/wasm:defs.bzl", "guest_spec_scaffold", "replace_generated")
 load(":dist.bzl", "surface_crate_stage", "surface_dom_package")
 
 # Where the component dirs live: any direct child of these packages is a
@@ -44,6 +45,7 @@ def surface_wasm_crate(
         test_rustc_env = {},
         test_tags = [],
         sidecars = [],
+        generated_srcs = {},
         visibility = ["//visibility:public"]):
     """A surface crate: host library, host tests, browser bundle, dist stage.
 
@@ -62,9 +64,15 @@ def surface_wasm_crate(
             documentation, and for a component its binding record and packaged
             specification; hand-authored ones are renamed to the artifact's
             basename, generated ones already carry it.
+        generated_srcs: modules generated into this crate, keyed by the path
+            each occupies — `{"src/spec.rs": ":<kind>_spec"}` for a
+            specification-bearing component. They feed both builds: a generated
+            module is plain Rust with no browser dependency, so the host half
+            compiles it too and the host suites see the same port names the page
+            does. See `replace_generated`.
         visibility: visibility of the host library and the bundle.
     """
-    srcs = native.glob(["src/**/*.rs"])
+    srcs = replace_generated(native.glob(["src/**/*.rs"]), generated_srcs)
 
     # The host half compiles the crate with its browser glue cfg'd out, which is
     # what makes it host-only: under wasm32 the same sources would want the
@@ -234,6 +242,14 @@ def surface_component(
     schema = native.glob(["schema.json"], allow_empty = True)
     committed_help = native.glob(["help.md"])
 
+    # The specification label is derived here exactly as it is for the package
+    # below, so the module a component compiles against and the module the host
+    # hash-binds at boot come from one file.
+    guest_spec_scaffold(
+        name = kind + "_spec",
+        spec = "//:config/specs/" + kind + ".brenn",
+    )
+
     surface_wasm_crate(
         name = kind,
         artifact = crate_name,
@@ -241,6 +257,7 @@ def surface_component(
         deps = deps,
         edition = edition,
         sidecars = [":" + kind + "_help", ":" + kind + "_package"] + schema,
+        generated_srcs = {"src/spec.rs": ":" + kind + "_spec"},
         test_data = committed_help + schema,
         test_deps = test_deps,
         test_rustc_env = test_rustc_env,

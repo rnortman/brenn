@@ -41,6 +41,11 @@ pub use brenn::replay::types::Header;
 
 use brenn_common::sanitize_untrusted_str;
 
+/// The grant vocabulary, re-exported: what a load spec grants, what this host
+/// links and what an operator writes are one set of words, and a caller
+/// building a `ProcessorLoadSpec` names them without reaching past this crate.
+pub use brenn_envelope::grants::ComponentGrant;
+
 /// Grace period added on top of SKEW_WINDOW_MS when computing the `last` namespace prune cutoff.
 ///
 /// Exported so integration tests can compute the same cutoff boundary without duplicating the
@@ -2013,27 +2018,12 @@ fn log_and_convert_store_error(slug: &str, op: &str, e: StoreError) -> Processor
 }
 
 // ---------------------------------------------------------------------------
-// Capability map (§3.1) — single source of truth for grant ↔ WIT interface
+// Capability linking — the grant vocabulary, gated
 // ---------------------------------------------------------------------------
-
-/// Grantable capability interfaces of `world processor`.
-///
-/// One source of truth used by the linker gating (§3.3) and the import-reflection
-/// check (§3.4); they share this table so they cannot drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Capability {
-    Ports,
-    Store,
-    Log,
-    Alert,
-    Config,
-    Mqtt,
-    Tools,
-}
 
 /// Types-only import every component carries; never a grant, always permitted.
 ///
-/// Matched with the same semver rule as capabilities (see `Capability::from_import_name`).
+/// Matched with the same semver rule as capabilities (see `capability_for_import`).
 /// Public for drift-guard tests.
 pub fn is_types_import(name: &str) -> bool {
     semver_compat_match(name, "brenn:processor/types@0.1.0")
@@ -2172,90 +2162,63 @@ pub fn semver_compat_match(actual: &str, canonical: &str) -> bool {
     }
 }
 
-impl Capability {
-    /// All grantable capabilities in a stable order.
-    pub const ALL: [Capability; 7] = [
-        Capability::Ports,
-        Capability::Store,
-        Capability::Log,
-        Capability::Alert,
-        Capability::Config,
-        Capability::Mqtt,
-        Capability::Tools,
-    ];
+/// The capability a WIT import name is, or `None` for a name the host links
+/// nothing for.
+///
+/// Matching is semver-compatible rather than exact-string — see
+/// [`semver_compat_match`] — because a component built against a compatible
+/// version of an interface is one wasmtime's own linker binds.
+///
+/// The vocabulary is [`ComponentGrant`] itself: the words an operator writes,
+/// the words a specification requires and the interfaces this host links are
+/// one set, and the grant that names no interface simply never matches.
+pub fn capability_for_import(name: &str) -> Option<ComponentGrant> {
+    ComponentGrant::ALL.into_iter().find(|grant| {
+        grant
+            .wit_import()
+            .is_some_and(|canonical| semver_compat_match(name, canonical))
+    })
+}
 
-    /// Operator-facing grant name (`"ports"`, `"store"`, …).
-    pub fn grant_name(self) -> &'static str {
-        match self {
-            Capability::Ports => "ports",
-            Capability::Store => "store",
-            Capability::Log => "log",
-            Capability::Alert => "alert",
-            Capability::Config => "config",
-            Capability::Mqtt => "mqtt",
-            Capability::Tools => "tools",
-        }
-    }
-
-    /// Canonical host-side import key at the host's WIT version.
-    ///
-    /// Used for diagnostics and the drift-guard test (§8 item 8).
-    /// Semver-compatible matching (not exact-string) is used in
-    /// `from_import_name` — see `semver_compat_match`.
-    pub fn import_name(self) -> &'static str {
-        match self {
-            Capability::Ports => "brenn:processor/ports@0.1.0",
-            Capability::Store => "brenn:processor/store@0.1.0",
-            Capability::Log => "brenn:processor/log@0.1.0",
-            Capability::Alert => "brenn:processor/alert@0.1.0",
-            Capability::Config => "brenn:processor/config@0.1.0",
-            Capability::Mqtt => "brenn:processor/mqtt@0.1.0",
-            Capability::Tools => "brenn:processor/tools@0.1.0",
-        }
-    }
-
-    /// Match an import key to a capability using semver-compatible version matching.
-    ///
-    /// Returns `None` for unrecognized or structurally wrong names.
-    pub fn from_import_name(name: &str) -> Option<Capability> {
-        Capability::ALL
-            .iter()
-            .find(|cap| semver_compat_match(name, cap.import_name()))
-            .copied()
-    }
-
-    /// Dispatch to the bindgen-generated `add_to_linker` for this interface.
-    fn add_to_linker(self, linker: &mut Linker<ProcessorData>) -> wasmtime::Result<()> {
-        match self {
-            Capability::Ports => processor_bindings::brenn::processor::ports::add_to_linker::<
-                _,
-                HasSelf<ProcessorData>,
-            >(linker, |d| d),
-            Capability::Store => processor_bindings::brenn::processor::store::add_to_linker::<
-                _,
-                HasSelf<ProcessorData>,
-            >(linker, |d| d),
-            Capability::Log => processor_bindings::brenn::processor::log::add_to_linker::<
-                _,
-                HasSelf<ProcessorData>,
-            >(linker, |d| d),
-            Capability::Alert => processor_bindings::brenn::processor::alert::add_to_linker::<
-                _,
-                HasSelf<ProcessorData>,
-            >(linker, |d| d),
-            Capability::Config => processor_bindings::brenn::processor::config::add_to_linker::<
-                _,
-                HasSelf<ProcessorData>,
-            >(linker, |d| d),
-            Capability::Mqtt => processor_bindings::brenn::processor::mqtt::add_to_linker::<
-                _,
-                HasSelf<ProcessorData>,
-            >(linker, |d| d),
-            Capability::Tools => processor_bindings::brenn::processor::tools::add_to_linker::<
-                _,
-                HasSelf<ProcessorData>,
-            >(linker, |d| d),
-        }
+/// Add the host functions one granted capability names to the linker.
+///
+/// Deny-by-default is structural: a component importing an interface no grant
+/// added here fails `instantiate_pre`.
+fn add_capability_to_linker(
+    grant: ComponentGrant,
+    linker: &mut Linker<ProcessorData>,
+) -> wasmtime::Result<()> {
+    match grant {
+        ComponentGrant::Ports => processor_bindings::brenn::processor::ports::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
+        ComponentGrant::Store => processor_bindings::brenn::processor::store::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
+        ComponentGrant::Log => processor_bindings::brenn::processor::log::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
+        ComponentGrant::Alert => processor_bindings::brenn::processor::alert::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
+        ComponentGrant::Config => processor_bindings::brenn::processor::config::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
+        ComponentGrant::Mqtt => processor_bindings::brenn::processor::mqtt::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
+        ComponentGrant::Tools => processor_bindings::brenn::processor::tools::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
+        // Callers must not pass a word that names no interface.
+        ComponentGrant::Takeover => unreachable!("`takeover` links no interface"),
     }
 }
 
@@ -2281,7 +2244,7 @@ pub struct ProcessorLoadSpec<'a> {
     /// Only listed capabilities are added to the linker; all others are absent.
     /// Validated by the caller (bootstrap config cross-validation) and re-asserted
     /// in `load` via `enforce_grants`.
-    pub grants: std::collections::BTreeSet<Capability>,
+    pub grants: std::collections::BTreeSet<ComponentGrant>,
     /// Path to the per-component SQLite KV store. `Some` iff the component has
     /// the `Store` grant; `None` = no store linked. The caller (bootstrap) enforces
     /// the invariant; `load` re-asserts via `assert!` (fires in both debug and release).
@@ -2390,12 +2353,19 @@ impl ProcessorComponent {
         // Conditional linking: only granted capabilities are added to the linker.
         // Deny-by-default is structural — an ungranted import makes instantiate_pre fail.
         let mut linker: Linker<ProcessorData> = Linker::new(&engine);
-        for cap in &spec.grants {
-            cap.add_to_linker(&mut linker).unwrap_or_else(|e| {
-                panic!(
-                    "failed to add {} to processor linker: {e}",
-                    cap.grant_name()
-                )
+        for grant in &spec.grants {
+            // A word naming no interface is a page capability, consented to at a
+            // binding on a surface. A backend component has no page, so a load
+            // spec carrying one is a caller that built its grant set wrong.
+            assert!(
+                grant.wit_import().is_some(),
+                "component {}: granted `{}`, which names no WIT interface — it is a page \
+                 capability consented to at a binding, and a backend component has no page",
+                spec.slug,
+                grant.word(),
+            );
+            add_capability_to_linker(*grant, &mut linker).unwrap_or_else(|e| {
+                panic!("failed to add {} to processor linker: {e}", grant.word())
             });
         }
 
@@ -2405,7 +2375,7 @@ impl ProcessorComponent {
         // cross-validation.
         assert_eq!(
             spec.store_path.is_some(),
-            spec.grants.contains(&Capability::Store),
+            spec.grants.contains(&ComponentGrant::Store),
             "component {}: store_path ({}) and Store grant ({}) must both be set or both absent",
             spec.slug,
             if spec.store_path.is_some() {
@@ -2413,7 +2383,7 @@ impl ProcessorComponent {
             } else {
                 "None"
             },
-            if spec.grants.contains(&Capability::Store) {
+            if spec.grants.contains(&ComponentGrant::Store) {
                 "granted"
             } else {
                 "not granted"
@@ -2427,7 +2397,7 @@ impl ProcessorComponent {
         // interface would `.expect`-panic at the first guest call.
         assert_eq!(
             spec.mqtt_publish.is_some(),
-            spec.grants.contains(&Capability::Mqtt),
+            spec.grants.contains(&ComponentGrant::Mqtt),
             "component {}: mqtt_publish callback ({}) and Mqtt grant ({}) must both be set or both absent",
             spec.slug,
             if spec.mqtt_publish.is_some() {
@@ -2435,7 +2405,7 @@ impl ProcessorComponent {
             } else {
                 "None"
             },
-            if spec.grants.contains(&Capability::Mqtt) {
+            if spec.grants.contains(&ComponentGrant::Mqtt) {
                 "granted"
             } else {
                 "not granted"
@@ -2449,7 +2419,7 @@ impl ProcessorComponent {
         // config-layer cross-validation.
         assert_eq!(
             spec.tool_host.is_some(),
-            spec.grants.contains(&Capability::Tools),
+            spec.grants.contains(&ComponentGrant::Tools),
             "component {}: tool_host seam ({}) and Tools grant ({}) must both be set or both absent",
             spec.slug,
             if spec.tool_host.is_some() {
@@ -2457,7 +2427,7 @@ impl ProcessorComponent {
             } else {
                 "None"
             },
-            if spec.grants.contains(&Capability::Tools) {
+            if spec.grants.contains(&ComponentGrant::Tools) {
                 "granted"
             } else {
                 "not granted"
@@ -2558,11 +2528,11 @@ impl ProcessorComponent {
         slug: &str,
         engine: &Engine,
         component: &Component,
-        grants: &std::collections::BTreeSet<Capability>,
+        grants: &std::collections::BTreeSet<ComponentGrant>,
     ) {
         let component_type = component.component_type();
         let mut violations: Vec<String> = Vec::new();
-        let mut imported_caps: Vec<Capability> = Vec::new();
+        let mut imported_caps: Vec<ComponentGrant> = Vec::new();
 
         for (name, _item) in component_type.imports(engine) {
             if is_types_import(name) {
@@ -2571,13 +2541,13 @@ impl ProcessorComponent {
                 // `instantiate_pre` — a structurally-wrong types import would produce
                 // an opaque wasmtime error there, which is acceptable given the
                 // types interface carries no functions in any current WIT version.
-            } else if let Some(cap) = Capability::from_import_name(name) {
+            } else if let Some(cap) = capability_for_import(name) {
                 if grants.contains(&cap) {
                     imported_caps.push(cap);
                 } else {
                     violations.push(format!(
                         "component {slug:?} requires ungranted capability {cap_name:?}",
-                        cap_name = cap.grant_name(),
+                        cap_name = cap.word(),
                     ));
                 }
             } else {
@@ -2595,8 +2565,8 @@ impl ProcessorComponent {
         }
 
         // Observability: log granted set and actually-imported capability set.
-        let granted_names: Vec<&str> = grants.iter().map(|c| c.grant_name()).collect();
-        let imported_names: Vec<&str> = imported_caps.iter().map(|c| c.grant_name()).collect();
+        let granted_names: Vec<&str> = grants.iter().map(|c| c.word()).collect();
+        let imported_names: Vec<&str> = imported_caps.iter().map(|c| c.word()).collect();
         info!(
             slug = slug,
             granted = ?granted_names,

@@ -24,6 +24,9 @@
 //
 // Returns Ok on success (all new entries processed).
 
+mod spec;
+
+use crate::spec::port::OUT;
 use brenn_guest::{
     Activation, Error, MessageEnvelopeExt, Processor, defer_cancel, defer_edit, publish,
     publish_deferred,
@@ -53,9 +56,9 @@ impl Processor for ProcessorDemo {
                         let now = activation
                             .now()
                             .expect("backend activation carries a host-stamped now");
-                        publish_deferred("out", "deferred-payload", now + 60_000)?;
+                        publish_deferred(OUT, "deferred-payload", now + 60_000)?;
                     } else if webhook.body == "__viewcount__" {
-                        let view = activation.deferred_for("out").ok_or_else(|| {
+                        let view = activation.deferred_for(OUT).ok_or_else(|| {
                             Error::failed("output port 'out' has no deferred window")
                         })?;
                         let summary = match view.entries().first() {
@@ -67,26 +70,26 @@ impl Processor for ProcessorDemo {
                             ),
                             None => format!("view={}", view.entries().len()),
                         };
-                        publish("out", &summary)?;
+                        publish(OUT, &summary)?;
                     } else if webhook.body == "__cancel__" {
-                        let view = activation.deferred_for("out").ok_or_else(|| {
+                        let view = activation.deferred_for(OUT).ok_or_else(|| {
                             Error::failed("output port 'out' has no deferred window")
                         })?;
                         if let Some(first) = view.entries().first() {
-                            defer_cancel("out", first.index())?;
+                            defer_cancel(OUT, first.index())?;
                         }
                     } else if webhook.body == "__reschedule__" {
                         let now = activation
                             .now()
                             .expect("backend activation carries a host-stamped now");
-                        let view = activation.deferred_for("out").ok_or_else(|| {
+                        let view = activation.deferred_for(OUT).ok_or_else(|| {
                             Error::failed("output port 'out' has no deferred window")
                         })?;
                         if let Some(first) = view.entries().first() {
-                            defer_edit("out", first.index(), None, Some(now + 3_600_000))?;
+                            defer_edit(OUT, first.index(), None, Some(now + 3_600_000))?;
                         }
                     } else {
-                        publish("out", &webhook.body)?;
+                        publish(OUT, &webhook.body)?;
                     }
                 }
             }

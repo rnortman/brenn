@@ -34,14 +34,12 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 
-use crate::logic::{ConfigNote, ModeClock, THEME_PORT};
+use crate::logic::{ConfigNote, ModeClock};
+use crate::spec::port::{THEME, TICK};
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
 const KIND: &str = "mode-clock";
-
-/// The boundary-wake port — must match a `[[surface.io_port]] port` declaration.
-const TICK_PORT: &str = "tick";
 
 /// The loader's entry, called once after this module's `default` init with the
 /// instance this module record was loaded for. The whole boot sequence lives
@@ -116,7 +114,7 @@ fn on_activation(
     };
     for window in &activation.ports {
         // The tick's payload is irrelevant — the wake is the message.
-        if window.port == TICK_PORT {
+        if window.port == TICK {
             continue;
         }
         let notes = state
@@ -143,7 +141,7 @@ fn on_activation(
             theme: theme.as_wire_str().to_string(),
         })
         .expect("a ThemeBody serializes to JSON");
-        if let Err(err) = publisher.publish(THEME_PORT, &body) {
+        if let Err(err) = publisher.publish(THEME, &body) {
             component_log(
                 host,
                 LogLevel::Error,
@@ -153,13 +151,7 @@ fn on_activation(
     }
     // A fixed dark/light mode has no next boundary, so it parks nothing — the
     // chain resumes from the config activation that puts the clock back in auto.
-    repark_tick(
-        activation,
-        publisher,
-        host,
-        TICK_PORT,
-        plan.release_at(now_ms),
-    );
+    repark_tick(activation, publisher, host, TICK, plan.release_at(now_ms));
 }
 
 // Browser-level tests for the activation glue: the DOM-free half is covered
@@ -203,7 +195,7 @@ mod tests {
         entry
             .call1(
                 &JsValue::NULL,
-                &JsValue::from_str(&activation_json(&[(TICK_PORT, "{}")], None, now_ms)),
+                &JsValue::from_str(&activation_json(&[(TICK, "{}")], None, now_ms)),
             )
             .expect("the entry returns ok");
 
@@ -218,7 +210,7 @@ mod tests {
         let [seam, _, port, body, _] = &recorded[0][..] else {
             panic!("{recorded:?}")
         };
-        assert_eq!((seam.as_str(), port.as_str()), ("publish", THEME_PORT));
+        assert_eq!((seam.as_str(), port.as_str()), ("publish", THEME));
         let theme: ThemeBody = serde_json::from_str(body).expect("the theme body is a ThemeBody");
         assert_eq!(theme.v, CONTROL_PLANE_VERSION);
         assert!(
@@ -231,7 +223,7 @@ mod tests {
         };
         assert_eq!(
             (seam.as_str(), defer_op.as_str(), port.as_str()),
-            ("defer", "publish", TICK_PORT),
+            ("defer", "publish", TICK),
             "the wake is parked on the in/out tick port, after the theme"
         );
         let deliver_after: u64 = deliver_after.parse().expect("a decimal release instant");
