@@ -1769,15 +1769,22 @@ export class BrennApp extends LitElement {
     this.ws.send({ type: "StopRequest" });
   }
 
-  /** Resolve the effective current model from user preference + app default. */
+  /** A preference the server does not offer is cleared from persisted
+   *  settings so it cannot resurrect. An empty available list means "not yet
+   *  known", not "nothing allowed", so it never clears the preference. */
   private resolveCurrentModel(): void {
     const pref = this.settings.preferredModel;
-    // Use preference if it's in the available list, otherwise fall back to default.
     if (pref && this.availableModels.some(m => m.value === pref)) {
       this.currentModel = pref;
-    } else {
-      this.currentModel = this.defaultModel;
+      return;
     }
+    if (pref && this.availableModels.length > 0) {
+      // TODO(per-app-model-preference): `preferredModel` is one origin-wide
+      // key, so clearing it here also un-prefers the model in every other app
+      // served from this origin.
+      this.settings.preferredModel = null;
+    }
+    this.currentModel = this.defaultModel;
   }
 
   private handleModelChange(model: string): void {

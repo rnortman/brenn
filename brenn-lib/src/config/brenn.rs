@@ -191,6 +191,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
             icon: _,
             working_dir: _,
             model: _,
+            models: _,
             single_instance: _,
             singleton: _,
             persistent: _,

@@ -36,6 +36,7 @@ pub fn test_app_config(slug: &str) -> AppConfig {
         icon: String::new(),
         working_dir: PathBuf::from("."),
         model: "sonnet".to_string(),
+        models: None,
         single_instance: false,
         singleton: false,
         persistent: false,

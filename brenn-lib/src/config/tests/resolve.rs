@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::ResolvedConfig;
+use crate::config::test_app_config;
 use crate::integration::IntegrationRegistry;
 
 // -----------------------------------------------------------------------
@@ -65,6 +66,106 @@ fn validate_per_app_model_override() {
     assert!(app.single_instance);
     assert_eq!(app.allowed_users, vec!["alice"]);
     assert_eq!(app.disabled_tools, vec!["Bash"]);
+}
+
+// -----------------------------------------------------------------------
+// models allow-list
+// -----------------------------------------------------------------------
+
+/// One app carrying the given allow-list, on a `sonnet` global default.
+fn models_config(
+    dir: &std::path::Path,
+    model: Option<&str>,
+    models: Option<Vec<&str>>,
+) -> BrennConfig {
+    BrennConfig {
+        server: super::test_server_config(),
+        claude_defaults: ClaudeDefaultsConfig {
+            model: "sonnet".to_string(),
+            ..Default::default()
+        },
+        apps: vec![AppConfigRaw {
+            slug: "pfin".to_string(),
+            working_dir: Some(dir.to_path_buf()),
+            model: model.map(str::to_string),
+            models: models.map(|m| m.into_iter().map(str::to_string).collect()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn resolve_models_config(config: &BrennConfig) -> ResolvedConfig {
+    validate_and_resolve(
+        config,
+        &IntegrationRegistry::new(vec![]),
+        Some(super::test_runtime_dir()),
+    )
+}
+
+#[test]
+fn models_absent_resolves_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = models_config(dir.path(), None, None);
+    let ResolvedConfig { apps, .. } = resolve_models_config(&config);
+    assert_eq!(apps["pfin"].models, None);
+}
+
+#[test]
+fn models_present_with_member_default_preserves_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = models_config(
+        dir.path(),
+        Some("opus[1m]"),
+        Some(vec!["opus[1m]", "sonnet"]),
+    );
+    let ResolvedConfig { apps, .. } = resolve_models_config(&config);
+    let app = &apps["pfin"];
+    assert_eq!(app.model, "opus[1m]");
+    assert_eq!(
+        app.models.as_deref(),
+        Some(["opus[1m]".to_string(), "sonnet".to_string()].as_slice()),
+    );
+}
+
+#[test]
+fn models_falls_back_to_claude_default_when_model_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = models_config(dir.path(), None, Some(vec!["sonnet"]));
+    let ResolvedConfig { apps, .. } = resolve_models_config(&config);
+    assert_eq!(apps["pfin"].model, "sonnet");
+}
+
+#[test]
+#[should_panic(expected = "empty `models` list")]
+fn models_empty_list_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = models_config(dir.path(), None, Some(vec![]));
+    resolve_models_config(&config);
+}
+
+#[test]
+#[should_panic(expected = "duplicate entry")]
+fn models_duplicate_entry_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = models_config(dir.path(), Some("sonnet"), Some(vec!["sonnet", "sonnet"]));
+    resolve_models_config(&config);
+}
+
+#[test]
+#[should_panic(expected = "is not in `models`")]
+fn models_excluding_per_app_model_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = models_config(dir.path(), Some("opus[1m]"), Some(vec!["sonnet"]));
+    resolve_models_config(&config);
+}
+
+#[test]
+#[should_panic(expected = "is not in `models`")]
+fn models_excluding_claude_defaults_fallback_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = models_config(dir.path(), None, Some(vec!["opus[1m]"]));
+    resolve_models_config(&config);
 }
 
 #[test]
@@ -503,92 +604,15 @@ fn validate_compaction_idle_default_is_270() {
 
 #[test]
 fn user_has_access_empty_allows_all() {
-    let app = AppConfig {
-        slug: "pfin".to_string(),
-        name: "pfin".to_string(),
-        description: String::new(),
-        icon: String::new(),
-        working_dir: PathBuf::from("/tmp"),
-        model: "sonnet".to_string(),
-        single_instance: false,
-        singleton: false,
-        persistent: false,
-        idle_timeout: None,
-        compaction: None,
-        idle_hook_secs: 0,
-        allowed_users: vec![],
-        disabled_tools: vec![],
-        mcp_servers: HashMap::new(),
-        multiuser: false,
-        prefix_username: false,
-        prefix_timestamp: false,
-        prefix_device: true,
-        path_mapper: PathMapper::Identity,
-        container_spawn: None,
-        start_hooks: StartHooksConfig::default(),
-        post_pull_hooks: PostPullHooksConfig::default(),
-        startup_hooks: StartupHooksConfig::default(),
-        cc_extra_args: vec![],
-        approval_rules: vec![],
-        attachment_targets: vec![],
-        integrations: HashMap::new(),
-        mounts: vec![],
-        history_replay_limit: 2000,
-        frontmatter: FrontmatterRenderConfig::default(),
-        state_dir: PathBuf::from("/tmp/.brenn/test-state"),
-        messaging: None,
-        pwa_push: None,
-        messaging_default_send_budget: 100,
-        policy: crate::access::AppPolicy::default(),
-        webhook_subscriptions: vec![],
-        mqtt_subscriptions: vec![],
-        chat_harness_policy: crate::access::AppPolicy::default(),
-    };
+    let app = test_app_config("pfin");
     assert!(app.user_has_access("anyone"));
 }
 
 #[test]
 fn user_has_access_restricted() {
     let app = AppConfig {
-        slug: "pfin".to_string(),
-        name: "pfin".to_string(),
-        description: String::new(),
-        icon: String::new(),
-        working_dir: PathBuf::from("/tmp"),
-        model: "sonnet".to_string(),
-        single_instance: false,
-        singleton: false,
-        persistent: false,
-        idle_timeout: None,
-        compaction: None,
-        idle_hook_secs: 0,
         allowed_users: vec!["alice".to_string()],
-        disabled_tools: vec![],
-        mcp_servers: HashMap::new(),
-        multiuser: false,
-        prefix_username: false,
-        prefix_timestamp: false,
-        prefix_device: true,
-        path_mapper: PathMapper::Identity,
-        container_spawn: None,
-        start_hooks: StartHooksConfig::default(),
-        post_pull_hooks: PostPullHooksConfig::default(),
-        startup_hooks: StartupHooksConfig::default(),
-        cc_extra_args: vec![],
-        approval_rules: vec![],
-        attachment_targets: vec![],
-        integrations: HashMap::new(),
-        mounts: vec![],
-        history_replay_limit: 2000,
-        frontmatter: FrontmatterRenderConfig::default(),
-        state_dir: PathBuf::from("/tmp/.brenn/test-state"),
-        messaging: None,
-        pwa_push: None,
-        messaging_default_send_budget: 100,
-        policy: crate::access::AppPolicy::default(),
-        webhook_subscriptions: vec![],
-        mqtt_subscriptions: vec![],
-        chat_harness_policy: crate::access::AppPolicy::default(),
+        ..test_app_config("pfin")
     };
     assert!(app.user_has_access("alice"));
     assert!(!app.user_has_access("bob"));
@@ -600,45 +624,9 @@ fn minimal_app_config_for_budget_test(
     global_default: u32,
 ) -> AppConfig {
     AppConfig {
-        slug: "test".to_string(),
-        name: "test".to_string(),
-        description: String::new(),
-        icon: String::new(),
-        working_dir: PathBuf::from("/tmp"),
-        model: "sonnet".to_string(),
-        single_instance: false,
-        singleton: false,
-        persistent: false,
-        idle_timeout: None,
-        compaction: None,
-        idle_hook_secs: 0,
-        allowed_users: vec![],
-        disabled_tools: vec![],
-        mcp_servers: HashMap::new(),
-        multiuser: false,
-        prefix_username: false,
-        prefix_timestamp: false,
-        prefix_device: true,
-        path_mapper: PathMapper::Identity,
-        container_spawn: None,
-        start_hooks: StartHooksConfig::default(),
-        post_pull_hooks: PostPullHooksConfig::default(),
-        startup_hooks: StartupHooksConfig::default(),
-        cc_extra_args: vec![],
-        approval_rules: vec![],
-        attachment_targets: vec![],
-        integrations: HashMap::new(),
-        mounts: vec![],
-        history_replay_limit: 2000,
-        frontmatter: FrontmatterRenderConfig::default(),
-        state_dir: PathBuf::from("/tmp/.brenn/test-state"),
         messaging,
         messaging_default_send_budget: global_default,
-        policy: crate::access::AppPolicy::default(),
-        pwa_push: None,
-        webhook_subscriptions: vec![],
-        mqtt_subscriptions: vec![],
-        chat_harness_policy: crate::access::AppPolicy::default(),
+        ..test_app_config("test")
     }
 }
 

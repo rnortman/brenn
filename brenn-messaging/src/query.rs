@@ -1273,42 +1273,17 @@ pub mod tests {
         allowed_users: Vec<String>,
     ) -> brenn_lib::config::AppConfig {
         brenn_lib::config::AppConfig {
-            slug: slug.to_string(),
-            name: slug.to_string(),
-            description: String::new(),
-            icon: String::new(),
             working_dir: std::path::PathBuf::from("/tmp"),
             model: String::new(),
-            single_instance: false,
-            singleton: false,
-            persistent: false,
-            idle_timeout: None,
-            compaction: None,
-            idle_hook_secs: 0,
             allowed_users,
-            disabled_tools: vec![],
             mcp_servers: Default::default(),
-            multiuser: false,
-            prefix_username: false,
-            prefix_timestamp: false,
-            prefix_device: true,
-            path_mapper: brenn_lib::config::PathMapper::Identity,
-            container_spawn: None,
             start_hooks: Default::default(),
             post_pull_hooks: Default::default(),
             startup_hooks: Default::default(),
-            cc_extra_args: vec![],
-            approval_rules: vec![],
-            attachment_targets: vec![],
             integrations: Default::default(),
-            mounts: vec![],
             history_replay_limit: 100,
             frontmatter: Default::default(),
             state_dir: std::path::PathBuf::from("/tmp"),
-            messaging: None,
-            messaging_default_send_budget: 100,
-            // Grant PwaPush exactly when this fixture wants push enabled, so
-            // pwa_push_enabled() reflects the intended state.
             policy: {
                 let mut p = brenn_lib::access::AppPolicy::default();
                 if pwa_push_enabled {
@@ -1324,9 +1299,7 @@ pub mod tests {
             } else {
                 None
             },
-            webhook_subscriptions: vec![],
-            mqtt_subscriptions: vec![],
-            chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+            ..brenn_lib::config::test_app_config(slug)
         }
     }
 

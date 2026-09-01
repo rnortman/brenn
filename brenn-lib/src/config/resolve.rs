@@ -267,6 +267,34 @@ pub fn validate_and_resolve(
             raw.slug,
         );
 
+        // The model allow-list, if present, must be usable: non-empty,
+        // duplicate-free, and containing the model this app actually runs.
+        // Alias spellings are CC-defined and cannot be checked until spawn.
+        let app_model = raw
+            .model
+            .clone()
+            .unwrap_or_else(|| config.claude_defaults.model.clone());
+        if let Some(models) = &raw.models {
+            assert!(
+                !models.is_empty(),
+                "app {:?}: empty `models` list — omit the attribute to allow all models",
+                raw.slug,
+            );
+            let mut seen = std::collections::HashSet::new();
+            for m in models {
+                assert!(
+                    seen.insert(m.as_str()),
+                    "app {:?}: duplicate entry {m:?} in `models`",
+                    raw.slug,
+                );
+            }
+            assert!(
+                crate::config::model_allowed(Some(models), &app_model),
+                "app {:?}: resolved model {app_model:?} is not in `models` {models:?} (the app's default model must itself be allowed)",
+                raw.slug,
+            );
+        }
+
         // Compaction settings require singleton (one conversation that never
         // ends = context grows without bound = needs compaction).
         let has_compact_settings = raw.compact_reminder_pct.is_some()
@@ -738,10 +766,8 @@ pub fn validate_and_resolve(
             description: raw.description.clone().unwrap_or_default(),
             icon: raw.icon.clone().unwrap_or_default(),
             working_dir: working_dir.clone(),
-            model: raw
-                .model
-                .clone()
-                .unwrap_or_else(|| config.claude_defaults.model.clone()),
+            model: app_model,
+            models: raw.models.clone(),
             single_instance: raw.single_instance,
             singleton: raw.singleton,
             persistent: raw.persistent,

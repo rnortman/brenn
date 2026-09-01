@@ -463,6 +463,20 @@ impl WsConnection {
         }
     }
 
+    /// The model list this connection may be offered: what CC reported for this
+    /// app, restricted to the app's allow-list.
+    ///
+    /// Empty when the app has never spawned, or when the allow-list names only
+    /// aliases the cache does not carry. Both are "nothing to show" for the
+    /// picker rather than "nothing allowed" — the app's own model is validated
+    /// to be allowed at config resolve, so sends work regardless.
+    pub(super) async fn available_models(&self) -> Vec<brenn_ws_types::ModelInfo> {
+        let allow = self.app_config().models.clone();
+        let models = self.state.cached_models.read().await;
+        let reported = models.get(&self.app_slug).map(Vec::as_slice).unwrap_or(&[]);
+        super::models::filter_models(allow.as_deref(), reported)
+    }
+
     /// If `cached_models` contains a non-empty entry for this connection's app,
     /// send `ModelsAvailable` to this connection.
     ///
@@ -473,11 +487,21 @@ impl WsConnection {
     /// cleaned up at the next backpressure send. See also: `Status` send at
     /// event_loop.rs:393.
     pub(super) async fn send_models_if_app_populated(&self) {
-        let models = self.state.cached_models.read().await;
-        if let Some(model_infos) = models.get(&self.app_slug)
-            && !model_infos.is_empty()
+        let reported = {
+            let models = self.state.cached_models.read().await;
+            models.get(&self.app_slug).cloned().unwrap_or_default()
+        };
+        self.send_filtered_models(&reported);
+    }
+
+    /// Restrict `reported` to the app's allow-list and send `ModelsAvailable`
+    /// when anything survives; an empty intersection sends nothing, which
+    /// hides the picker rather than showing it empty.
+    pub(super) fn send_filtered_models(&self, reported: &[brenn_ws_types::ModelInfo]) {
+        let filtered = super::models::filter_models(self.app_config().models.as_deref(), reported);
+        if !filtered.is_empty()
             && let SendResult::Closed = self.send_ws(WsServerMessage::ModelsAvailable {
-                available_models: model_infos.clone(),
+                available_models: filtered,
             })
         {
             tracing::debug!(
@@ -1838,6 +1862,136 @@ mod tests {
         assert!(
             ws_rx.try_recv().is_err(),
             "must not send ModelsAvailable when cached model list is empty"
+        );
+    }
+
+    /// An allow-list narrows what `available_models` offers.
+    ///
+    /// `event_loop` passes this list straight into `Welcome`, but that wiring
+    /// itself is unasserted here: `test_ws_conn_for_app` builds the connection
+    /// without the Welcome sequence, so there is no frame to read.
+    #[tokio::test]
+    async fn available_models_is_narrowed_by_the_allow_list() {
+        let (conn, _ws_rx, _db, _user_id) =
+            test_ws_conn_for_app(test_apps_with_models("opus", Some(&["opus"]))).await;
+        conn.state
+            .cached_models
+            .write()
+            .await
+            .insert("test".to_string(), test_model_infos());
+
+        let values: Vec<String> = conn
+            .available_models()
+            .await
+            .into_iter()
+            .map(|m| m.value)
+            .collect();
+        assert_eq!(values, vec!["opus".to_string()]);
+    }
+
+    /// Without an allow-list the whole reported list still reaches the client.
+    #[tokio::test]
+    async fn available_models_is_unrestricted_without_an_allow_list() {
+        let (conn, _ws_rx, _db, _user_id) = test_ws_conn_for_app(test_apps()).await;
+        conn.state
+            .cached_models
+            .write()
+            .await
+            .insert("test".to_string(), test_model_infos());
+
+        let values: Vec<String> = conn
+            .available_models()
+            .await
+            .into_iter()
+            .map(|m| m.value)
+            .collect();
+        assert_eq!(values, vec!["sonnet".to_string(), "opus".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn send_models_offers_only_the_allow_list() {
+        let (conn, mut ws_rx, _db, _user_id) =
+            test_ws_conn_for_app(test_apps_with_models("opus", Some(&["opus"]))).await;
+        conn.state
+            .cached_models
+            .write()
+            .await
+            .insert("test".to_string(), test_model_infos());
+
+        conn.send_models_if_app_populated().await;
+
+        let msgs = collect_until(&mut ws_rx, |m| {
+            matches!(m, WsServerMessage::ModelsAvailable { .. })
+        })
+        .await;
+        let models = msgs
+            .iter()
+            .find_map(|m| match m {
+                WsServerMessage::ModelsAvailable { available_models } => Some(available_models),
+                _ => None,
+            })
+            .expect("expected ModelsAvailable, got: {msgs:?}");
+        let values: Vec<&str> = models.iter().map(|m| m.value.as_str()).collect();
+        assert_eq!(values, vec!["opus"], "only the allowed model is offered");
+    }
+
+    /// An allow-list whose entry the cache does not carry leaves nothing to
+    /// offer, and the picker is hidden rather than shown empty.
+    #[tokio::test]
+    async fn send_models_skips_when_the_allow_list_misses_the_cache() {
+        let (conn, mut ws_rx, _db, _user_id) =
+            test_ws_conn_for_app(test_apps_with_models("opus[1m]", Some(&["opus[1m]"]))).await;
+        conn.state
+            .cached_models
+            .write()
+            .await
+            .insert("test".to_string(), test_model_infos());
+
+        conn.send_models_if_app_populated().await;
+
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "an empty intersection must send no ModelsAvailable"
+        );
+    }
+
+    /// The post-spawn immediate send hands `send_filtered_models` the list CC
+    /// just reported rather than the cache, and the allow-list narrows it the
+    /// same way.
+    #[tokio::test]
+    async fn send_filtered_models_narrows_a_freshly_reported_list() {
+        let (conn, mut ws_rx, _db, _user_id) =
+            test_ws_conn_for_app(test_apps_with_models("opus", Some(&["opus"]))).await;
+
+        // Nothing is cached: this is the spawn-returned list, not a cache read.
+        conn.send_filtered_models(&test_model_infos());
+
+        let msgs = collect_until(&mut ws_rx, |m| {
+            matches!(m, WsServerMessage::ModelsAvailable { .. })
+        })
+        .await;
+        let models = msgs
+            .iter()
+            .find_map(|m| match m {
+                WsServerMessage::ModelsAvailable { available_models } => Some(available_models),
+                _ => None,
+            })
+            .expect("expected ModelsAvailable");
+        let values: Vec<&str> = models.iter().map(|m| m.value.as_str()).collect();
+        assert_eq!(values, vec!["opus"], "only the allowed model is offered");
+    }
+
+    /// And it sends nothing when the allow-list keeps nothing.
+    #[tokio::test]
+    async fn send_filtered_models_is_silent_on_an_empty_intersection() {
+        let (conn, mut ws_rx, _db, _user_id) =
+            test_ws_conn_for_app(test_apps_with_models("opus[1m]", Some(&["opus[1m]"]))).await;
+
+        conn.send_filtered_models(&test_model_infos());
+
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "an empty intersection must send no ModelsAvailable"
         );
     }
 

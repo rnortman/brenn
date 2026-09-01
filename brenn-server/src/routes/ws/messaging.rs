@@ -38,20 +38,40 @@ impl WsConnection {
             return false;
         }
 
-        // Validate model against cached available models (if we have them).
+        // Two independent gates, both of which a model must clear. The app's
+        // allow-list is policy and always applies, with no empty-cache escape
+        // hatch. The cached CC-reported list is fact and applies whenever it is
+        // populated, accepting anything when it is not.
         if let Some(m) = model {
-            let models = self.state.cached_models.read().await;
-            let is_valid = models.get(&self.app_slug).is_none_or(|app_models| {
-                app_models.is_empty() || app_models.iter().any(|mi| mi.value == m)
-            });
-            drop(models);
-            if !is_valid {
+            let permitted = self.app_config().model_allowed(m);
+            let known = {
+                let models = self.state.cached_models.read().await;
+                models.get(&self.app_slug).is_none_or(|app_models| {
+                    app_models.is_empty() || app_models.iter().any(|mi| mi.value == m)
+                })
+            };
+            if !known {
+                // An alias CC never reported: fabricated by the client, which
+                // is fail2ban signal.
                 log_and_alert_security_event(
                     &self.state.alert_dispatcher,
                     SecurityEventType::SchemaViolation,
                     self.client_ip,
                     &format!("user {} sent invalid model {:?}", self.user_id, m),
                 );
+            } else if !permitted {
+                // A real alias this app does not permit: a stale tab or a
+                // cached bundle from before the allow-list tightened, which is
+                // expected and must not pollute the security stream.
+                warn!(
+                    app_slug = %self.app_slug,
+                    user = %self.user_id,
+                    model = %m,
+                    allowed = ?self.app_config().models,
+                    "refused a model outside the app's allow-list"
+                );
+            }
+            if !known || !permitted {
                 let _ = self.send_ws(WsServerMessage::Error {
                     message: format!("Invalid model: {m}"),
                 });
@@ -100,12 +120,17 @@ impl WsConnection {
         let Some(bridge) = self.resolve_bridge(Some(text)).await else {
             return false;
         };
-        if let Some(m) = model
-            && let Err(e) = bridge.set_model(m).await
-        {
+        // A null `model` means "the app's configured default", so always
+        // assert the effective model: a session left on a previous client's
+        // override returns to the default rather than drifting.
+        // `set_model` is seeded at spawn and dedups, so steady state is free.
+        let effective = model
+            .unwrap_or(self.app_config().model.as_str())
+            .to_string();
+        if let Err(e) = bridge.set_model(&effective).await {
             warn!(
                 conversation_id = self.current_conversation_id,
-                model = m,
+                model = %effective,
                 error = %e,
                 "set_model failed (continuing anyway)"
             );
@@ -1128,6 +1153,214 @@ mod tests {
             !invalid_model_error,
             "should not reject model when cache is empty: {msgs:?}"
         );
+    }
+
+    // --- Model allow-list tests ---
+
+    /// The allow-list gates independently of the cache: a model the CC cache
+    /// reports is still refused when the app does not list it.
+    #[tokio::test]
+    async fn send_message_off_allow_list_is_refused_despite_the_cache() {
+        let (mut conn, mut ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv_and_apps(
+            test_apps_with_models("sonnet", Some(&["sonnet"])),
+        )
+        .await;
+        conn.state
+            .cached_models
+            .write()
+            .await
+            .insert(TEST_APP_SLUG.to_string(), test_model_infos());
+        let (dispatcher, alerts, _handle) = brenn_obs::alerting::make_capturing_alerter();
+        conn.state.alert_dispatcher = dispatcher;
+
+        let dispatched = conn
+            .handle_send_message("hello", vec![], Some("opus"), vec![])
+            .await;
+
+        assert!(!dispatched, "an off-list model must not reach CC");
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(
+            msgs.iter().any(|m| match m {
+                WsServerMessage::Error { message } => message.contains("Invalid model"),
+                _ => false,
+            }),
+            "expected Error with 'Invalid model', got: {msgs:?}"
+        );
+        // A real alias the app no longer permits is a stale tab, not an
+        // attack: it must stay out of the security stream that feeds fail2ban.
+        conn.state.alert_dispatcher.flush().await;
+        assert!(
+            alerts.lock().unwrap().is_empty(),
+            "a permitted-but-off-list refusal must raise no security alert: {:?}",
+            alerts.lock().unwrap()
+        );
+    }
+
+    /// And there is no empty-cache escape hatch: with nothing cached, the
+    /// allow-list still decides.
+    #[tokio::test]
+    async fn send_message_off_allow_list_is_refused_with_an_empty_cache() {
+        let (mut conn, mut ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv_and_apps(
+            test_apps_with_models("sonnet", Some(&["sonnet"])),
+        )
+        .await;
+
+        let dispatched = conn
+            .handle_send_message("hello", vec![], Some("anything-goes"), vec![])
+            .await;
+
+        assert!(!dispatched, "an empty cache is not permission to send");
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(
+            msgs.iter().any(|m| match m {
+                WsServerMessage::Error { message } => message.contains("Invalid model"),
+                _ => false,
+            }),
+            "expected Error with 'Invalid model', got: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_on_allow_list_passes_validation() {
+        let (mut conn, mut ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv_and_apps(
+            test_apps_with_models("sonnet", Some(&["sonnet", "opus"])),
+        )
+        .await;
+
+        conn.handle_send_message("hello", vec![], Some("opus"), vec![])
+            .await;
+
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(
+            !msgs.iter().any(|m| match m {
+                WsServerMessage::Error { message } => message.contains("Invalid model"),
+                _ => false,
+            }),
+            "unexpected 'Invalid model' error: {msgs:?}"
+        );
+    }
+
+    /// And the cache still gates too: an allow-list entry CC never reported
+    /// (an operator typo, or an alias retired since the last spawn) is refused
+    /// rather than handed to the ack-less `set_model`.
+    #[tokio::test]
+    async fn send_message_on_allow_list_but_absent_from_the_cache_is_refused() {
+        let (mut conn, mut ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv_and_apps(
+            test_apps_with_models("sonnet", Some(&["sonnet", "haiku"])),
+        )
+        .await;
+        conn.state
+            .cached_models
+            .write()
+            .await
+            .insert(TEST_APP_SLUG.to_string(), test_model_infos());
+        let (dispatcher, alerts, _handle) = brenn_obs::alerting::make_capturing_alerter();
+        conn.state.alert_dispatcher = dispatcher;
+
+        let dispatched = conn
+            .handle_send_message("hello", vec![], Some("haiku"), vec![])
+            .await;
+
+        assert!(!dispatched, "an alias CC never reported must not reach CC");
+        // An alias CC never reported is fabricated, and that is fail2ban signal.
+        conn.state.alert_dispatcher.flush().await;
+        let captured = alerts.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected exactly one security alert, got: {captured:?}"
+        );
+        let (title, body) = &captured[0];
+        assert!(
+            format!("{title} {body}").contains("schema_violation"),
+            "alert is not a schema violation: title={title:?} body={body:?}"
+        );
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(
+            msgs.iter().any(|m| match m {
+                WsServerMessage::Error { message } => message.contains("Invalid model"),
+                _ => false,
+            }),
+            "expected Error with 'Invalid model', got: {msgs:?}"
+        );
+    }
+
+    // --- Live-session model enforcement ---
+
+    /// A send that names no model puts the session back on the app's default,
+    /// undoing an override a previous client left behind.
+    #[tokio::test]
+    async fn send_message_without_a_model_resets_the_session_to_the_app_default() {
+        let (mut conn, _ws_rx, _db, _uid, conv_id) =
+            test_ws_conn_with_active_bridge_and_apps(test_apps_with_models("sonnet", None)).await;
+        let bridge = conn
+            .state
+            .active_bridges
+            .get(conv_id)
+            .await
+            .expect("the fixture registered a bridge");
+        let mut outgoing = bridge.install_recording_session_for_test().await;
+        bridge.set_last_set_model_for_test(Some("opus")).await;
+
+        conn.handle_send_message("hello", vec![], None, vec![])
+            .await;
+
+        assert_eq!(
+            bridge.last_set_model_for_test().await.as_deref(),
+            Some("sonnet"),
+            "a null model means the app default, and the session must follow it"
+        );
+        let set_models = drain_set_models(&mut outgoing);
+        assert_eq!(
+            set_models,
+            vec!["sonnet".to_string()],
+            "expected exactly one set_model naming the app default"
+        );
+    }
+
+    /// Steady state emits nothing: the spawn seeds `last_set_model`, so a
+    /// default-model send dedups away rather than costing an NDJSON frame.
+    #[tokio::test]
+    async fn send_message_at_the_app_default_emits_no_set_model() {
+        let (mut conn, _ws_rx, _db, _uid, conv_id) =
+            test_ws_conn_with_active_bridge_and_apps(test_apps_with_models("sonnet", None)).await;
+        let bridge = conn
+            .state
+            .active_bridges
+            .get(conv_id)
+            .await
+            .expect("the fixture registered a bridge");
+        let mut outgoing = bridge.install_recording_session_for_test().await;
+        // What a spawn on the app default leaves behind.
+        bridge.set_last_set_model_for_test(Some("sonnet")).await;
+
+        conn.handle_send_message("hello", vec![], None, vec![])
+            .await;
+
+        let set_models = drain_set_models(&mut outgoing);
+        assert!(
+            set_models.is_empty(),
+            "a send at the app default must not re-assert it, got: {set_models:?}"
+        );
+    }
+
+    /// The model named by every `set_model` the recording session captured, in
+    /// order. Matches structurally so a `Debug` or variant rename cannot make
+    /// these assertions pass (or fail) for the wrong reason.
+    fn drain_set_models(
+        rx: &mut tokio::sync::mpsc::Receiver<brenn_cc::session::OutgoingEnvelope>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(env) = rx.try_recv() {
+            if let brenn_cc::protocol::CcOutgoing::ControlRequest {
+                request: brenn_cc::protocol::BrennControlRequest::SetModel { model },
+                ..
+            } = env.msg
+            {
+                out.push(model);
+            }
+        }
+        out
     }
 
     #[tokio::test]

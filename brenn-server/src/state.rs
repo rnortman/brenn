@@ -616,6 +616,7 @@ impl AppState {
     > {
         let app_slug = ctx.app_config.slug.clone();
         let conversation_id = ctx.conversation_id;
+        let model_allow_list = ctx.app_config.models.clone();
 
         let (bridge, rx, warnings, models) = ActiveBridge::spawn_new(ctx).await?;
 
@@ -628,6 +629,26 @@ impl AppState {
                 description: m.description.clone(),
             })
             .collect();
+
+        // Alias spellings in `models` are CC-defined and unverifiable until
+        // now. An entry CC did not report is invisible everywhere downstream —
+        // it just never appears in the picker — so say so once per spawn,
+        // which is the only chance to connect the symptom to the config.
+        if !model_infos.is_empty() {
+            let unreported = crate::routes::ws::models::unreported_allow_entries(
+                model_allow_list.as_deref(),
+                &model_infos,
+            );
+            if !unreported.is_empty() {
+                warn!(
+                    app_slug = %app_slug,
+                    unreported = ?unreported,
+                    configured = ?model_allow_list,
+                    reported = ?model_infos.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
+                    "app `models` names aliases CC did not report; they cannot be offered"
+                );
+            }
+        }
 
         // Cache models in memory and DB.
         if !model_infos.is_empty() {

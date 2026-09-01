@@ -492,6 +492,20 @@ pub(super) fn test_apps_with_failing_graf() -> Arc<IndexMap<String, AppConfig>> 
     test_apps_with_graf_at("/nonexistent/graf-binary-for-testing")
 }
 
+/// A one-app registry whose app runs `model` and restricts the picker to
+/// `models`. Pass `None` for `models` to leave the app unrestricted.
+pub(super) fn test_apps_with_models(
+    model: &str,
+    models: Option<&[&str]>,
+) -> Arc<IndexMap<String, AppConfig>> {
+    let mut apps = IndexMap::new();
+    let mut cfg = default_test_app_config("test", "Test App");
+    cfg.model = model.to_string();
+    cfg.models = models.map(|m| m.iter().map(|s| s.to_string()).collect());
+    apps.insert("test".to_string(), cfg);
+    Arc::new(apps)
+}
+
 /// Create apps map with a single-instance app.
 pub(super) fn test_apps_single_instance() -> Arc<IndexMap<String, AppConfig>> {
     let mut apps = IndexMap::new();

@@ -29,6 +29,9 @@ pub struct AppConfigRaw {
     pub working_dir: Option<PathBuf>,
     /// CC model override. If omitted, uses `claude_defaults.model`.
     pub model: Option<String>,
+    /// Allow-list of CC model aliases offered/accepted for this app.
+    /// `None` = unrestricted. A one-element list locks the picker.
+    pub models: Option<Vec<String>>,
     /// Enforce at most one active CC session for this app (globally).
     pub single_instance: bool,
     /// Singleton mode: one conversation per user, no conversation list.
@@ -192,6 +195,10 @@ pub struct AppConfig {
     /// Host-side working directory. Attachments are stored here.
     pub working_dir: PathBuf,
     pub model: String,
+    /// Allow-list of CC model aliases offered/accepted for this app.
+    /// `None` = unrestricted. A one-element list locks the picker.
+    /// Validated non-empty, duplicate-free, and containing `model`.
+    pub models: Option<Vec<String>>,
     pub single_instance: bool,
     /// Singleton mode: one conversation per user, no conversation list.
     pub singleton: bool,
@@ -310,6 +317,13 @@ pub struct AppConfig {
     pub chat_harness_policy: crate::access::AppPolicy,
 }
 
+/// Whether `alias` is permitted by a model allow-list.
+///
+/// `None` = unrestricted.
+pub fn model_allowed(allow: Option<&[String]>, alias: &str) -> bool {
+    allow.is_none_or(|list| list.iter().any(|a| a == alias))
+}
+
 impl AppConfig {
     /// Host-side path to the virtual tools JSON consumed by noop_mcp.
     /// Callers that need the CC-visible path for a containerized app must run
@@ -322,6 +336,15 @@ impl AppConfig {
     /// Empty `allowed_users` means all users have access.
     pub fn user_has_access(&self, username: &str) -> bool {
         self.allowed_users.is_empty() || self.allowed_users.iter().any(|u| u == username)
+    }
+
+    /// Whether a CC model alias may be used for this app.
+    ///
+    /// `models` unset means unrestricted, so every alias is allowed. This is
+    /// the single spelling of the allow-list policy; all enforcement goes
+    /// through it.
+    pub fn model_allowed(&self, alias: &str) -> bool {
+        model_allowed(self.models.as_deref(), alias)
     }
 
     /// Whether messaging is enabled for this app.
@@ -445,6 +468,7 @@ impl Default for AppConfigRaw {
             icon: None,
             working_dir: None,
             model: None,
+            models: None,
             single_instance: false,
             singleton: false,
             persistent: false,

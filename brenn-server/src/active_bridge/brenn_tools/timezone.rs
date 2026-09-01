@@ -790,48 +790,19 @@ mod tests {
         // Verify SetUserTimezone is present in core_virtual_tools output.
         // Uses the write_virtual_tools_file path (integration test): build a
         // minimal AppConfig, call core_virtual_tools, assert the name is present.
-        use std::collections::HashMap;
 
         let cfg = brenn_lib::config::AppConfig {
-            slug: "test".into(),
             name: "Test".into(),
-            description: String::new(),
-            icon: String::new(),
             working_dir: std::path::PathBuf::from("/tmp"),
             model: String::new(),
-            single_instance: false,
-            singleton: false,
-            persistent: false,
-            idle_timeout: None,
-            compaction: None,
-            idle_hook_secs: 0,
-            allowed_users: vec![],
-            disabled_tools: vec![],
-            mcp_servers: HashMap::new(),
-            multiuser: false,
-            prefix_username: false,
-            prefix_timestamp: false,
             prefix_device: false,
-            path_mapper: brenn_lib::config::PathMapper::Identity,
-            container_spawn: None,
             start_hooks: Default::default(),
             post_pull_hooks: Default::default(),
             startup_hooks: Default::default(),
-            cc_extra_args: vec![],
-            approval_rules: vec![],
-            attachment_targets: vec![],
-            integrations: HashMap::new(),
-            mounts: vec![],
             history_replay_limit: 100,
             frontmatter: Default::default(),
             state_dir: std::path::PathBuf::from("/tmp"),
-            messaging: None,
-            messaging_default_send_budget: 100,
-            policy: brenn_lib::access::AppPolicy::default(),
-            pwa_push: None,
-            webhook_subscriptions: vec![],
-            mqtt_subscriptions: vec![],
-            chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+            ..brenn_lib::config::test_app_config("test")
         };
 
         let tools = brenn_lib::integration::core_virtual_tools(&cfg);

@@ -2422,3 +2422,54 @@ Code sites (`TODO(surface-instance-counter-column-action)`):
 
 Done = one counting action carrying its column, one executor arm, and a new
 per-instance column reachable from the kernel core without a new variant.
+
+## `model-picker-lock-heuristic`
+
+The input bar locks the model picker whenever the server offers exactly one
+model (`renderModelPicker` in `frontend/src/components/input-bar.ts`), reading
+"one offered" as "one allowed". Those are the same thing only when the offered
+list was narrowed by the app's allow-list.
+
+They come apart when the model cache is stale: with two models allowed and only
+one of them in the cache, the client is offered one entry, locks the picker, and
+labels it with the model actually in effect — which may be the other one, absent
+from the list, so the label shows a raw alias with no description. The user
+cannot then select the allowed model the server did offer.
+
+Reachable only until the app's next spawn refreshes the cache, and the server
+already warns per spawn about allow-list entries CC did not report. What to do
+instead is a UX question rather than a bug fix: whether a one-entry list should
+stay lockable, become selectable (today `cycleModel` refuses lists shorter than
+two), or hide the picker when the effective model is not among the offered ones.
+
+Code site (`TODO(model-picker-lock-heuristic)`):
+`frontend/src/components/input-bar.ts`, in `renderModelPicker()`.
+
+Done = the picker is inert only when the model it shows is genuinely the only
+one the user may select, and the mixed case has a stated behavior.
+
+## `per-app-model-preference`
+
+The browser's model preference is a single origin-wide key —
+`preferredModel` in `LocalSettings` (`frontend/src/settings.ts`), persisted
+under `brenn-settings`. Apps are all served from `/app/<slug>` on that one
+origin, so the key is shared across every app the user opens.
+
+That was harmless while every app offered the same CC-reported model list. A
+per-app allow-list breaks the assumption: opening an app whose `models` list
+excludes the stored preference clears the preference — correctly, for that app
+— and thereby un-prefers the model in every other app too. The more apps adopt
+`models`, the more routine the collision.
+
+The shape of the fix is a per-app map, `preferredModels: Record<string, string
+| null>`, indexed by the app slug the component already holds. What needs
+deciding first is what happens to the single stored key on the first load
+after the change (drop it, or seed every app from it) and whether a preference
+is really per-app rather than per-app-per-user, which is a product question
+about how the picker is meant to feel.
+
+Code site (`TODO(per-app-model-preference)`):
+`frontend/src/components/app.ts`, in `resolveCurrentModel()`.
+
+Done = the preference is stored and cleared per app, and a clear in one app
+provably leaves another app's preference intact.

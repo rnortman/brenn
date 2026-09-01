@@ -462,3 +462,66 @@ describe("BrennInputBar — resize-before-upload", () => {
         expect(uploaded.size).toBe(256);
     });
 });
+
+describe("BrennInputBar — model picker states", () => {
+    async function mount(
+        models: { value: string; display_name: string; description: string }[],
+        current: string,
+    ): Promise<BrennInputBar> {
+        const el = document.createElement("brenn-input-bar") as BrennInputBar;
+        el.appSlug = "test";
+        el.availableModels = models as unknown as BrennInputBar["availableModels"];
+        el.currentModel = current;
+        document.body.appendChild(el);
+        await el.updateComplete;
+        return el;
+    }
+
+    const OPUS = { value: "opus[1m]", display_name: "Opus 5 1M", description: "big" };
+    const SONNET = { value: "sonnet", display_name: "Sonnet", description: "fast" };
+
+    afterEach(() => {
+        document.body.replaceChildren();
+    });
+
+    it("renders no picker when no models are offered", async () => {
+        const el = await mount([], "opus[1m]");
+        expect(el.querySelector(".model-picker")).toBeNull();
+    });
+
+    it("renders an inert label when exactly one model is offered", async () => {
+        const changes: string[] = [];
+        const el = await mount([OPUS], "opus[1m]");
+        el.onModelChange = (m) => { changes.push(m); };
+        await el.updateComplete;
+
+        const picker = el.querySelector(".model-picker") as HTMLElement;
+        expect(picker).not.toBeNull();
+        expect(picker.classList.contains("model-picker-locked")).toBe(true);
+        // Label shows the model; no cycle affordance.
+        expect(picker.textContent).toContain("Opus 5 1M");
+        expect(picker.textContent).not.toContain("⇌");
+
+        // Clicking must not change the model.
+        picker.click();
+        await el.updateComplete;
+        expect(changes).toEqual([]);
+        expect(el.currentModel).toBe("opus[1m]");
+    });
+
+    it("renders an interactive picker that cycles when 2+ models are offered", async () => {
+        const changes: string[] = [];
+        const el = await mount([OPUS, SONNET], "opus[1m]");
+        el.onModelChange = (m) => { changes.push(m); };
+        await el.updateComplete;
+
+        const picker = el.querySelector(".model-picker") as HTMLElement;
+        expect(picker).not.toBeNull();
+        expect(picker.classList.contains("model-picker-locked")).toBe(false);
+        expect(picker.textContent).toContain("⇌");
+
+        picker.click();
+        await el.updateComplete;
+        expect(changes).toEqual(["sonnet"]);
+    });
+});

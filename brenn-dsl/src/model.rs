@@ -991,6 +991,8 @@ vocabulary! {
         opt icon: V,
         opt working_dir: V,
         opt model: V,
+        /// Allow-list of CC model aliases. Absent means unrestricted.
+        opt models: V,
         opt single_instance: V,
         opt singleton: V,
         opt persistent: V,

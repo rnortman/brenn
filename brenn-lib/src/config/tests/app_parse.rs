@@ -56,6 +56,65 @@ new pfin: Finance();
 }
 
 #[test]
+fn models_allow_list_lowers_as_a_string_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_from_dsl(&format!(
+        r#"
+agent Finance() {{
+    working_dir = "{}";
+    model = "opus[1m]";
+    models = ["opus[1m]", "sonnet"];
+}}
+
+new pfin: Finance();
+"#,
+        dir.path().display()
+    ));
+    assert_eq!(
+        config.apps[0].models.as_deref(),
+        Some(["opus[1m]".to_string(), "sonnet".to_string()].as_slice()),
+    );
+}
+
+/// Absent (`None`) is distinct from empty: unrestricted vs. nothing allowed.
+#[test]
+fn models_absent_lowers_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_from_dsl(&format!(
+        r#"
+agent Finance() {{ working_dir = "{}"; }}
+
+new pfin: Finance();
+"#,
+        dir.path().display()
+    ));
+    assert!(config.apps[0].models.is_none());
+}
+
+#[test]
+fn models_non_string_element_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let refusal = sole_refusal(&format!(
+        r#"
+agent Finance() {{
+    working_dir = "{}";
+    models = ["sonnet", 3];
+}}
+
+new pfin: Finance();
+"#,
+        dir.path().display()
+    ))
+    .render();
+    // Naming the attr is not enough: the refusal must be about the element
+    // that is not a string, so it keeps failing if the type check goes away.
+    assert!(
+        refusal.contains("`models`: expected a string, got an integer"),
+        "the refusal must name the offending element's type: {refusal}"
+    );
+}
+
+#[test]
 fn multiple_apps_load() {
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();

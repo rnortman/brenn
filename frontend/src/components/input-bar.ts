@@ -225,10 +225,7 @@ export class BrennInputBar extends LitElement {
         </div>
         <div class="input-hint-row">
           <span class="input-hint" @click=${this.handleToggle}>${hint}</span>
-          ${this.availableModels.length > 1
-            ? html`<span class="model-picker" @click=${this.cycleModel}
-                         title=${this.availableModels.find(m => m.value === this.currentModel)?.description ?? ""}>${this.currentModelLabel} ⇌</span>`
-            : nothing}
+          ${this.renderModelPicker()}
         </div>
         <input type="file" id="file-input" multiple class="hidden-file-input"
                @change=${this.handleFileSelect}>
@@ -712,6 +709,22 @@ export class BrennInputBar extends LitElement {
   private get currentModelLabel(): string {
     const m = this.availableModels.find(m => m.value === this.currentModel);
     return m?.display_name ?? this.currentModel;
+  }
+
+  private renderModelPicker() {
+    // TODO(model-picker-lock-heuristic): one model offered is treated as one
+    // model allowed. When the server's list is narrowed by a stale cache
+    // rather than by the app's allow-list, the lone entry may not be the
+    // model in effect, and the label then names a model the list does not
+    // carry.
+    if (this.availableModels.length === 0) return nothing;
+    const title = this.availableModels.find(m => m.value === this.currentModel)?.description ?? "";
+    if (this.availableModels.length === 1) {
+      return html`<span class="model-picker model-picker-locked"
+                        title=${title}>${this.currentModelLabel}</span>`;
+    }
+    return html`<span class="model-picker" @click=${this.cycleModel}
+                      title=${title}>${this.currentModelLabel} ⇌</span>`;
   }
 
   private cycleModel(): void {

@@ -28,49 +28,19 @@ pub fn test_app_config(
     allowed_users: Vec<String>,
 ) -> AppConfig {
     AppConfig {
-        slug: slug.to_string(),
-        name: slug.to_string(),
-        description: String::new(),
-        icon: String::new(),
         working_dir: std::path::PathBuf::from("/tmp"),
         model: String::new(),
-        single_instance: false,
         singleton: true,
-        persistent: false,
-        idle_timeout: None,
-        compaction: None,
-        idle_hook_secs: 0,
         allowed_users,
-        disabled_tools: vec![],
         mcp_servers: Default::default(),
-        multiuser: false,
-        prefix_username: false,
-        prefix_timestamp: false,
         prefix_device: false,
-        path_mapper: crate::config::PathMapper::Identity,
-        container_spawn: None,
         start_hooks: Default::default(),
         post_pull_hooks: Default::default(),
         startup_hooks: Default::default(),
-        cc_extra_args: vec![],
-        approval_rules: vec![],
-        attachment_targets: vec![],
         integrations: Default::default(),
-        mounts: vec![],
         history_replay_limit: 100,
         frontmatter: Default::default(),
         state_dir: std::path::PathBuf::from("/tmp"),
-        // Grant both messaging capabilities whenever a messaging config is
-        // supplied, so messaging_enabled() treats the app as a participant.
-        // Also stamp a universal `brenn_subscribe` ACL matcher so the
-        // delivery-time gate authorizes these test apps to receive on their
-        // `brenn:` channels — `MessagingSubscribe` alone is not sufficient;
-        // delivery requires a covering matcher too. `Prefix("")` covers every
-        // channel (the resolution-time narrowing that rejects an empty prefix
-        // does not apply when the `AclSet` is constructed directly). A
-        // matching universal `brenn_publish` matcher is stamped for the same
-        // reason: the publish gate requires a covering `brenn_publish` matcher,
-        // so `MessagingPublish` alone does not authorize a send.
         policy: {
             let mut p = crate::access::AppPolicy::default();
             if messaging.is_some() {
@@ -88,14 +58,7 @@ pub fn test_app_config(
             p
         },
         messaging,
-        messaging_default_send_budget: 100,
-        pwa_push: None,
-        webhook_subscriptions: vec![],
-        mqtt_subscriptions: vec![],
-        // Deny-everything: a test that drives the chat machinery stamps
-        // `LlmChatConfig::harness_policy` over this itself, so nothing else
-        // silently gains chat-tree reach.
-        chat_harness_policy: crate::access::AppPolicy::default(),
+        ..crate::config::test_app_config(slug)
     }
 }
 

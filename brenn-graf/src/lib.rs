@@ -327,7 +327,6 @@ pub fn graf_config(app: &brenn_lib::config::AppConfig) -> Option<&GrafConfig> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use super::*;
@@ -523,25 +522,8 @@ default_slug = "life"
         };
 
         let app_config = brenn_lib::config::AppConfig {
-            slug: "test".into(),
-            name: "test".into(),
-            description: String::new(),
-            icon: String::new(),
             working_dir: tmp.path().to_path_buf(),
             model: "sonnet".into(),
-            single_instance: false,
-            singleton: false,
-            persistent: false,
-            idle_timeout: None,
-            compaction: None,
-            idle_hook_secs: 0,
-            allowed_users: vec![],
-            disabled_tools: vec![],
-            mcp_servers: HashMap::new(),
-            multiuser: false,
-            prefix_username: false,
-            prefix_timestamp: false,
-            prefix_device: true,
             // Containerized PathMapper: home_dir → container_home catch-all.
             path_mapper: brenn_lib::config::PathMapper::container(vec![
                 brenn_lib::config::PathMapping {
@@ -560,24 +542,9 @@ default_slug = "life"
                 extra_mounts: vec![],
                 extra_args: vec![],
             }),
-            start_hooks: brenn_lib::config::StartHooksConfig::default(),
-            post_pull_hooks: brenn_lib::config::PostPullHooksConfig::default(),
-            startup_hooks: brenn_lib::config::StartupHooksConfig::default(),
-            cc_extra_args: vec![],
-            approval_rules: vec![],
-            attachment_targets: vec![],
-            integrations: HashMap::new(),
             mounts: vec![mount],
-            history_replay_limit: 2000,
-            frontmatter: brenn_lib::config::FrontmatterRenderConfig::default(),
             state_dir: state_dir.clone(),
-            messaging: None,
-            messaging_default_send_budget: 100,
-            policy: brenn_lib::access::AppPolicy::default(),
-            pwa_push: None,
-            webhook_subscriptions: vec![],
-            mqtt_subscriptions: vec![],
-            chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+            ..brenn_lib::config::test_app_config("test")
         };
 
         let integration = GrafIntegration {

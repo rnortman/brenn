@@ -109,6 +109,7 @@ fn minimal_app_config_for_budget_test(
         icon: String::new(),
         working_dir: PathBuf::from("/tmp"),
         model: "sonnet".to_string(),
+        models: None,
         single_instance: false,
         singleton: false,
         persistent: false,

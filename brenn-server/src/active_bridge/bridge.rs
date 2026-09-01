@@ -312,6 +312,26 @@ pub struct SpawnContext<'a> {
     pub usage_session_gap_secs: u32,
 }
 
+/// The model a spawn runs, paired with the `last_set_model` seed it justifies.
+///
+/// The model is the caller's override, or the app's configured default. A
+/// fresh spawn's `--model` flag definitely put CC on that model, so it is
+/// recorded as the last asserted one and the first send dedups away. A resumed
+/// session is deliberately left unseeded: whether `--resume` restores the
+/// session's own model is unverified, so the first send's unconditional
+/// `set_model` stays as the re-assertion.
+fn spawn_model_and_seed(
+    model_override: Option<&str>,
+    app_model: &str,
+    resuming: bool,
+) -> (String, Option<String>) {
+    let model = model_override
+        .map(String::from)
+        .unwrap_or_else(|| app_model.to_string());
+    let seed = (!resuming).then(|| model.clone());
+    (model, seed)
+}
+
 impl ActiveBridge {
     /// Spawn a new CC session and start the event loop task.
     ///
@@ -384,9 +404,11 @@ impl ActiveBridge {
             Vec::new()
         };
 
-        let model = model_override
-            .map(String::from)
-            .unwrap_or_else(|| app_config.model.clone());
+        let (model, spawn_model) = spawn_model_and_seed(
+            model_override,
+            &app_config.model,
+            resume_session_id.is_some(),
+        );
 
         let config = build_cc_session_config(
             app_config,
@@ -493,7 +515,7 @@ impl ActiveBridge {
             approval_outcomes: tokio::sync::Mutex::new(HashMap::new()),
             pending_tool_uses: tokio::sync::Mutex::new(HashMap::new()),
             handled_tool_uses: tokio::sync::Mutex::new(HashSet::new()),
-            last_set_model: tokio::sync::Mutex::new(None),
+            last_set_model: tokio::sync::Mutex::new(spawn_model),
             integrations: app_config.integrations.clone(),
             container_spawn: app_config.container_spawn.clone(),
             mounts: app_config.mounts.clone(),
@@ -930,6 +952,35 @@ pub(super) const GLOBAL_EXTRA_STATIC_BASE: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh spawn seeds `last_set_model` with the model it passed as
+    /// `--model`, so the first send at that model costs no NDJSON frame.
+    #[test]
+    fn fresh_spawn_seeds_the_seed_with_the_spawn_model() {
+        assert_eq!(
+            spawn_model_and_seed(None, "sonnet", false),
+            ("sonnet".to_string(), Some("sonnet".to_string()))
+        );
+        assert_eq!(
+            spawn_model_and_seed(Some("opus"), "sonnet", false),
+            ("opus".to_string(), Some("opus".to_string())),
+            "the seed follows the override, not the app default"
+        );
+    }
+
+    /// A resumed spawn is not seeded, so the first send re-asserts the
+    /// effective model rather than deduping it away.
+    #[test]
+    fn resumed_spawn_leaves_the_seed_empty() {
+        assert_eq!(
+            spawn_model_and_seed(None, "sonnet", true),
+            ("sonnet".to_string(), None)
+        );
+        assert_eq!(
+            spawn_model_and_seed(Some("opus"), "sonnet", true),
+            ("opus".to_string(), None)
+        );
+    }
 
     /// ExportUsage is absent from the production static base of global_extra.
     ///

@@ -8,6 +8,7 @@ mod dispatch;
 mod event_loop;
 mod history;
 mod messaging;
+pub(crate) mod models;
 mod target;
 mod todos;
 mod usage;

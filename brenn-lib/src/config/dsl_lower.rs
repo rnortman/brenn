@@ -1527,6 +1527,7 @@ fn app(
         icon,
         working_dir,
         model,
+        models,
         single_instance,
         singleton,
         persistent,
@@ -1574,6 +1575,9 @@ fn app(
         icon: opt_str(icon.as_ref(), "icon", errors),
         working_dir: opt_path(working_dir.as_ref(), "working_dir", errors),
         model: opt_str(model.as_ref(), "model", errors),
+        // Not `unwrap_or_default()`: absent (unrestricted) and empty are
+        // distinct here, and empty is rejected at resolve time.
+        models: opt_strings(models.as_ref(), "models", errors),
         single_instance: opt_bool(single_instance.as_ref(), "single_instance", errors)
             .unwrap_or_default(),
         singleton: opt_bool(singleton.as_ref(), "singleton", errors).unwrap_or_default(),

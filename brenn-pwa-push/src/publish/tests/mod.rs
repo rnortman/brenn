@@ -34,35 +34,14 @@ pub(super) fn make_app_config(
 ) -> AppConfig {
     let dir = tempfile::tempdir().unwrap();
     AppConfig {
-        slug: slug.to_string(),
-        name: slug.to_string(),
-        description: String::new(),
-        icon: String::new(),
         working_dir: dir.path().to_path_buf(),
         model: String::new(),
-        single_instance: false,
-        singleton: false,
-        persistent: false,
-        idle_timeout: None,
-        compaction: None,
-        idle_hook_secs: 0,
         allowed_users,
-        disabled_tools: vec![],
         mcp_servers: Default::default(),
-        multiuser: false,
-        prefix_username: false,
-        prefix_timestamp: false,
-        prefix_device: true,
-        path_mapper: brenn_lib::config::PathMapper::Identity,
-        container_spawn: None,
         start_hooks: Default::default(),
         post_pull_hooks: Default::default(),
         startup_hooks: Default::default(),
-        cc_extra_args: vec![],
-        approval_rules: vec![],
-        attachment_targets: vec![],
         integrations: Default::default(),
-        mounts: vec![],
         history_replay_limit: 100,
         frontmatter: Default::default(),
         state_dir: dir.path().to_path_buf(),
@@ -70,9 +49,6 @@ pub(super) fn make_app_config(
             send_budget: 100,
             subscriptions: vec![],
         }),
-        messaging_default_send_budget: 100,
-        // Grant PwaPush exactly when this fixture wants push enabled, so
-        // pwa_push_enabled() reflects the intended state.
         policy: {
             let mut p = brenn_lib::access::AppPolicy::default();
             if pwa_push_enabled {
@@ -88,9 +64,7 @@ pub(super) fn make_app_config(
         } else {
             None
         },
-        webhook_subscriptions: vec![],
-        mqtt_subscriptions: vec![],
-        chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+        ..brenn_lib::config::test_app_config(slug)
     }
 }
 

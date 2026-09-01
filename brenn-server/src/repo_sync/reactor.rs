@@ -2367,56 +2367,18 @@ mod tests {
     // try_lock when overlapping.
     // -----------------------------------------------------------------------
 
-    use brenn_lib::config::{
-        AppConfig, CompactionConfig, PathMapper, PostPullHooksConfig, StartHooksConfig,
-        StartupHooksConfig,
-    };
+    use brenn_lib::config::{AppConfig, CompactionConfig, PostPullHooksConfig};
 
     /// Build an AppConfig with a post-pull hook that writes a marker file.
     fn mk_hook_app(slug: &str, working_dir: PathBuf, marker_name: &str) -> AppConfig {
         AppConfig {
-            slug: slug.to_string(),
-            name: slug.to_string(),
-            description: String::new(),
-            icon: String::new(),
             working_dir: working_dir.clone(),
-            model: "sonnet".to_string(),
-            single_instance: false,
-            singleton: false,
-            persistent: false,
-            idle_timeout: None,
             compaction: None::<CompactionConfig>,
-            idle_hook_secs: 0,
-            allowed_users: vec![],
-            disabled_tools: vec![],
-            mcp_servers: std::collections::HashMap::new(),
-            multiuser: false,
-            prefix_username: false,
-            prefix_timestamp: false,
-            prefix_device: true,
-            path_mapper: PathMapper::Identity,
-            container_spawn: None,
-            start_hooks: StartHooksConfig::default(),
             post_pull_hooks: PostPullHooksConfig {
                 host: vec![format!("touch {marker_name}")],
                 container: vec![],
             },
-            startup_hooks: StartupHooksConfig::default(),
-            cc_extra_args: vec![],
-            approval_rules: vec![],
-            attachment_targets: vec![],
-            integrations: std::collections::HashMap::new(),
-            mounts: vec![],
-            history_replay_limit: 2000,
-            frontmatter: brenn_lib::config::FrontmatterRenderConfig::default(),
-            state_dir: PathBuf::from("/tmp/.brenn/test-state"),
-            messaging: None,
-            messaging_default_send_budget: 100,
-            policy: brenn_lib::access::AppPolicy::default(),
-            pwa_push: None,
-            webhook_subscriptions: vec![],
-            mqtt_subscriptions: vec![],
-            chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+            ..brenn_lib::config::test_app_config(slug)
         }
     }
 

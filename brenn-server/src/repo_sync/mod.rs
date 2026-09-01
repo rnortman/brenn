@@ -390,10 +390,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use brenn_lib::config::{
-        AccessLevel, AppConfig, CompactionConfig, PathMapper, RepoDeclRaw, ResolvedMount,
-        StartHooksConfig,
-    };
+    use brenn_lib::config::{AccessLevel, AppConfig, CompactionConfig, RepoDeclRaw, ResolvedMount};
 
     fn mk_repo(slug: &str, remote: &str, auto_pull: bool) -> RepoDeclRaw {
         RepoDeclRaw {
@@ -425,45 +422,11 @@ mod tests {
     /// the function reads (`slug`, `mounts`) need to be meaningful.
     fn mk_app(slug: &str, mounts: Vec<ResolvedMount>) -> AppConfig {
         AppConfig {
-            slug: slug.to_string(),
-            name: slug.to_string(),
-            description: String::new(),
-            icon: String::new(),
             working_dir: PathBuf::from("/tmp"),
-            model: "sonnet".to_string(),
-            single_instance: false,
-            singleton: false,
-            persistent: false,
-            idle_timeout: None,
             compaction: None::<CompactionConfig>,
-            idle_hook_secs: 0,
-            allowed_users: vec![],
-            disabled_tools: vec![],
-            mcp_servers: HashMap::new(),
-            multiuser: false,
-            prefix_username: false,
-            prefix_timestamp: false,
-            prefix_device: true,
-            path_mapper: PathMapper::Identity,
-            container_spawn: None,
-            start_hooks: StartHooksConfig::default(),
-            post_pull_hooks: brenn_lib::config::PostPullHooksConfig::default(),
-            startup_hooks: brenn_lib::config::StartupHooksConfig::default(),
-            cc_extra_args: vec![],
-            approval_rules: vec![],
-            attachment_targets: vec![],
-            integrations: HashMap::new(),
             mounts,
-            history_replay_limit: 2000,
-            frontmatter: brenn_lib::config::FrontmatterRenderConfig::default(),
             state_dir: PathBuf::from("/tmp/state"),
-            messaging: None,
-            messaging_default_send_budget: 100,
-            policy: brenn_lib::access::AppPolicy::default(),
-            pwa_push: None,
-            webhook_subscriptions: vec![],
-            mqtt_subscriptions: vec![],
-            chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+            ..brenn_lib::config::test_app_config(slug)
         }
     }
 

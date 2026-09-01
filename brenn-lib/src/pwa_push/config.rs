@@ -207,7 +207,6 @@ pub fn resolve_pwa_push_layer(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use super::*;
 
@@ -232,7 +231,7 @@ mod tests {
     fn policy_panics_on_whitespace_entry() {
         let _ = EndpointPolicy::new(vec!["   ".to_string()], false);
     }
-    use crate::config::{AppConfig, FrontmatterRenderConfig, PathMapper};
+    use crate::config::AppConfig;
     use crate::pwa_push::config::AppPwaPushBlock;
 
     fn make_app(slug: &str, pwa_push: Option<AppPwaPushBlock>, push_authorized: bool) -> AppConfig {
@@ -250,45 +249,15 @@ mod tests {
         }
         // AppConfig is a large struct; use a minimal builder approach.
         AppConfig {
-            slug: slug.to_string(),
-            name: slug.to_string(),
-            description: String::new(),
-            icon: String::new(),
             working_dir: tempdir.path().to_path_buf(),
             model: "claude-sonnet".to_string(),
-            single_instance: false,
-            singleton: false,
-            persistent: false,
-            idle_timeout: None,
-            compaction: None,
-            idle_hook_secs: 0,
-            allowed_users: vec![],
-            disabled_tools: vec![],
-            mcp_servers: HashMap::new(),
-            multiuser: false,
-            prefix_username: false,
-            prefix_timestamp: false,
-            prefix_device: true,
-            path_mapper: PathMapper::Identity,
-            container_spawn: None,
             start_hooks: Default::default(),
             post_pull_hooks: Default::default(),
             startup_hooks: Default::default(),
-            cc_extra_args: vec![],
-            approval_rules: vec![],
-            attachment_targets: vec![],
-            integrations: HashMap::new(),
-            mounts: vec![],
-            history_replay_limit: 2000,
-            frontmatter: FrontmatterRenderConfig::default(),
             state_dir: tempdir.path().to_path_buf(),
-            messaging: None,
-            messaging_default_send_budget: 100,
             policy,
             pwa_push,
-            webhook_subscriptions: vec![],
-            mqtt_subscriptions: vec![],
-            chat_harness_policy: crate::access::AppPolicy::default(),
+            ..crate::config::test_app_config(slug)
         }
     }
 

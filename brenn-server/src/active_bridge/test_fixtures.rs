@@ -139,6 +139,17 @@ impl ActiveBridge {
         rx
     }
 
+    /// Test-only: read the model last asserted to CC.
+    pub(crate) async fn last_set_model_for_test(&self) -> Option<String> {
+        self.last_set_model.lock().await.clone()
+    }
+
+    /// Test-only: pretend a previous call put CC on `model`, so a test can set
+    /// up a session that has drifted off the app's default.
+    pub(crate) async fn set_last_set_model_for_test(&self, model: Option<&str>) {
+        *self.last_set_model.lock().await = model.map(str::to_string);
+    }
+
     /// Test-only: insert a pending synchronous permission into the bridge's
     /// in-memory map, bypassing the live `ApprovalRequired` → CC oneshot flow.
     /// Used by WS-layer tests that need to exercise `send_pending_permissions_*`
@@ -1025,37 +1036,13 @@ impl ActiveBridge {
         apps.insert(
             "testapp".to_string(),
             brenn_lib::config::AppConfig {
-                slug: "testapp".to_string(),
-                name: "testapp".to_string(),
-                description: String::new(),
-                icon: String::new(),
                 working_dir: state_dir.clone(),
                 model: "claude-sonnet".to_string(),
-                single_instance: false,
-                singleton: false,
-                persistent: false,
-                idle_timeout: None,
-                compaction: None,
-                idle_hook_secs: 0,
                 allowed_users: vec!["test".to_string()],
-                disabled_tools: vec![],
-                mcp_servers: std::collections::HashMap::new(),
-                multiuser: false,
-                prefix_username: false,
-                prefix_timestamp: false,
                 prefix_device: false,
-                path_mapper: PathMapper::Identity,
-                container_spawn: None,
                 start_hooks: Default::default(),
                 post_pull_hooks: Default::default(),
                 startup_hooks: Default::default(),
-                cc_extra_args: vec![],
-                approval_rules: vec![],
-                attachment_targets: vec![],
-                integrations: std::collections::HashMap::new(),
-                mounts: vec![],
-                history_replay_limit: 2000,
-                frontmatter: brenn_lib::config::FrontmatterRenderConfig::default(),
                 state_dir,
                 messaging: Some(brenn_lib::messaging::config::ResolvedMessagingConfig {
                     send_budget: 100,
@@ -1068,12 +1055,6 @@ impl ActiveBridge {
                         wake_min: brenn_lib::messaging::WakeMin::Normal,
                     }],
                 }),
-                messaging_default_send_budget: 100,
-                // App is a messaging sender; grant MessagingPublish so
-                // messaging_enabled() passes, plus a `brenn_publish` matcher for
-                // `test-channel` so create/edit jobs targeting it pass the
-                // create-time publish-ACL scope gate (scoped to the exact channel
-                // the automation tests use).
                 policy: {
                     let mut p = brenn_lib::access::AppPolicy::default();
                     p.grants
@@ -1085,10 +1066,7 @@ impl ActiveBridge {
                         ));
                     p
                 },
-                pwa_push: None,
-                webhook_subscriptions: vec![],
-                mqtt_subscriptions: vec![],
-                chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+                ..brenn_lib::config::test_app_config("testapp")
             },
         );
         let apps_arc = Arc::new(apps);
@@ -1513,42 +1491,14 @@ fn make_test_push_app_config(
     push_enabled: bool,
 ) -> brenn_lib::config::AppConfig {
     brenn_lib::config::AppConfig {
-        slug: "testapp".to_string(),
-        name: "testapp".to_string(),
-        description: String::new(),
-        icon: String::new(),
         working_dir: state_dir.clone(),
         model: "claude-sonnet".to_string(),
-        single_instance: false,
-        singleton: false,
-        persistent: false,
-        idle_timeout: None,
-        compaction: None,
-        idle_hook_secs: 0,
         allowed_users,
-        disabled_tools: vec![],
-        mcp_servers: std::collections::HashMap::new(),
-        multiuser: false,
-        prefix_username: false,
-        prefix_timestamp: false,
         prefix_device: false,
-        path_mapper: PathMapper::Identity,
-        container_spawn: None,
         start_hooks: Default::default(),
         post_pull_hooks: Default::default(),
         startup_hooks: Default::default(),
-        cc_extra_args: vec![],
-        approval_rules: vec![],
-        attachment_targets: vec![],
-        integrations: std::collections::HashMap::new(),
-        mounts: vec![],
-        history_replay_limit: 2000,
-        frontmatter: brenn_lib::config::FrontmatterRenderConfig::default(),
         state_dir,
-        messaging: None,
-        messaging_default_send_budget: 100,
-        // Grant PwaPush exactly when this fixture wants push enabled, so
-        // pwa_push_enabled() reflects the intended state.
         policy: {
             let mut p = brenn_lib::access::AppPolicy::default();
             if push_enabled {
@@ -1557,14 +1507,10 @@ fn make_test_push_app_config(
             }
             p
         },
-        // Push authorization is the `PwaPush` grant on `policy` above (set from
-        // `push_enabled`); the block carries only delivery settings now (§2.5.1).
         pwa_push: Some(brenn_lib::pwa_push::config::AppPwaPushBlock {
             default_title: None,
         }),
-        webhook_subscriptions: vec![],
-        mqtt_subscriptions: vec![],
-        chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+        ..brenn_lib::config::test_app_config("testapp")
     }
 }
 

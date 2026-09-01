@@ -1554,48 +1554,20 @@ mod tests {
                 subscriptions: vec![],
             };
             let app_cfg = brenn_lib::config::AppConfig {
-                slug: "test-app".to_string(),
-                name: "test-app".to_string(),
-                description: String::new(),
-                icon: String::new(),
                 working_dir: std::path::PathBuf::from("/tmp"),
                 model: String::new(),
-                single_instance: false,
-                singleton: false, // non-singleton
-                persistent: false,
-                idle_timeout: None,
-                compaction: None,
-                idle_hook_secs: 0,
                 allowed_users: vec!["testuser".to_string()],
-                disabled_tools: vec![],
                 mcp_servers: Default::default(),
-                multiuser: false,
-                prefix_username: false,
-                prefix_timestamp: false,
-                prefix_device: true,
-                path_mapper: brenn_lib::config::PathMapper::Identity,
-                container_spawn: None,
                 start_hooks: Default::default(),
                 post_pull_hooks: Default::default(),
                 startup_hooks: Default::default(),
-                cc_extra_args: vec![],
-                approval_rules: vec![],
-                attachment_targets: vec![],
                 integrations: Default::default(),
-                mounts: vec![],
                 history_replay_limit: 100,
                 frontmatter: Default::default(),
                 state_dir: std::path::PathBuf::from("/tmp"),
                 messaging: Some(messaging_cfg),
-                messaging_default_send_budget: 100,
-                // App is a messaging sender; grant MessagingPublish + a universal
-                // brenn_publish matcher so the fire-time publish (Seam A gate)
-                // authorizes.
                 policy: brenn_lib::access::AppPolicy::messaging_sender_policy(),
-                pwa_push: None,
-                webhook_subscriptions: vec![],
-                mqtt_subscriptions: vec![],
-                chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+                ..brenn_lib::config::test_app_config("test-app")
             };
             apps.insert("test-app".to_string(), app_cfg);
             let apps = Arc::new(apps);
@@ -1691,48 +1663,20 @@ mod tests {
                 subscriptions: vec![],
             };
             let app_cfg = brenn_lib::config::AppConfig {
-                slug: "test-app".to_string(),
-                name: "test-app".to_string(),
-                description: String::new(),
-                icon: String::new(),
                 working_dir: std::path::PathBuf::from("/tmp"),
                 model: String::new(),
-                single_instance: false,
-                singleton: false,
-                persistent: false,
-                idle_timeout: None,
-                compaction: None,
-                idle_hook_secs: 0,
                 allowed_users: vec!["testuser".to_string()],
-                disabled_tools: vec![],
                 mcp_servers: Default::default(),
-                multiuser: false,
-                prefix_username: false,
-                prefix_timestamp: false,
-                prefix_device: true,
-                path_mapper: brenn_lib::config::PathMapper::Identity,
-                container_spawn: None,
                 start_hooks: Default::default(),
                 post_pull_hooks: Default::default(),
                 startup_hooks: Default::default(),
-                cc_extra_args: vec![],
-                approval_rules: vec![],
-                attachment_targets: vec![],
                 integrations: Default::default(),
-                mounts: vec![],
                 history_replay_limit: 100,
                 frontmatter: Default::default(),
                 state_dir: std::path::PathBuf::from("/tmp"),
                 messaging: Some(messaging_cfg),
-                messaging_default_send_budget: 100,
-                // App is a messaging sender; grant MessagingPublish + a universal
-                // brenn_publish matcher so the fire-time publish (Seam A gate)
-                // authorizes.
                 policy: brenn_lib::access::AppPolicy::messaging_sender_policy(),
-                pwa_push: None,
-                webhook_subscriptions: vec![],
-                mqtt_subscriptions: vec![],
-                chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+                ..brenn_lib::config::test_app_config("test-app")
             };
             apps.insert("test-app".to_string(), app_cfg);
             let apps = Arc::new(apps);
@@ -1906,48 +1850,21 @@ mod tests {
                 subscriptions: vec![],
             };
             let app_cfg = brenn_lib::config::AppConfig {
-                slug: "test-app".to_string(),
-                name: "test-app".to_string(),
-                description: String::new(),
-                icon: String::new(),
                 working_dir: std::path::PathBuf::from("/tmp"),
                 model: String::new(),
-                single_instance: false,
                 singleton: true,
-                persistent: false,
-                idle_timeout: None,
-                compaction: None,
-                idle_hook_secs: 0,
                 allowed_users: vec!["testuser".to_string()],
-                disabled_tools: vec![],
                 mcp_servers: Default::default(),
-                multiuser: false,
-                prefix_username: false,
-                prefix_timestamp: false,
-                prefix_device: true,
-                path_mapper: brenn_lib::config::PathMapper::Identity,
-                container_spawn: None,
                 start_hooks: Default::default(),
                 post_pull_hooks: Default::default(),
                 startup_hooks: Default::default(),
-                cc_extra_args: vec![],
-                approval_rules: vec![],
-                attachment_targets: vec![],
                 integrations: Default::default(),
-                mounts: vec![],
                 history_replay_limit: 100,
                 frontmatter: Default::default(),
                 state_dir: std::path::PathBuf::from("/tmp"),
                 messaging: Some(messaging_cfg),
-                messaging_default_send_budget: 100,
-                // App is a messaging sender; grant MessagingPublish + a universal
-                // brenn_publish matcher so the fire-time publish (Seam A gate)
-                // authorizes.
                 policy: brenn_lib::access::AppPolicy::messaging_sender_policy(),
-                pwa_push: None,
-                webhook_subscriptions: vec![],
-                mqtt_subscriptions: vec![],
-                chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+                ..brenn_lib::config::test_app_config("test-app")
             };
             apps.insert("test-app".to_string(), app_cfg);
             let apps = Arc::new(apps);

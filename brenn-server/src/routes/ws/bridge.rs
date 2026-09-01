@@ -217,11 +217,7 @@ impl WsConnection {
             // Send ModelsAvailable to this WS connection immediately — before
             // BridgeSpawned fires — so the triggering tab never waits.
             // Other tabs receive ModelsAvailable via the BridgeSpawned handler.
-            if !model_infos.is_empty() {
-                let _ = self.send_ws(WsServerMessage::ModelsAvailable {
-                    available_models: model_infos,
-                });
-            }
+            self.send_filtered_models(&model_infos);
 
             self.attach_to_bridge_with_rx(&bridge, rx).await;
 

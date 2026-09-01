@@ -117,10 +117,7 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
     };
 
     // Send Welcome as the very first message — gives the frontend its identity.
-    let available_models = {
-        let models = conn.state.cached_models.read().await;
-        models.get(&conn.app_slug).cloned().unwrap_or_default()
-    };
+    let available_models = conn.available_models().await;
     let default_model = conn.app_config().model.clone();
     let attachment_targets: Vec<brenn_ws_types::TargetInfo> = conn
         .app_config()
