@@ -13,6 +13,7 @@ configuration and wraps it with `wasm-tools component new`, and
 """
 
 load("@bazel_skylib//lib:shell.bzl", "shell")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library")
 load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY", "WASM32_ONLY")
@@ -37,6 +38,9 @@ def wasm_guest_library(name, edition = "2024", deps = [], compile_data = [], vis
         visibility = visibility,
         deps = all_crate_deps(normal = True) + deps,
     )
+
+# Where a crate's `mod bindings;` resolves.
+BINDINGS_PATH = "src/bindings.rs"
 
 def replace_generated(srcs, generated):
     """Swap generated modules into a crate's globbed source list.
@@ -63,6 +67,7 @@ def wasm_guest_cdylib(
         deps = [],
         compile_data = [],
         generated_srcs = {},
+        shared_bindings = None,
         visibility = None):
     """A component crate's core WASM module, built for wasm32-unknown-unknown.
 
@@ -75,11 +80,25 @@ def wasm_guest_cdylib(
         deps: first-party dependencies. Third-party ones come from the hub.
         compile_data: files read at macro-expansion time (WIT worlds).
         generated_srcs: modules generated into this crate, keyed by the path
-            each occupies — `{"src/bindings.rs": ":bindings"}` for a raw-WIT
-            crate, `{"src/spec.rs": ":spec"}` for a specification-bearing one.
-            See `replace_generated`.
+            each occupies — `{"src/spec.rs": ":spec"}` for a
+            specification-bearing one. See `replace_generated`.
+        shared_bindings: a `wit_bindgen_rust` target generating a world several
+            crates share. Naming it places the generation at this crate's
+            bindings path and substitutes it, so `BINDINGS_PATH` is stated here
+            and not in each crate. Naming it alongside a `generated_srcs` entry
+            for that same path is an error.
         visibility: target visibility.
     """
+    if shared_bindings:
+        if BINDINGS_PATH in generated_srcs:
+            fail(("%s: shared_bindings names %s and generated_srcs also has an entry " +
+                  "for %s. Two statements of where this crate's bindings come from; " +
+                  "state one.") % (name, shared_bindings, BINDINGS_PATH))
+        bindings = name + "_bindings"
+        shared_guest_bindings(name = bindings, shared = shared_bindings)
+        generated_srcs = dict(generated_srcs)
+        generated_srcs[BINDINGS_PATH] = ":" + bindings
+
     srcs = replace_generated(native.glob(["src/**/*.rs"]), generated_srcs)
 
     rust_shared_library(
@@ -98,7 +117,7 @@ def wasm_guest_cdylib(
 # ---------------------------------------------------------------------------
 
 def _wit_bindgen_rust_impl(ctx):
-    out = ctx.actions.declare_file("src/bindings.rs")
+    out = ctx.actions.declare_file(ctx.attr.out)
     world = ctx.file.wit.basename[:-len(".wit")]
 
     # wit-bindgen names its output after the world, not after a flag, so the
@@ -131,13 +150,22 @@ mv "$scratch/$3.rs" "$4"
 
 wit_bindgen_rust = rule(
     implementation = _wit_bindgen_rust_impl,
-    doc = """Generate a raw-WIT crate's `src/bindings.rs` from its WIT world.
+    doc = """Generate a WIT world's Rust bindings.
 
     The bare wit-bindgen CLI is invoked with no SDK in the graph, so a crate
     that compiles against this output has proven the WIT is directly
     consumable.
+
+    Declared in the crate that consumes it, the default `out` puts the module
+    at the path the crate's `mod bindings;` resolves. A world several crates
+    generate identically is instead declared once, under a path of its own, and
+    reaches each crate through `wasm_guest_cdylib`'s `shared_bindings`.
     """,
     attrs = {
+        "out": attr.string(
+            default = BINDINGS_PATH,
+            doc = "Package-relative path of the generated module.",
+        ),
         "wit": attr.label(
             allow_single_file = [".wit"],
             mandatory = True,
@@ -155,6 +183,28 @@ wit_bindgen_rust = rule(
         ),
     },
 )
+
+def shared_guest_bindings(name, shared):
+    """Place a shared bindings generation at this crate's bindings path.
+
+    rules_rust resolves `mod bindings;` by path adjacency to the crate root, so
+    a generation declared in another package cannot be compiled where it lies —
+    it has to exist under this package's path.
+
+    The primitive underneath `wasm_guest_cdylib`'s `shared_bindings`, which is
+    what a crate states; calling it directly means also wiring the
+    substitution by hand.
+
+    Args:
+        name: target name.
+        shared: the `wit_bindgen_rust` target generating the world.
+    """
+    copy_file(
+        name = name,
+        src = shared,
+        out = BINDINGS_PATH,
+        allow_symlink = True,
+    )
 
 # ---------------------------------------------------------------------------
 # spec scaffolding

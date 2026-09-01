@@ -16,6 +16,7 @@ use brenn_surface_schema::{
 };
 
 use super::*;
+use crate::test_support::bindings::imply_vocabularies;
 
 const WIRE: &str = "brenn:site.bar.in";
 const OTHER_WIRE: &str = "ephemeral:site.bar.signal";
@@ -28,6 +29,7 @@ fn component(instance: &str) -> ComponentEntry {
         parked_batch_depth: 4,
         config: BTreeMap::new(),
         grants: vec![],
+        declared_out_ports: vec![],
     }
 }
 
@@ -47,7 +49,7 @@ fn subscription(instance: &str, port: &str, channel: &str, push: u64, retain: u6
 /// shape for a shared subscription, a fold across bindings, and both classes of
 /// store.
 fn doc(subscriptions: Vec<Binding>) -> BindingsDocument {
-    BindingsDocument {
+    imply_vocabularies(BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("p1"), component("p2"), component("chrome")],
         subscriptions,
@@ -73,7 +75,7 @@ fn doc(subscriptions: Vec<Binding>) -> BindingsDocument {
             error_channel: None,
             error_report_floor: None,
         },
-    }
+    })
 }
 
 /// The standard wiring: two of `p1`'s ports and one of `p2`'s on one wire

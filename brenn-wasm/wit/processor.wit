@@ -198,8 +198,14 @@ interface types {
 
 interface ports {
     variant publish-error {
-        /// Port name not bound for this component (attenuation). The guest
-        /// cannot target raw channel addresses — publish is port-name-only.
+        /// The publish was refused on authority, not on vocabulary: the
+        /// component was not granted this interface, the call is outside an
+        /// in-flight activation, or the channel bound to `port` fails the
+        /// host's output ACL. The guest cannot target raw channel addresses —
+        /// publish is port-name-only.
+        ///
+        /// A port the component's specification declares but the deployer left
+        /// unwired is NOT this error; see `publish`.
         not-permitted,
         /// Payload failed host validation (e.g. oversize). Diagnostic string.
         invalid-payload(string),
@@ -222,6 +228,19 @@ interface ports {
     /// `normal`). Visibility is deferred: all of an activation's publishes
     /// flush atomically, in call order, iff receive returns ok; err/trap
     /// discards them all.
+    ///
+    /// `port` is answered against the port vocabulary of the component's
+    /// specification — the ports it declares `out` or `io` — in three ways.
+    /// A declared port the deployer wired to a channel publishes normally. A
+    /// declared port the deployer left unwired returns ok and the message is
+    /// dropped: publishing to nowhere is as legal as publishing to a channel
+    /// nobody subscribes to, and wiring is the deployer's business, not the
+    /// guest's. The drop still runs every check that does not need a channel —
+    /// the payload cap and the per-activation budgets answer exactly as they
+    /// would on a wired port. A port the specification does not declare at all
+    /// is a contract violation: the component contradicts the specification its
+    /// artifact is hash-bound to, and the host traps the activation rather than
+    /// refuse the call.
     ///
     /// **Provenance / trust note:** Messages emitted via this import appear on
     /// the bus with `sender = "wasm:<slug>"` and `envelope_type = brenn`.
@@ -258,6 +277,10 @@ interface ports {
     /// the schedule (host-logged), since a post-activation flush has no error
     /// channel back to the guest.
     ///
+    /// `port` is answered against the specification's port vocabulary exactly
+    /// as in `publish`: wired schedules, declared-but-unwired returns ok and
+    /// schedules nothing, undeclared traps the activation.
+    ///
     /// Same provenance/trust note as `publish`: the message carries
     /// `sender = "wasm:<slug>"` with no external-origin marker.
     publish-deferred: func(port: string, payload: string, deliver-after: u64)
@@ -270,12 +293,16 @@ interface ports {
     /// returns ok at buffer time (the guest already returned before the race is
     /// resolvable).
     variant defer-error {
-        /// `port` is not one of this component's bound output ports.
+        /// The op was refused on authority: the component was not granted
+        /// this interface, or the call is outside an in-flight activation.
         not-permitted,
         /// `index` is outside the deferred-window this activation delivered for
         /// `port`. Snapshot-relative: an index valid against a *different*
         /// activation's window is still out of range here. This is a guest bug,
         /// so it fails fail-fast at buffer time.
+        ///
+        /// A port the specification declares but the deployer left unwired has
+        /// no deferred window at all, so every index into it is out of range.
         out-of-range,
         /// A per-activation budget is exhausted: the call budget (shared with
         /// publishes), the buffered-op ceiling, or — for an edit that replaces
@@ -296,6 +323,9 @@ interface ports {
     /// message identity captured in the snapshot, so a message that released
     /// between drain and flush cannot be mis-targeted; that case is a benign
     /// logged no-op, not an error. A cancelled message never becomes observable.
+    ///
+    /// A `port` the component's specification does not declare traps the
+    /// activation, as in `publish`.
     defer-cancel: func(port: string, index: u32) -> result<_, defer-error>;
 
     /// Edit one of this component's own parked messages, named by its `index` into
@@ -305,6 +335,9 @@ interface ports {
     /// flush iff receive returns ok, index resolved against the snapshot, a
     /// drain-vs-release race a benign logged no-op. A `deliver-after` at or before
     /// the host's `now` releases the message immediately at flush.
+    ///
+    /// A `port` the component's specification does not declare traps the
+    /// activation, as in `publish`.
     defer-edit: func(port: string, index: u32, payload: option<string>,
         deliver-after: option<u64>) -> result<_, defer-error>;
 }

@@ -208,6 +208,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),

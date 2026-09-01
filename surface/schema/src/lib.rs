@@ -204,6 +204,20 @@ pub struct ComponentEntry {
     /// than its spelling, so an unparseable word is a document-parse error
     /// instead of a reparse obligation on every reader.
     pub grants: Vec<String>,
+    /// Every port name this instance's component kind declares with direction
+    /// `out` or `io` — the complete vocabulary of names it may legally publish
+    /// to. Sorted and duplicate-free, so the document stays byte-stable.
+    ///
+    /// Carried because the bound-output table alone cannot tell a declared port
+    /// the deployer chose not to wire from a name the component's specification
+    /// never mentioned. The first is a legal publish onto no channel; the second
+    /// is the component contradicting the specification its artifact is
+    /// hash-bound to, and the kernel ends the activation for it.
+    ///
+    /// Inbound ports do not travel: the kernel builds activation windows from
+    /// the bindings, so an undeclared inbound port is unreachable by
+    /// construction.
+    pub declared_out_ports: Vec<String>,
     /// This instance's static config map, read through the component's `config`
     /// import. Empty unless the instance declares one.
     ///

@@ -573,7 +573,10 @@ impl SurfaceHandle {
     /// `Some(result)` — the caller is the instance whose entry is on the stack, so
     /// this is a **buffered** publish: it was offered to that activation's buffer
     /// (the sole quota authority for the call) and answered inline. Nothing
-    /// reaches the router or the wire until the entry returns ok.
+    /// reaches the router or the wire until the entry returns ok. An ok answer
+    /// carries the [`Admission`](crate::publish_buffer::Admission) — whether the
+    /// message joined the buffer or was dropped for want of a sink — which the
+    /// component is not told but the page's counters are.
     ///
     /// `None` — no activation is in flight, or a different instance's is. There
     /// is no second path: the caller is refused (`not-permitted`), because a
@@ -585,14 +588,18 @@ impl SurfaceHandle {
         port: &str,
         body: &str,
         urgency: Option<Urgency>,
-    ) -> Option<Result<(), brenn_surface_contract::PublishError>> {
+    ) -> Option<Result<crate::publish_buffer::Admission, crate::publish_buffer::PublishFault>> {
         // `body` is borrowed and only owned once the in-flight instance matches:
         // a refused publish (no activation in flight, or a different instance's)
         // returns `None` after the instance compare without paying the body's
         // allocation.
-        self.with_in_flight(instance, |buffer| match urgency {
-            Some(urgency) => buffer.publish_with_urgency(port, body.to_owned(), urgency),
-            None => buffer.publish(port, body.to_owned()),
+        self.with_in_flight(instance, |buffer| {
+            let before = buffer.dropped();
+            let answered = match urgency {
+                Some(urgency) => buffer.publish_with_urgency(port, body.to_owned(), urgency),
+                None => buffer.publish(port, body.to_owned()),
+            };
+            answered.map(|()| crate::publish_buffer::Admission::of(before, buffer.dropped()))
         })
     }
 
@@ -610,9 +617,11 @@ impl SurfaceHandle {
         port: &str,
         body: &str,
         deliver_after: u64,
-    ) -> Option<Result<(), brenn_surface_contract::PublishError>> {
+    ) -> Option<Result<crate::publish_buffer::Admission, crate::publish_buffer::PublishFault>> {
         self.with_in_flight(instance, |buffer| {
-            buffer.publish_deferred(port, body.to_owned(), deliver_after)
+            let before = buffer.dropped();
+            let answered = buffer.publish_deferred(port, body.to_owned(), deliver_after);
+            answered.map(|()| crate::publish_buffer::Admission::of(before, buffer.dropped()))
         })
     }
 
@@ -625,7 +634,7 @@ impl SurfaceHandle {
         instance: &str,
         port: &str,
         index: u32,
-    ) -> Option<Result<(), brenn_surface_contract::DeferError>> {
+    ) -> Option<Result<(), crate::publish_buffer::DeferFault>> {
         self.with_in_flight(instance, |buffer| buffer.defer_cancel(port, index))
     }
 
@@ -640,7 +649,7 @@ impl SurfaceHandle {
         index: u32,
         body: Option<String>,
         deliver_after: Option<u64>,
-    ) -> Option<Result<(), brenn_surface_contract::DeferError>> {
+    ) -> Option<Result<(), crate::publish_buffer::DeferFault>> {
         self.with_in_flight(instance, |buffer| {
             buffer.defer_edit(port, index, body, deliver_after)
         })

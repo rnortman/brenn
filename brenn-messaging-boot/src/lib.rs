@@ -32,6 +32,32 @@ mod offline;
 mod surfaces;
 mod wasm;
 
+/// Hold one port name to the charset every port name in the system shares:
+/// non-empty, RFC 3986 unreserved characters only.
+///
+/// The one statement of the rule for this crate's four placements — a
+/// consumer's bindings, a consumer's declared vocabulary, a surface's bindings,
+/// a surface component's declared vocabulary — because the charset is shared
+/// with channel addressing and two placements refusing different configs is a
+/// divergence that only shows up on a deploy. Uniqueness is deliberately not
+/// here: the binding sites also fold a name into a per-entity seen-set, which
+/// the vocabularies have no business sharing.
+///
+/// `context` is a pre-formatted label naming the block, the placement and the
+/// noun (`[[wasm_consumer]] "filter": output port name`), in the same style
+/// [`bound_channel`] takes.
+///
+/// # Panics
+///
+/// On an empty name and on a name outside the unreserved charset.
+fn assert_port_name(context: &str, port: &str) {
+    assert!(!port.is_empty(), "{context} must be non-empty");
+    assert!(
+        port.chars().all(brenn_lib::messaging::is_unreserved_char),
+        "{context} {port:?} must consist of RFC 3986 unreserved characters only (A-Za-z0-9._~-)",
+    );
+}
+
 /// The channel address a static port binding resolves to.
 ///
 /// `declared` is the `channel` the operator wrote on the binding. A binding

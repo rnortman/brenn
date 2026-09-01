@@ -212,13 +212,13 @@ impl SyncDoor {
         let stamps = flush_stamps(buffer.len());
         effects.extend(turn::on_input(
             page,
-            Input::ActivationDone(Completed {
+            Input::ActivationDone(Box::new(Completed {
                 instance,
                 generation,
                 outcome,
                 buffer,
                 stamps,
-            }),
+            })),
             now,
             now_ms,
         ));

@@ -39,6 +39,7 @@ fn load_config_component(config: HashMap<String, String>) -> ProcessorComponent 
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &config_artifact(),
         slug: "config-test",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),

@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::test_support::bindings::imply_vocabularies;
 use brenn_attach_client::subs::{DeliverDisposition, SubscribeAck};
 use brenn_attach_proto::{Cursor, GapInfo, GapReason, SubscribeOutcome};
 use brenn_surface_schema::bindings::{
@@ -62,7 +63,7 @@ fn ack(replay_count: u32) -> SubscribeAck {
 /// One component bound to one wire channel and one page-local plane: enough
 /// shape for a document to be valid and for a second version of it to differ.
 fn doc(kind: &str) -> BindingsDocument {
-    BindingsDocument {
+    imply_vocabularies(BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![ComponentEntry {
             instance: "chrome".to_string(),
@@ -70,6 +71,7 @@ fn doc(kind: &str) -> BindingsDocument {
             parked_batch_depth: 4,
             config: BTreeMap::new(),
             grants: vec![],
+            declared_out_ports: vec![],
         }],
         subscriptions: vec![Binding {
             channel: WIRE.to_string(),
@@ -101,7 +103,7 @@ fn doc(kind: &str) -> BindingsDocument {
             error_channel: None,
             error_report_floor: None,
         },
-    }
+    })
 }
 
 fn body(kind: &str) -> String {

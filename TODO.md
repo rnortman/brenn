@@ -1628,8 +1628,8 @@ unsupported. `Cargo.toml`/`Cargo.lock` stay as `crate.from_cargo` inputs.
 
 What is left is the last item on the original list: the committed generated
 files and the gates pinning them — the 37 ts-rs `.ts` files under
-`frontend/src/generated/`, `frontmatter.generated.ts`, the seven raw-WIT
-`bindings.rs`, and the surface `help.md` sidecars. Every one of them is a build
+`frontend/src/generated/`, `frontmatter.generated.ts`, and the surface
+`help.md` sidecars. Every one of them is a build
 artifact now, so with no committed copy there is nothing to drift and the
 `generated_parity_test` / `generated_tree_parity_test` gates, the per-crate
 `help_sidecar_matches_generator` tests, and the frontend's committed-copy
@@ -2250,31 +2250,6 @@ gates the one block.
 Done = every block in `docs/config-dsl.md` that is presented as compilable is
 compiled by `make check`, and the blocks that are not are marked as fragments in
 the prose.
-
-## `shared-processor-bindings`
-
-Four raw-WIT fixture components — `processor-exhaust`, `processor-mem-exhaust`,
-`processor-mqtt-test`, `processor-tool-test` — each carry their own
-`wit_bindgen_rust` target and their own committed `src/bindings.rs`, and the
-four files are byte-identical: the same generation of the same
-`brenn:processor` world, ~3,100 lines apiece. Every world change costs a 4×
-regenerated-file churn that buries the hand-written half of the diff, and the
-four `generated_parity_test`s can only ever fail together.
-
-The two candidate shapes differ in what coverage survives, which is why this is
-not a mechanical edit: one shared `wit_bindgen_rust` target with a single
-committed copy keeps the fixtures' raw-WIT independence (they exist to exercise
-the world without the guest SDK) but has to decide where a bindings file that
-belongs to no crate lives; moving the fixtures onto `brenn-guest` deletes the
-committed copies entirely and with them the only in-tree coverage of the
-non-SDK path.
-
-Code site (`TODO(shared-processor-bindings)`):
-`brenn-wasm/components/processor-exhaust/BUILD.bazel`, on the `bindings`
-target.
-
-Done = one generation of the processor world's bindings is committed once, and
-a world change regenerates one file.
 
 ## `surface-fault-report`
 

@@ -1259,6 +1259,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
         slug: "deadwasm".to_string(),
         package: "deadwasm".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1331,6 +1332,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
         slug: "undeclared".to_string(),
         package: "undeclared".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![ComponentGrant::Mqtt],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1404,6 +1406,7 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
         slug: "aclless".to_string(),
         package: "aclless".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1477,6 +1480,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
         slug: "scoped-wasm".to_string(),
         package: "scoped-wasm".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         // Non-empty ⇒ MessagingSubscribe grant is derived, but the matcher names
         // a different channel, so allows_channel_access("brenn:secret-channel") is false.
@@ -1552,6 +1556,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
         slug: "covered-wasm".to_string(),
         package: "covered-wasm".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![ChannelMatcherRaw::Exact(subscribed.to_string())],
         ephemeral_subscribe_acl: vec![],
@@ -1663,6 +1668,7 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
         slug: "undeclared-sub".to_string(),
         package: "undeclared-sub".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1729,6 +1735,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
         slug: "consume-demo-alice".to_string(),
         package: "processor-demo".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec!["out".to_string()],
         grants: vec![ComponentGrant::Ports],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1823,6 +1830,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
         slug: "consume-demo-alice".to_string(),
         package: "processor-demo".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1908,6 +1916,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
         slug: "consume-mqtt".to_string(),
         package: "consume-mqtt".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -2015,6 +2024,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
         slug: "consume-mqtt".to_string(),
         package: "consume-mqtt".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -2607,7 +2617,8 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
             publish_capacity: None,
         }],
         ..minimal_wasm_consumer()
-    };
+    }
+    .implying_its_vocabulary();
     let config = BrennConfig {
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
@@ -2732,7 +2743,8 @@ async fn build_messaging_gives_a_named_brenn_io_port_channel_a_db_row() {
             publish_capacity: None,
         }],
         ..minimal_wasm_consumer()
-    };
+    }
+    .implying_its_vocabulary();
     let config = BrennConfig {
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
@@ -2796,7 +2808,8 @@ async fn auto_channels_list_as_their_durability_says() {
             io_port("named", Some("brenn:etl.timer")),
         ],
         ..minimal_wasm_consumer()
-    };
+    }
+    .implying_its_vocabulary();
     let config = BrennConfig {
         channels: vec![brenn_lib::messaging::config::ChannelConfigRaw {
             send_rate: None,
@@ -2899,17 +2912,20 @@ async fn a_shared_local_name_across_the_two_realms_boots() {
     use brenn_server::test_support::init_db_memory;
 
     let config = BrennConfig {
-        wasm_consumers: vec![brenn_lib::messaging::config::WasmConsumerConfigRaw {
-            slug: "ticker".to_string(),
-            grants: vec![ComponentGrant::Ports],
-            io_ports: vec![io_port_raw(
-                "tick",
-                Some("local:etl.tick"),
-                Depth::Bounded(2),
-                Depth::Bounded(8),
-            )],
-            ..minimal_wasm_consumer()
-        }],
+        wasm_consumers: vec![
+            brenn_lib::messaging::config::WasmConsumerConfigRaw {
+                slug: "ticker".to_string(),
+                grants: vec![ComponentGrant::Ports],
+                io_ports: vec![io_port_raw(
+                    "tick",
+                    Some("local:etl.tick"),
+                    Depth::Bounded(2),
+                    Depth::Bounded(8),
+                )],
+                ..minimal_wasm_consumer()
+            }
+            .implying_its_vocabulary(),
+        ],
         surfaces: vec![SurfaceConfigRaw {
             subscriptions: vec![brenn_lib::messaging::config::SurfaceSubscriptionRaw {
                 // The stock global push depth is unbounded, which no page queue
@@ -3984,6 +4000,7 @@ fn io_port_consumer(
             .collect(),
         ..minimal_wasm_consumer()
     }
+    .implying_its_vocabulary()
 }
 
 /// Naming an auto channel is what lets a third party reach it — with an
@@ -4570,7 +4587,8 @@ fn io_port_at(address: &str) -> brenn_lib::config::BrennConfig {
             publish_capacity: None,
         }],
         ..minimal_wasm_consumer()
-    };
+    }
+    .implying_its_vocabulary();
     brenn_lib::config::BrennConfig {
         wasm_consumers: vec![consumer],
         ..brenn_lib::config::BrennConfig::default()

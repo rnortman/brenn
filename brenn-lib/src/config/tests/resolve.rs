@@ -836,6 +836,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
         slug: "pa".to_string(),
         package: "colliding".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![ComponentGrant::Mqtt],
         store_path: None,
         store_size_limit: None,

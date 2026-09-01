@@ -7,6 +7,8 @@ use brenn_attach_client::subs::Subscriptions;
 use brenn_attach_proto::DeferredViewEntry;
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
 use brenn_surface_contract::PublishError;
+
+use crate::publish_buffer::PortFault;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::{Binding, ComponentEntry, NoiseLevel, OutputBinding};
 
@@ -470,7 +472,7 @@ fn a_retain_only_binding_is_context_that_wakes_nobody_and_funds_nothing() {
     assert!(ready.buffer.publish("out", "a".into()).is_ok());
     assert_eq!(
         ready.buffer.publish("out", "b".into()),
-        Err(PublishError::QuotaExceeded)
+        Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
 
@@ -1041,6 +1043,9 @@ fn an_index_past_the_window_is_out_of_range() {
     assert!(ready.buffer.defer_cancel("local", 0).is_err());
 }
 
+/// The seeded buffer's vocabulary is the instance's own: a name outside it — a
+/// typo, an input port, another instance's port — is a specification violation
+/// and not a refusal the component reads.
 #[test]
 fn the_buffer_admits_the_instances_own_ports_only() {
     let mut page = Page::standard();
@@ -1048,12 +1053,12 @@ fn the_buffer_admits_the_instances_own_ports_only() {
     assert!(ready.buffer.publish("out", "hi".into()).is_ok());
     assert_eq!(
         ready.buffer.publish("nope", "hi".into()),
-        Err(PublishError::NotPermitted)
+        Err(PortFault::Undeclared("\"nope\"".to_string()))
     );
     // An input port is not a place to publish, and p2's ports are p2's.
     assert_eq!(
         ready.buffer.publish("in", "hi".into()),
-        Err(PublishError::NotPermitted)
+        Err(PortFault::Undeclared("\"in\"".to_string()))
     );
     let flush = ready.buffer.take();
     assert_eq!(flush.publishes.len(), 1);
@@ -1073,7 +1078,7 @@ fn the_grant_counts_new_envelopes_and_not_context() {
     assert!(ready.buffer.publish("out", "c".into()).is_ok());
     assert_eq!(
         ready.buffer.publish("out", "d".into()),
-        Err(PublishError::QuotaExceeded)
+        Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
     page.schedules.finish_ok("p1", ready.buffer.take().carry);
 
@@ -1082,7 +1087,7 @@ fn the_grant_counts_new_envelopes_and_not_context() {
     assert!(second.buffer.publish("out", "e".into()).is_ok());
     assert_eq!(
         second.buffer.publish("out", "f".into()),
-        Err(PublishError::QuotaExceeded)
+        Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
 
@@ -1097,7 +1102,7 @@ fn unspent_millitokens_carry_into_the_next_activation() {
     assert!(second.buffer.publish("out", "b".into()).is_ok());
     assert_eq!(
         second.buffer.publish("out", "c".into()),
-        Err(PublishError::QuotaExceeded)
+        Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
 
@@ -1118,7 +1123,7 @@ fn an_err_counts_the_failure_and_still_returns_the_carry() {
     assert!(second.buffer.publish("out", "a".into()).is_ok());
     assert_eq!(
         second.buffer.publish("out", "b".into()),
-        Err(PublishError::QuotaExceeded)
+        Err(PortFault::Refused(PublishError::QuotaExceeded))
     );
 }
 
@@ -1151,7 +1156,7 @@ fn the_buffer_carries_the_attachments_body_cap() {
     let mut ready = schedules.assemble("p1", 0, &mut ctx);
     assert_eq!(
         ready.buffer.publish("out", "far too long a body".into()),
-        Err(PublishError::InvalidPayload)
+        Err(PortFault::Refused(PublishError::InvalidPayload))
     );
 }
 

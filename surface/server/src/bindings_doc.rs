@@ -107,6 +107,10 @@ pub fn build_bindings_document(
                 kind: c.kind.clone(),
                 parked_batch_depth: c.parked_batch_depth,
                 grants: c.grants.iter().map(|g| g.word().to_string()).collect(),
+                // Sorted by construction: resolution carries the vocabulary as a
+                // `BTreeSet`, and the document's determinism rule needs the order
+                // to be a function of the names alone.
+                declared_out_ports: c.declared_out_ports.iter().cloned().collect(),
                 config: c.config.clone(),
             })
             .collect(),

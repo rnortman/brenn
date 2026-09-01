@@ -37,6 +37,7 @@ fn load_component(name: &str, slug: &str) -> ProcessorComponent {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path(name),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -61,6 +62,7 @@ fn load_dual() -> ProcessorComponent {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_dual"),
         slug: "dual",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -82,6 +84,7 @@ fn load_demo(output_ports: HashMap<String, brenn_wasm::OutputPortSpec>) -> Proce
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo",
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -103,6 +106,29 @@ fn load_demo_with_out() -> ProcessorComponent {
     load_demo(ports)
 }
 
+/// The demo publishing to `"out"`, which the component declares and the deployer
+/// did not wire.
+fn load_demo_declaring_out_unwired() -> ProcessorComponent {
+    let grants = [ComponentGrant::Ports].into_iter().collect();
+    ProcessorComponent::load(ProcessorLoadSpec {
+        component_path: &component_path("brenn_processor_demo"),
+        slug: "demo",
+        declared_out_ports: ["out".to_string()].into_iter().collect(),
+        output_ports: HashMap::new(),
+        input_amplification_mt: common::amp_in(),
+        mqtt_sinks: HashMap::new(),
+        grants,
+        store_path: None,
+        max_page_count: DEFAULT_MAX_PAGE_COUNT,
+        max_payload_bytes: 1024 * 1024,
+        config: HashMap::new(),
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        mqtt_publish: None,
+        tool_host: None,
+    })
+}
+
 fn load_demo_no_ports() -> ProcessorComponent {
     load_demo(HashMap::new())
 }
@@ -115,6 +141,7 @@ fn load_multiport() -> ProcessorComponent {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_multiport"),
         slug: "multiport",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -144,6 +171,7 @@ fn load_store_component(name: &str, slug: &str) -> (ProcessorComponent, tempfile
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path(name),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -198,6 +226,7 @@ fn load_missing_path_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new("/nonexistent/processor.wasm"),
         slug: "test",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -307,30 +336,86 @@ fn handle_webhook_envelope_publishes_inner_body() {
     }
 }
 
-// ── not-permitted publish ─────────────────────────────────────────────────────
-
+/// A bound output port outside the declared vocabulary would make the three-way
+/// rule incoherent — the port would deliver and simultaneously be a contract
+/// violation. Config resolution refuses it; the loader refuses it again, because
+/// a hand-built load spec never passes through that refusal.
 #[test]
-fn handle_webhook_unbound_port_returns_processing_failed() {
-    // Demo has no "out" port bound → publish returns NotPermitted → demo returns
-    // ProcessingFailed (it maps publish errors to processing-failed).
+#[should_panic(expected = "is bound but is not in the component's declared port vocabulary")]
+fn loading_a_bound_port_outside_the_declared_vocabulary_panics() {
+    let mut ports = HashMap::new();
+    ports.insert("out".to_string(), common::out_spec("brenn:test-out"));
+    let _ = ProcessorComponent::load(ProcessorLoadSpec {
+        component_path: &component_path("brenn_processor_demo"),
+        slug: "demo-undeclared-binding",
+        declared_out_ports: std::collections::BTreeSet::new(),
+        output_ports: ports,
+        input_amplification_mt: common::amp_in(),
+        mqtt_sinks: HashMap::new(),
+        grants: [ComponentGrant::Ports].into_iter().collect(),
+        store_path: None,
+        max_page_count: DEFAULT_MAX_PAGE_COUNT,
+        max_payload_bytes: 1024 * 1024,
+        config: HashMap::new(),
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        mqtt_publish: None,
+        tool_host: None,
+    });
+}
+
+// ── the three-way publish rule, end to end ───────────────────────────────────
+
+/// The demo declares `"out"` and the deployer left it unwired: the publish
+/// succeeds, the guest returns ok, and no message reaches the host. The
+/// component cannot tell this activation from one whose channel had no
+/// subscribers.
+#[test]
+fn handle_webhook_declared_unwired_port_succeeds_and_delivers_nothing() {
+    let comp = load_demo_declaring_out_unwired();
+    let activation = single_port_activation("in", vec![webhook_envelope("some-payload")], 0);
+    match comp.handle(activation) {
+        ProcessorOutcome::Ok { publishes, .. } => {
+            assert!(
+                publishes.is_empty(),
+                "a publish to an unwired port delivers nothing, got {publishes:?}"
+            );
+        }
+        other => panic!("expected Ok with no publish, got {other:?}"),
+    }
+}
+
+/// The demo publishes to `"out"` while declaring no ports at all — the artifact
+/// contradicting its own hash-bound specification. The activation traps, and the
+/// diagnostic names the component, the port and the reason.
+#[test]
+fn handle_webhook_undeclared_port_traps_the_activation() {
     let comp = load_demo_no_ports();
     let activation = single_port_activation("in", vec![webhook_envelope("some-payload")], 0);
-    assert!(
-        matches!(comp.handle(activation), ProcessorOutcome::Err(_)),
-        "unbound port must surface as Err(processing-failed)"
-    );
+    match comp.handle(activation) {
+        ProcessorOutcome::Trap(diagnostic) => {
+            assert!(
+                diagnostic.contains("demo")
+                    && diagnostic.contains("out")
+                    && diagnostic.contains("not declared"),
+                "the trap diagnostic must be attributable, got {diagnostic:?}"
+            );
+        }
+        other => panic!("expected a trap for an undeclared port, got {other:?}"),
+    }
 }
 
 // ── output-ACL deny / allow (end-to-end through handle) ───────────────────────
 
 /// Load the demo component with `out` bound to `brenn:secret` and a caller-supplied
-/// output ACL, so the publish-ACL gate (design §2.3) can be driven through `handle()`.
+/// output ACL, so the publish-ACL gate can be driven through `handle()`.
 fn load_demo_out_with_acl(channel: &str, acl: brenn_wasm::OutputAclFn) -> ProcessorComponent {
     let mut ports = HashMap::new();
     ports.insert("out".to_string(), common::out_spec(channel));
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-acl",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -347,9 +432,9 @@ fn load_demo_out_with_acl(channel: &str, acl: brenn_wasm::OutputAclFn) -> Proces
 }
 
 /// Bound port whose channel is outside the output ACL: `do_publish` returns
-/// `NotPermitted`, the demo maps it to `ProcessingFailed`, and nothing is buffered
-/// (design §2.3, §4 "Publish-ACL deny"). The guest-visible result is identical to
-/// an unbound port — `handle_webhook_unbound_port_returns_processing_failed`.
+/// `NotPermitted`, the demo maps it to `ProcessingFailed`, and nothing is buffered.
+/// The guest-visible result is identical to a bound port whose channel is denied;
+/// wiring itself is never observable.
 #[test]
 fn handle_webhook_bound_port_outside_output_acl_returns_processing_failed() {
     // Deny exactly the bound channel.
@@ -367,9 +452,8 @@ fn handle_webhook_bound_port_outside_output_acl_returns_processing_failed() {
     );
 }
 
-/// Positive pair: a bound port whose channel the ACL permits publishes normally
-/// (design §4 "Pair with a positive case"). Proves the gate does not reject an
-/// in-allowlist channel.
+/// Positive pair: a bound port whose channel the ACL permits publishes normally.
+/// Proves the gate does not reject an in-allowlist channel.
 #[test]
 fn handle_webhook_bound_port_inside_output_acl_publishes() {
     // Allow exactly the bound channel.
@@ -401,6 +485,7 @@ fn handle_oversized_payload_returns_processing_failed() {
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-tiny",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -488,6 +573,7 @@ fn two_webhook_envelopes_produce_two_buffered_publishes() {
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-multi",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
@@ -546,6 +632,7 @@ fn load_demo_budgeted(
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-budget",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: HashMap::from([("in".to_string(), amp_mt)]),
         mqtt_sinks: HashMap::new(),
@@ -1360,6 +1447,7 @@ fn run_wat_processor(slug: &str, wat_src: &str) -> ProcessorOutcome {
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: wasm_file.path(),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),

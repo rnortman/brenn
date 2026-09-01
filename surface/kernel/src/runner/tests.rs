@@ -9,6 +9,8 @@
 //! rule. So the run hands the page back, and the two drain tests read the plane it
 //! wrote and what the reader's entry was shown off it.
 
+use crate::publish_buffer::PortFault;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1376,6 +1378,76 @@ async fn a_trapped_entry_takes_its_instance_terminal() {
         Event::InstanceFailed { instance, reason }
             if instance == "p2" && reason == "the component fell over at rung 7"
     ));
+    running.task.abort();
+}
+
+/// A publish to a port outside the component's declared vocabulary is a
+/// contract violation, and the seam that observes it ends the activation.
+///
+/// The entry stands in for the browser's port export, which answers the
+/// contract's error words for a refusal and throws for a violation; a native
+/// entry says the same thing with a panic, which is what `invoke_native` reads as
+/// a trap. What is under test is the fold beyond that: trap ⇒ the instance is
+/// terminal, with the violation's own reason on both events.
+#[tokio::test(start_paused = true)]
+async fn an_undeclared_publish_traps_and_takes_its_instance_terminal() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    mount(
+        &mut running,
+        "p1",
+        Box::new(
+            |_, buffer| match buffer.publish("ghost", "hi".to_string()) {
+                Err(PortFault::Undeclared(port)) => panic!("undeclared port {port}"),
+                other => panic!("expected a vocabulary violation, got {other:?}"),
+            },
+        ),
+    );
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+
+    assert!(matches!(
+        running.event().await,
+        Event::ActivationFailed { instance, message }
+            if instance == "p1" && message.contains("undeclared port \"ghost\"")
+    ));
+    assert!(matches!(
+        running.event().await,
+        Event::InstanceFailed { instance, reason }
+            if instance == "p1" && reason.contains("undeclared port \"ghost\"")
+    ));
+    running.task.abort();
+}
+
+/// A declared port the deployer did not wire answers ok and delivers nothing: the
+/// instance runs on, and the flush carries no entry for it.
+///
+/// `narrowed_doc` is exactly that shape — it is `reporting_doc` with `p1`'s wire
+/// output binding removed, which leaves `out` in the vocabulary the components
+/// declare and out of the bound-output table.
+#[tokio::test(start_paused = true)]
+async fn a_publish_to_an_unwired_declared_port_delivers_nothing_and_runs_on() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach_with(&mut running, &feed, &narrowed_doc()).await;
+
+    let seen = Seen::default();
+    mount(&mut running, "p1", publishing(&seen, "out", "dropped"));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+
+    wait_until(|| seen.count() == 1).await;
+    assert!(
+        !controls.written().iter().any(|w| w.contains("dropped")),
+        "an unwired port publishes nowhere: {:?}",
+        controls.written()
+    );
     running.task.abort();
 }
 

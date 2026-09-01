@@ -605,6 +605,12 @@ mod processor_bindings {
         with: {
             "brenn:processor/store.transaction": crate::store::Transaction,
         },
+        // The `ports` entry points are the only imports that can end an
+        // activation rather than answer it: a publish naming a port the
+        // component's specification does not declare is a contract violation, and
+        // the host traps instead of refusing call by call. Every other interface
+        // keeps the plain result signature.
+        imports: { "brenn:processor/ports": trappable },
     });
 }
 
@@ -1165,6 +1171,10 @@ struct ProcessorData {
     kv_store: Option<Arc<KvStore>>,
     /// Logical port name → resolved binding + per-sink budget.
     output_ports: Arc<HashMap<String, OutputPortSpec>>,
+    /// The specification's declared `out`/`io` port vocabulary. A publish names
+    /// a bound port (delivered), a declared-but-unwired port (dropped), or
+    /// nothing in here at all (a contract violation that traps the activation).
+    declared_out_ports: Arc<std::collections::BTreeSet<String>>,
     config: Arc<HashMap<String, String>>,
     slug: Arc<str>,
     /// The shared per-activation gate: the payload cap, the per-sink millitoken
@@ -1256,35 +1266,58 @@ fn defer_error(refusal: GateRefusal) -> DeferError {
     }
 }
 
+/// The trap that ends an activation which named a port the component's
+/// specification does not declare, on a publish or on a deferred control op.
+///
+/// The artifact is hash-bound to that specification, so a name outside its
+/// declared vocabulary is the component contradicting its own author. The port
+/// name is guest-controlled and reaches a diagnostic string, so it is capped and
+/// debug-escaped exactly as it is on the logging paths.
+fn undeclared_port_trap(slug: &str, port: &str) -> wasmtime::Error {
+    wasmtime::Error::msg(format!(
+        "processor {slug}: named port {} — not declared by the component's \
+         specification",
+        cap_guest_for_log(port),
+    ))
+}
+
 impl ProcessorData {
     /// Inner publish implementation shared by `publish` and `publish_with_urgency`.
     ///
     /// `guest_urgency` is `Some(u)` for an explicit guest-supplied urgency (from
     /// `publish-with-urgency`) or `None` to use the port's configured default.
+    ///
+    /// The port name lands in one of three places. A **bound** port delivers. A
+    /// port the specification **declares** that the deployer did not wire is a
+    /// sink with no channel: the publish succeeds and the message is dropped,
+    /// because wiring is the deployer's business and a guest does not get to read
+    /// deployment topology out of error codes. A port the specification does not
+    /// declare at all is a contract violation, and the outer `Err` traps the
+    /// activation.
     fn do_publish(
         &mut self,
         port: String,
         payload: String,
         guest_urgency: Option<processor_bindings::brenn::processor::ports::Urgency>,
         deliver_after: Option<u64>,
-    ) -> Result<(), PublishError> {
+    ) -> wasmtime::Result<Result<(), PublishError>> {
         // Per-activation total-call budget (successful + failed).
         // Checked first to bound log-flood DoS from repeated unbound-port calls by
         // hostile out-of-tree components. Failed calls consume budget because they
         // are otherwise free from the attacker's perspective (no payload bytes, no
-        // successful buffer slot used).
-        self.gate.charge_call().map_err(publish_error)?;
+        // successful buffer slot used). It is charged ahead of the vocabulary
+        // check too, so a component looping on undeclared publishes cannot escape
+        // the flood bound by trapping instead of being refused.
+        if let Err(refusal) = self.gate.charge_call() {
+            return Ok(Err(publish_error(refusal)));
+        }
 
-        // Resolve port name → binding + budget (attenuation check).
-        // Port name is guest-controlled: cap and debug-escape before logging to prevent
-        // multi-megabyte log lines or ANSI-escape injection into the host log pipeline.
-        let Some(spec) = self.output_ports.get(&port) else {
-            warn!(
-                slug = %self.slug,
-                port = %cap_guest_for_log(&port),
-                "wasm publish: not-permitted — unbound port"
-            );
-            return Err(PublishError::NotPermitted);
+        // Resolve port name → binding + budget (attenuation check). Held through a
+        // local `Arc` so the lookup does not borrow `self` across the gate charges
+        // below.
+        let output_ports = Arc::clone(&self.output_ports);
+        let Some(spec) = output_ports.get(&port) else {
+            return self.publish_unwired(port, payload, deliver_after);
         };
         let channel_address = &spec.channel_address;
         let port_default_urgency = &spec.default_urgency;
@@ -1303,7 +1336,7 @@ impl ProcessorData {
                 channel = %channel_address,
                 "wasm publish: not-permitted — channel outside output ACL"
             );
-            return Err(PublishError::NotPermitted);
+            return Ok(Err(PublishError::NotPermitted));
         }
         use processor_bindings::brenn::processor::ports::Urgency as WitUrgency;
         let urgency = match guest_urgency {
@@ -1328,7 +1361,7 @@ impl ProcessorData {
             if refusal == GateRefusal::SinkExhausted {
                 *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
             }
-            return Err(publish_error(refusal));
+            return Ok(Err(publish_error(refusal)));
         }
         self.publish_buffer.push(ProcessorPublish {
             port,
@@ -1338,21 +1371,67 @@ impl ProcessorData {
             reply_to: None,
             deliver_after,
         });
-        Ok(())
+        Ok(Ok(()))
+    }
+
+    /// The publish path for a port with no binding: either a declared port the
+    /// deployer left unwired, or a name outside the specification entirely.
+    ///
+    /// Unwired is not a short-circuit. Everything a bound publish validates that
+    /// does not need a sink still runs, in the same order, and charges the same
+    /// activation-wide counters — the payload cap, `deliver-after`
+    /// representability, the buffered-entry ceiling and the byte aggregate. Only
+    /// what exists solely to serve a sink is skipped: the per-sink bucket, the
+    /// output ACL, the buffer, and the carry. Answering `Ok` where a bound port
+    /// answers `invalid-payload` would hand the guest its own wiring back through
+    /// the error codes the attenuation doctrine hides.
+    fn publish_unwired(
+        &mut self,
+        port: String,
+        payload: String,
+        deliver_after: Option<u64>,
+    ) -> wasmtime::Result<Result<(), PublishError>> {
+        if !self.declared_out_ports.contains(&port) {
+            return Err(undeclared_port_trap(&self.slug, &port));
+        }
+        if let Err(refusal) = self.gate.admit_publish_without_sink(
+            payload.len(),
+            deliver_after,
+            self.tool_request_buffer.len(),
+        ) {
+            return Ok(Err(publish_error(refusal)));
+        }
+        // Logged only once the gate has accepted, so the line names a message
+        // that was really dropped rather than one the gate went on to refuse.
+        // Port name is guest-controlled: cap and debug-escape before logging to
+        // prevent multi-megabyte log lines or ANSI-escape injection into the host
+        // log pipeline. `debug!` because an unwired declared port is a legitimate
+        // deployment, visible in dev without being prod noise.
+        debug!(
+            slug = %self.slug,
+            port = %cap_guest_for_log(&port),
+            "wasm publish: dropped — declared port is not wired"
+        );
+        Ok(Ok(()))
     }
 
     /// Buffer one deferred-message control op (`defer-cancel` / `defer-edit`).
     ///
     /// Validation is fail-fast at buffer time, while the guest still holds the
-    /// error channel: an unbound port is `NotPermitted`, an `index` outside the
-    /// deferred window this activation delivered for the port is `OutOfRange` (a
-    /// guest bug), and everything budgetary is the shared gate's — including an
-    /// edit payload, which is capped and charged exactly as a published payload
-    /// is. The actual cancel/edit is applied at flush by the host, which
-    /// resolves `index` against the snapshot's captured identities — so a message
-    /// that releases between drain and flush is a benign no-op there, not an error
-    /// here.
-    fn do_defer(&mut self, op: ProcessorDeferredOp) -> Result<(), DeferError> {
+    /// error channel: an `index` outside the deferred window this activation
+    /// delivered for the port is `OutOfRange` (a guest bug), and everything
+    /// budgetary is the shared gate's — including an edit payload, which is
+    /// capped and charged exactly as a published payload is. The actual
+    /// cancel/edit is applied at flush by the host, which resolves `index`
+    /// against the snapshot's captured identities — so a message that releases
+    /// between drain and flush is a benign no-op there, not an error here.
+    ///
+    /// The port name is judged by the same three-way rule `do_publish` applies. A
+    /// declared port the deployer did not wire has an empty deferred window —
+    /// windows exist only for bound outputs — so every index is `OutOfRange`
+    /// there, which is what the guest gets. A port outside the specification's
+    /// vocabulary traps.
+    fn do_defer(&mut self, op: ProcessorDeferredOp) -> wasmtime::Result<Result<(), DeferError>> {
         let (port, index) = match &op {
             ProcessorDeferredOp::Cancel { port, index } => (port, *index),
             ProcessorDeferredOp::Edit { port, index, .. } => (port, *index),
@@ -1371,32 +1450,35 @@ impl ProcessorData {
         // Ahead of the call charge, so this one refusal draws no slot: it reads
         // the argument and returns, touching no map and writing no log, and the
         // activation deadline bounds a guest that loops on it.
-        check_deliver_after(edit_deliver_after).map_err(defer_error)?;
+        if let Err(refusal) = check_deliver_after(edit_deliver_after) {
+            return Ok(Err(defer_error(refusal)));
+        }
         // Per-activation total-call budget, shared with `do_publish` (anti-flood):
         // every op that gets this far consumes budget whether or not it is
         // accepted, so a guest cannot flood the host with failing control ops for
         // free.
-        self.gate.charge_call().map_err(defer_error)?;
-        // Port must be a bound output port. `port` is guest-controlled: cap and
-        // debug-escape before logging, like `do_publish`.
-        if !self.output_ports.contains_key(port) {
-            warn!(
-                slug = %self.slug,
-                port = %cap_guest_for_log(port),
-                "wasm defer control: not-permitted — unbound port"
-            );
-            return Err(DeferError::NotPermitted);
+        if let Err(refusal) = self.gate.charge_call() {
+            return Ok(Err(defer_error(refusal)));
+        }
+        // The port must be in the specification's declared vocabulary; a name
+        // outside it is the component contradicting its own author, and the
+        // activation ends here rather than at every call.
+        if !self.declared_out_ports.contains(port) {
+            return Err(undeclared_port_trap(&self.slug, port));
         }
         // Index must be within the deferred window this activation delivered for
         // the port. An absent port bound is 0 (no deferred entries delivered), so
-        // any index is out of range there.
+        // any index is out of range there — which is also the whole of the answer
+        // for a declared port the deployer did not wire.
         let bound = self.deferred_index_bounds.get(port).copied().unwrap_or(0);
         if index >= bound {
-            return Err(DeferError::OutOfRange);
+            return Ok(Err(DeferError::OutOfRange));
         }
-        self.gate.admit_op(edit_payload_len).map_err(defer_error)?;
+        if let Err(refusal) = self.gate.admit_op(edit_payload_len) {
+            return Ok(Err(defer_error(refusal)));
+        }
         self.deferred_op_buffer.push(op);
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// Drain the activation's buffered deferred control ops. Called only on a
@@ -1549,8 +1631,16 @@ impl ProcessorData {
     }
 }
 
+/// The five `ports` entry points are trappable imports: the outer
+/// `wasmtime::Result` is the host's own verdict on whether the activation may
+/// continue, and the inner result is what the guest sees. Only a publish naming
+/// a port outside the component's declared vocabulary takes the outer `Err`.
 impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
-    fn publish(&mut self, port: String, payload: String) -> Result<(), PublishError> {
+    fn publish(
+        &mut self,
+        port: String,
+        payload: String,
+    ) -> wasmtime::Result<Result<(), PublishError>> {
         self.do_publish(port, payload, None, None)
     }
 
@@ -1559,7 +1649,7 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         port: String,
         payload: String,
         urgency: processor_bindings::brenn::processor::ports::Urgency,
-    ) -> Result<(), PublishError> {
+    ) -> wasmtime::Result<Result<(), PublishError>> {
         self.do_publish(port, payload, Some(urgency), None)
     }
 
@@ -1568,12 +1658,16 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         port: String,
         payload: String,
         deliver_after: u64,
-    ) -> Result<(), PublishError> {
+    ) -> wasmtime::Result<Result<(), PublishError>> {
         // No clock read here; the host decides park-vs-immediate at flush.
         self.do_publish(port, payload, None, Some(deliver_after))
     }
 
-    fn defer_cancel(&mut self, port: String, index: u32) -> Result<(), DeferError> {
+    fn defer_cancel(
+        &mut self,
+        port: String,
+        index: u32,
+    ) -> wasmtime::Result<Result<(), DeferError>> {
         self.do_defer(ProcessorDeferredOp::Cancel { port, index })
     }
 
@@ -1583,7 +1677,7 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         index: u32,
         payload: Option<String>,
         deliver_after: Option<u64>,
-    ) -> Result<(), DeferError> {
+    ) -> wasmtime::Result<Result<(), DeferError>> {
         self.do_defer(ProcessorDeferredOp::Edit {
             port,
             index,
@@ -1591,6 +1685,41 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
             deliver_after,
         })
     }
+}
+
+/// Test-only conveniences for the publish and defer paths.
+///
+/// Both assert that the port is in the component's declared vocabulary, so a
+/// test whose subject is something else does not have to thread the outer
+/// trap result through every assertion. The vocabulary trap itself is exercised
+/// through `do_publish` / `do_defer` directly.
+#[cfg(test)]
+impl ProcessorData {
+    fn do_publish_declared(
+        &mut self,
+        port: String,
+        payload: String,
+        guest_urgency: Option<processor_bindings::brenn::processor::ports::Urgency>,
+        deliver_after: Option<u64>,
+    ) -> Result<(), PublishError> {
+        self.do_publish(port, payload, guest_urgency, deliver_after)
+            .expect("the port is in the component's declared vocabulary")
+    }
+
+    fn do_defer_declared(&mut self, op: ProcessorDeferredOp) -> Result<(), DeferError> {
+        self.do_defer(op)
+            .expect("the port is in the component's declared vocabulary")
+    }
+}
+
+/// Bind `ports` as the data's output ports and declare exactly those names — a
+/// component whose deployer wired every port its author declared.
+///
+/// A test about an unwired declared port widens `declared_out_ports` itself.
+#[cfg(test)]
+fn bind_ports(data: &mut ProcessorData, ports: HashMap<String, OutputPortSpec>) {
+    data.declared_out_ports = Arc::new(ports.keys().cloned().collect());
+    data.output_ports = Arc::new(ports);
 }
 
 // --- mqtt::Host impl ---
@@ -1792,8 +1921,8 @@ impl ProcessorData {
         // so they are not part of its count.
         assert_eq!(
             self.gate.entries(),
-            self.publish_buffer.len(),
-            "every buffered publish must have been admitted by the gate"
+            self.publish_buffer.len() + self.gate.dropped(),
+            "every publish the gate admitted must be buffered or accounted a drop"
         );
         let mut publishes = std::mem::take(&mut self.publish_buffer);
         for req in std::mem::take(&mut self.tool_request_buffer) {
@@ -2239,6 +2368,13 @@ pub struct ProcessorLoadSpec<'a> {
     pub slug: &'a str,
     /// Logical port name → resolved binding + per-sink publish budget.
     pub output_ports: HashMap<String, OutputPortSpec>,
+    /// Every port name the component's specification declares with direction
+    /// `out` or `io` — the complete vocabulary this component may legally
+    /// publish to, wired or not. A superset of `output_ports`' keys: a declared
+    /// port the deployer chose not to bind is here and not there, and a publish
+    /// to it is dropped rather than refused. A name absent from this set is a
+    /// contract violation and traps the activation.
+    pub declared_out_ports: std::collections::BTreeSet<String>,
     /// Logical input port name → publish amplification in millitokens. Every
     /// bound input port must appear (windows are built from the same config);
     /// a missing entry for a driven window is a host invariant violation.
@@ -2292,6 +2428,9 @@ pub struct ProcessorComponent {
     kv_store: Option<Arc<KvStore>>,
     /// Logical port name → resolved binding + per-sink publish budget.
     output_ports: Arc<HashMap<String, OutputPortSpec>>,
+    /// The specification's declared `out`/`io` port vocabulary; a superset of
+    /// `output_ports`' keys, asserted so at load.
+    declared_out_ports: Arc<std::collections::BTreeSet<String>>,
     /// Logical input port name → publish amplification in millitokens.
     input_amplification_mt: Arc<HashMap<String, u64>>,
     /// ACL-allowed MQTT client slug → per-sink publish budget.
@@ -2507,6 +2646,18 @@ impl ProcessorComponent {
         // the map self-describing.
         let mut publish_carry: HashMap<SinkKey, u64> = HashMap::new();
         for port in spec.output_ports.keys() {
+            // A bound port outside the declared vocabulary would make the host's
+            // three-way publish rule incoherent — the port would deliver and
+            // simultaneously be a contract violation. Config resolution already
+            // refuses it; asserted again because a hand-built load spec reaches
+            // this loader without passing through that refusal.
+            assert!(
+                spec.declared_out_ports.contains(port),
+                "processor {}: output port {port:?} is bound but is not in the \
+                 component's declared port vocabulary {:?}",
+                spec.slug,
+                spec.declared_out_ports,
+            );
             publish_carry.insert(SinkKey::Port(port.clone()), 0);
         }
         for client in spec.mqtt_sinks.keys() {
@@ -2518,6 +2669,7 @@ impl ProcessorComponent {
             processor_pre,
             kv_store,
             output_ports: Arc::new(spec.output_ports),
+            declared_out_ports: Arc::new(spec.declared_out_ports),
             input_amplification_mt: Arc::new(spec.input_amplification_mt),
             mqtt_sinks: Arc::new(spec.mqtt_sinks),
             publish_carry: std::sync::Mutex::new(publish_carry),
@@ -2627,6 +2779,7 @@ impl ProcessorComponent {
                 limits,
                 kv_store: self.kv_store.clone(),
                 output_ports: Arc::clone(&self.output_ports),
+                declared_out_ports: Arc::clone(&self.declared_out_ports),
                 config: Arc::clone(&self.config),
                 slug: Arc::clone(&self.slug),
                 gate: ActivationGate::new(self.max_payload_bytes, publish_budget_by_sink),
@@ -2893,6 +3046,19 @@ impl ProcessorComponent {
                 );
             }
 
+            // Publishes to a declared-but-unwired port: one line per activation
+            // with the count, not one per call. A drop is a legitimate
+            // deployment, so this is `debug!` like its per-call sibling — but it
+            // is the only account of messages that were published and never
+            // arrived, which nothing else on this host reports.
+            if data.gate.dropped() > 0 {
+                debug!(
+                    slug = %data.slug,
+                    dropped = data.gate.dropped(),
+                    "wasm publishes dropped — declared ports are not wired"
+                );
+            }
+
             // Write the remaining per-sink budget back as carryover (uncapped; the
             // capacity clamp applies at the next activation start). Consumed tokens
             // are not refunded on failure — a crash-retry loop must not amplify. The
@@ -3082,6 +3248,7 @@ mod processor_store_host_tests {
             limits: StoreLimitsBuilder::new().build(),
             kv_store: Some(Arc::clone(&kv)),
             output_ports: Arc::new(HashMap::new()),
+            declared_out_ports: Arc::new(std::collections::BTreeSet::new()),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),
@@ -3101,18 +3268,36 @@ mod processor_store_host_tests {
         (db, kv, data)
     }
 
+    /// A port the component declares and the deployer did not wire: publishing
+    /// there is legal and the message is dropped.
+    const UNWIRED_PORT: &str = "unwired";
+
+    /// A port name outside the component's declared vocabulary entirely:
+    /// publishing there is a contract violation and traps.
+    const UNDECLARED_PORT: &str = "nope";
+
     /// Build a `ProcessorData` with a single bound output port (`"out"` →
     /// `channel_address`) and a caller-supplied `output_acl`, for exercising the
-    /// `do_publish` output-ACL gate (design §2.3) at the host-fn level.
+    /// `do_publish` output-ACL gate at the host-fn level.
+    ///
+    /// The declared vocabulary is `"out"` plus [`UNWIRED_PORT`], so every test
+    /// built on this data has all three publish cases within reach: the bound
+    /// port, the declared-unwired port, and any other name at all.
     fn make_publish_data(channel_address: &str, output_acl: OutputAclFn) -> ProcessorData {
         let mut ports = HashMap::new();
         ports.insert("out".to_string(), test_out_spec(channel_address));
         let mut budgets = HashMap::new();
         budgets.insert(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT);
+        let declared: std::collections::BTreeSet<String> = ports
+            .keys()
+            .cloned()
+            .chain(std::iter::once(UNWIRED_PORT.to_string()))
+            .collect();
         ProcessorData {
             resource_table: ResourceTable::new(),
             limits: StoreLimitsBuilder::new().build(),
             kv_store: None,
+            declared_out_ports: Arc::new(declared),
             output_ports: Arc::new(ports),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
@@ -3132,10 +3317,152 @@ mod processor_store_host_tests {
         }
     }
 
+    /// A publish to a declared port the deployer did not wire succeeds and the
+    /// message is dropped. The guest sees `Ok`, nothing buffers, and no sink is
+    /// charged — there is no sink. Publishing to nowhere is as legal as
+    /// publishing to a channel with zero subscribers.
+    #[test]
+    fn a_declared_unwired_port_drops_the_message_and_answers_ok() {
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        data.do_publish_declared(UNWIRED_PORT.to_string(), "body".to_string(), None, None)
+            .expect("publishing to a declared port is legal wired or not");
+        assert!(
+            data.publish_buffer.is_empty(),
+            "a dropped publish buffers nothing"
+        );
+        // The activation-wide counters are charged exactly as a bound publish
+        // charges them; only the per-sink bucket is untouched.
+        assert_eq!(data.gate.entries(), 1);
+        assert_eq!(data.gate.bytes(), 4);
+        assert_eq!(data.gate.calls(), 1);
+        assert_eq!(
+            data.gate.sinks()[&SinkKey::Port("out".to_string())],
+            TEST_GENEROUS_MT
+        );
+        assert!(data.publish_suppressed_by_sink.is_empty());
+    }
+
+    /// A deferred publish to a declared unwired port takes the same drop: the
+    /// guest sees `Ok`, nothing buffers, and no park is scheduled against a port
+    /// that has no channel to release onto.
+    #[test]
+    fn a_declared_unwired_port_drops_a_deferred_publish_and_answers_ok() {
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        data.do_publish_declared(
+            UNWIRED_PORT.to_string(),
+            "body".to_string(),
+            None,
+            Some(4_000_000_000_000),
+        )
+        .expect("a representable release time on a declared port is legal");
+        assert!(
+            data.publish_buffer.is_empty(),
+            "a dropped deferred publish schedules nothing"
+        );
+        assert_eq!(data.gate.dropped(), 1);
+        assert_eq!(data.gate.entries(), 1);
+        assert_eq!(
+            data.gate.sinks()[&SinkKey::Port("out".to_string())],
+            TEST_GENEROUS_MT,
+            "there is no sink to charge"
+        );
+    }
+
+    /// The drop path is not a short-circuit: every buffer-time refusal a bound
+    /// port can answer with, that does not need a sink, an unwired port answers
+    /// with identically. Were it to answer `Ok` where the bound port beside it
+    /// says `invalid-payload`, the guest could read its own wiring straight out
+    /// of the error codes the attenuation doctrine hides.
+    #[test]
+    fn the_drop_path_validates_exactly_as_the_bound_path_does() {
+        let oversize = "x".repeat(1025);
+        // Oversize payload ⇒ invalid-payload, on both ports.
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        let bound = data
+            .do_publish_declared("out".to_string(), oversize.clone(), None, None)
+            .expect_err("a payload over the cap is refused on a bound port");
+        let unwired = data
+            .do_publish_declared(UNWIRED_PORT.to_string(), oversize, None, None)
+            .expect_err("and on an unwired one");
+        assert!(matches!(bound, PublishError::InvalidPayload(_)));
+        assert!(matches!(unwired, PublishError::InvalidPayload(_)));
+
+        // Unrepresentable deliver-after ⇒ invalid-payload on the publish path
+        // (the WIT `publish-error` has no release-time variant), on both.
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        let bound = data
+            .do_publish_declared("out".to_string(), "b".to_string(), None, Some(u64::MAX))
+            .expect_err("an unrepresentable release time is refused on a bound port");
+        let unwired = data
+            .do_publish_declared(
+                UNWIRED_PORT.to_string(),
+                "b".to_string(),
+                None,
+                Some(u64::MAX),
+            )
+            .expect_err("and on an unwired one");
+        assert!(matches!(bound, PublishError::InvalidPayload(_)));
+        assert!(matches!(unwired, PublishError::InvalidPayload(_)));
+
+        // The aggregate backstops ⇒ quota-exceeded. Drops charge the entry
+        // ceiling, so filling it with drops refuses the next publish to either
+        // port.
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        for _ in 0..MAX_PUBLISHES_PER_ACTIVATION {
+            data.do_publish_declared(UNWIRED_PORT.to_string(), "x".to_string(), None, None)
+                .expect("under the entry ceiling");
+        }
+        let unwired = data
+            .do_publish_declared(UNWIRED_PORT.to_string(), "x".to_string(), None, None)
+            .expect_err("the entry ceiling counts drops");
+        let bound = data
+            .do_publish_declared("out".to_string(), "x".to_string(), None, None)
+            .expect_err("and it is the one ceiling both paths answer to");
+        assert!(matches!(unwired, PublishError::QuotaExceeded));
+        assert!(matches!(bound, PublishError::QuotaExceeded));
+    }
+
+    /// A publish naming a port the component's specification never declared is a
+    /// contract violation: the host traps the activation rather than refusing
+    /// call by call. The diagnostic names the slug, the port, and the reason.
+    #[test]
+    fn an_undeclared_port_traps_the_activation() {
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        let trap = data
+            .do_publish(UNDECLARED_PORT.to_string(), "body".to_string(), None, None)
+            .expect_err("an undeclared port must trap");
+        let msg = format!("{trap}");
+        assert!(
+            msg.contains("test-slug")
+                && msg.contains(UNDECLARED_PORT)
+                && msg.contains("not declared"),
+            "the trap must name the component, the port and the reason, got {msg:?}"
+        );
+        assert!(data.publish_buffer.is_empty());
+        // The call is charged before the vocabulary is consulted, so a component
+        // cannot dodge the flood bound by trapping instead of being refused.
+        assert_eq!(data.gate.calls(), 1);
+    }
+
+    /// The call ceiling is charged ahead of the vocabulary check, so a component
+    /// that has already spent its calls gets the budget refusal rather than the
+    /// trap — the flood bound answers first, on every port name.
+    #[test]
+    fn the_call_ceiling_answers_before_the_vocabulary_does() {
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            let _ = data.do_publish_declared(UNWIRED_PORT.to_string(), "x".to_string(), None, None);
+        }
+        let err = data
+            .do_publish(UNDECLARED_PORT.to_string(), "x".to_string(), None, None)
+            .expect("a spent call ceiling answers before the vocabulary check")
+            .expect_err("and it answers with a refusal");
+        assert!(matches!(err, PublishError::QuotaExceeded));
+    }
+
     /// Output-ACL deny: a bound port whose channel is rejected by `output_acl`
-    /// returns `PublishError::NotPermitted` and buffers nothing (design §2.3, §4
-    /// "Publish-ACL deny"). Reuses the same guest-visible variant as an unbound
-    /// port; the bound channel is denied because it is outside the allowlist.
+    /// returns `PublishError::NotPermitted` and buffers nothing. An unwired
+    /// declared port never reaches this gate — there is no channel to judge.
     #[test]
     fn do_publish_acl_deny_returns_not_permitted_and_buffers_nothing() {
         // Deny exactly the bound channel.
@@ -3143,7 +3470,7 @@ mod processor_store_host_tests {
         let mut data = make_publish_data("brenn:secret", acl);
 
         let err = data
-            .do_publish("out".to_string(), "payload".to_string(), None, None)
+            .do_publish_declared("out".to_string(), "payload".to_string(), None, None)
             .expect_err("publish to a channel outside the output ACL must be denied");
         assert!(
             matches!(err, PublishError::NotPermitted),
@@ -3176,7 +3503,7 @@ mod processor_store_host_tests {
         let acl: OutputAclFn = Arc::new(|addr: &str| addr == "brenn:allowed");
         let mut data = make_publish_data("brenn:allowed", acl);
 
-        data.do_publish("out".to_string(), "payload".to_string(), None, None)
+        data.do_publish_declared("out".to_string(), "payload".to_string(), None, None)
             .expect("publish to an in-allowlist channel must succeed");
         assert_eq!(
             data.publish_buffer.len(),
@@ -3203,7 +3530,7 @@ mod processor_store_host_tests {
         let mut data = make_publish_data("brenn:allowed", acl);
 
         let err = data
-            .do_publish(
+            .do_publish_declared(
                 "out".to_string(),
                 "payload".to_string(),
                 None,
@@ -3226,7 +3553,7 @@ mod processor_store_host_tests {
         );
 
         // A representable future time buffers normally.
-        data.do_publish(
+        data.do_publish_declared(
             "out".to_string(),
             "payload".to_string(),
             None,
@@ -3252,7 +3579,7 @@ mod processor_store_host_tests {
         let mut data = make_publish_data("brenn:allowed", acl);
 
         let err = data
-            .do_publish("out".to_string(), "x".repeat(1025), None, None)
+            .do_publish_declared("out".to_string(), "x".repeat(1025), None, None)
             .expect_err("a payload one byte over the cap must be refused");
         let PublishError::InvalidPayload(detail) = &err else {
             panic!("an oversize payload must be invalid-payload, got {err:?}");
@@ -3264,7 +3591,7 @@ mod processor_store_host_tests {
         assert_eq!(data.publish_buffer.len(), 0);
         assert_eq!(data.gate.bytes(), 0);
 
-        data.do_publish("out".to_string(), "x".repeat(1024), None, None)
+        data.do_publish_declared("out".to_string(), "x".repeat(1024), None, None)
             .expect("a payload exactly at the cap must buffer");
         assert_eq!(data.publish_buffer.len(), 1);
     }
@@ -3285,12 +3612,12 @@ mod processor_store_host_tests {
     #[test]
     fn do_defer_buffers_valid_ops() {
         let mut data = make_defer_data(2);
-        data.do_defer(ProcessorDeferredOp::Cancel {
+        data.do_defer_declared(ProcessorDeferredOp::Cancel {
             port: "out".to_string(),
             index: 0,
         })
         .expect("index 0 is within the 2-entry window");
-        data.do_defer(ProcessorDeferredOp::Edit {
+        data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 1,
             payload: Some("new".to_string()),
@@ -3324,7 +3651,7 @@ mod processor_store_host_tests {
     fn do_defer_index_out_of_range_is_rejected_at_buffer_time() {
         let mut data = make_defer_data(1);
         let err = data
-            .do_defer(ProcessorDeferredOp::Cancel {
+            .do_defer_declared(ProcessorDeferredOp::Cancel {
                 port: "out".to_string(),
                 index: 1,
             })
@@ -3336,7 +3663,7 @@ mod processor_store_host_tests {
         // index at all.
         let mut none = make_publish_data("brenn:allowed", Arc::new(|_| true));
         let err = none
-            .do_defer(ProcessorDeferredOp::Cancel {
+            .do_defer_declared(ProcessorDeferredOp::Cancel {
                 port: "out".to_string(),
                 index: 0,
             })
@@ -3344,17 +3671,69 @@ mod processor_store_host_tests {
         assert!(matches!(err, DeferError::OutOfRange));
     }
 
-    /// An unbound port is `NotPermitted`, buffering nothing.
+    /// A declared port the deployer did not wire has an empty deferred window —
+    /// windows exist only for bound outputs — so every index is `OutOfRange`,
+    /// exactly as it is for a bound port that delivered nothing. The guest reads
+    /// the same answer either way, which is the point: wiring is not observable
+    /// through error codes.
     #[test]
-    fn do_defer_unbound_port_is_not_permitted() {
+    fn do_defer_on_a_declared_unwired_port_is_out_of_range() {
         let mut data = make_defer_data(2);
         let err = data
-            .do_defer(ProcessorDeferredOp::Cancel {
-                port: "nope".to_string(),
+            .do_defer_declared(ProcessorDeferredOp::Cancel {
+                port: UNWIRED_PORT.to_string(),
                 index: 0,
             })
-            .expect_err("an unbound port must be refused");
-        assert!(matches!(err, DeferError::NotPermitted));
+            .expect_err("an unwired port delivered no window");
+        assert!(matches!(err, DeferError::OutOfRange));
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+        // The edit twin answers identically, and its body is not charged: the
+        // port is judged before anything about the op is.
+        let bytes_before = data.gate.bytes();
+        let err = data
+            .do_defer_declared(ProcessorDeferredOp::Edit {
+                port: UNWIRED_PORT.to_string(),
+                index: 0,
+                payload: Some("edited".to_string()),
+                deliver_after: None,
+            })
+            .expect_err("an unwired port delivered no window to edit either");
+        assert!(matches!(err, DeferError::OutOfRange));
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+        assert_eq!(data.gate.bytes(), bytes_before);
+    }
+
+    /// A control op naming a port outside the declared vocabulary is the
+    /// component contradicting its own specification: the activation ends.
+    #[test]
+    fn do_defer_on_an_undeclared_port_traps() {
+        let mut data = make_defer_data(2);
+        let trap = data
+            .do_defer(ProcessorDeferredOp::Cancel {
+                port: UNDECLARED_PORT.to_string(),
+                index: 0,
+            })
+            .expect_err("an undeclared port must trap the activation");
+        let msg = format!("{trap}");
+        assert!(
+            msg.contains(UNDECLARED_PORT) && msg.contains("not declared"),
+            "the trap must name the port and the reason, got {msg:?}"
+        );
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+        // And the edit twin, so the two hosts' control-op arms stay mirrored.
+        let trap = data
+            .do_defer(ProcessorDeferredOp::Edit {
+                port: UNDECLARED_PORT.to_string(),
+                index: 0,
+                payload: Some("edited".to_string()),
+                deliver_after: None,
+            })
+            .expect_err("an undeclared port must trap the activation");
+        let msg = format!("{trap}");
+        assert!(
+            msg.contains(UNDECLARED_PORT) && msg.contains("not declared"),
+            "the trap must name the port and the reason, got {msg:?}"
+        );
         assert_eq!(data.deferred_op_buffer.len(), 0);
     }
 
@@ -3364,7 +3743,7 @@ mod processor_store_host_tests {
     fn do_defer_edit_rejects_unrepresentable_deliver_after() {
         let mut data = make_defer_data(1);
         let err = data
-            .do_defer(ProcessorDeferredOp::Edit {
+            .do_defer_declared(ProcessorDeferredOp::Edit {
                 port: "out".to_string(),
                 index: 0,
                 payload: None,
@@ -3375,7 +3754,7 @@ mod processor_store_host_tests {
         assert_eq!(data.deferred_op_buffer.len(), 0);
 
         // A representable value buffers.
-        data.do_defer(ProcessorDeferredOp::Edit {
+        data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 0,
             payload: None,
@@ -3393,20 +3772,22 @@ mod processor_store_host_tests {
     #[test]
     fn do_defer_shares_the_per_activation_call_budget_with_publishes() {
         let mut data = make_defer_data(1); // index 0 is in range on "out"
-        // Exhaust the shared call budget with unbound-port publishes: each is
-        // rejected (NotPermitted, buffering nothing) but still consumes a call.
+        // Exhaust the shared call budget with publishes to a declared port the
+        // deployer did not wire: each is dropped (buffering nothing, whether the
+        // gate accepts it or refuses it at the entry ceiling) and still consumes
+        // a call.
         for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            let _ = data.do_publish("nope".to_string(), "x".to_string(), None, None);
+            let _ = data.do_publish_declared(UNWIRED_PORT.to_string(), "x".to_string(), None, None);
         }
         assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
         assert_eq!(
             data.publish_buffer.len(),
             0,
-            "unbound publishes buffer nothing"
+            "dropped publishes buffer nothing"
         );
 
         let err = data
-            .do_defer(ProcessorDeferredOp::Cancel {
+            .do_defer_declared(ProcessorDeferredOp::Cancel {
                 port: "out".to_string(),
                 index: 0,
             })
@@ -3426,7 +3807,7 @@ mod processor_store_host_tests {
     fn do_defer_buffer_cap_rejects_beyond_the_ceiling() {
         let mut data = make_defer_data(1); // index 0 stays in range every call
         for _ in 0..MAX_PUBLISHES_PER_ACTIVATION {
-            data.do_defer(ProcessorDeferredOp::Cancel {
+            data.do_defer_declared(ProcessorDeferredOp::Cancel {
                 port: "out".to_string(),
                 index: 0,
             })
@@ -3435,7 +3816,7 @@ mod processor_store_host_tests {
         assert_eq!(data.deferred_op_buffer.len(), MAX_PUBLISHES_PER_ACTIVATION);
 
         let err = data
-            .do_defer(ProcessorDeferredOp::Cancel {
+            .do_defer_declared(ProcessorDeferredOp::Cancel {
                 port: "out".to_string(),
                 index: 0,
             })
@@ -3455,7 +3836,7 @@ mod processor_store_host_tests {
     fn do_defer_edit_rejects_an_oversize_payload() {
         let mut data = make_defer_data(1); // the gate's cap is 1024 bytes
         let err = data
-            .do_defer(ProcessorDeferredOp::Edit {
+            .do_defer_declared(ProcessorDeferredOp::Edit {
                 port: "out".to_string(),
                 index: 0,
                 payload: Some("x".repeat(1025)),
@@ -3466,7 +3847,7 @@ mod processor_store_host_tests {
         assert_eq!(data.deferred_op_buffer.len(), 0);
 
         // A payload exactly at the cap buffers, so only the cap refused above.
-        data.do_defer(ProcessorDeferredOp::Edit {
+        data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 0,
             payload: Some("x".repeat(1024)),
@@ -3486,7 +3867,7 @@ mod processor_store_host_tests {
         // and the op ceiling never gets a chance to answer first.
         let mut data = make_defer_data(1);
         data.gate = ActivationGate::new(MAX_PUBLISH_BYTES_PER_ACTIVATION, budgets.clone());
-        data.do_defer(ProcessorDeferredOp::Edit {
+        data.do_defer_declared(ProcessorDeferredOp::Edit {
             port: "out".to_string(),
             index: 0,
             payload: Some("x".repeat(MAX_PUBLISH_BYTES_PER_ACTIVATION)),
@@ -3494,7 +3875,7 @@ mod processor_store_host_tests {
         })
         .expect("the edit payload fills the aggregate exactly");
         let err = data
-            .do_publish("out".to_string(), "y".to_string(), None, None)
+            .do_publish_declared("out".to_string(), "y".to_string(), None, None)
             .expect_err("a one-byte publish is refused by the aggregate the edit spent");
         assert!(matches!(err, PublishError::QuotaExceeded));
         assert_eq!(data.publish_buffer.len(), 0);
@@ -3507,7 +3888,7 @@ mod processor_store_host_tests {
         // And the converse: a publish that fills the aggregate refuses a later edit.
         let mut data = make_defer_data(1);
         data.gate = ActivationGate::new(MAX_PUBLISH_BYTES_PER_ACTIVATION, budgets);
-        data.do_publish(
+        data.do_publish_declared(
             "out".to_string(),
             "x".repeat(MAX_PUBLISH_BYTES_PER_ACTIVATION),
             None,
@@ -3515,7 +3896,7 @@ mod processor_store_host_tests {
         )
         .expect("the published payload fills the aggregate exactly");
         let err = data
-            .do_defer(ProcessorDeferredOp::Edit {
+            .do_defer_declared(ProcessorDeferredOp::Edit {
                 port: "out".to_string(),
                 index: 0,
                 payload: Some("y".to_string()),
@@ -3538,6 +3919,7 @@ mod processor_store_host_tests {
             limits: StoreLimitsBuilder::new().build(),
             kv_store: None,
             output_ports: Arc::new(HashMap::new()),
+            declared_out_ports: Arc::new(std::collections::BTreeSet::new()),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),
@@ -3653,7 +4035,7 @@ mod processor_store_host_tests {
         // bumps the shared counter.
         let mut ports = HashMap::new();
         ports.insert("out".to_string(), test_out_spec("brenn:out"));
-        data.output_ports = Arc::new(ports);
+        bind_ports(&mut data, ports);
         // Generous per-sink budget so the shared 512-call cap trips first.
         data.gate = ActivationGate::new(
             1024,
@@ -3663,7 +4045,7 @@ mod processor_store_host_tests {
         // Spend half the budget via ports.publish, the rest via mqtt-publish.
         let half = MAX_PUBLISH_CALLS_PER_ACTIVATION / 2;
         for _ in 0..half {
-            data.do_publish("out".to_string(), "p".to_string(), None, None)
+            data.do_publish_declared("out".to_string(), "p".to_string(), None, None)
                 .expect("under budget");
         }
         for _ in half..MAX_PUBLISH_CALLS_PER_ACTIVATION {
@@ -3885,6 +4267,7 @@ mod processor_store_host_tests {
             limits: StoreLimitsBuilder::new().build(),
             kv_store: None,
             output_ports: Arc::new(HashMap::new()),
+            declared_out_ports: Arc::new(std::collections::BTreeSet::new()),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),
@@ -4059,14 +4442,14 @@ mod processor_store_host_tests {
         let mut data = make_tool_data(StubToolHost::queue_ok(req));
         let mut ports = HashMap::new();
         ports.insert("out".to_string(), test_out_spec("brenn:allowed"));
-        data.output_ports = Arc::new(ports);
+        bind_ports(&mut data, ports);
         data.gate = ActivationGate::new(
             1024,
             HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]),
         );
 
         for _ in 0..MAX_PUBLISHES_PER_ACTIVATION - 1 {
-            data.do_publish("out".to_string(), "x".to_string(), None, None)
+            data.do_publish_declared("out".to_string(), "x".to_string(), None, None)
                 .expect("under the shared entry ceiling");
         }
         assert_eq!(data.gate.entries(), MAX_PUBLISHES_PER_ACTIVATION - 1);
@@ -4083,7 +4466,7 @@ mod processor_store_host_tests {
         assert_eq!(data.tool_request_buffer.len(), 1);
 
         let err = data
-            .do_publish("out".to_string(), "x".to_string(), None, None)
+            .do_publish_declared("out".to_string(), "x".to_string(), None, None)
             .expect_err("the buffered async request holds the last entry slot");
         assert!(matches!(err, PublishError::QuotaExceeded));
         assert_eq!(data.publish_buffer.len(), MAX_PUBLISHES_PER_ACTIVATION - 1);
@@ -4121,11 +4504,11 @@ mod processor_store_host_tests {
         // way production does it — through the gate, so its entry count matches.
         let mut ports = HashMap::new();
         ports.insert("out".to_string(), test_out_spec("brenn:some-port"));
-        data.output_ports = Arc::new(ports);
+        bind_ports(&mut data, ports);
         let mut budgets = HashMap::new();
         budgets.insert(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT);
         data.gate = ActivationGate::new(1024, budgets);
-        data.do_publish("out".into(), "port-body".into(), None, None)
+        data.do_publish_declared("out".into(), "port-body".into(), None, None)
             .expect("a bound port publish must buffer");
         data.do_queue_async("git-repo-pull".into(), "{}".into(), "c1")
             .expect("valid async call must buffer");
@@ -4195,7 +4578,7 @@ mod processor_store_host_tests {
 
         for i in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
             let err = data
-                .do_publish("out".to_string(), "payload".to_string(), None, None)
+                .do_publish_declared("out".to_string(), "payload".to_string(), None, None)
                 .expect_err("denied publish must return an error");
             assert!(
                 matches!(err, PublishError::NotPermitted),
@@ -4205,7 +4588,7 @@ mod processor_store_host_tests {
         // Budget now exhausted: the gate that fires first is the call-budget check,
         // so the next call is QuotaExceeded, not NotPermitted.
         let err = data
-            .do_publish("out".to_string(), "payload".to_string(), None, None)
+            .do_publish_declared("out".to_string(), "payload".to_string(), None, None)
             .expect_err("over-budget publish must return an error");
         assert!(
             matches!(err, PublishError::QuotaExceeded),
@@ -4306,11 +4689,11 @@ mod processor_store_host_tests {
         );
 
         for i in 0..(n + 1) {
-            data.do_publish("out".to_string(), "p".to_string(), None, None)
+            data.do_publish_declared("out".to_string(), "p".to_string(), None, None)
                 .unwrap_or_else(|e| panic!("publish {i} within budget must succeed, got {e:?}"));
         }
         let err = data
-            .do_publish("out".to_string(), "p".to_string(), None, None)
+            .do_publish_declared("out".to_string(), "p".to_string(), None, None)
             .expect_err("the N+2nd publish must be rejected");
         assert!(matches!(err, PublishError::QuotaExceeded));
         assert_eq!(
@@ -4335,6 +4718,7 @@ mod processor_store_host_tests {
             resource_table: ResourceTable::new(),
             limits: StoreLimitsBuilder::new().build(),
             kv_store: None,
+            declared_out_ports: Arc::new(ports.keys().cloned().collect()),
             output_ports: Arc::new(ports),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
@@ -4353,14 +4737,14 @@ mod processor_store_host_tests {
             deferred_index_bounds: HashMap::new(),
         };
         // Drain A.
-        data.do_publish("a".to_string(), "p".to_string(), None, None)
+        data.do_publish_declared("a".to_string(), "p".to_string(), None, None)
             .expect("A first publish ok");
         assert!(matches!(
-            data.do_publish("a".to_string(), "p".to_string(), None, None),
+            data.do_publish_declared("a".to_string(), "p".to_string(), None, None),
             Err(PublishError::QuotaExceeded)
         ));
         // B is unaffected.
-        data.do_publish("b".to_string(), "p".to_string(), None, None)
+        data.do_publish_declared("b".to_string(), "p".to_string(), None, None)
             .expect("B publishes despite A being dry");
         assert_eq!(
             data.publish_suppressed_by_sink
@@ -4586,6 +4970,7 @@ mod processor_config_host_tests {
             limits: StoreLimitsBuilder::new().build(),
             kv_store: Some(Arc::clone(&kv)),
             output_ports: Arc::new(HashMap::new()),
+            declared_out_ports: Arc::new(std::collections::BTreeSet::new()),
             config: Arc::new(config),
             slug: Arc::from("test-slug"),
             gate: ActivationGate::new(1024, HashMap::new()),

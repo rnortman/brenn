@@ -181,7 +181,13 @@ impl Page {
             );
             sink_mt.insert(binding.port.clone(), 1_000_000);
         }
-        PublishBuffer::new(outputs, sink_mt, 4_096, deferred)
+        PublishBuffer::new(
+            outputs,
+            self.bindings.declared_out_ports(instance),
+            sink_mt,
+            4_096,
+            deferred,
+        )
     }
 
     /// Park one message of `instance`'s on `NOTES`, answering its identity.

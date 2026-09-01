@@ -807,6 +807,9 @@ mod tests {
                 },
                 ResolvedComponent {
                     spec_sha256: fixture_spec_hash("writer"),
+                    // `out` is bound below; `spare` is declared and left
+                    // unwired, which is the case the vocabulary exists to carry.
+                    declared_out_ports: ["out", "spare"].into_iter().map(str::to_string).collect(),
                     ..ResolvedComponent::minimal("writer", "writer")
                 },
             ],
@@ -885,6 +888,13 @@ mod tests {
         assert_eq!(bindings.outputs.len(), 1);
         assert_eq!(bindings.outputs[0].channel, "brenn:writer-out");
         assert_eq!(bindings.chrome_instance, "protobar");
+        // The declared vocabulary travels sorted, and carries the unwired port
+        // the bound-output table cannot represent.
+        assert_eq!(bindings.components[1].declared_out_ports, ["out", "spare"]);
+        assert!(bindings.components[0].declared_out_ports.is_empty());
+        bindings
+            .validate()
+            .expect("the built document satisfies the schema's own rules");
     }
 
     /// The lowering names the resolved chrome instance — the singleton the page

@@ -685,6 +685,130 @@ fn outputs_without_inputs_panics() {
     resolve(&raw, &dir);
 }
 
+/// The class's declared out-port vocabulary reaches the resolved consumer
+/// whole: the bound port and the ports the deployer left unwired alike.
+///
+/// The unwired half is the point. Resolution drops an unbound port from
+/// `outputs`, so before this the host had no way to tell a port its author
+/// declared and its deployer left unheard from a name no specification
+/// mentions.
+#[test]
+fn a_resolved_consumer_carries_the_ports_its_class_declares_but_binds_none_of() {
+    let dir = dir_of(vec![
+        brenn_entry("brenn:in-ch"),
+        brenn_entry("brenn:out-ch"),
+    ]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "fan".to_string(),
+        package: "fan".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "out-ch".to_string(),
+        )],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        outputs: vec![out_raw("digest", "brenn:out-ch")],
+        declared_out_ports: vec![
+            "digest".to_string(),
+            "tick".to_string(),
+            "unheard".to_string(),
+        ],
+        ..minimal_wasm_consumer()
+    }];
+
+    let consumer = &resolve(&raw, &dir)[0];
+    assert_eq!(
+        consumer
+            .declared_out_ports
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["digest", "tick", "unheard"],
+    );
+    assert_eq!(
+        consumer.outputs.len(),
+        1,
+        "only the bound port has a sink; the other two are vocabulary and nothing else",
+    );
+}
+
+/// A bound output the class does not declare is the two halves of lowering
+/// disagreeing about which class the instance is an instance of — the compiler
+/// refuses the binding, so reaching resolution with one means something above
+/// is broken. Refused by name rather than resolved into a sink the host would
+/// later refuse to publish on.
+#[test]
+#[should_panic(expected = "is bound but is not in the class's declared out-port vocabulary")]
+fn a_bound_output_outside_the_declared_vocabulary_panics() {
+    let dir = dir_of(vec![
+        brenn_entry("brenn:in-ch"),
+        brenn_entry("brenn:out-ch"),
+    ]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "fan".to_string(),
+        package: "fan".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "out-ch".to_string(),
+        )],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        outputs: vec![out_raw("digest", "brenn:out-ch")],
+        declared_out_ports: vec!["unheard".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// A declared name is held to the charset every port name is held to: it is
+/// what the host compares a guest's publish against, and what a trap
+/// diagnostic prints.
+#[test]
+#[should_panic(expected = "declared out-port name \"bad port\" must consist of")]
+fn a_declared_out_port_outside_the_charset_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "fan".to_string(),
+        package: "fan".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        declared_out_ports: vec!["bad port".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// A vocabulary that names one port twice is a lowered set that is not a set.
+/// Refused here rather than silently deduplicated: the two halves of lowering
+/// disagree, and which one is right is not this code's guess to make.
+#[test]
+#[should_panic(expected = "declared out-port name \"digest\" appears twice")]
+fn a_declared_out_port_named_twice_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "fan".to_string(),
+        package: "fan".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        declared_out_ports: vec!["digest".to_string(), "digest".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+#[test]
+#[should_panic(expected = "declared out-port name must be non-empty")]
+fn an_empty_declared_out_port_name_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "fan".to_string(),
+        package: "fan".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        declared_out_ports: vec![String::new()],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
 /// `ResolvedWasmConsumer` carries correct port name, channel_uuid, and
 /// channel_address for an input and an output.
 #[test]
@@ -1063,6 +1187,7 @@ fn budget_consumer(chan: &str) -> WasmConsumerConfigRaw {
         publish_acl: vec![ChannelMatcherRaw::Exact(chan.to_string())],
         ..minimal_wasm_consumer()
     }
+    .implying_its_vocabulary()
 }
 
 /// Two-channel directory: one triggering (push) input and one pull-only

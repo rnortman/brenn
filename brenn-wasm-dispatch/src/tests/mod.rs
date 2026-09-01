@@ -221,6 +221,7 @@ pub fn build_cfg(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -312,6 +313,7 @@ pub async fn build_multi_channel_setup(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -481,6 +483,7 @@ pub async fn build_multiport_setup_with_depths(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(MULTIPORT_WASM),
         slug,
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -695,6 +698,7 @@ pub async fn build_two_channel_setup(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),

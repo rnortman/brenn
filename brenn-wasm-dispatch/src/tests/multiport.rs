@@ -29,6 +29,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
     let component2 = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -647,6 +648,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
     let component2 = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(MULTIPORT_WASM),
         slug,
+        declared_out_ports: ["out".to_string()].into_iter().collect(),
         output_ports: {
             let mut m = std::collections::HashMap::new();
             m.insert(
@@ -1139,6 +1141,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DUAL_WASM),
         slug,
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),

@@ -16,7 +16,7 @@
 //! freshly delivered document against the one it is running on and reload only
 //! on a real difference.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,7 @@ use crate::{
 /// The body-schema version stamped on every bindings document. Bumped whenever
 /// the document's shape changes; a reader that does not recognize the value
 /// refuses the document rather than guessing at its fields.
-pub const BINDINGS_DOCUMENT_VERSION: u32 = 1;
+pub const BINDINGS_DOCUMENT_VERSION: u32 = 2;
 
 /// Lowest admissible [`PlatformSection::status_interval_secs`]. The status
 /// channel is a heartbeat, not a meter: below this the kernel would write
@@ -173,6 +173,20 @@ impl BindingsDocument {
                 ));
             }
         }
+        // The declared vocabulary is sorted and duplicate-free by contract, and
+        // the contract is load-bearing: the reader diffs a freshly delivered
+        // document against the running one and reloads only on a real
+        // difference, so an unstable order is a reload on every delivery with
+        // no behavioural difference to point at it.
+        for c in &self.components {
+            if c.declared_out_ports.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(format!(
+                    "bindings document declares component instance {}'s port vocabulary {:?}, \
+                     which is not sorted and duplicate-free",
+                    c.instance, c.declared_out_ports
+                ));
+            }
+        }
         // A port publishes onto one channel. Two entries for one port would make
         // a component's publish resolve to whichever the reader indexed first,
         // which is a coin toss dressed as configuration.
@@ -192,6 +206,30 @@ impl BindingsDocument {
             if !input_ports.insert((&b.instance, &b.port)) {
                 return Err(format!(
                     "bindings document binds input port {}/{} twice",
+                    b.instance, b.port
+                ));
+            }
+        }
+        // A bound output port must be one its component's specification declares.
+        // The writer resolves bindings against that specification, so a binding
+        // outside it means the resolver and the vocabulary it lowered disagree —
+        // and the kernel would then have a bound port it must refuse to publish
+        // on. Walks the components once into a lookup: a nested scan would be
+        // quadratic on a page with many instances and many ports.
+        let declared: BTreeMap<&String, &Vec<String>> = self
+            .components
+            .iter()
+            .map(|c| (&c.instance, &c.declared_out_ports))
+            .collect();
+        for b in &self.outputs {
+            // An instance absent from the component list is caught below, with
+            // the inputs, in one message about the same mistake.
+            if let Some(ports) = declared.get(&b.instance)
+                && !ports.contains(&b.port)
+            {
+                return Err(format!(
+                    "bindings document binds output port {}/{}, which the component's declared \
+                     port vocabulary does not contain",
                     b.instance, b.port
                 ));
             }
@@ -368,6 +406,7 @@ mod tests {
             parked_batch_depth: 4,
             config: BTreeMap::new(),
             grants: vec![],
+            declared_out_ports: vec!["alt".to_string(), "out".to_string()],
         }
     }
 
@@ -492,6 +531,54 @@ mod tests {
             .validate()
             .expect_err("an instance id names one component");
         assert!(err.contains("p1") && err.contains("twice"), "{err}");
+    }
+
+    /// The cross-check the declared vocabulary exists for on the writing side:
+    /// a bound port the component never declared would leave the kernel holding
+    /// a binding it must refuse to publish on.
+    #[test]
+    fn rejects_an_output_binding_outside_the_declared_vocabulary() {
+        let mut doc = doc();
+        let mut undeclared = output("p1", "brenn:site.bar.elsewhere");
+        undeclared.port = "nope".to_string();
+        doc.outputs.push(undeclared);
+        let err = doc
+            .validate()
+            .expect_err("a bound port must be a declared port");
+        assert!(
+            err.contains("p1/nope") && err.contains("declared port vocabulary"),
+            "{err}"
+        );
+    }
+
+    /// The ordering claim the field's own documentation makes is checked where
+    /// it is made. Nothing downstream misbehaves on an unsorted set, which is
+    /// exactly why an ordering regression needs a validator to be visible at all.
+    #[test]
+    fn rejects_a_vocabulary_that_is_not_sorted_and_duplicate_free() {
+        let mut unsorted = doc();
+        unsorted.components[0].declared_out_ports = vec!["out".to_string(), "in".to_string()];
+        let err = unsorted
+            .validate()
+            .expect_err("the vocabulary is out of order");
+        assert!(err.contains("sorted and duplicate-free"), "{err}");
+
+        let mut repeated = doc();
+        repeated.components[0].declared_out_ports = vec!["out".to_string(), "out".to_string()];
+        let err = repeated.validate().expect_err("the vocabulary repeats");
+        assert!(err.contains("sorted and duplicate-free"), "{err}");
+    }
+
+    /// An output binding whose instance is absent from the component list is
+    /// reported as the missing instance it is, not as a vocabulary miss — the
+    /// vocabulary check has nothing to say about a component that is not there.
+    #[test]
+    fn an_output_on_an_unknown_instance_reports_the_missing_instance() {
+        let mut doc = doc();
+        doc.outputs
+            .push(output("ghost", "brenn:site.bar.elsewhere"));
+        let err = doc.validate().expect_err("the instance is absent");
+        assert!(err.contains("absent from the component list"), "{err}");
     }
 
     #[test]

@@ -206,6 +206,15 @@ fn consumer(slug: &str) -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw::minimal(slug, PACKAGED_MODULE, &[])
 }
 
+/// The same, for a consumer whose class declares outbound ports: the `out` and
+/// `io` names lowering carries beside the bindings, sorted.
+fn consumer_declaring(slug: &str, out_ports: &[&str]) -> WasmConsumerConfigRaw {
+    WasmConsumerConfigRaw {
+        declared_out_ports: out_ports.iter().map(|port| port.to_string()).collect(),
+        ..consumer(slug)
+    }
+}
+
 fn attrless_subscription(port: &str, channel: &str) -> WasmConsumerSubscriptionRaw {
     WasmConsumerSubscriptionRaw {
         port: port.to_string(),
@@ -261,6 +270,15 @@ fn placed_component(kind: &str) -> SurfaceComponentRaw {
     SurfaceComponentRaw {
         instance: Some(kind.to_string()),
         ..SurfaceComponentRaw::minimal(kind)
+    }
+}
+
+/// The same, for an instance whose class declares outbound ports: the `out` and
+/// `io` names lowering carries beside the bindings, sorted.
+fn placed_component_declaring(kind: &str, out_ports: &[&str]) -> SurfaceComponentRaw {
+    SurfaceComponentRaw {
+        declared_out_ports: out_ports.iter().map(|port| port.to_string()).collect(),
+        ..placed_component(kind)
     }
 }
 
@@ -2805,7 +2823,7 @@ new router: Router {
                 ])),
                 activation_burst: Some(4),
                 activation_min_period_ms: Some(250),
-                ..consumer("router")
+                ..consumer_declaring("router", &["acks", "digest", "outbound", "tick"])
             }],
             ..Default::default()
         },
@@ -3019,7 +3037,7 @@ new reserved: Reserved {
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.notes".to_string(),
                 )],
-                ..consumer("reserved")
+                ..consumer_declaring("reserved", &["out"])
             }],
             ..Default::default()
         },
@@ -3068,7 +3086,98 @@ new sink: Sink {
                     ("window_secs".to_string(), toml::Value::Integer(30)),
                     ("strict".to_string(), toml::Value::Boolean(true)),
                 ])),
-                ..consumer("sink")
+                ..consumer_declaring("sink", &["tick"])
+            }],
+            ..Default::default()
+        },
+    );
+}
+
+/// A consumer's declared out-port vocabulary is the class's, not the
+/// instance's: every `out` and `io` port the class states travels, sorted,
+/// whether or not the instance binds it, and no `in` port does.
+///
+/// This is the fact the hosts refuse a publish outside of, so it has to
+/// describe the class rather than the wiring — an unwired `optional out` is a
+/// port the component may publish to and nobody hears, not a port it may not
+/// publish to at all.
+#[test]
+fn a_consumers_declared_vocabulary_is_its_classs_out_and_io_ports() {
+    assert_lowers(
+        concat!(
+            r#"
+channel alerts at "brenn:alice-alerts" {
+    push_depth = 2;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}
+
+channel digests at "brenn:alice-digests" {
+    push_depth = 2;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}
+
+// ── packaged ──
+component Fan {
+    "#,
+            processor_needs!("ports"),
+            r#"
+    in inbound;
+    out digest;
+    optional out unheard;
+    optional io tick;
+}
+// ── packaged ──
+
+new fan: Fan {
+    grants = [ports];
+
+    acl subscribe [exact alerts];
+    acl publish [exact digests];
+
+    in inbound <- alerts { push_depth = 2; retain_depth = 4; }
+    out digest -> digests;
+}
+"#
+        ),
+        BrennConfig {
+            channels: vec![
+                ChannelConfigRaw {
+                    uuid: Some("85a5cf7e-6874-5766-9d69-712784754a1f".to_string()),
+                    push_depth: Some(Depth::Bounded(2)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                    standing_retain_depth: Some(Depth::Bounded(4)),
+                    ..channel_at("brenn:alice-alerts")
+                },
+                ChannelConfigRaw {
+                    uuid: Some("8b2e83fc-6121-55ef-a665-7bea3fb6a9a6".to_string()),
+                    push_depth: Some(Depth::Bounded(2)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                    standing_retain_depth: Some(Depth::Bounded(4)),
+                    ..channel_at("brenn:alice-digests")
+                },
+            ],
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![ComponentGrant::Ports],
+                subscriptions: vec![WasmConsumerSubscriptionRaw {
+                    push_depth: Some(Depth::Bounded(2)),
+                    retain_depth: Some(Depth::Bounded(4)),
+                    ..attrless_subscription("inbound", "brenn:alice-alerts")
+                }],
+                outputs: vec![WasmConsumerOutputRaw {
+                    port: "digest".to_string(),
+                    channel: Some("brenn:alice-digests".to_string()),
+                    urgency: None,
+                    publish_per_activation: None,
+                    publish_capacity: None,
+                }],
+                subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
+                publish_acl: vec![ChannelMatcherRaw::Exact("alice-digests".to_string())],
+                // `unheard` is an unbound optional out and `tick` a free io port
+                // the instance never states; both travel beside the bound
+                // `digest`, and the inbound port travels not at all.
+                ..consumer_declaring("fan", &["digest", "tick", "unheard"])
             }],
             ..Default::default()
         },
@@ -3138,7 +3247,7 @@ new sink: Sink {
                     "alice-pod.acks".to_string(),
                 )],
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact("alice-pod.acks".to_string())],
-                ..consumer("sink")
+                ..consumer_declaring("sink", &["acks"])
             }],
             ..Default::default()
         },
@@ -3191,7 +3300,7 @@ new sink: Sink {
                     "alice-pod.acks".to_string(),
                 )],
                 ephemeral_publish_acl: vec![ChannelMatcherRaw::Exact("alice-pod.acks".to_string())],
-                ..consumer("sink")
+                ..consumer_declaring("sink", &["acks"])
             }],
             ..Default::default()
         },
@@ -3349,7 +3458,7 @@ new sink: Sink {
                         ])),
                     ),
                 ])),
-                ..consumer("sink")
+                ..consumer_declaring("sink", &["tick"])
             }],
             ..Default::default()
         },
@@ -3574,7 +3683,7 @@ surface alice_desk {
                             ("layout".to_string(), "wide".to_string()),
                         ])),
                         grants: vec![ComponentGrant::Ports],
-                        ..placed_component("panel")
+                        ..placed_component_declaring("panel", &["acks", "outbound", "tick"])
                     },
                     SurfaceComponentRaw {
                         chrome: true,
@@ -3736,7 +3845,7 @@ surface alice_desk {
                 )],
                 components: vec![SurfaceComponentRaw {
                     grants: vec![ComponentGrant::Ports],
-                    ..placed_component("panel")
+                    ..placed_component_declaring("panel", &["acks"])
                 }],
                 subscriptions: vec![SurfaceSubscriptionRaw {
                     push_depth: Some(Depth::Bounded(1)),
@@ -3805,7 +3914,7 @@ surface alice_desk {
                 )],
                 components: vec![SurfaceComponentRaw {
                     grants: vec![ComponentGrant::Ports],
-                    ..placed_component("panel")
+                    ..placed_component_declaring("panel", &["acks"])
                 }],
                 subscriptions: vec![surface_input("panel", "acks", "ephemeral:alice-desk.acks")],
                 outputs: vec![surface_output("panel", "acks", "ephemeral:alice-desk.acks")],
@@ -3822,10 +3931,15 @@ surface alice_desk {
     );
 }
 
-/// An `optional` port an instance does not bind is inert: it contributes no
+/// An `optional` port an instance does not bind contributes no binding: no
 /// subscription, no output, no `io_port` and no ACL entry. This is what makes a
 /// component class shareable between documents that bind different subsets of
 /// its ports — the class permits the absence, the instance decides.
+///
+/// What it does contribute is vocabulary: both unbound outbound ports appear in
+/// the instance's `declared_out_ports`, which is what lets the host tell a
+/// publish to a port the deployer left unwired from a publish to a name the
+/// class never declared.
 ///
 /// The grant list holds only `subscribe` because a granted right that no bound
 /// port or acl statement reaches is separately refused: an unbound `out` port
@@ -3869,7 +3983,7 @@ surface alice_desk {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-desk.messages".to_string(),
                 )],
-                components: vec![placed_component("panel")],
+                components: vec![placed_component_declaring("panel", &["outbound", "tick"])],
                 subscriptions: vec![surface_input(
                     "panel",
                     "messages",

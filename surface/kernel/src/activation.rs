@@ -739,8 +739,12 @@ impl Schedules {
         verdicts
     }
 
-    /// Seed one activation's publish buffer: the instance's outputs, their sink
-    /// buckets, and the body cap.
+    /// Seed one activation's publish buffer: the instance's outputs, the port
+    /// vocabulary its specification declares, their sink buckets, and the body
+    /// cap.
+    ///
+    /// The vocabulary is what lets a publish be judged three ways rather than
+    /// two: bound, declared-but-unwired, or outside the specification entirely.
     ///
     /// Buckets are `seed_sink_budget(carry, budget, grant)` — the same arithmetic
     /// the backend runs, so a component's budget means the same thing on either
@@ -791,7 +795,13 @@ impl Schedules {
                 ),
             );
         }
-        PublishBuffer::new(outputs, sink_mt, ctx.max_body_bytes, deferred_ids)
+        PublishBuffer::new(
+            outputs,
+            ctx.bindings.declared_out_ports(instance),
+            sink_mt,
+            ctx.max_body_bytes,
+            deferred_ids,
+        )
     }
 
     /// An activation returned ok: the instance is idle again and its unspent

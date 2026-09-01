@@ -600,9 +600,31 @@ fn try_dispatch_reload(reason: &str) -> Result<(), JsValue> {
 /// Counted where a publish is admitted: the DOM seam's buffered route, the
 /// deferred family's, and the processor host's, so an operator's total does not
 /// depend on which transport a component reached the buffer through.
+///
+/// A publish the buffer accepted and dropped for want of a sink is not one of
+/// these: it was never queued, and it is [`count_dropped_publish`]'s.
 pub(crate) fn count_publish(instance: &str) {
     bump(&PUBLISHES);
     bump_instance(instance, |c| &mut c.publishes, 1);
+}
+
+/// Count one publish accepted and dropped because its declared port is unwired.
+///
+/// A column of its own rather than a share of `publishes`: the component was
+/// told ok, the message went nowhere, and an operator reading a page's totals
+/// against messages that never arrived needs the two apart. Per-instance only —
+/// the question it answers is which component is publishing into an unwired
+/// port, which a surface-wide total cannot say.
+pub(crate) fn count_dropped_publish(instance: &str) {
+    bump_instance(instance, |c| &mut c.dropped_publishes, 1);
+}
+
+/// Count whichever of the two an accepted publish turned out to be.
+pub(crate) fn count_admission(instance: &str, admission: crate::publish_buffer::Admission) {
+    match admission {
+        crate::publish_buffer::Admission::Buffered => count_publish(instance),
+        crate::publish_buffer::Admission::Dropped => count_dropped_publish(instance),
+    }
 }
 
 /// Wrap a component's registered `entry` function into the kernel's
@@ -1255,9 +1277,10 @@ mod tests {
         let InstanceCounters {
             publishes,
             drops,
+            dropped_publishes,
             activation_failures,
         } = *counters;
-        publishes + drops + activation_failures
+        publishes + drops + dropped_publishes + activation_failures
     }
 
     /// Each per-instance column moves on its own trigger and on nothing else:
@@ -1282,7 +1305,7 @@ mod tests {
     fn each_instance_column_moves_only_on_its_own_trigger() {
         type Trigger = fn(&str, &SurfaceHandle);
         type Column = fn(&InstanceCounters) -> u64;
-        let cases: [(&str, Trigger, Column, u64); 3] = [
+        let cases: [(&str, Trigger, Column, u64); 4] = [
             // Called directly rather than through the real publish path, which
             // needs a live wasm slot this suite cannot rig. This case pins
             // the column and its isolation, not the attribution of a real
@@ -1298,6 +1321,14 @@ mod tests {
                 |instance, _handle| count_activation(instance, &[("p", 0, 3), ("other", 0, 4)]),
                 |c| c.drops,
                 7,
+            ),
+            // Also called directly, and for the same reason: the drop verdict is
+            // read off the buffer at the wasm port seam this suite cannot rig.
+            (
+                "dropped_publishes",
+                |instance, _handle| count_dropped_publish(instance),
+                |c| c.dropped_publishes,
+                1,
             ),
             (
                 "activation_failures",
@@ -1340,6 +1371,36 @@ mod tests {
                 "counting {column} is not reporting an error"
             );
         }
+    }
+
+    /// The join between the buffer's verdict and the column it lands in. The two
+    /// halves are pinned apart — `Admission::of` in `publish_buffer`, the columns
+    /// above — and this is the mapping between them, which an inversion or a
+    /// copy-paste would silently break while both halves stayed green.
+    #[wasm_bindgen_test]
+    fn an_admission_lands_in_the_column_its_verdict_names() {
+        use crate::publish_buffer::Admission;
+
+        fresh_root();
+        let buffered = "wbt-ctr-adm-b";
+        count_admission(buffered, Admission::Buffered);
+        let counters = instance_counters(buffered);
+        assert_eq!(counters.publishes, 1);
+        assert_eq!(
+            column_sum(&counters),
+            1,
+            "a buffered publish moves `publishes` and nothing else"
+        );
+
+        let dropped = "wbt-ctr-adm-d";
+        count_admission(dropped, Admission::Dropped);
+        let counters = instance_counters(dropped);
+        assert_eq!(counters.dropped_publishes, 1);
+        assert_eq!(
+            column_sum(&counters),
+            1,
+            "a dropped publish moves `dropped_publishes` and nothing else"
+        );
     }
 
     /// A delivery moves the surface-wide total and no per-instance column at

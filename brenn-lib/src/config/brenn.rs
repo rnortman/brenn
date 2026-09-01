@@ -283,6 +283,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
             slug: _,
             package: _,
             spec_sha256: _,
+            declared_out_ports: _,
             grants,
             store_path: _,
             store_size_limit: _,

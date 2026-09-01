@@ -76,6 +76,7 @@ fn assert_boot_preconditions(build_id: &str, components_root: Option<&std::path:
 /// services and stay at the call site.
 pub(crate) struct ConsumerLoadParts {
     pub output_ports: std::collections::HashMap<String, brenn_wasm::OutputPortSpec>,
+    pub declared_out_ports: std::collections::BTreeSet<String>,
     pub input_amplification_mt: std::collections::HashMap<String, u64>,
     pub mqtt_sinks: std::collections::HashMap<String, brenn_wasm::SinkBudget>,
     pub grants: std::collections::BTreeSet<brenn_wasm::ComponentGrant>,
@@ -175,6 +176,7 @@ pub(crate) fn lower_consumer_load_parts(
 
     ConsumerLoadParts {
         output_ports,
+        declared_out_ports: consumer.declared_out_ports.clone(),
         input_amplification_mt,
         mqtt_sinks,
         grants,
@@ -708,6 +710,7 @@ pub async fn run_server(
         for consumer in &messaging_result.wasm_consumers {
             let ConsumerLoadParts {
                 output_ports,
+                declared_out_ports,
                 input_amplification_mt,
                 mqtt_sinks,
                 grants,
@@ -770,6 +773,7 @@ pub async fn run_server(
                     component_path: std::path::Path::new(""),
                     slug: &consumer.slug,
                     output_ports,
+                    declared_out_ports,
                     input_amplification_mt,
                     mqtt_sinks,
                     config: consumer.config.clone(),
@@ -1397,6 +1401,7 @@ mod tests {
                 component_path: Path::new(""),
                 slug,
                 output_ports: Default::default(),
+                declared_out_ports: Default::default(),
                 input_amplification_mt: Default::default(),
                 mqtt_sinks: Default::default(),
                 config: Default::default(),
@@ -1620,6 +1625,7 @@ mod tests {
             slug: "tooler".to_string(),
             package: "tooler".to_string(),
             spec_sha256: String::new(),
+            declared_out_ports: std::collections::BTreeSet::new(),
             grants: grants.iter().copied().collect(),
             store_path: None,
             max_page_count: 1,

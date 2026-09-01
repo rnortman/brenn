@@ -60,7 +60,6 @@ pub(crate) fn resolve_wasm_consumers(
     auto_wiring: &AutoWiring,
 ) -> Vec<ResolvedWasmConsumer> {
     use brenn_lib::config::wasm::{byte_size_to_max_page_count, resolve_component_config};
-    use brenn_lib::messaging::is_unreserved_char;
     use std::collections::{BTreeSet, HashSet};
 
     // Declared `[[mqtt_client]]` membership comes from the canonical resolved
@@ -200,14 +199,8 @@ pub(crate) fn resolve_wasm_consumers(
         // Collect all port names for uniqueness check (inputs + outputs).
         let mut seen_port_names: HashSet<String> = HashSet::new();
         let mut validate_port_name = |port: &str, context: &str| {
-            assert!(
-                !port.is_empty(),
-                "[[wasm_consumer]] {slug:?}: {context} port name must be non-empty",
-            );
-            assert!(
-                port.chars().all(is_unreserved_char),
-                "[[wasm_consumer]] {slug:?}: {context} port name {:?} must consist of \
-                 RFC 3986 unreserved characters only (A-Za-z0-9._~-)",
+            crate::assert_port_name(
+                &format!("[[wasm_consumer]] {slug:?}: {context} port name"),
                 port,
             );
             assert!(
@@ -798,10 +791,41 @@ pub(crate) fn resolve_wasm_consumers(
             );
         }
 
+        // The class's outbound vocabulary, as lowering carried it. Every name
+        // in it is a name the component may publish to; a publish outside it
+        // contradicts the specification the artifact is hash-bound to and traps
+        // the activation, so a malformed entry here would trap a component that
+        // did nothing wrong.
+        let mut declared_out_ports: BTreeSet<String> = BTreeSet::new();
+        for port in &consumer.declared_out_ports {
+            crate::assert_port_name(
+                &format!("[[wasm_consumer]] {slug:?}: declared out-port name"),
+                port,
+            );
+            assert!(
+                declared_out_ports.insert(port.clone()),
+                "[[wasm_consumer]] {slug:?}: declared out-port name {port:?} appears twice",
+            );
+        }
+        // Belt and suspenders over the compiler: the resolver refuses a binding
+        // naming a port the class does not declare, so a bound output outside
+        // the vocabulary means lowering and resolution disagree about which
+        // class this instance is an instance of.
+        for out in &outputs {
+            assert!(
+                declared_out_ports.contains(&out.port),
+                "[[wasm_consumer]] {slug:?}: output port {:?} is bound but is not in the \
+                 class's declared out-port vocabulary {declared_out_ports:?} — the lowered \
+                 vocabulary does not describe the lowered bindings",
+                out.port,
+            );
+        }
+
         result.push(ResolvedWasmConsumer {
             slug: slug.clone(),
             package: consumer.package.clone(),
             spec_sha256: consumer.spec_sha256.clone(),
+            declared_out_ports,
             grants,
             store_path,
             max_page_count,

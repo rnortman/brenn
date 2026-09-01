@@ -42,9 +42,9 @@ use brenn_dsl::model::{
     WebhookAttrs, Word, section_key,
 };
 use brenn_dsl::resolved::{
-    RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer, RHooks, RMcp, RMount, RNamed,
-    RRemote, RSection, RSubscribe, RSurface, RTail, RToolGrant, RVal, RValue, RWebhook,
-    RWebhookBlock, ResolvedConfig as DslResolved,
+    ClassRef, PortDir, RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer, RHooks,
+    RMcp, RMount, RNamed, RRemote, RSection, RSubscribe, RSurface, RTail, RToolGrant, RVal, RValue,
+    RWebhook, RWebhookBlock, ResolvedConfig as DslResolved,
 };
 
 use crate::access::raw::{
@@ -2256,6 +2256,7 @@ fn consumer(
             .expect("a top-level consumer's class is declared in a packaged module"),
         // A class fact, not a body key: carried from the declaring file.
         spec_sha256: instance.class.spec_sha256.clone(),
+        declared_out_ports: declared_out_ports(&instance.class),
         grants: authority
             .grants
             .iter()
@@ -2283,6 +2284,29 @@ fn consumer(
     };
     body.finish(errors);
     raw
+}
+
+/// Every port name a class declares outbound: its `out` ports and both halves
+/// of its `io` ports, sorted and duplicate-free.
+///
+/// This is the vocabulary the hosts refuse a publish outside of. Inbound ports
+/// do not travel: the host builds activation windows from the bindings, so a
+/// name it never bound is a name it never delivers to. Neither do doctypes or
+/// optionality — nothing at runtime reads them, and the configuration carries
+/// no fact without a reader.
+fn declared_out_ports(class: &ClassRef) -> Vec<String> {
+    let mut names: Vec<String> = class
+        .ports
+        .iter()
+        .filter(|port| matches!(port.dir, PortDir::Out | PortDir::Io))
+        .map(|port| port.name.value().clone())
+        .collect();
+    names.sort();
+    // The resolver refuses a class that declares one name twice, so this
+    // removes nothing; it holds the duplicate-free half of the contract at the
+    // seam that states it.
+    names.dedup();
+    names
 }
 
 /// A consumer's bindings, split into the three raw families they land in.
@@ -2667,6 +2691,7 @@ fn surface_components(
             instance: Some(name.clone()),
             // A class fact, not a body key: carried from the declaring file.
             spec_sha256: instance.class.spec_sha256.clone(),
+            declared_out_ports: declared_out_ports(&instance.class),
             send_burst: body.int("send_burst", errors),
             send_refill_secs: body.int("send_refill_secs", errors),
             // A depth is a count or a bare word, so it was projected out of

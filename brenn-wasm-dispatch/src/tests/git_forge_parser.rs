@@ -153,6 +153,7 @@ async fn build_parser_setup(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(GIT_FORGE_PARSER_WASM),
         slug,
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: amp,
         mqtt_sinks: std::collections::HashMap::new(),

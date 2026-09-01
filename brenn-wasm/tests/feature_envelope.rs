@@ -165,6 +165,7 @@ fn loaded_processor() -> ProcessorComponent {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &common::artifact_path("brenn_processor_demo"),
         slug: "feature-envelope",
+        declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),

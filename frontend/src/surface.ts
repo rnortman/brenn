@@ -425,6 +425,12 @@ export interface KernelModule extends WasmModule {
      * a headless instance's import shims delegate to. Every one takes the
      * instance id from the loader's own closure over the manifest entry — the
      * component never names itself.
+     *
+     * The four port entries answer a WIT variant name (or the empty string for
+     * ok) for everything the contract has a word for, and *throw* for the one
+     * thing it does not: a publish to a port the component's specification never
+     * declared. That thrown value carries no `payload`, so the glue lets it
+     * escape as a trap rather than lifting it into an error variant.
      */
     brenn_processor_publish(
         instance: string,
@@ -693,6 +699,11 @@ class ProcessorKindCache {
  * refused deferred-message control op as the `defer-error` variant: the glue's
  * `getErrorPayload` reads a thrown value's own `payload` property, so the shim
  * throws the variant rather than returning it.
+ *
+ * A port the component's specification does not declare is not a refusal and
+ * gets no variant: the kernel entry throws, that throw passes straight through
+ * this shim, and the absent `payload` is what makes the glue surface it as a
+ * trap.
  */
 function processorImports(
     kernel: KernelModule,

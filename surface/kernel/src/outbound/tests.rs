@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::test_support::bindings::imply_vocabularies;
 use brenn_attach_proto::{BatchDeferredOp, BatchEntry, DeferredOpKind, PublishBatchOutcome};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
@@ -31,6 +32,7 @@ fn component(instance: &str, parked_batch_depth: u64) -> ComponentEntry {
         parked_batch_depth,
         config: BTreeMap::new(),
         grants: vec![],
+        declared_out_ports: vec![],
     }
 }
 
@@ -49,7 +51,7 @@ fn output(instance: &str, port: &str, channel: &str, urgency: Urgency) -> Output
 /// page-local one; `p2` writes a durable channel at `low` and holds a
 /// single-flush outbox, which is what makes an overflow reachable in one step.
 fn doc(outputs: Vec<OutputBinding>, error: Option<(&str, LogLevel)>) -> BindingsDocument {
-    BindingsDocument {
+    imply_vocabularies(BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![
             component("p1", 2),
@@ -70,7 +72,7 @@ fn doc(outputs: Vec<OutputBinding>, error: Option<(&str, LogLevel)>) -> Bindings
             error_channel: error.map(|(channel, _)| channel.to_string()),
             error_report_floor: error.map(|(_, floor)| floor),
         },
-    }
+    })
 }
 
 fn standard_outputs() -> Vec<OutputBinding> {

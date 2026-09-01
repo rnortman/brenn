@@ -238,7 +238,13 @@ fn buffer(page: &SurfacePage, instance: &str) -> PublishBuffer {
         );
         sink_mt.insert(binding.port.clone(), 1_000_000);
     }
-    PublishBuffer::new(outputs, sink_mt, page.body_cap, HashMap::new())
+    PublishBuffer::new(
+        outputs,
+        bindings.declared_out_ports(instance),
+        sink_mt,
+        page.body_cap,
+        HashMap::new(),
+    )
 }
 
 /// The completion of an activation assembled for `instance` as the page holds it

@@ -29,6 +29,7 @@
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use brenn_attach_client::subs::SubscriptionDepths;
 use brenn_envelope::channel_capabilities;
@@ -86,6 +87,10 @@ pub struct AppliedBindings {
     wire_depths: BTreeMap<String, SubscriptionDepths>,
     /// Channel → the depth its page-side store is sized to, both classes.
     store_depths: BTreeMap<String, u64>,
+    /// Instance id → the port names its component kind declares it may publish
+    /// to. Shared rather than copied because every activation of the instance
+    /// seeds its buffer with the same set.
+    declared_out_ports: BTreeMap<String, Arc<BTreeSet<String>>>,
 }
 
 impl AppliedBindings {
@@ -111,12 +116,22 @@ impl AppliedBindings {
     /// validation disagree about what a well-formed document is.
     fn index(body: String, doc: BindingsDocument) -> Result<Self, BindingsError> {
         let mut components = BTreeMap::new();
+        let mut declared_out_ports = BTreeMap::new();
         for (i, c) in doc.components.iter().enumerate() {
             let prior = components.insert(c.instance.clone(), i);
             assert!(
                 prior.is_none(),
                 "surface client: bindings document declares component instance {} twice",
                 c.instance
+            );
+            declared_out_ports.insert(
+                c.instance.clone(),
+                Arc::new(
+                    c.declared_out_ports
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                ),
             );
         }
 
@@ -202,6 +217,7 @@ impl AppliedBindings {
             inputs_by_channel,
             wire_depths,
             store_depths,
+            declared_out_ports,
         })
     }
 
@@ -280,6 +296,23 @@ impl AppliedBindings {
             .outputs
             .iter()
             .filter(move |b| b.instance == instance)
+    }
+
+    /// The port vocabulary `instance`'s component kind declares it may publish
+    /// to — every `out` and `io` port of its specification, wired or not.
+    ///
+    /// The set a publish is judged against: a name in it that no output binding
+    /// wires is a legal publish onto no channel, and a name outside it is the
+    /// component contradicting its own specification.
+    ///
+    /// # Panics
+    ///
+    /// On an instance this surface does not declare. Every caller resolved the
+    /// instance from the document first, so a miss is a broken kernel invariant.
+    pub fn declared_out_ports(&self, instance: &str) -> Arc<BTreeSet<String>> {
+        Arc::clone(self.declared_out_ports.get(instance).unwrap_or_else(|| {
+            panic!("surface client: no declared port vocabulary for instance {instance:?}")
+        }))
     }
 
     /// Every input binding of one instance, in declaration order — the positions

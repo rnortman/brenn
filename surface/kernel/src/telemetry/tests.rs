@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::test_support::bindings::imply_vocabularies;
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
@@ -26,6 +27,7 @@ fn component(instance: &str) -> ComponentEntry {
         parked_batch_depth: 4,
         config: BTreeMap::new(),
         grants: vec![],
+        declared_out_ports: vec![],
     }
 }
 
@@ -42,7 +44,7 @@ fn subscription(instance: &str, port: &str) -> Binding {
 
 /// `chrome` with no bound input, `p1` with two.
 fn doc() -> BindingsDocument {
-    BindingsDocument {
+    imply_vocabularies(BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("chrome"), component("p1")],
         subscriptions: vec![subscription("p1", "in"), subscription("p1", "aux")],
@@ -56,7 +58,7 @@ fn doc() -> BindingsDocument {
             error_channel: None,
             error_report_floor: None,
         },
-    }
+    })
 }
 
 fn applied(doc: &BindingsDocument) -> AppliedBindings {

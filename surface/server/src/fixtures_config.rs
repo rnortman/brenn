@@ -147,6 +147,18 @@ impl SurfaceFixture {
                 capacity_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
             },
         });
+        // A bound port is a declared port — resolution proves it and the bindings
+        // document restates it — so the fixture states the wiring once and the
+        // vocabulary follows. A fixture whose subject *is* the vocabulary adds
+        // the unwired names to the component itself.
+        if let Some(c) = self
+            .inner
+            .components
+            .iter_mut()
+            .find(|c| c.instance == component)
+        {
+            c.declared_out_ports.insert(port.to_string());
+        }
         self
     }
 

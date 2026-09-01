@@ -75,7 +75,11 @@ pub enum Input {
     /// not.
     ActivationDeregistered { instance: String },
     /// An invoked activation entry returned.
-    ActivationDone(Completed),
+    ///
+    /// Boxed for the reason [`SyncDispatch::Ready`] is: it carries the
+    /// activation's whole publish buffer, several times the next-largest
+    /// variant, and every input of every turn would otherwise be sized for it.
+    ActivationDone(Box<Completed>),
     /// The outbox retry deadline fired: every blocked head is owed another offer.
     RetryDue,
     /// The confined release deadline fired: whatever is due enters retention now.
@@ -246,7 +250,7 @@ fn route(
         Input::ActivationRegistered { instance } => on_registered(page, &instance, reactions),
         Input::ActivationDeregistered { instance } => on_deregistered(page, &instance, reactions),
         Input::ActivationDone(done) => {
-            let completion = outward::on_activation_done(page, done, now, now_ms);
+            let completion = outward::on_activation_done(page, *done, now, now_ms);
             reactions.completion(page, completion, now, now_ms);
         }
         Input::RetryDue => {

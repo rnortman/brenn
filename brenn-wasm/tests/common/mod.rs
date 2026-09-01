@@ -140,13 +140,15 @@ pub fn out_spec(channel_address: &str) -> OutputPortSpec {
 
 /// Load a no-capability processor fixture component with no output ports and a no-op alerter.
 ///
-/// Grants no capabilities. Callers that need capabilities should construct
-/// `ProcessorLoadSpec` directly.
+/// Grants no capabilities, declares no ports — every publish it makes is a
+/// contract violation. Callers that need capabilities or a port vocabulary
+/// should construct `ProcessorLoadSpec` directly.
 pub fn load_processor_noop(name: &str, slug: &str) -> brenn_wasm::ProcessorComponent {
     brenn_wasm::ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &artifact_path(name),
         slug,
         output_ports: HashMap::new(),
+        declared_out_ports: std::collections::BTreeSet::new(),
         input_amplification_mt: amp_in(),
         mqtt_sinks: HashMap::new(),
         config: HashMap::new(),

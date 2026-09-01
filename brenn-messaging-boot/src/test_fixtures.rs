@@ -122,6 +122,7 @@ pub fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
         slug: "probe".to_string(),
         package: "probe".to_string(),
         spec_sha256: String::new(),
+        declared_out_ports: vec![],
         grants: vec![],
         store_path: None,
         store_size_limit: None,
@@ -326,6 +327,25 @@ pub(super) fn resolve(
 }
 
 #[cfg(test)]
+/// `resolve_surfaces` against a lowered auto wiring, with each fixture's
+/// components taken to declare exactly the out ports their bindings imply —
+/// what a hand-written fixture means when it says nothing about the
+/// vocabulary. One that says something is left alone.
+pub(super) fn resolve_surfaces_with_auto(
+    raw: &[brenn_lib::messaging::config::SurfaceConfigRaw],
+    dir: &MessagingDirectory,
+    globals: &brenn_lib::messaging::config::MessagingGlobalConfig,
+    auto: &super::auto::AutoWiring,
+) -> Vec<super::ResolvedSurface> {
+    let raw: Vec<brenn_lib::messaging::config::SurfaceConfigRaw> = raw
+        .iter()
+        .cloned()
+        .map(brenn_lib::messaging::config::SurfaceConfigRaw::implying_component_vocabularies)
+        .collect();
+    super::resolve_surfaces(&raw, dir, globals, auto)
+}
+
+#[cfg(test)]
 /// Call `resolve_wasm_consumers` against a lowered auto wiring, for the
 /// connection-bound port cases.
 pub(super) fn resolve_with_auto(
@@ -333,5 +353,13 @@ pub(super) fn resolve_with_auto(
     dir: &MessagingDirectory,
     auto: &super::auto::AutoWiring,
 ) -> Vec<ResolvedWasmConsumer> {
-    resolve_wasm_consumers(raw, dir, "64MiB", &IndexMap::new(), auto)
+    // Each fixture's class is taken to declare exactly the out ports its
+    // instance binds, which is what a hand-written fixture means when it says
+    // nothing about the vocabulary. One that says something is left alone.
+    let raw: Vec<WasmConsumerConfigRaw> = raw
+        .iter()
+        .cloned()
+        .map(WasmConsumerConfigRaw::implying_its_vocabulary)
+        .collect();
+    resolve_wasm_consumers(&raw, dir, "64MiB", &IndexMap::new(), auto)
 }

@@ -20,6 +20,12 @@ typo was detected at the first publish rather than at boot; inbound dispatch
 was a hand-written string match whose arms nothing checked; documentation
 tables were held shut by comments saying that nothing compiled them shut.
 
+For a scaffolded guest the typo is now a compile error. For a raw-WIT guest
+that skips the scaffold, the first publish is still where it surfaces — but as a
+trap naming the instance and the port, not as a per-call refusal the component
+can ignore: both hosts are handed the class's declared out-port vocabulary and
+treat a name outside it as the component contradicting its own specification.
+
 The input label is the *same label* the component package embeds and the host
 hash-binds at boot (`component-packages.md`). So the bytes that generate the
 code are the bytes the running system checks, and the generated module inherits
@@ -133,9 +139,12 @@ that path out of the source glob and appends the generated file:
 `wasm_guest_cdylib` for backend components, `surface_processor_component` for
 surface ones, feeding both its host `rust_library` and its wasm32
 `rust_shared_library`, since the generated module is plain Rust. A raw-WIT
-crate's `src/bindings.rs` rides the same parameter. A surface kind's
-specification label is derived from its package directory, so
-`surface_processor_component` wires this with no per-component editing.
+crate's `src/bindings.rs` arrives instead through `wasm_guest_cdylib`'s
+`shared_bindings`, which names the shared generation of that world and wires
+the substitution itself; `generated_srcs` remains the specification scaffold's
+slot. A surface kind's specification label is derived from its package
+directory, so `surface_processor_component` wires this with no per-component
+editing.
 
 **The output is untracked.** `.gitignore` covers `src/spec.rs` under both
 component trees. Bazel's dependency tracking replaces a drift gate: the

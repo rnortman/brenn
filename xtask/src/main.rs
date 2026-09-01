@@ -7,6 +7,7 @@ mod check_wit;
 mod deny;
 mod discover;
 mod file_set;
+mod generated_bindings_guard;
 mod git_spawn_guard;
 mod help_guard;
 mod policy_parity;
@@ -35,6 +36,7 @@ fn run_guards(root: &Path, files: &[PathBuf]) -> bool {
     let workspace_ok = workspace_guard::run_workspace_guard(root, files);
     let test_target_ok = test_target_guard::run_test_target_guard(root, files);
     let testutils_deps_ok = testutils_deps_guard::run_testutils_deps_guard(root, files);
+    let bindings_ok = generated_bindings_guard::run_generated_bindings_guard(files);
     removal_ok
         && spawn_ok
         && help_ok
@@ -43,6 +45,7 @@ fn run_guards(root: &Path, files: &[PathBuf]) -> bool {
         && workspace_ok
         && test_target_ok
         && testutils_deps_ok
+        && bindings_ok
 }
 
 /// `--manifest` names a listing of repo-root-relative paths; without it the set

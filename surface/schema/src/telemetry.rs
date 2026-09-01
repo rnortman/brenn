@@ -239,6 +239,14 @@ pub struct InstanceCounters {
     /// (drop-oldest, counted). Sustained non-zero drops mean the component is
     /// not keeping up with its bindings' `push_depth`.
     pub drops: u64,
+    /// Publishes this instance made to a port its specification declares and
+    /// nobody wired: accepted, charged, and discarded. Not counted in
+    /// `publishes`, which is what the kernel queued.
+    ///
+    /// A steady non-zero count is an unwired optional port being used as
+    /// designed; a count where the deployer believes the port is wired is the
+    /// only page-side signal that it is not.
+    pub dropped_publishes: u64,
     /// Activation failures reported for this instance, one per occurrence: both
     /// `Err` outcomes and traps, whatever level the failure was reported at.
     ///
@@ -553,6 +561,7 @@ mod tests {
                     InstanceCounters {
                         publishes: 2,
                         drops: 5,
+                        dropped_publishes: 6,
                         activation_failures: 4,
                     },
                 )]),
@@ -688,7 +697,14 @@ mod tests {
         // would be counting for nobody.
         assert_eq!(
             v["counters"]["instances"],
-            json!({ "p1": { "publishes": 2, "drops": 5, "activation_failures": 4 } })
+            json!({
+                "p1": {
+                    "publishes": 2,
+                    "drops": 5,
+                    "dropped_publishes": 6,
+                    "activation_failures": 4,
+                }
+            })
         );
         assert_eq!(v["overlay"]["holder"], json!("p1"));
         assert_eq!(v["overlay"]["since"], json!("1970-01-01T00:00:00Z"));

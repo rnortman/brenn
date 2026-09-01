@@ -396,6 +396,37 @@ fn resolve_component_grants(
     grants
 }
 
+/// Resolve a component instance's declared outbound port vocabulary — every
+/// `out` and `io` port name its class declares, as lowering carried it.
+///
+/// The kernel refuses a publish outside this set, so a malformed entry here
+/// would trap a component that did nothing wrong; the names are held to the
+/// same charset as a binding's.
+///
+/// # Panics
+///
+/// On an empty name, a name outside the unreserved charset, and a repeated
+/// name (the resolver refuses a class declaring one name twice).
+fn resolve_declared_out_ports(
+    slug: &str,
+    instance: &str,
+    comp: &SurfaceComponentRaw,
+) -> BTreeSet<String> {
+    let mut declared = BTreeSet::new();
+    for port in &comp.declared_out_ports {
+        crate::assert_port_name(
+            &format!("config: [[surface]] {slug:?}: component {instance:?} declared out-port name"),
+            port,
+        );
+        assert!(
+            declared.insert(port.clone()),
+            "config: [[surface]] {slug:?}: component {instance:?} declares out-port name \
+             {port:?} twice",
+        );
+    }
+    declared
+}
+
 /// Resolve a component instance's static config map — the page-lifetime
 /// analogue of the backend's process-lifetime map seeded from host config and read
 /// through the `config` import.
@@ -682,6 +713,7 @@ pub(crate) fn resolve_surfaces(
                 // Carried, not checked here: validated at boot by the surface
                 // asset gate.
                 spec_sha256: comp.spec_sha256.clone(),
+                declared_out_ports: resolve_declared_out_ports(slug, instance, comp),
                 config: resolve_component_config(slug, instance, comp),
                 grants,
                 send_budget: resolve_send_budget(slug, instance, comp),
@@ -834,14 +866,9 @@ pub(crate) fn resolve_surfaces(
                  is not declared as a [[surface.component]] on this surface",
             );
             // Item 5: port charset.
-            assert!(
-                !port.is_empty(),
-                "config: [[surface]] {slug:?}: {direction} port name must be non-empty",
-            );
-            assert!(
-                port.chars().all(is_unreserved_char),
-                "config: [[surface]] {slug:?}: {direction} port name {port:?} must consist of \
-                 RFC 3986 unreserved characters only (A-Za-z0-9._~-)",
+            crate::assert_port_name(
+                &format!("config: [[surface]] {slug:?}: {direction} port name"),
+                port,
             );
             // Items 3 + 4: scheme restriction and channel existence. Both
             // planes give a surface the same row, so one lookup covers a
@@ -1333,6 +1360,21 @@ pub(crate) fn resolve_surfaces(
                  binding(s) but \"ports\" is not in its grants — the component cannot publish; \
                  add \"ports\" to its grants or remove the output bindings",
             );
+
+            // Belt and suspenders over the compiler: the resolver refuses a
+            // binding naming a port the class does not declare, so a bound
+            // output outside the vocabulary means lowering and resolution
+            // disagree about which class this instance is an instance of.
+            for out in outputs.iter().filter(|o| o.instance == instance) {
+                assert!(
+                    comp.declared_out_ports.contains(&out.port),
+                    "config: [[surface]] {slug:?}: component {instance:?} binds output port \
+                     {:?}, which is not in its class's declared out-port vocabulary {:?} — the \
+                     lowered vocabulary does not describe the lowered bindings",
+                    out.port,
+                    comp.declared_out_ports,
+                );
+            }
 
             // `config` ⟺ a config map, both directions. A map no component may
             // read is unread configuration; a grant with no map behind it reads

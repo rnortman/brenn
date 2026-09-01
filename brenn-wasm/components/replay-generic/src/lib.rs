@@ -173,8 +173,6 @@ impl Guest for Component {
             } else {
                 // Non-expired — check for duplicate signature.
                 if key_sig(key) == sig_bytes {
-                    // rollback() returns () per generated bindings (bindings.rs:974) —
-                    // not a Result, so no error to handle. (errhandling-2 verified)
                     tx.rollback();
                     return Err(ReplayError::Duplicate);
                 }
@@ -184,7 +182,6 @@ impl Guest for Component {
 
         // Step 4: Cap check — fail closed before inserting.
         if non_expired_count >= CAP {
-            // rollback() returns () per generated bindings (bindings.rs:974). (errhandling-2)
             tx.rollback();
             return Err(ReplayError::TooManyRequests);
         }

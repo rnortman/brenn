@@ -70,6 +70,7 @@ fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path(),
         slug: "mqtt-test",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),

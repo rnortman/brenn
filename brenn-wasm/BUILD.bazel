@@ -1,5 +1,5 @@
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "component_fixtures", "component_install_tree", "component_package", "deployed_components_test", "grant_parity_test")
+load("//bazel/wasm:defs.bzl", "component_fixtures", "component_install_tree", "component_package", "deployed_components_test", "grant_parity_test", "wit_bindgen_rust")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
@@ -214,6 +214,28 @@ filegroup(
     name = "wit",
     srcs = glob(["wit/**/*.wit"]),
     visibility = ["//visibility:public"],
+)
+
+# Generated once and copied into each crate that compiles the `brenn:processor`
+# world directly, without the guest SDK: processor-exhaust,
+# processor-mem-exhaust, processor-mqtt-test, processor-tool-test.
+wit_bindgen_rust(
+    name = "processor_bindings",
+    out = "processor_bindings.rs",
+    visibility = ["//brenn-wasm/components:__subpackages__"],
+    wit = "wit/processor.wit",
+    wit_srcs = ":wit",
+)
+
+# Generated once and copied into each crate that compiles the `brenn:replay`
+# world directly, without the guest SDK: replay, replay-generic,
+# replay-fault-test.
+wit_bindgen_rust(
+    name = "replay_bindings",
+    out = "replay_bindings.rs",
+    visibility = ["//brenn-wasm/components:__subpackages__"],
+    wit = "wit/replay.wit",
+    wit_srcs = ":wit",
 )
 
 # The wasmtime host. The guest components it loads are a separate cargo

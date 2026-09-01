@@ -204,8 +204,9 @@ async fn err_outcome_acks_push_row_at_activation_start() {
     )
     .await;
 
-    // Insert a webhook envelope. The demo calls publish("out", …); with no output
-    // port bound, this returns NotPermitted, causing the guest to return Err.
+    // Insert a webhook envelope. The demo calls publish("out", …); the port is
+    // bound to a channel the output ACL denies, so the publish is NotPermitted
+    // and the guest returns Err.
     let wh_env = WebhookEnvelope {
         headers: vec![],
         key_id: "k".into(),
@@ -218,12 +219,17 @@ async fn err_outcome_acks_push_row_at_activation_start() {
     let _ =
         testutils::insert_bus_message(&messenger, &entry, &wh_body, ChannelScheme::Webhook).await;
 
-    // Build component with no output ports → publish("out", …) → NotPermitted → Err.
+    // Build the component with "out" bound to a channel the ACL denies →
+    // publish("out", …) → NotPermitted → the guest returns Err.
     let _db = tempfile::NamedTempFile::new().unwrap();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
-        output_ports: std::collections::HashMap::new(), // no "out" bound → NotPermitted
+        declared_out_ports: ["out".to_string()].into_iter().collect(),
+        output_ports: std::collections::HashMap::from([(
+            "out".to_string(),
+            test_out_spec("brenn:denied".to_string()),
+        )]),
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
         config: std::collections::HashMap::new(),
@@ -233,7 +239,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
+        output_acl: std::sync::Arc::new(|_| false),
         mqtt_publish: None,
         tool_host: None,
     }));
@@ -892,6 +898,7 @@ async fn build_ring_backed_consumer(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -1023,6 +1030,7 @@ async fn build_mixed_class_consumer(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: std::path::Path::new(DEMO_WASM),
         slug,
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -1290,6 +1298,7 @@ async fn boot_dispatch(
         .map(|consumer| {
             let ConsumerLoadParts {
                 output_ports,
+                declared_out_ports,
                 input_amplification_mt,
                 mqtt_sinks,
                 grants,
@@ -1301,6 +1310,7 @@ async fn boot_dispatch(
                 // loader, not the package resolution boot does.
                 component_path: std::path::Path::new(DEMO_WASM),
                 slug: &consumer.slug,
+                declared_out_ports,
                 output_ports,
                 input_amplification_mt,
                 mqtt_sinks,
@@ -1383,15 +1393,18 @@ async fn an_io_port_timer_loop_delivers_the_guests_own_deferred_wake() {
 
     let config = BrennConfig {
         channels: vec![trigger_channel()],
-        wasm_consumers: vec![WasmConsumerConfigRaw {
-            io_ports: vec![io_port_raw(
-                "out",
-                None,
-                Depth::Bounded(4),
-                Depth::Bounded(4),
-            )],
-            ..demo_consumer_raw("ticker")
-        }],
+        wasm_consumers: vec![
+            WasmConsumerConfigRaw {
+                io_ports: vec![io_port_raw(
+                    "out",
+                    None,
+                    Depth::Bounded(4),
+                    Depth::Bounded(4),
+                )],
+                ..demo_consumer_raw("ticker")
+            }
+            .implying_its_vocabulary(),
+        ],
         ..BrennConfig::default()
     };
 
@@ -1494,7 +1507,8 @@ fn link_config() -> brenn_lib::config::BrennConfig {
             publish_capacity: None,
         }],
         ..demo_consumer_raw("producer")
-    };
+    }
+    .implying_its_vocabulary();
     let reader = WasmConsumerConfigRaw {
         slug: "reader".to_string(),
         package: "processor-demo".to_string(),
@@ -1609,15 +1623,18 @@ async fn a_durable_named_io_port_channel_carries_a_schedule_across_a_restart() {
 
     let config = BrennConfig {
         channels: vec![trigger_channel()],
-        wasm_consumers: vec![WasmConsumerConfigRaw {
-            io_ports: vec![io_port_raw(
-                "out",
-                Some("brenn:ticker.timer"),
-                Depth::Bounded(4),
-                Depth::Bounded(4),
-            )],
-            ..demo_consumer_raw("ticker")
-        }],
+        wasm_consumers: vec![
+            WasmConsumerConfigRaw {
+                io_ports: vec![io_port_raw(
+                    "out",
+                    Some("brenn:ticker.timer"),
+                    Depth::Bounded(4),
+                    Depth::Bounded(4),
+                )],
+                ..demo_consumer_raw("ticker")
+            }
+            .implying_its_vocabulary(),
+        ],
         ..BrennConfig::default()
     };
     let db = init_db_memory_lib_slice();
@@ -1697,15 +1714,18 @@ async fn renaming_a_durable_auto_channel_writes_a_fresh_row() {
     let trigger = trigger_channel();
     let config_for = |address: &str| BrennConfig {
         channels: vec![trigger.clone()],
-        wasm_consumers: vec![WasmConsumerConfigRaw {
-            io_ports: vec![io_port_raw(
-                "out",
-                Some(address),
-                Depth::Bounded(4),
-                Depth::Bounded(4),
-            )],
-            ..demo_consumer_raw("ticker")
-        }],
+        wasm_consumers: vec![
+            WasmConsumerConfigRaw {
+                io_ports: vec![io_port_raw(
+                    "out",
+                    Some(address),
+                    Depth::Bounded(4),
+                    Depth::Bounded(4),
+                )],
+                ..demo_consumer_raw("ticker")
+            }
+            .implying_its_vocabulary(),
+        ],
         ..BrennConfig::default()
     };
     let db = init_db_memory_lib_slice();

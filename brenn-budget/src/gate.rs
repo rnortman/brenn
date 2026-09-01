@@ -29,6 +29,10 @@
 //!    aggregate, and the entry count only on acceptance, so a publish refused
 //!    by a later check has spent nothing.
 //!
+//! A publish to a port the component declares but its deployer did not wire has
+//! no sink, and takes [`ActivationGate::admit_publish_without_sink`] at step 3
+//! instead: the same checks in the same order, minus the bucket.
+//!
 //! # Control-op order
 //!
 //! 1. [`check_deliver_after`] — a fact about the argument, not about any
@@ -140,6 +144,11 @@ pub struct ActivationGate<K: Eq + Hash> {
     calls: usize,
     /// Accepted publishes.
     entries: usize,
+    /// Accepted publishes that had no sink to pay and no entry to buffer — the
+    /// subset of `entries` a host dropped rather than queued. Held here because
+    /// the sink-less admission is the only way to produce one, so the gate is
+    /// the one place that cannot fall out of step with the ceiling it charges.
+    dropped: usize,
     /// Accepted control ops.
     ops: usize,
     /// Accepted body bytes — published bodies and edit bodies together.
@@ -156,6 +165,7 @@ impl<K: Eq + Hash + Clone + Debug> ActivationGate<K> {
             sinks,
             calls: 0,
             entries: 0,
+            dropped: 0,
             ops: 0,
             bytes: 0,
         }
@@ -227,6 +237,50 @@ impl<K: Eq + Hash + Clone + Debug> ActivationGate<K> {
         Ok(())
     }
 
+    /// Judge one publish that has no sink, and on acceptance charge everything a
+    /// sunk publish would charge except the bucket.
+    ///
+    /// A component may declare an output port its deployer chose not to wire.
+    /// Publishing there is legal and the message is dropped, so there is no
+    /// bucket to pay — but every check that does not need one still has to
+    /// answer, in the same order and with the same verdicts, or the guest could
+    /// read its own wiring out of the difference between the two paths. Order and
+    /// charges are [`Self::admit_publish`]'s with the bucket step removed: body
+    /// cap, release-time representability, buffered-entry ceiling, byte
+    /// aggregate.
+    ///
+    /// The entry count is charged even though nothing is buffered: a dropped
+    /// publish must consume the same ceiling a delivered one does, or the ceiling
+    /// itself becomes the channel that reports wiring.
+    pub fn admit_publish_without_sink(
+        &mut self,
+        body_len: usize,
+        deliver_after: Option<u64>,
+        entry_addend: usize,
+    ) -> Result<(), GateRefusal> {
+        if body_len > self.max_body_bytes {
+            return Err(GateRefusal::BodyTooLarge {
+                len: body_len,
+                max: self.max_body_bytes,
+            });
+        }
+        check_deliver_after(deliver_after)?;
+        if self.entries + entry_addend >= MAX_PUBLISHES_PER_ACTIVATION {
+            return Err(GateRefusal::EntryCap {
+                cap: MAX_PUBLISHES_PER_ACTIVATION,
+            });
+        }
+        if self.bytes + body_len > MAX_PUBLISH_BYTES_PER_ACTIVATION {
+            return Err(GateRefusal::ByteCap {
+                cap: MAX_PUBLISH_BYTES_PER_ACTIVATION,
+            });
+        }
+        self.bytes += body_len;
+        self.entries += 1;
+        self.dropped += 1;
+        Ok(())
+    }
+
     /// Whether the buffered-entry ceiling is reached, counting `addend` host-held
     /// entries alongside the gate's own.
     ///
@@ -291,6 +345,14 @@ impl<K: Eq + Hash + Clone + Debug> ActivationGate<K> {
     /// Publishes accepted this activation.
     pub fn entries(&self) -> usize {
         self.entries
+    }
+
+    /// Publishes accepted with no sink, and so dropped rather than buffered —
+    /// the part of [`Self::entries`] a host's own buffer does not hold. A host
+    /// reconciles its buffer against the ceiling as
+    /// `entries() == buffered + dropped()`.
+    pub fn dropped(&self) -> usize {
+        self.dropped
     }
 
     /// Control ops accepted this activation.
@@ -602,6 +664,90 @@ mod tests {
         g.admit_publish(publish(1)).expect("accepted");
         let carry = g.into_sinks();
         assert_eq!(carry[PORT], 3 * MILLITOKENS_PER_PUBLISH);
+    }
+
+    /// The sink-less path answers every check the sunk path answers except the
+    /// bucket, with the same verdicts in the same order — that identity is what
+    /// keeps a component from reading its own wiring out of an error code.
+    #[test]
+    fn the_sinkless_path_matches_the_sunk_path_check_for_check() {
+        // Body cap.
+        let mut g = gate(8, u64::MAX);
+        assert_eq!(
+            g.admit_publish_without_sink(9, Some(u64::MAX), 0),
+            Err(GateRefusal::BodyTooLarge { len: 9, max: 8 })
+        );
+        // Representability, after the body cap.
+        assert_eq!(
+            g.admit_publish_without_sink(8, Some(u64::MAX), 0),
+            Err(GateRefusal::UnrepresentableDeliverAfter { ms: u64::MAX })
+        );
+        // Entry ceiling, counting the host's addend.
+        assert_eq!(
+            g.admit_publish_without_sink(1, None, MAX_PUBLISHES_PER_ACTIVATION),
+            Err(GateRefusal::EntryCap {
+                cap: MAX_PUBLISHES_PER_ACTIVATION
+            })
+        );
+        // Byte aggregate, last.
+        let mut g = gate(MAX_PUBLISH_BYTES_PER_ACTIVATION, u64::MAX);
+        g.admit_publish_without_sink(MAX_PUBLISH_BYTES_PER_ACTIVATION - 1, None, 0)
+            .expect("the first body fits the aggregate");
+        assert_eq!(
+            g.admit_publish_without_sink(2, None, 0),
+            Err(GateRefusal::ByteCap {
+                cap: MAX_PUBLISH_BYTES_PER_ACTIVATION
+            })
+        );
+        // Nothing refused was charged.
+        assert_eq!(g.entries(), 1);
+        assert_eq!(g.bytes(), MAX_PUBLISH_BYTES_PER_ACTIVATION - 1);
+    }
+
+    /// An accepted sink-less publish charges the entry and the bytes but spends
+    /// no tokens — there is no bucket to spend them from, and the two ceilings
+    /// are exactly what a dropped message must still answer to.
+    #[test]
+    fn an_accepted_sinkless_publish_charges_the_ceilings_and_no_bucket() {
+        let mut g = gate(1024, 3 * MILLITOKENS_PER_PUBLISH);
+        g.charge_call().expect("first call is under the ceiling");
+        g.admit_publish_without_sink(10, None, 0)
+            .expect("every sink-less check passes");
+        assert_eq!(g.entries(), 1);
+        assert_eq!(g.bytes(), 10);
+        assert_eq!(g.calls(), 1);
+        assert_eq!(g.sinks()[PORT], 3 * MILLITOKENS_PER_PUBLISH);
+    }
+
+    /// `dropped()` counts the sink-less admissions and only those, so a host can
+    /// reconcile its buffer against the ceiling without keeping a count of its
+    /// own. A refused sink-less publish charges nothing, here included.
+    #[test]
+    fn the_gate_counts_the_publishes_it_admitted_with_no_sink() {
+        let mut g = gate(8, 3 * MILLITOKENS_PER_PUBLISH);
+        g.admit_publish(publish(1)).expect("the bucket pays");
+        assert_eq!(g.dropped(), 0);
+        g.admit_publish_without_sink(4, None, 0)
+            .expect("every sink-less check passes");
+        g.admit_publish_without_sink(4, None, 0)
+            .expect("every sink-less check passes");
+        assert_eq!(
+            g.admit_publish_without_sink(9, None, 0),
+            Err(GateRefusal::BodyTooLarge { len: 9, max: 8 })
+        );
+        assert_eq!(g.dropped(), 2);
+        assert_eq!(g.entries(), 3);
+    }
+
+    /// The gate holds no sink table entry for an unwired port and does not need
+    /// one: the sink-less path never looks, so it cannot panic the way
+    /// [`ActivationGate::admit_publish`] does on an unseeded key.
+    #[test]
+    fn the_sinkless_path_needs_no_seeded_bucket() {
+        let mut g = ActivationGate::<&'static str>::new(1024, HashMap::new());
+        g.admit_publish_without_sink(4, None, 0)
+            .expect("no bucket is consulted");
+        assert_eq!(g.entries(), 1);
     }
 
     /// A publish naming a sink the gate was never seeded with is a broken host

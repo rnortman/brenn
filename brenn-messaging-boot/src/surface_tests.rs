@@ -32,8 +32,16 @@ fn resolve_surfaces(
     directory: &messaging::MessagingDirectory,
     globals: &brenn_lib::messaging::config::MessagingGlobalConfig,
 ) -> Vec<ResolvedSurface> {
+    // Each fixture's class is taken to declare exactly the out ports its
+    // instance binds, which is what a hand-written fixture means when it says
+    // nothing about the vocabulary. One that says something is left alone.
+    let raw_surfaces: Vec<brenn_lib::messaging::config::SurfaceConfigRaw> = raw_surfaces
+        .iter()
+        .cloned()
+        .map(brenn_lib::messaging::config::SurfaceConfigRaw::implying_component_vocabularies)
+        .collect();
     super::resolve_surfaces(
-        raw_surfaces,
+        &raw_surfaces,
         directory,
         globals,
         &super::auto::AutoWiring::default(),
@@ -476,6 +484,7 @@ fn surface_resolves_happy_path() {
         vec![
             ResolvedComponent {
                 spec_sha256: spec_hash("protobar"),
+                declared_out_ports: ["out".to_string()].into(),
                 grants: [ComponentGrant::Ports].into(),
                 ..ResolvedComponent::minimal("protobar", "protobar")
             },
@@ -518,6 +527,82 @@ fn surface_resolves_happy_path() {
     assert_eq!(s.publish_per_sec, DEFAULT_SURFACE_PUBLISH_PER_SEC);
 }
 
+/// A component's declared out-port vocabulary reaches the resolved instance
+/// whole: the bound port and the ports the surface leaves unwired alike.
+///
+/// The unwired half is the point. An unbound port appears in no
+/// `[[surface.output]]`, so before this the kernel had no way to tell a port
+/// the author declared and the deployer left unheard from a name no
+/// specification mentions.
+#[test]
+fn a_resolved_component_carries_the_ports_its_class_declares_but_binds_none_of() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].declared_out_ports =
+        vec!["out".to_string(), "tick".to_string(), "unheard".to_string()];
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    let component = &resolved[0].components[0];
+    assert_eq!(
+        component
+            .declared_out_ports
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["out", "tick", "unheard"],
+    );
+    assert_eq!(
+        resolved[0].outputs.len(),
+        1,
+        "only the bound port has a sink; the other two are vocabulary and nothing else",
+    );
+}
+
+/// A bound output the class does not declare is the two halves of lowering
+/// disagreeing about which class the instance is an instance of — the compiler
+/// refuses the binding, so reaching resolution with one means something above
+/// is broken.
+#[test]
+#[should_panic(expected = "is not in its class's declared out-port vocabulary")]
+fn a_surface_output_outside_the_declared_vocabulary_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].declared_out_ports = vec!["unheard".to_string()];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A declared name is held to the charset every port name is held to: it is
+/// what the kernel compares a component's publish against, and what a trap
+/// diagnostic prints.
+#[test]
+#[should_panic(expected = "declared out-port name \"bad port\"")]
+fn a_declared_surface_out_port_outside_the_charset_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].declared_out_ports = vec!["bad port".to_string(), "out".to_string()];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A vocabulary that names one port twice is a lowered set that is not a set.
+/// Refused rather than deduplicated: the two halves of lowering disagree, and
+/// which one is right is not this code's guess to make.
+#[test]
+#[should_panic(expected = "declares out-port name \"out\" twice")]
+fn a_declared_surface_out_port_named_twice_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].declared_out_ports = vec!["out".to_string(), "out".to_string()];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+#[test]
+#[should_panic(expected = "declared out-port name must be non-empty")]
+fn an_empty_declared_surface_out_port_name_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].declared_out_ports = vec![String::new(), "out".to_string()];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
 /// The field-by-field pin on what resolution puts on a `ResolvedComponent`.
 ///
 /// [`surface_resolves_happy_path`] compares whole values, but every literal in
@@ -533,6 +618,7 @@ fn every_field_of_a_resolved_component_is_pinned() {
         instance,
         kind,
         spec_sha256,
+        declared_out_ports,
         send_budget,
         parked_batch_depth,
         chrome,
@@ -543,6 +629,12 @@ fn every_field_of_a_resolved_component_is_pinned() {
     assert_eq!(instance, "protobar");
     assert_eq!(kind, "protobar");
     assert_eq!(*spec_sha256, spec_hash("protobar"));
+    // The class's whole outbound vocabulary, carried through lowering: this
+    // instance declares one out port, and it is the one the surface binds.
+    assert_eq!(
+        declared_out_ports.iter().cloned().collect::<Vec<_>>(),
+        ["out".to_string()]
+    );
     assert_eq!(
         *send_budget,
         brenn_lib::messaging::config::AttachSendBudget::default()
@@ -2934,7 +3026,7 @@ fn resolve_lowered(raw: brenn_lib::messaging::config::SurfaceConfigRaw) -> Vec<R
     let globals = test_globals();
     let wiring =
         super::auto::lower_auto_wiring(&[], &[], std::slice::from_ref(&raw), &[], &globals);
-    super::resolve_surfaces(&[raw], &dir_of(vec![]), &globals, &wiring)
+    super::test_fixtures::resolve_surfaces_with_auto(&[raw], &dir_of(vec![]), &globals, &wiring)
 }
 
 /// Both halves of an `io` port are bindings, and the output half is a publish:

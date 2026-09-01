@@ -282,6 +282,37 @@ fn ports_granted(
     }
 }
 
+/// Lift a port-vocabulary violation into the thrown value the loader's shim turns
+/// into a trap, writing the breadcrumb on the way out.
+///
+/// The four headless port exports answer `Ok(String)` for everything the
+/// contract has a word for and `Err` for the one thing it does not: a publish to
+/// a port the component's specification never declared. That is the DOM family's
+/// treatment of a call with no answer, applied to the port family for the same
+/// reason — the component's behaviour contradicts the specification its artifact
+/// is hash-bound to, and there is nothing to carry on with.
+fn undeclared_port_trap(host: &ProcessorHost, instance: &str, port: &str) -> JsValue {
+    let (report, reason) = crate::logic::undeclared_port(instance, port);
+    dom::apply_actions(std::slice::from_ref(&report), &host.handle);
+    JsValue::from_str(&reason)
+}
+
+/// The answer a port export gives for one buffer verdict: the WIT variant name
+/// for a refusal, a trap for a violation.
+fn port_answer<E>(
+    host: &ProcessorHost,
+    instance: &str,
+    fault: crate::publish_buffer::PortFault<E>,
+    variant: impl FnOnce(E) -> String,
+) -> Result<String, JsValue> {
+    match fault {
+        crate::publish_buffer::PortFault::Refused(err) => Ok(variant(err)),
+        crate::publish_buffer::PortFault::Undeclared(port) => {
+            Err(undeclared_port_trap(host, instance, &port))
+        }
+    }
+}
+
 /// A processor instance's `ports.publish` / `ports.publish-with-urgency` import.
 ///
 /// `instance` comes from the loader's own closure over the manifest entry it
@@ -302,34 +333,34 @@ pub fn brenn_processor_publish(
     port: &str,
     body: &str,
     urgency: Option<String>,
-) -> String {
+) -> Result<String, JsValue> {
     let urgency = match urgency {
         Some(raw) => match crate::Urgency::parse(&raw) {
             Some(urgency) => Some(urgency),
             // The guest's WIT enum lifts to a fixed string set, so an
             // unrecognized value is transpile-glue drift, not a component typo.
-            None => return "invalid-payload".to_string(),
+            None => return Ok("invalid-payload".to_string()),
         },
         None => None,
     };
     with_processor_host("processor publish", |host| {
         if !ports_granted(&host.core, &host.handle, instance, "ports.publish") {
-            return "not-permitted".to_string();
+            return Ok("not-permitted".to_string());
         }
         match host
             .handle
             .try_buffered_publish(instance, port, body, urgency)
         {
-            Some(Ok(())) => {
-                dom::count_publish(instance);
-                String::new()
+            Some(Ok(admission)) => {
+                dom::count_admission(instance, admission);
+                Ok(String::new())
             }
-            Some(Err(err)) => crate::logic::publish_error_str(err),
+            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::publish_error_str),
             // TODO(surface-wasm-test-in-ci): this None arm (absent host slot →
             // "not-permitted") depends on the live wasm host slot and can only
             // be pinned by the browser test runner, unlike the variant map,
             // which is natively tested in `logic`.
-            None => "not-permitted".to_string(),
+            None => Ok("not-permitted".to_string()),
         }
     })
 }
@@ -349,21 +380,21 @@ pub fn brenn_processor_publish_deferred(
     port: &str,
     body: &str,
     deliver_after: u64,
-) -> String {
+) -> Result<String, JsValue> {
     with_processor_host("processor deferred publish", |host| {
         if !ports_granted(&host.core, &host.handle, instance, "ports.publish-deferred") {
-            return "not-permitted".to_string();
+            return Ok("not-permitted".to_string());
         }
         match host
             .handle
             .try_buffered_publish_deferred(instance, port, body, deliver_after)
         {
-            Some(Ok(())) => {
-                dom::count_publish(instance);
-                String::new()
+            Some(Ok(admission)) => {
+                dom::count_admission(instance, admission);
+                Ok(String::new())
             }
-            Some(Err(err)) => crate::logic::publish_error_str(err),
-            None => "not-permitted".to_string(),
+            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::publish_error_str),
+            None => Ok("not-permitted".to_string()),
         }
     })
 }
@@ -378,15 +409,19 @@ pub fn brenn_processor_publish_deferred(
 /// the WIT rules a benign race the host logs and counts — the component has
 /// already returned by then, so it is not a refusal.
 #[wasm_bindgen]
-pub fn brenn_processor_defer_cancel(instance: &str, port: &str, index: u32) -> String {
+pub fn brenn_processor_defer_cancel(
+    instance: &str,
+    port: &str,
+    index: u32,
+) -> Result<String, JsValue> {
     with_processor_host("processor defer cancel", |host| {
         if !ports_granted(&host.core, &host.handle, instance, "ports.defer-cancel") {
-            return "not-permitted".to_string();
+            return Ok("not-permitted".to_string());
         }
         match host.handle.try_buffered_defer_cancel(instance, port, index) {
-            Some(Ok(())) => String::new(),
-            Some(Err(err)) => crate::logic::defer_error_str(err),
-            None => "not-permitted".to_string(),
+            Some(Ok(())) => Ok(String::new()),
+            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::defer_error_str),
+            None => Ok("not-permitted".to_string()),
         }
     })
 }
@@ -404,18 +439,18 @@ pub fn brenn_processor_defer_edit(
     index: u32,
     body: Option<String>,
     deliver_after: Option<u64>,
-) -> String {
+) -> Result<String, JsValue> {
     with_processor_host("processor defer edit", |host| {
         if !ports_granted(&host.core, &host.handle, instance, "ports.defer-edit") {
-            return "not-permitted".to_string();
+            return Ok("not-permitted".to_string());
         }
         match host
             .handle
             .try_buffered_defer_edit(instance, port, index, body, deliver_after)
         {
-            Some(Ok(())) => String::new(),
-            Some(Err(err)) => crate::logic::defer_error_str(err),
-            None => "not-permitted".to_string(),
+            Some(Ok(())) => Ok(String::new()),
+            Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::defer_error_str),
+            None => Ok("not-permitted".to_string()),
         }
     })
 }

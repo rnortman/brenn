@@ -308,6 +308,7 @@ async fn build_pipeline() -> Pipeline {
     let parser_component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: Path::new(PARSER_WASM),
         slug: PARSER_SLUG,
+        declared_out_ports: parser_outputs.keys().cloned().collect(),
         output_ports: parser_outputs,
         input_amplification_mt: parser_amp,
         mqtt_sinks: HashMap::new(),
@@ -394,6 +395,7 @@ async fn build_pipeline() -> Pipeline {
     let consumer_component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: Path::new(CONSUMER_WASM),
         slug: CONSUMER_SLUG,
+        declared_out_ports: consumer_outputs.keys().cloned().collect(),
         output_ports: consumer_outputs,
         input_amplification_mt: consumer_amp,
         mqtt_sinks: HashMap::new(),

@@ -21,7 +21,8 @@
 //! table, the deferred snapshot, the buffered entries — plus the last step onto
 //! the contract's error vocabulary.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use brenn_budget::{
     ActivationGate, GateRefusal, PublishCheck, RefusalKind, check_deliver_after,
@@ -34,33 +35,73 @@ use uuid::Uuid;
 use brenn_attach_client::store::DeferOp;
 
 use crate::bindings::channel_is_transportable;
+use crate::outbound::truncate_report_field;
+
+/// The byte cap on a guest-supplied port name reaching a diagnostic. The name is
+/// component-controlled and the diagnostic reaches the console and a log frame,
+/// so it is bounded here rather than at the reader.
+const MAX_PORT_NAME_REPORT_BYTES: usize = 256;
+
+/// A port call the buffer did not accept.
+///
+/// Two outcomes with different consequences, which is why they are one type and
+/// not one error code. A [`Refused`](Self::Refused) call is answered in the
+/// contract's own vocabulary and the component carries on. An
+/// [`Undeclared`](Self::Undeclared) call is the component publishing to a name
+/// its specification does not contain — the artifact is hash-bound to that
+/// specification, so the call is not an error the component gets to read, and the
+/// seam that made it ends the activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortFault<E> {
+    /// The contract's error vocabulary, as the component sees it.
+    Refused(E),
+    /// The offending port name, already capped and debug-escaped for a
+    /// diagnostic. Rendered into a trap reason by the seam, which is what knows
+    /// the instance it is speaking for.
+    Undeclared(String),
+}
+
+/// A refused or violating publish. See [`PortFault`].
+pub type PublishFault = PortFault<PublishError>;
+
+/// A refused or violating deferred-message control op. See [`PortFault`].
+pub type DeferFault = PortFault<DeferError>;
+
+/// Cap and debug-escape a component-supplied port name for a diagnostic.
+///
+/// `{:?}` quotes and escapes, so control characters and ANSI sequences reach the
+/// console and the log frame as text; the crate's one truncation policy bounds
+/// the length.
+fn port_for_report(port: &str) -> String {
+    truncate_report_field(format!("{port:?}"), MAX_PORT_NAME_REPORT_BYTES)
+}
 
 /// A gate verdict as the component sees it on the publish path.
 ///
 /// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
 /// backend host.
-fn publish_error(refusal: GateRefusal) -> PublishError {
-    match publish_refusal_kind(refusal) {
+fn publish_error(refusal: GateRefusal) -> PublishFault {
+    PortFault::Refused(match publish_refusal_kind(refusal) {
         RefusalKind::InvalidPayload(_) => PublishError::InvalidPayload,
         RefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
         RefusalKind::InvalidDeliverAfter => {
             unreachable!("publish_refusal_kind never answers invalid-deliver-after")
         }
-    }
+    })
 }
 
 /// A gate verdict as the component sees it on the control-op path.
 ///
 /// The classification is [`brenn_budget::defer_refusal_kind`], shared with the
 /// backend host.
-fn defer_error(refusal: GateRefusal) -> DeferError {
-    match defer_refusal_kind(refusal) {
+fn defer_error(refusal: GateRefusal) -> DeferFault {
+    PortFault::Refused(match defer_refusal_kind(refusal) {
         RefusalKind::InvalidDeliverAfter => DeferError::InvalidDeliverAfter,
         RefusalKind::QuotaExceeded => DeferError::QuotaExceeded,
         RefusalKind::InvalidPayload(_) => {
             unreachable!("defer_refusal_kind never answers invalid-payload")
         }
-    }
+    })
 }
 
 /// One publish accepted into the buffer, in call order.
@@ -113,6 +154,30 @@ pub(crate) struct BufferedDeferOp {
     pub kind: DeferOp,
 }
 
+/// What became of a publish the buffer accepted.
+///
+/// The component sees one answer for both — wiring is the deployer's business
+/// and a component does not read topology out of its own publish results — so
+/// this exists for the host side of the seam, which counts the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Queued for the flush: the port is bound and the message has a sink.
+    Buffered,
+    /// Accepted and discarded: the port is declared and nobody wired it.
+    Dropped,
+}
+
+impl Admission {
+    /// Read the verdict off the buffer's drop count either side of one publish.
+    pub fn of(before: usize, after: usize) -> Self {
+        if after > before {
+            Self::Dropped
+        } else {
+            Self::Buffered
+        }
+    }
+}
+
 /// One ok activation's buffered work, consuming the buffer: what it published,
 /// what it did to its own schedule, and the budget it did not spend.
 pub(crate) struct BufferedFlush {
@@ -138,9 +203,16 @@ pub(crate) struct OutputSpec {
 /// activation, and a buffer nobody seeded would silently enforce nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishBuffer {
-    /// This instance's bound outputs, keyed by port. An unknown key is
-    /// `not-permitted` — the component named a port its config does not give it.
+    /// This instance's bound outputs, keyed by port. An unknown key is not
+    /// automatically a refusal: it is judged against
+    /// [`declared_out_ports`](Self::declared_out_ports) first.
     outputs: HashMap<String, OutputSpec>,
+    /// Every port name this instance's specification declares it may publish to,
+    /// wired or not. A name in here that `outputs` does not hold is a declared
+    /// port the deployer left unwired — the publish succeeds and the message is
+    /// dropped. A name outside it is the component contradicting its own
+    /// specification.
+    declared_out_ports: Arc<BTreeSet<String>>,
     /// The shared per-activation gate: the counters, the per-port millitoken
     /// buckets, and the check order. Every budget answer this buffer gives comes
     /// from here, so a rule cannot hold on one hosting and not the other.
@@ -176,12 +248,14 @@ impl PublishBuffer {
     /// byte aggregate is the binding limit long before that.
     pub(crate) fn new(
         outputs: HashMap<String, OutputSpec>,
+        declared_out_ports: Arc<BTreeSet<String>>,
         sink_mt: HashMap<String, u64>,
         max_body_bytes: u64,
         deferred: HashMap<String, Vec<Uuid>>,
     ) -> Self {
         Self {
             outputs,
+            declared_out_ports,
             gate: ActivationGate::new(
                 usize::try_from(max_body_bytes).unwrap_or(usize::MAX),
                 sink_mt,
@@ -242,10 +316,19 @@ impl PublishBuffer {
             && self.batch_charge() + charge > self.gate.max_body_bytes()
     }
 
+    /// Publishes this activation that were accepted and dropped for want of a
+    /// sink — a declared port the deployer left unwired. Counted by the gate,
+    /// which is the only thing that can admit one; the caller of a publish reads
+    /// this across the call to learn whether its own message was the drop, since
+    /// the component is deliberately told nothing.
+    pub fn dropped(&self) -> usize {
+        self.gate.dropped()
+    }
+
     /// Publish `body` from this instance's output `port`, at the port's
     /// configured default urgency. Buffered, not sent: it reaches the router or
     /// the wire only if this activation returns ok.
-    pub fn publish(&mut self, port: &str, body: String) -> Result<(), PublishError> {
+    pub fn publish(&mut self, port: &str, body: String) -> Result<(), PublishFault> {
         self.publish_inner(port, body, None, None)
     }
 
@@ -261,7 +344,7 @@ impl PublishBuffer {
         port: &str,
         body: String,
         deliver_after: u64,
-    ) -> Result<(), PublishError> {
+    ) -> Result<(), PublishFault> {
         self.publish_inner(port, body, None, Some(deliver_after))
     }
 
@@ -272,7 +355,7 @@ impl PublishBuffer {
         port: &str,
         body: String,
         urgency: Urgency,
-    ) -> Result<(), PublishError> {
+    ) -> Result<(), PublishFault> {
         self.publish_inner(port, body, Some(urgency), None)
     }
 
@@ -280,22 +363,22 @@ impl PublishBuffer {
     ///
     /// The gate's publish order, with the page's one host-data check at its
     /// documented position: the call ceiling first (so a component looping on
-    /// rejections pays for them), then the port binding — `not-permitted`, the
-    /// only refusal this buffer decides on its own — then everything the gate
-    /// judges, which it charges only on acceptance.
+    /// rejections pays for them), then the port — three-way, per
+    /// [`Self::publish_unwired`] — then everything the gate judges, which it
+    /// charges only on acceptance.
     fn publish_inner(
         &mut self,
         port: &str,
         body: String,
         urgency_override: Option<Urgency>,
         deliver_after: Option<u64>,
-    ) -> Result<(), PublishError> {
+    ) -> Result<(), PublishFault> {
         self.gate.charge_call().map_err(publish_error)?;
         // The binding's own key is the sink key, so nothing is allocated to ask
         // the gate: a refused publish copies neither the port name nor the
         // channel, and only an accepted one owns them.
         let Some((sink, spec)) = self.outputs.get_key_value(port) else {
-            return Err(PublishError::NotPermitted);
+            return self.publish_unwired(port, &body, deliver_after);
         };
         let urgency = urgency_override.unwrap_or(spec.default_urgency);
         // The wire batch budget, before the gate charges anything: the gate
@@ -305,7 +388,7 @@ impl PublishBuffer {
         if body.len() <= self.gate.max_body_bytes()
             && self.overruns_batch_budget(&spec.channel, charge)
         {
-            return Err(PublishError::QuotaExceeded);
+            return Err(PortFault::Refused(PublishError::QuotaExceeded));
         }
         // A bound port always has a seeded bucket — the core seeds one per entry
         // of the same `outputs` map this resolved against — so the gate's miss
@@ -329,11 +412,42 @@ impl PublishBuffer {
         Ok(())
     }
 
+    /// The publish path for a port with no binding: either a declared port the
+    /// deployer left unwired, or a name outside the specification entirely.
+    ///
+    /// A declared port nobody wired is a sink with no channel, and publishing to
+    /// nowhere is as legal here as publishing to a channel with no subscribers.
+    /// The component sees `Ok` and the message is dropped: wiring is the
+    /// deployer's business, and a component does not get to read deployment
+    /// topology out of error codes.
+    ///
+    /// Not a short-circuit, for that same reason. Everything a bound publish
+    /// validates that does not need a sink still runs, in the same order and
+    /// charging the same activation-wide counters — the body cap, `deliver-after`
+    /// representability, the buffered-entry ceiling and the byte aggregate. Only
+    /// what exists to serve a sink is skipped: the per-sink bucket, the wire
+    /// batch budget, the buffer and the carry. Answering `Ok` where a bound port
+    /// answers `invalid-payload` would hand the component its own wiring back.
+    fn publish_unwired(
+        &mut self,
+        port: &str,
+        body: &str,
+        deliver_after: Option<u64>,
+    ) -> Result<(), PublishFault> {
+        if !self.declared_out_ports.contains(port) {
+            return Err(PortFault::Undeclared(port_for_report(port)));
+        }
+        self.gate
+            .admit_publish_without_sink(body.len(), deliver_after, 0)
+            .map_err(publish_error)?;
+        Ok(())
+    }
+
     /// Cancel one message this instance has parked on `port`'s channel, named by
     /// its `index` into the deferred window this activation was handed.
     ///
     /// Buffered like a publish, so an err or trap cancels nothing.
-    pub fn defer_cancel(&mut self, port: &str, index: u32) -> Result<(), DeferError> {
+    pub fn defer_cancel(&mut self, port: &str, index: u32) -> Result<(), DeferFault> {
         self.defer_inner(port, index, DeferOp::Cancel)
     }
 
@@ -349,7 +463,7 @@ impl PublishBuffer {
         index: u32,
         body: Option<String>,
         deliver_after: Option<u64>,
-    ) -> Result<(), DeferError> {
+    ) -> Result<(), DeferFault> {
         self.defer_inner(
             port,
             index,
@@ -365,16 +479,21 @@ impl PublishBuffer {
     /// The gate's control-op order, with the page's two host-data checks at their
     /// documented positions: representability first (a fact about the argument,
     /// not about any budget, and so the one refusal here that draws no call
-    /// slot), then the shared call count, then the port binding and the snapshot
+    /// slot), then the shared call count, then the port and the snapshot
     /// index — the two answers only this buffer holds — then the gate's op
     /// ceiling and edit-body rules.
+    ///
+    /// The port is judged three ways as it is on the publish path, but the
+    /// declared-unwired arm needs no drop semantics of its own: a port with no
+    /// binding has no deferred window, so every index is out of range there and
+    /// the ordinary index refusal is the honest answer.
     ///
     /// An edit body is weighed exactly as a published body is, against the same
     /// cap and the same per-activation aggregate. The page needs that as more than
     /// hygiene: a page edit travels to the server as a control op, where an
     /// oversize body is a protocol violation that kills the connection, so
     /// refusing it here keeps a conforming kernel from ever wiring one.
-    fn defer_inner(&mut self, port: &str, index: u32, kind: DeferOp) -> Result<(), DeferError> {
+    fn defer_inner(&mut self, port: &str, index: u32, kind: DeferOp) -> Result<(), DeferFault> {
         let edit_deliver_after = match &kind {
             DeferOp::Edit { deliver_after, .. } => *deliver_after,
             DeferOp::Cancel => None,
@@ -382,14 +501,17 @@ impl PublishBuffer {
         check_deliver_after(edit_deliver_after).map_err(defer_error)?;
         self.gate.charge_call().map_err(defer_error)?;
         let Some(spec) = self.outputs.get(port) else {
-            return Err(DeferError::NotPermitted);
+            if !self.declared_out_ports.contains(port) {
+                return Err(PortFault::Undeclared(port_for_report(port)));
+            }
+            return Err(PortFault::Refused(DeferError::OutOfRange));
         };
         let Some(&message_id) = self
             .deferred
             .get(port)
             .and_then(|ids| ids.get(index as usize))
         else {
-            return Err(DeferError::OutOfRange);
+            return Err(PortFault::Refused(DeferError::OutOfRange));
         };
         let edit_body_len = match &kind {
             DeferOp::Edit {
@@ -403,7 +525,7 @@ impl PublishBuffer {
         if edit_body_len.is_none_or(|len| len <= self.gate.max_body_bytes())
             && self.overruns_batch_budget(&spec.channel, charge)
         {
-            return Err(DeferError::QuotaExceeded);
+            return Err(PortFault::Refused(DeferError::QuotaExceeded));
         }
         self.gate.admit_op(edit_body_len).map_err(defer_error)?;
         self.defer_ops.push(BufferedDeferOp {
@@ -432,12 +554,13 @@ impl PublishBuffer {
     /// it. The core clamps the carry to `capacity_mt` when it seeds the next
     /// activation.
     pub(crate) fn take(self) -> BufferedFlush {
-        // The gate counts the entry ceiling, this vector holds the entries: a push
-        // that skipped `admit_publish` would let the two disagree and the ceiling
-        // would bound nothing.
+        // The gate counts the entry ceiling, this vector holds the entries, and a
+        // publish dropped for want of a sink is counted by the gate while holding
+        // no entry: a push that skipped the gate would let the two disagree and
+        // the ceiling would bound nothing.
         assert_eq!(
             self.gate.entries(),
-            self.entries.len(),
+            self.entries.len() + self.gate.dropped(),
             "every buffered publish must have been admitted by the gate"
         );
         BufferedFlush {
@@ -470,6 +593,22 @@ mod tests {
         }
     }
 
+    /// A declared but deliberately unwired port: in the vocabulary, absent from
+    /// the bound-output table.
+    const UNWIRED: &str = "spare";
+    /// A name the fixture's vocabulary does not contain at all.
+    const UNDECLARED: &str = "ghost";
+
+    /// The fixture's declared vocabulary: its two bound ports plus [`UNWIRED`].
+    fn vocabulary() -> Arc<BTreeSet<String>> {
+        Arc::new(
+            ["out", "notes", UNWIRED]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
     /// A buffer bound to one wire port and one confined one, with sink budgets
     /// wide enough that only the rules under test can refuse anything.
     fn buffer(max_body_bytes: u64) -> PublishBuffer {
@@ -481,7 +620,13 @@ mod tests {
             ("out".to_string(), 1_000_000),
             ("notes".to_string(), 1_000_000),
         ]);
-        PublishBuffer::new(outputs, sink_mt, max_body_bytes, HashMap::new())
+        PublishBuffer::new(
+            outputs,
+            vocabulary(),
+            sink_mt,
+            max_body_bytes,
+            HashMap::new(),
+        )
     }
 
     /// The whole point of the buffer-time rule: entries each well inside the body
@@ -494,7 +639,7 @@ mod tests {
         assert_eq!(buf.publish("out", "a".repeat(20)), Ok(()));
         assert_eq!(
             buf.publish("out", "b".repeat(20)),
-            Err(PublishError::QuotaExceeded),
+            Err(PortFault::Refused(PublishError::QuotaExceeded)),
             "18 channel bytes + 20 body bytes, twice, is 76 against a 64-byte budget"
         );
         assert_eq!(buf.len(), 1, "the refused publish buffers nothing");
@@ -536,7 +681,7 @@ mod tests {
         let mut buf = buffer(64);
         assert_eq!(
             buf.publish("out", "a".repeat(64)),
-            Err(PublishError::QuotaExceeded)
+            Err(PortFault::Refused(PublishError::QuotaExceeded))
         );
     }
 
@@ -548,7 +693,7 @@ mod tests {
         let mut buf = buffer(64);
         assert_eq!(
             buf.publish("out", "a".repeat(65)),
-            Err(PublishError::InvalidPayload)
+            Err(PortFault::Refused(PublishError::InvalidPayload))
         );
     }
 
@@ -565,12 +710,192 @@ mod tests {
         assert_eq!(buf.publish("out", "a".repeat(40)), Ok(()));
     }
 
+    /// The middle arm of the three-way rule: a port the specification declares
+    /// and the deployer did not wire is a sink with no channel. The component is
+    /// told ok and the message goes nowhere.
+    #[test]
+    fn a_declared_unwired_port_drops_the_message_and_answers_ok() {
+        let mut buf = buffer(1_024);
+        assert_eq!(buf.publish(UNWIRED, "hi".into()), Ok(()));
+        assert_eq!(buf.len(), 0, "a drop buffers nothing");
+        let flush = buf.take();
+        assert!(flush.publishes.is_empty());
+        assert!(
+            !flush.carry.contains_key(UNWIRED),
+            "a port with no sink carries nothing"
+        );
+    }
+
+    /// The drop path is not a short-circuit: every check that does not need a
+    /// sink answers exactly as it would on the bound port beside it, or the
+    /// component reads its own wiring out of the difference.
+    #[test]
+    fn the_drop_path_validates_exactly_as_the_bound_path_does() {
+        let mut bound = buffer(64);
+        let mut unwired = buffer(64);
+        // Pinned as concrete verdicts, not merely as equal ones: two paths that
+        // both regressed to `Ok` would agree with each other and lose the
+        // guarantee.
+        assert_eq!(
+            unwired.publish(UNWIRED, "a".repeat(65)),
+            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            "an oversize body is invalid-payload on the unwired port"
+        );
+        assert_eq!(
+            bound.publish("out", "a".repeat(65)),
+            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            "and the same on the bound port beside it"
+        );
+        assert_eq!(
+            unwired.publish_deferred(UNWIRED, "hi".into(), u64::MAX),
+            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            "an unrepresentable release time is an invalid payload on the unwired port"
+        );
+        assert_eq!(
+            bound.publish_deferred("out", "hi".into(), u64::MAX),
+            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            "and the same on the bound port beside it"
+        );
+    }
+
+    /// A deferred publish to an unwired declared port takes the same drop as the
+    /// immediate one: ok to the component, nothing buffered, and no park left
+    /// scheduled against a port that has no channel to release onto.
+    #[test]
+    fn a_declared_unwired_port_drops_a_deferred_publish_and_answers_ok() {
+        let mut buf = buffer(1_024);
+        assert_eq!(buf.publish_deferred(UNWIRED, "hi".into(), 60_000), Ok(()));
+        assert_eq!(buf.len(), 0, "a drop buffers nothing");
+        assert_eq!(buf.dropped(), 1);
+        let flush = buf.take();
+        assert!(flush.publishes.is_empty(), "nothing to release");
+        assert!(flush.defer_ops.is_empty(), "and no control op either");
+        assert!(!flush.carry.contains_key(UNWIRED));
+    }
+
+    /// A dropped publish charges the activation's entry ceiling, so the ceiling
+    /// cannot become the channel that reports wiring.
+    #[test]
+    fn a_dropped_publish_spends_the_entry_ceiling() {
+        let mut buf = buffer(1_024);
+        for _ in 0..brenn_budget::MAX_PUBLISHES_PER_ACTIVATION {
+            assert_eq!(buf.publish(UNWIRED, "hi".into()), Ok(()));
+        }
+        assert_eq!(
+            buf.publish("notes", "hi".into()),
+            Err(PortFault::Refused(PublishError::QuotaExceeded)),
+            "the drops filled the ceiling a bound publish answers to"
+        );
+    }
+
+    /// The count the port seam reads across a publish to tell a drop from a
+    /// queued message — the component is told the same thing either way, so
+    /// nothing else can distinguish them. A refused sink-less publish is not a
+    /// drop: nothing was accepted.
+    #[test]
+    fn the_buffer_counts_the_publishes_it_dropped() {
+        let mut buf = buffer(64);
+        assert_eq!(buf.dropped(), 0);
+        assert_eq!(buf.publish("out", "hi".into()), Ok(()));
+        assert_eq!(buf.dropped(), 0, "a bound publish is queued, not dropped");
+        assert_eq!(buf.publish(UNWIRED, "hi".into()), Ok(()));
+        assert_eq!(buf.dropped(), 1);
+        assert_eq!(
+            buf.publish(UNWIRED, "a".repeat(65)),
+            Err(PortFault::Refused(PublishError::InvalidPayload)),
+            "an oversize body is refused before anything is dropped"
+        );
+        assert_eq!(buf.dropped(), 1);
+        assert_eq!(
+            Admission::of(0, buf.dropped()),
+            Admission::Dropped,
+            "the seam reads the verdict off the count"
+        );
+        assert_eq!(Admission::of(1, buf.dropped()), Admission::Buffered);
+    }
+
+    /// The third arm: a name outside the vocabulary is the component
+    /// contradicting the specification its artifact is hash-bound to. Not an
+    /// error code — the seam ends the activation for it.
+    #[test]
+    fn an_undeclared_port_is_a_violation_not_a_refusal() {
+        let mut buf = buffer(1_024);
+        assert_eq!(
+            buf.publish(UNDECLARED, "hi".into()),
+            Err(PortFault::Undeclared("\"ghost\"".to_string()))
+        );
+        assert_eq!(
+            buf.publish_deferred(UNDECLARED, "hi".into(), 1),
+            Err(PortFault::Undeclared("\"ghost\"".to_string()))
+        );
+        assert_eq!(buf.len(), 0);
+    }
+
+    /// The port name reaches a diagnostic, so it is capped and escaped there and
+    /// not at the reader.
+    #[test]
+    fn a_hostile_port_name_is_capped_and_escaped_in_the_diagnostic() {
+        let mut buf = buffer(1_024);
+        let hostile = format!("\u{1b}[31m{}", "x".repeat(MAX_PORT_NAME_REPORT_BYTES * 2));
+        let Err(PortFault::Undeclared(report)) = buf.publish(&hostile, "hi".into()) else {
+            panic!("an undeclared port is a violation");
+        };
+        assert!(
+            report.len() <= MAX_PORT_NAME_REPORT_BYTES,
+            "{}",
+            report.len()
+        );
+        assert!(!report.contains('\u{1b}'), "the escape is not literal");
+    }
+
+    /// The call ceiling is charged before the port is looked at, so a component
+    /// looping on violations pays for the loop.
+    #[test]
+    fn the_call_ceiling_answers_before_the_vocabulary_does() {
+        let mut buf = buffer(1_024);
+        for _ in 0..brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            let _ = buf.publish(UNDECLARED, "hi".into());
+        }
+        assert_eq!(
+            buf.publish(UNDECLARED, "hi".into()),
+            Err(PortFault::Refused(PublishError::QuotaExceeded))
+        );
+    }
+
+    /// A declared port nobody wired has no deferred window, so every index into
+    /// it is out of range — the honest answer, and the same one a bound port with
+    /// an empty window gives.
+    #[test]
+    fn a_control_op_on_a_declared_unwired_port_is_out_of_range() {
+        let mut buf = buffer(1_024);
+        assert_eq!(
+            buf.defer_cancel(UNWIRED, 0),
+            Err(PortFault::Refused(DeferError::OutOfRange))
+        );
+        assert_eq!(
+            buf.defer_edit(UNWIRED, 0, Some("x".into()), None),
+            Err(PortFault::Refused(DeferError::OutOfRange))
+        );
+    }
+
+    /// A control op naming a port outside the vocabulary is the same violation a
+    /// publish to it is.
+    #[test]
+    fn a_control_op_on_an_undeclared_port_is_a_violation() {
+        let mut buf = buffer(1_024);
+        assert_eq!(
+            buf.defer_cancel(UNDECLARED, 0),
+            Err(PortFault::Undeclared("\"ghost\"".to_string()))
+        );
+    }
+
     /// A control op names a channel and an edit carries a body; the law charges
     /// both, so this gate must too.
     #[test]
     fn control_ops_spend_the_same_budget_as_publishes() {
         let mut buf = PublishBuffer::new(
             HashMap::from([("out".to_string(), spec(WIRE))]),
+            vocabulary(),
             HashMap::from([("out".to_string(), 1_000_000)]),
             64,
             HashMap::from([(
@@ -581,7 +906,7 @@ mod tests {
         assert_eq!(buf.defer_cancel("out", 0), Ok(()));
         assert_eq!(
             buf.defer_edit("out", 1, Some("x".repeat(30)), None),
-            Err(DeferError::QuotaExceeded),
+            Err(PortFault::Refused(DeferError::QuotaExceeded)),
             "18 + 18 + 30 charged bytes against a 64-byte budget"
         );
     }

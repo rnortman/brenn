@@ -290,6 +290,15 @@ component Chrome {
   legitimately leave this port unwired. Every port without it must be bound by
   every instance, at every placement; the resolver refuses the instance
   otherwise, pointing at the `new` statement and at the port's declaration.
+
+  An unwired optional `out`/`io` port is a live port at run time, not a missing
+  one: the component publishes on it and is told ok, and the message is dropped.
+  That is the bus model applied to ports — an unwired port is a sink with no
+  channel, and publishing to nowhere is as legal as publishing to a channel with
+  no subscribers. Wiring is the deployer's business and the component is not
+  shown it. A publish to a name the class does **not** declare at all is the
+  opposite case: the artifact is hash-bound to the specification, so the host
+  ends the activation.
 - `: "<tag>"` on a port is its **doctype** — the document contract a binding
   must agree with. See below.
 - `requires` and `optional` are the capability lists. A class states every

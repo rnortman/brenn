@@ -197,6 +197,7 @@ fn load(config: HashMap<String, String>) -> ProcessorComponent {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &artifact(),
         slug: "transplant",
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: HashMap::from([
             ("in".to_string(), 1000u64),

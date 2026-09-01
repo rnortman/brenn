@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::test_support::bindings::imply_vocabularies;
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
@@ -20,6 +21,7 @@ fn component(instance: &str) -> ComponentEntry {
         parked_batch_depth: 4,
         config: BTreeMap::new(),
         grants: vec![],
+        declared_out_ports: vec![],
     }
 }
 
@@ -58,7 +60,7 @@ fn local(channel: &str) -> LocalChannel {
 /// and one output per component — enough shape for every index to have
 /// something to say.
 fn doc() -> BindingsDocument {
-    BindingsDocument {
+    imply_vocabularies(BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
         components: vec![component("p1"), component("p2"), component("chrome")],
         subscriptions: vec![
@@ -79,7 +81,7 @@ fn doc() -> BindingsDocument {
             error_channel: Some("brenn:site.surface.bar.errors".to_string()),
             error_report_floor: Some(LogLevel::Warn),
         },
-    }
+    })
 }
 
 fn applied(doc: &BindingsDocument) -> AppliedBindings {
@@ -128,6 +130,8 @@ fn a_repeated_output_port_is_refused() {
 fn a_second_port_on_one_instance_is_admitted() {
     let mut doc = doc();
     doc.outputs.push(output("p1", "alt", WIRE));
+    doc.components[0].declared_out_ports.push("alt".to_string());
+    doc.components[0].declared_out_ports.sort();
     let applied = applied(&doc);
     assert_eq!(
         applied.output("p1", "alt").map(|b| b.channel.as_str()),

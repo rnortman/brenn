@@ -168,6 +168,7 @@ async fn tool_harness(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: Path::new(TOOL_WASM),
         slug,
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: tool_amp_map(),
         mqtt_sinks: std::collections::HashMap::new(),

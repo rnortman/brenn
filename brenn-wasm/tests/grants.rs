@@ -53,6 +53,7 @@ fn ungranted_known_capability_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-no-grants",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -84,6 +85,7 @@ fn unrecognized_import_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: wasm_file.path(),
         slug: "bogus-import",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -109,6 +111,7 @@ fn multiple_violations_listed() {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_log"),
         slug: "log-no-grants",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -132,6 +135,7 @@ fn multiple_violations_names_both_capabilities() {
         ProcessorComponent::load(ProcessorLoadSpec {
             component_path: &component_path("brenn_processor_log"),
             slug: "log-no-grants-2",
+            declared_out_ports: std::collections::BTreeSet::new(),
             output_ports: std::collections::HashMap::new(),
             input_amplification_mt: common::amp_in(),
             mqtt_sinks: std::collections::HashMap::new(),
@@ -173,6 +177,7 @@ fn subset_grants_loads_and_invokes() {
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_log"),
         slug: "log-subset",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -222,6 +227,7 @@ fn degenerate_empty_grants_load_succeeds() {
         ProcessorComponent::load(ProcessorLoadSpec {
             component_path: wasm_file.path(),
             slug: "noop-wat",
+            declared_out_ports: std::collections::BTreeSet::new(),
             output_ports: std::collections::HashMap::new(),
             input_amplification_mt: common::amp_in(),
             mqtt_sinks: std::collections::HashMap::new(),
@@ -261,6 +267,7 @@ fn degenerate_empty_grants_invoke_succeeds() {
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_exhaust"),
         slug: "exhaust-empty-grants",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -306,6 +313,7 @@ fn superset_grants_loads() {
     let _comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-all-grants",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -329,6 +337,7 @@ fn load_with(extra: ComponentGrant) {
     let _comp = ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_demo"),
         slug: "demo-page-capability",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -689,6 +698,7 @@ fn tools_grant_without_seam_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_exhaust"),
         slug: "tools-no-seam",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -718,6 +728,7 @@ fn load_store_path_without_store_grant_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_store_rt"),
         slug: "store-rt-no-grant",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),
@@ -747,6 +758,7 @@ fn load_store_grant_without_store_path_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path("brenn_processor_store_rt"),
         slug: "store-rt-no-path",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: std::collections::HashMap::new(),

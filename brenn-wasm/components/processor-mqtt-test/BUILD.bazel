@@ -1,26 +1,18 @@
-load("//bazel/gencode:defs.bzl", "generated_parity_test")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load(
     "//bazel/wasm:defs.bzl",
     "wasm_component",
     "wasm_guest_cdylib",
-    "wit_bindgen_rust",
 )
 
 policy_srcs()
-
-wit_bindgen_rust(
-    name = "bindings",
-    wit = "//brenn-wasm:wit/processor.wit",
-    wit_srcs = "//brenn-wasm:wit",
-)
 
 # The fixture is a raw-WIT component on purpose — the loop below asserts on the
 # host's own error variants — and links the SDK for one call, so the guest-side
 # `mqtt` wrapper is exercised against a real host callback.
 wasm_guest_cdylib(
     name = "brenn-processor-mqtt-test",
-    generated_srcs = {"src/bindings.rs": ":bindings"},
+    shared_bindings = "//brenn-wasm:processor_bindings",
     visibility = ["//visibility:public"],
     deps = ["//brenn-wasm/components/guest:brenn-guest"],
 )
@@ -29,10 +21,4 @@ wasm_component(
     name = "component",
     module = ":brenn-processor-mqtt-test",
     visibility = ["//visibility:public"],
-)
-
-generated_parity_test(
-    name = "bindings_parity_test",
-    committed = "src/bindings.rs",
-    generated = ":bindings",
 )

@@ -197,6 +197,7 @@ async fn consumer_harness(
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
         component_path: Path::new(CONSUMER_WASM),
         slug,
+        declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: amp,
         mqtt_sinks: HashMap::new(),

@@ -49,7 +49,37 @@ pub(crate) fn component_with_grants(instance: &str, kind: &str, grants: &[&str])
         parked_batch_depth: 2,
         config: BTreeMap::new(),
         grants: grants.iter().map(|g| (*g).to_string()).collect(),
+        // Left empty here and folded from the wiring by [`imply_vocabularies`]:
+        // a fixture component states a vocabulary only when the vocabulary is
+        // what the suite is about.
+        declared_out_ports: vec![],
     }
+}
+
+/// Give every component that states no port vocabulary the one its own output
+/// bindings imply.
+///
+/// The document side of the fixture rule whose home is
+/// `brenn_lib::messaging::config::imply_out_port_vocabulary` — a separate
+/// implementation only because a document holds bindings in a shape no
+/// config-raw type does, and this crate does not depend on that one. The rule
+/// itself, escape included, is stated there and not restated here.
+pub(crate) fn imply_vocabularies(mut doc: BindingsDocument) -> BindingsDocument {
+    for c in &mut doc.components {
+        if !c.declared_out_ports.is_empty() {
+            continue;
+        }
+        let mut ports: Vec<String> = doc
+            .outputs
+            .iter()
+            .filter(|b| b.instance == c.instance)
+            .map(|b| b.port.clone())
+            .collect();
+        ports.sort();
+        ports.dedup();
+        c.declared_out_ports = ports;
+    }
+    doc
 }
 
 /// One input binding at the caller's depths, counted at the `metered` rung so a
@@ -122,7 +152,7 @@ pub(crate) fn doc(
     outputs: Vec<OutputBinding>,
     local_channels: Vec<LocalChannel>,
 ) -> BindingsDocument {
-    BindingsDocument {
+    imply_vocabularies(BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
         components,
         subscriptions,
@@ -130,5 +160,5 @@ pub(crate) fn doc(
         local_channels,
         chrome_instance: CHROME.to_string(),
         platform: platform(),
-    }
+    })
 }

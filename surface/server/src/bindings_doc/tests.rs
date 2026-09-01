@@ -29,6 +29,11 @@ fn bar() -> ResolvedSurface {
         .subscribe("brenn:bar-a", "chrome", "content")
         .output(LOCAL_THEME_CHANNEL, "mode", "theme")
         .build();
+    // Declared and deliberately unwired, so the document carries a vocabulary
+    // wider than the wiring.
+    surface.components[1]
+        .declared_out_ports
+        .insert("spare".to_string());
     surface.local_channels.push(ResolvedLocalChannel {
         address: LOCAL_THEME_CHANNEL.to_string(),
         ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
@@ -69,6 +74,9 @@ fn document_carries_every_resolved_section() {
     assert_eq!(doc.outputs.len(), 1);
     assert_eq!(doc.outputs[0].channel, LOCAL_THEME_CHANNEL);
     assert_eq!(doc.local_channels.len(), 1);
+    // The bound port and the one the fixture declares without wiring: the
+    // distinction the bound-output table alone cannot carry.
+    assert_eq!(mode.declared_out_ports, ["spare", "theme"]);
     assert!(doc.validate().is_ok(), "the builder writes valid documents");
 }
 

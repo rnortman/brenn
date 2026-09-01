@@ -13,6 +13,15 @@ brenn-wasm/target/
 brenn-wasm/components/*/src/spec.rs
 surface/components/*/src/spec.rs
 surface/chrome/src/spec.rs
+# Generated processor bindings shared across raw-WIT fixtures.
+brenn-wasm/components/processor-exhaust/src/bindings.rs
+brenn-wasm/components/processor-mem-exhaust/src/bindings.rs
+brenn-wasm/components/processor-mqtt-test/src/bindings.rs
+brenn-wasm/components/processor-tool-test/src/bindings.rs
+# Generated replay bindings shared across the replay-family components.
+brenn-wasm/components/replay/src/bindings.rs
+brenn-wasm/components/replay-fault-test/src/bindings.rs
+brenn-wasm/components/replay-generic/src/bindings.rs
 /frontend/dist/
 /surface/dist/
 node_modules/

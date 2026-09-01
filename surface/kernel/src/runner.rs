@@ -788,13 +788,13 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         let stamps = self.driver.flush_stamps(buffer.len());
         effects.extend(turn::on_input(
             page,
-            Input::ActivationDone(Completed {
+            Input::ActivationDone(Box::new(Completed {
                 instance,
                 generation,
                 outcome,
                 buffer,
                 stamps,
-            }),
+            })),
             now,
             now_ms,
         ));

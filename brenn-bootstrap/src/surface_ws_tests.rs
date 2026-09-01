@@ -675,7 +675,8 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
             Depth::Bounded(4),
         )],
         ..minimal_wasm_consumer()
-    };
+    }
+    .implying_its_vocabulary();
     let deskbar = brenn_lib::messaging::config::SurfaceConfigRaw {
         io_ports: vec![surface_io_port_raw(
             COMPONENT,
@@ -685,7 +686,8 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
             Depth::Bounded(4),
         )],
         ..minimal_surface_raw()
-    };
+    }
+    .implying_component_vocabularies();
     let status_channel = ChannelConfigRaw {
         address: Some(brenn_surface_server::description::surface_status_bare(
             &brenn_surface_server::fixtures_config::description_params().prefix,

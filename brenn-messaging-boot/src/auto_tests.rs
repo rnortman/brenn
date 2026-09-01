@@ -5,7 +5,7 @@
 use super::auto::{lower_auto_wiring, wasm_endpoint_ref};
 use super::test_fixtures::{
     brenn_entry, dir_of, local_sub_raw, minimal_surface_raw, minimal_wasm_consumer, out_raw,
-    resolve_with_auto, sub_raw, surface_sub_raw,
+    resolve_surfaces_with_auto, resolve_with_auto, sub_raw, surface_sub_raw,
 };
 use super::*;
 use brenn_lib::messaging::ComponentGrant;
@@ -1181,7 +1181,7 @@ fn surface_free_ports_resolve_onto_a_page_local_channel() {
         .surface_channel("deskbar", "protobar", "tap")
         .unwrap()
         .to_string();
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+    let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions[0].channel_address, address);
     assert_eq!(surface.outputs[0].channel_address, address);
@@ -1234,7 +1234,8 @@ fn a_wire_spanning_link_injects_grants_on_both_sides() {
         .filter(|e| e.transport_type == ChannelScheme::Ephemeral)
         .cloned()
         .collect();
-    let resolved = resolve_surfaces(&surfaces, &dir_of(ephemeral.clone()), &globals(), &wiring);
+    let resolved =
+        resolve_surfaces_with_auto(&surfaces, &dir_of(ephemeral.clone()), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions[0].channel_address, to_page);
     assert!(surface.policy.allows_ephemeral_delivery(&bare));
@@ -1419,7 +1420,8 @@ fn io_ports_spanning_the_wire_share_one_ephemeral_channel() {
     assert_eq!(entries[0].transport_type, ChannelScheme::Ephemeral);
     let bare = entries[0].address.strip_prefix("ephemeral:").unwrap();
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(entries.to_vec()), &globals(), &wiring);
+    let resolved =
+        resolve_surfaces_with_auto(&surfaces, &dir_of(entries.to_vec()), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions[0].channel_address, entries[0].address);
     assert_eq!(surface.outputs[0].channel_address, entries[0].address);
@@ -1447,7 +1449,7 @@ fn surface_io_port_resolves_to_both_bindings_on_a_page_local_channel() {
         .to_string();
     assert!(address.starts_with("local:auto."));
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+    let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions.len(), 1);
     assert_eq!(surface.outputs.len(), 1);
@@ -1503,7 +1505,7 @@ fn a_named_page_local_auto_channel_shares_its_ring_with_an_operator_binding() {
     assert!(wiring.durable_entries().is_empty());
     assert!(wiring.nondurable_entries().is_empty());
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+    let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     let surface = &resolved[0];
     for sub in &surface.subscriptions {
         assert_eq!(sub.channel_address, "local:bar.loop");
@@ -1619,7 +1621,7 @@ fn surface_io_port_name_colliding_with_an_address_bound_subscription_panics() {
     let mut surfaces = vec![surface_with_io_port("deskbar")];
     surfaces[0].subscriptions = vec![surface_sub_raw("brenn:feed", "protobar", "loop")];
     let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
-    resolve_surfaces(
+    resolve_surfaces_with_auto(
         &surfaces,
         &dir_of(vec![brenn_entry("brenn:feed")]),
         &globals(),
@@ -1642,7 +1644,7 @@ fn surface_io_port_name_colliding_with_a_free_output_panics() {
         publish_capacity: None,
     }];
     let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
-    resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+    resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
 }
 
 #[test]
@@ -1666,7 +1668,7 @@ fn a_surface_local_binding_may_share_a_name_with_a_backend_local_channel() {
     surfaces[0].subscriptions = vec![local_sub_raw("local:etl.tick", "protobar", "snoop")];
     let wiring = lower_auto_wiring(&[], &consumers, &surfaces, &[], &globals());
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
+    let resolved = resolve_surfaces_with_auto(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     assert!(
         resolved[0]
             .local_channels

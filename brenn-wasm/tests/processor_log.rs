@@ -34,6 +34,7 @@ fn load_log_component(alerter: Arc<dyn ProcessorAlerter>) -> ProcessorComponent 
     ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path(),
         slug: "log-test",
+        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),

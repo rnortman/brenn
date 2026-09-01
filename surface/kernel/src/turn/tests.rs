@@ -241,6 +241,7 @@ fn empty_buffer() -> PublishBuffer {
     PublishBuffer::new(
         Default::default(),
         Default::default(),
+        Default::default(),
         0,
         Default::default(),
     )
@@ -616,13 +617,13 @@ fn a_completion_for_an_unmounted_instance_is_absorbed() {
     let mut page = page();
     let effects = feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: "gone".to_string(),
             generation: 0,
             outcome: ActivationOutcome::Ok(None),
             buffer: empty_buffer(),
             stamps: Vec::new(),
-        }),
+        })),
     );
     assert!(effects.is_empty());
 }
@@ -636,13 +637,13 @@ fn a_trapped_completion_takes_its_instance_terminal() {
         .expect("the fixture mounted p1");
     let effects = feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: "p1".to_string(),
             generation,
             outcome: ActivationOutcome::Trap("it panicked".to_string()),
             buffer: empty_buffer(),
             stamps: Vec::new(),
-        }),
+        })),
     );
     assert!(matches!(
         events(&effects).as_slice(),
@@ -923,13 +924,13 @@ fn a_sync_drain_leaves_no_follow_up_async_activation() {
     let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
     feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: ready.instance,
             generation: ready.generation,
             outcome: ActivationOutcome::Ok(None),
             buffer: ready.buffer,
             stamps: Vec::new(),
-        }),
+        })),
     );
 
     let (again, _) = dispatch(&mut page, NOW, NOW_MS);
@@ -946,7 +947,7 @@ fn a_sync_activation_that_errs_still_consumed_its_input() {
     let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
     feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: ready.instance,
             generation: ready.generation,
             outcome: ActivationOutcome::Err(brenn_surface_contract::ActivationError {
@@ -954,7 +955,7 @@ fn a_sync_activation_that_errs_still_consumed_its_input() {
             }),
             buffer: ready.buffer,
             stamps: Vec::new(),
-        }),
+        })),
     );
 
     let (again, _) = dispatch(&mut page, NOW, NOW_MS);
@@ -978,13 +979,13 @@ fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
         .expect("p1 binds the page-local channel");
     feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: ready.instance,
             generation: ready.generation,
             outcome: ActivationOutcome::Ok(Some("{\"cancel\":true}".to_string())),
             buffer: ready.buffer,
             stamps: vec![stamp(0x9c4)],
-        }),
+        })),
     );
     assert_eq!(retained(&page, NOTES), ["from the gesture"]);
 
@@ -995,7 +996,7 @@ fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
         .expect("p1 binds the page-local channel");
     feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: ready.instance,
             generation: ready.generation,
             outcome: ActivationOutcome::Err(brenn_surface_contract::ActivationError {
@@ -1003,7 +1004,7 @@ fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
             }),
             buffer: ready.buffer,
             stamps: vec![stamp(0x9c5)],
-        }),
+        })),
     );
     assert_eq!(retained(&page, NOTES), ["from the gesture"]);
 }
@@ -1067,13 +1068,13 @@ fn a_request_from_a_terminal_instance_is_refused() {
         .expect("the fixture mounted p1");
     feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: "p1".to_string(),
             generation,
             outcome: ActivationOutcome::Trap("it panicked".to_string()),
             buffer: empty_buffer(),
             stamps: Vec::new(),
-        }),
+        })),
     );
     let (answer, effects) = sync(&mut page, "p1", "ack", "{}");
     assert_eq!(refusal(answer), SyncRefusal::Failed);
@@ -1205,13 +1206,13 @@ fn drain(page: &mut SurfacePage) -> Vec<(String, Vec<String>)> {
         taken.push((ready.instance.clone(), bodies));
         feed(
             page,
-            Input::ActivationDone(Completed {
+            Input::ActivationDone(Box::new(Completed {
                 instance: ready.instance,
                 generation: ready.generation,
                 outcome: ActivationOutcome::Ok(None),
                 buffer: ready.buffer,
                 stamps: Vec::new(),
-            }),
+            })),
         );
     }
     panic!("the page never stopped being ready: {taken:?}");
@@ -1285,13 +1286,13 @@ fn a_sync_activation_settles_the_mount_debt() {
     assert!(!page.schedules.owes_mount_activation("p1"));
     feed(
         &mut page,
-        Input::ActivationDone(Completed {
+        Input::ActivationDone(Box::new(Completed {
             instance: ready.instance,
             generation: ready.generation,
             outcome: ActivationOutcome::Ok(None),
             buffer: ready.buffer,
             stamps: Vec::new(),
-        }),
+        })),
     );
 
     let taken = drain(&mut page);

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::test_support::bindings::imply_vocabularies;
 use brenn_attach_client::router::{GuardedBody, Origin, PlanePolicy};
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
 use brenn_surface_schema::bindings::{
@@ -24,13 +25,14 @@ fn component(instance: &str) -> ComponentEntry {
         parked_batch_depth: 4,
         config: BTreeMap::new(),
         grants: vec![],
+        declared_out_ports: vec![],
     }
 }
 
 /// Chrome plus one ordinary component, with the two guarded planes and a plain
 /// page-local channel declared.
 fn doc(instances: &[&str]) -> BindingsDocument {
-    BindingsDocument {
+    imply_vocabularies(BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
         components: instances.iter().map(|i| component(i)).collect(),
         subscriptions: Vec::new(),
@@ -57,7 +59,7 @@ fn doc(instances: &[&str]) -> BindingsDocument {
             error_channel: None,
             error_report_floor: None,
         },
-    }
+    })
 }
 
 fn applied(instances: &[&str]) -> AppliedBindings {

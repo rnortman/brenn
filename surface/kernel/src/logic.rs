@@ -184,6 +184,28 @@ pub fn ungranted_capability(instance: &str, grant: ComponentGrant, what: &str) -
     }
 }
 
+/// The breadcrumb and the trap reason for a component that named a port its
+/// specification does not declare, on a publish or on a deferred control op.
+///
+/// The artifact is hash-bound to that specification, so this is not a refusal
+/// the component could act on — it is the component contradicting its own
+/// author, and the seam that observed it ends the activation. Reported at
+/// `Error` because the instance is terminal; the reason travels back as the
+/// trap's own message.
+///
+/// `port` arrives already capped and debug-escaped — it is component-controlled
+/// text reaching a console line and a log frame.
+pub fn undeclared_port(instance: &str, port: &str) -> (KernelAction, String) {
+    let reason =
+        format!("component {instance} named port {port}, which its specification does not declare");
+    let action = KernelAction::Report {
+        level: LogLevel::Error,
+        message: reason.clone(),
+        subject: Some(instance.to_string()),
+    };
+    (action, reason)
+}
+
 /// The WIT `publish-error` name for a refused buffered publish, as an owned
 /// `String`.
 ///
@@ -1600,6 +1622,7 @@ mod tests {
             parked_batch_depth: 8,
             config: Default::default(),
             grants: vec![],
+            declared_out_ports: vec![],
         }
     }
 
@@ -2993,6 +3016,28 @@ mod tests {
         assert_eq!(
             defer_error_str(DeferError::InvalidDeliverAfter),
             "invalid-deliver-after"
+        );
+    }
+
+    /// The operator-visible half of the vocabulary violation: an `Error`-level
+    /// report attributed to the offending instance, naming the escaped port, and
+    /// a trap reason that says the same thing. Pinned here because the seam that
+    /// calls it is wasm-only and unreachable natively.
+    #[test]
+    fn an_undeclared_port_reports_at_error_against_its_own_instance() {
+        let (action, reason) = undeclared_port("p1", "\"ghost\"");
+        assert_eq!(
+            action,
+            KernelAction::Report {
+                level: LogLevel::Error,
+                message: reason.clone(),
+                subject: Some("p1".to_string()),
+            },
+            "the trap reason and the card say one thing"
+        );
+        assert!(
+            reason.contains("p1") && reason.contains("\"ghost\"") && reason.contains("declare"),
+            "the reason must name the instance, the escaped port and why, got {reason:?}"
         );
     }
 

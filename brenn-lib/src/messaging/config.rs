@@ -500,6 +500,13 @@ pub struct WasmConsumerConfigRaw {
     /// declared in. Not a body key — the class's fact, carried through lowering
     /// so boot can bind it to the spec packaged beside the artifact.
     pub spec_sha256: String,
+    /// Every port name this instance's class declares with direction `out` or
+    /// `io`, sorted and duplicate-free — the complete vocabulary of names the
+    /// component may legally publish to. Not a body key: the class's fact,
+    /// carried through lowering so the host can tell a declared-but-unwired
+    /// port (publish drops) from a name the specification never declared (the
+    /// activation traps).
+    pub declared_out_ports: Vec<String>,
     /// Capability interfaces to link for this component (deny-by-default).
     /// Required — no default. The operator states intent explicitly; an unstated
     /// `grants` is refused. Empty list = zero-capability consumer.
@@ -640,6 +647,7 @@ impl WasmConsumerConfigRaw {
             slug: slug.to_string(),
             package: package.to_string(),
             spec_sha256: String::new(),
+            declared_out_ports: vec![],
             grants: vec![],
             store_path: None,
             store_size_limit: None,
@@ -672,6 +680,22 @@ impl WasmConsumerConfigRaw {
             mqtt_outputs: vec![],
             tool_grants: vec![],
         }
+    }
+
+    /// The same consumer, carrying the outbound vocabulary its own bindings
+    /// imply — every `[[output]]` port plus every `[[io_port]]` name.
+    ///
+    /// [`imply_out_port_vocabulary`] states the rule, including the escape for
+    /// a fixture that has something to say about the vocabulary itself.
+    pub fn implying_its_vocabulary(mut self) -> Self {
+        let ports: Vec<&str> = self
+            .outputs
+            .iter()
+            .map(|out| out.port.as_str())
+            .chain(self.io_ports.iter().map(|io| io.port.as_str()))
+            .collect();
+        imply_out_port_vocabulary(&mut self.declared_out_ports, ports.into_iter());
+        self
     }
 }
 
@@ -964,6 +988,13 @@ pub struct SurfaceComponentRaw {
     /// declared in. Not a body key — the class's fact, carried through lowering
     /// so boot can bind it to the spec packaged in the dist tree.
     pub spec_sha256: String,
+    /// Every port name this instance's class declares with direction `out` or
+    /// `io`, sorted and duplicate-free — the complete vocabulary of names the
+    /// component may legally publish to. Not a body key: the class's fact,
+    /// carried through lowering so the kernel can tell a declared-but-unwired
+    /// port (publish drops) from a name the specification never declared (the
+    /// activation traps).
+    pub declared_out_ports: Vec<String>,
     /// Override for this instance's durable send-budget burst: how many
     /// publishes it may make back-to-back before the refill rate binds. Absent ⇒
     /// [`SURFACE_SEND_BURST`].
@@ -1032,6 +1063,7 @@ impl SurfaceComponentRaw {
             kind: kind.to_string(),
             instance: None,
             spec_sha256: String::new(),
+            declared_out_ports: vec![],
             send_burst: None,
             send_refill_secs: None,
             grants: vec![],
@@ -1039,6 +1071,65 @@ impl SurfaceComponentRaw {
             chrome: false,
             config: None,
         }
+    }
+}
+
+/// Give a fixture the declared out-port vocabulary its own bindings imply,
+/// unless it states one itself.
+///
+/// The one statement of the rule every fixture fold in the tree rides on.
+/// Resolution refuses a bound output that is not in the declared vocabulary,
+/// and the ordinary case is a class whose declared out ports are exactly the
+/// ones its instance binds — so this is how a fixture with nothing to say about
+/// the vocabulary says it. The escape is the load-bearing half: a fixture whose
+/// subject *is* the vocabulary — an unwired optional port, a bound port no
+/// class declares — states the field and is left untouched, which is the only
+/// reason those fixtures test what their names say.
+///
+/// `ports` is the fixture's own outbound bindings for the component in
+/// question, in any order and with repeats allowed.
+#[cfg(any(test, feature = "testutils"))]
+pub fn imply_out_port_vocabulary<'a>(
+    declared: &mut Vec<String>,
+    ports: impl Iterator<Item = &'a str>,
+) {
+    if !declared.is_empty() {
+        return;
+    }
+    let mut implied: Vec<String> = ports.map(str::to_string).collect();
+    implied.sort();
+    implied.dedup();
+    *declared = implied;
+}
+
+#[cfg(any(test, feature = "testutils"))]
+impl SurfaceConfigRaw {
+    /// The same surface, each of its components carrying the outbound
+    /// vocabulary the surface's own bindings imply for it — every
+    /// `[[surface.output]]` and `[[surface.io_port]]` naming that instance.
+    ///
+    /// The per-component counterpart of
+    /// [`WasmConsumerConfigRaw::implying_its_vocabulary`], over the same rule in
+    /// [`imply_out_port_vocabulary`].
+    pub fn implying_component_vocabularies(mut self) -> Self {
+        let outputs = &self.outputs;
+        let io_ports = &self.io_ports;
+        for component in &mut self.components {
+            let instance = component.instance.as_deref().unwrap_or(&component.kind);
+            let ports = outputs
+                .iter()
+                .filter(|out| out.instance == instance)
+                .map(|out| out.port.as_str())
+                .chain(
+                    io_ports
+                        .iter()
+                        .filter(|io| io.instance == instance)
+                        .map(|io| io.port.as_str()),
+                );
+            let ports: Vec<&str> = ports.collect();
+            imply_out_port_vocabulary(&mut component.declared_out_ports, ports.into_iter());
+        }
+        self
     }
 }
 
@@ -1403,6 +1494,12 @@ pub struct ResolvedWasmConsumer {
     /// Lowercase hex SHA-256 of the spec file this consumer's class was
     /// declared in — what boot compares against the record in that package.
     pub spec_sha256: String,
+    /// The complete vocabulary of port names this consumer's class declares
+    /// outbound (`out` and `io` directions). A publish to a bound name in this
+    /// set delivers; a publish to an unbound name in it drops; a publish to a
+    /// name outside it contradicts the specification the artifact is hash-bound
+    /// to, and traps the activation.
+    pub declared_out_ports: BTreeSet<String>,
     /// Granted capability interfaces for this component (deny-by-default).
     /// Determines which host functions are linked at component load time.
     pub grants: BTreeSet<ComponentGrant>,
@@ -1451,6 +1548,12 @@ pub struct ResolvedComponent {
     /// Lowercase hex SHA-256 of the spec file this instance's class was declared
     /// in. Must match the hash in the record packaged with this kind's artifacts.
     pub spec_sha256: String,
+    /// The complete vocabulary of port names this instance's class declares
+    /// outbound (`out` and `io` directions). Carried to the page in the
+    /// bindings document: a publish to a bound name delivers, one to an unbound
+    /// declared name drops, and one to a name outside the set traps the
+    /// instance.
+    pub declared_out_ports: BTreeSet<String>,
     /// This instance's durable send budget: its own declared override, or the
     /// defaults. Server-side only — the page is told nothing about it, because
     /// the server is the authority and a mirrored bucket has no reader yet.
@@ -1494,6 +1597,7 @@ impl ResolvedComponent {
             instance: instance.to_string(),
             kind: kind.to_string(),
             spec_sha256: String::new(),
+            declared_out_ports: BTreeSet::new(),
             send_budget: AttachSendBudget::default(),
             parked_batch_depth: DEFAULT_PARKED_BATCH_DEPTH,
             chrome: false,
