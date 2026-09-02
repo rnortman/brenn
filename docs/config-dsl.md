@@ -63,6 +63,17 @@ invocation names the root. A document with a `@` import and no `--modules` is
 refused naming the flag, and a `--modules` that is not a readable directory is
 refused whether or not anything imports.
 
+`--modules` may be given more than once — one root per installed release, brenn's
+own beside each component bundle's (`component-packages.md`, *Bundles and
+multiple roots*). The roots are searched as one namespace: `@<name>` resolves
+to `<root>/<name>.brenn` in exactly one of them. A name in none is refused
+naming every root searched. A basename present under two roots is refused
+naming the module and both roots, and it is refused whether or not the document
+imports it: the root list is a declared input of the compilation, the way the
+root file is, so listing every root is not learning an environment fact, and a
+module installed twice is a broken install however the document happens to use
+it. The same directory named twice, under any spelling, is the same refusal.
+
 A packaged module is one level deep — `use @a::b::C;` is refused — and the
 first segment is the whole module name. Everything else about a module holds:
 a glob binds what the module declares, a named import checks the name exists,

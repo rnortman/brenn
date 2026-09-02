@@ -1,0 +1,91 @@
+"""A component built outside brenn's repository, with brenn's rules.
+
+This is the reference a second repository copies: it depends on the `brenn`
+Bazel module and builds one `brenn:processor` component with the same macros,
+gates and packaging brenn's own components use. It lives inside brenn's tree
+only so brenn's CI can prove the authoring kit is consumable; nothing here
+ships in brenn's release, and Bazel treats this directory as a separate
+repository (its own MODULE.bazel is the boundary).
+
+Three facts are the consumer's to state, because bzlmod reads them from the
+root module only: the Rust toolchain (`rust.toolchain` below — brenn's own
+declaration is ignored from a dependency), the `fltk` git override (a
+`git_override` in a dependency's MODULE.bazel is ignored too, and fltk is in no
+registry), and the crate hub's name (two modules may not both name a hub
+`crates`, so this one is `example_crates`).
+"""
+
+module(
+    name = "brenn_component_example",
+    version = "0.0.0",
+)
+
+# The path override is what makes this an in-tree example. A real consumer
+# writes, in its place,
+#
+#     git_override(
+#         module_name = "brenn",
+#         commit = "<the brenn commit to build against>",
+#         remote = "https://github.com/rnortman/brenn.git",
+#     )
+bazel_dep(name = "brenn", version = "")
+local_path_override(
+    module_name = "brenn",
+    path = "../..",
+)
+
+# fltk, restated at brenn's commit. brenn's `//brenn-dsl:dsl_cli` — which
+# scaffolds the port module and runs the grant-parity gate — links fltk's
+# runtime crates, and fltk's module() declares no version and is in no
+# registry, so only a root-module `git_override` can supply it. Held equal to
+# brenn's pin by brenn's `xtask policy-parity`.
+bazel_dep(name = "fltk", version = "")
+git_override(
+    module_name = "fltk",
+    commit = "555824e6b1dee22161260c2843bd4dec68efd11a",
+    remote = "https://github.com/rnortman/fltk.git",
+)
+
+bazel_dep(name = "rules_rust", version = "0.73.0")
+
+# The Rust toolchain, declared here because rules_rust reads toolchain tags from
+# the root module only. Same version as brenn's — brenn's crates compile under
+# this toolchain, so a version below brenn's floor fails at compile — and the
+# wasm32 target added, because that is what a component builds for. Held equal
+# to brenn's by brenn's `xtask policy-parity`.
+#
+# brenn's own MODULE.bazel goes on to declare a `repository_set` per libc for
+# its static musl release binary. Nothing here builds a musl binary, so the
+# default set with one extra target triple is the whole declaration.
+RUST_VERSION = "1.95.0"
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    extra_target_triples = ["wasm32-unknown-unknown"],
+    versions = [RUST_VERSION],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# This workspace's own third-party crates. Named `example_crates`, not
+# `crates`: rules_rust refuses two hubs of one name across modules, and brenn
+# owns `crates` and `wasm_crates`.
+#
+# The lockfile is the cargo-bazel one, beside `Cargo.lock`; regenerate both
+# hubs' view with `CARGO_BAZEL_REPIN=1 bazel mod deps` after a `Cargo.lock`
+# change. The host triple is listed with wasm32 because crate_universe resolves
+# features by running cargo on an execution-platform triple.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "example_crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+    supported_platform_triples = [
+        "wasm32-unknown-unknown",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "example_crates")

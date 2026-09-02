@@ -1,0 +1,22 @@
+# One crate, its own workspace. The `[workspace]` table is what stops cargo
+# walking up into brenn's root workspace two directories above; a real
+# consumer's repository has no such neighbour and can drop it.
+#
+# Only third-party crates the component uses on its own appear here. Serde is
+# deliberately absent: brenn-guest's API is expressed in serde types, so the
+# derives must come from brenn's guest serde instance, which the BUILD file
+# names as `@brenn//brenn-wasm/components/guest:serde`. This workspace is
+# Bazel-only — cargo never builds it.
+[workspace]
+
+[package]
+name = "example-caser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+heck = "0.5"

@@ -1,0 +1,10 @@
+// A root whose two packaged imports are installed under two different module
+// roots, as two releases install them: `widget` under `a/`, and the `base` it
+// builds on under `b/`. Neither root holds the other's module.
+
+use @widget::*;
+use @base::Drain;
+
+const host = "example.com";
+
+new alice_desk: Bench(slug = "alice-desk");

@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e
 # Delete partially-written targets on recipe failure. Without this, a failing
 # recipe leaves the target file with a fresh mtime, causing subsequent
 # incremental builds to skip it entirely.
@@ -17,6 +17,25 @@ export BRENN_BUILD_ID
 # Extra flags for every bazel invocation. Public CI sets --config=ci, the
 # private deploy pipeline --config=cd; locally the .bazelrc defaults apply.
 BAZEL_CONFIG ?=
+
+# Extra flags for the example consumer workspace's bazel invocations
+# (`example-check`). Separate from BAZEL_CONFIG because the example's own
+# .bazelrc carries none of brenn's `ci`/`cd` configs and runs from its own
+# directory, so a lane's cache flags are spelled here with absolute paths.
+# EXAMPLE_LANE=ci|cd selects the block that mirrors the same-named stanza in
+# .bazelrc (the caches, their GC caps, the non-interactive output flags); the
+# two are kept in step by hand, and this is the one place the flattened copy
+# lives. Unset runs the example with its own defaults.
+EXAMPLE_LANE ?=
+ifeq ($(EXAMPLE_LANE),)
+EXAMPLE_BAZEL_CONFIG ?=
+else ifeq ($(EXAMPLE_LANE),ci)
+EXAMPLE_BAZEL_CONFIG ?= --disk_cache=$(CURDIR)/.bazel-disk-cache --experimental_disk_cache_gc_max_size=8G --repository_cache=$(CURDIR)/.bazel-repo-cache --repo_contents_cache= --show_timestamps --announce_rc --color=no --curses=no --keep_going
+else ifeq ($(EXAMPLE_LANE),cd)
+EXAMPLE_BAZEL_CONFIG ?= --disk_cache=$(HOME)/.build-cache/bazel-disk --experimental_disk_cache_gc_max_size=40G --experimental_disk_cache_gc_max_age=30d --repository_cache=$(HOME)/.build-cache/bazel-repo --show_timestamps --announce_rc --color=no --curses=no --keep_going
+else
+$(error EXAMPLE_LANE must be ci, cd or unset, not "$(EXAMPLE_LANE)")
+endif
 
 # Where bazel plants its convenience symlinks (--symlink_prefix in .bazelrc).
 # Every path below that names a build output goes through this, because the
@@ -139,6 +158,16 @@ bazel-policy-parity:
 	bazel build $(BAZEL_CONFIG) //:policy_manifest
 	bazel run $(BAZEL_CONFIG) //xtask -- policy-parity --root $(CURDIR) --manifest $(CURDIR)/$(BAZEL_BIN)/policy_manifest.txt
 
+# The out-of-tree authoring example. The first line runs the same gate set an
+# in-tree component gets; the second is the author's fit check over a root
+# document that imports the packaged module. Not a step of `check`: the example
+# is its own Bazel output base, so the disk cache does not bridge the two and
+# every brenn-dsl/brenn-guest change would compile twice at the hook. CI runs it
+# on every push (see TODO(example-check-precommit) at `check`).
+example-check:
+	cd examples/component && bazel test $(EXAMPLE_BAZEL_CONFIG) //...
+	cd examples/component && bazel run $(EXAMPLE_BAZEL_CONFIG) @brenn//brenn-dsl:dsl_cli -- check --modules "$(CURDIR)/examples/component/spec" "$(CURDIR)/examples/component/config/dev.brenn"
+
 # The advisory gate over both Cargo workspaces. Outside `bazel-check` because
 # cargo-deny fetches an advisory database over the network, which a sandboxed
 # test target has no business doing. `--root` is explicit: `bazel run` starts
@@ -156,6 +185,11 @@ xtask-deny:
 # JS/TS advisory gate has no CI job, and the stale-installed-scrubber check is
 # local by nature — it needs neither cargo nor Bazel, and CI never runs
 # `make check`.
+#
+# TODO(example-check-precommit): `example-check` is not a step here. After ~2
+# weeks of CI runs, read the step's warm-cache wall-clock from the run
+# summaries: under one minute it joins this list; over, the number is recorded
+# in this comment and it stays out.
 check: bazel-check bazel-policy-parity xtask-deny npm-audit scrub-selfcheck
 	@echo "check: all steps passed (bazel-check bazel-policy-parity xtask-deny npm-audit scrub-selfcheck)"
 

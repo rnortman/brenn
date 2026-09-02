@@ -47,7 +47,7 @@ build:clippy --output_groups=+clippy_checks
 build:rustfmt --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
 build:rustfmt --output_groups=+rustfmt_checks
 
-# fltk-serde-core's serde, pointed at this workspace's hub.
+# fltk-serde-core's serde, pointed at the instance //brenn-dsl links.
 #
 # The generated `de.rs` in //brenn-dsl hands values through fltk-serde-core into
 # `#[derive(Deserialize)]` structs whose derive comes from @crates//:serde;
@@ -55,7 +55,12 @@ build:rustfmt --output_groups=+rustfmt_checks
 # links its own module-private hub's serde and the crate fails to compile with
 # mismatched-instance errors. Set here rather than per target because it has to
 # hold for whatever links fltk-serde-core, directly or not.
-build --@fltk//crates/fltk-serde-core:serde=@crates//:serde
+#
+# Spelled through the `//brenn-dsl:fltk_serde` alias rather than `@crates`
+# directly: `@crates` is this module's apparent name for its own hub, which a
+# downstream module cannot see. A consumer's .bazelrc writes the same flag as
+# `--@fltk//crates/fltk-serde-core:serde=@brenn//brenn-dsl:fltk_serde`.
+build --@fltk//crates/fltk-serde-core:serde=//brenn-dsl:fltk_serde
 
 # ---------------------------------------------------------------------------
 # Release
@@ -88,6 +93,8 @@ build:release-package --//bazel/release:static_musl=True
 # ---------------------------------------------------------------------------
 # CI
 # ---------------------------------------------------------------------------
+# The example workspace runs outside this file; the Makefile's EXAMPLE_LANE=ci
+# block is this stanza flattened, and a change here is a change there.
 build:ci --disk_cache=.bazel-disk-cache
 build:ci --experimental_disk_cache_gc_max_size=8G
 # Every CI run starts on a fresh runner with a fresh output base, so without
@@ -118,7 +125,9 @@ test:ci --keep_going
 # Both caches live under the runner's persistent build-cache directory, so
 # successive deploys share every action and every fetched repository that did
 # not change between the pinned revisions. The GC caps are what keep the disk
-# quota that killed CARGO_INCREMENTAL from being reachable again.
+# quota that killed CARGO_INCREMENTAL from being reachable again. The
+# Makefile's EXAMPLE_LANE=cd block is this stanza flattened, and a change here
+# is a change there.
 build:cd --disk_cache=~/.build-cache/bazel-disk
 build:cd --experimental_disk_cache_gc_max_size=40G
 build:cd --experimental_disk_cache_gc_max_age=30d

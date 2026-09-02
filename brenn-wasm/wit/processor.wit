@@ -9,7 +9,11 @@ package brenn:processor@0.1.0;
 /// and a shape change is a hard cut updated everywhere at once, with no compat
 /// shim — the project's standing rule for internal contracts. The synchronous
 /// channel below (`activation.sync` and `receive`'s reply) landed under the
-/// second regime, together with the `dom` and `page-dom` interfaces.
+/// second regime, together with the `dom` and `page-dom` interfaces. The
+/// component under `examples/component/` in this repository is the canary for
+/// the hard-cut regime — it builds this world from another Bazel module and
+/// fails brenn's own CI when a cut is incomplete — and is not itself the
+/// out-of-tree population that ends it.
 ///
 /// The invariant this interface serves:
 ///

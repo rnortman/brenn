@@ -7,6 +7,7 @@ load("//brenn-dsl:defs.bzl", "format_check")
 exports_files([
     "Cargo.toml",
     "Cargo.lock",
+    "cargo-bazel-lock.json",
     "rust-toolchain.toml",
     "MODULE.bazel",
     # Read by scrub's rule-semantics suite.

@@ -172,7 +172,7 @@ def surface_processor_assets(name, kind, component, jco_version, spec, visibilit
         ],
         out_dirs = [transpiled],
         target_compatible_with = HOST_ONLY,
-        tool = "//surface:jco",
+        tool = Label("//surface:jco"),
     )
 
     _processor_stage(

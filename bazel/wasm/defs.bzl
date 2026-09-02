@@ -2,29 +2,73 @@
 
 Every crate under `brenn-wasm/components/` builds for wasm32-unknown-unknown and
 for nothing else. The two crate macros here carry that fact — the target triple,
-the guest crate hub, the globbed sources — so a crate's BUILD.bazel states only
-what is specific to it.
+the platform constraint, the globbed sources — so a crate's BUILD.bazel states
+only what is specific to it: its dependencies, from whichever crate hub the
+calling repository owns, and its generated modules.
 
 Above them sits the component pipeline: `wit_bindgen_rust` generates a raw
 crate's bindings, `guest_spec_scaffold` generates a specification-bearing
 crate's port module, `wasm_component` transitions a core module into the wasm32
 configuration and wraps it with `wasm-tools component new`, and
 `wasi_import_test` asserts the result imports nothing from `wasi:`.
+
+## External authoring contract
+
+This file is loaded across module boundaries: a repository that declares
+`bazel_dep(name = "brenn")` builds its components with these macros, so they
+are an external API with the same standing as the WIT worlds under
+`brenn-wasm/wit/`. The contract is exactly these:
+
+  `wasm_guest_library`, `wasm_guest_cdylib`, `wit_bindgen_rust`,
+  `shared_guest_bindings`, `guest_spec_scaffold`, `wasm_component`,
+  `component_package`, `component_install_tree`, `grant_parity_test`,
+  `deployed_components_test`.
+
+Two are not: `component_fixtures`, whose output path is only correct when
+declared from `//brenn-wasm`, and `wasm32_build`, a reacher for wasm32-only
+libraries inside this tree's own `bazel build //...`. An out-of-tree caller of
+either is on its own.
+
+Evolution policy, in two regimes, the same two `brenn-wasm/wit/processor.wit`
+states. Once an out-of-tree population exists, a public macro's attributes and
+outputs move only additively: a new fact is a new attribute with a default, and
+no existing attribute or output changes meaning. Until one exists, the macros
+are in-tree vocabulary and a shape change is a hard cut updated everywhere at
+once, with no compat shim. `examples/component/` is the compatibility canary
+for the hard-cut regime — a consumer built in this repository's own CI — and is
+not itself the out-of-tree population that ends it.
+
+Label anchoring: a string that names a target inside a macro body resolves
+against the *caller's* package and repository mapping, so from another module
+it names the wrong thing or nothing. Every implicit label in this file and in
+the `.bzl` files it loads is `Label(...)`-wrapped. A bare label string in a
+macro body is a bug unless it names one of the macro's own arguments.
 """
 
 load("@bazel_skylib//lib:shell.bzl", "shell")
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library")
-load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY", "WASM32_ONLY")
 
-def wasm_guest_library(name, edition = "2024", deps = [], compile_data = [], visibility = None):
-    """An rlib in the guest workspace, built for wasm32-unknown-unknown.
+def wasm_guest_library(
+        name,
+        edition = "2024",
+        deps = [],
+        proc_macro_deps = [],
+        compile_data = [],
+        visibility = None):
+    """An rlib in a guest workspace, built for wasm32-unknown-unknown.
+
+    Dependencies are taken verbatim. A crate's third-party deps come from its
+    own repository's hub — `all_crate_deps(normal = True)` from
+    `@wasm_crates//:defs.bzl` in this tree — and the macro names no hub itself,
+    so it is callable from a module whose hub is not this one.
 
     Args:
         name: target name; also the crate name.
         edition: Rust edition; must equal the crate's Cargo.toml edition.
-        deps: first-party dependencies. Third-party ones come from the hub.
+        deps: every non-proc-macro dependency, first- and third-party.
+        proc_macro_deps: every proc-macro dependency.
         compile_data: files read at macro-expansion time (WIT worlds).
         visibility: target visibility.
     """
@@ -33,10 +77,10 @@ def wasm_guest_library(name, edition = "2024", deps = [], compile_data = [], vis
         srcs = native.glob(["src/**/*.rs"]),
         compile_data = compile_data,
         edition = edition,
-        proc_macro_deps = all_crate_deps(proc_macro = True),
+        proc_macro_deps = proc_macro_deps,
         target_compatible_with = WASM32_ONLY,
         visibility = visibility,
-        deps = all_crate_deps(normal = True) + deps,
+        deps = deps,
     )
 
 # Where a crate's `mod bindings;` resolves.
@@ -65,6 +109,7 @@ def wasm_guest_cdylib(
         name,
         edition = "2024",
         deps = [],
+        proc_macro_deps = [],
         compile_data = [],
         generated_srcs = {},
         shared_bindings = None,
@@ -72,12 +117,14 @@ def wasm_guest_cdylib(
     """A component crate's core WASM module, built for wasm32-unknown-unknown.
 
     The output is a plain WASM module, not yet a WIT component: `wasm_component`
-    runs a layer up.
+    runs a layer up. Dependencies are taken verbatim, as `wasm_guest_library`
+    takes them.
 
     Args:
         name: target name; also the crate name.
         edition: Rust edition; must equal the crate's Cargo.toml edition.
-        deps: first-party dependencies. Third-party ones come from the hub.
+        deps: every non-proc-macro dependency, first- and third-party.
+        proc_macro_deps: every proc-macro dependency.
         compile_data: files read at macro-expansion time (WIT worlds).
         generated_srcs: modules generated into this crate, keyed by the path
             each occupies — `{"src/spec.rs": ":spec"}` for a
@@ -106,10 +153,10 @@ def wasm_guest_cdylib(
         srcs = srcs,
         compile_data = compile_data,
         edition = edition,
-        proc_macro_deps = all_crate_deps(proc_macro = True),
+        proc_macro_deps = proc_macro_deps,
         target_compatible_with = WASM32_ONLY,
         visibility = visibility,
-        deps = all_crate_deps(normal = True) + deps,
+        deps = deps,
     )
 
 # ---------------------------------------------------------------------------

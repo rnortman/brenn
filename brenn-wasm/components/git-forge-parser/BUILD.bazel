@@ -1,3 +1,4 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("//bazel/wasm:defs.bzl", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
 
@@ -17,7 +18,8 @@ wasm_guest_cdylib(
     name = "brenn-git-forge-parser",
     generated_srcs = {"src/spec.rs": ":spec"},
     visibility = ["//visibility:public"],
-    deps = [
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
         "//brenn-wasm/components/guest:brenn-guest",
     ],
 )

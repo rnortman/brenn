@@ -1,3 +1,4 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("//bazel/wasm:defs.bzl", "wasm_guest_library")
 
@@ -16,5 +17,27 @@ wasm_guest_library(
     name = "brenn-guest",
     compile_data = ["//brenn-wasm:wit"],
     visibility = ["//visibility:public"],
-    deps = ["//brenn-envelope:brenn-envelope_wasm"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + ["//brenn-envelope:brenn-envelope_wasm"],
+)
+
+# The guest graph's serde instance, for crates outside this repository.
+#
+# brenn-guest's public API is expressed in serde types: `push_events::<T:
+# Serialize>` and the spec-generated `PushEventsPayload` marker. A derive
+# written against a serde from another module's hub produces impls for a
+# different crate instance and satisfies none of those bounds — the same
+# reason `//brenn-envelope` is built once per graph. A downstream component
+# names these two targets in place of a serde of its own; the alias set is
+# exactly the third-party crates that appear in brenn-guest's public API.
+alias(
+    name = "serde",
+    actual = "@wasm_crates//:serde",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "serde_json",
+    actual = "@wasm_crates//:serde_json",
+    visibility = ["//visibility:public"],
 )

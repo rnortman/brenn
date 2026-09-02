@@ -15,7 +15,12 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_rust", version = "0.73.0")
 bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.73.0")
 bazel_dep(name = "bazel_skylib", version = "1.8.2")
-bazel_dep(name = "toolchains_musl", version = "0.1.27.bcr.1")
+# `dev_dependency`: the musl cc toolchain exists for brenn's own static release
+# binary, and the module registers its toolchains unconditionally — a
+# dependent module would inherit a musl `cc` toolchain matching its plain
+# linux platform and link every host tool against musl. Hidden from
+# dependents, present for brenn as root.
+bazel_dep(name = "toolchains_musl", version = "0.1.27.bcr.1", dev_dependency = True)
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
 bazel_dep(name = "aspect_rules_js", version = "3.4.0")
 bazel_dep(name = "rules_nodejs", version = "6.7.3")
@@ -104,7 +109,14 @@ register_toolchains("@rust_toolchains//:all")
 # and ring both compile C sources, so a static musl binary is a real
 # cross-compile and not a linker flag. Constraining it to `:libc_musl` keeps it
 # out of every build that is not asking for the musl platform.
-toolchains_musl = use_extension("@toolchains_musl//:toolchains_musl.bzl", "toolchains_musl")
+#
+# `dev_dependency`, like the `bazel_dep` above: the extension's `config` tag may
+# only be used from the root module and fails module resolution otherwise.
+toolchains_musl = use_extension(
+    "@toolchains_musl//:toolchains_musl.bzl",
+    "toolchains_musl",
+    dev_dependency = True,
+)
 toolchains_musl.config(
     extra_target_compatible_with = ["//bazel/platforms:libc_musl"],
 )
@@ -115,10 +127,23 @@ toolchains_musl.config(
 # Only the workspace root manifest is listed: crate_universe walks the
 # `members` list itself, so member manifests never have to be enumerated here
 # and cannot fall out of sync with Cargo.toml.
+#
+# Both hubs carry a committed cargo-bazel `lockfile` in addition to the cargo
+# one. rules_rust refuses to load a hub from a non-root module without it
+# (repinning is not supported across module boundaries), so the lockfiles are
+# what lets another Bazel module `bazel_dep` on brenn and build a component
+# with brenn's rules. They are generated, not hand-edited; whenever a
+# `Cargo.lock` changes, regenerate with
+#
+#     CARGO_BAZEL_REPIN=1 bazel mod deps
+#
+# A stale lockfile fails brenn's own build with rules_rust's digest-mismatch
+# error, which names that command.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
     manifests = ["//:Cargo.toml"],
 )
 
@@ -135,6 +160,7 @@ crate.from_cargo(
 crate.from_cargo(
     name = "wasm_crates",
     cargo_lockfile = "//brenn-wasm/components:Cargo.lock",
+    lockfile = "//brenn-wasm/components:cargo-bazel-lock.json",
     manifests = ["//brenn-wasm/components:Cargo.toml"],
     supported_platform_triples = [
         "wasm32-unknown-unknown",

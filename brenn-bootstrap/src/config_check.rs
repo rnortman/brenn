@@ -12,14 +12,14 @@
 //! secret, or touch the DB are excluded by name on
 //! [`resolve_messaging_offline`]. A workstation must be able to check a config
 //! destined for another host. What the check does read is exactly its declared
-//! inputs: the root document, and the module root its packaged imports resolve
+//! inputs: the root document, and the module roots its packaged imports resolve
 //! against.
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use brenn_lib::config::{BrennConfig, check_config};
+use brenn_lib::config::{BrennConfig, DocumentInputs, check_config};
 use brenn_lib::panic_util::{catch_quietly, panic_message};
 use brenn_messaging_boot::resolve_messaging_offline;
 
@@ -28,8 +28,12 @@ use brenn_messaging_boot::resolve_messaging_offline;
 /// Strictly stronger than [`check_config`]: a document that compiles and lowers
 /// clean can still be refused here, by a messaging gate that reads only the
 /// configuration.
-pub fn run_config_check(file: &Path, module_root: Option<&Path>) -> bool {
-    let config = match check_config(file, module_root) {
+pub fn run_config_check(file: &Path, module_roots: &[PathBuf]) -> bool {
+    let inputs = DocumentInputs {
+        root: file.to_path_buf(),
+        module_roots: module_roots.to_vec(),
+    };
+    let config = match check_config(&inputs) {
         Ok(config) => config,
         Err(report) => {
             eprintln!("{report}");
@@ -144,10 +148,9 @@ mod tests {
     /// `boot_gate_refusal` for those.
     fn check(name: &str, contents: &str) -> (bool, String) {
         let dir = tempfile::tempdir().unwrap();
-        let (file, module_root) = brenn_lib::config::stage_fixture(dir.path(), name, contents);
-        let module_root = module_root.as_deref();
-        let ok = run_config_check(&file, module_root);
-        let config = check_config(&file, module_root);
+        let inputs = brenn_lib::config::stage_fixture(dir.path(), name, contents);
+        let ok = run_config_check(&inputs.root, &inputs.module_roots);
+        let config = check_config(&inputs);
         assert!(
             config.is_ok() || !ok,
             "the report refused the document but the verdict passed it",
@@ -322,15 +325,141 @@ new alice_sink: Sink {
     #[test]
     fn a_document_importing_packaged_modules_checks_against_the_module_root() {
         let (_dir, file, modules) = packaged_document();
-        assert!(run_config_check(&file, Some(&modules)));
+        assert!(run_config_check(&file, &[modules]));
     }
 
     #[test]
     fn the_same_document_without_a_module_root_is_refused_naming_the_flag() {
         let (_dir, file, _modules) = packaged_document();
-        assert!(!run_config_check(&file, None));
-        let report = check_config(&file, None).expect_err("the document must be refused");
+        assert!(!run_config_check(&file, &[]));
+        let report =
+            check_config(&DocumentInputs::bare(file)).expect_err("the document must be refused");
         assert!(report.contains("pass `--modules <dir>`"), "{report}");
+    }
+
+    /// A second release's module root beside the first: the document's imports
+    /// resolve in whichever holds them.
+    fn second_release(dir: &Path, name: &str, module: &str) -> PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("bundle.brenn"), module).unwrap();
+        root
+    }
+
+    const BUNDLE_MODULE: &str = r#"
+component Relay {
+    abi = processor;
+    requires = [ports];
+    in messages;
+    out events;
+}
+"#;
+
+    #[test]
+    fn a_document_importing_from_two_roots_checks_against_both() {
+        let (dir, _file, modules) = packaged_document();
+        let bundle = second_release(dir.path(), "bundle", BUNDLE_MODULE);
+        let file = dir.path().join("two.brenn");
+        std::fs::write(
+            &file,
+            r#"use @sink::Sink;
+use @bundle::Relay;
+
+channel feed at "brenn:alice.feed" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+channel replies at "brenn:alice.replies" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+channel relayed at "brenn:alice.relayed" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+new alice_sink: Sink {
+    grants = [ports];
+    in messages <- feed;
+    out events -> replies;
+}
+
+new relay: Relay {
+    grants = [ports];
+    in messages <- replies;
+    out events -> relayed;
+}
+"#,
+        )
+        .unwrap();
+        assert!(run_config_check(&file, &[modules.clone(), bundle.clone()]));
+        // Either root alone leaves exactly the other's import unresolved.
+        for (root, missing) in [(&modules, "bundle"), (&bundle, "sink")] {
+            let inputs = DocumentInputs {
+                root: file.clone(),
+                module_roots: vec![root.clone()],
+            };
+            assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+            let report = check_config(&inputs).expect_err("one import must be unresolved");
+            assert!(
+                report.contains(&format!("no packaged module `{missing}`")),
+                "{report}"
+            );
+        }
+    }
+
+    /// A second root holding a byte-identical copy of the first's module: the
+    /// shape of the same release installed twice.
+    fn duplicate_release(dir: &Path, modules: &Path) -> PathBuf {
+        let copy = dir.join("copy");
+        std::fs::create_dir(&copy).unwrap();
+        std::fs::copy(modules.join("sink.brenn"), copy.join("sink.brenn")).unwrap();
+        copy
+    }
+
+    #[test]
+    fn a_module_installed_under_two_roots_is_refused_naming_both() {
+        let (dir, file, modules) = packaged_document();
+        let copy = duplicate_release(dir.path(), &modules);
+        let inputs = DocumentInputs {
+            root: file,
+            module_roots: vec![modules.clone(), copy.clone()],
+        };
+        assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+        let report = check_config(&inputs).expect_err("the duplicate must be refused");
+        assert!(
+            report.contains("packaged module `sink` is installed under more than one"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&modules.display().to_string())
+                && report.contains(&copy.display().to_string()),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_the_document_never_imports_is_still_refused() {
+        let (dir, _file, modules) = packaged_document();
+        let copy = duplicate_release(dir.path(), &modules);
+        let plain = dir.path().join("plain.brenn");
+        std::fs::write(&plain, "const host = \"example.com\";\n").unwrap();
+        assert!(run_config_check(&plain, std::slice::from_ref(&modules)));
+        let inputs = DocumentInputs {
+            root: plain,
+            module_roots: vec![modules, copy],
+        };
+        assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+        let report = check_config(&inputs).expect_err("the duplicate must be refused");
+        assert!(
+            report.contains("packaged module `sink` is installed under more than one"),
+            "{report}"
+        );
     }
 
     /// The check tool reports; only boot panics.
@@ -352,12 +481,12 @@ new alice_sink: Sink {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("main.brenn");
         std::fs::write(&file, contents).unwrap();
-        let config = check_config(&file, None)
+        let config = check_config(&DocumentInputs::bare(&file))
             .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"));
         let message = offline_messaging_refusal(&config)
             .expect("a messaging gate must refuse this configuration");
         assert!(
-            !run_config_check(&file, None),
+            !run_config_check(&file, &[]),
             "the offline pass refused it but the verdict passed it",
         );
         message
@@ -619,7 +748,7 @@ remote pod {
     fn shipped_config(filename: &str) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         assert!(
-            run_config_check(&root.join(filename), Some(&root.join("config/specs"))),
+            run_config_check(&root.join(filename), &[root.join("config/specs")]),
             "{filename} must pass config-check"
         );
     }
@@ -642,7 +771,8 @@ remote pod {
     /// built artifacts.
     fn shipped_config_binds_to_its_packaged_specs(filename: &str) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let config = match check_config(&root.join(filename), Some(&root.join("config/specs"))) {
+        let inputs = DocumentInputs::with_modules(root.join(filename), root.join("config/specs"));
+        let config = match check_config(&inputs) {
             Ok(config) => config,
             Err(report) => panic!("{filename} must compile: {report}"),
         };

@@ -13,20 +13,19 @@ async fn main() -> ExitCode {
     // `--config` and neither loads a third config to throw away.
     match &cli.command {
         Some(cli::Commands::ConfigDiff { a, b }) => {
-            return verdict(bootstrap::run_config_diff(a, b, cli.modules.as_deref()));
+            return verdict(bootstrap::run_config_diff(a, b, &cli.modules));
         }
         Some(cli::Commands::ConfigCheck { file }) => {
-            return verdict(bootstrap::run_config_check(file, cli.modules.as_deref()));
+            return verdict(bootstrap::run_config_check(file, &cli.modules));
         }
         _ => {}
     }
 
-    let config = brenn_lib::config::load_config(cli.config.as_deref(), cli.modules.as_deref());
+    let config = brenn_lib::config::load_config(cli.config.as_deref(), &cli.modules);
 
-    match cli
-        .command
-        .unwrap_or(cli::Commands::Serve { components: None })
-    {
+    match cli.command.unwrap_or(cli::Commands::Serve {
+        components: Vec::new(),
+    }) {
         cli::Commands::Invite => bootstrap::run_invite(&config).await,
         cli::Commands::Serve { components } => {
             bootstrap::run_server(config, cli.config, components, build_info::BUILD_ID).await;

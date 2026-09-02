@@ -13,8 +13,10 @@ pub struct Cli {
     /// imports resolve against. An environment fact, so it is named here and
     /// never in the document: the same document checks on a workstation against
     /// a source checkout and boots on a host against the installed tree.
+    /// Repeatable, one per installed release; a module must be under exactly
+    /// one of them.
     #[arg(long, value_name = "DIR")]
-    pub modules: Option<PathBuf>,
+    pub modules: Vec<PathBuf>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -27,9 +29,10 @@ pub enum Commands {
         /// Directory holding the installed component packages, one directory
         /// per package, named by the package. A boot fact only: config
         /// validation never resolves artifacts, so a document checks without
-        /// components installed.
+        /// components installed. Repeatable, one per installed release; a
+        /// package must be under exactly one of them.
         #[arg(long, value_name = "DIR")]
-        components: Option<PathBuf>,
+        components: Vec<PathBuf>,
     },
     /// Generate an invite code and print it to stdout.
     Invite,
@@ -48,8 +51,6 @@ pub enum Commands {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
     /// `--modules` is declared on the root parser and is not `global`, so it
@@ -62,7 +63,7 @@ mod tests {
     fn the_module_root_is_named_before_the_subcommand_and_not_after_it() {
         let cli = Cli::try_parse_from(["brenn", "--modules", "/srv/modules", "config-check", "x"])
             .expect("the flag precedes the subcommand");
-        assert_eq!(cli.modules.as_deref(), Some(Path::new("/srv/modules")));
+        assert_eq!(cli.modules, [PathBuf::from("/srv/modules")]);
         let Some(Commands::ConfigCheck { file }) = cli.command else {
             panic!("the subcommand still parses");
         };
@@ -82,7 +83,7 @@ mod tests {
         let Some(Commands::Serve { components }) = cli.command else {
             panic!("the subcommand parses");
         };
-        assert_eq!(components.as_deref(), Some(Path::new("/srv/components")));
+        assert_eq!(components, [PathBuf::from("/srv/components")]);
 
         assert!(
             Cli::try_parse_from([
@@ -99,5 +100,49 @@ mod tests {
             Cli::try_parse_from(["brenn", "--components", "/srv/components", "serve"]).is_err(),
             "the flag belongs to the subcommand, not the root parser"
         );
+    }
+
+    /// One flag per installed release, in the order written: brenn's roots and
+    /// then each bundle's, or whatever order the unit spells. Parsing keeps the
+    /// order because the refusals that list the roots quote it.
+    #[test]
+    fn each_root_flag_repeats_once_per_installed_release() {
+        let cli = Cli::try_parse_from([
+            "brenn",
+            "--modules",
+            "/srv/brenn/modules",
+            "--modules",
+            "/srv/bundle/modules",
+            "serve",
+            "--components",
+            "/srv/brenn/components",
+            "--components",
+            "/srv/bundle/components",
+        ])
+        .expect("both flags repeat");
+        assert_eq!(
+            cli.modules,
+            [
+                PathBuf::from("/srv/brenn/modules"),
+                PathBuf::from("/srv/bundle/modules")
+            ]
+        );
+        let Some(Commands::Serve { components }) = cli.command else {
+            panic!("the subcommand parses");
+        };
+        assert_eq!(
+            components,
+            [
+                PathBuf::from("/srv/brenn/components"),
+                PathBuf::from("/srv/bundle/components")
+            ]
+        );
+
+        let cli = Cli::try_parse_from(["brenn", "serve"]).expect("neither flag is required");
+        assert!(cli.modules.is_empty());
+        let Some(Commands::Serve { components }) = cli.command else {
+            panic!("the subcommand parses");
+        };
+        assert!(components.is_empty());
     }
 }

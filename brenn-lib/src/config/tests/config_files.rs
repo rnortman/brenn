@@ -12,8 +12,8 @@ use crate::config::brenn::check_config;
 
 fn load_config_file(filename: &str) -> BrennConfig {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    check_config(&root.join(filename), Some(&root.join("config/specs")))
-        .unwrap_or_else(|report| panic!("{filename} must load: {report}"))
+    let inputs = DocumentInputs::with_modules(root.join(filename), root.join("config/specs"));
+    check_config(&inputs).unwrap_or_else(|report| panic!("{filename} must load: {report}"))
 }
 
 // Full validation needs host-side paths to exist, so it runs only at server

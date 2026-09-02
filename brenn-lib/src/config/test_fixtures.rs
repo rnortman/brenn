@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use brenn_dsl::DocumentInputs;
 use brenn_dsl::diag::Diagnostic;
 
 use crate::access::AppPolicy;
@@ -88,20 +89,20 @@ pub fn repo_sync_at(dir: &std::path::Path) -> RepoSyncConfig {
 /// not a property a test states.
 pub fn lower_document(document: &str) -> Result<BrennConfig, Vec<Diagnostic>> {
     let dir = tempfile::tempdir().expect("a tempdir");
-    let (root, module_root) = stage_fixture(dir.path(), "main.brenn", document);
-    let compiled = brenn_dsl::compile(&root, module_root.as_deref())?;
+    let inputs = stage_fixture(dir.path(), "main.brenn", document);
+    let compiled = brenn_dsl::compile(&inputs)?;
     crate::config::dsl_lower::lower(compiled)
 }
 
 /// Write a fixture document into `dir` as the root `name`, splitting its fenced
 /// half out as a module root beside it.
 ///
-/// Returns the root document's path and the module root to compile it against; the
-/// module root is `None` for a fixture that fences nothing. Stated once because
+/// Returns the inputs to compile it with: the root document's path and the one
+/// module root, or none for a fixture that fences nothing. Stated once because
 /// every caller that compiles a fixture from disk — lowering here, the
 /// config-check report in `brenn-bootstrap` — has to stage it the same way, and
 /// a rule added to the fence transform has to reach both.
-pub fn stage_fixture(dir: &Path, name: &str, document: &str) -> (PathBuf, Option<PathBuf>) {
+pub fn stage_fixture(dir: &Path, name: &str, document: &str) -> DocumentInputs {
     let root = dir.join(name);
     match split_packaged(document) {
         Some((module, rest)) => {
@@ -110,11 +111,11 @@ pub fn stage_fixture(dir: &Path, name: &str, document: &str) -> (PathBuf, Option
             std::fs::write(modules.join(format!("{PACKAGED_MODULE}.brenn")), module)
                 .expect("write the module");
             std::fs::write(&root, rest).expect("write the root module");
-            (root, Some(modules))
+            DocumentInputs::with_modules(root, modules)
         }
         None => {
             std::fs::write(&root, document).expect("write the root module");
-            (root, None)
+            DocumentInputs::bare(root)
         }
     }
 }

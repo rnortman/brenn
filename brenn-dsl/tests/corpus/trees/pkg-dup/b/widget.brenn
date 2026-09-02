@@ -1,0 +1,10 @@
+// One copy, byte-identical to the one under `b/`: identical bytes are still
+// two releases shipping one module.
+
+const widget_skin = "widget";
+
+component Widget {
+    abi = processor;
+    requires = [];
+    in messages;
+}

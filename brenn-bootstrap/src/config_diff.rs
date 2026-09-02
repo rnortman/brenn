@@ -9,7 +9,7 @@
 //! stamped from assemblies, refactored any other way — is still the config they
 //! were running.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use brenn_lib::config::{BrennConfig, load_config, sort_order_dead_collections};
 use similar::TextDiff;
@@ -17,7 +17,7 @@ use similar::TextDiff;
 /// Load both files, compare, print the verdict. Returns whether they are equal,
 /// which the binary turns into its exit status.
 ///
-/// One module root serves both sides: the two documents being compared are
+/// One module-root list serves both sides: the two documents being compared are
 /// versions of one deployment, so a diff across two module universes is not a
 /// real operation.
 ///
@@ -25,9 +25,9 @@ use similar::TextDiff;
 ///
 /// Panics if either file fails to load — the differ compares valid configs, and
 /// an invalid one is a louder failure than a diff.
-pub fn run_config_diff(a: &Path, b: &Path, module_root: Option<&Path>) -> bool {
-    let config_a = load_config(Some(a), module_root);
-    let config_b = load_config(Some(b), module_root);
+pub fn run_config_diff(a: &Path, b: &Path, module_roots: &[PathBuf]) -> bool {
+    let config_a = load_config(Some(a), module_roots);
+    let config_b = load_config(Some(b), module_roots);
     let (equal, rendering) = diff(
         config_a,
         config_b,
@@ -168,7 +168,7 @@ channel alerts at "brenn:alice-alerts" {
 }
 "#,
         );
-        assert!(run_config_diff(&a, &b, None));
+        assert!(run_config_diff(&a, &b, &[]));
     }
 
     /// The packaged module both sides of the diff reach for, and the two
@@ -231,8 +231,9 @@ new alice_sink: Sink {{
     #[test]
     fn both_sides_of_a_diff_resolve_against_the_module_root() {
         let (_dir, modules, a, same, other) = packaged_pair();
-        assert!(run_config_diff(&a, &same, Some(&modules)));
-        assert!(!run_config_diff(&a, &other, Some(&modules)));
+        let roots = [modules];
+        assert!(run_config_diff(&a, &same, &roots));
+        assert!(!run_config_diff(&a, &other, &roots));
     }
 
     /// Exit status 0 on configs that differ would be a false "safe to deploy".
@@ -251,7 +252,7 @@ channel alerts at "brenn:alice-alerts" {
 }
 "#,
         );
-        assert!(!run_config_diff(&a, &b, None));
+        assert!(!run_config_diff(&a, &b, &[]));
     }
 
     /// A `nan` compares false against its own copy, so the equality check and

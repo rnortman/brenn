@@ -1,0 +1,11 @@
+/// Recases text. Every body that arrives on `text` is republished on `cased`
+/// as one JSON document carrying the original and four case conventions of it
+/// (kebab, snake, upper camel, shouty snake), so a downstream consumer can pick
+/// the spelling it needs without knowing how it was computed. Stateless; the
+/// only capabilities it reaches are publishing and the log.
+component ExampleCaser {
+  abi = processor;
+  requires = [ports, log];
+  in text: "brenn.example.text@1";
+  out cased: "brenn.example.cased@1";
+}

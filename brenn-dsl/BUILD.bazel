@@ -10,6 +10,21 @@ policy_srcs()
 
 exports_files(["Cargo.toml"])
 
+# The serde instance this crate links, under a name another module can spell.
+#
+# fltk-serde-core takes its serde through a label flag, and the flag has to
+# name the same instance the generated `de.rs` derives against, or the crate
+# fails to compile with mismatched-instance errors. `@crates` is this module's
+# apparent name for its hub and is invisible from a downstream module, so the
+# flag points here instead — `.bazelrc` in this tree, and
+# `--@fltk//crates/fltk-serde-core:serde=@brenn//brenn-dsl:fltk_serde` in a
+# consumer's.
+alias(
+    name = "fltk_serde",
+    actual = "@crates//:serde",
+    visibility = ["//visibility:public"],
+)
+
 # The parser, CST, unparser and serde front end, generated from the grammar and
 # its two sidecars. Nothing here is tracked: Bazel's dependency tracking is what
 # a checked-in copy would need a drift gate for, and editing the format spec is

@@ -1,0 +1,33 @@
+// A root document that wires the example component, for the author's own fit
+// check:
+//
+//     bazel run @brenn//brenn-dsl:dsl_cli -- check --modules spec config/dev.brenn
+//
+// `spec/` is the module root: it holds `example-caser.brenn` flat, which is
+// exactly the layout a bundle's `modules/` has once installed.
+
+use @example-caser::*;
+
+/// Text to recase.
+channel caser_in at "ephemeral:example.caser.in" {
+  description = "Bodies for the example caser to recase.";
+  push_depth = 8;
+  retain_depth = 8;
+  doctype = "brenn.example.text@1";
+}
+
+/// The recased documents.
+channel caser_out at "ephemeral:example.caser.out" {
+  description = "One recased document per inbound body.";
+  push_depth = 8;
+  retain_depth = 8;
+  doctype = "brenn.example.cased@1";
+}
+
+new caser: ExampleCaser {
+  grants = [ports, log];
+  activation_burst = 60;
+  activation_min_period_ms = 100;
+  in text <- caser_in { push_depth = 8; retain_depth = 8; }
+  out cased -> caser_out;
+}

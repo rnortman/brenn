@@ -1,3 +1,4 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load(
     "//bazel/wasm:defs.bzl",
@@ -14,7 +15,8 @@ wasm_guest_cdylib(
     name = "brenn-processor-mqtt-test",
     shared_bindings = "//brenn-wasm:processor_bindings",
     visibility = ["//visibility:public"],
-    deps = ["//brenn-wasm/components/guest:brenn-guest"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + ["//brenn-wasm/components/guest:brenn-guest"],
 )
 
 wasm_component(

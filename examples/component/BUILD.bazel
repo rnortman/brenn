@@ -1,0 +1,56 @@
+# One component, built with brenn's rules from another Bazel module. Every
+# target here has a counterpart under brenn's own `brenn-wasm/`; the gate set
+# is the same one an in-tree component gets.
+load("@brenn//bazel/wasm:defs.bzl", "component_install_tree", "component_package", "deployed_components_test", "grant_parity_test", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
+load("@example_crates//:defs.bzl", "all_crate_deps")
+
+guest_spec_scaffold(
+    name = "spec",
+    spec = "spec/example-caser.brenn",
+)
+
+# Serde must come from brenn's guest instance, not `@example_crates`: a derive
+# from a different crate instance satisfies none of brenn-guest's bounds.
+wasm_guest_cdylib(
+    name = "example-caser",
+    generated_srcs = {"src/spec.rs": ":spec"},
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "@brenn//brenn-wasm/components/guest:brenn-guest",
+        "@brenn//brenn-wasm/components/guest:serde",
+    ],
+)
+
+wasm_component(
+    name = "component",
+    module = ":example-caser",
+)
+
+# The package directory a host resolves `example-caser` to. The spec's basename
+# must equal the package name; the emitter asserts it.
+component_package(
+    name = "package",
+    component = ":component",
+    package = "example-caser",
+    spec = "spec/example-caser.brenn",
+    world = "brenn:processor",
+)
+
+grant_parity_test(
+    name = "grant_parity",
+    component = ":component",
+    spec = "spec/example-caser.brenn",
+)
+
+# A components root holding this one package: what a deployment installs as a
+# bundle's `components/`, and what a locally run brenn takes as `--components`.
+component_install_tree(
+    name = "components",
+    packages = [":package"],
+)
+
+deployed_components_test(
+    name = "deployed_components_test",
+    manifest = "deployed-components.txt",
+    packages = [":package"],
+)

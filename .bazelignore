@@ -29,3 +29,7 @@ brenn-wasm/components/target
 # Symlinks into first-party crates the guest workspace shares with the host.
 # Following them would make a second copy of those packages.
 brenn-wasm/components/host-crates
+# A nested Bazel root module (its own MODULE.bazel is the repository boundary).
+# The listing states the intent; `xtask policy-parity` subtracts it from the
+# git side and holds its copied pins equal to brenn's.
+examples/component

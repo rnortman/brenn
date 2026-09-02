@@ -60,6 +60,12 @@ impl Root {
         self.dir.path()
     }
 
+    /// This root as the one-entry list a host started with one `--components`
+    /// resolves against.
+    fn roots(&self) -> Vec<PathBuf> {
+        vec![self.dir.path().to_path_buf()]
+    }
+
     fn package(&self) -> PathBuf {
         self.dir.path().join(NAME)
     }
@@ -308,7 +314,7 @@ fn a_package_missing_its_artifact_is_refused() {
 #[test]
 fn a_consumer_is_handed_the_artifact_the_record_names() {
     let root = Root::processor(b"artifact bytes", SPEC);
-    let artifact = verify_consumer(root.path(), NAME, "demo", &sha256_hex(SPEC.as_bytes()));
+    let artifact = verify_consumer(&root.roots(), NAME, "demo", &sha256_hex(SPEC.as_bytes()));
     assert_eq!(artifact, root.package().join(ARTIFACT));
 }
 
@@ -316,14 +322,14 @@ fn a_consumer_is_handed_the_artifact_the_record_names() {
 #[should_panic(expected = "is not an installed package directory")]
 fn a_consumer_naming_a_package_this_release_does_not_ship_is_refused() {
     let root = Root::processor(b"artifact bytes", SPEC);
-    verify_consumer(root.path(), "panel", "demo", &sha256_hex(SPEC.as_bytes()));
+    verify_consumer(&root.roots(), "panel", "demo", &sha256_hex(SPEC.as_bytes()));
 }
 
 #[test]
 #[should_panic(expected = "is not an installed package directory")]
 fn a_replay_endpoint_naming_an_uninstalled_package_is_refused() {
     let root = Root::replay(b"replay bytes");
-    verify_replay(root.path(), "replay-typo", "hooks");
+    verify_replay(&root.roots(), "replay-typo", "hooks");
 }
 
 #[test]
@@ -332,7 +338,7 @@ fn a_replay_package_naming_an_absolute_path_is_refused() {
     // `join` on an absolute name discards the root entirely, so a name like
     // this would load a package the release never installed.
     let root = Root::replay(b"replay bytes");
-    verify_replay(root.path(), "/srv/old-flat/replay", "hooks");
+    verify_replay(&root.roots(), "/srv/old-flat/replay", "hooks");
 }
 
 #[test]
@@ -340,7 +346,7 @@ fn a_replay_package_naming_an_absolute_path_is_refused() {
 fn a_package_name_climbing_out_of_the_root_is_refused() {
     let root = Root::processor(b"artifact bytes", SPEC);
     verify_consumer(
-        root.path(),
+        &root.roots(),
         &format!(
             "../{}/{NAME}",
             root.path().file_name().unwrap().to_str().unwrap()
@@ -356,28 +362,28 @@ fn a_dot_named_package_is_refused() {
     // A dot-named directory survives a glob-driven install sweep, so a name
     // like this can only resolve to something no release installed.
     let root = Root::replay(b"replay bytes");
-    verify_replay(root.path(), ".hidden-replay", "hooks");
+    verify_replay(&root.roots(), ".hidden-replay", "hooks");
 }
 
 #[test]
 #[should_panic(expected = "which is not a package name")]
 fn an_empty_package_name_is_refused_before_it_resolves_to_the_root() {
     let root = Root::processor(b"artifact bytes", SPEC);
-    verify_consumer(root.path(), "", "demo", &sha256_hex(SPEC.as_bytes()));
+    verify_consumer(&root.roots(), "", "demo", &sha256_hex(SPEC.as_bytes()));
 }
 
 #[test]
 #[should_panic(expected = "without --components")]
 fn a_load_with_no_components_root_names_the_flag_that_is_missing() {
-    require_components_root(None, "consumer \"demo\"");
+    require_components_root(&[], "consumer \"demo\"");
 }
 
 #[test]
 fn a_components_root_that_was_passed_is_handed_straight_back() {
     let root = Root::replay(b"replay bytes");
     assert_eq!(
-        require_components_root(Some(root.path()), "consumer \"demo\""),
-        root.path()
+        require_components_root(&root.roots(), "consumer \"demo\""),
+        root.roots()
     );
     assert_components_root(root.path());
 }
@@ -398,21 +404,26 @@ fn a_consumer_configured_against_a_divergent_spec_is_refused() {
     // is the release's or it is drift.
     let root = Root::processor(b"artifact bytes", SPEC);
     let divergent = format!("// a deployer's note\n{SPEC}");
-    verify_consumer(root.path(), NAME, "demo", &sha256_hex(divergent.as_bytes()));
+    verify_consumer(
+        &root.roots(),
+        NAME,
+        "demo",
+        &sha256_hex(divergent.as_bytes()),
+    );
 }
 
 #[test]
 #[should_panic(expected = "but its record declares world")]
 fn a_consumer_pointed_at_a_replay_package_is_refused() {
     let root = Root::replay(b"replay bytes");
-    verify_consumer(root.path(), NAME, "demo", &sha256_hex(SPEC.as_bytes()));
+    verify_consumer(&root.roots(), NAME, "demo", &sha256_hex(SPEC.as_bytes()));
 }
 
 #[test]
 fn a_replay_endpoint_with_a_correct_record_loads() {
     let root = Root::replay(b"replay bytes");
     assert_eq!(
-        verify_replay(root.path(), NAME, "hooks"),
+        verify_replay(&root.roots(), NAME, "hooks"),
         root.package().join(ARTIFACT)
     );
 }
@@ -421,5 +432,143 @@ fn a_replay_endpoint_with_a_correct_record_loads() {
 #[should_panic(expected = "but its record declares world")]
 fn a_replay_endpoint_pointed_at_a_processor_package_is_refused() {
     let root = Root::processor(b"artifact bytes", SPEC);
-    verify_replay(root.path(), NAME, "hooks");
+    verify_replay(&root.roots(), NAME, "hooks");
+}
+
+// ── more than one components root ────────────────────────────────────────────
+//
+// A host started with one `--components` per installed release. A package is
+// under exactly one of them.
+
+#[test]
+fn a_package_resolves_in_whichever_root_holds_it() {
+    let brenn = Root::processor(b"artifact bytes", SPEC);
+    let bundle = tempfile::tempdir().unwrap();
+    let roots = vec![bundle.path().to_path_buf(), brenn.path().to_path_buf()];
+    assert_eq!(
+        verify_consumer(&roots, NAME, "demo", &sha256_hex(SPEC.as_bytes())),
+        brenn.package().join(ARTIFACT)
+    );
+    assert_disjoint_components_roots(&roots);
+}
+
+/// The text of the refusal `f` panics with.
+fn refusal(f: impl FnOnce()) -> String {
+    let payload = crate::panic_util::catch_quietly(std::panic::AssertUnwindSafe(f))
+        .expect_err("the call must refuse");
+    crate::panic_util::panic_message(&*payload)
+        .expect("a refusal carries text")
+        .to_string()
+}
+
+#[test]
+fn a_package_no_root_holds_is_refused_naming_every_root() {
+    let brenn = Root::processor(b"artifact bytes", SPEC);
+    let bundle = tempfile::tempdir().unwrap();
+    let roots = vec![bundle.path().to_path_buf(), brenn.path().to_path_buf()];
+    let message = refusal(|| {
+        verify_consumer(&roots, "panel", "demo", &sha256_hex(SPEC.as_bytes()));
+    });
+    assert!(
+        message.contains("is not an installed package directory under any --components root"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "(searched: {}, {})",
+            bundle.path().display(),
+            brenn.path().display()
+        )),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_package_under_two_roots_is_refused_at_resolution() {
+    let first = Root::processor(b"artifact bytes", SPEC);
+    let second = Root::processor(b"artifact bytes", SPEC);
+    let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+    let message = refusal(|| {
+        verify_consumer(&roots, NAME, "demo", &sha256_hex(SPEC.as_bytes()));
+    });
+    assert!(
+        message.contains(&format!(
+            "is installed under more than one --components root: {}, {}.",
+            first.package().display(),
+            second.package().display()
+        )),
+        "{message}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "without --components")]
+fn a_resolution_against_no_roots_names_the_flag_rather_than_an_empty_list() {
+    // The public `verify_*` entry points do not rely on their caller having
+    // gone through `require_components_root` first.
+    verify_replay(&[], NAME, "tap");
+}
+
+#[test]
+fn every_cross_root_fault_is_in_the_one_refusal() {
+    // Two colliding names and one root named twice: the operator reads all
+    // three, not the first.
+    let first = Root::processor(b"artifact bytes", SPEC);
+    let second = Root::replay(b"replay bytes");
+    std::fs::create_dir(first.path().join("relay")).unwrap();
+    std::fs::create_dir(second.path().join("relay")).unwrap();
+    let mut trailing = first.path().as_os_str().to_os_string();
+    trailing.push("/");
+    let roots = [
+        first.path().to_path_buf(),
+        second.path().to_path_buf(),
+        PathBuf::from(trailing),
+    ];
+    let message = refusal(|| assert_disjoint_components_roots(&roots));
+    assert!(message.contains("name the same directory"), "{message}");
+    assert!(
+        message.contains(&format!(
+            "component package `{NAME}` is installed under more than one --components root: {}, {}.",
+            first.path().display(),
+            second.path().display()
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "component package `relay` is installed under more than one --components root: {}, {}.",
+            first.path().display(),
+            second.path().display()
+        )),
+        "{message}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "is installed under more than one --components root")]
+fn a_package_under_two_roots_is_refused_before_anything_resolves_it() {
+    // Same install, checked at startup with no consumer configured at all.
+    let first = Root::processor(b"artifact bytes", SPEC);
+    let second = Root::replay(b"replay bytes");
+    assert_disjoint_components_roots(&[first.path().to_path_buf(), second.path().to_path_buf()]);
+}
+
+#[test]
+#[should_panic(expected = "name the same directory")]
+fn the_same_root_named_twice_is_refused_as_one_directory() {
+    let root = Root::replay(b"replay bytes");
+    let mut trailing = root.path().as_os_str().to_os_string();
+    trailing.push("/");
+    assert_disjoint_components_roots(&[root.path().to_path_buf(), PathBuf::from(trailing)]);
+}
+
+#[test]
+fn a_plain_file_in_a_root_is_not_a_package_name() {
+    // The installer refuses a flat file before the service is bounced; the
+    // cross-root scan compares package directories and lets that refusal be the
+    // one that names it.
+    let first = Root::replay(b"replay bytes");
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(second.path().join(NAME), b"a stray file").unwrap();
+    assert_disjoint_components_roots(&[first.path().to_path_buf(), second.path().to_path_buf()]);
 }

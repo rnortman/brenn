@@ -36,6 +36,9 @@ pub mod resolve;
 /// The far side of resolution: what a document means once references, strings,
 /// classes and assemblies are gone.
 pub mod resolved;
+/// A list of install roots scanned for duplicates, shared by the module and
+/// components roots.
+pub mod roots;
 /// Guest source generated from a component specification.
 pub mod scaffold;
 pub mod unparser;
@@ -44,7 +47,7 @@ use fltk_serde_core::ParseToTargetError;
 
 use diag::Diagnostic;
 
-pub use resolve::{compile, resolve_files};
+pub use resolve::{DocumentInputs, compile, resolve_files};
 
 /// The position type every diagnostic and every resolved value carries.
 ///

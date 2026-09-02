@@ -1,0 +1,6 @@
+// A root importing a module that two module roots both hold — the shape of a
+// deployment that installed the same module from two releases.
+
+use @widget::*;
+
+const host = "example.com";

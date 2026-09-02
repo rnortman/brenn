@@ -47,9 +47,10 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Directory the config's `use @<name>::…` imports resolve against.
+    /// A directory the config's `use @<name>::…` imports resolve against.
+    /// Repeatable, one per installed release.
     #[arg(long, value_name = "DIR")]
-    modules: Option<PathBuf>,
+    modules: Vec<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -148,7 +149,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = resolve_db_path(cli.db, cli.config, cli.modules)?;
+    let db_path = resolve_db_path(cli.db, cli.config, &cli.modules)?;
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .unwrap_or_else(|e| panic!("failed to open DB read-only at {}: {e}", db_path.display()));
 
@@ -222,12 +223,12 @@ fn run_events(conn: &Connection, args: EventsArgs) -> Result<(), Box<dyn std::er
 fn resolve_db_path(
     explicit: Option<PathBuf>,
     config_path: Option<PathBuf>,
-    module_root: Option<PathBuf>,
+    module_roots: &[PathBuf],
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(p) = explicit {
         return Ok(p);
     }
-    let cfg = config::load_config(config_path.as_deref(), module_root.as_deref());
+    let cfg = config::load_config(config_path.as_deref(), module_roots);
     Ok(cfg.database.path)
 }
 

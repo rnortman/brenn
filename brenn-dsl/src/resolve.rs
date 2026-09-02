@@ -48,6 +48,7 @@ use crate::resolved::{
     RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal, RValue, RWebhook, RWebhookBlock,
     RWordList, ResolvedConfig, str_value,
 };
+use crate::roots::scan_roots;
 
 /// The module key of the root file: the crate root has no path to name it by.
 const ROOT_KEY: &str = "";
@@ -55,21 +56,51 @@ const ROOT_KEY: &str = "";
 /// The extension a module file takes.
 const MODULE_EXT: &str = "brenn";
 
+/// The option that names the module roots, as diagnostics spell it.
+const MODULES_FLAG: &str = "--modules";
+
 /// What leads a packaged module's key, and the sigil that spells it in source.
 ///
 /// A tree module key is `::`-joined path segments, and the grammar admits no
 /// `@` in a name, so no tree import can ever produce a key in this namespace.
 const PKG_SIGIL: &str = "@";
 
-/// Compile a document tree, starting from its root file.
+/// What a compile reads and nothing else: the root document and the module
+/// roots its packaged imports resolve against.
 ///
-/// The root file's directory is the tree root: `use wiring::deskbar;` reads
-/// `<root_dir>/wiring/deskbar.brenn`. `module_root`, where one is supplied, is
-/// the flat directory packaged-module imports resolve against:
-/// `use @deskbar::*;` reads `<module_root>/deskbar.brenn`. A document with no
-/// packaged-module import is unaffected by it.
-pub fn compile(root: &Path, module_root: Option<&Path>) -> Result<DerivedConfig, Vec<Diagnostic>> {
-    let files = load(root, module_root)?;
+/// Built once where the document is named — the CLI, a check tool, a test —
+/// and passed down by reference. The root's directory is the tree root:
+/// `use wiring::deskbar;` reads `<root_dir>/wiring/deskbar.brenn`. Each module
+/// root is a flat directory: `use @deskbar::*;` reads `<module_root>/deskbar.brenn`
+/// in exactly one of them. A document with no packaged import is unaffected by
+/// the list, but every root named is still checked for what it claims to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentInputs {
+    pub root: PathBuf,
+    pub module_roots: Vec<PathBuf>,
+}
+
+impl DocumentInputs {
+    /// A document with no module roots.
+    pub fn bare(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            module_roots: Vec::new(),
+        }
+    }
+
+    /// A document with one module root.
+    pub fn with_modules(root: impl Into<PathBuf>, module_root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            module_roots: vec![module_root.into()],
+        }
+    }
+}
+
+/// Compile a document tree, starting from its root file.
+pub fn compile(inputs: &DocumentInputs) -> Result<DerivedConfig, Vec<Diagnostic>> {
+    let files = load(inputs)?;
     let config = resolve_files(files, ROOT_KEY)?;
     crate::derive::derive(config)
 }
@@ -163,27 +194,16 @@ fn check_packaged_discipline(files: &[(String, File)], errors: &mut Vec<Diagnost
 /// Parse the root file and, transitively, every module it reaches.
 ///
 /// Returns the modules in the order they were reached.
-fn load(root: &Path, module_root: Option<&Path>) -> Result<Vec<(String, File)>, Vec<Diagnostic>> {
+fn load(inputs: &DocumentInputs) -> Result<Vec<(String, File)>, Vec<Diagnostic>> {
+    let root = inputs.root.as_path();
     let root_dir = root.parent().unwrap_or(Path::new(".")).to_path_buf();
-    // An operator typo must not pass silently, so the module root is checked
-    // for what it claims to be whether or not the document reaches for it. The
-    // probe is a read, not a stat: a directory nothing may list answers every
-    // import with an absence, and "no packaged module" sends its reader hunting
-    // the release staging for a file that is sitting right there.
-    if let Some(dir) = module_root
-        && let Err(error) = std::fs::read_dir(dir)
-    {
-        return Err(vec![Diagnostic::unpositioned(
-            format!(
-                "--modules {}: not a readable directory: {error}",
-                dir.display()
-            ),
-            root.display().to_string(),
-        )]);
+    let errors = check_module_roots(&inputs.module_roots, root);
+    if !errors.is_empty() {
+        return Err(errors);
     }
     let mut loader = Loader {
         root_dir,
-        module_root: module_root.map(Path::to_path_buf),
+        module_roots: inputs.module_roots.clone(),
         reported_missing_module_root: false,
         files: Vec::new(),
         seen: HashMap::new(),
@@ -197,12 +217,49 @@ fn load(root: &Path, module_root: Option<&Path>) -> Result<Vec<(String, File)>, 
     Ok(loader.files)
 }
 
+/// Refuse a module-root list that is not a set of distinct directories holding
+/// distinct modules, whether or not the document imports any of them.
+///
+/// An operator typo must not pass silently, so each root is checked for what it
+/// claims to be. The probe is a read, not a stat: a directory nothing may list
+/// answers every import with an absence, and "no packaged module" sends its
+/// reader hunting the release staging for a file that is sitting right there.
+///
+/// The same module installed under two roots is a broken install — two releases
+/// shipping one module means one of them is stale the moment the other updates
+/// — and the roots are declared inputs, so listing them learns no environment
+/// fact the document did not already consent to. The scan is a directory
+/// listing per root; no module is read. Roots are compared after
+/// canonicalization, so `a` and `a/` name the same directory.
+fn check_module_roots(module_roots: &[PathBuf], root: &Path) -> Vec<Diagnostic> {
+    let file = root.display().to_string();
+    let suffix = format!(".{MODULE_EXT}");
+    // Must agree with `locate`: only plain files are modules, so a directory
+    // named `x.brenn` is not a duplicate of the file `x.brenn`.
+    let is_module = |entry: &std::fs::DirEntry| {
+        if !entry.path().is_file() {
+            return None;
+        }
+        let name = entry.file_name();
+        name.to_str()?
+            .strip_suffix(suffix.as_str())
+            .map(str::to_string)
+    };
+    scan_roots(MODULES_FLAG, module_roots, is_module)
+        .iter()
+        .map(|fault| {
+            Diagnostic::unpositioned(fault.describe(MODULES_FLAG, "packaged module"), &file)
+        })
+        .collect()
+}
+
 struct Loader {
     root_dir: PathBuf,
-    /// Where `@` imports resolve, where the caller supplied one. Absent is not
-    /// a default: a document that reaches for a packaged module without one is
-    /// refused naming the flag.
-    module_root: Option<PathBuf>,
+    /// Where `@` imports resolve, in the order the caller named them. Empty is
+    /// not a default: a document that reaches for a packaged module without one
+    /// is refused naming the flag. A module is under exactly one of them, held
+    /// by the cross-root scan before loading begins.
+    module_roots: Vec<PathBuf>,
     /// Whether the absent module root has already been reported. It is one
     /// fact about the invocation, not about any module, so a document importing
     /// nine packaged modules gets one sentence naming the flag.
@@ -261,9 +318,9 @@ impl Loader {
             if self.seen.contains_key(&module) {
                 continue;
             }
-            let path = match self.module_path(&module) {
-                Some(path) => path,
-                None => {
+            let path = match self.locate(&module) {
+                Located::File(path) => path,
+                Located::NoModuleRoot => {
                     if !self.reported_missing_module_root {
                         self.reported_missing_module_root = true;
                         self.errors.push(Diagnostic::at(
@@ -276,15 +333,14 @@ impl Loader {
                     self.seen.insert(module, PathBuf::new());
                     continue;
                 }
+                Located::Missing(message) => {
+                    self.errors.push(Diagnostic::at(message, span));
+                    // Poison it so a second `use` of the same missing module is
+                    // not a second report of the same absence.
+                    self.seen.insert(module, PathBuf::new());
+                    continue;
+                }
             };
-            if !path.is_file() {
-                self.errors
-                    .push(Diagnostic::at(self.missing_module(&module, &path), span));
-                // Poison it so a second `use` of the same missing module is not
-                // a second report of the same absence.
-                self.seen.insert(module, path);
-                continue;
-            }
             // The same file under a second module key would be parsed and
             // indexed twice, and every declaration in it would exist twice in
             // the resolved config. Reaching the root file by name is the way
@@ -308,46 +364,74 @@ impl Loader {
         stack.pop();
     }
 
-    /// Where a module key reads from, or nothing where it names a packaged
-    /// module and no module root was supplied.
+    /// Where a module key reads from.
     ///
     /// A tree key is its segments under the root directory, plus the extension.
     /// The grammar admits neither `..` nor an absolute head, so a tree module
     /// path cannot escape the root by construction. A packaged key is its one
-    /// name directly under the module root, which is flat.
-    fn module_path(&self, key: &str) -> Option<PathBuf> {
-        let mut path = if is_packaged(key) {
-            self.module_root.clone()?
-        } else {
-            self.root_dir.clone()
-        };
+    /// name directly under a module root, which is flat; the cross-root scan has
+    /// already refused a name present under two, so the first root holding it
+    /// is the only one.
+    fn locate(&self, key: &str) -> Located {
+        let relative = Self::relative_path(key);
+        if !is_packaged(key) {
+            let path = self.root_dir.join(&relative);
+            return if path.is_file() {
+                Located::File(path)
+            } else {
+                Located::Missing(format!(
+                    "no module `{key}`: expected `{}`",
+                    display_relative(&path, &self.root_dir)
+                ))
+            };
+        }
+        if self.module_roots.is_empty() {
+            return Located::NoModuleRoot;
+        }
+        let candidates: Vec<PathBuf> = self
+            .module_roots
+            .iter()
+            .map(|root| root.join(&relative))
+            .collect();
+        match candidates.iter().find(|path| path.is_file()) {
+            Some(path) => Located::File(path.clone()),
+            None => Located::Missing(missing_packaged_module(key, &candidates)),
+        }
+    }
+
+    /// A module key as a path under whichever root it resolves against.
+    fn relative_path(key: &str) -> PathBuf {
+        let mut path = PathBuf::new();
         for segment in module_name(key).split("::") {
             path.push(segment);
         }
         path.set_extension(MODULE_EXT);
-        Some(path)
+        path
     }
+}
 
-    /// What a module that is not on disk is reported as.
-    ///
-    /// A tree module is named against the root file's directory, which the
-    /// reader has in front of them. A packaged module's root is an environment
-    /// fact the document does not state, so the message spells it out whole:
-    /// "under which root" is the question the reader is actually asking.
-    fn missing_module(&self, key: &str, path: &Path) -> String {
-        if is_packaged(key) {
-            format!(
-                "no packaged module `{}`: expected `{}`",
-                module_name(key),
-                path.display()
-            )
-        } else {
-            format!(
-                "no module `{key}`: expected `{}`",
-                display_relative(path, &self.root_dir)
-            )
-        }
-    }
+/// Where a module key resolved to, or why it did not.
+enum Located {
+    File(PathBuf),
+    /// A packaged key with no module root to resolve against.
+    NoModuleRoot,
+    /// A file that is not on disk, with the message that says where it was
+    /// looked for.
+    Missing(String),
+}
+
+/// What a packaged module that is not on disk is reported as.
+///
+/// A tree module is named against the root file's directory, which the reader
+/// has in front of them. A packaged module's roots are environment facts the
+/// document does not state, so the message spells out every path probed:
+/// "under which root" is the question the reader is actually asking.
+fn missing_packaged_module(key: &str, probed: &[PathBuf]) -> String {
+    format!(
+        "no packaged module `{}`: expected {}",
+        module_name(key),
+        or_list(probed.iter().map(|path| path.display()))
+    )
 }
 
 fn is_packaged(key: &str) -> bool {

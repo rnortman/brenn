@@ -1,0 +1,19 @@
+// Installed by one release; imports a module another release installed.
+
+use @base::Drain;
+
+const widget_skin = "widget";
+
+component Widget {
+    abi = processor;
+    requires = [];
+    in messages;
+}
+
+assembly Bench(slug: String) {
+    channel messages at f"brenn:{slug}.in.p1.messages" {
+        push_depth = 8;
+        retain_depth = 32;
+        standing_retain_depth = 128;
+    }
+}

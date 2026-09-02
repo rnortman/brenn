@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use brenn_dsl::DocumentInputs;
 use brenn_dsl::diag::Diagnostic;
 
 use super::alerting::AlertingConfig;
@@ -352,33 +353,37 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
 /// - `path` is `Some` and its extension is not `brenn`
 /// - `path` is `None` and whether the fallback name exists cannot be determined
 /// - `path` is `None` and the fallback that exists fails to load
-pub fn load_config(path: Option<&Path>, module_root: Option<&Path>) -> BrennConfig {
+pub fn load_config(path: Option<&Path>, module_roots: &[PathBuf]) -> BrennConfig {
     let cwd = std::env::current_dir().expect("failed to determine current directory");
-    load_config_from(path, module_root, &cwd)
+    load_config_from(path, module_roots, &cwd)
 }
 
 /// Load configuration, probing `fallback_dir` for a config when no explicit path
 /// is given. Separated from `load_config` for testability (avoids
 /// `set_current_dir` in tests, which is process-global and not thread-safe).
-// TODO(config-document-inputs): `path` and `module_root` are adjacent
-// `Option<&Path>` parameters meaning different things, here and along the whole
-// load/check chain; swapping them at a call site compiles.
+///
+/// This sits above [`DocumentInputs`]: with no `--config` there may be no
+/// document at all, so the struct is built only once the fallback has found one.
 pub(crate) fn load_config_from(
     path: Option<&Path>,
-    module_root: Option<&Path>,
+    module_roots: &[PathBuf],
     fallback_dir: &Path,
 ) -> BrennConfig {
-    let path = match path {
+    let root = match path {
         Some(p) => p.to_path_buf(),
         None => match fallback_config(fallback_dir) {
             Some(found) => found,
             None => return BrennConfig::default(),
         },
     };
+    let inputs = DocumentInputs {
+        root,
+        module_roots: module_roots.to_vec(),
+    };
     // Boot is `check_config` plus the one thing a boot does that a check does
     // not: it dies on the report. One dispatch, so what the check tool accepts
     // and what boots cannot diverge in either direction.
-    check_config(&path, module_root).unwrap_or_else(|report| panic!("{report}"))
+    check_config(&inputs).unwrap_or_else(|report| panic!("{report}"))
 }
 
 /// The name a `--config`-less boot answers to, in the fallback directory.
@@ -433,12 +438,11 @@ impl DslFailure {
 
 /// A `.brenn` document, compiled and lowered, reporting rather than panicking.
 ///
-/// The file is the root module of its document tree, so its own directory is
-/// where `use` resolves from. `module_root`, where one is given, is where
-/// `use @<name>::…` resolves from instead.
-///
-fn read_dsl(path: &Path, module_root: Option<&Path>) -> Result<BrennConfig, DslFailure> {
-    let config = brenn_dsl::compile(path, module_root).map_err(|diagnostics| DslFailure {
+/// The root is the root module of its document tree, so its own directory is
+/// where `use` resolves from; the module roots are where `use @<name>::…`
+/// resolves from instead.
+fn read_dsl(inputs: &DocumentInputs) -> Result<BrennConfig, DslFailure> {
+    let config = brenn_dsl::compile(inputs).map_err(|diagnostics| DslFailure {
         stage: "compile",
         diagnostics,
     })?;
@@ -462,13 +466,14 @@ fn read_dsl(path: &Path, module_root: Option<&Path>) -> Result<BrennConfig, DslF
 /// "this config will boot on every host".
 ///
 /// It reads no facts beyond its declared inputs: the root path, and the module
-/// root packaged imports resolve against. The module root is an input like the
+/// roots packaged imports resolve against. A module root is an input like the
 /// root file is — the caller asserts these are the module bytes to check
 /// against — and the boot-time hash binding is what catches a caller who
 /// asserted wrong.
-pub fn check_config(path: &Path, module_root: Option<&Path>) -> Result<BrennConfig, String> {
+pub fn check_config(inputs: &DocumentInputs) -> Result<BrennConfig, String> {
+    let path = inputs.root.as_path();
     match path.extension().and_then(std::ffi::OsStr::to_str) {
-        Some("brenn") => read_dsl(path, module_root).map_err(|failure| failure.render(path)),
+        Some("brenn") => read_dsl(inputs).map_err(|failure| failure.render(path)),
         // The check tool reports; only boot panics.
         _ => Err(unrecognized_extension(path)),
     }

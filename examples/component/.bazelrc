@@ -1,0 +1,12 @@
+# The consumer-side half of brenn's serde coherence: fltk-serde-core must link
+# the serde instance `@brenn//brenn-dsl` links, or `dsl_cli` — built here from
+# source to scaffold the port module and run the grant-parity gate — fails to
+# compile with mismatched-instance errors. brenn's own .bazelrc spells the same
+# flag through its in-module alias.
+build --@fltk//crates/fltk-serde-core:serde=@brenn//brenn-dsl:fltk_serde
+
+# brenn's root .gitignore lists this directory's symlinks.
+build --symlink_prefix=.bazel-
+
+# Disable Aspect rules_js telemetry inherited from brenn's module graph.
+common --repo_env=DO_NOT_TRACK=1

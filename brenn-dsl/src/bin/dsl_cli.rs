@@ -34,9 +34,11 @@ enum Command {
     Check {
         /// The root `.brenn` file. Its directory is where `use` resolves from.
         root: PathBuf,
-        /// The directory `use @<name>::…` imports resolve against.
+        /// A directory `use @<name>::…` imports resolve against. Repeatable:
+        /// each installed release's module root is one `--modules`, and a
+        /// module must be under exactly one of them.
         #[arg(long, value_name = "DIR")]
-        modules: Option<PathBuf>,
+        modules: Vec<PathBuf>,
         /// Print the derived configuration.
         #[arg(long)]
         dump: bool,
@@ -93,7 +95,10 @@ fn main() -> ExitCode {
             root,
             modules,
             dump,
-        } => match brenn_dsl::compile(&root, modules.as_deref()) {
+        } => match brenn_dsl::compile(&brenn_dsl::DocumentInputs {
+            root: root.clone(),
+            module_roots: modules,
+        }) {
             Ok(config) => {
                 if dump {
                     println!("{config:#?}");

@@ -59,15 +59,18 @@ fn assert_build_id_valid(build_id: &str) {
 
 /// What a server refuses to start on, before any of it is used.
 ///
-/// The components root is checked here rather than where a consumer resolves
-/// against it, so a flag pointed at nothing is an operator error reported at
+/// The components roots are checked here rather than where a consumer resolves
+/// against them, so a flag pointed at nothing is an operator error reported at
 /// startup instead of one that hides until some later release happens to
-/// configure a consumer.
-fn assert_boot_preconditions(build_id: &str, components_root: Option<&std::path::Path>) {
+/// configure a consumer. The same goes for a package name installed under two
+/// roots: a broken install is refused whether or not this configuration
+/// instantiates the name.
+fn assert_boot_preconditions(build_id: &str, components_roots: &[PathBuf]) {
     assert_build_id_valid(build_id);
-    if let Some(root) = components_root {
+    for root in components_roots {
         brenn_lib::wasm_package::assert_components_root(root);
     }
+    brenn_lib::wasm_package::assert_disjoint_components_roots(components_roots);
 }
 
 /// The environment-free half of a `[[wasm_consumer]]`'s `ProcessorLoadSpec`:
@@ -187,10 +190,10 @@ pub(crate) fn lower_consumer_load_parts(
 pub async fn run_server(
     config: BrennConfig,
     config_path: Option<PathBuf>,
-    components_root: Option<PathBuf>,
+    components_roots: Vec<PathBuf>,
     build_id: &'static str,
 ) {
-    assert_boot_preconditions(build_id, components_root.as_deref());
+    assert_boot_preconditions(build_id, &components_roots);
 
     let obs_config = obs_config::build(&config, config_path.as_ref());
     obs::install_pending_panic_hook(&obs_config);
@@ -652,7 +655,7 @@ pub async fn run_server(
                 if let Some(ref rp) = ep.replay_protection {
                     let component = load_verified_replay(
                         &ep.slug,
-                        components_root.as_deref(),
+                        &components_roots,
                         &rp.component,
                         &rp.store_path,
                         rp.max_page_count,
@@ -764,7 +767,7 @@ pub async fn run_server(
                 None
             };
             let (component, artifact_path) = load_verified_consumer(
-                components_root.as_deref(),
+                &components_roots,
                 &consumer.package,
                 &consumer.slug,
                 &consumer.spec_sha256,
@@ -1213,17 +1216,17 @@ pub async fn run_server(
 /// have verified the package it came out of.
 fn load_verified_replay(
     slug: &str,
-    components_root: Option<&std::path::Path>,
+    components_roots: &[PathBuf],
     package: &str,
     store_path: &std::path::Path,
     max_page_count: u32,
     config: std::collections::HashMap<String, String>,
 ) -> brenn_wasm::ReplayComponent {
-    let root = brenn_lib::wasm_package::require_components_root(
-        components_root,
+    let roots = brenn_lib::wasm_package::require_components_root(
+        components_roots,
         &format!("webhook endpoint {slug:?} replay protection"),
     );
-    let component_path = brenn_lib::wasm_package::verify_replay(root, package, slug);
+    let component_path = brenn_lib::wasm_package::verify_replay(roots, package, slug);
     brenn_wasm::ReplayComponent::load(slug, &component_path, store_path, max_page_count, config)
 }
 
@@ -1236,18 +1239,18 @@ fn load_verified_replay(
 /// `component_path` — whatever it staged there is discarded for the artifact
 /// the package bound. The artifact's path is handed back for the caller's log.
 fn load_verified_consumer(
-    components_root: Option<&std::path::Path>,
+    components_roots: &[PathBuf],
     package: &str,
     slug: &str,
     config_spec_sha256: &str,
     spec: brenn_wasm::ProcessorLoadSpec<'_>,
 ) -> (brenn_wasm::ProcessorComponent, std::path::PathBuf) {
-    let root = brenn_lib::wasm_package::require_components_root(
-        components_root,
+    let roots = brenn_lib::wasm_package::require_components_root(
+        components_roots,
         &format!("consumer {slug:?}"),
     );
     let artifact =
-        brenn_lib::wasm_package::verify_consumer(root, package, slug, config_spec_sha256);
+        brenn_lib::wasm_package::verify_consumer(roots, package, slug, config_spec_sha256);
     // The spec's borrows outlive this call; narrowing them to the artifact's
     // scope is what lets the path the verification produced be the one loaded.
     let mut spec: brenn_wasm::ProcessorLoadSpec<'_> = spec;
@@ -1432,7 +1435,8 @@ mod tests {
         ) -> brenn_wasm::ProcessorComponent {
             let mut spec = load_spec(slug);
             fill(&mut spec);
-            super::super::load_verified_consumer(root, package, slug, config_spec_sha256, spec).0
+            let roots: Vec<PathBuf> = root.map(Path::to_path_buf).into_iter().collect();
+            super::super::load_verified_consumer(&roots, package, slug, config_spec_sha256, spec).0
         }
 
         const SPEC: &str = "component Demo {\n  abi = processor;\n}\n";
@@ -1482,7 +1486,7 @@ mod tests {
             // page.
             let component = super::super::load_verified_replay(
                 "endpoint",
-                Some(dir.path()),
+                &[dir.path().to_path_buf()],
                 "replay",
                 &dir.path().join("replay.sqlite"),
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
@@ -1581,7 +1585,7 @@ mod tests {
             std::fs::write(&artifact, b"tampered").expect("tamper");
             super::super::load_verified_replay(
                 "endpoint",
-                Some(dir.path()),
+                &[dir.path().to_path_buf()],
                 "replay",
                 &dir.path().join("replay.sqlite"),
                 1,
@@ -1596,7 +1600,7 @@ mod tests {
             package(dir.path(), "replay", b"not a component", Some(SPEC));
             super::super::load_verified_replay(
                 "endpoint",
-                Some(dir.path()),
+                &[dir.path().to_path_buf()],
                 "replay",
                 &dir.path().join("replay.sqlite"),
                 1,
@@ -1719,8 +1723,8 @@ mod tests {
     #[test]
     fn boot_preconditions_pass_on_a_real_components_root() {
         let dir = tempfile::tempdir().unwrap();
-        assert_boot_preconditions("test-build", Some(dir.path()));
-        assert_boot_preconditions("test-build", None);
+        assert_boot_preconditions("test-build", &[dir.path().to_path_buf()]);
+        assert_boot_preconditions("test-build", &[]);
     }
 
     /// The root is checked at startup, with no consumer configured and nothing
@@ -1731,7 +1735,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("brenn_demo.wasm");
         std::fs::write(&file, b"not a directory").unwrap();
-        assert_boot_preconditions("test-build", Some(&file));
+        assert_boot_preconditions("test-build", &[file]);
+    }
+
+    /// Two releases' roots with disjoint package names boot; the same name
+    /// under both is refused before any consumer resolves it.
+    #[test]
+    fn boot_preconditions_hold_the_components_roots_disjoint() {
+        let brenn = tempfile::tempdir().unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::create_dir(brenn.path().join("demo")).unwrap();
+        std::fs::create_dir(bundle.path().join("relay")).unwrap();
+        let roots = [brenn.path().to_path_buf(), bundle.path().to_path_buf()];
+        assert_boot_preconditions("test-build", &roots);
+    }
+
+    #[test]
+    #[should_panic(expected = "is installed under more than one --components root")]
+    fn boot_preconditions_refuse_a_package_present_in_two_roots() {
+        let brenn = tempfile::tempdir().unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::create_dir(brenn.path().join("demo")).unwrap();
+        std::fs::create_dir(bundle.path().join("demo")).unwrap();
+        let roots = [brenn.path().to_path_buf(), bundle.path().to_path_buf()];
+        assert_boot_preconditions("test-build", &roots);
     }
 
     /// An empty build id must panic: it would produce a zero-length WS

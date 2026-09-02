@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
+use brenn_dsl::roots::{display_list, scan_roots};
 use serde::Deserialize;
 
 use crate::util::sha256_hex;
@@ -262,24 +263,42 @@ fn verify(record: &PackageRecord, package_dir: &Path) -> PathBuf {
     artifact_path
 }
 
-/// Resolve `<components_root>/<package>` and refuse when nothing is installed
-/// there.
+/// Resolve `<root>/<package>` across the components roots and refuse unless
+/// exactly one root holds it.
 ///
 /// `what` names the thing the configuration wired, so the message says which
-/// instantiation went looking.
-fn resolve_dir(components_root: &Path, package: &str, what: &str) -> PathBuf {
+/// instantiation went looking. Zero hits is a package no installed release
+/// ships; two is two releases shipping one name, which is not a deployment
+/// anyone meant — a single root would let the second silently shadow the first,
+/// and the whole point of a root per release is that the host can see both.
+fn resolve_dir(components_roots: &[PathBuf], package: &str, what: &str) -> PathBuf {
     assert_package_name(package, what);
-    let dir = components_root.join(package);
+    require_components_root(components_roots, what);
+    let mut hits: Vec<PathBuf> = components_roots
+        .iter()
+        .map(|root| root.join(package))
+        .filter(|dir| dir.is_dir())
+        .collect();
     assert!(
-        dir.is_dir(),
-        "boot: {what} names component package {package:?}, but {} is not an installed package \
-         directory. A configuration may import any module the module root ships, but only a \
-         component the release ships as a backend package can be instantiated at top level — a \
-         surface kind ships its module and no package. Check the name against the release's \
-         installed components, or the {COMPONENTS_FLAG} root this host was started with. \
-         Refusing to start (fail-fast on invalid config).",
-        dir.display(),
+        hits.len() < 2,
+        "boot: {what} names component package {package:?}, which is installed under more than \
+         one {COMPONENTS_FLAG} root: {}. A package ships with exactly one release; two copies \
+         mean a stale install or two bundles claiming one name. Remove or rename one. Refusing \
+         to start (fail-fast on invalid config).",
+        display_list(&hits),
     );
+    let Some(dir) = hits.pop() else {
+        panic!(
+            "boot: {what} names component package {package:?}, but {package} is not an installed \
+             package directory under any {COMPONENTS_FLAG} root (searched: {}). A configuration \
+             may import any module the module roots ship, but only a component the release ships \
+             as a backend package can be instantiated at top level — a surface kind ships its \
+             module and no package. Check the name against the installed releases' components, \
+             or the {COMPONENTS_FLAG} roots this host was started with. Refusing to start \
+             (fail-fast on invalid config).",
+            display_list(components_roots),
+        )
+    };
     dir
 }
 
@@ -327,12 +346,12 @@ fn assert_package_name(package: &str, what: &str) {
 /// `config_spec_sha256` is the class's `spec_sha256`, carried from the file the
 /// class was declared in. Returns the artifact path for the loader.
 pub fn verify_consumer(
-    components_root: &Path,
+    components_roots: &[PathBuf],
     package: &str,
     slug: &str,
     config_spec_sha256: &str,
 ) -> PathBuf {
-    let dir = resolve_dir(components_root, package, &format!("consumer {slug:?}"));
+    let dir = resolve_dir(components_roots, package, &format!("consumer {slug:?}"));
     let record = load_record(&dir);
     assert!(
         record.world == WORLD_PROCESSOR,
@@ -362,9 +381,9 @@ pub fn verify_consumer(
 
 /// The full check for a replay component: installed, internally bound and
 /// replay-world. There is no spec side — a replay component declares no class.
-pub fn verify_replay(components_root: &Path, package: &str, slug: &str) -> PathBuf {
+pub fn verify_replay(components_roots: &[PathBuf], package: &str, slug: &str) -> PathBuf {
     let dir = resolve_dir(
-        components_root,
+        components_roots,
         package,
         &format!("webhook endpoint {slug:?} replay protection"),
     );
@@ -379,20 +398,51 @@ pub fn verify_replay(components_root: &Path, package: &str, slug: &str) -> PathB
     verify(&record, &dir)
 }
 
-/// The components root a boot-time load resolves against, or a refusal naming
+/// The components roots a boot-time load resolves against, or a refusal naming
 /// the flag that was not passed.
 ///
 /// `what` names the instantiation that wanted one, so an operator learns both
 /// that the flag is missing and which part of the configuration needs it.
-pub fn require_components_root<'a>(components_root: Option<&'a Path>, what: &str) -> &'a Path {
-    components_root.unwrap_or_else(|| {
-        panic!(
-            "boot: {what} loads an installed component package, but this host was started \
-             without {COMPONENTS_FLAG} <DIR>. Where components are installed is an environment \
-             fact the configuration never states, so it has to be named on the command line. \
-             Refusing to start (fail-fast on invalid config).",
-        )
-    })
+pub fn require_components_root<'a>(components_roots: &'a [PathBuf], what: &str) -> &'a [PathBuf] {
+    assert!(
+        !components_roots.is_empty(),
+        "boot: {what} loads an installed component package, but this host was started without \
+         {COMPONENTS_FLAG} <DIR>. Where components are installed is an environment fact the \
+         configuration never states, so it has to be named on the command line, once per \
+         installed release. Refusing to start (fail-fast on invalid config).",
+    );
+    components_roots
+}
+
+/// Refuse a components-root list in which one package name is installed under
+/// two roots, whatever the configuration goes on to instantiate. Every fault
+/// the scan finds is in the one refusal, so a broken install is fixed in one
+/// pass rather than one boot per fault.
+///
+/// A root per release is what lets the host see a collision at all; refusing it
+/// at startup rather than when a consumer happens to resolve the name is the
+/// same posture as the module roots' cross-root scan. Roots are compared after
+/// canonicalization, so the same directory named twice is refused as one
+/// directory rather than as a duplicate of everything in it. Directory names
+/// only — a plain file in a root is the installer's refusal, not this one.
+pub fn assert_disjoint_components_roots(components_roots: &[PathBuf]) {
+    let is_package = |entry: &std::fs::DirEntry| {
+        if !entry.path().is_dir() {
+            return None;
+        }
+        entry.file_name().to_str().map(str::to_string)
+    };
+    let faults = scan_roots(COMPONENTS_FLAG, components_roots, is_package);
+    assert!(
+        faults.is_empty(),
+        "boot: the {COMPONENTS_FLAG} roots are not a set of distinct releases:\n{}\nRefusing to \
+         start (fail-fast on invalid config).",
+        faults
+            .iter()
+            .map(|fault| fault.describe(COMPONENTS_FLAG, "component package"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 /// Refuse a components root that is not a directory, whatever the configuration

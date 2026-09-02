@@ -90,6 +90,11 @@ jobs:
       # difference: signal on a fresh checkout, noise on a working tree.
       - run: make bazel-policy-parity BAZEL_CONFIG=--config=ci
 
+      # The out-of-tree authoring example. It is its own Bazel root module, so
+      # it runs in its own output base; the lane points it at the same two
+      # caches the `ci` config gives brenn (its .bazelrc carries no `ci` stanza).
+      - run: make example-check EXAMPLE_LANE=ci
+
       # The release lane, which `bazel test //...` above does not reach: it
       # builds the package in the dev configuration, so the musl platform
       # transition, the `select()` that picks the linkage assertion, and the

@@ -1,0 +1,9 @@
+// Installed by the other release.
+
+const base_skin = "bench";
+
+component Drain {
+    abi = processor;
+    requires = [];
+    in messages;
+}

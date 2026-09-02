@@ -8,8 +8,8 @@ mod support;
 
 use std::path::PathBuf;
 
-use brenn_dsl::compile;
 use brenn_dsl::diag::Diagnostic;
+use brenn_dsl::{DocumentInputs, compile};
 
 /// One fixture tree's root file.
 fn root(tree: &str) -> PathBuf {
@@ -32,14 +32,22 @@ fn modules(tree: &str) -> PathBuf {
         .join("modules")
 }
 
-/// Compile a fixture tree, expecting it to fail, and return the diagnostics.
-fn errors(tree: &str) -> Vec<Diagnostic> {
-    errors_with(tree, None)
+/// A fixture tree's root file with the module roots to compile it against.
+fn inputs(tree: &str, module_roots: &[PathBuf]) -> DocumentInputs {
+    DocumentInputs {
+        root: root(tree),
+        module_roots: module_roots.to_vec(),
+    }
 }
 
-/// Compile a fixture tree against a module root, expecting it to fail.
-fn errors_with(tree: &str, module_root: Option<PathBuf>) -> Vec<Diagnostic> {
-    match compile(&root(tree), module_root.as_deref()) {
+/// Compile a fixture tree, expecting it to fail, and return the diagnostics.
+fn errors(tree: &str) -> Vec<Diagnostic> {
+    errors_with(tree, &[])
+}
+
+/// Compile a fixture tree against module roots, expecting it to fail.
+fn errors_with(tree: &str, module_roots: &[PathBuf]) -> Vec<Diagnostic> {
+    match compile(&inputs(tree, module_roots)) {
         Ok(_) => panic!("`{tree}` was expected not to compile"),
         Err(errors) => errors,
     }
@@ -47,12 +55,12 @@ fn errors_with(tree: &str, module_root: Option<PathBuf>) -> Vec<Diagnostic> {
 
 /// The one message a failing tree is expected to produce.
 fn one_error(tree: &str) -> String {
-    one_error_with(tree, None)
+    one_error_with(tree, &[])
 }
 
-/// The one message a failing tree compiled against a module root produces.
-fn one_error_with(tree: &str, module_root: Option<PathBuf>) -> String {
-    let errors = errors_with(tree, module_root);
+/// The one message a failing tree compiled against module roots produces.
+fn one_error_with(tree: &str, module_roots: &[PathBuf]) -> String {
+    let errors = errors_with(tree, module_roots);
     assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
     errors[0].message.clone()
 }
@@ -64,7 +72,7 @@ fn messages(errors: &[Diagnostic]) -> Vec<&str> {
 #[test]
 fn a_root_reaches_a_nested_module_and_a_flat_one() {
     let output =
-        compile(&root("ok"), None).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+        compile(&inputs("ok", &[])).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
     // The nested module's own declaration reached the resolved config, and the
     // constant it interpolated came from the flat module the root imported
     // whole: loading and indexing a module is not the same as emitting it.
@@ -159,7 +167,7 @@ fn a_missing_module_is_positioned_at_the_use_that_named_it() {
 
 #[test]
 fn a_root_reaches_two_packaged_modules_and_one_reaches_the_other() {
-    let output = compile(&root("pkg-ok"), Some(&modules("pkg-ok")))
+    let output = compile(&inputs("pkg-ok", &[modules("pkg-ok")]))
         .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
     // The glob brought in the module's assembly, which the root stamped, and
     // the module's own `@` import resolved against the same root.
@@ -183,7 +191,7 @@ fn a_root_reaches_two_packaged_modules_and_one_reaches_the_other() {
 fn a_missing_packaged_module_names_the_file_it_looked_for() {
     let expected = modules("pkg-missing").join("absent.brenn");
     assert_eq!(
-        one_error_with("pkg-missing", Some(modules("pkg-missing"))),
+        one_error_with("pkg-missing", &[modules("pkg-missing")]),
         format!(
             "no packaged module `absent`: expected `{}`",
             expected.display()
@@ -206,7 +214,7 @@ fn a_module_root_that_is_not_a_directory_is_refused_whatever_the_document_import
     // The document here has no packaged import at all: an operator typo must
     // not pass silently just because nothing happened to reach for it.
     let typo = support::corpus_dir().join("trees").join("no-such-modules");
-    let errors = errors_with("ok", Some(typo.clone()));
+    let errors = errors_with("ok", std::slice::from_ref(&typo));
     assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
     let prefix = format!("--modules {}: not a readable directory: ", typo.display());
     assert!(
@@ -234,7 +242,7 @@ fn a_module_root_that_cannot_be_listed_is_refused_as_the_root_and_not_as_absent_
     if std::fs::read_dir(&modules).is_ok() {
         return;
     }
-    let errors = errors_with("ok", Some(modules.clone()));
+    let errors = errors_with("ok", std::slice::from_ref(&modules));
     let prefix = format!(
         "--modules {}: not a readable directory: ",
         modules.display()
@@ -250,7 +258,7 @@ fn a_module_root_that_cannot_be_listed_is_refused_as_the_root_and_not_as_absent_
 #[test]
 fn a_packaged_import_is_one_level_deep() {
     assert_eq!(
-        one_error_with("pkg-deep", Some(modules("pkg-deep"))),
+        one_error_with("pkg-deep", &[modules("pkg-deep")]),
         "a packaged module is one level: `use @<module>::<Item>;`",
     );
 }
@@ -258,7 +266,7 @@ fn a_packaged_import_is_one_level_deep() {
 #[test]
 fn one_file_reached_as_a_tree_module_and_a_packaged_one_is_still_one_module() {
     assert_eq!(
-        one_error_with("pkg-two-keys", Some(modules("pkg-two-keys"))),
+        one_error_with("pkg-two-keys", &[modules("pkg-two-keys")]),
         "`@widget` is already loaded as modules::widget: one file is one module",
     );
 }
@@ -266,7 +274,7 @@ fn one_file_reached_as_a_tree_module_and_a_packaged_one_is_still_one_module() {
 #[test]
 fn a_cycle_between_packaged_modules_names_its_members() {
     assert_eq!(
-        one_error_with("pkg-cycle", Some(modules("pkg-cycle"))),
+        one_error_with("pkg-cycle", &[modules("pkg-cycle")]),
         "import cycle: @alpha -> @beta -> @alpha",
     );
 }
@@ -277,7 +285,7 @@ fn a_packaged_module_that_imports_the_tree_and_stamps_is_refused_for_each() {
     // not exist in this tree, so a loader that walked it would stack a fourth
     // diagnostic — an absence — in front of the refusal that is the real
     // answer. Exactly three messages is what proves it did not.
-    let errors = errors_with("pkg-discipline", Some(modules("pkg-discipline")));
+    let errors = errors_with("pkg-discipline", &[modules("pkg-discipline")]);
     assert_eq!(
         messages(&errors),
         [
@@ -365,5 +373,139 @@ fn an_instantiation_in_one_module_waits_for_one_in_another() {
             .map(|grant| grant.principal.dotted())
             .collect::<Vec<_>>(),
         ["alice.pa"]
+    );
+}
+
+// ── more than one module root ────────────────────────────────────────────────
+//
+// Each installed release has a module root of its own, so a host names several.
+// A module is under exactly one of them: the roots are declared inputs, and the
+// same name under two is a broken install whether or not the document imports
+// it.
+
+/// A fixture tree's second-release module root: a subdirectory beside its root
+/// file, named for the release.
+fn release_root(tree: &str, release: &str) -> PathBuf {
+    support::corpus_dir().join("trees").join(tree).join(release)
+}
+
+#[test]
+fn a_packaged_import_resolves_in_whichever_root_holds_it() {
+    let output = compile(&inputs(
+        "pkg-two-roots",
+        &[
+            release_root("pkg-two-roots", "a"),
+            release_root("pkg-two-roots", "b"),
+        ],
+    ))
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    // `widget` came from `a/` and the `base` it imports from `b/`: a packaged
+    // module's own `@` import is resolved against the whole list, not against
+    // the root it was found under.
+    assert_eq!(
+        output.resolved.channels[0].handle.dotted(),
+        "alice_desk.messages"
+    );
+}
+
+#[test]
+fn a_module_under_two_roots_is_refused_naming_both() {
+    let a = release_root("pkg-dup", "a");
+    let b = release_root("pkg-dup", "b");
+    assert_eq!(
+        one_error_with("pkg-dup", &[a.clone(), b.clone()]),
+        format!(
+            "packaged module `widget` is installed under more than one --modules root: {}, {}. \
+             It ships with exactly one release; two copies mean a stale install or two bundles \
+             claiming one name. Remove or rename one",
+            a.display(),
+            b.display()
+        ),
+    );
+}
+
+#[test]
+fn a_duplicate_nothing_imports_is_still_refused() {
+    // The `ok` tree imports no packaged module at all. The roots are declared
+    // inputs, and a broken install is refused independently of what today's
+    // document happens to touch.
+    let errors = errors_with(
+        "ok",
+        &[release_root("pkg-dup", "a"), release_root("pkg-dup", "b")],
+    );
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert!(
+        errors[0].message.starts_with(
+            "packaged module `widget` is installed under more than one --modules root"
+        ),
+        "{}",
+        errors[0].message
+    );
+}
+
+#[test]
+fn the_same_root_named_twice_is_refused_as_one_directory() {
+    // `a` and `a/` are the same directory, and canonicalization is what says
+    // so; the refusal names the directory rather than every module in it.
+    let modules = modules("pkg-ok");
+    let mut trailing = modules.clone().into_os_string();
+    trailing.push("/");
+    let errors = errors_with(
+        "pkg-ok",
+        &[modules.clone(), PathBuf::from(trailing.clone())],
+    );
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert_eq!(
+        errors[0].message,
+        format!(
+            "--modules {} and --modules {} name the same directory: every --modules root is a \
+             distinct release's",
+            modules.display(),
+            PathBuf::from(trailing).display()
+        ),
+    );
+}
+
+#[test]
+fn a_missing_packaged_module_names_every_root_it_was_looked_for_under() {
+    let first = modules("pkg-missing");
+    let second = release_root("pkg-two-roots", "b");
+    assert_eq!(
+        one_error_with("pkg-missing", &[first.clone(), second.clone()]),
+        format!(
+            "no packaged module `absent`: expected `{}` or `{}`",
+            first.join("absent.brenn").display(),
+            second.join("absent.brenn").display()
+        ),
+    );
+}
+
+#[test]
+fn a_directory_named_like_a_module_is_not_a_duplicate_of_the_module() {
+    // Import resolution requires a file; a stray `widget.brenn/` directory
+    // under a second root is not a duplicate and cannot shadow the real module.
+    let scratch = std::env::var("TEST_TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
+    let decoy = scratch.join(format!("decoy-module-root-{}", std::process::id()));
+    std::fs::create_dir_all(decoy.join("widget.brenn")).unwrap();
+    compile(&inputs("pkg-ok", &[modules("pkg-ok"), decoy.clone()]))
+        .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    // Ordering must not matter: the module resolves even when the decoy
+    // directory precedes the real root in the list.
+    compile(&inputs("pkg-ok", &[decoy, modules("pkg-ok")]))
+        .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+#[test]
+fn an_unreadable_root_is_refused_beside_readable_ones() {
+    // One bad entry in the list is reported as itself; the good root is not
+    // blamed for it.
+    let typo = support::corpus_dir().join("trees").join("no-such-modules");
+    let errors = errors_with("pkg-ok", &[modules("pkg-ok"), typo.clone()]);
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    let prefix = format!("--modules {}: not a readable directory: ", typo.display());
+    assert!(
+        errors[0].message.starts_with(&prefix),
+        "{}",
+        errors[0].message
     );
 }

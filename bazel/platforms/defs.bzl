@@ -10,11 +10,15 @@ skip instead.
 
 # Crates whose only artifact form is a WASM module: the WIT guests, and the
 # browser cdylibs whose DOM glue is behind `cfg(target_arch = "wasm32")`.
-WASM32_ONLY = ["@platforms//cpu:wasm32"]
+#
+# `Label(...)`-anchored, as is every label below: these constants are read from
+# `.bzl` files a downstream module loads, and a bare string would resolve
+# against that module's repository mapping instead of this one's.
+WASM32_ONLY = [Label("@platforms//cpu:wasm32")]
 
 # Targets that run, or are exercised, on the host: tests, gates, and the host
 # libraries beside a browser cdylib.
 HOST_ONLY = select({
-    "//bazel/platforms:is_wasm32": ["@platforms//:incompatible"],
+    Label("//bazel/platforms:is_wasm32"): [Label("@platforms//:incompatible")],
     "//conditions:default": [],
 })

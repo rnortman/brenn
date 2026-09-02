@@ -1,3 +1,4 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load(
     "//bazel/wasm:defs.bzl",
@@ -15,6 +16,8 @@ wasm_guest_cdylib(
     shared_bindings = "//brenn-wasm:replay_bindings",
     edition = "2021",
     visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
 )
 
 wasm_component(

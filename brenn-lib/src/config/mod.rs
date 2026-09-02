@@ -32,6 +32,8 @@ pub use automation::*;
 #[cfg(test)]
 pub(crate) use brenn::load_config_from;
 pub use brenn::*;
+/// What a document load or check reads: the root and its module roots.
+pub use brenn_dsl::DocumentInputs;
 pub use claude_defaults::*;
 pub use container::*;
 pub use events::*;

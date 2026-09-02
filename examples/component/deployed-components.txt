@@ -1,0 +1,4 @@
+# The packages this workspace ships, one name per line. Same grammar as
+# brenn's own manifest; `deployed_components_test` holds it equal to the set
+# of `component_package` targets in both directions.
+example-caser

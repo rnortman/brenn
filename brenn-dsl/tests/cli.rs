@@ -277,3 +277,17 @@ fn scaffold_refuses_a_two_class_specification_until_class_names_one() {
         "{module}"
     );
 }
+
+#[test]
+fn the_flag_repeats_once_per_module_root() {
+    let tree = support::corpus_dir().join("trees").join("pkg-two-roots");
+    let a = tree.join("a").display().to_string();
+    let b = tree.join("b").display().to_string();
+    let output = check("pkg-two-roots", &["--modules", &a, "--modules", &b]);
+    assert!(output.status.success(), "{output:?}");
+    // Either root alone leaves one import unresolved.
+    let output = check("pkg-two-roots", &["--modules", &a]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no packaged module `base`"), "{stderr}");
+}

@@ -224,8 +224,17 @@ nothing. The resolver refuses the word where it is written. `takeover` keeps
 
 ## Status
 
-**The generated module's shape is an in-tree contract for now.** No
-out-of-tree authoring path consumes it yet, and `dsl_cli scaffold` is not
-shipped anywhere an out-of-tree author could run it. Both are deliberate: the
-shape is promoted to an external contract when a distribution path for it is
-designed, not by accident of being written down here.
+**`dsl_cli scaffold` is reachable by an out-of-tree author**, as
+`@brenn//brenn-dsl:dsl_cli`, built from source in the consumer's execution
+configuration when its `BUILD.bazel` calls `guest_spec_scaffold` from
+`@brenn//bazel/wasm:defs.bzl`. No binary is shipped; the distribution is the
+Bazel module dependency (`component-packages.md`, *Authoring an out-of-tree
+component*), and `examples/component/` is the consumer that proves it.
+
+**The generated module's shape is under the same two-regime evolution policy as
+every other contract the dependency exposes** (the docstring of
+`bazel/wasm/defs.bzl`; `processor.wit`): until a component repository outside
+brenn's exists, the shape may move as a hard cut updated everywhere at once,
+and the in-tree example is the canary that a cut is complete; once such a
+repository exists, the shape moves only additively. Reachable is not yet
+frozen — the second regime begins when the first real consumer does.
