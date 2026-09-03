@@ -291,3 +291,74 @@ fn the_flag_repeats_once_per_module_root() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no packaged module `base`"), "{stderr}");
 }
+
+// ── wire-kind ────────────────────────────────────────────────────────────────
+
+/// A specification declaring exactly the classes named, each with the smallest
+/// body the grammar accepts.
+fn classes_text(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!("component {name} {{\n  abi = processor;\n}}\n"))
+        .collect()
+}
+
+fn wire_kind(dir: &str, names: &[&str], extra: &[&str]) -> Output {
+    let dir = scratch(dir);
+    let spec = write(&dir, "spec.brenn", &classes_text(names));
+    let spec = spec.display().to_string();
+    let mut args = vec!["wire-kind", spec.as_str()];
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+/// The folds a build depends on: two-word classes, an initialism spelled the
+/// only way the grammar accepts one (`cname` refuses consecutive uppercase), and
+/// a single word. What the browser asks for is this string, so it is pinned here
+/// rather than left to the caller's habit.
+#[test]
+fn wire_kind_prints_the_kebab_fold_of_the_one_class() {
+    for (class, kind) in [
+        ("ModeClock", "mode-clock"),
+        ("DemoPanel", "demo-panel"),
+        ("HttpThing", "http-thing"),
+        ("Chrome", "chrome"),
+    ] {
+        let output = wire_kind("wire-kind-one", &[class], &[]);
+        assert!(output.status.success(), "{class}: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{kind}\n"));
+    }
+}
+
+#[test]
+fn wire_kind_takes_the_class_the_flag_names() {
+    let output = wire_kind(
+        "wire-kind-selected",
+        &["DemoPanel", "DemoCounter"],
+        &["--class", "DemoCounter"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "demo-counter\n");
+}
+
+/// Guessing at a multi-class module would print one of two kinds and stage the
+/// component under it, which is the failure this subcommand exists to catch.
+#[test]
+fn wire_kind_refuses_a_multi_class_module_without_the_flag() {
+    let output = wire_kind("wire-kind-ambiguous", &["DemoPanel", "DemoCounter"], &[]);
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--class <Name>"), "{stderr}");
+}
+
+#[test]
+fn wire_kind_names_a_class_the_module_does_not_declare() {
+    let output = wire_kind("wire-kind-absent", &["DemoPanel"], &["--class", "Nope"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no component class named `Nope`"),
+        "{stderr}"
+    );
+}

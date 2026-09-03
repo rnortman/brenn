@@ -9,14 +9,17 @@
 # as empty, an asset tree that was never built, two package directories with one
 # name — is checked to fail rather than to ship a tarball missing a piece.
 #
-# The module root gets the same treatment: the backend modules arrive as
-# arguments and the surface ones are harvested off the staged tree, so both
-# halves are staged here and a name claimed twice is checked to fail.
+# The module root gets the same treatment: both halves are harvested off the
+# staged tree — the backend one off each shipped package directory, the surface
+# one off the staged surface tree — so the good case asserts `modules/` entry by
+# entry, and a name reached both ways is checked to stage once when the two
+# copies agree and to fail when they do not.
 set -uo pipefail
 
 names="$1"
 assemble="$2"
 record_lib="$3"
+stage_lib="$4"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
 failures=0
 
@@ -41,8 +44,6 @@ mkdir -p "$tmp/in/surface/processor/transplant"
 printf 'component Transplant {}\n' > "$tmp/in/surface/processor/transplant/transplant.spec.brenn"
 printf '{\n  "kind": "transplant"\n}\n' > "$tmp/in/surface/processor/transplant/manifest.json"
 
-mkdir -p "$tmp/in/modules"
-printf 'component Shipped {}\n' > "$tmp/in/modules/shipped-component.brenn"
 printf 'stub\n' > "$tmp/in/noop_mcp.py"
 
 # The build declares each package's files under `<target>/<name>/`, so the
@@ -59,6 +60,12 @@ printf '\0asm\1\0\0\0' > "$tmp/in/pkg/b/also_shipped/brenn_also_shipped.wasm"
 printf '{"v": 2, "name": "test_only", "artifact": "brenn_test_only.wasm"}\n' \
     > "$tmp/in/pkg/c/test_only/package.json"
 printf '\0asm\1\0\0\0' > "$tmp/in/pkg/c/test_only/brenn_test_only.wasm"
+# A specification of its own, so "an unlisted package's module was harvested" is
+# a thing the exact-set assertion below can actually see. brenn builds packages
+# it does not deploy, and the module root is derived from the packages that
+# ship: a harvest reading the built set instead of the listed set would put
+# import vocabulary for this one on every host.
+printf 'component TestOnly {}\n' > "$tmp/in/pkg/c/test_only/test_only.brenn"
 
 # Repeated at every invocation below, because a package is not optional: the
 # host resolves a component by the directory it installs as.
@@ -70,6 +77,7 @@ packages=(
     --package "$tmp/in/pkg/b/also_shipped/brenn_also_shipped.wasm"
     --package "$tmp/in/pkg/c/test_only/package.json"
     --package "$tmp/in/pkg/c/test_only/brenn_test_only.wasm"
+    --package "$tmp/in/pkg/c/test_only/test_only.brenn"
 )
 
 cat > "$tmp/in/manifest.txt" <<'EOF'
@@ -81,8 +89,7 @@ EOF
 
 run() {
     "$assemble" \
-        --names "$names" --record-lib "$record_lib" \
-        --module "$tmp/in/modules/shipped-component.brenn" \
+        --names "$names" --record-lib "$record_lib" --stage-lib "$stage_lib" \
         --out "$1" \
         --manifest "$2" \
         --frontend "$tmp/in/frontend" \
@@ -112,7 +119,7 @@ for path in \
     components/shipped/brenn_shipped.wasm \
     components/also_shipped/package.json \
     components/also_shipped/brenn_also_shipped.wasm \
-    modules/shipped-component.brenn \
+    modules/shipped.brenn \
     modules/transplant.brenn; do
     [ -f "$tmp/out/$path" ] || fail "the staged tree is missing $path"
 done
@@ -125,11 +132,17 @@ done
 [ -x "$tmp/out/scripts/manifest_names.sh" ] \
     || fail "the staged manifest grammar is not executable"
 
-# Staged under the authored basename and the record's kind respectively, and
-# byte-identical to what they copy: an import resolves to these bytes and the
+# Exactly what ships, and nothing else. A presence-only list would not notice a
+# module appearing (an unshipped package's spec) or disappearing (a harvest that
+# stopped running), which is the whole of what the derived module root claims.
+staged_modules="$(cd "$tmp/out/modules" && find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort | tr '\n' ' ')"
+[ "$staged_modules" = "shipped.brenn transplant.brenn " ] \
+    || fail "modules/ holds $staged_modules"
+
+# Byte-identical to what they copy: an import resolves to these bytes and the
 # host binds them against the package.
-cmp -s "$tmp/in/modules/shipped-component.brenn" "$tmp/out/modules/shipped-component.brenn" \
-    || fail "a backend module was not staged verbatim"
+cmp -s "$tmp/in/pkg/a/shipped/shipped.brenn" "$tmp/out/modules/shipped.brenn" \
+    || fail "a backend module was not harvested from its packaged copy"
 cmp -s "$tmp/in/surface/processor/transplant/transplant.spec.brenn" "$tmp/out/modules/transplant.brenn" \
     || fail "a processor kind's module was not harvested from its packaged copy"
 
@@ -163,6 +176,7 @@ mkdir -p "$tmp/in/pkg-norecord/shipped"
 printf '\0asm\1\0\0\0' > "$tmp/in/pkg-norecord/shipped/brenn_shipped.wasm"
 expect_failure "a package with no record" "holds no package.json" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-norecord" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" \
@@ -178,12 +192,14 @@ expect_failure "an empty manifest" "names no components" \
 mkdir -p "$tmp/in/unbuilt"
 expect_failure "an empty asset tree" "holds no files" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-unbuilt" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/unbuilt" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" "${packages[@]}"
 
 expect_failure "a non-directory asset tree" "not a directory" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-notdir" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/noop_mcp.py" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" "${packages[@]}"
@@ -195,6 +211,7 @@ printf '{"v": 2, "name": "shipped", "artifact": "other.wasm"}\n' \
     > "$tmp/in/pkg-dup/shipped/package.json"
 expect_failure "two package directories sharing a name" "two package directories are named shipped" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-dup" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/bin/brenn" \
@@ -202,11 +219,13 @@ expect_failure "two package directories sharing a name" "two package directories
 
 expect_failure "no binaries at all" "no --bin given" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-nobin" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" "${packages[@]}"
 
 expect_failure "an unrecognized argument" "unrecognized argument" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-badarg" --whatever
 
 # Each required flag in turn. A rule wired without one of these still fails
@@ -217,10 +236,11 @@ required_args=(
     --manifest "$tmp/in/manifest.txt"
     --names "$names"
     --record-lib "$record_lib"
+    --stage-lib "$stage_lib"
     --frontend "$tmp/in/frontend"
     --surface "$tmp/in/surface"
 )
-for dropped in out manifest names record-lib frontend surface; do
+for dropped in out manifest names record-lib stage-lib frontend surface; do
     argv=()
     for ((i = 0; i < ${#required_args[@]}; i += 2)); do
         [ "${required_args[i]}" = "--$dropped" ] && continue
@@ -230,15 +250,34 @@ for dropped in out manifest names record-lib frontend surface; do
         "$assemble" "${argv[@]}" --bin "$tmp/in/bin/brenn" "${packages[@]}"
 done
 
-# Two modules claiming one import: the root is flat, so one would silently win.
-mkdir -p "$tmp/in/modules-dup"
-printf 'component Other {}\n' > "$tmp/in/modules-dup/transplant.brenn"
-expect_failure "a module name claimed twice" "a module root is flat" \
+# One name reached both ways — a shipped package and a surface kind — is the
+# only shape brenn can produce. Byte-identical copies are one authored module
+# and stage once; differing ones are two files claiming one import, and which of
+# them a deployment compiles against cannot come down to copy order.
+mkdir -p "$tmp/in/surface-same/processor/shipped"
+cp -R "$tmp/in/surface/." "$tmp/in/surface-same/"
+printf '{\n  "kind": "shipped"\n}\n' > "$tmp/in/surface-same/processor/shipped/manifest.json"
+cp "$tmp/in/pkg/a/shipped/shipped.brenn" "$tmp/in/surface-same/processor/shipped/shipped.spec.brenn"
+
+if ! "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
+    --out "$tmp/out-samemod" --manifest "$tmp/in/manifest.txt" \
+    --frontend "$tmp/in/frontend" --surface "$tmp/in/surface-same" \
+    --bin "$tmp/in/bin/brenn" "${packages[@]}" > "$tmp/samemod.log" 2>&1; then
+    fail "one authored module at both placements should stage: $(cat "$tmp/samemod.log")"
+fi
+cmp -s "$tmp/in/pkg/a/shipped/shipped.brenn" "$tmp/out-samemod/modules/shipped.brenn" \
+    || fail "the module staged at both placements is not the authored file"
+
+cp -R "$tmp/in/surface-same" "$tmp/in/surface-drift"
+printf 'component Shipped {} // authored later\n' \
+    > "$tmp/in/surface-drift/processor/shipped/shipped.spec.brenn"
+expect_failure "a module name reached twice with differing bytes" "one name is one authored module" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
-    --out "$tmp/out-dupmod" --manifest "$tmp/in/manifest.txt" \
-    --frontend "$tmp/in/frontend" --surface "$tmp/in/surface" \
-    --bin "$tmp/in/bin/brenn" \
-    --module "$tmp/in/modules-dup/transplant.brenn" "${packages[@]}"
+    --stage-lib "$stage_lib" \
+    --out "$tmp/out-driftmod" --manifest "$tmp/in/manifest.txt" \
+    --frontend "$tmp/in/frontend" --surface "$tmp/in/surface-drift" \
+    --bin "$tmp/in/bin/brenn" "${packages[@]}"
 
 # A surface kind whose packaged copy did not ship: the tree names the kind, so
 # the module a deployment would import is the one thing missing.
@@ -247,9 +286,37 @@ cp -R "$tmp/in/surface/." "$tmp/in/surface-nospec/"
 rm "$tmp/in/surface-nospec/processor/transplant/transplant.spec.brenn"
 expect_failure "a surface kind with no packaged module" "ships no packaged module" \
     "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-nospec" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/frontend" --surface "$tmp/in/surface-nospec" \
     --bin "$tmp/in/bin/brenn" "${packages[@]}"
+
+# And one carrying neither its record nor its specification: every kind
+# directory is a kind, so an empty one must fail rather than be silently skipped.
+mkdir -p "$tmp/in/surface-recordless/processor"
+cp -R "$tmp/in/surface/." "$tmp/in/surface-recordless/"
+mkdir -p "$tmp/in/surface-recordless/processor/orphan"
+expect_failure "a surface kind directory with no record at all" "ships no packaged module" \
+    "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
+    --out "$tmp/out-recordless" --manifest "$tmp/in/manifest.txt" \
+    --frontend "$tmp/in/frontend" --surface "$tmp/in/surface-recordless" \
+    --bin "$tmp/in/bin/brenn" "${packages[@]}"
+
+# ---------------------------------------------------------------------------
+# What the staged trees owe the module root
+# ---------------------------------------------------------------------------
+# The assertion reads the staged trees, so we can drive it over a tree built by
+# hand — the only way to present a tree whose harvest never ran.
+cp -R "$tmp/out" "$tmp/out-lostharvest"
+rm -f "$tmp/out-lostharvest/modules/"*
+if ! (. "$stage_lib"; stage_assert_modules_owed "$tmp/out") > "$tmp/owed.log" 2>&1; then
+    fail "a tree whose modules were harvested should pass: $(cat "$tmp/owed.log")"
+fi
+expect_failure "a staged tree whose harvest did not run" "modules/shipped.brenn" \
+    bash -c '. "$1"; stage_assert_modules_owed "$2"' bash "$stage_lib" "$tmp/out-lostharvest"
+expect_failure "a staged tree whose harvest did not run" "modules/transplant.brenn" \
+    bash -c '. "$1"; stage_assert_modules_owed "$2"' bash "$stage_lib" "$tmp/out-lostharvest"
 
 # ---------------------------------------------------------------------------
 # Symlinked inputs, as a sandboxed action's are
@@ -260,6 +327,7 @@ ln -s "$tmp/in/frontend/skins/dark.css" "$tmp/in/linked-frontend/skins/dark.css"
 ln -s "$tmp/in/bin/brenn" "$tmp/in/linked-brenn"
 
 if ! "$assemble" --names "$names" --record-lib "$record_lib" \
+    --stage-lib "$stage_lib" \
     --out "$tmp/out-linked" --manifest "$tmp/in/manifest.txt" \
     --frontend "$tmp/in/linked-frontend" --surface "$tmp/in/surface" \
     --bin "$tmp/in/linked-brenn" "${packages[@]}" > "$tmp/linked.log" 2>&1; then

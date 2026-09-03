@@ -413,6 +413,29 @@ fn an_assembly_stamps_the_top_level_vocabulary() {
     assert_eq!(surface.acls.len(), 1);
 }
 
+/// A surface and a top-level `new` in one assembly body. The grammar admits the
+/// mix, and placement is the `new`'s position and nothing else, so an assembly
+/// that stamps a page and a backend instance behind it is one declaration.
+#[test]
+fn an_assembly_stamps_a_surface_and_a_top_level_instance_in_one_body() {
+    let file = statements();
+    let assembly = file
+        .assemblies()
+        .next()
+        .expect("the corpus declares an assembly");
+
+    assert_eq!(assembly.surfaces().count(), 1);
+    let instances: Vec<&str> = assembly
+        .instantiations()
+        .map(|inst| inst.handle.value().as_str())
+        .collect();
+    assert_eq!(
+        instances,
+        ["counter"],
+        "the surface's own instances are the surface's, not the body's"
+    );
+}
+
 /// An assembly body takes the four forms it stamps with, and nothing else: an
 /// `acl` there has no enclosing principal, and a definition there would scope
 /// definitions somewhere nothing else does. Both are syntax errors, not items

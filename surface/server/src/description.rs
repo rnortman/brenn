@@ -252,16 +252,21 @@ pub fn surface_config_spec(bare_channels: &[String]) -> SystemParticipantSpec {
 // ── Document builders ──────────────────────────────────────────────────────
 
 /// Build every boot-published document as `(address, body)` pairs, in publish
-/// order. Reads the per-kind sidecar files under `surface_dist_dir`: a missing
-/// `.help.md` warns and yields a generated stub; a missing `.schema.json` yields
-/// `schema: null`; a malformed `.schema.json` panics (a shipped machine-readable
-/// artifact that is not valid JSON is operator/vendor error, worse to publish
-/// than to fail fast).
+/// order. Reads each kind's sidecar files from the root that serves that kind,
+/// which is the only place they can be: a bundle installs its kinds into a root
+/// of its own. A missing `.help.md` warns and yields a generated stub; a missing
+/// `.schema.json` yields `schema: null`; a malformed `.schema.json` panics (a
+/// shipped machine-readable artifact that is not valid JSON is operator/vendor
+/// error, worse to publish than to fail fast).
+///
+/// A kind with no root at all reads no sidecar and takes the same stub, without
+/// the warning: at boot that arrangement is unreachable, because a configured
+/// kind no installed root offers is refused before this runs.
 pub fn build_description_docs(
     prefix: &str,
     build_id: &str,
     surfaces: &[ResolvedSurface],
-    surface_dist_dir: &Path,
+    roots: &crate::SurfaceRoots,
 ) -> Vec<(String, String)> {
     let ts = chrono::Utc::now().to_rfc3339();
     let mut docs = Vec::new();
@@ -279,13 +284,14 @@ pub fn build_description_docs(
     }
 
     for kind in distinct_kinds(surfaces) {
+        let root = roots.kind_root(&kind);
         docs.push((
             kind_help_channel(prefix, &kind),
-            build_kind_help(&kind, surfaces, surface_dist_dir, &ts),
+            build_kind_help(&kind, surfaces, root, &ts),
         ));
         docs.push((
             kind_schema_channel(prefix, &kind),
-            build_kind_schema(&kind, surface_dist_dir, &ts),
+            build_kind_schema(&kind, root, &ts),
         ));
     }
 
@@ -407,7 +413,7 @@ fn build_surface_help(prefix: &str, build_id: &str, surface: &ResolvedSurface, t
 fn build_kind_help(
     kind: &str,
     surfaces: &[ResolvedSurface],
-    surface_dist_dir: &Path,
+    root: Option<&Path>,
     ts: &str,
 ) -> String {
     let module = processor_module_path(kind);
@@ -454,7 +460,7 @@ fn build_kind_help(
     let _ = writeln!(md);
     let _ = writeln!(md, "## Documentation");
     let _ = writeln!(md);
-    match read_help_sidecar(kind, surface_dist_dir) {
+    match read_help_sidecar(kind, root) {
         Some(doc) => {
             let _ = writeln!(md, "{doc}");
         }
@@ -496,9 +502,9 @@ struct Dimensions {
 /// none) and `dimensions` is the validated `.dimensions.json` sidecar (or `null`
 /// when absent). The channel always exists so the topology is uniform; `null` is
 /// the machine-readable "not shipped".
-fn build_kind_schema(kind: &str, surface_dist_dir: &Path, ts: &str) -> String {
-    let schema = read_schema_sidecar(kind, surface_dist_dir);
-    let dimensions = read_dimensions_sidecar(kind, surface_dist_dir);
+fn build_kind_schema(kind: &str, root: Option<&Path>, ts: &str) -> String {
+    let schema = read_schema_sidecar(kind, root);
+    let dimensions = read_dimensions_sidecar(kind, root);
     let body = json!({
         "v": SCHEMA_VERSION,
         "kind": kind,
@@ -535,8 +541,8 @@ fn sidecar_stem(kind: &str) -> String {
 /// Read the kind's markdown help sidecar (any valid UTF-8 accepted). `None` +
 /// boot warning when absent — undocumented is valid config, but the remedy is
 /// now in the component author's hands (ship the file), not an in-tree edit.
-fn read_help_sidecar(kind: &str, surface_dist_dir: &Path) -> Option<String> {
-    let path = surface_dist_dir.join(help_sidecar_filename(kind));
+fn read_help_sidecar(kind: &str, root: Option<&Path>) -> Option<String> {
+    let path = root?.join(help_sidecar_filename(kind));
     match std::fs::read_to_string(&path) {
         Ok(doc) => Some(doc),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -560,8 +566,8 @@ fn read_help_sidecar(kind: &str, surface_dist_dir: &Path) -> Option<String> {
 /// are optional, no warning). A present-but-unparseable sidecar is a boot panic:
 /// publishing malformed bytes to a machine-consumer channel is worse than
 /// failing fast.
-fn read_schema_sidecar(kind: &str, surface_dist_dir: &Path) -> Option<serde_json::Value> {
-    let path = surface_dist_dir.join(schema_sidecar_filename(kind));
+fn read_schema_sidecar(kind: &str, root: Option<&Path>) -> Option<serde_json::Value> {
+    let path = root?.join(schema_sidecar_filename(kind));
     match std::fs::read_to_string(&path) {
         Ok(text) => Some(serde_json::from_str(&text).unwrap_or_else(|err| {
             panic!(
@@ -586,8 +592,8 @@ fn read_schema_sidecar(kind: &str, surface_dist_dir: &Path) -> Option<serde_json
 /// sidecar, since a shipped invalid layout constraint is worse to publish than to
 /// refuse. Returns the validated value re-serialized so the published payload
 /// carries exactly the accepted shape.
-fn read_dimensions_sidecar(kind: &str, surface_dist_dir: &Path) -> Option<serde_json::Value> {
-    let path = surface_dist_dir.join(dimensions_sidecar_filename(kind));
+fn read_dimensions_sidecar(kind: &str, root: Option<&Path>) -> Option<serde_json::Value> {
+    let path = root?.join(dimensions_sidecar_filename(kind));
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,

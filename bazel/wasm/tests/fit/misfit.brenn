@@ -1,0 +1,7 @@
+// A document whose vocabulary resolves and whose stamp does not fit: `Bench`
+// comes from a module root, and the argument it is given is the wrong type. The
+// refusal gate drives this one.
+
+use @widget::*;
+
+new alice_desk: Bench(slug = 7);

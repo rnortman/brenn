@@ -19,7 +19,7 @@ brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 tempfile = "3"
 # Read by the `surface_dom` suite alone (cargo has no per-test dependency
 # granularity; the Bazel graph gives them to that one target).
-brenn-surface-contract = { version = "0.1.0", path = "../surface/contract" }
+brenn-page-harness = { version = "0.1.0", path = "../surface/page-harness" }
 brenn-chrome = { version = "0.1.0", path = "../surface/chrome" }
 brenn-meeting = { version = "0.1.0", path = "../surface/components/meeting" }
 brenn-cal = { version = "0.1.0", path = "../brenn-cal" }

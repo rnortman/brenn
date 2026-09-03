@@ -1361,6 +1361,37 @@ fn a_port_bound_to_both_a_link_and_a_channel_is_refused() {
     );
 }
 
+/// The two directions of one port are not two bindings that happen to agree.
+/// Writing them apart — an `in` and an `out` on one name, even at one channel —
+/// is the same port bound twice, and is refused here rather than reaching boot
+/// as a subscription and an output that boot would have to tell apart from a
+/// deliberate bidirectional pair.
+#[test]
+fn splitting_an_io_port_into_an_in_and_an_out_is_refused() {
+    let errors = refusals(concat!(
+        "channel feed at \"brenn:alice.in.feed\" { push_depth = 2; retain_depth = 2; }\n",
+        packaged!(),
+        "component Sink {\n",
+        "    abi = processor; requires = [ports];\n",
+        "    io events;\n",
+        "}\n",
+        packaged!(),
+        "new alice_sink: Sink {\n",
+        "    slug = \"alice-sink\";\n",
+        "    in events <- feed;\n",
+        "    out events -> feed;\n",
+        "}\n",
+    ));
+    assert_eq!(
+        errors,
+        vec![
+            "this instance binds port `events` twice; a port is wired once".to_string(),
+            "port `events` is an `io` port, bound as `in`".to_string(),
+        ],
+        "{errors:?}"
+    );
+}
+
 /// The contract is the class's, so it binds a consumer exactly as it binds a
 /// surface-placed instance.
 #[test]

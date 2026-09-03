@@ -724,7 +724,6 @@ fn every_section_lowers_with_every_key_stated() {
 server {
     bind_address = "127.0.0.1:3100";
     static_dir = "/opt/brenn/frontend/dist";
-    surface_dist_dir = "/opt/brenn/surface/dist";
     secure_cookies = false;
     trusted_proxy_hops = 1;
     pid_file = "/run/brenn/brenn.pid";
@@ -836,7 +835,6 @@ container cc {
             server: ServerConfig {
                 bind_address: "127.0.0.1:3100".parse().expect("a socket address"),
                 static_dir: PathBuf::from("/opt/brenn/frontend/dist"),
-                surface_dist_dir: PathBuf::from("/opt/brenn/surface/dist"),
                 secure_cookies: false,
                 trusted_proxy_hops: 1,
                 pid_file: Some(PathBuf::from("/run/brenn/brenn.pid")),
@@ -1358,6 +1356,21 @@ fn a_count_out_of_the_targets_range_is_refused() {
     assert_eq!(
         diagnostic.message,
         "`trusted_proxy_hops`: 300 is out of range for this key"
+    );
+}
+
+/// `surface_dist_dir` is not vocabulary — the surface asset tree is an artifact
+/// fact named on the command line. A config still spelling the key is refused
+/// rather than quietly ignored.
+#[test]
+fn the_deleted_surface_asset_key_is_refused_as_unknown() {
+    let diagnostic = refusal(
+        r#"server { public_url = "https://brenn.example.com"; surface_dist_dir = "/opt/brenn/surface/dist"; }"#,
+    );
+    assert!(
+        diagnostic.message.contains("surface_dist_dir"),
+        "{}",
+        diagnostic.message,
     );
 }
 

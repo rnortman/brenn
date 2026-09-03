@@ -35,7 +35,11 @@ use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::{ChannelScheme, MessagingDirectory};
 use brenn_messaging::Messenger;
 use brenn_messaging::system::SystemParticipantSpec;
-use brenn_surface_contract::KERNEL_ARTIFACT;
+use brenn_surface_contract::{KERNEL_ARTIFACT, PROCESSOR_DIR};
+
+pub use brenn_surface_contract::processor_kind_from_path;
+
+const SURFACE_FLAG: &str = "--surface";
 use brenn_surface_schema::surface_bindable_address;
 
 use self::profile::SurfaceProfile;
@@ -304,18 +308,42 @@ pub fn build_surface_runtimes(
         .collect()
 }
 
-/// Boot-time surface-asset existence check.
+/// Where each served surface asset lives, once the installed roots are scanned.
 ///
-/// When any `[[surface]]` is configured, the kernel module pair
-/// (`brenn_surface_kernel.js` + `…_bg.wasm`, referenced unconditionally by every
-/// surface page) must exist under `surface_dist_dir`, and every configured
-/// component kind must have the assets its ABI implies: a `dom` kind its
-/// wasm-bindgen module pair, packaged specification and the record binding them
-/// (`dom_assets`), a `processor` kind its transpiled tree plus a conforming
-/// manifest and import profile (`processor_assets`). A missing or stale artifact
-/// is a deploy/packaging mistake — config-shaped, boot-time, never
-/// attacker-reachable — so this panics (house fail-fast policy). No-op when no
-/// surfaces are configured.
+/// The URL namespace under `/surface-static` is one tree; the filesystem behind
+/// it is several, one per installed release. A page manifest never says which
+/// root a kind came from, so this map is the whole of that knowledge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurfaceRoots {
+    /// The one root that holds the kernel module pair and the flat sidecars.
+    /// `None` iff no `--surface` was given — a surface-less deployment.
+    pub kernel: Option<std::path::PathBuf>,
+    /// Wire kind → the one root whose `processor/<kind>/` holds it.
+    pub kinds: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
+
+impl SurfaceRoots {
+    /// The root serving one kind, or `None` where no installed root offers it.
+    pub fn kind_root(&self, kind: &str) -> Option<&std::path::Path> {
+        self.kinds.get(kind).map(std::path::PathBuf::as_path)
+    }
+}
+
+/// Boot-time surface-asset existence check, over every installed root.
+///
+/// Each root is a release's surface tree: brenn's own carries the kernel module
+/// pair and the flat sidecars beside its kinds, a component bundle's carries
+/// kinds alone. The scan is of the roots as declared, not of what the current
+/// configuration happens to name — a kind installed under two roots is an
+/// ambiguous deploy whether or not anything instantiates it today, so it is
+/// refused either way.
+///
+/// Then, when any `[[surface]]` is configured, every configured component kind
+/// must have the assets its ABI implies under *its* root: a `processor` kind its
+/// transpiled tree plus a conforming manifest and import profile
+/// (`processor_assets`). A missing or stale artifact is a deploy/packaging
+/// mistake — config-shaped, boot-time, never attacker-reachable — so this panics
+/// (house fail-fast policy).
 ///
 /// The kernel keeps a bare pair-existence check: it is not a component, so it
 /// has no kind, no class and no specification to bind — nothing to record.
@@ -323,11 +351,38 @@ pub fn build_surface_runtimes(
 /// Lives beside `build_surface_runtimes` (a plain function over the resolved
 /// list), not in `SurfaceRuntime::build`, so it never runs on the
 /// `AppState`-constructing unit tests.
-pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[ResolvedSurface]) {
-    if surfaces.is_empty() {
-        return;
+///
+/// # Panics
+///
+/// On a repeated root, a kind offered by two roots, zero or two kernel roots, a
+/// root offering neither the kernel nor a kind, a configured kind no root
+/// offers, and everything the per-kind and per-instance passes already panic
+/// on.
+pub fn validate_surface_assets(
+    roots: &[std::path::PathBuf],
+    surfaces: &[ResolvedSurface],
+) -> SurfaceRoots {
+    if roots.is_empty() {
+        assert!(
+            surfaces.is_empty(),
+            "boot: {} [[surface]] block(s) are configured but the server was started without \
+             {SURFACE_FLAG}. The surface asset tree is an artifact fact, so it is named on the command \
+             line and never in the document: pass one --surface per installed release. Refusing to \
+             start (fail-fast on invalid config).",
+            surfaces.len(),
+        );
+        return SurfaceRoots::default();
     }
-    assert_module_pair_exists(surface_dist_dir, KERNEL_ARTIFACT, "kernel");
+    let kinds = scan_surface_roots(roots);
+    let kernel = sole_kernel_root(roots);
+    assert_every_root_offers_something(roots, &kernel, &kinds);
+    let roots = SurfaceRoots {
+        kernel: Some(kernel),
+        kinds,
+    };
+    if surfaces.is_empty() {
+        return roots;
+    }
     // Kind-grain checks (asset existence, record, profile) run once per distinct
     // kind across the whole config — several instances, on one surface or
     // several, share one artifact. Import⊆grants and the specification binding
@@ -338,7 +393,20 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
             if kinds.contains_key(comp.kind.as_str()) {
                 continue;
             }
-            let manifest = processor_assets::validate_processor_kind(surface_dist_dir, &comp.kind);
+            let root = roots.kind_root(&comp.kind).unwrap_or_else(|| {
+                panic!(
+                    "boot: [[surface]] {:?} component {:?} names kind {:?}, which no installed \
+                     surface root offers. The roots scanned were {}, and between them they offer \
+                     {}. Install the release carrying that kind, or name its root with another \
+                     --surface. Refusing to start (fail-fast on invalid config).",
+                    surface.slug,
+                    comp.instance,
+                    comp.kind,
+                    root_list(&roots),
+                    offered_kinds(&roots),
+                )
+            });
+            let manifest = processor_assets::validate_processor_kind(root, &comp.kind);
             kinds.insert(
                 comp.kind.as_str(),
                 KindAssets {
@@ -373,6 +441,142 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
             assert_spec_bound(&surface.slug, comp, &assets.spec_sha256);
         }
     }
+    roots
+}
+
+/// The kind → root map, with every way the root list is not a set of distinct
+/// releases holding distinct kinds refused in one pass.
+///
+/// A kind is a directory under `processor/`; nothing here reads its contents,
+/// because which root owns a kind has to be settled before the per-kind pass
+/// can ask a root anything.
+fn scan_surface_roots(
+    roots: &[std::path::PathBuf],
+) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    let is_kind = |entry: &std::fs::DirEntry| {
+        if !entry.path().is_dir() {
+            return None;
+        }
+        Some(entry.file_name().to_string_lossy().into_owned())
+    };
+    let (faults, holders) =
+        brenn_dsl::roots::scan_roots_in(SURFACE_FLAG, roots, Some(PROCESSOR_DIR), is_kind);
+    assert!(
+        faults.is_empty(),
+        "boot: the {SURFACE_FLAG} roots are not a set of distinct releases:\n{}\nA kind is served \
+         from exactly one tree, and the page manifest names no root, so which one served it would \
+         be an accident of scan order. Refusing to start (fail-fast on invalid config).",
+        faults
+            .iter()
+            .map(|fault| fault.describe(SURFACE_FLAG, "surface kind"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    holders
+        .into_iter()
+        .map(|(kind, holders)| (kind, holders[0].to_path_buf()))
+        .collect()
+}
+
+/// Every declared root must be one release's surface tree, and a release's
+/// surface tree offers something: brenn's holds the kernel pair, a bundle's
+/// holds at least one `processor/<kind>/` (a bundle with no kind stages no
+/// `surface/` at all). A root that offers neither is a `--surface` pointed one
+/// directory off — at a bundle's install root rather than its `surface/` — and
+/// nothing else downstream would notice: the scan finds no kinds, the kernel
+/// rule is satisfied by brenn's own root, and boot succeeds until some later
+/// configuration first stamps the kind that was supposed to be there.
+///
+/// # Panics
+///
+/// Naming every root that offers nothing, and what a surface root holds.
+fn assert_every_root_offers_something(
+    roots: &[std::path::PathBuf],
+    kernel: &std::path::Path,
+    kinds: &std::collections::BTreeMap<String, std::path::PathBuf>,
+) {
+    let empty: Vec<&std::path::PathBuf> = roots
+        .iter()
+        .filter(|root| root.as_path() != kernel && !kinds.values().any(|held| held == *root))
+        .collect();
+    assert!(
+        empty.is_empty(),
+        "boot: {} {SURFACE_FLAG} root(s) offer nothing: {}. Every root is one installed \
+         release's surface tree — brenn's own carries the kernel module pair, a component \
+         bundle's carries at least one processor/<kind>/ directory — so a root with neither \
+         is a flag pointed one directory off (a bundle's install root rather than its \
+         surface/ tree). Refusing to start (fail-fast on invalid config).",
+        empty.len(),
+        brenn_dsl::roots::display_list(&empty),
+    );
+}
+
+/// The one root carrying the kernel module pair.
+///
+/// Exactly one, because every surface page references the kernel by a path with
+/// no kind in it: two candidates leave the served bytes to scan order, and none
+/// is a deploy with no shell to boot. A bundle's surface root carries no kernel
+/// by construction, so a second candidate is a mis-pointed `--surface`.
+fn sole_kernel_root(roots: &[std::path::PathBuf]) -> std::path::PathBuf {
+    let wasm = kernel_wasm_artifact();
+    let holders: Vec<&std::path::PathBuf> = roots
+        .iter()
+        .filter(|root| root.join(KERNEL_ARTIFACT).exists() && root.join(&wasm).exists())
+        .collect();
+    match holders.as_slice() {
+        [only] => (*only).clone(),
+        [] => panic!(
+            "boot: no --surface root holds the kernel module pair ({KERNEL_ARTIFACT} + {wasm}), \
+             which every surface page references. The roots scanned were {}. One of them must be \
+             brenn's own installed surface tree (run `make build`; on deploy ensure the surface \
+             install ran). Refusing to start (fail-fast on invalid config).",
+            brenn_dsl::roots::display_list(roots),
+        ),
+        many => panic!(
+            "boot: {} --surface roots hold the kernel module pair ({KERNEL_ARTIFACT} + {wasm}): \
+             {}. Exactly one root is brenn's own surface tree; a component bundle's root carries \
+             kinds alone. Refusing to start (fail-fast on invalid config).",
+            many.len(),
+            brenn_dsl::roots::display_list(many),
+        ),
+    }
+}
+
+/// The kernel's wasm sibling, derived from the JS artifact name the contract
+/// pins, so the two never drift apart here.
+fn kernel_wasm_artifact() -> String {
+    format!(
+        "{}_bg.wasm",
+        KERNEL_ARTIFACT
+            .strip_suffix(".js")
+            .expect("a wasm-bindgen module artifact ends in .js"),
+    )
+}
+
+/// The distinct roots a scan reached, for a refusal that has to name them.
+fn root_list(roots: &SurfaceRoots) -> String {
+    let mut seen: Vec<&std::path::PathBuf> = roots.kernel.iter().collect();
+    for root in roots.kinds.values() {
+        if !seen.contains(&root) {
+            seen.push(root);
+        }
+    }
+    seen.iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn offered_kinds(roots: &SurfaceRoots) -> String {
+    if roots.kinds.is_empty() {
+        return "no kinds at all".to_string();
+    }
+    roots
+        .kinds
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What one validated component kind's installed assets tell the per-instance
@@ -744,29 +948,6 @@ fn assert_no_covering_publish(
     );
 }
 
-/// Assert both halves of a wasm-bindgen `--target web` module — the `.js` loader
-/// and its `_bg.wasm` sibling — exist under `dir`. `what` labels the module in
-/// the panic message. The kernel is the only wasm-bindgen module on a surface;
-/// components are transpiled component-model trees.
-fn assert_module_pair_exists(dir: &std::path::Path, js_artifact: &str, what: &str) {
-    let wasm_artifact = format!(
-        "{}_bg.wasm",
-        js_artifact
-            .strip_suffix(".js")
-            .expect("a wasm-bindgen module artifact ends in .js")
-    );
-    for artifact in [js_artifact, wasm_artifact.as_str()] {
-        let path = dir.join(artifact);
-        assert!(
-            path.exists(),
-            "boot: {what} surface asset {artifact} missing at {} — surface assets are not \
-             built/deployed (run `make build`; on deploy ensure surface_dist_dir is \
-             populated). Refusing to start (fail-fast on invalid config).",
-            path.display(),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use brenn_lib::messaging::Urgency;
@@ -1078,11 +1259,31 @@ mod tests {
         write_processor_tree(dir, kind, &[], |_| {});
     }
 
+    /// Every fixture below installs one root, which is what a deployment
+    /// without bundles has. The multi-root arrangement gets its own cases at
+    /// the end of this module.
+    fn validate_one_root(root: &std::path::Path, surfaces: &[ResolvedSurface]) -> SurfaceRoots {
+        validate_surface_assets(&[root.to_path_buf()], surfaces)
+    }
+
+    /// An offered kind whose directory holds nothing, so the scan maps it and
+    /// the per-kind pass is the one that refuses it.
+    fn write_empty_kind_dir(dir: &std::path::Path, kind: &str) {
+        std::fs::create_dir_all(dir.join("processor").join(kind)).expect("kind dir");
+    }
+
     #[test]
-    fn validate_surface_assets_noop_when_no_surfaces() {
-        // Empty surface list is a no-op even against a nonexistent directory:
-        // the check only guards surfaces that actually exist.
-        validate_surface_assets(std::path::Path::new("/nonexistent/surface/dist"), &[]);
+    fn validate_surface_assets_returns_empty_roots_when_neither_exists() {
+        // No --surface and no surface: a surface-less deployment, which serves
+        // nothing under /surface-static and is asked for nothing.
+        let roots = validate_surface_assets(&[], &[]);
+        assert_eq!(roots, SurfaceRoots::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "started without --surface")]
+    fn validate_surface_assets_panics_on_a_surface_with_no_root() {
+        validate_surface_assets(&[], &[resolved("deskbar")]);
     }
 
     #[test]
@@ -1093,18 +1294,18 @@ mod tests {
         for comp in &surface.components {
             write_valid_kind(dir.path(), &comp.kind);
         }
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     #[test]
-    #[should_panic(expected = "kernel surface asset brenn_surface_kernel.js missing")]
+    #[should_panic(expected = "no --surface root holds the kernel module pair")]
     fn validate_surface_assets_panics_on_missing_kernel_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
         let surface = resolved("deskbar");
         for comp in &surface.components {
             write_valid_kind(dir.path(), &comp.kind);
         }
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// A surface whose sole component is a `processor` of `kind`, with no
@@ -1253,7 +1454,7 @@ mod tests {
             brenn_lib::messaging::ComponentGrant::Config,
         ]
         .into();
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     #[test]
@@ -1261,7 +1462,20 @@ mod tests {
     fn validate_surface_assets_panics_on_missing_processor_manifest() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
-        validate_surface_assets(
+        // The kind is installed — the directory is there — and empty.
+        write_empty_kind_dir(dir.path(), "transplant");
+        validate_one_root(
+            dir.path(),
+            &[resolved_with_processor("deskbar", "transplant")],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "which no installed surface root offers")]
+    fn validate_surface_assets_panics_on_a_kind_no_root_offers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1278,7 +1492,7 @@ mod tests {
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
             m["future_field"] = serde_json::json!("whatever");
         });
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1292,7 +1506,7 @@ mod tests {
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
             m["v"] = serde_json::json!(3);
         });
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1309,7 +1523,7 @@ mod tests {
                 .expect("files is an array")
                 .push(serde_json::json!("missing-chunk.core.wasm"));
         });
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1323,7 +1537,7 @@ mod tests {
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
             m["source_sha256"] = serde_json::json!("00".repeat(32));
         });
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1343,7 +1557,7 @@ mod tests {
             processor_assets::kind_dir(dir.path(), "transplant").join("transplant.spec.brenn"),
         )
         .expect("remove the packaged spec");
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1365,7 +1579,7 @@ mod tests {
             processor_assets::kind_dir(dir.path(), "transplant").join("transplant.spec.brenn"),
         )
         .expect("remove the packaged spec");
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1381,7 +1595,7 @@ mod tests {
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
             m["spec_sha256"] = serde_json::json!("00".repeat(32));
         });
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1398,7 +1612,7 @@ mod tests {
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
             m["spec"] = serde_json::json!("elsewhere.spec.brenn");
         });
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1410,7 +1624,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         write_processor_tree(dir.path(), "store-rt", &["ports", "store"], |_| {});
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "store-rt")],
         );
@@ -1458,7 +1672,7 @@ mod tests {
             |_| {},
         );
 
-        validate_surface_assets(dir.path(), &[resolved_with_processor("deskbar", kind)]);
+        validate_one_root(dir.path(), &[resolved_with_processor("deskbar", kind)]);
     }
 
     #[test]
@@ -1469,7 +1683,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         write_processor_tree(dir.path(), "transplant", &["ports", "telepathy"], |_| {});
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1491,7 +1705,7 @@ mod tests {
             &["ports", "wasi:clocks/wall-clock"],
             |_| {},
         );
-        validate_surface_assets(
+        validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
@@ -1506,7 +1720,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         write_processor_tree(dir.path(), "noisy", &["ports", "alert"], |_| {});
-        validate_surface_assets(dir.path(), &[resolved_with_processor("deskbar", "noisy")]);
+        validate_one_root(dir.path(), &[resolved_with_processor("deskbar", "noisy")]);
     }
 
     /// The same kind passes once the instance holds the grant its imports name.
@@ -1519,7 +1733,7 @@ mod tests {
         surface.components[0]
             .grants
             .insert(brenn_lib::messaging::ComponentGrant::Alert);
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// The assert is per instance, not per kind: the module is shared, the
@@ -1539,7 +1753,7 @@ mod tests {
         sibling.instance = "noisy-2".to_string();
         sibling.grants = [brenn_lib::messaging::ComponentGrant::Ports].into();
         surface.components.push(sibling);
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     // -----------------------------------------------------------------------
@@ -1564,7 +1778,7 @@ mod tests {
         }
         surface.components[1].spec_sha256 =
             brenn_lib::util::sha256_hex(b"// specification for writer, plus a note\n");
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// The processor twin: same refusal, same words, the other carrier.
@@ -1580,7 +1794,7 @@ mod tests {
         let mut surface = resolved_with_processor("deskbar", "transplant");
         surface.components[0].spec_sha256 =
             brenn_lib::util::sha256_hex(b"// specification for transplant, plus a note\n");
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// Sibling instances of one kind are bound one at a time: a conforming
@@ -1598,7 +1812,7 @@ mod tests {
         sibling.instance = "protobar-2".to_string();
         sibling.spec_sha256 = brenn_lib::util::sha256_hex(b"another copy\n");
         surface.components.push(sibling);
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// The `serde(skip)` backstop: the class fact is filled at lowering, so an
@@ -1613,7 +1827,7 @@ mod tests {
             write_valid_kind(dir.path(), &comp.kind);
         }
         surface.components[1].spec_sha256 = String::new();
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// The processor twin of the backstop.
@@ -1625,7 +1839,7 @@ mod tests {
         write_processor_tree(dir.path(), "transplant", &["ports"], |_| {});
         let mut surface = resolved_with_processor("deskbar", "transplant");
         surface.components[0].spec_sha256 = String::new();
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// The kernel is not a component: it has no kind, no class and no
@@ -1664,7 +1878,7 @@ mod tests {
         for comp in &surface.components {
             write_valid_kind(dir.path(), &comp.kind);
         }
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// `types` is in every processor's import list and no host implements it —
@@ -1677,7 +1891,7 @@ mod tests {
         write_processor_tree(dir.path(), "plain", &["types"], |_| {});
         let mut surface = resolved_with_processor("deskbar", "plain");
         surface.components[0].grants = Default::default();
-        validate_surface_assets(dir.path(), &[surface]);
+        validate_one_root(dir.path(), &[surface]);
     }
 
     /// A surface carrying a binding that crosses the websocket but built with no
@@ -1976,6 +2190,109 @@ mod tests {
         assert_eq!(
             manifest.source_sha256,
             hex::encode(sha2::Sha256::digest(component_bytes)),
+        );
+    }
+
+    // ── more than one installed root ─────────────────────────────────────────
+    //
+    // A component bundle installs its kinds into a root of its own, so brenn's
+    // next deploy — which empties its own — cannot delete them. The scan is of
+    // the roots as declared, not of what today's configuration names.
+
+    #[test]
+    fn kinds_split_across_two_roots_pass_and_the_map_names_each_root() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_valid_kind(brenn.path(), "chrome");
+        write_valid_kind(bundle.path(), "demo-panel");
+
+        let mut surface = resolved_with_processor("deskbar", "chrome");
+        surface.components.push(ResolvedComponent {
+            spec_sha256: fixture_spec_hash("demo-panel"),
+            grants: [brenn_lib::messaging::ComponentGrant::Ports].into(),
+            ..ResolvedComponent::minimal("demo-panel-1", "demo-panel")
+        });
+
+        let roots = validate_surface_assets(
+            &[brenn.path().to_path_buf(), bundle.path().to_path_buf()],
+            &[surface],
+        );
+        assert_eq!(roots.kernel.as_deref(), Some(brenn.path()));
+        assert_eq!(roots.kind_root("chrome"), Some(brenn.path()));
+        assert_eq!(roots.kind_root("demo-panel"), Some(bundle.path()),);
+    }
+
+    /// The scan is not driven by the configuration: a kind installed twice is
+    /// an ambiguous deploy whether or not anything mounts it today.
+    #[test]
+    #[should_panic(expected = "installed under more than one --surface root")]
+    fn a_kind_offered_by_two_roots_is_refused_even_when_unconfigured() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_valid_kind(brenn.path(), "chrome");
+        write_valid_kind(bundle.path(), "chrome");
+        validate_surface_assets(
+            &[brenn.path().to_path_buf(), bundle.path().to_path_buf()],
+            &[],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "roots hold the kernel module pair")]
+    fn two_kernel_roots_are_refused() {
+        let one = tempfile::tempdir().expect("tempdir");
+        let two = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(one.path());
+        write_kernel_pair(two.path());
+        validate_surface_assets(&[one.path().to_path_buf(), two.path().to_path_buf()], &[]);
+    }
+
+    /// A bundle root alone: kinds and no kernel, which is a mis-pointed
+    /// `--surface` rather than a bundle's fault.
+    #[test]
+    #[should_panic(expected = "no --surface root holds the kernel module pair")]
+    fn a_root_set_with_no_kernel_is_refused() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_valid_kind(bundle.path(), "demo-panel");
+        validate_surface_assets(&[bundle.path().to_path_buf()], &[]);
+    }
+
+    /// The realistic mis-pointing: `--surface $BUNDLES_DIR/<bundle>` instead of
+    /// `.../<bundle>/surface`. It holds no kernel and no `processor/`, so
+    /// nothing downstream would notice until some later configuration first
+    /// stamps the kind that was supposed to be there.
+    #[test]
+    #[should_panic(expected = "root(s) offer nothing")]
+    fn a_root_offering_neither_the_kernel_nor_a_kind_is_refused() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let one_directory_off = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_valid_kind(brenn.path(), "chrome");
+        std::fs::create_dir_all(
+            one_directory_off
+                .path()
+                .join("surface/processor/demo-panel"),
+        )
+        .expect("the bundle's real surface tree, one level below the flag");
+        validate_surface_assets(
+            &[
+                brenn.path().to_path_buf(),
+                one_directory_off.path().to_path_buf(),
+            ],
+            &[],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "name the same directory")]
+    fn the_same_root_named_twice_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        validate_surface_assets(
+            &[dir.path().to_path_buf(), dir.path().join(".").to_path_buf()],
+            &[],
         );
     }
 }

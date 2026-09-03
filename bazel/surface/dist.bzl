@@ -8,10 +8,36 @@ component bytes it came from.
 
 Each crate stages its own contribution, so the dir → artifact naming stays in
 the package that owns the crate, and `surface_dist` merges the stages.
+
+## External authoring contract
+
+This file is loaded across module boundaries: a repository that declares
+`bazel_dep(name = "brenn")` builds and stages its page-hosted components with
+it, so it is an external API with the same standing as `//bazel/wasm:defs.bzl`.
+The contract is exactly one macro:
+
+  `surface_processor_assets(name, kind, component, spec)`.
+
+Three are not. `surface_crate_stage` and `surface_dist` assemble *this* tree —
+the kernel bundle, the flat sidecars, the merge — and a bundle's surface root
+carries none of that. `//bazel/surface:defs.bzl`'s `surface_processor_component`
+is the in-tree wrapper that also builds a host half and generates help; the
+guest half it builds is the `wasm_guest_cdylib` + `wasm_component` pair
+`//bazel/wasm:defs.bzl` already exports, which is what an out-of-tree caller
+uses.
+
+Evolution policy and label anchoring are `//bazel/wasm:defs.bzl`'s: this macro
+is a build-time contract, hard-cut at the pin a consumer names, while the
+`processor/<kind>/` tree it emits and the record inside it are a runtime
+contract and move only additively (`docs/component-packages.md`, *Contract
+evolution*). Every implicit label here is `Label(...)`-wrapped, because a bare
+label string in a macro body resolves against the caller's package.
 """
 
 load("@aspect_bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
 load("@aspect_rules_js//js:defs.bzl", "js_run_binary")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("//bazel/js:defs.bzl", "bindir_relative")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
 load("//bazel/wasm:defs.bzl", "grant_parity_test")
 
@@ -62,6 +88,7 @@ def _processor_stage_impl(ctx):
     args.add(ctx.file.jco_version)
     args.add(ctx.file.spec)
     args.add(ctx.file._emitter)
+    args.add(ctx.executable._dsl_cli)
     args.add(out.path)
 
     ctx.actions.run(
@@ -74,7 +101,10 @@ def _processor_stage_impl(ctx):
             ctx.file._emitter,
             ctx.file._wit_lib,
         ],
-        tools = [ctx.file._wasm_tools],
+        tools = [
+            ctx.file._wasm_tools,
+            ctx.attr._dsl_cli[DefaultInfo].files_to_run,
+        ],
         executable = ctx.file._stage,
         arguments = [args],
         env = {
@@ -92,6 +122,11 @@ _processor_stage = rule(
 
     The manifest is emitted by the same script the component build runs, so the
     staged manifest and the component's own are comparable byte for byte.
+
+    The kind is the BUILD author's string and the browser asks for the fold of
+    the specification's class name. Staging holds the two equal, so a kind
+    named one thing and a class another fails here rather than building green
+    and refusing at boot with a directory nothing serves.
     """,
     attrs = {
         "component": attr.label(
@@ -115,6 +150,11 @@ _processor_stage = rule(
             mandatory = True,
             doc = "The `js_run_binary` output directory jco wrote.",
         ),
+        "_dsl_cli": attr.label(
+            cfg = "exec",
+            default = Label("//brenn-dsl:dsl_cli"),
+            executable = True,
+        ),
         "_emitter": attr.label(
             allow_single_file = True,
             default = Label("//surface:emit-processor-manifest.sh"),
@@ -135,7 +175,7 @@ _processor_stage = rule(
     },
 )
 
-def surface_processor_assets(name, kind, component, jco_version, spec, visibility = ["//visibility:public"]):
+def surface_processor_assets(name, kind, component, spec, visibility = ["//visibility:public"]):
     """Transpile one processor component and stage the result for `surface/dist`.
 
     `--instantiation async` is load-bearing: it makes the emitted module export
@@ -145,30 +185,42 @@ def surface_processor_assets(name, kind, component, jco_version, spec, visibilit
 
     Args:
         name: target name; also the staging directory's name.
-        kind: the processor kind, which names the transpiled module tree.
+        kind: the processor kind, which names the transpiled module tree. It
+            must be the kebab fold of the specification's component class name,
+            which is what the browser asks for; staging refuses anything else.
         component: the `wasm_component` target to transpile.
-        jco_version: a file holding the jco version, recorded in the manifest.
-        spec: the component's authored specification under `config/specs`. Its
+        spec: the component's authored specification. Its
             hash is the manifest's binding to the configuration that names this
             kind, so a kind whose spec is unauthored has no build.
         visibility: visibility of the staging directory.
     """
     transpiled = name + "_transpile"
+    staged_component = transpiled + "_input.wasm"
+
+    # jco runs with the output tree's root as its working directory, so both
+    # paths it is given are `bindir_relative` ones. The component is copied into
+    # this package first so that they are names this macro can spell: the
+    # component target's own output basename is the guest crate's, which is not
+    # knowable here.
+    copy_file(
+        name = transpiled + "_input",
+        src = component,
+        out = staged_component,
+        target_compatible_with = HOST_ONLY,
+    )
 
     js_run_binary(
         name = transpiled,
-        srcs = [component],
+        srcs = [":" + transpiled + "_input"],
         args = [
             "transpile",
-            # Paths are relative to the bin dir the js tool runs in, which is
-            # what `$(rootpath)` yields for a generated file.
-            "$(rootpath %s)" % component,
+            bindir_relative(staged_component),
             "--instantiation",
             "async",
             "--name",
             kind,
             "--out-dir",
-            "%s/%s" % (native.package_name(), transpiled),
+            bindir_relative(transpiled),
         ],
         out_dirs = [transpiled],
         target_compatible_with = HOST_ONLY,
@@ -178,7 +230,10 @@ def surface_processor_assets(name, kind, component, jco_version, spec, visibilit
     _processor_stage(
         name = name,
         component = component,
-        jco_version = jco_version,
+        # Not an argument: the version recorded in a manifest is the version of
+        # the binary that ran, and a caller who could pass one could pass a
+        # version nothing transpiled with.
+        jco_version = Label("//surface:jco_version"),
         kind = kind,
         spec = spec,
         target_compatible_with = HOST_ONLY,

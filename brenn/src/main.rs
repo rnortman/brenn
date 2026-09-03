@@ -25,10 +25,18 @@ async fn main() -> ExitCode {
 
     match cli.command.unwrap_or(cli::Commands::Serve {
         components: Vec::new(),
+        surface: Vec::new(),
     }) {
         cli::Commands::Invite => bootstrap::run_invite(&config).await,
-        cli::Commands::Serve { components } => {
-            bootstrap::run_server(config, cli.config, components, build_info::BUILD_ID).await;
+        cli::Commands::Serve {
+            components,
+            surface,
+        } => {
+            let install_roots = cli::InstallRoots {
+                components,
+                surface,
+            };
+            bootstrap::run_server(config, cli.config, install_roots, build_info::BUILD_ID).await;
         }
         cli::Commands::ConfigDiff { .. } | cli::Commands::ConfigCheck { .. } => {
             unreachable!("handled above, before the config loads")

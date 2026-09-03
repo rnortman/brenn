@@ -23,6 +23,16 @@ exports_files([
 # so shipping a component never waits on an edit here.
 exports_files(glob(["config/specs/*.brenn"]))
 
+# The module root this release ships, as a target. A `config_fit_test` in
+# another Bazel module names it so a document that stamps one of brenn's own
+# packaged classes is checked against the vocabulary brenn installs, rather
+# than against a copy of it.
+filegroup(
+    name = "modules",
+    srcs = glob(["config/specs/*.brenn"]),
+    visibility = ["//visibility:public"],
+)
+
 # The shipped root configs and the shared modules they import, globbed rather
 # than listed: a new module joins the config-file tests and the format gate
 # below by existing, so neither can be silently skipped.
@@ -91,6 +101,7 @@ filegroup(
         "//bazel/frontend/tests:policy_srcs",
         "//bazel/gencode:policy_srcs",
         "//bazel/gencode/tests:policy_srcs",
+        "//bazel/js:policy_srcs",
         "//bazel/platforms:policy_srcs",
         "//bazel/policy:policy_srcs",
         "//bazel/release:policy_srcs",
@@ -169,6 +180,7 @@ filegroup(
         "//surface/components/protobar:policy_srcs",
         "//surface/contract:policy_srcs",
         "//surface/kernel:policy_srcs",
+        "//surface/page-harness:policy_srcs",
         "//surface/schema:policy_srcs",
         "//surface/server:policy_srcs",
         "//surface/test-fixtures:policy_srcs",

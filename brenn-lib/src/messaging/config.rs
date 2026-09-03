@@ -808,8 +808,15 @@ pub struct WasmConsumerOutputRaw {
 pub struct WasmConsumerIoPortRaw {
     /// Logical port name presented to the guest for both directions. Must be
     /// non-empty, unreserved-charset, and distinct from every other port name on
-    /// the consumer — this block is the only sanctioned way one name serves both
-    /// directions, because it is what carries the same-channel guarantee.
+    /// the consumer — this block carries the same-channel guarantee structurally,
+    /// by holding one channel for two directions.
+    ///
+    /// The other shape an `io` port takes is a subscription and an output
+    /// sharing one name, which is what an `io` binding to an already-declared
+    /// channel lowers to. There the guarantee is checked rather than held:
+    /// nothing but an `io` binding produces the pair (a port bound twice is
+    /// refused before lowering), and boot admits the shared name only when both
+    /// halves resolved the same address.
     pub port: String,
     /// Absent ⇒ the port's own anonymous non-transportable channel. Present ⇒ a
     /// named auto channel at this full scheme-qualified address. Must be absent

@@ -1314,7 +1314,9 @@ pub mod dom {
     // TODO(surface-guest-mount-idiom): every UI kind hand-copies the same mount
     // bookkeeping around this constant — an `Option<View>` field, an identical
     // `expect`, and a mount arm in its handler. The SDK should own the
-    // lifecycle; which shape it takes is a `Processor`-trait decision.
+    // lifecycle; which shape it takes is a `Processor`-trait decision. There is
+    // an out-of-tree copy, so the shape is one an author outside this
+    // repository reproduces from an example.
 
     /// The port a mount activation names: the instance's first call, where it
     /// builds its UI. Reserved by its colon, which no specification identifier

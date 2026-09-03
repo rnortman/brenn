@@ -70,3 +70,22 @@ package_shape() {
         fi
     fi
 }
+
+# The number `<key>` states in `<record>`, or empty when it states none. Version
+# fields are unquoted, so the string scrape above matches them not at all.
+#
+# Usage: record_number <record> <key>
+record_number() {
+    sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\)[[:space:]]*,\\{0,1\\}[[:space:]]*$/\\1/p" "$1"
+}
+
+# The string items of the array `<key>` in `<record>`, one per line, in the
+# order the record states them; empty when it states no such array. The emitter
+# writes an array on one line, so this scrapes the line and splits it.
+#
+# Usage: record_list <record> <key>
+record_list() {
+    sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\\[\\(.*\\)\\][[:space:]]*,\\{0,1\\}[[:space:]]*$/\\1/p" "$1" |
+        tr ',' '\n' |
+        sed -n 's/^[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p'
+}

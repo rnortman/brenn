@@ -59,17 +59,17 @@ def _release_package_impl(ctx):
     args.add("--manifest", ctx.file.manifest)
     args.add("--names", ctx.file._manifest_names)
     args.add("--record-lib", ctx.file._record_lib)
+    args.add("--stage-lib", ctx.file._stage_lib)
     args.add("--frontend", frontend.path)
     args.add("--surface", surface.path)
     args.add_all(binaries, before_each = "--bin")
     args.add_all(ctx.files.lib_files, before_each = "--lib")
     args.add_all(ctx.files.packages, before_each = "--package")
-    args.add_all(ctx.files.modules, before_each = "--module")
 
     ctx.actions.run(
         outputs = [out],
         inputs = depset(
-            binaries + ctx.files.packages + ctx.files.modules +
+            binaries + ctx.files.packages +
             ctx.files.lib_files + [ctx.file.manifest],
             transitive = [
                 ctx.attr.frontend[DefaultInfo].files,
@@ -80,6 +80,7 @@ def _release_package_impl(ctx):
         tools = [
             ctx.file._manifest_names,
             ctx.file._record_lib,
+            ctx.file._stage_lib,
         ],
         arguments = [args],
         mnemonic = "ReleasePackage",
@@ -118,12 +119,6 @@ _release_package = rule(
             mandatory = True,
             doc = "The deploy manifest naming the components that ship.",
         ),
-        "modules": attr.label_list(
-            allow_empty = False,
-            allow_files = [".brenn"],
-            mandatory = True,
-            doc = "The authored modules of the backend components that ship, staged under `modules/`.",
-        ),
         "packages": attr.label_list(
             allow_empty = False,
             mandatory = True,
@@ -145,10 +140,14 @@ _release_package = rule(
             allow_single_file = True,
             default = Label("//bazel/wasm:record_lib.sh"),
         ),
+        "_stage_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/release:stage_lib.sh"),
+        ),
     },
 )
 
-def release_package(name, manifest, binaries, packages, modules, frontend, surface, lib_files = [], visibility = None):
+def release_package(name, manifest, binaries, packages, frontend, surface, lib_files = [], visibility = None):
     """The staged release tree, plus the gate on the contract `deploy.sh` reads.
 
     Pairing them here makes the gate structural: the tree cannot be added to
@@ -160,8 +159,9 @@ def release_package(name, manifest, binaries, packages, modules, frontend, surfa
         name: target name; also the staging directory's name.
         manifest: the deploy manifest naming the packages that ship.
         binaries: host binaries, installed to `bin/`.
-        packages: every `component_package` target in the tree.
-        modules: the authored module of every backend component that ships.
+        packages: every `component_package` target in the tree. The module root
+            is derived from the shipped ones: a package's authored `.brenn`
+            copy stages under `modules/` as well.
         frontend: the frontend asset tree.
         surface: the surface asset tree.
         lib_files: loose files installed to `lib/`.
@@ -173,7 +173,6 @@ def release_package(name, manifest, binaries, packages, modules, frontend, surfa
         frontend = frontend,
         lib_files = lib_files,
         manifest = manifest,
-        modules = modules,
         packages = packages,
         surface = surface,
         target_compatible_with = HOST_ONLY,
@@ -185,6 +184,7 @@ def release_package(name, manifest, binaries, packages, modules, frontend, surfa
         size = "small",
         src = "//bazel/release:package_check.sh",
         args = [
+            "$(rootpath //bazel/release:bundle_check.sh)",
             "$(rootpath //bazel/wasm:manifest_names.sh)",
             "$(rootpath //bazel/wasm:record_lib.sh)",
             "$(rootpath :%s)" % name,
@@ -195,6 +195,7 @@ def release_package(name, manifest, binaries, packages, modules, frontend, surfa
         }),
         data = [
             manifest,
+            "//bazel/release:bundle_check.sh",
             "//bazel/wasm:manifest_names.sh",
             "//bazel/wasm:record_lib.sh",
             ":" + name,

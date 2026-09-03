@@ -24,7 +24,6 @@ use config::surfaces::*;
 server {
   bind_address = "127.0.0.1:3100";
   static_dir = ".bazel-bin/frontend/dist";
-  surface_dist_dir = ".bazel-bin/surface/dist";
   secure_cookies = false;
   public_url = "http://127.0.0.1:3100";
 }

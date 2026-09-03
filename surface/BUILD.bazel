@@ -6,6 +6,7 @@ load("@surface_npm//surface:@bytecodealliance/jco/package_json.bzl", jco_bin = "
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("//bazel/surface:dist.bzl", "surface_dist", "surface_processor_assets")
+load("//bazel/wasm:defs.bzl", "component_bundle")
 
 policy_srcs()
 
@@ -33,11 +34,15 @@ jco_bin.jco_binary(
 # A regex over JSON matches any line carrying the needle, and this file already
 # carries comment keys, so the match count is checked: a second line would
 # otherwise put two versions in every processor manifest, past a non-empty test.
+# Public because `surface_processor_assets` names it itself, from whatever
+# module calls it: the version in a manifest is the version of the binary that
+# transpiled it, out of tree as in tree.
 genrule(
     name = "jco_version",
     srcs = ["package.json"],
     outs = ["jco_version.txt"],
     target_compatible_with = HOST_ONLY,
+    visibility = ["//visibility:public"],
     cmd = """set -eu
 matched=$$(sed -n 's/.*"@bytecodealliance\\/jco": "\\(.*\\)".*/\\1/p' $<)
 count=$$(printf '%s' "$$matched" | grep -c '' || true)
@@ -76,12 +81,31 @@ _PROCESSOR_KINDS = [
     surface_processor_assets(
         name = kind + "_assets",
         component = component,
-        jco_version = ":jco_version",
         kind = kind,
         spec = "//:config/specs/{kind}.brenn".format(kind = kind),
     )
     for (kind, component) in _PROCESSOR_KINDS
 ]
+
+# The bundle rule's surface arm, over real staging targets. `examples/component`
+# builds a `component_bundle` of packages alone, so without this the wiring that
+# hands a stage over as one directory — and the module harvest off the staged
+# `<kind>.spec.brenn` — would first run in a consumer's repository. Not a
+# release artifact: nothing installs it, and its whole output is the contract
+# test beside it.
+component_bundle(
+    name = "bundle_fixture",
+    # brenn's `config/specs` is not one bundle's root; list the two files this
+    # fixture releases rather than globbing the directory.
+    spec_root = [
+        "//:config/specs/echo-stub.brenn",
+        "//:config/specs/mode-clock.brenn",
+    ],
+    surface_kinds = [
+        ":echo-stub_assets",
+        ":mode-clock_assets",
+    ],
+)
 
 # Derived, not retyped. `surface_processor_component()` mints `<kind>_dist` in every
 # component package, and a hand-written list here is a second edit a mechanical

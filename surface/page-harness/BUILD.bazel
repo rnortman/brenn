@@ -1,0 +1,51 @@
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "wit_root")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The world, staged as a directory this crate can name wherever it is built
+# from. A consumer module builds this target out of `external/<canonical>/`, so
+# `CARGO_MANIFEST_DIR` is taken from the staged directory's own execpath rather
+# than written as a workspace-relative literal, and the `bindgen!` path is one
+# basename inside it.
+wit_root(
+    name = "wit",
+    srcs = ["//brenn-wasm:wit"],
+)
+
+# The `bindgen!` reads the WIT at macro-expansion time, so the world travels as
+# compile_data.
+rust_library(
+    name = "page-harness",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = [":wit"],
+    crate_name = "brenn_page_harness",
+    edition = "2024",
+    rustc_env = {"CARGO_MANIFEST_DIR": "$(execpath :wit)"},
+    target_compatible_with = HOST_ONLY,
+    testonly = True,
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-envelope",
+        "//surface/contract",
+    ],
+)
+
+# The recording hosts answer a guest whose behaviour no in-tree fixture has:
+# publishing at a chosen urgency and editing a parked message are ordinary
+# `brenn:processor` calls, and an out-of-tree component that makes them must be
+# recorded rather than met with a panic. Driven against `Page` directly, because
+# what is under test is the host half.
+rust_test(
+    name = "page-harness_test",
+    size = "small",
+    compile_data = [":wit"],
+    crate = ":page-harness",
+    rustc_env = {"CARGO_MANIFEST_DIR": "$(execpath :wit)"},
+    target_compatible_with = HOST_ONLY,
+)

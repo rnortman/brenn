@@ -30,6 +30,8 @@ pub mod addressing;
 pub mod channel_model;
 pub mod chat;
 pub mod grants;
+#[cfg(feature = "testutils")]
+pub mod testutils;
 
 // ---------------------------------------------------------------------------
 // Address scheme

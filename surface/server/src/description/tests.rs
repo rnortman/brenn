@@ -16,6 +16,19 @@ use crate::test_fixtures::{directory_with, surface_outputting_to};
 
 const PREFIX: &str = "surface";
 
+/// Every configured kind served from one root, which is the single-root
+/// arrangement the sidecar readers see in tree.
+fn roots(dir: &Path, surfaces: &[ResolvedSurface]) -> crate::SurfaceRoots {
+    crate::SurfaceRoots {
+        kernel: Some(dir.to_path_buf()),
+        kinds: surfaces
+            .iter()
+            .flat_map(|surface| surface.components.iter())
+            .map(|comp| (comp.kind.clone(), dir.to_path_buf()))
+            .collect(),
+    }
+}
+
 /// A resolved surface: slug/skin, `(instance, kind)` components, one content
 /// subscription per instance (`brenn:{slug}-{instance}` on port `messages`). All
 /// ACL/policy/limit fields are inert defaults.
@@ -224,7 +237,12 @@ fn doc_addresses_match_boot_published_set() {
     // keys its bodies with the same per-address helpers boot_published_channels
     // uses. (No sidecars needed — a missing-sidecar dir just yields stubs.)
     let surfaces = multi_surface_config();
-    let docs = build_description_docs(PREFIX, "b", &surfaces, Path::new("/nonexistent-dist"));
+    let docs = build_description_docs(
+        PREFIX,
+        "b",
+        &surfaces,
+        &roots(Path::new("/nonexistent-dist"), &surfaces),
+    );
     let mut doc_addrs: Vec<String> = docs.iter().map(|(a, _)| a.clone()).collect();
     let mut expected = boot_published_channels(PREFIX, &surfaces);
     doc_addrs.sort();
@@ -237,7 +255,12 @@ fn doc_addresses_match_boot_published_set() {
 #[test]
 fn index_lists_every_surface_and_kind_address() {
     let surfaces = multi_surface_config();
-    let docs = build_description_docs(PREFIX, "build-xyz", &surfaces, Path::new("/nonexistent"));
+    let docs = build_description_docs(
+        PREFIX,
+        "build-xyz",
+        &surfaces,
+        &roots(Path::new("/nonexistent"), &surfaces),
+    );
     let (_, index) = docs
         .iter()
         .find(|(a, _)| a == "brenn:surface.index")
@@ -252,7 +275,12 @@ fn index_lists_every_surface_and_kind_address() {
 #[test]
 fn surface_help_lists_instances_channels_and_pointers() {
     let surfaces = multi_surface_config();
-    let docs = build_description_docs(PREFIX, "b", &surfaces, Path::new("/nonexistent"));
+    let docs = build_description_docs(
+        PREFIX,
+        "b",
+        &surfaces,
+        &roots(Path::new("/nonexistent"), &surfaces),
+    );
     let (_, help) = docs
         .iter()
         .find(|(a, _)| a == "brenn:surface.surface.bar.help")
@@ -277,7 +305,12 @@ fn kind_help_embeds_sidecar_verbatim_under_header() {
     )
     .unwrap();
     let surfaces = multi_surface_config();
-    let help = build_kind_help("protobar", &surfaces, dir.path(), "2026-07-13T00:00:00Z");
+    let help = build_kind_help(
+        "protobar",
+        &surfaces,
+        Some(dir.path()),
+        "2026-07-13T00:00:00Z",
+    );
     // Generated header names the kind, module, and mounting surface/channel.
     assert!(help.contains("Component kind `protobar`"));
     assert!(help.contains("processor/protobar/protobar.js"));
@@ -291,9 +324,88 @@ fn kind_help_embeds_sidecar_verbatim_under_header() {
 fn kind_help_missing_sidecar_produces_stub() {
     let dir = tempfile::tempdir().unwrap();
     let surfaces = multi_surface_config();
-    let help = build_kind_help("protobar", &surfaces, dir.path(), "2026-07-13T00:00:00Z");
+    let help = build_kind_help(
+        "protobar",
+        &surfaces,
+        Some(dir.path()),
+        "2026-07-13T00:00:00Z",
+    );
     assert!(help.contains("Component kind `protobar`"));
     assert!(help.contains("ships no documentation"));
+}
+
+/// Two installed releases, two sidecar sets. `build_description_docs` reads a
+/// kind's documentation from the root that installed that kind, so a bundle's
+/// kinds publish the bundle's text and brenn's publish brenn's — a reader that
+/// always used `roots.kernel` would pass every single-root case in this file and
+/// publish the wrong bytes on a real two-root host.
+#[test]
+fn each_kind_reads_the_sidecars_of_the_root_that_installed_it() {
+    let brenn = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    std::fs::write(
+        brenn.path().join("brenn_protobar.help.md"),
+        "FROM BRENN'S ROOT",
+    )
+    .unwrap();
+    std::fs::write(
+        brenn.path().join("brenn_protobar.schema.json"),
+        r#"{"root":"brenn"}"#,
+    )
+    .unwrap();
+    // Same basenames under the other root, so a reader that joined the wrong
+    // root would find a file rather than fall through to the stub.
+    std::fs::write(
+        bundle.path().join("brenn_protobar.help.md"),
+        "FROM THE BUNDLE'S ROOT",
+    )
+    .unwrap();
+    std::fs::write(
+        bundle.path().join("brenn_mode_clock.help.md"),
+        "MODE CLOCK, FROM THE BUNDLE'S ROOT",
+    )
+    .unwrap();
+
+    let surfaces = multi_surface_config();
+    let roots = crate::SurfaceRoots {
+        kernel: Some(brenn.path().to_path_buf()),
+        kinds: [
+            ("protobar".to_string(), brenn.path().to_path_buf()),
+            ("mode-clock".to_string(), bundle.path().to_path_buf()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let docs = build_description_docs(PREFIX, "b", &surfaces, &roots);
+    let doc = |address: &str| {
+        docs.iter()
+            .find(|(a, _)| a == address)
+            .unwrap_or_else(|| panic!("{address} present"))
+            .1
+            .clone()
+    };
+
+    let protobar = doc("brenn:surface.kind.protobar.help");
+    assert!(protobar.contains("FROM BRENN'S ROOT"), "{protobar}");
+    assert!(!protobar.contains("FROM THE BUNDLE'S ROOT"), "{protobar}");
+    let protobar_schema: serde_json::Value =
+        serde_json::from_str(&doc("brenn:surface.kind.protobar.schema")).unwrap();
+    assert_eq!(protobar_schema["schema"]["root"], "brenn");
+
+    let clock = doc("brenn:surface.kind.mode-clock.help");
+    assert!(
+        clock.contains("MODE CLOCK, FROM THE BUNDLE'S ROOT"),
+        "{clock}"
+    );
+
+    // `echo-stub` is in no root's map — the arrangement a kind gets when its
+    // release is not installed at all. It publishes the same stub a kind with a
+    // root and no sidecar publishes, and a null schema.
+    let stub = doc("brenn:surface.kind.echo-stub.help");
+    assert!(stub.contains("ships no documentation"), "{stub}");
+    let stub_schema: serde_json::Value =
+        serde_json::from_str(&doc("brenn:surface.kind.echo-stub.schema")).unwrap();
+    assert_eq!(stub_schema["schema"], serde_json::Value::Null);
 }
 
 #[test]
@@ -305,7 +417,7 @@ fn kind_schema_carries_verbatim_json_or_null() {
     )
     .unwrap();
     // With a sidecar: schema embedded verbatim.
-    let body = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["v"], 1);
     assert_eq!(doc["kind"], "protobar");
@@ -314,7 +426,7 @@ fn kind_schema_carries_verbatim_json_or_null() {
     assert!(doc["ts"].is_string());
 
     // No sidecar (echo-stub): schema is JSON null, channel still uniform.
-    let body = build_kind_schema("echo-stub", dir.path(), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema("echo-stub", Some(dir.path()), "2026-07-13T00:00:00Z");
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["kind"], "echo-stub");
     assert_eq!(doc["schema"], serde_json::Value::Null);
@@ -329,7 +441,7 @@ fn kind_schema_malformed_sidecar_panics() {
         "{ this is not json",
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
 }
 
 // ── dimensions vocabulary ────────────────────────────────────────────────────
@@ -337,7 +449,7 @@ fn kind_schema_malformed_sidecar_panics() {
 #[test]
 fn kind_schema_dimensions_null_when_absent() {
     let dir = tempfile::tempdir().unwrap();
-    let body = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(
         doc.as_object().unwrap().contains_key("dimensions"),
@@ -354,7 +466,7 @@ fn kind_schema_dimensions_published_validated() {
         r#"{"v":1,"min_width":320,"max_width":1280,"min_height":200}"#,
     )
     .unwrap();
-    let body = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     let dims = &doc["dimensions"];
     assert_eq!(dims["v"], 1);
@@ -374,7 +486,7 @@ fn kind_schema_dimensions_malformed_panics() {
         "{ not json",
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
 }
 
 #[test]
@@ -386,7 +498,7 @@ fn kind_schema_dimensions_unknown_field_panics() {
         r#"{"v":1,"min_width":320,"depth":10}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
 }
 
 #[test]
@@ -398,7 +510,7 @@ fn kind_schema_dimensions_empty_panics() {
         r#"{"v":1}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
 }
 
 #[test]
@@ -410,7 +522,7 @@ fn kind_schema_dimensions_min_gt_max_panics() {
         r#"{"v":1,"min_width":1280,"max_width":320}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
 }
 
 /// The height axis is the second conjunct of the inversion check; without this
@@ -424,7 +536,7 @@ fn kind_schema_dimensions_min_gt_max_height_panics() {
         r#"{"v":1,"min_height":800,"max_height":200}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
 }
 
 /// `min == max` is a legitimate fixed-size kind: the boundary is `lo <= hi`, and
@@ -437,7 +549,7 @@ fn kind_schema_dimensions_fixed_axis_accepted() {
         r#"{"v":1,"min_width":640,"max_width":640}"#,
     )
     .unwrap();
-    let body = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["dimensions"]["min_width"], 640);
     assert_eq!(doc["dimensions"]["max_width"], 640);
@@ -454,7 +566,7 @@ fn kind_schema_dimensions_wrong_version_panics() {
         r#"{"v":2,"min_width":320}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", dir.path(), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
 }
 
 // ── instance-config channel reservation ──────────────────────────────────────

@@ -1,3 +1,6 @@
+// TODO(surface-description-vocabulary-packaged): these declarations are the
+// deployer's to copy because a bundle cannot `use @` a config-tree module, so
+// every deployment and every component repository holds its own copy of them.
 /// Where admitted warn/error surface reports are republished by the trusted
 /// in-code system publisher.
 ///

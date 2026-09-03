@@ -595,6 +595,15 @@ every push, which is also the auto-deploy-to-staging path.
 Until then the operator-side trigger stands in for the gate: run `make e2e`
 before tagging a release, and after any change under `surface/`.
 
+One of the two blockers is answered elsewhere, which narrows this one.
+`brenn-component-demo` runs the same recipe — build the artifacts, mint an
+invite, background a server, `npx playwright install --with-deps chromium`,
+run the specs — as a gate on `.github/workflows/ci.yml`'s `ubuntu-latest`,
+where the provisioning step is one line and the runner is a fresh VM per job.
+So the provisioning half is a solved problem; what remains for brenn's own,
+larger suite is the port and the capacity-1 shared runner, and whether this
+repository's public CI is where it should run at all.
+
 Part of this suite's charter: the browser-executed proof that a component whose
 grants do not admit an import is actually refused in a live page. The refusal
 itself is a boot-time host panic with per-instance host tests
@@ -2322,6 +2331,11 @@ implement, and neither the SDK nor the kernel can name the instance or the kind
 in the panic message today, which is the other half of what makes the copied
 `expect` unhelpful.
 
+The idiom is now hand-copied outside this repository as well: the DOM component
+in `brenn-component-demo` reproduces it from an in-tree example, which is what
+an out-of-tree author has to do. So the SDK-owned lifecycle has a customer whose
+copy no change here can update.
+
 Code sites (`TODO(surface-guest-mount-idiom)`):
 `brenn-wasm/components/guest/src/lib.rs`, at `dom::MOUNT`.
 
@@ -2450,3 +2464,98 @@ Done = after ~2 weeks of CI runs, the step's warm-cache wall-clock is read from
 the run summaries and the decision is in the Makefile with the number that made
 it: under one minute it joins `check`; over, the number is recorded in the
 comment and it stays out.
+
+## `surface-description-vocabulary-packaged`
+
+Every deployment that serves a surface must stamp a `SurfaceDescription(slug)`
+per slug and a `KindDescription(kind)` per kind, or boot panics
+(`surface/server/src/description.rs`, `validate_surface_description`). The two
+assemblies, and the `surface_errors`/`surface_index` channels they publish on,
+are declared in brenn's *config tree* (`config/surfaces.brenn`), which a bundle
+cannot `use @`. So every deployment and every bundle repository copies the file.
+`brenn-component-demo/config/describe.brenn` is the first copy — byte-identical
+apart from a header comment — and there will be one per repository.
+
+The addresses, the depths and the channel set are brenn's, not the deployer's.
+When brenn adds a fifth per-surface description channel, changes a depth or
+moves the prefix, every copy in every repository is stale, nothing compares a
+copy with its original, and the failure is a boot panic on the next production
+restart — after the release is installed and the service stopped.
+
+brenn already has the distribution channel for vocabulary a deployment imports:
+`config/specs/*.brenn`, offered as `@brenn//:modules` and imported with
+`use @<name>::*;`. The definitions belong there; only the stamps are the
+deployer's.
+
+Code site (`TODO(surface-description-vocabulary-packaged)`):
+`config/surfaces.brenn`.
+
+Done = `SurfaceDescription`, `KindDescription`, `surface_errors` and
+`surface_index` are declared in a packaged module under `config/specs/`, brenn's
+own `config/surfaces.brenn` and every deployment reach them with `use @`, and no
+copy of the definitions exists outside brenn. Moving assemblies out of the
+config tree is a design call — packaged modules have carried component classes
+only — which is why this is written down rather than done.
+
+## `standard-chrome-vocabulary`
+
+Every `surface` must hold exactly one chrome (`surface/server/src/bindings_doc.rs`),
+and every author writes the same eight-line `new chrome: Chrome { ... }` block
+wiring the four reserved `local:brenn/*` control planes plus `io toast-tick` at
+fixed depths. brenn carries seven copies (`brenn.dev.brenn`, `brenn.e2e.brenn`);
+`brenn-component-demo/spec/demo-panel.brenn` adds two more and makes the block
+an exemplar an out-of-tree author copies.
+
+The vocabulary is not the author's to know: the reserved names are the kernel's
+(`brenn_surface_schema::RESERVED_LOCAL_CHANNELS`) and an unrecognised one is
+refused, but a *missing* plane is not — a page whose chrome omits
+`in toast <- "local:brenn/toast"` boots and silently never shows a toast. A
+change to the control-plane set means editing every surface in every repository
+in the ecosystem, with no list of where they are.
+
+Code site (`TODO(standard-chrome-vocabulary)`): `brenn.dev.brenn`, above the
+first of its five copies of the block.
+
+Done = the standard wiring is vocabulary rather than prose — an assembly shipped
+in the packaged `chrome` module that a page stamps as `new chrome: StandardChrome;`,
+or default bindings on `Chrome`'s reserved ports so an unbound reserved plane
+wires itself — every in-tree page uses it, and the demo demonstrates the shared
+form. Which of the two is a design call (the first needs an assembly
+instantiation inside a `surface` body to resolve; the second is a new binding
+default regime), which is why this is written down rather than done.
+
+## `mcp-script-path-precondition`
+
+`claude_defaults.mcp_script_path` names the noop MCP server every Claude Code
+subprocess is spawned against (`brenn-server/src/active_bridge/cc_spawn_config.rs`,
+which writes it into the MCP server config verbatim). Nothing checks that the
+file exists: `dsl_lower` accepts any string, `assert_boot_preconditions` does
+not look at it, and `config-check` touches no filesystem. A deployment that
+names a file that is not there boots green, serves, and fails at the first
+session spawn — inside a subprocess, with whatever diagnosis Claude Code's
+MCP-failure handling gives. Every brenn tool that rides that server
+(`DisplayFile`, the approval routing) is silently absent.
+
+That is the shape the backend principle forbids, and every other artifact fact
+a deployment states — the components roots, the surface roots, the module roots
+— is refused at boot rather than at first use.
+
+Two questions have to be answered before the check can be written, which is why
+this is written down rather than done:
+
+- **Which cwd a relative path resolves against.** brenn's own configs spell it
+  `noop_mcp.py`, which resolves against the server's working directory when the
+  server reads it and against the agent's `working_dir` when Claude Code does.
+  Those are different directories for any agent that names one. A check has to
+  pick, and picking changes what a relative path means.
+- **Containerized apps.** An app with `container_spawn` bind-mounts the host
+  file to a fixed container path, so the host path is the one to check there —
+  but an app whose spawn config is per-app makes "the path" a per-app fact
+  rather than one default.
+
+Code site (`TODO(mcp-script-path-precondition)`):
+`brenn-bootstrap/src/lib.rs`, at `assert_boot_preconditions`.
+
+Done = a deployment naming an unreadable `mcp_script_path` is refused at boot,
+naming the path and the config key, with the resolution base stated in
+`docs/config-dsl.md`.

@@ -116,20 +116,36 @@ pub fn test_app_with_static_dir(
     (app, db, tmp)
 }
 
-/// Build a test app with a tempdir-backed `surface_dist_dir` containing the
-/// named files, for tests exercising the `/surface-static` asset tree. Returns
+/// Build a test app with a tempdir-backed surface kernel root containing the
+/// named files, for tests exercising the `/surface-static` asset tree. A name
+/// may carry directories (`processor/<kind>/…`), and every kind so named is
+/// mapped to the same root, which is the single-root arrangement. Returns
 /// (router, db, tempdir); the tempdir must outlive the router or files vanish
 /// on drop.
-pub fn test_app_with_surface_dist_dir(
+pub fn test_app_with_surface_roots(
     files: &[(&str, &[u8])],
 ) -> (Router, brenn_db::Db, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
+    let mut kinds = std::collections::BTreeMap::new();
     for (name, contents) in files {
-        std::fs::write(tmp.path().join(name), contents).unwrap();
+        let path = tmp.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+        if let Some(kind) = name
+            .strip_prefix("processor/")
+            .and_then(|rest| rest.split('/').next())
+        {
+            kinds.insert(kind.to_string(), tmp.path().to_path_buf());
+        }
     }
     let db = crate::test_support::init_db_memory();
     let mut state = test_state(&db);
-    state.surface_dist_dir = tmp.path().to_path_buf();
+    state.surface_roots = brenn_surface_server::SurfaceRoots {
+        kernel: Some(tmp.path().to_path_buf()),
+        kinds,
+    };
     let app = build_router(state, None, 0, 2576)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
     (app, db, tmp)

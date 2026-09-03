@@ -1,0 +1,20 @@
+[package]
+name = "brenn-page-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A recording page host for surface-placed components: one instantiation of a built artifact, driven through scripted activations against a fake element tree"
+
+# Test-only, host-only, and public: a component authored outside this repository
+# is tested against the same recording host brenn's own page-placed kinds are.
+# `wasmtime` runs the artifact, `brenn-surface-contract` supplies the DOM
+# allow-lists and the gesture vocabulary the kernel enforces, and
+# `brenn-envelope` supplies the grant words the caller names to select what gets
+# linked and the fixture envelope frames every delivery here wears — the same
+# frames a backend-hosted suite for the same component takes, from the same
+# place, so neither placement's fixtures live in the other's crate.
+[dependencies]
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+serde_json = "1"
+brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope", features = ["testutils"] }
+brenn-surface-contract = { version = "0.1.0", path = "../contract" }

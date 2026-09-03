@@ -7,6 +7,7 @@ files something else must have written first.
 """
 
 load("@aspect_rules_js//js:defs.bzl", "js_run_binary")
+load("//bazel/js:defs.bzl", "bindir_relative")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
 
 def frontend_bundle(
@@ -37,17 +38,27 @@ def frontend_bundle(
     if sourcemap:
         outs.append(out + ".map")
 
+    # The staged tree has to be named as a path, not only as a dependency, so it
+    # is required to be a target of this package.
+    if not src_tree.startswith(":"):
+        fail("src_tree must name a target in this package, got %s" % src_tree)
+    src_tree_dir = src_tree[1:]
+
     args = [
-        # The tool runs with the bin directory as its working directory, so a
-        # generated input is named by its bin-relative path and outputs are
+        # The tool runs with the output tree's root as its working directory, so
+        # a generated input is named by its bin-relative path and outputs are
         # written to theirs. The entry point is named relative to the tree
         # instead, which is what the bundle's own module names are relative to.
+        #
+        # The staged tree is an output of this package, so `bindir_relative`
+        # spells it; `$(rootpath)` would name it `../<repo>/…` from a module
+        # that depends on brenn, which resolves out of the output tree.
         "--root",
-        "$(rootpath %s)" % src_tree,
+        bindir_relative(src_tree_dir),
         "--entry",
         "src/%s" % entry,
         "--outfile",
-        "%s/%s" % (native.package_name(), out),
+        bindir_relative(out),
     ]
     if sourcemap:
         args.append("--sourcemap")

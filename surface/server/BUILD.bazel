@@ -12,6 +12,7 @@ FIRST_PARTY_DEPS = [
     "//attach/server",
     "//brenn-budget",
     "//brenn-db",
+    "//brenn-dsl",
     "//brenn-envelope",
     "//brenn-lib",
     "//brenn-messaging",

@@ -1,7 +1,7 @@
 //! Boot validation for `abi = "processor"` surface assets.
 //!
 //! A processor kind ships as a jco-transpiled tree under
-//! `<surface_dist_dir>/processor/<kind>/`: the transpiled JS + core wasm, the
+//! `<surface root>/processor/<kind>/`: the transpiled JS + core wasm, the
 //! source component artifact it was transpiled from, and a `manifest.json`
 //! recording the source hash, the pinned jco version, the specification the
 //! component was authored against and that specification's hash, the component's
@@ -93,8 +93,10 @@ pub struct ProcessorManifest {
 }
 
 /// Directory holding a processor kind's transpiled tree.
-pub fn kind_dir(surface_dist_dir: &Path, kind: &str) -> PathBuf {
-    surface_dist_dir.join("processor").join(kind)
+pub fn kind_dir(surface_root: &Path, kind: &str) -> PathBuf {
+    surface_root
+        .join(brenn_surface_contract::PROCESSOR_DIR)
+        .join(kind)
 }
 
 /// The source component artifact copied beside the transpiled output, so the
@@ -120,15 +122,15 @@ fn spec_artifact(kind: &str) -> String {
 /// partial deploy), a specification name that is not the one the kind derives, a
 /// missing or divergent packaged specification, a backend-only import, or an
 /// import name no WIT interface defines.
-pub fn validate_processor_kind(surface_dist_dir: &Path, kind: &str) -> ProcessorManifest {
-    let dir = kind_dir(surface_dist_dir, kind);
+pub fn validate_processor_kind(surface_root: &Path, kind: &str) -> ProcessorManifest {
+    let dir = kind_dir(surface_root, kind);
     let manifest_path = dir.join("manifest.json");
 
     let raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|err| {
         panic!(
             "boot: processor component {kind:?} has no readable asset manifest at {} ({err}) — \
              the transpiled tree is not built/deployed (build the surface assets; on deploy \
-             ensure surface_dist_dir is populated). Refusing to start (fail-fast on invalid \
+             ensure the surface install ran). Refusing to start (fail-fast on invalid \
              config).",
             manifest_path.display(),
         )
@@ -164,7 +166,7 @@ pub fn validate_processor_kind(surface_dist_dir: &Path, kind: &str) -> Processor
             path.exists(),
             "boot: processor component {kind:?} asset manifest lists {file:?}, which is missing at \
              {} — the transpiled tree is incomplete (run `make build`; on deploy ensure \
-             surface_dist_dir is populated). Refusing to start (fail-fast on invalid config).",
+             the surface install ran). Refusing to start (fail-fast on invalid config).",
             path.display(),
         );
     }
@@ -198,7 +200,7 @@ fn assert_source_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManife
         "boot: processor component {kind:?} has a stale transpile: {artifact} hashes to {actual}, \
          but its manifest was written from {} — the component was rebuilt without re-transpiling, \
          or the deploy synced only part of the tree. Re-run `make build` and redeploy the \
-         whole surface_dist_dir. Refusing to start (fail-fast on invalid config).",
+         whole surface root. Refusing to start (fail-fast on invalid config).",
         manifest.source_sha256,
     );
 }
@@ -241,7 +243,7 @@ fn assert_spec_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManifest
         "boot: processor component {kind:?} has a specification that does not match its record: \
          {derived} hashes to {actual}, but its manifest was written from {} — the tree was \
          assembled from mismatched parts, or the packaged specification was edited in place. \
-         Rebuild the surface assets and redeploy the whole surface_dist_dir. Refusing to start \
+         Rebuild the surface assets and redeploy the whole surface root. Refusing to start \
          (fail-fast on invalid config).",
         manifest.spec_sha256,
     );

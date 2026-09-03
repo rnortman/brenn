@@ -1,7 +1,5 @@
-// A root document that wires the example component, for the author's own fit
-// check:
-//
-//     bazel run @brenn//brenn-dsl:dsl_cli -- check --modules spec config/dev.brenn
+// A root document that wires the example component, compiled by the `dev_fit`
+// target beside it.
 //
 // `spec/` is the module root: it holds `example-caser.brenn` flat, which is
 // exactly the layout a bundle's `modules/` has once installed.

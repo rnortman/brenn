@@ -217,7 +217,7 @@ mod tests {
             bridge_notify_tx: tokio::sync::broadcast::channel(1).0,
             pending_uploads: PendingUploads::default(),
             static_dir: std::path::PathBuf::from("/tmp"),
-            surface_dist_dir: std::path::PathBuf::from("/tmp"),
+            surface_roots: brenn_surface_server::SurfaceRoots::default(),
             cached_models: Default::default(),
             tool_registry: Default::default(),
             tools: std::sync::Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),

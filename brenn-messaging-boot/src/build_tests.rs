@@ -3677,20 +3677,11 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
     let messenger = result.messenger.as_ref().expect("messaging must be up");
 
     // Two boot-publishes, distinct build ids (no configured surfaces, no sidecar
-    // reads — the dist path is unused).
-    let docs1 = build_description_docs(
-        "surface",
-        "build-1",
-        &result.surfaces,
-        std::path::Path::new("/nonexistent"),
-    );
+    // reads — the roots are unused).
+    let roots = brenn_surface_server::SurfaceRoots::default();
+    let docs1 = build_description_docs("surface", "build-1", &result.surfaces, &roots);
     publish_description(messenger, &docs1).await;
-    let docs2 = build_description_docs(
-        "surface",
-        "build-2",
-        &result.surfaces,
-        std::path::Path::new("/nonexistent"),
-    );
+    let docs2 = build_description_docs("surface", "build-2", &result.surfaces, &roots);
     publish_description(messenger, &docs2).await;
 
     // A non-subscriber pull is clamped to standing_retain_depth (1) — the newest.

@@ -1,5 +1,5 @@
 {
-  "checksum": "288dc34e93e38de2fff922eb23eade8563139205c4294a76f1757142b1bf2760",
+  "checksum": "8ea82fb0adbbe6eef2f0c90694fae94e32922dd6cd4c7922ddcb010d26c676f4",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4275,6 +4275,50 @@
             {
               "id": "tracing-test 0.2.6",
               "target": "tracing_test"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-page-harness 0.1.0": {
+      "name": "brenn-page-harness",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_page_harness",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_page_harness",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
+              "id": "wasmtime 47.0.4",
+              "target": "wasmtime"
             }
           ],
           "selects": {}
@@ -36444,6 +36488,7 @@
     "brenn-mode-clock 0.1.0": "surface/components/mode-clock",
     "brenn-mqtt 0.1.0": "brenn-mqtt",
     "brenn-obs 0.1.0": "brenn-obs",
+    "brenn-page-harness 0.1.0": "surface/page-harness",
     "brenn-pfin 0.1.0": "brenn-pfin",
     "brenn-protobar 0.1.0": "surface/components/protobar",
     "brenn-pwa-push 0.1.0": "brenn-pwa-push",

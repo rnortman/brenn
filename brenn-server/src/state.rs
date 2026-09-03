@@ -82,9 +82,11 @@ pub struct AppState {
     pub pending_uploads: PendingUploads,
     /// Directory containing static frontend assets (JS, CSS, manifest).
     pub static_dir: PathBuf,
-    /// Directory containing surface assets (wasm shell + component modules),
-    /// served under `/surface-static`.
-    pub surface_dist_dir: PathBuf,
+    /// Where each surface asset lives: the root holding the kernel module pair
+    /// and the flat sidecars, and one root per installed component kind. Served
+    /// under `/surface-static`, whose URL namespace is one tree even where the
+    /// filesystem behind it is several.
+    pub surface_roots: brenn_surface_server::SurfaceRoots,
     /// Cached available models from CC's init ack, keyed by app slug.
     /// Populated on first CC spawn per app; refreshed on subsequent spawns.
     pub cached_models: Arc<RwLock<HashMap<String, Vec<ModelInfo>>>>,
@@ -774,7 +776,7 @@ impl AppState {
             bridge_notify_tx: broadcast::channel(64).0,
             pending_uploads: Default::default(),
             static_dir: std::path::PathBuf::from("frontend/dist"),
-            surface_dist_dir: std::path::PathBuf::from("surface/dist"),
+            surface_roots: brenn_surface_server::SurfaceRoots::default(),
             cached_models: Default::default(),
             tool_registry: Default::default(),
             tools: Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),

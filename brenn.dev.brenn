@@ -18,7 +18,6 @@ use config::surfaces::*;
 server {
   bind_address = "127.0.0.1:3000";
   static_dir = ".bazel-bin/frontend/dist";
-  surface_dist_dir = ".bazel-bin/surface/dist";
   secure_cookies = false;
   public_url = "http://127.0.0.1:3000";
 }
@@ -214,6 +213,9 @@ surface dev-stub {
     in messages <- dev_stub { push_depth = 8; noise = alarm; }
     out out -> dev_stub;
   }
+  // TODO(standard-chrome-vocabulary): this block is transcribed once per page,
+  // here and in every repository that authors one; the reserved plane names are
+  // the kernel's, and omitting one boots and goes quiet rather than refusing.
   new chrome: Chrome {
     grants = [ports, log, dom, page-dom];
     chrome = true;

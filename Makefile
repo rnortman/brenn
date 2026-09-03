@@ -22,10 +22,12 @@ BAZEL_CONFIG ?=
 # (`example-check`). Separate from BAZEL_CONFIG because the example's own
 # .bazelrc carries none of brenn's `ci`/`cd` configs and runs from its own
 # directory, so a lane's cache flags are spelled here with absolute paths.
-# EXAMPLE_LANE=ci|cd selects the block that mirrors the same-named stanza in
-# .bazelrc (the caches, their GC caps, the non-interactive output flags); the
-# two are kept in step by hand, and this is the one place the flattened copy
-# lives. Unset runs the example with its own defaults.
+# EXAMPLE_LANE=ci|cd selects the block that flattens the same-named stanza in
+# .bazelrc (the caches, their GC caps, the non-interactive output flags), which
+# is the canonical text. Every module that builds against brenn from its own
+# output base carries a flattened copy of it — this one, and one per out-of-tree
+# bundle repository — so a flag change is made in .bazelrc and then transcribed.
+# Unset runs the example with its own defaults.
 EXAMPLE_LANE ?=
 ifeq ($(EXAMPLE_LANE),)
 EXAMPLE_BAZEL_CONFIG ?=
@@ -158,15 +160,27 @@ bazel-policy-parity:
 	bazel build $(BAZEL_CONFIG) //:policy_manifest
 	bazel run $(BAZEL_CONFIG) //xtask -- policy-parity --root $(CURDIR) --manifest $(CURDIR)/$(BAZEL_BIN)/policy_manifest.txt
 
-# The out-of-tree authoring example. The first line runs the same gate set an
-# in-tree component gets; the second is the author's fit check over a root
-# document that imports the packaged module. Not a step of `check`: the example
-# is its own Bazel output base, so the disk cache does not bridge the two and
-# every brenn-dsl/brenn-guest change would compile twice at the hook. CI runs it
-# on every push (see TODO(example-check-precommit) at `check`).
+# The out-of-tree authoring example: the same gate set an in-tree component
+# gets, plus the fit check over the root document that imports the packaged
+# module, plus the surface kit staging one kind from the example's own package.
+#
+# Not a step of `check`: the example is its own Bazel output base, so the disk
+# cache does not bridge the two and every brenn-dsl/brenn-guest change would
+# compile twice at the hook. CI runs it on every push (see
+# TODO(example-check-precommit) at `check`).
+#
+# The two calls of the surface kit spell their paths differently and both are
+# gated here: the example's own kind is the kit called from a consumer package,
+# and the second line is one of brenn's kinds built from the example's output
+# base, which is the kit called from brenn's package with brenn in the external
+# repository position. One transpile each, not brenn's whole served tree.
+#
+# The third line covers the remaining js-tool path: it is only reachable from
+# a consumer-position build, so it is gated here or nowhere.
 example-check:
 	cd examples/component && bazel test $(EXAMPLE_BAZEL_CONFIG) //...
-	cd examples/component && bazel run $(EXAMPLE_BAZEL_CONFIG) @brenn//brenn-dsl:dsl_cli -- check --modules "$(CURDIR)/examples/component/spec" "$(CURDIR)/examples/component/config/dev.brenn"
+	cd examples/component && bazel build $(EXAMPLE_BAZEL_CONFIG) @brenn//surface:echo-stub_assets
+	cd examples/component && bazel build $(EXAMPLE_BAZEL_CONFIG) @brenn//frontend:dist
 
 # The advisory gate over both Cargo workspaces. Outside `bazel-check` because
 # cargo-deny fetches an advisory database over the network, which a sandboxed
@@ -292,7 +306,8 @@ e2e: run-artifacts e2e/node_modules
 	fi; \
 	invite=$$($(E2E_BIN) --config brenn.e2e.brenn --modules config/specs invite); \
 	$(E2E_BIN) --config brenn.e2e.brenn --modules config/specs serve \
-	    --components $(BAZEL_BIN)/brenn-wasm/install_tree & \
+	    --components $(BAZEL_BIN)/brenn-wasm/install_tree \
+	    --surface $(BAZEL_BIN)/surface/dist & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null || true' EXIT INT TERM; \
 	echo "e2e: server PID $$srv; polling $(E2E_BASE_URL)/auth/login ..."; \
@@ -314,7 +329,8 @@ launchdev: run-artifacts
 		echo "Dev server already running (PID $$(cat $(DEV_PIDFILE)))"; \
 	else \
 		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn --modules config/specs serve \
-		    --components $(BAZEL_BIN)/brenn-wasm/install_tree & \
+		    --components $(BAZEL_BIN)/brenn-wasm/install_tree \
+		    --surface $(BAZEL_BIN)/surface/dist & \
 		echo $$! > $(DEV_PIDFILE); \
 		echo "Dev server started (PID $$!)"; \
 		sleep 1; \

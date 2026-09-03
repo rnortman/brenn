@@ -2,7 +2,7 @@
 # Assemble one processor kind's slice of the surface asset tree.
 #
 # Usage: processor_stage.sh <kind> <component.wasm> <transpiled-dir> \
-#            <jco-version-file> <spec.brenn> <emitter> <out-dir>
+#            <jco-version-file> <spec.brenn> <emitter> <dsl-cli> <out-dir>
 #
 # The output holds `processor/<kind>/`: jco's transpiled module tree, the
 # component bytes it came from (copied beside the output so boot validation
@@ -22,7 +22,18 @@ transpiled="$3"
 version_file="$4"
 spec="$5"
 emitter="$6"
-out="$7"
+dsl_cli="$7"
+out="$8"
+
+# The served kind is the kebab fold of the specification's component class name;
+# the directory staged here is the string the BUILD author typed. Nothing
+# downstream compares them, so a mismatch would build green and leave the page
+# asking for a directory that does not exist.
+expected=$("$dsl_cli" wire-kind "$spec")
+if [ "$kind" != "$expected" ]; then
+    echo "processor_stage: kind \"$kind\" is not the wire kind of the class in $spec, which is \"$expected\"" >&2
+    exit 1
+fi
 
 version=$(cat "$version_file")
 if [ -z "$version" ]; then

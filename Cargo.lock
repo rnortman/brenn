@@ -910,6 +910,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-page-harness"
+version = "0.1.0"
+dependencies = [
+ "brenn-envelope",
+ "brenn-surface-contract",
+ "serde_json",
+ "wasmtime",
+]
+
+[[package]]
 name = "brenn-pfin"
 version = "0.1.0"
 dependencies = [
@@ -1140,6 +1150,7 @@ dependencies = [
  "brenn-attach-server",
  "brenn-budget",
  "brenn-db",
+ "brenn-dsl",
  "brenn-envelope",
  "brenn-lib",
  "brenn-messaging",
@@ -1247,7 +1258,7 @@ dependencies = [
  "brenn-common",
  "brenn-envelope",
  "brenn-meeting",
- "brenn-surface-contract",
+ "brenn-page-harness",
  "chrono",
  "rusqlite",
  "semver",

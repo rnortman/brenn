@@ -1587,7 +1587,6 @@ vocabulary! {
     struct ServerAttrs<V> {
         opt bind_address: V,
         opt static_dir: V,
-        opt surface_dist_dir: V,
         opt secure_cookies: V,
         opt trusted_proxy_hops: V,
         opt pid_file: V,

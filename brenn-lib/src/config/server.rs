@@ -7,9 +7,6 @@ pub struct ServerConfig {
     pub bind_address: SocketAddr,
     /// Path to the static file directory (frontend/dist).
     pub static_dir: PathBuf,
-    /// Path to the surface asset directory (surface/dist), holding the
-    /// wasm-bindgen shell and component modules served under `/surface-static`.
-    pub surface_dist_dir: PathBuf,
     /// Whether to set the Secure flag on session cookies.
     /// Default: true (production-safe). Set to false only for local HTTP dev.
     pub secure_cookies: bool,
@@ -53,7 +50,6 @@ impl Default for ServerConfig {
         Self {
             bind_address: SocketAddr::from(([0, 0, 0, 0], 3000)),
             static_dir: PathBuf::from("/opt/brenn/frontend/dist"),
-            surface_dist_dir: PathBuf::from("/opt/brenn/surface/dist"),
             secure_cookies: true,
             trusted_proxy_hops: 0,
             pid_file: None,

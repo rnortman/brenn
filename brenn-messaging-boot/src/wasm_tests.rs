@@ -496,6 +496,54 @@ fn input_output_port_name_collision_panics() {
     resolve(&raw, &dir);
 }
 
+/// One subscription and one output naming the *same* channel are one
+/// bidirectional port, not a collision.
+#[test]
+fn input_output_port_name_on_one_channel_is_a_bidirectional_port() {
+    let dir = dir_of(vec![brenn_entry("brenn:both-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "io-pair".to_string(),
+        package: "a".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "both-ch".to_string(),
+        )],
+        subscriptions: vec![sub_raw("brenn:both-ch", "total")],
+        outputs: vec![out_raw("total", "brenn:both-ch")],
+        ..minimal_wasm_consumer()
+    }];
+    let resolved = resolve(&raw, &dir);
+    assert_eq!(resolved.len(), 1);
+    let c = &resolved[0];
+    assert_eq!(c.inputs.len(), 1);
+    assert_eq!(c.inputs[0].port, "total");
+    assert_eq!(c.outputs.len(), 1);
+    assert_eq!(c.outputs[0].port, "total");
+    assert_eq!(
+        c.inputs[0].sub.channel_address,
+        c.outputs[0].channel_address
+    );
+}
+
+/// A third binding on that name is still a collision — the exception admits one
+/// input and one output, not an unbounded set.
+#[test]
+#[should_panic(expected = "duplicate port name")]
+fn third_binding_on_a_bidirectional_port_name_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:both-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "io-pair-plus".to_string(),
+        package: "a".to_string(),
+        subscriptions: vec![sub_raw("brenn:both-ch", "total")],
+        outputs: vec![
+            out_raw("total", "brenn:both-ch"),
+            out_raw("total", "brenn:both-ch"),
+        ],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
 /// A config input port literally named `tool-results` collides with the
 /// synthetic async-tool-result inbox port folded in for a consumer holding an
 /// async tool grant; it must be rejected at resolve time.

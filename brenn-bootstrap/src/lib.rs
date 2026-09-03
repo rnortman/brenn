@@ -65,12 +65,16 @@ fn assert_build_id_valid(build_id: &str) {
 /// configure a consumer. The same goes for a package name installed under two
 /// roots: a broken install is refused whether or not this configuration
 /// instantiates the name.
-fn assert_boot_preconditions(build_id: &str, components_roots: &[PathBuf]) {
+///
+/// TODO(mcp-script-path-precondition): `claude_defaults.mcp_script_path` is not
+/// among the artifact facts checked here, so a configuration naming a file that
+/// does not exist boots and fails at the first session spawn instead.
+fn assert_boot_preconditions(build_id: &str, roots: &cli::InstallRoots) {
     assert_build_id_valid(build_id);
-    for root in components_roots {
+    for root in &roots.components {
         brenn_lib::wasm_package::assert_components_root(root);
     }
-    brenn_lib::wasm_package::assert_disjoint_components_roots(components_roots);
+    brenn_lib::wasm_package::assert_disjoint_components_roots(&roots.components);
 }
 
 /// The environment-free half of a `[[wasm_consumer]]`'s `ProcessorLoadSpec`:
@@ -190,10 +194,11 @@ pub(crate) fn lower_consumer_load_parts(
 pub async fn run_server(
     config: BrennConfig,
     config_path: Option<PathBuf>,
-    components_roots: Vec<PathBuf>,
+    install_roots: cli::InstallRoots,
     build_id: &'static str,
 ) {
-    assert_boot_preconditions(build_id, &components_roots);
+    assert_boot_preconditions(build_id, &install_roots);
+    let components_roots = install_roots.components;
 
     let obs_config = obs_config::build(&config, config_path.as_ref());
     obs::install_pending_panic_hook(&obs_config);
@@ -506,19 +511,23 @@ pub async fn run_server(
         },
     );
 
-    // Publish the surface self-description documents once at boot, so any app can
-    // pull them via `MessageChannelGet`. Built from the resolved surfaces, the
-    // running build id, and the per-kind sidecar files under `surface_dist_dir`,
-    // so the retained docs describe the running config. Skipped only when no
-    // messaging is configured: there is no bus to publish onto and no surface to
-    // describe.
+    // Unconditional: a broken install is refused independently of what today's
+    // config touches, and the kind → root map it returns is what the router
+    // serves from.
+    let surface_roots = brenn_surface_server::validate_surface_assets(
+        &install_roots.surface,
+        &messaging_result.surfaces,
+    );
+
+    // Publish surface self-description documents so any app can pull them via
+    // `MessageChannelGet`.
     if let Some(messenger) = messenger {
         let prefix = &config.surface_description.prefix;
         let docs = brenn_surface_server::description::build_description_docs(
             prefix,
             build_id,
             &messaging_result.surfaces,
-            &config.server.surface_dist_dir,
+            &surface_roots,
         );
         brenn_surface_server::description::publish_description(messenger, &docs).await;
 
@@ -565,14 +574,6 @@ pub async fn run_server(
         if surfaces.is_empty() {
             std::collections::HashMap::new()
         } else {
-            // Fail-fast on missing surface assets before any runtime is built: a
-            // configured surface whose shell/component modules are absent from
-            // surface_dist_dir is an un-serveable deploy, caught at boot rather
-            // than as a broken page under auth later.
-            brenn_surface_server::validate_surface_assets(
-                &config.server.surface_dist_dir,
-                &surfaces,
-            );
             let messenger = messaging_result.messenger.as_ref().expect(
                 "[[surface]] blocks configured but no Messenger: the any_messaging gate \
                  forces messaging on whenever surfaces exist",
@@ -922,7 +923,7 @@ pub async fn run_server(
         bridge_notify_tx: tokio::sync::broadcast::channel(64).0,
         pending_uploads: pending_uploads.clone(),
         static_dir: config.server.static_dir.clone(),
-        surface_dist_dir: config.server.surface_dist_dir.clone(),
+        surface_roots: surface_roots.clone(),
         cached_models: Default::default(),
         tool_registry,
         tools: tool_registry_core,
@@ -1712,6 +1713,13 @@ mod tests {
         assert_unique_store_paths(&[], &consumer);
     }
 
+    fn components_only<const N: usize>(components: [PathBuf; N]) -> cli::InstallRoots {
+        cli::InstallRoots {
+            components: components.into(),
+            ..cli::InstallRoots::default()
+        }
+    }
+
     /// A valid build id (non-empty, at most 64 chars) must not panic. The
     /// 64-char boundary is inclusive.
     #[test]
@@ -1723,8 +1731,8 @@ mod tests {
     #[test]
     fn boot_preconditions_pass_on_a_real_components_root() {
         let dir = tempfile::tempdir().unwrap();
-        assert_boot_preconditions("test-build", &[dir.path().to_path_buf()]);
-        assert_boot_preconditions("test-build", &[]);
+        assert_boot_preconditions("test-build", &components_only([dir.path().to_path_buf()]));
+        assert_boot_preconditions("test-build", &cli::InstallRoots::default());
     }
 
     /// The root is checked at startup, with no consumer configured and nothing
@@ -1735,7 +1743,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("brenn_demo.wasm");
         std::fs::write(&file, b"not a directory").unwrap();
-        assert_boot_preconditions("test-build", &[file]);
+        assert_boot_preconditions("test-build", &components_only([file]));
     }
 
     /// Two releases' roots with disjoint package names boot; the same name
@@ -1746,7 +1754,7 @@ mod tests {
         let bundle = tempfile::tempdir().unwrap();
         std::fs::create_dir(brenn.path().join("demo")).unwrap();
         std::fs::create_dir(bundle.path().join("relay")).unwrap();
-        let roots = [brenn.path().to_path_buf(), bundle.path().to_path_buf()];
+        let roots = components_only([brenn.path().to_path_buf(), bundle.path().to_path_buf()]);
         assert_boot_preconditions("test-build", &roots);
     }
 
@@ -1757,7 +1765,7 @@ mod tests {
         let bundle = tempfile::tempdir().unwrap();
         std::fs::create_dir(brenn.path().join("demo")).unwrap();
         std::fs::create_dir(bundle.path().join("demo")).unwrap();
-        let roots = [brenn.path().to_path_buf(), bundle.path().to_path_buf()];
+        let roots = components_only([brenn.path().to_path_buf(), bundle.path().to_path_buf()]);
         assert_boot_preconditions("test-build", &roots);
     }
 

@@ -231,10 +231,11 @@ configuration when its `BUILD.bazel` calls `guest_spec_scaffold` from
 Bazel module dependency (`component-packages.md`, *Authoring an out-of-tree
 component*), and `examples/component/` is the consumer that proves it.
 
-**The generated module's shape is under the same two-regime evolution policy as
-every other contract the dependency exposes** (the docstring of
-`bazel/wasm/defs.bzl`; `processor.wit`): until a component repository outside
-brenn's exists, the shape may move as a hard cut updated everywhere at once,
-and the in-tree example is the canary that a cut is complete; once such a
-repository exists, the shape moves only additively. Reachable is not yet
-frozen — the second regime begins when the first real consumer does.
+**The generated module's shape is a build-time contract**
+(`component-packages.md`, *Contract evolution*): it is consumed at the commit a
+consumer names in its own `git_override`, so it may move as a hard cut updated
+everywhere at once, and the cut costs a consumer a migration at its next pin
+bump and nothing before. `examples/component/` is the canary that a cut is
+complete on brenn's side. Reachable is not frozen, and deliberately so — what a
+running host reads out of an installed bundle is a different set of shapes,
+under the additive rule the same section states.

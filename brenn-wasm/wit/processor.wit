@@ -3,17 +3,16 @@ package brenn:processor@0.1.0;
 /// External ABI — out-of-tree components are first-class consumers of this
 /// interface.
 ///
-/// Evolution policy, in two regimes. Once an out-of-tree population exists,
-/// evolution is additive-import-only: a new capability is a new interface, and
-/// no existing shape moves. Until one exists, the world is in-tree vocabulary
-/// and a shape change is a hard cut updated everywhere at once, with no compat
-/// shim — the project's standing rule for internal contracts. The synchronous
-/// channel below (`activation.sync` and `receive`'s reply) landed under the
-/// second regime, together with the `dom` and `page-dom` interfaces. The
-/// component under `examples/component/` in this repository is the canary for
-/// the hard-cut regime — it builds this world from another Bazel module and
-/// fails brenn's own CI when a cut is incomplete — and is not itself the
-/// out-of-tree population that ends it.
+/// Evolution is **additive-import-only**: a new capability is a new interface,
+/// and no existing shape moves. This is a runtime contract — a host links a
+/// component built against some earlier commit of this world, so a cut here is
+/// a boot refusal on a machine neither side chose. Breaking it is a deliberate
+/// coordinated event: every out-of-tree component is rebuilt against the new
+/// world before the host that needs it is released.
+///
+/// `examples/component/` is the in-repository canary that a change to the
+/// world is complete on this side.
+/// See `docs/component-packages.md`, *Contract evolution*.
 ///
 /// The invariant this interface serves:
 ///

@@ -1,0 +1,21 @@
+// A packaged module in the second root, reaching across to the first: the
+// resolver searches every root, so which one holds a name is not the author's
+// concern.
+
+use @base::Drain;
+
+const widget_skin = "widget";
+
+component Widget {
+    abi = processor;
+    requires = [];
+    in messages;
+}
+
+assembly Bench(slug: String) {
+    channel messages at f"brenn:{slug}.in.p1.messages" {
+        push_depth = 8;
+        retain_depth = 32;
+        standing_retain_depth = 128;
+    }
+}

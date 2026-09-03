@@ -1,0 +1,9 @@
+// The fit a deployment has: vocabulary from two module roots and one sibling of
+// this document's own. Two roots because a release installs one and a component
+// bundle installs another, and a module must be under exactly one of them.
+
+use shared::*;
+use @widget::*;
+use @base::Drain;
+
+new alice_desk: Bench(slug = slug);

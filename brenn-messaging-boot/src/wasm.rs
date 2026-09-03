@@ -37,7 +37,9 @@ use super::resolve_publish_millitokens;
 /// - slug containing `:` or `@` (rejected by `ParticipantId::for_wasm` constructor)
 /// - duplicate port name within a consumer (across inputs and outputs; an
 ///   io_port registers its one name once, for both of its directions, so
-///   declaring that name again in either split list is the collision)
+///   declaring that name again in either split list is the collision. One
+///   input and one output naming the *same* channel are the exception: that
+///   pair is one bidirectional port on an operator-declared channel)
 /// - empty port name or port name containing non-unreserved chars
 /// - output channel is not a pub/sub scheme (`brenn:`/`ephemeral:`/`local:`) —
 ///   `mqtt:`/`webhook:`/`pwa_push:` egress never rides the buffered path
@@ -60,7 +62,7 @@ pub(crate) fn resolve_wasm_consumers(
     auto_wiring: &AutoWiring,
 ) -> Vec<ResolvedWasmConsumer> {
     use brenn_lib::config::wasm::{byte_size_to_max_page_count, resolve_component_config};
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     // Declared `[[mqtt_client]]` membership comes from the canonical resolved
     // client map (the same one threaded into the LLM-side `validate_mqtt_client`),
@@ -196,9 +198,10 @@ pub(crate) fn resolve_wasm_consumers(
                 .unwrap_or(DEFAULT_ACTIVATION_MIN_PERIOD),
         };
 
-        // Collect all port names for uniqueness check (inputs + outputs).
-        let mut seen_port_names: HashSet<String> = HashSet::new();
-        let mut validate_port_name = |port: &str, context: &str| {
+        // Charset and reserved-name validation. Uniqueness is separate, because
+        // an output half may legitimately repeat an input's name (below) and
+        // that is only knowable once both have resolved their channel.
+        let validate_port_name = |port: &str, context: &str| {
             crate::assert_port_name(
                 &format!("[[wasm_consumer]] {slug:?}: {context} port name"),
                 port,
@@ -211,13 +214,16 @@ pub(crate) fn resolve_wasm_consumers(
                  would collide",
                 port,
             );
-            assert!(
-                seen_port_names.insert(port.to_string()),
-                "[[wasm_consumer]] {slug:?}: duplicate port name {:?} (port names must be \
-                 unique across inputs and outputs)",
-                port,
-            );
         };
+        let mut seen_port_names: HashSet<String> = HashSet::new();
+        // An output repeating an input's port name is legal exactly when both
+        // resolve to the same channel address — that pair is one bidirectional
+        // port, which is what an `io` binding to an already-declared channel
+        // lowers to. It is the only thing that lowers to it: two separately
+        // authored bindings cannot wear one port name, because binding a port
+        // twice is refused where the instance body is resolved. `remove` on
+        // lookup (below) ensures at most one output per input.
+        let mut input_addresses: HashMap<String, String> = HashMap::new();
 
         // Both halves of each io_port are channel-less and take the one address
         // the lowering pass assigned — the two directions cannot be wired apart.
@@ -241,13 +247,19 @@ pub(crate) fn resolve_wasm_consumers(
         let mut ephemeral_inputs: Vec<String> = Vec::new();
         let mut local_inputs: Vec<String> = Vec::new();
 
-        for (sub, kind) in consumer
+        for (sub, kind, is_io_port) in consumer
             .subscriptions
             .iter()
-            .map(|sub| (sub, "subscription"))
-            .chain(io_subscriptions.iter().map(|sub| (sub, "io_port")))
+            .map(|sub| (sub, "subscription", false))
+            .chain(io_subscriptions.iter().map(|sub| (sub, "io_port", true)))
         {
             validate_port_name(&sub.port, kind);
+            assert!(
+                seen_port_names.insert(sub.port.clone()),
+                "[[wasm_consumer]] {slug:?}: duplicate port name {:?} (port names must be \
+                 unique across inputs and outputs)",
+                sub.port,
+            );
 
             let channel = super::bound_channel(
                 &format!("[[wasm_consumer]] {slug:?}"),
@@ -304,6 +316,12 @@ pub(crate) fn resolve_wasm_consumers(
                 "[[wasm_consumer]] {slug:?}: duplicate subscription for channel {:?}",
                 entry.address,
             );
+            // Only an ordinary subscription opens the pairing exception. An
+            // io_port already holds both directions, so a split-list output
+            // wearing its name would be a second output on one port name.
+            if !is_io_port {
+                input_addresses.insert(sub.port.clone(), entry.address.clone());
+            }
 
             // The whole ladder: sub → the channel's own rung.
             let ch = &entry.resolved_channel;
@@ -419,8 +437,9 @@ pub(crate) fn resolve_wasm_consumers(
         let mut outputs = Vec::with_capacity(consumer.outputs.len() + io_outputs.len());
         let mut address_bound_outputs: Vec<String> = Vec::new();
         // An io_port's name was already registered by its input half, so
-        // `is_io_port` skips the duplicate-name check that would reject the
-        // second direction. `kind` is panic-message text only.
+        // `is_io_port` skips the name checks that would reject the second
+        // direction. An ordinary output repeating an input's name is checked
+        // against that input's address instead.
         for (out, kind, is_io_port) in consumer
             .outputs
             .iter()
@@ -443,6 +462,21 @@ pub(crate) fn resolve_wasm_consumers(
                      channel address",
                 )
             });
+            // `remove` rather than `get`: the exception admits one output per
+            // input, so a third binding on the name finds nothing and collides.
+            // The addresses must match, not merely both exist: two halves on
+            // different channels are two ports sharing a name, which is what the
+            // guest's one port name cannot mean.
+            if !is_io_port && !seen_port_names.insert(out.port.clone()) {
+                assert_eq!(
+                    input_addresses.remove(&out.port).as_deref(),
+                    Some(entry.address.as_str()),
+                    "[[wasm_consumer]] {slug:?}: duplicate port name {:?} (port names must be \
+                     unique across inputs and outputs; the one exception is an input and an \
+                     output naming the same channel, which is one bidirectional port)",
+                    out.port,
+                );
+            }
             // The buffered `ports.publish` path serves pub/sub schemes only
             // (brenn:/ephemeral:/local:). Do NOT let mqtt:/webhook:/pwa_push:
             // ride this path — MQTT egress uses the separate synchronous

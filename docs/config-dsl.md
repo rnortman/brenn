@@ -710,6 +710,19 @@ also at both placements: a class declared inline in a deployment's own
 configuration cannot drive a component instance, because its file is not the
 author's file byte for byte.
 
+The same division draws the line for how this language itself may change.
+**Root-document vocabulary is hard-cut**: settings sections, their keys, and the
+statements a deployment writes for itself change with the release, and updating
+the configuration is part of deploying — this is the standing rule for internal
+contracts, and `server.surface_dist_dir` becoming a boot flag is an instance of
+it. **Packaged-module vocabulary is not** — the `component` class, `assembly`,
+`const` and `use @` subset, because its author is not the deployer and its file
+is installed by a different release than the binary that reads it. A host
+compiles a bundle's `modules/<name>.brenn` at boot against whatever compiler it
+happens to be running, so that subset only gains: a new class attribute arrives
+with a default, and no existing vocabulary in it changes meaning
+(`component-packages.md`, *Contract evolution*).
+
 ## Authoring conventions
 
 These rules apply to every `.brenn` tree, in this repo and in a deployment's

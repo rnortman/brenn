@@ -33,6 +33,14 @@ pub enum Commands {
         /// package must be under exactly one of them.
         #[arg(long, value_name = "DIR")]
         components: Vec<PathBuf>,
+
+        /// Directory holding an installed surface asset tree, served under
+        /// `/surface-static`. An artifact fact, so it is named here and never
+        /// in the document. Repeatable, one per installed release; exactly one
+        /// root carries the kernel module pair, and a kind must be under
+        /// exactly one of them.
+        #[arg(long, value_name = "DIR")]
+        surface: Vec<PathBuf>,
     },
     /// Generate an invite code and print it to stdout.
     Invite,
@@ -47,6 +55,22 @@ pub enum Commands {
     /// integration registry and the runtime dir are the boot's business — so
     /// `ok` means the file is a config, not that it will boot on every host.
     ConfigCheck { file: PathBuf },
+}
+
+/// The install-root lists a *server* boot was given, as one value.
+///
+/// Two lists: the component packages a consumer loads from, and the surface
+/// asset trees a page is served out of. They are named on the command line
+/// rather than in the document because where a release is installed is an
+/// environment fact, and they are one value because named fields are what keeps
+/// two lists of the same type from being handed over in each other's place.
+///
+/// The module roots are the third root type and are deliberately not here:
+/// they are resolved before a server exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallRoots {
+    pub components: Vec<PathBuf>,
+    pub surface: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -80,7 +104,7 @@ mod tests {
     fn the_components_root_is_a_serve_flag_and_not_a_config_tool_flag() {
         let cli = Cli::try_parse_from(["brenn", "serve", "--components", "/srv/components"])
             .expect("serve takes the flag");
-        let Some(Commands::Serve { components }) = cli.command else {
+        let Some(Commands::Serve { components, .. }) = cli.command else {
             panic!("the subcommand parses");
         };
         assert_eq!(components, [PathBuf::from("/srv/components")]);
@@ -102,6 +126,29 @@ mod tests {
         );
     }
 
+    /// The surface asset tree is an artifact fact, so it sits beside
+    /// `--components` on `serve` and not in the config document. The config
+    /// tools never resolve artifacts, so they do not take it.
+    #[test]
+    fn the_surface_root_is_a_serve_flag_and_not_a_config_tool_flag() {
+        let cli = Cli::try_parse_from(["brenn", "serve", "--surface", "/srv/surface"])
+            .expect("serve takes the flag");
+        let Some(Commands::Serve { surface, .. }) = cli.command else {
+            panic!("the subcommand parses");
+        };
+        assert_eq!(surface, [PathBuf::from("/srv/surface")]);
+
+        assert!(
+            Cli::try_parse_from(["brenn", "config-check", "--surface", "/srv/surface", "x"])
+                .is_err(),
+            "config-check does not take the flag"
+        );
+        assert!(
+            Cli::try_parse_from(["brenn", "--surface", "/srv/surface", "serve"]).is_err(),
+            "the flag belongs to the subcommand, not the root parser"
+        );
+    }
+
     /// One flag per installed release, in the order written: brenn's roots and
     /// then each bundle's, or whatever order the unit spells. Parsing keeps the
     /// order because the refusals that list the roots quote it.
@@ -118,8 +165,12 @@ mod tests {
             "/srv/brenn/components",
             "--components",
             "/srv/bundle/components",
+            "--surface",
+            "/srv/brenn/surface",
+            "--surface",
+            "/srv/bundle/surface",
         ])
-        .expect("both flags repeat");
+        .expect("every flag repeats");
         assert_eq!(
             cli.modules,
             [
@@ -127,7 +178,11 @@ mod tests {
                 PathBuf::from("/srv/bundle/modules")
             ]
         );
-        let Some(Commands::Serve { components }) = cli.command else {
+        let Some(Commands::Serve {
+            components,
+            surface,
+        }) = cli.command
+        else {
             panic!("the subcommand parses");
         };
         assert_eq!(
@@ -137,12 +192,24 @@ mod tests {
                 PathBuf::from("/srv/bundle/components")
             ]
         );
+        assert_eq!(
+            surface,
+            [
+                PathBuf::from("/srv/brenn/surface"),
+                PathBuf::from("/srv/bundle/surface")
+            ]
+        );
 
-        let cli = Cli::try_parse_from(["brenn", "serve"]).expect("neither flag is required");
+        let cli = Cli::try_parse_from(["brenn", "serve"]).expect("no flag is required");
         assert!(cli.modules.is_empty());
-        let Some(Commands::Serve { components }) = cli.command else {
+        let Some(Commands::Serve {
+            components,
+            surface,
+        }) = cli.command
+        else {
             panic!("the subcommand parses");
         };
         assert!(components.is_empty());
+        assert!(surface.is_empty());
     }
 }

@@ -1,11 +1,14 @@
 //! Grammar-development ergonomics: read a document and say what came out.
 //!
-//! Four subcommands. `parse` reads one file through the front end: a document
+//! Five subcommands. `parse` reads one file through the front end: a document
 //! it accepts can still name things that do not exist. `check` compiles a tree
 //! from its root and reports everything the compiler can validate today.
 //! `scaffold` reads one component specification and writes the Rust module its
 //! guest crate compiles against. `grant-parity` holds one specification's
-//! `requires` list equal to what its built artifact imports.
+//! `requires` list equal to what its built artifact imports. `wire-kind` prints
+//! the kind a specification's component class is served under, which is what
+//! holds a build's chosen directory name equal to the name the browser asks
+//! for.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -72,6 +75,21 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         imports: PathBuf,
     },
+    /// Print the wire kind one component class is served under.
+    ///
+    /// The fold from class name to kind is the compiler's, and a surface build
+    /// picks its own directory name by hand. The two coincide by habit in a
+    /// tree whose author has the habit; printed here they can be compared, so a
+    /// staging step refuses the mismatch instead of building green and refusing
+    /// at boot with a kind nothing serves.
+    WireKind {
+        /// The `.brenn` specification to read.
+        spec: PathBuf,
+        /// Which component class to take, where the module declares more than
+        /// one.
+        #[arg(long, value_name = "NAME")]
+        class: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -114,6 +132,29 @@ fn main() -> ExitCode {
         },
         Command::Scaffold { spec, class, out } => scaffold(&spec, class.as_deref(), &out),
         Command::GrantParity { spec, imports } => grant_parity(&spec, &imports),
+        Command::WireKind { spec, class } => print_wire_kind(&spec, class.as_deref()),
+    }
+}
+
+/// Print one class's wire kind on stdout, or the reason there is no one class.
+///
+/// A module declaring several classes is refused until `--class` names one,
+/// because a kind belongs to a class and not to a file.
+fn print_wire_kind(spec: &Path, class: Option<&str>) -> ExitCode {
+    let filename = spec.display().to_string();
+    let selected = brenn_dsl::parse_file(spec).and_then(|file| {
+        brenn_dsl::scaffold::select_class(&file, class, &filename)
+            .map(|class| brenn_dsl::derive::wire_kind(class.name.value()))
+    });
+    match selected {
+        Ok(kind) => {
+            println!("{kind}");
+            ExitCode::SUCCESS
+        }
+        Err(diagnostic) => {
+            eprintln!("{}", diagnostic.render());
+            ExitCode::FAILURE
+        }
     }
 }
 

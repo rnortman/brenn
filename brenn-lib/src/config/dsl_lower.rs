@@ -1115,9 +1115,6 @@ fn server(body: &mut Body, errors: &mut Vec<Diagnostic>) -> ServerConfig {
         static_dir: body
             .path("static_dir", errors)
             .unwrap_or(defaults.static_dir),
-        surface_dist_dir: body
-            .path("surface_dist_dir", errors)
-            .unwrap_or(defaults.surface_dist_dir),
         secure_cookies: body
             .bool("secure_cookies", errors)
             .unwrap_or(defaults.secure_cookies),

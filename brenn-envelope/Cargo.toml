@@ -5,6 +5,11 @@ edition = "2024"
 publish = false
 description = "Brenn message envelope wire types and shared address vocabulary — host, WASM guest, and the .brenn config front end"
 
+[features]
+# The fixture envelope frames, built through `MessageEnvelope::to_envelope_json`
+# so a test host windows the same text a real one does. Off in release builds.
+testutils = []
+
 [dependencies]
 chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }

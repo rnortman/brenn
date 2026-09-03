@@ -1243,3 +1243,73 @@ fn a_binding_naming_no_declaration_is_refused() {
     );
     assert!(refusal.contains("relay"), "{refusal}");
 }
+
+// ── a surface and a top-level instance in one assembly ───────────────────────
+
+/// One assembly stamping a page and the backend instance behind it. Placement
+/// is the `new`'s position and nothing else: the same class would resolve the
+/// same way at either one, and the two ends of the wiring are ordinary channels
+/// the assembly declared.
+const SPLIT: &str = "\
+// ── packaged ──
+component Panel { abi = processor; requires = [ports]; out clicks; in total; }
+component Counter { abi = processor; requires = [ports]; in clicks; io total; }
+// ── packaged ──
+
+assembly Split(slug: String) {
+    channel clicks at f\"ephemeral:{slug}.clicks\" { push_depth = 8; retain_depth = 8; }
+    channel total at f\"ephemeral:{slug}.total\" { push_depth = 1; retain_depth = 1; }
+
+    surface page {
+        slug = slug;
+        grants = [subscribe, publish];
+        new panel: Panel {
+            grants = [ports];
+            out clicks -> clicks;
+            in total <- total;
+        }
+    }
+
+    new counter: Counter {
+        slug = f\"{slug}-counter\";
+        grants = [ports];
+        in clicks <- clicks;
+        io total <-> total;
+    }
+}
+
+new demo: Split(slug = \"demo\");
+";
+
+#[test]
+fn one_assembly_stamps_both_placements_and_wires_them_to_its_own_channels() {
+    let config = resolved(SPLIT);
+    assert_eq!(channels(&config), ["demo.clicks", "demo.total"]);
+
+    let surface = &config.surfaces[0];
+    assert_eq!(surface.handle.dotted(), "demo.page");
+    assert_eq!(surface.components.len(), 1);
+    assert_eq!(surface.components[0].instance.value(), "panel");
+
+    let consumers: Vec<String> = config
+        .consumers
+        .iter()
+        .map(|consumer| consumer.handle.dotted())
+        .collect();
+    assert_eq!(consumers, ["demo.counter"]);
+    assert_eq!(config.consumers[0].slug.value(), "demo-counter");
+
+    // Both ends name the assembly's own channels, so the page's publish and the
+    // backend instance's subscribe are the same two ids.
+    let bound = |bindings: &[brenn_dsl::resolved::RBinding]| -> Vec<usize> {
+        bindings
+            .iter()
+            .map(|binding| match binding.chan {
+                Some(RChanRef::Decl(id)) => id.0,
+                ref other => panic!("a declared channel, not {other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(bound(&surface.components[0].bindings), [0, 1]);
+    assert_eq!(bound(&config.consumers[0].bindings), [0, 1]);
+}

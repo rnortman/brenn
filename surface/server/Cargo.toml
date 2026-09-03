@@ -18,6 +18,7 @@ testutils = ["brenn-lib/testutils", "dep:brenn-db", "dep:brenn-messaging-store",
 brenn-attach-server = { version = "0.1.0", path = "../../attach/server" }
 brenn-budget = { version = "0.1.0", path = "../../brenn-budget" }
 brenn-db = { version = "0.1.0", path = "../../brenn-db", optional = true }
+brenn-dsl = { version = "0.1.0", path = "../../brenn-dsl" }
 brenn-envelope = { path = "../../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../../brenn-lib" }
 brenn-messaging = { version = "0.1.0", path = "../../brenn-messaging" }

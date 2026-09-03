@@ -1,0 +1,5 @@
+"""Home of the path helper every js tool invocation shares."""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()

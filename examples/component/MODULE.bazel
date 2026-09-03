@@ -7,12 +7,13 @@ only so brenn's CI can prove the authoring kit is consumable; nothing here
 ships in brenn's release, and Bazel treats this directory as a separate
 repository (its own MODULE.bazel is the boundary).
 
-Three facts are the consumer's to state, because bzlmod reads them from the
+Four facts are the consumer's to state, because bzlmod reads them from the
 root module only: the Rust toolchain (`rust.toolchain` below — brenn's own
 declaration is ignored from a dependency), the `fltk` git override (a
 `git_override` in a dependency's MODULE.bazel is ignored too, and fltk is in no
-registry), and the crate hub's name (two modules may not both name a hub
-`crates`, so this one is `example_crates`).
+registry), the `aspect_rules_js` override that makes brenn's jco runnable from
+a consumer's output base, and the crate hub's name (two modules may not both
+name a hub `crates`, so this one is `example_crates`).
 """
 
 module(
@@ -47,6 +48,24 @@ git_override(
 )
 
 bazel_dep(name = "rules_rust", version = "0.73.0")
+
+# rules_js, ahead of its releases.
+#
+# brenn's `surface_processor_assets` transpiles with `@brenn//surface:jco`, a
+# tool whose npm package store lives in brenn's `surface` package. Through
+# 3.4.1, `npm_package_store` computes the store's relative link targets one
+# character short when the store sits in an external repository's sub-package,
+# so every transitive dependency of the tool resolves to a path that does not
+# exist and jco dies with `ERR_MODULE_NOT_FOUND` on its first import. Upstream
+# fixed it in the commit pinned below; a module override in a dependency is
+# ignored, so brenn cannot supply this and every consumer of the surface kit
+# states it until the fix is in a release.
+bazel_dep(name = "aspect_rules_js", version = "3.4.0")
+git_override(
+    module_name = "aspect_rules_js",
+    commit = "048c545230815b7b1f127f2880ec11f1e0878dc1",
+    remote = "https://github.com/aspect-build/rules_js.git",
+)
 
 # The Rust toolchain, declared here because rules_rust reads toolchain tags from
 # the root module only. Same version as brenn's — brenn's crates compile under

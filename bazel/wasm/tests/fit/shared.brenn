@@ -1,0 +1,4 @@
+// A sibling of the root, imported by path rather than by package name: it
+// resolves against the root's own directory and belongs to no module root.
+
+const slug = "alice-desk";

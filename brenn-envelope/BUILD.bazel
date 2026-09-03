@@ -1,3 +1,4 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
@@ -11,9 +12,12 @@ exports_files(["Cargo.toml"])
 # crate's dependency entry under that path.
 GUEST_WORKSPACE_PATH = "brenn-wasm/components/host-crates/brenn-envelope"
 
+# `testutils` carries the fixture envelope frames the test hosts above window at
+# guests; the release configs clear the flag, so the shipped binary has no copy.
 rust_library(
     name = "brenn-envelope",
     srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
     edition = "2024",
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
@@ -26,6 +30,7 @@ rust_library(
 rust_test(
     name = "brenn-envelope_test",
     crate = ":brenn-envelope",
+    crate_features = ["testutils"],
     data = ["//docs:chat-protocol.md"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

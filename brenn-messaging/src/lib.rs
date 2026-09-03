@@ -4297,7 +4297,6 @@ mod tests {
         ServerConfig {
             bind_address: "127.0.0.1:3000".parse().unwrap(),
             static_dir: std::path::PathBuf::from("/tmp"),
-            surface_dist_dir: std::path::PathBuf::from("/tmp"),
             secure_cookies: false,
             trusted_proxy_hops: 0,
             pid_file: None,

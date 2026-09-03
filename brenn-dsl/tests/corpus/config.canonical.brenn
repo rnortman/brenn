@@ -4,7 +4,6 @@
 server {
   bind_address = "127.0.0.1:3000";
   static_dir = "/opt/brenn/frontend/dist";
-  surface_dist_dir = "/opt/brenn/surface/dist";
   secure_cookies = true;
   trusted_proxy_hops = 1;
   pid_file = "/run/brenn/brenn.pid";

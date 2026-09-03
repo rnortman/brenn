@@ -98,18 +98,6 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
-# The authored module of every packaged component, for the release's module
-# root. Every one of these stages, unfiltered by the deploy manifest, so what
-# keeps the modules staged and the components shipped naming one set is
-# `deployed_components_test`: it holds the manifest and this dict equal in both
-# directions. A world with no component class — replay — contributes nothing to
-# import.
-filegroup(
-    name = "deployed_modules",
-    srcs = [spec for (_, spec) in COMPONENT_PACKAGES.values() if spec],
-    visibility = ["//visibility:public"],
-)
-
 deployed_components_test(
     name = "deployed_components_test",
     manifest = "deployed-components.txt",
@@ -287,14 +275,16 @@ WASM_TEST_SUITES = [
             "chrome",
             "echo-stub",
             "meeting",
+            "processor-config",
+            "processor-log",
         ],
         [],
         [
             "//surface/chrome",
             "//surface/components/meeting",
-            "//surface/contract",
+            "//surface/page-harness",
         ],
-        [":wit"],
+        [],
     ),
     (
         "consume_engine",

@@ -13,20 +13,29 @@ policy_srcs()
 
 # Both gates harvest the surface kinds' modules out of the staged tree, so both
 # are handed the script that states a record's field shape.
-# `package_check` reads the binding records, so its fixtures are written by the
-# build's own emitter rather than by hand: a gate proven against a record shape
-# nothing holds equal to the emitted one is a gate that can drift green.
-# `assemble` only copies the files, so its fixtures stay opaque.
+# `bundle_check` and `package_check` read the binding records, so their fixtures
+# are written by the build's own emitter rather than by hand: a gate proven
+# against a record shape nothing holds equal to the emitted one is a gate that
+# can drift green. `assemble` only copies the files, so its fixtures stay
+# opaque.
+_RECORD_FIXTURES = [
+    "//bazel/wasm:record_lib.sh",
+    "//bazel/wasm:emit_package.sh",
+    "//bazel/wasm:wit_lib.sh",
+    "//surface:emit-processor-manifest.sh",
+]
+
 _EXTRA = {
+    # The staging library last, because it is the script's fourth argument and
+    # this list is what the invocation's tail is built from.
     "assemble": [
         "//bazel/wasm:record_lib.sh",
+        "//bazel/release:stage_lib.sh",
     ],
-    "package_check": [
-        "//bazel/wasm:record_lib.sh",
-        "//bazel/wasm:emit_package.sh",
-        "//bazel/wasm:wit_lib.sh",
-        "//surface:emit-processor-manifest.sh",
-    ],
+    "bundle_check": _RECORD_FIXTURES,
+    # The delegate last, because `package_check.sh` takes it as an argument and
+    # this list is what the invocation's tail is built from.
+    "package_check": _RECORD_FIXTURES + ["//bazel/release:bundle_check.sh"],
 }
 
 [
@@ -47,6 +56,7 @@ _EXTRA = {
     )
     for script in [
         "assemble",
+        "bundle_check",
         "package_check",
     ]
 ]

@@ -127,6 +127,38 @@ pub(crate) async fn not_found(
     StatusCode::NOT_FOUND
 }
 
+/// One `/surface-static` request, resolved to the installed root that holds it.
+///
+/// The URL namespace is one tree; the filesystem behind it is several. A
+/// `processor/<kind>/…` path is served from the root that installed that kind,
+/// everything else from the root holding the kernel module pair and the flat
+/// sidecars. A kind no root offers — and every request at all on a surface-less
+/// deployment — is a 404 and a fail2ban signal: a page manifest never emits such
+/// a URL, so asking for one is a probe.
+async fn surface_static(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Extension(client_ip::ClientIp(ip)): Extension<client_ip::ClientIp>,
+    axum::extract::OriginalUri(original): axum::extract::OriginalUri,
+    req: Request<Body>,
+) -> Response {
+    let path = req.uri().path().trim_start_matches('/');
+    let root = match brenn_surface_server::processor_kind_from_path(path) {
+        Some(kind) => state.surface_roots.kind_root(kind),
+        None => state.surface_roots.kernel.as_deref(),
+    };
+    let Some(root) = root else {
+        // The nested service sees the path with `/surface-static` stripped, and
+        // a security log naming a path no URL has is one a fail2ban rule cannot
+        // be written against.
+        log_security_event(SecurityEventType::UnrecognizedUrl, ip, original.path());
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    tower::ServiceExt::oneshot(tower_http::services::ServeDir::new(root), req)
+        .await
+        .expect("ServeDir reports a missing or unreadable file as a response, never as an error")
+        .map(Body::new)
+}
+
 /// Middleware that detects global rate-limit rejections and emits a
 /// `SecurityEventType::RateLimitHit` security event for fail2ban.
 ///
@@ -464,7 +496,7 @@ pub fn build_router(
         // `WebAssembly.instantiateStreaming` requires.
         .nest_service(
             "/surface-static",
-            no_cache(tower_http::services::ServeDir::new(&state.surface_dist_dir)),
+            no_cache(axum::routing::any(surface_static).with_state(state.clone())),
         )
         // require_auth INNER, asset governor OUTER (applied last below): an
         // unauthenticated asset request still spends an asset token before the
@@ -594,7 +626,7 @@ mod tests {
     };
     use crate::test_support::state::{
         landing_page_router_two_apps, test_app, test_app_for_access_control, test_app_security,
-        test_app_with_apps, test_app_with_static_dir, test_app_with_surface_dist_dir, test_state,
+        test_app_with_apps, test_app_with_static_dir, test_app_with_surface_roots, test_state,
     };
 
     use super::*;
@@ -1794,13 +1826,125 @@ mod tests {
         );
     }
 
+    /// Two installed roots behind one URL namespace: each kind's module comes
+    /// from the root that installed it, the kernel from the root that holds it,
+    /// and a kind no root offers is a 404 rather than a lookup in whichever tree
+    /// happened to be first. That mapping is the whole of what a page manifest
+    /// does not say.
+    #[tokio::test]
+    async fn surface_static_serves_each_kind_from_the_root_that_installed_it() {
+        let brenn = tempfile::tempdir().unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        let write = |root: &std::path::Path, rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write(brenn.path(), "brenn_surface_kernel.js", "export {};");
+        write(brenn.path(), "processor/chrome/chrome.js", "// chrome");
+        write(
+            bundle.path(),
+            "processor/demo-panel/demo-panel.js",
+            "// panel",
+        );
+
+        let db = crate::test_support::init_db_memory();
+        let mut state = test_state(&db);
+        state.surface_roots = brenn_surface_server::SurfaceRoots {
+            kernel: Some(brenn.path().to_path_buf()),
+            kinds: [
+                ("chrome".to_string(), brenn.path().to_path_buf()),
+                ("demo-panel".to_string(), bundle.path().to_path_buf()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let app = build_router(state, None, 0, 2576)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+        let (session_token, _) = setup_authenticated_user(&db).await;
+
+        for (path, expected) in [
+            ("/surface-static/brenn_surface_kernel.js", "export {};"),
+            ("/surface-static/processor/chrome/chrome.js", "// chrome"),
+            (
+                "/surface-static/processor/demo-panel/demo-panel.js",
+                "// panel",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("cookie", format!("brenn_session={session_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-cache"),
+                "{path}",
+            );
+            assert_eq!(body_string(response.into_body()).await, expected, "{path}");
+        }
+
+        // A kind no root offers. The page manifest never emits this URL, so the
+        // request is a probe and gets the same 404 an unknown path gets.
+        let unmapped = app
+            .oneshot(
+                Request::get("/surface-static/processor/nope/nope.js")
+                    .header("cookie", format!("brenn_session={session_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unmapped.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A surface-less deployment — no `--surface` at all, which is legal and is
+    /// what `SurfaceRoots::default()` is. There is no tree to fall back to, so
+    /// every request under the prefix is a 404 rather than a read rooted at
+    /// whatever the process's working directory happens to be.
+    #[tokio::test]
+    async fn surface_static_404s_everything_on_a_surface_less_deployment() {
+        let db = crate::test_support::init_db_memory();
+        let mut state = test_state(&db);
+        state.surface_roots = brenn_surface_server::SurfaceRoots::default();
+        let app = build_router(state, None, 0, 2576)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+        let (session_token, _) = setup_authenticated_user(&db).await;
+
+        for path in [
+            "/surface-static/processor/demo-panel/demo-panel.js",
+            "/surface-static/brenn_surface_kernel.js",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("cookie", format!("brenn_session={session_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
     /// `/surface-static/*` serves the surface asset tree with `no-cache`, the
     /// correct `application/wasm` MIME (load-bearing for
     /// `WebAssembly.instantiateStreaming`), 404s missing files, and sits behind
     /// `require_auth` like the rest of `protected_routes`.
     #[tokio::test]
     async fn surface_static_serves_assets_no_cache_and_authed() {
-        let (app, db, _tmp) = test_app_with_surface_dist_dir(&[
+        let (app, db, _tmp) = test_app_with_surface_roots(&[
             ("brenn_surface_kernel.js", b"export {};"),
             ("brenn_surface_kernel_bg.wasm", b"\0asm\x01\0\0\0"),
         ]);
@@ -2161,7 +2305,10 @@ mod tests {
         let db = crate::test_support::init_db_memory();
         let mut state = test_state(&db);
         state.static_dir = tmp.path().to_path_buf();
-        state.surface_dist_dir = tmp.path().to_path_buf();
+        state.surface_roots = brenn_surface_server::SurfaceRoots {
+            kernel: Some(tmp.path().to_path_buf()),
+            kinds: std::collections::BTreeMap::new(),
+        };
         let app = build_router(state, Some(sec), 1, 2576)
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
         let (session_token, _) = setup_authenticated_user(&db).await;

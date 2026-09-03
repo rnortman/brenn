@@ -1,8 +1,10 @@
 # One component, built with brenn's rules from another Bazel module. Every
 # target here has a counterpart under brenn's own `brenn-wasm/`; the gate set
 # is the same one an in-tree component gets.
-load("@brenn//bazel/wasm:defs.bzl", "component_install_tree", "component_package", "deployed_components_test", "grant_parity_test", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
+load("@brenn//bazel/surface:dist.bzl", "surface_processor_assets")
+load("@brenn//bazel/wasm:defs.bzl", "component_bundle", "component_install_tree", "component_package", "config_fit_test", "deployed_components_test", "grant_parity_test", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
 load("@example_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_test")
 
 guest_spec_scaffold(
     name = "spec",
@@ -42,6 +44,20 @@ grant_parity_test(
     spec = "spec/example-caser.brenn",
 )
 
+# The same artifact staged for the browser: transpiled by brenn's jco, staged
+# under `processor/example-caser/` with its record and its spec. Nothing here
+# serves a page — what this target gates is the surface kit run from a
+# consumer's package and a consumer's output base, where brenn is an external
+# repository and the paths the transpile is handed are not the ones an in-tree
+# build produces. It also brings the kind-name fold and the exported
+# grant-parity gate under brenn's own CI.
+surface_processor_assets(
+    name = "caser_assets",
+    component = ":component",
+    kind = "example-caser",
+    spec = "spec/example-caser.brenn",
+)
+
 # A components root holding this one package: what a deployment installs as a
 # bundle's `components/`, and what a locally run brenn takes as `--components`.
 component_install_tree(
@@ -53,4 +69,42 @@ deployed_components_test(
     name = "deployed_components_test",
     manifest = "deployed-components.txt",
     packages = [":package"],
+)
+
+# The release this repository would deploy: the same tree the install root holds,
+# plus the manifest, the grammar tool an installer execs, and the module root a
+# deployment's `use @example-caser::*;` resolves against.
+component_bundle(
+    name = "bundle",
+    manifest = "deployed-components.txt",
+    packages = [":package"],
+    # A glob, not a list: the label must track the directory so new files are
+    # picked up without editing BUILD.
+    spec_root = glob(["spec/*.brenn"]),
+    surface_kinds = [":caser_assets"],
+)
+
+# The author's fit check, as a test: the root document that wires this
+# component, compiled against the module root a deployment installs it into.
+# The one gate here that is about the deployment rather than the component.
+config_fit_test(
+    name = "dev_fit",
+    config = "config/dev.brenn",
+    modules = ["spec/example-caser.brenn"],
+)
+
+# The page harness, exercised from another module. brenn's own suites build it
+# in brenn's execroot, where a repository-position mistake in the crate cannot
+# show; this target is where one does.
+rust_test(
+    name = "page_harness_test",
+    size = "small",
+    srcs = ["tests/page_harness.rs"],
+    data = [":component"],
+    edition = "2024",
+    env = {"EXAMPLE_CASER_WASM": "$(rootpath :component)"},
+    deps = [
+        "@brenn//brenn-envelope",
+        "@brenn//surface/page-harness",
+    ],
 )

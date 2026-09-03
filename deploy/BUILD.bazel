@@ -24,15 +24,13 @@ release_package(
     frontend = "//frontend:dist",
     lib_files = ["//:noop_mcp.py"],
     manifest = "//brenn-wasm:deployed-components.txt",
-    # The module root a deployment's `use @<name>::…` imports resolve against.
-    # Only the backend half: a surface kind's module is harvested from the
-    # staged surface tree, which already carries it per kind.
-    modules = ["//brenn-wasm:deployed_modules"],
     # Every package in the tree is offered; `deployed-components.txt` decides
     # which of them ship. Passing the deployed subset here instead would make
     # the manifest a second list to keep in step with this one, and the drift
     # would ship a component nobody listed or drop one everybody expects. An
-    # entry whose package is missing fails assembly.
+    # entry whose package is missing fails assembly. The module root under
+    # `modules/` is derived from the shipped ones — a package carries its
+    # authored specification — so there is no second list of the same files.
     packages = ["//brenn-wasm:packages"],
     surface = "//surface:dist",
     visibility = ["//visibility:public"],

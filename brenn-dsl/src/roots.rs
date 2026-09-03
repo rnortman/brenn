@@ -67,17 +67,35 @@ pub fn scan_roots<'a>(
     roots: &'a [PathBuf],
     is_entry: impl Fn(&DirEntry) -> Option<String>,
 ) -> Vec<RootListFault<'a>> {
+    scan_roots_in(flag, roots, None, is_entry).0
+}
+
+/// [`scan_roots`], with the entries read from `subdir` under each root and the
+/// name → holders map handed back.
+///
+/// `subdir` is for a root whose entries are one level in: a surface root holds
+/// its kinds under `processor/`, and the root itself carries other installed
+/// files beside that directory. A root without the subdirectory contributes no
+/// entries and is not a fault — a release may ship a root and no entry of this
+/// kind — but the root itself must still be a listable directory.
+///
+/// The map holds every name, single-held ones included, so a caller that needs
+/// "which root owns this name" builds it from the same walk that refused the
+/// collisions.
+pub fn scan_roots_in<'a>(
+    flag: &str,
+    roots: &'a [PathBuf],
+    subdir: Option<&str>,
+    is_entry: impl Fn(&DirEntry) -> Option<String>,
+) -> (Vec<RootListFault<'a>>, BTreeMap<String, Vec<&'a Path>>) {
     let mut faults = Vec::new();
     let mut canonical: Vec<(PathBuf, &Path)> = Vec::new();
     let mut holders: BTreeMap<String, Vec<&Path>> = BTreeMap::new();
     for root in roots {
-        let entries = match std::fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(error) => {
-                faults.push(RootListFault::Unreadable { root, error });
-                continue;
-            }
-        };
+        if let Err(error) = std::fs::read_dir(root) {
+            faults.push(RootListFault::Unreadable { root, error });
+            continue;
+        }
         let resolved = root.canonicalize().unwrap_or_else(|error| {
             panic!(
                 "{flag} {}: listed but not canonicalizable: {error}",
@@ -92,9 +110,25 @@ pub fn scan_roots<'a>(
             continue;
         }
         canonical.push((resolved, root));
+        let listed = match subdir {
+            None => root.clone(),
+            Some(subdir) => {
+                let inner = root.join(subdir);
+                if !inner.is_dir() {
+                    continue;
+                }
+                inner
+            }
+        };
+        let entries = std::fs::read_dir(&listed).unwrap_or_else(|error| {
+            panic!("{flag} {}: cannot be listed: {error}", listed.display())
+        });
         for entry in entries {
             let entry = entry.unwrap_or_else(|error| {
-                panic!("{flag} {}: listing failed midway: {error}", root.display())
+                panic!(
+                    "{flag} {}: listing failed midway: {error}",
+                    listed.display()
+                )
             });
             if let Some(name) = is_entry(&entry) {
                 holders.entry(name).or_default().push(root);
@@ -103,11 +137,14 @@ pub fn scan_roots<'a>(
     }
     faults.extend(
         holders
-            .into_iter()
+            .iter()
             .filter(|(_, roots)| roots.len() > 1)
-            .map(|(name, roots)| RootListFault::Duplicate { name, roots }),
+            .map(|(name, roots)| RootListFault::Duplicate {
+                name: name.clone(),
+                roots: roots.clone(),
+            }),
     );
-    faults
+    (faults, holders)
 }
 
 /// Paths joined with `, ` for a message.
@@ -222,6 +259,38 @@ mod tests {
             "{faults:?}"
         );
         assert!(matches!(&faults[1], RootListFault::Duplicate { name, .. } if name == "x"));
+    }
+
+    #[test]
+    fn a_root_without_the_subdirectory_contributes_no_entries_and_is_not_a_fault() {
+        let a = root_with("subdir-absent", &[]);
+        let b = root_with("subdir-absent", &[]);
+        std::fs::create_dir(b.join("inner")).unwrap();
+        std::fs::write(b.join("inner").join("x"), b"").unwrap();
+        let roots = [a.clone(), b.clone()];
+        let (faults, holders) = scan_roots_in("--f", &roots, Some("inner"), files);
+        assert!(faults.is_empty(), "{faults:?}");
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders["x"], vec![b.as_path()]);
+    }
+
+    #[test]
+    fn entries_under_the_subdirectory_of_two_roots_collide_and_name_the_roots() {
+        let a = root_with("subdir-dup", &[]);
+        let b = root_with("subdir-dup", &[]);
+        for root in [&a, &b] {
+            std::fs::create_dir(root.join("inner")).unwrap();
+            std::fs::write(root.join("inner").join("x"), b"").unwrap();
+        }
+        let roots = [a.clone(), b.clone()];
+        let (faults, holders) = scan_roots_in("--f", &roots, Some("inner"), files);
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(
+            matches!(&faults[0], RootListFault::Duplicate { name, roots }
+                if name == "x" && *roots == vec![a.as_path(), b.as_path()]),
+            "{faults:?}"
+        );
+        assert_eq!(holders["x"], vec![a.as_path(), b.as_path()]);
     }
 
     #[test]

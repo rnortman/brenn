@@ -21,6 +21,7 @@ policy_srcs()
 # implementation, two callers, and a wasm-tools format change cannot reach one
 # and miss the other.
 exports_files([
+    "bundle_assemble.sh",
     "deployed_components_check.sh",
     "emit_package.sh",
     "grant_parity_check.sh",

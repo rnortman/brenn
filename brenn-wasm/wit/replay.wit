@@ -1,5 +1,16 @@
 package brenn:replay@0.1.0;
 
+/// External ABI — out-of-tree components are first-class consumers of this
+/// interface.
+///
+/// Evolution is **additive-import-only**, `brenn:processor`'s rule and for the
+/// same reason: a host links a replay component built against some earlier
+/// commit of this world, out of a bundle whose release it did not choose, so a
+/// shape that moves is a boot refusal rather than a compile error anybody sees.
+/// A new capability is a new interface. Breaking it is a deliberate coordinated
+/// event, and the design that makes the cut says so.
+/// See `docs/component-packages.md`, *Contract evolution*.
+
 interface types {
     /// Wall-clock instant. Milliseconds since Unix epoch, UTC.
     /// Host produces; component treats as opaque ordering key.

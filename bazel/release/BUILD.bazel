@@ -7,7 +7,9 @@ policy_srcs()
 
 exports_files([
     "assemble.sh",
+    "bundle_check.sh",
     "package_check.sh",
+    "stage_lib.sh",
 ])
 
 # Whether the packaged binaries are built static against musl. Off by default,

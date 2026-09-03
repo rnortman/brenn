@@ -6,8 +6,9 @@
 # modules could all be dangling links and every gate would still be green. Here
 # the inputs are fixtures: a transpile directory of symlinks (the shape a
 # sandboxed action's inputs actually have) must stage as real files, an empty
-# version file must be rejected naming the file, and the copied component must
-# land writable, because the emitter runs over the staged tree.
+# version file must be rejected naming the file, a kind that is not the fold of
+# the specification's class must be rejected naming both, and the copied
+# component must land writable, because the emitter runs over the staged tree.
 set -uo pipefail
 
 stage="$1"
@@ -37,6 +38,18 @@ printf ']}\n' >> "$dest/manifest.json"
 STUB
 chmod +x "$emitter"
 
+# The real one parses the specification; this one answers with whatever the
+# fixture puts in a file, which is what lets the mismatch arm be driven without
+# a compiler in the test.
+dsl_cli="$tmp/dsl_cli.sh"
+cat > "$dsl_cli" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = "wire-kind" ] || { echo "unexpected subcommand $1" >&2; exit 1; }
+cat "$(dirname "$2")/wire-kind.txt"
+STUB
+chmod +x "$dsl_cli"
+
 # A transpile directory whose entries are symlinks, nested as jco's output is.
 mkdir -p "$tmp/real/interfaces" "$tmp/transpiled/interfaces"
 printf 'export const mod = 1;\n' > "$tmp/real/demo.js"
@@ -50,10 +63,11 @@ printf '1.4.0' > "$tmp/version.txt"
 # Read-only, like every source input a sandboxed action is handed.
 printf 'component Demo {\n  abi = processor;\n}\n' > "$tmp/demo.brenn"
 chmod a-w "$tmp/demo.brenn"
+printf 'demo' > "$tmp/wire-kind.txt"
 
 out="$tmp/out"
 if ! "$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" "$tmp/demo.brenn" \
-    "$emitter" "$out" > "$tmp/stage.log" 2>&1; then
+    "$emitter" "$dsl_cli" "$out" > "$tmp/stage.log" 2>&1; then
     fail "staging a well-formed transpile failed: $(cat "$tmp/stage.log")"
 fi
 
@@ -97,10 +111,27 @@ fi
 # every manifest.
 : > "$tmp/empty-version.txt"
 if out_text=$("$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/empty-version.txt" \
-    "$tmp/demo.brenn" "$emitter" "$tmp/out_empty" 2>&1); then
+    "$tmp/demo.brenn" "$emitter" "$dsl_cli" "$tmp/out_empty" 2>&1); then
     fail "an empty version file should be rejected, exited 0: $out_text"
 elif ! printf '%s' "$out_text" | grep -qF "empty-version.txt"; then
     fail "the rejection does not name the version file: $out_text"
+fi
+
+# A kind the BUILD author typed that is not the fold of the class name in the
+# specification beside it. Every file would stage, every hash would verify, and
+# the page would ask for a directory that does not exist.
+if out_text=$("$stage" demo-panel "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" \
+    "$tmp/demo.brenn" "$emitter" "$dsl_cli" "$tmp/out_mismatch" 2>&1); then
+    fail "a kind that is not the class's wire kind should be rejected, exited 0: $out_text"
+else
+    for needle in demo-panel demo demo.brenn; do
+        if ! printf '%s' "$out_text" | grep -qF "$needle"; then
+            fail "the kind rejection does not name $needle: $out_text"
+        fi
+    done
+    if [ -e "$tmp/out_mismatch/processor" ]; then
+        fail "a rejected kind staged files anyway"
+    fi
 fi
 
 if [ "$failures" -ne 0 ]; then

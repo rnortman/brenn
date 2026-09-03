@@ -112,6 +112,17 @@ assembly Deskbar(slug: String, driver: Agent) {
         }
     }
 
+    // A surface and a top-level instantiation in one body: placement is the
+    // `new`'s position and nothing else, so one assembly can stamp a page and
+    // the backend instance it talks to.
+    new counter: Reserved {
+        slug = f"{slug}-counter";
+        grants = [ports];
+
+        in in <- acks { push_depth = 8; }
+        out out -> relay;
+    }
+
     grant driver subscribe prefix f"brenn:{slug}.";
 }
 

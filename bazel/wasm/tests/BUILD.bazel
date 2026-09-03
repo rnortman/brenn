@@ -6,6 +6,7 @@ rejected.
 """
 
 load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "config_fit_test")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 
 policy_srcs()
@@ -89,6 +90,28 @@ native_test(
     target_compatible_with = HOST_ONLY,
 )
 
+# The staging script, over fixture trees. `component_bundle` runs it once per
+# build over inputs that are correct, and the one in-tree call passes packages
+# and no surface kinds — so the surface arm and every refusal would otherwise
+# first run in a consumer's repository.
+native_test(
+    name = "bundle_assemble_test",
+    size = "small",
+    src = "bundle_assemble_test.sh",
+    args = [
+        "$(rootpath //bazel/wasm:manifest_names.sh)",
+        "$(rootpath //bazel/wasm:bundle_assemble.sh)",
+        "$(rootpath //bazel/release:stage_lib.sh)",
+    ],
+    data = [
+        "//bazel/release:stage_lib.sh",
+        "//bazel/wasm:bundle_assemble.sh",
+        "//bazel/wasm:manifest_names.sh",
+    ],
+    out = "bundle_assemble_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
 # The manifest grammar has one implementation and three callers, so its edge
 # cases are asserted here rather than in each gate.
 native_test(
@@ -99,4 +122,40 @@ native_test(
     data = ["//bazel/wasm:manifest_names.sh"],
     out = "manifest_names_test.run",
     target_compatible_with = HOST_ONLY,
+)
+
+# The same document set, driven at the refusal. `config_fit_test` itself has no
+# way to want a failure, so the negative case is a sibling over `dsl_cli check`
+# directly.
+native_test(
+    name = "config_fit_refusal_test",
+    size = "small",
+    src = "config_fit_refusal_test.sh",
+    args = [
+        "$(rootpath //brenn-dsl:dsl_cli)",
+        "$(rootpath fit/misfit.brenn)",
+        "$(rootpath fit/mods-one/base.brenn)",
+        "$(rootpath fit/mods-two/widget.brenn)",
+    ],
+    data = [
+        "fit/misfit.brenn",
+        "fit/mods-one/base.brenn",
+        "fit/mods-two/widget.brenn",
+        "//brenn-dsl:dsl_cli",
+    ],
+    out = "config_fit_refusal_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# The fit gate over a document whose vocabulary arrives from two module roots
+# and one sibling. The macro derives a `--modules` per distinct directory, so
+# this is also what holds that derivation to two.
+config_fit_test(
+    name = "config_fit_test",
+    config = "fit/root.brenn",
+    modules = [
+        "fit/mods-one/base.brenn",
+        "fit/mods-two/widget.brenn",
+    ],
+    tree = ["fit/shared.brenn"],
 )

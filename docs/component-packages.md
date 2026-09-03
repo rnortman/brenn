@@ -30,6 +30,54 @@ The package closes that window by making the author's specification travel with
 the artifact, and by making the host check that the specification the
 configuration used is byte-for-byte the one the component was built with.
 
+## Contract evolution
+
+Two kinds of contract come out of this repository, and they evolve under
+different rules because they are consumed at different times.
+
+**Runtime contracts are additive.** These are what a running host reads from a
+bundle built earlier, against a brenn commit the host did not choose. The host
+and the bundle are installed by different releases, so a cut in one of these is
+a boot refusal on somebody else's machine:
+
+- the WIT packages `brenn:processor` and `brenn:replay` — a new capability is a
+  new interface, and no existing shape moves;
+- the **backend package record** (`package.json`, below) — `v` is the whole
+  story, and a bump re-releases every bundle;
+- the **surface record** `processor/<kind>/manifest.json` v2 and the served
+  layout `processor/<kind>/{<kind>.js, <kind>.component.wasm,
+  <kind>.spec.brenn, manifest.json, …}`;
+- the grant-word set and the import→capability mapping both hosts reconcile
+  (`capability_for_import`, `SURFACE_IMPORTS`);
+- the **packaged-module subset of the DSL** — `component` classes, `assembly`,
+  `const`, `use @` — because the host's compiler reads a bundle's
+  `modules/<name>.brenn` at boot.
+
+A new class attribute arrives with a default, a new grant word is a new WIT
+interface, a new record field is a `v` bump, and no existing vocabulary in that
+subset changes meaning. Breaking one of these is a deliberate coordinated
+event: every bundle is re-released against the new brenn before brenn's pin
+moves, and the design that makes the cut says so.
+
+**Build-time contracts are hard-cut, at the pin.** These are consumed against a
+commit the consumer names in its own `git_override`: the macros in
+`bazel/wasm/defs.bzl` and `bazel/surface/dist.bzl`, `brenn-guest`'s Rust API,
+the scaffold's generated module shape, `surface/page-harness`, `dsl_cli`'s
+subcommands, and the guest alias sets. A cut costs the consumer a migration
+when it next bumps that pin, and nothing before, because nothing that is
+already deployed reads them. `examples/component/` is the canary that a cut is
+complete on brenn's side; a consumer repository's CI at its next pin bump is
+where the cut is paid.
+
+Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
+does not already buy, which is why the two are split rather than held to one
+promise. There is no changelog file: the git history of the files named above
+is the record.
+
+The out-of-tree population that these rules exist for is not hypothetical any
+more — `brenn-component-demo` is a repository outside this one that builds
+components with these macros for both placements, bundles them, and deploys.
+
 ## The package directory
 
 A package is a directory under the host's components root, named by the
@@ -122,12 +170,10 @@ later version may add. They are absent rather than reserved.
 
 ### Compatibility stance
 
-The record is an **external contract**, and the house rule for external
-contracts applies: no compatibility shims, stated up front. `v` is the whole
-story. A version bump is a breaking change; a record written by a newer build is
-refused by an older host rather than partially read, and the reader rejects
-unknown fields for the same reason. Ship the release whose binary and components
-were built together.
+The record is a runtime contract; *Contract evolution* above is the rule it
+evolves under. What is specific to the record: `v` is the whole story, a record
+written by a newer build is refused by an older host rather than partially read,
+and the reader rejects unknown fields for the same reason.
 
 ## What the host checks at boot
 
@@ -283,16 +329,62 @@ holds a `deployed-components.txt` manifest equal to the packages built. The
 specification lives beside the code (the example's `spec/`), and that directory
 is also the module root the author's own fit check reads:
 
+`config_fit_test` compiles a root document against the module roots a host
+would resolve it from, so the author's own configuration is a build target
+rather than a command to remember:
+
 ```
-bazel test //...
-bazel run @brenn//brenn-dsl:dsl_cli -- check --modules spec config/dev.brenn
+config_fit_test(
+    name = "dev_fit",
+    config = "config/dev.brenn",
+    modules = ["//spec:modules", "@brenn//:modules"],
+)
 ```
 
+`bazel test //...` runs all of them.
+
 The docstring of `bazel/wasm/defs.bzl` names every macro that is part of this
-contract and the two that are not, and states the evolution policy the
-contract is under. Until a component repository outside brenn's exists, a
-macro's attributes and outputs may move as a hard cut; the example is the
-canary that such a cut is complete, not the population that ends the regime.
+contract and the three that are not; `bazel/surface/dist.bzl` does the same for
+the surface half. Both are build-time contracts under *Contract evolution*
+above: hard-cut at the pin the consumer names.
+
+### The surface half
+
+A page-hosted component is not a different kind of component. There is no
+`abi = dom`: a UI kind is `abi = processor` with `dom` in its `requires`, built
+by the same `wasm_guest_cdylib` + `wasm_component` pair as a headless one. What
+differs is where the artifact is staged and how the browser loads it, and that
+is one more macro:
+
+```
+surface_processor_assets(
+    name = "demo-panel_assets",
+    kind = "demo-panel",
+    component = "//demo-panel:component",
+    spec = "//spec:demo-panel.brenn",
+)
+```
+
+It transpiles the component with brenn's own pinned jco — the consumer states
+nothing about node or jco, and the version recorded in the emitted record is
+the version of the binary that ran — and emits one directory,
+`processor/<kind>/`, holding the transpiled JS tree, `<kind>.component.wasm`,
+the packaged specification `<kind>.spec.brenn`, and the `manifest.json` that
+binds them. `grant_parity_test` arrives with it, exactly as it does for a
+backend package.
+
+One naming rule is worth stating because it used to be a build-green,
+boot-refusing trap: **the `kind` must be the wire fold of the component class's
+name** — `DemoPanel` → `demo-panel`. The served directory, the directory the
+build stages, and the kind the compiler derives from the class all have to be
+the same string. The staging step asserts it (it asks `dsl_cli wire-kind` for
+the class's fold and fails naming both), so a mismatch is a build failure with
+both names in it rather than a boot refusal about a missing manifest.
+
+`brenn-component-demo` is the worked example beside `examples/component/`: a
+repository outside brenn that ships one headless component, one DOM component,
+two assemblies wiring them, host tests against both hostings, and a browser
+suite — and deploys as a bundle.
 
 ### Without Bazel
 
@@ -304,6 +396,118 @@ install the same specification bytes as `<name>.brenn` in a module root the host
 is started with. If the two copies differ by so much as a comment, the host
 refuses to boot and says so. Nothing on the loading side knows or cares which
 path produced the bytes.
+
+## Building a bundle
+
+A **bundle** is a component repository's release: the tree an installer unpacks
+on a host, described under *Bundles and multiple roots* below. `component_bundle`
+stages it and pairs it with the same kind of contract gate brenn's own tarball
+passes:
+
+```
+component_bundle(
+    name = "bundle",
+    manifest = "deployed-components.txt",
+    packages = [":demo-counter_package"],
+    spec_root = ["//spec:modules"],
+    surface_kinds = [":demo-panel_assets", ":demo-counter_assets"],
+)
+```
+
+At least one of `packages` and `surface_kinds` is required; `manifest` is
+required exactly when `packages` is non-empty, and refused otherwise.
+`spec_root` is required and may be empty. The tree lands under `<name>/`:
+
+- `components/<package>/` per `component_package`, plus the manifest copied as
+  `components/deployed-components.txt` and the `scripts/manifest_names.sh` an
+  installer execs to read it. `packages` must be exactly the manifest's set — a
+  bundle repository has no unshipped packages — and the assembly holds the two
+  equal in both directions.
+- `surface/processor/<kind>/` per `surface_processor_assets`, each staging
+  target's directory copied whole. No kernel and no flat sidecars: exactly one
+  surface root holds the kernel and that one is brenn's.
+- `modules/<name>.brenn`, the packaged specification of every package and every
+  kind, flat. A component shipped for both hostings is staged once and the two
+  copies must be byte-identical or the build fails naming both.
+
+`spec_root` is the repository's **authored** module root — glob it, so the label
+tracks the directory — and the staged `modules/` tree is held set-equal to it,
+byte for byte. That direction is what lets a deployment certify its `use @…;`
+imports against a bundle repository's checkout instead of against a built
+bundle: without it a file authored under that root and shipped by nothing is
+vocabulary a config can import, a config gate accepts, and the host refuses at
+its next boot.
+
+`<name>_contract` is declared beside it: `bundle_check.sh` over the staged tree,
+re-computing every hash, holding every record against the files beside it and
+the module root against both, in both directions. It is the same script
+`package_check.sh` runs over brenn's own tarball — one implementation, two
+callers — so a bundle is held to the tarball's contract and not to a second,
+looser one.
+
+The bundle carries no `VERSION` and no tarball rule. Those are the deploying
+side's: a release pipeline builds the tree from a pinned ref, adds its own
+installer and a `VERSION`, and tars it, the way brenn's own tarball is built.
+
+## Testing a component against the hosts
+
+Both hosts are public, so a component can be driven where it is authored rather
+than only after it is installed.
+
+**Backend.** `brenn_wasm::ProcessorComponent::load(ProcessorLoadSpec { … })` is
+the real host: it instantiates the artifact, links exactly the grants the load
+spec names, and returns a `ProcessorOutcome` naming what the component
+published. The fixtures a load spec needs — `noop_proc_alerter`, `allow_all`,
+`test_out_spec` — are exported from `brenn_wasm_dispatch::tests` behind the
+default-on `testutils` feature. Default-on because a consumer cannot enable a
+feature on a dependency module's Bazel target; nothing a consumer writes turns
+it on or off.
+
+**Page.** `brenn_page_harness::Harness` is the recording page host brenn's own
+DOM kinds are tested against: a fake element tree with a transcript of every
+`create-element`, `set-text`, `append` and `listen` call, publish and park
+records, and recording `alert` and `config` implementations.
+`Harness::new(artifact, page, grants)` links exactly the grants given, so a
+component reaching for a capability its specification does not declare fails to
+instantiate rather than working in a test and refusing at boot.
+
+Both take the artifact as a path, which is what a `rust_test` has to be told:
+
+```
+rust_test(
+    name = "tests",
+    data = ["//demo-counter:component", "//demo-panel:component"],
+    env = {
+        "DEMO_COUNTER_WASM": "$(rootpath //demo-counter:component)",
+        "DEMO_PANEL_WASM": "$(rootpath //demo-panel:component)",
+    },
+    deps = [
+        "@brenn//brenn-envelope",
+        "@brenn//brenn-wasm",
+        "@brenn//brenn-wasm-dispatch",
+        "@brenn//surface/page-harness",
+    ],
+)
+```
+
+read back with `std::env::var`. brenn's own suites walk
+`CARGO_MANIFEST_DIR/../brenn-wasm/target/components/` instead; that convention
+is in-tree only and does not survive the move out, because a consumer crate sits
+wherever its own repository puts it.
+
+The costed part is the compile, not the run: depending on `brenn-wasm` and
+`brenn-wasm-dispatch` pulls wasmtime and sqlite into the consumer's own output
+base. That is the price of testing against the real hosts rather than a mock of
+them, it is paid once per cold cache, and a CI job that does it wants a timeout
+in hours rather than minutes on its first run.
+
+A component that is meant to run at both placements is tested at both, on one
+script, reduced to the one thing both hosts can be compared on: the sequence of
+`(port, body)` pairs it published. The two hosts share no transcript type — one
+returns an outcome, the other records host calls as strings — so each suite
+reduces its own host's output and the two are compared against one constant.
+That is the transplant invariant, at the grain a consumer can hold without a
+shared abstraction.
 
 ## In-tree packaging
 
@@ -383,29 +587,47 @@ releases shipping one module means one of them is stale the moment the other
 updates. The module scan runs when the configuration loads; the package scan
 runs immediately after, before anything is served.
 
-A **bundle** is the release of a component repository — a tree with the same two
-subdirectories brenn's tarball has, `components/<name>/` (the package
-directories, plus `components/deployed-components.txt`) and
-`modules/<name>.brenn` (the same specifications, flat). The repository is the
-store of record; the bundle is what its CI builds from a pinned ref, the way
-brenn's tarball is built from brenn's. The example's `component_install_tree`
-output and its `spec/` directory are exactly those two trees. A bundle installs
-into **its own** components root and module root, exclusively its own in the
-same sense as brenn's, and the service is started with one `--modules` and one
-`--components` more per bundle:
+A **bundle** is the release of a component repository — a tree carrying up to
+three of the subdirectories brenn's tarball has, and only the ones it ships:
+
+| tree | what it holds | installs as |
+|---|---|---|
+| `components/` | one `<name>/` package directory per backend component, plus `components/deployed-components.txt` and the `scripts/manifest_names.sh` an installer execs to read it | one `serve --components` root |
+| `surface/` | `processor/<kind>/` per page-hosted kind — the transpiled tree, the component bytes, the packaged spec, the record binding them | one `serve --surface` root |
+| `modules/` | the authored module of every one of them, flat | one `--modules` root |
+
+No kernel bundle and no flat sidecars: exactly one surface root holds the
+kernel, and that one is brenn's. Every `--surface` root must offer one or the
+other — the kernel pair, or at least one `processor/<kind>/` — so a flag pointed
+one directory off (a bundle's install root rather than its `surface/` tree) is
+refused at that boot instead of at the later one that first stamps the kind.
+
+`modules/` is always present and is empty when the bundle owes it nothing: a
+replay-world package ships no specification, so a bundle whose packages are all
+replay-world is imported by no configuration and named instead by a
+`replay_protection` block's `component =`.
+
+The repository is the store of record; the bundle is what its CI builds from a
+pinned ref, the way brenn's tarball is built from brenn's. `component_bundle`
+stages it and pairs it with the same contract gate brenn's own tarball passes,
+so a record that does not bind the bytes beside it fails the bundle's build
+rather than the target host's next boot. A bundle installs into roots of **its
+own**, one per tree it ships, exclusively its own in the same sense as brenn's,
+and the service is started with one flag more per root:
 
 ```
 brenn --config prod.brenn --modules /srv/brenn/modules --modules /srv/caser/modules \
-  serve --components /srv/brenn/lib --components /srv/caser/components
+  serve --components /srv/brenn/lib --components /srv/caser/components \
+  --surface /srv/brenn/surface --surface /srv/caser/surface
 ```
 
-The exclusivity rule brenn's installer checks among its own six install
-directories extends to bundle roots by statement rather than by check — brenn's
-installer cannot see directories its configuration does not name. A bundle root
-placed inside one of brenn's sync directories is deleted by brenn's next
-deploy, and the service then fails to start with the existing "not an installed
-package directory" refusal naming the missing package and every root searched.
-Give each bundle directories of its own. A bundle whose package name collides
+The exclusivity rule brenn's installer checks among its own install directories
+covers bundle roots too: the deploying side names the directory bundles install
+under alongside brenn's own, and refuses a layout in which one equals or nests
+inside another. Without that, a bundle root placed inside one of brenn's sync
+directories is deleted by brenn's next deploy, and the service then fails to
+start with the "not an installed package directory" refusal naming the missing
+package and every root searched. Give each bundle directories of its own. A bundle whose package name collides
 with a brenn package is refused at boot as a cross-root duplicate; the name is
 the author's to change.
 
@@ -413,6 +635,31 @@ One shared root with per-release ownership manifests was considered and
 rejected: two bundles shipping one package name would overwrite each other
 silently, and a single root has no second copy for the host to compare. Multiple
 roots give the host the collision, and it refuses.
+
+### What a deployment still copies by hand
+
+Two pieces of brenn's own vocabulary reach a deployment by transcription rather
+than by import, and both drift silently.
+
+The **self-description assemblies** — `SurfaceDescription(slug)` and
+`KindDescription(kind)`, with the `surface_errors` and `surface_index` channels
+they publish on — are declared in brenn's config tree
+(`config/surfaces.brenn`), not in a packaged module, so a bundle cannot
+`use @` them. Every deployment that serves a surface must stamp one
+`SurfaceDescription` per slug and one `KindDescription` per kind or boot panics,
+and the only way to get the definitions is to copy the file. The addresses, the
+depths and the channel set are brenn's: when they change, every copy is stale
+and the failure is a boot panic on the next restart. Nothing compares a copy
+with its original. `TODO(surface-description-vocabulary-packaged)`.
+
+The **chrome wiring** is the same shape. A surface must hold exactly one chrome,
+and the block that wires its four reserved `local:brenn/*` control planes plus
+`io toast-tick` is written out per page. An unrecognised reserved name is
+refused; a *missing* plane is not, so a page whose chrome omits one boots and
+goes quiet. `TODO(standard-chrome-vocabulary)`.
+
+Until both are packaged vocabulary, a bundle repository's `config/` is a copy
+with a shelf life, and the pin bump that updates brenn is when it is re-copied.
 
 ## Surface packages
 
@@ -437,19 +684,19 @@ kind; at most one of those copies is the bytes the tree was built from, and the
 one that is not now refuses at boot. The surface kernel is exempt: it is not a
 component, so it has no kind, no class and no specification to bind.
 
-In-tree, the records are emitted by the build: `surface_processor_assets` names
-the spec at its call site. `package_check.sh`
+The records are emitted by the build, in tree and out of it alike:
+`surface_processor_assets` names the spec at its call site. `package_check.sh`
 re-verifies every surface record over the staged release tree, and the deploy
 installs the asset tree as a whole rather than overlaying it, so no file from a
 prior release survives beside a fresh record.
 
-**These shapes are in-tree contracts, not external ones.** There is no
-out-of-tree surface authoring path today, and claiming a contract nobody can
-consume would freeze a shape that still needs room to move as surface
-components migrate out of tree. The version counters are in place for the day
-that status is granted deliberately. The backend package above is an external
-contract and is stated as one; this asymmetry is deliberate, not an oversight.
-The authoring paths are asymmetric for the same reasons: a backend component is
-built out of tree by depending on brenn's module (*Authoring an out-of-tree
-component*), while a surface kind's jco transpile and served-tree layout are
-still brenn's build alone.
+**These shapes are external contracts**, granted that status deliberately now
+that there is an out-of-tree surface authoring path to consume them
+(*Authoring an out-of-tree component*, the surface half). The record and the
+served layout are runtime contracts under *Contract evolution*: a host reads
+them out of a bundle built against a brenn commit it did not choose, so a new
+field is a `v` bump and the layout below `processor/<kind>/` does not move.
+Both records — the backend package's and this one — are now external and
+versioned; the asymmetry that used to be stated here is gone, and the two
+carriers remain two only because a surface kind is a directory and a backend
+component is a file.

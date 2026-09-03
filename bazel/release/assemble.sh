@@ -2,13 +2,15 @@
 # Stage the deploy tarball's directory tree.
 #
 # Usage: assemble.sh --out DIR --manifest FILE --names FILE --record-lib FILE
-#                    --frontend DIR --surface DIR
+#                    --stage-lib FILE --frontend DIR --surface DIR
 #                    [--bin FILE]... [--lib FILE]...
-#                    [--package FILE]... [--module FILE]...
+#                    [--package FILE]...
 #
 # `--names` is `manifest_names.sh`, which states the manifest's grammar for
 # every reader of it; `--record-lib` is `record_lib.sh`, which states how a
-# binding record's fields are read.
+# binding record's fields are read; `--stage-lib` is `stage_lib.sh`, the
+# staging body this script and `bazel/wasm/bundle_assemble.sh` share, so a
+# packaging rule holds for brenn's own tarball and for a component bundle alike.
 #
 # The layout is the one `deploy.sh` unpacks and reads: `bin/` for the two host
 # binaries, `frontend/` and `surface/` for the served asset trees, `lib/` for
@@ -21,11 +23,11 @@
 #
 # `modules/` is what a deployment's `use @<name>::…` imports resolve against:
 # one file per component, named `<name>.brenn` for the wire kind, which is the
-# authored basename. The backend half arrives as `--module` arguments; the
-# surface half is harvested out of the staged surface tree, whose per-kind
-# directories already carry each kind's packaged copy. Harvesting
-# rather than listing keeps the staged set equal to the shipped set by
-# construction.
+# authored basename. Both halves are harvested rather than listed — the backend
+# one off each staged package directory, the surface one off the staged surface
+# tree, whose per-kind directories already carry each kind's packaged copy — so
+# the staged set equals the shipped set by construction and there is no second
+# list of the same files to keep in step.
 #
 # A shipped component is a package directory named for the component, holding
 # the artifact, its `package.json` binding record, and, for a processor-world
@@ -50,12 +52,12 @@ out=""
 manifest=""
 names=""
 record_lib=""
+stage_lib=""
 frontend=""
 surface=""
 bins=()
 libs=()
 packages=()
-modules=()
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -67,8 +69,8 @@ while [ "$#" -gt 0 ]; do
         --bin) bins+=("$2"); shift 2 ;;
         --lib) libs+=("$2"); shift 2 ;;
         --package) packages+=("$2"); shift 2 ;;
-        --module) modules+=("$2"); shift 2 ;;
         --record-lib) record_lib="$2"; shift 2 ;;
+        --stage-lib) stage_lib="$2"; shift 2 ;;
         *) echo "ERROR: unrecognized argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -79,14 +81,20 @@ for required in out manifest names frontend surface; do
         exit 2
     fi
 done
-# Named apart from the loop above: its flag spells the underscore as a hyphen.
+# Named apart from the loop above: their flags spell the underscore as a hyphen.
 if [ -z "$record_lib" ]; then
     echo "ERROR: --record-lib is required" >&2
+    exit 2
+fi
+if [ -z "$stage_lib" ]; then
+    echo "ERROR: --stage-lib is required" >&2
     exit 2
 fi
 
 # shellcheck source=/dev/null
 . "$record_lib"
+# shellcheck source=/dev/null
+. "$stage_lib"
 
 if [ "${#bins[@]}" -eq 0 ]; then
     echo "ERROR: no --bin given; a package with no binaries deploys nothing" >&2
@@ -123,54 +131,21 @@ for lib in "${libs[@]}"; do
     cp -L "$lib" "$out/lib/$(basename "$lib")"
 done
 
-# Shipped beside the packages it names so the deploy step can resolve them.
-cp -L "$manifest" "$out/components/deployed-components.txt"
+# Shipped beside the packages it names so the deploy step can resolve them, and
+# with the grammar that reads it.
+stage_manifest "$out" "$manifest" "$names"
 
-# The manifest's grammar travels with the manifest. The deploying repo's
-# preflight reads the same file on the target host, and a transcription of the
-# grammar there is one that goes stale the release the format grows an
-# annotation; execing this copy is what keeps the readers at one.
-cp -L "$names" "$out/scripts/manifest_names.sh"
-chmod +x "$out/scripts/manifest_names.sh"
-
-# Package name → the files of its directory, so a manifest entry resolves a
-# whole package by the name it states. The build declares each package's files
-# under `<something>/<name>/`, so the parent directory's basename is the name.
-declare -A pkg_files=()
-declare -A pkg_dir=()
-for file in "${packages[@]}"; do
-    dir="$(dirname "$file")"
-    name="$(basename "$dir")"
-    if [ -n "${pkg_dir[$name]:-}" ] && [ "${pkg_dir[$name]}" != "$dir" ]; then
-        echo "ERROR: two package directories are named $name: ${pkg_dir[$name]} and $dir" >&2
-        exit 1
-    fi
-    pkg_dir["$name"]="$dir"
-    pkg_files["$name"]="${pkg_files[$name]:-}$file"$'\n'
-done
+stage_associate_packages "${packages[@]}"
 
 shipped=0
 listed="$("$names" "$manifest")"
 while read -r line; do
     [ -n "$line" ] || continue
-    if [ -z "${pkg_dir[$line]:-}" ]; then
+    if [ -z "${STAGE_PKG_DIR[$line]:-}" ]; then
         echo "ERROR: $manifest lists $line, which no component_package target packages" >&2
         exit 1
     fi
-    dest="$out/components/$line"
-    mkdir -p "$dest"
-    while read -r file; do
-        [ -n "$file" ] || continue
-        cp -L "$file" "$dest/$(basename "$file")"
-    done <<< "${pkg_files[$line]}"
-
-    # The record is mandatory: without it the package is unresolvable, so a
-    # tarball missing one deploys a host that panics on the component it was
-    # built to ship.
-    if [ ! -f "$dest/package.json" ]; then
-        echo "ERROR: $manifest lists $line, whose package holds no package.json" >&2
-        exit 1
-    fi
+    stage_package "$out" "$line"
     shipped=$((shipped + 1))
 done <<< "$listed"
 
@@ -185,31 +160,5 @@ fi
 # The module root
 # ---------------------------------------------------------------------------
 
-# One name per staged module, so the flat root cannot hold two files claiming
-# one import. A backend component and a surface kind sharing a name would be the
-# same authored file, and staging it twice is a decision to make deliberately
-# rather than to resolve by copy order.
-stage_module() {
-    local src="$1" name="$2"
-    if [ -e "$out/modules/$name" ]; then
-        echo "ERROR: two components stage the module $name; a module root is flat" >&2
-        exit 1
-    fi
-    cp -L "$src" "$out/modules/$name"
-}
-
-for module in "${modules[@]}"; do
-    stage_module "$module" "$(basename "$module")"
-done
-
-# The surface half, read off the staged tree: a kind's record is
-# directory-keyed, and its packaged copy sits beside it under the kind itself.
-for kind_dir in "$out"/surface/processor/*/; do
-    [ -f "$kind_dir/manifest.json" ] || continue
-    kind="$(basename "$kind_dir")"
-    if [ ! -f "$kind_dir/$kind.spec.brenn" ]; then
-        echo "ERROR: surface processor kind $kind ships no packaged module" >&2
-        exit 1
-    fi
-    stage_module "$kind_dir/$kind.spec.brenn" "$kind.brenn"
-done
+stage_harvest_surface_modules "$out"
+stage_assert_modules_owed "$out"

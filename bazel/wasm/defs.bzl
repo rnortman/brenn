@@ -21,22 +21,29 @@ are an external API with the same standing as the WIT worlds under
 
   `wasm_guest_library`, `wasm_guest_cdylib`, `wit_bindgen_rust`,
   `shared_guest_bindings`, `guest_spec_scaffold`, `wasm_component`,
-  `component_package`, `component_install_tree`, `grant_parity_test`,
-  `deployed_components_test`.
+  `component_package`, `component_install_tree`, `component_bundle`,
+  `grant_parity_test`, `deployed_components_test`, `config_fit_test`.
 
-Two are not: `component_fixtures`, whose output path is only correct when
-declared from `//brenn-wasm`, and `wasm32_build`, a reacher for wasm32-only
-libraries inside this tree's own `bazel build //...`. An out-of-tree caller of
-either is on its own.
+Three are not: `component_fixtures`, whose output path is only correct when
+declared from `//brenn-wasm`; `wasm32_build`, a reacher for wasm32-only
+libraries inside this tree's own `bazel build //...`; and `wit_root`, which
+stages a WIT package for a host crate's `bindgen!` and is this tree's own
+plumbing — a consumer depends on such a crate, it never declares one. An
+out-of-tree caller of any of the three is on its own.
 
-Evolution policy, in two regimes, the same two `brenn-wasm/wit/processor.wit`
-states. Once an out-of-tree population exists, a public macro's attributes and
-outputs move only additively: a new fact is a new attribute with a default, and
-no existing attribute or output changes meaning. Until one exists, the macros
-are in-tree vocabulary and a shape change is a hard cut updated everywhere at
-once, with no compat shim. `examples/component/` is the compatibility canary
-for the hard-cut regime — a consumer built in this repository's own CI — and is
-not itself the out-of-tree population that ends it.
+Evolution policy: these macros are a **build-time** contract, and build-time
+contracts are hard-cut. A consumer loads them from the commit it names in its
+own `git_override`, so an attribute or output that moves costs that consumer a
+migration when it next bumps the pin, and nothing before — nothing already
+deployed reads a macro. `examples/component/` is the canary that a cut is
+complete on this side, and `brenn-component-demo` is where it is paid.
+
+That is not the rule the *runtime* contracts are under: what a running host
+reads out of a bundle built earlier — the WIT worlds, the two records, the
+served surface layout, the packaged-module subset of the DSL — moves only
+additively, because the host and the bundle are installed by different
+releases. Both rules are stated in one place, `docs/component-packages.md`,
+*Contract evolution*.
 
 Label anchoring: a string that names a target inside a macro body resolves
 against the *caller's* package and repository mapping, so from another module
@@ -625,6 +632,208 @@ def component_install_tree(name, packages, visibility = None):
     )
 
 # ---------------------------------------------------------------------------
+# The release of a component repository
+# ---------------------------------------------------------------------------
+
+def _sole_stage_directory(target):
+    """The single directory a surface staging target produces."""
+    files = target[DefaultInfo].files.to_list()
+    if len(files) != 1 or not files[0].is_directory:
+        fail("%s must produce exactly one directory, got %s" % (target.label, files))
+    return files[0]
+
+def _component_bundle_impl(ctx):
+    out = ctx.actions.declare_directory(ctx.label.name)
+
+    args = ctx.actions.args()
+    args.add("--out", out.path)
+    args.add("--names", ctx.file._names)
+    args.add("--stage-lib", ctx.file._stage_lib)
+    inputs = []
+
+    seen = {}
+    for target in ctx.attr.packages:
+        info = target[ComponentPackageInfo]
+        if info.package in seen:
+            fail("two targets package the name %s; a components root holds one directory per package" % info.package)
+        seen[info.package] = True
+        files = info.files.to_list()
+        args.add_all(files, before_each = "--package")
+        inputs.extend(files)
+
+    if ctx.attr.packages:
+        args.add("--manifest", ctx.file.manifest)
+        inputs.append(ctx.file.manifest)
+
+    stages = [_sole_stage_directory(t) for t in ctx.attr.surface_kinds]
+
+    # Without this each stage would arrive as its expanded file list, and the
+    # assembly would be handed files where it expects directories.
+    args.add_all(stages, before_each = "--surface-stage", expand_directories = False)
+    inputs.extend(stages)
+
+    specs = ctx.files.spec_root
+    args.add_all(specs, before_each = "--spec")
+    inputs.extend(specs)
+
+    ctx.actions.run(
+        outputs = [out],
+        inputs = depset(inputs),
+        executable = ctx.file._assemble,
+        tools = [ctx.file._names, ctx.file._stage_lib],
+        arguments = [args],
+        mnemonic = "ComponentBundle",
+        progress_message = "Staging the component bundle at %s" % out.short_path,
+    )
+    return [DefaultInfo(
+        files = depset([out]),
+        runfiles = ctx.runfiles(files = [out]),
+    )]
+
+_component_bundle = rule(
+    implementation = _component_bundle_impl,
+    doc = """The unpacked shape of a component repository's release tarball.
+
+    Up to three of the subdirectories brenn's own tarball carries, and each
+    installs into a root of its own beside brenn's: `components/` with the
+    manifest naming its packages, `surface/` with one transpiled tree per
+    page-hosted kind, and `modules/` with the authored module of every one of
+    them. `VERSION` and the install script are deliberately absent, as they are
+    from brenn's: both are the deploying repo's, added beside its `tar`.
+    """,
+    attrs = {
+        "manifest": attr.label(
+            allow_single_file = True,
+            doc = "The manifest naming the backend packages that ship.",
+        ),
+        "packages": attr.label_list(
+            providers = [ComponentPackageInfo],
+            doc = "The `component_package` targets to stage under `components/`.",
+        ),
+        "spec_root": attr.label_list(
+            allow_files = [".brenn"],
+            doc = "The authored module root, held set-equal to the staged `modules/`.",
+        ),
+        "surface_kinds": attr.label_list(
+            doc = "The `surface_processor_assets` targets to stage under `surface/`.",
+        ),
+        "_assemble": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:bundle_assemble.sh"),
+        ),
+        "_names": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:manifest_names.sh"),
+        ),
+        "_stage_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/release:stage_lib.sh"),
+        ),
+    },
+)
+
+def _bundle_contract_test_impl(ctx):
+    tree = _sole_stage_directory(ctx.attr.bundle)
+    check = ctx.file._check
+    names = ctx.file._names
+    record_lib = ctx.file._record_lib
+
+    args = [names.short_path, record_lib.short_path, tree.short_path]
+    files = [tree, check, names, record_lib]
+    if ctx.file.manifest:
+        args += ["--manifest", ctx.file.manifest.short_path]
+        files.append(ctx.file.manifest)
+
+    return [DefaultInfo(
+        executable = _check_wrapper(ctx, check, args),
+        runfiles = ctx.runfiles(files = files),
+    )]
+
+_bundle_contract_test = rule(
+    implementation = _bundle_contract_test_impl,
+    doc = """Hold a staged bundle to the records inside it.
+
+    The same script brenn's own release tree is held to, over the same three
+    trees: a rule tightened for one is tightened for both, and a bundle that
+    passes here is one an installer can copy directory by directory.
+    """,
+    attrs = {
+        "bundle": attr.label(
+            mandatory = True,
+            doc = "The `component_bundle` target to check.",
+        ),
+        "manifest": attr.label(
+            allow_single_file = True,
+            doc = "The manifest the staged copy is compared against.",
+        ),
+        "_check": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/release:bundle_check.sh"),
+        ),
+        "_names": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:manifest_names.sh"),
+        ),
+        "_record_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:record_lib.sh"),
+        ),
+    },
+    test = True,
+)
+
+def component_bundle(name, spec_root = None, packages = [], surface_kinds = [], manifest = None, visibility = None):
+    """A component repository's release tree, plus the gate on its contract.
+
+    Pairing them here makes the gate structural, as `release_package` does for
+    brenn's own tarball: the tree cannot be added to a graph without the check
+    that every record in it binds the bytes beside it.
+
+    Args:
+        name: target name; also the staging directory's name.
+        spec_root: the authored `.brenn` files of this repository's module root —
+            a `glob` of it, so the label tracks the directory. The staged
+            `modules/` tree is held set-equal to this, byte for byte. Required,
+            possibly empty: a deployment's config gate certifies `use @…;`
+            imports against the authored root rather than against a built
+            bundle, and this is the only thing that makes the two the same set.
+        packages: the `component_package` targets to stage under `components/`.
+            Exactly the manifest's set — a bundle repository has no unshipped
+            packages, so the assembly holds the two equal in both directions.
+        surface_kinds: the `surface_processor_assets` targets whose transpiled
+            trees stage under `surface/`.
+        manifest: the manifest naming the shipped packages; required iff
+            `packages` is non-empty, and refused otherwise.
+        visibility: visibility of the staged tree.
+    """
+    if spec_root == None:
+        fail("component_bundle(%s) states no spec_root; name the authored module root, even if it is empty" % name)
+    if not packages and not surface_kinds:
+        fail("component_bundle(%s) stages neither packages nor surface kinds, so it ships nothing" % name)
+    if packages and not manifest:
+        fail("component_bundle(%s) stages packages, so it needs the manifest that names them" % name)
+    if manifest and not packages:
+        fail("component_bundle(%s) names a manifest but stages no packages" % name)
+
+    _component_bundle(
+        name = name,
+        manifest = manifest,
+        packages = packages,
+        spec_root = spec_root,
+        surface_kinds = surface_kinds,
+        target_compatible_with = HOST_ONLY,
+        visibility = visibility,
+    )
+
+    _bundle_contract_test(
+        name = name + "_contract",
+        bundle = ":" + name,
+        manifest = manifest,
+        size = "small",
+        target_compatible_with = HOST_ONLY,
+    )
+
+# ---------------------------------------------------------------------------
 # Host-side fixtures
 # ---------------------------------------------------------------------------
 
@@ -877,3 +1086,139 @@ def deployed_components_test(name, manifest, packages):
         size = "small",
         target_compatible_with = HOST_ONLY,
     )
+
+def _module_root(file):
+    """The directory holding `file`, as the test's runfiles tree names it.
+
+    A file at the workspace root has no directory segment, and `--modules ""` is
+    a refusal about an unreadable directory rather than about where modules may
+    live, so that case is named `.` — the smallest layout a consumer can have is
+    one spec beside its `BUILD.bazel`.
+    """
+    root = file.short_path[:-(len(file.basename) + 1)]
+    return root if root else "."
+
+def _config_fit_test_impl(ctx):
+    dsl_cli = ctx.executable._dsl_cli
+    roots = []
+    for module in ctx.files.modules:
+        root = _module_root(module)
+        if root not in roots:
+            roots.append(root)
+    if not roots:
+        fail("`modules` names no `.brenn` file, so there is no module root to check against")
+    args = ["check"]
+    for root in sorted(roots):
+        args.append("--modules")
+        args.append(root)
+    args.append(ctx.file.config.short_path)
+    script = _check_wrapper(ctx, dsl_cli, args)
+    return [DefaultInfo(
+        executable = script,
+        runfiles = ctx.runfiles(
+            files = [ctx.file.config, dsl_cli] + ctx.files.modules + ctx.files.tree,
+        ).merge(ctx.attr._dsl_cli[DefaultInfo].default_runfiles),
+    )]
+
+_config_fit_test = rule(
+    implementation = _config_fit_test_impl,
+    doc = """Compile one root document against the module roots a deployment gives it.
+
+    The fit an author cannot check by building components: whether the document
+    that stamps them resolves, whether every binding's doctypes propagate, and
+    whether the vocabulary it imports is the vocabulary the module roots
+    actually carry. Everything else in the gate set holds a component against
+    its own specification; this holds a deployment against the set of them.
+
+    The module roots are derived rather than declared: a `--modules` per
+    distinct directory of the files named, which is the same rule a host is
+    started with and the same one an installer's roots satisfy.
+    """,
+    attrs = {
+        "config": attr.label(
+            allow_single_file = [".brenn"],
+            mandatory = True,
+            doc = "The root document. Its directory is where `use` resolves from.",
+        ),
+        "modules": attr.label_list(
+            allow_files = [".brenn"],
+            mandatory = True,
+            doc = "The packaged modules `use @<name>::…` resolves against, as " +
+                  "files or filegroups of them. One `--modules` per distinct " +
+                  "directory among them.",
+        ),
+        "tree": attr.label_list(
+            allow_files = [".brenn"],
+            default = [],
+            doc = "The rest of the config tree the root imports with a plain " +
+                  "`use`, which resolves against the root's own directory " +
+                  "rather than against a module root.",
+        ),
+        "_dsl_cli": attr.label(
+            cfg = "exec",
+            default = Label("//brenn-dsl:dsl_cli"),
+            executable = True,
+        ),
+    },
+    test = True,
+)
+
+def config_fit_test(name, config, modules, tree = []):
+    """See `_config_fit_test`.
+
+    Args:
+        name: target name.
+        config: the root `.brenn` document.
+        modules: the packaged modules it imports, as files or filegroups.
+        tree: the root's own sibling documents, when it imports any.
+    """
+    _config_fit_test(
+        name = name,
+        config = config,
+        modules = modules,
+        tree = tree,
+        size = "small",
+        target_compatible_with = HOST_ONLY,
+    )
+
+
+# ---------------------------------------------------------------------------
+# WIT staged as a directory, for a host crate's `bindgen!`
+# ---------------------------------------------------------------------------
+
+def _wit_root_impl(ctx):
+    out = ctx.actions.declare_directory(ctx.label.name)
+    args = ctx.actions.args()
+    args.add(out.path)
+    args.add_all(ctx.files.srcs)
+    ctx.actions.run_shell(
+        outputs = [out],
+        inputs = ctx.files.srcs,
+        arguments = [args],
+        command = 'dest="$1"; shift; mkdir -p "$dest"; for src in "$@"; do cp "$src" "$dest/"; done',
+        mnemonic = "WitRoot",
+        progress_message = "Staging the WIT package for %s" % ctx.label,
+    )
+    return [DefaultInfo(files = depset([out]))]
+
+wit_root = rule(
+    implementation = _wit_root_impl,
+    doc = """The WIT files of one package, staged flat into a declared directory.
+
+    `wasmtime::component::bindgen!` resolves its `path` against
+    `CARGO_MANIFEST_DIR` and then canonicalizes, so the env var has to name a
+    real directory holding the world. A literal workspace-relative value is only
+    right in this repository's own execroot: from a consumer module brenn's
+    packages sit under `external/<canonical>/`, and a host crate a consumer
+    tests against would look for the WIT where nothing is. The directory this
+    declares is reached with `$(execpath)`, which carries that prefix wherever
+    the crate is built from.
+    """,
+    attrs = {
+        "srcs": attr.label_list(
+            allow_files = [".wit"],
+            mandatory = True,
+            doc = "The package's `.wit` files, staged by basename.",
+        ),
+    },
+)

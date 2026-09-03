@@ -734,7 +734,21 @@ pub const HELP_SIDECAR_HEADER: &str =
 /// is the unit and this names only its entry point. The single home for the
 /// layout the transpile rule writes and the page manifest reads.
 pub fn processor_module_path(kind: &str) -> String {
-    format!("processor/{kind}/{kind}.js")
+    format!("{PROCESSOR_DIR}/{kind}/{kind}.js")
+}
+
+/// The one directory every transpiled kind is staged under, in the served tree
+/// and in every installed surface root alike.
+pub const PROCESSOR_DIR: &str = "processor";
+
+/// The kind a `processor/<kind>/…` path names, or `None` for a path that is not
+/// under [`PROCESSOR_DIR`] at all.
+///
+/// `path` is root-relative and carries no leading slash.
+pub fn processor_kind_from_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix(PROCESSOR_DIR)?.strip_prefix('/')?;
+    let kind = rest.split('/').next()?;
+    (!kind.is_empty()).then_some(kind)
 }
 
 /// The `brenn_<kind with - → _>` stem a kind's documentation sidecars ship
@@ -772,6 +786,25 @@ pub fn is_valid_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processor_path_round_trips() {
+        let path = processor_module_path("mode-clock");
+        assert_eq!(path, "processor/mode-clock/mode-clock.js");
+        assert_eq!(processor_kind_from_path(&path), Some("mode-clock"));
+        assert_eq!(
+            processor_kind_from_path("processor/echo-stub"),
+            Some("echo-stub")
+        );
+        assert_eq!(
+            processor_kind_from_path("processor/echo-stub/"),
+            Some("echo-stub")
+        );
+        assert_eq!(processor_kind_from_path("processor/"), None);
+        assert_eq!(processor_kind_from_path("processor"), None);
+        assert_eq!(processor_kind_from_path("brenn_surface_kernel.js"), None);
+        assert_eq!(processor_kind_from_path("processors/x/y"), None);
+    }
 
     #[test]
     fn event_names_frozen() {
