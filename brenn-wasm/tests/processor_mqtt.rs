@@ -398,6 +398,23 @@ fn recording_callback(
     (callback, seen)
 }
 
+/// A callback whose outcome is read from a shared cell at call time, so one loaded
+/// component can be driven through several outcomes.
+///
+/// `ProcessorComponent::load` cranelift-compiles the guest, which dominates the runtime of
+/// this suite; a loop that varies only the outcome must not pay for it per iteration.
+fn switchable_callback() -> (MqttPublishFn, Arc<std::sync::Mutex<MqttPublishOutcome>>) {
+    let cell = Arc::new(std::sync::Mutex::new(MqttPublishOutcome::Ok));
+    let cell_cb = Arc::clone(&cell);
+    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _ct, _qos, _retain| {
+        cell_cb
+            .lock()
+            .expect("the switchable callback's lock is never poisoned")
+            .clone()
+    });
+    (callback, cell)
+}
+
 /// `mqtt::publish_json` sends `application/json` and a body that parses back to
 /// the value the guest handed it.
 ///
@@ -462,6 +479,9 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
 /// disconnect is retryable, and this walks the whole variant set to say so.
 #[test]
 fn the_sdk_classifies_and_renders_every_publish_failure() {
+    let (callback, outcome_cell) = switchable_callback();
+    let comp = load_mqtt_test(callback);
+
     for (outcome, expected) in [
         (
             MqttPublishOutcome::NotPermitted,
@@ -484,8 +504,9 @@ fn the_sdk_classifies_and_renders_every_publish_failure() {
             "transient=true mqtt publish test-client/test/topic: broker: disconnected",
         ),
     ] {
-        let (callback, _seen) = recording_callback(outcome.clone());
-        let comp = load_mqtt_test(callback);
+        *outcome_cell
+            .lock()
+            .expect("the switchable callback's lock is never poisoned") = outcome.clone();
 
         let result = comp.handle(activation_with_body("CLASSIFY"));
 

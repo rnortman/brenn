@@ -2647,3 +2647,70 @@ Code site (`TODO(config-fit-test-lowers)`): `bazel/wasm/defs.bzl`, at
 Done = a lowering-only refusal in a fixture root fails the fit gate in CI, or
 the entry records the argument for leaving lowering to `config-check` and the
 gate's docstring says so.
+
+## `replay-epoch-host-io`
+
+The replay world's wall budget (`REPLAY_EPOCH_DEADLINE_TICKS`, ≈ 30 s) has to be
+sized for honest host I/O, not just guest misbehavior. A wasmtime epoch deadline
+is wall clock across the whole guest call, including the time the guest is parked
+in a host import doing SQLite work, so the budget's floor is set by
+`store::KV_BUSY_TIMEOUT_MS` (5 s) plus a starved guest thread — which is why it is
+30 s and not the ~1 s the guest's own measured worst case (69 ms for the most
+expensive single check locally, ~1.5 s extrapolated to the CD runner) would
+want. The
+cost is paid in production: `ReplayComponent::check` runs under the per-endpoint
+mutex, so the budget is also the head-of-line blocking window for every inbound
+webhook on that endpoint, and a wedged guest holds it for the full 30 s.
+
+The two constants are also in latent conflict for whoever tunes them next: raise
+`KV_BUSY_TIMEOUT_MS`, or lower this deadline back toward the guest's own worst
+case, and honest traffic starts trapping — which `check` turns into a panic and
+the webhook route into a 500. The floor itself is now held by a const assert
+(`replay_wall_budget_clears_the_store_lock_wait`), so that edit fails to compile
+rather than shipping; what is still open is the reason the floor exists at all.
+
+Closing it means separating the two budgets: stop the clock the guest is charged
+for while it is inside a host store import (pause or re-arm the epoch deadline
+around the import boundary), so the wall budget can go back to bounding guest
+stalls at something near the guest's own worst case, and store contention is
+bounded by `busy_timeout` alone. Whether wasmtime's epoch API supports that
+cleanly for a synchronous host call, and whether the processor world wants the
+same treatment, is the design question.
+
+Code site (`TODO(replay-epoch-host-io)`): `brenn-wasm/src/lib.rs`, at
+`REPLAY_EPOCH_DEADLINE_TICKS`.
+
+Done = the replay epoch deadline is justified by guest behavior alone and no
+longer has to clear `busy_timeout`, or the entry records why charging host time
+to the guest budget is the right trade and the constant's doc comment says so.
+
+## `wasm-test-wall-time-baselines`
+
+Every `//brenn-wasm` test target is `size = "large"`, so all 20 share one 900s
+ceiling and no suite has a wall-time regression signal any more. The measured
+baselines live in a comment in `brenn-wasm/BUILD.bazel` (median suite ~16s
+locally, heaviest 27.8s), which nothing reads: a suite that gets 10x slower —
+a replay fuel/epoch regression, a fixture rebuilt per test instead of once —
+passes silently until it crosses 900s, which is also the hang-detection latency
+for a 3s suite.
+
+The family sizing itself is not the thing to undo. At the ~21x local-to-runner
+factor this repo has measured, ten of the suites do not fit `medium`/`moderate`,
+so a per-suite `timeout` split buys the signal back by putting the median suite
+one fixture away from a CI timeout.
+
+What is wanted is the baselines as data rather than prose, plus a check that
+reads a suite's reported wall time and fails when it exceeds its baseline by a
+chosen factor. The design questions are where the data lives (a dict in the
+BUILD file consumed by the test rule, or a file a `make check` step reads
+alongside `bazel-testlogs`), what factor is tolerable given that the CD runner's
+own factor varies (~7x observed for `replay_engine`, ~21x assumed), and whether
+it gates or only reports — a gate that flakes on runner load is worse than the
+prose.
+
+Code site (`TODO(wasm-test-wall-time-baselines)`): `brenn-wasm/BUILD.bazel`, at
+the family sizing comment.
+
+Done = a suite that regresses its recorded baseline by the chosen factor fails or
+reports in CI, or the entry records why per-suite wall time is not worth tracking
+and the BUILD comment stops claiming a regression would be noticed.

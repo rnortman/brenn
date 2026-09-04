@@ -16,10 +16,24 @@ use brenn_wasm::{CheckInput, Header, REPLAY_FUEL, ReplayComponent};
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
 
-use common::{artifact_path, replay_artifact};
+use common::{GENEROUS_EPOCH_TICKS, artifact_path, replay_artifact};
 
 fn fault_artifact() -> std::path::PathBuf {
     artifact_path("brenn_replay_fault_test")
+}
+
+/// The `fuel remaining=<n>` value out of a rendered replay trap error.
+///
+/// Panics if the diagnostic is absent — the tests below assert on the number, and a
+/// missing field is the regression they are there to catch.
+fn reported_fuel_remaining(err: &str) -> u64 {
+    let (_, tail) = err.split_once("fuel remaining=").unwrap_or_else(|| {
+        panic!("trap error must carry the `fuel remaining=` diagnostic; got: {err}")
+    });
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|e| panic!("`fuel remaining=` must be a number ({e}); got: {err}"))
 }
 
 fn open_fault() -> (NamedTempFile, ReplayComponent) {
@@ -74,15 +88,14 @@ fn simple_input(client_id: &str, ts_ms: u64, nonce: &str) -> CheckInput {
 /// A fuel-exhausting replay guest traps (outer Err) rather than hanging.
 ///
 /// SPIN with a generous epoch deadline and the production `REPLAY_FUEL`: fuel runs out
-/// first and the guest traps. If the fuel bound were not installed (revert §2.2/§2.4)
-/// this call would never return — the test would hang rather than fail, which is the
-/// exact behavior H1046 fixes. Mirrors `fuel_exhausting_guest_traps_not_panics`
+/// first and the guest traps. Without a fuel bound this call would never return — the
+/// test would hang rather than fail. Mirrors `fuel_exhausting_guest_traps_not_panics`
 /// (`consume_engine.rs:619`).
 #[test]
 fn fuel_exhausting_replay_guest_traps_not_hangs() {
     let (_db, component) = open_fault();
-    // High epoch deadline so the epoch cannot trip before fuel is exhausted.
-    let result = component.check_with_limits(&fault_input("SPIN"), u64::MAX, REPLAY_FUEL);
+    let result =
+        component.check_with_limits(&fault_input("SPIN"), GENEROUS_EPOCH_TICKS, REPLAY_FUEL);
     assert!(
         result.is_err(),
         "fuel-exhausting SPIN must trap (outer Err), got Ok({:?})",
@@ -92,6 +105,20 @@ fn fuel_exhausting_replay_guest_traps_not_hangs() {
     assert!(
         err.contains("all fuel consumed"),
         "fuel-trap message must contain the wasmtime fuel-exhaustion phrase; got: {err}"
+    );
+    // The diagnostic side: wasmtime's phrase carries no numbers, so `run_on_store`'s context
+    // is what tells an operator which bound was hit. Near-zero remaining fuel against the
+    // reported budget is the "exhaustion" reading, and its twin is asserted in
+    // `epoch_deadline_spins_replay_guest_traps`.
+    assert!(
+        err.contains(&format!("fuel budget={REPLAY_FUEL}")),
+        "trap context must report the fuel budget this run was held to; got: {err}"
+    );
+    let remaining = reported_fuel_remaining(&err);
+    assert!(
+        remaining <= REPLAY_FUEL / 100,
+        "a fuel-exhaustion trap must report near-zero remaining fuel (got {remaining} of \
+         {REPLAY_FUEL}); got: {err}"
     );
 }
 
@@ -127,6 +154,26 @@ fn epoch_deadline_spins_replay_guest_traps() {
         err.contains("interrupt"),
         "epoch-trap message must contain the wasmtime epoch-interrupt phrase \
          (`wasm trap: interrupt`), not a fuel-exhaustion phrase; got: {err}"
+    );
+    // The diagnostic side, and the other half of the discrimination the context exists for:
+    // fuel still intact at the wall budget is the "stall" reading. Both budgets must be the
+    // *overridden* ones — reporting the production constants here would make the numbers
+    // contradict each other (remaining fuel above the budget, elapsed a fraction of it).
+    let remaining = reported_fuel_remaining(&err);
+    assert!(
+        remaining > u64::MAX / 4,
+        "an epoch-deadline trap must report fuel still largely intact (got {remaining} of \
+         {}); got: {err}",
+        u64::MAX / 2
+    );
+    assert!(
+        err.contains(&format!("fuel budget={}", u64::MAX / 2)),
+        "trap context must report the overridden fuel budget, not `REPLAY_FUEL`; got: {err}"
+    );
+    assert!(
+        err.contains("wall budget=100 ms"),
+        "trap context must report the overridden 1-tick wall budget, not the production one; \
+         got: {err}"
     );
 }
 
@@ -273,12 +320,22 @@ fn replay_resource_cap_constants_are_sensible() {
 
 // ── Honest-workload regression ────────────────────────────────────────────────
 
-/// The production replay component runs an honest accept within all installed budgets:
-/// the new fuel/epoch/memory bounds do not spuriously trap the real workload. This is
-/// the replay analogue of `full_size_window_does_not_spuriously_trap_demo`
-/// (`consume_engine.rs:636`) — coverage that the budgets are not too tight.
+/// The production replay component accepts an honest check on the *installed* production
+/// limits — fuel, epoch deadline and the store memory cap together, as `check` installs
+/// them, with nothing overridden.
+///
+/// This is the one test in this file that runs on the production budgets, but it deliberately
+/// covers only the cheapest path (empty store, single insert, no dedup scan) to keep it
+/// short, so it says nothing about a wall budget sized for the worst case. The two coverages
+/// it does not provide:
+/// - the *expensive* honest path against `REPLAY_FUEL` is
+///   `honest_replay_check_near_full_window_within_fuel` below, which overrides the wall
+///   budget so its assertion is about fuel alone;
+/// - the expensive honest path against the production *wall* budget is not in this file at
+///   all. It lives in `replay_engine.rs`'s nonce-cap tests, which fill a full 1024-entry
+///   window on unoverridden limits — those are what a wall-budget regression fails.
 #[test]
-fn honest_replay_check_within_budget_unaffected() {
+fn production_limits_accept_an_honest_replay_check() {
     let db = NamedTempFile::new().unwrap();
     let component = ReplayComponent::load(
         "phonebuddy",
@@ -304,7 +361,7 @@ fn honest_replay_check_within_budget_unaffected() {
 /// The honest *worst case* — a near-full nonce window forcing the production component's
 /// cap-scan / prune walk — still runs within the `REPLAY_FUEL` budget.
 ///
-/// `honest_replay_check_within_budget_unaffected` covers only the cheapest path (an empty
+/// `production_limits_accept_an_honest_replay_check` covers only the cheapest path (an empty
 /// store, a single insert, no dedup scan). The `REPLAY_FUEL` doc comment justifies raising
 /// the budget from 50M to 320M on a measured ≈ 58.6M-instruction honest *worst* case (a
 /// scan/prune at the high end of the nonce window). This test exercises that high-fuel
@@ -313,8 +370,13 @@ fn honest_replay_check_within_budget_unaffected() {
 /// accepts within budget — coverage that the bound is not too tight for the real worst case,
 /// not only the cheapest case. Replay analogue of
 /// `full_size_window_does_not_spuriously_trap_demo` (`consume_engine.rs:636`).
+///
+/// Every call here overrides the epoch deadline to `GENEROUS_EPOCH_TICKS` and keeps the production
+/// `REPLAY_FUEL`, so a trap can only mean fuel exhaustion. On the production wall budget the
+/// same trap would also be reachable by the host being busy, and this test — the one that
+/// guards the fuel constant — could not tell the two apart.
 #[test]
-fn honest_replay_check_near_full_window_within_budget() {
+fn honest_replay_check_near_full_window_within_fuel() {
     let db = NamedTempFile::new().unwrap();
     let component = ReplayComponent::load(
         "phonebuddy",
@@ -336,7 +398,11 @@ fn honest_replay_check_near_full_window_within_budget() {
     for i in 0..1023u64 {
         let nonce = format!("nonce{i:05}");
         let result = component
-            .check_raw_for_testing(&simple_input("full_window_client", base_ts + i, &nonce))
+            .check_with_limits(
+                &simple_input("full_window_client", base_ts + i, &nonce),
+                GENEROUS_EPOCH_TICKS,
+                REPLAY_FUEL,
+            )
             .expect("no wasmtime error while filling the nonce window");
         assert!(
             result.is_ok(),
@@ -349,11 +415,11 @@ fn honest_replay_check_near_full_window_within_budget() {
     // strictly-later timestamp: this drives the worst-case scan/insert path at the high end of
     // the window and must still accept within REPLAY_FUEL (not trap, not TooManyRequests).
     let result = component
-        .check_raw_for_testing(&simple_input(
-            "full_window_client",
-            base_ts + 1023,
-            "noncefinal",
-        ))
+        .check_with_limits(
+            &simple_input("full_window_client", base_ts + 1023, "noncefinal"),
+            GENEROUS_EPOCH_TICKS,
+            REPLAY_FUEL,
+        )
         .expect("no wasmtime error on the worst-case honest check against a full window");
     assert!(
         result.is_ok(),
@@ -368,14 +434,40 @@ fn honest_replay_check_near_full_window_within_budget() {
 /// All other tests use `check_raw_for_testing` / `check_with_limits`, which surface the trap
 /// as an outer `Err`. This test exercises the real production dispatch path: `check`'s
 /// `unwrap_or_else(|e| panic!(...))` (lib.rs) maps the trap to a panic, which the route layer
-/// re-raises into a 500 (design §2.5). A SPIN at the production `REPLAY_FUEL` exhausts fuel
-/// and traps; `check` must panic. If the panic mapping were removed or made conditional, this
-/// test would fail. `expected` pins the production panic phrase so the panic is the trap-map,
-/// not some unrelated panic.
+/// re-raises into a 500. A SPIN on the installed production budgets traps; `check` must
+/// panic. If the panic mapping were removed or made conditional, this test would fail.
+///
+/// It also holds the panic *text*, which is the only diagnostic an operator gets for a
+/// production trap: the phrase pins the trap-map, `fuel budget=` pins the trap context
+/// reaching the panic at all, and the deeper wasmtime layer pins the `{e:#}` rendering that
+/// carries the cause chain — plain `{e}` would print the context and swallow the cause.
+/// `catch_unwind` rather than `should_panic`, which admits only one expected substring.
 #[test]
-#[should_panic(expected = "WASM runtime error (guest trap or instantiation)")]
 fn check_production_path_panics_on_resource_trap() {
     let (_db, component) = open_fault();
-    // Production fuel, generous epoch: fuel exhausts and traps; `check` maps it to a panic.
-    let _ = component.check(&fault_input("SPIN"));
+    // Whichever of fuel and the wall budget runs out first traps; both are the installed
+    // production values here, and `check` maps either to the same panic.
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = component.check(&fault_input("SPIN"));
+    }))
+    .expect_err("production `check` must panic on a resource-exhaustion trap");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("panic payload must be a string"));
+    assert!(
+        msg.contains("WASM runtime error (guest trap or instantiation)"),
+        "the panic must be `check`'s trap-map, not some unrelated panic; got: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("fuel budget={REPLAY_FUEL}")),
+        "the panic must carry the trap context, including the production fuel budget; \
+         got: {msg}"
+    );
+    assert!(
+        msg.contains("error while executing"),
+        "the panic must render the whole error chain (`{{e:#}}`), not the outermost context \
+         alone; got: {msg}"
+    );
 }

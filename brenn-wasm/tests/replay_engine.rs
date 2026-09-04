@@ -249,6 +249,14 @@ fn two_clients_share_nonce_both_accepted() {
 
 // ── AC-nonce-cap-fail-closed ───────────────────────────────────────────────────
 
+/// Also the wall-budget regression gate. Both this test and
+/// `last_ns_nonce_cap_hit_rolls_back_prune` fill the full 1024-entry nonce window through
+/// `check_raw_for_testing`, i.e. on the *installed* production fuel and epoch budgets, and
+/// they are the only tests anywhere that run the expensive honest path on those budgets
+/// (`replay_engine_bounds.rs` overrides the wall budget wherever it fills a window). The
+/// 1024 count is load-bearing beyond the cap semantics: shrinking it to speed the suite up
+/// deletes the last empirical coverage of `REPLAY_EPOCH_DEADLINE_TICKS`, whose floor is then
+/// held only by the const assert in `lib.rs`.
 #[test]
 fn nonce_cap_hit_fails_closed() {
     let (_db, component) = open_component();
@@ -511,6 +519,9 @@ fn last_ns_self_row_present_after_accept() {
     );
 }
 
+/// Also a wall-budget regression gate; see `nonce_cap_hit_fails_closed`. The 1024-entry
+/// fill runs on the installed production budgets, so the count is load-bearing for that
+/// reason as well as for the prune-rollback semantics.
 #[test]
 fn last_ns_nonce_cap_hit_rolls_back_prune() {
     // AC5: prune deletes inside a tx that later fails (cap-hit) are rolled back.

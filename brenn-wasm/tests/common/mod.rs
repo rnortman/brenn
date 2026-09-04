@@ -19,6 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 
+/// An epoch deadline no honest (or spinning-but-fuel-bounded) run reaches, for tests whose
+/// assertion is about fuel rather than wall clock. ≈ 1 hour at the 100 ms tick both engine
+/// families use.
+///
+/// Never `u64::MAX` for this: `Store::set_epoch_deadline` computes `current_epoch + delta`,
+/// which overflows — a panic in a debug build — as soon as the engine's ticker thread has
+/// fired once. A test that wants "no wall limit" wants this constant.
+pub const GENEROUS_EPOCH_TICKS: u64 = 36_000;
+
 /// Absolute path to a built component artifact, by artifact stem
 /// (e.g. `"brenn_replay"` → `brenn-wasm/target/components/brenn_replay.wasm`).
 ///

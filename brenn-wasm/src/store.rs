@@ -27,6 +27,15 @@ use crate::StoreError;
 /// required `max_page_count` parameter on `KvStore::open`.
 pub const DEFAULT_MAX_PAGE_COUNT: u32 = (64 * 1024 * 1024 / PAGE_SIZE) as u32; // 16384
 
+/// How long a `KvStore` connection waits for a contended write lock before returning
+/// `SQLITE_BUSY`.
+///
+/// Also a floor on the replay guest's wall-clock budget: the guest is parked in a host
+/// import for the whole wait, so `REPLAY_EPOCH_DEADLINE_TICKS` must cover it with room to
+/// spare or one honest lock wait traps a legitimate check.
+/// `replay_wall_budget_clears_the_store_lock_wait` holds the two together.
+pub(crate) const KV_BUSY_TIMEOUT_MS: u64 = 5000;
+
 // Process-global guard: each store file may be open by at most one KvStore.
 // Enforces the "one file per ReplayComponent" invariant in code, not just prose.
 static OPEN_PATHS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
@@ -141,7 +150,7 @@ impl KvStore {
             .unwrap_or_else(|e| panic!("failed to set WAL mode on KV store: {e}"));
         conn.pragma_update(None, "foreign_keys", "ON")
             .unwrap_or_else(|e| panic!("failed to enable foreign keys on KV store: {e}"));
-        conn.pragma_update(None, "busy_timeout", 5000)
+        conn.pragma_update(None, "busy_timeout", KV_BUSY_TIMEOUT_MS as i64)
             .unwrap_or_else(|e| panic!("failed to set busy_timeout on KV store: {e}"));
         conn.pragma_update(None, "max_page_count", max_page_count)
             .unwrap_or_else(|e| panic!("failed to set max_page_count on KV store: {e}"));

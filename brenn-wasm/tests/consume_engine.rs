@@ -1132,9 +1132,13 @@ fn full_size_window_leaves_fuel_headroom() {
         .map(|i| envelope_json("brenn:ch", &format!("msg-{i}")))
         .collect();
     let activation = single_port_activation("in", envelopes, 0);
-    // Epoch deadline far beyond the ticker's reach for this activation, so fuel is
-    // the only limit under test.
-    let outcome = comp.handle_with_limits(activation, u64::MAX, production_budget / 4);
+    // Epoch deadline far beyond the ticker's reach for this activation, so fuel is the only
+    // limit under test.
+    let outcome = comp.handle_with_limits(
+        activation,
+        common::GENEROUS_EPOCH_TICKS,
+        production_budget / 4,
+    );
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "a full-size window must complete on a quarter of the production fuel budget \

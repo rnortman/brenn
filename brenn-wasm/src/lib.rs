@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::{debug, error, info, trace, warn};
 
@@ -414,7 +415,7 @@ impl ReplayComponent {
     pub fn check(&self, input: &CheckInput) -> (Result<(), ReplayError>, bool) {
         let verdict = self
             .run_check(input, None)
-            .unwrap_or_else(|e| panic!("WASM runtime error (guest trap or instantiation): {e}"));
+            .unwrap_or_else(|e| panic!("WASM runtime error (guest trap or instantiation): {e:#}"));
         // Read-and-clear the quota_hit flag. SeqCst to ensure we see the write
         // that happened inside tx_put (same thread in spawn_blocking, but use
         // SeqCst for clarity and cross-thread-safe-at-Arc-boundary).
@@ -454,7 +455,8 @@ impl ReplayComponent {
                 .unwrap_or_else(|e| panic!("run_check override: set_fuel: {e}"));
             store.set_epoch_deadline(epoch_deadline);
         }
-        self.run_on_store(store, input)
+        let epoch_ticks = overrides.map_or(REPLAY_EPOCH_DEADLINE_TICKS, |(ticks, _)| ticks);
+        self.run_on_store(store, input, epoch_ticks)
     }
 
     /// Instantiate-and-call on an already-built store, then run the unconditional
@@ -463,19 +465,46 @@ impl ReplayComponent {
     /// test hatches) and `check_with_memory_limit` (memory-override test hatch) both build
     /// their store, then delegate here — so the cleanup is single-sourced and the test
     /// accessors exercise the same dispatch body the production path uses.
+    ///
+    /// `epoch_ticks` is the deadline the caller installed on the store, for the trap-path
+    /// diagnostic only.
     fn run_on_store(
         &self,
         mut store: Store<StoreData>,
         input: &CheckInput,
+        epoch_ticks: u64,
     ) -> wasmtime::Result<Result<(), ReplayError>> {
+        // The budgets reported on the trap path are the ones installed on *this* store, not
+        // the `REPLAY_*` constants: two of the three callers override them, and a diagnostic
+        // that names a budget the run was not held to is worse than none. Fuel is read back
+        // off the store; the epoch deadline cannot be read back, so the caller passes the
+        // tick count it installed.
+        let fuel_budget = store.get_fuel().ok();
         // Capture each fallible step into a local instead of `?`-propagating mid-body,
         // so cleanup runs once on the way out regardless of where the failure occurred.
+        let started = Instant::now();
         let outcome = self
             .replay_pre
             .instantiate(&mut store)
             .and_then(|replay| replay.call_check(&mut store, input));
+        let elapsed = started.elapsed();
         self.cleanup_leaked_tx();
-        outcome
+        // wasmtime renders an epoch interrupt and a fuel exhaustion as bare trap strings
+        // with no numbers attached, and the remediation differs (a spinning guest, a guest
+        // stalled in a store lock, a slow host). Remaining fuel plus wall time separate
+        // them: near-zero fuel is exhaustion, intact fuel at the wall budget is a stall.
+        outcome.map_err(|e| {
+            let fuel = store
+                .get_fuel()
+                .map_or_else(|_| "unavailable".to_string(), |f| f.to_string());
+            let budget = fuel_budget.map_or_else(|| "unavailable".to_string(), |f| f.to_string());
+            e.context(format!(
+                "replay check failed after {elapsed:?} (slug={}, fuel remaining={fuel}, \
+                 fuel budget={budget}, wall budget={} ms)",
+                self.slug,
+                epoch_ticks * REPLAY_EPOCH_TICK_MS,
+            ))
+        })
     }
 
     /// If a store transaction is still active after `run_check`'s call returns (trap or
@@ -485,7 +514,7 @@ impl ReplayComponent {
     /// trap), so a leaked transaction on the shared `Arc<KvStore>` is not rolled back via
     /// the normal `HostTransaction::drop` path and would wedge every later check on this
     /// endpoint. Roll it back explicitly to release the write lock. Modeled on the
-    /// processor world's `cleanup_leaked_tx` (H1046, design §2.5.1). Rollback failure
+    /// processor world's `cleanup_leaked_tx`. Rollback failure
     /// escalates to panic (an unrollback-able store is corruption, not a tolerable state).
     fn cleanup_leaked_tx(&self) {
         if self.kv_store.is_tx_active() {
@@ -526,8 +555,8 @@ impl ReplayComponent {
     /// test use only.
     ///
     /// Allows tests to pass a tiny epoch deadline and high fuel to drive the epoch
-    /// interrupt path without waiting for the production ≈ 5 s wall budget. Mirrors
-    /// `ProcessorComponent::handle_with_limits` (design §4).
+    /// interrupt path without waiting for the production ≈ 30 s wall budget. Mirrors
+    /// `ProcessorComponent::handle_with_limits`.
     ///
     /// A thin wrapper over `run_check` with the override applied — it carries no
     /// instantiate/call/cleanup body of its own, so the test accessor exercises the same
@@ -563,7 +592,7 @@ impl ReplayComponent {
         // StoreLimits is not mutable after construction; replace the whole limits field.
         // The rest of the store settings (fuel, epoch) come from make_store.
         store.data_mut().limits = replay_store_limits_with_memory(memory_limit_bytes);
-        self.run_on_store(store, input)
+        self.run_on_store(store, input, REPLAY_EPOCH_DEADLINE_TICKS)
     }
 
     /// The underlying KvStore, for test assertions (e.g. `is_tx_active` after a leak-trap).
@@ -909,35 +938,57 @@ pub const PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION: usize = 64;
 /// processor precedent (`PROCESSOR_EPOCH_TICK_MS` is also `const`, not `pub const`).
 const REPLAY_EPOCH_TICK_MS: u64 = 100;
 
-/// Replay epoch deadline ticks per check (50 × 100 ms ≈ 5 s wall budget).
+/// Replay epoch deadline ticks per check (300 × 100 ms ≈ 30 s wall budget).
 ///
-/// Deliberately tighter than the processor's 300 ticks (≈ 30 s): a replay check is one
-/// fixed KV lookup/insert and should finish in milliseconds. Because the per-endpoint
-/// mutex serializes all traffic to an endpoint behind a slow guest, a tighter wall
-/// budget is strictly safer and has no honest cost (design §2.7-B). Not
-/// operator-configurable (design §2.6).
+/// The epoch deadline is wall clock over the whole guest call, *including* the time the
+/// guest is parked in a host import doing SQLite work, so it is not a guest-CPU budget:
+/// `REPLAY_FUEL` bounds instructions executed and is the instrument for a spinning guest,
+/// while this deadline must cover honest host I/O as well as guest stalls.
+///
+/// What the budget is *not* sized by: the check's own cost. Measured on a developer host,
+/// the honest worst case — the cap-scan/prune walk at the high end of a full 1024-nonce
+/// window — is 69 ms for the most expensive single check and 8.3 ms mean over 1024
+/// sequential accepts. Even at the widest local-to-runner factor this repo has measured
+/// (~21x, `surface/server/BUILD.bazel`) that is ~1.5 s, and the CI runner nonetheless
+/// trapped these checks at a 5 s deadline. So the binding terms are the two things that
+/// stop the guest without costing it instructions: `store::KV_BUSY_TIMEOUT_MS`, a single
+/// honest contended-write wait the guest is parked in for its whole duration, and
+/// descheduling — the epoch ticker is a free-running thread, so it keeps counting while a
+/// loaded runner starves the guest thread. Hence a budget that is a multiple of the lock
+/// wait rather than a multiple of the check cost:
+/// `replay_wall_budget_clears_the_store_lock_wait` asserts the floor mechanically.
+/// The direction to be wrong in matters — a budget under the honest wall time makes
+/// production `check` panic on legitimate traffic, which the webhook route re-raises as
+/// a 500.
+///
+/// The cost of the margin: `ReplayComponent::check` runs while the request holds the
+/// per-endpoint mutex, so this deadline is also the head-of-line blocking window for every
+/// inbound webhook on that endpoint — a wedged guest takes the endpoint out for this long
+/// per request, with nothing shedding in front of it. Tighter is strictly better for that
+/// window and strictly worse for false traps; 30 s is 6x the lock-wait floor, which leaves
+/// room for one wait plus a starved guest thread and is the smallest bucket that does.
+///
+/// Not operator-configurable.
+///
+/// TODO(replay-epoch-host-io): charge only guest execution against this budget — pause or
+/// re-arm the epoch deadline around host store imports — so the guest-misbehavior bound
+/// stops having to be sized for worst-case honest SQLite I/O.
 ///
 /// Crate-private — an internal tuning detail with no external consumer, matching the
 /// processor precedent (`PROCESSOR_EPOCH_DEADLINE_TICKS` is also `const`, not `pub const`).
 /// Tests drive the epoch path with a literal `1`-tick deadline via `check_with_limits`,
 /// so they do not import this constant.
-const REPLAY_EPOCH_DEADLINE_TICKS: u64 = 50;
+const REPLAY_EPOCH_DEADLINE_TICKS: u64 = 300;
 
 /// Fixed per-call fuel for a replay check (320M instructions).
 ///
 /// A replay check is a single fixed-shape operation (no per-envelope window), so a flat
-/// budget is correct — there is no envelope count to scale by (design §2.7-C).
-///
-/// The design (§2.1/§2.7-C) initially proposed 50M (matching `PROCESSOR_FUEL_MINIMUM`),
-/// but the production `brenn_replay.wasm` worst-case honest check — an insert or cap-scan
-/// at the high end of the 1024-nonce / 5-minute window, which prunes/scans the namespace —
-/// measured ≈ 58.6M instructions, exceeding 50M. Per the design's own escape hatch
-/// (§2.7-B / §5: "If a real component proves the budget too tight, raising the constant is
-/// a one-line change"), the budget is raised to 320M: the same order as the processor
-/// world's full-window budget (`PROCESSOR_FUEL_PER_ENVELOPE × 32`), ≈ 5.5× the measured
-/// honest worst case (generous headroom), and still finite — a CPU-spinning guest
-/// exhausts it well within the epoch window, and the epoch deadline (§2.7-B) is the
-/// wall-clock backstop regardless.
+/// budget is correct — there is no envelope count to scale by. 320M is ≈ 5.5× the
+/// measured honest worst case (a cap-scan/prune walk over a full 1024-nonce window),
+/// and still finite — a CPU-spinning guest exhausts it well within the epoch window,
+/// and `REPLAY_EPOCH_DEADLINE_TICKS` is the wall-clock backstop. That worst case is
+/// `REPLAY_MEASURED_WORST_CASE_FUEL`, and
+/// `replay_fuel_budget_clears_the_measured_worst_case` holds the ratio.
 pub const REPLAY_FUEL: u64 = 320_000_000;
 
 /// Maximum memory a replay guest may grow to (bytes). 16 MiB per check.
@@ -949,7 +1000,7 @@ pub const REPLAY_FUEL: u64 = 320_000_000;
 pub const REPLAY_MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum elements **per table** a replay guest's store may hold. Same as the processor
-/// world; bounds structural growth with no honest reason to differ (design §2.7-D).
+/// world; bounds structural growth with no honest reason to differ.
 pub const REPLAY_MAX_TABLE_ELEMENTS: usize = 65_536;
 
 /// Maximum WASM instances a replay guest's store may hold. Same as the processor world.
@@ -985,6 +1036,43 @@ fn replay_store_limits_with_memory(memory_size: usize) -> StoreLimits {
         .tables(REPLAY_MAX_TABLES)
         .trap_on_grow_failure(true)
         .build()
+}
+
+// ── Replay budget floors ──────────────────────────────────────────────────────
+//
+// The two replay budgets are sized against numbers that live outside their own
+// declarations — the store's lock wait and a measured honest worst case — and
+// crossing either floor turns legitimate webhook traffic into a trap, a panic and
+// a 500. Timing tests cannot catch that: the honest worst case runs well inside
+// both budgets on developer hardware whatever the constants say, which is how a
+// 5 s wall budget survived until a slow CI runner hit it. These const asserts fail
+// at compile time on the edit instead.
+
+/// Instructions the honest worst-case replay check was measured at (a cap-scan /
+/// prune walk over a full 1024-nonce window), the number `REPLAY_FUEL`'s
+/// rationale is derived from.
+#[cfg(test)]
+const REPLAY_MEASURED_WORST_CASE_FUEL: u64 = 58_600_000;
+
+#[cfg(test)]
+mod replay_budget_floor_tests {
+    use super::*;
+    use crate::store::KV_BUSY_TIMEOUT_MS;
+
+    /// The wall budget clears one full store lock wait with at least as much again
+    /// left for the guest's own honest work.
+    #[test]
+    fn replay_wall_budget_clears_the_store_lock_wait() {
+        const { assert!(REPLAY_EPOCH_DEADLINE_TICKS * REPLAY_EPOCH_TICK_MS >= 2 * KV_BUSY_TIMEOUT_MS) };
+    }
+
+    /// The fuel budget stays at least 2x the measured honest worst case, and stays
+    /// finite enough that a spinning guest exhausts it inside the wall budget.
+    #[test]
+    fn replay_fuel_budget_clears_the_measured_worst_case() {
+        const { assert!(REPLAY_FUEL >= 2 * REPLAY_MEASURED_WORST_CASE_FUEL) };
+        const { assert!(REPLAY_FUEL <= 100 * REPLAY_MEASURED_WORST_CASE_FUEL) };
+    }
 }
 
 /// One buffered publish from a guest activation.

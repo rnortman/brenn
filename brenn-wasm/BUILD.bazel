@@ -260,12 +260,17 @@ rust_library(
     ],
 )
 
+# `size = "large"` for the same reason as the suites below: 12.1s locally under
+# the same concurrent run, ~250s at the same ~21x factor — inside `medium`, but
+# by less than the factor's own uncertainty. It has not timed out on the runner.
+#
 # No fixtures: the in-crate unit tests build engines and stores directly and
 # open no component artifact — every `env!("CARGO_MANIFEST_DIR")/target/
 # components/` call site is in the `tests/` suites below. A unit test that grows
 # one fails here on a missing runfile, which is the direction to be wrong in.
 rust_test(
     name = "brenn-wasm_test",
+    size = "large",
     crate = ":brenn-wasm",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
@@ -351,9 +356,55 @@ WASM_TEST_SUITES = [
     ("store_round_trip", ["replay-fault-test"], [], [], []),
 ]
 
+# Sized `large` (900s ceiling, ~300MB resource estimate) as a family.
+#
+# Observed, not assumed: on the CD runner `processor_mqtt` and
+# `replay_engine_bounds` were killed at the `medium` 300s ceiling and
+# `replay_engine` passed at 172s; no other suite has timed out.
+#
+# Baselines, all 20 brenn-wasm test targets run concurrently on a developer host
+# (`bazel test //brenn-wasm:all --nocache_test_results`, seconds):
+#
+#     grants                27.8    processor_log        15.6
+#     replay_engine         24.9    surface_dom          15.4
+#     replay_engine_bounds  22.8    brenn-wasm_test      12.1
+#     consume_engine        22.6    processor_mqtt        9.9
+#     replay_generic_engine 18.5    store_round_trip      7.0
+#     processor_config      17.2    instantiation_fail    3.0
+#     processor_transplant  16.8    echo_stub_dom         0.6
+#     feature_envelope      16.5
+#
+# At the one local-to-runner factor this repo has measured (~21x,
+# `surface/server/BUILD.bazel`) ten of these clear the `medium` 300s ceiling, so
+# the family is not a heavy head with a cheap tail — the median suite is 16s
+# locally and does not fit. That factor is also conservative here: `replay_engine`
+# at 24.9s locally ran 172s on the runner, a factor of ~7.
+#
+# Sized as a family for that reason and two more: the factor is a single
+# measurement on one runner, a suite here is dominated by compiling guest
+# components inside the test binary so they scale together, and buying the margin
+# per suite would put every suite one fixture away from another CI timeout round.
+#
+# The resource estimate is wanted too, not just the ceiling: these binaries hold
+# cranelift-compiled engines, so ~300MB each is honest, and the test parallelism
+# it costs on a small runner is the intended trade — that is why this is `size`
+# and not `timeout`, which raises the ceiling while still claiming a `medium`
+# appetite. Hang-detection latency for these suites is 900s as a consequence.
+#
+# A suite that starts taking far longer than the numbers above is a regression,
+# not an expected cost of this sizing — and nothing here can tell: every suite has
+# the same 900s ceiling, so a 10x slowdown (a replay fuel/epoch regression, a
+# fixture rebuilt per test) passes silently until it crosses it.
+#
+# TODO(wasm-test-wall-time-baselines): make the table above data a check reads,
+# failing when a suite exceeds its baseline by a chosen factor, instead of prose
+# nobody diffs. Not a per-suite `timeout` split: at the ~21x factor the median
+# suite does not fit `moderate` either, so that would trade the missing signal
+# for CI flakes.
 [
     rust_test(
         name = suite,
+        size = "large",
         srcs = ["tests/{}.rs".format(suite)] + glob(["tests/common/*.rs"]),
         compile_data = extra_compile_data,
         crate_root = "tests/{}.rs".format(suite),
