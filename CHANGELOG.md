@@ -2,6 +2,86 @@
 
 All notable changes to Brenn are documented here.
 
+## [Unreleased]
+
+Out-of-tree components are real — a separate repository can build and deploy
+them. The install flags changed to support that, and `surface_dist_dir` moved
+out of config and onto the command line. Separately, agents can switch between
+Claude accounts at run time without losing their conversation.
+
+### Added
+
+- **Out-of-tree components are real.** A separate repository can depend on
+  brenn as a Bazel module and build backend and page-hosted components using
+  brenn's own rules and gates. The release artifact is a *bundle* — a directory
+  tree the host loads alongside brenn's own. Copy `examples/component/` to
+  start; `docs/component-packages.md` is the full contract.
+  **Operator action:** give each bundle its own install directories, separate
+  from brenn's. A bundle directory nested inside brenn's sync tree will be
+  deleted on brenn's next deploy.
+- **Repeatable install roots.** `--modules`, `serve --components`, and the new
+  `serve --surface` all accept multiple directories — one per installed release.
+  A duplicate module or package name across roots is refused at boot.
+- **Claude account profiles.** `claude_profile` declares a named account backed
+  by a `claude setup-token` token file. An agent lists the accounts it may use
+  (`claude_profiles`) and can optionally be steered between them at run time via
+  a pub/sub channel (`claude_profile_goal`). Switching is seamless — the
+  conversation respawns transparently, no history lost. Agents without profiles
+  are unaffected. See `docs/claude-accounts.md`.
+  **Operator action:** the server's environment must not carry credentials that
+  outrank the token (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, etc.) or
+  the profile is silently ignored. Boot refuses the cases it can detect.
+  **Accepted risk (§7.1a):** the token is readable by the conversation's own
+  tools and is minted for a year; see `docs/security-posture.md`.
+
+### Changed
+
+- **BREAKING: `server.surface_dist_dir` is now `serve --surface <DIR>`.**
+  The config key is gone; a document that still has it is refused.
+  **Operator action:** remove the key from your `.brenn` file and add
+  `--surface <DIR>` to the unit's `ExecStart` in the same deploy.
+- **BREAKING for component authors: out-port enforcement.** Publishing to a
+  port name the component's spec does not declare now traps the activation.
+  Publishing to a declared but unwired optional port now silently succeeds
+  (the message is dropped) instead of returning an error. Bindings document
+  is v2; no shim.
+- `npm-audit` is temporarily out of `make check`; run `make npm-audit` by hand.
+
+## [0.18.2] — 2026-08-31
+
+### Added
+
+- **Per-app model allow-list.** `models = [...]` on an app restricts the model
+  picker and the server enforces it. A single-element list locks the picker.
+  Omit the key to keep the current unrestricted behavior.
+
+### Changed
+
+- **Model re-assertion on every send.** The server now resets a conversation to
+  the app's configured model on every message, not just when a client sends an
+  explicit override. This is what unsticks a session that drifted to the wrong
+  model. It also means the model follows whichever client sent last.
+
+### Fixed
+
+- **Stale model preference in the browser.** A model the server no longer
+  offers was being resurrected from `localStorage` on every page load. Now
+  cleared the first time the server's model list excludes it.
+
+## [0.18.1] — 2026-08-31
+
+### Fixed
+
+- **Surface components from bundles would crash immediately.** The kernel was
+  handing message envelopes to guests as JSON objects instead of the JSON
+  strings the WIT contract specifies. Every out-of-tree surface component
+  trapped on its first non-empty port window, and nothing in the logs or the
+  status document said why. Fixed the serialization, and also fixed the
+  observability: trap reasons now reach the console and `brenn:surface-errors`,
+  the status document reports `degraded` immediately when an instance dies
+  (instead of `health: ok` until the next heartbeat), and repeated identical
+  failures are counted rather than flooding the error channel.
+
 ## [0.18.0] — 2026-08-31
 
 The story here is that a component now ships as a **package** — the artifact,
