@@ -119,6 +119,7 @@ filegroup(
         "//brenn-budget:policy_srcs",
         "//brenn-cal:policy_srcs",
         "//brenn-cc:policy_srcs",
+        "//brenn-cc-profile:policy_srcs",
         "//brenn-cli:policy_srcs",
         "//brenn-common:policy_srcs",
         "//brenn-db:policy_srcs",

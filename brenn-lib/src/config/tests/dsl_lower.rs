@@ -25,6 +25,7 @@ use crate::config::attachment::{
 };
 use crate::config::automation::AutomationGlobalConfig;
 use crate::config::claude_defaults::ClaudeDefaultsConfig;
+use crate::config::claude_profile::{AppClaudeProfiles, ClaudeProfileRaw};
 use crate::config::container::{ContainerConfig, default_container_home};
 use crate::config::events::EventsConfig;
 use crate::config::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksConfig};
@@ -764,7 +765,14 @@ alerting {
 claude_defaults {
     mcp_script_path = "/opt/brenn/alice_mcp.py";
     model = "opus";
+    profile_token_dir = "/home/alice/.secrets";
 }
+
+claude_profile main;
+
+claude_profile spare { expires = "2027-09-01"; }
+
+claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
 
 repo_sync {
     repo_dir = "/home/alice/repos";
@@ -874,7 +882,33 @@ container cc {
             claude_defaults: ClaudeDefaultsConfig {
                 mcp_script_path: PathBuf::from("/opt/brenn/alice_mcp.py"),
                 model: "opus".to_string(),
+                profile_token_dir: Some(PathBuf::from("/home/alice/.secrets")),
             },
+            claude_profiles: BTreeMap::from([
+                (
+                    "main".to_string(),
+                    ClaudeProfileRaw {
+                        token_file: PathBuf::from("/home/alice/.secrets/claude-profile-main.token"),
+                        expires: None,
+                    },
+                ),
+                (
+                    "spare".to_string(),
+                    ClaudeProfileRaw {
+                        token_file: PathBuf::from(
+                            "/home/alice/.secrets/claude-profile-spare.token",
+                        ),
+                        expires: Some("2027-09-01".parse().expect("an ISO date")),
+                    },
+                ),
+                (
+                    "legacy".to_string(),
+                    ClaudeProfileRaw {
+                        token_file: PathBuf::from("/srv/old-secrets/claude-legacy.token"),
+                        expires: None,
+                    },
+                ),
+            ]),
             repo_sync: RepoSyncConfig {
                 repo_dir: Some(PathBuf::from("/home/alice/repos")),
                 poll_interval_secs: 301,
@@ -1061,7 +1095,7 @@ fn a_partial_watchdog_section_keeps_the_defaults_for_the_rest() {
 /// is the tripwire for that: the test below asserts it covers every kindword the
 /// language admits, and lowers all of them, so a kindword added to the
 /// vocabulary is a red test rather than a boot panic.
-const MINIMAL_SECTIONS: [(&str, &str); 18] = [
+const MINIMAL_SECTIONS: [(&str, &str); 19] = [
     (
         "server",
         r#"server { public_url = "https://brenn.example.com"; }"#,
@@ -1086,6 +1120,10 @@ const MINIMAL_SECTIONS: [(&str, &str); 18] = [
         r#"container cc { image = "brenn-cc:latest"; home_dir = "/home/alice/container-home"; }"#,
     ),
     ("integration", r#"integration graf { command = "graf"; }"#),
+    (
+        "claude_profile",
+        r#"claude_profile main { token_file = "/home/alice/.secrets/claude-main.token"; }"#,
+    ),
 ];
 
 /// Every kindword the language admits reaches a lowering arm.
@@ -5266,4 +5304,494 @@ fn a_link_lowers_to_its_endpoint_set() {
     assert!(config.wasm_consumers[0].outputs[0].channel.is_none());
     assert!(config.surfaces[0].subscriptions[0].channel.is_none());
     assert!(config.surfaces[0].io_ports[0].channel.is_none());
+}
+
+// ── claude profiles ──────────────────────────────────────────────────────────
+
+/// The declared profiles of a document that states nothing else.
+fn profiles_of(document: &str) -> BTreeMap<String, ClaudeProfileRaw> {
+    config_from_dsl(document).claude_profiles
+}
+
+/// The body-less form states a whole profile: the name is the identity and the
+/// path follows the convention.
+#[test]
+fn a_body_less_profile_takes_the_conventional_token_path() {
+    assert_eq!(
+        profiles_of(
+            r#"
+claude_defaults { profile_token_dir = "/home/alice/.secrets"; }
+
+claude_profile main;
+"#
+        ),
+        BTreeMap::from([(
+            "main".to_string(),
+            ClaudeProfileRaw {
+                token_file: PathBuf::from("/home/alice/.secrets/claude-profile-main.token"),
+                expires: None,
+            },
+        )]),
+    );
+}
+
+/// The convention is read wherever `claude_defaults` sits, including below the
+/// profiles it applies to.
+#[test]
+fn the_token_dir_applies_to_profiles_written_above_it() {
+    let profiles = profiles_of(
+        r#"
+claude_profile main;
+
+claude_defaults { profile_token_dir = "/home/alice/.secrets"; }
+"#,
+    );
+    assert_eq!(
+        profiles["main"].token_file,
+        PathBuf::from("/home/alice/.secrets/claude-profile-main.token"),
+    );
+}
+
+/// A written path is the path, convention or no convention.
+#[test]
+fn a_written_token_file_wins_over_the_convention() {
+    let profiles = profiles_of(
+        r#"
+claude_defaults { profile_token_dir = "/home/alice/.secrets"; }
+
+claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
+"#,
+    );
+    assert_eq!(
+        profiles["legacy"].token_file,
+        PathBuf::from("/srv/old-secrets/claude-legacy.token"),
+    );
+}
+
+/// `expires` is an ISO date, parsed here so a typo is a diagnostic rather than
+/// a note nobody reads.
+#[test]
+fn an_expiry_date_lowers_as_a_date() {
+    let profiles =
+        profiles_of(r#"claude_profile spare { token_file = "/s/t"; expires = "2027-09-01"; }"#);
+    assert_eq!(
+        profiles["spare"].expires,
+        Some("2027-09-01".parse().expect("an ISO date")),
+    );
+}
+
+#[test]
+fn a_malformed_expiry_date_is_refused() {
+    let diagnostic =
+        refusal(r#"claude_profile spare { token_file = "/s/t"; expires = "next tuesday"; }"#);
+    assert!(
+        diagnostic.message.contains("`expires`") && diagnostic.message.contains("ISO date"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// Neither a path nor a convention means no token to read, and the refusal
+/// names both ways out.
+#[test]
+fn a_profile_with_no_path_and_no_token_dir_is_refused() {
+    let diagnostic = refusal("claude_profile main;");
+    assert!(
+        diagnostic.message.contains("token_file")
+            && diagnostic.message.contains("profile_token_dir"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// Two names for one account is a mistake: the profile name is what identifies
+/// an account everywhere downstream.
+#[test]
+fn two_profiles_reading_one_token_file_are_refused() {
+    let diagnostic = refusal(
+        r#"
+claude_profile main { token_file = "/home/alice/.secrets/claude.token"; }
+
+claude_profile spare { token_file = "/home/alice/.secrets/claude.token"; }
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("same token file"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// The collision is on the settled path, so a written path colliding with a
+/// defaulted one is refused too.
+#[test]
+fn a_written_path_colliding_with_a_defaulted_one_is_refused() {
+    let diagnostic = refusal(
+        r#"
+claude_defaults { profile_token_dir = "/home/alice/.secrets"; }
+
+claude_profile main;
+
+claude_profile spare { token_file = "/home/alice/.secrets/claude-profile-main.token"; }
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("same token file"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// A document with no `claude_profile` block declares no accounts, which is
+/// every deployment until an operator adds one.
+#[test]
+fn a_document_with_no_profiles_declares_none() {
+    assert!(profiles_of("claude_defaults { }").is_empty());
+}
+
+/// The body-less form is a grammar shape, not a licence: a kindword with
+/// required attrs is refused written that way exactly as it is written `{}`.
+#[test]
+fn a_body_less_section_does_not_bypass_required_keys() {
+    for document in ["container sandbox;", "container sandbox {}"] {
+        let diagnostics = refusals(document);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("image")),
+            "{document}: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+// ── an agent's accounts ──────────────────────────────────────────────────────
+
+/// The two accounts and the goal channel every test below writes against,
+/// followed by whatever the test's own agent body states.
+fn document_with_profiles(agent_body: &str) -> String {
+    format!(
+        r#"
+claude_profile main {{ token_file = "/s/main"; }}
+
+claude_profile spare {{ token_file = "/s/spare"; }}
+
+/// Which account the PA runs under. Latest wins.
+channel cc_profile_pa at "brenn:cc-profile.alice-pa" {{
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 8;
+}}
+
+agent Assistant() {{
+{agent_body}
+}}
+
+new alice: Assistant();
+"#
+    )
+}
+
+/// The lowered accounts of the sole agent of a document built that way.
+fn app_profiles_of(agent_body: &str) -> Option<AppClaudeProfiles> {
+    config_from_dsl(&document_with_profiles(agent_body))
+        .apps
+        .swap_remove(0)
+        .claude_profiles
+}
+
+/// The sole refusal of a document built that way.
+fn profile_refusal(agent_body: &str) -> Diagnostic {
+    sole_refusal(&document_with_profiles(agent_body))
+}
+
+#[test]
+fn an_agent_lowers_its_accounts_and_its_goal_channel() {
+    assert_eq!(
+        app_profiles_of(
+            r#"
+    claude_profiles = ["main", "spare"];
+    claude_profile_goal = exact cc_profile_pa;
+"#
+        ),
+        Some(AppClaudeProfiles {
+            allowed: vec!["main".to_string(), "spare".to_string()],
+            goal: Some("brenn:cc-profile.alice-pa".to_string()),
+        }),
+    );
+}
+
+/// The list is literals, so a `const` states it once for however many agents
+/// share the same accounts.
+#[test]
+fn the_account_list_comes_from_a_const_as_readily_as_from_a_literal() {
+    let config = config_from_dsl(
+        r#"
+claude_profile main { token_file = "/s/main"; }
+
+claude_profile spare { token_file = "/s/spare"; }
+
+const std_profiles = ["main", "spare"];
+
+agent Assistant() {
+    claude_profiles = std_profiles;
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        config.apps[0].claude_profiles,
+        Some(AppClaudeProfiles {
+            allowed: vec!["main".to_string(), "spare".to_string()],
+            goal: None,
+        }),
+    );
+}
+
+/// An agent that states no accounts is every agent in every deployment that
+/// declares none: no token at spawn, nothing to switch.
+#[test]
+fn an_agent_that_states_no_accounts_lowers_none() {
+    assert_eq!(app_profiles_of("    model = \"sonnet\";"), None);
+}
+
+#[test]
+fn a_goal_written_as_an_address_lowers_the_same_as_a_handle() {
+    let profiles = app_profiles_of(
+        r#"
+    claude_profiles = ["main"];
+    claude_profile_goal = exact "brenn:cc-profile.alice-pa";
+"#,
+    );
+    assert_eq!(
+        profiles.expect("the agent states accounts").goal,
+        Some("brenn:cc-profile.alice-pa".to_string()),
+    );
+}
+
+/// The account list is checked against the declared blocks: a name nothing
+/// declares is a typo, and a typo would otherwise be a profile that resolves to
+/// no token at boot.
+#[test]
+fn an_account_no_block_declares_is_refused() {
+    let diagnostic = profile_refusal(r#"    claude_profiles = ["main", "spair"];"#);
+    assert!(
+        diagnostic.message.contains("`spair`") && diagnostic.message.contains("claude_profile"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn an_account_named_twice_is_refused() {
+    let diagnostic = profile_refusal(r#"    claude_profiles = ["main", "main"];"#);
+    assert!(
+        diagnostic.message.contains("twice"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// An empty list is not "no accounts": it says the agent may use none, which
+/// leaves the spawn path with nothing to resolve.
+#[test]
+fn an_empty_account_list_is_refused() {
+    let diagnostic = profile_refusal("    claude_profiles = [];");
+    assert!(
+        diagnostic.message.contains("empty"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn a_goal_without_an_account_list_is_refused() {
+    let diagnostic = profile_refusal("    claude_profile_goal = exact cc_profile_pa;");
+    assert!(
+        diagnostic.message.contains("claude_profiles"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// A goal is one channel. A prefix names a family, and a family has no latest
+/// message.
+#[test]
+fn a_prefix_goal_is_refused() {
+    let diagnostic = profile_refusal(
+        r#"
+    claude_profiles = ["main"];
+    claude_profile_goal = prefix "brenn:cc-profile.";
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("`prefix`") && diagnostic.message.contains("one channel"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// A bare handle in a value position resolves against the `const` scope, which
+/// is why the goal is spelled as a matcher at all.
+#[test]
+fn a_bare_handle_goal_is_refused() {
+    let diagnostic = profile_refusal(
+        r#"
+    claude_profiles = ["main"];
+    claude_profile_goal = cc_profile_pa;
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("cc_profile_pa"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// A plain string is not a channel reference either: it would name an address
+/// nothing checked.
+#[test]
+fn a_plain_string_goal_is_refused() {
+    let diagnostic = profile_refusal(
+        r#"
+    claude_profiles = ["main"];
+    claude_profile_goal = "brenn:cc-profile.alice-pa";
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("exact"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn a_goal_naming_an_undeclared_channel_is_refused() {
+    let diagnostic = profile_refusal(
+        r#"
+    claude_profiles = ["main"];
+    claude_profile_goal = exact "brenn:cc-profile.nobody";
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("not a declared channel"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// The goal has to survive the restart that a profile change is: an ephemeral
+/// channel forgets it.
+#[test]
+fn an_ephemeral_goal_channel_is_refused() {
+    let diagnostic = sole_refusal(
+        r#"
+claude_profile main { token_file = "/s/main"; }
+
+channel cc_profile_pa at "ephemeral:cc-profile.alice-pa" {
+    push_depth = 1;
+    retain_depth = 1;
+}
+
+agent Assistant() {
+    claude_profiles = ["main"];
+    claude_profile_goal = exact cc_profile_pa;
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("not durable"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// The goal is the one message the mechanism reads from that window, so the
+/// window is one deep. The channel's `push_depth` is nobody's business here:
+/// a system subscriber takes both its depths from `retain_depth`.
+#[test]
+fn a_goal_channel_retained_other_than_once_is_refused() {
+    for retain in ["0", "8", "unbounded"] {
+        let document = format!(
+            r#"
+claude_profile main {{ token_file = "/s/main"; }}
+
+channel cc_profile_pa at "brenn:cc-profile.alice-pa" {{
+    push_depth = 0;
+    retain_depth = {retain};
+    standing_retain_depth = 8;
+}}
+
+agent Assistant() {{
+    claude_profiles = ["main"];
+    claude_profile_goal = exact cc_profile_pa;
+}}
+
+new alice: Assistant();
+"#
+        );
+        let diagnostic = sole_refusal(&document);
+        assert!(
+            diagnostic.message.contains("retain_depth = 1"),
+            "{retain}: {}",
+            diagnostic.render(),
+        );
+    }
+}
+
+/// `push_depth = 0` on the goal channel is nothing to this subscriber: a system
+/// participant's depths come from `retain_depth`.
+#[test]
+fn a_goal_channel_that_wakes_nobody_else_is_accepted() {
+    let config = config_from_dsl(
+        r#"
+claude_profile main { token_file = "/s/main"; }
+
+channel cc_profile_pa at "brenn:cc-profile.alice-pa" {
+    push_depth = 0;
+    retain_depth = 1;
+    standing_retain_depth = 8;
+}
+
+agent Assistant() {
+    claude_profiles = ["main"];
+    claude_profile_goal = exact cc_profile_pa;
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        config.apps[0]
+            .claude_profiles
+            .as_ref()
+            .expect("the agent states accounts")
+            .goal
+            .as_deref(),
+        Some("brenn:cc-profile.alice-pa"),
+    );
+}
+
+/// Under `--bare` Claude Code ignores the token and bills whatever `/login`
+/// left in the home, so the profile the agent claims to run under would be a
+/// lie — and this is the one outranking credential config resolution can see.
+#[test]
+fn a_bare_agent_with_accounts_is_refused() {
+    let diagnostic = profile_refusal(
+        r#"
+    claude_profiles = ["main"];
+    cc_extra_args = ["--bare"];
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("--bare"),
+        "{}",
+        diagnostic.render(),
+    );
 }

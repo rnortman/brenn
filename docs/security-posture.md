@@ -418,6 +418,47 @@ originates outside operator config.
   security-relevant behavior of CC depends on a minimum version, the backend must
   refuse to run against an older one rather than silently lose the guarantee.
 
+### 7.1a Accepted risk — CC's account credential is readable from inside CC
+
+The account a conversation runs under is `CLAUDE_CODE_OAUTH_TOKEN` in the CC
+process's environment. CC's own tools inherit that environment: anything the
+model can be induced to run — `Bash` with `env`, a script that posts its
+environment somewhere — can read the token. Prompt injection through tool
+results, fetched pages, or repository contents is the ordinary way that happens,
+and the container sandbox does not help, because the token is inside the
+container by design.
+
+**Why it is accepted.** The alternative available today is the `/login`
+credential in the home's `~/.claude/.credentials.json`, which is equally readable
+from inside the container by the same means, so this is not a new class of
+exposure. The environment variable does keep the token off the host's
+world-readable `/proc/<pid>/cmdline`: the containerized spawn passes `-e NAME`
+only, so podman copies the value from its own environment rather than putting it
+on a command line.
+
+**What is worse about it, and what follows.** A `claude setup-token` token is
+minted for a year and revoked only out of band, where the `/login` credential is
+short-lived and refreshed. So:
+
+- Treat a profile's token file as a durable secret: 0600, one account per
+  profile, and rotate by overwriting the file and restarting.
+- An agent bound to a high-value account is a candidate for a narrowed tool set;
+  a leak is not detectable from inside Brenn, only as spend on the account.
+- A publish grant on a goal channel is authority over which account an agent's
+  spend lands on, held by the same injectable principal. The authority reaches
+  every agent bound to that channel, onto any account in *that* agent's allowed
+  set — acceptance is per bound agent, not against the publisher's set — and it
+  moves all of that agent's conversations, since a goal is per app. So `exact`
+  on a goal channel the publisher does not share bounds the authority to the
+  publisher's own accounts, while a shared channel widens it to the widest set
+  among the sharers; `prefix "brenn:cc-profile."` extends it to every agent's
+  account choice, and belongs only on an agent with a narrowed tool set.
+- The image's environment and the home's `settings.json` `apiKeyHelper` are the
+  operator's to keep clean: either one silently outranks the profile's token, and
+  Brenn can only refuse the cases it can see. Which credentials outrank it, and
+  which of those Brenn refuses, are in
+  [the Claude accounts guide](claude-accounts.md#when-the-account-is-not-the-account).
+
 ### 7.2 CC's output stream (B3)
 
 CC's output is parsed and acted upon. The control path (where CC asks the backend

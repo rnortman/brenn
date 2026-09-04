@@ -78,15 +78,17 @@ async fn died_with_server_shutting_down_suppresses_alerts() {
         "server_shutting_down should suppress Error/Status broadcasts"
     );
 
-    // And the conversation should still be Active (not errored).
+    // The death ends the loop, whose teardown completes the conversation —
+    // the same end state a drain reaches, and the one `--resume` reads a
+    // `cc_session_id` back out of after a restart.
     let conv = {
         let conn = bridge.db.lock().await;
         conversation::get_conversation(&conn, bridge.conversation_id)
     };
     assert_eq!(
         conv.status,
-        ConversationStatus::Active,
-        "conversation should stay Active for resume-after-restart"
+        ConversationStatus::Completed,
+        "an intentional shutdown completes the conversation; it never errors it"
     );
 
     // Alert side is also silent — this is the test that guards against
@@ -286,9 +288,16 @@ async fn subprocess_crash_broadcasts_cancel() {
     let _ = recv_broadcast(&mut broadcast_rx).await;
     let _ = recv_broadcast(&mut broadcast_rx).await;
 
-    // Drop the event sender → event loop exits → teardown path runs.
     let fence = event_fence(&bridge);
-    drop(event_tx);
+    event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .unwrap();
+
+    // Await the death epoch and the teardown epoch, so complete_and_kill and
+    // drain_and_cancel_pending_permissions have both run. The broadcasts they
+    // produced are buffered and read below.
+    await_fence_n(fence, 2).await;
 
     // The teardown must broadcast PermissionCancelled before removing
     // the bridge from the registry.
@@ -311,9 +320,7 @@ async fn subprocess_crash_broadcasts_cancel() {
     );
 
     // And the bridge must be removed from the registry (pre-existing
-    // teardown behavior) after the broadcast. Await the teardown epoch
-    // to ensure complete_and_kill and drain_and_cancel_pending_permissions ran.
-    await_fence(fence).await;
+    // teardown behavior) after the broadcast.
     assert!(
         active_bridges.get(bridge.conversation_id).await.is_none(),
         "bridge should be removed after event loop ends"
@@ -321,14 +328,13 @@ async fn subprocess_crash_broadcasts_cancel() {
 }
 
 #[tokio::test]
-async fn event_channel_closed_removes_from_registry() {
+async fn cc_exit_removes_from_registry() {
     let (bridge_ref, event_tx, _broadcast_rx, active_bridges) = test_bridge().await;
 
     // Subscribe the fence immediately after test_bridge() so the receiver
     // starts at epoch 0 (before the startup-drain increment). The event loop
-    // will increment the epoch twice: once for the startup drain (0→1) and
-    // once for post-loop teardown after drop(event_tx) (1→2). await_fence_n(2)
-    // ensures both increments have fired before asserting on side effects.
+    // increments the epoch three times: the startup drain (0→1), the `Died`
+    // event (1→2), and post-loop teardown (2→3).
     let fence = event_fence(&bridge_ref);
 
     // Register the bridge in active_bridges.
@@ -344,11 +350,13 @@ async fn event_channel_closed_removes_from_registry() {
             .is_some()
     );
 
-    // Drop the sender to close the channel (simulates CC exit).
-    drop(event_tx);
+    bridge_ref.drain_on_idle.store(true, Ordering::SeqCst);
+    event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .unwrap();
 
-    // Await startup-drain epoch + teardown epoch (2 total).
-    await_fence_n(fence, 2).await;
+    await_fence_n(fence, 3).await;
 
     // Bridge should be removed from registry.
     assert!(
@@ -361,12 +369,12 @@ async fn event_channel_closed_removes_from_registry() {
 }
 
 #[tokio::test]
-async fn event_channel_closed_completes_conversation() {
+async fn cc_exit_completes_conversation() {
     let (bridge, event_tx, _broadcast_rx, active_bridges) = test_bridge().await;
 
     // Subscribe the fence immediately after test_bridge() at epoch 0 — see
-    // event_channel_closed_removes_from_registry for the full explanation.
-    // Await 2 epochs: startup-drain (0→1) + teardown after drop(event_tx) (1→2).
+    // cc_exit_removes_from_registry for the full explanation. Three epochs:
+    // startup drain, the `Died` event, teardown.
     let fence = event_fence(&bridge);
 
     active_bridges
@@ -380,10 +388,13 @@ async fn event_channel_closed_completes_conversation() {
         assert_eq!(conv.status, ConversationStatus::Active);
     }
 
-    // Drop the sender to close the channel (simulates CC exit).
-    drop(event_tx);
+    bridge.drain_on_idle.store(true, Ordering::SeqCst);
+    event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .unwrap();
 
-    await_fence_n(fence, 2).await;
+    await_fence_n(fence, 3).await;
 
     // Conversation should be Completed.
     let conn = bridge.db.lock().await;
@@ -392,6 +403,46 @@ async fn event_channel_closed_completes_conversation() {
         conv.status,
         ConversationStatus::Completed,
         "conversation should be Completed after CC exits"
+    );
+}
+
+/// A `Died` for a bridge the watchdog already reaped. The reset and the page
+/// happened there, so this arm repeats neither — but it must still end the
+/// loop. A loop that stayed would park in `recv().await` holding an `Arc` on a
+/// deregistered bridge: invisible to the watchdog's sweep, and leaked with
+/// everything the bridge holds for the life of the process.
+#[tokio::test]
+async fn a_death_already_handled_still_ends_the_loop() {
+    use std::sync::atomic::AtomicU32;
+    let alert_count = Arc::new(AtomicU32::new(0));
+    let (dispatcher, _h) = AlertDispatcher::new(
+        CountingAlerter(alert_count.clone()),
+        RateLimiter::new(10, 60),
+    );
+    let (bridge, event_tx, mut broadcast_rx, _ab) = test_bridge_with_dispatcher(dispatcher).await;
+    // Three epochs from here: the startup drain, the `Died`, and teardown.
+    let fence = event_fence(&bridge);
+
+    bridge.died_handled.store(true, Ordering::SeqCst);
+    event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .unwrap();
+
+    await_fence_n(fence, 3).await;
+    assert_eq!(
+        alert_count.load(Ordering::SeqCst),
+        0,
+        "the incident was already paged; a second page confuses the timeline"
+    );
+    assert!(
+        !drain_broadcast(&mut broadcast_rx).iter().any(|m| matches!(
+            m,
+            WsServerMessage::Status {
+                state: CcState::Error
+            }
+        )),
+        "the clean-slate reset already ran; this arm re-broadcasts nothing"
     );
 }
 

@@ -1,0 +1,40 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-envelope",
+    "//brenn-lib",
+    "//brenn-messaging",
+    "//brenn-obs",
+]
+
+rust_library(
+    name = "brenn-cc-profile",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# CARGO_MANIFEST_DIR resolves from the runfiles root, where Bazel tests start.
+rust_test(
+    name = "brenn-cc-profile_test",
+    size = "small",
+    crate = ":brenn-cc-profile",
+    data = ["//docs:claude-accounts.md"],
+    edition = "2024",
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-cc-profile"},
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
+rust_doc_test(
+    name = "brenn-cc-profile_doc_test",
+    crate = ":brenn-cc-profile",
+)

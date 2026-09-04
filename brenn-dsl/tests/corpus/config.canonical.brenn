@@ -49,6 +49,14 @@ alerting {
 claude_defaults {
   mcp_script_path = "/opt/brenn/noop_mcp.py";
   model = "sonnet";
+  profile_token_dir = "/home/alice/.secrets";
+}
+
+// One Claude account, as a token file. Every key is optional, so the common
+// case is the body-less form and the path follows the convention.
+claude_profile main;
+claude_profile spare {
+  expires = "2027-09-01";
 }
 
 repo_sync {

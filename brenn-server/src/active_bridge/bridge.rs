@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, Instant};
 
 use brenn_approval_rules::ApprovalRuleSet;
-use brenn_cc::session::CcSession;
+use brenn_cc::session::{CcSession, SessionEvent};
 use brenn_db::Db;
 use brenn_db::conversation;
 use brenn_lib::app::AppTool;
@@ -82,9 +82,11 @@ pub struct ActiveBridge {
     /// soonest hold is due to expire. `std::sync::Mutex` because
     /// `JoinHandle::abort()` is sync.
     pub(super) lifetime_timer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// When this bridge was constructed (`Instant::now()` at spawn time).
-    /// Used to measure init latency and diagnose stuck spawns.
-    pub(super) spawn_instant: Instant,
+    /// When the CC process this bridge currently holds was spawned. Used to
+    /// measure init latency and diagnose stuck spawns. `std::sync::Mutex`
+    /// because a profile swap replaces the process and the figure must measure
+    /// *that* process, not the bridge.
+    pub(super) spawn_instant: std::sync::Mutex<Instant>,
     /// Reference to the global bridge registry, needed for self-kill on drain.
     pub(super) active_bridges: ActiveBridges,
     /// Per-tool extension implementations, keyed by tool name. Used for custom
@@ -264,6 +266,32 @@ pub struct ActiveBridge {
     /// wedge. `None` where the deployment has no bus, and in test bridges.
     pub(in crate::active_bridge) chat_adapter_handle:
         std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The Claude profile name the current CC process was spawned under.
+    /// `None` for an app that declared no `claude_profiles`. In memory only:
+    /// cost attribution needs the profile per *turn*, which is a different
+    /// grain than a per-conversation column could hold.
+    pub(in crate::active_bridge) cc_profile: std::sync::Mutex<Option<String>>,
+    /// Which profile each profiled app should run under. `None` when no agent
+    /// declared `claude_profiles`. Read to decide whether this bridge is stale.
+    pub(in crate::active_bridge) cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// How a swap reaches the world: the replacement spawn and the model cache.
+    /// `None` on test bridges that never spawned a process.
+    pub(in crate::active_bridge) swap_host: Option<Arc<dyn super::profile_swap::ProfileSwapHost>>,
+    /// Set for the window in which a profile swap has torn the old CC process
+    /// down and not yet installed its replacement. Keeps a second swap and the
+    /// wedge watchdog off a bridge that is mid-swap; it says nothing about which
+    /// death belongs to the swap, which is `swap_ack`'s job.
+    pub(in crate::active_bridge) swapping: AtomicBool,
+    /// A swap's claim on the death of the process it is retiring: installed
+    /// before the teardown, taken and rung by the event loop's `Died` arm. One
+    /// death consumes it, so a replacement that dies a moment later is an
+    /// ordinary death and no swap can be woken by a stale signal.
+    pub(in crate::active_bridge) swap_ack:
+        std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// The sender half of the CC event channel this bridge's event loop reads.
+    /// A swap hands it to the replacement process so the existing loop stays the
+    /// consumer, and a failed swap sends a synthetic `Died` down it.
+    pub(in crate::active_bridge) cc_event_tx: mpsc::Sender<SessionEvent>,
     /// Set once the clean-slate death reset has run for this bridge (from the
     /// event loop's `Died` handler or the watchdog). Lets the watchdog tell a
     /// loop that ended after cleanly processing session death from one that died
@@ -310,6 +338,13 @@ pub struct SpawnContext<'a> {
     pub mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
     pub automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
     pub usage_session_gap_secs: u32,
+    /// Which profile each profiled app should run under. The account this
+    /// spawn runs under is this handle resolved against `app_config.slug`, and
+    /// a live bridge compares against it to tell it is on the wrong one.
+    pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// The server-owned half of the swap host; `spawn_new` completes it with
+    /// this bridge's transcript writer and alert dispatcher.
+    pub swap_host_seed: super::profile_swap::SwapHostSeed,
 }
 
 /// The model a spawn runs, paired with the `last_set_model` seed it justifies.
@@ -376,6 +411,8 @@ impl ActiveBridge {
             mqtt_event_router,
             automation_engine,
             usage_session_gap_secs,
+            cc_profiles,
+            swap_host_seed,
         } = ctx;
 
         // Create event channels.
@@ -387,7 +424,13 @@ impl ActiveBridge {
         let (broadcast_tx, initial_rx) = broadcast::channel(512);
         let bus_chat_rx = broadcast_tx.subscribe();
 
-        let container_name_suffix = format!("conv{conversation_id}");
+        // Derived, not carried: one expression, so no second spawn path can
+        // pass a profile that disagrees with the goal handle beside it.
+        let cc_profile = cc_profiles
+            .as_ref()
+            .and_then(|g| g.resolve(&app_config.slug));
+        let container_name_suffix =
+            super::cc_spawn_config::conversation_container_suffix(conversation_id);
         let transcript_name = format!("cc-{}-{container_name_suffix}.ndjson", app_config.slug);
         let mut transcript_writer = TranscriptWriter::new(log_dir, &transcript_name)
             .map_err(|e| format!("failed to create transcript writer: {e}"))?;
@@ -410,18 +453,21 @@ impl ActiveBridge {
             resume_session_id.is_some(),
         );
 
-        let config = build_cc_session_config(
+        let config = build_cc_session_config(super::cc_spawn_config::CcSpawnInputs {
             app_config,
             mcp_script_path,
             model,
             container_name_suffix,
             resume_session_id,
-            transcript,
-            alert_dispatcher.clone(),
+            transcript: transcript.clone(),
+            alert_dispatcher: alert_dispatcher.clone(),
             user_tz,
-            server_shutting_down.clone(),
-        );
+            server_shutting_down: server_shutting_down.clone(),
+            cc_profile: cc_profile.clone(),
+        });
 
+        let swap_shutdown = server_shutting_down.clone();
+        let swap_host_profiled = cc_profile.is_some();
         let spawn_instant = Instant::now();
         info!(
             conversation_id,
@@ -429,7 +475,7 @@ impl ActiveBridge {
             "spawning CC session",
         );
 
-        let (session, init_ack_info) = CcSession::spawn(config, cc_event_tx)
+        let (session, init_ack_info) = CcSession::spawn(config, cc_event_tx.clone())
             .await
             .map_err(|e| format!("CC spawn failed: {e}"))?;
 
@@ -505,7 +551,7 @@ impl ActiveBridge {
                 bus_idle_timeout,
             ),
             lifetime_timer: std::sync::Mutex::new(None),
-            spawn_instant,
+            spawn_instant: std::sync::Mutex::new(spawn_instant),
             active_bridges: active_bridges.clone(),
             tool_registry,
             tools,
@@ -550,6 +596,24 @@ impl ActiveBridge {
             event_loop_handle: std::sync::Mutex::new(None),
             chat_adapter_handle: std::sync::Mutex::new(None),
             died_handled: AtomicBool::new(false),
+            cc_profile: std::sync::Mutex::new(cc_profile.map(|p| p.name)),
+            cc_profiles,
+            // Only a bridge that can go stale gets one. An app with no
+            // `claude_profiles` never resolves a profile, so it can never swap.
+            swap_host: swap_host_profiled.then(|| {
+                Arc::new(super::profile_swap::ServerSwapHost {
+                    models: swap_host_seed.models,
+                    app_config: app_config.clone(),
+                    mcp_script_path: mcp_script_path.to_path_buf(),
+                    transcript,
+                    alert_dispatcher: alert_dispatcher.clone(),
+                    user_tz,
+                    server_shutting_down: swap_shutdown,
+                }) as Arc<dyn super::profile_swap::ProfileSwapHost>
+            }),
+            swapping: AtomicBool::new(false),
+            swap_ack: std::sync::Mutex::new(None),
+            cc_event_tx,
             #[cfg(test)]
             event_loop_epoch: epoch_tx,
         });

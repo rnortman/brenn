@@ -70,6 +70,9 @@ pub struct ResolvedConfig {
     /// channels, supplying depths without declaring a channel. All mint sites
     /// must resolve against the same table.
     pub system_channel_tuning: crate::messaging::config::SystemChannelTuning,
+    /// Declared Claude accounts, keyed by profile name, with each token file
+    /// read exactly once during startup.
+    pub claude_profiles: std::collections::BTreeMap<String, super::ClaudeProfile>,
 }
 
 /// Validate raw config and resolve defaults, producing the final app registry
@@ -818,6 +821,7 @@ pub fn validate_and_resolve(
             post_pull_hooks: raw.post_pull_hooks.clone().unwrap_or_default(),
             startup_hooks: raw.startup_hooks.clone().unwrap_or_default(),
             cc_extra_args: raw.cc_extra_args.clone(),
+            claude_profiles: raw.claude_profiles.clone(),
             approval_rules: raw.approval_rules.clone(),
             attachment_targets,
             integrations: resolved_integrations,
@@ -1048,6 +1052,11 @@ pub fn validate_and_resolve(
     // (the common case) skip this entirely.
     let pwa_push = crate::pwa_push::config::resolve_pwa_push_layer(&config.pwa_push, &apps);
 
+    // Read once here, like every other secret the bootstrap layer is handed:
+    // a declared profile whose token file is missing, empty, or readable by
+    // another local account is a misconfiguration and stops the process.
+    let claude_profiles = super::load_claude_profiles(&config.claude_profiles);
+
     ResolvedConfig {
         apps: Arc::new(apps),
         webhook_endpoints,
@@ -1055,6 +1064,7 @@ pub fn validate_and_resolve(
         mqtt_clients: resolved_clients,
         pwa_push,
         system_channel_tuning,
+        claude_profiles,
     }
 }
 

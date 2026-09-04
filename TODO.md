@@ -2222,6 +2222,13 @@ entry, retiring the free-`io` form, changing a binding arrow — leaves the one
 reference an operator copies from full of examples that no longer compile, and
 no gate notices.
 
+`docs/claude-accounts.md` is in the same position and is the worse case: its
+three snippets are the copy-paste path for standing up an account under
+pressure, and a second spelling of the same declaration — `agent
+PersonalAssistant()`, an empty parameter list the grammar accepts and nothing in
+the tree writes — survived in `config-dsl.md` until a human reviewer read it.
+Whatever shape this takes covers both documents.
+
 What makes this more than mechanical: most snippets are fragments, not
 documents. A `channel` block alone is not a loadable root (a durable channel
 needs a uuid pin; a root needs server keys), so gating them means deciding what
@@ -2240,9 +2247,9 @@ Code site (`TODO(dsl-doc-examples-ungated)`):
 brenn-lib/src/config/tests/config_files.rs, on the transcription test that
 gates the one block.
 
-Done = every block in `docs/config-dsl.md` that is presented as compilable is
-compiled by `make check`, and the blocks that are not are marked as fragments in
-the prose.
+Done = every block in `docs/config-dsl.md` and `docs/claude-accounts.md` that is
+presented as compilable is compiled by `make check`, and the blocks that are not
+are marked as fragments in the prose.
 
 ## `surface-fault-report`
 
@@ -2465,6 +2472,33 @@ the run summaries and the decision is in the Makefile with the number that made
 it: under one minute it joins `check`; over, the number is recorded in the
 comment and it stays out.
 
+## `npm-audit-precommit`
+
+`npm-audit` is out of `make check`. It is the only advisory gate over the
+`frontend`, `surface` and `e2e` npm trees and it has no CI job, so while it is
+out nothing audits them — `make npm-audit` still works and has to be run by
+hand.
+
+It came out because npm's `/-/npm/v1/security/audits/quick` endpoint spent a
+full day timing out and returning 503, which failed the pre-commit hook on every
+commit in the repo regardless of what the commit touched. Removing it was the
+operator's call, taken to unblock work, and is meant to be temporary.
+
+Code site (`TODO(npm-audit-precommit)`): `Makefile`, on `check:`.
+
+Nothing forces this closed: no CI job runs `make npm-audit`, no date expires the
+removal, and the only thing standing between the trees and an indefinite gap is
+someone reading this entry. Whether the forcing function is a scheduled CI job
+(a new cron, which `.github/workflows/ci.yml` couples to xtask's cron-sync
+guard, plus a call on whether an npm advisory reddens the repo's CI) or a dated
+re-check is an operator call, not one to take while closing a review.
+
+Done = `npm-audit` is back in the `check:` prerequisite list and in its echo
+line, a run of `make check` passes with it, the `make check` sentence under
+"Code Standards" in `CLAUDE.md` lists npm audit again with the temporary-gap
+clause removed, and the operator has said whether a scheduled CI run of
+`make npm-audit` is wanted alongside it.
+
 ## `surface-description-vocabulary-packaged`
 
 Every deployment that serves a surface must stamp a `SurfaceDescription(slug)`
@@ -2559,3 +2593,4 @@ Code site (`TODO(mcp-script-path-precondition)`):
 Done = a deployment naming an unreadable `mcp_script_path` is refused at boot,
 naming the path and the config key, with the resolution base stated in
 `docs/config-dsl.md`.
+

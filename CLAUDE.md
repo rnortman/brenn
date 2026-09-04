@@ -171,7 +171,7 @@ Don't use TODOs for vague aspirations. Every TODO should describe a concrete thi
 ## Code Standards
 
 - Rust edition 2024, stable toolchain.
-- `make check` must pass — it runs the full Bazel test graph with clippy (no warnings) and rustfmt as aspects, plus policy parity, dependency deny, npm audit, and the scrub self-check. Cargo buildability is formally unsupported; there is no cargo lane.
+- `make check` must pass — it runs the full Bazel test graph with clippy (no warnings) and rustfmt as aspects, plus policy parity, dependency deny, and the scrub self-check. The npm advisory gate is temporarily out of `check` (see `TODO.md`, `npm-audit-precommit`); run `make npm-audit` by hand. Cargo buildability is formally unsupported; there is no cargo lane.
 - Frontend: `tsc --strict`. No `any` types.
 - Comments follow `docs/comment-standard.md`. Two of its rules are backed by a mechanical scrub gate: Rule 1 (no references to ephemeral docs) and Rule 9 (generic names — `alice`, `example.com` — in comments, examples, and fixtures).
 - No backwards-compatibility shims for internal APIs. Just update all callers at once. This includes config file changes; it should be normal to be forced to update config when deploying a new version. Backend/frontend protocol changes also must not have compat shims -- the frontend auto-refreshes after backend deploy anyway, just update the frontend at the same time as the backend. Backward compat is a *maybe* for external APIs/interfaces/contracts (e.g. webhook schemas, WASM/WIT contracts, MQTT schemas); any backward compat shims *must* be called out clearly at the design stage (or earlier, in requirements) otherwise the assumption is no backward compat.

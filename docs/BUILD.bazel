@@ -6,5 +6,6 @@ policy_srcs()
 # describes cannot drift apart unnoticed.
 exports_files([
     "chat-protocol.md",
+    "claude-accounts.md",
     "config-dsl.md",
 ])

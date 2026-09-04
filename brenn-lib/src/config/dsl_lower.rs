@@ -42,9 +42,9 @@ use brenn_dsl::model::{
     WebhookAttrs, Word, section_key,
 };
 use brenn_dsl::resolved::{
-    ClassRef, PortDir, RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer, RHooks,
-    RMcp, RMount, RNamed, RRemote, RSection, RSubscribe, RSurface, RTail, RToolGrant, RVal, RValue,
-    RWebhook, RWebhookBlock, ResolvedConfig as DslResolved,
+    ClassRef, MatcherKind, PortDir, RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer,
+    RHooks, RMatcherVal, RMcp, RMount, RNamed, RRemote, RSection, RSubscribe, RSurface, RTail,
+    RToolGrant, RVal, RValue, RWebhook, RWebhookBlock, ResolvedConfig as DslResolved, scheme,
 };
 
 use crate::access::raw::{
@@ -81,6 +81,7 @@ use super::attachment::{AttachmentHandlerConfig, AttachmentTargetRaw, default_ti
 use super::automation::AutomationGlobalConfig;
 use super::brenn::BrennConfig;
 use super::claude_defaults::ClaudeDefaultsConfig;
+use super::claude_profile::{AppClaudeProfiles, ClaudeProfileRaw, default_token_file_name};
 use super::container::{ContainerConfig, default_container_home};
 use super::events::EventsConfig;
 use super::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksConfig};
@@ -140,10 +141,18 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
         ));
     }
 
-    let sections = sections(&resolved.sections, &mut errors);
+    let mut sections = sections(&resolved.sections, &mut errors);
+    let claude_profiles = claude_profiles(
+        std::mem::take(&mut sections.claude_profiles),
+        sections
+            .claude_defaults
+            .as_ref()
+            .and_then(|defaults| defaults.profile_token_dir.as_deref()),
+        &mut errors,
+    );
     let repos = repos(&resolved.repos, &mut errors);
     let mqtt_clients = mqtt_clients(&resolved.mqtt_clients, &mut errors);
-    let apps = apps(&derived, &mut errors);
+    let apps = apps(&derived, &claude_profiles, &mut errors);
     let mut link_endpoints = LinkEndpoints::new();
     let wasm_consumers = consumers(&derived, &mut link_endpoints, &mut errors);
     let surfaces = surfaces(&derived, &mut link_endpoints, &mut errors);
@@ -158,6 +167,7 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
         security: sections.security.unwrap_or_default(),
         alerting: sections.alerting,
         claude_defaults: sections.claude_defaults.unwrap_or_default(),
+        claude_profiles,
         repo_sync: sections.repo_sync.unwrap_or_default(),
         repos,
         container: sections.container,
@@ -366,6 +376,21 @@ fn toml_table(entries: &[(String, RVal)], key: &str) -> Result<toml::Table, Diag
 
 fn expect_path(value: &RVal, key: &str) -> Result<PathBuf, Diagnostic> {
     expect_str(value, key).map(PathBuf::from)
+}
+
+/// An ISO calendar date: `expires = "2027-09-01"`.
+///
+/// A string, because the language has no date literal and inventing one for a
+/// single attr would be a grammar change for nothing. The parse is what makes
+/// the string a date rather than a comment.
+fn expect_date(value: &RVal, key: &str) -> Result<chrono::NaiveDate, Diagnostic> {
+    let text = expect_str(value, key)?;
+    text.parse().map_err(|_| {
+        Diagnostic::at(
+            format!("`{key}`: expected an ISO date (YYYY-MM-DD), got {text:?}"),
+            value.span().clone(),
+        )
+    })
 }
 
 /// A list of strings: `endpoint_host_allowlist = ["push.example.com"]`.
@@ -773,6 +798,15 @@ impl<'a> Body<'a> {
         keep(expect_path(value, key), errors)
     }
 
+    fn date(
+        &mut self,
+        key: &'static str,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<chrono::NaiveDate> {
+        let value = self.take(key)?;
+        keep(expect_date(value, key), errors)
+    }
+
     fn required_path(
         &mut self,
         key: &'static str,
@@ -924,6 +958,18 @@ struct Sections {
     watchdog: Option<WatchdogConfig>,
     container: HashMap<String, ContainerConfig>,
     integrations: HashMap<String, toml::Value>,
+    /// Profiles as written, before the `profile_token_dir` convention is
+    /// applied: that needs `claude_defaults`, which the document may state
+    /// after the profiles.
+    claude_profiles: BTreeMap<String, StatedProfile>,
+}
+
+/// One `claude_profile` block's body, held until the token-path convention can
+/// be applied to it.
+struct StatedProfile {
+    token_file: Option<PathBuf>,
+    expires: Option<chrono::NaiveDate>,
+    at: Span,
 }
 
 /// TODO(dsl-vocabulary-config-parity): the kindword arms below, and every key
@@ -971,6 +1017,22 @@ fn sections(list: &[RSection], errors: &mut Vec<Diagnostic>) -> Sections {
                     .value()
                     .clone();
                 out.container.insert(name, container(&mut body, errors));
+            }
+            "claude_profile" => {
+                let name = section
+                    .name
+                    .as_ref()
+                    .expect("a claude_profile section carries a name")
+                    .value()
+                    .clone();
+                out.claude_profiles.insert(
+                    name,
+                    StatedProfile {
+                        token_file: body.path("token_file", errors),
+                        expires: body.date("expires", errors),
+                        at: section.kindword.span().clone(),
+                    },
+                );
             }
             "integration" => {
                 let name = section
@@ -1226,7 +1288,63 @@ fn claude_defaults(body: &mut Body, errors: &mut Vec<Diagnostic>) -> ClaudeDefau
             .path("mcp_script_path", errors)
             .unwrap_or(defaults.mcp_script_path),
         model: body.str("model", errors).unwrap_or(defaults.model),
+        profile_token_dir: body.path("profile_token_dir", errors),
     }
+}
+
+/// Every `claude_profile` block with its token path settled.
+///
+/// The convention — `<profile_token_dir>/claude-profile-<name>.token` — is
+/// applied here rather than at the block, because the block may be written
+/// above the `claude_defaults` section that states the directory.
+///
+/// Two profiles resolving to one token path is refused: two names for one
+/// account is a mistake, and the two would then be indistinguishable everywhere
+/// a profile name is meant to identify an account.
+fn claude_profiles(
+    stated: BTreeMap<String, StatedProfile>,
+    token_dir: Option<&std::path::Path>,
+    errors: &mut Vec<Diagnostic>,
+) -> BTreeMap<String, ClaudeProfileRaw> {
+    let mut profiles = BTreeMap::new();
+    let mut by_path: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for (name, profile) in stated {
+        let token_file = match (profile.token_file, token_dir) {
+            (Some(written), _) => written,
+            (None, Some(dir)) => dir.join(default_token_file_name(&name)),
+            (None, None) => {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`claude_profile {name}` states no `token_file` and \
+                         `claude_defaults.profile_token_dir` is not set, so there is no \
+                         path to read its token from; state one of the two"
+                    ),
+                    profile.at.clone(),
+                ));
+                continue;
+            }
+        };
+        if let Some(earlier) = by_path.get(&token_file) {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`claude_profile {name}` reads the same token file as `claude_profile \
+                     {earlier}` ({}); two names for one account is a mistake",
+                    token_file.display()
+                ),
+                profile.at.clone(),
+            ));
+            continue;
+        }
+        by_path.insert(token_file.clone(), name.clone());
+        profiles.insert(
+            name,
+            ClaudeProfileRaw {
+                token_file,
+                expires: profile.expires,
+            },
+        );
+    }
+    profiles
 }
 
 fn repo_sync(body: &mut Body, errors: &mut Vec<Diagnostic>) -> RepoSyncConfig {
@@ -1484,14 +1602,201 @@ fn mqtt_clients(
 // ---------------------------------------------------------------------------
 
 /// `[[app]]` per agent, with the authority derivation computed for it.
-fn apps(derived: &DerivedConfig, errors: &mut Vec<Diagnostic>) -> Vec<AppConfigRaw> {
+///
+/// `profiles` is the document's declared Claude accounts, already settled: an
+/// agent's `claude_profiles` list is checked against those names here.
+fn apps(
+    derived: &DerivedConfig,
+    profiles: &BTreeMap<String, ClaudeProfileRaw>,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<AppConfigRaw> {
     let resolved = &derived.resolved;
     resolved
         .agents
         .iter()
         .zip(&derived.agents)
-        .map(|(agent, authority)| app(resolved, agent, authority, errors))
+        .map(|(agent, authority)| app(resolved, agent, authority, profiles, errors))
         .collect()
+}
+
+/// The three agent attrs the Claude-account lowering reads together.
+///
+/// `cc_extra_args` rides along because `--bare` and a profile are mutually
+/// exclusive: under `--bare` Claude Code ignores `CLAUDE_CODE_OAUTH_TOKEN` and
+/// bills the home's login instead, so the profile would be a lie.
+struct StatedAppProfiles<'a> {
+    profiles: Option<&'a Attr<RVal>>,
+    goal: Option<&'a Attr<RVal>>,
+    cc_extra_args: &'a [String],
+    cc_extra_args_at: Option<&'a Attr<RVal>>,
+}
+
+/// The accounts one agent may run under, and where its goal comes from.
+///
+/// `None` where the agent states no `claude_profiles` — the case for every
+/// agent in a deployment that declares no accounts — and also where what it
+/// states was refused, because a refused lowering is discarded whole.
+fn app_claude_profiles(
+    resolved: &DslResolved,
+    declared: &BTreeMap<String, ClaudeProfileRaw>,
+    stated: StatedAppProfiles<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<AppClaudeProfiles> {
+    let Some(attr) = stated.profiles else {
+        if let Some(goal) = stated.goal {
+            errors.push(Diagnostic::at(
+                "`claude_profile_goal` names the channel that decides which account this \
+                 agent runs under, but the agent states no `claude_profiles`, so there is \
+                 no account for a goal to name; state the accounts it may use"
+                    .to_string(),
+                goal.value.span().clone(),
+            ));
+        }
+        return None;
+    };
+    let allowed = expect_strings(&attr.value, "claude_profiles", errors)?;
+    let mut admitted = true;
+    if allowed.is_empty() {
+        errors.push(Diagnostic::at(
+            "`claude_profiles` is empty: an agent allowed no account has none to run \
+             under. Omit the key to leave the agent on whatever `/login` left in its home"
+                .to_string(),
+            attr.value.span().clone(),
+        ));
+        admitted = false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &allowed {
+        if !declared.contains_key(name) {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`claude_profiles` names `{name}`, which no `claude_profile` block \
+                     declares"
+                ),
+                attr.value.span().clone(),
+            ));
+            admitted = false;
+        }
+        if !seen.insert(name.clone()) {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`claude_profiles` names `{name}` twice; the list is a preference \
+                     order, in which a name has one place"
+                ),
+                attr.value.span().clone(),
+            ));
+            admitted = false;
+        }
+    }
+    if let Some(at) = stated.cc_extra_args_at
+        && stated.cc_extra_args.iter().any(|arg| arg == "--bare")
+    {
+        errors.push(Diagnostic::at(
+            "`cc_extra_args` passes `--bare`, under which Claude Code ignores \
+             `CLAUDE_CODE_OAUTH_TOKEN` and authenticates with whatever `/login` left in \
+             the agent's home: the profile this agent runs under would be a lie. Drop one \
+             of the two"
+                .to_string(),
+            at.value.span().clone(),
+        ));
+        admitted = false;
+    }
+    let goal = match stated.goal {
+        Some(at) => {
+            let address = goal_channel(resolved, at, errors);
+            admitted &= address.is_some();
+            address
+        }
+        None => None,
+    };
+    admitted.then_some(AppClaudeProfiles { allowed, goal })
+}
+
+/// The canonical address a `claude_profile_goal` names.
+///
+/// An `exact` matcher, because that is the only attr-value position in which a
+/// handle resolves to a channel. The channel it names must be one the document
+/// declares, durable, and retained one deep: the goal is a state document, and
+/// the mechanism reads it by taking the latest message of that channel's
+/// window at every boot.
+fn goal_channel(
+    resolved: &DslResolved,
+    attr: &Attr<RVal>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<String> {
+    let key = "claude_profile_goal";
+    let RValue::Matcher(matcher) = attr.value.value() else {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{key}`: a goal is one channel, written as an `exact` matcher — \
+                 `{key} = exact <channel>`; this is {}",
+                attr.value.value().kind(),
+            ),
+            attr.value.span().clone(),
+        ));
+        return None;
+    };
+    if *matcher.kind.value() != MatcherKind::Exact {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{key}`: a goal is one channel, and only `exact` names one; `{}` names a \
+                 family",
+                matcher.kind.value().as_str(),
+            ),
+            matcher.kind.span().clone(),
+        ));
+        return None;
+    }
+    let index = match matcher.val.value() {
+        RMatcherVal::Chan(id) => id.0,
+        RMatcherVal::Lit(address) => {
+            let found = resolved
+                .channels
+                .iter()
+                .position(|channel| channel.address.value() == address);
+            let Some(index) = found else {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`{key}`: `{address}` is not a declared channel; a goal channel is \
+                         declared with a `channel` block like any other"
+                    ),
+                    matcher.val.span().clone(),
+                ));
+                return None;
+            };
+            index
+        }
+    };
+    let channel = &resolved.channels[index];
+    let address = channel.address.value().clone();
+    let durable = scheme::split_spellable(&address)
+        .is_some_and(|(scheme, _)| scheme::config_identified(scheme));
+    if !durable {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{key}`: `{address}` is not durable, so the goal it carries would not \
+                 survive the restart a profile change needs; a goal channel is `brenn:`"
+            ),
+            matcher.val.span().clone(),
+        ));
+        return None;
+    }
+    let retained_once = matches!(
+        channel.attrs.retain_depth.as_ref().map(|depth| &depth.value),
+        Some(IntOrWord::Int(count)) if *count.value() == 1,
+    );
+    if !retained_once {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{key}`: `{address}` must state `retain_depth = 1`; the goal is the one \
+                 message a reader takes from that window, and a window of another size \
+                 says something else"
+            ),
+            matcher.val.span().clone(),
+        ));
+        return None;
+    }
+    Some(address)
 }
 
 /// One `[[app]]`.
@@ -1508,6 +1813,7 @@ fn app(
     resolved: &DslResolved,
     agent: &RAgent,
     authority: &DAuthority,
+    declared_profiles: &BTreeMap<String, ClaudeProfileRaw>,
     errors: &mut Vec<Diagnostic>,
 ) -> AppConfigRaw {
     // Destructured with no `..`: an attr added to `AgentAttrs` fails
@@ -1551,10 +1857,25 @@ fn app(
         prefix_device,
         container,
         container_working_dir,
+        claude_profiles,
+        claude_profile_goal,
         send_budget,
     }: &AgentAttrs<RVal> = &agent.attrs;
     let label = agent.slug.value().clone();
     let (start_hooks, post_pull_hooks, startup_hooks) = hook_blocks(&agent.hooks, errors);
+    let extra_args =
+        opt_strings(cc_extra_args.as_ref(), "cc_extra_args", errors).unwrap_or_default();
+    let app_profiles = app_claude_profiles(
+        resolved,
+        declared_profiles,
+        StatedAppProfiles {
+            profiles: claude_profiles.as_ref(),
+            goal: claude_profile_goal.as_ref(),
+            cc_extra_args: &extra_args,
+            cc_extra_args_at: cc_extra_args.as_ref(),
+        },
+        errors,
+    );
     let send_budget = opt_int(send_budget.as_ref(), "send_budget", errors);
     let subs = subscriptions(resolved, agent, errors);
     // The `messaging` block is present exactly when the agent has something to
@@ -1616,8 +1937,8 @@ fn app(
         start_hooks,
         post_pull_hooks,
         startup_hooks,
-        cc_extra_args: opt_strings(cc_extra_args.as_ref(), "cc_extra_args", errors)
-            .unwrap_or_default(),
+        cc_extra_args: extra_args,
+        claude_profiles: app_profiles,
         // No attr spelling: a nested table of rule patterns.
         approval_rules: Vec::new(),
         attachment_targets: attachment_targets(&agent.attachment_targets, &label, errors),

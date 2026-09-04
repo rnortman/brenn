@@ -2,6 +2,32 @@
 
 use std::path::Path;
 
+/// A secret that is handed onward rather than compared: it must survive in
+/// plaintext and must never reach a log, a panic message, or a command line.
+///
+/// The redacting `Debug` is the point. A comparison secret can be stored as a
+/// digest and printed freely; a bearer credential cannot, so the type carries
+/// the discipline instead of every struct that holds one. `expose` is the only
+/// way to the bytes, and it is spelled to be visible at the call site.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(<redacted>)")
+    }
+}
+
 /// Read a secret from a file: trim whitespace, panic on missing/unreadable/empty.
 ///
 /// The `label` string is embedded verbatim in panic messages; callers should
@@ -73,6 +99,14 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+
+    #[test]
+    fn secret_string_debug_hides_the_value() {
+        let secret = SecretString::new("sk-ant-oat01-tOkEn".to_string());
+        assert_eq!(format!("{secret:?}"), "SecretString(<redacted>)");
+        assert!(!format!("{secret:?}").contains("tOkEn"));
+        assert_eq!(secret.expose(), "sk-ant-oat01-tOkEn");
+    }
 
     #[test]
     fn reads_and_trims_secret() {

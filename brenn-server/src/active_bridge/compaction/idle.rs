@@ -40,6 +40,10 @@ pub(in crate::active_bridge) async fn set_idle_and_drain(bridge: &Arc<ActiveBrid
         crate::idle_hooks::run_idle_hooks_for_shutdown(bridge).await;
         bridge.drain_no_hooks().await;
     } else {
+        // A goal that changed mid-turn waited for this moment: the process can
+        // only change account between turns. Cheap and synchronous unless this
+        // bridge is actually on the wrong one.
+        bridge.reconsider_profile();
         // Normal path: arm the shared timer fresh from this moment.
         bridge.maybe_arm_idle_hook_timer().await;
     }

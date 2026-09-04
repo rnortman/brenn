@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use brenn_lib::config::{ContainerSpawnConfig, container_rm_args};
+use brenn_lib::config::{ContainerSpawnConfig, SecretString, container_rm_args};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use brenn_obs::transcript::TranscriptWriter;
 use brenn_ws_types::PermissionModeValue;
@@ -87,6 +87,11 @@ pub struct CcSessionConfig {
     /// Extra environment variables for the CC process (bare apps only).
     /// For containerized apps, env vars are injected as podman -e flags instead.
     pub env_vars: Vec<(String, String)>,
+    /// Environment variables whose value is a credential — today,
+    /// `CLAUDE_CODE_OAUTH_TOKEN`. Separate from `env_vars` because these must
+    /// never reach a command line: containerized apps get `-e NAME` and the
+    /// value travels through the podman client's own environment.
+    pub secret_env_vars: Vec<(String, SecretString)>,
     /// Pre-created **per-session** shutdown flag for the reader task to check
     /// on EOF.
     ///
@@ -290,6 +295,11 @@ pub(crate) struct SpawnCommand {
     pub cwd: Option<PathBuf>,
     /// Extra environment variables for the process (bare-process mode only).
     pub env_vars: Vec<(String, String)>,
+    /// Environment variables carrying a credential, set on the spawned process
+    /// in **both** modes: on the CC child when bare, and on the podman client
+    /// when containerized, where the matching `-e NAME` flag copies the value
+    /// across without it ever reaching an argument vector.
+    pub secret_env_vars: Vec<(String, SecretString)>,
     /// Name of the container this command creates. `None` for bare-process mode.
     pub container_name: Option<String>,
 }
@@ -556,13 +566,20 @@ pub(crate) fn build_spawn_command(config: &CcSessionConfig) -> SpawnCommand {
 
         let mut podman_args = container.base_podman_args();
 
-        let extra_flags: Vec<String> = vec![
+        let mut extra_flags: Vec<String> = vec![
             "-i".into(),
             "--name".into(),
             container_name.clone(),
             "--label".into(),
             "brenn-managed=true".to_string(),
         ];
+        // `-e NAME` with no `=`: podman copies the value from its own
+        // environment, so a bearer token never appears in the host's
+        // world-readable `/proc/<pid>/cmdline`.
+        for (key, _) in &config.secret_env_vars {
+            extra_flags.push("-e".into());
+            extra_flags.push(key.clone());
+        }
         ContainerSpawnConfig::insert_podman_flags(&mut podman_args, &extra_flags);
 
         // Command: claude + its args.
@@ -574,6 +591,9 @@ pub(crate) fn build_spawn_command(config: &CcSessionConfig) -> SpawnCommand {
             args: podman_args,
             cwd: None,
             env_vars: vec![],
+            // On the podman process, not on the container command line — that
+            // is what `-e NAME` above reads from.
+            secret_env_vars: config.secret_env_vars.clone(),
             container_name: Some(container_name),
         }
     } else {
@@ -582,6 +602,7 @@ pub(crate) fn build_spawn_command(config: &CcSessionConfig) -> SpawnCommand {
             args: cc_args,
             cwd: Some(config.cwd.clone()),
             env_vars: config.env_vars.clone(),
+            secret_env_vars: config.secret_env_vars.clone(),
             container_name: None,
         }
     }
@@ -638,6 +659,13 @@ impl CcSession {
         }
         if !cmd.env_vars.is_empty() {
             command.envs(cmd.env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        }
+        if !cmd.secret_env_vars.is_empty() {
+            command.envs(
+                cmd.secret_env_vars
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.expose())),
+            );
         }
 
         let mut child = command.spawn().map_err(CcError::SpawnFailed)?;
@@ -1097,6 +1125,7 @@ mod tests {
             add_dirs: vec![],
             cc_extra_args: vec![],
             env_vars: vec![],
+            secret_env_vars: vec![],
             shutting_down: None,
             server_shutting_down: None,
         }
@@ -2040,13 +2069,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn container_command_has_empty_env_vars() {
-        let config = container_config();
+    async fn container_command_carries_exactly_the_secret_env_vars() {
+        let mut config = container_config();
+        config.secret_env_vars = vec![(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            SecretString::new("sk-ant-oat-secret".to_string()),
+        )];
         let cmd = build_spawn_command(&config);
         assert_eq!(cmd.program, "podman");
         assert!(
             cmd.env_vars.is_empty(),
-            "containerized mode should have empty env_vars (injected as podman -e flags instead)"
+            "containerized mode injects plain env vars as podman -e KEY=VALUE flags instead"
+        );
+        assert_eq!(cmd.secret_env_vars.len(), 1);
+        assert_eq!(cmd.secret_env_vars[0].0, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(cmd.secret_env_vars[0].1.expose(), "sk-ant-oat-secret");
+    }
+
+    /// The whole point of the `-e NAME` form: podman copies the value from its
+    /// own environment, so the token is not in `/proc/<pid>/cmdline`.
+    #[tokio::test]
+    async fn container_command_names_the_secret_var_without_its_value() {
+        let mut config = container_config();
+        config.secret_env_vars = vec![(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            SecretString::new("sk-ant-oat-secret".to_string()),
+        )];
+        let cmd = build_spawn_command(&config);
+        let idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "CLAUDE_CODE_OAUTH_TOKEN")
+            .expect("the variable is named on the podman command line");
+        assert_eq!(cmd.args[idx - 1], "-e");
+        assert!(
+            !cmd.args[idx].contains('='),
+            "the `-e NAME` form carries no value: {:?}",
+            cmd.args[idx]
+        );
+        assert!(
+            !cmd.args.iter().any(|a| a.contains("sk-ant-oat-secret")),
+            "no argument may carry the token bytes: {:?}",
+            cmd.args
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_command_carries_the_secret_env_var() {
+        let mut config = bare_config();
+        config.secret_env_vars = vec![(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            SecretString::new("sk-ant-oat-secret".to_string()),
+        )];
+        let cmd = build_spawn_command(&config);
+        assert_eq!(cmd.program, "claude");
+        assert_eq!(cmd.secret_env_vars.len(), 1);
+        assert_eq!(cmd.secret_env_vars[0].1.expose(), "sk-ant-oat-secret");
+        assert!(!cmd.args.iter().any(|a| a.contains("sk-ant-oat-secret")));
+    }
+
+    #[tokio::test]
+    async fn no_profile_means_no_secret_env_vars_in_either_mode() {
+        assert!(
+            build_spawn_command(&bare_config())
+                .secret_env_vars
+                .is_empty()
+        );
+        assert!(
+            build_spawn_command(&container_config())
+                .secret_env_vars
+                .is_empty()
         );
     }
 }

@@ -78,6 +78,15 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     /// impetus pool, and of the outbound draws that share it. `0` makes the
     /// conversation attended-only.
     pub send_budget: u32,
+    /// The CC event sender the bridge hands to a replacement process. `None`
+    /// (default) mints a throwaway whose receiver is already gone.
+    pub cc_event_tx: Option<tokio::sync::mpsc::Sender<brenn_cc::session::SessionEvent>>,
+    /// Which profile each profiled app should run under. `None` (default) makes
+    /// the bridge unprofiled and therefore never stale.
+    pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// The swap's contact with the world. `None` (default) is right for every
+    /// bridge that never swaps — any app with no `claude_profiles`.
+    pub swap_host: Option<Arc<dyn super::profile_swap::ProfileSwapHost>>,
 }
 
 impl Default for TestBridgeConfig {
@@ -102,6 +111,9 @@ impl Default for TestBridgeConfig {
             tools: None,
             tool_grants: std::collections::BTreeMap::new(),
             send_budget: 100,
+            cc_event_tx: None,
+            cc_profiles: None,
+            swap_host: None,
         }
     }
 }
@@ -373,6 +385,9 @@ impl ActiveBridge {
             tools,
             tool_grants,
             send_budget,
+            cc_event_tx,
+            cc_profiles,
+            swap_host,
         } = cfg;
         // Resolve: None → fresh per-bridge registry; Some → caller-supplied shared registry.
         let active_bridges = active_bridges_opt.unwrap_or_else(ActiveBridges::new);
@@ -402,7 +417,7 @@ impl ActiveBridge {
             cc_idle: AtomicBool::new(true),
             lifetime: super::lifetime::LifetimeArbiter::new(idle_timeout, bus_idle_timeout),
             lifetime_timer: std::sync::Mutex::new(None),
-            spawn_instant: Instant::now(),
+            spawn_instant: std::sync::Mutex::new(Instant::now()),
             active_bridges,
             tool_registry: Arc::new(HashMap::new()),
             tools,
@@ -454,6 +469,12 @@ impl ActiveBridge {
             event_loop_handle: std::sync::Mutex::new(None),
             chat_adapter_handle: std::sync::Mutex::new(None),
             died_handled: AtomicBool::new(false),
+            cc_profile: std::sync::Mutex::new(None),
+            cc_profiles,
+            swap_host,
+            swapping: AtomicBool::new(false),
+            swap_ack: std::sync::Mutex::new(None),
+            cc_event_tx: cc_event_tx.unwrap_or_else(|| tokio::sync::mpsc::channel(1).0),
             event_loop_epoch: epoch_tx,
         })
     }

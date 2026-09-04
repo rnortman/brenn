@@ -1,5 +1,5 @@
 {
-  "checksum": "8ea82fb0adbbe6eef2f0c90694fae94e32922dd6cd4c7922ddcb010d26c676f4",
+  "checksum": "eabf117b0c4c4730eb5ec58bd07bbf229ed46d531cd1036895ce5cfc5825e437",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2951,6 +2951,55 @@
       "license_ids": [],
       "license_file": null
     },
+    "brenn-cc-profile 0.1.0": {
+      "name": "brenn-cc-profile",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_cc_profile",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_cc_profile",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "tokio 1.52.3",
+              "target": "tokio"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
     "brenn-chrome 0.1.0": {
       "name": "brenn-chrome",
       "version": "0.1.0",
@@ -3261,6 +3310,12 @@
         "compile_data_glob": [
           "**"
         ],
+        "crate_features": {
+          "common": [
+            "testutils"
+          ],
+          "selects": {}
+        },
         "deps": {
           "common": [
             {
@@ -36470,6 +36525,7 @@
     "brenn-budget 0.1.0": "brenn-budget",
     "brenn-cal 0.1.0": "brenn-cal",
     "brenn-cc 0.1.0": "brenn-cc",
+    "brenn-cc-profile 0.1.0": "brenn-cc-profile",
     "brenn-chrome 0.1.0": "surface/chrome",
     "brenn-cli 0.1.0": "brenn-cli",
     "brenn-common 0.1.0": "brenn-common",

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use brenn_cc::protocol::outgoing::{HookMatcher, HooksConfig};
 use brenn_cc::session::CcSessionConfig;
+use brenn_cc_profile::{CLAUDE_OAUTH_TOKEN_VAR, OUTRANKING_CREDENTIAL_VARS};
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::transcript::TranscriptWriter;
 use tracing::info;
@@ -16,24 +17,54 @@ pub(super) const MCP_SERVER_NAME: &str = "brenn";
 /// Container-side path where noop_mcp.py is bind-mounted.
 pub(super) const CONTAINER_MCP_SCRIPT_PATH: &str = "/opt/brenn/noop_mcp.py";
 
+/// The podman container name a conversation's CC process runs under, as a
+/// suffix of `brenn-<app slug>-`. One spelling of the rule: the reaper matches
+/// the names this produces, so a second spelling would create containers it
+/// does not recognise.
+pub(crate) fn conversation_container_suffix(conversation_id: i64) -> String {
+    format!("conv{conversation_id}")
+}
+
+/// Everything a CC spawn needs that is not already on the app's config.
+///
+/// A struct rather than an argument list because there are two spawn paths —
+/// the initial one and the profile swap's respawn — and a new field must be a
+/// compile error at both rather than a value that silently differs.
+pub(crate) struct CcSpawnInputs<'a> {
+    pub app_config: &'a brenn_lib::config::AppConfig,
+    pub mcp_script_path: &'a Path,
+    /// The model CC starts on. The first send re-asserts it, so this is what
+    /// runs until then.
+    pub model: String,
+    pub container_name_suffix: String,
+    pub resume_session_id: Option<String>,
+    pub transcript: Arc<TranscriptWriter>,
+    pub alert_dispatcher: AlertDispatcher,
+    /// Becomes `GRAF_USER_TZ` in CC's environment so graf MCP calls compute
+    /// "today" in the user's zone.
+    pub user_tz: chrono_tz::Tz,
+    pub server_shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// The Claude account this spawn runs under, or `None` for an app that
+    /// declared no `claude_profiles`.
+    pub cc_profile: Option<brenn_cc_profile::ResolvedProfile>,
+}
+
 /// Build the `CcSessionConfig` used to spawn the CC subprocess from
-/// `ActiveBridge::spawn_new()`.
+/// `ActiveBridge::spawn_new()` and from the profile swap's respawn.
 /// Keeps hooks, MCP config, container mounts, and allowed tools in one place.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_cc_session_config(
-    app_config: &brenn_lib::config::AppConfig,
-    mcp_script_path: &Path,
-    model: String,
-    container_name_suffix: String,
-    resume_session_id: Option<String>,
-    transcript: Arc<TranscriptWriter>,
-    alert_dispatcher: AlertDispatcher,
-    // `user_tz` becomes `GRAF_USER_TZ` in CC's environment so graf MCP
-    // calls compute "today" in the user's zone. See
-    // `docs/designs/graf-user-tz.md`.
-    user_tz: chrono_tz::Tz,
-    server_shutting_down: Arc<std::sync::atomic::AtomicBool>,
-) -> CcSessionConfig {
+pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionConfig {
+    let CcSpawnInputs {
+        app_config,
+        mcp_script_path,
+        model,
+        container_name_suffix,
+        resume_session_id,
+        transcript,
+        alert_dispatcher,
+        user_tz,
+        server_shutting_down,
+        cc_profile,
+    } = inputs;
     // Register hooks for ALL tools (matcher = None = wildcard).
     //
     // PreToolUse: intercept brenn noop tools (DisplayFile, ProposeReconciliation),
@@ -88,6 +119,17 @@ pub(crate) fn build_cc_session_config(
                 seen.insert(key.as_str()),
                 "BUG: duplicate integration env var key {key:?} — two integrations are \
                  emitting the same key for app {:?}; one would silently override the other",
+                app_config.slug,
+            );
+            // Claude Code ranks each of these above `CLAUDE_CODE_OAUTH_TOKEN`,
+            // so one of them in the environment would silently bill a different
+            // account than the profile names and every per-profile figure would
+            // be a lie.
+            assert!(
+                cc_profile.is_none() || !OUTRANKING_CREDENTIAL_VARS.contains(&key.as_str()),
+                "BUG: integration env var {key:?} outranks CLAUDE_CODE_OAUTH_TOKEN in Claude \
+                 Code's credential precedence, and app {:?} runs under a claude_profile — the \
+                 profile would name one account while CC used another",
                 app_config.slug,
             );
         }
@@ -169,6 +211,10 @@ pub(crate) fn build_cc_session_config(
         } else {
             vec![]
         },
+        secret_env_vars: cc_profile
+            .into_iter()
+            .map(|p| (CLAUDE_OAUTH_TOKEN_VAR.to_string(), p.token))
+            .collect(),
         shutting_down: None,
         server_shutting_down: Some(server_shutting_down),
     }
@@ -473,27 +519,51 @@ mod tests {
         run_build_cc_session_config_with_tz(app_config, chrono_tz::UTC)
     }
 
+    fn run_build_cc_session_config_with_profile(
+        app_config: &brenn_lib::config::AppConfig,
+        profile: &str,
+        token: &str,
+    ) -> CcSessionConfig {
+        run_build_cc_session_config_inner(
+            app_config,
+            chrono_tz::UTC,
+            Some(brenn_cc_profile::ResolvedProfile {
+                name: profile.to_string(),
+                token: brenn_lib::config::SecretString::new(token.to_string()),
+            }),
+        )
+    }
+
     /// Variant that takes an explicit `user_tz` for tests that assert
     /// `GRAF_USER_TZ` wiring.
     fn run_build_cc_session_config_with_tz(
         app_config: &brenn_lib::config::AppConfig,
         user_tz: chrono_tz::Tz,
     ) -> CcSessionConfig {
+        run_build_cc_session_config_inner(app_config, user_tz, None)
+    }
+
+    fn run_build_cc_session_config_inner(
+        app_config: &brenn_lib::config::AppConfig,
+        user_tz: chrono_tz::Tz,
+        cc_profile: Option<brenn_cc_profile::ResolvedProfile>,
+    ) -> CcSessionConfig {
         let dir = tempfile::tempdir().unwrap();
         let transcript =
             Arc::new(brenn_obs::transcript::TranscriptWriter::new(dir.path(), "test.log").unwrap());
         let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
-        build_cc_session_config(
+        build_cc_session_config(CcSpawnInputs {
             app_config,
-            Path::new("/opt/brenn/noop_mcp.py"),
-            "sonnet".to_string(),
-            "conv-test".to_string(),
-            None,
+            mcp_script_path: Path::new("/opt/brenn/noop_mcp.py"),
+            model: "sonnet".to_string(),
+            container_name_suffix: "conv-test".to_string(),
+            resume_session_id: None,
             transcript,
             alert_dispatcher,
             user_tz,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
+            server_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cc_profile,
+        })
     }
 
     /// The session must get a fresh per-session shutdown flag and the shared
@@ -857,5 +927,85 @@ mod tests {
             }),
         );
         run_build_cc_session_config(&app);
+    }
+
+    /// An integration emitting a credential variable that outranks the token
+    /// would silently bill a different account than the profile names.
+    #[tokio::test]
+    #[should_panic(expected = "outranks CLAUDE_CODE_OAUTH_TOKEN")]
+    async fn build_cc_session_config_panics_on_outranking_integration_env_key() {
+        use std::sync::Arc;
+        let mut app = minimal_test_app_config();
+        app.integrations.insert(
+            "alpha".to_string(),
+            Arc::new(ConstEnvIntegration {
+                name: "alpha",
+                key: "ANTHROPIC_API_KEY",
+                value: "sk-ant-api-whatever",
+            }),
+        );
+        run_build_cc_session_config_with_profile(&app, "main", "sk-ant-oat-token");
+    }
+
+    /// The same key on an app without profiles is the operator's business:
+    /// nothing claims which account that app runs under.
+    #[tokio::test]
+    async fn build_cc_session_config_allows_outranking_env_key_without_a_profile() {
+        use std::sync::Arc;
+        let mut app = minimal_test_app_config();
+        app.integrations.insert(
+            "alpha".to_string(),
+            Arc::new(ConstEnvIntegration {
+                name: "alpha",
+                key: "ANTHROPIC_API_KEY",
+                value: "sk-ant-api-whatever",
+            }),
+        );
+        let cfg = run_build_cc_session_config(&app);
+        assert!(cfg.secret_env_vars.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_cc_session_config_puts_the_profile_token_in_secret_env_vars() {
+        let cfg = run_build_cc_session_config_with_profile(
+            &minimal_test_app_config(),
+            "main",
+            "sk-ant-oat-token",
+        );
+        assert_eq!(cfg.secret_env_vars.len(), 1);
+        assert_eq!(cfg.secret_env_vars[0].0, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(cfg.secret_env_vars[0].1.expose(), "sk-ant-oat-token");
+        assert!(
+            !cfg.env_vars
+                .iter()
+                .any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
+            "the token must not travel the plain env-var path, which podman renders as \
+             `-e KEY=VALUE` on a world-readable command line"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_cc_session_config_without_a_profile_carries_no_secret_env_vars() {
+        let cfg = run_build_cc_session_config(&minimal_test_app_config());
+        assert!(cfg.secret_env_vars.is_empty());
+    }
+
+    /// A containerized app's plain integration env vars still go on the podman
+    /// command line; only the credential is kept off it.
+    #[tokio::test]
+    async fn build_cc_session_config_containerized_keeps_the_token_off_the_podman_args() {
+        let mut app = minimal_test_app_config();
+        app.container_spawn = Some(test_container("/host/wd", "/home/user/wd"));
+        let cfg = run_build_cc_session_config_with_profile(&app, "main", "sk-ant-oat-token");
+        let spawn = cfg.container.as_ref().expect("containerized");
+        assert!(
+            !spawn
+                .extra_args
+                .iter()
+                .any(|a| a.contains("sk-ant-oat-token")),
+            "no podman argument may carry the token bytes: {:?}",
+            spawn.extra_args
+        );
+        assert_eq!(cfg.secret_env_vars.len(), 1);
     }
 }

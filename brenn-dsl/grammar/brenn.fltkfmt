@@ -59,10 +59,10 @@ after "<->" { nbsp; }
 rule section
 {
     ws_allowed: nbsp;
-    after "{" { hard; }
-    before "}" { hard; }
-    after "}" { hard; }
-    nest from after "{" to before "}";
+    after open { hard; }
+    before close { hard; }
+    after close { hard; }
+    nest from after open to before close;
 }
 
 rule body_block

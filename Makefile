@@ -191,21 +191,27 @@ xtask-deny:
 	bazel run $(BAZEL_CONFIG) //xtask -- deny --root $(CURDIR)
 
 # Full pre-commit check suite: the Bazel graph, the policy scan's file-set
-# parity against git, the advisory gates over both dependency ecosystems, and
-# the scrub gate's own liveness. Each step is independently invocable and
-# streams its own output.
+# parity against git, the Rust advisory gate, and the scrub gate's own
+# liveness. Each step is independently invocable and streams its own output.
 #
-# `npm-audit` and `scrub-selfcheck` are here because nothing else runs them: the
-# JS/TS advisory gate has no CI job, and the stale-installed-scrubber check is
-# local by nature — it needs neither cargo nor Bazel, and CI never runs
-# `make check`.
+# `scrub-selfcheck` is here because nothing else runs it: the stale-installed-
+# scrubber check is local by nature — it needs neither cargo nor Bazel, and CI
+# never runs `make check`.
+#
+# TODO(npm-audit-precommit): `npm-audit` is not a step here, so nothing audits
+# the three npm trees — that gate has no CI job either, and nothing but the
+# TODO entry forces the gap closed. The target still works; run `make npm-audit`
+# by hand meanwhile. It came out because npm's
+# `/-/npm/v1/security/audits/quick` endpoint timed out and returned 503 for a
+# full day, failing every commit in the repo regardless of content. Put it back
+# in this list once the endpoint is reliable again.
 #
 # TODO(example-check-precommit): `example-check` is not a step here. After ~2
 # weeks of CI runs, read the step's warm-cache wall-clock from the run
 # summaries: under one minute it joins this list; over, the number is recorded
 # in this comment and it stays out.
-check: bazel-check bazel-policy-parity xtask-deny npm-audit scrub-selfcheck
-	@echo "check: all steps passed (bazel-check bazel-policy-parity xtask-deny npm-audit scrub-selfcheck)"
+check: bazel-check bazel-policy-parity xtask-deny scrub-selfcheck
+	@echo "check: all steps passed (bazel-check bazel-policy-parity xtask-deny scrub-selfcheck)"
 
 build:
 	bazel build $(BAZEL_CONFIG) //...

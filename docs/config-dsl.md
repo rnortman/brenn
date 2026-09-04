@@ -145,6 +145,96 @@ one that does not is refused as a kindword typo rather than parsed and dropped.
 A second section under one kindword-and-name is two answers to one question and
 is refused with both sites shown.
 
+A section whose keys are all optional may drop its body and end in `;`:
+
+```
+claude_profile main;
+```
+
+The two spellings mean the same thing — `claude_profile main {}` states exactly
+as much — so a section with required keys is refused either way.
+
+### Claude accounts
+
+A `claude_profile` block binds a name to one Claude account. The account is a
+token file: `claude setup-token` mints a long-lived OAuth token on any machine
+with a browser, and Claude Code reads it from `CLAUDE_CODE_OAUTH_TOKEN`, which
+outranks whatever `/login` left in the shared `~/.claude`. So switching accounts
+is spawning a process with a different value in that variable, and nothing in
+the config root is swapped, symlinked, or moved.
+
+```
+claude_defaults {
+  profile_token_dir = "/home/brenn/.brenn-secrets";
+}
+
+claude_profile main;
+claude_profile spare { expires = "2027-09-01"; }
+claude_profile legacy { token_file = "/srv/old-secrets/claude-legacy.token"; }
+```
+
+- `token_file` — the host path to the token, 0600, one line. Omitted, the path
+  is `<claude_defaults.profile_token_dir>/claude-profile-<name>.token`; a
+  profile with neither is refused naming both ways out, and two profiles
+  resolving to one path are refused because two names for one account is a
+  mistake.
+- `expires` — an ISO date the operator records as the token's last good day. The
+  token is opaque and Brenn cannot read its lifetime; the date buys one warning
+  at boot when it is near or past, and nothing else reads it.
+
+Every declared profile's token is read at startup. Missing, empty, unreadable,
+or group/world-readable stops the process naming the profile — the same posture
+remote bearer tokens take.
+
+An agent says which of those accounts it may run under, and where the choice
+among them comes from:
+
+```
+/// Which account the PA runs under. Latest wins.
+channel cc_profile_pa at "brenn:cc-profile.alice-pa" {
+  push_depth = 1;
+  retain_depth = 1;
+  standing_retain_depth = 8;
+  doctype = "brenn.cc-profile.goal@1";
+}
+
+const std_profiles = ["main", "spare"];
+
+agent PersonalAssistant {
+  claude_profiles = std_profiles;
+  claude_profile_goal = exact cc_profile_pa;
+}
+```
+
+- `claude_profiles` — the accounts this agent may use, in preference order. The
+  first is what it runs under until a goal names another. Every entry must name
+  a declared `claude_profile`, no entry may repeat, and the list may not be
+  empty. The list is literals, so a `const` states it once for however many
+  agents share the same accounts. An agent that states none gets no token at
+  spawn and authenticates with whatever `/login` left in its home.
+- `claude_profile_goal` — the channel whose latest message names the account
+  this agent should run under. Written as an `exact` matcher, because that is
+  the only attr-value position in which a handle resolves to a channel. The
+  channel must be declared, `brenn:` (durable, so the goal survives a restart)
+  and `retain_depth = 1` (the goal is one message, and the latest wins). Its
+  `push_depth` is for its other subscribers. Requires `claude_profiles`.
+  Several agents may name one channel to move together.
+
+The message body is the profile name, trimmed, and nothing else. A body naming
+an account an agent may not use is rejected for that agent, with a warning
+alert; its previous goal stands. The `doctype` binds nothing in-tree — no port
+declares it — but it is the tag a goal-publishing component's port will carry,
+so goal channels state `brenn.cc-profile.goal@1`.
+
+`cc_extra_args = ["--bare"]` together with `claude_profiles` is refused: under
+`--bare` Claude Code ignores `CLAUDE_CODE_OAUTH_TOKEN` and bills whatever
+`/login` left in the home, so the account the agent claims to run under would be
+a lie.
+
+Minting a token, rotating one, publishing a goal by hand, and the two ways an
+outranking credential can make the account a lie without Brenn noticing are in
+[the Claude accounts guide](claude-accounts.md).
+
 ### Values and constants
 
 Values are strings, f-strings, raw strings (`"""…"""`), integers, floats,

@@ -29,6 +29,7 @@ rust_library(
         "//brenn-automation",
         "//brenn-budget",
         "//brenn-cc",
+        "//brenn-cc-profile",
         "//brenn-common",
         "//brenn-envelope",
         "//brenn-git",

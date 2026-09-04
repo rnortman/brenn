@@ -70,6 +70,20 @@ impl ActiveBridges {
             .collect()
     }
 
+    /// Tell every live bridge of an app whose Claude profile goal just moved to
+    /// reconsider which account it is on.
+    ///
+    /// Only those apps: a bridge of an untouched app is on the profile its goal
+    /// still names, and asking it would be a wake for nothing. Each bridge
+    /// decides for itself whether this is a moment it may swap.
+    pub async fn reconsider_profiles(&self, changed: &[String]) {
+        for slug in changed {
+            for bridge in self.get_for_app(slug).await {
+                bridge.reconsider_profile();
+            }
+        }
+    }
+
     /// Snapshot every live bridge. Returns cloned `Arc`s so the caller can
     /// iterate without holding the registry lock (and can safely `remove`
     /// bridges mid-iteration). Used by the wedge watchdog's sweep.

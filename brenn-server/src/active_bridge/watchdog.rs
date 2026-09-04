@@ -115,7 +115,9 @@ impl Watchdog {
 
             // A live event loop will still carry a deferred drain to completion,
             // so an intentional drain does suppress the busy-I/O predicate below.
-            if reason.is_intentional() {
+            // So does a profile swap: it is between two processes on purpose,
+            // and it holds the session lock the reaping below would need.
+            if reason.is_intentional() || bridge.swapping.load(Ordering::SeqCst) {
                 continue;
             }
 

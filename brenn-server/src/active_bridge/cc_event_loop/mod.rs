@@ -33,6 +33,12 @@ use streaming::handle_stream_event;
 
 /// Reason CC's process exited. Computed once at the `SessionEvent::Died`
 /// boundary from the two bridge-level flags that indicate intentional teardown.
+///
+/// A profile swap's own teardown is deliberately not among them: the swap
+/// claims the death of the process it retires (`ActiveBridge::swap_ack`) and
+/// the `Died` arm answers that claim before it classifies anything. A flag
+/// would have to be read at exactly the right instant to mean the same thing,
+/// and would swallow a replacement's death if it were read a moment late.
 pub(in crate::active_bridge) enum ShutdownReason {
     /// Intentional teardown — suppress alert and leave conversation Active.
     Intentional { drain: bool, server: bool },
@@ -187,6 +193,28 @@ pub(super) async fn cc_event_loop(
                 handle_turn_completed(&bridge, &result, &alert_dispatcher).await;
             }
             SessionEvent::Died(err) => {
+                if let Some(ack) = bridge.take_swap_ack() {
+                    // Not a death: a Claude profile swap tore this process down
+                    // and is holding the session lock waiting to install its
+                    // replacement. Nothing is reset, nothing is alerted, and the
+                    // loop stays — it is the replacement's consumer too. The
+                    // claim is now spent, so the replacement's own death will be
+                    // classified on its merits.
+                    info!(
+                        conversation_id = bridge.conversation_id,
+                        "CC session ended for a Claude profile swap: {err}"
+                    );
+                    if ack.send(()).is_err() {
+                        warn!(
+                            conversation_id = bridge.conversation_id,
+                            "the profile swap that retired this process is no longer waiting"
+                        );
+                    }
+                    #[cfg(test)]
+                    bridge.event_loop_epoch.send_modify(|e| *e += 1);
+                    continue;
+                }
+                let shutdown_reason = ShutdownReason::from_bridge(&bridge);
                 if bridge.died_handled() {
                     // The watchdog (or a prior death) already ran the clean-slate
                     // reset and paged for this bridge. Do not re-alert, re-mark
@@ -196,12 +224,7 @@ pub(super) async fn cc_event_loop(
                         conversation_id = bridge.conversation_id,
                         "CC session died, but death already handled — skipping duplicate reset"
                     );
-                    #[cfg(test)]
-                    bridge.event_loop_epoch.send_modify(|e| *e += 1);
-                    continue;
-                }
-                let shutdown_reason = ShutdownReason::from_bridge(&bridge);
-                if let ShutdownReason::Intentional { drain, server } = shutdown_reason {
+                } else if let ShutdownReason::Intentional { drain, server } = shutdown_reason {
                     // Intentional shutdown — not an error. `drain` is a
                     // per-conversation drain (tab close, idle); `server`
                     // is a process-wide SIGTERM. Both skip the Warning alert
@@ -244,6 +267,16 @@ pub(super) async fn cc_event_loop(
                     // Error + error broadcasts + died_handled.
                     reset_dead_session(&bridge, format!("CC session died: {err}")).await;
                 }
+                // Every `Died` that is not the swap's ends the loop. The bridge
+                // holds a clone of the event sender so a swap can hand it to the
+                // replacement process, which means "channel closed ⇒ process
+                // gone" is no longer available as the teardown signal. Without
+                // this the loop would park in `recv().await` holding its
+                // `Arc<ActiveBridge>` — deregistered, so `active_bridges.all()`
+                // never sees it again, and leaked for the life of the process.
+                #[cfg(test)]
+                bridge.event_loop_epoch.send_modify(|e| *e += 1);
+                break;
             }
             SessionEvent::UnrecognizedMessage { raw_line } => {
                 // The alert for this was already dispatched (and per-process

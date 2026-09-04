@@ -72,6 +72,7 @@ pub(in crate::active_bridge) async fn make_bridge_no_loop(
         alert_dispatcher.clone(),
         TestBridgeConfig {
             active_bridges: Some(active_bridges.clone()),
+            cc_event_tx: Some(event_tx.clone()),
             ..cfg
         },
     );
@@ -208,17 +209,49 @@ pub(in crate::active_bridge) fn drain_broadcast(
 
 /// Shut down a test event loop and drain its capturing alerter.
 ///
-/// Drops both `AlertDispatcher` clones — the one held by `cc_event_loop` (released
-/// when `event_tx` closes the loop) and the one stored on `bridge.alert_dispatcher`
-/// — then awaits the drainer `handle`. Both clones must be gone before the alert
-/// mpsc closes, otherwise `handle.await` blocks forever. Awaiting also flushes
-/// pending broadcasts as a side effect of the loop completing, so callers may
-/// `drain_broadcast` afterward.
+/// Drops both `AlertDispatcher` clones — the one held by `cc_event_loop` and the
+/// one stored on `bridge.alert_dispatcher` — then awaits the drainer `handle`.
+/// Both clones must be gone before the alert mpsc closes, otherwise
+/// `handle.await` blocks forever. Awaiting also flushes pending broadcasts as a
+/// side effect of the loop completing, so callers may `drain_broadcast`
+/// afterward.
+///
+/// A death ends the loop, and only a death does: the bridge holds its own clone
+/// of the event sender for profile swaps, so dropping this one leaves the
+/// channel open. The death sent here is an intentional one — it fires no alert
+/// and errors nothing, so an alert count asserted afterward is the caller's own.
+/// It fails harmlessly when the caller already ended the loop with a death of
+/// its own.
 pub(in crate::active_bridge) async fn drop_and_drain_alerts(
     event_tx: mpsc::Sender<SessionEvent>,
     bridge: Arc<ActiveBridge>,
     handle: tokio::task::JoinHandle<()>,
 ) {
+    // Flush first. The channel is FIFO, so once a marker event has been
+    // processed every event the caller sent has been too — including a death
+    // whose alert the caller is about to count. `UnrecognizedMessage` is the
+    // marker because it alerts nothing (its alert fires in the reader task).
+    // A send that fails means the caller already ended the loop.
+    let fence = event_fence(&bridge);
+    if event_tx
+        .send(SessionEvent::UnrecognizedMessage {
+            raw_line: "test-support flush marker".to_string(),
+        })
+        .await
+        .is_ok()
+    {
+        await_fence(fence).await;
+    }
+    bridge
+        .server_shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    if event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .is_err()
+    {
+        tracing::debug!("event loop already ended; teardown has nothing to send a death to");
+    }
     drop(event_tx);
     drop(bridge);
     handle.await.unwrap();

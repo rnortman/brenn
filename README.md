@@ -129,8 +129,10 @@ No vaporware in the pitch, so:
 - **Getting-started docs are not done.** You can build and run it (`make build`,
   `make launchdev`), but standing up a real configuration is currently more
   archaeology than onboarding. The configuration language itself has a prose
-  reference — [the config DSL document](docs/config-dsl.md) — but there is no
-  guide to a first deployment. It's not ready for anybody who doesn't know what
+  reference — [the config DSL document](docs/config-dsl.md) — and one operational
+  flow has a guide of its own, [Claude accounts: profiles and
+  switching](docs/claude-accounts.md), but there is no guide to a first
+  deployment. It's not ready for anybody who doesn't know what
   they're doing to host it yet. I'd just rather not pretend it's turnkey. So if
   you were looking for the install guide, there isn't one. (Your LLM can figure
   it out though, even if you can't.)

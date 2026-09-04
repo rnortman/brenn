@@ -506,6 +506,7 @@ dependencies = [
  "brenn-attach-proto",
  "brenn-attach-server",
  "brenn-automation",
+ "brenn-cc-profile",
  "brenn-common",
  "brenn-db",
  "brenn-dsl",
@@ -569,6 +570,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "brenn-cc-profile"
+version = "0.1.0"
+dependencies = [
+ "brenn-envelope",
+ "brenn-lib",
+ "brenn-messaging",
+ "brenn-obs",
  "tokio",
  "tracing",
 ]
@@ -809,6 +822,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "brenn-budget",
+ "brenn-cc-profile",
  "brenn-db",
  "brenn-envelope",
  "brenn-lib",
@@ -1039,6 +1053,7 @@ dependencies = [
  "brenn-budget",
  "brenn-cal",
  "brenn-cc",
+ "brenn-cc-profile",
  "brenn-common",
  "brenn-db",
  "brenn-envelope",

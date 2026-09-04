@@ -1019,6 +1019,18 @@ vocabulary! {
         opt prefix_device: V,
         opt container: V,
         opt container_working_dir: V,
+        /// Names of the `claude_profile` blocks this agent may run under, in
+        /// preference order: the first is what it runs under until a goal says
+        /// otherwise. Absent means no Claude account is supplied at spawn.
+        opt claude_profiles: V,
+        /// The channel whose latest message names the profile this agent
+        /// should run under, written as an `exact` matcher.
+        ///
+        /// A matcher rather than a plain value because that is the only
+        /// attr-value position in which a handle resolves to a channel: a
+        /// reference in a plain value position resolves against the `const`
+        /// scope and nothing else.
+        opt claude_profile_goal: V,
         /// The per-conversation send budget. Lowering nests this inside the
         /// app's `messaging` table, so the key name transcribes but the
         /// nesting does not.
@@ -1233,6 +1245,12 @@ pub struct TypedBlock<A> {
     /// Sub-blocks, still held: whether a block's kindword nests a second level
     /// at all is that kindword's to say.
     pub subs: Vec<SectionNode>,
+    /// Whether the `{` delimiter was present in the source.
+    pub open: bool,
+    /// Whether the `}` delimiter was present in the source.
+    pub close: bool,
+    /// Whether a `;` terminated the block.
+    pub semi: bool,
 }
 
 /// A typed block taken apart, with its attrs as a key/value listing.
@@ -1262,6 +1280,9 @@ impl<A> TypedBlock<A> {
             name: self.name,
             attrs: f(self.attrs)?,
             subs: self.subs,
+            open: self.open,
+            close: self.close,
+            semi: self.semi,
         })
     }
 }
@@ -1647,6 +1668,17 @@ vocabulary! {
     struct ClaudeDefaultsAttrs<V> {
         opt mcp_script_path: V,
         opt model: V,
+        opt profile_token_dir: V,
+    }
+
+    /// A `claude_profile` block: one Claude account, as a token file.
+    ///
+    /// Every key optional, so the block-less form `claude_profile main;` states
+    /// a whole profile — the token path then follows the
+    /// `claude_defaults.profile_token_dir` convention.
+    struct ClaudeProfileAttrs<V> {
+        opt token_file: V,
+        opt expires: V,
     }
 
     /// The `repo_sync` section: where repo clones live, how often repos are
@@ -1770,6 +1802,7 @@ kindword_dispatch! {
     "wasm" unnamed => Wasm(WasmAttrs),
     "watchdog" unnamed => Watchdog(WatchdogAttrs),
     "container" named => Container(ContainerAttrs),
+    "claude_profile" named => ClaudeProfile(ClaudeProfileAttrs),
     "integration" named => Integration(OpenAttrs),
 }
 

@@ -438,6 +438,11 @@ impl ActiveBridge {
         // drop tears down the container and blocks until podman has done so;
         // holding the lock across it would stall every other task that touches
         // this bridge's session behind a container teardown.
+        //
+        // `profile_swap::swap_session` deliberately does the opposite, and the
+        // two must not be "fixed" to match: there the stall is the point, so a
+        // send issued mid-swap parks on the mutex and lands on the replacement
+        // process instead of finding a gap.
         let taken = {
             let mut session = self.session.lock().await;
             if let Some(ref s) = *session {

@@ -7,6 +7,7 @@ use brenn_dsl::diag::Diagnostic;
 use super::alerting::AlertingConfig;
 use super::app::AppConfigRaw;
 use super::claude_defaults::ClaudeDefaultsConfig;
+use super::claude_profile::ClaudeProfileRaw;
 use super::container::ContainerConfig;
 use super::events::EventsConfig;
 use super::logging::LoggingConfig;
@@ -78,6 +79,8 @@ pub struct BrennConfig {
     pub security: SecurityConfig,
     pub alerting: Option<AlertingConfig>,
     pub claude_defaults: ClaudeDefaultsConfig,
+    /// Declared Claude accounts, keyed by profile name.
+    pub claude_profiles: std::collections::BTreeMap<String, ClaudeProfileRaw>,
     /// Repo-sync settings (polling interval, staleness cap, webhook URL prefix
     /// override). See `docs/designs/repo-sync.md`. Omitting the section falls
     /// back to `RepoSyncConfig::default()`.
@@ -220,6 +223,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
             post_pull_hooks: _,
             startup_hooks: _,
             cc_extra_args: _,
+            claude_profiles: _,
             approval_rules: _,
             attachment_targets: _,
             integrations: _,

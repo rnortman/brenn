@@ -25,6 +25,7 @@ brenn-approval-rules = { version = "0.1.0", path = "../brenn-approval-rules" }
 brenn-attach-proto = { version = "0.1.0", path = "../attach/proto" }
 brenn-attach-server = { version = "0.1.0", path = "../attach/server" }
 brenn-cc = { version = "0.1.0", path = "../brenn-cc" }
+brenn-cc-profile = { version = "0.1.0", path = "../brenn-cc-profile" }
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
 brenn-envelope = { path = "../brenn-envelope" }
 brenn-git = { version = "0.1.0", path = "../brenn-git" }

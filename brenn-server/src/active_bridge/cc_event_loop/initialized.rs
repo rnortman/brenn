@@ -45,9 +45,14 @@ pub(in crate::active_bridge) async fn handle_initialized(
         }
     };
 
-    let init_elapsed = bridge.spawn_instant.elapsed();
+    let init_elapsed = bridge
+        .spawn_instant
+        .lock()
+        .expect("spawn_instant lock poisoned")
+        .elapsed();
     info!(
         conversation_id = bridge.conversation_id,
+        cc_profile = ?bridge.cc_profile_name(),
         init_elapsed_ms = init_elapsed.as_millis() as u64,
         session_id = %info.session_id,
         model = %info.model,

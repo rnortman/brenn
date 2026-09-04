@@ -211,6 +211,8 @@ impl WsConnection {
                     mqtt_event_router: self.state.mqtt_event_router.clone(),
                     automation_engine: self.state.automation_engine.clone(),
                     usage_session_gap_secs: self.state.usage_session_gap_secs,
+                    cc_profiles: self.state.cc_profiles.clone(),
+                    swap_host_seed: self.state.swap_host_seed(),
                 })
                 .await?;
 

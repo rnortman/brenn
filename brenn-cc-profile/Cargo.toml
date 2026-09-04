@@ -1,0 +1,20 @@
+[package]
+name = "brenn-cc-profile"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Claude account profiles at runtime: the goal channel's accepted value per app, and the token that spawn puts in the environment"
+
+# Sits between the resolved config (which holds the profiles and each agent's
+# allowed set) and the messaging substrate (which carries the goal). Nothing
+# above — the spawn path and bootstrap — is named here.
+[dependencies]
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+tracing = "0.1.44"
+
+[dev-dependencies]
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+tokio = { version = "1.50.0", features = ["macros", "rt"] }

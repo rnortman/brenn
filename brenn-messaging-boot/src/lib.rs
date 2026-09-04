@@ -998,6 +998,21 @@ pub async fn build_messaging(
             ),
         );
     }
+    // Goal addresses are operator-declared durable channels, so they are
+    // already in `all_entries` when the fold below looks for them.
+    let goal_addrs: Vec<String> = {
+        let mut addrs: Vec<String> = apps
+            .values()
+            .filter_map(|app| app.claude_profiles.as_ref())
+            .filter_map(|p| p.goal.clone())
+            .collect();
+        addrs.sort();
+        addrs.dedup();
+        addrs
+    };
+    if !goal_addrs.is_empty() {
+        system_participants.push(brenn_cc_profile::cc_profile_spec(&goal_addrs));
+    }
     brenn_messaging::system::fold_spec_subscriptions(&mut all_entries, &system_participants);
 
     // The non-durable channels join `all_entries` here, after the WASM and

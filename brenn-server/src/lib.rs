@@ -20,6 +20,7 @@ mod intercept_helpers;
 mod messaging_intercept;
 pub mod messaging_router;
 mod middleware;
+mod model_cache;
 mod mqtt_intercept;
 pub mod mqtt_router;
 mod mqtt_subscribe;

@@ -7,6 +7,7 @@
 
 mod apps;
 mod automation;
+mod cc_profile;
 mod cleanup;
 pub mod cli;
 mod config_check;
@@ -235,7 +236,23 @@ pub async fn run_server(
         mqtt_clients,
         pwa_push: resolved_pwa_push,
         system_channel_tuning,
+        claude_profiles,
     } = validate_and_resolve(&config, &integration_registry, runtime_dir.as_deref());
+
+    // A token is opaque: Brenn cannot read its lifetime, so the only expiry
+    // signal there is is the date the operator wrote down. One alert per
+    // profile that is past it or close to it, and nothing else reads the date.
+    {
+        let today = chrono::Local::now().date_naive();
+        for (name, warning) in brenn_lib::config::expiry_alerts(&claude_profiles, today) {
+            tracing::warn!(profile = %name, "{warning}");
+            guard.alert_dispatcher.alert(
+                brenn_obs::alerting::AlertSeverity::Warning,
+                "Claude profile token expiring".to_string(),
+                warning,
+            );
+        }
+    }
 
     // Auto-clone repos into the directories created above. Runs after
     // validation so we have ContainerSpawnConfig for container-side clones
@@ -911,6 +928,58 @@ pub async fn run_server(
         assert_every_subscriber_wired(messenger, router);
     }
 
+    // Claude account profiles. Every profiled agent starts on the first entry of
+    // its `claude_profiles`; a goal channel then moves it.
+    //
+    // The retained goal is learned by a *read*, not by delivery: a system
+    // subscriber's position is durable, so after the first boot the retained
+    // message is behind the cursor and never arrives as new. And the read
+    // happens here, above the `AppState` literal, because everything below —
+    // `set_state`, the dispatcher sweep, autonomous wakes — is an eager spawn
+    // path that would otherwise bill a turn to the account the agent was on
+    // before the last publish. A publish landing between this read and the drain
+    // task's first pass is delivered as new and applied then; no spawn is
+    // possible inside that window.
+    let (cc_profiles, cc_profile_inbox) = {
+        let app_profiles: std::collections::BTreeMap<String, brenn_lib::config::AppClaudeProfiles> =
+            apps.iter()
+                .filter_map(|(slug, app)| app.claude_profiles.clone().map(|p| (slug.clone(), p)))
+                .collect();
+        if app_profiles.is_empty() {
+            (None, None)
+        } else {
+            let bare_profiled: Vec<String> = apps
+                .iter()
+                .filter(|(slug, app)| {
+                    app.container_spawn.is_none() && app_profiles.contains_key(*slug)
+                })
+                .map(|(slug, _)| slug.clone())
+                .collect();
+            brenn_cc_profile::refuse_outranking_server_env(&bare_profiled);
+            let goal = std::sync::Arc::new(brenn_cc_profile::ProfileGoal::new(
+                claude_profiles,
+                app_profiles,
+                guard.alert_dispatcher.clone(),
+            ));
+            let mut inbox = None;
+            if !goal.goal_addresses().is_empty() {
+                let messenger = messaging_result.messenger.clone().expect(
+                    "a claude_profile_goal names a declared durable channel, so messaging is on",
+                );
+                let notify = system_notifiers
+                    .iter()
+                    .find(|(component, _)| *component == brenn_cc_profile::CC_PROFILE_COMPONENT)
+                    .map(|(_, notify)| notify.clone())
+                    .expect(
+                        "the cc-profile spec is pushed exactly when a goal channel is named, and \
+                         every subscribing spec gets a parked-notify binding",
+                    );
+                inbox = Some(cc_profile::attach_and_seed(&goal, messenger, notify).await);
+            }
+            (Some(goal), inbox)
+        }
+    };
+
     let state = AppState {
         build_id,
         db,
@@ -945,6 +1014,7 @@ pub async fn run_server(
         attach_heartbeat_secs: brenn_surface_server::HEARTBEAT_SECS,
         replay_components,
         replay_locks,
+        cc_profiles: cc_profiles.clone(),
     };
 
     // Attach the AppState to the WakeRouter, then spawn the background
@@ -1045,6 +1115,13 @@ pub async fn run_server(
                 .spawn(),
             );
             info!("tool_registry: async tool executor task spawned");
+        }
+
+        if let Some(inbox) = cc_profile_inbox {
+            let goal = cc_profiles
+                .clone()
+                .expect("the inbox exists only when the profile goal handle does");
+            cc_profile::spawn_goal_drain(inbox, goal, state.active_bridges.clone());
         }
     }
 

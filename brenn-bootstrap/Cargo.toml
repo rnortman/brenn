@@ -16,6 +16,7 @@ brenn-graf = { version = "0.1.0", path = "../brenn-graf" }
 brenn-hooks = { version = "0.1.0", path = "../brenn-hooks" }
 brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-cc-profile = { version = "0.1.0", path = "../brenn-cc-profile" }
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
 brenn-messaging-boot = { version = "0.1.0", path = "../brenn-messaging-boot" }
 brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }

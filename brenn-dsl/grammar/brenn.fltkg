@@ -211,7 +211,25 @@ use_stmt := %"use" : pkg:"@"? . path:path , (%"::" . glob:"*")? . %";" , ;
 // A generic section: `server { ... }`, `webhook w { ... }`, and every named
 // sub-block inside an entity body. The kindword is data, not a keyword, so what
 // a section means is decided after the parse, by its kindword.
-section := doc:doc? , kindword:name , name:name? , %"{" , (attrs:attr | subs:section)* , %"}" , ;
+//
+// The body is optional and a labeled `semi:";"?` follows it, so `claude_profile
+// main;` says "this kindword, this name, nothing else". The braces stay an
+// anonymous group rather than a rule of their own: `attrs` and `subs` must
+// reach the model at the section's own level, empty when no body was written,
+// or a body-less section would deserialize into a different shape than an empty
+// braced one and the required-key check would have two cases instead of one.
+// The braces are labeled rather than suppressed, for the reason the terminator
+// discipline above gives: a suppressed literal leaves no trace in the CST, so
+// the unparser re-emits it unconditionally and would render `claude_profile
+// main;` as `claude_profile main { };`. Both of them, because the unparser
+// decides each literal on its own. They are always written together and the
+// model reads them as one fact.
+//
+// The terminator takes `.`, not `,`, for `link_stmt`'s reason: a second
+// optional-whitespace position after the body would render as a stray space
+// before whatever follows the block, and would keep the closing brace's break
+// from collapsing into the enclosing body's.
+section := doc:doc? , kindword:name , name:name? , (open:"{" , (attrs:attr | subs:section)* , close:"}")? . semi:";"? , ;
 
 // The one body-entry shape. The grammar knows no field names; the target struct
 // closes each key set, so an unknown key is a positioned deserialize error

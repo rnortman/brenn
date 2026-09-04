@@ -266,6 +266,42 @@ impl SystemInbox {
         }
     }
 
+    /// Read the participant's window on every subscribed channel without
+    /// moving anything: no advance, no charge, no delivery.
+    ///
+    /// For a participant whose channels carry *state* rather than events. A
+    /// position is durable, so a restart resumes past the retained value and
+    /// never sees it delivered again; a participant that must know the current
+    /// state at boot learns it by reading rather than by waiting to be told.
+    /// The pair is `(channel address, window)`, with the window's newest entry
+    /// last whether it is new or context.
+    ///
+    /// # Panics
+    ///
+    /// When a subscribed channel holds no position for this participant — call
+    /// [`attach`](Self::attach) first.
+    pub async fn snapshot(&self) -> Vec<(String, brenn_messaging_store::store::SubscriberWindow)> {
+        let subscriber = self.subscriber();
+        let mut out = Vec::new();
+        for (entry, sub) in self.subscriptions() {
+            let window = self
+                .messenger
+                .store_for(&entry)
+                .window(&subscriber, sub.push_depth, sub.retain_depth)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "messaging: no position for system subscriber {} on {} — snapshot runs \
+                         after attach",
+                        subscriber.as_str(),
+                        entry.address
+                    )
+                });
+            out.push((entry.address.clone(), window));
+        }
+        out
+    }
+
     /// Read the participant's window on every subscribed channel and advance
     /// its position past what the window served, before returning the batch —
     /// ack-at-dequeue, at-most-once. Empty when every channel is caught up.
@@ -569,6 +605,59 @@ mod tests {
         let h = harness().await;
         insert_row(&h, "unattached").await;
         inbox(&h).dequeue_batch().await;
+    }
+
+    /// The state-channel read: a window per subscription, newest last, and
+    /// nothing moves. A participant that reads the retained value at boot must
+    /// still be delivered anything that arrives afterwards.
+    #[tokio::test]
+    async fn snapshot_reads_the_window_without_advancing() {
+        let h = harness().await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        insert_row(&h, "first").await;
+        insert_row(&h, "latest").await;
+
+        let snap = inbox.snapshot().await;
+        assert_eq!(snap.len(), 2, "one window per subscribed channel");
+        let (address, window) = snap
+            .iter()
+            .find(|(a, _)| a.ends_with("inbox/reqs"))
+            .expect("the channel the rows landed on");
+        assert_eq!(address, "brenn:inbox/reqs");
+        assert_eq!(
+            window.entries.last().map(|(_, env)| env.body.as_str()),
+            Some("latest"),
+            "newest last"
+        );
+
+        // A second read answers the same, and a dequeue still delivers both:
+        // the snapshot charged nothing and moved nothing.
+        assert_eq!(inbox.snapshot().await.len(), 2);
+        assert_eq!(bodies(&inbox.dequeue_batch().await), ["first", "latest"]);
+    }
+
+    /// An empty channel yields an empty window rather than nothing at all — the
+    /// caller distinguishes "no state published yet" from "not subscribed".
+    #[tokio::test]
+    async fn snapshot_of_an_empty_channel_is_an_empty_window() {
+        let h = harness().await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+
+        let snap = inbox.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        assert!(snap.iter().all(|(_, w)| w.entries.is_empty()));
+    }
+
+    /// The read is push-enabled, so it needs a position — the same wiring rule
+    /// `dequeue_batch` holds, and the reason `attach` runs first.
+    #[tokio::test]
+    #[should_panic(expected = "snapshot runs after attach")]
+    async fn snapshot_without_a_position_panics() {
+        let h = harness().await;
+        insert_row(&h, "unattached").await;
+        inbox(&h).snapshot().await;
     }
 
     #[tokio::test]

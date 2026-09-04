@@ -62,8 +62,20 @@ pub(in crate::active_bridge) async fn reset_session_runtime_state(bridge: &Activ
 /// conversation id during an incident is exactly the diagnosis gap this exists
 /// to close. Best effort: the session may already be gone (reaped before the
 /// report), and a child that wrote nothing leaves an empty tail.
+///
+/// The wait for the session lock is bounded because one holder — a profile swap
+/// — holds it across a CC startup *and* is itself waiting on the caller: the
+/// event loop reporting a death is the task that would have to run for the swap
+/// to release. Reporting without the tail beats deadlocking the pair.
 pub(in crate::active_bridge) async fn session_stderr_tail(bridge: &ActiveBridge) -> Vec<String> {
-    let guard = bridge.session.lock().await;
+    const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+    let Ok(guard) = tokio::time::timeout(LOCK_WAIT, bridge.session.lock()).await else {
+        tracing::warn!(
+            conversation_id = bridge.conversation_id,
+            "session lock busy; reporting this death without CC's stderr tail"
+        );
+        return Vec::new();
+    };
     guard.as_ref().map(|s| s.stderr_tail()).unwrap_or_default()
 }
 

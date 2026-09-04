@@ -397,3 +397,41 @@ fn an_alerting_section_without_its_rate_limit_is_refused() {
         typed_str("alerting {\n    max_alerts = 10;\n}\n").expect_err("`window_secs` is required");
     assert!(error.message.contains("window_secs"), "{}", error.message);
 }
+
+/// The body-less form deserializes into the same shape the braced form does:
+/// an empty attr listing and no held sub-blocks.
+#[test]
+fn a_body_less_section_types_as_an_empty_listing() {
+    let ConfigBlock::ClaudeProfile(profile) =
+        typed_str("claude_profile main;\n").expect("a body-less section types")
+    else {
+        panic!("the claude_profile section");
+    };
+    assert_eq!(
+        profile.name.as_ref().map(|name| name.value().as_str()),
+        Some("main")
+    );
+    assert!(profile.attrs.token_file.is_none());
+    assert!(profile.attrs.expires.is_none());
+    assert!(profile.subs.is_empty());
+    assert!(!profile.open);
+    assert!(profile.semi);
+
+    let braced = typed_str("claude_profile main { }\n").expect("the braced form types");
+    let ConfigBlock::ClaudeProfile(braced) = braced else {
+        panic!("the claude_profile section");
+    };
+    assert!(braced.open);
+    assert!(!braced.semi);
+    assert_eq!(braced.attrs, profile.attrs);
+}
+
+/// A kindword with required attrs is refused written body-less, exactly as it
+/// is refused written `{}`: the two forms reach the same required-key check.
+#[test]
+fn a_body_less_section_does_not_bypass_required_keys() {
+    for src in ["container sandbox;\n", "container sandbox { }\n"] {
+        let error = typed_str(src).expect_err("`image` is required");
+        assert!(error.message.contains("image"), "{src}: {}", error.message);
+    }
+}

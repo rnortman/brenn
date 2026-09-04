@@ -239,6 +239,7 @@ mod tests {
             attach_heartbeat_secs: 1,
             replay_components: Arc::new(std::collections::HashMap::new()),
             replay_locks: Arc::new(std::collections::HashMap::new()),
+            cc_profiles: None,
             test_wake_bridge: Default::default(),
             wake_spawns: Default::default(),
         };

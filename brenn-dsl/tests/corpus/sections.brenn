@@ -23,6 +23,12 @@ webhook push_alice {
     }
 }
 
+// A section whose keys are all optional may drop its body and end in `;`. It
+// means what the braced form means: an empty attr listing, held sub-blocks
+// none, and the same required-key check.
+claude_profile main;
+claude_profile spare { expires = "2027-09-01"; }
+
 // The bearer counterpart: a token where the HMAC endpoint has a key.
 webhook push_bob {
     signature {

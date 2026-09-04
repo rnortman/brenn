@@ -4942,6 +4942,9 @@ fn emit_attachment_target(
         name,
         attrs,
         subs,
+        open: _,
+        close: _,
+        semi: _,
     } = block;
     let (attrs, refused) = resolve_attrs(attrs, scope, errors);
     // Walked whatever the body did: an operator fixing one error at a time is
@@ -5067,6 +5070,9 @@ fn emit_tool_grant(
         name,
         attrs,
         subs,
+        open: _,
+        close: _,
+        semi: _,
     } = block;
     // The dispatch refuses a `tool` block with no name before this, so the
     // absence here is that refusal already reported.
@@ -6161,13 +6167,23 @@ fn check_addresses(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
 /// A `prefix` matcher is not one of them — it is written about a family, and
 /// the family a declared channel belongs to is not that channel.
 ///
-/// Nor are the value positions inside an entity. The value language admits a
-/// matcher anywhere a value goes, so `description = exact "brenn:…";` is
-/// writable — but an attribute value is not a channel reference, nothing
-/// downstream reads one as an identity, and a matcher where a scalar belongs is
-/// a type error lowering raises. The rule is about the positions that *do* name
-/// a channel; widening it to every value would refuse a second spelling nobody
-/// spells and nothing resolves.
+/// The value positions inside an entity are not covered, with one known
+/// exception. The value language admits a matcher anywhere a value goes, so
+/// `description = exact "brenn:…";` is writable — but an ordinary attribute
+/// value is not a channel reference, nothing downstream reads one as an
+/// identity, and a matcher where a scalar belongs is a type error lowering
+/// raises. The rule is about the positions that *do* name a channel; widening
+/// it to every value would refuse a second spelling nobody spells and nothing
+/// resolves.
+///
+/// The exception is an agent's `claude_profile_goal`, whose `exact` matcher
+/// *is* read downstream as a channel identity. Both spellings are accepted
+/// there and lowering resolves either against the declared channels, so a
+/// literal that names no declared channel is refused at that site instead of
+/// here — the failure this rule exists to prevent (an address that resolves to
+/// nothing, or to two things) cannot survive it. A further address-bearing
+/// attribute value must either carry that same resolution or be added to this
+/// walk; leaving it with neither is what silently unwires it.
 fn literal_addresses(config: &ResolvedConfig) -> Vec<(&str, &Span)> {
     // Destructured, not field-accessed: this walk is a hand-written mirror of
     // the resolved model, and a new entity vector has to be answered for here

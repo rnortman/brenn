@@ -572,6 +572,9 @@ async fn run_cc(cli: CcArgs) {
         add_dirs: vec![],
         cc_extra_args: vec![],
         env_vars: vec![],
+        // The CLI inherits whatever credential the invoking shell holds; it has
+        // no profiles.
+        secret_env_vars: vec![],
         shutting_down: None,
         server_shutting_down: None,
     };

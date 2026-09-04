@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::integration::Integration;
 
 use super::attachment::{AttachmentTarget, AttachmentTargetRaw};
+use super::claude_profile::AppClaudeProfiles;
 use super::container::ContainerSpawnConfig;
 use super::frontmatter::FrontmatterRenderConfig;
 use super::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksConfig};
@@ -117,6 +118,9 @@ pub struct AppConfigRaw {
     pub startup_hooks: Option<StartupHooksConfig>,
     /// Extra CLI arguments passed verbatim to the `claude` command.
     pub cc_extra_args: Vec<String>,
+    /// Which Claude accounts this app may run under, and where its goal comes
+    /// from. `None` for an app that declares no profiles.
+    pub claude_profiles: Option<AppClaudeProfiles>,
     /// Static auto-approval rules (pattern-based). Checked before DB rules.
     pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets (e.g. "Import bank export").
@@ -244,6 +248,10 @@ pub struct AppConfig {
     pub startup_hooks: StartupHooksConfig,
     /// Extra CLI arguments passed verbatim to the `claude` command.
     pub cc_extra_args: Vec<String>,
+    /// Which Claude accounts this app may run under, and where its goal comes
+    /// from. `None` for an app that declares no profiles: it gets no token at
+    /// spawn and authenticates with whatever `/login` left in its home.
+    pub claude_profiles: Option<AppClaudeProfiles>,
     /// Static auto-approval rules from the config document.
     pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets.
@@ -496,6 +504,7 @@ impl Default for AppConfigRaw {
             post_pull_hooks: None,
             startup_hooks: None,
             cc_extra_args: vec![],
+            claude_profiles: None,
             approval_rules: vec![],
             attachment_targets: vec![],
             integrations: vec![],

@@ -57,6 +57,7 @@ pub fn test_app_config(slug: &str) -> AppConfig {
         post_pull_hooks: PostPullHooksConfig::default(),
         startup_hooks: StartupHooksConfig::default(),
         cc_extra_args: vec![],
+        claude_profiles: None,
         approval_rules: vec![],
         attachment_targets: vec![],
         integrations: HashMap::new(),

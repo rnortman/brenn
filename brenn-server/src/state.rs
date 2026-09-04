@@ -168,6 +168,10 @@ pub struct AppState {
     /// rather than fail. One entry per replay-protected endpoint; empty for
     /// unbound endpoints (fast path). Keyed by endpoint slug.
     pub replay_locks: Arc<HashMap<String, Arc<Mutex<()>>>>,
+    /// Which Claude account each profiled app should run under, and the token
+    /// that says so. `None` when no agent declares `claude_profiles`. Built
+    /// once at boot, moved thereafter only by the goal channel.
+    pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
     /// Usage session gap in seconds. A new usage event that arrives more than
     /// this many seconds after `last_activity_at` closes the prior session and
     /// opens a new one. Default (and test fixture value): 1800 (30 minutes).
@@ -582,6 +586,8 @@ impl AppState {
                 mqtt_event_router: self.mqtt_event_router.clone(),
                 automation_engine: self.automation_engine.clone(),
                 usage_session_gap_secs: self.usage_session_gap_secs,
+                cc_profiles: self.cc_profiles.clone(),
+                swap_host_seed: self.swap_host_seed(),
             })
             .await?;
 
@@ -592,6 +598,25 @@ impl AppState {
         }
 
         Ok(bridge)
+    }
+
+    /// The three handles that record an app's model set.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn model_cache(&self) -> crate::model_cache::ModelCache {
+        crate::model_cache::ModelCache {
+            db: self.db.clone(),
+            apps: self.apps.clone(),
+            cached: self.cached_models.clone(),
+        }
+    }
+
+    /// The server-owned half of a bridge's profile-swap host. `spawn_new`
+    /// completes it with the bridge's own transcript writer and dispatcher.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn swap_host_seed(&self) -> crate::active_bridge::SwapHostSeed {
+        crate::active_bridge::SwapHostSeed {
+            models: self.model_cache(),
+        }
     }
 
     /// Spawn a CC subprocess, cache its models, register the bridge, and notify.
@@ -618,49 +643,15 @@ impl AppState {
     > {
         let app_slug = ctx.app_config.slug.clone();
         let conversation_id = ctx.conversation_id;
-        let model_allow_list = ctx.app_config.models.clone();
 
         let (bridge, rx, warnings, models) = ActiveBridge::spawn_new(ctx).await?;
 
-        // Convert CC ModelOption → WS ModelInfo for callers and the model cache.
-        let model_infos: Vec<ModelInfo> = models
-            .iter()
-            .map(|m| ModelInfo {
-                value: m.value.clone(),
-                display_name: m.display_name.clone(),
-                description: m.description.clone(),
-            })
-            .collect();
-
-        // Alias spellings in `models` are CC-defined and unverifiable until
-        // now. An entry CC did not report is invisible everywhere downstream —
-        // it just never appears in the picker — so say so once per spawn,
-        // which is the only chance to connect the symptom to the config.
-        if !model_infos.is_empty() {
-            let unreported = crate::routes::ws::models::unreported_allow_entries(
-                model_allow_list.as_deref(),
-                &model_infos,
-            );
-            if !unreported.is_empty() {
-                warn!(
-                    app_slug = %app_slug,
-                    unreported = ?unreported,
-                    configured = ?model_allow_list,
-                    reported = ?model_infos.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
-                    "app `models` names aliases CC did not report; they cannot be offered"
-                );
-            }
-        }
-
-        // Cache models in memory and DB.
-        if !model_infos.is_empty() {
-            self.cached_models
-                .write()
-                .await
-                .insert(app_slug.clone(), model_infos.clone());
-            let conn = self.db.lock().await;
-            brenn_db::save_app_models(&conn, &app_slug, &model_infos);
-        }
+        // The model set is a property of the account, so the same recording step
+        // runs here and after a profile swap.
+        let model_infos = self
+            .model_cache()
+            .record_app_models(&app_slug, &models)
+            .await;
 
         // Register in active_bridges.
         self.active_bridges
@@ -798,6 +789,7 @@ impl AppState {
             attach_heartbeat_secs: 1,
             replay_components: Arc::new(HashMap::new()),
             replay_locks: Arc::new(HashMap::new()),
+            cc_profiles: None,
             // These two fields, and the wake stubs that read them, exist only
             // in this crate's own test build.
             #[cfg(test)]

@@ -27,7 +27,9 @@ fn grammar_file(name: &str) -> String {
 /// The names of the grammar rules whose definition parses a literal `{`.
 ///
 /// A rule runs from its `name :=` line to the next one, so a definition split
-/// across lines is read whole.
+/// across lines is read whole. Both spellings count: a suppressed `%"{"` and a
+/// labeled `open:"{"`, which is what a rule whose body is optional must write
+/// so the unparser emits the brace only where one was.
 fn brace_bearing_rules(grammar: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let mut current: Option<(String, String)> = None;
@@ -38,7 +40,7 @@ fn brace_bearing_rules(grammar: &str) -> BTreeSet<String> {
             && name.trim().chars().all(|c| c.is_alphanumeric() || c == '_')
         {
             if let Some((name, body)) = current.take()
-                && body.contains("%\"{\"")
+                && body.contains("\"{\"")
             {
                 found.insert(name);
             }
@@ -48,7 +50,7 @@ fn brace_bearing_rules(grammar: &str) -> BTreeSet<String> {
         }
     }
     if let Some((name, body)) = current
-        && body.contains("%\"{\"")
+        && body.contains("\"{\"")
     {
         found.insert(name);
     }

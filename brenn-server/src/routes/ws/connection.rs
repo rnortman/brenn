@@ -474,7 +474,7 @@ impl WsConnection {
         let allow = self.app_config().models.clone();
         let models = self.state.cached_models.read().await;
         let reported = models.get(&self.app_slug).map(Vec::as_slice).unwrap_or(&[]);
-        super::models::filter_models(allow.as_deref(), reported)
+        crate::model_cache::filter_models(allow.as_deref(), reported)
     }
 
     /// If `cached_models` contains a non-empty entry for this connection's app,
@@ -498,7 +498,8 @@ impl WsConnection {
     /// when anything survives; an empty intersection sends nothing, which
     /// hides the picker rather than showing it empty.
     pub(super) fn send_filtered_models(&self, reported: &[brenn_ws_types::ModelInfo]) {
-        let filtered = super::models::filter_models(self.app_config().models.as_deref(), reported);
+        let filtered =
+            crate::model_cache::filter_models(self.app_config().models.as_deref(), reported);
         if !filtered.is_empty()
             && let SendResult::Closed = self.send_ws(WsServerMessage::ModelsAvailable {
                 available_models: filtered,

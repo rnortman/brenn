@@ -4,6 +4,7 @@ mod attachment;
 mod automation;
 mod brenn;
 mod claude_defaults;
+mod claude_profile;
 mod container;
 pub(crate) mod dsl_lower;
 mod events;
@@ -35,6 +36,7 @@ pub use brenn::*;
 /// What a document load or check reads: the root and its module roots.
 pub use brenn_dsl::DocumentInputs;
 pub use claude_defaults::*;
+pub use claude_profile::*;
 pub use container::*;
 pub use events::*;
 pub use frontmatter::*;
@@ -48,6 +50,7 @@ pub use repo::*;
 #[cfg(test)]
 pub(crate) use resolve::shallow_merge_toml;
 pub use resolve::{ResolvedConfig, validate_and_resolve};
+pub use secret::SecretString;
 pub(crate) use secret::{load_secret_file, load_secret_file_private};
 pub use security::*;
 pub use server::*;

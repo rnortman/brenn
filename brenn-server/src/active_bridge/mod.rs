@@ -21,6 +21,7 @@ mod lifecycle;
 mod lifetime;
 mod mcp_constants;
 mod permission_sync;
+mod profile_swap;
 mod registry;
 #[cfg(test)]
 mod test_fixtures;
@@ -41,6 +42,7 @@ pub use bridge::SpawnContext;
 pub(crate) use cc_event_loop::drain::deliver_conversation_backlog;
 pub use cc_spawn_config::write_virtual_tools_file;
 pub(in crate::active_bridge) use compaction::CompactionPhase;
+pub use profile_swap::SwapHostSeed;
 pub use registry::ActiveBridges;
 pub(in crate::active_bridge) use tool_summary::{
     PendingToolUse, emit_prerendered_summary, emit_tool_result_summaries,
