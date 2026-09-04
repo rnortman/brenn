@@ -2,7 +2,7 @@
 
 All notable changes to Brenn are documented here.
 
-## [Unreleased]
+## [0.19.0] — 2026-09-04
 
 Out-of-tree components are real — a separate repository can build and deploy
 them. The install flags changed to support that, and `surface_dist_dir` moved
