@@ -38,6 +38,7 @@ fn the_statement_corpus_covers_every_top_level_form() {
             Item::McpServer(_) => "mcp_server",
             Item::Acl(_) => "acl",
             Item::Grant(_) => "grant",
+            Item::Principal(_) => "principal",
             Item::Section(_) => "section",
         });
     }
@@ -56,6 +57,7 @@ fn the_statement_corpus_covers_every_top_level_form() {
         "mcp_server",
         "acl",
         "grant",
+        "principal",
     ] {
         assert!(seen.contains(&form), "the corpus is missing a {form}");
     }
@@ -248,15 +250,17 @@ fn a_subscribe_tail_takes_a_count_or_the_unbounded_word() {
     let agent = file.agents().next().expect("an agent class");
     let tail = &agent.subs[0].tail.as_ref().expect("a tail").attrs;
     let retain_depth = &tail.retain_depth.as_ref().expect("a depth").value;
-    let IntOrWord::Word(word) = retain_depth else {
-        panic!("the written token is a word: {retain_depth:?}");
-    };
-    assert_eq!(word.as_str(), "unbounded");
+    assert!(
+        retain_depth.is_unbounded(),
+        "the written token is the unbounded word: {retain_depth:?}"
+    );
 
     let error = parse_str(&subscribe("retain_depth = \"unbounded\";"), "t.brenn")
         .expect_err("the quoted form is no longer a spelling of the token");
     assert!(
-        error.message.contains("expected an integer or a bare word"),
+        error
+            .message
+            .contains("expected a count, the word `unbounded`"),
         "{}",
         error.message
     );
@@ -311,10 +315,13 @@ fn a_binding_tail_is_typed_by_its_direction() {
         tail.noise.as_ref().expect("a noise token").value.as_str(),
         "metered"
     );
-    assert!(matches!(
-        tail.retain_depth.as_ref().expect("a depth").value,
-        IntOrWord::Word(_)
-    ));
+    assert!(
+        tail.retain_depth
+            .as_ref()
+            .expect("a depth")
+            .value
+            .is_unbounded()
+    );
 
     let Binding::Outof(outbound) = &bindings[1] else {
         panic!("the second binding points out");
@@ -375,7 +382,9 @@ fn a_binding_tail_is_typed_by_its_direction() {
     )
     .expect_err("a depth is a count or a bare word");
     assert!(
-        error.message.contains("expected an integer or a bare word"),
+        error
+            .message
+            .contains("expected a count, the word `unbounded`"),
         "{}",
         error.message
     );
@@ -571,7 +580,7 @@ fn bindings_carry_their_direction_as_the_variant() {
 fn an_instantiation_takes_arguments_or_a_body() {
     let file = statements();
     let instances: Vec<_> = file.instantiations().collect();
-    assert_eq!(instances.len(), 4);
+    assert_eq!(instances.len(), 6);
 
     let parameterized = &instances[0];
     assert_eq!(parameterized.handle.value(), "alice_pa");
@@ -592,6 +601,28 @@ fn an_instantiation_takes_arguments_or_a_body() {
         "an instance body's attrs stay a map until the class is known"
     );
     assert!(!configured.semi, "a block-ended statement takes no `;`");
+
+    // A stamp under a principal with no ceiling of its own: the clause reads,
+    // and the absent body is still absent.
+    let exactly = &instances[4];
+    assert_eq!(exactly.handle.value(), "alice_bench");
+    assert_eq!(
+        exactly.under.as_ref().expect("a clause").head.value(),
+        "ui_readonly"
+    );
+    assert!(exactly.body.is_none());
+
+    // A stamp under a principal that narrows it: the clause and the ceiling
+    // together, which is what the two positions have to admit at once.
+    let narrowed = &instances[5];
+    assert_eq!(
+        narrowed.under.as_ref().expect("a clause").head.value(),
+        "ui"
+    );
+    let ceiling = narrowed.body.as_ref().expect("a ceiling");
+    assert!(ceiling.value().attrs.get("grants").is_some());
+    assert_eq!(ceiling.value().acls.len(), 1);
+    assert!(ceiling.value().bindings.is_empty());
 }
 
 /// Port names are the component's own, so a port named after a binding keyword
@@ -809,4 +840,108 @@ fn formatting_preserves_the_statement_model() {
     for (source, canonical) in source.webhooks().zip(canonical.webhooks()) {
         webhooks_match(source, canonical);
     }
+}
+
+/// A `///` comment spanning several lines is one comment wherever it is
+/// written. Every declaration inside an assembly or a surface body is indented,
+/// so this is the only form a packaged module's author can write a paragraph in.
+#[test]
+fn a_multi_line_doc_comment_on_an_indented_declaration_is_one_comment() {
+    let file = statements();
+    let assembly = file.assemblies().next().expect("the corpus assembly");
+
+    // A blank line between the doc comment and its declaration does not detach
+    // it: the break rule swallows the gap, so the comment is still the one that
+    // precedes the channel.
+    let messages = assembly.channels().next().expect("the first channel");
+    let ChannelDef::Decl(messages) = messages else {
+        panic!("the corpus declares it with a handle");
+    };
+    let doc = messages
+        .doc
+        .as_ref()
+        .expect("a doc comment across a blank line still attaches");
+    let lines: Vec<&str> = doc
+        .lines
+        .iter()
+        .map(|l| l.content.value().as_str())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            " A doc comment separated from the declaration it attaches to by a blank",
+            " line. The gap goes the way the gaps between doc lines go.",
+        ],
+    );
+
+    let acks = assembly.channels().nth(1).expect("the second channel");
+    let ChannelDef::Decl(acks) = acks else {
+        panic!("the corpus declares it with a handle");
+    };
+    let doc = acks.doc.as_ref().expect("a doc comment");
+    let lines: Vec<&str> = doc
+        .lines
+        .iter()
+        .map(|l| l.content.value().as_str())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            " A multi-line doc comment on an indented declaration: every line after",
+            " the first carries the body's indentation, and the lines stay one comment.",
+            "",
+            " A paragraph break inside one is an empty `///` line.",
+        ],
+        "the indentation before each `///` is not text, and the lines are one comment",
+    );
+
+    // A blank line between two `///` lines does not end the comment and is not
+    // a line of it.
+    let counter = assembly
+        .instantiations()
+        .last()
+        .expect("the assembly's top-level instantiation");
+    let doc = counter.doc.as_ref().expect("a doc comment");
+    let lines: Vec<&str> = doc
+        .lines
+        .iter()
+        .map(|l| l.content.value().as_str())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            " A doc comment written with a blank line between two of its lines.",
+            " The blank line is not text and does not survive formatting.",
+        ],
+    );
+}
+
+/// What sits between two `///` lines is whitespace and nothing else: a `//`
+/// comment inside a doc comment has no meaning to give it and no place to
+/// render, so it ends the doc and the `///` after it is a syntax error.
+#[test]
+fn a_line_comment_between_two_doc_lines_is_refused() {
+    let error = parse_str(
+        "assembly A(slug: String) {\n\
+         \x20 /// first line\n\
+         \x20 // a note\n\
+         \x20 /// second line\n\
+         \x20 link relay;\n\
+         }\n",
+        "t.brenn",
+    )
+    .expect_err("a `//` line does not join a doc comment");
+    let rendered = error.to_string();
+    // Both halves, because either alone would pass on the wrong failure: the
+    // position says the parse stopped at the `///` after the note rather than
+    // anywhere else, and the named rule says the note was still being read as a
+    // line comment when it did — which is what "the `//` ended the doc" means.
+    assert!(
+        rendered.contains("line 4"),
+        "the refusal points at the `///` that follows the note: {rendered}",
+    );
+    assert!(
+        rendered.contains("line_comment"),
+        "the note is still an unterminated line comment there: {rendered}",
+    );
 }

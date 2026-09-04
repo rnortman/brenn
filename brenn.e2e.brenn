@@ -16,7 +16,7 @@ use @mode-clock::*;
 use @processor-demo::*;
 use @processor-transplant::*;
 use @protobar::*;
-use config::surfaces::*;
+use @surface-description::*;
 
 /// Where the server listens and what it believes about the proxy in front. The
 /// two asset trees are build outputs, reached through bazel's convenience
@@ -77,6 +77,7 @@ uuid_pins {
   "brenn:bar-c" = "0d0f95db-13aa-4214-a461-aa1fbf788351";
 }
 
+new surface_commons: SurfaceCommons;
 new bar_desc: SurfaceDescription(slug = "bar");
 new bar_pixel_desc: SurfaceDescription(slug = "bar-pixel");
 new bar_feeder_desc: SurfaceDescription(slug = "bar-feeder");
@@ -154,8 +155,9 @@ assembly BarSurface(slug: String, skin: String) {
 /// republished on the assembly's own ephemeral channel, so the flag, the
 /// packaged module, the assembly expansion and the boot-time package binding
 /// are all on the path of a plain `make e2e`.
-new demo: DemoLoop(slug = "e2e-demo", source = bar_a);
-
+new demo: DemoLoop(slug = "e2e-demo", source = bar_a) {
+  grants = [ports];
+}
 new bar: BarSurface(slug = "bar", skin = "bench");
 new bar_pixel: BarSurface(slug = "bar-pixel", skin = "foundry");
 

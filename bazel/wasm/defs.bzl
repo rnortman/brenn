@@ -22,7 +22,8 @@ are an external API with the same standing as the WIT worlds under
   `wasm_guest_library`, `wasm_guest_cdylib`, `wit_bindgen_rust`,
   `shared_guest_bindings`, `guest_spec_scaffold`, `wasm_component`,
   `component_package`, `component_install_tree`, `component_bundle`,
-  `grant_parity_test`, `deployed_components_test`, `config_fit_test`.
+  `grant_parity_test`, `deployed_components_test`, `config_fit_test`,
+  `library_module_test`.
 
 Three are not: `component_fixtures`, whose output path is only correct when
 declared from `//brenn-wasm`; `wasm32_build`, a reacher for wasm32-only
@@ -54,6 +55,7 @@ macro body is a bug unless it names one of the macro's own arguments.
 
 load("@bazel_skylib//lib:shell.bzl", "shell")
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY", "WASM32_ONLY")
 
@@ -676,6 +678,9 @@ def _component_bundle_impl(ctx):
     args.add_all(specs, before_each = "--spec")
     inputs.extend(specs)
 
+    args.add_all(ctx.files.library_modules, before_each = "--library-module")
+    inputs.extend(ctx.files.library_modules)
+
     ctx.actions.run(
         outputs = [out],
         inputs = depset(inputs),
@@ -702,6 +707,11 @@ _component_bundle = rule(
     from brenn's: both are the deploying repo's, added beside its `tar`.
     """,
     attrs = {
+        "library_modules": attr.label_list(
+            allow_files = [".brenn"],
+            doc = "Packaged modules no package or surface kind owns, staged " +
+                  "flat under `modules/` and named in `modules/library-modules.txt`.",
+        ),
         "manifest": attr.label(
             allow_single_file = True,
             doc = "The manifest naming the backend packages that ship.",
@@ -738,8 +748,16 @@ def _bundle_contract_test_impl(ctx):
     names = ctx.file._names
     record_lib = ctx.file._record_lib
 
-    args = [names.short_path, record_lib.short_path, tree.short_path]
-    files = [tree, check, names, record_lib]
+    stage_lib = ctx.file._stage_lib
+
+    args = [
+        names.short_path,
+        record_lib.short_path,
+        tree.short_path,
+        "--stage-lib",
+        stage_lib.short_path,
+    ]
+    files = [tree, check, names, record_lib, stage_lib]
     if ctx.file.manifest:
         args += ["--manifest", ctx.file.manifest.short_path]
         files.append(ctx.file.manifest)
@@ -778,11 +796,22 @@ _bundle_contract_test = rule(
             allow_single_file = True,
             default = Label("//bazel/wasm:record_lib.sh"),
         ),
+        "_stage_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/release:stage_lib.sh"),
+        ),
     },
     test = True,
 )
 
-def component_bundle(name, spec_root = None, packages = [], surface_kinds = [], manifest = None, visibility = None):
+def component_bundle(
+        name,
+        spec_root = None,
+        packages = [],
+        surface_kinds = [],
+        manifest = None,
+        library_modules = [],
+        visibility = None):
     """A component repository's release tree, plus the gate on its contract.
 
     Pairing them here makes the gate structural, as `release_package` does for
@@ -804,6 +833,12 @@ def component_bundle(name, spec_root = None, packages = [], surface_kinds = [], 
             trees stage under `surface/`.
         manifest: the manifest naming the shipped packages; required iff
             `packages` is non-empty, and refused otherwise.
+        library_modules: authored `.brenn` modules this bundle ships that no
+            package and no surface kind owns — shared vocabulary, imported by a
+            deployment rather than copied. Each stages as `modules/<basename>`,
+            is named in `modules/library-modules.txt`, and gets a
+            `library_module_test`. Each must also be under `spec_root`, which is
+            what a config gate reads instead of building the bundle.
         visibility: visibility of the staged tree.
     """
     if spec_root == None:
@@ -815,8 +850,15 @@ def component_bundle(name, spec_root = None, packages = [], surface_kinds = [], 
     if manifest and not packages:
         fail("component_bundle(%s) names a manifest but stages no packages" % name)
 
+    for module in library_modules:
+        library_module_test(
+            name = name + "_module_" + module_import_name(module),
+            module = module,
+        )
+
     _component_bundle(
         name = name,
+        library_modules = library_modules,
         manifest = manifest,
         packages = packages,
         spec_root = spec_root,
@@ -1098,8 +1140,19 @@ def _module_root(file):
     root = file.short_path[:-(len(file.basename) + 1)]
     return root if root else "."
 
-def _config_fit_test_impl(ctx):
-    dsl_cli = ctx.executable._dsl_cli
+def _check_args(ctx):
+    """The `dsl_cli check` invocation for one root document and its module roots.
+
+    A `--modules` per distinct directory among the files named, which is the
+    same rule a host is started with and the same one an installer's roots
+    satisfy. Both fit gates build it here so the passing and the refusing case
+    cannot be checking different commands.
+
+    `dsl_cli check` parses, resolves and derives; it does not lower, so every
+    refusal that lives in lowering is invisible to every gate built from this.
+    TODO(config-fit-test-lowers): run a lowering pass from the fit gates, or
+    record why lowering stays `config-check`'s.
+    """
     roots = []
     for module in ctx.files.modules:
         root = _module_root(module)
@@ -1112,7 +1165,11 @@ def _config_fit_test_impl(ctx):
         args.append("--modules")
         args.append(root)
     args.append(ctx.file.config.short_path)
-    script = _check_wrapper(ctx, dsl_cli, args)
+    return args
+
+def _config_fit_test_impl(ctx):
+    dsl_cli = ctx.executable._dsl_cli
+    script = _check_wrapper(ctx, dsl_cli, _check_args(ctx))
     return [DefaultInfo(
         executable = script,
         runfiles = ctx.runfiles(
@@ -1163,6 +1220,92 @@ _config_fit_test = rule(
     test = True,
 )
 
+def _config_fit_refusal_test_impl(ctx):
+    dsl_cli = ctx.executable._dsl_cli
+    script = _check_wrapper(
+        ctx,
+        ctx.file._refuses,
+        [dsl_cli.short_path, ctx.attr.expect] + _check_args(ctx),
+    )
+    return [DefaultInfo(
+        executable = script,
+        runfiles = ctx.runfiles(
+            files = [ctx.file.config, ctx.file._refuses, dsl_cli] +
+                    ctx.files.modules + ctx.files.tree,
+        ).merge(ctx.attr._dsl_cli[DefaultInfo].default_runfiles),
+    )]
+
+_config_fit_refusal_test = rule(
+    implementation = _config_fit_refusal_test_impl,
+    doc = """The fit gate's other direction: a document that must not compile.
+
+    `config_fit_test` is the only gate an out-of-tree deployer has over its own
+    root document, and every call of it is a passing case. A gate that went
+    permanently green — a wrapper that lost the exit status, the wrong file
+    handed to `check` — would fail silently, and the first refusal would be a
+    boot panic on the target host.
+
+    A separate rule rather than a `expect_failure` knob on the fit gate: a rule
+    that can be told to want a failure is one an author can leave pointed the
+    wrong way, while a target spelled `..._refusal_test` says what it wants in
+    its name. `expect` is mandatory for the same reason — a document may fail to
+    compile for a reason that has nothing to do with the case.
+    """,
+    attrs = {
+        "config": attr.label(
+            allow_single_file = [".brenn"],
+            mandatory = True,
+            doc = "The root document, which must be refused.",
+        ),
+        "expect": attr.string(
+            mandatory = True,
+            doc = "A substring of the refusal, so a document refused for some " +
+                  "other reason does not pass as this case.",
+        ),
+        "modules": attr.label_list(
+            allow_files = [".brenn"],
+            mandatory = True,
+            doc = "The packaged modules `use @<name>::…` resolves against, as " +
+                  "in `config_fit_test`.",
+        ),
+        "tree": attr.label_list(
+            allow_files = [".brenn"],
+            default = [],
+            doc = "The rest of the config tree the root imports with a plain `use`.",
+        ),
+        "_dsl_cli": attr.label(
+            cfg = "exec",
+            default = Label("//brenn-dsl:dsl_cli"),
+            executable = True,
+        ),
+        "_refuses": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/wasm:config_fit_refusal.sh"),
+        ),
+    },
+    test = True,
+)
+
+def config_fit_refusal_test(name, config, modules, expect, tree = []):
+    """See `_config_fit_refusal_test`.
+
+    Args:
+        name: target name.
+        config: the root `.brenn` document, which must be refused.
+        modules: the packaged modules it imports, as files or filegroups.
+        expect: a substring of the refusal this case is about.
+        tree: the root's own sibling documents, when it imports any.
+    """
+    _config_fit_refusal_test(
+        name = name,
+        config = config,
+        modules = modules,
+        expect = expect,
+        tree = tree,
+        size = "small",
+        target_compatible_with = HOST_ONLY,
+    )
+
 def config_fit_test(name, config, modules, tree = []):
     """See `_config_fit_test`.
 
@@ -1181,6 +1324,80 @@ def config_fit_test(name, config, modules, tree = []):
         target_compatible_with = HOST_ONLY,
     )
 
+# The extension every packaged module carries; the rest of the name is the
+# import spelling.
+_MODULE_EXT = ".brenn"
+
+def module_import_name(module):
+    """The `use @<name>` spelling of a packaged module file label.
+
+    The same derivation the resolver makes: a module at
+    `config/specs/surface-description.brenn` is imported as
+    `use @surface-description::*;`. Exported because the macros that pair a
+    library module with its gate need to name the gate after the module, and a
+    second transcription of this rule would be a target name that drifts from
+    the import it checks.
+
+    Args:
+        module: the `.brenn` file label.
+    """
+    base = Label(module).name.split("/")[-1]
+    if not base.endswith(_MODULE_EXT):
+        fail("%s is not a %s file, so it names no packaged module" % (module, _MODULE_EXT))
+    return base[:-len(_MODULE_EXT)]
+
+def module_file_name(module):
+    """The staged basename of a packaged module file label.
+
+    `Label`'s own split, so a label whose file part follows a colon
+    (`//spec:widget.brenn`) reads the same as one spelled with a slash. A list
+    that derives the name by partitioning the label string instead names a file
+    that does not exist as soon as the directory holding it gets a `BUILD.bazel`.
+
+    Args:
+        module: the `.brenn` file label.
+    """
+    return module_import_name(module) + _MODULE_EXT
+
+def library_module_test(name, module):
+    """Hold one library module to the packaged-module discipline.
+
+    A library module is vocabulary a release ships that no component package and
+    no surface kind owns, so nothing else in the graph compiles it: it reaches a
+    deployment through `use @<name>::*;` and, without this, the first reader of
+    it is the compiler at that deployment's boot. What is compiled here is a
+    one-line root document that imports nothing else, with the module's own
+    directory as the only module root, so a file that declares a top-level
+    channel, an instance or a principal — the packaged subset's top-level rules
+    — fails brenn's own build.
+
+    What it does not reach is an assembly's body: a body is resolved only when
+    something stamps it, and this root stamps nothing.
+    TODO(library-module-body-gate): stamp what the module declares, or teach
+    `dsl_cli check` to expand every declared assembly once.
+
+    The import spelling is the basename without its extension, which is the same
+    derivation the resolver makes: a module at `config/specs/surface-description.brenn`
+    is `use @surface-description::*;`.
+
+    Args:
+        name: target name.
+        module: the `.brenn` file label.
+    """
+    stem = module_import_name(module)
+
+    root = name + "_root" + _MODULE_EXT
+    write_file(
+        name = name + "_root",
+        out = root,
+        content = ["use @%s::*;" % stem, ""],
+    )
+
+    config_fit_test(
+        name = name,
+        config = ":" + root,
+        modules = [module],
+    )
 
 # ---------------------------------------------------------------------------
 # WIT staged as a directory, for a host crate's `bindgen!`

@@ -1,0 +1,7 @@
+// A ceiling that covers the words and none of the reach. The refusal lands at
+// the author's statement, where a reader can see what the arrangement asked
+// for, and names the stamp as the place the consent goes.
+
+use @panel::*;
+
+new demo: Page(slug = "demo") { grants = [dom, subscribe]; }

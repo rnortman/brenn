@@ -1,0 +1,10 @@
+// Consent text that consents to nothing, both shapes at once: a word no
+// instance in the subtree holds, and an `acl` line in a family the arrangement
+// reaches nowhere beyond the channel it declares.
+
+use @panel::*;
+
+new demo: Page(slug = "demo") {
+    grants = [dom, subscribe, tools];
+    acl publish [prefix "brenn:house."];
+}

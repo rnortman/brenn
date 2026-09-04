@@ -98,7 +98,7 @@ pub struct DAclSet {
 /// what says which scheme it is about, and that is how the runtime's own config
 /// spells it. The span is where the entry came from: the matcher that was
 /// written, or the binding that derived it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DMatcher {
     Exact(Spanned<String>),
     Prefix(Spanned<String>),
@@ -121,7 +121,7 @@ impl DMatcher {
 }
 
 /// One inbound MQTT entry: a topic filter, scoped to the client that carries it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DMqttSub {
     pub client: Spanned<String>,
     pub topic_filter: Spanned<String>,
@@ -133,7 +133,7 @@ pub struct DMqttSub {
 /// The two budgets are the egress sink's, and the entry that mints the sink is
 /// where they are written: an entry with neither takes the runtime's default
 /// budget, which is why they are `Option` rather than a resolved pair.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DMqttClient {
     pub client: Spanned<String>,
     pub publish_per_activation: Option<f64>,
@@ -141,7 +141,7 @@ pub struct DMqttClient {
 }
 
 /// One inbound webhook entry, by endpoint slug.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DWebhook {
     pub endpoint: Spanned<String>,
 }
@@ -166,7 +166,7 @@ pub struct DRemoteAuthority {
 ///
 /// Plain counts, never the word for an unbounded window: an unbounded queue is
 /// not an answer a network principal may be given.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DRemoteSubEntry {
     pub m: DMatcher,
     pub push_depth: u64,

@@ -94,7 +94,7 @@ fn a_grant_over_an_agent_parameter_names_the_agent_the_argument_named() {
     let principals: Vec<String> = config
         .grants
         .iter()
-        .map(|grant| grant.principal.dotted())
+        .map(|grant| grant.target.dotted())
         .collect();
     assert_eq!(principals, ["alice_pa", "bob_pa"]);
 }
@@ -243,8 +243,8 @@ assembly Pod(slug: String) {
 new alice: Pod(slug = \"alice\") { chrome = false; }
 "
         ),
-        "an assembly instantiation takes arguments, not a body; per-instance values \
-         are assembly parameters"
+        "a stamp's body is its ceiling: `grants` and `acl` lines, which cap what the \
+         arrangement may hold; per-instance values are assembly parameters"
     );
 }
 
@@ -367,7 +367,7 @@ assembly Pod(slug: String) {
 new alice: Pod(slug = \"alice\");
 "
         ),
-        "parameter `slug` names a value, and a grant names a principal"
+        "parameter `slug` names a value, and a grant names a running entity"
     );
 }
 
@@ -662,7 +662,7 @@ new alice: Pod(slug = \"alice-pa\");
 "
         ),
         "`pa` is not a parameter of this assembly, and an assembly grants \
-         about its parameters; pass the principal in"
+         about its parameters; pass the entity in"
     );
 }
 
@@ -752,7 +752,7 @@ fn an_agent_argument_may_name_a_stamped_agent() {
     let principals: Vec<String> = config
         .grants
         .iter()
-        .map(|grant| grant.principal.dotted())
+        .map(|grant| grant.target.dotted())
         .collect();
     assert_eq!(principals, ["alice.pa"]);
     assert_eq!(
@@ -1312,4 +1312,394 @@ fn one_assembly_stamps_both_placements_and_wires_them_to_its_own_channels() {
     };
     assert_eq!(bound(&surface.components[0].bindings), [0, 1]);
     assert_eq!(bound(&config.consumers[0].bindings), [0, 1]);
+}
+
+// ── the stamp: what a `new` against an assembly consents to ─────────────────
+
+/// A packaged arrangement: an author's assembly, with a surface, an instance
+/// holding a capability, and a channel of its own. Stamped from deployer text
+/// it is the packaged boundary, which is where a ceiling is required.
+const PACKAGED_PAGE: &str = "\
+// ── packaged ──
+component Panel { abi = processor; requires = []; in messages; }
+
+assembly DemoPage(slug: String) {
+    channel out at f\"ephemeral:{slug}.out\";
+    surface page {
+        slug = slug;
+        grants = [subscribe];
+        new panel: Panel { grants = [dom]; in messages <- out; }
+    }
+}
+// ── packaged ──
+";
+
+/// The dotted handle of every stamp the config recorded.
+fn stamps(config: &ResolvedConfig) -> Vec<String> {
+    config
+        .stamps
+        .iter()
+        .map(|stamp| stamp.handle.dotted())
+        .collect()
+}
+
+/// The packaged boundary records itself with nothing written: its ceiling is
+/// then empty, and what the arrangement confers is checked against that.
+#[test]
+fn a_stamp_of_a_packaged_assembly_records_the_boundary() {
+    let config = resolved(&format!(
+        "{PACKAGED_PAGE}\nnew demo: DemoPage(slug = \"demo\");\n"
+    ));
+    assert_eq!(stamps(&config), ["demo"]);
+    let stamp = &config.stamps[0];
+    assert_eq!(stamp.assembly.value(), "DemoPage");
+    assert_eq!(stamp.package.as_deref(), Some("fixtures"));
+    assert!(!stamp.packaged_site, "the `new` is the deployer's text");
+    assert_eq!(stamp.parent, None);
+    assert!(stamp.under.is_none());
+    assert!(stamp.grants.is_none());
+    assert!(stamp.acls.is_empty());
+}
+
+/// The whole point of recording it: every entity the arrangement stamped points
+/// back at the one stamp whose ceiling covers it.
+#[test]
+fn every_entity_a_recorded_stamp_emits_names_it() {
+    let config = resolved(&format!(
+        "{PACKAGED_PAGE}\nnew demo: DemoPage(slug = \"demo\");\n"
+    ));
+    let id = Some(brenn_dsl::resolved::StampId(0));
+    assert_eq!(config.channels[0].stamp, id);
+    assert_eq!(config.surfaces[0].stamp, id);
+    assert_eq!(config.surfaces[0].components[0].stamp, id);
+}
+
+/// The other two authority-bearing shapes an assembly can emit: a top-level
+/// consumer and an agent. Each is what makes the words it holds reach the
+/// ceiling's fold, and neither is reachable through a surface, so each is
+/// asserted on its own. A tree assembly with a ceiling written on its stamp,
+/// because a packaged module declares no agent class.
+#[test]
+fn a_stamped_consumer_and_a_stamped_agent_name_the_stamp() {
+    let config = resolved(
+        "\
+// ── packaged ──
+component Sink { abi = processor; requires = [ports]; in messages; }
+// ── packaged ──
+agent Assistant() {
+    name = \"Assistant\";
+    slug = \"desk-pa\";
+    grants = [pwa_push];
+}
+
+assembly Desk(slug: String) {
+    channel out at f\"ephemeral:{slug}.out\" { push_depth = 4; retain_depth = 16; }
+    new consume: Sink { grants = [ports]; in messages <- out; }
+    new pa: Assistant();
+}
+
+new demo: Desk(slug = \"demo\") { grants = [ports, pwa_push]; }
+",
+    );
+    let id = Some(brenn_dsl::resolved::StampId(0));
+    assert_eq!(stamps(&config), ["demo"]);
+    assert_eq!(config.consumers[0].handle.dotted(), "demo.consume");
+    assert_eq!(config.consumers[0].stamp, id);
+    assert_eq!(config.agents[0].handle.dotted(), "demo.pa");
+    assert_eq!(config.agents[0].stamp, id);
+}
+
+/// A tree assembly stamped with neither `under` nor a body records nothing:
+/// the deployer's own text is the trust anchor, and there is nothing to cap.
+#[test]
+fn a_tree_assembly_stamped_bare_records_nothing() {
+    let config = resolved(
+        "\
+assembly Pod(slug: String) {
+    channel out at f\"ephemeral:{slug}.out\";
+}
+
+new alice: Pod(slug = \"alice\");
+",
+    );
+    assert!(stamps(&config).is_empty());
+    assert_eq!(config.channels[0].stamp, None);
+}
+
+/// A ceiling written on a tree assembly's stamp is optional attenuation, and
+/// writing it is what records the stamp.
+#[test]
+fn a_ceiling_written_on_a_tree_stamp_records_it() {
+    let config = resolved(
+        "\
+assembly Pod(slug: String) {
+    channel out at f\"ephemeral:{slug}.out\";
+}
+
+new alice: Pod(slug = \"alice\") {
+    grants = [ephemeral_publish];
+    acl publish [prefix \"ephemeral:alice.\"];
+}
+",
+    );
+    assert_eq!(stamps(&config), ["alice"]);
+    let stamp = &config.stamps[0];
+    assert_eq!(stamp.package, None);
+    let words: Vec<&str> = stamp
+        .grants
+        .as_ref()
+        .expect("a written axis")
+        .words
+        .iter()
+        .map(|word| word.name.value().as_str())
+        .collect();
+    assert_eq!(words, ["ephemeral_publish"]);
+    assert_eq!(stamp.acls.len(), 1);
+    assert_eq!(stamp.acls[0].plane.value(), "publish");
+}
+
+/// A channel handed in as an argument is reach the deployer consented to by
+/// naming it, so the stamp carries it rather than deriving it.
+#[test]
+fn a_channel_argument_is_carried_as_handed_reach() {
+    let config = resolved(&format!(
+        "\
+{}
+channel source at \"ephemeral:source\";
+
+assembly Loop(feed: Channel) {{
+    channel out at \"ephemeral:loop.out\";
+    surface page {{
+        slug = \"loop\";
+        grants = [subscribe];
+        new panel: Panel {{ in messages <- feed; }}
+    }}
+}}
+
+new demo: Loop(feed = source) {{ grants = [dom]; }}
+",
+        PACKAGED_PAGE
+    ));
+    assert_eq!(config.stamps[0].handed, vec![ChanId(0)]);
+}
+
+/// `under` names the principal, and a stamp with no body of its own holds
+/// exactly what the principal holds.
+#[test]
+fn a_stamp_under_a_principal_names_it() {
+    let config = resolved(&format!(
+        "{PACKAGED_PAGE}\nprincipal ui {{\n    grants = [dom, subscribe];\n}}\n\nnew demo: DemoPage(slug = \"demo\") under ui;\n"
+    ));
+    assert_eq!(
+        config.stamps[0].under.as_ref().expect("a clause").dotted(),
+        "ui"
+    );
+}
+
+/// An assembly reaches a principal the way it reaches an agent: as a
+/// parameter, resolved through to the declaration the argument named.
+#[test]
+fn a_principal_parameter_carries_through_to_the_stamp() {
+    let config = resolved(&format!(
+        "\
+{PACKAGED_PAGE}
+principal site {{
+    grants = [dom, subscribe];
+}}
+
+assembly Deployment(ui: Principal) {{
+    new page: DemoPage(slug = \"demo\") under ui;
+}}
+
+new deployment: Deployment(ui = site);
+"
+    ));
+    assert_eq!(stamps(&config), ["deployment.page"]);
+    assert_eq!(
+        config.stamps[0].under.as_ref().expect("a clause").dotted(),
+        "site"
+    );
+}
+
+/// A nested stamp with nothing written records nothing, and what it stamps
+/// belongs to the boundary above it — one ceiling over the whole expansion.
+#[test]
+fn a_nested_bare_stamp_belongs_to_the_boundary_above_it() {
+    let config = resolved(&format!(
+        "\
+{PACKAGED_PAGE}
+assembly Deployment() {{
+    new page: DemoPage(slug = \"demo\");
+}}
+
+new deployment: Deployment();
+"
+    ));
+    assert_eq!(stamps(&config), ["deployment.page"]);
+    assert_eq!(
+        config.channels[0].stamp,
+        Some(brenn_dsl::resolved::StampId(0))
+    );
+}
+
+// ── what the stamp refuses ──────────────────────────────────────────────────
+
+#[test]
+fn a_stamp_body_holds_no_binding() {
+    assert_eq!(
+        refusal(&format!(
+            "{PACKAGED_PAGE}\nchannel feed at \"ephemeral:feed\";\n\nnew demo: DemoPage(slug = \"demo\") {{\n    in messages <- feed;\n}}\n"
+        )),
+        "a stamp's body is its ceiling: `grants` and `acl` lines, which cap what the \
+         arrangement may hold; per-instance values are assembly parameters"
+    );
+}
+
+#[test]
+fn a_stamp_body_holds_no_sub_block() {
+    assert_eq!(
+        refusal(&format!(
+            "{PACKAGED_PAGE}\nnew demo: DemoPage(slug = \"demo\") {{\n    tool git-repo-pull {{}}\n}}\n"
+        )),
+        "a stamp's body is its ceiling: `grants` and `acl` lines, which cap what the \
+         arrangement may hold; per-instance values are assembly parameters"
+    );
+}
+
+/// `under` places an assembly under a principal. A component instance holds
+/// what its own `grants` and bindings say, so the clause has no reading there.
+#[test]
+fn under_on_a_top_level_component_is_refused() {
+    let messages = refusals(&format!(
+        "{PACKAGED_PAGE}\nprincipal ui {{\n    grants = [dom];\n}}\n\nnew demo: Panel under ui {{\n    slug = \"demo\";\n    grants = [dom];\n}}\n"
+    ));
+    assert!(
+        messages.iter().any(|message| message
+            == "`under` places an assembly under a principal; a component instance holds \
+                what its own `grants` and bindings say"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn under_on_a_surface_placed_component_is_refused() {
+    let messages = refusals(&format!(
+        "{PACKAGED_PAGE}\nprincipal ui {{\n    grants = [dom];\n}}\n\nsurface panel {{\n    slug = \"panel\";\n    grants = [subscribe];\n    new view: Panel under ui {{ grants = [dom]; }}\n}}\n"
+    ));
+    assert!(
+        messages.iter().any(|message| message
+            == "`under` places an assembly under a principal; a component instance holds \
+                what its own `grants` and bindings say"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn under_on_an_agent_is_refused() {
+    let messages = refusals(
+        "\
+principal ui {
+    grants = [dom];
+}
+
+agent Assistant(name: String) {
+    slug = name;
+    model = \"sonnet\";
+}
+
+new alice: Assistant(name = \"alice-pa\") under ui;
+",
+    );
+    assert!(
+        messages.iter().any(|message| message
+            == "`under` places an assembly under a principal; an agent holds what its own \
+                `grants` and bindings say"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_stamp_under_a_running_entity_is_refused() {
+    assert_eq!(
+        refusal(&format!(
+            "\
+{PACKAGED_PAGE}
+agent Assistant(name: String) {{
+    slug = name;
+    model = \"sonnet\";
+}}
+
+new alice: Assistant(name = \"alice-pa\");
+new demo: DemoPage(slug = \"demo\") under alice;
+"
+        )),
+        "`alice` is an instance; a stamp is under a `principal`"
+    );
+}
+
+/// A parameter is the only principal a packaged file can reach, so a bare name
+/// there is refused with that fact rather than with the module's own scope.
+#[test]
+fn under_in_packaged_text_names_a_parameter() {
+    let source = "\
+// ── packaged ──
+component Panel { abi = processor; requires = []; in messages; }
+
+assembly Inner(slug: String) {
+    channel out at f\"ephemeral:{slug}.out\";
+}
+
+assembly Outer(slug: String) {
+    new inner: Inner(slug = slug) under ui;
+}
+// ── packaged ──
+
+new demo: Outer(slug = \"demo\");
+";
+    assert_eq!(
+        refusal(source),
+        "a packaged module declares no principal, so `ui` names none here; an arrangement \
+         is handed one as a `Principal` parameter"
+    );
+}
+
+#[test]
+fn a_principal_parameter_bound_to_a_channel_is_refused() {
+    assert_eq!(
+        refusal(
+            "\
+channel feed at \"ephemeral:feed\";
+
+assembly Deployment(ui: Principal) {
+    channel out at \"ephemeral:out\";
+}
+
+new deployment: Deployment(ui = feed);
+"
+        ),
+        "parameter `ui` is a `Principal`; `feed` is a channel"
+    );
+}
+
+/// The two spellings of one thing again, from the assembly's side: a grant
+/// widens a running entity, and a principal's authority is its own body.
+#[test]
+fn a_grant_naming_a_principal_parameter_is_refused() {
+    assert_eq!(
+        refusal(
+            "\
+principal site {
+    grants = [dom];
+}
+
+assembly Deployment(ui: Principal) {
+    channel out at \"ephemeral:out\";
+    grant ui publish prefix \"ephemeral:out.\";
+}
+
+new deployment: Deployment(ui = site);
+"
+        ),
+        "parameter `ui` names a principal, and a grant names a running entity"
+    );
 }

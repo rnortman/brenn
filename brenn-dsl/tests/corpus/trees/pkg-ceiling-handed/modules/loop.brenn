@@ -1,0 +1,24 @@
+// An arrangement handed a channel: the deployment names it in the argument
+// list, which is the consent to reach that one address. The author's `acl`
+// line widens it to a prefix, which reaches addresses the deployment handed
+// over nothing about.
+
+component Sink {
+    abi = processor;
+    requires = [ports];
+    in messages;
+    out events;
+}
+
+assembly Loop(slug: String, source: Channel) {
+    channel out at f"ephemeral:{slug}.out" {
+        push_depth = 4;
+        retain_depth = 16;
+    }
+    new consume: Sink {
+        grants = [ports];
+        acl subscribe [prefix "brenn:feed."];
+        in messages <- source;
+        out events -> out;
+    }
+}

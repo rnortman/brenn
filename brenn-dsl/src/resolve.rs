@@ -34,19 +34,19 @@ use crate::model::{
     AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem,
     AttachmentTargetAttrs, Attr, AttrBlock, AttrMap, Binding as BindStmt, ChanAddr, ChanRef,
     ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
-    InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapValues, Matcher, MatcherVal,
-    McpServerStmt, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs, OutTail, Param,
-    ParamList, PathRef, PathSeg, PortDir as DeclDir, RateLimitAttrs, SectionNode, StrLike, StrLit,
-    StrPart, SubscribeStmt, SubscribeTail, SurfaceDef, ToolBlock, TypedBlock, UseStmt, UuidPin,
-    Value, WordList,
+    InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapDepths, MapValues, Matcher,
+    MatcherVal, McpServerStmt, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs, OutTail,
+    Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, PrincipalDef, RateLimitAttrs,
+    SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail, SurfaceDef, ToolBlock,
+    TypedBlock, UNBOUNDED, UseStmt, UuidPin, Value, WordList,
 };
 use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent,
     RAttachmentTarget, RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks,
-    RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort, RRateLimit, RRemote, RSection,
-    RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal, RValue, RWebhook, RWebhookBlock,
-    RWordList, ResolvedConfig, str_value,
+    RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort, RPrincipal, RRateLimit,
+    RRemote, RSection, RStamp, RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal, RValue,
+    RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId, str_value,
 };
 use crate::roots::scan_roots;
 
@@ -132,6 +132,7 @@ pub fn resolve_files(
     let Emitted { config, withheld } = emit_entities(&index, files, &mut errors);
     check_identity(&config, &mut errors);
     check_grants(&config, &withheld, &mut errors);
+    check_principal_chains(&config, &mut errors);
     check_addresses(&config, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
@@ -183,6 +184,15 @@ fn check_packaged_discipline(files: &[(String, File)], errors: &mut Vec<Diagnost
         for item in &file.items {
             match item.value() {
                 Item::ConstDef(_) | Item::Component(_) | Item::Assembly(_) => {}
+                // Its own sentence: the general refusal is about effect, and a
+                // principal has none. What it would do is decide how much
+                // authority the arrangements it is delegated to may hold, which
+                // is the deployment's decision and not the author's.
+                Item::Principal(_) => errors.push(Diagnostic::at(
+                    "a packaged module declares no principal; what an arrangement holds is \
+                     the deployment's to give",
+                    item.span().clone(),
+                )),
                 _ => errors.push(Diagnostic::at(DISCIPLINE_REFUSAL, item.span().clone())),
             }
         }
@@ -517,6 +527,7 @@ pub enum SymKind {
     Surface,
     Instance,
     Remote,
+    Principal,
     Webhook,
     Repo,
     MqttClient,
@@ -536,6 +547,7 @@ impl SymKind {
             SymKind::Surface => "a surface",
             SymKind::Instance => "an instance",
             SymKind::Remote => "a remote",
+            SymKind::Principal => "a principal",
             SymKind::Webhook => "a webhook",
             SymKind::Repo => "a repo",
             SymKind::MqttClient => "an mqtt client",
@@ -715,6 +727,12 @@ impl Index {
                         binding.site.clone(),
                     ));
                 }
+                if name == UNBOUNDED {
+                    errors.push(Diagnostic::at(
+                        format!("{RESERVED_UNBOUNDED}, and cannot be a parameter's name"),
+                        span.clone(),
+                    ));
+                }
                 seen.insert(name, span);
                 let ty = check_param_type(&param.ty, errors);
                 if let Some(default) = &param.default
@@ -747,6 +765,12 @@ impl Index {
             let mut resolved = HashMap::new();
             for constant in file.consts() {
                 let ConstDef { name, value, .. } = constant;
+                if name.value() == UNBOUNDED {
+                    errors.push(Diagnostic::at(
+                        format!("{RESERVED_UNBOUNDED}, and cannot be a constant's name"),
+                        name.span().clone(),
+                    ));
+                }
                 let mut refusals = Vec::new();
                 check_leaf_only(value, "a constant", &mut refusals);
                 if !refusals.is_empty() {
@@ -886,6 +910,7 @@ fn declared_name(item: &Item) -> Option<(SymKind, &Spanned<String>)> {
         Item::Surface(def) => (SymKind::Surface, &def.name),
         Item::Inst(stmt) => (SymKind::Instance, &stmt.handle),
         Item::Remote(def) => (SymKind::Remote, &def.name),
+        Item::Principal(def) => (SymKind::Principal, &def.name),
         Item::Webhook(def) => (SymKind::Webhook, &def.name),
         Item::Repo(def) => (SymKind::Repo, &def.name),
         Item::MqttClient(def) => (SymKind::MqttClient, &def.name),
@@ -980,10 +1005,11 @@ enum ParamType {
     Channel,
     Agent,
     Repo,
+    Principal,
 }
 
 /// The parameter types the language has, in the order a message lists them.
-const PARAM_TYPES: [ParamType; 7] = [
+const PARAM_TYPES: [ParamType; 8] = [
     ParamType::String,
     ParamType::Int,
     ParamType::Bool,
@@ -991,6 +1017,7 @@ const PARAM_TYPES: [ParamType; 7] = [
     ParamType::Channel,
     ParamType::Agent,
     ParamType::Repo,
+    ParamType::Principal,
 ];
 
 impl ParamType {
@@ -1004,6 +1031,7 @@ impl ParamType {
             "Channel" => ParamType::Channel,
             "Agent" => ParamType::Agent,
             "Repo" => ParamType::Repo,
+            "Principal" => ParamType::Principal,
             _ => return None,
         })
     }
@@ -1018,6 +1046,7 @@ impl ParamType {
             ParamType::Channel => "Channel",
             ParamType::Agent => "Agent",
             ParamType::Repo => "Repo",
+            ParamType::Principal => "Principal",
         }
     }
 
@@ -1025,7 +1054,7 @@ impl ParamType {
     /// value. An entity is checked before the value walk, and cannot default.
     fn is_entity(self) -> bool {
         match self {
-            ParamType::Channel | ParamType::Agent | ParamType::Repo => true,
+            ParamType::Channel | ParamType::Agent | ParamType::Repo | ParamType::Principal => true,
             ParamType::String | ParamType::Int | ParamType::Bool | ParamType::Table => false,
         }
     }
@@ -1365,6 +1394,16 @@ fn interpolate(fstr: &crate::model::FStr, scope: &impl ValueScope) -> Result<Str
 }
 
 // ── the file-scope value scope ───────────────────────────────────────────────
+
+/// Why the one word a depth spells an unbounded window with is not declarable.
+///
+/// A depth position looks a name up, and `unbounded` is a word before it is a
+/// name — so a constant or a parameter of that spelling would be a declaration
+/// nothing in a depth position can ever reach, and a reader would have to know
+/// the resolution order to tell which one a depth meant. These are the only two
+/// declarations a depth could resolve to an integer through; a channel or an
+/// instance handle of that name is a value position's refusal already.
+const RESERVED_UNBOUNDED: &str = "`unbounded` is the word a depth spells an unbounded window with";
 
 /// A handle path as the tables key it: the head and its `.`-segments joined.
 fn dotted_path(head: &str, rest: &[&Spanned<String>]) -> String {
@@ -2098,7 +2137,12 @@ fn emit_entities(
     // Expansion runs between the addresses and the bodies: an assembly stamps
     // channels of its own, and a reference anywhere in the document may name
     // one of them.
-    let (stamped, failed) = {
+    let Expansion {
+        stamped,
+        stamps: recorded,
+        handed,
+        failed,
+    } = {
         let mut handles = Handles {
             channels: &mut channels,
             links: &mut links,
@@ -2121,6 +2165,8 @@ fn emit_entities(
             config.withhold_stamps(inst.handle.value());
         }
     }
+    config.stamps = recorded;
+    config.handed_principals = handed;
     let classes = component_classes(
         index, &modules, &declaring, &channels, &links, &stamps, errors,
     );
@@ -2301,6 +2347,7 @@ fn emit_item(
         }
         Item::Channel(def) => emit_channel(*def, declaration, scope, config, errors),
         Item::Link(stmt) => emit_link(*stmt, scope, config),
+        Item::Principal(def) => emit_principal(*def, scope, config, errors),
         Item::Remote(def) => {
             let handle = HandlePath(vec![def.name.clone()]);
             let (attrs, mut refused) = resolve_attrs(def.attrs, scope, errors);
@@ -2366,8 +2413,8 @@ fn emit_item(
         Item::McpServer(def) => emit_named!(def, config.mcp_servers, None),
         Item::Acl(stmt) => errors.push(Diagnostic::at(
             "an acl statement needs an enclosing entity body (surface, agent, remote, \
-             or a new instance); at top level, grant authority to a named principal \
-             with `grant`",
+             or a new instance); at top level, grant authority to a named running \
+             entity with `grant`",
             stmt.plane.span().clone(),
         )),
         Item::Grant(stmt) => match emit_grant(*stmt, scope) {
@@ -2435,6 +2482,7 @@ fn emit_channel(
             );
             config.channels.push(RChannel {
                 handle: scope.handle(decl.handle),
+                stamp: None,
                 address,
                 attrs,
                 doc: decl.doc,
@@ -2571,6 +2619,40 @@ fn collecting_resolver<'s, S: ValueScope>(
 /// The message a collecting walk can never produce.
 const NEVER_FAILS: &str = "the collecting resolver substitutes rather than failing";
 
+/// A depth position, resolved before the body's values: a count as written, the
+/// word `unbounded`, or a name replaced by the integer it resolves to.
+///
+/// Positioned at the name, so every later reader — lowering's non-negative
+/// check, derivation's span, the key listing — sees an integer written where the
+/// name was. `unbounded` is a word before it is a name and is never looked up,
+/// which is what the reservation on that spelling at a constant's and a
+/// parameter's declaration keeps true.
+fn resolve_depth(
+    key: &str,
+    depth: IntOrWord,
+    scope: &impl ValueScope,
+) -> Result<IntOrWord, Diagnostic> {
+    match depth {
+        IntOrWord::Int(count) => Ok(IntOrWord::Int(count)),
+        IntOrWord::Name { path, span } if path.is_unbounded() => Ok(IntOrWord::Name { path, span }),
+        IntOrWord::Name { path, span } => {
+            let named = scope.lookup(&path, &span)?;
+            match named.value() {
+                RValue::Int(count) => Ok(IntOrWord::Int(Spanned::new(*count, span))),
+                other => Err(Diagnostic::at(
+                    format!(
+                        "`{key}`: `{}` names {}, and a depth is a non-negative integer or \
+                         the word `unbounded`",
+                        path.spelling(),
+                        other.kind()
+                    ),
+                    span,
+                )),
+            }
+        }
+    }
+}
+
 /// One body resolved under one scope: every value attempted, every refusal
 /// recorded.
 ///
@@ -2581,10 +2663,26 @@ const NEVER_FAILS: &str = "the collecting resolver substitutes rather than faili
 /// discovered is not.
 fn resolve_attrs<A, S>(attrs: A, scope: &S, errors: &mut Vec<Diagnostic>) -> (A::Output, Refused)
 where
-    A: MapValues<Spanned<Value>, RVal>,
+    A: MapValues<Spanned<Value>, RVal> + MapDepths,
     S: ValueScope,
 {
     let mut refused = Refused::default();
+    // Depths first: they are not value fields, so the two walks are independent
+    // and both look names up in the same scope. A refused depth is left as
+    // written and the body is dropped — nothing keeps it, because a resolution
+    // error is a failed compile and lowering never sees the field.
+    let attrs = attrs
+        .map_depths(
+            &mut |key, written| match resolve_depth(key, written.clone(), scope) {
+                Ok(depth) => Ok(depth),
+                Err(error) => {
+                    errors.push(error);
+                    refused.drop_part();
+                    Ok(written)
+                }
+            },
+        )
+        .expect(NEVER_FAILS);
     let resolved = attrs
         .map_all(&mut collecting_resolver(scope, errors, &mut refused))
         .expect(NEVER_FAILS);
@@ -2623,10 +2721,10 @@ const PLANE_WORDS: [&str; 2] = ["subscribe", "publish"];
 
 /// `grant alice_pa subscribe prefix "brenn:alice-desk.";`.
 ///
-/// Which entity the principal names is checked once the entity space is
+/// Which entity the statement names is checked once the entity space is
 /// complete ([`check_grants`]); the plane word is checked here.
 fn emit_grant(stmt: GrantStmt, scope: &Scope<'_>) -> Result<RGrant, Diagnostic> {
-    let principal_span = stmt.principal.head.clone();
+    let target_span = stmt.principal.head.clone();
     if !PLANE_WORDS.contains(&stmt.plane.value().as_str()) {
         return Err(Diagnostic::at(
             format!(
@@ -2637,60 +2735,164 @@ fn emit_grant(stmt: GrantStmt, scope: &Scope<'_>) -> Result<RGrant, Diagnostic> 
         ));
     }
     // An assembly grants to what it was given: the parameter carries the
-    // handle of the entity the argument named, and that handle is the
-    // principal.
+    // handle of the entity the argument named, and that handle is the target.
     if let Some(bound) = scope.param(&stmt.principal) {
-        let ParamVal::Agent(principal) = bound else {
+        let ParamVal::Agent(target) = bound else {
             return Err(Diagnostic::at(
                 format!(
-                    "parameter `{}` names {}, and a grant names a principal",
-                    principal_span.value(),
+                    "parameter `{}` names {}, and a grant names a running entity",
+                    target_span.value(),
                     bound.kind()
                 ),
-                principal_span.span().clone(),
+                target_span.span().clone(),
             ));
         };
         if let Some(segment) = Scope::segments(&stmt.principal).first() {
             return Err(no_such_segment(
-                principal_span.value(),
+                target_span.value(),
                 Some("parameter"),
                 segment,
             ));
         }
-        let principal = principal.clone();
+        let target = target.clone();
         return Ok(RGrant {
-            principal,
-            principal_span,
+            target,
+            stamp: None,
+            target_span,
             plane: stmt.plane,
             m: resolve_matcher(&stmt.m, scope)?,
         });
     }
     // An assembly body grants about its parameters. A bare name here would
-    // record a principal with no instance prefix on it, so two instantiations
+    // record a target with no instance prefix on it, so two instantiations
     // would write one grant twice and a body name colliding with a top-level
     // one would attach the authority to the wrong entity.
     if scope.prefix.is_some() {
         return Err(Diagnostic::at(
             format!(
                 "`{}` is not a parameter of this assembly, and an assembly grants \
-                 about its parameters; pass the principal in",
-                principal_span.value()
+                 about its parameters; pass the entity in",
+                target_span.value()
             ),
-            principal_span.span().clone(),
+            target_span.span().clone(),
         ));
     }
     // Module qualification is how the name was reached, not part of the
     // identity it reached: the handle is the declared name and whatever
     // instance segments follow it.
-    let (_, name, rest) = scope.qualified(&stmt.principal, principal_span.span())?;
-    let mut segments = vec![Spanned::new(name, principal_span.span().clone())];
+    let (_, name, rest) = scope.qualified(&stmt.principal, target_span.span())?;
+    let mut segments = vec![Spanned::new(name, target_span.span().clone())];
     segments.extend(rest.into_iter().cloned());
     Ok(RGrant {
-        principal: HandlePath(segments),
-        principal_span,
+        target: HandlePath(segments),
+        stamp: None,
+        target_span,
         plane: stmt.plane,
         m: resolve_matcher(&stmt.m, scope)?,
     })
+}
+
+/// The one key a principal's body admits.
+const PRINCIPAL_GRANTS: &str = "grants";
+
+/// What a principal's body is refused with when it says anything else.
+///
+/// One sentence rather than an unknown-key listing: the legal set is a single
+/// key, and what a reader needs is what a principal *is*, not that they mistyped
+/// `grants`.
+const PRINCIPAL_BODY_REFUSAL: &str =
+    "a principal is authority and nothing else: `grants` and `acl` lines";
+
+/// `principal ui under site { grants = [dom]; acl publish [prefix "brenn:x."]; }`.
+///
+/// The body is read here and compared against the parent's authority in
+/// derivation, which is where an `acl` line becomes a family entry. What this
+/// pass answers is what the text names: which words, which matchers, and which
+/// declared principal `under` reached.
+fn emit_principal(
+    def: PrincipalDef,
+    scope: &Scope<'_>,
+    config: &mut Emitted,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let handle = HandlePath(vec![def.name.clone()]);
+    let span = def.name.span().clone();
+    let mut refused = Refused::default();
+    for (key, value) in def.attrs.entries() {
+        if key != PRINCIPAL_GRANTS {
+            errors.push(Diagnostic::at(PRINCIPAL_BODY_REFUSAL, value.span().clone()));
+            refused.drop_part();
+        }
+    }
+    let grants = match def.attrs.get(PRINCIPAL_GRANTS) {
+        Some(value) => match RWordList::from_value(value) {
+            Ok(words) => Some(words),
+            Err(error) => {
+                errors.push(error);
+                refused.drop_part();
+                None
+            }
+        },
+        None => None,
+    };
+    let acls = emit_acls(def.acls, scope, errors, &mut refused);
+    let parent = match &def.under {
+        Some(path) => match principal_under(path, scope, PRINCIPAL_UNDER_READING) {
+            Ok(parent) => Some(parent),
+            Err(error) => {
+                errors.push(error);
+                refused.drop_part();
+                None
+            }
+        },
+        None => None,
+    };
+    if refused.any() {
+        config.withhold(&handle, Grantable::No);
+        return;
+    }
+    config.principals.push(RPrincipal {
+        handle,
+        parent,
+        grants,
+        acls,
+        span,
+        doc: def.doc,
+    });
+}
+
+/// How an `under` on a `principal` declaration reads when it named something
+/// else.
+const PRINCIPAL_UNDER_READING: &str = "a principal is declared under a `principal`";
+
+/// How an `under` on a stamp reads when it named something else.
+const STAMP_UNDER_READING: &str = "a stamp is under a `principal`";
+
+/// The principal an `under` clause names.
+///
+/// A chain of principals bottoms out at the operator, so the only thing `under`
+/// may name is another `principal` declaration. A running entity is refused by
+/// name: an agent's authority is partly derived from its own wiring, and what
+/// it would mean for an arrangement to hold exactly that is not decided.
+fn principal_under(
+    path: &PathRef,
+    scope: &Scope<'_>,
+    reading: &str,
+) -> Result<HandlePath, Diagnostic> {
+    let span = path.head.span().clone();
+    let (symbol, name, rest) = scope.symbol(path, &span)?;
+    if let Some(segment) = rest.first() {
+        return Err(no_such_segment(&name, None, segment));
+    }
+    if symbol.kind != SymKind::Principal {
+        return Err(two_site(
+            format!("`{name}` is {}; {reading}", symbol.kind.describe()),
+            span,
+            "declared here",
+            symbol.span.clone(),
+        ));
+    }
+    Ok(HandlePath(vec![Spanned::new(name, span)]))
 }
 
 /// The `acl` statements of an entity body, resolved.
@@ -3076,9 +3278,11 @@ pub const SURFACE_COMPONENT_KEYS: [&str; 6] = [
     "config",
 ];
 
-/// The key of a component instance's body that is a token context rather than
-/// a value: a depth is a count or the word `unbounded`, and a bare word in a
-/// value position would resolve as a name.
+/// The key of a component instance's body whose value is a depth — a count, the
+/// word `unbounded`, or a name that resolves to a count.
+///
+/// Projected out of the value walk so the word is not read as a name, then
+/// resolved by the depth resolver, which is why it is not an `RVal`.
 const SURFACE_PARKED_DEPTH: &str = "parked_batch_depth";
 
 /// The key an instance body states its capabilities with, at either placement:
@@ -3514,6 +3718,7 @@ fn emit_surface(
     } else {
         config.surfaces.push(RSurface {
             handle,
+            stamp: None,
             slug,
             attrs,
             acls,
@@ -3536,14 +3741,16 @@ fn emit_component(
     errors: &mut Vec<Diagnostic>,
 ) -> Option<(RComponentInst, Refused)> {
     let class = resolve_class(&inst, scope, classes, Placement::Surface, errors)?;
+    refuse_under(&inst, "a component instance", errors);
     check_instance_name(&inst.handle, siblings, errors);
-    let parked_batch_depth = parked_depth(inst.body.as_ref(), errors);
+    let parked_batch_depth = parked_depth(inst.body.as_ref(), scope, errors);
     let grants = instance_grants(inst.body.as_ref(), errors);
     let at = inst.handle.span().clone();
     let body = instance_body(inst.body, &class, Placement::Surface, &at, scope, errors);
     Some((
         RComponentInst {
             instance: inst.handle,
+            stamp: None,
             class,
             parked_batch_depth,
             grants,
@@ -3604,6 +3811,7 @@ fn emit_consumer(
     config.emitted(&handle);
     config.consumers.push(RConsumer {
         handle,
+        stamp: None,
         slug,
         class,
         grants,
@@ -3615,15 +3823,26 @@ fn emit_consumer(
     });
 }
 
-/// A component instance's `parked_batch_depth`, projected out of the body
-/// before its values resolve: a depth is a count or a bare word, and resolving
-/// the word as a value would read it as a name.
+/// A component instance's `parked_batch_depth`, projected out of the body and
+/// resolved under the instance's scope.
+///
+/// The projection exists so the *word* `unbounded` is not read as a name, not so
+/// a name is never read at all: a depth also takes a constant or an `Int`
+/// parameter, which the depth resolver replaces with the count it names.
 fn parked_depth(
     body: Option<&Spanned<InstBody>>,
+    scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<IntOrWord> {
     let value = body?.value().attrs.get(SURFACE_PARKED_DEPTH)?;
-    match IntOrWord::from_value(value) {
+    let projected = match IntOrWord::from_value(value) {
+        Ok(depth) => depth,
+        Err(error) => {
+            errors.push(error);
+            return None;
+        }
+    };
+    match resolve_depth(SURFACE_PARKED_DEPTH, projected, scope) {
         Ok(depth) => Some(depth),
         Err(error) => {
             errors.push(error);
@@ -3793,7 +4012,7 @@ fn instance_body(
             None => refused.drop_part(),
         }
     }
-    // Both placements: an instance is a principal in its own right wherever it
+    // Both placements: an instance holds authority in its own right wherever it
     // is placed. A surface component's authority contains the component within
     // the surface; the surface's own is what the backend admits over the wire.
     let resolved = emit_acls(body.acls, scope, errors, &mut refused);
@@ -4139,6 +4358,10 @@ enum ParamVal {
     Chan(ChanId),
     Agent(HandlePath),
     Repo(HandlePath),
+    /// A bare principal, handed in for a stamp inside the body to be `under`.
+    /// Must not appear as a `grant` target: a principal's authority is its own
+    /// body, not something a grant widens.
+    Principal(HandlePath),
 }
 
 impl ParamVal {
@@ -4149,6 +4372,7 @@ impl ParamVal {
             ParamVal::Chan(_) => "a channel",
             ParamVal::Agent(_) => "an agent",
             ParamVal::Repo(_) => "a repo",
+            ParamVal::Principal(_) => "a principal",
         }
     }
 }
@@ -4182,6 +4406,7 @@ fn emit_inst(
     };
     match symbol.kind {
         SymKind::AgentClass => {
+            refuse_under(&inst, "an agent", errors);
             // Declared until emitted: the emitter clears it on the one path
             // that pushes, so every early return leaves it registered.
             config.withhold(&handle, Grantable::Yes);
@@ -4192,6 +4417,7 @@ fn emit_inst(
         // no entity of its own, so there is nothing to withhold.
         SymKind::Assembly => {}
         _ => {
+            refuse_under(&inst, "a component instance", errors);
             config.withhold(&handle, Grantable::Yes);
             emit_consumer(inst, scope, classes, config, errors);
         }
@@ -4230,6 +4456,7 @@ fn emit_agent(
     ) else {
         return;
     };
+    config.handed_principals.extend(handed_principals(&params));
     // The class body resolves in the file that declared it, not the file that
     // instantiated it: a class means what it meant where it was written.
     // Nothing the instantiating body stamped is visible in the class body: what
@@ -4270,6 +4497,7 @@ fn emit_agent(
     let blocks = emit_blocks(&class.blocks, &pscope, errors, &mut refused);
     let agent = RAgent {
         handle,
+        stamp: None,
         slug,
         class: class.name.clone(),
         attrs,
@@ -4292,6 +4520,24 @@ fn emit_agent(
         config.emitted(&agent.handle);
         config.agents.push(agent);
     }
+}
+
+/// The principals an argument list handed in, in a deterministic order.
+///
+/// Read for one thing: a `principal` whose only delegation is an argument some
+/// class dropped on the floor was handed *somewhere*, so the refusal for one
+/// that delegates to nothing must not fire at it. The bindings are a map, so
+/// the handles are sorted rather than left in whatever order the walk hashed.
+fn handed_principals(params: &ParamBindings) -> Vec<HandlePath> {
+    let mut found: Vec<HandlePath> = params
+        .values()
+        .filter_map(|bound| match bound {
+            ParamVal::Principal(handle) => Some(handle.clone()),
+            _ => None,
+        })
+        .collect();
+    found.sort_by_key(HandlePath::dotted);
+    found
 }
 
 /// Bind one instantiation's arguments to its class's parameters.
@@ -4409,7 +4655,9 @@ fn bind_one(
         | (ParamType::Table, RValue::Table(_)) => true,
         (ParamType::String | ParamType::Int | ParamType::Bool | ParamType::Table, _) => false,
         // An entity type took the branch above.
-        (ParamType::Channel | ParamType::Agent | ParamType::Repo, _) => unreachable!(),
+        (ParamType::Channel | ParamType::Agent | ParamType::Repo | ParamType::Principal, _) => {
+            unreachable!()
+        }
     };
     if !matches {
         return Err(Diagnostic::at(
@@ -4450,6 +4698,9 @@ fn bind_entity(
         return match (ty, bound) {
             (ParamType::Agent, ParamVal::Agent(handle)) => Ok(ParamVal::Agent(handle.clone())),
             (ParamType::Repo, ParamVal::Repo(handle)) => Ok(ParamVal::Repo(handle.clone())),
+            (ParamType::Principal, ParamVal::Principal(handle)) => {
+                Ok(ParamVal::Principal(handle.clone()))
+            }
             (_, other) => Err(Diagnostic::at(
                 format!(
                     "parameter `{}` is a `{}`; parameter `{}` names {}",
@@ -4477,7 +4728,8 @@ fn bind_entity(
             ParamVal::Agent(handle)
         }
         ParamType::Repo if symbol.kind == SymKind::Repo => ParamVal::Repo(handle),
-        ParamType::Agent | ParamType::Repo => {
+        ParamType::Principal if symbol.kind == SymKind::Principal => ParamVal::Principal(handle),
+        ParamType::Agent | ParamType::Repo | ParamType::Principal => {
             return Err(two_site(
                 format!(
                     "parameter `{}` is a `{}`; `{name}` is {}",
@@ -4531,6 +4783,16 @@ fn stamped_entity(
     let dotted = handle.dotted();
     match ty {
         ParamType::Agent => {}
+        ParamType::Principal => {
+            return Err(Diagnostic::at(
+                format!(
+                    "parameter `{}` is a `Principal`; `{dotted}` is stamped by an \
+                     instantiation, and a principal is a top-level declaration",
+                    param.name.value()
+                ),
+                span.clone(),
+            ));
+        }
         ParamType::Repo => {
             return Err(Diagnostic::at(
                 format!(
@@ -4811,10 +5073,10 @@ fn emit_subs(
                 span: chan_ref_span(&sub.chan),
                 tail,
             }),
-            // Every key of `SubscribeTail` is a projection, so nothing in it
-            // can fail to resolve and this arm cannot be reached today. It
-            // withholds the statement rather than half-reading it the day the
-            // vocabulary gains a value key.
+            // Nothing in `SubscribeTail` is a value key, but its two depths
+            // may name a constant or a parameter that does not resolve to a
+            // count, and a refused depth drops the tail. The statement is
+            // withheld rather than half-read.
             Ok(_) => refused.drop_part(),
             Err(error) => {
                 errors.push(error);
@@ -5243,7 +5505,7 @@ fn typed_tail<A, F>(
     errors: &mut Vec<Diagnostic>,
 ) -> (A::Output, Refused)
 where
-    A: MapValues<Spanned<Value>, RVal>,
+    A: MapValues<Spanned<Value>, RVal> + MapDepths,
     F: FnOnce() -> A::Output,
 {
     match tail {
@@ -5264,6 +5526,231 @@ where
 // items, each with the frame it resolves under.
 
 type AssemblyTable = TemplateTable<AssemblyDef>;
+
+// ── the stamp: what a `new` against an assembly consents to ─────────────────
+
+/// The one key a stamp's ceiling admits, which is the same key an instance's
+/// capabilities are written with.
+const STAMP_CEILING_KEY: &str = "grants";
+
+/// What a stamp's body is refused with when it says anything else.
+const STAMP_BODY_REFUSAL: &str = "a stamp's body is its ceiling: `grants` and `acl` lines, \
+     which cap what the arrangement may hold; per-instance values are assembly parameters";
+
+/// What `under` on anything but an assembly stamp is refused with.
+fn refuse_under(inst: &NewStmt, holder: &str, errors: &mut Vec<Diagnostic>) {
+    if let Some(path) = &inst.under {
+        errors.push(Diagnostic::at(
+            format!(
+                "`under` places an assembly under a principal; {holder} holds what its own \
+                 `grants` and bindings say"
+            ),
+            path.head.span().clone(),
+        ));
+    }
+}
+
+/// Where a binding was written, for a refusal about the statement rather than
+/// about what it names.
+fn binding_port(binding: &BindStmt) -> &Spanned<String> {
+    match binding {
+        BindStmt::Into(dir) => &dir.port,
+        BindStmt::Outof(dir) => &dir.port,
+        BindStmt::Both(io) => &io.port,
+    }
+}
+
+/// The one `new` a stamp is read at: the statement, the assembly it names, the
+/// frame it is written in, and the tables that answer for both.
+///
+/// One value rather than an argument list, as `Tables` and `Handles` are: every
+/// rule a stamp is read under takes some of these and a rule added later takes
+/// another, and a site passed whole derives what it can rather than trusting a
+/// caller to derive it the same way twice.
+struct StampSite<'a> {
+    /// The `new` statement.
+    inst: &'a NewStmt,
+    /// The assembly it names, for the related site every body refusal carries.
+    def: &'a AssemblyDef,
+    /// The frame the `new` is written in.
+    parent: &'a Frame,
+    /// The file that declares the assembly — packaged or not is what makes the
+    /// stamp of it subject.
+    declaring: usize,
+    /// The arguments, which is where a handed channel comes from.
+    params: &'a ParamBindings,
+    index: &'a Index,
+}
+
+/// The ceiling a stamp writes, read at the `new` that wrote it.
+///
+/// Answers `None` when something in the body or the `under` clause was refused,
+/// which stops the expansion of that `new`: an arrangement expanded under a
+/// ceiling nobody could read would be checked against nothing.
+///
+/// The body and the clause resolve in the *stamping* scope, not the assembly's:
+/// they are text at the `new` site, and the only name from inside the assembly
+/// they could reach is one the arrangement itself decides.
+fn stamp_record(
+    site: StampSite<'_>,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Option<RStamp>> {
+    let StampSite {
+        inst,
+        def,
+        parent,
+        declaring,
+        params,
+        index,
+    } = site;
+    // Where the `new` itself is written, which is what makes a stamp of packaged
+    // authority a subject one and what says which principals are in scope.
+    let packaged_site = is_packaged(&index.files[parent.file].key);
+    let mut refused = false;
+    let mut acls = Vec::new();
+    let mut grants = None;
+    if let Some(body) = &inst.body {
+        let body = body.value();
+        for (key, value) in body.attrs.entries() {
+            if key != STAMP_CEILING_KEY {
+                errors.push(two_site(
+                    STAMP_BODY_REFUSAL,
+                    value.span().clone(),
+                    "the assembly is declared here",
+                    def.name.span().clone(),
+                ));
+                refused = true;
+            }
+        }
+        for binding in &body.bindings {
+            errors.push(two_site(
+                STAMP_BODY_REFUSAL,
+                binding_port(binding).span().clone(),
+                "the assembly is declared here",
+                def.name.span().clone(),
+            ));
+            refused = true;
+        }
+        for block in &body.blocks {
+            let (_, span) = crate::model::section_kindword(block);
+            errors.push(two_site(
+                STAMP_BODY_REFUSAL,
+                span,
+                "the assembly is declared here",
+                def.name.span().clone(),
+            ));
+            refused = true;
+        }
+        if let Some(value) = body.attrs.get(STAMP_CEILING_KEY) {
+            match RWordList::from_value(value) {
+                Ok(words) => grants = Some(words),
+                Err(error) => {
+                    errors.push(error);
+                    refused = true;
+                }
+            }
+        }
+        let mut dropped = Refused::default();
+        acls = emit_acls(body.acls.clone(), scope, errors, &mut dropped);
+        refused |= dropped.any();
+    }
+    let under = match &inst.under {
+        Some(path) => match stamp_under(path, scope, packaged_site) {
+            Ok(handle) => Some((handle, path.head.span().clone())),
+            Err(error) => {
+                errors.push(error);
+                refused = true;
+                None
+            }
+        },
+        None => None,
+    };
+    if refused {
+        return None;
+    }
+    let key = &index.files[declaring].key;
+    let package = is_packaged(key).then(|| module_name(key).to_string());
+    // The packaged boundary: author-written arrangement, stamped by text the
+    // deployer wrote. That is the one place a ceiling is required, so it is
+    // recorded whether or not anything was written at it.
+    let subject = package.is_some() && !packaged_site;
+    if !subject && inst.under.is_none() && inst.body.is_none() {
+        return Some(None);
+    }
+    // A `Channel` argument is the reach the deployer consented to by naming the
+    // channel, so it is carried with the stamp rather than derived from the
+    // arrangement. Sorted: the bindings are a hash map, and a diagnostic that
+    // reads them has to read them the same way twice.
+    let mut handed: Vec<ChanId> = params
+        .values()
+        .filter_map(|bound| match bound {
+            ParamVal::Chan(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    handed.sort_by_key(|id| id.0);
+    handed.dedup();
+    Some(Some(RStamp {
+        handle: parent.stamp(inst.handle.clone()),
+        assembly: def.name.clone(),
+        package,
+        packaged_site,
+        parent: parent.stamp,
+        under_span: under.as_ref().map(|(_, span)| span.clone()),
+        under: under.map(|(handle, _)| handle),
+        wrote_body: inst.body.is_some(),
+        grants,
+        acls,
+        handed,
+        span: inst.handle.span().clone(),
+    }))
+}
+
+/// The principal a stamp's `under` names: a bare principal, or a `Principal`
+/// parameter of the enclosing assembly.
+///
+/// Packaged text has no principal in scope — a packaged module declares none —
+/// so a parameter is the only form admitted there, and a bare name is refused
+/// with that fact rather than with whatever the module's own scope holds.
+fn stamp_under(
+    path: &PathRef,
+    scope: &Scope<'_>,
+    packaged_site: bool,
+) -> Result<HandlePath, Diagnostic> {
+    let span = path.head.span().clone();
+    if let Some(bound) = scope.param(path) {
+        if let Some(segment) = Scope::segments(path).first() {
+            return Err(no_such_segment(
+                path.head.value(),
+                Some("parameter"),
+                segment,
+            ));
+        }
+        let ParamVal::Principal(handle) = bound else {
+            return Err(Diagnostic::at(
+                format!(
+                    "parameter `{}` names {}, and a stamp is under a principal",
+                    path.head.value(),
+                    bound.kind()
+                ),
+                span,
+            ));
+        };
+        return Ok(handle.clone());
+    }
+    if packaged_site {
+        return Err(Diagnostic::at(
+            format!(
+                "a packaged module declares no principal, so `{}` names none here; \
+                 an arrangement is handed one as a `Principal` parameter",
+                path.head.value()
+            ),
+            span,
+        ));
+    }
+    principal_under(path, scope, STAMP_UNDER_READING)
+}
 
 /// Collect the assemblies before emission consumes the items around them.
 fn assembly_defs(modules: &[Vec<Spanned<Item>>]) -> AssemblyTable {
@@ -5289,6 +5776,9 @@ struct Frame {
     /// top-level frame has none, which is what makes it the top level.
     prefix: Option<HandlePath>,
     params: ParamBindings,
+    /// The nearest recorded stamp this body was expanded inside, which is what
+    /// the entities it emits belong to.
+    stamp: Option<StampId>,
 }
 
 impl Frame {
@@ -5328,6 +5818,19 @@ struct Stamped {
     order: ((usize, usize), usize),
 }
 
+/// What one pass of expansion produced.
+struct Expansion {
+    /// Every item an instantiation stamped, in the order the config carries.
+    stamped: Vec<Stamped>,
+    /// The stamps recorded, indexed by [`StampId`].
+    stamps: Vec<RStamp>,
+    /// Every principal handed in as a `Principal` argument.
+    handed: Vec<HandlePath>,
+    /// The instantiations that expanded nothing, so that whatever they would
+    /// have stamped is registered as declared.
+    failed: HashSet<(usize, usize)>,
+}
+
 /// Expand every assembly instantiation the document reaches.
 ///
 /// A fixpoint worklist rather than one pass in source order: an argument may
@@ -5347,7 +5850,7 @@ fn expand_assemblies(
     stamps: &mut StampTable,
     minted: (usize, usize),
     errors: &mut Vec<Diagnostic>,
-) -> (Vec<Stamped>, HashSet<(usize, usize)>) {
+) -> Expansion {
     let (minted, minted_links) = minted;
     let mut walk = Walk {
         index,
@@ -5355,6 +5858,8 @@ fn expand_assemblies(
         next: minted,
         next_link: minted_links,
         out: Vec::new(),
+        recorded: Vec::new(),
+        handed: Vec::new(),
         root: (0, 0),
         seq: 0,
     };
@@ -5365,6 +5870,7 @@ fn expand_assemblies(
                 root: position,
                 prefix: None,
                 params: ParamBindings::new(),
+                stamp: None,
             })
         })
         .collect();
@@ -5476,7 +5982,12 @@ fn expand_assemblies(
         }
     }
     handles.links.renumber(&link_remap);
-    (out, failed)
+    Expansion {
+        stamped: out,
+        stamps: walk.recorded,
+        handed: walk.handed,
+        failed,
+    }
 }
 
 /// The two handle spaces a declaration lands in, carried together.
@@ -5589,6 +6100,7 @@ impl Waits<'_> {
             root: frame.root,
             prefix: None,
             params: ParamBindings::new(),
+            stamp: None,
         };
         seen.push(site);
         let mut found = None;
@@ -5678,6 +6190,12 @@ struct Walk<'a> {
     /// The next link id to mint.
     next_link: usize,
     out: Vec<Stamped>,
+    /// The stamps the walk recorded, in the order it reached them. A
+    /// [`StampId`] is a position here.
+    recorded: Vec<RStamp>,
+    /// Every principal handed in as a `Principal` argument, whether or not the
+    /// class it reached writes `under` with it.
+    handed: Vec<HandlePath>,
     /// The top-level instantiation being expanded, which every item it stamps
     /// is ordered under.
     root: (usize, usize),
@@ -5716,16 +6234,6 @@ impl Walk<'_> {
         }
         let site = (symbol.file, symbol.item);
         let def = self.assemblies.get(&site).map(Rc::clone)?;
-        if let Some(body) = &inst.body {
-            errors.push(two_site(
-                "an assembly instantiation takes arguments, not a body; per-instance \
-                 values are assembly parameters",
-                body.span().clone(),
-                "the assembly is declared here",
-                def.name.span().clone(),
-            ));
-            return Some(SymKind::Assembly);
-        }
         if chain.iter().any(|(seen, _)| *seen == site) {
             let mut through: Vec<&str> = chain.iter().map(|(_, name)| name.as_str()).collect();
             through.push(def.name.value());
@@ -5753,11 +6261,42 @@ impl Walk<'_> {
         let Some(params) = params else {
             return Some(SymKind::Assembly);
         };
+        self.handed.extend(handed_principals(&params));
+        // The ceiling before the arrangement: a stamp whose consent could not
+        // be read expands nothing, so nothing is emitted that is checked
+        // against no ceiling at all.
+        let recorded = {
+            let scope = parent.scope(self.index, handles.channels, handles.links, stamps);
+            stamp_record(
+                StampSite {
+                    inst,
+                    def: &def,
+                    parent,
+                    declaring: symbol.file,
+                    params: &params,
+                    index: self.index,
+                },
+                &scope,
+                errors,
+            )
+        };
+        let Some(recorded) = recorded else {
+            return Some(SymKind::Assembly);
+        };
+        let stamp = match recorded {
+            Some(record) => {
+                let id = StampId(self.recorded.len());
+                self.recorded.push(record);
+                Some(id)
+            }
+            None => parent.stamp,
+        };
         let frame = Rc::new(Frame {
             file: symbol.file,
             root: parent.root,
             prefix: Some(parent.stamp(inst.handle.clone())),
             params,
+            stamp,
         });
         // Channels first, and all of them, before anything nested: an id is
         // minted here and read everywhere, so the order it is minted in is the
@@ -5903,6 +6442,8 @@ fn emit_stamped(
         .frame
         .scope(tables.index, tables.channels, tables.links, tables.stamps);
     let (classes, agents) = (tables.classes, tables.agents);
+    let stamp = stamped.frame.stamp;
+    let marks = Marks::of(config);
     match stamped.item {
         AssemblyItem::Channel(def) => {
             emit_channel(*def, stamped.declaration, &scope, config, errors)
@@ -5914,6 +6455,98 @@ fn emit_stamped(
             Ok(grant) => config.grants.push(grant),
             Err(error) => errors.push(error),
         },
+    }
+    marks.attribute(config, stamp);
+}
+
+/// Where each authority-bearing vector ended before one stamped item was
+/// emitted.
+///
+/// The attribution is taken here rather than written at each emit site: what
+/// stamp an entity came out of is a fact about the frame that emitted it, and
+/// every emitter is shared with the top-level pass, where there is no stamp.
+/// A push the emitters gain later is attributed by joining this list, and the
+/// resolved model is destructured below so that joining it is not optional.
+#[derive(Clone, Copy)]
+struct Marks {
+    channels: usize,
+    surfaces: usize,
+    consumers: usize,
+    agents: usize,
+    grants: usize,
+}
+
+impl Marks {
+    fn of(config: &Emitted) -> Marks {
+        // Destructured, not field-accessed: a stamp is what makes an entity's
+        // authority the arrangement's rather than the deployment's, so a new
+        // vector the emitters push into has to be answered for here. One that is
+        // not carries no stamp, drops out of what a ceiling is compared against,
+        // and the ceiling quietly stops capping part of the arrangement.
+        let ResolvedConfig {
+            channels,
+            surfaces,
+            consumers,
+            agents,
+            grants,
+            // A tuning is a matcher over a family, not a holder of anything.
+            tunings: _,
+            // A link joins two channels and holds no authority of its own.
+            links: _,
+            // A pin is an address's identity.
+            uuid_pins: _,
+            // A remote is the deployment's own peer; no arrangement stamps one.
+            remotes: _,
+            // The two records the ceiling model is written in. A principal is
+            // deployer text by discipline, and a stamp carries its own parent.
+            principals: _,
+            stamps: _,
+            // A handed principal is an argument, not an entity.
+            handed_principals: _,
+            // Declarations an arrangement reaches by name. What reaches them is
+            // the reach entries of whoever binds them, which are counted on the
+            // binder.
+            webhooks: _,
+            repos: _,
+            mqtt_clients: _,
+            mcp_servers: _,
+            // Display metadata.
+            sections: _,
+        } = &**config;
+        Marks {
+            channels: channels.len(),
+            surfaces: surfaces.len(),
+            consumers: consumers.len(),
+            agents: agents.len(),
+            grants: grants.len(),
+        }
+    }
+
+    /// Record the stamp on everything emitted since the mark.
+    fn attribute(self, config: &mut Emitted, stamp: Option<StampId>) {
+        if stamp.is_none() {
+            return;
+        }
+        for channel in &mut config.channels[self.channels..] {
+            channel.stamp = stamp;
+        }
+        for surface in &mut config.surfaces[self.surfaces..] {
+            surface.stamp = stamp;
+            // A stamped surface's instances were written in the same body, so
+            // they came out of the same stamp.
+            for component in &mut surface.components {
+                component.stamp = stamp;
+            }
+        }
+        for consumer in &mut config.consumers[self.consumers..] {
+            consumer.stamp = stamp;
+        }
+        for agent in &mut config.agents[self.agents..] {
+            agent.stamp = stamp;
+        }
+        for grant in &mut config.grants[self.grants..] {
+            grant.stamp = stamp;
+        }
     }
 }
 
@@ -6083,36 +6716,130 @@ fn check_identity(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     check_family(clients.iter(), Family::MqttClient, errors);
 }
 
-/// Every `grant`'s principal names an entity authority can be held by.
+/// Every `grant`'s target names a running entity authority can be held by.
 ///
 /// Post-expansion, because the entity space is not complete until every
 /// assembly has been stamped: a grant may name an entity a later instantiation
 /// writes.
 ///
-/// A withheld entity of a grantable kind counts as a principal: it was
-/// declared, and the compile already fails on whatever withheld it. Reporting
-/// its grants as naming nothing would fan one bad attr value out into one
-/// false diagnostic per grant that mentions the entity. A withheld repo or
-/// webhook does not count: a grant may never name one, and that mistake is
-/// independent of whatever broke the body.
+/// A withheld entity of a grantable kind counts: it was declared, and the
+/// compile already fails on whatever withheld it. Reporting its grants as
+/// naming nothing would fan one bad attr value out into one false diagnostic
+/// per grant that mentions the entity. A withheld repo or webhook does not
+/// count: a grant may never name one, and that mistake is independent of
+/// whatever broke the body.
+///
+/// Bare principals are tested first, so a `grant` aimed at one gets the
+/// sentence about what a principal is instead of the one about what a grant
+/// names. Two spellings of one thing is the mistake worth naming: a principal's
+/// authority is written in its body, and a grant widens a running entity.
 fn check_grants(config: &ResolvedConfig, withheld: &Withheld, errors: &mut Vec<Diagnostic>) {
-    let mut principals: HashSet<String> = HashSet::new();
-    principals.extend(config.surfaces.iter().map(|e| e.handle.dotted()));
-    principals.extend(config.agents.iter().map(|e| e.handle.dotted()));
-    principals.extend(config.remotes.iter().map(|e| e.handle.dotted()));
-    principals.extend(config.consumers.iter().map(|e| e.handle.dotted()));
+    let principals: HashSet<String> = config
+        .principals
+        .iter()
+        .map(|entity| entity.handle.dotted())
+        .collect();
+    let mut holders: HashSet<String> = HashSet::new();
+    holders.extend(config.surfaces.iter().map(|e| e.handle.dotted()));
+    holders.extend(config.agents.iter().map(|e| e.handle.dotted()));
+    holders.extend(config.remotes.iter().map(|e| e.handle.dotted()));
+    holders.extend(config.consumers.iter().map(|e| e.handle.dotted()));
     for grant in &config.grants {
-        let handle = grant.principal.dotted();
-        if !principals.contains(&handle) && !withheld.grantable(&handle) {
+        let handle = grant.target.dotted();
+        if principals.contains(&handle) {
             errors.push(Diagnostic::at(
                 format!(
-                    "`{handle}` is not a principal; a grant names a surface, an agent, \
+                    "`{handle}` is a principal; its authority is written in its body, \
+                     and a grant widens a running entity"
+                ),
+                grant.target_span.span().clone(),
+            ));
+            continue;
+        }
+        if !holders.contains(&handle) && !withheld.grantable(&handle) {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{handle}` is not a running entity; a grant names a surface, an agent, \
                      a remote or a consumer"
                 ),
-                grant.principal_span.span().clone(),
+                grant.target_span.span().clone(),
             ));
         }
     }
+}
+
+/// Every principal chain bottoms out at the operator.
+///
+/// The one structural rule about `under` that no single declaration can answer:
+/// which principal a name reaches is resolution's, and whether following those
+/// names terminates is a property of the whole set. Refused here rather than in
+/// derivation because derivation's principal walk visits parents first, which a
+/// cycle makes impossible.
+///
+/// One refusal per cycle, at the declaration that closes it: every member is
+/// equally part of it, and one message per member would be one mistake reported
+/// as several.
+fn check_principal_chains(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
+    let slots: HashMap<&str, usize> = config
+        .principals
+        .iter()
+        .enumerate()
+        .map(|(index, principal)| (principal.handle.0[0].value().as_str(), index))
+        .collect();
+    let mut reported: HashSet<usize> = HashSet::new();
+    for start in 0..config.principals.len() {
+        let mut path: Vec<usize> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut at = start;
+        loop {
+            if !seen.insert(at) {
+                let head = path
+                    .iter()
+                    .position(|index| *index == at)
+                    .expect("on the path");
+                let members = &path[head..];
+                let closer = *members.last().expect("a cycle has a closing edge");
+                if !members.iter().any(|index| reported.contains(index)) {
+                    reported.extend(members.iter().copied());
+                    errors.push(principal_cycle(config, closer, members));
+                }
+                break;
+            }
+            path.push(at);
+            // A parent that names no principal was refused where it was written,
+            // and a chain that stops there is no cycle.
+            let Some(parent) = &config.principals[at].parent else {
+                break;
+            };
+            let Some(&next) = slots.get(parent.0[0].value().as_str()) else {
+                break;
+            };
+            at = next;
+        }
+    }
+}
+
+/// One cycle, read from the declaration that closed it back around to itself.
+fn principal_cycle(config: &ResolvedConfig, closer: usize, members: &[usize]) -> Diagnostic {
+    let name = |index: usize| config.principals[index].handle.dotted();
+    let mut chain = vec![name(closer)];
+    chain.extend(members.iter().map(|index| name(*index)));
+    let mut reading = format!("`{}` is under", chain[0]);
+    for link in &chain[1..] {
+        reading.push_str(&format!(" `{link}`, which is under"));
+    }
+    reading.truncate(reading.len() - ", which is under".len());
+    let span = config.principals[closer]
+        .parent
+        .as_ref()
+        .expect("the closing declaration is under something")
+        .0[0]
+        .span()
+        .clone();
+    Diagnostic::at(
+        format!("{reading}; a chain of principals bottoms out at the operator"),
+        span,
+    )
 }
 
 /// The two rules that read every address in the expanded document at once.
@@ -6199,6 +6926,12 @@ fn literal_addresses(config: &ResolvedConfig) -> Vec<(&str, &Span)> {
         consumers: _,
         agents: _,
         remotes: _,
+        // A ceiling's `acl` lines name channels the same way an entity's do.
+        principals: _,
+        // A stamp's ceiling lines do too.
+        stamps: _,
+        // A handed principal is a handle, and it spells no address.
+        handed_principals: _,
         // A webhook block carries attrs, no chan_ref.
         webhooks: _,
         repos: _,
@@ -6226,6 +6959,12 @@ fn literal_addresses(config: &ResolvedConfig) -> Vec<(&str, &Span)> {
     }
     for remote in &config.remotes {
         acl_literals(&remote.acls, &mut found);
+    }
+    for principal in &config.principals {
+        acl_literals(&principal.acls, &mut found);
+    }
+    for stamp in &config.stamps {
+        acl_literals(&stamp.acls, &mut found);
     }
     for grant in &config.grants {
         matcher_literal(&grant.m, &mut found);
@@ -6399,6 +7138,7 @@ mod tests {
             root: 0,
             prefix: None,
             params: ParamBindings::new(),
+            stamp: None,
         };
         let scope = frame.scope(&index, &channels, &links, &stamps);
         let Value::Ref(path) = value.value() else {
@@ -6462,6 +7202,7 @@ mod tests {
             root: 0,
             prefix: None,
             params: ParamBindings::new(),
+            stamp: None,
         };
         let scope = frame.scope(&index, &channels, &links, &stamps);
         // The site of `new thing`, read the way the reference in either body

@@ -9,8 +9,48 @@ them. The install flags changed to support that, and `surface_dist_dir` moved
 out of config and onto the command line. Separately, agents can switch between
 Claude accounts at run time without losing their conversation.
 
+Authority is the other half of the out-of-tree components story. A packaged
+assembly is config text an out-of-tree author wrote, and stamping one used to
+accept everything it declared. Now the deployment states what the arrangement may hold — a
+*principal*, a *ceiling*, or both — and the compiler proves the arrangement fits
+under it. Brenn's own surface self-description vocabulary stops being a file
+every deployment copies and ships as a library module in the release instead.
+
 ### Added
 
+- **Principals and stamp ceilings.** Deployer text can declare a `principal` — a
+  named bundle of authority, grant words plus reach, optionally `under` another
+  principal — and a `new` of an assembly can be stamped `under` one and carry a
+  ceiling body (`grants = [...];` and `acl` lines). The compiler derives what the
+  arrangement actually confers — capability words, surface attach words, every
+  `acl` entry, binding-derived reach, and every `grant` it emits — and refuses
+  anything the ceiling does not cover, in both directions: consent that covers
+  nothing is refused as dead config too. An assembly reaches a principal through
+  a new `Principal` parameter type. Nothing is lowered; this is entirely a
+  compile-time check. `docs/config-dsl.md` (*Principals*, *Assemblies*) is the
+  reference.
+- **Library modules, and brenn's own vocabulary as the first one.** A `.brenn`
+  file that no component package or surface kind owns can now ship in a release
+  or bundle's `modules/` tree: `library_modules` on `release_package` and
+  `component_bundle` stages it and lists it in `modules/library-modules.txt`,
+  each entry gated by a generated `library_module_test`, and the package and
+  bundle checkers hold the listed half against the harvested one. The surface
+  self-description assemblies — `SurfaceCommons`, `SurfaceDescription(slug)`,
+  `KindDescription(kind)` — are the first: they ship as
+  `@surface-description` and are imported, not copied.
+- **The host says what it resolved.** The existing "WASM processor component
+  loaded" and "replay protection loaded" lines now carry the resolving root, the
+  world, and the artifact and spec hashes, and the surface asset walk logs one
+  line per kind (kind, root, spec and source hashes) plus one for the kernel
+  root. No new log lines per instance — the journal now answers "which release
+  is this host running" without one.
+- **`config_fit_refusal_test`.** The fit gate's other direction as a rule an
+  out-of-tree author can call: a fixture root that must *not* compile, with a
+  mandatory `expect` string.
+- **Security posture: the packaged-module boundary has a name.** A new actor row
+  for the component author's `.brenn` text (out-of-tree: untrusted, adversarial
+  — it is not operator config even though the operator imports it) and boundary
+  B8, packaged module text → compiler, with its threats and reviewer rubric.
 - **Out-of-tree components are real.** A separate repository can depend on
   brenn as a Bazel module and build backend and page-hosted components using
   brenn's own rules and gates. The release artifact is a *bundle* — a directory
@@ -36,6 +76,41 @@ Claude accounts at run time without losing their conversation.
 
 ### Changed
 
+- **BREAKING: stamping a packaged assembly now states what it may hold.** A
+  `new` of an assembly declared in a packaged module, written in deployer text,
+  is checked against its ceiling. An arrangement that confers a capability word,
+  a surface attach word, an `acl` entry or a `grant` the ceiling does not cover
+  is refused — and the refusal writes the line you need. An arrangement that
+  confers nothing and reaches only its own and its handed channels still needs
+  no ceiling text, which is the common case.
+  **Operator action:** expect a refusal on the first check after a bundle pin
+  bump that grows an assembly's authority. That is the intended failure:
+  authority a bundle grows is authority you re-consent to, in your file.
+- **BREAKING: `config/surfaces.brenn` is gone.** The self-description
+  vocabulary ships in the release's `modules/` tree.
+  **Operator action:** replace `use config::surfaces::*;` with
+  `use @surface-description::*;` and add `new surface_commons: SurfaceCommons;`
+  beside the per-slug and per-kind description stamps. Retention that was tuned
+  by forking the file is now arguments at the stamp (`errors_retain`,
+  `errors_standing`, `geometry_retain`, `status_retain`). Release first: a
+  config importing this vocabulary does not compile against an older tarball.
+- **BREAKING: `config-check` refuses a missing self-description stamp.** The
+  half of the boot-time description validation that is a pure function of the
+  document now runs offline, so a forgotten stamp is refused *before* the
+  installer stops the service instead of panicking after it. The widening this
+  implies: every document with messaging active must declare
+  `brenn:surface.index`, surface or no surface — hand-written or by stamping
+  `SurfaceCommons`. Documents that used to pass the gate and die at boot are now
+  refused by the gate. These refusals and the error-lane ones are spelled
+  `config: [<lane>] …` rather than `boot: …`, and the eviction-frontier warning
+  is reported by `config-check` as advice beside its verdict.
+- **BREAKING: `unbounded` cannot name a constant or a parameter.** It is the
+  word a depth spells an unbounded window with, and is refused at the
+  declaration so a depth written `unbounded` always means the word.
+- **`SurfaceCommons`'s `errors_standing` default is `1024`.** The old default
+  tripped the boot check's eviction-frontier warning in every deployment that
+  took it; 1024 is four admitted send bursts. Raise it at the stamp if more
+  surfaces than that report.
 - **BREAKING: `server.surface_dist_dir` is now `serve --surface <DIR>`.**
   The config key is gone; a document that still has it is refused.
   **Operator action:** remove the key from your `.brenn` file and add
@@ -46,6 +121,20 @@ Claude accounts at run time without losing their conversation.
   (the message is dropped) instead of returning an error. Bindings document
   is v2; no shim.
 - `npm-audit` is temporarily out of `make check`; run `make npm-audit` by hand.
+
+### Fixed
+
+- **A name could not stand in for a number in a depth.** `push_depth`,
+  `retain_depth`, `standing_retain_depth` and a surface instance's
+  `parked_batch_depth` read a bare token, so a constant or an `Int` parameter
+  was refused there. They now take an integer, the word `unbounded`, or a name
+  that resolves to an integer — which is what lets a packaged assembly
+  parameterise its own retention.
+- **A multi-line `///` comment on an indented declaration was a syntax error.**
+  Anything declared inside an assembly or surface body could carry only a
+  single-line doc comment. Whitespace and blank lines between `///` lines are
+  now part of one comment (a `//` line between them is still refused), and
+  `brennfmt` renders every line contiguously at the declaration's indent.
 
 ## [0.18.2] — 2026-08-31
 

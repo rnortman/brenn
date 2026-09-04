@@ -1,0 +1,20 @@
+component Panel {
+    abi = processor;
+    requires = [dom];
+    in messages;
+}
+
+assembly Page(slug: String) {
+    channel out at f"ephemeral:{slug}.out" {
+        push_depth = 4;
+        retain_depth = 16;
+    }
+    surface page {
+        slug = slug;
+        grants = [subscribe];
+        new panel: Panel {
+            grants = [dom];
+            in messages <- out;
+        }
+    }
+}

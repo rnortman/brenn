@@ -1,0 +1,5 @@
+/// A library module that instantiates: a top-level channel is the deployment's
+/// to declare, not a packaged module's. The gate's negative case.
+channel loose at "brenn:commons.loose" {
+  description = "A channel no deployment asked for.";
+}

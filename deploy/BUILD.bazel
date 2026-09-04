@@ -9,11 +9,29 @@ semantics plus the musl transition on the binaries.
 """
 
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("//bazel/release:defs.bzl", "release_package")
+load("//bazel/wasm:defs.bzl", "module_file_name")
 
 policy_srcs()
+
+# brenn's own vocabulary, shipped for a deployment to import rather than to
+# copy. Listed rather than globbed: a library module is vocabulary this
+# release promises, and the promise is a line someone wrote. The glob that
+# *offers* the same directory is `//:modules`, and the two are held equal by
+# `//bazel/release/tests:config_specs_accounted_test`, which reads the names
+# below.
+BRENN_LIBRARY_MODULES = ["//:config/specs/surface-description.brenn"]
+
+# What this release promises, as names, for that gate.
+write_file(
+    name = "library_module_names",
+    out = "library-module-names.txt",
+    content = sorted([module_file_name(label) for label in BRENN_LIBRARY_MODULES]),
+    visibility = ["//visibility:public"],
+)
 
 release_package(
     name = "release_package",
@@ -23,6 +41,7 @@ release_package(
     ],
     frontend = "//frontend:dist",
     lib_files = ["//:noop_mcp.py"],
+    library_modules = BRENN_LIBRARY_MODULES,
     manifest = "//brenn-wasm:deployed-components.txt",
     # Every package in the tree is offered; `deployed-components.txt` decides
     # which of them ship. Passing the deployed subset here instead would make

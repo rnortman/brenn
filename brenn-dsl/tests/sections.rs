@@ -570,16 +570,29 @@ fn an_int_or_word_takes_both_arms_and_refuses_the_rest() {
     };
     assert_eq!(*count.value(), 64);
 
+    // A parse-time projection: the reservation on this spelling is a check at
+    // a constant's declaration, and nothing here resolves.
     let value = only_const_value("const a = unbounded;\n");
-    let IntOrWord::Word(word) = IntOrWord::from_value(&value).expect("a word") else {
-        panic!("the word arm");
+    assert!(
+        IntOrWord::from_value(&value)
+            .expect("a reference")
+            .is_unbounded(),
+        "the reference arm, holding the one word a depth spells"
+    );
+
+    let value = only_const_value("const a = depths.geometry;\n");
+    let IntOrWord::Name { path, .. } =
+        IntOrWord::from_value(&value).expect("a qualified reference")
+    else {
+        panic!("the reference arm");
     };
-    assert_eq!(word.as_str(), "unbounded");
+    assert_eq!(path.spelling(), "depths.geometry");
 
     let value = only_const_value("const a = \"64\";\n");
     let error = IntOrWord::from_value(&value).expect_err("a quoted count is not a count");
     assert_eq!(
         error.message,
-        "expected an integer or a bare word, found a string"
+        "expected a count, the word `unbounded`, or a name that resolves to a count, found a \
+         string"
     );
 }

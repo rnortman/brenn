@@ -22,9 +22,19 @@
 #
 #   STAGE_PKG_DIR[name]    the package's directory
 #   STAGE_PKG_FILES[name]  its files, one per line
+#
+# A third carries the library modules from `stage_library_module` to
+# `stage_library_list`, for the same reason.
+#
+#   STAGE_LIBRARY_MODULES  the basenames staged as library modules
 
 declare -gA STAGE_PKG_DIR=()
 declare -gA STAGE_PKG_FILES=()
+declare -ga STAGE_LIBRARY_MODULES=()
+
+# The listed half of the module root, beside the harvested half. Absent from a
+# tree that lists none.
+STAGE_LIBRARY_LIST="library-modules.txt"
 
 # Package name → the files of its directory, so a manifest entry resolves a
 # whole package by the name it states. The build declares each package's files
@@ -152,4 +162,58 @@ stage_assert_modules_owed() {
              "root did not run" >&2
         exit 1
     fi
+}
+
+# One library module: a packaged `.brenn` that no component package and no
+# surface kind owns, so the harvest cannot find it and the checkers cannot pair
+# it with an owner. It is staged flat beside the harvested modules and its
+# basename is recorded, and the recorded list is what tells every later reader
+# that this file is owed by a list rather than by a package.
+#
+# Called after the harvest, so a basename the harvest already staged is caught
+# here: two files under one import name is a deployment compiling against
+# whichever the copy order left, and a library module may not shadow the
+# authored module of a component installed beside it. Two library modules
+# sharing a basename are the same collision reached the other way — two roots
+# each shipping a `commons.brenn` — and are refused first, so the message names
+# the list rather than a component that owns nothing.
+stage_library_module() {
+    local out="$1" src="$2" name
+    name="$(basename "$src")"
+    case "$name" in
+        *.brenn) ;;
+        *)
+            echo "ERROR: $src is not a .brenn file; a library module is authored" \
+                 "configuration text" >&2
+            exit 1
+            ;;
+    esac
+    local listed
+    for listed in ${STAGE_LIBRARY_MODULES[@]+"${STAGE_LIBRARY_MODULES[@]}"}; do
+        if [ "$listed" = "$name" ]; then
+            echo "ERROR: the library module $src would be staged as modules/$name," \
+                 "which another library module of this tree is listed under; one" \
+                 "name is one authored module" >&2
+            exit 1
+        fi
+    done
+    if [ -e "$out/modules/$name" ]; then
+        echo "ERROR: the library module $src would be staged as modules/$name," \
+             "which a component's own authored module already holds; one name is" \
+             "one authored module" >&2
+        exit 1
+    fi
+    mkdir -p "$out/modules"
+    cp -L "$src" "$out/modules/$name"
+    STAGE_LIBRARY_MODULES+=("$name")
+}
+
+# The list, written once after every library module is staged. Sorted, so the
+# file is a function of the set and not of the caller's argument order, and
+# absent when nothing was listed.
+stage_library_list() {
+    local out="$1"
+    [ "${#STAGE_LIBRARY_MODULES[@]}" -gt 0 ] || return 0
+    printf '%s\n' "${STAGE_LIBRARY_MODULES[@]}" | LC_ALL=C sort \
+        > "$out/modules/$STAGE_LIBRARY_LIST"
 }

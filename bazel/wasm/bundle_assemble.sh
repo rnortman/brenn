@@ -4,7 +4,7 @@
 # Usage: bundle_assemble.sh --out DIR --names FILE --stage-lib FILE
 #                           [--manifest FILE]
 #                           [--package FILE]... [--surface-stage DIR]...
-#                           [--spec FILE]...
+#                           [--spec FILE]... [--library-module FILE]...
 #
 # `--stage-lib` is `bazel/release/stage_lib.sh`, the staging body this script
 # and brenn's own `bazel/release/assemble.sh` share: the package-name
@@ -40,6 +40,13 @@
 # packages are all replay-world stages an empty `modules/`, and is named by a
 # `replay_protection` block's `component =` rather than by an import.
 #
+# `--library-module` is the listed half: vocabulary the bundle ships that no
+# package and no surface kind carries, so nothing can be harvested off it. The
+# listed basenames travel in the tree as `modules/library-modules.txt`, which is
+# how the contract test and an installer tell a module owed by a list from one
+# owed by a component. That list file is not itself a module, so the authored-root
+# equality below holds over the `.brenn` files and skips it.
+#
 # `--spec` names the repository's *authored* module root, and the staged
 # `modules/` tree is held set-equal to it, byte-identical file by file. That is
 # what makes the authored root usable as a stand-in for the installed one: a
@@ -61,6 +68,7 @@ manifest=""
 packages=()
 stages=()
 specs=()
+library_modules=()
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -71,6 +79,7 @@ while [ "$#" -gt 0 ]; do
         --package) packages+=("$2"); shift 2 ;;
         --surface-stage) stages+=("$2"); shift 2 ;;
         --spec) specs+=("$2"); shift 2 ;;
+        --library-module) library_modules+=("$2"); shift 2 ;;
         *) echo "ERROR: unrecognized argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -171,6 +180,17 @@ stage_harvest_surface_modules "$out"
 stage_assert_modules_owed "$out"
 
 # ---------------------------------------------------------------------------
+# The listed half of the module root
+# ---------------------------------------------------------------------------
+
+# After the harvest, so a listed name that shadows a component's own authored
+# module is refused here rather than deciding an import by copy order.
+for module in ${library_modules[@]+"${library_modules[@]}"}; do
+    stage_library_module "$out" "$module"
+done
+stage_library_list "$out"
+
+# ---------------------------------------------------------------------------
 # The authored module root
 # ---------------------------------------------------------------------------
 
@@ -194,6 +214,11 @@ done
 
 while read -r staged; do
     [ -n "$staged" ] || continue
+    # The list is a fact about the tree, not vocabulary; the authored root does
+    # not offer it and never should.
+    if [ "$staged" = "$STAGE_LIBRARY_LIST" ]; then
+        continue
+    fi
     for spec in ${specs[@]+"${specs[@]}"}; do
         if [ "$(basename "$spec")" = "$staged" ]; then
             continue 2

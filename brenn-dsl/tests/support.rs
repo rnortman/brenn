@@ -268,12 +268,18 @@ pub fn resolve_errors(source: &str) -> Vec<Diagnostic> {
     compile(source).expect_err("a refusal")
 }
 
-/// The diagnostics a tree is refused with in derivation, whole.
+/// The diagnostics a one-file document is refused with in derivation, whole.
 pub fn derive_errors(source: &str) -> Vec<Diagnostic> {
-    derive_tree(&[("", source)]).expect_err("a refusal")
+    derive_errors_tree(&[("", source)])
+}
+
+/// The diagnostics a tree is refused with in derivation, whole — for the
+/// assertions that read a span in a module other than the root.
+pub fn derive_errors_tree(modules: &[(&str, &str)]) -> Vec<Diagnostic> {
+    derive_tree(modules).expect_err("a refusal")
 }
 
 /// Just the messages, for a panic that has to say what went wrong.
-fn messages(errors: &[Diagnostic]) -> Vec<&str> {
+pub fn messages(errors: &[Diagnostic]) -> Vec<&str> {
     errors.iter().map(|error| error.message.as_str()).collect()
 }

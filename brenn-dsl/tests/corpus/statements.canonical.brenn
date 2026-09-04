@@ -92,11 +92,17 @@ mcp_server graf {
 }
 
 assembly Deskbar(slug: String, driver: Agent) {
+  /// A doc comment separated from the declaration it attaches to by a blank
+  /// line. The gap goes the way the gaps between doc lines go.
   channel messages_p1 at f"brenn:{slug}.in.p1.messages" {
     push_depth = 64;
     retain_depth = 64;
     doctype = "brenn.panel.message@1";
   }
+  /// A multi-line doc comment on an indented declaration: every line after
+  /// the first carries the body's indentation, and the lines stay one comment.
+  ///
+  /// A paragraph break inside one is an empty `///` line.
   channel acks at f"brenn:{slug}.out.meeting.acks" {
     push_depth = 8;
     retain_depth = 32;
@@ -127,6 +133,8 @@ assembly Deskbar(slug: String, driver: Agent) {
   // A surface and a top-level instantiation in one body: placement is the
   // `new`'s position and nothing else, so one assembly can stamp a page and
   // the backend instance it talks to.
+  /// A doc comment written with a blank line between two of its lines.
+  /// The blank line is not text and does not survive formatting.
   new counter: Reserved {
     slug = f"{slug}-counter";
     grants = [ports]
@@ -199,3 +207,23 @@ acl subscribe [prefix "brenn:alice-desk."]
 
 ;
 grant alice_pa publish exact wasm_demo_out;
+
+/// Everything the arrangements this deployment stamps may ever hold.
+principal ui {
+  grants = [dom, log, page-dom, ports, publish, subscribe];
+  acl subscribe [prefix "brenn:alice-desk."];
+}
+
+/// Fewer words, the same reach.
+principal ui_readonly under ui {
+  grants = [dom, log, page-dom, ports];
+}
+
+/// Exactly what `ui_readonly` holds, and no ceiling of its own.
+new alice_bench: Deskbar(slug = "alice-bench", driver = alice_pa) under ui_readonly;
+
+/// The same arrangement, narrowed again where it is stamped.
+new alice_slab: Deskbar(slug = "alice-slab", driver = alice_pa) under ui {
+  grants = [dom, log, page-dom, ports];
+  acl subscribe [prefix "brenn:alice-desk.slab."];
+}

@@ -1,0 +1,11 @@
+// What every UI arrangement this deployment hosts may hold, stated once and
+// handed to the arrangement that stamps them. `demo` narrows it; `split` takes
+// it whole, which is what `under ui;` with no body says.
+
+use deployment::*;
+
+principal ui {
+    grants = [dom, log, subscribe];
+}
+
+new site: Deployment(ui = ui);

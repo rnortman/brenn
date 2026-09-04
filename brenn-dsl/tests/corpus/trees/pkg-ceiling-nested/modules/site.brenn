@@ -1,0 +1,23 @@
+// A packaged module stamping another packaged module's assembly. The nested
+// `new` writes neither `under` nor a body, so it records no stamp of its own
+// and everything it emits belongs to the deployment's boundary above it.
+
+use @panel::*;
+
+component Ping {
+    abi = processor;
+    requires = [alert];
+    in messages;
+}
+
+assembly Site(slug: String) {
+    channel tick at f"ephemeral:{slug}.tick" {
+        push_depth = 4;
+        retain_depth = 16;
+    }
+    new ping: Ping {
+        grants = [alert];
+        in messages <- tick;
+    }
+    new page: Page(slug = slug);
+}

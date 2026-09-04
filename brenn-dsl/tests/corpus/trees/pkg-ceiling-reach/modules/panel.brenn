@@ -1,0 +1,25 @@
+// The same arrangement, with an `acl` line of its own: the author's surface
+// reaches a whole durable family, which is the larger half of what a packaged
+// assembly confers and the half a cap on words alone would miss.
+
+component Panel {
+    abi = processor;
+    requires = [dom];
+    in messages;
+}
+
+assembly Page(slug: String) {
+    channel out at f"ephemeral:{slug}.out" {
+        push_depth = 4;
+        retain_depth = 16;
+    }
+    surface page {
+        slug = slug;
+        grants = [subscribe];
+        acl subscribe [prefix "brenn:house.", exact out];
+        new panel: Panel {
+            grants = [dom];
+            in messages <- out;
+        }
+    }
+}

@@ -12,7 +12,7 @@ use @mode-clock::*;
 use @processor-demo::*;
 use @processor-transplant::*;
 use @protobar::*;
-use config::surfaces::*;
+use @surface-description::*;
 
 /// Where the server listens and what it believes about the proxy in front.
 server {
@@ -124,6 +124,7 @@ channel dev_stub at "ephemeral:dev-stub" {
   push_depth = 1;
   retain_depth = 8;
 }
+new surface_commons: SurfaceCommons;
 new dev_stub_desc: SurfaceDescription(slug = "dev-stub");
 new bar_desc: SurfaceDescription(slug = "bar");
 new bar_pixel_desc: SurfaceDescription(slug = "bar-pixel");

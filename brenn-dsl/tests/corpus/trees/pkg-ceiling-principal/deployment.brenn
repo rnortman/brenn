@@ -1,0 +1,14 @@
+// A tree assembly stamping a packaged one: its frame's file is not packaged,
+// so each `new` here is the packaged boundary. It reaches the deployment's
+// principal the way an assembly reaches an agent — as a parameter, which is
+// the only principal a body can name.
+
+use @panel::*;
+
+assembly Deployment(ui: Principal) {
+    new demo: Page(slug = "demo") under ui {
+        grants = [dom, subscribe];
+    }
+    new split: Page(slug = "split") under ui;
+    new logger: Logger(slug = "logger") under ui;
+}

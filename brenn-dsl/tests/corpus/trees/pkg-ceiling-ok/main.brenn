@@ -1,0 +1,7 @@
+// The common case: the deployment writes the words the arrangement holds, and
+// the only reach it needs is the channel the arrangement declares, which
+// stamping it is the consent to mint.
+
+use @panel::*;
+
+new demo: Page(slug = "demo") { grants = [dom, subscribe]; }

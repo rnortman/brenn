@@ -68,6 +68,7 @@ and the reason.
 | **Claude Code subprocess** | **Semi-trusted.** Launched by us, but its output is attacker-influenceable. | We spawn and parameterize CC, so we trust *how it is configured*. We do **not** trust *what it emits*: its output is shaped by the conversation, by any tool/MCP servers it talks to, and by any file or web content it ingests, all of which can carry adversarial content. CC output must therefore be treated as attacker-influenceable even though the process is "ours." |
 | **WASM guest — in-tree** | Sandboxed-trusted. | First-party code, but deliberately sandboxed to contain its *own* bugs. The sandbox is a blast-radius limiter, not a statement that the code is hostile. |
 | **WASM guest — out-of-tree** | **Untrusted. Adversarial.** | Third-party extension code is a first-class extension surface and must be assumed hostile. The sandbox is the security boundary. A guarantee that holds only for a well-behaved guest is **not** a security guarantee. |
+| **Component author (packaged module text)** | In-tree: sandboxed-trusted, as the in-tree guest. Out-of-tree: **untrusted, adversarial**, as the out-of-tree guest. | A component package ships `.brenn` text — a specification, and possibly assemblies the deployment stamps. That text is configuration the compiler reads at boot, and it is **not operator config** even though the operator imports it: the operator writes the `use @<name>::*;` and the stamp, not the arrangement behind them. What we rely on the author not to do: nothing. The stamp ceiling bounds the authority their text can confer, the sandbox bounds what their code can do with it, and the bundle pin bounds who gets to be an author at all. |
 | **Unauthenticated network client** | Untrusted. | Anyone who can reach the listener before authenticating: login/registration traffic, URL probing, inbound webhooks. Adversarial by default. |
 | **Authenticated remote attacher (native daemon)** | Authenticated, bounded — mechanically the browser's posture. | A daemon holding a `[[remote]]` bearer token, acting as the single principal `remote:<slug>`. Operator-owned hardware makes it in practice *more* trustworthy than a browser, which is a reason to expect fewer violations, not to skip the checks: it is held to deny-by-default grants, per-scheme ACLs, budgets, and violation-as-signal exactly as a browser is. An eventual peer server will be too. |
 
@@ -121,6 +122,11 @@ subprocesses, and the WASM guests. B6 is the backend → hosted-app subprocess
 boundary; the inputs that flow across it may be CC- or browser-influenced, but the
 backend is the invoker.)
 
+(B8 is inside the box marked "operator config", which is why it needs naming
+separately: a packaged component's `.brenn` text is compiled together with the
+operator's document, so it enters the trust anchor as configuration. The
+operator's stamp of it is a delegation, not an endorsement.)
+
 | ID | Boundary | Direction of distrust |
 |----|----------|----------------------|
 | **B0** | Unauthenticated network → backend | client untrusted |
@@ -131,6 +137,7 @@ backend is the invoker.)
 | **B5** | Inbound webhook → backend → WASM | external party untrusted |
 | **B6** | Backend → hosted-app subprocess | risk is injection through the argument/input vector |
 | **B7** | Authenticated remote attacher (native daemon) → backend | daemon-supplied data untrusted; identity is bounded to the `[[remote]]` principal and its ACLs |
+| **B8** | Packaged module text → compiler | author-supplied configuration text untrusted; what an arrangement may confer is bounded by the ceiling the deployer stamped it under |
 
 ---
 
@@ -575,7 +582,10 @@ internally-originated.
   if the operator explicitly granted it. The enforcement must be structural and
   fail-closed (refuse to run a guest that requires an ungranted capability), not a
   warn-and-continue. A capability reachable without a grant, or a grant check that
-  degrades instead of refusing, is a finding.
+  degrades instead of refusing, is a finding. For an instance a packaged
+  arrangement stamped, the operator's explicit grant is the principal the stamp is
+  under together with the ceiling written on it — a delegation the compiler proves
+  attenuates from the operator's own text (§9b).
 - **No ambient host access.** Guests get no implicit access to filesystem,
   network, clock, randomness, or environment. Every host-exposed function is a
   deliberate, granted capability. A newly exposed host function without a grant
@@ -829,6 +839,63 @@ indistinguishable to the caller and produces exactly one `AuthFailure`; the
 profile's scheme match is exhaustive and denies by default; the subscription cap
 is enforced; the slug is sanitized wherever it reaches a log or event; the cap
 rejection emits no security event.
+
+---
+
+## 9b. Boundary B8 — Packaged Module Text → Compiler
+
+**Who:** the author of a component package or bundle, through the `.brenn` files
+under every `--modules` root. Those files are the author's specifications and,
+where the author ships assemblies, whole arrangements — surfaces, channels,
+component instances, grants and ACL statements — that a deployment brings into
+its own configuration with one `use` and one `new`.
+
+**Trust decision: the author's text is untrusted for what it may *confer*.** It
+is compiled together with the operator's document, so it is read at the trust
+anchor, but the operator wrote none of it. The distinction the rest of this
+document rests on — operator config is policy, not attack surface — does not
+extend to text an out-of-tree author wrote and a pin bump can change without a
+character moving in the operator's file.
+
+**Threats:**
+
+- **Authority injection.** An arrangement that confers more than the deployer
+  consented to: capability words on the instances it stamps, surface attach
+  grants, `acl` statements with free `prefix` matchers, a `grant` widening the
+  deployer's own agent, durable channels at addresses of its choosing, bindings
+  to the deployer's declared webhook and MQTT endpoints.
+- **Namespace claims.** A durable address the deployer also declares (the
+  existing duplicate-address refusal), or one the deployer does not — which is
+  the arrangement's own channel and is consent the stamp already gave.
+- **Parser robustness.** A document that panics the compiler is a boot refusal,
+  which is the correct outcome under *better dead than wrong*. A document that
+  compiles to something other than what it says is a finding.
+
+**Policies the compiler must uphold:**
+
+- **A packaged module declares no top-level entity and no principal.** The
+  packaged-module discipline is what keeps an author's file from adding channels,
+  surfaces, agents or authority declarations to the deployment at import; what an
+  arrangement holds is the deployment's to give.
+- **A stamp of a packaged assembly states what it accepts.** The deployer names a
+  principal, writes a ceiling, or both, and the compiler proves that everything
+  the arrangement confers — every word, every ACL entry, every `grant` it emits —
+  attenuates from it. Nothing conferred beyond the ceiling, and nothing in the
+  ceiling that confers nothing.
+- **The chain bottoms out at the operator.** A principal's authority is written,
+  not inherited from an ambient root, so every word and every reach entry a chain
+  will ever delegate appears in the deployer's own text.
+- **Authority a bundle grows is authority the deployer re-consents to.** A pin
+  bump that adds a grant word or an ACL statement to an arrangement turns the next
+  config check into a refusal naming the new word and the stamp — before any host
+  is touched.
+
+**What the reviewer verifies:** a packaged assembly that can hold authority the
+principal its stamp is under does not name is a finding. So is any path by which
+packaged text reaches the deployment's authority without passing the ceiling
+check — a new authority-bearing resolved entity that carries no stamp
+attribution, a conferral the fold does not count, or a refusal that degrades to a
+warning.
 
 ---
 

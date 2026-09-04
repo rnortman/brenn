@@ -22,6 +22,7 @@ policy_srcs()
 # and miss the other.
 exports_files([
     "bundle_assemble.sh",
+    "config_fit_refusal.sh",
     "deployed_components_check.sh",
     "emit_package.sh",
     "grant_parity_check.sh",

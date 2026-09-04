@@ -83,6 +83,7 @@ pub enum Item {
     Surface(Box<SurfaceDef>),
     Inst(Box<NewStmt>),
     Remote(Box<RemoteDef>),
+    Principal(Box<PrincipalDef>),
     Webhook(Box<WebhookDef>),
     Repo(Box<NamedAttrDef<RepoAttrs>>),
     MqttClient(Box<NamedAttrDef<MqttClientAttrs>>),
@@ -124,6 +125,7 @@ impl File {
         surfaces => Surface(SurfaceDef),
         instantiations => Inst(NewStmt),
         remotes => Remote(RemoteDef),
+        principals => Principal(PrincipalDef),
         webhooks => Webhook(WebhookDef),
         repos => Repo(NamedAttrDef<RepoAttrs>),
         mqtt_clients => MqttClient(NamedAttrDef<MqttClientAttrs>),
@@ -161,7 +163,7 @@ impl AssemblyDef {
 /// instances, and the grants that wire its parameters. What is missing is
 /// missing from the grammar too, so a form written here is a positioned syntax
 /// error rather than an item nothing reads — an `acl` in an assembly body has no
-/// enclosing principal, and a definition here would scope definitions somewhere
+/// enclosing entity, and a definition here would scope definitions somewhere
 /// nothing else does.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum AssemblyItem {
@@ -357,6 +359,10 @@ pub struct SurfaceDef {
 
 /// `new p1: Protobar { in messages <- messages_p1; }`, or with an argument
 /// list instead of a body. One form for components, agents and assemblies.
+///
+/// On an assembly stamp the body is the ceiling — `grants` and `acl` lines
+/// capping what the arrangement may hold — and `under` names the principal the
+/// stamp holds no more than.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NewStmt {
@@ -364,6 +370,10 @@ pub struct NewStmt {
     pub handle: Spanned<String>,
     pub cls: PathRef,
     pub args: Option<ArgList>,
+    /// The principal an assembly stamp is under, or `None`. Only meaningful
+    /// on an assembly instantiation; a component or agent holds what its own
+    /// body and bindings say.
+    pub under: Option<PathRef>,
     pub body: Option<Spanned<InstBody>>,
     /// Whether a `;` terminated the statement.
     pub semi: bool,
@@ -470,10 +480,13 @@ pub struct MatcherList {
 }
 
 /// `grant alice_pa subscribe prefix "brenn:alice-desk.";` — authority written
-/// about another principal.
+/// about another running entity.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantStmt {
+    /// The running entity the grant is about. Named `principal` because that is
+    /// the grammar's label; what it holds is a surface, an agent, a remote or a
+    /// consumer, never a `principal` declaration.
     pub principal: PathRef,
     pub plane: Spanned<String>,
     pub m: Matcher,
@@ -486,6 +499,25 @@ pub struct RemoteDef {
     pub doc: Option<DocComment>,
     pub name: Spanned<String>,
     pub attrs: RemoteAttrs,
+    pub acls: Vec<AclStmt>,
+}
+
+/// `principal ui under site { grants = [dom]; acl publish [prefix "brenn:x."]; }`.
+///
+/// Authority with no running body. `attrs` is a map rather than a typed
+/// vocabulary because the one key it admits is `grants` and everything else is
+/// refused with a sentence about what a principal is — a vocabulary struct's
+/// unknown-key diagnostic would name a legal set of one and say nothing about
+/// why.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalDef {
+    pub doc: Option<DocComment>,
+    pub name: Spanned<String>,
+    /// The principal this one is declared under, or `None` for one directly
+    /// under the operator.
+    pub under: Option<PathRef>,
+    pub attrs: AttrMap,
     pub acls: Vec<AclStmt>,
 }
 
@@ -581,6 +613,14 @@ pub struct AttrBlock<A = AttrMap> {
 // `WordList` or `IntOrWord` so that a bare identifier there is recorded as a
 // word rather than resolved as a name.
 //
+// `IntOrWord` is the one token context resolution revisits, and it is the only
+// one that can be: a depth is a count, so a name standing in a depth's place
+// has a value in the language to stand for. The other token positions are
+// closed vocabularies of words that no value type holds, so there is no literal
+// for a name to stand in place of. The revisit is `map_depths`, emitted from the
+// same field walk as `map_values` so a depth key added to any vocabulary is
+// carried across without a second list.
+//
 // A config field with no entry here is inexpressible from the DSL until the
 // vocabulary catches up, and says so as an unknown-key error at the offending
 // key. That is the priced cost of transcription; the fields left out are the
@@ -621,6 +661,22 @@ pub trait MapValues<V, V2> {
         self,
         f: &mut impl FnMut(V) -> Result<V2, Diagnostic>,
     ) -> Result<Self::Output, Diagnostic>;
+}
+
+/// The depth crossing, kept off `MapValues` because it is a different one.
+///
+/// A depth field is not a value field: it stays the same type across the step,
+/// so nothing here names a value type, and a body that has no value position at
+/// all can still hold a name in a count's place. One method, implemented beside
+/// each `map_values`, so a resolver that resolves a body asks for both.
+pub trait MapDepths {
+    /// Carry every depth field through `f`, keyed for the diagnostic.
+    fn map_depths(
+        self,
+        f: &mut impl FnMut(&'static str, IntOrWord) -> Result<IntOrWord, Diagnostic>,
+    ) -> Result<Self, Diagnostic>
+    where
+        Self: Sized;
 }
 
 /// The wire spelling of a vocabulary field's key.
@@ -680,6 +736,17 @@ impl<V> OpenAttrs<V> {
     }
 }
 
+impl<V> MapDepths for OpenAttrs<V> {
+    /// An open body has no typed field at all, so it holds no depth: the
+    /// crossing is the identity.
+    fn map_depths(
+        self,
+        _f: &mut impl FnMut(&'static str, IntOrWord) -> Result<IntOrWord, Diagnostic>,
+    ) -> Result<Self, Diagnostic> {
+        Ok(self)
+    }
+}
+
 impl<V, V2> MapValues<V, V2> for OpenAttrs<V> {
     type Output = OpenAttrs<V2>;
 
@@ -709,13 +776,13 @@ macro_rules! vocabulary {
         $(#[$struct_meta:meta])*
         struct $name:ident<V> { $($body:tt)* }
     )+) => {
-        $( vocabulary_emit! { f listed yes generic [$(#[$struct_meta])*] $name [] [] [] [] [] [] $($body)* } )+
+        $( vocabulary_emit! { f g listed yes generic [$(#[$struct_meta])*] $name [] [] [] [] [] [] [] $($body)* } )+
     };
     ($(
         $(#[$struct_meta:meta])*
         struct $name:ident; { $($body:tt)* }
     )+) => {
-        $( vocabulary_emit! { f listed yes plain [$(#[$struct_meta])*] $name [] [] [] [] [] [] $($body)* } )+
+        $( vocabulary_emit! { f g listed yes plain [$(#[$struct_meta])*] $name [] [] [] [] [] [] [] $($body)* } )+
     };
 }
 
@@ -730,17 +797,17 @@ macro_rules! vocabulary {
 macro_rules! vocabulary_emit {
     // Every field walked: hand the accumulators to the emit the shape marker
     // selects.
-    ($f:ident $listed:ident $empty:ident $shape:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]) => {
-        vocabulary_item! { $shape $f $listed $empty [$(#[$struct_meta])*] $name
-            [$($fields)*] [$($names)*] [$($maps)*] [$($empties)*] [$($entries)*] [$($keys)*] }
+    ($f:ident $g:ident $listed:ident $empty:ident $shape:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]) => {
+        vocabulary_item! { $shape $f $g $listed $empty [$(#[$struct_meta])*] $name
+            [$($fields)*] [$($names)*] [$($maps)*] [$($empties)*] [$($entries)*] [$($keys)*] [$($depths)*] }
     };
 
     // An optional value field. A value field is what `V` is for, so these four
     // arms name the shape: a `struct Name;` vocabulary stating one has no
     // matching arm and fails the expansion.
-    ($f:ident $listed:ident $empty:ident generic [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]
+    ($f:ident $g:ident $listed:ident $empty:ident generic [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]
         $(#[$field_meta:meta])* opt $key:ident: V, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed $empty generic [$($meta)*] $name
+        vocabulary_emit! { $f $g $listed $empty generic [$($meta)*] $name
             [$($fields)* $(#[$field_meta])* pub $key: Option<Attr<V>>,]
             [$($names)* $key,]
             [$($maps)* $key: match $key {
@@ -752,27 +819,67 @@ macro_rules! vocabulary_emit {
                 $listed.push((attr_key(stringify!($key)), attr.value.into_rval()));
             }]
             [$($keys)* attr_key_const(stringify!($key)),]
+            [$($depths)* $key,]
             $($rest)* }
     };
 
     // A required value field.
-    ($f:ident $listed:ident $empty:ident generic [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]
+    ($f:ident $g:ident $listed:ident $empty:ident generic [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]
         $(#[$field_meta:meta])* req $key:ident: V, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed no generic [$($meta)*] $name
+        vocabulary_emit! { $f $g $listed no generic [$($meta)*] $name
             [$($fields)* $(#[$field_meta])* pub $key: Attr<V>,]
             [$($names)* $key,]
             [$($maps)* $key: Attr { value: $f($key.value)? },]
             [$($empties)*]
             [$($entries)* $listed.push((attr_key(stringify!($key)), $key.value.into_rval()));]
             [$($keys)* attr_key_const(stringify!($key)),]
+            [$($depths)* $key,]
+            $($rest)* }
+    };
+
+    // A depth field, optional or required. Matched ahead of the generic
+    // projection arms below, which would otherwise take it: a depth is
+    // accumulated into `map_depths` instead of crossing as it is.
+    ($f:ident $g:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]
+        $(#[$field_meta:meta])* opt $key:ident: IntOrWord, $($rest:tt)*) => {
+        vocabulary_emit! { $f $g $listed $empty $shape [$($meta)*] $name
+            [$($fields)* $(#[$field_meta])* pub $key: Option<Attr<IntOrWord>>,]
+            [$($names)* $key,]
+            [$($maps)* $key,]
+            [$($empties)* $key: None,]
+            [$($entries)* if let Some(attr) = $key {
+                $listed.push((attr_key(stringify!($key)), attr.value.into_rval()));
+            }]
+            [$($keys)* attr_key_const(stringify!($key)),]
+            [$($depths)* $key: match $key {
+                Some(attr) => Some(Attr {
+                    value: $g(attr_key_const(stringify!($key)), attr.value)?,
+                }),
+                None => None,
+            },]
+            $($rest)* }
+    };
+
+    ($f:ident $g:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]
+        $(#[$field_meta:meta])* req $key:ident: IntOrWord, $($rest:tt)*) => {
+        vocabulary_emit! { $f $g $listed no $shape [$($meta)*] $name
+            [$($fields)* $(#[$field_meta])* pub $key: Attr<IntOrWord>,]
+            [$($names)* $key,]
+            [$($maps)* $key,]
+            [$($empties)*]
+            [$($entries)* $listed.push((attr_key(stringify!($key)), $key.value.into_rval()));]
+            [$($keys)* attr_key_const(stringify!($key)),]
+            [$($depths)* $key: Attr {
+                value: $g(attr_key_const(stringify!($key)), $key.value)?,
+            },]
             $($rest)* }
     };
 
     // A projection-typed field, optional or required: already final, so it
     // crosses as it is.
-    ($f:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]
+    ($f:ident $g:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]
         $(#[$field_meta:meta])* opt $key:ident: $ty:ty, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed $empty $shape [$($meta)*] $name
+        vocabulary_emit! { $f $g $listed $empty $shape [$($meta)*] $name
             [$($fields)* $(#[$field_meta])* pub $key: Option<Attr<$ty>>,]
             [$($names)* $key,]
             [$($maps)* $key,]
@@ -781,18 +888,20 @@ macro_rules! vocabulary_emit {
                 $listed.push((attr_key(stringify!($key)), attr.value.into_rval()));
             }]
             [$($keys)* attr_key_const(stringify!($key)),]
+            [$($depths)* $key,]
             $($rest)* }
     };
 
-    ($f:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]
+    ($f:ident $g:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]
         $(#[$field_meta:meta])* req $key:ident: $ty:ty, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed no $shape [$($meta)*] $name
+        vocabulary_emit! { $f $g $listed no $shape [$($meta)*] $name
             [$($fields)* $(#[$field_meta])* pub $key: Attr<$ty>,]
             [$($names)* $key,]
             [$($maps)* $key,]
             [$($empties)*]
             [$($entries)* $listed.push((attr_key(stringify!($key)), $key.value.into_rval()));]
             [$($keys)* attr_key_const(stringify!($key)),]
+            [$($depths)* $key,]
             $($rest)* }
     };
 }
@@ -807,12 +916,13 @@ macro_rules! vocabulary_emit {
 /// shared emit below, so a change to it is one edit rather than two that can
 /// drift.
 macro_rules! vocabulary_item {
-    (generic $f:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]) => {
-        vocabulary_shared! { $listed $empty [$(#[$struct_meta])*] $name
+    (generic $f:ident $g:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]) => {
+        vocabulary_shared! { $g $listed $empty [$(#[$struct_meta])*] $name
             [V = Spanned<Value>]
             [impl $name<crate::resolved::RVal>]
             [impl<V> $name<V>]
-            [$($fields)*] [$($names)*] [$($empties)*] [$($entries)*] [$($keys)*] }
+            [impl<V> MapDepths for $name<V>]
+            [$($fields)*] [$($names)*] [$($empties)*] [$($entries)*] [$($keys)*] [$($depths)*] }
 
         impl<V> $name<V> {
             /// Carry every value field through `f`, giving the same vocabulary
@@ -843,12 +953,13 @@ macro_rules! vocabulary_item {
         }
     };
 
-    (plain $f:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]) => {
-        vocabulary_shared! { $listed $empty [$(#[$struct_meta])*] $name
+    (plain $f:ident $g:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*] [$($depths:tt)*]) => {
+        vocabulary_shared! { $g $listed $empty [$(#[$struct_meta])*] $name
             []
             [impl $name]
             [impl $name]
-            [$($fields)*] [$($names)*] [$($empties)*] [$($entries)*] [$($keys)*] }
+            [impl MapDepths for $name]
+            [$($fields)*] [$($names)*] [$($empties)*] [$($entries)*] [$($keys)*] [$($depths)*] }
 
         impl<V, V2> MapValues<V, V2> for $name {
             type Output = $name;
@@ -872,9 +983,10 @@ macro_rules! vocabulary_item {
 /// The shape decides only the headers, so both shapes hand them in — the
 /// struct's type parameters, and the two impl heads the bodies below hang from.
 macro_rules! vocabulary_shared {
-    ($listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident
-     [$($params:tt)*] [$($entries_head:tt)*] [$($empty_head:tt)*]
-     [$($fields:tt)*] [$($names:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]) => {
+    ($g:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident
+     [$($params:tt)*] [$($entries_head:tt)*] [$($empty_head:tt)*] [$($depths_head:tt)*]
+     [$($fields:tt)*] [$($names:tt)*] [$($empties:tt)*] [$($entries:tt)*] [$($keys:tt)*]
+     [$($depths:tt)*]) => {
         $(#[$struct_meta])*
         #[derive(Clone, Debug, Deserialize, PartialEq)]
         #[serde(deny_unknown_fields)]
@@ -911,6 +1023,25 @@ macro_rules! vocabulary_shared {
             }
         }
 
+        $($depths_head)* {
+            /// Carry every depth field through the resolver, keyed for the
+            /// diagnostic.
+            ///
+            /// Emitted from the accumulated depth fields, so a depth key added
+            /// to the vocabulary is carried across by the same expansion.
+            // A vocabulary with no depth field consumes neither the resolver
+            // nor its own destructured fields; the walk is one arm per field
+            // either way.
+            #[allow(unused_variables)]
+            fn map_depths(
+                self,
+                $g: &mut impl FnMut(&'static str, IntOrWord) -> Result<IntOrWord, Diagnostic>,
+            ) -> Result<Self, Diagnostic> {
+                let $name { $($names)* } = self;
+                Ok($name { $($depths)* })
+            }
+        }
+
         vocabulary_empty! { $empty [$($empty_head)*] $name [$($empties)*] }
     };
 }
@@ -941,7 +1072,8 @@ vocabulary! {
     /// address by the declaration itself, the uuid by a `uuid_pins` block.
     struct ChannelAttrs<V> {
         opt description: V,
-        /// Depth fields take a count or the word `unbounded`.
+        /// Depth fields take a count, the word `unbounded`, or a name that
+        /// resolves to a count.
         opt push_depth: IntOrWord,
         opt retain_depth: IntOrWord,
         opt standing_retain_depth: IntOrWord,
@@ -1155,7 +1287,8 @@ vocabulary! {
     /// The three raw subscription structs' fields other than the address each
     /// carries, held equal to them by a parity gate in `brenn-lib`.
     struct SubscribeTail; {
-        /// Depth fields take a count or the word `unbounded`.
+        /// Depth fields take a count, the word `unbounded`, or a name that
+        /// resolves to a count.
         opt push_depth: IntOrWord,
         opt retain_depth: IntOrWord,
         opt noise: Word,
@@ -1173,7 +1306,8 @@ vocabulary! {
     /// other than the port and the channel the statement carries, held equal to
     /// them by a parity gate in `brenn-lib`.
     struct InTail<V> {
-        /// Depth fields take a count or the word `unbounded`.
+        /// Depth fields take a count, the word `unbounded`, or a name that
+        /// resolves to a count.
         opt push_depth: IntOrWord,
         opt retain_depth: IntOrWord,
         opt noise: Word,
@@ -1201,7 +1335,8 @@ vocabulary! {
     /// port and the channel, held equal to them by a parity gate in
     /// `brenn-lib`.
     struct IoTail<V> {
-        /// Depth fields take a count or the word `unbounded`.
+        /// Depth fields take a count, the word `unbounded`, or a name that
+        /// resolves to a count.
         opt push_depth: IntOrWord,
         opt retain_depth: IntOrWord,
         opt noise: Word,
@@ -1443,6 +1578,22 @@ macro_rules! kindword_dispatch {
                 f: &mut impl FnMut(V) -> Result<V2, Diagnostic>,
             ) -> Result<Self::Output, Diagnostic> {
                 self.map_values(f)
+            }
+        }
+
+        impl<V> MapDepths for $sum<V> {
+            /// Forwarded to the block's own vocabulary rather than written as
+            /// the identity, so a kindworded vocabulary that grows a depth
+            /// field is covered here without a second list.
+            fn map_depths(
+                self,
+                f: &mut impl FnMut(&'static str, IntOrWord) -> Result<IntOrWord, Diagnostic>,
+            ) -> Result<Self, Diagnostic> {
+                Ok(match self {
+                    $(Self::$variant(block) => $sum::$variant(Box::new(block.map_attrs(
+                        |attrs| attrs.map_depths(f),
+                    )?)),)+
+                })
             }
         }
 
@@ -1928,7 +2079,23 @@ fn unknown_kindword(kindword: &str, span: Span, context: &str, legal: &[&str]) -
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DocComment {
-    pub lines: Vec<Spanned<String>>,
+    pub lines: Vec<DocLine>,
+}
+
+/// One `///` line of a doc comment.
+///
+/// The line's trailing newline, the next line's indentation and any blank lines
+/// between two lines are one lexeme the grammar keeps so the formatter can put
+/// its own break where they were. It is layout and not content, so `nl` is
+/// named here only to be thrown away — named rather than merely omitted, so
+/// that the unknown-field guard every other struct in this file relies on stays
+/// on and a third label the grammar grows cannot slip past unnoticed.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DocLine {
+    pub content: Spanned<String>,
+    #[serde(rename = "nl")]
+    pub _nl: serde::de::IgnoredAny,
 }
 
 /// A value in any value position.
@@ -2068,12 +2235,29 @@ impl WordList {
     }
 }
 
-/// A field that takes an integer or one token standing in for it — the depth
-/// fields, where `unbounded` is a word and every other value is a count.
+/// The one spelling of an unbounded window.
+///
+/// A depth position reads a reference as a name to resolve, so this word has to
+/// be recognised before the lookup and cannot be declared as anything else: a
+/// constant or a parameter spelled this way is refused at its declaration.
+pub const UNBOUNDED: &str = "unbounded";
+
+/// A field that takes an integer, one token standing in for it, or a name that
+/// resolves to one — the depth fields.
+///
+/// The only word in these positions is `unbounded`; every other reference is a
+/// name resolved to the integer it names. The parse form records what was
+/// written; the resolved form holds a count wherever a name was.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IntOrWord {
     Int(Spanned<i64>),
-    Word(Word),
+    /// A reference written where a count goes: the word `unbounded`, or a name
+    /// resolution replaces with the integer it names. After resolution the only
+    /// `Name` that remains is `unbounded`.
+    Name {
+        path: PathRef,
+        span: Span,
+    },
 }
 
 impl IntOrWord {
@@ -2081,15 +2265,27 @@ impl IntOrWord {
     pub fn from_value(value: &Spanned<Value>) -> Result<IntOrWord, Diagnostic> {
         match value.value() {
             Value::Int(count) => Ok(IntOrWord::Int(count.clone())),
-            Value::Ref(_) => Word::from_value(value).map(IntOrWord::Word),
+            Value::Ref(path) => Ok(IntOrWord::Name {
+                path: path.clone(),
+                span: value.span().clone(),
+            }),
             other => Err(Diagnostic::at(
                 format!(
-                    "expected an integer or a bare word, found {}",
+                    "expected a count, the word `unbounded`, or a name that resolves to a \
+                     count, found {}",
                     value_kind(other)
                 ),
                 value.span().clone(),
             )),
         }
+    }
+
+    /// Whether this is the word an unbounded window is spelled with.
+    ///
+    /// After resolution the only `Name` that remains is `unbounded`; every
+    /// other name has been replaced by the count it named.
+    pub fn is_unbounded(&self) -> bool {
+        matches!(self, IntOrWord::Name { path, .. } if path.is_unbounded())
     }
 }
 
@@ -2168,6 +2364,36 @@ pub enum BraceEscape {
 pub struct PathRef {
     pub head: Spanned<String>,
     pub segs: Vec<PathSeg>,
+}
+
+impl PathRef {
+    /// Whether this is the bare word an unbounded window is spelled with.
+    ///
+    /// One home for the rule "a bare head, no segments, spelled `unbounded`",
+    /// because the two ends of one pipeline turn on it: what a depth reads as a
+    /// word rather than looking up, and what lowering accepts as an unbounded
+    /// window.
+    pub fn is_unbounded(&self) -> bool {
+        self.segs.is_empty() && self.head.value() == UNBOUNDED
+    }
+
+    /// The path as written, separators included.
+    ///
+    /// For a diagnostic that has to name the reference the author typed rather
+    /// than the head alone, which is what a table-field constant or a
+    /// module-qualified name reduces to otherwise.
+    pub fn spelling(&self) -> String {
+        let mut text = self.head.value().clone();
+        for seg in &self.segs {
+            let (separator, name) = match seg {
+                PathSeg::Module(seg) => ("::", &seg.name),
+                PathSeg::Inst(seg) => (".", &seg.name),
+            };
+            text.push_str(separator);
+            text.push_str(name.value());
+        }
+        text
+    }
 }
 
 /// One segment of a path.
@@ -2353,10 +2579,10 @@ mod tests {
             .collect();
         assert_eq!(spellings, ["subscribe", "publish"]);
 
-        let IntOrWord::Word(word) = &block.attrs.depth.value else {
-            panic!("the word arm");
-        };
-        assert_eq!(word.as_str(), "unbounded");
+        assert!(
+            block.attrs.depth.value.is_unbounded(),
+            "the reference arm, holding the one word a depth spells"
+        );
     }
 
     /// On the bridge path a bad list element is positioned at the whole list —
@@ -2388,7 +2614,7 @@ mod tests {
         let held = file.sections().next().expect("one section");
         let error = typed::<ProjectionAttrs>(held).expect_err("a quoted count is not a count");
         assert!(
-            error.message.contains("integer or a bare word"),
+            error.message.contains("a count, the word `unbounded`"),
             "{}",
             error.message
         );

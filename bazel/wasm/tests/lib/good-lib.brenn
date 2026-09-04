@@ -1,0 +1,9 @@
+/// A library module: vocabulary a release ships that no component package and
+/// no surface kind owns. It declares and instantiates nothing, which is the
+/// whole of the packaged-module discipline.
+assembly Commons(depth: Int = 100) {
+  channel notes at "ephemeral:commons.notes" {
+    description = "Notes the arrangement keeps to itself.";
+    retain_depth = depth;
+  }
+}

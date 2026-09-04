@@ -563,8 +563,48 @@ directories carry it.
 
 `package_check.sh` holds the root to its packages in both directions: every
 shipped specification has a byte-identical module staged, and every staged
-module is byte-identical to a shipped specification. A file that is neither is a
-module a deployment could import and the host would refuse at boot.
+module is byte-identical to a shipped specification — or listed as a library
+module, below. A file that is neither is a module a deployment could import and
+the host would refuse at boot.
+
+### Library modules
+
+Not every module a release ships belongs to a component. Shared vocabulary —
+assemblies and constants a deployment stamps but no artifact implements — has no
+package and no surface kind to be harvested off, so it is **listed** instead:
+
+```
+modules/surface-description.brenn   a library module: vocabulary, no artifact
+modules/library-modules.txt         the list, one basename per line, sorted
+```
+
+A `release_package` or `component_bundle` names them in `library_modules`, each
+staged as `modules/<basename>` with its basename appended to
+`modules/library-modules.txt`. The list travels in the tree because every reader
+of `modules/` — the contract test, a deploying repo's preflight — otherwise has
+to pair each module with an owning package and must refuse what it cannot pair.
+A tree that lists none carries no list file at all, so its `modules/` is
+byte-identical to what it was before the carrier existed.
+
+Two rules keep the two halves apart. A library module may not take a basename
+the harvest already staged — two files under one import, decided by copy order —
+and a staged module is owned *or* listed, never both, because two statements of
+one ownership can disagree at the next pin. A bundle's library modules must also
+be under its `spec_root`, which is the authored tree a deployment's config gate
+reads instead of building the bundle.
+
+Nothing else in the build compiles a library module: no component owns one, so
+without a gate the first reader of it is the compiler at a deployment's boot,
+with the service already stopped. Each `library_modules` entry therefore gets a
+`library_module_test`, which compiles a one-line root document importing just
+that module against just its own directory. A module that declares a top-level
+channel, an instance, a principal — the packaged subset's top-level rules —
+fails brenn's own build.
+
+The gate stops at the top level. An assembly's body is resolved only when
+something stamps it, and that root stamps nothing, so a body that names a depth
+no constant or parameter resolves to, or reaches for anything else the resolver
+refuses, passes here and is refused at a deployment's `config-check` instead.
 
 ## Bundles and multiple roots
 
@@ -638,28 +678,42 @@ roots give the host the collision, and it refuses.
 
 ### What a deployment still copies by hand
 
-Two pieces of brenn's own vocabulary reach a deployment by transcription rather
-than by import, and both drift silently.
+One piece of brenn's own vocabulary still reaches a deployment by
+transcription rather than by import, and it drifts silently.
 
-The **self-description assemblies** — `SurfaceDescription(slug)` and
-`KindDescription(kind)`, with the `surface_errors` and `surface_index` channels
-they publish on — are declared in brenn's config tree
-(`config/surfaces.brenn`), not in a packaged module, so a bundle cannot
-`use @` them. Every deployment that serves a surface must stamp one
-`SurfaceDescription` per slug and one `KindDescription` per kind or boot panics,
-and the only way to get the definitions is to copy the file. The addresses, the
-depths and the channel set are brenn's: when they change, every copy is stale
-and the failure is a boot panic on the next restart. Nothing compares a copy
-with its original. `TODO(surface-description-vocabulary-packaged)`.
+The **chrome wiring**. A surface must hold exactly one chrome, and the block
+that wires its four reserved `local:brenn/*` control planes plus `io toast-tick`
+is written out per page. An unrecognised reserved name is refused; a *missing*
+plane is not, so a page whose chrome omits one boots and goes quiet.
+`TODO(standard-chrome-vocabulary)`.
 
-The **chrome wiring** is the same shape. A surface must hold exactly one chrome,
-and the block that wires its four reserved `local:brenn/*` control planes plus
-`io toast-tick` is written out per page. An unrecognised reserved name is
-refused; a *missing* plane is not, so a page whose chrome omits one boots and
-goes quiet. `TODO(standard-chrome-vocabulary)`.
+Until it is packaged vocabulary, that block in a bundle repository's `config/`
+is a copy with a shelf life, and the pin bump that updates brenn is when it is
+re-copied. The self-description assemblies — `SurfaceCommons`,
+`SurfaceDescription(slug)` and `KindDescription(kind)` — are not in that
+position: they ship as a library module (*Library modules*, above), imported
+with `use @surface-description::*;`.
 
-Until both are packaged vocabulary, a bundle repository's `config/` is a copy
-with a shelf life, and the pin bump that updates brenn is when it is re-copied.
+Each has its own arity, and a deployment whose stamps are missing is refused
+with every missing channel named at once. `config-check` makes that refusal — so
+the bundle installer's pre-stop check does too — and the fit test does not, since
+it compiles without lowering. `SurfaceCommons` is stamped **once per
+deployment**; `SurfaceDescription` **once per surface slug**;
+`KindDescription` **once per processor kind the deployment's pages instantiate**,
+the chrome kind included:
+
+```
+use @surface-description::*;
+
+new surface_commons: SurfaceCommons;
+new demo_desc: SurfaceDescription(slug = "demo");
+new panel_kind_desc: KindDescription(kind = "demo-panel");
+new chrome_kind_desc: KindDescription(kind = "chrome");
+```
+
+`SurfaceCommons` carries the two channels every surface-serving deployment
+publishes on whatever surfaces it declares — the error lane and the topology
+index — which is why it is stamped once and not per slug.
 
 ## Surface packages
 

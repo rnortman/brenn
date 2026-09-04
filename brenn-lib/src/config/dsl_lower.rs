@@ -599,14 +599,14 @@ fn token_text<T: DeserializeOwned>(text: &str, span: &Span, key: &str) -> Result
 // Value types with their own spelling
 // ---------------------------------------------------------------------------
 
-/// The one spelling of an unbounded window.
-const UNBOUNDED: &str = "unbounded";
-
 /// A depth: a non-negative count, or the word `unbounded`.
 ///
 /// The runtime's `Depth` deserializer never runs on this path, so this is the
 /// one place the DSL spelling of a depth is decided; the equivalence tests pin
-/// the two paths to the same result.
+/// the two paths to the same result. A name written in a depth position was
+/// replaced by the count it named during resolution, so the only reference that
+/// reaches here is `unbounded`; the other arm is this function's own statement
+/// of what it admits.
 fn depth(value: &IntOrWord, key: &str) -> Result<Depth, Diagnostic> {
     const EXPECTED: &str = "a non-negative integer or the word `unbounded`";
     match value {
@@ -617,10 +617,10 @@ fn depth(value: &IntOrWord, key: &str) -> Result<Depth, Diagnostic> {
                 count.span().clone(),
             )),
         },
-        IntOrWord::Word(word) if word.name.value() == UNBOUNDED => Ok(Depth::Unbounded),
-        IntOrWord::Word(word) => Err(Diagnostic::at(
-            format!("`{key}`: expected {EXPECTED}, got `{}`", word.name.value()),
-            word.name.span().clone(),
+        _ if value.is_unbounded() => Ok(Depth::Unbounded),
+        IntOrWord::Name { path, span } => Err(Diagnostic::at(
+            format!("`{key}`: expected {EXPECTED}, got `{}`", path.spelling()),
+            span.clone(),
         )),
     }
 }
@@ -2822,7 +2822,10 @@ fn links(resolved: &DslResolved, mut endpoints: LinkEndpoints) -> Vec<LinkConfig
 fn doc_text(doc: &DocComment) -> String {
     doc.lines
         .iter()
-        .map(|line| line.value().strip_prefix(' ').unwrap_or(line.value()))
+        .map(|line| {
+            let text = line.content.value();
+            text.strip_prefix(' ').unwrap_or(text)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

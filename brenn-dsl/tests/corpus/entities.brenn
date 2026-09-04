@@ -13,6 +13,14 @@ channel utterance at "brenn:alice-pod.out.utterance" {
     send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 };
 }
 
+/// A depth position also takes a name that resolves to a count, written bare or
+/// as a table field.
+channel geometry at "brenn:alice-desk.geometry" {
+    push_depth = window;
+    retain_depth = depths.geometry;
+    standing_retain_depth = depths.status;
+}
+
 surface alice_desk {
     grants = [subscribe, publish, takeover];
     skin = "bench";

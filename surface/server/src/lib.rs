@@ -33,6 +33,7 @@ use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::config::{ResolvedComponent, ResolvedSurface, ResolvedWasmConsumer};
 use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::{ChannelScheme, MessagingDirectory};
+use brenn_lib::panic_util::CONFIG_REFUSAL;
 use brenn_messaging::Messenger;
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_surface_contract::{KERNEL_ARTIFACT, PROCESSOR_DIR};
@@ -376,6 +377,9 @@ pub fn validate_surface_assets(
     let kinds = scan_surface_roots(roots);
     let kernel = sole_kernel_root(roots);
     assert_every_root_offers_something(roots, &kernel, &kinds);
+    // The kernel pair is not a component — no kind, no class, no specification —
+    // so the root it was served from is the whole of its identity.
+    tracing::info!(root = %kernel.display(), "surface kernel root resolved");
     let roots = SurfaceRoots {
         kernel: Some(kernel),
         kinds,
@@ -407,6 +411,15 @@ pub fn validate_surface_assets(
                 )
             });
             let manifest = processor_assets::validate_processor_kind(root, &comp.kind);
+            // Together with the kernel line above, this is the operator's answer
+            // to which release each installed kind came from.
+            tracing::info!(
+                kind = %comp.kind,
+                root = %root.display(),
+                spec_sha256 = %manifest.spec_sha256,
+                source_sha256 = %manifest.source_sha256,
+                "surface processor kind resolved"
+            );
             kinds.insert(
                 comp.kind.as_str(),
                 KindAssets {
@@ -660,12 +673,13 @@ pub const SURFACE_ERROR_BODY_MAX_BYTES: usize = 6
     * (brenn_surface_schema::MAX_LOG_MESSAGE_BYTES + brenn_surface_schema::MAX_LOG_SOURCE_BYTES)
     + 256;
 
-/// Boot-time validation of `[observability] surface_error_channel`.
+/// Validation of `[observability] surface_error_channel`.
 ///
 /// Every failure here is operator config, never attacker-reachable, so each is a
-/// boot panic (house fail-fast policy). No-op when the channel is unset
-/// (surfaces console-only). Runs once the messaging directory exists, before any
-/// session can attach:
+/// panic (house fail-fast policy). A pure function of the document and the
+/// directory, so the offline messaging pass runs it as well as boot. No-op when
+/// the channel is unset (surfaces console-only). At boot it runs once the
+/// messaging directory exists, before any session can attach:
 ///
 /// - The address must parse under the `brenn:` scheme — a durable, replayable
 ///   channel; `ephemeral:`/`webhook:`/`mqtt:` are rejected.
@@ -684,71 +698,119 @@ pub const SURFACE_ERROR_BODY_MAX_BYTES: usize = 6
 /// originating in Brenn's native code. The surviving single-writer machinery
 /// ([`assert_channel_single_writer`], [`SingleWriterPrincipals`]) guards the
 /// boot-published surface-description channels.
+///
+/// Returns the one non-fatal finding this validator has, or `None`. It is
+/// returned rather than logged because the callers report differently: boot has
+/// a `tracing` subscriber and the offline config check has none, so a warning
+/// emitted here would vanish on the gate an operator actually reads before a
+/// deploy.
+#[must_use]
 pub fn validate_surface_error_channel(
     channel: Option<&str>,
     directory: Option<&MessagingDirectory>,
     max_body_bytes: usize,
-) {
-    let Some(channel) = channel else {
-        return;
-    };
+) -> Option<SurfaceErrorAdvisory> {
+    let channel = channel?;
 
     // The address must be a well-formed brenn: channel (durable, replayable);
     // the parse is the validation, its bare name no longer needed downstream.
     well_formed_name(channel, ChannelScheme::Brenn).unwrap_or_else(|| {
         panic!(
-            "boot: [observability] surface_error_channel {channel:?} is not a well-formed brenn: \
-             address — error reports need a durable, replayable channel, so only the brenn: scheme \
-             is accepted. Refusing to start (fail-fast on invalid config)."
+            "{CONFIG_REFUSAL}[observability] surface_error_channel {channel:?} is not a \
+             well-formed brenn: address — error reports need a durable, replayable channel, so \
+             only the brenn: scheme is accepted."
         )
     });
 
     let directory = directory.unwrap_or_else(|| {
         panic!(
-            "boot: [observability] surface_error_channel {channel:?} is set but no messaging is \
-             configured (no [[channel]] blocks, no Messenger). Declare messaging or unset the \
-             channel. Refusing to start (fail-fast on invalid config)."
+            "{CONFIG_REFUSAL}[observability] surface_error_channel {channel:?} is set but no \
+             messaging is configured (no [[channel]] blocks, no Messenger). Declare messaging or \
+             unset the channel."
         )
     });
 
     let Some(entry) = directory.resolve(channel) else {
         panic!(
-            "boot: [observability] surface_error_channel {channel:?} does not resolve to any \
-             declared [[channel]] block — error routing requires an explicit matching channel; no \
-             implicit channel is created. Refusing to start (fail-fast on invalid config)."
+            "{CONFIG_REFUSAL}[observability] surface_error_channel {channel:?} does not resolve \
+             to any declared [[channel]] block — error routing requires an explicit matching \
+             channel; no implicit channel is created."
         );
     };
 
     // A bounded eviction frontier at or below one surface's admitted send burst
     // means one fully-admitted burst can rotate every earlier report out of the
-    // durable channel before the budget refills. Warn once at boot; the evicted
-    // reports still survive the kernel's console copy, so this is a footgun, not a
-    // fatal misconfiguration. A pinned channel (frontier None) never triggers.
-    if let Some(frontier) = entry.reap_frontier()
-        && frontier <= u64::from(brenn_messaging::publish::SURFACE_SEND_BURST)
-    {
-        let refill_window_secs = u64::from(brenn_messaging::publish::SURFACE_SEND_BURST)
-            * brenn_messaging::publish::SURFACE_SEND_REFILL.as_secs();
-        tracing::warn!(
-            channel,
+    // durable channel before the budget refills. The evicted reports still
+    // survive the kernel's console copy, so this is a footgun, not a fatal
+    // misconfiguration. A pinned channel (frontier None) never triggers.
+    let advisory = entry
+        .reap_frontier()
+        .filter(|frontier| *frontier <= u64::from(brenn_messaging::publish::SURFACE_SEND_BURST))
+        .map(|frontier| SurfaceErrorAdvisory {
+            channel: channel.to_string(),
             frontier,
-            burst = brenn_messaging::publish::SURFACE_SEND_BURST,
-            refill_window_secs,
-            "boot: [observability] surface_error_channel eviction frontier is at or below the \
-             surface send burst — one admitted burst can rotate every earlier report out of \
-             the channel, and the budget fully refills within the window. Evicted reports still \
-             survive the kernel's console copy. Raise the channel's standing_retain_depth above \
-             the burst to close the window."
-        );
-    }
+            burst: brenn_messaging::publish::SURFACE_SEND_BURST,
+            refill_window_secs: u64::from(brenn_messaging::publish::SURFACE_SEND_BURST)
+                * brenn_messaging::publish::SURFACE_SEND_REFILL.as_secs(),
+        });
 
     assert!(
         max_body_bytes >= SURFACE_ERROR_BODY_MAX_BYTES,
-        "boot: [messaging] max_body_bytes {max_body_bytes} is below the worst-case surface error \
-         report body ({SURFACE_ERROR_BODY_MAX_BYTES} bytes) — a report publish could hit \
-         BodyTooLarge at runtime. Raise max_body_bytes. Refusing to start (fail-fast on invalid \
-         config).",
+        "{CONFIG_REFUSAL}[messaging] max_body_bytes {max_body_bytes} is below the worst-case \
+         surface error report body ({SURFACE_ERROR_BODY_MAX_BYTES} bytes) — a report publish \
+         could hit BodyTooLarge at runtime. Raise max_body_bytes.",
     );
+
+    advisory
+}
+
+/// The eviction-frontier finding [`validate_surface_error_channel`] raises: the
+/// error channel's frontier sits at or below one surface's admitted send burst,
+/// so one admitted burst can rotate every earlier report out of it.
+///
+/// Advice, not a refusal — the evicted reports still survive the kernel's
+/// console copy — so it travels back to the caller and is reported the way that
+/// caller reports.
+pub struct SurfaceErrorAdvisory {
+    /// The configured `surface_error_channel` address.
+    pub channel: String,
+    /// The channel's eviction frontier.
+    pub frontier: u64,
+    /// One surface's admitted send burst.
+    pub burst: u32,
+    /// How long the send-burst budget takes to refill in full.
+    pub refill_window_secs: u64,
+}
+
+/// Report a [`SurfaceErrorAdvisory`] the way a caller with a `tracing`
+/// subscriber reports it: the rendered sentence, plus its numbers as fields so a
+/// subscriber can key on them rather than on the text.
+///
+/// Lives beside the struct rather than at the call site so that the one shape
+/// this advisory takes in a log is written once and can be tested without a
+/// boot.
+pub fn log_surface_error_advisory(advisory: &SurfaceErrorAdvisory) {
+    tracing::warn!(
+        channel = %advisory.channel,
+        frontier = advisory.frontier,
+        burst = advisory.burst,
+        refill_window_secs = advisory.refill_window_secs,
+        "boot: {advisory}"
+    );
+}
+
+impl std::fmt::Display for SurfaceErrorAdvisory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[observability] surface_error_channel {:?} has an eviction frontier ({}) at or below \
+             the surface send burst ({}) — one admitted burst can rotate every earlier report out \
+             of the channel, and the budget fully refills within {} seconds. Evicted reports \
+             still survive the kernel's console copy. Raise the channel's standing_retain_depth \
+             above the burst to close the window.",
+            self.channel, self.frontier, self.burst, self.refill_window_secs,
+        )
+    }
 }
 
 /// The single principal permitted to write a single-writer `brenn:` channel.
@@ -1973,64 +2035,109 @@ mod tests {
         )
     }
 
-    /// Frontier exactly at the burst boundary → warns, naming the frontier.
+    /// Frontier exactly at the burst boundary → advises, naming the frontier.
     #[test]
-    #[tracing_test::traced_test]
-    fn validate_surface_error_channel_warns_at_frontier_boundary() {
+    fn validate_surface_error_channel_advises_at_frontier_boundary() {
         let n = u64::from(brenn_messaging::publish::SURFACE_SEND_BURST);
         let dir = directory_with_standing_depth("surface-errors", n);
-        validate_surface_error_channel(
+        let advisory = validate_surface_error_channel(
             Some("brenn:surface-errors"),
             Some(&dir),
             SURFACE_ERROR_BODY_MAX_BYTES,
-        );
-        assert!(
-            logs_contain("eviction frontier is at or below"),
-            "frontier == burst must emit the retention warn"
-        );
-        assert!(
-            logs_contain(&format!("frontier={n}")),
-            "the warn must name the offending frontier value"
+        )
+        .expect("frontier == burst must raise the retention advisory");
+        assert_eq!(advisory.frontier, n);
+        assert_eq!(advisory.burst, brenn_messaging::publish::SURFACE_SEND_BURST);
+        // The arithmetic the struct introduced, and the one thing the operator
+        // sizes `standing_retain_depth` against: computed here from the two
+        // constants, so a swapped multiplicand or a millisecond unit is a red
+        // test rather than a wrong number in the advice.
+        let refill = u64::from(brenn_messaging::publish::SURFACE_SEND_BURST)
+            * brenn_messaging::publish::SURFACE_SEND_REFILL.as_secs();
+        assert_eq!(advisory.refill_window_secs, refill);
+        assert_eq!(
+            advisory.to_string(),
+            format!(
+                "[observability] surface_error_channel \"brenn:surface-errors\" has an eviction \
+                 frontier ({n}) at or below the surface send burst ({}) — one admitted burst can \
+                 rotate every earlier report out of the channel, and the budget fully refills \
+                 within {refill} seconds. Evicted reports still survive the kernel's console \
+                 copy. Raise the channel's standing_retain_depth above the burst to close the \
+                 window.",
+                brenn_messaging::publish::SURFACE_SEND_BURST,
+            ),
         );
     }
 
-    /// Frontier one above the burst → no warn (a single burst leaves a report).
+    /// The boot half of the same advisory. `validate_surface_error_channel`
+    /// returns it and boot logs it; nothing else asserts that the logging
+    /// happens, so dropping or renaming a field there would fail nothing.
     #[test]
     #[tracing_test::traced_test]
-    fn validate_surface_error_channel_no_warn_above_frontier_boundary() {
+    fn the_boot_advisory_carries_its_fields_into_the_log() {
+        // One below the burst, so the frontier and the burst are different
+        // numbers and a transposition between them is visible.
+        let n = u64::from(brenn_messaging::publish::SURFACE_SEND_BURST) - 1;
+        let dir = directory_with_standing_depth("surface-errors", n);
+        let advisory = validate_surface_error_channel(
+            Some("brenn:surface-errors"),
+            Some(&dir),
+            SURFACE_ERROR_BODY_MAX_BYTES,
+        )
+        .expect("a frontier below the burst must raise the retention advisory");
+        log_surface_error_advisory(&advisory);
+        for field in [
+            format!("frontier={n}"),
+            format!("burst={}", brenn_messaging::publish::SURFACE_SEND_BURST),
+            format!(
+                "refill_window_secs={}",
+                u64::from(brenn_messaging::publish::SURFACE_SEND_BURST)
+                    * brenn_messaging::publish::SURFACE_SEND_REFILL.as_secs()
+            ),
+            "channel=brenn:surface-errors".to_string(),
+            "eviction frontier".to_string(),
+        ] {
+            assert!(logs_contain(&field), "the log carries no {field:?}");
+        }
+    }
+
+    /// Frontier one above the burst → no advisory (a single burst leaves a
+    /// report).
+    #[test]
+    fn validate_surface_error_channel_no_advisory_above_frontier_boundary() {
         let n = u64::from(brenn_messaging::publish::SURFACE_SEND_BURST) + 1;
         let dir = directory_with_standing_depth("surface-errors", n);
-        validate_surface_error_channel(
-            Some("brenn:surface-errors"),
-            Some(&dir),
-            SURFACE_ERROR_BODY_MAX_BYTES,
-        );
         assert!(
-            !logs_contain("eviction frontier is at or below"),
-            "frontier > burst must not warn"
+            validate_surface_error_channel(
+                Some("brenn:surface-errors"),
+                Some(&dir),
+                SURFACE_ERROR_BODY_MAX_BYTES,
+            )
+            .is_none(),
+            "frontier > burst must not advise"
         );
     }
 
-    /// Default (unbounded) standing depth pins the channel → frontier None → no warn.
+    /// Default (unbounded) standing depth pins the channel → frontier None → no
+    /// advisory.
     #[test]
-    #[tracing_test::traced_test]
-    fn validate_surface_error_channel_no_warn_when_pinned() {
+    fn validate_surface_error_channel_no_advisory_when_pinned() {
         let dir = directory_with("surface-errors");
-        validate_surface_error_channel(
-            Some("brenn:surface-errors"),
-            Some(&dir),
-            SURFACE_ERROR_BODY_MAX_BYTES,
-        );
         assert!(
-            !logs_contain("eviction frontier is at or below"),
-            "a pinned (Unbounded) channel must never warn"
+            validate_surface_error_channel(
+                Some("brenn:surface-errors"),
+                Some(&dir),
+                SURFACE_ERROR_BODY_MAX_BYTES,
+            )
+            .is_none(),
+            "a pinned (Unbounded) channel must never advise"
         );
     }
 
     #[test]
     fn validate_surface_error_channel_noop_when_unset() {
         // Unset channel is a no-op even with no directory (console-only path).
-        validate_surface_error_channel(None, None, 1);
+        assert!(validate_surface_error_channel(None, None, 1).is_none());
     }
 
     #[test]
@@ -2038,10 +2145,13 @@ mod tests {
         // The error channel is many-writer by design: a surface's injected
         // error-channel ACL is legitimate, not a single-writer violation.
         let dir = directory_with("surface-errors");
-        validate_surface_error_channel(
-            Some("brenn:surface-errors"),
-            Some(&dir),
-            SURFACE_ERROR_BODY_MAX_BYTES,
+        assert!(
+            validate_surface_error_channel(
+                Some("brenn:surface-errors"),
+                Some(&dir),
+                SURFACE_ERROR_BODY_MAX_BYTES,
+            )
+            .is_none()
         );
     }
 
@@ -2049,7 +2159,7 @@ mod tests {
     #[should_panic(expected = "not a well-formed brenn: address")]
     fn validate_surface_error_channel_panics_on_foreign_scheme() {
         let dir = directory_with("surface-errors");
-        validate_surface_error_channel(
+        let _ = validate_surface_error_channel(
             Some("ephemeral:surface-errors"),
             Some(&dir),
             SURFACE_ERROR_BODY_MAX_BYTES,
@@ -2059,7 +2169,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "no messaging is configured")]
     fn validate_surface_error_channel_panics_when_messaging_absent() {
-        validate_surface_error_channel(
+        let _ = validate_surface_error_channel(
             Some("brenn:surface-errors"),
             None,
             SURFACE_ERROR_BODY_MAX_BYTES,
@@ -2070,7 +2180,7 @@ mod tests {
     #[should_panic(expected = "does not resolve to any declared")]
     fn validate_surface_error_channel_panics_on_undeclared_channel() {
         let dir = directory_with("some-other-channel");
-        validate_surface_error_channel(
+        let _ = validate_surface_error_channel(
             Some("brenn:surface-errors"),
             Some(&dir),
             SURFACE_ERROR_BODY_MAX_BYTES,
@@ -2081,7 +2191,7 @@ mod tests {
     #[should_panic(expected = "below the worst-case surface error report body")]
     fn validate_surface_error_channel_panics_on_insufficient_body_headroom() {
         let dir = directory_with("surface-errors");
-        validate_surface_error_channel(
+        let _ = validate_surface_error_channel(
             Some("brenn:surface-errors"),
             Some(&dir),
             SURFACE_ERROR_BODY_MAX_BYTES - 1,

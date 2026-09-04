@@ -12,8 +12,8 @@ use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::fixture_text::processor_header;
 use fltk_serde_core::Spanned;
 use support::{
-    PACKAGED, at, derive_errors, derive_refusal, derive_refusals, derived, durable, nondurable,
-    packaged,
+    PACKAGED, at, derive_errors, derive_errors_tree, derive_refusal, derive_refusals,
+    derive_refusals_tree, derived, derived_tree, durable, messages, nondurable, packaged,
 };
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
@@ -602,7 +602,7 @@ fn a_remotes_ceiling_is_a_count_and_never_an_unbounded_window() {
              [prefix \"brenn:alice.\" { push_depth = \"unbounded\", retain_depth = 4 }];\n"
         )),
         "push_depth is a string, and a remote's ceiling is a plain count: an unbounded \
-         window is not an answer a network principal may be given"
+         window is not an answer a network peer may be given"
     );
 }
 
@@ -2569,7 +2569,7 @@ fn a_budget_on_a_principal_that_holds_no_sink_is_refused() {
             ),
         )),
         "`publish_capacity` is not part of agent `alice`'s `mqtt_publish` entry: an egress \
-         budget tunes the sink a component holds, and this principal publishes through a \
+         budget tunes the sink a component holds, and this entity publishes through a \
          host that budgets its own"
     );
 }
@@ -2593,4 +2593,1947 @@ fn one_client_holds_one_budget() {
         "consumer `alice_sink` states an egress budget for client `bob_hub` twice: one \
          client is one sink, and one sink holds one budget"
     );
+}
+
+// ── principals ───────────────────────────────────────────────────────────────
+//
+// A bare principal is authority and nothing else, declared to be delegated
+// from. Every rule here is one relation — attenuation — applied at a different
+// pair, and the two dead-config rules are its inverse: consent text that
+// consents to nothing.
+//
+// Every fixture writes a chain, because attenuation is a relation between two
+// authorities and a chain of two is the smallest thing it has anything to say
+// about.
+
+/// One link of a chain: a principal, and the arrangement stamped under it.
+///
+/// Every fixture writes a chain, because attenuation is a relation between two
+/// authorities and a chain of two is the smallest thing it has anything to say
+/// about. Every link carries an arrangement, because the inverse direction
+/// judges a principal by what is under it: a principal nothing is under
+/// delegates to nothing, and a word or line no arrangement under it needs is
+/// dead config. So a link of a passing chain holds exactly what it writes, and
+/// a link whose body is refused holds nothing at all — a refused body is judged
+/// in neither direction.
+struct Link<'a> {
+    /// The principal's body.
+    body: &'a str,
+    /// The grant words the arrangement's consumer holds. Backend words, since
+    /// the arrangement is a top-level consumer; the two grant vocabularies
+    /// meeting in one namespace has its own case in the ceiling suite below.
+    words: &'a str,
+    /// The matchers the arrangement's own `acl subscribe` statement writes
+    /// beside the channel it declares, which is the reach it asks for beyond
+    /// its default. Empty for an arrangement that asks for none — an explicit
+    /// statement is the whole authority for the plane, so the statement is
+    /// written only where there is something to add to it.
+    reach: &'a str,
+}
+
+/// The principals a chain declares, root first, each under the one before it.
+const CHAIN: [&str; 3] = ["site", "ui", "kitchen"];
+
+/// A chain of principals, each with an arrangement stamped under it.
+fn chain(links: &[Link<'_>]) -> String {
+    let mut module = String::new();
+    let mut document = String::new();
+    for (index, link) in links.iter().enumerate() {
+        let name = CHAIN[index];
+        module.push_str(&format!(
+            "component Sink{index} {{ {} in messages; }}\n\
+             assembly Hold{index}() {{\n\
+             \x20   channel out at \"ephemeral:{name}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+             \x20   new consume: Sink{index} {{ grants = [{}]; {}in messages <- out; }}\n\
+             }}\n",
+            processor_header(link.words),
+            link.words,
+            statement(link.reach),
+        ));
+        let under = match index {
+            0 => String::new(),
+            _ => format!(" under {}", CHAIN[index - 1]),
+        };
+        document.push_str(&format!(
+            "principal {name}{under} {{\n{}}}\nnew by_{name}: Hold{index}() under {name};\n",
+            link.body,
+        ));
+    }
+    format!("{PACKAGED}{module}{PACKAGED}{document}")
+}
+
+/// The `acl subscribe` statement an arrangement writes for the reach it asks
+/// for beyond the channel it declares, which it names beside it: an explicit
+/// statement is the whole authority for its plane, so a binding beside one
+/// derives nothing.
+fn statement(reach: &str) -> String {
+    match reach.is_empty() {
+        true => String::new(),
+        false => format!("acl subscribe [exact out, {reach}]; "),
+    }
+}
+
+/// A packaged module holding two arrangements, for the fixtures where one
+/// principal is wider than any single arrangement under it.
+///
+/// `Page` is a surface with a placed instance — an attach word and a
+/// capability; `Logger` is a top-level consumer holding `log`. Two of them
+/// because a principal is reusable and is judged by the union of everything
+/// under it: a word one arrangement does not need is dead config unless
+/// another under the same principal holds it, which one arrangement cannot
+/// show.
+fn two_arrangements(document: &str) -> String {
+    format!(
+        "{PACKAGED}component Panel {{ {} in messages; }}\n\
+         component Feed {{ {} in messages; }}\n\
+         \n\
+         assembly Page(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   surface page {{\n\
+         \x20       slug = slug;\n\
+         \x20       grants = [subscribe];\n\
+         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20   }}\n\
+         }}\n\
+         assembly Logger(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   new consume: Feed {{ grants = [log]; in messages <- out; }}\n\
+         }}\n{PACKAGED}{document}",
+        processor_header("dom"),
+        processor_header("log"),
+    )
+}
+
+/// A root principal holds what it writes, on either axis or both.
+///
+/// The assertion is that the chain compiles: the child narrows what the parent
+/// wrote, and every excess is refused, so a root whose axis the pass had
+/// dropped would refuse the child's narrowing of it. Words and reach are
+/// listed together here because one narrowing case per shape is the same claim
+/// three times — the observable consequences of a *wrongly* built axis have
+/// their own cases below (`a_child_inherits_the_axis_it_does_not_write`, the
+/// excess and narrows-nothing refusals).
+///
+/// Each case's arrangement holds exactly what its link writes, which is what
+/// makes the chain live text in both directions at once.
+#[test]
+fn a_root_principal_holds_the_axes_it_writes() {
+    for (root, child) in [
+        (
+            Link {
+                body: "    grants = [alert, config, log];\n",
+                words: "alert, config, log",
+                reach: "",
+            },
+            Link {
+                body: "    grants = [alert, log];\n",
+                words: "alert, log",
+                reach: "",
+            },
+        ),
+        (
+            Link {
+                body: "    acl subscribe [prefix \"brenn:house.\"];\n",
+                words: "",
+                reach: "prefix \"brenn:house.\"",
+            },
+            Link {
+                body: "    acl subscribe [prefix \"brenn:house.cmd.\"];\n",
+                words: "",
+                reach: "prefix \"brenn:house.cmd.\"",
+            },
+        ),
+        (
+            Link {
+                body: concat!(
+                    "    grants = [alert, log];\n",
+                    "    acl subscribe [prefix \"brenn:house.\"];\n",
+                ),
+                words: "alert, log",
+                reach: "prefix \"brenn:house.\"",
+            },
+            Link {
+                body: "    grants = [log];\n",
+                words: "log",
+                reach: "prefix \"brenn:house.\"",
+            },
+        ),
+    ] {
+        let source = chain(&[root, child]);
+        let config = derived(&source);
+        // Nothing lowers a principal, which is what the two declarations beside
+        // an entity space holding only the arrangements asserts.
+        assert_eq!(config.resolved.principals.len(), 2, "{source}");
+        assert!(config.resolved.surfaces.is_empty());
+        assert_eq!(config.resolved.consumers.len(), 2);
+    }
+}
+
+/// The child writes one axis and inherits the other, which is the whole reason
+/// replacement is per axis rather than wholesale: `ui` holds `site`'s reach
+/// without restating it, and narrowing its reach later cannot silently widen
+/// its words.
+#[test]
+fn a_child_inherits_the_axis_it_does_not_write() {
+    let config = derived(&chain(&[
+        Link {
+            body: concat!(
+                "    grants = [alert, log];\n",
+                "    acl subscribe [prefix \"brenn:house.\"];\n",
+            ),
+            words: "alert, log",
+            reach: "prefix \"brenn:house.\"",
+        },
+        Link {
+            body: "    grants = [log];\n",
+            words: "log",
+            reach: "prefix \"brenn:house.\"",
+        },
+        // A third principal under `ui` narrows the reach `ui` never wrote,
+        // which only holds if `ui` inherited it.
+        Link {
+            body: "    acl subscribe [prefix \"brenn:house.kitchen.\"];\n",
+            words: "log",
+            reach: "prefix \"brenn:house.kitchen.\"",
+        },
+    ]));
+    assert_eq!(config.resolved.principals.len(), 3);
+}
+
+/// An `acl` line replaces the inherited entries of the family it resolves to
+/// and no other, so a child narrowing the durable plane keeps the ephemeral
+/// reach it was given.
+#[test]
+fn a_line_replaces_only_the_family_it_resolves_to() {
+    let config = derived(&chain(&[
+        Link {
+            body: "    acl subscribe [prefix \"brenn:house.\", prefix \"ephemeral:house.\"];\n",
+            words: "",
+            reach: "prefix \"brenn:house.\", prefix \"ephemeral:house.\"",
+        },
+        Link {
+            body: "    acl subscribe [prefix \"brenn:house.cmd.\"];\n",
+            words: "",
+            reach: "prefix \"brenn:house.cmd.\", prefix \"ephemeral:house.\"",
+        },
+        Link {
+            body: "    acl subscribe [prefix \"ephemeral:house.kitchen.\"];\n",
+            words: "",
+            reach: "prefix \"brenn:house.cmd.\", \
+                   prefix \"ephemeral:house.kitchen.\"",
+        },
+    ]));
+    assert_eq!(config.resolved.principals.len(), 3);
+}
+
+/// Exact under prefix holds, which is what lets a chain name one address out of
+/// a family its parent holds whole. The assertion is the *absence* of an excess
+/// refusal: the one message is that the exact line caps nothing.
+///
+/// It caps nothing by construction, and that is the honest consequence of the
+/// two rules together rather than a fixture that could be written better. Every
+/// address an exact entry can name is either a channel the arrangement declares
+/// or one it was handed, and both are consent already given — so a ceiling
+/// spells `exact` only where the reach it names is already the arrangement's
+/// default.
+#[test]
+fn an_exact_entry_narrows_a_prefix_its_parent_holds() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            durable("cmd", "brenn:house.cmd"),
+            chain(&[
+                Link {
+                    body: "    acl subscribe [prefix \"brenn:house.\"];\n",
+                    words: "",
+                    reach: "prefix \"brenn:house.\"",
+                },
+                Link {
+                    body: "    acl subscribe [exact cmd];\n",
+                    words: "",
+                    reach: "",
+                },
+            ]),
+        )),
+        "this `acl subscribe` line caps nothing any arrangement under `ui` reaches in \
+         `brenn_subscribe` beyond its own channels and what it was handed; a ceiling line \
+         nothing needs is dead config"
+    );
+}
+
+#[test]
+fn a_word_the_parent_does_not_hold_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[
+            Link {
+                body: "    grants = [alert, log];\n",
+                words: "alert, log",
+                reach: "",
+            },
+            Link {
+                body: "    grants = [alert, tools];\n",
+                words: "",
+                reach: "",
+            },
+        ])),
+        "`tools` is not a word `site` holds, which `ui` is under: a principal holds no \
+         more than the one it is under, and everything a chain delegates is written at \
+         its root"
+    );
+}
+
+#[test]
+fn reach_the_parent_does_not_hold_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[
+            Link {
+                body: "    acl subscribe [prefix \"brenn:house.\"];\n",
+                words: "",
+                reach: "prefix \"brenn:house.\"",
+            },
+            Link {
+                body: "    acl subscribe [prefix \"brenn:other.\"];\n",
+                words: "",
+                reach: "",
+            },
+        ])),
+        "`other.` is not reach `site` holds, which `ui` is under: a principal holds no \
+         more than the one it is under, and everything a chain delegates is written at \
+         its root"
+    );
+}
+
+/// A prefix reaches addresses an exact entry does not, so subsumption does not
+/// hold in that direction however narrow the prefix looks.
+///
+/// The exact line the parent writes is itself dead config — see
+/// [`an_exact_entry_narrows_a_prefix_its_parent_holds`] — so the excess is the
+/// first of two messages rather than the only one.
+#[test]
+fn a_prefix_over_an_exact_entry_is_refused() {
+    let refusals = derive_refusals(&format!(
+        "{}{}",
+        durable("cmd", "brenn:house.cmd"),
+        chain(&[
+            Link {
+                body: "    acl subscribe [exact cmd];\n",
+                words: "",
+                reach: "",
+            },
+            Link {
+                body: "    acl subscribe [prefix \"brenn:house.cmd.\"];\n",
+                words: "",
+                reach: "",
+            },
+        ]),
+    ));
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert_eq!(
+        refusals[0],
+        "`house.cmd.` is not reach `site` holds, which `ui` is under: a principal \
+         holds no more than the one it is under, and everything a chain delegates is \
+         written at its root"
+    );
+    // And the second is the other rule reading the same pair of lines: `site`'s
+    // own `exact` line caps nothing, because every address an exact entry can
+    // name is a channel the arrangement declared or was handed. The count is
+    // asserted so a third message about one mistake fails here.
+    assert_eq!(
+        refusals[1],
+        "this `acl subscribe` line caps nothing any arrangement under `site` reaches in \
+         `brenn_subscribe` beyond its own channels and what it was handed; a ceiling line \
+         nothing needs is dead config"
+    );
+}
+
+/// The root rule, stated as a refusal: reach that the root never wrote cannot
+/// first appear below it, because the operator's authority is not inheritable
+/// and an axis a root does not write is empty.
+#[test]
+fn reach_under_a_parent_that_wrote_none_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[
+            Link {
+                body: "    grants = [alert, log];\n",
+                words: "alert, log",
+                reach: "",
+            },
+            Link {
+                body: "    acl subscribe [prefix \"brenn:house.\"];\n",
+                words: "",
+                reach: "",
+            },
+        ])),
+        "`house.` is not reach `site` holds, which `ui` is under: a principal holds \
+         no more than the one it is under, and everything a chain delegates is written at \
+         its root"
+    );
+}
+
+#[test]
+fn a_body_that_writes_no_axis_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[
+            Link {
+                body: "    grants = [alert, log];\n",
+                words: "alert, log",
+                reach: "",
+            },
+            Link {
+                body: "",
+                words: "",
+                reach: "",
+            },
+        ])),
+        "`ui` is under `site` and narrows nothing: a principal's body writes the axis it \
+         narrows, and `site` is already a name for what this holds"
+    );
+}
+
+#[test]
+fn a_words_axis_equal_to_the_inherited_one_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[
+            Link {
+                body: "    grants = [alert, log];\n",
+                words: "alert, log",
+                reach: "",
+            },
+            Link {
+                body: "    grants = [log, alert];\n",
+                words: "",
+                reach: "",
+            },
+        ])),
+        "this `grants` list is what `site` holds, so it narrows nothing; a ceiling axis \
+         that caps nothing is dead config"
+    );
+}
+
+#[test]
+fn a_reach_line_equal_to_the_inherited_one_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[
+            Link {
+                body: "    acl subscribe [prefix \"brenn:house.\"];\n",
+                words: "",
+                reach: "prefix \"brenn:house.\"",
+            },
+            Link {
+                body: "    acl subscribe [prefix \"brenn:house.\"];\n",
+                words: "",
+                reach: "",
+            },
+        ])),
+        "this `acl subscribe` line is what `site` holds in `brenn_subscribe`, so it narrows \
+         nothing; a ceiling line that caps nothing is dead config"
+    );
+}
+
+#[test]
+fn a_ceiling_word_in_no_grant_vocabulary_is_refused() {
+    let refusal = derive_refusal(&chain(&[Link {
+        body: "    grants = [dom, chrome];\n",
+        words: "",
+        reach: "",
+    }]));
+    assert!(
+        refusal.starts_with(
+            "`chrome` is not a grant word, so it caps nothing; a ceiling names `alert`, "
+        ),
+        "{refusal}"
+    );
+}
+
+/// A confined channel reaches the one component that binds it and is authorized
+/// by the host that serves it, so there is no reach for a ceiling to cap.
+#[test]
+fn a_confined_family_in_a_ceiling_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[Link {
+            body: "    acl subscribe [prefix \"local:brenn/\"];\n",
+            words: "",
+            reach: "",
+        }])),
+        "a ceiling caps no `local_subscribe` authority: a confined channel reaches the \
+         one component that binds it, authorized by the host that serves it"
+    );
+}
+
+/// A window belongs on the position that holds it; a ceiling says how far reach
+/// goes, not how deep.
+#[test]
+fn a_depth_tail_on_a_ceiling_entry_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[Link {
+            body: "    acl subscribe [prefix \"brenn:house.\" { push_depth = 4 }];\n",
+            words: "",
+            reach: "",
+        }])),
+        "`push_depth` is a depth, and a ceiling caps reach rather than depth"
+    );
+}
+
+#[test]
+fn a_cycle_of_principals_is_refused() {
+    assert_eq!(
+        derive_refusal(
+            "principal a under b {\n    grants = [dom];\n}\n\
+             principal b under a {\n    grants = [log];\n}\n",
+        ),
+        "`b` is under `a`, which is under `b`; a chain of principals bottoms out at the \
+         operator"
+    );
+}
+
+#[test]
+fn under_naming_a_running_entity_is_refused() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            agent_with("subscribe", ""),
+            "principal ui under alice {\n    grants = [dom];\n}\n",
+        )),
+        "`alice` is an instance; a principal is declared under a `principal`"
+    );
+}
+
+#[test]
+fn under_naming_a_channel_is_refused() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            durable("cmd", "brenn:house.cmd"),
+            "principal ui under cmd {\n    grants = [dom];\n}\n",
+        )),
+        "`cmd` is a channel; a principal is declared under a `principal`"
+    );
+}
+
+#[test]
+fn under_naming_nothing_is_refused() {
+    assert_eq!(
+        derive_refusal("principal ui under site {\n    grants = [dom];\n}\n"),
+        "`site` is not declared in this file"
+    );
+}
+
+/// Two spellings of one thing is the mistake worth naming: a grant widens a
+/// running entity, and a principal's authority is its body. Exactly one
+/// diagnostic — the running-entity refusal must not fire for the same handle.
+#[test]
+fn a_grant_naming_a_principal_is_refused_once() {
+    let refusals = derive_refusals(&format!(
+        "{}{}",
+        chain(&[
+            Link {
+                body: "    grants = [alert, log];\n",
+                words: "alert, log",
+                reach: "",
+            },
+            Link {
+                body: "    grants = [log];\n",
+                words: "log",
+                reach: "",
+            },
+        ]),
+        "grant ui publish prefix \"brenn:house.\";\n",
+    ));
+    assert_eq!(
+        refusals,
+        vec![
+            "`ui` is a principal; its authority is written in its body, and a grant widens \
+             a running entity"
+                .to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_body_item_that_is_not_authority_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[
+            Link {
+                body: "    grants = [log];\n    slug = \"site\";\n",
+                words: "",
+                reach: "",
+            },
+            Link {
+                body: "    grants = [];\n",
+                words: "",
+                reach: "",
+            },
+        ])),
+        "a principal is authority and nothing else: `grants` and `acl` lines"
+    );
+}
+
+/// A packaged module declares no principal: the consent would then be the
+/// author's words, and a pin bump could widen it without a character changing
+/// in the deployer's file.
+#[test]
+fn a_packaged_module_declares_no_principal() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}{}",
+            PACKAGED, "principal ui {\n    grants = [dom];\n}\n", PACKAGED,
+        )),
+        "a packaged module declares no principal; what an arrangement holds is the \
+         deployment's to give"
+    );
+}
+
+// ── stamp ceilings ───────────────────────────────────────────────────────────
+//
+// A stamp of a packaged assembly imports config text its author wrote into the
+// deployment's trust anchor. The ceiling is what the deployment says that text
+// may come to, and every case here is the same fold: what the arrangement
+// confers against what consents to it.
+//
+// The fixtures are fenced, so the assembly is a packaged module's and its
+// stamp in the document half is the packaged boundary.
+
+/// A packaged arrangement holding a top-level consumer: a channel of its own, a
+/// consumer bound between a handed channel and that channel, one capability.
+fn packaged_loop(body: &str) -> String {
+    format!(
+        "{PACKAGED}component Sink {{\n    {}\n    in messages;\n    optional out events;\n}}\n\
+         \n\
+         assembly Loop(slug: String, source: Channel) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   new consume: Sink {{\n\
+         \x20       grants = [ports];\n\
+         \x20       in messages <- source;\n\
+         \x20       out events -> out;\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         channel bar at \"ephemeral:bar\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         new demo: Loop(slug = \"demo\", source = bar){body}\n",
+        processor_header("ports"),
+    )
+}
+
+/// A packaged arrangement holding a surface with a placed instance: attach
+/// words on the surface, a capability on the instance, a channel of its own.
+fn packaged_page(body: &str) -> String {
+    format!(
+        "{PACKAGED}component Panel {{\n    {}\n    in messages;\n}}\n\
+         \n\
+         assembly Page(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   surface page {{\n\
+         \x20       slug = slug;\n\
+         \x20       grants = [subscribe];\n\
+         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         new demo: Page(slug = \"demo\"){body}\n",
+        processor_header("dom"),
+    )
+}
+
+/// The common case: the deployer writes the words the arrangement holds, and
+/// the reach it needs is the channel it declares and the one it was handed,
+/// which the stamp consents to by stamping and by passing.
+#[test]
+fn a_ceiling_covering_what_the_arrangement_confers_passes() {
+    let config = derived(&packaged_loop(" { grants = [ports]; }"));
+    assert_eq!(config.resolved.stamps.len(), 1);
+    assert_eq!(config.consumers[0].grants.len(), 1);
+}
+
+/// The same over a surface and its placed instance: the attach word and the
+/// capability word are one namespace, so one list caps both.
+#[test]
+fn a_ceiling_covers_a_surface_and_its_instances() {
+    let config = derived(&packaged_page(" { grants = [dom, subscribe]; }"));
+    assert_eq!(config.resolved.stamps.len(), 1);
+}
+
+/// The description shape, which is why the ceiling's default is right: an
+/// arrangement that declares channels and holds nothing needs no ceiling text,
+/// and the stamp is one line.
+#[test]
+fn an_arrangement_that_confers_nothing_needs_no_ceiling() {
+    let config = derived(&format!(
+        "{PACKAGED}assembly Describe(slug: String) {{\n\
+         \x20   channel geometry at f\"brenn:surface.{{slug}}.geometry\" {{ push_depth = 1; retain_depth = 1; standing_retain_depth = 1; }}\n\
+         }}\n{PACKAGED}\
+         new demo: Describe(slug = \"demo\");\n"
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+    let stamp = &config.resolved.stamps[0];
+    assert!(stamp.grants.is_none() && stamp.acls.is_empty());
+}
+
+/// A word the arrangement holds and the ceiling does not is the whole point:
+/// the refusal names the word, the instance holding it, and writes the
+/// whole line the deployer needs.
+#[test]
+fn a_word_beyond_the_ceiling_is_refused_with_the_line_to_write() {
+    let source = packaged_page(" { grants = [subscribe]; }");
+    let errors = derive_errors(&source);
+    assert_eq!(
+        errors[0].message,
+        "stamping `Page` from `@fixtures` confers `dom` on `demo.page.panel`, which this \
+         stamp's ceiling does not cover: a packaged arrangement holds what the deployment \
+         stamps it with, so write it — `grants = [dom, subscribe];`"
+    );
+    // At the stamp — the deployer's file, which is where the line goes — with
+    // the author's `grants` word as the related site.
+    assert_eq!(errors[0].line_col(), at(&source, "demo: Page"));
+    assert_eq!(errors[0].related[0].0, "`demo.page.panel` holds it here");
+}
+
+/// With nothing written the ceiling is empty, so every word is reported and
+/// every one carries the same suggested line: fixing one fixes all.
+#[test]
+fn an_empty_ceiling_reports_every_word_with_one_line() {
+    let refusals = derive_refusals(&packaged_page(";"));
+    assert_eq!(refusals.len(), 2);
+    for refusal in &refusals {
+        assert!(
+            refusal.ends_with("so write it — `grants = [dom, subscribe];`"),
+            "{refusal}"
+        );
+    }
+}
+
+/// A ceiling under a principal suggests the principal instead: the consent
+/// belongs where the deployer put it, and a stamp's body can only narrow what
+/// the principal holds.
+#[test]
+fn a_word_beyond_a_principal_names_the_principal() {
+    let refusal = derive_refusal(&format!(
+        "principal ui {{ grants = [subscribe]; }}\n{}",
+        packaged_page(" under ui;")
+    ));
+    assert_eq!(
+        refusal,
+        "stamping `Page` from `@fixtures` confers `dom` on `demo.page.panel`, which this \
+         stamp's ceiling does not cover: a packaged arrangement holds what the deployment \
+         stamps it with, so add `dom` to `ui`, or stamp under a principal that holds it"
+    );
+}
+
+/// The principal holds the word and the stamp's own body hands down less, so
+/// the edit that fixes it is the stamp's `grants` line: naming the principal
+/// would name a line that already holds it.
+#[test]
+fn a_word_a_stamps_own_body_dropped_names_the_stamps_ceiling() {
+    let refusal = derive_refusal(&format!(
+        "principal ui {{ grants = [dom, subscribe]; }}\n{}",
+        packaged_page(" under ui { grants = [subscribe]; }")
+    ));
+    assert!(
+        refusal.ends_with(
+            "so add `dom` to this stamp's ceiling — `ui` holds it, and this stamp's body \
+             hands down less"
+        ),
+        "{refusal}"
+    );
+}
+
+/// The same discrimination on the reach axis, per family: `ui` covers the
+/// entry and the stamp's own `acl` line does not, so the line to widen is the
+/// stamp's.
+#[test]
+fn reach_a_stamps_own_body_dropped_names_the_stamps_ceiling() {
+    let refusal = derive_refusal(&format!(
+        "{PACKAGED}component Panel {{ {} in messages; }}\n\
+         \n\
+         assembly Page(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   surface page {{\n\
+         \x20       slug = slug;\n\
+         \x20       grants = [subscribe];\n\
+         \x20       acl subscribe [exact out, prefix \"brenn:site.house.\", prefix \"brenn:site.shed.\"];\n\
+         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         principal ui {{ grants = [dom, subscribe]; acl subscribe [prefix \"brenn:site.\"]; }}\n\
+         new demo: Page(slug = \"demo\") under ui {{ acl subscribe [prefix \"brenn:site.house.\"]; }}\n",
+        processor_header("dom"),
+    ));
+    assert!(
+        refusal.ends_with(
+            "add `acl subscribe [prefix \"brenn:site.shed.\"];` to this stamp's ceiling if that \
+             reach is wanted — `ui` holds it, and this stamp's body hands down less"
+        ),
+        "{refusal}"
+    );
+}
+
+/// A word enters a chain at its root and a child can only narrow, so a word
+/// missing from `ui` is missing from everything `ui` is under too, and the
+/// suggestion names them.
+#[test]
+fn a_word_beyond_a_chain_names_every_principal_it_must_reach() {
+    let refusal = derive_refusal(&two_arrangements(
+        "principal site { grants = [log, subscribe]; }\n\
+         principal ui under site { grants = [subscribe]; }\n\
+         new logger: Logger(slug = \"logger\") under site;\n\
+         new demo: Page(slug = \"demo\") under ui;\n",
+    ));
+    assert!(
+        refusal.ends_with("so add `dom` to `ui`, and to the principals it is under: `site`"),
+        "{refusal}"
+    );
+}
+
+/// Reach the arrangement writes for itself beyond its own channels is refused
+/// at the author's statement, with the stamp as the related site and the line
+/// the deployer would have to write.
+#[test]
+fn reach_beyond_the_ceiling_is_refused_at_the_authors_statement() {
+    let source = format!(
+        "{PACKAGED}component Panel {{ {} in messages; }}\n\
+         \n\
+         assembly Page(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   surface page {{\n\
+         \x20       slug = slug;\n\
+         \x20       grants = [subscribe];\n\
+         \x20       acl subscribe [exact out, prefix \"brenn:house.\"];\n\
+         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         new demo: Page(slug = \"demo\") {{ grants = [dom, subscribe]; }}\n",
+        processor_header("dom"),
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(
+        errors[0].message,
+        "`acl subscribe [prefix \"brenn:house.\"]` on `demo.page` reaches beyond what `Page` from \
+         `@fixtures` declares or was handed, and the stamp `demo` consents to none of it — \
+         add `acl subscribe [prefix \"brenn:house.\"];` to the stamp if that reach is wanted"
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "brenn:house."));
+    assert_eq!(errors[0].related[0].0, "stamped here");
+}
+
+/// A prefix over a handed channel does not hold: the deployer handed one
+/// address, and a prefix reaches addresses they did not.
+#[test]
+fn a_prefix_over_a_handed_channel_is_refused() {
+    let refusal = derive_refusal(&format!(
+        "{PACKAGED}component Sink {{ {} in messages; }}\n\
+         \n\
+         assembly Loop(source: Channel) {{\n\
+         \x20   new consume: Sink {{\n\
+         \x20       grants = [];\n\
+         \x20       acl subscribe [prefix \"ephemeral:bar.\"];\n\
+         \x20       in messages <- source;\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         channel bar at \"ephemeral:bar.in\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         new demo: Loop(source = bar);\n",
+        processor_header(""),
+    ));
+    assert!(
+        refusal.starts_with(
+            "`acl subscribe [prefix \"ephemeral:bar.\"]` on `demo.consume` reaches beyond what \
+             `Loop` from `@fixtures` declares or was handed"
+        ),
+        "{refusal}"
+    );
+}
+
+/// A binding to a `webhook:` literal reaches an endpoint the deployer declared
+/// and did not hand in, so it is reach the ceiling has to cover.
+#[test]
+fn a_binding_to_an_endpoint_is_reach_the_ceiling_covers() {
+    let arrangement = format!(
+        "{PACKAGED}component Sink {{ {} in messages; }}\n\
+         \n\
+         assembly Hook() {{\n\
+         \x20   new consume: Sink {{ grants = []; in messages <- \"webhook:alice-inbox\"; }}\n\
+         }}\n{PACKAGED}\
+         webhook alice_inbox {{ slug = \"alice-inbox\"; }}\n\
+         new demo: Hook(){}\n",
+        processor_header(""),
+        "{BODY}",
+    );
+    let refusal = derive_refusal(&arrangement.replace("{BODY}", ";"));
+    assert!(
+        refusal.starts_with("`acl subscribe [endpoint \"webhook:alice-inbox\"]` on `demo.consume`"),
+        "{refusal}"
+    );
+    let config = derived(&arrangement.replace(
+        "{BODY}",
+        " { acl subscribe [endpoint \"webhook:alice-inbox\"]; }",
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+}
+
+/// A `grant` the deployer writes at top level is consent already given, so it
+/// is not reach the stamp confers — the arrangement passes with nothing
+/// written.
+#[test]
+fn a_deployer_grant_into_a_subtree_is_not_conferred() {
+    let config = derived(&format!(
+        "{PACKAGED}component Sink {{ {} in messages; }}\n\
+         \n\
+         assembly Loop() {{\n\
+         \x20   channel out at \"ephemeral:demo.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   new consume: Sink {{ grants = []; in messages <- out; }}\n\
+         }}\n{PACKAGED}\
+         channel wide at \"ephemeral:wide\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         new demo: Loop();\n\
+         grant demo.consume subscribe exact wide;\n",
+        processor_header(""),
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+    assert_eq!(config.consumers[0].acl.ephemeral_subscribe.len(), 2);
+}
+
+/// The same reach written *inside* the arrangement is the author's, and it is
+/// conferred: an assembly widening an entity is reach the stamp hands out.
+#[test]
+fn a_grant_inside_an_arrangement_is_conferred() {
+    let source = format!(
+        "{PACKAGED}component Sink {{ {} in messages; }}\n\
+         \n\
+         assembly Loop(target: Agent) {{\n\
+         \x20   channel out at \"ephemeral:demo.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   new consume: Sink {{ grants = []; in messages <- out; }}\n\
+         \x20   grant target subscribe prefix \"ephemeral:demo.\";\n\
+         }}\n{PACKAGED}\
+         agent Assistant() {{ name = \"Assistant\"; grants = [subscribe]; }}\n\
+         new alice: Assistant();\n\
+         new demo: Loop(target = alice){};\n",
+        processor_header(""),
+        "{BODY}",
+    );
+    let refusal = derive_refusal(&source.replace("{BODY}", ""));
+    assert!(
+        refusal.starts_with("`acl subscribe [prefix \"ephemeral:demo.\"]` on `alice`"),
+        "{refusal}"
+    );
+    let config =
+        derived(&source.replace("{BODY}", " { acl subscribe [prefix \"ephemeral:demo.\"]; }"));
+    assert_eq!(config.resolved.stamps.len(), 1);
+}
+
+/// `under p;` with no body is how a stamp says "exactly `p`": the ceiling is
+/// the principal's authority unchanged, and there is no narrowing to ask about.
+#[test]
+fn a_stamp_under_a_principal_with_no_body_holds_exactly_it() {
+    let config = derived(&format!(
+        "principal ui {{ grants = [dom, subscribe]; }}\n{}",
+        packaged_page(" under ui;")
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+    let stamp = &config.resolved.stamps[0];
+    assert_eq!(
+        stamp.under.as_ref().map(|p| p.dotted()).as_deref(),
+        Some("ui")
+    );
+    assert!(!stamp.wrote_body);
+}
+
+/// A body under a principal narrows it, and what the arrangement confers is
+/// held to the narrowed ceiling rather than to the principal.
+#[test]
+fn a_body_under_a_principal_narrows_what_the_arrangement_may_hold() {
+    // `log` is what the page's ceiling narrows away, and the second
+    // arrangement is what keeps it from being dead config: a principal wider
+    // than one arrangement is exactly what makes it worth declaring.
+    let tree = |body: &str| {
+        two_arrangements(&format!(
+            "principal ui {{ grants = [dom, log, subscribe]; }}\n\
+             new logger: Logger(slug = \"logger\") under ui;\n\
+             new demo: Page(slug = \"demo\") under ui{body}\n"
+        ))
+    };
+    let config = derived(&tree(" { grants = [dom, subscribe]; }"));
+    assert_eq!(config.resolved.stamps.len(), 2);
+    // The same narrowing with the word the arrangement needs taken away is the
+    // refusal, and it names the ceiling rather than the principal above it.
+    let refusal = derive_refusal(&tree(" { grants = [subscribe]; }"));
+    assert!(
+        refusal.contains("confers `dom` on `demo.page.panel`"),
+        "{refusal}"
+    );
+}
+
+/// `alert` is one word across both grant vocabularies, so one ceiling word
+/// covers a consumer's alert capability and a surface's alert attach right at
+/// once — the deployer consents to being paged once, not twice.
+#[test]
+fn one_alert_word_covers_both_vocabularies() {
+    let config = derived(&format!(
+        "{PACKAGED}component Sink {{ {} in messages; }}\n\
+         \n\
+         assembly Both(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   surface page {{ slug = slug; grants = [subscribe, alert]; acl subscribe [exact out]; }}\n\
+         \x20   new consume: Sink {{ grants = [alert]; in messages <- out; }}\n\
+         }}\n{PACKAGED}\
+         new demo: Both(slug = \"demo\") {{ grants = [alert, subscribe]; }}\n",
+        processor_header("alert"),
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+}
+
+/// An assembly may `new` an agent, and the agent's stated words count toward
+/// what the stamp confers like any other entity's.
+#[test]
+fn an_agents_words_count_toward_what_a_stamp_confers() {
+    let arrangement = "\
+agent Assistant() {
+    name = \"Assistant\";
+    slug = \"desk-pa\";
+    grants = [pwa_push];
+}
+
+assembly Desk() {
+    new pa: Assistant();
+}
+";
+    let refusal = derive_refusal(&format!(
+        "{arrangement}new desk: Desk() {{ grants = []; }}\n"
+    ));
+    assert!(
+        refusal.contains("confers `pwa_push` on `desk.pa`"),
+        "{refusal}"
+    );
+    let config = derived(&format!(
+        "{arrangement}new desk: Desk() {{ grants = [pwa_push]; }}\n"
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+}
+
+// ── nested stamps ────────────────────────────────────────────────────────────
+//
+// Two packaged modules, the outer arrangement stamping the inner. The outer
+// ceiling is a statement about the whole subtree, so what the inner
+// arrangement confers is counted against it whether or not the inner `new`
+// records a stamp of its own.
+
+/// The inner arrangement: a surface with one placed instance holding one
+/// capability.
+const INNER: &str = "\
+component Panel { abi = processor; requires = [dom]; in messages; }
+
+assembly Inner(slug: String) {
+    channel out at f\"ephemeral:{slug}.out\" { push_depth = 4; retain_depth = 16; }
+    surface page {
+        slug = slug;
+        grants = [subscribe];
+        new panel: Panel { grants = [dom]; in messages <- out; }
+    }
+}
+";
+
+/// The outer arrangement: one entity of its own holding a word the inner
+/// arrangement does not need, so a nested body narrowing the enclosing ceiling
+/// narrows something real, and the inner stamp written with whatever the case
+/// writes.
+fn outer(nested: &str) -> String {
+    format!(
+        "use @inner::*;\n\n\
+         component Ping {{ abi = processor; requires = [alert]; in messages; }}\n\
+         \n\
+         assembly Outer() {{\n\
+         \x20   channel tick at \"ephemeral:outer.tick\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   new ping: Ping {{ grants = [alert]; in messages <- tick; }}\n\
+         \x20   new page: Inner(slug = \"demo\"){nested}\n\
+         }}\n"
+    )
+}
+
+/// A nested `new` with nothing written records no stamp of its own, so the
+/// entities it emits belong to the deployer's boundary and its one ceiling
+/// covers the whole expansion.
+#[test]
+fn a_bare_nested_stamp_is_covered_by_the_outer_ceiling() {
+    let config = derived_tree(&[
+        (
+            "",
+            "use @outer::*;\n\nnew demo: Outer() { grants = [alert, dom, subscribe]; }\n",
+        ),
+        ("@outer", &outer(";")),
+        ("@inner", INNER),
+    ]);
+    assert_eq!(config.resolved.stamps.len(), 1);
+    assert_eq!(config.resolved.stamps[0].handle.dotted(), "demo");
+}
+
+/// And the outer ceiling is what refuses it: a word the inner arrangement
+/// holds and the outer stamp does not cover is reported at the outer stamp.
+#[test]
+fn the_outer_ceiling_refuses_what_the_inner_arrangement_confers() {
+    let refusals = derive_refusals_tree(&[
+        (
+            "",
+            "use @outer::*;\n\nnew demo: Outer() { grants = [alert, subscribe]; }\n",
+        ),
+        ("@outer", &outer(";")),
+        ("@inner", INNER),
+    ]);
+    assert_eq!(refusals.len(), 1);
+    assert!(
+        refusals[0].contains("confers `dom` on `demo.page.page.panel`"),
+        "{}",
+        refusals[0]
+    );
+}
+
+/// An author narrowing a nested arrangement is the doctrine in the author's
+/// hands: the nested body records a stamp, its own subtree is held to it, and
+/// the enclosing ceiling still bounds the whole.
+#[test]
+fn a_nested_author_body_records_a_stamp_and_binds_its_subtree() {
+    let config = derived_tree(&[
+        (
+            "",
+            "use @outer::*;\n\nnew demo: Outer() { grants = [alert, dom, subscribe]; }\n",
+        ),
+        ("@outer", &outer(" { grants = [dom, subscribe]; }")),
+        ("@inner", INNER),
+    ]);
+    let stamps: Vec<String> = config
+        .resolved
+        .stamps
+        .iter()
+        .map(|stamp| stamp.handle.dotted())
+        .collect();
+    assert_eq!(stamps, ["demo", "demo.page"]);
+    assert_eq!(
+        config.resolved.stamps[1].parent,
+        Some(brenn_dsl::resolved::StampId(0))
+    );
+    assert!(config.resolved.stamps[1].packaged_site);
+}
+
+/// A nested body cannot widen the ceiling it arrives inside: it narrows the
+/// enclosing one, and a word the enclosing ceiling does not hold is refused at
+/// the nested stamp.
+#[test]
+fn a_nested_body_beyond_the_enclosing_ceiling_is_refused() {
+    let refusals = derive_refusals_tree(&[
+        (
+            "",
+            "use @outer::*;\n\nnew demo: Outer() { grants = [alert, subscribe]; }\n",
+        ),
+        ("@outer", &outer(" { grants = [dom, subscribe]; }")),
+        ("@inner", INNER),
+    ]);
+    assert!(
+        refusals.iter().any(|refusal| refusal
+            == "`dom` is not a word the ceiling on the stamp `demo` holds, which the stamp \
+                `demo.page` is under: a stamp's ceiling holds no more than what it is under, \
+                and everything a chain delegates is written at its root"),
+        "{refusals:?}"
+    );
+}
+
+/// An author's own attenuation that the nested arrangement exceeds is the
+/// author's bug, and the refusal says so: no line the deployer writes answers
+/// a ceiling written in the arrangement's own text.
+#[test]
+fn a_refusal_at_a_packaged_stamp_names_the_author() {
+    let refusals = derive_refusals_tree(&[
+        (
+            "",
+            "use @outer::*;\n\nnew demo: Outer() { grants = [alert, dom, subscribe]; }\n",
+        ),
+        ("@outer", &outer(" { grants = [subscribe]; }")),
+        ("@inner", INNER),
+    ]);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("confers `dom` on `demo.page.page.panel`"),
+        "{}",
+        refusals[0]
+    );
+    assert!(
+        refusals[0].contains("that line is the author's: this stamp is the arrangement's own text"),
+        "{}",
+        refusals[0]
+    );
+}
+
+/// A dead ceiling line an author wrote is the author's to delete: no
+/// deployment that stamps the bundle can edit the module the line is in, so the
+/// refusal says whose text it is, as the fit rule does.
+#[test]
+fn dead_ceiling_text_in_packaged_text_names_the_author() {
+    // The shared `outer` fixture holds one word beyond the inner arrangement's,
+    // which a nested body cannot both narrow and hold dead text in. Two words
+    // beyond is what leaves room for one of each.
+    let module = "use @inner::*;\n\n\
+                  component Ping { abi = processor; requires = [alert, log]; in messages; }\n\
+                  \n\
+                  assembly Outer() {\n\
+                  \x20   channel tick at \"ephemeral:outer.tick\" \
+                  { push_depth = 4; retain_depth = 16; }\n\
+                  \x20   new ping: Ping { grants = [alert, log]; in messages <- tick; }\n\
+                  \x20   new page: Inner(slug = \"demo\") { grants = [alert, dom, subscribe]; }\n\
+                  }\n";
+    let refusals = derive_refusals_tree(&[
+        (
+            "",
+            "use @outer::*;\n\nnew demo: Outer() { grants = [alert, dom, log, subscribe]; }\n",
+        ),
+        ("@outer", module),
+        ("@inner", INNER),
+    ]);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(
+        refusals[0],
+        "`alert` caps nothing — no instance stamped by `Inner` from `@inner` holds it; a \
+         ceiling word nothing reaches is dead config — and that line is the author's: this \
+         stamp is the arrangement's own text"
+    );
+}
+
+/// A `Principal` parameter is how an assembly reaches a principal, and a tree
+/// assembly carrying one to a subject stamp is the demo's shape.
+#[test]
+fn a_principal_parameter_carries_a_ceiling_into_a_tree_assembly() {
+    let config = derived_tree(&[
+        (
+            "",
+            "use @inner::*;\n\n\
+             principal demo_ui { grants = [dom, subscribe]; }\n\
+             assembly Deployment(ui: Principal) {\n\
+             \x20   new page: Inner(slug = \"demo\") under ui;\n\
+             }\n\
+             new deployment: Deployment(ui = demo_ui);\n",
+        ),
+        ("@inner", INNER),
+    ]);
+    assert_eq!(config.resolved.stamps.len(), 1);
+    assert_eq!(
+        config.resolved.stamps[0].under.as_ref().map(|p| p.dotted()),
+        Some("demo_ui".to_string())
+    );
+}
+
+/// A principal handed into a stamped arrangement is a bound of its own and
+/// does not widen the ceiling it arrives inside: what the text says is what
+/// the ceiling is, so the wider principal is refused rather than intersected.
+///
+/// The refusal is anchored at the `under` clause that chose the principal —
+/// which for a nested stamp is the author's file — with the argument that
+/// handed it in as a related site, because that is the other place the
+/// arrangement can be given something narrower.
+#[test]
+fn a_handed_principal_wider_than_the_enclosing_ceiling_is_refused() {
+    let holder = "use @inner::*;\n\nassembly Holder(ui: Principal) {\n\
+                  \x20   new page: Inner(slug = \"demo\") under ui { grants = [dom]; }\n\
+                  }\n";
+    let errors = derive_errors_tree(&[
+        (
+            "",
+            "use @holder::*;\n\n\
+             principal wide { grants = [dom, page-dom, subscribe]; }\n\
+             new demo: Holder(ui = wide) { grants = [dom, subscribe]; }\n",
+        ),
+        ("@holder", holder),
+        ("@inner", INNER),
+    ]);
+    let refusal = errors
+        .iter()
+        .find(|error| {
+            error
+                .message
+                .starts_with("`wide` holds the word `page-dom`")
+        })
+        .unwrap_or_else(|| panic!("{:?}", messages(&errors)));
+    assert_eq!(
+        refusal.message,
+        "`wide` holds the word `page-dom`, which the ceiling on the stamp `demo` does \
+         not: a principal handed into a stamped arrangement is a bound of its own, and \
+         the ceiling it arrives inside is not widened by one"
+    );
+    assert_eq!(refusal.line_col(), at(holder, "ui { grants"));
+    let related: Vec<&str> = refusal
+        .related
+        .iter()
+        .map(|(what, _)| what.as_str())
+        .collect();
+    assert_eq!(
+        related,
+        [
+            "held here",
+            "handed in here",
+            "the enclosing ceiling is written here"
+        ]
+    );
+}
+
+// ── what the fold counts, and what it does not ───────────────────────────────
+
+/// A top-level consumer inside a packaged arrangement holds capabilities the
+/// stamp has to cover, exactly as a surface-placed instance does — the
+/// `DemoLoop` shape, whose words reach the fold through the consumer vector
+/// rather than through a surface.
+#[test]
+fn a_consumers_word_beyond_the_ceiling_is_refused() {
+    let refusal = derive_refusal(&packaged_loop(";"));
+    assert!(
+        refusal.contains("confers `ports` on `demo.consume`"),
+        "{refusal}"
+    );
+    assert!(
+        refusal.ends_with("so write it — `grants = [ports];`"),
+        "{refusal}"
+    );
+}
+
+/// Confined reach is the serving host's to authorize, not the deployment's: a
+/// ceiling refuses a line in a confined family, so a confined entry the
+/// arrangement derives cannot be reach the ceiling has to cover — the refusal
+/// would name a line that is itself refused. Every real chrome binds
+/// `local:brenn/theme`, so this is the shape that has to compile.
+#[test]
+fn a_confined_binding_needs_no_ceiling_line() {
+    let config = derived(&format!(
+        "{PACKAGED}component Panel {{ {} in messages; in theme; }}\n\
+         \n\
+         assembly Page(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   surface page {{\n\
+         \x20       slug = slug;\n\
+         \x20       grants = [subscribe];\n\
+         \x20       new panel: Panel {{\n\
+         \x20           grants = [dom];\n\
+         \x20           in messages <- out;\n\
+         \x20           in theme <- \"local:brenn/theme\" {{ push_depth = 1; }}\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         new demo: Page(slug = \"demo\") {{ grants = [dom, subscribe]; }}\n",
+        processor_header("dom"),
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+    // The confined entry is derived and held, which is what makes its absence
+    // from the fit check a decision rather than an accident.
+    assert_eq!(config.resolved.surfaces[0].components[0].bindings.len(), 2);
+    assert_eq!(
+        patterns(&config.surface_components[0][0].acl.local_subscribe),
+        ["brenn/theme"]
+    );
+}
+
+/// The exact arm of the line a reach refusal writes: an address no declared
+/// channel holds, which is the only shape the arrangement can have written —
+/// a literal naming a declared channel is refused as a second spelling of its
+/// handle, and a channel of the subtree's own or one handed in is default
+/// reach. Following the suggestion compiles, which is the whole claim the
+/// refusal makes.
+#[test]
+fn the_exact_arm_of_a_reach_suggestion_is_followable() {
+    let arrangement = format!(
+        "{PACKAGED}component Panel {{ {} in messages; }}\n\
+         \n\
+         assembly Page(slug: String) {{\n\
+         \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         \x20   surface page {{\n\
+         \x20       slug = slug;\n\
+         \x20       grants = [subscribe];\n\
+         \x20       acl subscribe [exact out, exact \"brenn:elsewhere\"];\n\
+         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         new demo: Page(slug = \"demo\") {{ grants = [dom, subscribe];{} }}\n",
+        processor_header("dom"),
+        "{LINE}",
+    );
+    let refusal = derive_refusal(&arrangement.replace("{LINE}", ""));
+    assert_eq!(
+        refusal,
+        "`acl subscribe [exact \"brenn:elsewhere\"]` on `demo.page` reaches beyond what `Page` \
+         from `@fixtures` declares or was handed, and the stamp `demo` consents to none of it \
+         — add `acl subscribe [exact \"brenn:elsewhere\"];` to the stamp if that reach is wanted"
+    );
+    let config =
+        derived(&arrangement.replace("{LINE}", " acl subscribe [exact \"brenn:elsewhere\"];"));
+    assert_eq!(config.resolved.stamps.len(), 1);
+}
+
+// ── mqtt reach in a ceiling ──────────────────────────────────────────────────
+//
+// The reach that leaves the machine. Both transport families compare by
+// equality — a client for a sink, a client and a filter for a subscription —
+// so a ceiling names the same spelling the arrangement wrote and nothing about
+// a wildcard is arithmetic.
+
+/// A packaged bridge holding both mqtt planes: a subscription over a wildcard
+/// filter and a sink with a budget of its own.
+fn packaged_bridge(body: &str) -> String {
+    format!(
+        "{PACKAGED}component Sink {{ {} in messages; }}\n\
+         \n\
+         assembly Bridge(source: Channel) {{\n\
+         \x20   new consume: Sink {{\n\
+         \x20       grants = [mqtt];\n\
+         \x20       acl subscribe [exact source, topic_filter \"mqtt:bob_hub:house/#\"];\n\
+         \x20       acl publish [client \"mqtt:bob_hub\" {{ publish_capacity = 4 }}];\n\
+         \x20       in messages <- source;\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         {INGRESS}\
+         channel bar at \"ephemeral:bar\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         new demo: Bridge(source = bar){body}\n",
+        processor_header("mqtt"),
+    )
+}
+
+/// The ceiling names the same client and the same filter, and the budget tail
+/// the arrangement wrote is not part of what is compared: a ceiling caps reach,
+/// and the sink's window belongs on the entry that mints it.
+#[test]
+fn a_ceiling_covers_conferred_mqtt_reach() {
+    let config = derived(&packaged_bridge(
+        " { grants = [mqtt]; acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"]; \
+         acl publish [client \"mqtt:bob_hub\"]; }",
+    ));
+    assert_eq!(config.resolved.stamps.len(), 1);
+    assert_eq!(config.consumers[0].acl.mqtt_publish.len(), 1);
+    assert_eq!(config.consumers[0].acl.mqtt_subscribe.len(), 1);
+}
+
+/// A filter that differs is not narrower, it is other: there is no arithmetic
+/// over a topic filter, so a ceiling that names one filter consents to that
+/// filter and no other.
+#[test]
+fn a_ceiling_whose_topic_filter_differs_is_refused() {
+    let refusal = derive_refusal(&packaged_bridge(
+        " { grants = [mqtt]; acl subscribe [topic_filter \"mqtt:bob_hub:house/lamp\"]; \
+         acl publish [client \"mqtt:bob_hub\"]; }",
+    ));
+    assert_eq!(
+        refusal,
+        "`acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"]` on `demo.consume` reaches \
+         beyond what `Bridge` from `@fixtures` declares or was handed, and the stamp `demo` \
+         consents to none of it — add `acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"];` \
+         to the stamp if that reach is wanted"
+    );
+}
+
+// ── a refusal in consent text stops there ────────────────────────────────────
+//
+// Ceiling text the compiler could not read is not the ceiling the document
+// states, so nothing under it is judged against it. The refusal already
+// reported is the answer; a second one per conferred word would bury it.
+
+/// A mistyped word in a stamp's own ceiling is one message, not one per word
+/// the arrangement holds.
+#[test]
+fn a_refused_ceiling_word_suppresses_the_fit_check() {
+    assert_eq!(
+        derive_refusal(&packaged_page(" { grants = [dom, chrome, subscribe]; }")),
+        "`chrome` is not a grant word, so it caps nothing; a ceiling names `alert`, \
+         `config`, `dom`, `dynamic_subscribe`, `ephemeral_publish`, `ephemeral_subscribe`, \
+         `log`, `mqtt`, `page-dom`, `ports`, `publish`, `pwa_push`, `store`, `subscribe`, \
+         `takeover` or `tools`"
+    );
+}
+
+/// And a mistyped word in a *principal* is one message too, however many
+/// stamps and child principals are under it. A root principal that was refused
+/// holds the operator's empty authority, so judging anything against it would
+/// report every word every arrangement under it confers, each suggesting a fix
+/// to a principal that already holds the word.
+#[test]
+fn a_refused_principal_body_suppresses_everything_under_it() {
+    assert_eq!(
+        derive_refusals(&two_arrangements(
+            "principal ui { grants = [dom, subscribe, prots]; }\n\
+             principal narrow under ui { grants = [dom]; }\n\
+             new demo: Page(slug = \"demo\") under ui;\n\
+             new other: Page(slug = \"other\") under narrow;\n",
+        ))
+        .len(),
+        1
+    );
+}
+
+/// The same promise on the shape a packaged deployment tree makes normal: a
+/// nested stamp whose `under` is a `Principal` parameter, inside an enclosing
+/// stamp whose own ceiling was refused. The enclosing ceiling then holds what
+/// nobody wrote, so the handed principal is not compared against it — a
+/// comparison that would report the deployer's own ceiling words back at them
+/// as reach the ceiling does not hold, each with a fix that changes nothing.
+#[test]
+fn a_refused_enclosing_ceiling_suppresses_the_handed_principals_bound() {
+    let holder = "use @inner::*;\n\nassembly Holder(ui: Principal) {\n\
+                  \x20   new page: Inner(slug = \"demo\") under ui { grants = [dom]; }\n\
+                  }\n";
+    let refusals = derive_refusals_tree(&[
+        (
+            "",
+            "use @holder::*;\n\n\
+             principal wide { grants = [dom, subscribe]; }\n\
+             new demo: Holder(ui = wide) { grants = [dom, subscribe, prots]; }\n",
+        ),
+        ("@holder", holder),
+        ("@inner", INNER),
+    ]);
+    assert!(
+        refusals[0].starts_with("`prots` is not a grant word"),
+        "{refusals:?}"
+    );
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+}
+
+/// A line that reaches *further* than the axis it replaces is a widening, and
+/// exactly one message says so. The narrows-nothing rule is mutual coverage in
+/// both directions for this reason: a one-directional test fires here too, and
+/// telling the reader that a line which holds strictly more is a second
+/// spelling of what it replaced contradicts the excess refusal beside it.
+#[test]
+fn a_reach_line_that_widens_is_refused_once() {
+    let refusals = derive_refusals(&chain(&[
+        Link {
+            body: "    acl subscribe [prefix \"brenn:house.\", prefix \"brenn:shed.\"];\n",
+            words: "",
+            reach: "prefix \"brenn:house.\", prefix \"brenn:shed.\"",
+        },
+        Link {
+            body: "    acl subscribe [prefix \"brenn:house.\", prefix \"brenn:shed.\", \
+                   prefix \"brenn:barn.\"];\n",
+            words: "",
+            reach: "",
+        },
+    ]));
+    assert!(
+        refusals[0].starts_with("`barn.` is not reach `site` holds"),
+        "{refusals:?}"
+    );
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+}
+
+// ── consent text that consents to nothing ──────────────────────────
+//
+// The inverse direction, and the half that makes a stamp's ceiling a statement
+// of consent rather than a bound: a word or a line that caps nothing is
+// authority the deployment stated and the arrangement never asked for. Left
+// standing it outlives the bundle revision that needed it, and the next pin
+// bump that re-introduces that authority needs no new consent.
+
+/// A word no instance in the subtree holds.
+#[test]
+fn a_ceiling_word_the_arrangement_does_not_hold_is_dead() {
+    let source = packaged_page(" { grants = [dom, subscribe, tools]; }");
+    let errors = derive_errors(&source);
+    assert_eq!(
+        errors[0].message,
+        "`tools` caps nothing — no instance stamped by `Page` from `@fixtures` holds it; \
+         a ceiling word nothing reaches is dead config"
+    );
+    // At the word, which is the text to delete.
+    assert_eq!(errors[0].line_col(), at(&source, "tools]"));
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+}
+
+/// The description shape with a `grants` line written anyway: an arrangement
+/// that holds no capability is stamped with no list at all, and an empty one
+/// reads as though the deployment had something in mind.
+#[test]
+fn an_empty_grants_line_over_a_confer_nothing_arrangement_is_dead() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{PACKAGED}assembly Describe(slug: String) {{\n\
+             \x20   channel geometry at f\"brenn:surface.{{slug}}.geometry\" {{ push_depth = 1; retain_depth = 1; standing_retain_depth = 1; }}\n\
+             }}\n{PACKAGED}\
+             new demo: Describe(slug = \"demo\") {{ grants = []; }}\n"
+        )),
+        "no instance stamped by `Describe` from `@fixtures` holds a capability, so this \
+         `grants` line caps nothing; the stamp of an arrangement that holds no capability \
+         writes no `grants` line"
+    );
+}
+
+/// An `acl` line in a family the arrangement reaches nowhere.
+#[test]
+fn a_ceiling_line_in_a_family_the_arrangement_never_reaches_is_dead() {
+    let source = packaged_loop(" { grants = [ports]; acl publish [prefix \"brenn:demo.\"]; }");
+    let errors = derive_errors(&source);
+    assert_eq!(
+        errors[0].message,
+        "this `acl publish` line caps nothing `Loop` from `@fixtures` reaches in \
+         `brenn_publish` beyond its own channels and what it was handed; a ceiling line \
+         nothing needs is dead config"
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "publish [prefix"));
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+}
+
+/// And one that re-states reach the stamp already consented to by stamping the
+/// arrangement that declares the channel. Default reach is the reason the
+/// common case writes no `acl` line at all, so a line that only covers it is
+/// consent given twice.
+#[test]
+fn a_ceiling_line_over_the_arrangements_own_channel_is_dead() {
+    let refusal = derive_refusal(&packaged_loop(
+        " { grants = [ports]; acl publish [prefix \"ephemeral:demo.\"]; }",
+    ));
+    assert!(
+        refusal.starts_with("this `acl publish` line caps nothing"),
+        "{refusal}"
+    );
+}
+
+/// A stamp whose ceiling text was refused for what it says is judged in the
+/// inverse direction by nothing. The excess is the one message; a line that
+/// reaches beyond the principal and covers nothing the arrangement asked for
+/// would otherwise draw two refusals for one line, and the fix for the excess
+/// is what decides whether the line is really dead.
+#[test]
+fn a_refused_stamp_ceiling_is_not_also_judged_dead() {
+    let refusals = derive_refusals(&two_arrangements(
+        "principal ui { grants = [dom, subscribe]; }\n\
+         new demo: Page(slug = \"demo\") under ui { acl publish [prefix \"brenn:x.\"]; }\n",
+    ));
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("is not reach `ui` holds"),
+        "{refusals:?}"
+    );
+}
+
+/// A principal handed to a class that never writes `under` with it was
+/// delegated all the same: the dead text is the parameter the class dropped, in
+/// a file that may be the author's, and the deployer's declaration is not where
+/// to report it. So no refusal at the declaration.
+#[test]
+fn a_handed_principal_a_class_never_uses_is_not_refused_at_the_declaration() {
+    let config = derived_tree(&[
+        (
+            "",
+            "use @inner::*;\n\n\
+             principal demo_ui { grants = [dom, subscribe]; }\n\
+             assembly Deployment(ui: Principal) {\n\
+             \x20   new page: Inner(slug = \"demo\") { grants = [dom, subscribe]; }\n\
+             }\n\
+             new deployment: Deployment(ui = demo_ui);\n",
+        ),
+        ("@inner", INNER),
+    ]);
+    let handed: Vec<String> = config
+        .resolved
+        .handed_principals
+        .iter()
+        .map(|handle| handle.dotted())
+        .collect();
+    assert_eq!(handed, ["demo_ui"]);
+    assert!(
+        config
+            .resolved
+            .stamps
+            .iter()
+            .all(|stamp| stamp.under.is_none()),
+        "no stamp is under it, which is what the refusal would have read"
+    );
+}
+
+/// A stamp with no body of its own states nothing, so there is nothing that
+/// could be dead — the shape every description stamp has.
+#[test]
+fn a_stamp_with_no_body_is_judged_in_neither_direction() {
+    let config = derived(&two_arrangements(
+        "principal ui { grants = [dom, log, subscribe]; }\n\
+         new logger: Logger(slug = \"logger\") under ui;\n\
+         new demo: Page(slug = \"demo\") under ui;\n",
+    ));
+    assert_eq!(config.resolved.stamps.len(), 2);
+    assert!(config.resolved.stamps.iter().all(|stamp| !stamp.wrote_body));
+}
+
+/// A principal is judged by the union of everything under it, which is what
+/// makes one worth declaring rather than writing a ceiling per stamp: a word
+/// one arrangement narrows away is live text as long as another under the same
+/// principal holds it.
+#[test]
+fn a_word_one_arrangement_under_a_principal_holds_is_live() {
+    let tree = |stamps: &str| {
+        two_arrangements(&format!(
+            "principal ui {{ grants = [dom, log, subscribe]; }}\n{stamps}"
+        ))
+    };
+    let both = "new logger: Logger(slug = \"logger\") under ui;\n\
+                new demo: Page(slug = \"demo\") under ui { grants = [dom, subscribe]; }\n";
+    let config = derived(&tree(both));
+    assert_eq!(config.resolved.stamps.len(), 2);
+    // Take the arrangement that needs `log` away and the word caps nothing:
+    // the union is over what is there, not over what the deployment meant.
+    let refusal = derive_refusal(&tree(
+        "new demo: Page(slug = \"demo\") under ui { grants = [dom, subscribe]; }\n",
+    ));
+    assert!(refusal.starts_with("`log` caps nothing"), "{refusal}");
+}
+
+/// A word on a principal that no arrangement under it holds is dead config,
+/// refused where the deployment wrote it — the same rule a stamp's own ceiling
+/// is held to, over the union instead of over one subtree.
+#[test]
+fn a_principal_word_nothing_under_it_holds_is_refused() {
+    let source = two_arrangements(
+        "principal ui { grants = [dom, subscribe, tools]; }\n\
+         new demo: Page(slug = \"demo\") under ui;\n",
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(
+        messages(&errors),
+        [
+            "`tools` caps nothing — no arrangement under `ui` holds it; a ceiling word \
+          nothing reaches is dead config"
+        ]
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "tools"));
+}
+
+/// The same for reach: a line in a family nothing under the principal reaches
+/// beyond its own channels caps nothing, and is refused at the plane word.
+#[test]
+fn a_principal_line_nothing_under_it_needs_is_refused() {
+    let source = two_arrangements(
+        "principal ui {\n\
+         \x20   grants = [dom, subscribe];\n\
+         \x20   acl publish [prefix \"brenn:house.\"];\n\
+         }\n\
+         new demo: Page(slug = \"demo\") under ui;\n",
+    );
+    let errors = derive_errors(&source);
+    assert_eq!(
+        messages(&errors),
+        [
+            "this `acl publish` line caps nothing any arrangement under `ui` reaches in \
+          `brenn_publish` beyond its own channels and what it was handed; a ceiling line \
+          nothing needs is dead config"
+        ]
+    );
+    assert_eq!(errors[0].line_col(), at(&source, "publish [prefix"));
+}
+
+/// An empty `grants` list on a principal nothing under which holds a
+/// capability: the list is a statement, and the statement is that the
+/// deployment had something in mind.
+#[test]
+fn an_empty_grants_list_on_a_principal_that_delegates_none_is_refused() {
+    assert_eq!(
+        derive_refusal(&chain(&[Link {
+            body: "    grants = [];\n    acl subscribe [prefix \"brenn:house.\"];\n",
+            words: "",
+            reach: "prefix \"brenn:house.\"",
+        }])),
+        "no arrangement under `site` holds a capability, so this `grants` line caps \
+         nothing; a principal that delegates no capability writes no `grants` line"
+    );
+}
+
+/// A principal nothing is under delegates nothing, which makes every word and
+/// line it writes text about nothing at all. Refused where it is declared, as
+/// an unused `uuid_pin` is.
+#[test]
+fn a_principal_nothing_is_under_is_refused() {
+    let source = "principal ui {\n    grants = [dom];\n}\n";
+    let errors = derive_errors(source);
+    assert_eq!(
+        messages(&errors),
+        [
+            "`ui` delegates to nothing: no stamp is under it and no principal is declared \
+          under it, so the authority it writes reaches no arrangement"
+        ]
+    );
+    assert_eq!(errors[0].line_col(), at(source, "ui {"));
+}
+
+/// A chain that reaches no arrangement is one message at its leaf, not one per
+/// link: a principal with a child delegates through it, so the leaf is where
+/// the whole chain's failure to reach anything is reported. Reporting every
+/// ancestor, and then every word each of them wrote, is one mistake fanned out
+/// over a document.
+#[test]
+fn a_chain_that_reaches_nothing_is_refused_at_its_leaf() {
+    assert_eq!(
+        derive_refusal(
+            "principal site {\n    grants = [dom, log];\n}\n\
+             principal ui under site {\n    grants = [dom];\n}\n",
+        ),
+        "`ui` delegates to nothing: no stamp is under it and no principal is declared \
+         under it, so the authority it writes reaches no arrangement"
+    );
+}
+
+/// A principal whose own text was refused is judged in the inverse direction by
+/// nothing. The excess is the one message; reporting the words it wrote as dead
+/// beside it would be the same mistake told twice, and the fix for the excess
+/// is what decides whether any of them is really dead.
+#[test]
+fn a_refused_principal_body_is_not_also_judged_dead() {
+    let refusals = derive_refusals(&two_arrangements(
+        "principal ui { grants = [dom, log, subscribe]; }\n\
+         principal narrow under ui { grants = [dom, subscribe, tools]; }\n\
+         new logger: Logger(slug = \"logger\") under ui;\n\
+         new demo: Page(slug = \"demo\") under narrow;\n",
+    ));
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].starts_with("`tools` is not a word"),
+        "{refusals:?}"
+    );
+}
+
+// ── malformed consent text ───────────────────────────────────────────────────
+
+/// A `grants` value that is not a word list is refused where it is written, and
+/// the principal is withheld rather than half-read.
+#[test]
+fn a_malformed_grants_axis_on_a_principal_is_refused() {
+    assert_eq!(
+        derive_refusal("principal ui {\n    grants = \"dom\";\n}\n"),
+        "expected a list of bare words, found a string"
+    );
+}
+
+/// The same on a stamp, where the blast radius is larger: the `new` expands
+/// nothing, so every entity the arrangement would have emitted is absent. One
+/// message even so — a top-level `grant` naming a vanished entity does not
+/// earn a second.
+#[test]
+fn a_malformed_grants_axis_on_a_stamp_ceiling_is_refused() {
+    let source = format!(
+        "{}channel wide at \"ephemeral:wide\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         grant demo.page subscribe exact wide;\n",
+        packaged_page(" { grants = \"dom\"; }"),
+    );
+    assert_eq!(
+        derive_refusal(&source),
+        "expected a list of bare words, found a string"
+    );
+}
+
+// ── cycle shapes ─────────────────────────────────────────────────────────────
+//
+// The cycle refusal is what makes the derive pass's ordering walk sound: a
+// chain that does not bottom out is refused here, so the walk asserts it can
+// order every chain rather than tolerating one it cannot.
+
+/// The one-member cycle: a principal under itself.
+#[test]
+fn a_principal_under_itself_is_refused() {
+    assert_eq!(
+        derive_refusal("principal a under a {\n    grants = [dom];\n}\n"),
+        "`a` is under `a`; a chain of principals bottoms out at the operator"
+    );
+}
+
+/// Three members, which is the only shape that exercises the repetition in the
+/// reading.
+#[test]
+fn a_three_member_cycle_reads_the_whole_chain() {
+    assert_eq!(
+        derive_refusal(
+            "principal a under c {\n    grants = [dom];\n}\n\
+             principal b under a {\n    grants = [dom];\n}\n\
+             principal c under b {\n    grants = [dom];\n}\n",
+        ),
+        "`b` is under `a`, which is under `c`, which is under `b`; a chain of principals \
+         bottoms out at the operator"
+    );
+}
+
+/// A chain that *enters* a cycle from outside it is walked from every start,
+/// and the promise is one refusal for the cycle rather than one per start.
+#[test]
+fn a_cycle_reached_from_a_tail_is_refused_once() {
+    assert_eq!(
+        derive_refusal(
+            "principal c under b {\n    grants = [dom];\n}\n\
+             principal b under a {\n    grants = [dom];\n}\n\
+             principal a under b {\n    grants = [dom];\n}\n",
+        ),
+        "`a` is under `b`, which is under `a`; a chain of principals bottoms out at the \
+         operator"
+    );
+}
+
+// ── the `Principal` parameter's edges ────────────────────────────────────────
+
+/// A principal is a top-level declaration, so nothing stamps one and reaching
+/// under an instance handle for one names nothing.
+#[test]
+fn a_principal_argument_under_an_instance_handle_is_refused() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{PACKAGED}assembly Held(slug: String) {{\n\
+             \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
+             }}\n\
+             \n\
+             assembly Pod() {{ new inner: Held(slug = \"in\"); }}\n\
+             assembly Deployment(ui: Principal) {{ new held: Held(slug = \"d\") under ui; }}\n{PACKAGED}\
+             new pod: Pod();\n\
+             new deployment: Deployment(ui = pod.inner);\n"
+        )),
+        "parameter `ui` is a `Principal`; `pod.inner` is stamped by an instantiation, and a \
+         principal is a top-level declaration"
+    );
+}
+
+/// An `under` naming a segment under a principal names nothing, at a
+/// declaration and at a stamp alike.
+#[test]
+fn under_reaching_under_a_principals_name_is_refused() {
+    assert_eq!(
+        derive_refusal(
+            "principal site {\n    grants = [dom];\n}\n\
+             principal ui under site.x {\n    grants = [dom];\n}\n",
+        ),
+        "`site` is not an instance, so `.x` names nothing"
+    );
+    assert_eq!(
+        derive_refusal(&format!(
+            "principal ui {{ grants = [dom, subscribe]; }}\n{}",
+            packaged_page(" under ui.x;"),
+        )),
+        "`ui` is not an instance, so `.x` names nothing"
+    );
+}
+
+/// An assembly hands its own `Principal` parameter to a nested assembly's,
+/// which is the shape a real deployment tree has: one principal declared at the
+/// root and passed down. The stamp at the bottom is checked against that
+/// principal, which the refusal naming it is what proves.
+#[test]
+fn a_principal_parameter_forwards_through_a_nested_assembly() {
+    let tree = |grants: &str| {
+        format!(
+            "use @inner::*;\n\n\
+             principal demo_ui {{ grants = [{grants}]; }}\n\
+             assembly Middle(ui: Principal) {{\n\
+             \x20   new page: Inner(slug = \"demo\") under ui;\n\
+             }}\n\
+             assembly Deployment(ui: Principal) {{\n\
+             \x20   new middle: Middle(ui = ui);\n\
+             }}\n\
+             new deployment: Deployment(ui = demo_ui);\n"
+        )
+    };
+    let config = derived_tree(&[("", &tree("dom, subscribe")), ("@inner", INNER)]);
+    assert_eq!(
+        config.resolved.stamps[0].under.as_ref().map(|p| p.dotted()),
+        Some("demo_ui".to_string())
+    );
+    // The word taken away is refused against the principal the chain forwarded,
+    // not against an empty authority.
+    let refusals = derive_refusals_tree(&[("", &tree("subscribe")), ("@inner", INNER)]);
+    let refusal = only_refusal(&refusals);
+    assert!(
+        refusal.ends_with("so add `dom` to `demo_ui`, or stamp under a principal that holds it"),
+        "{refusal}"
+    );
+}
+
+/// The one message of a tree refused with exactly one.
+fn only_refusal(refusals: &[String]) -> &str {
+    match refusals {
+        [one] => one,
+        many => panic!("expected one refusal, found {many:?}"),
+    }
 }

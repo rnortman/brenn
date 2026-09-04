@@ -32,6 +32,7 @@ item := const_def:const_def
       | surface:surface_def
       | inst:new_stmt
       | remote:remote_def
+      | principal:principal_def
       | webhook:webhook_def
       | repo:repo_def
       | mqtt_client:mqtt_client_def
@@ -103,7 +104,7 @@ agent_class := doc:doc? , %"agent" : name:cname , params:param_list? , %"{" ,
 
 // An assembly stamps entities: channels, a surface, instances, and the grants
 // that wire its parameters. Not the whole top-level vocabulary — an `acl` here
-// would have no enclosing principal, and definitions here would open a second
+// would have no enclosing entity, and definitions here would open a second
 // definition-scoping regime; both are refused as syntax rather than parsed and
 // dropped.
 assembly_def := doc:doc? , %"assembly" : name:cname , params:param_list , %"{" , items:assembly_item* , %"}"  , ;
@@ -118,8 +119,11 @@ param_default := %"=" , value:value ;
 surface_def := doc:doc? , %"surface" : name:name , %"{" , (attrs:attr | acls:acl_stmt | insts:new_stmt)* , %"}"  , ;
 
 // One instantiation form for components, agents and assemblies: arguments for
-// the parameterized classes, a body for the ones configured per instance.
-new_stmt := doc:doc? , %"new" : handle:name , %":" , cls:path , args:arg_list? , body:inst_body? , semi:";"? , ;
+// the parameterized classes, a body for the ones configured per instance. On an
+// assembly stamp the body is the ceiling instead, and `under` names the
+// principal the stamp is under.
+new_stmt := doc:doc? , %"new" : handle:name , %":" , cls:path , args:arg_list? ,
+            under:under_clause? , body:inst_body? , semi:";"? , ;
 arg_list := %"(" , (args:arg , (%"," , args:arg)*)? , %")" ;
 arg := name:name , %"=" , value:value ;
 // `section` is last, exactly as the agent body orders it: it is identifier-led,
@@ -150,9 +154,19 @@ chan_ref := addr:str_like | handle:path ;
 acl_stmt := %"acl" : plane:name : matchers:matcher_list , %";" , ;
 matcher_list := %"[" , (items:matcher , (%"," , items:matcher)*)? , %"]" ;
 
-// Cross-principal: authority written about another principal, which is what an
-// assembly needs to wire its driver.
+// Cross-entity: authority written about another running entity, which is what
+// an assembly needs to wire its driver.
 grant_stmt := %"grant" : principal:path : plane:name : m:matcher , %";" , ;
+
+// A bare principal: authority with no running body, declared to be delegated
+// from. The body is `grants` and `acl` lines and nothing else — a principal is
+// authority, so a form that would give it behavior is refused as syntax.
+principal_def := doc:doc? , %"principal" : name:name , under:under_clause? ,
+                 %"{" , (attrs:attr | acls:acl_stmt)* , %"}" , ;
+
+// `under p` — the principal this one holds no more than. Written where a
+// declaration states whose authority it is attenuated from.
+under_clause := %"under" : parent:path ;
 
 // ── the remaining entities ───────────────────────────────────────────────────
 
@@ -337,5 +351,19 @@ line_comment := prefix:"//" . content:/([^\/\n][^\n]*)?/ . "\n" ;
 // between the doc's newline and the keyword, which is unavoidable when
 // declarations are indented inside blocks. Attachment is positional and always
 // to the following declaration; blank lines do not detach it.
+// A doc line's `nl` swallows its newline together with the next line's
+// indentation and any blank lines, so the lines of one multi-line `///` are
+// adjacent in the grammar however deeply the declaration is nested. Nothing
+// else fits between them: a `//` line there is a syntax error, because a
+// comment inside a doc comment has no meaning to give it and no place to
+// render. `brenn.fltkfmt` renders `nl` as a hard break, which lands every line
+// at the declaration's own indent, and drops the blank lines a doc block was
+// written with — a paragraph break inside one is an empty `///` line.
+//
+// The break is its own rule because a labelled item is what the unparser
+// recreates the source from, and a rule whose items are all terminals serves
+// its own text to the model; `doc_break` keeps `doc_line` a product rule of two
+// fields, of which the model reads the one that is content.
 doc := lines:doc_line+ ;
-doc_line := %"///" . text:/[^\n]*/ . %"\n" ;
+doc_line := %"///" . content:/[^\n]*/ . nl:doc_break ;
+doc_break := ws:/\n\s*/ ;

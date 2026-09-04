@@ -9,12 +9,24 @@
 set -uo pipefail
 
 names="$1"
-check="$2"
+gate="$2"
 record_lib="$3"
 emit="$4"
 export WIT_LIB="$5"
 emit_processor="$6"
+stage_lib="$7"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
+
+# The gate takes the staging body by path, as the assembler does — that is where
+# the names it looks for in the tree are written. Every case below drives it
+# through this wrapper so the path is stated once rather than at twenty call
+# sites.
+check="$tmp/bundle_check"
+cat > "$check" <<EOF
+#!/usr/bin/env bash
+exec "$gate" "\$@" --stage-lib "$stage_lib"
+EOF
+chmod +x "$check"
 failures=0
 
 fail() {
@@ -219,6 +231,44 @@ reject "a module no package stands behind" \
 build_tree "$tree"; printf 'notes\n' > "$tree/modules/README.txt"
 reject "a file in the module root that is not a module" \
     "modules/README.txt is not a .brenn module" --manifest "$manifest"
+
+# ---------------------------------------------------------------------------
+# The listed half of the module root
+# ---------------------------------------------------------------------------
+# A library module is owed by a list rather than by a component, so the
+# pair-it-with-an-owner rule above cannot pass it and the list is the only thing
+# that can. Every way the list and the tree can disagree reaches a host as
+# vocabulary a config resolves in the build and nowhere on the target.
+build_tree "$tree"
+printf 'assembly Commons() {}\n' > "$tree/modules/commons.brenn"
+printf 'commons.brenn\n' > "$tree/modules/library-modules.txt"
+if ! "$check" "$names" "$record_lib" "$tree" --manifest "$manifest" > "$tmp/listed.log" 2>&1; then
+    fail "a listed library module should pass: $(cat "$tmp/listed.log")"
+fi
+
+build_tree "$tree"; printf 'absent.brenn\n' > "$tree/modules/library-modules.txt"
+reject "a listed name with no file" \
+    "lists absent.brenn, but modules/absent.brenn is missing or empty" --manifest "$manifest"
+
+build_tree "$tree"; printf 'shipped.brenn\n' > "$tree/modules/library-modules.txt"
+reject "a listed name that is also a package's specification" \
+    "one module has one owner" --manifest "$manifest"
+
+build_tree "$tree"; printf 'notes.txt\n' > "$tree/modules/library-modules.txt"
+printf 'notes\n' > "$tree/modules/notes.txt"
+reject "a listed name that is not a module" \
+    "lists notes.txt, which is not a .brenn module" --manifest "$manifest"
+
+build_tree "$tree"; : > "$tree/modules/library-modules.txt"
+reject "an empty list" \
+    "library-modules.txt is empty" --manifest "$manifest"
+
+# The unlisted, unowned module is still refused, and the refusal names both
+# ways a module can be accounted for — a reader who added the file and forgot
+# the list needs to be told the list exists.
+build_tree "$tree"; printf 'assembly Commons() {}\n' > "$tree/modules/commons.brenn"
+reject "an unlisted, unowned module" \
+    "is listed by no library-modules.txt" --manifest "$manifest"
 
 # The candidate globs are what a caller with a placement of its own states
 # instead of the defaults; stating one that matches nothing must not quietly

@@ -1,0 +1,6 @@
+// A ceiling missing a word the arrangement holds. The refusal names the word,
+// the instance that holds it, and writes the whole line the deployment needs.
+
+use @panel::*;
+
+new demo: Page(slug = "demo") { grants = [subscribe]; }

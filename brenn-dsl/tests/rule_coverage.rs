@@ -45,9 +45,12 @@ const NOT_IN_A_FIXTURE: &[(&str, &str)] = &[(
 /// that every shape of it is. The suites that read these fixtures are what
 /// assert what the rule produces.
 ///
-/// `None` is for the four rules every non-empty document reaches — the goal
-/// rule, its item sum, an identifier, a value — where no snippet discriminates
-/// anything and one would only pretend to.
+/// `None` is for a rule no snippet can discriminate, and only for that: the goal
+/// rule and its item sum, which every non-empty document reaches; an identifier
+/// and a value, which every construct is built from; and a rule with no text of
+/// its own, such as the break between two `///` lines. A snippet for any of
+/// these would name text some other rule produces, so the row states the reason
+/// instead.
 const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
     // The document and its declaration vocabulary.
     ("file", "lexical.brenn", None),
@@ -154,6 +157,12 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         "grant_stmt",
         "statements.brenn",
         Some("grant driver subscribe"),
+    ),
+    ("principal_def", "statements.brenn", Some("principal ui {")),
+    (
+        "under_clause",
+        "statements.brenn",
+        Some("principal ui_readonly under ui"),
     ),
     // The remaining entities.
     ("remote_def", "statements.brenn", Some("remote reachy00 {")),
@@ -269,6 +278,11 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         "lexical.brenn",
         Some("/// Second line of the same doc comment."),
     ),
+    // The break between two `///` lines has no text of its own to match on: it
+    // is the newline, the next line's indentation and any blank lines between
+    // them. The fixture that reaches it is the one whose doc comment has a
+    // second line.
+    ("doc_break", "lexical.brenn", None),
 ];
 
 /// Every rule the table accounts for, exempt or covered.

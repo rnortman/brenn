@@ -9,6 +9,7 @@ mod support;
 use std::path::PathBuf;
 
 use brenn_dsl::diag::Diagnostic;
+use brenn_dsl::resolved::StampId;
 use brenn_dsl::{DocumentInputs, compile};
 
 /// One fixture tree's root file.
@@ -67,6 +68,20 @@ fn one_error_with(tree: &str, module_roots: &[PathBuf]) -> String {
 
 fn messages(errors: &[Diagnostic]) -> Vec<&str> {
     errors.iter().map(|error| error.message.as_str()).collect()
+}
+
+/// The basename of the file a span is in — which file a refusal is anchored in
+/// is the fact these trees exist to pin, and the leading directories are the
+/// sandbox's.
+fn filename(span: &brenn_dsl::Span) -> String {
+    let path = span
+        .filename_inner()
+        .expect("a fixture span names its file");
+    PathBuf::from(path)
+        .file_name()
+        .expect("a filename")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[test]
@@ -343,7 +358,7 @@ fn an_instantiation_reaches_an_imported_module_s_stamped_entities() {
         config
             .grants
             .iter()
-            .map(|grant| grant.principal.dotted())
+            .map(|grant| grant.target.dotted())
             .collect::<Vec<_>>(),
         ["alice.pa"]
     );
@@ -370,7 +385,7 @@ fn an_instantiation_in_one_module_waits_for_one_in_another() {
         config
             .grants
             .iter()
-            .map(|grant| grant.principal.dotted())
+            .map(|grant| grant.target.dotted())
             .collect::<Vec<_>>(),
         ["alice.pa"]
     );
@@ -508,4 +523,150 @@ fn an_unreadable_root_is_refused_beside_readable_ones() {
         "{}",
         errors[0].message
     );
+}
+
+// ── stamp ceilings across real module roots ──────────────────────────────────
+//
+// The in-memory suites share one packaged module by fixture convention; these
+// trees are what a deployment actually has — an author's module under a module
+// root, a tree module of the deployment's own, and a root document that stamps.
+// Which file a refusal is anchored in is the fact worth pinning here: a ceiling
+// is the deployment's line, and reach the arrangement asked for is the author's.
+
+/// The common case, end to end: the words the arrangement holds, and no `acl`
+/// line at all because the only address it reaches is the one it declares.
+#[test]
+fn a_ceiling_over_a_packaged_arrangement_compiles() {
+    let output = compile(&inputs("pkg-ceiling-ok", &[modules("pkg-ceiling-ok")]))
+        .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    // One recorded stamp — the boundary — and the surface it stamped out.
+    assert_eq!(output.resolved.stamps.len(), 1);
+    assert_eq!(output.resolved.surfaces.len(), 1);
+    assert_eq!(
+        output.resolved.stamps[0].package.as_deref(),
+        Some("panel"),
+        "the stamp records the module that declared the assembly",
+    );
+}
+
+/// A word the arrangement holds and the ceiling does not: the refusal is in the
+/// root document, where the line goes, and the author's `grants` word is the
+/// related site.
+#[test]
+fn a_word_beyond_a_ceiling_is_refused_in_the_root_document() {
+    let errors = errors_with("pkg-ceiling-words", &[modules("pkg-ceiling-words")]);
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert_eq!(
+        errors[0].message,
+        "stamping `Page` from `@panel` confers `dom` on `demo.page.panel`, which this \
+         stamp's ceiling does not cover: a packaged arrangement holds what the deployment \
+         stamps it with, so write it — `grants = [dom, subscribe];`"
+    );
+    assert_eq!(filename(&errors[0].span), "main.brenn");
+    assert_eq!(filename(&errors[0].related[0].1), "panel.brenn");
+}
+
+/// Reach the arrangement asked for and the ceiling does not hold: the other
+/// direction of the same anchoring rule — the refusal is in the author's file,
+/// which is the only place a reader can see what was asked for, and the stamp
+/// in the root is the related site.
+#[test]
+fn reach_beyond_a_ceiling_is_refused_in_the_authors_module() {
+    let errors = errors_with("pkg-ceiling-reach", &[modules("pkg-ceiling-reach")]);
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert!(
+        errors[0].message.starts_with(
+            "`acl subscribe [prefix \"brenn:house.\"]` on `demo.page` reaches beyond what \
+             `Page` from `@panel` declares or was handed"
+        ),
+        "{}",
+        errors[0].message
+    );
+    assert_eq!(filename(&errors[0].span), "panel.brenn");
+    assert_eq!(errors[0].related[0].0, "stamped here");
+    assert_eq!(filename(&errors[0].related[0].1), "main.brenn");
+}
+
+/// Two packaged modules deep, the inner `new` writing nothing: it records no
+/// stamp, so the one ceiling in the root covers both arrangements' words.
+#[test]
+fn one_ceiling_covers_a_nested_packaged_stamp() {
+    let output = compile(&inputs(
+        "pkg-ceiling-nested",
+        &[modules("pkg-ceiling-nested")],
+    ))
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    assert_eq!(output.resolved.stamps.len(), 1);
+    // The inner arrangement's surface and the outer arrangement's consumer both
+    // belong to that one boundary.
+    assert_eq!(output.resolved.surfaces[0].stamp, Some(StampId(0)));
+    assert_eq!(output.resolved.consumers[0].stamp, Some(StampId(0)));
+}
+
+/// A channel handed in as an argument is reach the deployment consented to by
+/// naming it, and no more: the author's prefix over it reaches addresses the
+/// argument list says nothing about.
+#[test]
+fn a_prefix_over_a_handed_channel_is_refused() {
+    let errors = errors_with("pkg-ceiling-handed", &[modules("pkg-ceiling-handed")]);
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert!(
+        errors[0]
+            .message
+            .contains("reaches beyond what `Loop` from `@loop` declares or was handed"),
+        "{}",
+        errors[0].message
+    );
+}
+
+/// The inverse direction over a real tree: a ceiling word nothing reaches and
+/// an `acl` line in a family the arrangement never touches, each refused where
+/// the deployment wrote it.
+#[test]
+fn dead_ceiling_text_is_refused_where_the_deployment_wrote_it() {
+    let errors = errors_with("pkg-ceiling-dead", &[modules("pkg-ceiling-dead")]);
+    assert_eq!(
+        messages(&errors),
+        [
+            "`tools` caps nothing — no instance stamped by `Page` from `@panel` holds it; a \
+             ceiling word nothing reaches is dead config",
+            "this `acl publish` line caps nothing `Page` from `@panel` reaches in \
+             `brenn_publish` beyond its own channels and what it was handed; a ceiling line \
+             nothing needs is dead config",
+        ]
+    );
+    for error in &errors {
+        assert_eq!(filename(&error.span), "main.brenn");
+    }
+}
+
+/// The shape a deployment tree has: the principal declared once in the root, a
+/// tree assembly that takes it as a parameter, and three stamps of a packaged
+/// assembly under it — one narrowing, one taking it whole, and one holding the
+/// word the first narrows away, which is what keeps that word live text.
+#[test]
+fn a_principal_reaches_a_packaged_stamp_through_a_tree_assembly() {
+    let output = compile(&inputs(
+        "pkg-ceiling-principal",
+        &[modules("pkg-ceiling-principal")],
+    ))
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    assert_eq!(output.resolved.principals.len(), 1);
+    assert_eq!(output.resolved.stamps.len(), 3);
+    // Both stamps resolved the parameter through to the declaration, which is
+    // the handle a refusal about either of them would name.
+    for stamp in &output.resolved.stamps {
+        assert_eq!(
+            stamp.under.as_ref().map(|under| under.dotted()).as_deref(),
+            Some("ui")
+        );
+    }
+    // Nothing lowers a bare principal: the three arrangements produce exactly
+    // these entities, so a principal reaching the derived config as an entity
+    // of any family moves one of these counts. The empty agent list alone would
+    // hold for a reason unrelated to principals — the tree declares no agent.
+    assert_eq!(output.surfaces.len(), 2);
+    assert_eq!(output.consumers.len(), 1);
+    assert_eq!(output.resolved.channels.len(), 3);
+    assert!(output.agents.is_empty());
 }

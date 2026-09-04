@@ -19,7 +19,7 @@ tree says so in its syntax (*Packaged-module imports*, below).
 
 ```
 use config::bar::*;
-use config::surfaces::*;
+use @surface-description::*;
 use @chrome::*;
 ```
 
@@ -101,21 +101,51 @@ assembly DemoLoop(slug: String, source: Channel) {
 }
 
 // Written by the deployment:
-new demo: DemoLoop(slug = "demo", source = feed);
+new demo: DemoLoop(slug = "demo", source = feed) { grants = [ports]; }
 ```
 
 The author ships the arrangement; the deployment chooses to stamp it. The `new`
 is where consent lives, and it is always the deployment's line.
 
-**Stamping a packaged assembly accepts everything its body declares**, including
-authority the deployment never spells out. An assembly body admits `grant` and
-`surface` alongside its channels, links and instances, and the declarations-only
-discipline does not look inside one — it refuses those forms at a packaged
-module's top level, where they would take effect on import, and admits them
-inside an assembly, where nothing happens until someone writes `new`. So a
-deployment's one-line `new` may confer grants, and open a surface, that appear
-only in the author's file. Read a packaged assembly before stamping it, the way
-you would read any other thing you are about to authorize.
+**A stamp of a packaged assembly states what it accepts.** An assembly body
+admits `grant` and `surface` alongside its channels, links and instances, and
+the declarations-only discipline does not look inside one — it refuses those
+forms at a packaged module's top level, where they would take effect on import,
+and admits them inside an assembly, where nothing happens until someone writes
+`new`. So a one-line `new` can confer capability words, open a surface, and
+widen the deployment's own agent, all of it written in a file the deployment
+does not own.
+
+That is why the body on the stamp above is not decoration. It is the stamp's
+**ceiling**: the authority the deployment consents to the arrangement holding.
+The compiler works out what the arrangement actually confers — every capability
+word, every attach word, every `acl` entry and every `grant` it emits — and
+refuses the difference in both directions. Nothing beyond the ceiling, and
+nothing in the ceiling that caps nothing.
+
+Two things need no ceiling text, which is why most stamps have none. An
+arrangement that holds no capability writes no `grants` line — the shape every
+surface-description stamp has. And the channels an arrangement declares, plus
+the channels the deployment handed it as `Channel` arguments, are reach it
+already consented to by stamping and by passing, so they need no `acl` line
+either. `DemoLoop` above declares its own `out` and was handed `source`; one
+word is all it takes.
+
+Where the ceiling comes from is *Authority*, below: a stamp writes one, or names
+a `principal` with `under`, or both. Reading the author's file is still how you
+decide whether you want the arrangement; it is no longer how you find out what
+it takes. The refusal writes the line for you:
+
+```
+stamping `DemoLoop` from `@processor-demo` confers `ports` on `demo.consume`,
+which this stamp's ceiling does not cover: a packaged arrangement holds what the
+deployment stamps it with, so write it — `grants = [ports];`
+```
+
+The same refusal is what a pin bump surfaces. A new bundle revision whose
+arrangement grew a grant word or an `acl` line turns the next `config-check`
+into a refusal naming the word and the stamp — authority a bundle grows is
+authority the deployment re-consents to, before any host is touched.
 
 ### Settings sections
 
@@ -260,6 +290,12 @@ use site, not in the constant. Constants are file-scoped wherever in the file
 they are written; the convention is to keep them together at the foot of the
 module.
 
+A constant stands in every position a literal of its type does, depths included.
+One name is reserved: `unbounded` is the word a depth spells an unbounded window
+with, so a constant or a parameter of that spelling is refused at its
+declaration — otherwise a reader would have to know the resolution order to tell
+which of the two a depth meant.
+
 A dotted reference reads into a table (`alice_env.DATA_DIR`) or into an
 instantiated assembly (`alice-desk.layout`).
 
@@ -286,6 +322,25 @@ matcher over a system-minted family, possibly a prefix — which says something
 about channels the system creates rather than creating one. A handle and a
 literal address are disjoint spellings: a channel that is declared is referred
 to by its handle, never by re-spelling its address.
+
+A depth — `push_depth`, `retain_depth`, `standing_retain_depth`, and a surface
+instance's `parked_batch_depth` — takes a count, the word `unbounded`, or a name
+that resolves to a count: a constant, a table field of one, or an `Int` parameter
+of the enclosing assembly. The last is why one would: a packaged assembly can
+declare a channel whose retention is the stamping deployment's judgment rather
+than the author's, as `SurfaceCommons` does —
+
+```
+assembly SurfaceCommons(errors_retain: Int = 100, errors_standing: Int = 100) {
+  channel surface_errors at "brenn:surface-errors" {
+    retain_depth = errors_retain;
+    standing_retain_depth = errors_standing;
+  }
+}
+```
+
+— and a deployment that wants a longer window writes it at the stamp instead of
+copying the module.
 
 `standing_retain_depth` is not an optional tuning: it is the disk reaper's
 frontier, so every durable (`brenn:`) channel must state it and every other
@@ -612,9 +667,9 @@ authored** — nothing is derived from wiring.
 ### Assemblies
 
 An assembly is a parameterized group of entities, stamped once per deployment of
-the pattern. It may stamp channels, a surface, instances, and cross-principal
-grants — not definitions, and not an `acl` (which would have no enclosing
-principal).
+the pattern. It may stamp channels, a surface, instances, and grants about
+another entity — not definitions, and not an `acl` (which would have no
+enclosing entity to be about).
 
 ```
 assembly Deskbar(slug: String, driver: Agent) {
@@ -645,10 +700,49 @@ new alice-desk: Deskbar(slug = "alice-desk", driver = alice-pa);
 ```
 
 Parameters are typed — `String`, `Int`, `Bool`, `Table`, `Channel`, `Agent`,
-`Repo` — and may carry defaults. An entity parameter is what lets a stamping
-carry its whole footprint, authority included, instead of leaving half of it in
-the agent class. An assembly earns its place at the **second** stamping within
-one document; a single stamping stays longhand.
+`Principal`, `Repo` — and may carry defaults. An entity parameter is what lets a
+stamping carry its whole footprint, authority included, instead of leaving half
+of it in the agent class. An assembly earns its place at the **second** stamping
+within one document; a single stamping stays longhand.
+
+A stamp takes a **ceiling** as well as arguments — what the arrangement it
+stamps may hold (*Authority*, *Principals*). Three forms, in the order a
+document usually reaches for them:
+
+```
+new demo: DemoLoop(slug = "demo", source = feed);                       // nothing written
+new demo: DemoLoop(slug = "demo", source = feed) { grants = [ports]; }  // a ceiling
+new page: Page(slug = "demo") under ui;                                 // exactly `ui`
+new page: Page(slug = "demo") under ui { grants = [dom]; }              // less than `ui`
+```
+
+`under <name>` names the principal the stamp is under; a body narrows what it
+hands down. A body with `under` and nothing to narrow is refused — `under ui;`
+is how a stamp says "exactly `ui`" — and so is a body that narrows nothing.
+Anything in a stamp's body other than `grants` and `acl` is refused too:
+per-instance values are assembly parameters, and a stamp's body is its ceiling.
+
+A `Principal` parameter is the only way an assembly body can name a principal,
+the way an `Agent` parameter is the only way it can name an agent, and it is
+legal only as the target of `under`. Which is the shape a deployment tree has:
+the principal is declared once at the root, handed to the assembly, and the
+stamps inside it are `under` the parameter.
+
+```
+// the root document
+principal demo_ui { grants = [dom, log, page-dom, ports, publish, subscribe]; }
+new deployment: DemoDeployment(ui = demo_ui);
+
+// the assembly
+assembly DemoDeployment(ui: Principal) {
+  new demo: DemoPage(slug = "demo") under ui { grants = [dom, log, page-dom, ports]; }
+  new split: DemoSplitPage(slug = "demo-split") under ui;
+}
+```
+
+`under` and a ceiling apply to an assembly stamp only. A component instance
+holds what its own `grants` and bindings say, so `under` on one is refused, as
+it is on an agent.
 
 ### Attachers and ingress
 
@@ -673,7 +767,7 @@ Five more declarations, each a body of attrs:
 
 Authority is written in two layers, and both are deny-by-default.
 
-**Layer 1, `grants`** — what a principal holds, in the vocabulary its own
+**Layer 1, `grants`** — what a running entity holds, in the vocabulary its own
 entity type states.
 
 A component instance's grants name capabilities: `ports`, `store`, `log`,
@@ -684,7 +778,7 @@ page has no `store` and no `mqtt`, a top-level consumer has no page to take
 over — and the illegal word is refused by name at the instance rather than left
 out of the vocabulary.
 
-A `surface` or a `remote` — the two attach-route principals, a browser page and
+A `surface` or a `remote` — the two attach-route entities, a browser page and
 a native daemon — writes **plane** words instead: `subscribe`, `publish`, and
 `alert`. A plane is one word here and one right per address scheme in the config
 it lowers to, so `subscribe` covers the durable and the ephemeral scheme at
@@ -709,9 +803,11 @@ acl subscribe [
 the family it names — a channel *tuning* prefix is required to, and an ACL
 prefix that does not is a wider grant than it looks. A matcher may carry an
 inline-table tail (`prefix "…" { push_depth = 4, retain_depth = 64 }`) where the
-subscription's depths belong with the scope. `grant <principal> <plane> <matcher>;` is the cross-principal
-form — authority written *about* another principal, which is what an assembly
-needs to wire its driver.
+subscription's depths belong with the scope. `grant <entity> <plane> <matcher>;`
+is the cross-entity form — authority written *about* another running entity,
+which is what an assembly needs to wire its driver. It names a running entity,
+never a `principal` (*Principals*, below): a principal's authority is its own
+body, and a grant widens something that runs.
 
 A `client` entry on a top-level component's publish plane may carry a tail too,
 and it tunes the MQTT egress sink that entry mints:
@@ -724,7 +820,7 @@ Both keys are optional and both are token counts, spelled as the `out` binding
 spells the same two knobs; an entry with no tail leaves the sink on the
 runtime's default budget. One client is one sink, so two budgeted entries naming
 one client are refused, and only a top-level component holds a sink of its own —
-the tail on any other principal's `client` entry is refused too.
+the tail on any other entity's `client` entry is refused too.
 
 A component states no plane at all: its transport rights are read off its
 bindings and ACL entries. Two of its capability words therefore pair with
@@ -766,6 +862,89 @@ A class requiring `store` placed on a surface refuses twice, once for host
 legality and once for the missing grant. Both diagnostics are true and point at
 the same contradiction.
 
+### Principals
+
+Everything above is authority a running entity holds. A **principal** is
+authority and nothing else — a declared bundle of grant words and reach, with no
+runtime body, that exists to be delegated from. Nothing lowers one; it is a
+compile-time statement about what the deployment is willing to hand out.
+
+```
+/// Every UI arrangement this deployment hosts holds at most this: the page
+/// words, and the household families on both planes.
+principal ui {
+  grants = [dom, log, page-dom, ports, publish, subscribe];
+  acl subscribe [prefix "brenn:house."];
+  acl publish [prefix "brenn:house."];
+}
+
+/// Fewer words, the same reach.
+principal ui_readonly under ui { grants = [dom, log, page-dom, ports]; }
+
+/// The same words, publish narrowed to the command family.
+principal household under ui { acl publish [prefix "brenn:house.cmd."]; }
+```
+
+The body is `grants` and `acl` lines and nothing else, and the words come from
+every grant vocabulary at once: `page-dom` beside `ephemeral_subscribe`, and the
+one spelling the two vocabularies share, `alert`, covering both a component's
+alert capability and a surface's alert attach right. Both words consent to the
+same consequence — this arrangement may page the operator — so a deployment
+spells that consent once.
+
+**`under` delegates, and delegation only narrows.** One relation, *attenuation*,
+holds the whole chain together: a principal declared under another holds no more
+than its parent, a stamp's ceiling holds no more than the principal it is under,
+a nested stamp's ceiling holds no more than the enclosing one, and what a stamp
+confers holds no more than its ceiling. The operator is the unnamed root of
+every chain, and the operator's authority **cannot be inherited**: a principal
+or a ceiling written directly under the operator holds exactly what it writes,
+and an axis it does not write is empty.
+
+Each axis is written or inherited, independently. A `grants` line replaces the
+inherited words; an `acl` line replaces the inherited entries of the family it
+resolves to. Replacement, not intersection — what the reader sees is what the
+principal holds, and the compiler proves it fits rather than computing something
+the text does not show. Two consequences worth stating plainly, because the
+refusals lean on them: **everything a chain will ever delegate is written at the
+chain's root**, and a word or a family of reach cannot first appear below it.
+`household` above narrows a family `ui` wrote; had `ui` written no `acl` lines,
+`household`'s line would be excess over an empty axis and refused.
+
+Subsumption on the reach axis is deliberately literal: exact under exact by
+equality, exact under prefix by string prefix, prefix under prefix the same way,
+and prefix under exact never. Endpoints and MQTT topic filters compare as
+strings — a wildcard ceiling is written as the same wildcard, with no
+topic-filter arithmetic. A `local:` family is held by nothing, so it is refused
+in a ceiling: a confined channel reaches the one component that binds it and is
+authorized by the host that serves it.
+
+**Consent text that consents to nothing is refused**, so what a reader sees is
+true. A written axis identical to the one it replaces narrows nothing. A ceiling
+word no instance in the stamp's subtree holds caps nothing, and so does
+`grants = [];` over an arrangement that holds no capability. An `acl` line in a
+family the arrangement reaches nowhere beyond its own and its handed channels
+caps nothing either. Each is dead config and each is refused where it is
+written.
+
+A `principal` is held to the same two tests, but over the **union** of every
+stamp under it — its own, and those under the principals declared under it.
+That union is what makes a principal worth declaring once instead of writing a
+ceiling per stamp: a word one arrangement narrows away is live text as long as
+another arrangement under the same principal holds it, and it is dead only when
+none of them does. A principal nothing is under at all — no stamp names it in
+`under`, no principal is declared under it — delegates nothing, so every word
+and line it writes is text about nothing; that is refused where it is declared.
+A chain that reaches no arrangement is one message at its leaf rather than one
+per link, since a principal with a child delegates through the child.
+
+A `principal` is a top-level declaration of the deployment's own text. A
+packaged module declares none — the consent would then be the author's words,
+and a pin bump could widen it without a character changing in the deployment's
+file — and an assembly declares none either, since a definition inside an
+assembly body would open a second definition-scoping regime. An assembly reaches
+a principal the way it reaches an agent: as a parameter (*Assemblies*).
+
 ## Ownership
 
 **The component specification is owned by the component's author, in full.** The
@@ -775,7 +954,8 @@ builds the artifact is in a position to make them. A deployment does four things
 and no more: it **instantiates**, **wires**, **grants**, and **consents**. The
 first of those carries the other three whenever it stamps a packaged assembly:
 the wiring and the grants may be written in the author's file, and the
-deployment's `new` is the consent to all of it (*Packaged-module imports*).
+deployment's `new` — with the ceiling on it — is the consent to all of it
+(*Packaged-module imports*, *Principals*).
 
 That division is why a deployment does not hold the specification at all. It
 **imports the author's module** — `use @<kind>::*;` — from the module root its

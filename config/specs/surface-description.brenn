@@ -1,0 +1,106 @@
+/// The two channels every surface-serving deployment publishes on, whatever
+/// surfaces it declares: the error lane and the topology index. brenn's, not
+/// the deployer's — the addresses, the depths' shape and the set are what the
+/// kernel publishes and `validate_surface_description_set` requires.
+///
+/// Errors are facts, not signals: a report that rotates out before anyone reads
+/// it is the outage the channel exists to describe. `errors_standing` has to
+/// clear one surface's admitted send burst (`SURFACE_SEND_BURST`,
+/// `brenn-lib/src/messaging/config.rs`), or a single fully-admitted burst
+/// rotates every earlier report off disk before the budget refills — the boot
+/// check warns at `standing <= SURFACE_SEND_BURST`. The default is four of
+/// those bursts, which is the window a deployment gets without thinking about
+/// it; raise it at the stamp when more surfaces than that report here, since
+/// how many do is the deployment's fact. Both depths are the stamp's to give.
+///
+/// The index is depth 1 by nature — it is latest-wins topology, and message
+/// N + 1 subsumes message N.
+assembly SurfaceCommons(errors_retain: Int = 100, errors_standing: Int = 1024) {
+  channel surface_errors at "brenn:surface-errors" {
+    description = "Surface client error reports (trusted republish)";
+    push_depth = 1;
+    retain_depth = errors_retain;
+    standing_retain_depth = errors_standing;
+  }
+  channel surface_index at "brenn:surface.index" {
+    description = "Surface topology index (system-published, latest-wins)";
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+  }
+
+}
+
+/// The four self-description channels one surface carries: the boot-published
+/// help document, the geometry and status the shell reports, and the bindings
+/// document the shell replays on every attach.
+///
+/// Help is depth 1 because it is regenerated from configuration and the
+/// component sidecars on every boot, so a deeper window would hold N
+/// near-identical copies, one per restart.
+///
+/// Geometry and status are written forever — geometry per resize, status per
+/// heartbeat — so both windows must be bounded or the database grows without
+/// limit, and the boot check refuses unbounded outright. Bounded is not
+/// necessarily 1: status carries overlay holdership, the only path by which a
+/// fullscreen-wedged bar becomes visible to an operator, and at depth 1 an
+/// operator can see that a bar is wedged *now* but never that it was wedged
+/// while they were away. How long "while they were away" is, and how often the
+/// deployment heartbeats, are the deployment's facts — hence the two
+/// parameters, each setting its channel's retained and standing windows
+/// together. `push_depth` stays 1 on both: a heartbeat subsumes its
+/// predecessor, so being woken with the newest is correct — the window is for
+/// reading back, not for waking.
+///
+/// The bindings channel is ephemeral because the document is rebuilt from
+/// configuration at every boot, and a durable copy could only preserve a stale
+/// document the next boot overwrites. One per surface is mandatory; boot is
+/// fatal without it. On a non-durable channel the retained window *is* the
+/// standing buffer, so there is no third number and no uuid.
+assembly SurfaceDescription(slug: String,
+  geometry_retain: Int = 1,
+  status_retain: Int = 1) {
+  channel help at f"brenn:surface.surface.{slug}.help" {
+    description = f"Surface help: {slug}";
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+  }
+  channel geometry at f"brenn:surface.surface.{slug}.geometry" {
+    description = f"Surface geometry: {slug}";
+    push_depth = 1;
+    retain_depth = geometry_retain;
+    standing_retain_depth = geometry_retain;
+  }
+  channel status at f"brenn:surface.surface.{slug}.status" {
+    description = f"Surface status: {slug}";
+    push_depth = 1;
+    retain_depth = status_retain;
+    standing_retain_depth = status_retain;
+  }
+  channel bindings at f"ephemeral:surface.surface.{slug}.bindings" {
+    description = f"Surface bindings document: {slug}";
+    push_depth = 1;
+    retain_depth = 1;
+  }
+
+}
+
+/// The help and schema documents one component kind carries. Keyed by kind, not
+/// by surface, so every surface declaring that kind reads the same pair. Both
+/// are depth 1 for the reason a surface's help document is.
+assembly KindDescription(kind: String) {
+  channel help at f"brenn:surface.kind.{kind}.help" {
+    description = f"Kind help: {kind}";
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+  }
+  channel schema at f"brenn:surface.kind.{kind}.schema" {
+    description = f"Kind schema: {kind}";
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+  }
+
+}

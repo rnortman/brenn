@@ -1,5 +1,31 @@
 # TODOs
 
+## `library-module-body-gate`
+
+`library_module_test` (`bazel/wasm/defs.bzl`) compiles a one-line root document
+`use @<name>::*;` against the module's own directory. That proves the module
+parses and that its **top-level** statements satisfy the packaged subset — a
+top-level channel, an instance, a principal. It proves nothing about an
+assembly's body: a body is resolved only when something stamps it
+(`expand_assemblies`), and a root that stamps nothing never expands one.
+
+So the class of error the depth-name work introduced is invisible to the gate —
+`retain_depth` naming a `String` parameter, an undeclared constant, or a
+`Channel` parameter inside an assembly the module declares. The first reader of
+it is a deployment's `config-check`, or its boot.
+
+Closing it is a choice between two shapes, which is why it is an entry and not
+a patch: the macro grows a required `stamps` argument of one-line `new`
+statements (a build-API change every out-of-tree `component_bundle` sees), or
+`dsl_cli check` grows a mode that expands every declared assembly once with
+defaults and refuses a required parameter that has none (a CLI vocabulary
+addition, and a rule about which library modules are gateable at all). Either
+way `docs/component-packages.md`'s *Library modules* and the macro's docstring
+stop having to state the limit — for this class. `config-fit-test-lowers` is the
+sibling gap and the larger one: none of the three fit gates lowers, so no
+lowering-only refusal reaches any of them, whether or not a body was expanded.
+Closing this entry alone does not make the gates complete.
+
 ## `dsl-vocabulary-config-parity`
 
 `brenn-dsl`'s attr vocabularies and rule tables were hand transcriptions of
@@ -2499,38 +2525,6 @@ line, a run of `make check` passes with it, the `make check` sentence under
 clause removed, and the operator has said whether a scheduled CI run of
 `make npm-audit` is wanted alongside it.
 
-## `surface-description-vocabulary-packaged`
-
-Every deployment that serves a surface must stamp a `SurfaceDescription(slug)`
-per slug and a `KindDescription(kind)` per kind, or boot panics
-(`surface/server/src/description.rs`, `validate_surface_description`). The two
-assemblies, and the `surface_errors`/`surface_index` channels they publish on,
-are declared in brenn's *config tree* (`config/surfaces.brenn`), which a bundle
-cannot `use @`. So every deployment and every bundle repository copies the file.
-`brenn-component-demo/config/describe.brenn` is the first copy — byte-identical
-apart from a header comment — and there will be one per repository.
-
-The addresses, the depths and the channel set are brenn's, not the deployer's.
-When brenn adds a fifth per-surface description channel, changes a depth or
-moves the prefix, every copy in every repository is stale, nothing compares a
-copy with its original, and the failure is a boot panic on the next production
-restart — after the release is installed and the service stopped.
-
-brenn already has the distribution channel for vocabulary a deployment imports:
-`config/specs/*.brenn`, offered as `@brenn//:modules` and imported with
-`use @<name>::*;`. The definitions belong there; only the stamps are the
-deployer's.
-
-Code site (`TODO(surface-description-vocabulary-packaged)`):
-`config/surfaces.brenn`.
-
-Done = `SurfaceDescription`, `KindDescription`, `surface_errors` and
-`surface_index` are declared in a packaged module under `config/specs/`, brenn's
-own `config/surfaces.brenn` and every deployment reach them with `use @`, and no
-copy of the definitions exists outside brenn. Moving assemblies out of the
-config tree is a design call — packaged modules have carried component classes
-only — which is why this is written down rather than done.
-
 ## `standard-chrome-vocabulary`
 
 Every `surface` must hold exactly one chrome (`surface/server/src/bindings_doc.rs`),
@@ -2594,3 +2588,62 @@ Done = a deployment naming an unreadable `mcp_script_path` is refused at boot,
 naming the path and the config key, with the resolution base stated in
 `docs/config-dsl.md`.
 
+## `ceiling-principal-ids`
+
+`config.principals` is a `Vec`, and the ceiling check addresses a principal by
+its dotted handle across three structures that have to be kept in step by hand:
+the authorities map, the `unstated` set, and the cached parent chains the two
+suggestion builders read — plus the name→index map `principal_order` builds and
+throws away. One `Vec` indexed by an id would carry all four, and every lookup
+allocates a dotted string on a boot path to reach it.
+
+A `PrincipalId(usize)` beside `StampId`, resolved at resolution where the
+name→index map already exists, would make the authorities a `Vec` indexed by
+id, the chains a parent walk on demand, and every lookup an index. What has to
+be decided first is whether `RPrincipal.parent` and `RStamp.under` carry an id
+or a `HandlePath`: they are the record a refusal reads a name out of, and the id
+form means the record no longer carries the spelling the document wrote.
+
+Code site (`TODO(ceiling-principal-ids)`): `brenn-dsl/src/derive.rs`, at
+`check_ceilings`.
+
+Done = a principal is reached by id and no structure keyed by a principal's
+dotted name survives in `derive.rs`.
+
+## `config-fit-test-lowers`
+
+`config_fit_test`, `config_fit_refusal_test` and `library_module_test` all run
+`dsl_cli check` (`bazel/wasm/defs.bzl`), which is `brenn_dsl::compile` — parse,
+resolve, derive. Lowering lives in `brenn-lib` (`config/dsl_lower.rs`), which
+`brenn-dsl` cannot depend on, so every lowering-only refusal is invisible to
+these gates: for brenn's own fixtures and for every out-of-tree bundle's CI.
+
+What that class holds: a string where a value position wants an integer, an
+integer out of range for its key, a negative depth, an unparseable
+`bind_address` or log level, a stray `send_rate` key, the union-vocabulary
+maskings (`noise` on a webhook subscription, `amplification` on a surface
+binding), a webhook with no `signature` block or an unknown scheme, and an
+unknown attachment handler type. The path that lowers is `brenn config-check`,
+which the installers run before the stop and which `make check` runs over the
+shipped roots; an out-of-tree author's first reader for this class is their own
+boot or their installer.
+
+A different gap from `library-module-body-gate`, which is about an assembly body
+no root stamps, and the two cross-refer.
+
+Why it is written down rather than done: closing it is a choice with costs on
+both sides. Running `brenn config-check` from the gate means an out-of-tree
+bundle builds the whole brenn binary to check a config, and every fixture root
+has to be a lowerable document — server keys and all, where today's refusal
+fixtures are minimal roots that only compile. Moving lowering down into
+`brenn-dsl` is not possible; it reads the domain crates' types. A third shape, a
+`dsl_cli lower` linking `brenn-lib`, puts the domain crates behind the DSL
+binary every out-of-tree build already compiles. Which is right depends on what
+the fit gate is for.
+
+Code site (`TODO(config-fit-test-lowers)`): `bazel/wasm/defs.bzl`, at
+`_check_args`.
+
+Done = a lowering-only refusal in a fixture root fails the fit gate in CI, or
+the entry records the argument for leaving lowering to `config-check` and the
+gate's docstring says so.

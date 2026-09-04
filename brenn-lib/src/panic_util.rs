@@ -13,6 +13,24 @@ use std::cell::Cell;
 use std::panic::{PanicHookInfo, UnwindSafe};
 use std::sync::OnceLock;
 
+/// The prefix a panic message carries when it refuses operator configuration.
+///
+/// A caught payload is classified by its text, so the producers and the
+/// classifier have to agree on a spelling. This constant is that agreement: a
+/// validator on a path a reporting tool runs builds its message with it, and
+/// the classifier matches on it. On boot-only paths nothing classifies the
+/// text, which is why refusals there are spelled freely.
+pub const CONFIG_REFUSAL: &str = "config: ";
+
+/// The prefix a panic message carries when it reports a host defect on a path a
+/// reporting tool also runs.
+///
+/// The counterpart of [`CONFIG_REFUSAL`]: an assert that fires only when the
+/// host is wrong, not when the configuration is, wants to reach the operator as
+/// a bug report with its backtrace rather than as a verdict on a file that is
+/// fine.
+pub const HOST_DEFECT: &str = "boot: ";
+
 thread_local! {
     /// Set only for the duration of a [`catch_quietly`] call on this thread.
     static SUPPRESS_HOOK: Cell<bool> = const { Cell::new(false) };

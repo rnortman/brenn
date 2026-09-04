@@ -10,7 +10,7 @@ use brenn_dsl::resolved::{ChanId, MatcherKind, RChanRef, RMatcherVal, RTail, RVa
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use support::{
-    at, compile, compile_tree, packaged, refusal, refusal_tree, refusals, refusals_tree,
+    at, compile, compile_tree, messages, packaged, refusal, refusal_tree, refusals, refusals_tree,
     resolve_errors, resolved, resolved_tree,
 };
 
@@ -190,14 +190,16 @@ fn a_parameter_colliding_with_a_top_level_name_is_refused_at_the_parameter() {
 fn a_parameter_type_the_language_does_not_have_names_the_ones_it_does() {
     assert_eq!(
         refusal("assembly Deskbar(driver: Widget) {\n}\n"),
-        "`Widget` is not a parameter type; expected one of String, Int, Bool, Table, Channel, Agent, Repo"
+        "`Widget` is not a parameter type; expected one of String, Int, Bool, Table, Channel, \
+         Agent, Repo, Principal"
     );
 }
 
 #[test]
 fn every_parameter_type_the_language_has_is_accepted() {
     compile(
-        "assembly Deskbar(a: String, b: Int, c: Bool, d: Table, e: Channel, f: Agent, g: Repo) {\n}\n",
+        "assembly Deskbar(a: String, b: Int, c: Bool, d: Table, e: Channel, f: Agent, \
+         g: Repo, h: Principal) {\n}\n",
     )
     .expect("the whole set");
 }
@@ -357,8 +359,8 @@ fn a_top_level_acl_is_refused_with_the_form_that_works() {
     assert_eq!(
         refusal("acl subscribe [prefix \"brenn:alice-desk.\"];\n"),
         "an acl statement needs an enclosing entity body (surface, agent, remote, \
-         or a new instance); at top level, grant authority to a named principal \
-         with `grant`"
+         or a new instance); at top level, grant authority to a named running \
+         entity with `grant`"
     );
 }
 
@@ -372,7 +374,7 @@ fn a_grant_carries_the_principal_it_names() {
         "grant bob_pod subscribe prefix \"brenn:alice-desk.\";\n",
     ));
     let grant = &config.grants[0];
-    assert_eq!(grant.principal.dotted(), "bob_pod");
+    assert_eq!(grant.target.dotted(), "bob_pod");
     assert_eq!(grant.plane.value(), "subscribe");
     assert_eq!(grant.m.kind.value(), &MatcherKind::Prefix);
 }
@@ -1118,7 +1120,8 @@ fn a_surface_carries_its_components_and_their_bindings() {
 
 /// A component instance's `parked_batch_depth` is a depth, so it is projected
 /// out of the body rather than resolved among its values: a bare `unbounded`
-/// there is the word, not a name the scope has to hold.
+/// there is the word, not a name the scope has to hold. A name that is *not*
+/// that word is resolved, by the depth resolver rather than the value walk.
 #[test]
 fn a_components_parked_depth_is_projected() {
     let config = resolved(&surface_doc(
@@ -1130,10 +1133,10 @@ fn a_components_parked_depth_is_projected() {
         .parked_batch_depth
         .as_ref()
         .expect("a parked depth");
-    let IntOrWord::Word(word) = depth else {
-        panic!("the written token is a word: {depth:?}");
-    };
-    assert_eq!(word.as_str(), "unbounded");
+    assert!(
+        depth.is_unbounded(),
+        "the written token is the unbounded word: {depth:?}"
+    );
     assert!(
         component.attrs.is_empty(),
         "the projected key does not also ride among the values"
@@ -1144,7 +1147,8 @@ fn a_components_parked_depth_is_projected() {
             "    abi = processor; requires = [];\n    optional in messages;\n",
             "        parked_batch_depth = \"unbounded\";\n",
         )),
-        "expected an integer or a bare word, found a string"
+        "expected a count, the word `unbounded`, or a name that resolves to a count, found a \
+         string"
     );
 }
 
@@ -2031,7 +2035,7 @@ fn a_grant_may_not_name_an_assembly_handle() {
     );
     assert_eq!(
         refusal(&source),
-        "`alice` is not a principal; a grant names a surface, an agent, \
+        "`alice` is not a running entity; a grant names a surface, an agent, \
          a remote or a consumer"
     );
 }
@@ -2046,7 +2050,7 @@ fn an_assembly_that_did_not_expand_keeps_its_handle_a_non_principal() {
         vec![
             "`Pod` has no parameter `name`; it takes `slug: String`".to_string(),
             "`Pod` takes `slug`, and this instantiation states no value for it".to_string(),
-            "`alice` is not a principal; a grant names a surface, an agent, \
+            "`alice` is not a running entity; a grant names a surface, an agent, \
              a remote or a consumer"
                 .to_string(),
         ]
@@ -2123,7 +2127,7 @@ fn a_grant_naming_a_withheld_repo_still_says_a_repo_is_no_principal() {
         )),
         vec![
             "`nowhere` is not declared in this file".to_string(),
-            "`notes` is not a principal; a grant names a surface, an agent, \
+            "`notes` is not a running entity; a grant names a surface, an agent, \
              a remote or a consumer"
                 .to_string(),
         ]
@@ -2276,7 +2280,11 @@ new alice: Pa(mode = \"panel\");
     );
     assert_eq!(
         messages,
-        ["`Surface` is not a parameter type; expected one of String, Int, Bool, Table, Channel, Agent, Repo".to_string()]
+        [
+            "`Surface` is not a parameter type; expected one of String, Int, Bool, Table, \
+             Channel, Agent, Repo, Principal"
+                .to_string()
+        ]
     );
 }
 
@@ -2341,7 +2349,7 @@ fn a_grant_names_something_authority_can_be_held_by() {
             "channel alice_cmd at \"brenn:alice.cmd\";\n",
             "grant alice_cmd subscribe prefix \"brenn:alice-desk.\";\n",
         )),
-        "`alice_cmd` is not a principal; a grant names a surface, an agent, \
+        "`alice_cmd` is not a running entity; a grant names a surface, an agent, \
          a remote or a consumer"
     );
 }
@@ -3986,4 +3994,323 @@ fn a_glob_of_a_packaged_module_binds_its_whole_vocabulary() {
         ("@spec", PKG_SPEC),
     ]);
     assert_eq!(config.consumers.len(), 2);
+}
+
+// ── names in depth positions ─────────────────────────────────────────────────
+//
+// A depth takes a count, the word `unbounded`, or a name that resolves to a
+// count — a constant, a table field of one, or an `Int` parameter of the
+// enclosing assembly. Resolution replaces the name with the integer, positioned
+// at the name, so every later reader sees a count written where the name was.
+// One resolution step reaches every depth position in the language, and each
+// case below is one of those positions.
+
+/// The count a resolved depth holds, and the source text its span covers.
+fn count(depth: &IntOrWord) -> (i64, Option<&str>) {
+    let IntOrWord::Int(count) = depth else {
+        panic!("a resolved depth is a count: {depth:?}");
+    };
+    (*count.value(), count.span().text_str())
+}
+/// A document whose depths are named: the two forms a constant takes, in a
+/// channel declaration and in a tuning block.
+const NAMED_DEPTHS: &str = "\
+const D = 16;
+const depths = { geometry = 32, status = 240 };
+
+channel messages at \"ephemeral:alice-desk.messages\" {
+    push_depth = D;
+    retain_depth = depths.geometry;
+    standing_retain_depth = unbounded;
+}
+
+channel at prefix \"mqtt:broker:alice/\" {
+    push_depth = depths.status;
+    retain_depth = D;
+}
+";
+
+#[test]
+fn a_constant_and_a_table_field_stand_in_for_a_count() {
+    let config = resolved(NAMED_DEPTHS);
+    let attrs = &config.channels[0].attrs;
+    assert_eq!(
+        count(&attrs.push_depth.as_ref().expect("a push depth").value),
+        (16, Some("D"))
+    );
+    assert_eq!(
+        count(&attrs.retain_depth.as_ref().expect("a retain depth").value),
+        (32, Some("depths.geometry"))
+    );
+    assert!(
+        attrs
+            .standing_retain_depth
+            .as_ref()
+            .expect("a standing depth")
+            .value
+            .is_unbounded(),
+        "the word is a word before it is a name, and is never looked up"
+    );
+
+    let tuning = &config.tunings[0].attrs;
+    assert_eq!(
+        count(&tuning.push_depth.as_ref().expect("a push depth").value),
+        (240, Some("depths.status"))
+    );
+    assert_eq!(
+        count(&tuning.retain_depth.as_ref().expect("a retain depth").value),
+        (16, Some("D"))
+    );
+}
+
+/// An assembly whose channel retention is its caller's judgment: the shape
+/// `SurfaceCommons` has, and the reason a depth reads a name at all.
+const COMMONS: &str = "\
+assembly Commons(slug: String, errors_retain: Int = 100, errors_standing: Int = 100) {
+    channel surface_errors at f\"ephemeral:{slug}.surface-errors\" {
+        retain_depth = errors_retain;
+        standing_retain_depth = errors_standing;
+    }
+}
+
+new plain: Commons(slug = \"plain\");
+new tuned: Commons(slug = \"tuned\", errors_retain = 256, errors_standing = 1024);
+";
+
+#[test]
+fn an_int_parameter_reaches_a_channel_body_by_default_and_by_argument() {
+    let config = resolved(COMMONS);
+    let depths = |index: usize| {
+        let attrs = &config.channels[index].attrs;
+        (
+            count(&attrs.retain_depth.as_ref().expect("a retain depth").value),
+            count(
+                &attrs
+                    .standing_retain_depth
+                    .as_ref()
+                    .expect("a standing depth")
+                    .value,
+            ),
+        )
+    };
+    assert_eq!(
+        depths(0),
+        ((100, Some("errors_retain")), (100, Some("errors_standing"))),
+        "the parameter's default, positioned at the name in the assembly body"
+    );
+    assert_eq!(
+        depths(1),
+        (
+            (256, Some("errors_retain")),
+            (1024, Some("errors_standing"))
+        ),
+        "the stamp's arguments, at the same position"
+    );
+}
+
+/// The same parameter in every binding tail the language has, plus an agent's
+/// `subscribe`: four more vocabularies, one resolution step.
+const TAILS: &str = "\
+// ── packaged ──
+component Loop { abi = processor; requires = []; in feed; io tick; }
+// ── packaged ──
+
+assembly Wiring(slug: String, depth: Int = 8) {
+    channel feed at f\"ephemeral:{slug}.feed\" { retain_depth = depth; }
+    channel tick at f\"ephemeral:{slug}.tick\" { retain_depth = depth; }
+    new worker: Loop {
+        slug = slug;
+        grants = [ephemeral_subscribe];
+        in feed <- feed { push_depth = depth; retain_depth = unbounded; }
+        io tick <-> tick { push_depth = depth; }
+    }
+}
+
+agent Watcher(name: String, depth: Int = 8) {
+    slug = name;
+    model = \"sonnet\";
+    subscribe wiring.feed { push_depth = depth; }
+}
+
+new wiring: Wiring(slug = \"alice\", depth = 12);
+new watcher: Watcher(name = \"alice-watch\", depth = 20);
+";
+
+#[test]
+fn an_int_parameter_reaches_every_binding_tail_and_a_subscribe_tail() {
+    let config = resolved(TAILS);
+    let bindings = &config.consumers[0].bindings;
+    let RTail::In(inbound) = &bindings[0].tail else {
+        panic!("the first binding points in");
+    };
+    assert_eq!(
+        count(&inbound.push_depth.as_ref().expect("a push depth").value),
+        (12, Some("depth"))
+    );
+    assert!(
+        inbound
+            .retain_depth
+            .as_ref()
+            .expect("a retain depth")
+            .value
+            .is_unbounded()
+    );
+    let RTail::Io(both) = &bindings[1].tail else {
+        panic!("the second binding points both ways");
+    };
+    assert_eq!(
+        count(&both.push_depth.as_ref().expect("a push depth").value),
+        (12, Some("depth"))
+    );
+
+    let tail = &config.agents[0].subs[0].tail;
+    assert_eq!(
+        count(&tail.push_depth.as_ref().expect("a push depth").value),
+        (20, Some("depth")),
+        "an agent class takes its own parameters, and its tail reads one too"
+    );
+}
+
+#[test]
+fn a_constant_stands_in_for_a_surface_instances_parked_depth() {
+    let document = format!(
+        "const parked = 24;\n{}",
+        surface_doc(
+            "    abi = processor; requires = [];\n    optional in messages;\n",
+            "        parked_batch_depth = parked;\n",
+        )
+    );
+    let config = resolved(&document);
+    let depth = config.surfaces[0].components[0]
+        .parked_batch_depth
+        .as_ref()
+        .expect("a parked depth");
+    assert_eq!(count(depth), (24, Some("parked")));
+}
+
+/// A depth whose name resolves to something that is not a count, is not
+/// declared at all, or names an entity rather than a value.
+#[test]
+fn a_depth_name_that_is_not_a_count_is_refused_at_the_name() {
+    let channel = |head: &str, depth: &str| {
+        format!(
+            "{head}channel messages at \"ephemeral:alice-desk.messages\" {{\n    \
+             retain_depth = {depth};\n}}\n"
+        )
+    };
+
+    assert_eq!(
+        refusal(&channel("const skin = \"bench\";\n", "skin")),
+        "`retain_depth`: `skin` names a string, and a depth is a non-negative integer \
+         or the word `unbounded`"
+    );
+    assert_eq!(
+        refusal(&channel("const depths = { geometry = 16 };\n", "depths")),
+        "`retain_depth`: `depths` names a table, and a depth is a non-negative integer \
+         or the word `unbounded`"
+    );
+    assert_eq!(
+        refusal(&channel("", "infinite")),
+        "`infinite` is not declared in this file"
+    );
+    assert_eq!(
+        refusal(&channel(
+            "channel feed at \"ephemeral:alice-desk.feed\";\n",
+            "feed"
+        )),
+        "`feed` names a channel, which is not a value"
+    );
+}
+
+/// A `Channel` parameter in a depth position: the value walk's own refusal,
+/// which the depth resolver passes through rather than restating.
+#[test]
+fn a_non_value_parameter_in_a_depth_is_refused_as_one() {
+    assert_eq!(
+        refusal(
+            "channel feed at \"ephemeral:alice-desk.feed\";\n\
+             assembly Wiring(slug: String, source: Channel) {\n    \
+             channel out at f\"ephemeral:{slug}.out\" { retain_depth = source; }\n}\n\
+             new wiring: Wiring(slug = \"alice\", source = feed);\n"
+        ),
+        "parameter `source` names a channel, which is not a value"
+    );
+}
+
+/// The withholding half of the depth change, in the three vocabularies that
+/// are not a channel body. Each of these is a `refusal`, which asserts exactly
+/// one message: a refused depth drops the tail or the projection it was written
+/// in, so nothing downstream reports a second time about a subscription or a
+/// binding whose depth never resolved.
+#[test]
+fn a_refused_depth_is_the_one_message_in_every_vocabulary() {
+    // An agent's `subscribe` tail.
+    assert_eq!(
+        refusal(
+            "const skin = \"bench\";\n\
+             channel feed at \"brenn:alice-desk.feed\";\n\
+             agent Watcher {\n    \
+             slug = \"alice-watch\";\n    \
+             model = \"sonnet\";\n    \
+             grants = [subscribe];\n    \
+             subscribe feed { push_depth = skin; }\n}\n\
+             new watcher: Watcher;\n"
+        ),
+        "`push_depth`: `skin` names a string, and a depth is a non-negative integer \
+         or the word `unbounded`"
+    );
+
+    // An `in` binding tail.
+    assert_eq!(
+        refusal(&format!(
+            "const skin = \"bench\";\n{}",
+            surface_doc(
+                "    abi = processor; requires = [];\n    in messages;\n",
+                "        in messages <- messages { push_depth = skin; }\n",
+            )
+        )),
+        "`push_depth`: `skin` names a string, and a depth is a non-negative integer \
+         or the word `unbounded`"
+    );
+
+    // A surface instance's `parked_batch_depth`.
+    assert_eq!(
+        refusal(&format!(
+            "const skin = \"bench\";\n{}",
+            surface_doc(
+                "    abi = processor; requires = [];\n    optional in messages;\n",
+                "        parked_batch_depth = skin;\n",
+            )
+        )),
+        "`parked_batch_depth`: `skin` names a string, and a depth is a non-negative \
+         integer or the word `unbounded`"
+    );
+}
+
+/// The one spelling a depth reads as a word cannot also be a declaration: a
+/// reader would have to know the resolution order to tell which one a depth
+/// meant.
+#[test]
+fn the_unbounded_spelling_is_refused_at_a_declaration() {
+    let source = "const unbounded = 4;\n";
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert_eq!(
+        errors[0].message,
+        "`unbounded` is the word a depth spells an unbounded window with, and cannot be \
+         a constant's name"
+    );
+    assert_eq!(errors[0].line_col(), at(source, "unbounded"));
+
+    assert_eq!(
+        refusals(
+            "assembly Wiring(unbounded: Int = 4) {\n    \
+             channel out at \"ephemeral:alice-desk.out\" { retain_depth = unbounded; }\n}\n\
+             new wiring: Wiring();\n"
+        ),
+        [
+            "`unbounded` is the word a depth spells an unbounded window with, and cannot be \
+             a parameter's name"
+        ]
+    );
 }

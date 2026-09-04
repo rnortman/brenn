@@ -1,6 +1,7 @@
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "component_fixtures", "component_install_tree", "component_package", "deployed_components_test", "grant_parity_test", "wit_bindgen_rust")
+load("//bazel/wasm:defs.bzl", "component_fixtures", "component_install_tree", "component_package", "deployed_components_test", "grant_parity_test", "module_file_name", "wit_bindgen_rust")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
 
@@ -47,6 +48,22 @@ COMPONENT_PACKAGES = {
     "replay": ("brenn:replay", None),
     "replay-generic": ("brenn:replay", None),
 }
+
+# The specifications the packages above ship, as names. `config/specs/` is a
+# mixed directory — what a consumer compiles against is the glob `//:modules`,
+# what a release stages is harvested off packages and kinds plus the listed
+# library modules — and `//bazel/release/tests:config_specs_accounted_test`
+# holds the two equal by reading this list and its two siblings.
+write_file(
+    name = "package_spec_names",
+    out = "package-spec-names.txt",
+    content = sorted([
+        module_file_name(spec)
+        for (_world, spec) in COMPONENT_PACKAGES.values()
+        if spec
+    ]),
+    visibility = ["//visibility:public"],
+)
 
 [
     component_package(

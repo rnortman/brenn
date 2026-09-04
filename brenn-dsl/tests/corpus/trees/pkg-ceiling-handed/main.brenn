@@ -1,0 +1,13 @@
+// Exact under prefix does not hold in that direction, however narrow the
+// prefix looks: the deployment handed one channel over, and the ceiling has to
+// say so if the family is what the arrangement may reach.
+
+use @loop::*;
+
+channel feed at "brenn:feed.bar" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 16;
+}
+
+new demo: Loop(slug = "demo", source = feed) { grants = [ports]; }

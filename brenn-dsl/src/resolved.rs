@@ -56,6 +56,20 @@ pub struct ResolvedConfig {
     pub consumers: Vec<RConsumer>,
     pub agents: Vec<RAgent>,
     pub remotes: Vec<RRemote>,
+    /// Bare principals: authority declared to be delegated from. Compile-time
+    /// only — nothing lowers one, because a principal has no runtime body.
+    pub principals: Vec<RPrincipal>,
+    /// Every principal an instantiation handed in as a `Principal` argument,
+    /// sorted by handle. A parameter is legal only as the target of `under`, so
+    /// an argument a class *uses* arrives as some stamp's own `under` — this is
+    /// the record of the handing itself, which is what tells a principal whose
+    /// parameter was dropped from one that was delegated to nothing at all.
+    /// Compile-time only, as [`RPrincipal`] is.
+    pub handed_principals: Vec<HandlePath>,
+    /// Every assembly stamp the document records: the packaged boundary, and
+    /// every stamp that wrote a ceiling. A [`StampId`] indexes this vector.
+    /// Compile-time only, as [`RPrincipal`] is.
+    pub stamps: Vec<RStamp>,
     pub webhooks: Vec<RWebhook>,
     pub repos: Vec<RNamed<RepoAttrs<RVal>>>,
     pub mqtt_clients: Vec<RNamed<MqttClientAttrs<RVal>>>,
@@ -115,7 +129,7 @@ impl IntoRVal for IntOrWord {
                 let span = count.span().clone();
                 Spanned::new(RValue::Int(*count.value()), span)
             }
-            IntOrWord::Word(word) => word.into_rval(),
+            IntOrWord::Name { path, span } => Spanned::new(RValue::Str(path.spelling()), span),
         }
     }
 }
@@ -123,7 +137,7 @@ impl IntoRVal for IntOrWord {
 /// A value with the language removed.
 ///
 /// Gone relative to `model::Value`: a reference (resolved to its referent's
-/// value, or to the identity of the channel or principal it named), an f-string
+/// value, or to the identity of the channel or entity it named), an f-string
 /// (interpolated), a raw string and an escaped one (both decoded). What is left
 /// is data.
 #[derive(Debug, Clone, PartialEq)]
@@ -310,6 +324,10 @@ pub struct ChanId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LinkId(pub usize);
 
+/// A recorded assembly stamp, by position in [`ResolvedConfig::stamps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StampId(pub usize);
+
 /// An entity's identity after expansion: `alice_desk.messages_p1`.
 ///
 /// The full path, not the leaf, because two instantiations of one assembly
@@ -349,6 +367,9 @@ impl HandlePath {
 #[derive(Debug, PartialEq)]
 pub struct RChannel {
     pub handle: HandlePath,
+    /// The recorded stamp this channel was expanded inside, or `None` for one
+    /// written in deployer text.
+    pub stamp: Option<StampId>,
     /// Concrete and scheme-qualified. What follows the scheme is the runtime's
     /// to validate.
     pub address: Spanned<String>,
@@ -394,6 +415,8 @@ pub struct RPin {
 #[derive(Debug, PartialEq)]
 pub struct RSurface {
     pub handle: HandlePath,
+    /// The recorded stamp this surface was expanded inside.
+    pub stamp: Option<StampId>,
     /// The wire spelling: the `slug` attr where one was written, else the
     /// handle's dotted path.
     pub slug: Spanned<String>,
@@ -408,10 +431,13 @@ pub struct RSurface {
 pub struct RComponentInst {
     /// The `new` handle, which is the runtime's instance name.
     pub instance: Spanned<String>,
+    /// The recorded stamp the enclosing surface was expanded inside.
+    pub stamp: Option<StampId>,
     pub class: ClassRef,
     /// The parked window, in the count-or-word form a depth is written in.
-    /// A token context, so it is projected rather than resolved, and it rides
-    /// beside the other keys rather than among them.
+    /// Projected out of the value walk and resolved by the depth resolver, so a
+    /// name here already holds the count it named; it rides beside the other
+    /// keys rather than among them because it is not an `RVal`.
     pub parked_batch_depth: Option<IntOrWord>,
     /// The capabilities the operator gave this instance. A token context, like
     /// the depth above, so it rides beside the other keys rather than among
@@ -434,6 +460,8 @@ pub struct RComponentInst {
 #[derive(Debug, PartialEq)]
 pub struct RConsumer {
     pub handle: HandlePath,
+    /// The recorded stamp this consumer was expanded inside.
+    pub stamp: Option<StampId>,
     pub slug: Spanned<String>,
     pub class: ClassRef,
     /// The transport rights the operator stated. A token context, so it is
@@ -587,6 +615,8 @@ pub enum RChanRef {
 #[derive(Debug, PartialEq)]
 pub struct RAgent {
     pub handle: HandlePath,
+    /// The recorded stamp this agent was expanded inside.
+    pub stamp: Option<StampId>,
     pub slug: Spanned<String>,
     /// The class it came from. Classes are gone after expansion; this is what a
     /// later diagnostic cites when it has to say where an agent came from.
@@ -654,6 +684,75 @@ pub struct RRemote {
     pub doc: Option<DocComment>,
 }
 
+/// A bare principal: a declared bundle of authority with no running body.
+///
+/// Two axes, each written or inherited: the `grants` words and the reach its
+/// `acl` lines state. What it comes to, and that it holds no more than the
+/// principal it is under, is derivation's — this side carries the text.
+#[derive(Debug, PartialEq)]
+pub struct RPrincipal {
+    pub handle: HandlePath,
+    /// The principal this one is `under`, or `None` for one under the operator,
+    /// whose authority cannot be inherited.
+    pub parent: Option<HandlePath>,
+    /// The words it writes, or `None` where it writes no `grants` line and
+    /// inherits the axis.
+    pub grants: Option<RWordList>,
+    pub acls: Vec<RAcl>,
+    /// Where the name is written: what a refusal about the whole principal
+    /// cites.
+    pub span: Span,
+    pub doc: Option<DocComment>,
+}
+
+/// One `new` against an assembly, recorded because what it stamps is capped.
+///
+/// A stamp is recorded when it is the packaged boundary — a `new` in
+/// non-packaged text against an assembly a packaged module declares — or when
+/// it wrote a ceiling of its own. Every other assembly stamp records nothing,
+/// and the entities it emits belong to the nearest recorded ancestor.
+#[derive(Debug, PartialEq)]
+pub struct RStamp {
+    /// The `new` handle in the file that wrote it.
+    pub handle: HandlePath,
+    pub assembly: Spanned<String>,
+    /// The packaged module that declares the assembly, or `None` for one
+    /// declared in the configuration tree. `Some` from non-packaged text is
+    /// what makes the stamp the packaged boundary.
+    pub package: Option<String>,
+    /// Whether the `new` itself is written in packaged text — which decides
+    /// whether a refusal at this stamp is the deployer's to fix or the
+    /// author's.
+    pub packaged_site: bool,
+    /// The nearest recorded stamp this one was expanded inside.
+    pub parent: Option<StampId>,
+    /// The principal `under` names, resolved through any parameter — so its
+    /// segments carry the position of whatever named the principal, which for a
+    /// parameter is the argument at the enclosing `new`.
+    pub under: Option<HandlePath>,
+    /// Where the `under` clause itself is written: the site a refusal about
+    /// which principal this stamp chose is anchored at, which for a stamp in
+    /// packaged text is the author's clause rather than the deployer's
+    /// argument.
+    pub under_span: Option<Span>,
+    /// Whether a body was written at all.
+    ///
+    /// Not the same question as whether the body wrote anything: `under p;`
+    /// with no body is how a stamp says "exactly `p`", and an empty body is
+    /// text that narrows nothing, which is dead config.
+    pub wrote_body: bool,
+    /// The words the ceiling writes, or `None` where it writes no `grants`
+    /// line and inherits the axis.
+    pub grants: Option<RWordList>,
+    pub acls: Vec<RAcl>,
+    /// Channels handed in as `Channel` arguments — reach the deployer consented
+    /// to by naming them.
+    pub handed: Vec<ChanId>,
+    /// Where the `new` handle is written: what a refusal about the whole stamp
+    /// cites.
+    pub span: Span,
+}
+
 /// A `webhook` and its typed sub-blocks.
 #[derive(Debug, PartialEq)]
 pub struct RWebhook {
@@ -683,11 +782,16 @@ pub struct RAcl {
 }
 
 /// `grant alice_pa subscribe prefix "brenn:alice-desk.";` — authority written
-/// about another principal, with that principal resolved.
+/// about another running entity, with that entity resolved.
 #[derive(Debug, PartialEq)]
 pub struct RGrant {
-    pub principal: HandlePath,
-    pub principal_span: Spanned<String>,
+    /// The running entity whose authority this widens.
+    pub target: HandlePath,
+    /// The recorded stamp this statement was expanded inside. A grant written
+    /// in deployer text has none, which is what keeps the deployer's own
+    /// consent out of what a stamp confers.
+    pub stamp: Option<StampId>,
+    pub target_span: Spanned<String>,
     pub plane: Spanned<String>,
     pub m: RMatcher,
 }
@@ -764,6 +868,7 @@ pub type RWordList = WordList;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{PathRef, PathSeg, Seg};
 
     fn word(name: &str) -> Word {
         Word {
@@ -795,10 +900,18 @@ mod tests {
     fn either_arm_of_an_int_or_word_carries_as_what_it_is() {
         let count = IntOrWord::Int(Spanned::new(7, Span::unknown()));
         assert_eq!(count.into_rval().into_value(), RValue::Int(7));
-        let unbounded = IntOrWord::Word(word("all"));
+        let named = IntOrWord::Name {
+            path: PathRef {
+                head: Spanned::new("depths".into(), Span::unknown()),
+                segs: vec![PathSeg::Inst(Seg {
+                    name: Spanned::new("geometry".into(), Span::unknown()),
+                })],
+            },
+            span: Span::unknown(),
+        };
         assert_eq!(
-            unbounded.into_rval().into_value(),
-            RValue::Str("all".into())
+            named.into_rval().into_value(),
+            RValue::Str("depths.geometry".into())
         );
     }
 }

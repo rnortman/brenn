@@ -59,6 +59,11 @@ after "<->" { nbsp; }
 rule section
 {
     ws_allowed: nbsp;
+    // A doc comment ends in a formatter break rather than a re-emitted newline
+    // literal, and this rule's `nbsp` would otherwise put a space before a
+    // doc'd section's kindword. The other brace-bearing rules take the global
+    // `ws_allowed: nil` and need nothing.
+    after doc { nil; }
     after open { hard; }
     before close { hard; }
     after close { hard; }
@@ -114,6 +119,15 @@ rule surface_def
 }
 
 rule inst_body
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+// `principal ui under site { … }`: a body per line, entries indented.
+rule principal_def
 {
     after "{" { hard; }
     before "}" { hard; }
@@ -269,6 +283,14 @@ rule arg_list
 
 // `before "]"` is said here because `matcher`'s own `ws_allowed` would
 // otherwise leave a space between the last matcher and the bracket.
+// The clause carries its own leading space, so `principal ui { … }` — where the
+// clause is absent — does not render one for a node that is not there. Same
+// reason `port_decl` says `after "optional"` rather than spacing the position.
+rule under_clause
+{
+    before "under" { nbsp; }
+}
+
 rule matcher_list
 {
     group;
@@ -296,4 +318,11 @@ rule inline_table
     after "{" { nbsp; }
     before "}" { nbsp; }
     nest from after "{" to before "}";
+}
+
+// The line break belongs to the formatter, not to the source: `nl` ate the
+// newline, the next line's indentation and any blank lines between doc lines.
+rule doc_line
+{
+    render nl as hard;
 }

@@ -86,6 +86,7 @@ const BRACED_RULES: &[&str] = &[
     "inline_table",
     "inst_body",
     "interp",
+    "principal_def",
     "remote_def",
     "section",
     "surface_def",

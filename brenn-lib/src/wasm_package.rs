@@ -90,6 +90,30 @@ struct PackageRecord {
     spec_sha256: Option<String>,
 }
 
+/// What a verified package bound, for the caller that loads it and the log line
+/// that says what this host is running.
+///
+/// The record itself stays private — a caller holds one of these only by having
+/// gone through the verification — but what it bound is operational fact an
+/// operator needs: which root served the package, which world its artifact
+/// targets, and the two digests the boot check re-computed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    /// The artifact's path, which is what the loader is handed.
+    pub artifact: PathBuf,
+    /// The components root the package resolved under. One root per installed
+    /// release, so this names the release the artifact came out of.
+    pub root: PathBuf,
+    /// The WIT package the artifact targets.
+    pub world: String,
+    /// Lowercase hex SHA-256 of the artifact's bytes, re-computed here.
+    pub artifact_sha256: String,
+    /// Lowercase hex SHA-256 of the packaged spec's bytes, for a
+    /// processor-world package; `None` for a replay-world one, which carries no
+    /// specification.
+    pub spec_sha256: Option<String>,
+}
+
 /// The record's path within a package directory.
 fn record_path(package_dir: &Path) -> PathBuf {
     package_dir.join(RECORD_NAME)
@@ -225,8 +249,8 @@ fn load_record(package_dir: &Path) -> PackageRecord {
 /// Re-compute what the record binds and refuse any disagreement.
 ///
 /// The artifact's bytes are hashed and compared, and for a processor-world
-/// package the packaged spec's bytes too. Returns the artifact's path, which is
-/// what the loader is handed.
+/// package the packaged spec's bytes too. Returns what the record bound, which
+/// carries the artifact path the loader is handed.
 ///
 /// There is a window between this read and the loader's own: the artifact could
 /// change in between. Accepted deliberately — this binding is anti-drift, not
@@ -234,7 +258,7 @@ fn load_record(package_dir: &Path) -> PackageRecord {
 /// are what it catches; a writer to the components directory between the two
 /// reads already owns the host, because that directory is operator-installed
 /// beside the operator's configuration.
-fn verify(record: &PackageRecord, package_dir: &Path) -> PathBuf {
+fn verify(record: &PackageRecord, package_dir: &Path, root: &Path) -> Verified {
     let artifact_path = package_dir.join(&record.artifact);
     let bytes = read_or_die(&artifact_path, "component artifact");
     let actual = sha256_hex(&bytes);
@@ -247,8 +271,15 @@ fn verify(record: &PackageRecord, package_dir: &Path) -> PathBuf {
         artifact_path.display(),
         record.artifact_sha256,
     );
+    let bound = |artifact: PathBuf| Verified {
+        artifact,
+        root: root.to_path_buf(),
+        world: record.world.clone(),
+        artifact_sha256: record.artifact_sha256.clone(),
+        spec_sha256: record.spec_sha256.clone(),
+    };
     let Some(expected) = record.spec_sha256.as_deref() else {
-        return artifact_path;
+        return bound(artifact_path);
     };
     let path = spec_path(package_dir, &record.name);
     let spec = read_or_die(&path, "packaged component specification");
@@ -260,24 +291,28 @@ fn verify(record: &PackageRecord, package_dir: &Path) -> PathBuf {
          the release package. Refusing to start (fail-fast on invalid config).",
         path.display(),
     );
-    artifact_path
+    bound(artifact_path)
 }
 
 /// Resolve `<root>/<package>` across the components roots and refuse unless
 /// exactly one root holds it.
+///
+/// Returns the root and the package directory under it: one root per installed
+/// release, so which root served the package is which release the artifact came
+/// out of, and that is what the boot log reports.
 ///
 /// `what` names the thing the configuration wired, so the message says which
 /// instantiation went looking. Zero hits is a package no installed release
 /// ships; two is two releases shipping one name, which is not a deployment
 /// anyone meant — a single root would let the second silently shadow the first,
 /// and the whole point of a root per release is that the host can see both.
-fn resolve_dir(components_roots: &[PathBuf], package: &str, what: &str) -> PathBuf {
+fn resolve_dir(components_roots: &[PathBuf], package: &str, what: &str) -> (PathBuf, PathBuf) {
     assert_package_name(package, what);
     require_components_root(components_roots, what);
-    let mut hits: Vec<PathBuf> = components_roots
+    let mut hits: Vec<(PathBuf, PathBuf)> = components_roots
         .iter()
-        .map(|root| root.join(package))
-        .filter(|dir| dir.is_dir())
+        .map(|root| (root.clone(), root.join(package)))
+        .filter(|(_, dir)| dir.is_dir())
         .collect();
     assert!(
         hits.len() < 2,
@@ -285,9 +320,9 @@ fn resolve_dir(components_roots: &[PathBuf], package: &str, what: &str) -> PathB
          one {COMPONENTS_FLAG} root: {}. A package ships with exactly one release; two copies \
          mean a stale install or two bundles claiming one name. Remove or rename one. Refusing \
          to start (fail-fast on invalid config).",
-        display_list(&hits),
+        display_list(hits.iter().map(|(_, dir)| dir)),
     );
-    let Some(dir) = hits.pop() else {
+    let Some(hit) = hits.pop() else {
         panic!(
             "boot: {what} names component package {package:?}, but {package} is not an installed \
              package directory under any {COMPONENTS_FLAG} root (searched: {}). A configuration \
@@ -299,7 +334,7 @@ fn resolve_dir(components_roots: &[PathBuf], package: &str, what: &str) -> PathB
             display_list(components_roots),
         )
     };
-    dir
+    hit
 }
 
 /// Refuse a package name that is not a single plain directory name or that
@@ -344,14 +379,15 @@ fn assert_package_name(package: &str, what: &str) {
 /// byte-identical to the one the running configuration compiled against.
 ///
 /// `config_spec_sha256` is the class's `spec_sha256`, carried from the file the
-/// class was declared in. Returns the artifact path for the loader.
+/// class was declared in. Returns what the package bound, which carries the
+/// artifact path for the loader.
 pub fn verify_consumer(
     components_roots: &[PathBuf],
     package: &str,
     slug: &str,
     config_spec_sha256: &str,
-) -> PathBuf {
-    let dir = resolve_dir(components_roots, package, &format!("consumer {slug:?}"));
+) -> Verified {
+    let (root, dir) = resolve_dir(components_roots, package, &format!("consumer {slug:?}"));
     let record = load_record(&dir);
     assert!(
         record.world == WORLD_PROCESSOR,
@@ -361,7 +397,7 @@ pub fn verify_consumer(
          (fail-fast on invalid config).",
         record.world,
     );
-    let artifact_path = verify(&record, &dir);
+    let verified = verify(&record, &dir, &root);
     let packaged = record
         .spec_sha256
         .as_deref()
@@ -376,13 +412,13 @@ pub fn verify_consumer(
          (fail-fast on invalid config).",
         dir.display(),
     );
-    artifact_path
+    verified
 }
 
 /// The full check for a replay component: installed, internally bound and
 /// replay-world. There is no spec side — a replay component declares no class.
-pub fn verify_replay(components_roots: &[PathBuf], package: &str, slug: &str) -> PathBuf {
-    let dir = resolve_dir(
+pub fn verify_replay(components_roots: &[PathBuf], package: &str, slug: &str) -> Verified {
+    let (root, dir) = resolve_dir(
         components_roots,
         package,
         &format!("webhook endpoint {slug:?} replay protection"),
@@ -395,7 +431,7 @@ pub fn verify_replay(components_roots: &[PathBuf], package: &str, slug: &str) ->
          cross-wired deployment. Refusing to start (fail-fast on invalid config).",
         record.world,
     );
-    verify(&record, &dir)
+    verify(&record, &dir, &root)
 }
 
 /// The components roots a boot-time load resolves against, or a refusal naming

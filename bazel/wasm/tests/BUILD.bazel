@@ -6,7 +6,7 @@ rejected.
 """
 
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "config_fit_test")
+load("//bazel/wasm:defs.bzl", "config_fit_refusal_test", "config_fit_test", "library_module_test")
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 
 policy_srcs()
@@ -124,27 +124,17 @@ native_test(
     target_compatible_with = HOST_ONLY,
 )
 
-# The same document set, driven at the refusal. `config_fit_test` itself has no
-# way to want a failure, so the negative case is a sibling over `dsl_cli check`
-# directly.
-native_test(
+# The same document set, driven at the refusal, over the same two module roots:
+# the fit gate's passing call below and this one build the same command, so a
+# gate that went green because the command changed fails here.
+config_fit_refusal_test(
     name = "config_fit_refusal_test",
-    size = "small",
-    src = "config_fit_refusal_test.sh",
-    args = [
-        "$(rootpath //brenn-dsl:dsl_cli)",
-        "$(rootpath fit/misfit.brenn)",
-        "$(rootpath fit/mods-one/base.brenn)",
-        "$(rootpath fit/mods-two/widget.brenn)",
-    ],
-    data = [
-        "fit/misfit.brenn",
+    config = "fit/misfit.brenn",
+    expect = "parameter `slug` is a `String`",
+    modules = [
         "fit/mods-one/base.brenn",
         "fit/mods-two/widget.brenn",
-        "//brenn-dsl:dsl_cli",
     ],
-    out = "config_fit_refusal_test.run",
-    target_compatible_with = HOST_ONLY,
 )
 
 # The fit gate over a document whose vocabulary arrives from two module roots
@@ -158,4 +148,33 @@ config_fit_test(
         "fit/mods-two/widget.brenn",
     ],
     tree = ["fit/shared.brenn"],
+)
+
+# The library-module gate over a module that keeps the packaged discipline. The
+# macro writes the one-line root itself, so what this pins is the derivation of
+# the import spelling from the basename as much as the module's own legality.
+library_module_test(
+    name = "library_module_test",
+    module = "lib/good-lib.brenn",
+)
+
+# The same gate driven at the refusal, over a module that declares a top-level
+# channel. `library_module_test` has no way to want a failure, so the negative
+# case is a sibling over `dsl_cli check` directly.
+native_test(
+    name = "library_module_refusal_test",
+    size = "small",
+    src = "library_module_refusal_test.sh",
+    args = [
+        "$(rootpath //brenn-dsl:dsl_cli)",
+        "$(rootpath lib-refusal-root.brenn)",
+        "$(rootpath lib/bad-lib.brenn)",
+    ],
+    data = [
+        "lib-refusal-root.brenn",
+        "lib/bad-lib.brenn",
+        "//brenn-dsl:dsl_cli",
+    ],
+    out = "library_module_refusal_test.run",
+    target_compatible_with = HOST_ONLY,
 )

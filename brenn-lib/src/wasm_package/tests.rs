@@ -115,9 +115,14 @@ fn a_processor_record_reads_back_what_the_build_wrote() {
         record.spec_sha256.as_deref(),
         Some(sha256_hex(SPEC.as_bytes())).as_deref()
     );
+    let verified = verify(&record, &root.package(), root.path());
+    assert_eq!(verified.artifact, root.package().join(ARTIFACT));
+    assert_eq!(verified.root, root.path());
+    assert_eq!(verified.world, WORLD_PROCESSOR);
+    assert_eq!(verified.artifact_sha256, sha256_hex(b"artifact bytes"));
     assert_eq!(
-        verify(&record, &root.package()),
-        root.package().join(ARTIFACT)
+        verified.spec_sha256.as_deref(),
+        Some(sha256_hex(SPEC.as_bytes())).as_deref()
     );
 }
 
@@ -128,7 +133,14 @@ fn a_replay_record_reads_back_and_verifies_without_a_spec() {
     assert_eq!(record.world, WORLD_REPLAY);
     assert_eq!(record.spec, None);
     assert_eq!(record.spec_sha256, None);
-    verify(&record, &root.package());
+    let verified = verify(&record, &root.package(), root.path());
+    assert_eq!(verified.artifact, root.package().join(ARTIFACT));
+    assert_eq!(verified.root, root.path());
+    assert_eq!(verified.world, WORLD_REPLAY);
+    assert_eq!(verified.artifact_sha256, sha256_hex(b"replay bytes"));
+    // A replay package declares no class, so there is no spec to bind and
+    // nothing for the record to hash.
+    assert_eq!(verified.spec_sha256, None);
 }
 
 #[test]
@@ -275,7 +287,7 @@ fn an_artifact_replaced_after_packaging_is_refused() {
     let root = Root::processor(b"artifact bytes", SPEC);
     let record = load_record(&root.package());
     root.retouch_artifact(b"other bytes entirely");
-    verify(&record, &root.package());
+    verify(&record, &root.package(), root.path());
 }
 
 #[test]
@@ -288,7 +300,7 @@ fn a_packaged_spec_replaced_after_packaging_is_refused() {
         "component Sink { abi = processor; }\n",
     )
     .unwrap();
-    verify(&record, &root.package());
+    verify(&record, &root.package(), root.path());
 }
 
 #[test]
@@ -297,7 +309,7 @@ fn a_processor_package_missing_its_spec_file_is_refused() {
     let root = Root::processor(b"artifact bytes", SPEC);
     let record = load_record(&root.package());
     std::fs::remove_file(spec_path(&root.package(), NAME)).unwrap();
-    verify(&record, &root.package());
+    verify(&record, &root.package(), root.path());
 }
 
 #[test]
@@ -306,7 +318,7 @@ fn a_package_missing_its_artifact_is_refused() {
     let root = Root::processor(b"artifact bytes", SPEC);
     let record = load_record(&root.package());
     std::fs::remove_file(root.package().join(ARTIFACT)).unwrap();
-    verify(&record, &root.package());
+    verify(&record, &root.package(), root.path());
 }
 
 // ── resolving a package by name ──────────────────────────────────────────────
@@ -314,8 +326,9 @@ fn a_package_missing_its_artifact_is_refused() {
 #[test]
 fn a_consumer_is_handed_the_artifact_the_record_names() {
     let root = Root::processor(b"artifact bytes", SPEC);
-    let artifact = verify_consumer(&root.roots(), NAME, "demo", &sha256_hex(SPEC.as_bytes()));
-    assert_eq!(artifact, root.package().join(ARTIFACT));
+    let verified = verify_consumer(&root.roots(), NAME, "demo", &sha256_hex(SPEC.as_bytes()));
+    assert_eq!(verified.artifact, root.package().join(ARTIFACT));
+    assert_eq!(verified.root, root.path());
 }
 
 #[test]
@@ -422,10 +435,10 @@ fn a_consumer_pointed_at_a_replay_package_is_refused() {
 #[test]
 fn a_replay_endpoint_with_a_correct_record_loads() {
     let root = Root::replay(b"replay bytes");
-    assert_eq!(
-        verify_replay(&root.roots(), NAME, "hooks"),
-        root.package().join(ARTIFACT)
-    );
+    let verified = verify_replay(&root.roots(), NAME, "hooks");
+    assert_eq!(verified.artifact, root.package().join(ARTIFACT));
+    assert_eq!(verified.root, root.path());
+    assert_eq!(verified.world, WORLD_REPLAY);
 }
 
 #[test]
@@ -445,10 +458,11 @@ fn a_package_resolves_in_whichever_root_holds_it() {
     let brenn = Root::processor(b"artifact bytes", SPEC);
     let bundle = tempfile::tempdir().unwrap();
     let roots = vec![bundle.path().to_path_buf(), brenn.path().to_path_buf()];
-    assert_eq!(
-        verify_consumer(&roots, NAME, "demo", &sha256_hex(SPEC.as_bytes())),
-        brenn.package().join(ARTIFACT)
-    );
+    // The root the package resolved under is the release the artifact came out
+    // of; the empty bundle root beside it must not confuse that.
+    let verified = verify_consumer(&roots, NAME, "demo", &sha256_hex(SPEC.as_bytes()));
+    assert_eq!(verified.artifact, brenn.package().join(ARTIFACT));
+    assert_eq!(verified.root, brenn.path());
     assert_disjoint_components_roots(&roots);
 }
 

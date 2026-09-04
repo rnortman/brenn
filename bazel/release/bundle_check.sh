@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Assert a staged tree of component trees is internally bound.
 #
-# Usage: bundle_check.sh <names-tool> <record-lib> <tree>
+# Usage: bundle_check.sh <names-tool> <record-lib> <tree> --stage-lib FILE
 #                        [--manifest FILE] [--module-candidate GLOB]...
 #
 # `<names-tool>` is `manifest_names.sh`, which states the manifest's grammar for
 # every reader of it; `<record-lib>` is `record_lib.sh`, which states how a
-# binding record's fields are read.
+# binding record's fields are read; `--stage-lib` is `stage_lib.sh`, which names
+# the files the staging half writes, the library-module list among them.
 #
 # Three subdirectories are checked, each only if it is there: `components/` with
 # its manifest and one package directory per entry, `surface/` with one record
@@ -28,10 +29,18 @@
 # the components installed beside it. The closing direction searches the
 # candidate globs, which default to the two trees this script stages and which a
 # caller with trees of its own replaces.
+#
+# A **library module** is the one thing that direction cannot pair: vocabulary
+# the tree ships that no component and no surface kind carries, so there is no
+# packaged copy to be byte-identical to. Those are listed, in
+# `modules/library-modules.txt`, and the list is what makes them legal — every
+# staged module is either byte-identical to an owning copy *or* listed, never
+# both, and every listed name is a file in the root. A tree that lists none has
+# no such file and is checked exactly as it always was.
 set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
-    echo "usage: $0 <names-tool> <record-lib> <tree>" \
+    echo "usage: $0 <names-tool> <record-lib> <tree> --stage-lib FILE" \
          "[--manifest FILE] [--module-candidate GLOB]..." >&2
     exit 2
 fi
@@ -41,14 +50,21 @@ pkg="$3"
 shift 3
 
 manifest=""
+stage_lib=""
 candidates=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --manifest) manifest="$2"; shift 2 ;;
+        --stage-lib) stage_lib="$2"; shift 2 ;;
         --module-candidate) candidates+=("$2"); shift 2 ;;
         *) echo "ERROR: unrecognized argument: $1" >&2; exit 2 ;;
     esac
 done
+
+if [ -z "$stage_lib" ]; then
+    echo "ERROR: --stage-lib is required" >&2
+    exit 2
+fi
 
 if [ "${#candidates[@]}" -eq 0 ]; then
     candidates=("$pkg/components/*/*.brenn" "$pkg/surface/processor/*/*.spec.brenn")
@@ -67,6 +83,11 @@ shopt -u nullglob
 
 # shellcheck source=/dev/null
 . "$record_lib"
+# The staging half's own body, for the names it writes into the tree: what this
+# gate looks for and what the assembler wrote have to be one fact, and a
+# transcription of it here is the copy that rots.
+# shellcheck source=/dev/null
+. "$stage_lib"
 
 if [ ! -d "$pkg" ]; then
     echo "ERROR: $pkg is not a directory; the check would assert nothing."
@@ -338,6 +359,32 @@ fi
 # round: a stray or tampered module is text no package stands behind.
 # ---------------------------------------------------------------------------
 
+library_list="$pkg/modules/$STAGE_LIBRARY_LIST"
+listed_modules=""
+if [ "$modules_root" -eq 1 ] && [ -e "$library_list" ]; then
+    if [ ! -s "$library_list" ]; then
+        fail "modules/$STAGE_LIBRARY_LIST is empty; a tree that lists no library module carries no list"
+    else
+        listed_modules="$(LC_ALL=C sort "$library_list")"
+        # Every listed name is a file in the root: a name with nothing behind it
+        # is an import a config resolves in the build's list and nowhere on the
+        # host.
+        while read -r name; do
+            [ -n "$name" ] || continue
+            case "$name" in
+                *.brenn) ;;
+                *)
+                    fail "modules/$STAGE_LIBRARY_LIST lists $name, which is not a .brenn module"
+                    continue
+                    ;;
+            esac
+            if [ ! -s "$pkg/modules/$name" ]; then
+                fail "modules/$STAGE_LIBRARY_LIST lists $name, but modules/$name is missing or empty"
+            fi
+        done <<< "$listed_modules"
+    fi
+fi
+
 if [ "$modules_root" -eq 1 ]; then
     shopt -s nullglob
     staged_modules=("$pkg"/modules/*)
@@ -347,6 +394,10 @@ if [ "$modules_root" -eq 1 ]; then
     fi
     for module in "${staged_modules[@]}"; do
         name="$(basename "$module")"
+        # The list is a fact about the root, not vocabulary in it.
+        if [ "$name" = "$STAGE_LIBRARY_LIST" ]; then
+            continue
+        fi
         case "$name" in
             *.brenn) ;;
             *)
@@ -362,8 +413,15 @@ if [ "$modules_root" -eq 1 ]; then
                 break
             fi
         done
-        if [ -z "$found" ]; then
-            fail "modules/$name is byte-identical to no packaged specification in this tree; it is text nothing installed stands behind"
+        # Owned or listed, and exactly one of the two: a listed name that also
+        # copies a component's specification is a second statement of the same
+        # ownership, and the two could then disagree at the next pin.
+        if printf '%s\n' "$listed_modules" | grep -qxF "$name"; then
+            if [ -n "$found" ]; then
+                fail "modules/$name is listed as a library module and is also the packaged specification $found; one module has one owner"
+            fi
+        elif [ -z "$found" ]; then
+            fail "modules/$name is byte-identical to no packaged specification in this tree and is listed by no library-modules.txt; it is text nothing installed stands behind"
         fi
     done
 fi

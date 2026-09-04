@@ -32,10 +32,16 @@ _EXTRA = {
         "//bazel/wasm:record_lib.sh",
         "//bazel/release:stage_lib.sh",
     ],
-    "bundle_check": _RECORD_FIXTURES,
+    # The staging library last, because the wrapper below appends it as the
+    # gate's `--stage-lib` and this list is what the invocation's tail is built
+    # from.
+    "bundle_check": _RECORD_FIXTURES + ["//bazel/release:stage_lib.sh"],
     # The delegate last, because `package_check.sh` takes it as an argument and
     # this list is what the invocation's tail is built from.
-    "package_check": _RECORD_FIXTURES + ["//bazel/release:bundle_check.sh"],
+    "package_check": _RECORD_FIXTURES + [
+        "//bazel/release:bundle_check.sh",
+        "//bazel/release:stage_lib.sh",
+    ],
 }
 
 [
@@ -60,3 +66,40 @@ _EXTRA = {
         "package_check",
     ]
 ]
+
+# The other direction from the gates above: those hold a staged tree together,
+# this holds the source directory the staging reads from accountable. Every name
+# under `config/specs/` is shipped by a package, by a surface kind, or by
+# `//deploy`'s library-module list — and every name those three state exists.
+native_test(
+    name = "config_specs_accounted_test",
+    size = "small",
+    src = "config_specs_accounted_test.sh",
+    args = [
+        "$(rootpath //:config_spec_names)",
+        "$(rootpath //brenn-wasm:package_spec_names)",
+        "$(rootpath //surface:kind_spec_names)",
+        "$(rootpath //deploy:library_module_names)",
+    ],
+    data = [
+        "//:config_spec_names",
+        "//brenn-wasm:package_spec_names",
+        "//deploy:library_module_names",
+        "//surface:kind_spec_names",
+    ],
+    out = "config_specs_accounted_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# The gate above passes over four lists that are equal by construction, so
+# neither of its refusal branches runs there. This drives the same script over
+# fabricated lists that are wrong one way at a time.
+native_test(
+    name = "config_specs_accounted_driver_test",
+    size = "small",
+    src = "config_specs_accounted_driver_test.sh",
+    args = ["$(rootpath config_specs_accounted_test.sh)"],
+    data = ["config_specs_accounted_test.sh"],
+    out = "config_specs_accounted_driver_test.run",
+    target_compatible_with = HOST_ONLY,
+)

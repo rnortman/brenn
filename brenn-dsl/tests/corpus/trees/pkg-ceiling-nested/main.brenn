@@ -1,0 +1,7 @@
+// One ceiling over the whole expansion, two modules deep: the words the outer
+// arrangement holds and the words the inner one holds are one list, because a
+// bare nested stamp records nothing and the boundary is the deployment's `new`.
+
+use @site::*;
+
+new demo: Site(slug = "demo") { grants = [alert, dom, subscribe]; }

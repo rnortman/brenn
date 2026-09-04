@@ -1,0 +1,44 @@
+// The arrangement a component author ships: a channel of its own, a surface,
+// and one placed instance. Everything it confers is written here, in a file the
+// deployment does not own — which is what its stamp's ceiling is about.
+
+component Panel {
+    abi = processor;
+    requires = [dom];
+    in messages;
+}
+
+assembly Page(slug: String) {
+    channel out at f"ephemeral:{slug}.out" {
+        push_depth = 4;
+        retain_depth = 16;
+    }
+    surface page {
+        slug = slug;
+        grants = [subscribe];
+        new panel: Panel {
+            grants = [dom];
+            in messages <- out;
+        }
+    }
+}
+
+component Feed {
+    abi = processor;
+    requires = [log];
+    in messages;
+}
+
+// A second arrangement under the same principal, holding the one word the page
+// does not: a principal is judged by the union of everything under it, so a
+// word one arrangement narrows away is live text as long as another holds it.
+assembly Logger(slug: String) {
+    channel out at f"ephemeral:{slug}.out" {
+        push_depth = 4;
+        retain_depth = 16;
+    }
+    new consume: Feed {
+        grants = [log];
+        in messages <- out;
+    }
+}

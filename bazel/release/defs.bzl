@@ -15,6 +15,7 @@ whole tree.
 
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/wasm:defs.bzl", "library_module_test", "module_import_name")
 
 _MUSL_PLATFORM = str(Label("//bazel/platforms:linux_x86_64_musl"))
 _STATIC_MUSL_FLAG = str(Label("//bazel/release:static_musl"))
@@ -65,11 +66,12 @@ def _release_package_impl(ctx):
     args.add_all(binaries, before_each = "--bin")
     args.add_all(ctx.files.lib_files, before_each = "--lib")
     args.add_all(ctx.files.packages, before_each = "--package")
+    args.add_all(ctx.files.library_modules, before_each = "--library-module")
 
     ctx.actions.run(
         outputs = [out],
         inputs = depset(
-            binaries + ctx.files.packages +
+            binaries + ctx.files.packages + ctx.files.library_modules +
             ctx.files.lib_files + [ctx.file.manifest],
             transitive = [
                 ctx.attr.frontend[DefaultInfo].files,
@@ -114,6 +116,11 @@ _release_package = rule(
             allow_files = True,
             doc = "Loose files installed to `lib/`, the MCP stub among them.",
         ),
+        "library_modules": attr.label_list(
+            allow_files = [".brenn"],
+            doc = "Packaged modules no component or surface kind owns, staged " +
+                  "flat under `modules/` and named in `modules/library-modules.txt`.",
+        ),
         "manifest": attr.label(
             allow_single_file = True,
             mandatory = True,
@@ -147,7 +154,16 @@ _release_package = rule(
     },
 )
 
-def release_package(name, manifest, binaries, packages, frontend, surface, lib_files = [], visibility = None):
+def release_package(
+        name,
+        manifest,
+        binaries,
+        packages,
+        frontend,
+        surface,
+        lib_files = [],
+        library_modules = [],
+        visibility = None):
     """The staged release tree, plus the gate on the contract `deploy.sh` reads.
 
     Pairing them here makes the gate structural: the tree cannot be added to
@@ -165,6 +181,15 @@ def release_package(name, manifest, binaries, packages, frontend, surface, lib_f
         frontend: the frontend asset tree.
         surface: the surface asset tree.
         lib_files: loose files installed to `lib/`.
+        library_modules: packaged `.brenn` modules that no component package and
+            no surface kind owns — brenn's own vocabulary, shipped for a
+            deployment to import rather than to copy. Each stages as
+            `modules/<basename>` and is named in `modules/library-modules.txt`,
+            which is what tells the contract test and the deploying repo's
+            preflight that the file is owed by a list and not by a component.
+            Each also gets a `library_module_test`, so a module that violates
+            the packaged-module discipline fails here rather than at a
+            deployment's boot.
         visibility: visibility of the staged tree.
     """
     _release_package(
@@ -172,12 +197,23 @@ def release_package(name, manifest, binaries, packages, frontend, surface, lib_f
         binaries = binaries,
         frontend = frontend,
         lib_files = lib_files,
+        library_modules = library_modules,
         manifest = manifest,
         packages = packages,
         surface = surface,
         target_compatible_with = HOST_ONLY,
         visibility = visibility,
     )
+
+    # Paired here rather than left to the caller, as the contract test is: a
+    # library module is compiled by nothing else in the graph, so a module added
+    # to the tree without its gate is one whose first reader is a deployment's
+    # boot.
+    for module in library_modules:
+        library_module_test(
+            name = name + "_module_" + module_import_name(module),
+            module = module,
+        )
 
     native_test(
         name = name + "_contract",
@@ -192,10 +228,13 @@ def release_package(name, manifest, binaries, packages, frontend, surface, lib_f
         ] + select({
             "//bazel/release:musl_binaries": ["static"],
             "//conditions:default": ["dynamic"],
-        }),
+        }) + [
+            "$(rootpath //bazel/release:stage_lib.sh)",
+        ],
         data = [
             manifest,
             "//bazel/release:bundle_check.sh",
+            "//bazel/release:stage_lib.sh",
             "//bazel/wasm:manifest_names.sh",
             "//bazel/wasm:record_lib.sh",
             ":" + name,

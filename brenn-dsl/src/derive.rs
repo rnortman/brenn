@@ -17,13 +17,15 @@
 //! 3. **Identity** — the durable channel uuids, pinned or derived, and their
 //!    distinctness against each other and against the runtime's derived
 //!    non-durable identities.
-//! 4. **Authority** — which family every `acl` matcher and cross-principal
+//! 4. **Authority** — which family every `acl` matcher and cross-entity
 //!    `grant` lands in, whether the entity that holds it has that family at all,
 //!    and what the matcher comes to once its scheme is stripped; then what every
 //!    binding and subscription derives where nothing explicit holds its plane,
-//!    and that each of them is covered by the authority the principal ends up
+//!    and that each of them is covered by the authority the entity ends up
 //!    with.
-//! 5. **The wire-kind fold** — the kebab kind each surface-placed component
+//! 5. **Principals** — every declared principal's authority, and that each
+//!    holds no more than the one it is `under`.
+//! 6. **The wire-kind fold** — the kebab kind each surface-placed component
 //!    instance is served under, and its collision check.
 //!
 //! Several tables below are transcriptions of runtime behavior — the schemes and
@@ -31,7 +33,7 @@
 //! seeds. `brenn-dsl` depends on no brenn domain crate, so they are stated here
 //! and carry the same drift exposure as the attr vocabularies do.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use fltk_cst_core::Span;
@@ -60,8 +62,8 @@ use crate::model::Word;
 use crate::resolved::scheme::{config_identified, spellable_quoted_list, split_spellable};
 use crate::resolved::{
     ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
-    RChannel, RMatcher, RMatcherVal, RPort, RSurface, RTail, RToolGrant, RTuning, RVal, RValue,
-    ResolvedConfig, str_value,
+    RChannel, RMatcher, RMatcherVal, RPort, RStamp, RSurface, RTail, RToolGrant, RTuning, RVal,
+    RValue, RWordList, ResolvedConfig, StampId, str_value,
 };
 
 /// Derive a resolved document.
@@ -74,7 +76,8 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
     check_channel_model(&config, &mut errors);
     let channel_uuids = derive_channel_identity(&config, &mut errors);
     let refs = Refs::of(&config);
-    let authorities = derive_authorities(&config, &refs, &mut errors);
+    let (authorities, conferrals) = derive_authorities(&config, &refs, &mut errors);
+    check_ceilings(&config, &conferrals, &refs, &mut errors);
     let surface_component_kinds = fold_component_kinds(&config, &mut errors);
     check_links(&config, &mut errors);
     check_doctypes(&config, &refs, &mut errors);
@@ -319,7 +322,7 @@ fn check_tuning_address(tuning: &RTuning, errors: &mut Vec<Diagnostic>) {
             "a tuning block carries no description: the endpoint or tool that mints the \
              channel owns it — write the note as a `//` comment"
                 .to_string(),
-            first.span().clone(),
+            first.content.span().clone(),
         ));
     }
     if let Some(description) = &tuning.attrs.description {
@@ -448,7 +451,7 @@ fn require_depth(
 fn int_or_word_span(value: &crate::model::IntOrWord) -> &Span {
     match value {
         crate::model::IntOrWord::Int(count) => count.span(),
-        crate::model::IntOrWord::Word(word) => word.name.span(),
+        crate::model::IntOrWord::Name { span, .. } => span,
     }
 }
 
@@ -633,21 +636,28 @@ fn host_refusal(kind: EntityKind, right: Capability) -> Option<&'static str> {
 /// review.
 const COMPONENT_CAPABILITIES: &[Capability] = Capability::ALL.split_at(ComponentGrant::ALL.len()).0;
 
-/// The principal a statement is about: what it is, and what to call it.
+/// The running entity a statement is about: what it is, and what to call it.
 #[derive(Debug, Clone, Copy)]
-struct Principal<'a> {
+struct Holder<'a> {
     kind: EntityKind,
     label: &'a str,
 }
 
-/// Where an entry was written.
+/// Where an entry came from.
 ///
-/// A `grant` reaches into another principal's authority, and one thing is legal
-/// in an entity's own body and not from outside it.
+/// Two readers, one fact. Entry resolution asks it because a `grant` reaches
+/// into another entity's authority and one thing is legal in an entity's own
+/// body and not from outside it. The ceiling fold asks it because what a stamp
+/// confers is what the arrangement wrote — its own statements and what its
+/// bindings derive — and never what someone else's `grant` handed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
+enum Origin {
+    /// An `acl` statement in the holder's own body.
     Statement,
-    Grant,
+    /// Derived from a binding the holder makes.
+    Binding,
+    /// A `grant` aimed at the holder, by position in `ResolvedConfig::grants`.
+    Grant(usize),
 }
 
 /// One ACL list the runtime keeps, named as the field that holds it.
@@ -748,6 +758,18 @@ impl Family {
         }
     }
 
+    /// Is this family confined — reach a ceiling neither caps nor is asked for?
+    ///
+    /// One home for the fact, because three readers depend on agreeing about it:
+    /// a ceiling line in a confined family is refused, a confined channel is
+    /// absent from a stamp's default reach, and a confined entry an arrangement
+    /// derives is not reach the stamp confers. A confined channel reaches the
+    /// one component that binds it, authorized by the host that serves the page
+    /// rather than by anything a deployment writes.
+    fn confined(self) -> bool {
+        matches!(self, Self::LocalSubscribe | Self::LocalPublish)
+    }
+
     /// Which matcher kind writes an entry in this list.
     fn admits(self, kind: MatcherKind) -> bool {
         match self {
@@ -768,6 +790,34 @@ impl Family {
         }
     }
 
+    /// The plane its entries are on.
+    ///
+    /// A webhook is inbound only, so it is the subscribe plane.
+    fn plane(self) -> Plane {
+        match self {
+            Self::BrennSubscribe
+            | Self::EphemeralSubscribe
+            | Self::LocalSubscribe
+            | Self::MqttSubscribe
+            | Self::Webhook => Plane::Subscribe,
+            Self::BrennPublish
+            | Self::EphemeralPublish
+            | Self::LocalPublish
+            | Self::MqttPublish => Plane::Publish,
+        }
+    }
+
+    /// The scheme its entries are addresses under.
+    fn scheme(self) -> ChannelScheme {
+        match self {
+            Self::BrennSubscribe | Self::BrennPublish => ChannelScheme::Brenn,
+            Self::EphemeralSubscribe | Self::EphemeralPublish => ChannelScheme::Ephemeral,
+            Self::LocalSubscribe | Self::LocalPublish => ChannelScheme::Local,
+            Self::MqttSubscribe | Self::MqttPublish => ChannelScheme::Mqtt,
+            Self::Webhook => ChannelScheme::Webhook,
+        }
+    }
+
     /// Is this a list whose entries a remote states depth ceilings on?
     pub fn carries_ceilings(self) -> bool {
         matches!(self, Self::BrennSubscribe | Self::EphemeralSubscribe)
@@ -776,7 +826,7 @@ impl Family {
     /// Why this entity type keeps no list of this family.
     ///
     /// The one home for the fact both refusal paths rest on: a matcher naming a
-    /// family the principal lacks, and a position on a scheme that family would
+    /// family the holder lacks, and a position on a scheme that family would
     /// have authorized.
     fn absent_reason(self, kind: EntityKind) -> String {
         match (self, kind) {
@@ -791,7 +841,7 @@ impl Family {
     /// The field this list is held in, in a struct of this shape.
     ///
     /// [`Family::name`] is the `App` spelling; the other two drop the `brenn_`
-    /// qualifier, because a struct that is already about one principal's
+    /// qualifier, because a struct that is already about one entity's
     /// `brenn:` lists says it once in the type rather than nine times in the
     /// fields, and a config struct appends `_acl` because its ACL lists sit
     /// beside its ports and its budgets.
@@ -822,7 +872,7 @@ impl Family {
 }
 
 /// One entry, before it is filed under the family it belongs to.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum DEntry {
     Chan(DMatcher),
     Ceiling(DRemoteSubEntry),
@@ -896,23 +946,26 @@ impl<'a> Refs<'a> {
     }
 }
 
-/// One principal, as every phase of the authority pass sees it.
+/// One running entity, as every phase of the authority pass sees it.
 ///
 /// Statements, grants, bindings and the grants walk all run over one list of
-/// these, so a rule that must hold for every principal is written once and a
+/// these, so a rule that must hold for every entity is written once and a
 /// per-kind exemption is a value on the row rather than a missing loop.
 struct Subject<'a> {
     kind: EntityKind,
-    /// The dotted handle, spelled once per principal.
+    /// The dotted handle, spelled once per entity.
     label: String,
+    /// The recorded stamp this entity was expanded inside, or `None` for one
+    /// written in deployer text under no recorded stamp.
+    stamp: Option<StampId>,
     /// Where the identity is written: what a refusal about the whole entity cites.
     span: Span,
     acls: &'a [RAcl],
-    /// Every position this principal attaches through. Empty for a remote, which
+    /// Every position this entity attaches through. Empty for a remote, which
     /// holds no ports and states no subscriptions, so its authority is the
     /// entries it writes and the ones granted to it.
     bounds: Vec<Bound<'a>>,
-    /// Whether a refusal about one of its positions is this principal's to
+    /// Whether a refusal about one of its positions is this entity's to
     /// report.
     ///
     /// False for a surface-placed instance: its bindings are also its surface's
@@ -931,7 +984,7 @@ struct Subject<'a> {
     /// required with no default).
     words: Option<&'a [Word]>,
     /// What its class declares it needs, for a component instance; `None` for
-    /// every other principal, none of which instantiates a spec.
+    /// every other entity, none of which instantiates a spec.
     spec: Option<&'a ClassRef>,
     /// The `tool` statements it holds. A component's are coupled to its `tools`
     /// word; an agent's are its whole tool authority, coupled to nothing.
@@ -939,9 +992,9 @@ struct Subject<'a> {
 }
 
 impl Subject<'_> {
-    /// This principal, as a diagnostic names it.
-    fn principal(&self) -> Principal<'_> {
-        Principal {
+    /// This entity, as a diagnostic names it.
+    fn holder(&self) -> Holder<'_> {
+        Holder {
             kind: self.kind,
             label: &self.label,
         }
@@ -975,12 +1028,13 @@ impl Subject<'_> {
     }
 }
 
-/// Every principal in the document, in the order the derived model holds them:
-/// surfaces, consumers, agents, remotes.
+/// Every running entity in the document, in the order the derived model holds
+/// them: surfaces, consumers, agents, remotes.
 fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
     let surfaces = config.surfaces.iter().map(|entity| Subject {
         kind: EntityKind::Surface,
         label: entity.handle.dotted(),
+        stamp: entity.stamp,
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: surface_bounds(entity),
@@ -997,6 +1051,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         surface.components.iter().map(move |instance| Subject {
             kind: EntityKind::Component(ComponentHost::Surface),
             label: format!("{prefix}.{}", instance.instance.value()),
+            stamp: instance.stamp,
             span: instance.instance.span().clone(),
             acls: &instance.acls,
             bounds: binding_bounds(&instance.bindings),
@@ -1010,6 +1065,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
     let consumers = config.consumers.iter().map(|entity| Subject {
         kind: EntityKind::Component(ComponentHost::TopLevel),
         label: entity.handle.dotted(),
+        stamp: entity.stamp,
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: binding_bounds(&entity.bindings),
@@ -1022,6 +1078,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
     let agents = config.agents.iter().map(|entity| Subject {
         kind: EntityKind::Agent,
         label: entity.handle.dotted(),
+        stamp: entity.stamp,
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: agent_bounds(entity),
@@ -1038,6 +1095,9 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
     let remotes = config.remotes.iter().map(|entity| Subject {
         kind: EntityKind::Remote,
         label: entity.handle.dotted(),
+        // A remote is a network peer named in deployer text; no assembly
+        // declares one, so nothing stamps one.
+        stamp: None,
         span: handle_span(&entity.handle),
         acls: &entity.acls,
         bounds: Vec::new(),
@@ -1055,7 +1115,7 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
         .collect()
 }
 
-/// One principal's entries as they accumulate, and where the explicit `acl`
+/// One entity's entries as they accumulate, and where the explicit `acl`
 /// statements it holds are.
 ///
 /// The spans are what a coverage refusal cites: an explicit statement is the
@@ -1063,14 +1123,14 @@ fn subjects(config: &ResolvedConfig) -> Vec<Subject<'_>> {
 /// by the statement that stopped it from deriving.
 #[derive(Default)]
 struct Stated {
-    entries: Vec<(Family, DEntry)>,
+    entries: Vec<(Family, DEntry, Origin)>,
     explicit: Vec<(Plane, Span)>,
-    /// Where the first send this principal makes is, if it makes one: a position
+    /// Where the first send this entity makes is, if it makes one: a position
     /// on the publish plane, or the ring a free `io` port mints. What the `ports`
     /// rule is about at either placement — a send is a right to send whether or
     /// not an entry was ever filed for it.
     output: Option<Span>,
-    /// Whether anything this principal wrote was refused.
+    /// Whether anything this entity wrote was refused.
     ///
     /// Agreement asks whether the words and the lists say the same thing, and a
     /// refused statement means the lists are not what the document says — so the
@@ -1116,11 +1176,11 @@ impl Stated {
         if self
             .entries
             .iter()
-            .any(|(held_family, held)| (*held_family, held.key()) == (family, key))
+            .any(|(held_family, held, _)| (*held_family, held.key()) == (family, key))
         {
             return;
         }
-        self.entries.push((family, entry));
+        self.entries.push((family, entry, Origin::Binding));
     }
 
     /// Is anything filed under this family?
@@ -1130,22 +1190,22 @@ impl Stated {
     fn first(&self, family: Family) -> Option<&DEntry> {
         self.entries
             .iter()
-            .find(|(held, _)| *held == family)
-            .map(|(_, entry)| entry)
+            .find(|(held, _, _)| *held == family)
+            .map(|(_, entry, _)| entry)
     }
 
     /// Is anything here enough for a position on this family to be authorized?
     fn covers(&self, family: Family, name: &str) -> bool {
         self.entries
             .iter()
-            .any(|(held_family, entry)| *held_family == family && entry.covers(name))
+            .any(|(held_family, entry, _)| *held_family == family && entry.covers(name))
     }
 }
 
-/// Every principal's effective authority: what its own body states, what other
+/// Every entity's effective authority: what its own body states, what other
 /// statements grant it, and what its bindings derive.
 ///
-/// Four phases over one principal list, so every entity type takes every phase:
+/// Four phases over one entity list, so every entity type takes every phase:
 /// its own statements, the grants aimed at it, its bindings, then its `grants`
 /// words against the lists the first three came to.
 ///
@@ -1156,7 +1216,7 @@ fn derive_authorities(
     config: &ResolvedConfig,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> DAuthorities {
+) -> (DAuthorities, Conferred) {
     let subjects = subjects(config);
     // Surface-placed components are deliberately absent: they hold no handle in
     // the handle space, so nothing can name one as a `grant` target, and a
@@ -1172,10 +1232,14 @@ fn derive_authorities(
         .map(|subject| collect_statements(subject, refs, errors))
         .collect();
 
-    for grant in &config.grants {
-        let label = grant.principal.dotted();
+    // Parallel to `config.grants`: what each grant filed. Not reachable
+    // through the target's own row — a stamped arrangement may widen an entity
+    // outside its subtree, and that entity has no row of its own.
+    let mut granted: Vec<Option<(Family, DEntry)>> = Vec::new();
+    for (position, grant) in config.grants.iter().enumerate() {
+        let label = grant.target.dotted();
         let Some(&index) = slots.get(label.as_str()) else {
-            unreachable!("resolution refuses a grant that names no principal");
+            unreachable!("resolution refuses a grant that names no running entity");
         };
         let Some(plane) = Plane::parse(grant.plane.value()) else {
             unreachable!("resolution refuses a grant on a plane that is not a plane");
@@ -1184,17 +1248,23 @@ fn derive_authorities(
         let entry = resolve_entry(
             &grant.m,
             plane,
-            subjects[index].principal(),
-            Source::Grant,
+            subjects[index].holder(),
+            Origin::Grant(position),
             refs,
             errors,
             &mut held.refused,
         );
-        // A refused grant is a refused part of this principal's authority, so
-        // agreement stops asking about the principal it was aimed at.
+        // A refused grant is a refused part of that entity's authority, so
+        // agreement stops asking about the entity it was aimed at.
         match entry {
-            Some(entry) => held.entries.push(entry),
-            None => held.refused = true,
+            Some((family, entry)) => {
+                granted.push(Some((family, entry.clone())));
+                held.entries.push((family, entry, Origin::Grant(position)));
+            }
+            None => {
+                granted.push(None);
+                held.refused = true;
+            }
         }
     }
 
@@ -1208,16 +1278,30 @@ fn derive_authorities(
     let mut authorities = DAuthorities::default();
     // Flat, in `subjects` walk order; re-nested per surface below.
     let mut placed: Vec<DAuthority> = Vec::new();
+    // What every stamped entity holds. Collected here because this is the one
+    // pass that has the whole of an entity's authority in hand: the lowered
+    // `DAuthority` has filed its entries by family and dropped where each came
+    // from, and the ceiling rules turn on exactly that.
+    let mut entities = Vec::new();
     for (subject, held) in subjects.iter().zip(stated) {
         let grants = derive_grants(subject, &held, errors);
+        if subject.stamp.is_some() {
+            entities.push(Conferral {
+                stamp: subject.stamp,
+                label: subject.label.clone(),
+                words: grants.words,
+                entries: held.entries.clone(),
+            });
+        }
+        let tokens = grants.tokens;
         match subject.kind {
-            EntityKind::Surface => authorities.surfaces.push(authority(held, grants)),
-            EntityKind::Component(ComponentHost::Surface) => placed.push(authority(held, grants)),
+            EntityKind::Surface => authorities.surfaces.push(authority(held, tokens)),
+            EntityKind::Component(ComponentHost::Surface) => placed.push(authority(held, tokens)),
             EntityKind::Component(ComponentHost::TopLevel) => {
-                authorities.consumers.push(authority(held, grants))
+                authorities.consumers.push(authority(held, tokens))
             }
-            EntityKind::Agent => authorities.agents.push(authority(held, grants)),
-            EntityKind::Remote => authorities.remotes.push(remote_authority(held, grants)),
+            EntityKind::Agent => authorities.agents.push(authority(held, tokens)),
+            EntityKind::Remote => authorities.remotes.push(remote_authority(held, tokens)),
         }
     }
     let mut rest = placed.into_iter();
@@ -1230,13 +1314,45 @@ fn derive_authorities(
         rest.next().is_none(),
         "one authority per placed instance, in surface order"
     );
-    authorities
+    (
+        authorities,
+        Conferred {
+            entities,
+            grants: granted,
+        },
+    )
 }
 
-/// One principal's entries, filed into the families an app-side entity holds.
+/// The authority-side inputs the ceiling fold needs.
+struct Conferred {
+    /// One row per authority-bearing entity with a recorded stamp.
+    entities: Vec<Conferral>,
+    /// Parallel to [`ResolvedConfig::grants`]: the entry each grant filed, or
+    /// `None` where it was refused.
+    grants: Vec<Option<(Family, DEntry)>>,
+}
+
+/// What one stamped entity confers on the stamp it came out of.
+///
+/// One row per authority-bearing entity with a recorded stamp; an entity under
+/// none confers on nothing and gets no row.
+struct Conferral {
+    /// The stamp it was expanded inside. Every recorded stamp on that stamp's
+    /// ancestor chain counts it, because an outer ceiling is a statement about
+    /// the whole subtree under it.
+    stamp: Option<StampId>,
+    /// The dotted handle, as a refusal names the holder.
+    label: String,
+    /// Its grant words, in the ceiling's spelling.
+    words: Vec<Spanned<String>>,
+    /// Its reach, with where each entry came from.
+    entries: Vec<(Family, DEntry, Origin)>,
+}
+
+/// One entity's entries, filed into the families an app-side entity holds.
 fn authority(stated: Stated, grants: Vec<Spanned<String>>) -> DAuthority {
     let mut acl = DAclSet::default();
-    for (family, entry) in stated.entries {
+    for (family, entry, _) in stated.entries {
         entry.file(family, &mut Lists::Acl(&mut acl));
     }
     DAuthority { grants, acl }
@@ -1248,7 +1364,7 @@ fn remote_authority(stated: Stated, grants: Vec<Spanned<String>>) -> DRemoteAuth
         grants,
         ..DRemoteAuthority::default()
     };
-    for (family, entry) in stated.entries {
+    for (family, entry, _) in stated.entries {
         entry.file(family, &mut Lists::Remote(&mut remote));
     }
     remote
@@ -1264,25 +1380,37 @@ fn handle_span(handle: &HandlePath) -> Span {
         .clone()
 }
 
+/// The plane an `acl` statement names.
+///
+/// One home for the refusal: a running entity's statement and a ceiling's line
+/// are both read here, and a reword that reached only one of them would explain
+/// the same mistake in two voices.
+fn acl_plane(acl: &RAcl, errors: &mut Vec<Diagnostic>) -> Option<Plane> {
+    let plane = Plane::parse(acl.plane.value());
+    if plane.is_none() {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` is not a plane; an acl statement names `subscribe` or `publish`, \
+                 and which scheme it is about comes from its matchers",
+                acl.plane.value()
+            ),
+            acl.plane.span().clone(),
+        ));
+    }
+    plane
+}
+
 /// One entity's own `acl` statements, resolved into the entries they name.
 fn collect_statements(
     subject: &Subject<'_>,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Stated {
-    let principal = subject.principal();
+    let holder = subject.holder();
     let mut stated = Stated::default();
     for acl in subject.acls {
-        let Some(plane) = Plane::parse(acl.plane.value()) else {
+        let Some(plane) = acl_plane(acl, errors) else {
             stated.refused = true;
-            errors.push(Diagnostic::at(
-                format!(
-                    "`{}` is not a plane; an acl statement names `subscribe` or `publish`, \
-                     and which scheme it is about comes from its matchers",
-                    acl.plane.value()
-                ),
-                acl.plane.span().clone(),
-            ));
             continue;
         };
         stated.explicit.push((plane, acl.plane.span().clone()));
@@ -1290,14 +1418,16 @@ fn collect_statements(
             let entry = resolve_entry(
                 matcher,
                 plane,
-                principal,
-                Source::Statement,
+                holder,
+                Origin::Statement,
                 refs,
                 errors,
                 &mut stated.refused,
             );
             match entry {
-                Some(entry) => stated.entries.push(entry),
+                Some((family, entry)) => {
+                    stated.entries.push((family, entry, Origin::Statement));
+                }
                 None => stated.refused = true,
             }
         }
@@ -1317,63 +1447,41 @@ fn collect_statements(
 fn resolve_entry(
     matcher: &RMatcher,
     plane: Plane,
-    principal: Principal<'_>,
-    source: Source,
+    holder: Holder<'_>,
+    origin: Origin,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
     refused: &mut bool,
 ) -> Option<(Family, DEntry)> {
     let kind = *matcher.kind.value();
     let span = matcher.val.span().clone();
-    let (scheme, bare) = matcher_address(matcher, kind, refs, errors)?;
-    let Some(family) = Family::of(scheme, plane) else {
-        errors.push(Diagnostic::at(
-            "a webhook is inbound only, so there is no publishing to one: an endpoint \
-             belongs on the subscribe plane"
-                .to_string(),
-            span,
-        ));
-        return None;
-    };
-    if !family.held_by(principal.kind) {
-        errors.push(Diagnostic::at(
-            no_such_family(family, principal),
-            span.clone(),
-        ));
+    let (family, bare) = matcher_family(matcher, plane, kind, refs, errors)?;
+    if !family.held_by(holder.kind) {
+        errors.push(Diagnostic::at(no_such_family(family, holder), span.clone()));
         return None;
     }
-    if !family.admits(kind) {
-        errors.push(Diagnostic::at(
-            format!(
-                "`{}` is not how an entry in `{}` is written; that family takes {}",
-                kind.as_str(),
-                family.name(),
-                family.kinds()
-            ),
-            matcher.kind.span().clone(),
-        ));
+    if !family_admits(matcher, kind, family, errors) {
         return None;
     }
-    let ceilings = principal.kind == EntityKind::Remote && family.carries_ceilings();
-    if ceilings && source == Source::Grant {
+    let ceilings = holder.kind == EntityKind::Remote && family.carries_ceilings();
+    if ceilings && matches!(origin, Origin::Grant(_)) {
         errors.push(Diagnostic::at(
             format!(
                 "a grant cannot reach the subscribe plane of remote `{}`: its entries cap \
                  how deep a subscription may be held, and one ceiling per remote is what \
                  makes that a bound — write the entry in the remote's own `acl subscribe`",
-                principal.label
+                holder.label
             ),
             span,
         ));
         return None;
     }
-    let entry = match family {
-        Family::MqttSubscribe => {
-            *refused |= refuse_tail(matcher, family, errors);
-            DEntry::MqttSub(mqtt_sub_entry(&bare, &span, refs, errors)?)
-        }
-        Family::MqttPublish => {
-            let budget = mqtt_sink_budget(matcher, principal, errors);
+    // Two families are built here rather than by `plain_entry`, because what a
+    // statement adds to them is inside the entry: an mqtt sink's budgets, and a
+    // remote's subscribe depths. Every other family is the shared construction.
+    let entry = match (family, ceilings) {
+        (Family::MqttPublish, _) => {
+            let budget = mqtt_sink_budget(matcher, holder, errors);
             *refused |= budget.is_none();
             let (publish_per_activation, publish_capacity) = budget.unwrap_or((None, None));
             DEntry::MqttPub(DMqttClient {
@@ -1382,34 +1490,104 @@ fn resolve_entry(
                 publish_capacity,
             })
         }
-        Family::Webhook => {
-            *refused |= refuse_tail(matcher, family, errors);
-            if !refs.endpoint(&bare, &span, errors) {
-                return None;
-            }
-            DEntry::Webhook(DWebhook {
-                endpoint: Spanned::new(bare, span),
+        (_, true) => {
+            let pattern = channel_matcher(kind, bare, &span, errors)?;
+            let (push_depth, retain_depth) = remote_ceilings(matcher, &span, errors)?;
+            DEntry::Ceiling(DRemoteSubEntry {
+                m: pattern,
+                push_depth,
+                retain_depth,
             })
         }
         _ => {
-            let pattern = channel_matcher(kind, bare, &span, errors)?;
-            match ceilings {
-                true => {
-                    let (push_depth, retain_depth) = remote_ceilings(matcher, &span, errors)?;
-                    DEntry::Ceiling(DRemoteSubEntry {
-                        m: pattern,
-                        push_depth,
-                        retain_depth,
-                    })
-                }
-                false => {
-                    *refused |= refuse_tail(matcher, family, errors);
-                    DEntry::Chan(pattern)
-                }
-            }
+            *refused |= refuse_tail(matcher, family, errors);
+            plain_entry(family, kind, bare, &span, refs, errors)?
         }
     };
     Some((family, entry))
+}
+
+/// One matcher's family entry, undecorated.
+///
+/// The one construction both readers of a matcher end at — a running entity's
+/// `acl` statement and a ceiling's `acl` line — so an entry a ceiling is
+/// compared against is built the way the entry it caps was. A family whose
+/// entry carries something the writer decorates it with is the caller's, and
+/// there are two: an mqtt sink's budgets and a remote's subscribe depths.
+fn plain_entry(
+    family: Family,
+    kind: MatcherKind,
+    bare: String,
+    span: &Span,
+    refs: &Refs<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<DEntry> {
+    Some(match family {
+        Family::MqttSubscribe => DEntry::MqttSub(mqtt_sub_entry(&bare, span, refs, errors)?),
+        Family::MqttPublish => DEntry::MqttPub(DMqttClient {
+            client: mqtt_client(&bare, span, refs, errors)?,
+            publish_per_activation: None,
+            publish_capacity: None,
+        }),
+        Family::Webhook => {
+            if !refs.endpoint(&bare, span, errors) {
+                return None;
+            }
+            DEntry::Webhook(DWebhook {
+                endpoint: Spanned::new(bare, span.clone()),
+            })
+        }
+        _ => DEntry::Chan(channel_matcher(kind, bare, span, errors)?),
+    })
+}
+
+/// The family a matcher on a plane is about, and what follows its scheme.
+///
+/// The half of entry resolution that is the same question whoever asks it: a
+/// running entity's own statement, a grant aimed at it, and a ceiling line all
+/// read one matcher as one family. What differs after this is who may hold that
+/// family, which is the caller's.
+fn matcher_family(
+    matcher: &RMatcher,
+    plane: Plane,
+    kind: MatcherKind,
+    refs: &Refs<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<(Family, String)> {
+    let (scheme, bare) = matcher_address(matcher, kind, refs, errors)?;
+    match Family::of(scheme, plane) {
+        Some(family) => Some((family, bare)),
+        None => {
+            errors.push(Diagnostic::at(
+                "a webhook is inbound only, so there is no publishing to one: an endpoint \
+                 belongs on the subscribe plane",
+                matcher.val.span().clone(),
+            ));
+            None
+        }
+    }
+}
+
+/// That this family's entries are written the way this matcher writes them.
+fn family_admits(
+    matcher: &RMatcher,
+    kind: MatcherKind,
+    family: Family,
+    errors: &mut Vec<Diagnostic>,
+) -> bool {
+    if family.admits(kind) {
+        return true;
+    }
+    errors.push(Diagnostic::at(
+        format!(
+            "`{}` is not how an entry in `{}` is written; that family takes {}",
+            kind.as_str(),
+            family.name(),
+            family.kinds()
+        ),
+        matcher.kind.span().clone(),
+    ));
+    false
 }
 
 /// What a matcher is about: the scheme it names, and what follows it.
@@ -1597,7 +1775,7 @@ pub const REMOTE_CEILING_KEYS: [&str; 2] = [PUSH_DEPTH_KEY, RETAIN_DEPTH_KEY];
 ///
 /// Both required, and plain counts: a remote has no `channel` block of its own to
 /// inherit a depth from, and an unbounded window is not an answer a network
-/// principal may be given.
+/// peer may be given.
 /// The admitted keys are [`REMOTE_CEILING_KEYS`], pinned by a parity test in
 /// `brenn-lib` against the runtime struct's fields.
 fn remote_ceilings(
@@ -1677,7 +1855,7 @@ fn count(value: &RVal, key: &str, errors: &mut Vec<Diagnostic>) -> Option<u64> {
             errors.push(Diagnostic::at(
                 format!(
                     "{key} is {}, and a remote's ceiling is a plain count: an unbounded \
-                     window is not an answer a network principal may be given",
+                     window is not an answer a network peer may be given",
                     other.kind()
                 ),
                 value.span().clone(),
@@ -1701,28 +1879,28 @@ pub const MQTT_SINK_KEYS: [&str; 2] = [PUBLISH_PER_ACTIVATION_KEY, PUBLISH_CAPAC
 /// Both keys are optional — an entry that states neither takes the runtime's
 /// default budget — and both are token counts, so an integer is the same number
 /// as the float it widens to. Only a top-level component holds an MQTT sink of
-/// its own; every other principal publishes through a host that budgets its
+/// its own; every other entity publishes through a host that budgets its
 /// egress elsewhere, and a tail there is refused.
 ///
 /// `None` says something in the tail was refused: the entry is still the client
 /// it names, but not the budget that was written.
 fn mqtt_sink_budget(
     matcher: &RMatcher,
-    principal: Principal<'_>,
+    holder: Holder<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<(Option<f64>, Option<f64>)> {
     if matcher.tail.is_empty() {
         return Some((None, None));
     }
-    if principal.kind != EntityKind::Component(ComponentHost::TopLevel) {
+    if holder.kind != EntityKind::Component(ComponentHost::TopLevel) {
         for (key, value) in &matcher.tail {
             errors.push(Diagnostic::at(
                 format!(
                     "`{key}` is not part of {} `{}`'s `mqtt_publish` entry: an egress budget \
-                     tunes the sink a component holds, and this principal publishes through a \
+                     tunes the sink a component holds, and this entity publishes through a \
                      host that budgets its own",
-                    principal.kind.label(),
-                    principal.label
+                    holder.kind.label(),
+                    holder.label
                 ),
                 value.span().clone(),
             ));
@@ -1800,18 +1978,18 @@ fn refuse_tail(matcher: &RMatcher, family: Family, errors: &mut Vec<Diagnostic>)
     !matcher.tail.is_empty()
 }
 
-/// The refusal for a family the principal's entity type does not have.
-fn no_such_family(family: Family, principal: Principal<'_>) -> String {
+/// The refusal for a family the holder's entity type does not have.
+fn no_such_family(family: Family, holder: Holder<'_>) -> String {
     format!(
         "{} `{}` can hold no `{}` authority: {}",
-        principal.kind.label(),
-        principal.label,
+        holder.kind.label(),
+        holder.label,
         family.name(),
-        family.absent_reason(principal.kind)
+        family.absent_reason(holder.kind)
     )
 }
 
-/// The lists an entry is filed into: an app-side principal's families, or the
+/// The lists an entry is filed into: an app-side entity's families, or the
 /// four a remote has.
 enum Lists<'a> {
     Acl(&'a mut DAclSet),
@@ -1888,6 +2066,51 @@ impl DEntry {
         }
     }
 
+    /// Does this entry hold no more than `parent`, within one family?
+    ///
+    /// The subsumption half of attenuation. Exact under exact is equality;
+    /// exact under prefix is the prefix reaching it; prefix under prefix is one
+    /// prefix reaching the other; prefix under exact never holds, because a
+    /// family reaches addresses one address does not. The transport shapes
+    /// compare by equality: there is no arithmetic over a topic filter or an
+    /// endpoint that says one covers another, so a wildcard ceiling is written
+    /// as the same wildcard.
+    ///
+    /// Every caller compares two ceiling-shaped authorities, and a remote entry
+    /// is in neither: a ceiling line in a family that carries depths is refused
+    /// its tail, and a remote is never stamped, so nothing a stamp confers is
+    /// one either.
+    fn subsumed_by(&self, parent: &DEntry) -> bool {
+        match (self, parent) {
+            (DEntry::Ceiling(_), _) | (_, DEntry::Ceiling(_)) => unreachable!(
+                "a remote's entry is in no ceiling and in nothing a stamp confers, so \
+                 attenuation never compares one"
+            ),
+            (DEntry::Chan(mine), DEntry::Chan(theirs)) => match (mine, theirs) {
+                (DMatcher::Exact(mine), DMatcher::Exact(theirs)) => mine.value() == theirs.value(),
+                (DMatcher::Exact(mine), DMatcher::Prefix(theirs))
+                | (DMatcher::Prefix(mine), DMatcher::Prefix(theirs)) => {
+                    mine.value().starts_with(theirs.value().as_str())
+                }
+                (DMatcher::Prefix(_), DMatcher::Exact(_)) => false,
+            },
+            (DEntry::MqttSub(mine), DEntry::MqttSub(theirs)) => {
+                (mine.client.value(), mine.topic_filter.value())
+                    == (theirs.client.value(), theirs.topic_filter.value())
+            }
+            (DEntry::MqttPub(mine), DEntry::MqttPub(theirs)) => {
+                mine.client.value() == theirs.client.value()
+            }
+            (DEntry::Webhook(mine), DEntry::Webhook(theirs)) => {
+                mine.endpoint.value() == theirs.endpoint.value()
+            }
+            // Two entries of one family are one shape, and every caller
+            // compares within a family; a pair that is not is this pass
+            // contradicting itself, which is a panic rather than an answer.
+            _ => unreachable!("attenuation compares two entries of one family"),
+        }
+    }
+
     /// File this entry under the family it was resolved for.
     ///
     /// The one table pairing a family with the entry a matcher in it becomes and
@@ -1943,7 +2166,7 @@ impl DEntry {
 // authority is written out — so it suppresses derivation, and every binding on
 // the plane then has to be covered by what was written.
 
-/// One position that attaches a principal to a channel.
+/// One position that attaches an entity to a channel.
 struct Bound<'a> {
     /// Which planes it covers: `in` subscribes, `out` publishes, `io` does both.
     dir: PortDir,
@@ -2011,7 +2234,7 @@ fn binding_bounds(bindings: &[RBinding]) -> Vec<Bound<'_>> {
         .collect()
 }
 
-/// Where the first send this principal makes outside the position walk is.
+/// Where the first send this entity makes outside the position walk is.
 ///
 /// Two shapes hold none: a free `io` port, whose page-local ring is minted for
 /// the page it is served to, and any link-bound binding with a publishing role,
@@ -2053,7 +2276,7 @@ fn agent_bounds(agent: &RAgent) -> Vec<Bound<'_>> {
 fn check_mqtt_sinks(subject: &Subject<'_>, stated: &mut Stated, errors: &mut Vec<Diagnostic>) {
     let mut budgeted: Vec<&str> = Vec::new();
     let mut duplicates: Vec<(String, Span)> = Vec::new();
-    for (family, entry) in &stated.entries {
+    for (family, entry, _) in &stated.entries {
         let (Family::MqttPublish, DEntry::MqttPub(sink)) = (family, entry) else {
             continue;
         };
@@ -2080,9 +2303,9 @@ fn check_mqtt_sinks(subject: &Subject<'_>, stated: &mut Stated, errors: &mut Vec
     }
 }
 
-/// What one principal's positions come to: the entries they derive where nothing
+/// What one entity's positions come to: the entries they derive where nothing
 /// explicit holds the plane, and that every one of them is authorized by the
-/// entries the principal ends up with.
+/// entries the entity ends up with.
 fn derive_bounds(
     stated: &mut Stated,
     subject: &Subject<'_>,
@@ -2095,8 +2318,8 @@ fn derive_bounds(
     // A free `io` port is a send before any position is walked: the ring is
     // minted whether or not the document names a channel.
     stated.output = subject.free_send.clone();
-    // What is wrong with a position rather than with this principal's lists:
-    // reported only by the principal that owns the position, so a binding a
+    // What is wrong with a position rather than with this entity's lists:
+    // reported only by the entity that owns the position, so a binding a
     // surface and its instance both attach through earns one message.
     //
     // Dropping the non-owner's copy is sound only while the owner reaches the
@@ -2298,6 +2521,1354 @@ fn bound_entry(
     })
 }
 
+// ── principals: authority declared to be delegated from ─────────────────────
+//
+// A bare principal is an authority and nothing else: no runtime body, nothing
+// lowered, declared so that arrangements can be delegated authority under it.
+// One relation holds a whole chain together — attenuation, `a ⊑ b`, "a holds no
+// more than b" — and every rule here is that relation applied at a different
+// pair.
+//
+// The operator is the unnamed root of every chain, and its authority cannot be
+// inherited: a principal written directly under the operator holds exactly what
+// it writes. So everything a chain will ever delegate is written at its root,
+// and a child can only narrow.
+
+/// An authority: the words it holds and the reach it holds.
+///
+/// Words are grant words compared as spelled, across every grant vocabulary the
+/// language has, so `alert` covers both a component's alert capability and a
+/// surface's alert attach right. That is deliberate: both words consent to the
+/// same consequence, and keying on the vocabulary as well would make one consent
+/// spelled twice.
+///
+/// A word carries the position it was written at, because a refusal about a word
+/// points at the word. Sorted, so a diagnostic that lists words lists them the
+/// same way twice.
+#[derive(Clone, Default)]
+struct Authority {
+    words: BTreeMap<String, Span>,
+    reach: Vec<(Family, DEntry)>,
+}
+
+impl Authority {
+    /// Whether these two authorities hold the same words.
+    ///
+    /// Keys only: the map's values are where each word was written, and two
+    /// documents' spans are never equal.
+    fn same_words(&self, other: &Authority) -> bool {
+        self.words.keys().eq(other.words.keys())
+    }
+
+    /// Every entry of one family this authority holds.
+    fn family(&self, family: Family) -> impl Iterator<Item = &DEntry> {
+        self.reach
+            .iter()
+            .filter(move |(held, _)| *held == family)
+            .map(|(_, entry)| entry)
+    }
+
+    /// Every word and entry of this authority that `parent` does not cover.
+    ///
+    /// The attenuation relation itself: `self ⊑ parent` exactly when this is
+    /// empty. Reach is compared within a family — an entry says nothing about a
+    /// plane or a scheme it is not about.
+    fn attenuated_from(&self, parent: &Authority) -> Vec<Excess> {
+        let mut excess = Vec::new();
+        for (word, span) in &self.words {
+            if !parent.words.contains_key(word) {
+                excess.push(Excess::Word(word.clone(), span.clone()));
+            }
+        }
+        for (family, entry) in &self.reach {
+            if !parent.family(*family).any(|held| entry.subsumed_by(held)) {
+                excess.push(Excess::Reach(
+                    entry.name().to_string(),
+                    entry.span().clone(),
+                ));
+            }
+        }
+        excess
+    }
+}
+
+/// One thing an authority holds that the authority it was compared against does
+/// not, and where it was written.
+enum Excess {
+    Word(String, Span),
+    Reach(String, Span),
+}
+
+impl Excess {
+    /// What this excess is, as the refusal about it names it.
+    fn describe(&self) -> String {
+        match self {
+            Excess::Word(word, _) => format!("`{word}` is not a word"),
+            Excess::Reach(name, _) => format!("`{name}` is not reach"),
+        }
+    }
+
+    /// The excess named as a noun: "`ui` holds the word `tools`, which …".
+    fn what(&self) -> String {
+        match self {
+            Excess::Word(word, _) => format!("the word `{word}`"),
+            Excess::Reach(name, _) => format!("reach over `{name}`"),
+        }
+    }
+
+    /// Where it was written.
+    fn span(&self) -> &Span {
+        match self {
+            Excess::Word(_, span) | Excess::Reach(_, span) => span,
+        }
+    }
+}
+
+/// The words a ceiling may name: every grant vocabulary's spellings, in one
+/// namespace.
+///
+/// Derived, never authored — a word added to either vocabulary is nameable in a
+/// ceiling with no edit here.
+static CEILING_WORDS: LazyLock<BTreeSet<&'static str>> = LazyLock::new(|| {
+    Capability::ALL
+        .into_iter()
+        .map(Capability::word)
+        .chain(AttachGrant::ALL.into_iter().map(AttachGrant::word))
+        .collect()
+});
+
+/// A ceiling body: the `grants` line it writes and the `acl` lines it writes.
+struct Body<'a> {
+    grants: Option<&'a RWordList>,
+    acls: &'a [RAcl],
+}
+
+/// What a ceiling body writes, resolved.
+struct Written {
+    /// The two axes as an authority of their own: only what the body wrote.
+    axes: Authority,
+    /// Whether a `grants` line was written at all — which is what says the words
+    /// axis is replaced rather than inherited. An empty list is a statement.
+    wrote_words: bool,
+    /// The families the `acl` lines resolved to, each with the plane word of the
+    /// line that reached it. Replacement and the dead-config rules are keyed on
+    /// these: a line replaces the inherited entries of the family it resolves
+    /// to, and no other.
+    families: Vec<(Family, Spanned<String>)>,
+    /// Whether anything the body wrote was refused. What it comes to is then not
+    /// what the document says, so no rule about that is asked and nothing
+    /// downstream inherits it.
+    refused: bool,
+}
+
+impl Written {
+    /// Whether the body wrote no axis at all.
+    fn empty(&self) -> bool {
+        !self.wrote_words && self.families.is_empty()
+    }
+
+    /// The entries this body wrote in one family.
+    fn family(&self, family: Family) -> impl Iterator<Item = &DEntry> {
+        self.axes.family(family)
+    }
+}
+
+/// One ceiling body's two axes, resolved, with what is illegal in a ceiling
+/// refused.
+fn written_authority(body: Body<'_>, refs: &Refs<'_>, errors: &mut Vec<Diagnostic>) -> Written {
+    let mut written = Written {
+        axes: Authority::default(),
+        wrote_words: false,
+        families: Vec::new(),
+        refused: false,
+    };
+    if let Some(list) = body.grants {
+        written.wrote_words = true;
+        for word in &list.words {
+            if !CEILING_WORDS.contains(word.name.value().as_str()) {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`{}` is not a grant word, so it caps nothing; a ceiling names {}",
+                        word.name.value(),
+                        or_list(CEILING_WORDS.iter().copied())
+                    ),
+                    word.name.span().clone(),
+                ));
+                written.refused = true;
+                continue;
+            }
+            written
+                .axes
+                .words
+                .insert(word.name.value().clone(), word.name.span().clone());
+        }
+    }
+    for acl in body.acls {
+        let Some(plane) = acl_plane(acl, errors) else {
+            written.refused = true;
+            continue;
+        };
+        for matcher in &acl.matchers {
+            match ceiling_entry(matcher, plane, refs, errors) {
+                Some((family, entry)) => {
+                    if !written.families.iter().any(|(held, _)| *held == family) {
+                        written.families.push((family, acl.plane.clone()));
+                    }
+                    written.axes.reach.push((family, entry));
+                }
+                None => written.refused = true,
+            }
+        }
+    }
+    written
+}
+
+/// One `acl` matcher of a ceiling, as the family entry it becomes.
+///
+/// The same matcher→family core a running entity's statement goes through, with
+/// two questions answered differently. Which families are cappable is one: every
+/// family but the confined ones, because a `local:` channel reaches the one
+/// component that binds it and is authorized by the host that serves it rather
+/// than by anything a ceiling holds. Depth tails are the other: a ceiling caps
+/// reach, and a window belongs on the position that holds it.
+fn ceiling_entry(
+    matcher: &RMatcher,
+    plane: Plane,
+    refs: &Refs<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<(Family, DEntry)> {
+    let kind = *matcher.kind.value();
+    let span = matcher.val.span().clone();
+    let (family, bare) = matcher_family(matcher, plane, kind, refs, errors)?;
+    if family.confined() {
+        errors.push(Diagnostic::at(
+            format!(
+                "a ceiling caps no `{}` authority: a confined channel reaches the one \
+                 component that binds it, authorized by the host that serves it",
+                family.name()
+            ),
+            span,
+        ));
+        return None;
+    }
+    if !family_admits(matcher, kind, family, errors) {
+        return None;
+    }
+    let mut refused = false;
+    for (key, value) in &matcher.tail {
+        errors.push(Diagnostic::at(
+            format!("`{key}` is a depth, and a ceiling caps reach rather than depth"),
+            value.span().clone(),
+        ));
+        refused = true;
+    }
+    if refused {
+        return None;
+    }
+    Some((
+        family,
+        plain_entry(family, kind, bare, &span, refs, errors)?,
+    ))
+}
+
+/// Every ceiling in the document, and that each holds no more than the one it
+/// is under.
+///
+/// Two halves of one relation. First every declared principal's authority,
+/// parents first — which the cycle refusal in resolution is what makes
+/// possible: a chain bottoms out at the operator, so a walk that defers a
+/// principal until its parent is built terminates. Then every recorded stamp's
+/// ceiling, and that what its arrangement confers fits under it.
+fn check_ceilings(
+    config: &ResolvedConfig,
+    conferred: &Conferred,
+    refs: &Refs<'_>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    // Asserted rather than tolerated: every rule below is an authority gate, and
+    // a pass that answered a chain it could not order by checking nothing would
+    // compile a document with no ceiling enforced anywhere and no message saying
+    // so. Resolution refuses a chain that does not bottom out, and a document
+    // that does not resolve is never derived.
+    let order = principal_order(config)
+        .unwrap_or_else(|| unreachable!("resolution refuses a principal chain that cycles"));
+    let root = Authority::default();
+    // TODO(ceiling-principal-ids): a principal is addressed by its dotted handle
+    // across three structures that have to be kept in step — the walk's own
+    // name→index map, these authorities, and the chains below — over one `Vec`
+    // that an id would index directly, as `StampId` indexes the stamps.
+    let mut authorities: HashMap<String, Authority> = HashMap::new();
+    // Which principals hold an authority that is not what their text says,
+    // because something in their body was refused. Nothing under one is judged:
+    // see `Delegated`.
+    let mut unstated: HashSet<String> = HashSet::new();
+    // Root-first, so a suggestion that has to name every principal a word must
+    // be added to can read the chain off one map.
+    let mut chains: HashMap<String, Vec<String>> = HashMap::new();
+    // What each principal's body wrote, by declaration index, and whether it is
+    // text the dead-config rules below are asked about at all. A body that was
+    // refused, or one under a body that was, has already been reported on; a
+    // second message about what it delegates would be a second message about one
+    // mistake.
+    let mut bodies: Vec<Option<Written>> = (0..config.principals.len()).map(|_| None).collect();
+    for index in order {
+        let principal = &config.principals[index];
+        let label = principal.handle.dotted();
+        let parent = principal.parent.as_ref().map(HandlePath::dotted);
+        // Asserted, not tolerated: an `under` that named no declared principal
+        // is refused in resolution and a document that does not resolve is never
+        // derived, so a miss here is this pass looking a principal up under a
+        // name it does not carry — a compiler bug, and one that would otherwise
+        // read as the deployer's consent being too narrow.
+        let inherited = parent.as_ref().map_or(&root, |parent| {
+            authorities.get(parent).unwrap_or_else(|| {
+                unreachable!("resolution refuses an `under` that names no principal")
+            })
+        });
+        let written = written_authority(
+            Body {
+                grants: principal.grants.as_ref(),
+                acls: &principal.acls,
+            },
+            refs,
+            errors,
+        );
+        // A parent whose own text was refused holds an authority the document
+        // does not state, so no rule is asked of what is under it.
+        let above_unstated = parent
+            .as_ref()
+            .is_some_and(|parent| unstated.contains(parent));
+        let delegation = parent
+            .as_ref()
+            .filter(|_| !above_unstated)
+            .map(|parent| Delegation {
+                holder: format!("`{label}`"),
+                above: format!("`{parent}`"),
+                noun: "a principal's body",
+                rule: "a principal holds no more than the one it is under",
+                span: principal.span.clone(),
+            });
+        if written.refused || above_unstated {
+            unstated.insert(label.clone());
+        }
+        let (authority, body_refused) = attenuate(delegation.as_ref(), inherited, &written, errors);
+        if !body_refused && !above_unstated {
+            bodies[index] = Some(written);
+        }
+        let chain = match &parent {
+            Some(parent) => {
+                let mut chain = chains.get(parent).cloned().unwrap_or_else(|| {
+                    unreachable!("`principal_order` lists a parent before its children")
+                });
+                chain.push(parent.clone());
+                chain
+            }
+            None => Vec::new(),
+        };
+        chains.insert(label.clone(), chain);
+        authorities.insert(label, authority);
+    }
+    let delegated = Delegated {
+        authorities,
+        unstated,
+        chains,
+    };
+    // Computed here rather than inside the stamp pass because both halves read
+    // them: a stamp's ceiling is judged against its own subtree, and a
+    // principal's text against the union of every subtree under it.
+    let confers = confers(config, conferred);
+    let defaults = default_reach(config);
+    check_stamps(config, &confers, &defaults, &delegated, refs, errors);
+    check_dead_principals(config, &confers, &defaults, &delegated, &bodies, errors);
+}
+
+/// That every `principal` delegates its authority to something, and that every
+/// word and line it writes is authority some arrangement under it holds.
+///
+/// The inverse direction for a declaration rather than for a stamp, and the
+/// reason it is not a copy of [`check_dead_ceiling`]: a principal is reusable,
+/// so it is judged by the union of everything under it. A principal that roots
+/// several stamps holds a word legitimately when any one of them needs it, and
+/// the word is dead only when none does.
+fn check_dead_principals(
+    config: &ResolvedConfig,
+    confers: &HashMap<StampId, Confers>,
+    defaults: &HashMap<StampId, Vec<(Family, DEntry)>>,
+    delegated: &Delegated,
+    bodies: &[Option<Written>],
+    errors: &mut Vec<Diagnostic>,
+) {
+    // An arrangement that confers nothing, for a stamp that holds no entry at
+    // all: the union below reads it as "holds no word, reaches nothing".
+    let nothing = Confers::default();
+    for (index, principal) in config.principals.iter().enumerate() {
+        let label = principal.handle.dotted();
+        let stamps = delegated_stamps(config, delegated, &label);
+        if stamps.is_empty() {
+            // A principal with children delegates through them, so the leaf of
+            // the chain is where the whole chain's failure to reach an
+            // arrangement is reported: refusing every ancestor as well, and then
+            // every word each of them wrote, is one mistake fanned out over a
+            // document.
+            let rooted = config.principals.iter().any(|child| {
+                child
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.dotted() == label)
+            });
+            // A principal handed to a class as a `Principal` argument was
+            // delegated, and the message below would be false at the
+            // declaration. What is dead in that arrangement is the parameter
+            // the class never wrote `under` with, in a file that may be the
+            // author's; the deployer's `principal` is not the place to say so.
+            let handed = config
+                .handed_principals
+                .iter()
+                .any(|argument| argument.dotted() == label);
+            if !rooted && !handed {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`{label}` delegates to nothing: no stamp is under it and no \
+                         principal is declared under it, so the authority it writes reaches \
+                         no arrangement"
+                    ),
+                    principal.span.clone(),
+                ));
+            }
+            continue;
+        }
+        let Some(written) = bodies[index].as_ref() else {
+            continue;
+        };
+        let held: Vec<(&Confers, &[(Family, DEntry)])> = stamps
+            .iter()
+            .map(|stamp| {
+                (
+                    confers.get(stamp).unwrap_or(&nothing),
+                    defaults.get(stamp).map_or(&[][..], Vec::as_slice),
+                )
+            })
+            .collect();
+        if written.wrote_words
+            && written.axes.words.is_empty()
+            && held.iter().all(|(confers, _)| confers.words.is_empty())
+        {
+            errors.push(Diagnostic::at(
+                format!(
+                    "no arrangement under `{label}` holds a capability, so this `grants` \
+                     line caps nothing; a principal that delegates no capability writes no \
+                     `grants` line"
+                ),
+                principal.span.clone(),
+            ));
+        }
+        for (word, span) in &written.axes.words {
+            if held
+                .iter()
+                .any(|(confers, _)| confers.words.contains_key(word))
+            {
+                continue;
+            }
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{word}` caps nothing — no arrangement under `{label}` holds it; a \
+                     ceiling word nothing reaches is dead config"
+                ),
+                span.clone(),
+            ));
+        }
+        for (family, plane) in &written.families {
+            if held
+                .iter()
+                .any(|(confers, defaults)| reaches_beyond(*family, confers, defaults))
+            {
+                continue;
+            }
+            errors.push(Diagnostic::at(
+                format!(
+                    "this `acl {}` line caps nothing any arrangement under `{label}` \
+                     reaches in `{}` beyond its own channels and what it was handed; a \
+                     ceiling line nothing needs is dead config",
+                    plane.value(),
+                    family.name()
+                ),
+                plane.span().clone(),
+            ));
+        }
+    }
+}
+
+/// Every stamp one principal delegates to: those `under` it, and those under a
+/// principal it is under.
+///
+/// Transitive through child principals, which is what makes a chain's root the
+/// place every word is written and still leaves each word judged by real use.
+/// A `Principal` argument the class wrote `under` with arrives here as that
+/// stamp's own `under`; one it dropped arrives nowhere, which is why the
+/// caller reads [`ResolvedConfig::handed_principals`] before it says a
+/// principal delegates to nothing.
+fn delegated_stamps(config: &ResolvedConfig, delegated: &Delegated, label: &str) -> Vec<StampId> {
+    config
+        .stamps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stamp)| {
+            let under = stamp.under.as_ref().map(HandlePath::dotted)?;
+            let reaches =
+                under == label || delegated.chain(&under).iter().any(|above| above == label);
+            reaches.then_some(StampId(index))
+        })
+        .collect()
+}
+
+/// Whether an arrangement asks for reach in one family beyond what stamping it
+/// and handing it its arguments already consented to.
+///
+/// The one test both dead-config directions turn on: a ceiling line in a family
+/// the arrangement reaches nowhere beyond its own and its handed channels caps
+/// nothing, whether it is written on the stamp or on a principal above it.
+fn reaches_beyond(family: Family, confers: &Confers, defaults: &[(Family, DEntry)]) -> bool {
+    confers
+        .reach
+        .iter()
+        .filter(|(held, _, _)| *held == family)
+        .any(|(_, entry, _)| {
+            !defaults
+                .iter()
+                .any(|(held, default)| *held == family && entry.subsumed_by(default))
+        })
+}
+
+/// What a refusal about one body calls the body, what it is under, and the rule
+/// it breaks.
+///
+/// One struct because the two things that write a ceiling — a `principal`
+/// declaration and a stamp — break the same rules in the same order and differ
+/// only in what a reader should be told they are. A body under the operator has
+/// no delegation at all: there is nothing above it to narrow.
+struct Delegation {
+    /// How a refusal names the body's holder: ``​`ui`​`` or ``the stamp `demo`​``.
+    holder: String,
+    /// How it names what the body narrows: ``​`site`​`` or ``the ceiling on the
+    /// stamp `deployment`​``.
+    above: String,
+    /// The noun for the body itself.
+    noun: &'static str,
+    /// The rule an excess breaks, as its refusal states it.
+    rule: &'static str,
+    /// Where the whole thing is written: what the narrows-nothing refusal cites.
+    span: Span,
+}
+
+/// One body's authority, built from what it inherits and what it writes.
+///
+/// Replacement, not intersection: on the words axis a `grants` line replaces the
+/// inherited words, and on the reach axis an `acl` line replaces the inherited
+/// entries of the family it resolves to. What the reader sees is what the
+/// holder holds, and the compiler proves it fits rather than computing
+/// something the text does not show.
+///
+/// The second half of the answer is whether this body's own text was refused —
+/// malformed, or a widening, or a narrowing of nothing. A caller reads it to
+/// keep the dead-config rules off text that already earned a message: two
+/// refusals about one line is one mistake reported twice.
+fn attenuate(
+    delegation: Option<&Delegation>,
+    inherited: &Authority,
+    written: &Written,
+    errors: &mut Vec<Diagnostic>,
+) -> (Authority, bool) {
+    // A body with a refusal in it is not the authority the document states, so
+    // nothing is asked of it and nothing inherits it: the parent's authority
+    // stands in, and a child is never refused for a consequence of a refusal
+    // already reported.
+    if written.refused {
+        return (inherited.clone(), true);
+    }
+    let mut refused = false;
+    if let Some(delegation) = delegation {
+        refused = check_narrowing(delegation, inherited, written, errors);
+    }
+    let words = match written.wrote_words {
+        true => written.axes.words.clone(),
+        false => inherited.words.clone(),
+    };
+    let mut reach = written.axes.reach.clone();
+    for (family, entry) in &inherited.reach {
+        if written.families.iter().any(|(held, _)| held == family) {
+            continue;
+        }
+        reach.push((*family, entry.clone()));
+    }
+    (Authority { words, reach }, refused)
+}
+
+/// That a written axis holds no more than the axis it replaces, and that it
+/// narrows it.
+///
+/// Both directions of one rule: consent text that consents to more than it was
+/// given is a widening, and consent text identical to what it was given is dead
+/// config. A body under the operator writes its whole authority, so there is
+/// nothing there to narrow and neither half applies — which is why the caller
+/// has no delegation to pass in that case.
+///
+/// Answers whether it refused anything, which is what tells a caller that this
+/// body's own text has already been reported on: the dead-config rules about
+/// what a `principal` delegates are not asked of a body that broke this one.
+fn check_narrowing(
+    delegation: &Delegation,
+    inherited: &Authority,
+    written: &Written,
+    errors: &mut Vec<Diagnostic>,
+) -> bool {
+    let Delegation {
+        holder,
+        above,
+        noun,
+        rule,
+        span,
+    } = delegation;
+    if written.empty() {
+        errors.push(Diagnostic::at(
+            format!(
+                "{holder} is under {above} and narrows nothing: {noun} writes the axis it \
+                 narrows, and {above} is already a name for what this holds"
+            ),
+            span.clone(),
+        ));
+        return true;
+    }
+    let mut refused = false;
+    for excess in written.axes.attenuated_from(inherited) {
+        refused = true;
+        errors.push(Diagnostic::at(
+            format!(
+                "{} {above} holds, which {holder} is under: {rule}, and everything a chain \
+                 delegates is written at its root",
+                excess.describe()
+            ),
+            excess.span().clone(),
+        ));
+    }
+    if written.wrote_words && written.axes.same_words(inherited) {
+        refused = true;
+        errors.push(Diagnostic::at(
+            format!(
+                "this `grants` list is what {above} holds, so it narrows nothing; \
+                 a ceiling axis that caps nothing is dead config"
+            ),
+            written
+                .axes
+                .words
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| span.clone()),
+        ));
+    }
+    for (family, plane) in &written.families {
+        let held: Vec<&DEntry> = inherited.family(*family).collect();
+        let mine: Vec<&DEntry> = written.family(*family).collect();
+        // Narrows nothing when the two axes reach each other in both
+        // directions, which is what "a second spelling of what it replaced"
+        // means. Coverage rather than a count, because a repeated matcher is one
+        // reach and a matcher subsumed by another next to it adds none — and
+        // both directions, because a line that reaches *further* than the axis
+        // it replaces is a widening, refused by the excess rule above, and
+        // telling the reader in the same breath that it is a second spelling of
+        // what it replaced would be false.
+        let same = !held.is_empty()
+            && held
+                .iter()
+                .all(|other| mine.iter().any(|entry| other.subsumed_by(entry)))
+            && mine
+                .iter()
+                .all(|entry| held.iter().any(|other| entry.subsumed_by(other)));
+        if same {
+            refused = true;
+            errors.push(Diagnostic::at(
+                format!(
+                    "this `acl {}` line is what {above} holds in `{}`, so it narrows \
+                     nothing; a ceiling line that caps nothing is dead config",
+                    plane.value(),
+                    family.name()
+                ),
+                plane.span().clone(),
+            ));
+        }
+    }
+    refused
+}
+
+/// The principals in an order that visits a parent before its children.
+///
+/// `None` where a chain does not bottom out at the operator — a cycle, which
+/// resolution has already refused at the declaration that closed it.
+fn principal_order(config: &ResolvedConfig) -> Option<Vec<usize>> {
+    let slots: HashMap<String, usize> = config
+        .principals
+        .iter()
+        .enumerate()
+        .map(|(index, principal)| (principal.handle.dotted(), index))
+        .collect();
+    let mut order = Vec::new();
+    let mut placed: HashSet<usize> = HashSet::new();
+    while order.len() < config.principals.len() {
+        let mut progressed = false;
+        for (index, principal) in config.principals.iter().enumerate() {
+            if placed.contains(&index) {
+                continue;
+            }
+            let ready = match &principal.parent {
+                // Asserted, not tolerated: resolution refuses an `under` that
+                // named no declared principal, and treating a miss as a root
+                // would order a chain this pass cannot see and check every
+                // ceiling under it against the wrong authority.
+                Some(parent) => placed.contains(slots.get(&parent.dotted()).unwrap_or_else(|| {
+                    unreachable!("resolution refuses an `under` that names no principal")
+                })),
+                None => true,
+            };
+            if ready {
+                order.push(index);
+                placed.insert(index);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return None;
+        }
+    }
+    Some(order)
+}
+
+// ── stamp ceilings: what an arrangement confers against what consents to it ──
+//
+// A stamp of a packaged assembly imports config text an adversarial author
+// wrote into the deployment's trust anchor. The ceiling is what the deployment
+// says that text may come to: the stamp states what it accepts, and the
+// compiler refuses the difference in both directions — nothing conferred beyond
+// the ceiling, and nothing in the ceiling that confers nothing.
+
+/// Every declared principal as a stamp reads it: what it holds, whether that is
+/// what its text says, and the chain it is under.
+struct Delegated {
+    /// Each principal's authority, by dotted handle.
+    authorities: HashMap<String, Authority>,
+    /// The principals whose own body was refused, or that are under one whose
+    /// was. Their authority is not what the document states, so nothing under
+    /// one is judged against it: the refusal already reported is the answer, and
+    /// one mistyped word in a principal that roots several stamps would
+    /// otherwise fan out into a refusal per conferred word under every one of
+    /// them, each suggesting a fix that changes nothing.
+    unstated: HashSet<String>,
+    /// Each principal's chain, root-first: the principals it is under.
+    chains: HashMap<String, Vec<String>>,
+}
+
+impl Delegated {
+    /// The principals one principal is under, root-first.
+    ///
+    /// Empty for a principal directly under the operator; every declared
+    /// principal has an entry, which the walk that built the map inserted.
+    fn chain(&self, label: &str) -> Vec<String> {
+        self.chains
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("every declared principal has a chain"))
+    }
+
+    /// What one principal holds.
+    ///
+    /// Asserted, not tolerated, for the reason the principal walk asserts it:
+    /// resolution refuses an `under` that names no principal.
+    fn authority(&self, label: &str) -> &Authority {
+        self.authorities.get(label).unwrap_or_else(|| {
+            unreachable!("resolution refuses an `under` that names no principal")
+        })
+    }
+}
+
+/// Every recorded stamp, its ceiling, and that what it stamps fits under it.
+///
+/// Index order, which is walk order, which is parents before children: a stamp
+/// is recorded when its `new` is read and its arrangement is expanded after
+/// that, so an enclosing stamp always holds the lower index.
+fn check_stamps(
+    config: &ResolvedConfig,
+    confers: &HashMap<StampId, Confers>,
+    defaults: &HashMap<StampId, Vec<(Family, DEntry)>>,
+    delegated: &Delegated,
+    refs: &Refs<'_>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let root = Authority::default();
+    let mut ceilings: Vec<Authority> = Vec::new();
+    // What each stamp's body actually wrote, kept past the ceiling it produced:
+    // the dead-config rules are about the text, not about the authority the text
+    // and its inheritance came to.
+    let mut bodies: Vec<Written> = Vec::new();
+    // A stamp whose own ceiling text was refused has no stated ceiling to hold
+    // its subtree against; the refusal already reported is the answer, and a
+    // second one about its consequence is noise.
+    let mut refused: Vec<bool> = Vec::new();
+    // A stamp whose ceiling text was refused for what it says — a widening, or a
+    // narrowing of nothing — is still held to the fit rule against the ceiling
+    // it wrote, but nothing more is said about that text: the dead-config
+    // message would be a second message about one line.
+    let mut reported: Vec<bool> = Vec::new();
+    for (index, stamp) in config.stamps.iter().enumerate() {
+        let enclosing = stamp.parent.map(|StampId(parent)| {
+            assert!(parent < index, "a stamp is recorded before its arrangement");
+            parent
+        });
+        let handed = stamp
+            .under
+            .as_ref()
+            .map(HandlePath::dotted)
+            .map(|label| (delegated.authority(&label), label));
+        // Whether what the ceiling is judged against is what the document
+        // states. A handed principal whose own text was refused, or an enclosing
+        // ceiling that was, is an authority nobody wrote; asking anything of
+        // this stamp against it reports the same mistake again once per word
+        // and entry its arrangement holds.
+        let unstated = match (&handed, enclosing) {
+            (Some((_, label)), enclosing) => {
+                delegated.unstated.contains(label)
+                    || enclosing.is_some_and(|parent| refused[parent])
+            }
+            (None, Some(parent)) => refused[parent],
+            (None, None) => false,
+        };
+        // A handed principal is a bound of its own, and it does not widen the
+        // ceiling it arrives inside: what the text says is what the ceiling is.
+        if let (false, Some((handed, label)), Some(parent)) = (unstated, &handed, enclosing) {
+            for excess in handed.attenuated_from(&ceilings[parent]) {
+                let mut refusal = Diagnostic::at(
+                    format!(
+                        "`{label}` holds {}, which the ceiling on the stamp `{}` does not: a \
+                         principal handed into a stamped arrangement is a bound of its own, \
+                         and the ceiling it arrives inside is not widened by one",
+                        excess.what(),
+                        config.stamps[parent].handle.dotted()
+                    ),
+                    under_span(stamp),
+                );
+                refusal
+                    .related
+                    .push(("held here".to_string(), excess.span().clone()));
+                // Where the principal reached this clause, when that is not the
+                // clause: a `Principal` parameter is named at the enclosing
+                // `new`, and the argument is the other place the arrangement
+                // can be handed something narrower.
+                let named = handle_span(stamp.under.as_ref().unwrap_or_else(|| {
+                    unreachable!("a handed principal is a stamp that wrote `under`")
+                }));
+                if named != under_span(stamp) {
+                    refusal.related.push(("handed in here".to_string(), named));
+                }
+                refusal.related.push((
+                    "the enclosing ceiling is written here".to_string(),
+                    config.stamps[parent].span.clone(),
+                ));
+                errors.push(refusal);
+            }
+        }
+        let (inherited, above) = match (&handed, enclosing) {
+            (Some((handed, label)), _) => (*handed, Some(format!("`{label}`"))),
+            (None, Some(parent)) => (
+                &ceilings[parent],
+                Some(format!(
+                    "the ceiling on the stamp `{}`",
+                    config.stamps[parent].handle.dotted()
+                )),
+            ),
+            // The operator: what the body writes is the whole ceiling, and an
+            // axis it does not write is empty.
+            (None, None) => (&root, None),
+        };
+        let written = written_authority(
+            Body {
+                grants: stamp.grants.as_ref(),
+                acls: &stamp.acls,
+            },
+            refs,
+            errors,
+        );
+        // `under p;` with no body is how a stamp says "exactly `p`", so there
+        // is no narrowing to ask about; an empty body is text that narrows
+        // nothing, which the narrowing rule refuses.
+        let delegation = above
+            .filter(|_| stamp.wrote_body && !unstated)
+            .map(|above| Delegation {
+                holder: format!("the stamp `{}`", stamp.handle.dotted()),
+                above,
+                noun: "a stamp's ceiling",
+                rule: "a stamp's ceiling holds no more than what it is under",
+                span: stamp.span.clone(),
+            });
+        refused.push(written.refused || unstated);
+        let (ceiling, body_refused) = attenuate(delegation.as_ref(), inherited, &written, errors);
+        ceilings.push(ceiling);
+        reported.push(body_refused);
+        bodies.push(written);
+    }
+    let nothing = Confers::default();
+    for (index, stamp) in config.stamps.iter().enumerate() {
+        if refused[index] {
+            continue;
+        }
+        let default = defaults.get(&StampId(index)).cloned().unwrap_or_default();
+        let mut effective = ceilings[index].clone();
+        effective.reach.extend(default.iter().cloned());
+        let held = confers.get(&StampId(index)).unwrap_or(&nothing);
+        check_fit(config, stamp, held, &effective, delegated, errors);
+        if !reported[index] {
+            check_dead_ceiling(stamp, &bodies[index], held, &default, errors);
+        }
+    }
+}
+
+/// That a stamp's ceiling text caps something, so what a reader sees is true.
+///
+/// The inverse of the fit rule, and the half that makes a ceiling *consent*
+/// rather than a bound: a word or a line that caps nothing is authority the
+/// deployment stated and the arrangement never asked for, and it survives in
+/// the deployer's file after the bundle that needed it stopped needing it —
+/// so the next pin bump that re-introduces it needs no new consent.
+///
+/// Judged against this stamp's own subtree, because a stamp's body is one
+/// deployment's statement about one arrangement. A `principal` is judged
+/// against the union of everything under it instead, which is what makes it
+/// reusable.
+fn check_dead_ceiling(
+    stamp: &RStamp,
+    written: &Written,
+    confers: &Confers,
+    defaults: &[(Family, DEntry)],
+    errors: &mut Vec<Diagnostic>,
+) {
+    // A stamp with no body of its own states nothing, so there is nothing here
+    // that could be dead: `under p;` is how a stamp says "exactly `p`", and a
+    // stamp with neither is the boundary recorded with nothing written.
+    if !stamp.wrote_body {
+        return;
+    }
+    let stamped = match &stamp.package {
+        Some(package) => format!("`{}` from `@{package}`", stamp.assembly.value()),
+        None => format!("`{}`", stamp.assembly.value()),
+    };
+    // Whose file the dead text is in, the same fact the fit rule reports. A
+    // stamp written in packaged text is an author narrowing a nested
+    // arrangement, so the line is in a module every deployment that stamps the
+    // bundle imports and none of them can edit: without this the refusal reads
+    // as consent the deployer left behind and sends them looking in their own
+    // file for a line that is not there.
+    let owner = match stamp.packaged_site {
+        true => " — and that line is the author's: this stamp is the arrangement's own text",
+        false => "",
+    };
+    // An arrangement that holds no capability is stamped with no `grants` line
+    // at all; the empty list is text that caps nothing, and it reads as though
+    // the deployment had something in mind.
+    if written.wrote_words && written.axes.words.is_empty() && confers.words.is_empty() {
+        errors.push(Diagnostic::at(
+            format!(
+                "no instance stamped by {stamped} holds a capability, so this `grants` line \
+                 caps nothing; the stamp of an arrangement that holds no capability \
+                 writes no `grants` line{owner}"
+            ),
+            stamp.span.clone(),
+        ));
+    }
+    for (word, span) in &written.axes.words {
+        if confers.words.contains_key(word) {
+            continue;
+        }
+        errors.push(Diagnostic::at(
+            format!(
+                "`{word}` caps nothing — no instance stamped by {stamped} holds it; a ceiling \
+                 word nothing reaches is dead config{owner}"
+            ),
+            span.clone(),
+        ));
+    }
+    for (family, plane) in &written.families {
+        // What the line has to cap: reach the arrangement asked for in this
+        // family that the stamp's default reach does not already answer. A line
+        // that only re-states the arrangement's own channels, or a channel the
+        // deployer handed in, consents to something already consented to.
+        //
+        // Whether *this* line is what answers it is deliberately not asked. A
+        // family the arrangement reaches and the line does not cover is the fit
+        // rule's refusal, which names the line to write instead; saying in the
+        // same breath that the line caps nothing would be a second message about
+        // one mistake.
+        if reaches_beyond(*family, confers, defaults) {
+            continue;
+        }
+        errors.push(Diagnostic::at(
+            format!(
+                "this `acl {}` line caps nothing {stamped} reaches in `{}` beyond its own \
+                 channels and what it was handed; a ceiling line nothing needs is dead \
+                 config{owner}",
+                plane.value(),
+                family.name()
+            ),
+            plane.span().clone(),
+        ));
+    }
+}
+
+/// Where a stamp's `under` clause is written, which is where the choice of
+/// principal was made.
+///
+/// The clause itself, not the handle it resolved to: a clause naming a
+/// `Principal` parameter resolves to a handle whose position is the argument at
+/// the enclosing `new`, in another file, and the clause is what a reader has to
+/// change. A stamp with no `under` clause is cited at the `new` handle instead.
+fn under_span(stamp: &RStamp) -> Span {
+    stamp
+        .under_span
+        .clone()
+        .unwrap_or_else(|| stamp.span.clone())
+}
+
+/// What one stamp's arrangement confers.
+#[derive(Default)]
+struct Confers {
+    /// Each grant word, with every entity that holds it and where the word is
+    /// written. One refusal per missing word rather than one per instance, with
+    /// every holder as a related site.
+    words: BTreeMap<String, Vec<(String, Span)>>,
+    /// Each reach entry the arrangement itself wrote — its own `acl` statements,
+    /// what its bindings derive, and what a `grant` inside it hands out — with
+    /// the entity the entry is about.
+    reach: Vec<(Family, DEntry, String)>,
+}
+
+/// What every recorded stamp confers, keyed by stamp.
+///
+/// An entity counts toward every stamp on its own stamp's ancestor chain, not
+/// only the nearest: a nested stamp's own check bounds it by its own ceiling
+/// alone, and the outer ceiling is a statement about the whole subtree under it.
+///
+/// A `grant` aimed *into* a subtree from outside it is deliberately absent. It
+/// is deployer text, or reach another stamp confers and is counted there;
+/// counting it here would make the deployer spell one consent twice and would
+/// point the refusal at the author's file for a line the deployer wrote.
+///
+/// Confined reach is absent too, and for the reason a ceiling refuses a line in
+/// a confined family: it is the serving host's to authorize, so demanding it of
+/// a ceiling that cannot hold it would refuse every arrangement whose chrome
+/// binds a `local:` address, with no line that answers the refusal.
+fn confers(config: &ResolvedConfig, conferred: &Conferred) -> HashMap<StampId, Confers> {
+    let mut confers: HashMap<StampId, Confers> = HashMap::new();
+    for entity in &conferred.entities {
+        for stamp in ancestry(config, entity.stamp) {
+            let held = confers.entry(stamp).or_default();
+            for word in &entity.words {
+                held.words
+                    .entry(word.value().clone())
+                    .or_default()
+                    .push((entity.label.clone(), word.span().clone()));
+            }
+            for (family, entry, origin) in &entity.entries {
+                if matches!(origin, Origin::Grant(_)) || family.confined() {
+                    continue;
+                }
+                held.reach
+                    .push((*family, entry.clone(), entity.label.clone()));
+            }
+        }
+    }
+    for (grant, entry) in config.grants.iter().zip(&conferred.grants) {
+        let Some((family, entry)) = entry.as_ref().filter(|(family, _)| !family.confined()) else {
+            continue;
+        };
+        for stamp in ancestry(config, grant.stamp) {
+            confers.entry(stamp).or_default().reach.push((
+                *family,
+                entry.clone(),
+                grant.target.dotted(),
+            ));
+        }
+    }
+    confers
+}
+
+/// The reach every recorded stamp holds without writing a line for it.
+///
+/// Two kinds of consent already given: a channel the arrangement declares,
+/// which stamping it is the consent to mint, and a channel handed in as an
+/// argument, which naming it in the argument list is the consent to reach.
+/// Both are exact entries on both planes of the address's own scheme.
+fn default_reach(config: &ResolvedConfig) -> HashMap<StampId, Vec<(Family, DEntry)>> {
+    let mut reach: HashMap<StampId, Vec<(Family, DEntry)>> = HashMap::new();
+    let mut add = |stamp: Option<StampId>, channel: &RChannel| {
+        for id in ancestry(config, stamp) {
+            reach.entry(id).or_default().extend(exact_entries(channel));
+        }
+    };
+    for channel in &config.channels {
+        add(channel.stamp, channel);
+    }
+    for (index, stamp) in config.stamps.iter().enumerate() {
+        for &ChanId(handed) in &stamp.handed {
+            add(Some(StampId(index)), &config.channels[handed]);
+        }
+    }
+    reach
+}
+
+/// One declared channel as the exact entries that reach it, on both planes.
+///
+/// A confined channel is absent: it reaches the one component that binds it,
+/// authorized by the host that serves it, and no ceiling caps it.
+fn exact_entries(channel: &RChannel) -> Vec<(Family, DEntry)> {
+    let Some((scheme, bare)) = split_spellable(channel.address.value()) else {
+        return Vec::new();
+    };
+    Plane::ALL
+        .into_iter()
+        .filter_map(|plane| Family::of(scheme, plane))
+        .filter(|family| !family.confined())
+        .map(|family| {
+            (
+                family,
+                DEntry::Chan(DMatcher::Exact(Spanned::new(
+                    bare.to_string(),
+                    channel.address.span().clone(),
+                ))),
+            )
+        })
+        .collect()
+}
+
+/// Every recorded stamp an entity under `stamp` confers on: the stamp itself
+/// and every one it was expanded inside.
+fn ancestry(config: &ResolvedConfig, stamp: Option<StampId>) -> Vec<StampId> {
+    let mut chain = Vec::new();
+    let mut next = stamp;
+    while let Some(id) = next {
+        chain.push(id);
+        next = config.stamps[id.0].parent;
+    }
+    chain
+}
+
+/// That what a stamp's arrangement confers fits under its effective ceiling.
+///
+/// One refusal per excess. A word is reported once with every instance holding
+/// it as a related site, because the suggested line is the same for all of them
+/// and fixing one fixes all; a reach entry is reported at the statement in the
+/// author's file that produced it, which is the only place a reader can see
+/// what the arrangement asked for.
+fn check_fit(
+    config: &ResolvedConfig,
+    stamp: &RStamp,
+    confers: &Confers,
+    effective: &Authority,
+    delegated: &Delegated,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let stamped = match &stamp.package {
+        Some(package) => format!("`{}` from `@{package}`", stamp.assembly.value()),
+        None => format!("`{}`", stamp.assembly.value()),
+    };
+    // Whose file a refusal here belongs to. A stamp written in packaged text is
+    // an author narrowing a nested arrangement, so an arrangement that exceeds
+    // it is the author's to fix and no line the deployer writes can answer it.
+    let owner = match stamp.packaged_site {
+        true => " — and that line is the author's: this stamp is the arrangement's own text",
+        false => "",
+    };
+    let all: Vec<&str> = confers.words.keys().map(String::as_str).collect();
+    for (word, holders) in &confers.words {
+        if effective.words.contains_key(word) {
+            continue;
+        }
+        let (first, _) = &holders[0];
+        let mut refusal = Diagnostic::at(
+            format!(
+                "stamping {stamped} confers `{word}` on `{first}`, which this stamp's \
+                 ceiling does not cover: a packaged arrangement holds what the deployment \
+                 stamps it with, so {}{owner}",
+                word_suggestion(word, &all, stamp, delegated)
+            ),
+            stamp.span.clone(),
+        );
+        for (holder, span) in holders {
+            refusal
+                .related
+                .push((format!("`{holder}` holds it here"), span.clone()));
+        }
+        errors.push(refusal);
+    }
+    for (family, entry, holder) in &confers.reach {
+        if effective
+            .family(*family)
+            .any(|held| entry.subsumed_by(held))
+        {
+            continue;
+        }
+        let line = entry_line(*family, entry);
+        let mut refusal = Diagnostic::at(
+            format!(
+                "`{line}` on `{holder}` reaches beyond what {stamped} declares or was \
+                 handed, and the stamp `{}` consents to none of it — {}{owner}",
+                stamp.handle.dotted(),
+                reach_suggestion(&line, *family, entry, stamp, config, delegated)
+            ),
+            entry.span().clone(),
+        );
+        refusal
+            .related
+            .push(("stamped here".to_string(), stamp.span.clone()));
+        errors.push(refusal);
+    }
+}
+
+/// One reach entry written back out as the `acl` line that would hold it.
+///
+/// The refusal writes the deployer's line for them, so the address carries its
+/// scheme and the matcher its kind — which is exactly how the entry was
+/// resolved, read backwards.
+fn entry_line(family: Family, entry: &DEntry) -> String {
+    let prefix = family.scheme().prefix();
+    let (kind, address) = match entry {
+        DEntry::Chan(DMatcher::Exact(pattern)) => {
+            (MatcherKind::Exact, format!("{prefix}{}", pattern.value()))
+        }
+        DEntry::Chan(DMatcher::Prefix(pattern)) => {
+            (MatcherKind::Prefix, format!("{prefix}{}", pattern.value()))
+        }
+        // A remote's entry reaches no refusal here: a remote is never stamped,
+        // so nothing a stamp confers is one.
+        DEntry::Ceiling(_) => {
+            unreachable!("a remote's entry is in nothing a stamp confers")
+        }
+        DEntry::MqttSub(entry) => (
+            MatcherKind::TopicFilter,
+            format!(
+                "{prefix}{}:{}",
+                entry.client.value(),
+                entry.topic_filter.value()
+            ),
+        ),
+        DEntry::MqttPub(entry) => (
+            MatcherKind::Client,
+            format!("{prefix}{}", entry.client.value()),
+        ),
+        DEntry::Webhook(entry) => (
+            MatcherKind::Endpoint,
+            format!("{prefix}{}", entry.endpoint.value()),
+        ),
+    };
+    format!(
+        "acl {} [{} \"{address}\"]",
+        family.plane().word(),
+        kind.as_str()
+    )
+}
+
+/// Where a missing word can be written, which is wherever the ceiling that
+/// excludes it was written.
+///
+/// A stamp under a principal narrows what that principal holds, so the word is
+/// the principal's to gain only when the principal lacks it too; when the
+/// principal holds it, the ceiling that dropped it is the stamp's own body.
+/// A word enters a chain at its root and a child can only narrow, so a word
+/// missing from the principal a stamp is under is missing from every principal
+/// that one is under too.
+fn word_suggestion(word: &str, all: &[&str], stamp: &RStamp, delegated: &Delegated) -> String {
+    match (stamp.under.as_ref().map(HandlePath::dotted), stamp.parent) {
+        (Some(under), _) if delegated.authority(&under).words.contains_key(word) => format!(
+            "add `{word}` to this stamp's ceiling — `{under}` holds it, and this stamp's \
+             body hands down less"
+        ),
+        (Some(under), _) => {
+            let missing = missing_in_chain(word, &under, delegated);
+            match missing.is_empty() {
+                true => format!(
+                    "add `{word}` to `{under}`, or stamp under a principal that \
+                                 holds it"
+                ),
+                false => format!(
+                    "add `{word}` to `{under}`, and to the principals it is under: {}",
+                    quoted_list(&missing)
+                ),
+            }
+        }
+        (None, Some(_)) => format!(
+            "add `{word}` to this ceiling, and to the enclosing stamp's if that one does \
+             not hold it either"
+        ),
+        (None, None) => format!("write it — `grants = [{}];`", all.join(", ")),
+    }
+}
+
+/// Where a reach entry can be written. The same cases as a word's, and the
+/// same reason.
+fn reach_suggestion(
+    line: &str,
+    family: Family,
+    entry: &DEntry,
+    stamp: &RStamp,
+    config: &ResolvedConfig,
+    delegated: &Delegated,
+) -> String {
+    match (stamp.under.as_ref().map(HandlePath::dotted), stamp.parent) {
+        (Some(under), _)
+            if delegated
+                .authority(&under)
+                .family(family)
+                .any(|held| entry.subsumed_by(held)) =>
+        {
+            format!(
+                "add `{line};` to this stamp's ceiling if that reach is wanted — `{under}` \
+                 holds it, and this stamp's body hands down less"
+            )
+        }
+        (Some(under), _) => {
+            let chain = delegated.chain(&under);
+            match chain.is_empty() {
+                true => format!("add `{line};` to `{under}` if that reach is wanted"),
+                false => format!(
+                    "add `{line};` to `{under}`, and to the principals it is under ({}), if \
+                     that reach is wanted",
+                    quoted_list(&chain)
+                ),
+            }
+        }
+        (None, Some(StampId(parent))) => format!(
+            "add `{line};` to this ceiling, and to the ceiling on the stamp `{}` if that one \
+             does not hold that reach either",
+            config.stamps[parent].handle.dotted()
+        ),
+        (None, None) => format!("add `{line};` to the stamp if that reach is wanted"),
+    }
+}
+
+/// Every principal in this one's chain that does not hold the word either,
+/// root-first.
+fn missing_in_chain(word: &str, under: &str, delegated: &Delegated) -> Vec<String> {
+    delegated
+        .chain(under)
+        .into_iter()
+        .filter(|label| !delegated.authority(label).words.contains_key(word))
+        .collect()
+}
+
+/// ``​`a`, `b`​`` — a list of names as a suggestion spells them.
+fn quoted_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // ── grants: the rights an entity states, and that they match its lists ───────
 //
 // A `grants` list names rights; the ACL lists say what each right reaches. The
@@ -2331,7 +3902,7 @@ struct Vocabulary {
 fn vocabulary(kind: EntityKind) -> Vocabulary {
     match kind {
         // A surface and a remote hold one vocabulary between them: both are
-        // attach-route principals, and the rights a wire carries do not depend
+        // attach-route entities, and the rights a wire carries do not depend
         // on which kind of client is at the far end. Nothing page-shaped is
         // here — `takeover` is a capability a component holds within the page,
         // stated on the component.
@@ -2532,12 +4103,29 @@ enum Right<'a> {
     Capability(Capability, &'a Spanned<String>),
 }
 
+/// What one entity's `grants` list comes to, in the two spellings that read it.
+struct DerivedGrants {
+    /// The runtime's spelling: a plane word expanded into one token per scheme
+    /// it has entries on, then the capability words as written. What lowering
+    /// carries.
+    tokens: Vec<Spanned<String>>,
+    /// The ceiling's spelling: one word per right the entity holds, as the
+    /// document wrote it, plane words unexpanded. What a stamp's ceiling caps —
+    /// a ceiling names grant words as spelled, and the scheme-compound tokens
+    /// are the lowered config's spelling rather than any vocabulary's.
+    ///
+    /// Built from the classified rights, so a word the pass refused is absent:
+    /// a plane word a component may not state never became a right, and a
+    /// ceiling is never asked to cap one.
+    words: Vec<Spanned<String>>,
+}
+
 /// One entity's `grants`, classified, checked against its lists, and expanded.
 fn derive_grants(
     subject: &Subject<'_>,
     stated: &Stated,
     errors: &mut Vec<Diagnostic>,
-) -> Vec<Spanned<String>> {
+) -> DerivedGrants {
     let kind = subject.kind;
     let label = &subject.label;
     // A word this pass refuses means the classified list is not what the document
@@ -2678,7 +4266,21 @@ fn derive_grants(
     if matches!(kind, EntityKind::Component(_)) && subject.words.is_some() {
         check_tool_coupling(subject, &rights, errors);
     }
-    expand(kind, &rights, stated)
+    let words = rights
+        .iter()
+        .map(|right| match right {
+            Right::Plane(plane, word) => {
+                Spanned::new(plane.word().to_string(), word.span().clone())
+            }
+            Right::Capability(right, word) => {
+                Spanned::new(right.word().to_string(), word.span().clone())
+            }
+        })
+        .collect();
+    DerivedGrants {
+        tokens: expand(kind, &rights, stated),
+        words,
+    }
 }
 
 /// A component's `tools` word against the `tool` statements beside it, both

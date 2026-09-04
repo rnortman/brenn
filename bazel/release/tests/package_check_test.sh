@@ -19,6 +19,7 @@ emit="$4"
 export WIT_LIB="$5"
 emit_processor="$6"
 bundle_check="$7"
+stage_lib="$8"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
 failures=0
 
@@ -117,16 +118,16 @@ printf 'component Transplant {}\n' > "$processor_spec"
 pkg="$tmp/pkg"
 build_tree "$pkg"
 
-if ! "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" dynamic > "$tmp/ok.log" 2>&1; then
+if ! "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" dynamic "$stage_lib" > "$tmp/ok.log" 2>&1; then
     fail "a complete tree should pass: $(cat "$tmp/ok.log")"
 fi
-if ! "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" static > "$tmp/ok-static.log" 2>&1; then
+if ! "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" static "$stage_lib" > "$tmp/ok-static.log" 2>&1; then
     fail "a complete tree with no loader named should pass static: $(cat "$tmp/ok-static.log")"
 fi
 
 reject() {
     local label="$1" needle="$2" linkage="${3:-dynamic}" out
-    if out=$("$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" "$linkage" 2>&1); then
+    if out=$("$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" "$linkage" "$stage_lib" 2>&1); then
         fail "$label should be rejected, exited 0: $out"
     elif ! printf '%s' "$out" | grep -qF "$needle"; then
         fail "$label: the rejection does not name the problem: $out"
@@ -153,7 +154,7 @@ reject "a missing MCP stub" "lib/noop_mcp.py is missing"
 for loader in /lib64/ld-linux-x86-64.so.2 /lib/ld-musl-x86_64.so.1; do
     build_tree "$pkg"; printf 'ELF %s\n' "$loader" > "$pkg/bin/brenn"
     reject "a binary naming $loader in a static build" "not a static build" static
-    if ! "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" dynamic > "$tmp/dyn.log" 2>&1; then
+    if ! "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" dynamic "$stage_lib" > "$tmp/dyn.log" 2>&1; then
         fail "the same binary should pass in dynamic mode: $(cat "$tmp/dyn.log")"
     fi
 done
@@ -315,7 +316,7 @@ build_tree "$pkg"; rm -rf "$pkg/modules"
 reject "a tree with no module root" "modules/ is missing"
 # An absent module root must not abort the gate early; later checks and the
 # summary must still run.
-out=$("$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" dynamic 2>&1 || true)
+out=$("$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" dynamic "$stage_lib" 2>&1 || true)
 if ! printf '%s' "$out" | grep -qF "problem(s) with the staged tree"; then
     fail "a tree with no module root: the gate stopped before its summary: $out"
 fi
@@ -355,12 +356,12 @@ reject "a file in the module root that is not a module" \
     "modules/README.txt is not a .brenn module"
 
 # And the gate's own preconditions.
-if out=$("$check" "$bundle_check" "$names" "$record_lib" "$tmp/absent" "$manifest" dynamic 2>&1); then
+if out=$("$check" "$bundle_check" "$names" "$record_lib" "$tmp/absent" "$manifest" dynamic "$stage_lib" 2>&1); then
     fail "a package dir that does not exist should be rejected, exited 0: $out"
 elif ! printf '%s' "$out" | grep -qF "not a directory"; then
     fail "the rejection does not say what went wrong: $out"
 fi
-if "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" sideways > /dev/null 2>&1; then
+if "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" sideways "$stage_lib" > /dev/null 2>&1; then
     fail "an unrecognized linkage mode should be rejected"
 fi
 

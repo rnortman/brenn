@@ -609,8 +609,67 @@ channel presence at "ephemeral:alice-desk.presence" {
     assert!(message.contains("unbounded"), "{message}");
 }
 
-/// A word other than `unbounded` in a depth position is refused the same way a
-/// negative count is.
+/// A depth written as a name lowers to the count the name held.
+///
+/// The claim the parameterised description vocabulary rests on: a table field of
+/// a constant and an `Int` parameter are both replaced by the count they name
+/// before lowering sees them, so the stamped document and the literal one are
+/// one `BrennConfig`. Whole-config equality rather than a field read — a
+/// resolution step that dropped a key would otherwise pass.
+#[test]
+fn depths_written_as_names_lower_to_the_counts_they_name() {
+    let named = r#"
+const depths = { push = 4, retain = 16 };
+
+assembly Commons(slug: String, retain: Int = 16) {
+    channel messages at f"ephemeral:{slug}.messages" {
+        push_depth = depths.push;
+        retain_depth = retain;
+    }
+}
+
+new alice: Commons(slug = "alice");
+new bob: Commons(slug = "bob", retain = 7);
+"#;
+    let literal = r#"
+channel alice_messages at "ephemeral:alice.messages" {
+    push_depth = 4;
+    retain_depth = 16;
+}
+
+channel bob_messages at "ephemeral:bob.messages" {
+    push_depth = 4;
+    retain_depth = 7;
+}
+"#;
+    assert_eq!(config_from_dsl(named), config_from_dsl(literal));
+}
+
+/// A negative count reached through a name is the same refusal a negative
+/// literal is, positioned at the name.
+#[test]
+fn a_negative_constant_in_a_depth_is_refused_at_the_name() {
+    let refusal = refusal(
+        r#"
+const window = -1;
+
+channel presence at "ephemeral:alice-desk.presence" {
+    push_depth = window;
+    retain_depth = 1;
+}
+"#,
+    );
+    let message = refusal.render();
+    assert!(message.contains("`push_depth`"), "{message}");
+    assert!(message.contains("got -1"), "{message}");
+    assert_eq!(refusal.line_col(), Some((5, 18)), "{message}");
+}
+
+/// A word other than `unbounded` in a depth position is a *name*, and is
+/// refused at resolution as an undeclared one rather than reaching lowering.
+///
+/// The arm lowering keeps for a reference it cannot read is its own statement of
+/// what it admits; nothing produces one.
 #[test]
 fn a_word_other_than_unbounded_is_refused_in_a_depth_position() {
     let refusal = refusal(
@@ -622,8 +681,8 @@ channel presence at "ephemeral:alice-desk.presence" {
 "#,
     );
     let message = refusal.render();
-    assert!(message.contains("`push_depth`"), "{message}");
-    assert!(message.contains("`infinite`"), "{message}");
+    assert!(message.contains("infinite"), "{message}");
+    assert!(!message.contains("`push_depth`"), "{message}");
 }
 
 /// `send_rate` is a table with no vocabulary behind it, so its keys are matched

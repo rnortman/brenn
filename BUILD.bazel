@@ -1,5 +1,6 @@
 """Workspace root — exports, and the repo-wide policy file set."""
 
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//bazel/policy:defs.bzl", "policy_srcs", "source_manifest")
 load("//brenn-dsl:defs.bzl", "format_check")
@@ -30,6 +31,21 @@ exports_files(glob(["config/specs/*.brenn"]))
 filegroup(
     name = "modules",
     srcs = glob(["config/specs/*.brenn"]),
+    visibility = ["//visibility:public"],
+)
+
+# What that glob offers, as names. `config/specs/` is a mixed directory:
+# specifications owned by a component package or a surface kind, which ship
+# because their owner ships, beside library modules, which ship because
+# `//deploy` lists them. Nothing about the glob says which is which, so a file
+# owned by nothing would be vocabulary every fit test compiles against and no
+# release stages — a phantom module whose first reader is a deployment's boot.
+# `//bazel/release/tests:config_specs_accounted_test` holds this list equal to
+# the union of the three that account for it.
+write_file(
+    name = "config_spec_names",
+    out = "config-spec-names.txt",
+    content = sorted([spec.rpartition("/")[2] for spec in glob(["config/specs/*.brenn"])]),
     visibility = ["//visibility:public"],
 )
 

@@ -596,9 +596,21 @@ pub fn messaging_configured(
     webhook_endpoints: &IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
 ) -> bool {
-    !config.channels.is_empty()
+    messaging_configured_by_document(config)
         || !webhook_endpoints.is_empty()
         || !mqtt_ingress_channels.is_empty()
+}
+
+/// The half of [`messaging_configured`] that reads the document alone.
+///
+/// The two runtime-derived inputs — resolved webhook endpoints and resolved
+/// mqtt ingress channels — are the only terms of that predicate a caller
+/// without an environment cannot supply, so they live in the caller above and
+/// everything a document decides for itself lives here. A pass that has no
+/// environment asks this one by name rather than passing empty values to the
+/// full predicate, and a new runtime-derived term has exactly one place to go.
+pub fn messaging_configured_by_document(config: &BrennConfig) -> bool {
+    !config.channels.is_empty()
         || !config.wasm_consumers.is_empty()
         || !config.surfaces.is_empty()
         // A remote attaches to the bus and nothing else; declaring one without

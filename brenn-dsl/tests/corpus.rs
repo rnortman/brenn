@@ -89,7 +89,7 @@ fn a_doc_comment_reaches_the_model_and_its_lines_stay_separate() {
         .expect("the constant carries a doc comment");
     assert_eq!(doc.lines.len(), 2);
     assert_eq!(
-        doc.lines[0].value(),
+        doc.lines[0].content.value(),
         " Where component artifacts live on this host."
     );
 }
@@ -113,7 +113,7 @@ fn four_slashes_are_a_doc_comment() {
         panic!("a constant");
     };
     let doc = constant.doc.as_ref().expect("a doc comment");
-    assert_eq!(doc.lines[0].value(), "/text");
+    assert_eq!(doc.lines[0].content.value(), "/text");
 }
 
 /// A `.brenn` file ends with a newline: a line comment's terminator is part of

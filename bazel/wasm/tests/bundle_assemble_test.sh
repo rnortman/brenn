@@ -275,6 +275,44 @@ printf 'component DemoPanel { abi = processor; } // authored later\n' > "$tmp/dr
 reject "an authored spec whose bytes are not the released ones" "are one file" \
     --surface-stage "$tmp/stage-b" --spec "$tmp/drift/demo-panel.brenn"
 
+# ---------------------------------------------------------------------------
+# A library module: shipped vocabulary no package and no surface kind owns
+# ---------------------------------------------------------------------------
+# It is authored under the same root, so the set-equality above still holds over
+# it; what it needs from the assembly is to be staged at all, since nothing can
+# be harvested off it, and to be named in the list the checkers read. The list
+# itself is not vocabulary and must not be held against the authored root.
+setup
+mkdir -p "$tmp/authored"
+commons_spec="$tmp/authored/commons.brenn"
+printf 'assembly Commons() {}\n' > "$commons_spec"
+if ! out=$(run --surface-stage "$tmp/stage-b" --spec "$panel_spec" \
+    --spec "$commons_spec" --library-module "$commons_spec" 2>&1); then
+    fail "a bundle with a library module should stage: $out"
+else
+    if ! cmp -s "$commons_spec" "$tmp/out/modules/commons.brenn"; then
+        fail "the library module was not staged from its authored copy"
+    fi
+    listed="$(cat "$tmp/out/modules/library-modules.txt" 2>&1)"
+    if [ "$listed" != "commons.brenn" ]; then
+        fail "library-modules.txt reads: $listed"
+    fi
+fi
+
+# A library module the authored root does not offer is still a divergence: the
+# config gate reads that root and would accept an import the bundle ships from
+# nowhere it can see.
+setup
+reject "a library module outside the authored root" "the two are one set" \
+    --surface-stage "$tmp/stage-b" --spec "$panel_spec" \
+    --library-module "$commons_spec"
+
+setup
+reject "a library module shadowing a surface kind's module" \
+    "one name is one authored module" \
+    --surface-stage "$tmp/stage-b" --spec "$panel_spec" \
+    --library-module "$panel_spec"
+
 if [ "$failures" -ne 0 ]; then
     echo "$failures case(s) failed"
     exit 1

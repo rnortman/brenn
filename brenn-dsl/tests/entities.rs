@@ -34,15 +34,15 @@ fn a_channel_body_types_its_depths_and_its_words() {
         tuning.push_depth.as_ref().expect("a push depth").value,
         IntOrWord::Int(_)
     ));
-    let IntOrWord::Word(standing) = &tuning
-        .standing_retain_depth
-        .as_ref()
-        .expect("a standing depth")
-        .value
-    else {
-        panic!("`unbounded` is a word, not a count");
-    };
-    assert_eq!(standing.as_str(), "unbounded");
+    assert!(
+        tuning
+            .standing_retain_depth
+            .as_ref()
+            .expect("a standing depth")
+            .value
+            .is_unbounded(),
+        "`unbounded` is a word, not a count"
+    );
 
     assert_eq!(
         tuning.noise.as_ref().expect("noise").value.as_str(),
@@ -66,6 +66,21 @@ fn a_channel_body_types_its_depths_and_its_words() {
             .value(),
         Value::Table(_)
     ));
+
+    // The second channel writes its depths as names, which the parse form
+    // records as references and resolution replaces with the counts they name.
+    let ChannelDef::Decl(named) = file.channels().nth(1).expect("a second channel") else {
+        panic!("the channel names a handle");
+    };
+    let tuning = &named.body.as_ref().expect("a body").attrs;
+    let spelling = |attr: &Option<brenn_dsl::model::Attr<IntOrWord>>| {
+        let IntOrWord::Name { path, .. } = &attr.as_ref().expect("a depth").value else {
+            panic!("a name written in a depth position");
+        };
+        path.spelling()
+    };
+    assert_eq!(spelling(&tuning.push_depth), "window");
+    assert_eq!(spelling(&tuning.retain_depth), "depths.geometry");
 }
 
 #[test]

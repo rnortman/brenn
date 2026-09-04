@@ -1,12 +1,13 @@
 """The surface asset tree: the npm toolchain, and `dist` itself."""
 
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@surface_npm//:defs.bzl", "npm_link_all_packages")
 load("@surface_npm//surface:@bytecodealliance/jco/package_json.bzl", jco_bin = "bin")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("//bazel/surface:dist.bzl", "surface_dist", "surface_processor_assets")
-load("//bazel/wasm:defs.bzl", "component_bundle")
+load("//bazel/wasm:defs.bzl", "component_bundle", "module_file_name")
 
 policy_srcs()
 
@@ -74,6 +75,23 @@ _PROCESSOR_KINDS = [
     ("chrome", "//surface/chrome:chrome_component"),
 ]
 
+# Where a kind's authored specification lives, written once: the staging targets
+# below name the file, and the list of names beside them reads the same string,
+# so the two cannot disagree about which file a kind ships.
+_KIND_SPEC = "//:config/specs/{kind}.brenn"
+
+# The specifications those kinds ship, as names — the surface half of what
+# accounts for `config/specs/`. See `//brenn-wasm:package_spec_names`.
+write_file(
+    name = "kind_spec_names",
+    out = "kind-spec-names.txt",
+    content = sorted([
+        module_file_name(_KIND_SPEC.format(kind = kind))
+        for (kind, _component) in _PROCESSOR_KINDS
+    ]),
+    visibility = ["//visibility:public"],
+)
+
 # `<kind>_assets`, never `<kind>`: a staging target's output directory is its
 # name, and the chrome kind's crate is the sibling package `surface/chrome`,
 # whose own output paths a target named `chrome` here would sit inside.
@@ -82,7 +100,7 @@ _PROCESSOR_KINDS = [
         name = kind + "_assets",
         component = component,
         kind = kind,
-        spec = "//:config/specs/{kind}.brenn".format(kind = kind),
+        spec = _KIND_SPEC.format(kind = kind),
     )
     for (kind, component) in _PROCESSOR_KINDS
 ]

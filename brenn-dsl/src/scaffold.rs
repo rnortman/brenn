@@ -564,7 +564,7 @@ fn write_header(out: &mut String, spec_basename: &str, doc: Option<&DocComment>)
     out.push('\n');
     if let Some(doc) = doc {
         for line in &doc.lines {
-            let text = line.value().trim_end();
+            let text = line.content.value().trim_end();
             if text.is_empty() {
                 out.push_str("//!\n");
             } else {

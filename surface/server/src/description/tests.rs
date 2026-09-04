@@ -637,21 +637,13 @@ fn surface_help_spec_has_exact_publish_acl_per_channel_and_no_subscriptions() {
     assert!(bares.iter().all(|b| !b.contains(':')));
 }
 
-// ── Boot validation ────────────────────────────────────────────────────────
+// ── Validation ─────────────────────────────────────────────────────────────
 
 #[test]
 fn validate_passes_for_valid_config() {
     let surfaces = multi_surface_config();
     let dir = full_directory(&surfaces, Depth::Bounded(1));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals {
-            surfaces: &surfaces,
-            ..Default::default()
-        },
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 #[test]
@@ -661,15 +653,7 @@ fn validate_panics_on_unbounded_runtime_retain_depth() {
     // growth by design — a boot error.
     let surfaces = multi_surface_config();
     let dir = full_directory(&surfaces, Depth::Unbounded);
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals {
-            surfaces: &surfaces,
-            ..Default::default()
-        },
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 #[test]
@@ -685,10 +669,9 @@ fn validate_panics_on_foreign_writer_of_runtime_channel() {
         .cloned()
         .chain(std::iter::once(foreign))
         .collect();
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &principals,
             ..Default::default()
@@ -721,10 +704,9 @@ fn validate_panics_on_owning_surfaces_own_component_writing_runtime_channel() {
     });
     let dir = full_directory(&surfaces, Depth::Bounded(1));
     let principals = surfaces.clone();
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &principals,
             ..Default::default()
@@ -760,10 +742,9 @@ fn validate_accepts_owning_surface_geometry_status_grant() {
             )));
     }
     let dir = full_directory(&surfaces, Depth::Bounded(1));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &surfaces,
             ..Default::default()
@@ -779,12 +760,7 @@ fn validate_panics_and_aggregates_missing_declarations() {
     // Drop two declarations; the panic must name both.
     bares.retain(|b| b != "surface.index" && b != "surface.kind.echo-stub.schema");
     let dir = directory_with_channels(&bares, Depth::Bounded(1));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals::default(),
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 #[test]
@@ -793,12 +769,7 @@ fn validate_panics_on_zero_standing_retain_depth() {
     let surfaces = multi_surface_config();
     let bares = boot_published_bare_channels(PREFIX, &surfaces);
     let dir = directory_with_channels(&bares, Depth::Bounded(0));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals::default(),
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 #[test]
@@ -808,7 +779,7 @@ fn validate_panics_on_malformed_prefix() {
         prefix: "bad/prefix".to_string(),
         status_interval_secs: 60,
     };
-    validate_surface_description(&config, &[], None, SingleWriterPrincipals::default());
+    validate_surface_description_set(&config, &[], None);
 }
 
 #[test]
@@ -818,7 +789,7 @@ fn validate_panics_on_status_interval_below_floor() {
         prefix: PREFIX.to_string(),
         status_interval_secs: 4,
     };
-    validate_surface_description(&config, &[], None, SingleWriterPrincipals::default());
+    validate_surface_description_set(&config, &[], None);
 }
 
 #[test]
@@ -828,7 +799,7 @@ fn validate_panics_on_status_interval_above_ceiling() {
         prefix: PREFIX.to_string(),
         status_interval_secs: 3601,
     };
-    validate_surface_description(&config, &[], None, SingleWriterPrincipals::default());
+    validate_surface_description_set(&config, &[], None);
 }
 
 /// No messaging configured ⇒ no directory and no surfaces, so there are no
@@ -836,7 +807,7 @@ fn validate_panics_on_status_interval_above_ceiling() {
 /// still run (see the malformed-prefix and interval tests, which pass `None`).
 #[test]
 fn validate_noop_when_messaging_absent() {
-    validate_surface_description(&on_config(), &[], None, SingleWriterPrincipals::default());
+    validate_surface_description_set(&on_config(), &[], None);
 }
 
 #[test]
@@ -847,10 +818,9 @@ fn validate_panics_on_foreign_writer() {
     let bares: Vec<String> = boot_published_bare_channels(PREFIX, &[]);
     let dir = directory_with_channels(&bares, Depth::Bounded(1));
     let foreign = surface_outputting_to("brenn:surface.index");
-    validate_surface_description(
-        &on_config(),
-        &[],
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &[], Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: std::slice::from_ref(&foreign),
             ..Default::default()
@@ -865,12 +835,7 @@ fn validate_no_surfaces_still_validates_index() {
     let bares = boot_published_bare_channels(PREFIX, &[]);
     assert_eq!(bares.len(), 1);
     let dir = directory_with_channels(&bares, Depth::Bounded(1));
-    validate_surface_description(
-        &on_config(),
-        &[],
-        Some(&dir),
-        SingleWriterPrincipals::default(),
-    );
+    validate_surface_description_set(&on_config(), &[], Some(&dir));
 }
 
 // ── Config channel ─────────────────────────────────────────────────────────
@@ -927,14 +892,10 @@ fn validate_panics_when_a_config_channel_is_undeclared() {
     let surfaces = multi_surface_config();
     let raw = full_directory_raw(&surfaces, Depth::Bounded(1));
     let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
-    validate_surface_description(
+    validate_surface_description_set(
         &on_config(),
         &surfaces,
         Some(&MessagingDirectory::with_entries(entries)),
-        SingleWriterPrincipals {
-            surfaces: &surfaces,
-            ..Default::default()
-        },
     );
 }
 
@@ -943,15 +904,7 @@ fn validate_panics_when_a_config_channel_is_undeclared() {
 fn validate_panics_on_config_channel_that_retains_nothing() {
     let surfaces = multi_surface_config();
     let dir = full_directory_with_config_retain(&surfaces, Depth::Bounded(1), Depth::Bounded(0));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals {
-            surfaces: &surfaces,
-            ..Default::default()
-        },
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 /// The kernel owns the sole subscription to its surface's config channel; a
@@ -970,16 +923,7 @@ fn validate_panics_on_an_input_bound_to_the_surfaces_own_config_channel() {
         noise: brenn_lib::messaging::config::NoiseLevel::Silent,
     });
     let dir = full_directory(&surfaces, Depth::Bounded(1));
-    let principals = surfaces.clone();
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals {
-            surfaces: &principals,
-            ..Default::default()
-        },
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 /// The write side of the same exclusion: the bindings document has one writer,
@@ -999,16 +943,7 @@ fn validate_panics_on_an_output_bound_to_the_surfaces_own_config_channel() {
         },
     });
     let dir = full_directory(&surfaces, Depth::Bounded(1));
-    let principals = surfaces.clone();
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals {
-            surfaces: &principals,
-            ..Default::default()
-        },
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 /// Another surface's config channel is not excluded — the kernel owns only its
@@ -1025,16 +960,7 @@ fn validate_admits_an_input_bound_to_another_surfaces_config_channel() {
         noise: brenn_lib::messaging::config::NoiseLevel::Silent,
     });
     let dir = full_directory(&surfaces, Depth::Bounded(1));
-    let principals = surfaces.clone();
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
-        SingleWriterPrincipals {
-            surfaces: &principals,
-            ..Default::default()
-        },
-    );
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
 /// The scheme-matched half of the sweep. A principal holding an
@@ -1060,10 +986,9 @@ fn validate_panics_on_ephemeral_publish_coverage_of_a_config_channel() {
         .cloned()
         .chain(std::iter::once(foreign))
         .collect();
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &principals,
             ..Default::default()
@@ -1094,10 +1019,9 @@ fn validate_ignores_brenn_publish_coverage_of_a_config_channels_bare_name() {
         .cloned()
         .chain(std::iter::once(bystander))
         .collect();
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &principals,
             ..Default::default()
@@ -1123,10 +1047,9 @@ fn boot_system_participants(surfaces: &[ResolvedSurface]) -> Vec<SystemParticipa
 fn validate_passes_with_the_boot_system_participants_swept() {
     let surfaces = multi_surface_config();
     let dir = full_directory(&surfaces, Depth::Bounded(1));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &surfaces,
             system_participants: &boot_system_participants(&surfaces),
@@ -1149,10 +1072,9 @@ fn validate_panics_on_a_second_system_participant_covering_a_config_channel() {
         ChannelScheme::Ephemeral,
         &[surface_config_bare(PREFIX, "bar")],
     ));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &surfaces,
             system_participants: &participants,
@@ -1177,10 +1099,9 @@ fn validate_panics_on_a_second_system_participant_covering_a_boot_published_chan
         ChannelScheme::Brenn,
         &[index_bare(PREFIX)],
     ));
-    validate_surface_description(
-        &on_config(),
-        &surfaces,
-        Some(&dir),
+    let set = validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+    validate_surface_description_writers(
+        &set,
         SingleWriterPrincipals {
             surfaces: &surfaces,
             system_participants: &participants,

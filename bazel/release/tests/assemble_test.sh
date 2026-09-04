@@ -13,7 +13,10 @@
 # staged tree — the backend one off each shipped package directory, the surface
 # one off the staged surface tree — so the good case asserts `modules/` entry by
 # entry, and a name reached both ways is checked to stage once when the two
-# copies agree and to fail when they do not.
+# copies agree and to fail when they do not. The listed half — a library module,
+# owed by no component — is driven separately, because what it claims is the
+# opposite: that the tree carries a file the harvest could never have found, and
+# a list saying so.
 set -uo pipefail
 
 names="$1"
@@ -88,16 +91,18 @@ also_shipped
 EOF
 
 run() {
+    local out="$1" manifest="$2"
+    shift 2
     "$assemble" \
         --names "$names" --record-lib "$record_lib" --stage-lib "$stage_lib" \
-        --out "$1" \
-        --manifest "$2" \
+        --out "$out" \
+        --manifest "$manifest" \
         --frontend "$tmp/in/frontend" \
         --surface "$tmp/in/surface" \
         --bin "$tmp/in/bin/brenn" \
         --bin "$tmp/in/bin/brenn-cli" \
         --lib "$tmp/in/noop_mcp.py" \
-        "${packages[@]}"
+        "${packages[@]}" "$@"
 }
 
 if ! run "$tmp/out" "$tmp/in/manifest.txt" > "$tmp/out.log" 2>&1; then
@@ -317,6 +322,61 @@ expect_failure "a staged tree whose harvest did not run" "modules/shipped.brenn"
     bash -c '. "$1"; stage_assert_modules_owed "$2"' bash "$stage_lib" "$tmp/out-lostharvest"
 expect_failure "a staged tree whose harvest did not run" "modules/transplant.brenn" \
     bash -c '. "$1"; stage_assert_modules_owed "$2"' bash "$stage_lib" "$tmp/out-lostharvest"
+
+# ---------------------------------------------------------------------------
+# The listed half of the module root
+# ---------------------------------------------------------------------------
+# A library module is vocabulary the release ships that no package and no
+# surface kind carries, so the harvest cannot reach it and every checker's
+# pair-it-with-an-owner rule cannot pass it. The list is what carries the fact.
+mkdir -p "$tmp/in/lib-modules"
+printf 'assembly Commons() {}\n' > "$tmp/in/lib-modules/surface-description.brenn"
+printf 'assembly More() {}\n' > "$tmp/in/lib-modules/aardvark.brenn"
+
+if ! run "$tmp/out-lib" "$tmp/in/manifest.txt" \
+    --library-module "$tmp/in/lib-modules/surface-description.brenn" \
+    --library-module "$tmp/in/lib-modules/aardvark.brenn" > "$tmp/lib.log" 2>&1; then
+    fail "a release with library modules should assemble: $(cat "$tmp/lib.log")"
+fi
+
+staged_lib="$(cd "$tmp/out-lib/modules" && find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort | tr '\n' ' ')"
+[ "$staged_lib" = "aardvark.brenn library-modules.txt shipped.brenn surface-description.brenn transplant.brenn " ] \
+    || fail "modules/ with library modules holds $staged_lib"
+cmp -s "$tmp/in/lib-modules/surface-description.brenn" \
+    "$tmp/out-lib/modules/surface-description.brenn" \
+    || fail "a library module was not staged from its authored copy"
+
+# Sorted and one per line: the list is a function of the set, not of the
+# caller's argument order, so a reader can compare two releases' lists.
+listed="$(cat "$tmp/out-lib/modules/library-modules.txt")"
+[ "$listed" = "$(printf 'aardvark.brenn\nsurface-description.brenn')" ] \
+    || fail "library-modules.txt reads: $listed"
+
+# A release that lists none carries no list file.
+[ ! -e "$tmp/out/modules/library-modules.txt" ] \
+    || fail "a release with no library modules staged a list anyway"
+
+# A listed name that a component's own authored module already holds: two files
+# under one import, decided by copy order.
+expect_failure "a library module shadowing a component's module" \
+    "one name is one authored module" \
+    run "$tmp/out-lib-shadow" "$tmp/in/manifest.txt" \
+    --library-module "$tmp/in/pkg/a/shipped/shipped.brenn"
+
+# Two roots each shipping a `commons.brenn`: the same collision, and a refusal
+# that says which of the two ways a name was already taken.
+mkdir -p "$tmp/in/lib-modules-other"
+printf 'assembly Other() {}\n' > "$tmp/in/lib-modules-other/aardvark.brenn"
+expect_failure "one basename listed twice" \
+    "which another library module of this tree is listed under" \
+    run "$tmp/out-lib-twice" "$tmp/in/manifest.txt" \
+    --library-module "$tmp/in/lib-modules/aardvark.brenn" \
+    --library-module "$tmp/in/lib-modules-other/aardvark.brenn"
+
+printf 'not a module\n' > "$tmp/in/lib-modules/notes.txt"
+expect_failure "a listed file that is not a module" "is not a .brenn file" \
+    run "$tmp/out-lib-ext" "$tmp/in/manifest.txt" \
+    --library-module "$tmp/in/lib-modules/notes.txt"
 
 # ---------------------------------------------------------------------------
 # Symlinked inputs, as a sandboxed action's are

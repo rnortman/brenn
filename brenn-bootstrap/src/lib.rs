@@ -507,19 +507,27 @@ pub async fn run_server(
     let app_policies: Vec<(&str, &brenn_lib::access::AppPolicy)> = messenger
         .map(|m| m.app_policies().collect())
         .unwrap_or_default();
-    brenn_surface_server::validate_surface_error_channel(
+    if let Some(advisory) = brenn_surface_server::validate_surface_error_channel(
         config.observability.surface_error_channel.as_deref(),
         messenger.map(|m| &**m.directory()),
         config.messaging.max_body_bytes,
-    );
+    ) {
+        brenn_surface_server::log_surface_error_advisory(&advisory);
+    }
 
     // Validate the derived self-description channel set under the same directory
-    // + resolved surfaces (single-writer, brenn:, declared,
-    // standing_retain_depth >= 1). Every failure is a boot panic.
-    brenn_surface_server::description::validate_surface_description(
+    // + resolved surfaces (brenn:, declared, standing_retain_depth >= 1), then
+    // sweep its single writers. The set half also runs offline, under
+    // `config-check`; the writer half needs the principals below and runs here
+    // only, after the set half has proven every derived address resolves. Every
+    // failure is a boot panic.
+    let description_channels = brenn_surface_server::description::validate_surface_description_set(
         &config.surface_description,
         &messaging_result.surfaces,
         messenger.map(|m| &**m.directory()),
+    );
+    brenn_surface_server::description::validate_surface_description_writers(
+        &description_channels,
         brenn_surface_server::SingleWriterPrincipals {
             app_policies: &app_policies,
             wasm_consumers: &messaging_result.wasm_consumers,
@@ -671,7 +679,7 @@ pub async fn run_server(
         if let Some(ref svc) = webhook_result.service {
             for ep in svc.all_endpoints() {
                 if let Some(ref rp) = ep.replay_protection {
-                    let component = load_verified_replay(
+                    let (component, verified) = load_verified_replay(
                         &ep.slug,
                         &components_roots,
                         &rp.component,
@@ -685,6 +693,10 @@ pub async fn run_server(
                         endpoint = %ep.slug,
                         component = %rp.component,
                         store_path = %rp.store_path.display(),
+                        component_path = %verified.artifact.display(),
+                        root = %verified.root.display(),
+                        world = %verified.world,
+                        artifact_sha256 = %verified.artifact_sha256,
                         "replay protection loaded"
                     );
                 }
@@ -784,7 +796,7 @@ pub async fn run_server(
             } else {
                 None
             };
-            let (component, artifact_path) = load_verified_consumer(
+            let (component, verified) = load_verified_consumer(
                 &components_roots,
                 &consumer.package,
                 &consumer.slug,
@@ -812,7 +824,11 @@ pub async fn run_server(
             info!(
                 slug = %consumer.slug,
                 package = %consumer.package,
-                component_path = %artifact_path.display(),
+                component_path = %verified.artifact.display(),
+                root = %verified.root.display(),
+                world = %verified.world,
+                artifact_sha256 = %verified.artifact_sha256,
+                spec_sha256 = verified.spec_sha256.as_deref(),
                 store_path_present,
                 store_path = consumer.store_path.as_deref().map(|p| p.display().to_string()),
                 "WASM processor component loaded"
@@ -1299,13 +1315,23 @@ fn load_verified_replay(
     store_path: &std::path::Path,
     max_page_count: u32,
     config: std::collections::HashMap<String, String>,
-) -> brenn_wasm::ReplayComponent {
+) -> (
+    brenn_wasm::ReplayComponent,
+    brenn_lib::wasm_package::Verified,
+) {
     let roots = brenn_lib::wasm_package::require_components_root(
         components_roots,
         &format!("webhook endpoint {slug:?} replay protection"),
     );
-    let component_path = brenn_lib::wasm_package::verify_replay(roots, package, slug);
-    brenn_wasm::ReplayComponent::load(slug, &component_path, store_path, max_page_count, config)
+    let verified = brenn_lib::wasm_package::verify_replay(roots, package, slug);
+    let component = brenn_wasm::ReplayComponent::load(
+        slug,
+        &verified.artifact,
+        store_path,
+        max_page_count,
+        config,
+    );
+    (component, verified)
 }
 
 /// Resolve a consumer's package, verify it, then load what it names.
@@ -1315,26 +1341,30 @@ fn load_verified_replay(
 /// component whose package does not bind it cannot reach the loader. The
 /// caller assembles the dozen wired fields of the load spec but never its
 /// `component_path` — whatever it staged there is discarded for the artifact
-/// the package bound. The artifact's path is handed back for the caller's log.
+/// the package bound. What the package bound is handed back for the caller's
+/// log, which is how the journal names the release this artifact came out of.
 fn load_verified_consumer(
     components_roots: &[PathBuf],
     package: &str,
     slug: &str,
     config_spec_sha256: &str,
     spec: brenn_wasm::ProcessorLoadSpec<'_>,
-) -> (brenn_wasm::ProcessorComponent, std::path::PathBuf) {
+) -> (
+    brenn_wasm::ProcessorComponent,
+    brenn_lib::wasm_package::Verified,
+) {
     let roots = brenn_lib::wasm_package::require_components_root(
         components_roots,
         &format!("consumer {slug:?}"),
     );
-    let artifact =
+    let verified =
         brenn_lib::wasm_package::verify_consumer(roots, package, slug, config_spec_sha256);
     // The spec's borrows outlive this call; narrowing them to the artifact's
     // scope is what lets the path the verification produced be the one loaded.
     let mut spec: brenn_wasm::ProcessorLoadSpec<'_> = spec;
-    spec.component_path = &artifact;
+    spec.component_path = &verified.artifact;
     let component = brenn_wasm::ProcessorComponent::load(spec);
-    (component, artifact)
+    (component, verified)
 }
 
 /// Assert that all replay store paths and consumer store paths are unique across
@@ -1562,7 +1592,7 @@ mod tests {
             // A real page budget, unlike the refusal cases below: this load
             // reaches the KV store, which cannot lay out its schema in one
             // page.
-            let component = super::super::load_verified_replay(
+            let (component, _verified) = super::super::load_verified_replay(
                 "endpoint",
                 &[dir.path().to_path_buf()],
                 "replay",

@@ -4,7 +4,7 @@
 # Usage: assemble.sh --out DIR --manifest FILE --names FILE --record-lib FILE
 #                    --stage-lib FILE --frontend DIR --surface DIR
 #                    [--bin FILE]... [--lib FILE]...
-#                    [--package FILE]...
+#                    [--package FILE]... [--library-module FILE]...
 #
 # `--names` is `manifest_names.sh`, which states the manifest's grammar for
 # every reader of it; `--record-lib` is `record_lib.sh`, which states how a
@@ -23,11 +23,18 @@
 #
 # `modules/` is what a deployment's `use @<name>::…` imports resolve against:
 # one file per component, named `<name>.brenn` for the wire kind, which is the
-# authored basename. Both halves are harvested rather than listed — the backend
-# one off each staged package directory, the surface one off the staged surface
-# tree, whose per-kind directories already carry each kind's packaged copy — so
-# the staged set equals the shipped set by construction and there is no second
-# list of the same files to keep in step.
+# authored basename. Both component halves are harvested rather than listed —
+# the backend one off each staged package directory, the surface one off the
+# staged surface tree, whose per-kind directories already carry each kind's
+# packaged copy — so the staged set equals the shipped set by construction and
+# there is no second list of the same files to keep in step.
+#
+# A library module has no such owner: it is vocabulary the release ships that no
+# component and no surface kind carries, so nothing can be harvested off. Those
+# are listed, with `--library-module`, and the list travels in the tree as
+# `modules/library-modules.txt` so every later reader — the contract test here,
+# the deploying repo's preflight — reads the same fact rather than inferring
+# ownership and refusing what it cannot pair.
 #
 # A shipped component is a package directory named for the component, holding
 # the artifact, its `package.json` binding record, and, for a processor-world
@@ -58,6 +65,7 @@ surface=""
 bins=()
 libs=()
 packages=()
+library_modules=()
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -69,6 +77,7 @@ while [ "$#" -gt 0 ]; do
         --bin) bins+=("$2"); shift 2 ;;
         --lib) libs+=("$2"); shift 2 ;;
         --package) packages+=("$2"); shift 2 ;;
+        --library-module) library_modules+=("$2"); shift 2 ;;
         --record-lib) record_lib="$2"; shift 2 ;;
         --stage-lib) stage_lib="$2"; shift 2 ;;
         *) echo "ERROR: unrecognized argument: $1" >&2; exit 2 ;;
@@ -162,3 +171,10 @@ fi
 
 stage_harvest_surface_modules "$out"
 stage_assert_modules_owed "$out"
+
+# After the harvest, so a listed name that shadows a component's own authored
+# module is refused here rather than deciding an import by copy order.
+for module in ${library_modules[@]+"${library_modules[@]}"}; do
+    stage_library_module "$out" "$module"
+done
+stage_library_list "$out"

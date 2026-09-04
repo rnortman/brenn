@@ -24,14 +24,21 @@ rule port_doctype { transparent; }
 rule param_default { transparent; }
 rule io_target { transparent; }
 rule mcp_server_ref { transparent; }
+rule under_clause { transparent; }
 
-// These three keep a type of their own and redirect their text to the child
-// that carries it, so the suppressed punctuation around it — `///`, a
-// backslash, the triple quotes — stays out of what the model reads. `transparent`
-// does not compose with the redirect: an erased rule serves its whole lexeme.
-rule doc_line { text_from: text; }
+// These two keep a type of their own and redirect their text to the child that
+// carries it, so the suppressed punctuation around it — a backslash, the triple
+// quotes — stays out of what the model reads. `transparent` does not compose
+// with the redirect: an erased rule serves its whole lexeme.
 rule escape { text_from: text; }
 rule raw_string { text_from: text; }
+
+rule doc_break { transparent; }
+
+// `doc_line` cannot take the same redirect: its trailing `nl` is labelled so the
+// unparser can put a formatter break where the newline was, and a redirect would
+// leave that label recorded nowhere. It stays a product rule of two fields, and
+// the model reads the one that is content.
 
 // Body entries and inline-table entries are keyed by their key child, so a
 // duplicated key in one body is refused before the target sees either element,

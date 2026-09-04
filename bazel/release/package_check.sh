@@ -2,7 +2,7 @@
 # Assert the staged release tree satisfies what the deploy script reads from it.
 #
 # Usage: package_check.sh <bundle-check> <names-tool> <record-lib>
-#                         <package-dir> <manifest> <static|dynamic>
+#                         <package-dir> <manifest> <static|dynamic> <stage-lib>
 #
 # `<bundle-check>` is `bundle_check.sh`, which holds the three component trees
 # every staged tree carries — `components/`, `surface/`, `modules/` — to their
@@ -30,9 +30,9 @@
 # either. The static arm rejects any named loader, not just the glibc one.
 set -euo pipefail
 
-if [ "$#" -ne 6 ]; then
+if [ "$#" -ne 7 ]; then
     echo "usage: $0 <bundle-check> <names-tool> <record-lib>" \
-         "<package-dir> <manifest> <static|dynamic>" >&2
+         "<package-dir> <manifest> <static|dynamic> <stage-lib>" >&2
     exit 2
 fi
 bundle_check="$1"
@@ -41,12 +41,13 @@ record_lib="$3"
 pkg="$4"
 manifest="$5"
 linkage="$6"
+stage_lib="$7"
 
 case "$linkage" in
     static|dynamic) ;;
     *)
         echo "usage: $0 <bundle-check> <names-tool> <record-lib>" \
-             "<package-dir> <manifest> <static|dynamic>" >&2
+             "<package-dir> <manifest> <static|dynamic> <stage-lib>" >&2
         exit 2
         ;;
 esac
@@ -113,6 +114,7 @@ echo "release package: $linkage linkage"
 # placement the delegate knows nothing about: the flat specification copies
 # beside the surface kernel bundle.
 exec "$bundle_check" "$names" "$record_lib" "$pkg" \
+    --stage-lib "$stage_lib" \
     --manifest "$manifest" \
     --module-candidate "$pkg/components/*/*.brenn" \
     --module-candidate "$pkg/surface/*.spec.brenn" \
