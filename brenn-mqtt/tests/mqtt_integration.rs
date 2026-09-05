@@ -843,7 +843,7 @@ async fn auth_good_credentials_connects() {
 
     let mut config =
         test_client_config("testbroker-authgood", broker.port, ca, TlsVersionMin::Tls12);
-    config.username = Some("brenn-itest".to_string());
+    config.identity.username = Some("brenn-itest".to_string());
     config.password = Some("brenn-itest-password".to_string());
     let SpawnedClient {
         svc,
@@ -880,7 +880,7 @@ async fn auth_bad_credentials_drives_failed_with_reason() {
     let auth_filter = "brenn/itest/auth/#";
     let mut config =
         test_client_config("testbroker-authbad", broker.port, ca, TlsVersionMin::Tls12);
-    config.username = Some("brenn-itest".to_string());
+    config.identity.username = Some("brenn-itest".to_string());
     config.password = Some("wrong-password".to_string());
     let SpawnedClient {
         svc,

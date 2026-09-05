@@ -947,8 +947,8 @@ impl ActiveBridge {
         let mqtt_service = brenn_mqtt::MqttService::new();
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
         let mut config = crate::test_support::mqtt::test_client_config("home");
-        config.urgency = brenn_lib::messaging::Urgency::High;
-        config.qos = 2;
+        config.identity.urgency = brenn_lib::messaging::Urgency::High;
+        config.identity.qos = 2;
         let handle = brenn_mqtt::MqttClientHandle::new(Arc::new(config), vec![], stop_tx);
         mqtt_service.add_client(handle).await;
 

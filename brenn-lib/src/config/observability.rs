@@ -1,7 +1,7 @@
 use brenn_surface_schema::LogLevel;
 
 /// Top-level `[observability]` config section.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ObservabilityConfig {
     pub usage: UsageObservabilityConfig,
 
@@ -38,7 +38,7 @@ impl Default for ObservabilityConfig {
 }
 
 /// Usage-observability sub-section (`[observability.usage]`).
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UsageObservabilityConfig {
     /// Inactivity gap in minutes that closes a usage session. Default: 30.
     pub session_gap_minutes: u32,

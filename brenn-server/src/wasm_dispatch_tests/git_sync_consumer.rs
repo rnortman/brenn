@@ -222,6 +222,9 @@ async fn consumer_harness(
         mqtt_publish: None,
         tool_host: Some(tool_host),
     }));
+    // The store is opened at the start rather than at the load; this fixture
+    // stands in for both.
+    component.open_store();
 
     let cfg = WasmConsumerConfig {
         slug: slug.to_string(),
@@ -374,11 +377,10 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     assert_eq!(req["args"]["repos"][0], SLUG);
 
     // Step 2: the executor pulls the fixture and publishes the result.
-    let caller_grants: Arc<ToolCallerGrants> = {
-        let mut map: ToolCallerGrants = HashMap::new();
-        map.insert(guest_sub.as_str().to_string(), harness.tool_grants.clone());
-        Arc::new(map)
-    };
+    let caller_grants = Arc::new(ToolCallerGrants::new(HashMap::from([(
+        guest_sub.as_str().to_string(),
+        harness.tool_grants.clone(),
+    )])));
     let (exec_alert, _h) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(
         Arc::clone(&harness.messenger),

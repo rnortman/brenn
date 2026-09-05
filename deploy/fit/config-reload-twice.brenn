@@ -1,0 +1,6 @@
+// The pair is the facility, and the facility is one. A second stamp declares
+// the same two addresses a second time.
+use @config-reload::*;
+
+new first: ConfigReload();
+new second: ConfigReload();

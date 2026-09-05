@@ -590,23 +590,34 @@ Code sites (`TODO(surface-counters-host-testable)`):
 
 ## `config-check-offline-residue`
 
-`brenn config-check` runs the messaging resolution passes that read only
-`BrennConfig` (`brenn_messaging_boot::resolve_messaging_offline`), so the
-per-instance surface gates decide its verdict. Two things it still cannot see,
-and they are different problems:
+`brenn config-check` runs the whole messaging planner
+(`brenn_messaging_boot::resolve_messaging_offline` calls `plan_messaging`), so
+the directory it validates against holds every entry boot's holds and consumer
+resolution decides its verdict. What is left is what the planner is not handed:
 
-- **Wasm-consumer resolution.** `resolve_wasm_consumers` takes the resolved
-  mqtt-client map, which is built by reading `password_file` / `ca_file` off
-  disk, so the pass is environment-coupled for a reason that has nothing to do
-  with what it checks. Separating client identity from the secret reads would
-  let the consumer gates join the offline pass. That is this entry.
+- **Webhook endpoint resolution.** The planner mints an endpoint's channel entry
+  and mount from the raw block, but `resolve_webhook_endpoints` — slug charset,
+  duplicate slug and mount, ownership, signature scheme, secrets, replay
+  protection — runs only at boot, because it reads this host's secret files and
+  mutates the resolved-app registry. Splitting it the way `[[mqtt_client]]`
+  resolution was split (document facts, then the secret reads) is this entry.
+  Per-app webhook and mqtt subscription stamping rides along with it.
+- **The tool substrate.** With no `ToolRegistry`, no request channels or result
+  inboxes are minted, the `brenn:tools/` and `brenn:tool-results/` arms of the
+  exact-tuning cross-check have no population to check against, and per-consumer
+  `validate_grants` does not run. A config check would need the registry, which
+  is built over live repo-sync state.
+- **Replay store aliasing.** `assert_unique_store_paths` runs, but with an empty
+  replay-path list: the endpoints it would come from are the first bullet's.
 - **The per-instance import⊆grants assert** (`validate_surface_assets`) reads
   the built `.wasm` component trees. A config checker does not have them and
   should not grow a build. It is boot-and-CI-with-artifacts territory, listed
   here only so it is not re-litigated into this slug.
 
+Every one is a *missed* refusal with boot authoritative, never a false one.
+
 Done = on a machine holding no secrets, `brenn config-check` fails a
-`[[wasm_consumer]]` whose grants and wiring disagree.
+`[[webhook_endpoint]]` whose slug, mount or ownership is wrong.
 
 Code site (`TODO(config-check-offline-residue)`):
 `brenn-messaging-boot/src/offline.rs`, on `resolve_messaging_offline`.
@@ -2730,3 +2741,28 @@ the family sizing comment.
 Done = a suite that regresses its recorded baseline by the chosen factor fails or
 reports in CI, or the entry records why per-suite wall time is not worth tracking
 and the BUILD comment stops claiming a regression would be noticed.
+
+## `reload-refusal-kinds`
+
+A refused reload reports its reasons as `refusals: Vec<String>` in the
+`brenn:config.status` body, and two grammars share that list with opposite
+remedies. A line ending in "this change needs a restart" means the document is
+good and the running process cannot walk to it, so bouncing the service applies
+it. A compile diagnostic, or one of boot's environment asserts ("Refusing to
+start (fail-fast on invalid config)"), means the document or the host is wrong
+and a restart makes it worse. The stated audience for these bodies is an LLM,
+which today can only tell them apart by substring-matching prose that is free to
+be reworded.
+
+What is wanted is the remedy carried as data — a kind beside each line
+(`needs-restart` / `invalid-document` / `environment`) — so a reader branches on
+a field. That is an incompatible reshape of a body whose schema is declared an
+additive contract with a version of its own, so it wants the `v` bump and the
+reader vocabulary decided together rather than in a patch.
+
+Code site (`TODO(reload-refusal-kinds)`): `brenn-messaging/src/config_reload.rs`,
+at `ReloadStatus::refusals`.
+
+Done = a refused outcome states its remedy in a field, `v` reflects the reshape,
+and the two producers in `brenn-bootstrap/src/reload/driver.rs` classify rather
+than concatenate.

@@ -126,7 +126,7 @@ impl MqttService {
         self.clients
             .write()
             .await
-            .insert(handle.config.slug.clone(), handle);
+            .insert(handle.config.identity.slug.clone(), handle);
     }
 
     /// Look up the session handle for `client_slug`.
@@ -202,14 +202,15 @@ impl MqttService {
     /// Returns `None` if the client has no session (the caller maps that to a tool
     /// error; we never spawn supervisors at runtime).
     pub async fn ingress_urgency(&self, client_slug: &str) -> Option<Urgency> {
-        self.get_client(client_slug).map(|h| h.config.urgency)
+        self.get_client(client_slug)
+            .map(|h| h.config.identity.urgency)
     }
 
     /// The default broker SUBSCRIBE QoS for `client_slug`'s session.
     ///
     /// Returns `None` if the client has no session.
     pub async fn ingress_qos(&self, client_slug: &str) -> Option<u8> {
-        self.get_client(client_slug).map(|h| h.config.qos)
+        self.get_client(client_slug).map(|h| h.config.identity.qos)
     }
 
     /// Register `topic_filter` (at `qos`) on `client_slug`'s reconnect-survival
@@ -305,7 +306,7 @@ impl MqttService {
             2 => QoS::ExactlyOnce,
             _ => {
                 return Err(MqttError::NotConnected {
-                    client_slug: handle.config.slug.clone(),
+                    client_slug: handle.config.identity.slug.clone(),
                     last_error: Some(format!("invalid qos: {qos}")),
                 });
             }
@@ -322,7 +323,7 @@ impl MqttService {
             None => {
                 let state = handle.supervisor_state.read().await;
                 return Err(MqttError::NotConnected {
-                    client_slug: handle.config.slug.clone(),
+                    client_slug: handle.config.identity.slug.clone(),
                     last_error: state.last_error().map(|s| s.to_string()),
                 });
             }
@@ -339,7 +340,7 @@ impl MqttService {
                 client.publish(topic, rumq_qos, retain, payload).await
             };
             result.map_err(|e| MqttError::NotConnected {
-                client_slug: handle.config.slug.clone(),
+                client_slug: handle.config.identity.slug.clone(),
                 last_error: Some(e.to_string()),
             })?;
             return Ok(PubackOutcome::Success);
@@ -377,7 +378,7 @@ impl MqttService {
             handle.pending_publishes.lock().await.pop_back();
             drop(client_guard);
             return Err(MqttError::NotConnected {
-                client_slug: handle.config.slug.clone(),
+                client_slug: handle.config.identity.slug.clone(),
                 last_error: Some(e.to_string()),
             });
         }
@@ -386,7 +387,7 @@ impl MqttService {
         match ack_rx.await {
             Ok(outcome) => outcome,
             Err(_) => Err(MqttError::NotConnected {
-                client_slug: handle.config.slug.clone(),
+                client_slug: handle.config.identity.slug.clone(),
                 last_error: Some("supervisor task dropped the ack channel".to_string()),
             }),
         }
@@ -457,7 +458,7 @@ mod tests {
 
         let got = svc.get_client("home");
         assert!(got.is_some());
-        assert_eq!(got.unwrap().config.slug, "home");
+        assert_eq!(got.unwrap().config.identity.slug, "home");
         assert!(svc.get_client("nonesuch").is_none());
     }
 
@@ -504,8 +505,8 @@ mod tests {
         let svc = MqttService::new();
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let mut config = brenn_lib::mqtt::test_support::test_client_config("home");
-        config.urgency = Urgency::High;
-        config.qos = 2;
+        config.identity.urgency = Urgency::High;
+        config.identity.qos = 2;
         let handle = MqttClientHandle::new(Arc::new(config), vec![], tx);
         svc.add_client(handle).await;
 

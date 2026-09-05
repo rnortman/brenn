@@ -266,6 +266,19 @@ impl SystemInbox {
         }
     }
 
+    /// Give one system participant its positions before anything can publish to
+    /// it.
+    ///
+    /// Boot's use of [`Self::attach`]: a participant's own drain loop attaches
+    /// too, but that runs on a spawned task, and a message released before the
+    /// position exists would land below it and never be seen. The `Notify` is
+    /// the loop's, not this call's, so the one made here is discarded.
+    pub async fn attach_for(component: &'static str, messenger: &Arc<Messenger>) {
+        SystemInbox::new(component, Arc::clone(messenger), Arc::new(Notify::new()))
+            .attach()
+            .await;
+    }
+
     /// Read the participant's window on every subscribed channel without
     /// moving anything: no advance, no charge, no delivery.
     ///

@@ -49,6 +49,7 @@ use crate::resolved::{
     RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId, str_value,
 };
 use crate::roots::scan_roots;
+use crate::source::SourceFile;
 
 /// The module key of the root file: the crate root has no path to name it by.
 const ROOT_KEY: &str = "";
@@ -99,10 +100,13 @@ impl DocumentInputs {
 }
 
 /// Compile a document tree, starting from its root file.
+///
+/// The returned config includes the files this read; [`resolve_files`] does
+/// not populate them (it takes modules already in memory).
 pub fn compile(inputs: &DocumentInputs) -> Result<DerivedConfig, Vec<Diagnostic>> {
-    let files = load(inputs)?;
-    let config = resolve_files(files, ROOT_KEY)?;
-    crate::derive::derive(config)
+    let Loaded { modules, sources } = load(inputs)?;
+    let config = resolve_files(modules, ROOT_KEY)?;
+    Ok(crate::derive::derive(config)?.with_files(sources))
 }
 
 /// Resolve an already-loaded set of modules — the testable core, no I/O.
@@ -201,10 +205,18 @@ fn check_packaged_discipline(files: &[(String, File)], errors: &mut Vec<Diagnost
 
 // ── pass 1: load ─────────────────────────────────────────────────────────────
 
+/// What one load produced: the parsed modules, and what was read to get them.
+struct Loaded {
+    /// Module key to model, in the order the modules were reached, root first.
+    modules: Vec<(String, File)>,
+    /// Parallel to `modules`: where each was read from, within the document.
+    sources: Vec<SourceFile>,
+}
+
 /// Parse the root file and, transitively, every module it reaches.
 ///
 /// Returns the modules in the order they were reached.
-fn load(inputs: &DocumentInputs) -> Result<Vec<(String, File)>, Vec<Diagnostic>> {
+fn load(inputs: &DocumentInputs) -> Result<Loaded, Vec<Diagnostic>> {
     let root = inputs.root.as_path();
     let root_dir = root.parent().unwrap_or(Path::new(".")).to_path_buf();
     let errors = check_module_roots(&inputs.module_roots, root);
@@ -216,6 +228,7 @@ fn load(inputs: &DocumentInputs) -> Result<Vec<(String, File)>, Vec<Diagnostic>>
         module_roots: inputs.module_roots.clone(),
         reported_missing_module_root: false,
         files: Vec::new(),
+        sources: Vec::new(),
         seen: HashMap::new(),
         loaded: HashMap::new(),
         errors: Vec::new(),
@@ -224,7 +237,10 @@ fn load(inputs: &DocumentInputs) -> Result<Vec<(String, File)>, Vec<Diagnostic>>
     if !loader.errors.is_empty() {
         return Err(loader.errors);
     }
-    Ok(loader.files)
+    Ok(Loaded {
+        modules: loader.files,
+        sources: loader.sources,
+    })
 }
 
 /// Refuse a module-root list that is not a set of distinct directories holding
@@ -276,6 +292,9 @@ struct Loader {
     reported_missing_module_root: bool,
     /// Modules in the order they were reached, root first.
     files: Vec<(String, File)>,
+    /// Parallel to `files`: each module's place in the document and the hash of
+    /// the bytes parsed for it.
+    sources: Vec<SourceFile>,
     /// Module key to the path it was read from — also the "already visited" set.
     seen: HashMap<String, PathBuf>,
     /// Canonical path to the module key it was first loaded as. One file is one
@@ -304,6 +323,7 @@ impl Loader {
         if let Ok(canonical) = path.canonicalize() {
             self.loaded.insert(canonical, key.clone());
         }
+        let place = Self::place(&key, &path);
         self.seen.insert(key.clone(), path);
         // A packaged module's tree imports are refused by the discipline pass;
         // following one here would report a missing module in front of the
@@ -316,6 +336,10 @@ impl Loader {
             .filter_map(|stmt| use_target(stmt).and_then(Result::ok))
             .map(|target| (target.module, target.span))
             .collect();
+        self.sources.push(SourceFile {
+            path: place,
+            source_sha256: file.source_sha256.clone(),
+        });
         self.files.push((key.clone(), file));
 
         stack.push(key);
@@ -407,6 +431,23 @@ impl Loader {
             Some(path) => Located::File(path.clone()),
             None => Located::Missing(missing_packaged_module(key, &candidates)),
         }
+    }
+
+    /// Where a module sits within the document, as its identity records it.
+    ///
+    /// The root has no key to name it by, so it is its own basename; a tree
+    /// module is its path under the root directory; a packaged module is its
+    /// name under a module root, with the sigil kept so a tree module of the
+    /// same name is a different place.
+    fn place(key: &str, path: &Path) -> PathBuf {
+        if key == ROOT_KEY {
+            return PathBuf::from(path.file_name().unwrap_or(path.as_os_str()));
+        }
+        let relative = Self::relative_path(key);
+        if !is_packaged(key) {
+            return relative;
+        }
+        PathBuf::from(format!("{PKG_SIGIL}{}", relative.display()))
     }
 
     /// A module key as a path under whichever root it resolves against.

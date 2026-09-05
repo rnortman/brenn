@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 pub use tracing::level_filters::LevelFilter;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LoggingConfig {
     /// Directory for all log files (diagnostic, security, and CC transcripts).
     pub log_dir: PathBuf,

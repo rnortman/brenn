@@ -3,10 +3,10 @@
 //! Two layers. First the file goes through the same path `--config` boots from —
 //! parse, resolve, derive, lower — with diagnostics rendered instead of a panic
 //! ([`brenn_lib::config::check_config`]). Then the lowered configuration goes
-//! through the messaging resolution passes that read nothing but the
-//! configuration itself ([`resolve_messaging_offline`]), so the per-instance
-//! surface gates — grant/binding coherence, chrome placement — decide the
-//! verdict here rather than only at a service start.
+//! through the whole messaging planner ([`resolve_messaging_offline`]), which
+//! reads nothing but the configuration, so the consumer gates and the
+//! per-instance surface gates — grant/binding coherence, chrome placement —
+//! decide the verdict here rather than only at a service start.
 //!
 //! Environment facts remain out of scope: the passes that stat a path, read a
 //! secret, or touch the DB are excluded by name on
@@ -33,14 +33,14 @@ pub fn run_config_check(file: &Path, module_roots: &[PathBuf]) -> bool {
         root: file.to_path_buf(),
         module_roots: module_roots.to_vec(),
     };
-    let config = match check_config(&inputs) {
-        Ok(config) => config,
+    let document = match check_config(&inputs) {
+        Ok(document) => document,
         Err(report) => {
             eprintln!("{report}");
             return false;
         }
     };
-    match offline_messaging_outcome(&config) {
+    match offline_messaging_outcome(&document.config) {
         Ok(advisories) => {
             // Advice, not a verdict: the document is a config either way, and
             // this tool is the last place before a deploy where an operator
@@ -48,7 +48,14 @@ pub fn run_config_check(file: &Path, module_roots: &[PathBuf]) -> bool {
             for advisory in &advisories {
                 eprintln!("{}: warning: {advisory}", file.display());
             }
-            println!("{}: ok", file.display());
+            // The hash names the whole tree that was checked, not just the
+            // root file, so an operator can hold what they certified against
+            // what a running process says it is projecting.
+            println!(
+                "{}: ok document_sha256={}",
+                file.display(),
+                document.document_sha256
+            );
             true
         }
         Err(message) => {
@@ -82,7 +89,13 @@ pub fn run_config_check(file: &Path, module_roots: &[PathBuf]) -> bool {
 /// On a payload [`refusal_text`] does not read as a refusal — a host bug rather
 /// than a config verdict.
 fn offline_messaging_outcome(config: &BrennConfig) -> Result<Vec<String>, String> {
-    catch_quietly(AssertUnwindSafe(|| resolve_messaging_offline(config))).map_err(refusal_text)
+    catch_quietly(AssertUnwindSafe(|| {
+        resolve_messaging_offline(config)
+            .map(|advisory| advisory.to_string())
+            .into_iter()
+            .collect::<Vec<String>>()
+    }))
+    .map_err(refusal_text)
 }
 
 /// How every refusal in the offline messaging passes starts.
@@ -98,10 +111,33 @@ fn offline_messaging_outcome(config: &BrennConfig) -> Result<Vec<String>, String
 ///
 /// The resolvers' spelling is [`CONFIG_REFUSAL`], shared with the validators
 /// that build their messages from it, so the classifier and its producers
-/// cannot drift by a retyped literal.
-const REFUSAL_PREFIXES: [&str; 3] = [CONFIG_REFUSAL, "surface \"", "remote \""];
+/// cannot drift by a retyped literal. Consumer resolution is the one pass that
+/// names the block it is refusing instead — `[[wasm_consumer]] "slug": …`, some
+/// forty asserts of it — and a document can reach every one of them, so that
+/// spelling is listed too.
+const REFUSAL_PREFIXES: [&str; 4] = [
+    CONFIG_REFUSAL,
+    "[[wasm_consumer]] ",
+    "surface \"",
+    "remote \"",
+];
+
+/// Whether a caught planner payload's text reads as a refusal of the document.
+///
+/// The classification alone, without the re-panic [`refusal_text`] wraps it in:
+/// the reload driver runs the same planner over a candidate while a healthy
+/// process is serving, and there the safe direction is the opposite one.
+pub(crate) fn is_config_refusal(message: &str) -> bool {
+    REFUSAL_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+}
 
 /// Read a caught payload as a refusal, or re-panic because it is a bug.
+///
+/// Shared with the reload driver, which runs the same planner over a candidate
+/// document and needs the same reading of what it says: the two callers differ
+/// in what they do with a refusal, never in what counts as one.
 ///
 /// The narrow reading is the point. Rendering any panic as a config refusal
 /// would send an operator hunting through a file that is fine for a defect that
@@ -116,19 +152,17 @@ const REFUSAL_PREFIXES: [&str; 3] = [CONFIG_REFUSAL, "surface \"", "remote \""];
 /// A refusal spelled some third way lands here too, and re-panicking on it is
 /// the safe direction: the operator still reads the message, with a backtrace
 /// naming the assert that produced it.
-fn refusal_text(payload: Box<dyn Any + Send>) -> String {
+pub(crate) fn refusal_text(payload: Box<dyn Any + Send>) -> String {
     let Some(message) = panic_message(&*payload) else {
         panic!(
-            "config-check: messaging resolution panicked with a payload of type id {:?}, which \
+            "the messaging planner panicked with a payload of type id {:?}, which \
              carries no message — every refusal here is an assert message, so this is a bug",
             (*payload).type_id(),
         );
     };
     assert!(
-        REFUSAL_PREFIXES
-            .iter()
-            .any(|prefix| message.starts_with(prefix)),
-        "config-check: messaging resolution panicked with a message that is not a config \
+        is_config_refusal(message),
+        "the messaging planner panicked with a message that is not a config \
          refusal, so this is a bug in the resolvers rather than a verdict on the file: \
          {message}",
     );
@@ -202,6 +236,19 @@ channel surface_index at "brenn:surface.index" {
                     .to_string(),
             )),
             "remote \"pod\": publish_acl prefix matcher is empty (would match every channel)",
+        );
+        // Consumer resolution names the block it is refusing instead of
+        // carrying the resolvers' marker, and a document can reach every one of
+        // its forty-odd asserts — including from a block a reload converges, so
+        // the reload driver reads this same classification.
+        assert_eq!(
+            refusal_text(Box::new(
+                "[[wasm_consumer]] \"sifter\": subscription.channel \"brenn:tools/nope\" is not \
+                 a known channel address"
+                    .to_string(),
+            )),
+            "[[wasm_consumer]] \"sifter\": subscription.channel \"brenn:tools/nope\" is not a \
+             known channel address",
         );
     }
 
@@ -549,22 +596,42 @@ new relay: Relay {
         gate_refusal(contents, &[repo_root().join("config/specs")])
     }
 
+    /// A document whose classes are fenced into a packaged module, refused.
+    ///
+    /// `gate_refusal` writes the text as one file, which a fixture declaring a
+    /// top-level instance cannot be: its class is in an installed package.
+    fn staged_gate_refusal(contents: &str) -> String {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        refusal_of(&brenn_lib::config::stage_fixture(
+            dir.path(),
+            "main.brenn",
+            contents,
+        ))
+    }
+
     /// The body of both: write `contents` to a temporary root, check it against
     /// `module_roots`, and return the offline pass's refusal text.
     fn gate_refusal(contents: &str, module_roots: &[PathBuf]) -> String {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let file = dir.path().join("main.brenn");
         std::fs::write(&file, contents).expect("the document is writable");
-        let inputs = DocumentInputs {
-            root: file.clone(),
+        refusal_of(&DocumentInputs {
+            root: file,
             module_roots: module_roots.to_vec(),
-        };
-        let config = check_config(&inputs)
-            .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"));
+        })
+    }
+
+    /// Check `inputs`, holding both layers: the front end accepts the document
+    /// (so the refusal is the offline pass's own) and the verdict refuses it
+    /// (so the pass decides the verdict).
+    fn refusal_of(inputs: &DocumentInputs) -> String {
+        let config = check_config(inputs)
+            .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"))
+            .config;
         let message = offline_messaging_outcome(&config)
             .expect_err("a messaging gate must refuse this configuration");
         assert!(
-            !run_config_check(&file, module_roots),
+            !run_config_check(&inputs.root, &inputs.module_roots),
             "the offline pass refused it but the verdict passed it",
         );
         message
@@ -694,9 +761,12 @@ channel feed at "brenn:alice.feed" {
     }
 
     /// The error channel every surface is granted must be a `brenn:` address.
-    /// The output-coverage assert has no config-check fixture: a DSL-authored
-    /// surface always covers its own outputs, and the assert is pinned in
-    /// `brenn-messaging-boot`'s surface tests for the raw shapes boot handles.
+    /// This document configures no messaging, so the refusal is the one the
+    /// planner's no-messaging arm makes — the same arm, and the same words,
+    /// boot reaches. The output-coverage assert has no config-check fixture: a
+    /// DSL-authored surface always covers its own outputs, and the assert is
+    /// pinned in `brenn-messaging-boot`'s surface tests for the raw shapes boot
+    /// handles.
     #[test]
     fn a_misschemed_surface_error_channel_is_refused() {
         let message = boot_gate_refusal(
@@ -707,7 +777,7 @@ channel feed at "brenn:alice.feed" {
         );
         assert!(message.contains("surface_error_channel"), "{message}");
         assert!(
-            message.contains("must be a well-formed brenn: address"),
+            message.contains("is not a well-formed brenn: address"),
             "{message}"
         );
     }
@@ -716,9 +786,9 @@ channel feed at "brenn:alice.feed" {
     /// families rather than one block: a webhook secret, an mqtt client's
     /// password and CA, and a consumer's component artifact are all environment
     /// facts this machine does not hold, and none of them may decide the
-    /// verdict. The offline pass also sees fewer channels than boot does — no
-    /// `webhook:` or `mqtt:` directory entries — which can only make it more
-    /// permissive, never stricter.
+    /// verdict. What this pass still cannot answer is the endpoint resolution
+    /// and tool substrate the planner is handed no inputs for, which can only
+    /// make it more permissive, never stricter.
     #[test]
     fn a_config_full_of_environment_coupled_blocks_still_passes() {
         let (ok, report) = check(
@@ -826,6 +896,157 @@ remote pod {
         assert!(message.contains("\"pod\""), "{message}");
     }
 
+    /// The parity document: every family whose resolution used to read the host,
+    /// declared at once and bound the way a deployment binds it.
+    ///
+    /// `endpoints` decides which endpoint the `webhook:`-bound consumer names and
+    /// which endpoint the tuning block tunes, so one text serves the positive
+    /// case and the two undeclared-endpoint refusals.
+    fn parity_document(consumer_endpoint: &str, tuned_endpoint: &str) -> String {
+        format!(
+            r#"{SURFACE_INDEX_DECL}
+channel digests at "brenn:alice.digests" {{
+    push_depth = 8;
+    retain_depth = 64;
+    standing_retain_depth = 64;
+}}
+
+// The endpoint's secret, the broker's password and CA, and the remote's bearer
+// token are all files this machine does not have.
+webhook push_alice {{
+    mount = "/webhooks/push-alice";
+    signature {{
+        scheme = bearer-token;
+        header = "authorization";
+    }}
+    token phone {{ secret_file = "/nonexistent/alice/push-alice.token"; }}
+}}
+
+mqtt_client broker {{
+    url = "mqtts://broker.example.com:8883";
+    username = "alice";
+    password_file = "/nonexistent/alice/broker.password";
+    ca_file = "/nonexistent/alice/broker-ca.pem";
+}}
+
+remote pod {{
+    token_file = "/nonexistent/alice/remote-pod.token";
+    grants = [publish];
+    acl publish [prefix "brenn:alice."];
+}}
+
+// A tuning block over a system-minted channel: it declares nothing, so the
+// entry it sizes is one the derivation mints from the endpoint.
+channel at "webhook:{tuned_endpoint}" {{
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 16;
+}}
+
+// ── packaged ──
+component Hooked {{
+    {ports}
+    in inbound;
+    out digest;
+}}
+
+component Brokered {{
+    {stores}
+    in inbound;
+    out digest;
+}}
+// ── packaged ──
+
+new hooked: Hooked {{
+    grants = [ports];
+    in inbound <- "webhook:{consumer_endpoint}" {{ push_depth = 4; }}
+    out digest -> digests;
+}}
+
+// The store lands under a directory this machine does not have: where a
+// consumer's KV store lives is the deployment host's fact.
+new brokered: Brokered {{
+    grants = [ports, store];
+    store_path = "/nonexistent/alice/state/brokered.db";
+    in inbound <- "mqtt:broker:alice/state" {{ push_depth = 4; }}
+    out digest -> digests;
+}}
+
+// A second `mqtt:` address, minted by an app rather than by a consumer.
+agent Assistant() {{
+    grants = [subscribe];
+    subscribe "mqtt:broker:alice/other" {{ push_depth = 4; retain_depth = 8; }}
+}}
+
+new alice: Assistant();
+"#,
+            ports = processor_needs!("ports"),
+            stores = processor_header("ports, store"),
+        )
+    }
+
+    /// The whole environment-coupled document certifies on a machine holding
+    /// none of what it names. This is the workstation and the annex gate: the
+    /// planner reads the document and the document alone, so every file above —
+    /// the endpoint secret, the broker password and CA, the remote token, the
+    /// store's parent directory — is boot's to read and none of them decides
+    /// the verdict.
+    #[test]
+    fn the_whole_environment_coupled_document_still_certifies() {
+        let (ok, report) = check("main.brenn", &parity_document("push_alice", "push_alice"));
+        assert!(ok, "{report}");
+    }
+
+    /// The other direction of the same population, and which layer answers it:
+    /// a binding to an endpoint the document does not declare is a name the
+    /// compiler cannot resolve, so the front end refuses it before the planner
+    /// is handed anything. The planner's own refusal for the same shape — a
+    /// port on an address the channel population lacks — is pinned in
+    /// `brenn-messaging-boot`'s plan tests, over a raw configuration the
+    /// compiler cannot express.
+    #[test]
+    fn a_consumer_bound_to_an_undeclared_endpoint_is_refused() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let inputs = brenn_lib::config::stage_fixture(
+            dir.path(),
+            "main.brenn",
+            &parity_document("push_bob", "push_alice"),
+        );
+        assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+        let report = check_config(&inputs).expect_err("the binding must be refused");
+        assert!(report.contains("push_bob"), "{report}");
+    }
+
+    /// A tuning block naming one is the planner's to refuse, and it does:
+    /// the exact-tuning cross-check reads the raw endpoint blocks, which this
+    /// pass holds, so a typo in a depth-sizing block is caught on a workstation
+    /// rather than at the next service start.
+    #[test]
+    fn a_tuning_block_over_an_undeclared_endpoint_is_refused() {
+        let message = staged_gate_refusal(&parity_document("push_alice", "push_bob"));
+        assert!(message.contains("webhook:push_bob"), "{message}");
+        assert!(
+            message.contains("tunes a channel this config never mints"),
+            "{message}"
+        );
+    }
+
+    /// The planner's no-messaging arm, reached by a document that routes surface
+    /// error reports onto a bus it never configures. The refusal is boot's, and
+    /// it has to be made before the early return or a config check would
+    /// certify a document whose error lane goes nowhere.
+    #[test]
+    fn an_error_channel_with_no_messaging_at_all_is_refused() {
+        let message = boot_gate_refusal(
+            r#"observability {
+    surface_error_channel = "brenn:alice.errors";
+}
+"#,
+        );
+        assert!(message.contains("surface_error_channel"), "{message}");
+        assert!(message.contains("no messaging is configured"), "{message}");
+    }
+
     /// The shipped configs pass the strengthened check. Without the offline
     /// messaging pass, a config that lowers clean but panics the service at boot
     /// is reported `ok`.
@@ -842,7 +1063,8 @@ remote pod {
         // burst — from either side — is a red test here rather than a warning on
         // every dev boot.
         let config = check_config(&DocumentInputs::with_modules(root.join(filename), specs))
-            .unwrap_or_else(|report| panic!("{filename} must compile: {report}"));
+            .unwrap_or_else(|report| panic!("{filename} must compile: {report}"))
+            .config;
         let advisories = offline_messaging_outcome(&config)
             .unwrap_or_else(|message| panic!("{filename} must pass the offline pass: {message}"));
         assert!(
@@ -871,7 +1093,7 @@ remote pod {
         let root = repo_root();
         let inputs = DocumentInputs::with_modules(root.join(filename), root.join("config/specs"));
         let config = match check_config(&inputs) {
-            Ok(config) => config,
+            Ok(document) => document.config,
             Err(report) => panic!("{filename} must compile: {report}"),
         };
         let mut checked = 0;
@@ -922,7 +1144,7 @@ remote pod {
             module_roots: vec![repo_root().join("config/specs")],
         };
         match check_config(&inputs) {
-            Ok(config) => config,
+            Ok(document) => document.config,
             Err(report) => panic!("the document must compile: {report}"),
         }
     }
@@ -1257,7 +1479,8 @@ channel surface_errors at "brenn:surface-errors" {
         )
         .expect("the document is writable");
         let config = check_config(&DocumentInputs::bare(&file))
-            .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"));
+            .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"))
+            .config;
         let advisories = offline_messaging_outcome(&config).expect("the document must pass");
         assert_eq!(advisories.len(), 1, "{advisories:?}");
         assert!(

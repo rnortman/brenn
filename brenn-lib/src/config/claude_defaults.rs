@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 /// Server-global CC defaults, shared across all apps.
 /// Per-app configs can override `model`.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClaudeDefaultsConfig {
     /// Path to the Brenn DisplayFile MCP stub script (noop_mcp.py).
     pub mcp_script_path: PathBuf,

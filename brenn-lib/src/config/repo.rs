@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Top-level repo declaration from `[[repo]]`.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RepoDeclRaw {
     /// URL-safe identifier (`[a-z0-9][a-z0-9-]*`). Globally unique across repos.
     pub slug: String,
@@ -14,7 +14,7 @@ pub struct RepoDeclRaw {
 }
 
 /// Per-app mount from `[[app.mount]]`.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MountConfigRaw {
     /// Slug of a `[[repo]]` entry.
     pub repo: String,

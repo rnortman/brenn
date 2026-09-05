@@ -35,7 +35,7 @@ use crate::tools::ResolvedToolGrant;
 ///
 /// Deny-by-default end to end: a default (empty) policy grants nothing and
 /// matches no ACL list. Backend-only — no `ts-rs` derive.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppPolicy {
     /// Layer 1: coarse capability grants.
     pub grants: GrantSet,
@@ -338,12 +338,44 @@ impl AppPolicy {
     }
 }
 
+/// A resolved policy reached either by borrow or by shared handle, so one lookup
+/// can answer for both sources a participant's authority comes from.
+///
+/// An app's policy is a field of an immutable `AppConfig` map and answers as a
+/// borrow. Every other subscriber's policy sits behind an `Arc` in a registry
+/// that changes while the process runs, so it answers as a clone of that `Arc`
+/// — reading it must not hold the registry's lock. Both deref to the same
+/// `AppPolicy`, so a caller asks its question once.
+pub enum PolicyRef<'a> {
+    /// A policy owned by something that outlives the lookup.
+    Borrowed(&'a AppPolicy),
+    /// A policy held behind a shared handle, cloned out of its registry.
+    Shared(std::sync::Arc<AppPolicy>),
+}
+
+impl std::ops::Deref for PolicyRef<'_> {
+    type Target = AppPolicy;
+
+    fn deref(&self) -> &AppPolicy {
+        match self {
+            PolicyRef::Borrowed(p) => p,
+            PolicyRef::Shared(p) => p,
+        }
+    }
+}
+
+impl std::fmt::Debug for PolicyRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 /// Layer-1 grant set. Deny-by-default: a capability not in the set is denied.
 ///
 /// Backed by a `BTreeSet` so a later phase's logging can iterate grants in a
 /// stable order. Only `has` and `insert` are exposed; `iter`/`is_empty` are
 /// added with their first consumer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantSet(BTreeSet<AppCapability>);
 
 impl GrantSet {

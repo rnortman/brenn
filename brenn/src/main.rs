@@ -21,13 +21,13 @@ async fn main() -> ExitCode {
         _ => {}
     }
 
-    let config = brenn_lib::config::load_config(cli.config.as_deref(), &cli.modules);
+    let document = brenn_lib::config::load_config(cli.config.as_deref(), &cli.modules);
 
     match cli.command.unwrap_or(cli::Commands::Serve {
         components: Vec::new(),
         surface: Vec::new(),
     }) {
-        cli::Commands::Invite => bootstrap::run_invite(&config).await,
+        cli::Commands::Invite => bootstrap::run_invite(&document.config).await,
         cli::Commands::Serve {
             components,
             surface,
@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
                 components,
                 surface,
             };
-            bootstrap::run_server(config, cli.config, install_roots, build_info::BUILD_ID).await;
+            bootstrap::run_server(document, cli.config, install_roots, build_info::BUILD_ID).await;
         }
         cli::Commands::ConfigDiff { .. } | cli::Commands::ConfigCheck { .. } => {
             unreachable!("handled above, before the config loads")

@@ -4,6 +4,36 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Live config reload.** A running server can re-read its config document and
+  converge to it without restarting. Two doors, both off unless the deployment
+  declares the reload channel pair (`ConfigReload` from the new
+  `@config-reload` library module): `SIGUSR1` and a message published to
+  `brenn:config.reload`. Channels, links, and WASM consumers — including
+  consumers whose package artifact changed on disk — are added, removed, or
+  retuned in place. Everything else (agents, surfaces, remotes, MQTT clients,
+  server settings) is compared whole: any difference is refused and the running
+  system is left untouched. Outcomes are published to `brenn:config.status` as
+  a retained JSON body and fired as alerts on refusal.
+- **Document identity hash.** `brenn config-check` and the boot log now report a
+  SHA-256 over every file the compile read, keyed by document-relative path, so
+  what an operator certified offline can be held against what a process is
+  running.
+- **Channel tombstones.** Removing a channel on reload drops its subscriptions
+  and publishes a tombstone so late readers learn the address is gone rather than
+  silently missing messages.
+- **Messaging planner extracted.** The channel and consumer resolution that boot
+  performs is now a pure `plan_messaging` function in `brenn-messaging-boot`,
+  callable from both boot and reload without duplicating the wiring logic.
+- **WASM consumer lifecycle extracted.** Consumer load, start, and stop are
+  factored out of `brenn-bootstrap` into a `ConsumerRegistry` and per-consumer
+  `LoadedConsumer`, so reload can retire and replace individual consumers
+  without touching the rest of the dispatch tree.
+- **Security posture: boundary B9** documents the reload requester's trust
+  model — the request is a trigger, never an input, and the content gate is the
+  document on disk under the same compiler the boot path uses.
+
 ### Fixed
 
 - **Statement formatting no longer orphans terminators.** A `;` that ends a

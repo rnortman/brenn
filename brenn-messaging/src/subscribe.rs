@@ -679,10 +679,10 @@ impl Messenger {
         //      removal still found none: a durable/directory inconsistency, a host
         //      bug. Keep the panic.
         let snapshot_had_subscriber = entry.app_subscriber(app_slug).is_some();
-        let (still_subscribed, was_dormant) = match self
-            .directory
-            .remove_subscriber(&channel_uuid, app_slug)
-        {
+        let (still_subscribed, was_dormant) = match self.directory.remove_subscriber(
+            &channel_uuid,
+            &SubscriberEntryKind::App(app_slug.to_string()),
+        ) {
             Some(remaining) => {
                 // Removed a folded subscriber: the remaining count came from
                 // `remove_subscriber` under its own write-lock — no second

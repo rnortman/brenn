@@ -1,4 +1,4 @@
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SecurityConfig {
     /// Auth endpoint rate limit: token replenishment interval in seconds.
     /// One token is added every this many seconds.

@@ -29,7 +29,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 use brenn_lib::messaging::Urgency;
-use brenn_lib::mqtt::config::{MqttClientConfig, TlsVersionMin};
+use brenn_lib::mqtt::config::{MqttClientConfig, MqttClientIdentity, TlsVersionMin};
 use brenn_mqtt::service::IngressSubscribeOutcome;
 use brenn_mqtt::state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle};
 use brenn_mqtt::{InboundPayload, MqttEventRouter, MqttService, spawn_client_supervisor};
@@ -354,21 +354,23 @@ pub fn test_client_config(
     tls_version_min: TlsVersionMin,
 ) -> MqttClientConfig {
     MqttClientConfig {
-        slug: client_slug.to_string(),
-        host: BrokerHarness::HOST.to_string(),
-        port,
-        username: None,
+        identity: MqttClientIdentity {
+            slug: client_slug.to_string(),
+            host: BrokerHarness::HOST.to_string(),
+            port,
+            username: None,
+            tls_version_min,
+            keepalive_secs: Some(30),
+            inbound_payload_cap_bytes: 4 * 1024 * 1024,
+            last_will: None,
+            reconnect_backoff_initial_secs: 1,
+            reconnect_backoff_max_secs: 60,
+            qos: 1,
+            urgency: Urgency::Normal,
+            session_expiry_secs: 0,
+        },
         password: None,
         ca_cert_pem: Some(ca_pem),
-        tls_version_min,
-        keepalive_secs: Some(30),
-        inbound_payload_cap_bytes: 4 * 1024 * 1024,
-        last_will: None,
-        reconnect_backoff_initial_secs: 1,
-        reconnect_backoff_max_secs: 60,
-        qos: 1,
-        urgency: Urgency::Normal,
-        session_expiry_secs: 0,
     }
 }
 
@@ -466,7 +468,7 @@ pub async fn spawn_client_with_config(
     config: Arc<MqttClientConfig>,
     static_subs: Vec<(String, u8)>,
 ) -> SpawnedClient {
-    let client_slug = config.slug.clone();
+    let client_slug = config.identity.slug.clone();
 
     let subs: Vec<IngressSubscription> = static_subs
         .into_iter()

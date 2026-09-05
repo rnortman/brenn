@@ -6,11 +6,37 @@
 
 mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::resolved::StampId;
 use brenn_dsl::{DocumentInputs, compile};
+
+/// A scratch directory of this test's own, emptied first so a run never
+/// inherits what a previous one left behind.
+///
+/// `TEST_TMPDIR` is the runner's own scratch, cleaned up for us; a plain run
+/// with no runner falls back to the system temp directory.
+fn scratch_dir(name: &str) -> PathBuf {
+    let base = std::env::var("TEST_TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
+    let dir = base.join(format!("{name}-{}", std::process::id()));
+    // A test that tightened the directory's mode to observe an unlistable
+    // module root leaves it that way when it fails or when it runs as a user
+    // for whom the tightening does nothing; loosen it back before the removal
+    // so this run is not refused for the last one's arrangements.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _restored = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("scratch directory {}: {error}", dir.display()),
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
 /// One fixture tree's root file.
 fn root(tree: &str) -> PathBuf {
@@ -247,14 +273,13 @@ fn a_module_root_that_is_not_a_directory_is_refused_whatever_the_document_import
 fn a_module_root_that_cannot_be_listed_is_refused_as_the_root_and_not_as_absent_modules() {
     use std::os::unix::fs::PermissionsExt;
 
-    let scratch = std::env::var("TEST_TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
-    let modules = scratch.join(format!("unlistable-module-root-{}", std::process::id()));
-    std::fs::create_dir(&modules).unwrap();
+    let modules = scratch_dir("unlistable-module-root");
     std::fs::write(modules.join("widget.brenn"), "const skin = \"bench\";\n").unwrap();
     std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o000)).unwrap();
     // Root reads a mode-000 directory anyway, and then there is nothing to
     // observe; the assertion is worth nothing rather than wrong.
     if std::fs::read_dir(&modules).is_ok() {
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o700)).unwrap();
         return;
     }
     let errors = errors_with("ok", std::slice::from_ref(&modules));
@@ -499,8 +524,7 @@ fn a_missing_packaged_module_names_every_root_it_was_looked_for_under() {
 fn a_directory_named_like_a_module_is_not_a_duplicate_of_the_module() {
     // Import resolution requires a file; a stray `widget.brenn/` directory
     // under a second root is not a duplicate and cannot shadow the real module.
-    let scratch = std::env::var("TEST_TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
-    let decoy = scratch.join(format!("decoy-module-root-{}", std::process::id()));
+    let decoy = scratch_dir("decoy-module-root");
     std::fs::create_dir_all(decoy.join("widget.brenn")).unwrap();
     compile(&inputs("pkg-ok", &[modules("pkg-ok"), decoy.clone()]))
         .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
@@ -669,4 +693,140 @@ fn a_principal_reaches_a_packaged_stamp_through_a_tree_assembly() {
     assert_eq!(output.consumers.len(), 1);
     assert_eq!(output.resolved.channels.len(), 3);
     assert!(output.agents.is_empty());
+}
+
+// ── document identity ────────────────────────────────────────────────────────
+
+/// The compiled tree, or a panic naming why it did not compile.
+fn compiled(tree: &str, module_roots: &[PathBuf]) -> brenn_dsl::derived::DerivedConfig {
+    compile(&inputs(tree, module_roots)).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)))
+}
+
+/// The places a compile read from, as its identity records them.
+fn places(config: &brenn_dsl::derived::DerivedConfig) -> Vec<String> {
+    config
+        .files
+        .iter()
+        .map(|file| file.path.display().to_string())
+        .collect()
+}
+
+#[test]
+fn every_file_a_compile_read_is_in_the_document() {
+    let output = compiled("doc-identity", &[modules("pkg-ok")]);
+    // Read order, root first: the root, the tree module it imports, the
+    // packaged module, and the packaged module that one builds on. A tree
+    // module is placed under the root's directory; a packaged one keeps its
+    // sigil, so a tree module of the same name is a different place.
+    assert_eq!(
+        places(&output),
+        [
+            "main.brenn",
+            "wiring/deskbar.brenn",
+            "@widget.brenn",
+            "@base.brenn",
+        ]
+    );
+    // Each file's own hash is the hash of its bytes, so the document's identity
+    // is derived from nothing but what was read.
+    for file in &output.files {
+        let place = file.path.display().to_string();
+        let path = match place.strip_prefix('@') {
+            Some(name) => modules("pkg-ok").join(name),
+            None => root("doc-identity")
+                .parent()
+                .expect("the root file has a directory")
+                .join(&file.path),
+        };
+        let source = std::fs::read_to_string(&path).expect("a fixture file");
+        assert_eq!(
+            file.source_sha256,
+            brenn_dsl::source_sha256(&source),
+            "{}",
+            file.path.display()
+        );
+    }
+}
+
+#[test]
+fn the_order_of_the_module_roots_is_not_part_of_the_identity() {
+    // A second root holding nothing the document imports changes where a module
+    // was found and not what was read, so the identity is unmoved by it — and
+    // by the order the two roots were named in.
+    let empty = scratch_dir("identity-empty-root");
+    let real = modules("pkg-ok");
+    let one = compiled("doc-identity", &[real.clone(), empty.clone()]);
+    let other = compiled("doc-identity", &[empty, real]);
+    assert_eq!(one.document_sha256(), other.document_sha256());
+}
+
+#[test]
+fn one_byte_of_a_packaged_module_moves_the_identity() {
+    // The module roots are a copy this test owns, so the byte it edits is its
+    // own; the root document is the fixture either way.
+    let root_dir = scratch_dir("identity-modules");
+    for name in ["widget.brenn", "base.brenn"] {
+        std::fs::copy(modules("pkg-ok").join(name), root_dir.join(name)).unwrap();
+    }
+    let before = compiled("doc-identity", std::slice::from_ref(&root_dir));
+    let widget = root_dir.join("widget.brenn");
+    let edited = format!(
+        "{}\n// one more byte\n",
+        std::fs::read_to_string(&widget).unwrap()
+    );
+    std::fs::write(&widget, edited).unwrap();
+    let after = compiled("doc-identity", &[root_dir]);
+    // The comment changes no configuration at all, which is the point: identity
+    // is about the text, and what the text means is a separate question.
+    assert_eq!(
+        before.resolved.channels.len(),
+        after.resolved.channels.len()
+    );
+    assert_ne!(before.document_sha256(), after.document_sha256());
+    assert_eq!(places(&before), places(&after));
+}
+
+#[test]
+fn where_the_tree_lives_is_not_part_of_the_identity() {
+    // The identity's whole use is comparing what one machine certified with
+    // what another says it is projecting, and the two hold the same document at
+    // different absolute paths.
+    let one = staged_copy("identity-place-one");
+    let other = staged_copy("identity-place-two");
+    let first = compiled_at(&one);
+    let second = compiled_at(&other);
+    assert_eq!(places(&first), places(&second));
+    assert_eq!(first.document_sha256(), second.document_sha256());
+}
+
+/// The `doc-identity` tree and the packaged modules it imports, copied into a
+/// scratch directory of their own.
+fn staged_copy(name: &str) -> PathBuf {
+    let dir = scratch_dir(name);
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("wiring")).unwrap();
+    std::fs::copy(root("doc-identity"), tree.join("main.brenn")).unwrap();
+    std::fs::copy(
+        root("doc-identity")
+            .parent()
+            .expect("the root file has a directory")
+            .join("wiring/deskbar.brenn"),
+        tree.join("wiring/deskbar.brenn"),
+    )
+    .unwrap();
+    let module_root = dir.join("modules");
+    std::fs::create_dir_all(&module_root).unwrap();
+    for module in ["widget.brenn", "base.brenn"] {
+        std::fs::copy(modules("pkg-ok").join(module), module_root.join(module)).unwrap();
+    }
+    dir
+}
+
+/// Compile the copy `staged_copy` left in `dir`.
+fn compiled_at(dir: &Path) -> brenn_dsl::derived::DerivedConfig {
+    let inputs = DocumentInputs {
+        root: dir.join("tree/main.brenn"),
+        module_roots: vec![dir.join("modules")],
+    };
+    compile(&inputs).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)))
 }

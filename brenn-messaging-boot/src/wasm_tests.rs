@@ -1017,10 +1017,12 @@ fn reserved_char_port_name_panics() {
     resolve(&raw, &dir);
 }
 
-/// Missing store_path parent directory panics at bootstrap.
+/// A `store_path` whose parent directory is on no machine here still resolves,
+/// absolute path and all: whether the directory exists is a fact about the
+/// deployment host, asked where the store is opened. This pass answers only what
+/// the document says.
 #[test]
-#[should_panic(expected = "parent directory does not exist")]
-fn missing_store_path_parent_panics() {
+fn a_store_path_with_no_parent_directory_still_resolves() {
     let (dir, chan_addr) = make_brenn_dir("brenn:no-parent-ch");
     let raw = vec![WasmConsumerConfigRaw {
         slug: "no-parent".to_string(),
@@ -1032,7 +1034,13 @@ fn missing_store_path_parent_panics() {
         subscriptions: vec![sub_raw(&chan_addr, "in")],
         ..minimal_wasm_consumer()
     }];
-    resolve(&raw, &dir);
+    let resolved = resolve(&raw, &dir);
+    assert_eq!(
+        resolved[0].store_path.as_deref(),
+        Some(std::path::Path::new(
+            "/nonexistent_dir_xyz_brenn_test/store.sqlite"
+        )),
+    );
 }
 
 // --- Config passthrough ---
@@ -1213,12 +1221,14 @@ fn store_grant_without_store_path_panics() {
 
 /// Build an `IndexMap` of declared MQTT clients from bare slugs, mirroring the
 /// registry `resolve_wasm_consumers` cross-checks `mqtt_publish` matchers against.
-fn declared_clients(slugs: &[&str]) -> IndexMap<String, brenn_lib::mqtt::config::MqttClientConfig> {
+fn declared_clients(
+    slugs: &[&str],
+) -> IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity> {
     let raw: Vec<_> = slugs
         .iter()
         .map(|s| brenn_lib::mqtt::config::MqttClientConfigRaw::minimal(s, "mqtts://127.0.0.1:1"))
         .collect();
-    brenn_lib::mqtt::config::resolve_clients(&raw)
+    brenn_lib::mqtt::config::resolve_client_identities(&raw)
 }
 
 /// A one-subscription, one-output consumer with the `ports` grant and a publish
@@ -1662,4 +1672,69 @@ fn auto_namespace_sibling_address_resolves() {
 /// One-consumer slice for the resolver.
 fn raw_vec(raw: WasmConsumerConfigRaw) -> Vec<WasmConsumerConfigRaw> {
     vec![raw]
+}
+
+// --- Whole-value comparison ---
+//
+// A difference the comparison cannot see is a consumer left running authority,
+// pacing, or wiring nobody wrote.
+
+/// Two resolutions of the same block are the same value.
+#[test]
+fn the_same_block_resolves_to_the_same_consumer() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:compare-same");
+    let raw = minimal_wasm_consumer_raw("compare", "/tmp/a.wasm", &chan_addr);
+    let one = resolve(std::slice::from_ref(&raw), &dir);
+    let other = resolve(&[raw], &dir);
+    assert_eq!(one[0], other[0]);
+}
+
+/// An ACL line is a policy difference, and policy is part of the value.
+#[test]
+fn a_policy_only_difference_is_a_difference() {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    let (dir, chan_addr) = make_brenn_dir("brenn:compare-policy");
+    let plain = minimal_wasm_consumer_raw("compare", "/tmp/a.wasm", &chan_addr);
+    let widened = WasmConsumerConfigRaw {
+        subscribe_acl: vec![ChannelMatcherRaw::Exact("inbox".to_string())],
+        ..plain.clone()
+    };
+    let before = resolve(&[plain], &dir);
+    let after = resolve(&[widened], &dir);
+    assert_ne!(before[0], after[0]);
+}
+
+/// Pacing is part of the value.
+#[test]
+fn a_pacing_only_difference_is_a_difference() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:compare-pacing");
+    let plain = minimal_wasm_consumer_raw("compare", "/tmp/a.wasm", &chan_addr);
+    let paced = WasmConsumerConfigRaw {
+        activation_burst: Some(5),
+        activation_min_period_ms: Some(250),
+        ..plain.clone()
+    };
+    let before = resolve(&[plain], &dir);
+    let after = resolve(&[paced], &dir);
+    assert_ne!(before[0], after[0]);
+}
+
+/// An input port's resolved depth is part of the value.
+#[test]
+fn an_input_depth_only_difference_is_a_difference() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:compare-depth");
+    let plain = minimal_wasm_consumer_raw("compare", "/tmp/a.wasm", &chan_addr);
+    let deeper = WasmConsumerConfigRaw {
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            retain_depth: Some(Depth::Bounded(64)),
+            ..sub_raw(&chan_addr, "in")
+        }],
+        ..plain.clone()
+    };
+    let before = resolve(&[plain], &dir);
+    let after = resolve(&[deeper], &dir);
+    assert_ne!(before[0], after[0]);
+    // The difference is the port's, and nothing else moved with it.
+    assert_eq!(before[0].policy, after[0].policy);
+    assert_eq!(before[0].outputs, after[0].outputs);
 }

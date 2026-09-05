@@ -338,11 +338,10 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
     // --- Step 2: the executor drains the request, pulls the fixture, publishes
     // the result to the consumer's inbox. It runs against the same grant map the
     // guest's host holds, so the call-time and execute-time gates cannot drift.
-    let caller_grants: Arc<ToolCallerGrants> = {
-        let mut map: ToolCallerGrants = HashMap::new();
-        map.insert(guest_sub.as_str().to_string(), harness.tool_grants.clone());
-        Arc::new(map)
-    };
+    let caller_grants = Arc::new(ToolCallerGrants::new(HashMap::from([(
+        guest_sub.as_str().to_string(),
+        harness.tool_grants.clone(),
+    )])));
     let (exec_alert, _exec_alert_handle) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(
         Arc::clone(&harness.messenger),

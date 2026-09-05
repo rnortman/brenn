@@ -676,6 +676,33 @@ rejected: two bundles shipping one package name would overwrite each other
 silently, and a single root has no second copy for the host to compare. Multiple
 roots give the host the collision, and it refuses.
 
+### Upgrading a bundle under a running host
+
+Installing a bundle is an rsync into its roots and a service bounce. On a
+deployment that declares the reload facility (`docs/message-bus.md` §2.8) the
+bounce can be a reload instead, for the case that matters most — a new build of
+a component whose configuration did not move.
+
+The host does not take the document's word for what is running. Each running
+consumer is held against the package record on disk — artifact hash and spec hash
+both — so a bundle whose artifact changed under an unmoved document is a *changed*
+consumer: the old instance is retired, and the new bytes are loaded, verified and
+started in its place. The alternative would be a process that keeps executing
+bytes no installed root holds any more.
+
+Two things about the upgrade path are worth knowing before relying on it:
+
+- **A bundle carrying `surface/` still needs a restart.** Surfaces do not
+  converge at all: a document that changes one is refused, and a surface asset
+  tree that moved under an unmoved document is not noticed — the served tree and
+  the self-description publishes are both boot-time facts. Only backend packages
+  are held against their records.
+- **The roots can move while a reload is preparing** — an rsync into a directory
+  is not atomic. Verify the install, then ask for the reload, rather than the
+  other way round; a reload that reads a half-synced root refuses on a hash
+  mismatch, which is the correct outcome but not a pleasant way to learn the
+  rsync had not finished.
+
 ### What a deployment still copies by hand
 
 One piece of brenn's own vocabulary still reaches a deployment by

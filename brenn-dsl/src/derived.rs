@@ -18,6 +18,7 @@ use fltk_serde_core::Spanned;
 use uuid::Uuid;
 
 use crate::resolved::ResolvedConfig;
+use crate::source::SourceFile;
 
 /// A whole configuration, derived.
 #[derive(Debug, PartialEq)]
@@ -44,6 +45,10 @@ pub struct DerivedConfig {
     /// the backend admits over the wire; an instance's contains that instance
     /// within the surface, and holds `local:` entries the surface has none of.
     pub surface_components: Vec<Vec<DAuthority>>,
+    /// Every file the compile read, in read order, root first.
+    ///
+    /// Empty when modules were loaded from memory rather than from disk.
+    pub files: Vec<SourceFile>,
 }
 
 /// Every entity's authority, in the four vectors the derived config holds them
@@ -253,6 +258,18 @@ impl DerivedConfig {
             channel_uuids,
             surface_component_kinds,
             surface_components,
+            files: Vec::new(),
         }
+    }
+
+    /// Record the files a compile read.
+    pub fn with_files(mut self, files: Vec<SourceFile>) -> DerivedConfig {
+        self.files = files;
+        self
+    }
+
+    /// The identity of the document this was derived from.
+    pub fn document_sha256(&self) -> String {
+        crate::source::document_sha256(&self.files)
     }
 }

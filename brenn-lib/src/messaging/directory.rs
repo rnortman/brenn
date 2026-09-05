@@ -240,20 +240,39 @@ impl SubscriberEntryKind {
     }
 
     /// Whether two kinds name the same subscriber on one channel: same variant,
-    /// same [`slug`](Self::slug).
+    /// same [`slug`](Self::slug), and — for a conversation — the same
+    /// conversation.
     ///
     /// The single definition of subscriber identity: it is what
-    /// [`MessagingDirectory::add_subscriber`] replaces by, so any caller
-    /// predicting that replacement asks here rather than restating the rule.
+    /// [`MessagingDirectory::add_subscriber`] replaces by and what
+    /// [`MessagingDirectory::remove_subscriber`] removes by, so any caller
+    /// predicting either asks here rather than restating the rule.
     /// Deliberately not the derived `PartialEq`, which also compares depths and
     /// noise — a re-registration at new depths is the same subscriber.
     ///
-    /// `ChatConversation` compares by its app slug, so two conversations of one
-    /// app read as the same principal here. That is the rule `add_subscriber`
-    /// has always applied; nothing registers a per-conversation entry through
-    /// it today, and the day something does, this is the one place to sharpen.
+    /// A `ChatConversation` carries its `conversation_id` into the comparison:
+    /// the app slug alone would make every conversation of one app a single
+    /// subscriber, so a caller naming one conversation would remove its
+    /// siblings. Two conversations sit on separate channels today, which is why
+    /// the coarse reading never showed; identity is stated at the grain the key
+    /// is written at rather than at the grain today's callers happen to use.
     pub fn same_principal(&self, other: &SubscriberEntryKind) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other) && self.slug() == other.slug()
+        match (self, other) {
+            (
+                SubscriberEntryKind::ChatConversation {
+                    app_slug,
+                    conversation_id,
+                },
+                SubscriberEntryKind::ChatConversation {
+                    app_slug: other_app,
+                    conversation_id: other_conversation,
+                },
+            ) => app_slug == other_app && conversation_id == other_conversation,
+            _ => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+                    && self.slug() == other.slug()
+            }
+        }
     }
 }
 
@@ -276,8 +295,9 @@ pub enum WakeEconomics {
 /// declared wake economics. Keyed in [`Messenger::subscribers`] by the
 /// subscriber's directory [`SubscriberEntryKind`].
 ///
-/// The policy is behind an `Arc` so the boot-only installer can assert the
-/// `Messenger` is still uniquely owned before wiring it in.
+/// The policy is behind an `Arc` so a registration can be read out of the
+/// registry without holding its lock, and so the boot-only installer can assert
+/// the `Messenger` is still uniquely owned before wiring it in.
 #[derive(Debug, Clone)]
 pub struct SubscriberRegistration {
     /// Resolved access-control policy for this subscriber (publish authority
@@ -355,13 +375,23 @@ impl MessagingDirectory {
     }
 
     pub fn with_entries(entries: Vec<ChannelEntry>) -> Self {
+        Self::from_arcs(entries.into_iter().map(Arc::new).collect())
+    }
+
+    /// Build a directory over entries that are already shared.
+    ///
+    /// Mutation is copy-on-write, so an `Arc<ChannelEntry>` a caller holds is
+    /// already an immutable snapshot: a directory built from the `Arc`s another
+    /// directory's `list()` handed out is a detached copy of it, and no entry is
+    /// cloned to make one.
+    pub fn from_arcs(entries: Vec<Arc<ChannelEntry>>) -> Self {
         let mut by_uuid = HashMap::with_capacity(entries.len());
         let mut by_address = HashMap::with_capacity(entries.len());
         let mut order = Vec::with_capacity(entries.len());
         for entry in entries {
             order.push(entry.uuid);
             by_address.insert(entry.address.clone(), entry.uuid);
-            by_uuid.insert(entry.uuid, Arc::new(entry));
+            by_uuid.insert(entry.uuid, entry);
         }
         Self {
             inner: RwLock::new(DirectoryInner {
@@ -447,33 +477,60 @@ impl MessagingDirectory {
         true
     }
 
-    /// Remove an `App(slug)` subscriber from a channel, copy-on-write.
+    /// Remove one subscriber from a channel, copy-on-write.
     ///
-    /// Clones the target `ChannelEntry`, retains-out the matching `App(slug)`
-    /// subscriber (leaving `Wasm` and other-app subscribers untouched), and
-    /// swaps the `Arc` under the write-lock.
+    /// Clones the target `ChannelEntry`, retains-out the subscriber sharing
+    /// `kind`'s principal (leaving every other subscriber untouched), and swaps
+    /// the `Arc` under the write-lock. The mirror of [`Self::add_subscriber`],
+    /// which replaces at the same grain: an app's dynamic unsubscribe passes
+    /// `App(slug)`, a departing consumer passes `Wasm(slug)`, and a
+    /// `ChatConversation` names one conversation rather than every conversation
+    /// of its app ([`SubscriberEntryKind::same_principal`]).
     ///
     /// Returns `Some(remaining)` — the count of subscribers left on the channel
-    /// after the removal — if the channel existed and a matching `App(slug)`
-    /// subscriber was removed; `None` if the channel is unknown or no `App(slug)`
-    /// subscriber was present. The remaining count is computed inside the single
-    /// write-lock critical section so the unsubscribe path's "last subscriber on
-    /// this filter?" decision needs no second `resolve` + entry clone
-    /// (efficiency-3).
-    pub fn remove_subscriber(&self, channel_uuid: &Uuid, app_slug: &str) -> Option<usize> {
+    /// after the removal — if the channel existed and a matching subscriber was
+    /// removed; `None` if the channel is unknown or no matching subscriber was
+    /// present. The remaining count is computed inside the single write-lock
+    /// critical section so the unsubscribe path's "last subscriber on this
+    /// filter?" decision needs no second `resolve` + entry clone.
+    pub fn remove_subscriber(
+        &self,
+        channel_uuid: &Uuid,
+        kind: &SubscriberEntryKind,
+    ) -> Option<usize> {
         let mut inner = self.inner.write().expect("directory lock poisoned");
         let existing = inner.by_uuid.get(channel_uuid)?;
         let mut entry = ChannelEntry::clone(existing);
         let before = entry.subscribers.len();
-        entry
-            .subscribers
-            .retain(|s| !matches!(&s.kind, SubscriberEntryKind::App(slug) if slug == app_slug));
+        entry.subscribers.retain(|s| !s.kind.same_principal(kind));
         if entry.subscribers.len() == before {
             return None;
         }
         let remaining = entry.subscribers.len();
         inner.by_uuid.insert(*channel_uuid, Arc::new(entry));
         Some(remaining)
+    }
+
+    /// Set a channel's description in place, copy-on-write.
+    ///
+    /// The description is metadata: it feeds the operator listings and the
+    /// durable row, and nothing that routes, sizes or authorizes. So it is the
+    /// one part of an entry that changes without the entry being re-created —
+    /// the channel's subscribers and everything reading them are untouched. The
+    /// caller owns the durable row: a persisted channel's column is written by
+    /// the row upsert, not from here.
+    ///
+    /// Returns `true` if the channel existed and now carries `description`;
+    /// `false` if `channel_uuid` is unknown.
+    pub fn set_description(&self, channel_uuid: &Uuid, description: Option<String>) -> bool {
+        let mut inner = self.inner.write().expect("directory lock poisoned");
+        let Some(existing) = inner.by_uuid.get(channel_uuid) else {
+            return false;
+        };
+        let mut entry = ChannelEntry::clone(existing);
+        entry.description = description;
+        inner.by_uuid.insert(*channel_uuid, Arc::new(entry));
+        true
     }
 
     /// Insert a brand-new channel (entry + address index + iteration order).
@@ -627,6 +684,19 @@ mod tests {
         }
     }
 
+    fn conversation_subscriber(app_slug: &str, conversation_id: i64) -> SubscriberEntry {
+        SubscriberEntry {
+            kind: SubscriberEntryKind::ChatConversation {
+                app_slug: app_slug.to_string(),
+                conversation_id,
+            },
+            push_depth: config::Depth::Bounded(1),
+            retain_depth: config::Depth::Unbounded,
+            noise: config::NoiseLevel::Silent,
+            wake_min: Some(WakeMin::Normal),
+        }
+    }
+
     fn wasm_subscriber(slug: &str) -> SubscriberEntry {
         SubscriberEntry {
             kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -757,7 +827,10 @@ mod tests {
         let dir = MessagingDirectory::with_entries(vec![e]);
 
         // Two subscribers remain (wasm-x + app-b) after removing app-a.
-        assert_eq!(dir.remove_subscriber(&uuid, "app-a"), Some(2));
+        assert_eq!(
+            dir.remove_subscriber(&uuid, &SubscriberEntryKind::App("app-a".to_string())),
+            Some(2)
+        );
 
         let after = dir.resolve(&addr).expect("channel exists");
         let slugs: Vec<&str> = after.subscribers.iter().map(|s| s.kind.slug()).collect();
@@ -779,9 +852,18 @@ mod tests {
         let dir = MessagingDirectory::with_entries(vec![e]);
 
         // Unknown channel.
-        assert_eq!(dir.remove_subscriber(&Uuid::new_v4(), "app-a"), None);
+        assert_eq!(
+            dir.remove_subscriber(
+                &Uuid::new_v4(),
+                &SubscriberEntryKind::App("app-a".to_string())
+            ),
+            None
+        );
         // Known channel, but no App(app-a) subscriber (only WASM present).
-        assert_eq!(dir.remove_subscriber(&uuid, "app-a"), None);
+        assert_eq!(
+            dir.remove_subscriber(&uuid, &SubscriberEntryKind::App("app-a".to_string())),
+            None
+        );
     }
 
     /// `remove_subscriber` returns `Some(0)` when it removes the last subscriber,
@@ -794,7 +876,145 @@ mod tests {
         let uuid = e.uuid;
         let dir = MessagingDirectory::with_entries(vec![e]);
 
-        assert_eq!(dir.remove_subscriber(&uuid, "only-app"), Some(0));
+        assert_eq!(
+            dir.remove_subscriber(&uuid, &SubscriberEntryKind::App("only-app".to_string())),
+            Some(0)
+        );
+    }
+
+    /// `remove_subscriber` reaches a `Wasm(slug)` subscriber too — the grain a
+    /// departing consumer leaves by — and leaves an app subscribed to the same
+    /// channel where it was.
+    #[test]
+    fn directory_remove_subscriber_reaches_a_wasm_entry() {
+        let mut e = entry("dyn-remove-wasm");
+        e.subscribers = vec![app_subscriber("watcher"), wasm_subscriber("retiree")];
+        let uuid = e.uuid;
+        let addr = e.address.clone();
+        let dir = MessagingDirectory::with_entries(vec![e]);
+
+        assert_eq!(
+            dir.remove_subscriber(&uuid, &SubscriberEntryKind::Wasm("retiree".to_string())),
+            Some(1)
+        );
+
+        let after = dir.resolve(&addr).expect("channel exists");
+        assert_eq!(after.subscribers.len(), 1);
+        assert_eq!(
+            after.subscribers[0].kind,
+            SubscriberEntryKind::App("watcher".to_string())
+        );
+        // The same slug under the other kind was never there to remove.
+        assert_eq!(
+            dir.remove_subscriber(&uuid, &SubscriberEntryKind::Wasm("watcher".to_string())),
+            None
+        );
+    }
+
+    /// A conversation subscriber is named at the grain its key is written at:
+    /// removing one conversation of an app leaves that app's other
+    /// conversations subscribed. The coarse reading — app slug only — would
+    /// take both.
+    #[test]
+    fn directory_remove_subscriber_names_one_conversation() {
+        let mut e = entry("dyn-remove-conversation");
+        e.subscribers = vec![
+            conversation_subscriber("desk", 1),
+            conversation_subscriber("desk", 2),
+        ];
+        let uuid = e.uuid;
+        let addr = e.address.clone();
+        let dir = MessagingDirectory::with_entries(vec![e]);
+
+        assert_eq!(
+            dir.remove_subscriber(
+                &uuid,
+                &SubscriberEntryKind::ChatConversation {
+                    app_slug: "desk".to_string(),
+                    conversation_id: 1,
+                }
+            ),
+            Some(1)
+        );
+
+        let after = dir.resolve(&addr).expect("channel exists");
+        assert_eq!(
+            after
+                .subscribers
+                .iter()
+                .map(|s| s.kind.clone())
+                .collect::<Vec<_>>(),
+            vec![SubscriberEntryKind::ChatConversation {
+                app_slug: "desk".to_string(),
+                conversation_id: 2,
+            }],
+        );
+    }
+
+    /// The same grain on the way in: a second conversation of one app is a
+    /// second subscriber, not a replacement of the first.
+    #[test]
+    fn directory_add_subscriber_keeps_conversations_apart() {
+        let mut e = entry("dyn-add-conversation");
+        e.subscribers = vec![conversation_subscriber("desk", 1)];
+        let uuid = e.uuid;
+        let addr = e.address.clone();
+        let dir = MessagingDirectory::with_entries(vec![e]);
+
+        assert!(dir.add_subscriber(&uuid, conversation_subscriber("desk", 2)));
+
+        let after = dir.resolve(&addr).expect("channel exists");
+        assert_eq!(after.subscribers.len(), 2);
+
+        // The same conversation again replaces, as any re-registration does.
+        assert!(dir.add_subscriber(&uuid, conversation_subscriber("desk", 2)));
+        assert_eq!(
+            dir.resolve(&addr)
+                .expect("channel exists")
+                .subscribers
+                .len(),
+            2
+        );
+    }
+
+    /// `set_description` swaps the text in place and touches nothing else on the
+    /// entry — same uuid, same resolved config, same subscribers.
+    #[test]
+    fn directory_set_description_leaves_the_rest_of_the_entry() {
+        let mut e = entry("described");
+        e.description = Some("before".to_string());
+        e.subscribers = vec![app_subscriber("watcher"), wasm_subscriber("worker")];
+        let uuid = e.uuid;
+        let addr = e.address.clone();
+        let dir = MessagingDirectory::with_entries(vec![e]);
+        let before = dir.resolve(&addr).expect("channel exists");
+
+        assert!(dir.set_description(&uuid, Some("after".to_string())));
+
+        let after = dir.resolve(&addr).expect("channel exists");
+        assert_eq!(after.description.as_deref(), Some("after"));
+        assert_eq!(after.uuid, before.uuid);
+        assert_eq!(after.address, before.address);
+        assert_eq!(after.transport_type, before.transport_type);
+        assert_eq!(after.mount, before.mount);
+        let slugs: Vec<&str> = after.subscribers.iter().map(|s| s.kind.slug()).collect();
+        assert_eq!(slugs, vec!["watcher", "worker"]);
+
+        assert!(dir.set_description(&uuid, None));
+        assert!(
+            dir.resolve(&addr)
+                .expect("channel exists")
+                .description
+                .is_none()
+        );
+    }
+
+    /// `set_description` on an unknown channel returns `false` and mutates
+    /// nothing.
+    #[test]
+    fn directory_set_description_unknown_channel() {
+        let dir = MessagingDirectory::with_entries(vec![]);
+        assert!(!dir.set_description(&Uuid::new_v4(), Some("x".to_string())));
     }
 
     /// `add_channel` makes a new address resolvable and listable.

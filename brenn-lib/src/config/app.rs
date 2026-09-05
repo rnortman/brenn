@@ -15,7 +15,7 @@ use super::repo::{MountConfigRaw, ResolvedMount};
 
 /// Raw per-app config, one per `agent` instantiation.
 /// Validated and resolved into `AppConfig` by `validate_and_resolve`.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppConfigRaw {
     /// URL-safe identifier (e.g. "pfin"). Must match `[a-z0-9][a-z0-9-]*`.
     pub slug: String,

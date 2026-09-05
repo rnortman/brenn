@@ -47,17 +47,19 @@ rust_library(
 # family. The binary links `brenn-server` with `testutils` on, since these tests
 # build on the fixtures the crate below tests with.
 #
-# 62 tests, each booting a real messaging layer and most loading a guest
-# component; the binary finishes in 6.3s locally and 53.9s at
-# `--test-threads=1`. `medium` (300s), not `small` (60s): the repo's one
+# 214 tests, each booting a real messaging layer and most loading a guest
+# component; the binary finishes in 21.9s locally and 134.0s at
+# `--test-threads=1`. `large` (900s), not `medium` (300s): the repo's one
 # measured local-to-CD-runner factor for a suite of this shape is ~21x
-# (brenn-server's 22s local against 472s on the forgejo runner), which puts this
-# binary near 130s on a cold 4-vCPU runner — over the small budget, under the
-# medium one. `size` reserves the same 1 CPU at either tier, so this buys
-# timeout honesty and nothing else.
+# (brenn-server's 22s local against 472s on the forgejo runner), which puts
+# this binary near 460s on a cold 4-vCPU runner — past the medium budget,
+# inside the large one. `size` reserves the same 1 CPU at either tier, so this
+# buys timeout honesty and nothing else. Re-measure both numbers when the suite
+# grows again rather than carrying this arithmetic forward: a stale
+# justification is what stops the next person from measuring.
 rust_test(
     name = "brenn-bootstrap_test",
-    size = "medium",
+    size = "large",
     crate = ":brenn-bootstrap",
     # The moved dispatch suite and the verified-load acceptance cases load the
     # demo guest, and the replay acceptance case its own; the harness names them as
@@ -67,7 +69,15 @@ rust_test(
     # they import; `rustc_env` below names the directory those paths hang off.
     data = [
         "//:brenn_configs",
+        # The config-map reload case asks a guest what its config map holds, so
+        # that a `config`-only edit is observed by the activation rather than
+        # only by the delta.
+        "//brenn-wasm:fixture_processor_config",
         "//brenn-wasm:fixture_processor_demo",
+        # The bundle-shaped reload case installs a second artifact under one
+        # package name, which is what makes the record comparison the only
+        # thing that can see the change.
+        "//brenn-wasm:fixture_processor_dual",
         "//brenn-wasm:fixture_replay",
     ],
     edition = "2024",

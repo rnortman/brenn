@@ -356,6 +356,61 @@ each boot — so retuning takes effect on restart with no migration. Lowering
 `standing_retain_depth` lets the next reap pass evict; raising it cannot
 resurrect what was already evicted.
 
+### 2.8 The reload pair
+
+Two channels are the config-reload facility, and they are **declared, not
+minted**: `brenn:config.reload` and `brenn:config.status`. Nothing in the system
+brings them into existence — a deployment stamps `ConfigReload()` from brenn's
+`@config-reload` library module, or it has no reload facility. Both, or neither:
+a document declaring one without the other is refused at boot.
+
+| address | kind | shape |
+|---|---|---|
+| `brenn:config.reload` | signal | push 1; short window. Request N + 1 subsumes N — every request means "converge to whatever is on disk now" — so requests arriving while a reload runs coalesce into one further reload. The body is not read; publishing anything is the request. |
+| `brenn:config.status` | state | push 1, retain 1, deeper standing. The retained head is the last outcome; the standing tail is the last few, for an operator reading backwards through a refusal. |
+
+Declared rather than minted for two reasons. The addresses have to be fixed —
+there is one process and one document, and the agent that asks for a reload
+cannot read configuration to learn a name — but everything *else* about them is
+the deployment's: the windows are sized at the stamp, and access is granted with
+ordinary ACLs. An agent that may trigger a reload is one the deployer wrote
+`publish` on the request channel for, and nothing else in the system can. A
+minted pair would have put that authority somewhere other than the ACL that
+every other authority in the document is written in.
+
+The participant on them is `system:config-reload`, built by the host when the
+pair is declared: it subscribes to the request channel and publishes to the
+status channel, and to neither in the other direction.
+
+The status body is JSON and an additive external contract — an LLM reads it —
+so fields are added, never renamed or removed, and `v` bumps only on an
+incompatible reshape:
+
+```json
+{
+  "v": 1,
+  "outcome": "booted" | "applied" | "unchanged" | "refused",
+  "trigger": "boot" | "bus" | "signal",
+  "generation": 3,
+  "at": "2026-09-04T12:00:00Z",
+  "document_sha256": "…",
+  "root": "/home/brenn/config/brenn-prod.brenn",
+  "running_document_sha256": "…",
+  "delta": { "consumers_added": [], "consumers_removed": [], "consumers_changed": [],
+             "channels_added": [], "channels_removed": [], "channels_changed": [],
+             "channels_described": [] },
+  "refusals": []
+}
+```
+
+`running_document_sha256` is the document the process is *projecting*;
+`document_sha256` is the one the outcome was about. A reader answers "is this
+process running what is on disk" by comparing the retained
+`running_document_sha256` against `brenn config-check`'s hash of the tree. Boot
+publishes `booted` with `generation: 0`, so the retained state always describes
+the process now running, and `generation` counts applied reloads since that
+boot. What a reload will and will not converge is `docs/config-dsl.md`.
+
 ## 3. Signals and facts
 
 The model's real demand on its user is a question it forces at design time:

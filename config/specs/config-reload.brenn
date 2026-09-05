@@ -1,0 +1,48 @@
+/// The reload facility's two channels, declared as a pair. Their presence is
+/// what turns the facility on: the host builds the `system:config-reload`
+/// participant iff this document declares both, and refuses to boot on one
+/// without the other.
+///
+/// The addresses are fixed rather than parameterized. There is one process and
+/// one document, and the agent that asks for a reload has to know the names
+/// without reading configuration. Nothing else about them is brenn's: the
+/// deployment stamps them, sizes them, and grants access to them like any other
+/// declared channel, so an agent that may trigger a reload is one the deployer
+/// wrote a `publish` ACL for on the request channel and nothing else in the
+/// system can.
+///
+/// `requests` is a **signal** channel: request N + 1 subsumes request N, since
+/// every one of them means the same thing — converge to whatever is on disk
+/// now. The body is not read. Hence `push_depth = 1`, and a window that is
+/// short because a request nobody served is worth nothing once a later one has
+/// been served. Sized for how many can pile up while one reload runs, not for
+/// history.
+///
+/// `status` is a **state** channel: it carries the last outcome, and its
+/// retained head is the answer to "is this process projecting the document on
+/// disk". `retain_depth = 1` is the state itself; `standing` is deeper so the
+/// last few outcomes survive on disk for an operator reading backwards through
+/// a refusal. Both windows are the deployment's judgment — a deployment that
+/// reloads often wants more standing, not more retention, because the head is
+/// the state and the tail is only evidence.
+///
+/// A `standing_retain_depth` of zero on the status channel is refused at boot:
+/// it would leave the retained outcome unreadable by the reader the channel
+/// exists for.
+assembly ConfigReload(requests_retain: Int = 4,
+  requests_standing: Int = 4,
+  status_standing: Int = 8) {
+  channel requests at "brenn:config.reload" {
+    description = "Config reload requests (converge to the document on disk)";
+    push_depth = 1;
+    retain_depth = requests_retain;
+    standing_retain_depth = requests_standing;
+  }
+  channel status at "brenn:config.status" {
+    description = "Config reload outcomes (retained: what this process projects)";
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = status_standing;
+  }
+
+}

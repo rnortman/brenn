@@ -19,6 +19,7 @@
 
 pub mod chat_provision;
 pub mod chat_roster;
+pub mod config_reload;
 pub mod conversations;
 pub mod dispatcher;
 pub mod edit;
@@ -712,7 +713,10 @@ pub struct Messenger {
     /// through it — so the publish ladder, the batch flush paths, and a release
     /// pass all answer "who gets this" from one implementation reading one
     /// registry. Carries no subscriber registrations until
-    /// `with_subscriber_registrations` populates it at boot.
+    /// `with_subscriber_registrations` populates it at boot;
+    /// `register_subscriber_registration` and
+    /// `retire_subscriber_registration` edit it afterwards, as subscribers join
+    /// and leave a running process.
     pub(crate) targets: Arc<store::TargetResolver>,
     pub(crate) router: Arc<dyn WakeRouter>,
     pub(crate) defaults: MessagingGlobalConfig,
@@ -859,9 +863,11 @@ pub struct Messenger {
     /// created on that pair's first publish at the channel's resolved rate.
     /// Every publish on every scheme draws from it.
     ///
-    /// Bounded without eviction: senders are config-resolved principals and
-    /// channels are config-declared, so the key space is a product of two
-    /// operator-authored sets.
+    /// Bounded: senders are config-resolved principals and channels are
+    /// config-declared, so the key space is a product of two operator-authored
+    /// sets. A reload evicts the entries of every channel it takes out of the
+    /// directory (`forget_send_rate_buckets`), so a retuned channel is rated at
+    /// the rate its new entry declares.
     pub(crate) send_rate_buckets:
         Mutex<HashMap<(String, Uuid), brenn_lib::token_bucket::TokenBucket>>,
     /// Per-sender count of publishes the send-rate gate refused.
@@ -1151,9 +1157,13 @@ impl Messenger {
     /// shared, one entry per non-app subscriber keyed by its
     /// [`SubscriberEntryKind`]. Consumes and returns the `Arc` because the
     /// registry is populated at boot, immediately after `new`, while the `Arc`
-    /// is still uniquely owned (`Arc::get_mut` therefore always succeeds).
-    /// Panics if the `Arc` is already shared — that would be a boot-ordering
-    /// bug.
+    /// is still uniquely owned. The two `Arc::get_mut` calls below buy no
+    /// mutability the registry needs — it has its own lock — they assert that
+    /// unique ownership, so a call sequenced after the first share is a loud
+    /// boot-ordering failure rather than a registration landing behind a reader.
+    /// The registrations a running process makes go through
+    /// [`Self::register_subscriber_registration`], which has no such ordering
+    /// requirement.
     ///
     /// May be called more than once to fold in different subscriber kinds; a
     /// duplicate registration key across calls is a boot-wiring bug and panics
@@ -2123,6 +2133,43 @@ impl Messenger {
         self.defaults.max_body_bytes
     }
 
+    /// Drop every send-rate bucket held for these channels.
+    ///
+    /// A bucket is created at the rate its channel's entry carried when the
+    /// sender first published there and is never re-read, so a channel whose
+    /// entry leaves the directory — retired outright, or replaced by the new
+    /// side of a retune under the same uuid — must have its buckets forgotten
+    /// with it. The next publish on a replacement entry then builds one at the
+    /// rate that entry declares, which is the rate a process booted on the same
+    /// document would enforce.
+    pub fn forget_send_rate_buckets(&self, channels: &[Uuid]) {
+        if channels.is_empty() {
+            return;
+        }
+        let mut buckets = self
+            .send_rate_buckets
+            .lock()
+            .expect("messaging: send_rate_buckets lock poisoned");
+        buckets.retain(|(_, uuid), _| !channels.contains(uuid));
+    }
+
+    /// The channels this messenger currently holds a send-rate bucket for.
+    ///
+    /// Behind `testutils`: the bucket map is publish-path state with no
+    /// production reader, and the only question worth asking of it from outside
+    /// is whether an entry that left the directory took its buckets with it.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn send_rate_bucket_channels(&self) -> Vec<Uuid> {
+        let buckets = self
+            .send_rate_buckets
+            .lock()
+            .expect("messaging: send_rate_buckets lock poisoned");
+        let mut uuids: Vec<Uuid> = buckets.keys().map(|(_, uuid)| *uuid).collect();
+        uuids.sort();
+        uuids.dedup();
+        uuids
+    }
+
     /// Read-only `(slug, policy)` iterator over the post-injection app map the
     /// publish gates consult (`resolve_publish_sender` reads this exact map,
     /// `messaging/gates.rs`). Exposed for boot-time single-writer validation of
@@ -2150,8 +2197,46 @@ impl Messenger {
     pub fn subscriber_registration(
         &self,
         kind: &SubscriberEntryKind,
-    ) -> Option<&SubscriberRegistration> {
+    ) -> Option<SubscriberRegistration> {
         self.targets.registration(kind)
+    }
+
+    /// Register one subscriber after boot, keyed by its
+    /// [`SubscriberEntryKind`] — the runtime counterpart of
+    /// [`Self::with_subscriber_registrations`], for a subscriber that joins a
+    /// process already serving. Clears the key's tombstone, so a subscriber
+    /// replaced under the same key is live again.
+    ///
+    /// # Panics
+    ///
+    /// If the key is already live: two subscribers under one key is a wiring
+    /// bug, not a replacement.
+    pub fn register_subscriber_registration(
+        &self,
+        kind: SubscriberEntryKind,
+        registration: SubscriberRegistration,
+    ) {
+        self.targets.register(HashMap::from([(kind, registration)]));
+    }
+
+    /// Retire one subscriber's registration: the key leaves the live registry
+    /// and becomes a tombstone, so a publish or wake still holding a directory
+    /// snapshot that names it resolves "gone" rather than panicking. Called
+    /// after the subscriber's directory entries are gone and its task has
+    /// joined.
+    ///
+    /// # Panics
+    ///
+    /// If the key is not live.
+    pub fn retire_subscriber_registration(&self, kind: &SubscriberEntryKind) {
+        self.targets.retire(kind);
+    }
+
+    /// Whether `kind` was registered and has since been retired. `false` both
+    /// for a live key and for one that was never registered — the two are
+    /// distinguished by [`Self::subscriber_registration`].
+    pub fn subscriber_registration_retired(&self, kind: &SubscriberEntryKind) -> bool {
+        self.targets.is_retired(kind)
     }
 
     /// Resolved access-control policy for a directory subscriber, covering
@@ -2166,7 +2251,7 @@ impl Messenger {
     pub fn subscriber_policy(
         &self,
         kind: &SubscriberEntryKind,
-    ) -> Option<&brenn_lib::access::AppPolicy> {
+    ) -> Option<brenn_lib::access::PolicyRef<'_>> {
         self.targets.policy(kind)
     }
 
@@ -3589,6 +3674,92 @@ mod tests {
             None,
             "an unknown app slug resolves to no economics"
         );
+    }
+
+    /// The registry is mutable after boot and remembers who left: a retired key
+    /// resolves to no registration, reads as retired rather than as never-wired,
+    /// and comes back live under a fresh registration.
+    #[test]
+    fn a_retired_registration_is_gone_and_re_registration_revives_it() {
+        use std::sync::Arc;
+
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![])),
+            Arc::from("test-source"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::config::MessagingGlobalConfig::default(),
+        );
+        let key = SubscriberEntryKind::Wasm("worker".to_string());
+        let registration = |grant| SubscriberRegistration {
+            policy: {
+                let mut p = brenn_lib::access::AppPolicy::default();
+                p.grants.insert(grant);
+                Arc::new(p)
+            },
+            wake: WakeEconomics::Eager,
+        };
+
+        // Never registered: absent, and not retired either.
+        assert!(messenger.subscriber_registration(&key).is_none());
+        assert!(!messenger.subscriber_registration_retired(&key));
+
+        messenger.register_subscriber_registration(
+            key.clone(),
+            registration(brenn_envelope::grants::AppCapability::MessagingSubscribe),
+        );
+        assert!(
+            messenger
+                .subscriber_registration(&key)
+                .expect("live")
+                .policy
+                .has_grant(brenn_envelope::grants::AppCapability::MessagingSubscribe)
+        );
+
+        messenger.retire_subscriber_registration(&key);
+        assert!(
+            messenger.subscriber_registration(&key).is_none(),
+            "a retired key holds no registration"
+        );
+        assert!(messenger.subscriber_registration_retired(&key));
+        assert_eq!(
+            messenger.subscriber_policy(&key).map(|_| ()),
+            None,
+            "and no policy — the delivery gate reads that as deny"
+        );
+        assert_eq!(messenger.subscriber_wake_economics(&key), None);
+
+        // A replacement under the same key clears the tombstone.
+        messenger.register_subscriber_registration(
+            key.clone(),
+            registration(brenn_envelope::grants::AppCapability::MessagingPublish),
+        );
+        assert!(!messenger.subscriber_registration_retired(&key));
+        assert!(
+            messenger
+                .subscriber_policy(&key)
+                .expect("live again")
+                .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
+        );
+    }
+
+    /// Retiring what was never registered is a wiring bug, not a no-op: the
+    /// caller believes it is removing something.
+    #[test]
+    #[should_panic(expected = "retire of unregistered")]
+    fn retiring_an_unregistered_key_panics() {
+        use std::sync::Arc;
+
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![])),
+            Arc::from("test-source"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::config::MessagingGlobalConfig::default(),
+        );
+        messenger.retire_subscriber_registration(&SubscriberEntryKind::Wasm("ghost".to_string()));
     }
 
     /// `Messenger::new` installs an empty store registry, so no channel resolves

@@ -6,7 +6,7 @@
 // suppressed with targeted #[allow(...)]. Blanket -A clippy::all is not used.
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use tracing::{debug, error, info, trace, warn};
@@ -2505,6 +2505,17 @@ pub struct ProcessorLoadSpec<'a> {
     pub tool_host: Option<ToolHostFn>,
 }
 
+/// A component's KV store: where it lives, and the handle once it is open.
+///
+/// The two are apart because a store file admits exactly one `KvStore` in the
+/// process, so opening cannot be part of loading — see
+/// [`ProcessorComponent::open_store`].
+struct DeferredStore {
+    path: std::path::PathBuf,
+    max_page_count: u32,
+    opened: OnceLock<Arc<KvStore>>,
+}
+
 /// Loaded, pre-linked processor component for bus consumption and publication.
 ///
 /// `ProcessorPre<ProcessorData>` is built once in `load`; per-call cost is
@@ -2512,8 +2523,10 @@ pub struct ProcessorLoadSpec<'a> {
 pub struct ProcessorComponent {
     engine: Engine,
     processor_pre: ProcessorPre<ProcessorData>,
-    /// `None` when the component does not have the `Store` grant.
-    kv_store: Option<Arc<KvStore>>,
+    /// `None` when the component does not have the `Store` grant. Present but
+    /// unopened between [`load`](Self::load) and
+    /// [`open_store`](Self::open_store).
+    store: Option<DeferredStore>,
     /// Logical port name → resolved binding + per-sink publish budget.
     output_ports: Arc<HashMap<String, OutputPortSpec>>,
     /// The specification's declared `out`/`io` port vocabulary; a superset of
@@ -2701,9 +2714,15 @@ impl ProcessorComponent {
             )
         });
 
-        let kv_store: Option<Arc<KvStore>> = spec
-            .store_path
-            .map(|p| KvStore::open(p, spec.max_page_count));
+        // The file is not opened here: a store may be held by an instance of
+        // this same consumer that is still running, and a host that loads a
+        // replacement before retiring the old one must not be refused for it.
+        // See `DeferredStore`.
+        let store = spec.store_path.map(|path| DeferredStore {
+            path: path.to_path_buf(),
+            max_page_count: spec.max_page_count,
+            opened: OnceLock::new(),
+        });
 
         // Spawn an epoch ticker thread for this engine.
         // Uses an EngineWeak so the thread exits naturally when ProcessorComponent
@@ -2755,7 +2774,7 @@ impl ProcessorComponent {
         Self {
             engine,
             processor_pre,
-            kv_store,
+            store,
             output_ports: Arc::new(spec.output_ports),
             declared_out_ports: Arc::new(spec.declared_out_ports),
             input_amplification_mt: Arc::new(spec.input_amplification_mt),
@@ -2865,7 +2884,7 @@ impl ProcessorComponent {
             ProcessorData {
                 resource_table: ResourceTable::new(),
                 limits,
-                kv_store: self.kv_store.clone(),
+                kv_store: self.kv_store(),
                 output_ports: Arc::clone(&self.output_ports),
                 declared_out_ports: Arc::clone(&self.declared_out_ports),
                 config: Arc::clone(&self.config),
@@ -3182,14 +3201,65 @@ impl ProcessorComponent {
         }
     }
 
+    /// Open this component's KV store, if it has one.
+    ///
+    /// Separate from [`load`](Self::load) because the two happen at different
+    /// moments and the file admits one holder: a store file may be open by at
+    /// most one `KvStore` in the process, so a host that loads a replacement
+    /// for a running consumer — which is what a config reload does before it
+    /// retires anything — must be able to compile and instantiate the
+    /// replacement while the old instance still holds the file. The open then
+    /// happens once the old instance is gone.
+    ///
+    /// # Panics
+    ///
+    /// If the store is already open, and on anything that makes the file
+    /// unusable — a store nobody can open is a consumer that cannot run.
+    pub fn open_store(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let opened = KvStore::open(&store.path, store.max_page_count);
+        assert!(
+            store.opened.set(opened).is_ok(),
+            "component {}: open_store called twice for {}",
+            self.slug,
+            store.path.display(),
+        );
+    }
+
+    /// The opened store, or `None` for a component without the `Store` grant.
+    ///
+    /// # Panics
+    ///
+    /// If the component has a store and [`open_store`](Self::open_store) was
+    /// never called: a granted guest whose store silently went missing would
+    /// read an empty namespace and write into nothing.
+    fn kv_store(&self) -> Option<Arc<KvStore>> {
+        self.store.as_ref().map(|store| {
+            store
+                .opened
+                .get()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "component {}: its store at {} was never opened — call open_store \
+                         before dispatching to it",
+                        self.slug,
+                        store.path.display(),
+                    )
+                })
+                .clone()
+        })
+    }
+
     /// Expose the underlying KvStore for test assertions.
     ///
-    /// Panics if this component was loaded without the `Store` grant (every
-    /// caller is a store-granting test; an absent store is a test-setup error).
+    /// Panics if this component was loaded without the `Store` grant, or with
+    /// one whose store was never opened (every caller is a store-granting test;
+    /// either is a test-setup error).
     #[doc(hidden)]
-    pub fn kv_store_for_testing(&self) -> &Arc<KvStore> {
-        self.kv_store
-            .as_ref()
+    pub fn kv_store_for_testing(&self) -> Arc<KvStore> {
+        self.kv_store()
             .expect("kv_store_for_testing called on a component without the Store grant")
     }
 

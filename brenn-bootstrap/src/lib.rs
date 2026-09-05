@@ -12,10 +12,12 @@ mod cleanup;
 pub mod cli;
 mod config_check;
 mod config_diff;
+mod consumers;
 mod mqtt;
 mod obs_config;
 mod pid_file;
 mod pwa_push;
+mod reload;
 mod repo_sync;
 mod shutdown;
 #[cfg(test)]
@@ -29,7 +31,7 @@ mod webhook;
 
 use std::path::PathBuf;
 
-use brenn_lib::config::{BrennConfig, ResolvedConfig, validate_and_resolve};
+use brenn_lib::config::{BrennConfig, LoadedDocument, ResolvedConfig, validate_and_resolve};
 use brenn_lib::integration::IntegrationRegistry;
 use brenn_obs as obs;
 use tokio::net::TcpListener;
@@ -78,122 +80,8 @@ fn assert_boot_preconditions(build_id: &str, roots: &cli::InstallRoots) {
     brenn_lib::wasm_package::assert_disjoint_components_roots(&roots.components);
 }
 
-/// The environment-free half of a `[[wasm_consumer]]`'s `ProcessorLoadSpec`:
-/// everything derivable from the resolved consumer alone. The remaining fields
-/// (alerter, store path, MQTT egress callback, tool host) depend on process-wide
-/// services and stay at the call site.
-pub(crate) struct ConsumerLoadParts {
-    pub output_ports: std::collections::HashMap<String, brenn_wasm::OutputPortSpec>,
-    pub declared_out_ports: std::collections::BTreeSet<String>,
-    pub input_amplification_mt: std::collections::HashMap<String, u64>,
-    pub mqtt_sinks: std::collections::HashMap<String, brenn_wasm::SinkBudget>,
-    pub grants: std::collections::BTreeSet<brenn_wasm::ComponentGrant>,
-    pub output_acl: brenn_wasm::OutputAclFn,
-}
-
-/// Lower a resolved consumer to the load-spec fields it fully determines.
-pub(crate) fn lower_consumer_load_parts(
-    consumer: &brenn_lib::messaging::config::ResolvedWasmConsumer,
-) -> ConsumerLoadParts {
-    use brenn_lib::messaging::ComponentGrant;
-    use brenn_lib::messaging::Urgency;
-    use brenn_wasm::ProcessorUrgency;
-    use std::collections::{BTreeSet, HashMap};
-
-    let output_ports: HashMap<String, brenn_wasm::OutputPortSpec> = consumer
-        .outputs
-        .iter()
-        .map(|o| {
-            let wu = match o.default_urgency {
-                Urgency::VeryLow => ProcessorUrgency::VeryLow,
-                Urgency::Low => ProcessorUrgency::Low,
-                Urgency::Normal => ProcessorUrgency::Normal,
-                Urgency::High => ProcessorUrgency::High,
-            };
-            (
-                o.port.clone(),
-                brenn_wasm::OutputPortSpec {
-                    channel_address: o.channel_address.clone(),
-                    default_urgency: wu,
-                    budget: brenn_wasm::SinkBudget {
-                        fill_mt: o.budget.fill_mt,
-                        capacity_mt: o.budget.capacity_mt,
-                    },
-                },
-            )
-        })
-        .collect();
-    // Windows are built from the same `inputs`, so every driven window port
-    // is present.
-    let input_amplification_mt: HashMap<String, u64> = consumer
-        .inputs
-        .iter()
-        .map(|i| (i.port.clone(), i.amplification_mt))
-        .collect();
-    let mqtt_sinks: HashMap<String, brenn_wasm::SinkBudget> = consumer
-        .mqtt_sinks
-        .iter()
-        .map(|(client, b)| {
-            (
-                client.clone(),
-                brenn_wasm::SinkBudget {
-                    fill_mt: b.fill_mt,
-                    capacity_mt: b.capacity_mt,
-                },
-            )
-        })
-        .collect();
-    // `takeover` names no interface and cannot reach a top-level consumer.
-    // Asserted here because a hand-built config reaches this loader without
-    // passing through the config front end's refusal.
-    let grants: BTreeSet<ComponentGrant> = consumer
-        .grants
-        .iter()
-        .inspect(|g| {
-            assert!(
-                g.wit_import().is_some(),
-                "consumer {:?}: granted `{}`, which names no WIT interface and belongs to a \
-                 page — a top-level consumer has no page, and the config front end refuses \
-                 the word",
-                consumer.slug,
-                g.word(),
-            )
-        })
-        .copied()
-        .collect();
-    // The word and the statements it consents to are one configuration, refused
-    // at derive in either direction. Asserted again here because a hand-built
-    // config reaches this loader without passing through that refusal.
-    assert_eq!(
-        grants.contains(&ComponentGrant::Tools),
-        !consumer.policy.tool_grants.is_empty(),
-        "consumer {:?}: `tools` is granted iff the consumer names a tool — a grant with \
-         no tool reaches nothing, and a tool with no grant is authority nobody gave",
-        consumer.slug,
-    );
-    // `brenn-wasm` never sees a brenn-lib type; this closure bridges the two.
-    let policy = consumer.policy.clone();
-    let output_acl: brenn_wasm::OutputAclFn = std::sync::Arc::new(move |addr: &str| {
-        match brenn_lib::messaging::ChannelScheme::split(addr) {
-            Some((scheme, name)) => {
-                brenn_lib::messaging::gates::publish_acl_allows(&policy, scheme, name)
-            }
-            None => false,
-        }
-    });
-
-    ConsumerLoadParts {
-        output_ports,
-        declared_out_ports: consumer.declared_out_ports.clone(),
-        input_amplification_mt,
-        mqtt_sinks,
-        grants,
-        output_acl,
-    }
-}
-
 pub async fn run_server(
-    config: BrennConfig,
+    document: LoadedDocument,
     config_path: Option<PathBuf>,
     install_roots: cli::InstallRoots,
     build_id: &'static str,
@@ -201,9 +89,35 @@ pub async fn run_server(
     assert_boot_preconditions(build_id, &install_roots);
     let components_roots = install_roots.components;
 
-    let obs_config = obs_config::build(&config, config_path.as_ref());
+    let obs_config = obs_config::build(&document.config, config_path.as_ref());
     obs::install_pending_panic_hook(&obs_config);
     let guard = obs::init(&obs_config);
+
+    // Before anything slow: with no handler installed, SIGUSR1 terminates the
+    // process, and the reload the operator issues against a service that is
+    // still coming up would kill the boot rather than wait for it. The door
+    // over this stream opens at the end of boot.
+    let usr1 = reload::doors::install_sigusr1();
+
+    // Nothing before this point has a logger; this is the earliest we can
+    // record which document the process is projecting.
+    info!(
+        document_sha256 = %document.document_sha256,
+        files = %document.file_places(),
+        "config loaded"
+    );
+    // The document's own answer, not the flag's: with no `--config` the loader
+    // probes for a fallback file, and a reload re-reads *that* root. Reporting
+    // the flag here would leave a fallback boot publishing no root while
+    // reloading a real one.
+    let root_path = document
+        .inputs
+        .as_ref()
+        .map(|inputs| inputs.root.display().to_string());
+    // The document is kept whole: it is the baseline the reload facility
+    // decides every candidate against. The clone gives the running process
+    // its own copy of the configuration.
+    let config = document.config.clone();
 
     // Write PID file if configured (used by logrotate's postrotate to send SIGHUP).
     if let Some(ref pid_file_path) = config.server.pid_file {
@@ -232,10 +146,8 @@ pub async fn run_server(
     let ResolvedConfig {
         apps,
         webhook_endpoints,
-        mut mqtt_ingress_channels,
         mqtt_clients,
         pwa_push: resolved_pwa_push,
-        system_channel_tuning,
         claude_profiles,
     } = validate_and_resolve(&config, &integration_registry, runtime_dir.as_deref());
 
@@ -358,14 +270,10 @@ pub async fn run_server(
     // at all does not require `server.public_url`, so we must not call
     // `resolve_source` (which panics on absent public_url) unless messaging is
     // actually configured.
-    let any_messaging = brenn_messaging_boot::messaging_configured(
-        &config,
-        &webhook_endpoints,
-        &mqtt_ingress_channels,
-    )
-        // build_pwa_push also consumes server_origin; these two terms force
-        // resolution for it even when build_messaging itself early-returns.
-        || apps.values().any(|a| a.messaging_enabled())
+    let any_messaging = brenn_messaging_boot::messaging_configured(&config)
+        // `build_pwa_push` consumes the same origin and is not part of the
+        // messaging predicate: a document may declare `[pwa_push]` with no
+        // channel, app, surface, remote, consumer or endpoint at all.
         || resolved_pwa_push.is_some();
     let messaging_server_origin: Option<std::sync::Arc<str>> = if any_messaging {
         Some(brenn_messaging::resolve_source(&config.server))
@@ -408,20 +316,42 @@ pub async fn run_server(
     // past-release row already has a fully initialized router for
     // `spawn_eager_wake`. Without that ordering, those rows could be
     // released-and-orphaned during the startup race (review F1).
-    let mut messaging_result = brenn_messaging_boot::build_messaging(
+    // The replay endpoints' KV stores, which the planner holds the consumers'
+    // stores unique against. Read off the resolved endpoints rather than off the
+    // `WebhookService` built further down: the paths are canonical either way,
+    // and the check belongs to the derivation.
+    let replay_store_paths: Vec<std::path::PathBuf> = webhook_endpoints
+        .values()
+        .filter_map(|ep| {
+            ep.replay_protection
+                .as_ref()
+                .map(|rp| rp.store_path.clone())
+        })
+        .collect();
+
+    // Held so the reload facility plans every candidate against the same
+    // booted identities.
+    let mqtt_client_identities = brenn_lib::mqtt::config::client_identities(&mqtt_clients);
+
+    let (mut messaging_result, plan_carried) = brenn_messaging_boot::build_messaging(
         &config,
         db.clone(),
         &apps,
         active_bridges.clone(),
         guard.alert_dispatcher.clone(),
         messaging_server_origin.clone(),
-        &webhook_endpoints,
-        &mqtt_ingress_channels,
-        &system_channel_tuning,
-        &mqtt_clients,
+        &mqtt_client_identities,
         &tool_registry_core,
+        &replay_store_paths,
     )
     .await;
+
+    let brenn_messaging_boot::PlanCarried {
+        mut mqtt_ingress_channels,
+        surface_error_advisory,
+        planned_directory,
+        tool_caller_grants: planned_tool_caller_grants,
+    } = plan_carried;
 
     // Boot re-activation of durable dynamic `mqtt:` subscriptions: the
     // boot merge folded them into the directory, but the ingress supervisor's
@@ -446,7 +376,7 @@ pub async fn run_server(
                         client_slug: dyn_ch.client_slug,
                         topic: dyn_ch.topic,
                         qos: dyn_ch.qos,
-                        urgency: client.urgency,
+                        urgency: client.identity.urgency,
                     });
                 }
                 None => {
@@ -495,46 +425,12 @@ pub async fn run_server(
         );
     }
 
-    // Validate `[observability] surface_error_channel` while the messaging
-    // directory and the resolved surfaces are both in hand, before any session
-    // can attach. No-op when the channel is unset; every failure is a boot panic
-    // (operator config, fail fast).
-    let messenger = messaging_result.messenger.as_ref();
-    // Sweep the exact post-injection app map the publish gates consult, so the
-    // single-writer validation cannot drift from enforcement. Empty when no
-    // messaging is configured (the channel-set-but-no-messaging case panics on
-    // the absent directory before these are read).
-    let app_policies: Vec<(&str, &brenn_lib::access::AppPolicy)> = messenger
-        .map(|m| m.app_policies().collect())
-        .unwrap_or_default();
-    if let Some(advisory) = brenn_surface_server::validate_surface_error_channel(
-        config.observability.surface_error_channel.as_deref(),
-        messenger.map(|m| &**m.directory()),
-        config.messaging.max_body_bytes,
-    ) {
+    // Logged here because this is the caller with a `tracing` subscriber;
+    // the validation itself ran inside `build_messaging`.
+    if let Some(advisory) = surface_error_advisory {
         brenn_surface_server::log_surface_error_advisory(&advisory);
     }
-
-    // Validate the derived self-description channel set under the same directory
-    // + resolved surfaces (brenn:, declared, standing_retain_depth >= 1), then
-    // sweep its single writers. The set half also runs offline, under
-    // `config-check`; the writer half needs the principals below and runs here
-    // only, after the set half has proven every derived address resolves. Every
-    // failure is a boot panic.
-    let description_channels = brenn_surface_server::description::validate_surface_description_set(
-        &config.surface_description,
-        &messaging_result.surfaces,
-        messenger.map(|m| &**m.directory()),
-    );
-    brenn_surface_server::description::validate_surface_description_writers(
-        &description_channels,
-        brenn_surface_server::SingleWriterPrincipals {
-            app_policies: &app_policies,
-            wasm_consumers: &messaging_result.wasm_consumers,
-            surfaces: &messaging_result.surfaces,
-            system_participants: &messaging_result.system_participants,
-        },
-    );
+    let messenger = messaging_result.messenger.as_ref();
 
     // Unconditional: a broken install is refused independently of what today's
     // config touches, and the kind → root map it returns is what the router
@@ -705,159 +601,45 @@ pub async fn run_server(
         (Arc::new(components), Arc::new(locks))
     };
 
-    // Cross-store path uniqueness: replay stores (from webhook endpoints) and
-    // consumer stores (from wasm_consumers) must not alias each other.
-    // The OPEN_PATHS guard in KvStore::open catches this at load time, but with
-    // a generic error. A boot-time check here provides the human-readable panic
-    // rather than that generic one.
-    {
-        let replay_paths: Vec<std::path::PathBuf> = webhook_result
-            .service
-            .as_ref()
-            .map(|svc| {
-                svc.all_endpoints()
-                    .filter_map(|ep| {
-                        ep.replay_protection
-                            .as_ref()
-                            .map(|rp| rp.store_path.clone())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let consumer_paths: Vec<(std::path::PathBuf, String)> = messaging_result
+    // WASM processor components: load each [[wasm_consumer]]'s component at
+    // startup. Panics on failure — a boot that cannot load a declared component
+    // must not serve. Each load mints the `Notify` its dispatch task will park
+    // on; the binding that carries wakes to it is registered below, before
+    // `set_state`, so a wake arriving with the first WASM push finds it.
+    let loaded_consumers: Vec<(String, consumers::LoadedConsumer)> = {
+        let load_ctx = consumers::ConsumerLoadContext {
+            components_roots: &components_roots,
+            alert_dispatcher: &guard.alert_dispatcher,
+            mqtt_service: mqtt_result.service.clone(),
+            tool_registry: &tool_registry_core,
+            max_payload_bytes: config.messaging.max_body_bytes,
+        };
+        messaging_result
             .wasm_consumers
             .iter()
-            .filter_map(|c| c.store_path.clone().map(|p| (p, c.slug.clone())))
-            .collect();
-        assert_unique_store_paths(&replay_paths, &consumer_paths);
-    }
-
-    // WASM processor components: load each [[wasm_consumer]]'s component at
-    // startup. Panics on failure (missing/unloadable component is a bootstrap
-    // panic per requirements/Lifecycle). Also creates a per-consumer Notify and
-    // registers it on the WakeRouter for the off-loop dispatch task.
-    let processing_components = {
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        let mut components: HashMap<String, Arc<brenn_wasm::ProcessorComponent>> = HashMap::new();
-        for consumer in &messaging_result.wasm_consumers {
-            let ConsumerLoadParts {
-                output_ports,
-                declared_out_ports,
-                input_amplification_mt,
-                mqtt_sinks,
-                grants,
-                output_acl,
-            } = lower_consumer_load_parts(consumer);
-            let has_tool_grants = !consumer.policy.tool_grants.is_empty();
-            let alerter = std::sync::Arc::new(brenn_wasm_dispatch::DispatcherAlerter::new(
-                guard
-                    .alert_dispatcher
-                    .clone()
-                    .with_field("wasm_slug", &consumer.slug),
-                consumer.slug.clone(),
-            ));
-            // Synchronous MQTT egress callback. Built iff the consumer holds the
-            // `Mqtt` grant — the `mqtt` interface is linked iff this is `Some`, and
-            // `ProcessorComponent::load` re-asserts that invariant. The constructor
-            // captures the resolved policy (the same one the LLM path uses), the
-            // consumer slug as the connector-namespace key, and the (optional) MQTT
-            // service.
-            let mqtt_publish: Option<brenn_wasm::MqttPublishFn> = if consumer
-                .grants
-                .contains(&brenn_lib::messaging::ComponentGrant::Mqtt)
-            {
-                Some(wasm_mqtt::make_wasm_mqtt_publish_fn(
-                    consumer.policy.clone(),
+            .map(|consumer| {
+                (
                     consumer.slug.clone(),
-                    mqtt_result.service.clone(),
-                    guard.alert_dispatcher.clone(),
-                ))
-            } else {
-                None
-            };
-            // Real tool host over the shared registry, built iff the consumer
-            // holds ≥1 tool grant (so `tool_host.is_some()` tracks the `Tools`
-            // capability — `ProcessorComponent::load` re-asserts that invariant).
-            // Validate the consumer's grants against the registry first (fail-fast,
-            // before serving): the resolved wasm policy is not in the `apps` map
-            // `validate_config` scanned at registry build, so it is checked here.
-            let tool_host: Option<brenn_wasm::ToolHostFn> = if has_tool_grants {
-                tool_registry_core.validate_grants(
-                    &format!("wasm consumer {:?}", consumer.slug),
-                    &consumer.policy.tool_grants,
-                );
-                Some(std::sync::Arc::new(brenn_tool_registry::WasmToolHost::new(
-                    tool_registry_core.clone(),
-                    consumer.policy.tool_grants.clone(),
-                    consumer.slug.clone(),
-                    guard.alert_dispatcher.clone(),
-                )))
-            } else {
-                None
-            };
-            let (component, verified) = load_verified_consumer(
-                &components_roots,
-                &consumer.package,
-                &consumer.slug,
-                &consumer.spec_sha256,
-                brenn_wasm::ProcessorLoadSpec {
-                    // Placeholder; the callee owns this field.
-                    component_path: std::path::Path::new(""),
-                    slug: &consumer.slug,
-                    output_ports,
-                    declared_out_ports,
-                    input_amplification_mt,
-                    mqtt_sinks,
-                    config: consumer.config.clone(),
-                    grants,
-                    store_path: consumer.store_path.as_deref(),
-                    max_page_count: consumer.max_page_count,
-                    max_payload_bytes: config.messaging.max_body_bytes,
-                    alerter,
-                    output_acl,
-                    mqtt_publish,
-                    tool_host,
-                },
-            );
-            let store_path_present = consumer.store_path.is_some();
-            info!(
-                slug = %consumer.slug,
-                package = %consumer.package,
-                component_path = %verified.artifact.display(),
-                root = %verified.root.display(),
-                world = %verified.world,
-                artifact_sha256 = %verified.artifact_sha256,
-                spec_sha256 = verified.spec_sha256.as_deref(),
-                store_path_present,
-                store_path = consumer.store_path.as_deref().map(|p| p.display().to_string()),
-                "WASM processor component loaded"
-            );
-            components.insert(consumer.slug.clone(), Arc::new(component));
-        }
-        Arc::new(components)
+                    consumers::load_consumer(&load_ctx, consumer, None),
+                )
+            })
+            .collect()
     };
 
-    // Register per-consumer Notify instances on the WakeRouter as ParkedNotify
-    // delivery bindings and retain a clone for each off-loop dispatch task.
-    // The router stores one Arc clone; the task gets another. Must happen
-    // before set_state so bindings are present when the first WASM push arrives.
-    let wasm_notifiers: Vec<(String, std::sync::Arc<tokio::sync::Notify>)> = {
+    // Register each loaded consumer's `Notify` on the WakeRouter as its
+    // ParkedNotify delivery binding. The router stores one Arc clone; the task
+    // gets another. Must happen before set_state so bindings are present when
+    // the first WASM push arrives.
+    if let Some(ref router) = messaging_result.router {
         use brenn_lib::messaging::SubscriberEntryKind;
         use brenn_server::messaging_router::DeliveryBinding;
-        let mut notifiers = Vec::new();
-        if let Some(ref router) = messaging_result.router {
-            for consumer in &messaging_result.wasm_consumers {
-                let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-                router.register_delivery_binding(
-                    SubscriberEntryKind::Wasm(consumer.slug.clone()),
-                    DeliveryBinding::ParkedNotify(notify.clone()),
-                );
-                notifiers.push((consumer.slug.clone(), notify));
-            }
+        for (slug, loaded) in &loaded_consumers {
+            router.register_delivery_binding(
+                SubscriberEntryKind::Wasm(slug.clone()),
+                DeliveryBinding::ParkedNotify(loaded.notify.clone()),
+            );
         }
-        notifiers
-    };
+    }
 
     // Register a ParkedNotify delivery binding for every subscribing system
     // participant (before set_state, like the wasm notifiers above, so a request
@@ -894,19 +676,25 @@ pub async fn run_server(
         .iter()
         .find(|(component, _)| *component == brenn_tool_registry::TOOL_EXECUTOR_COMPONENT)
         .map(|(_, notify)| {
-            let mut caller_grants: brenn_tool_registry::ToolCallerGrants =
-                std::collections::HashMap::new();
-            for consumer in &messaging_result.wasm_consumers {
-                if consumer.policy.tool_grants.is_empty() {
-                    continue;
-                }
-                let caller = brenn_lib::messaging::ParticipantId::for_wasm(&consumer.slug)
-                    .as_str()
-                    .to_owned();
-                caller_grants.insert(caller, consumer.policy.tool_grants.clone());
-            }
-            (notify.clone(), std::sync::Arc::new(caller_grants))
+            (
+                notify.clone(),
+                std::sync::Arc::new(brenn_tool_registry::ToolCallerGrants::new(
+                    planned_tool_caller_grants,
+                )),
+            )
         });
+
+    // Taken before the executor's pair is moved into its task: the reload
+    // facility needs the grant table and its own drain-loop `Notify`.
+    let reload_tool_caller_grants = tool_executor_wiring
+        .as_ref()
+        .map(|(_, grants)| grants.clone());
+    let reload_notify = system_notifiers
+        .iter()
+        .find(|(component, _)| {
+            *component == brenn_messaging::config_reload::CONFIG_RELOAD_COMPONENT
+        })
+        .map(|(_, notify)| notify.clone());
 
     // Register the remaining delivery bindings: every configured app delivers
     // inline through its conversation bridge, and every surface and remote fans
@@ -1038,6 +826,11 @@ pub async fn run_server(
     // past-release row that the deadline / deliver-after scanner finds
     // on its first pass already has a fully-initialized router for
     // `spawn_eager_wake`.
+    // Every consumer in service, held for the life of the process. Its readers
+    // are the reload driver's; boot's only interest is that the stop senders it
+    // holds stay alive, since dropping one stops that consumer's task.
+    let mut consumer_registry = consumers::ConsumerRegistry::new();
+    let mut reload_requests: Option<reload::doors::ReloadRequests> = None;
     if let (Some(messenger), Some(router)) = (
         messaging_result.messenger.as_ref(),
         messaging_result.router.as_ref(),
@@ -1045,16 +838,21 @@ pub async fn run_server(
         router.set_state(state.clone());
 
         // Give the tool executor its position on its request channels before
-        // anything can put a message into retention. Its drain loop attaches
-        // too, but that runs on a spawned task; the dispatcher below releases
-        // due parked messages on its first pass, and a request released before
-        // the position exists would land below it and never be served.
-        brenn_messaging::system::SystemInbox::new(
+        // anything can put a message into retention: the dispatcher below
+        // releases due parked messages on its first pass, and a request
+        // released below the position would never be served.
+        brenn_messaging::system::SystemInbox::attach_for(
             brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT,
-            messenger.clone(),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
+            messenger,
         )
-        .attach()
+        .await;
+
+        reload::status::attach_and_publish_booted(
+            &messaging_result.system_participants,
+            messenger,
+            &document.document_sha256,
+            root_path.clone(),
+        )
         .await;
 
         // Spawn background tasks. Returned JoinHandles are intentionally
@@ -1074,21 +872,13 @@ pub async fn run_server(
         // eager wakes without waiting for the first POLL_INTERVAL sleep.
         messenger.dispatch_kick();
 
-        // Spawn one off-loop WASM consumer dispatch task per [[wasm_consumer]].
-        // Dropped handles = process-lifetime tasks (same policy as deadline/deliver-after).
-        for (slug, notify) in wasm_notifiers {
-            // Slug is in wasm_notifiers iff it was in wasm_consumers (both come from
-            // the same config list). A miss means the two maps diverged — a
-            // host-wiring invariant violation; panic immediately per BETTER DEAD THAN WRONG.
-            // processing_components is a local map (not on AppState); a miss here means
-            // the wasm_notifiers and processing_components lists diverged — invariant
-            // violation, panic immediately per BETTER DEAD THAN WRONG.
-            let component = processing_components.get(&slug).unwrap_or_else(|| {
-                panic!(
-                    "wasm_dispatch bootstrap: slug {slug:?} is in wasm_notifiers \
-                     but absent from processing_components — host-wiring invariant violated"
-                )
-            });
+        // Start one off-loop dispatch task per [[wasm_consumer]], keeping each
+        // handle: a dropped stop sender is itself the stop signal, so the
+        // registry has to outlive the block that fills it.
+        for (slug, loaded) in loaded_consumers {
+            // The load walked `wasm_consumers`, so every slug is one of theirs.
+            // A miss means the two walks diverged — a host-wiring invariant
+            // violation; panic immediately per BETTER DEAD THAN WRONG.
             let consumer = messaging_result
                 .wasm_consumers
                 .iter()
@@ -1096,22 +886,10 @@ pub async fn run_server(
                 .unwrap_or_else(|| {
                     panic!("wasm_dispatch bootstrap: slug {slug:?} not in wasm_consumers")
                 });
-            let inputs: Vec<brenn_lib::messaging::config::WasmInputPort> = consumer.inputs.clone();
-            let outputs: Vec<brenn_lib::messaging::config::WasmOutputPort> =
-                consumer.outputs.clone();
-            drop(brenn_wasm_dispatch::spawn_wasm_consumer_task(
-                brenn_wasm_dispatch::WasmConsumerConfig {
-                    slug: slug.clone(),
-                    component: component.clone(),
-                    notify,
-                    messenger: messenger.clone(),
-                    alert_dispatcher: state.alert_dispatcher.clone(),
-                    inputs,
-                    outputs,
-                    activation_pacing: consumer.activation_pacing,
-                },
-            ));
-            info!(slug = %slug, "wasm_dispatch: consumer task spawned");
+            consumer_registry.insert(
+                slug,
+                consumers::start_consumer(loaded, consumer, messenger, &state.alert_dispatcher),
+            );
         }
 
         // Spawn the async tool executor drain task: the single
@@ -1139,7 +917,46 @@ pub async fn run_server(
                 .expect("the inbox exists only when the profile goal handle does");
             cc_profile::spawn_goal_drain(inbox, goal, state.active_bridges.clone());
         }
+
+        // Last: the driver takes the consumer registry, so nothing may start
+        // a consumer after this point.
+        if let Some(notify) = reload_notify {
+            let env = reload::driver::ReloadEnv {
+                inputs: document
+                    .inputs
+                    .clone()
+                    .expect("a document that declares channels was read from a tree"),
+                root: root_path.clone(),
+                apps: apps.clone(),
+                mqtt_clients: mqtt_client_identities,
+                tool_registry: state.tools.clone(),
+                replay_store_paths: replay_store_paths.clone(),
+                components_roots: components_roots.clone(),
+                mqtt_service: mqtt_result.service.clone(),
+                max_payload_bytes: config.messaging.max_body_bytes,
+                messenger: messenger.clone(),
+                router: router.clone(),
+                tool_caller_grants: reload_tool_caller_grants,
+                alert_dispatcher: guard.alert_dispatcher.clone(),
+            };
+            let baseline = reload::driver::Baseline::from_parts(
+                document,
+                planned_directory,
+                messaging_result.wasm_consumers.clone(),
+            );
+            let requests = reload::doors::spawn_driver(reload::driver::ReloadDriver::new(
+                env,
+                baseline,
+                consumer_registry,
+            ));
+            reload::doors::spawn_bus_door(messenger, notify, requests.clone());
+            reload_requests = Some(requests);
+        }
     }
+
+    // Opened whether or not the facility is declared: the stream was installed
+    // at the top of boot and something has to drain it.
+    reload::doors::spawn_signal_door(usr1, reload_requests);
 
     // MQTT: inject AppState into the event router so inbound messages can
     // call `submit_ingress`. The supervisors are already running; they won't
@@ -1308,7 +1125,7 @@ pub async fn run_server(
 /// structural rather than conventional — the configuration carries a package
 /// name and no path, so the only way to obtain an artifact path at all is to
 /// have verified the package it came out of.
-fn load_verified_replay(
+pub(crate) fn load_verified_replay(
     slug: &str,
     components_roots: &[PathBuf],
     package: &str,
@@ -1332,77 +1149,6 @@ fn load_verified_replay(
         config,
     );
     (component, verified)
-}
-
-/// Resolve a consumer's package, verify it, then load what it names.
-///
-/// Same ordering rule as [`load_verified_replay`], and one function for the
-/// same reason: the resolution is the only source of an artifact path, so a
-/// component whose package does not bind it cannot reach the loader. The
-/// caller assembles the dozen wired fields of the load spec but never its
-/// `component_path` — whatever it staged there is discarded for the artifact
-/// the package bound. What the package bound is handed back for the caller's
-/// log, which is how the journal names the release this artifact came out of.
-fn load_verified_consumer(
-    components_roots: &[PathBuf],
-    package: &str,
-    slug: &str,
-    config_spec_sha256: &str,
-    spec: brenn_wasm::ProcessorLoadSpec<'_>,
-) -> (
-    brenn_wasm::ProcessorComponent,
-    brenn_lib::wasm_package::Verified,
-) {
-    let roots = brenn_lib::wasm_package::require_components_root(
-        components_roots,
-        &format!("consumer {slug:?}"),
-    );
-    let verified =
-        brenn_lib::wasm_package::verify_consumer(roots, package, slug, config_spec_sha256);
-    // The spec's borrows outlive this call; narrowing them to the artifact's
-    // scope is what lets the path the verification produced be the one loaded.
-    let mut spec: brenn_wasm::ProcessorLoadSpec<'_> = spec;
-    spec.component_path = &verified.artifact;
-    let component = brenn_wasm::ProcessorComponent::load(spec);
-    (component, verified)
-}
-
-/// Assert that all replay store paths and consumer store paths are unique across
-/// both sets.
-///
-/// `replay_paths`: canonical store paths from `[[webhook_endpoint]].replay_protection`.
-/// `consumer_paths`: `(store_path, slug)` pairs from `[[wasm_consumer]]`.
-///
-/// Panics on the first duplicate with a human-readable message.
-/// Called before `KvStore::open` so the message names the config source, not the
-/// internal `OPEN_PATHS` guard error.
-pub(crate) fn assert_unique_store_paths(
-    replay_paths: &[std::path::PathBuf],
-    consumer_paths: &[(std::path::PathBuf, String)],
-) {
-    use std::collections::HashMap;
-    let mut seen: HashMap<&std::path::Path, String> = HashMap::new();
-    for path in replay_paths {
-        if let Some(prior_owner) = seen.insert(path.as_path(), "replay endpoint".to_string()) {
-            panic!(
-                "bootstrap: store_path {:?} is shared between two replay endpoints \
-                 (also owned by {prior_owner}) — each store_path must be unique \
-                 across all replay and consumer stores",
-                path
-            );
-        }
-    }
-    for (path, slug) in consumer_paths {
-        let owner_label = format!("[[wasm_consumer]] {slug:?}");
-        if let Some(prior_owner) = seen.insert(path.as_path(), owner_label) {
-            panic!(
-                "bootstrap: store_path {:?} is shared between [[wasm_consumer]] {slug:?} \
-                 and {prior_owner} — each store_path must be unique across all \
-                 replay and consumer stores",
-                path
-            );
-        }
-    }
 }
 
 /// Boot cross-check: every directory subscriber must resolve to both a
@@ -1457,368 +1203,6 @@ fn assert_every_subscriber_wired(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The verify-then-load pair, over a package on disk.
-    ///
-    /// The unit checks live in `brenn-lib`; what is pinned here is that the boot
-    /// path runs them, and runs them *first*. Each case hands the loader an
-    /// artifact it would reject on its own terms, so a panic naming the package
-    /// is proof the verification happened before the load rather than instead of
-    /// it — and a refactor that drops or reorders the call fails here instead of
-    /// shipping a host that loads unbound components.
-    mod verified_load {
-        use std::path::{Path, PathBuf};
-
-        struct NoopAlerter;
-
-        impl brenn_wasm::ProcessorAlerter for NoopAlerter {
-            fn alert(&self, _severity: brenn_wasm::GuestAlertSeverity, _title: &str, _body: &str) {}
-        }
-
-        /// A components root holding one package directory, with a record
-        /// binding whatever `artifact_bytes` and `spec` are given here. The
-        /// record is written by hand — not by the emitter — because these cases
-        /// need records the emitter refuses to write.
-        fn package(root: &Path, name: &str, artifact_bytes: &[u8], spec: Option<&str>) -> PathBuf {
-            let dir = root.join(name);
-            std::fs::create_dir_all(&dir).expect("create package dir");
-            let artifact = dir.join(format!("{name}.wasm"));
-            std::fs::write(&artifact, artifact_bytes).expect("write artifact");
-            let artifact_sha = brenn_lib::util::sha256_hex(artifact_bytes);
-            let record = match spec {
-                Some(text) => {
-                    std::fs::write(dir.join(format!("{name}.brenn")), text).expect("write spec");
-                    format!(
-                        "{{\n  \"v\": 2,\n  \"name\": \"{name}\",\n  \"world\": \
-                         \"brenn:processor\",\n  \"artifact\": \"{name}.wasm\",\n  \
-                         \"artifact_sha256\": \"{artifact_sha}\",\n  \"spec\": \
-                         \"{name}.brenn\",\n  \"spec_sha256\": \"{}\"\n}}\n",
-                        brenn_lib::util::sha256_hex(text.as_bytes()),
-                    )
-                }
-                None => format!(
-                    "{{\n  \"v\": 2,\n  \"name\": \"{name}\",\n  \"world\": \
-                     \"brenn:replay\",\n  \"artifact\": \"{name}.wasm\",\n  \
-                     \"artifact_sha256\": \"{artifact_sha}\"\n}}\n",
-                ),
-            };
-            std::fs::write(dir.join("package.json"), record).expect("write record");
-            artifact
-        }
-
-        fn load_spec(slug: &str) -> brenn_wasm::ProcessorLoadSpec<'_> {
-            brenn_wasm::ProcessorLoadSpec {
-                // Placeholder; the callee owns this field.
-                component_path: Path::new(""),
-                slug,
-                output_ports: Default::default(),
-                declared_out_ports: Default::default(),
-                input_amplification_mt: Default::default(),
-                mqtt_sinks: Default::default(),
-                config: Default::default(),
-                grants: Default::default(),
-                store_path: None,
-                max_page_count: 1,
-                max_payload_bytes: 1024,
-                alerter: std::sync::Arc::new(NoopAlerter),
-                output_acl: std::sync::Arc::new(|_| true),
-                mqtt_publish: None,
-                tool_host: None,
-            }
-        }
-
-        /// Resolve, verify, and load a consumer's package by calling the boot
-        /// path itself, so these cases cover the sequence `run_server` runs
-        /// rather than a copy of it.
-        ///
-        /// `root` is an `Option` because a host started without `--components`
-        /// has no root to resolve against, and the refusal that fact earns is
-        /// part of the path under test.
-        fn verify_then_load(
-            root: Option<&Path>,
-            package: &str,
-            slug: &str,
-            config_spec_sha256: &str,
-            fill: impl FnOnce(&mut brenn_wasm::ProcessorLoadSpec<'_>),
-        ) -> brenn_wasm::ProcessorComponent {
-            let mut spec = load_spec(slug);
-            fill(&mut spec);
-            let roots: Vec<PathBuf> = root.map(Path::to_path_buf).into_iter().collect();
-            super::super::load_verified_consumer(&roots, package, slug, config_spec_sha256, spec).0
-        }
-
-        const SPEC: &str = "component Demo {\n  abi = processor;\n}\n";
-
-        /// A real built component's bytes, by artifact basename.
-        ///
-        /// The refusal cases below hand the loader bytes it rejects, which is
-        /// what makes them proof of ordering; the two acceptance cases need the
-        /// opposite — an artifact that loads — or a false refusal on a valid
-        /// package would first be seen on a deploy target.
-        fn fixture_bytes(basename: &str) -> Vec<u8> {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../brenn-wasm/target/components")
-                .join(format!("{basename}.wasm"));
-            std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-        }
-
-        #[test]
-        fn a_consumer_whose_package_binds_it_loads() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            package(
-                dir.path(),
-                "demo",
-                &fixture_bytes("brenn_processor_demo"),
-                Some(SPEC),
-            );
-            // Returning at all is the assertion: verification passed and the
-            // loader instantiated the artifact behind it. Both would panic.
-            let component = verify_then_load(
-                Some(dir.path()),
-                "demo",
-                "demo",
-                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                // processor-demo imports `ports`; the load is a real one, so
-                // the grant it needs is the real one too.
-                |spec| spec.grants = [brenn_wasm::ComponentGrant::Ports].into_iter().collect(),
-            );
-            drop(component);
-        }
-
-        #[test]
-        fn a_replay_endpoint_whose_package_binds_it_loads() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            package(dir.path(), "replay", &fixture_bytes("brenn_replay"), None);
-            // A real page budget, unlike the refusal cases below: this load
-            // reaches the KV store, which cannot lay out its schema in one
-            // page.
-            let (component, _verified) = super::super::load_verified_replay(
-                "endpoint",
-                &[dir.path().to_path_buf()],
-                "replay",
-                &dir.path().join("replay.sqlite"),
-                brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
-                Default::default(),
-            );
-            drop(component);
-        }
-
-        #[test]
-        #[should_panic(expected = "was configured against a specification that hashes to")]
-        fn a_consumer_configured_against_no_specification_at_all_never_reaches_the_loader() {
-            // The empty hash is what a lowering that stopped filling the field
-            // would produce, and every hand-built fixture in the tree defaults
-            // it to one. It must match nothing rather than match everything.
-            let dir = tempfile::tempdir().expect("tempdir");
-            package(dir.path(), "demo", b"not a component", Some(SPEC));
-            verify_then_load(Some(dir.path()), "demo", "demo", "", |_| {});
-        }
-
-        #[test]
-        #[should_panic(expected = "but its package record binds")]
-        fn a_consumer_artifact_its_record_does_not_bind_never_reaches_the_loader() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = package(dir.path(), "demo", b"not a component", Some(SPEC));
-            std::fs::write(&artifact, b"tampered").expect("tamper");
-            verify_then_load(
-                Some(dir.path()),
-                "demo",
-                "demo",
-                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                |_| {},
-            );
-        }
-
-        #[test]
-        #[should_panic(expected = "was configured against a specification that hashes to")]
-        fn a_consumer_whose_config_spec_is_not_the_packaged_one_never_reaches_the_loader() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            package(dir.path(), "demo", b"not a component", Some(SPEC));
-            verify_then_load(
-                Some(dir.path()),
-                "demo",
-                "demo",
-                &brenn_lib::util::sha256_hex(b"component Demo {}\n"),
-                |_| {},
-            );
-        }
-
-        #[test]
-        #[should_panic(expected = "has no readable record")]
-        fn a_consumer_with_no_record_never_reaches_the_loader() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            std::fs::create_dir(dir.path().join("demo")).expect("create package dir");
-            std::fs::write(dir.path().join("demo/demo.wasm"), b"not a component")
-                .expect("write artifact");
-            verify_then_load(
-                Some(dir.path()),
-                "demo",
-                "demo",
-                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                |_| {},
-            );
-        }
-
-        #[test]
-        #[should_panic(expected = "is not an installed package directory")]
-        fn a_consumer_naming_a_package_that_is_not_installed_never_reaches_the_loader() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            package(dir.path(), "demo", b"not a component", Some(SPEC));
-            verify_then_load(
-                Some(dir.path()),
-                "panel",
-                "demo",
-                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                |_| {},
-            );
-        }
-
-        #[test]
-        #[should_panic(expected = "without --components")]
-        fn a_consumer_configured_on_a_host_started_without_the_flag_never_reaches_the_loader() {
-            verify_then_load(
-                None,
-                "demo",
-                "demo",
-                &brenn_lib::util::sha256_hex(SPEC.as_bytes()),
-                |_| {},
-            );
-        }
-
-        #[test]
-        #[should_panic(expected = "but its package record binds")]
-        fn a_replay_artifact_its_record_does_not_bind_never_reaches_the_loader() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let artifact = package(dir.path(), "replay", b"not a component", None);
-            std::fs::write(&artifact, b"tampered").expect("tamper");
-            super::super::load_verified_replay(
-                "endpoint",
-                &[dir.path().to_path_buf()],
-                "replay",
-                &dir.path().join("replay.sqlite"),
-                1,
-                Default::default(),
-            );
-        }
-
-        #[test]
-        #[should_panic(expected = "declares world")]
-        fn a_replay_endpoint_handed_a_processor_package_never_reaches_the_loader() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            package(dir.path(), "replay", b"not a component", Some(SPEC));
-            super::super::load_verified_replay(
-                "endpoint",
-                &[dir.path().to_path_buf()],
-                "replay",
-                &dir.path().join("replay.sqlite"),
-                1,
-                Default::default(),
-            );
-        }
-    }
-
-    /// A resolved consumer with the given grant words and tool names, all
-    /// other fields defaulted.
-    fn tool_consumer(
-        grants: &[brenn_lib::messaging::ComponentGrant],
-        tools: &[&str],
-    ) -> brenn_lib::messaging::config::ResolvedWasmConsumer {
-        let mut policy = brenn_lib::access::AppPolicy::default();
-        for tool in tools {
-            policy.tool_grants.insert(
-                (*tool).to_string(),
-                brenn_lib::tools::ResolvedToolGrant {
-                    acl: Vec::new(),
-                    rate_limit: None,
-                },
-            );
-        }
-        brenn_lib::messaging::config::ResolvedWasmConsumer {
-            slug: "tooler".to_string(),
-            package: "tooler".to_string(),
-            spec_sha256: String::new(),
-            declared_out_ports: std::collections::BTreeSet::new(),
-            grants: grants.iter().copied().collect(),
-            store_path: None,
-            max_page_count: 1,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            config: std::collections::HashMap::new(),
-            policy,
-            activation_pacing: brenn_lib::messaging::config::ActivationPacing {
-                burst: 1,
-                min_period: std::time::Duration::from_millis(1),
-            },
-            mqtt_sinks: std::collections::HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn a_granted_tools_word_with_a_named_tool_lowers_to_the_capability() {
-        let parts = lower_consumer_load_parts(&tool_consumer(
-            &[
-                brenn_lib::messaging::ComponentGrant::Ports,
-                brenn_lib::messaging::ComponentGrant::Tools,
-            ],
-            &["git-repo-pull"],
-        ));
-        assert!(parts.grants.contains(&brenn_wasm::ComponentGrant::Tools));
-    }
-
-    #[test]
-    #[should_panic(expected = "granted iff the consumer names a tool")]
-    fn a_tools_word_with_no_tool_statement_panics() {
-        lower_consumer_load_parts(&tool_consumer(
-            &[brenn_lib::messaging::ComponentGrant::Tools],
-            &[],
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "granted iff the consumer names a tool")]
-    fn a_tool_statement_with_no_tools_word_panics() {
-        lower_consumer_load_parts(&tool_consumer(
-            &[brenn_lib::messaging::ComponentGrant::Ports],
-            &["git-repo-pull"],
-        ));
-    }
-
-    /// Two distinct store paths (no duplicates) must not panic.
-    #[test]
-    fn unique_store_paths_no_panic() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let replay = vec![tmp.path().join("replay.sqlite")];
-        let consumer = vec![(
-            tmp.path().join("consumer.sqlite"),
-            "my-consumer".to_string(),
-        )];
-        assert_unique_store_paths(&replay, &consumer);
-    }
-
-    /// A consumer store path that aliases a replay store path must panic with a
-    /// clear message.
-    #[test]
-    #[should_panic(expected = "store_path")]
-    fn consumer_store_path_aliasing_replay_panics() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let shared = tmp.path().join("shared.sqlite");
-        let replay = vec![shared.clone()];
-        let consumer = vec![(shared, "my-consumer".to_string())];
-        assert_unique_store_paths(&replay, &consumer);
-    }
-
-    /// Two consumer store paths sharing the same path must panic.
-    #[test]
-    #[should_panic(expected = "store_path")]
-    fn duplicate_consumer_store_paths_panic() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let shared = tmp.path().join("shared.sqlite");
-        let consumer = vec![
-            (shared.clone(), "consumer-a".to_string()),
-            (shared, "consumer-b".to_string()),
-        ];
-        assert_unique_store_paths(&[], &consumer);
-    }
 
     fn components_only<const N: usize>(components: [PathBuf; N]) -> cli::InstallRoots {
         cli::InstallRoots {

@@ -1,0 +1,6 @@
+// The reload facility, stamped as a deployment stamps it. `library_module_test`
+// imports `@config-reload` and stamps nothing, so without this the assembly's
+// body is first resolved at a deployment's boot.
+use @config-reload::*;
+
+new config_reload: ConfigReload();

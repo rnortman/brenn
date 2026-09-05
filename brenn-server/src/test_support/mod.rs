@@ -18,6 +18,17 @@ pub fn init_db_memory() -> brenn_db::Db {
     brenn_db::into_db(conn)
 }
 
+/// Open (or create) a file-backed database carrying the server's slice.
+///
+/// The same migrations [`init_db_memory`] runs, over a real file — for the
+/// cases whose subject is a database that outlives one process: a copy taken
+/// mid-run, or a second boot over what the first one wrote.
+pub fn init_db_file(path: &std::path::Path) -> brenn_db::Db {
+    let conn = brenn_db::open_connection(path);
+    crate::db::run_server_slice_migrations(&conn);
+    brenn_db::into_db(conn)
+}
+
 /// Canonical build-id fixture for tests. Every test `AppState` is built with
 /// this value (via `AppState::for_test` and the ad-hoc test constructors), and
 /// the handshake tests build their `?build=` URLs from it — so the stale-client

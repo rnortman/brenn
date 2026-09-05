@@ -45,7 +45,7 @@ pub(crate) fn default_hmac_algorithm() -> String {
 // ---------------------------------------------------------------------------
 
 /// Top-level `[[webhook_endpoint]]` block.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WebhookEndpointConfigRaw {
     /// URL-safe identifier; charset `[A-Za-z0-9._~-]+`, globally unique.
     pub slug: String,
@@ -81,7 +81,7 @@ pub struct WebhookEndpointConfigRaw {
 
 /// Signature scheme config: the variant is chosen by the `scheme` word, and a
 /// key belonging to another variant is refused at that key.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WebhookSignatureConfigRaw {
     /// HMAC-SHA256 over raw body. Phonebuddy, GitHub/Forgejo, generic.
     HmacRawBody {
@@ -115,7 +115,7 @@ pub enum WebhookSignatureConfigRaw {
 }
 
 /// `[[webhook_endpoint.key]]` entry (HMAC variants only).
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WebhookKeyConfigRaw {
     /// Opaque key identifier; charset `[A-Za-z0-9._-]{1,64}`.
     pub key_id: String,
@@ -124,7 +124,7 @@ pub struct WebhookKeyConfigRaw {
 }
 
 /// `[[webhook_endpoint.token]]` entry (`bearer-token` variant only).
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WebhookTokenConfigRaw {
     /// Opaque token identifier; charset `[A-Za-z0-9._-]{1,64}`.
     pub token_id: String,
@@ -137,7 +137,7 @@ pub struct WebhookTokenConfigRaw {
 /// When present, inbound requests for this endpoint are checked against the
 /// named WASM replay component before being delivered. Both fields required
 /// when the sub-table is present.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplayProtectionConfigRaw {
     /// Name of the installed component package holding the WASM replay
     /// artifact. Resolved against the components root at boot.
@@ -157,7 +157,7 @@ pub struct ReplayProtectionConfigRaw {
 }
 
 /// Per-app `[[app.webhook_subscription]]` block.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppWebhookSubscriptionRaw {
     /// References `[[webhook_endpoint]].slug`.
     pub endpoint: String,
@@ -713,6 +713,34 @@ fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> SignatureScheme {
 /// `/webhooks/` are rejected.
 const WEBHOOK_MOUNT_PREFIX: &str = "/webhooks/";
 
+/// The HTTP mount path a `[[webhook_endpoint]]` block serves at: the declared
+/// one, or `/webhooks/<slug>`.
+///
+/// Shared by [`resolve_webhook_endpoints`], which hands it to the HTTP layer,
+/// and by the boot-plan derivation, which carries it on the endpoint's
+/// `webhook:` channel entry. One function so the mount a request arrives on and
+/// the mount `list_channels` reports cannot disagree.
+///
+/// # Panics
+///
+/// When the declared mount does not start with `/webhooks/` or has nothing
+/// after it.
+pub fn webhook_mount(raw: &WebhookEndpointConfigRaw) -> String {
+    let slug = &raw.slug;
+    let mount = raw
+        .mount
+        .clone()
+        .unwrap_or_else(|| format!("{WEBHOOK_MOUNT_PREFIX}{slug}"));
+    let tail = mount.strip_prefix(WEBHOOK_MOUNT_PREFIX).unwrap_or("");
+    assert!(
+        !tail.is_empty(),
+        "[[webhook_endpoint]] {slug:?}: mount {mount:?} is invalid — \
+         must start with {WEBHOOK_MOUNT_PREFIX:?} and include a non-empty path segment \
+         after it (suggestion: use \"{WEBHOOK_MOUNT_PREFIX}{slug}\")",
+    );
+    mount
+}
+
 /// Resolve replay protection for `raw` and assert that its store_path is not
 /// already in `store_path_set`. On success the store_path is inserted into the
 /// set.
@@ -843,20 +871,7 @@ pub fn resolve_webhook_endpoints(
             slug,
         );
 
-        // Mount path: default or explicit.
-        let mount = raw
-            .mount
-            .clone()
-            .unwrap_or_else(|| format!("{WEBHOOK_MOUNT_PREFIX}{slug}"));
-
-        // Namespace check: mount must start with WEBHOOK_MOUNT_PREFIX and have a non-empty tail.
-        let tail = mount.strip_prefix(WEBHOOK_MOUNT_PREFIX).unwrap_or("");
-        assert!(
-            !tail.is_empty(),
-            "[[webhook_endpoint]] {slug:?}: mount {mount:?} is invalid — \
-             must start with {WEBHOOK_MOUNT_PREFIX:?} and include a non-empty path segment \
-             after it (suggestion: use \"{WEBHOOK_MOUNT_PREFIX}{slug}\")",
-        );
+        let mount = webhook_mount(raw);
 
         // Rule 4: mount uniqueness.
         assert!(

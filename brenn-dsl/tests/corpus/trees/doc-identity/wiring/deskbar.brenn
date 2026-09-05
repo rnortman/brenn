@@ -1,0 +1,9 @@
+// A nested tree module: `wiring::deskbar`.
+
+assembly Deskbar(slug: String) {
+    channel status at f"brenn:{slug}.status" {
+        push_depth = 4;
+        retain_depth = 16;
+        standing_retain_depth = 64;
+    }
+}

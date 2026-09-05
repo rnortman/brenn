@@ -16,10 +16,11 @@ use tracing::{debug, warn};
 
 use brenn_db::auth::user::get_user_by_username;
 use brenn_db::conversation::{get_or_create_singleton_conversation, get_singleton_conversation_id};
+use brenn_lib::access::PolicyRef;
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::{
-    ParticipantId, SubscriberEntry, SubscriberEntryKind, SubscriberRegistration, Urgency,
-    WakeEconomics, WakeMin,
+    ParticipantId, SubscriberEntry, SubscriberEntryKind, SubscriberRegistration,
+    TombstonedRegistry, Urgency, WakeEconomics, WakeMin,
 };
 
 /// One attach-shaped subscriber a just-retained message is fanned out to live.
@@ -61,22 +62,27 @@ impl AttachFeedTarget {
 
 /// The participant registry: each subscriber's access policy and wake economics,
 /// plus the apps map its `App` half resolves through.
+///
+/// The registry is read on the publish and wake paths and written when a
+/// subscriber joins or leaves, so it sits behind an `RwLock` and every read
+/// answers with owned values rather than borrows into the guard.
 pub struct TargetResolver {
     apps: Arc<IndexMap<String, AppConfig>>,
     /// One entry per registered non-app subscriber (WASM consumer, surface,
     /// remote, or system component), keyed by its directory
     /// [`SubscriberEntryKind`]. App subscribers are absent: their policy and
-    /// economics resolve from `apps`,
-    /// which also carries their non-policy configuration, so the two cannot
-    /// diverge from a registry clone.
-    subscribers: HashMap<SubscriberEntryKind, SubscriberRegistration>,
+    /// economics resolve from `apps`, which also carries their non-policy
+    /// configuration, so the two cannot diverge from a registry clone.
+    subscribers: TombstonedRegistry<SubscriberRegistration>,
 }
 
 impl std::fmt::Debug for TargetResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (live, retired) = self.subscribers.counts();
         f.debug_struct("TargetResolver")
             .field("apps", &self.apps.len())
-            .field("subscribers", &self.subscribers.len())
+            .field("subscribers", &live)
+            .field("retired", &retired)
             .finish_non_exhaustive()
     }
 }
@@ -86,28 +92,44 @@ impl TargetResolver {
         apps: Arc<IndexMap<String, AppConfig>>,
         subscribers: HashMap<SubscriberEntryKind, SubscriberRegistration>,
     ) -> Self {
-        Self { apps, subscribers }
-    }
-
-    /// Fold in a batch of subscriber registrations. Called once per subscriber
-    /// kind at boot, while the resolver is still uniquely owned; a duplicate key
-    /// across calls is a boot-wiring bug and panics.
-    pub fn register(
-        &mut self,
-        registrations: HashMap<SubscriberEntryKind, SubscriberRegistration>,
-    ) {
-        for (key, reg) in registrations {
-            let prev = self.subscribers.insert(key.clone(), reg);
-            assert!(
-                prev.is_none(),
-                "target resolver: duplicate registration for {key:?} — boot wiring bug",
-            );
+        Self {
+            apps,
+            subscribers: TombstonedRegistry::with_live("target resolver", subscribers),
         }
     }
 
-    /// The registration for a non-app subscriber, if it has one.
-    pub fn registration(&self, kind: &SubscriberEntryKind) -> Option<&SubscriberRegistration> {
-        self.subscribers.get(kind)
+    /// Fold in a batch of subscriber registrations, clearing any tombstone the
+    /// keys carried — a subscriber registered again under the same key is simply
+    /// live again. Called once per subscriber kind at boot and once per
+    /// subscriber that joins afterwards; registering a key that is already live
+    /// is a wiring bug and panics.
+    pub fn register(&self, registrations: HashMap<SubscriberEntryKind, SubscriberRegistration>) {
+        self.subscribers.register_all(registrations);
+    }
+
+    /// Retire one registration: the key leaves the live map and becomes a
+    /// tombstone, so a lookup racing the departure answers "gone" rather than
+    /// panicking.
+    ///
+    /// # Panics
+    ///
+    /// If the key is not live. Retiring what was never registered, or retiring
+    /// twice, is a wiring bug.
+    pub fn retire(&self, kind: &SubscriberEntryKind) {
+        self.subscribers.retire(kind);
+    }
+
+    /// Whether `kind` holds a tombstone: registered once, retired since, and not
+    /// registered again.
+    pub fn is_retired(&self, kind: &SubscriberEntryKind) -> bool {
+        self.subscribers.is_retired(kind)
+    }
+
+    /// The registration for a non-app subscriber, if it has one — owned, because
+    /// the registry's lock is released before the caller reads it. Cheap: an
+    /// `Arc` clone and a `Copy` enum.
+    pub fn registration(&self, kind: &SubscriberEntryKind) -> Option<SubscriberRegistration> {
+        self.subscribers.get(kind).live()
     }
 
     /// Access-control policy for a directory subscriber of any kind.
@@ -120,13 +142,20 @@ impl TargetResolver {
     /// policy is per-app rather than per-conversation is also why a subscription
     /// minted at runtime needs no registration of its own — there is nothing per
     /// conversation to register.
-    pub fn policy(&self, kind: &SubscriberEntryKind) -> Option<&brenn_lib::access::AppPolicy> {
+    pub fn policy(&self, kind: &SubscriberEntryKind) -> Option<PolicyRef<'_>> {
         match kind {
-            SubscriberEntryKind::App(slug) => self.apps.get(slug).map(|app| &app.policy),
-            SubscriberEntryKind::ChatConversation { app_slug, .. } => {
-                self.apps.get(app_slug).map(|app| &app.chat_harness_policy)
-            }
-            other => self.subscribers.get(other).map(|r| r.policy.as_ref()),
+            SubscriberEntryKind::App(slug) => self
+                .apps
+                .get(slug)
+                .map(|app| PolicyRef::Borrowed(&app.policy)),
+            SubscriberEntryKind::ChatConversation { app_slug, .. } => self
+                .apps
+                .get(app_slug)
+                .map(|app| PolicyRef::Borrowed(&app.chat_harness_policy)),
+            other => self
+                .subscribers
+                .map(other, |r| PolicyRef::Shared(r.policy.clone()))
+                .live(),
         }
     }
 
@@ -144,7 +173,7 @@ impl TargetResolver {
             | SubscriberEntryKind::ChatConversation { app_slug: slug, .. } => {
                 self.apps.get(slug).map(|_| WakeEconomics::UrgencyGated)
             }
-            other => self.subscribers.get(other).map(|r| r.wake),
+            other => self.subscribers.map(other, |r| r.wake).live(),
         }
     }
 

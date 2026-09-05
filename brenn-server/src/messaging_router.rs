@@ -6,12 +6,13 @@
 //! on `AppState` indirectly via `Arc<dyn WakeRouter>` inside `Messenger`.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::remote::ResolvedRemote;
-use brenn_lib::messaging::{AttachScope, MessageEnvelope, ParticipantId, SubscriberEntryKind};
+use brenn_lib::messaging::{
+    AttachScope, Lookup, MessageEnvelope, ParticipantId, SubscriberEntryKind, TombstonedRegistry,
+};
 use brenn_messaging::{DeliveryShape, WakeRouter};
 use brenn_messaging_store::store::{AttachFeedTarget, DeferredMessage};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
@@ -43,19 +44,20 @@ pub struct WakeRouterImpl {
     /// configured (e.g. in tests that don't need alarm wiring).
     alert_dispatcher: Option<AlertDispatcher>,
     /// Every subscriber's declared delivery mechanism, keyed by its
-    /// [`SubscriberEntryKind`]. Populated by [`Self::register_delivery_binding`]
-    /// at bootstrap, before any publish path — one entry per configured app,
-    /// WASM consumer, system component, and surface. `deliver` /
-    /// `deliver_ingress` / `spawn_eager_wake` / `delivery_shape` resolve the
-    /// binding by key and act on the binding variant, never on the identity
-    /// prefix. A missing binding at dispatch time is a host-wiring invariant
-    /// violation → panic.
-    bindings: std::sync::RwLock<HashMap<SubscriberEntryKind, DeliveryBinding>>,
+    /// [`SubscriberEntryKind`]: every configured app, WASM consumer, system
+    /// component, surface and remote. `deliver_ingress` / `spawn_eager_wake` /
+    /// `delivery_shape` resolve the binding by key and act on the binding
+    /// variant, never on the identity prefix. A retired key answers "gone" —
+    /// the wake is dropped, because a subscriber that left is not woken and a
+    /// publish in flight holding a directory snapshot that still names it must
+    /// not tear the process down; a key that was never bound panics.
+    bindings: TombstonedRegistry<DeliveryBinding>,
 }
 
 /// How a subscriber is woken and delivered to. Registered at boot behind the
 /// subscriber's [`SubscriberEntryKind`]; the live dispatch path matches on the
 /// variant rather than on the identity prefix.
+#[derive(Clone)]
 pub enum DeliveryBinding {
     /// Off-loop task parked on a `Notify`; never delivered inline through the
     /// shared dispatch loop (WASM consumers, system subscribers). The off-loop
@@ -97,7 +99,7 @@ impl WakeRouterImpl {
             active_bridges,
             state: tokio::sync::OnceCell::new(),
             alert_dispatcher: None,
-            bindings: std::sync::RwLock::new(HashMap::new()),
+            bindings: TombstonedRegistry::new("delivery bindings"),
         }
     }
 
@@ -127,15 +129,32 @@ impl WakeRouterImpl {
     /// [`SubscriberEntryKind`]. Called at bootstrap for every configured app
     /// (`ConversationBridge`), WASM consumer / system component (`ParkedNotify`
     /// with the off-loop task's `Notify`), surface and remote (`AttachSessions`),
-    /// before any publish path runs. Duplicate registration for the same key is
-    /// a bootstrap wiring bug → panic.
+    /// before any publish path runs, and afterwards for a subscriber that joins
+    /// a running process. Clears the key's tombstone, so a subscriber replaced
+    /// under the same key is bound again. Duplicate registration of a live key
+    /// is a wiring bug → panic.
     pub fn register_delivery_binding(&self, key: SubscriberEntryKind, binding: DeliveryBinding) {
-        let mut map = self.bindings.write().expect("bindings RwLock poisoned");
-        let prev = map.insert(key.clone(), binding);
-        assert!(
-            prev.is_none(),
-            "register_delivery_binding called twice for {key:?} — bootstrap wiring bug"
-        );
+        self.bindings.register(key, binding);
+    }
+
+    /// Retire one subscriber's delivery binding: the key leaves the live table
+    /// and becomes a tombstone. Called once the subscriber's directory entries
+    /// are gone and its task has joined, so what remains is only work already in
+    /// flight — which resolves "gone" and is dropped.
+    ///
+    /// # Panics
+    ///
+    /// If the key holds no live binding. Retiring what was never bound, or
+    /// retiring twice, is a wiring bug.
+    pub fn retire_delivery_binding(&self, key: &SubscriberEntryKind) {
+        self.bindings.retire(key);
+    }
+
+    /// Whether `key` was bound and has since been retired. `false` both for a
+    /// live key and for one that was never bound — the two are distinguished by
+    /// [`Self::has_delivery_binding`].
+    pub fn delivery_binding_retired(&self, key: &SubscriberEntryKind) -> bool {
+        self.bindings.is_retired(key)
     }
 
     /// Register the `AttachSessions` delivery route for one surface. This is
@@ -176,24 +195,22 @@ impl WakeRouterImpl {
     /// publish can reach the dispatch path (a missing binding at dispatch time
     /// panics; the cross-check turns that into a named boot failure).
     pub fn has_delivery_binding(&self, key: &SubscriberEntryKind) -> bool {
-        chat_conversation(key).is_some()
-            || self
-                .bindings
-                .read()
-                .expect("bindings RwLock poisoned")
-                .contains_key(key)
+        chat_conversation(key).is_some() || self.bindings.is_live(key)
     }
 
     /// Resolve a subscriber's delivery route from its registered binding,
-    /// releasing the lock before the (async) delivery work runs. A missing
-    /// binding is a host-wiring invariant violation → panic.
+    /// releasing the lock before the (async) delivery work runs. A retired key
+    /// routes nowhere; a key that was never bound is a host-wiring invariant
+    /// violation → panic.
     fn delivery_route(&self, key: &SubscriberEntryKind) -> DeliveryRoute {
-        let map = self.bindings.read().expect("bindings RwLock poisoned");
-        match map.get(key) {
-            Some(DeliveryBinding::ConversationBridge) => DeliveryRoute::ConversationBridge,
-            Some(DeliveryBinding::AttachSessions) => DeliveryRoute::AttachSessions,
-            Some(DeliveryBinding::ParkedNotify(_)) => DeliveryRoute::Parked,
-            None => panic!(
+        match self.bindings.map(key, |binding| match binding {
+            DeliveryBinding::ConversationBridge => DeliveryRoute::ConversationBridge,
+            DeliveryBinding::AttachSessions => DeliveryRoute::AttachSessions,
+            DeliveryBinding::ParkedNotify(_) => DeliveryRoute::Parked,
+        }) {
+            Lookup::Live(route) => route,
+            Lookup::Retired => DeliveryRoute::Gone,
+            Lookup::Unknown => panic!(
                 "no delivery binding registered for {key:?} — host-wiring invariant violated \
                  (every subscriber gets a binding at bootstrap)"
             ),
@@ -241,6 +258,8 @@ enum DeliveryRoute {
     ConversationBridge,
     AttachSessions,
     Parked,
+    /// The key was bound and has been retired: there is nobody to deliver to.
+    Gone,
 }
 
 #[async_trait::async_trait]
@@ -478,7 +497,7 @@ impl WakeRouter for WakeRouterImpl {
             // bus tool requests, and neither intersects the webhook:/mqtt:
             // channels ingress arrives on. A non-conversation target here is a
             // host-wiring invariant violation.
-            DeliveryRoute::AttachSessions | DeliveryRoute::Parked => {
+            DeliveryRoute::AttachSessions | DeliveryRoute::Parked | DeliveryRoute::Gone => {
                 panic!(
                     "WakeRouter::deliver_ingress called for non-conversation subscriber {key:?} — \
                      host-wiring invariant violated: ingress rows only target conversations"
@@ -505,17 +524,16 @@ impl WakeRouter for WakeRouterImpl {
             state.spawn_chat_wake(conversation_id, Tz::UTC);
             return;
         }
-        // Resolve the binding under the read lock; the wake work (notify / state
-        // call) is sync so holding the guard across it is fine.
-        let map = self.bindings.read().expect("bindings RwLock poisoned");
-        match map.get(key) {
+        // The binding is cloned out of the registry — a `Notify` handle or a unit
+        // variant — so the wake work below runs with no lock held.
+        match self.bindings.get(key) {
             // Notify the off-loop parked dispatch task (WASM consumer or system
             // component, e.g. the tool executor). The task holds an `Arc` clone;
             // `notify_one` sets its permit.
-            Some(DeliveryBinding::ParkedNotify(notify)) => {
+            Lookup::Live(DeliveryBinding::ParkedNotify(notify)) => {
                 notify.notify_one();
             }
-            Some(DeliveryBinding::ConversationBridge) => {
+            Lookup::Live(DeliveryBinding::ConversationBridge) => {
                 let conversation_id = subscriber.as_conversation_id();
                 // `set_state` runs in main.rs before any task that can reach
                 // this code path. A None here is a structural-invariant
@@ -537,7 +555,7 @@ impl WakeRouter for WakeRouterImpl {
             // No per-channel filter (the wake carries only the participant): the
             // session drains all its active durable channels. No sessions → no-op;
             // parked rows wait for the next attach.
-            Some(DeliveryBinding::AttachSessions) => {
+            Lookup::Live(DeliveryBinding::AttachSessions) => {
                 let registry_key = attach_registry_key(key).unwrap_or_else(|| {
                     panic!(
                         "spawn_eager_wake: {key:?} holds an AttachSessions binding but names no \
@@ -552,7 +570,12 @@ impl WakeRouter for WakeRouterImpl {
                     handle.drain_notify.notify_one();
                 }
             }
-            None => panic!(
+            // Retired: the subscriber left. The channel does not care who is
+            // subscribed, so the wake is simply dropped.
+            Lookup::Retired => {
+                debug!(subscriber = ?key, "wake dropped: subscriber retired");
+            }
+            Lookup::Unknown => panic!(
                 "spawn_eager_wake: no delivery binding registered for {key:?} — \
                  host-wiring invariant violated"
             ),
@@ -598,13 +621,9 @@ impl WakeRouter for WakeRouterImpl {
             }
             return;
         }
-        let conversation_bridge = matches!(
-            self.bindings
-                .read()
-                .expect("bindings RwLock poisoned")
-                .get(key),
-            Some(DeliveryBinding::ConversationBridge)
-        );
+        let conversation_bridge = self.bindings.map(key, |binding| {
+            matches!(binding, DeliveryBinding::ConversationBridge)
+        }) == Lookup::Live(true);
         if conversation_bridge
             && let Some(bridge) = self
                 .active_bridges
@@ -637,13 +656,19 @@ impl WakeRouter for WakeRouterImpl {
         if chat_conversation(key).is_some() {
             return DeliveryShape::Inline;
         }
-        let map = self.bindings.read().expect("bindings RwLock poisoned");
-        match map.get(key) {
-            Some(DeliveryBinding::ConversationBridge) | Some(DeliveryBinding::AttachSessions) => {
+        match self.bindings.map(key, |binding| match binding {
+            DeliveryBinding::ConversationBridge | DeliveryBinding::AttachSessions => {
                 DeliveryShape::Inline
             }
-            Some(DeliveryBinding::ParkedNotify(_)) => DeliveryShape::ParkedWake,
-            None => panic!(
+            DeliveryBinding::ParkedNotify(_) => DeliveryShape::ParkedWake,
+        }) {
+            Lookup::Live(shape) => shape,
+            // Retired: the row is parked with nobody behind it. `ParkedWake` is
+            // the shape whose wake is a notify and nothing more, so the wake
+            // pass takes the arm that drops it rather than one that can cost a
+            // subprocess.
+            Lookup::Retired => DeliveryShape::ParkedWake,
+            Lookup::Unknown => panic!(
                 "delivery_shape: no delivery binding registered for {key:?} — \
                  host-wiring invariant violated"
             ),
@@ -1176,6 +1201,103 @@ mod tests {
                 .await
                 .expect("Notify::notified() should resolve immediately after notify_one");
         });
+    }
+
+    /// A retired key is neither live nor unknown. Its wake is dropped, its
+    /// delivery shape reads as parked-with-nobody, and `has_delivery_binding`
+    /// reports it unbound — while a key that was never bound still panics
+    /// (`spawn_eager_wake_panics_for_unregistered_wasm_slug` and
+    /// `delivery_shape_panics_for_unregistered_key` hold that half).
+    #[test]
+    fn a_retired_binding_drops_its_wake_instead_of_panicking() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let key = SubscriberEntryKind::Wasm("retiree".to_string());
+        router.register_delivery_binding(
+            key.clone(),
+            DeliveryBinding::ParkedNotify(Arc::clone(&notify)),
+        );
+        assert!(router.has_delivery_binding(&key));
+        assert!(!router.delivery_binding_retired(&key));
+
+        router.retire_delivery_binding(&key);
+
+        assert!(!router.has_delivery_binding(&key), "no live binding");
+        assert!(router.delivery_binding_retired(&key), "a tombstone instead");
+        assert_eq!(
+            router.delivery_shape(&key),
+            DeliveryShape::ParkedWake,
+            "the row is parked with nobody behind it"
+        );
+        // The wake resolves "gone" and is dropped: no panic, and the retired
+        // task's `Notify` is left alone.
+        router.spawn_eager_wake(&key, &ParticipantId::for_wasm("retiree"));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified())
+                .await
+                .expect_err("a dropped wake must not notify the retired task");
+        });
+    }
+
+    /// Registering the same key again clears the tombstone: a consumer replaced
+    /// under its own slug is simply bound again, and its wake lands on the new
+    /// task's `Notify`.
+    #[test]
+    fn re_registering_a_retired_key_revives_it() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        let key = SubscriberEntryKind::Wasm("replaced".to_string());
+        router.register_delivery_binding(
+            key.clone(),
+            DeliveryBinding::ParkedNotify(Arc::new(tokio::sync::Notify::new())),
+        );
+        router.retire_delivery_binding(&key);
+
+        let fresh = Arc::new(tokio::sync::Notify::new());
+        router.register_delivery_binding(
+            key.clone(),
+            DeliveryBinding::ParkedNotify(Arc::clone(&fresh)),
+        );
+
+        assert!(!router.delivery_binding_retired(&key));
+        assert!(router.has_delivery_binding(&key));
+        router.spawn_eager_wake(&key, &ParticipantId::for_wasm("replaced"));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(10), fresh.notified())
+                .await
+                .expect("the revived binding takes the wake");
+        });
+    }
+
+    /// Retiring a key that holds no live binding is a wiring bug — the caller
+    /// believes it is removing something.
+    #[test]
+    #[should_panic(expected = "retire of unregistered")]
+    fn retiring_an_unbound_key_panics() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.retire_delivery_binding(&SubscriberEntryKind::Wasm("ghost".to_string()));
+    }
+
+    /// And retiring twice is the same bug: the second call names a key the live
+    /// table no longer holds.
+    #[test]
+    #[should_panic(expected = "retire of unregistered")]
+    fn retiring_twice_panics() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        let key = SubscriberEntryKind::Wasm("retiree".to_string());
+        router.register_delivery_binding(
+            key.clone(),
+            DeliveryBinding::ParkedNotify(Arc::new(tokio::sync::Notify::new())),
+        );
+        router.retire_delivery_binding(&key);
+        router.retire_delivery_binding(&key);
     }
 
     /// `spawn_eager_wake` for an unregistered `wasm:` slug panics — host-wiring
@@ -1820,7 +1942,7 @@ mod tests {
     /// `register_delivery_binding` called twice for the same key panics
     /// (bootstrap wiring bug detection).
     #[test]
-    #[should_panic(expected = "register_delivery_binding called twice")]
+    #[should_panic(expected = "duplicate registration for")]
     fn register_delivery_binding_panics_on_duplicate_wasm() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         let n = Arc::new(tokio::sync::Notify::new());
@@ -1905,7 +2027,7 @@ mod tests {
 
     /// `register_delivery_binding` called twice for the same system key panics.
     #[test]
-    #[should_panic(expected = "register_delivery_binding called twice")]
+    #[should_panic(expected = "duplicate registration for")]
     fn register_delivery_binding_panics_on_duplicate_system() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         let n = Arc::new(tokio::sync::Notify::new());

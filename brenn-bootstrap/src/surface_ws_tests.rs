@@ -657,11 +657,12 @@ const LINK_PORT: &str = "link";
 fn spanning_link_config() -> brenn_lib::config::BrennConfig {
     use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::{
-        ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw,
-        MessagingGlobalConfig, WasmConsumerConfigRaw,
+        Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingGlobalConfig,
+        WasmConsumerConfigRaw,
     };
     use brenn_messaging_boot::test_fixtures::{
-        io_port_raw, minimal_surface_raw, minimal_wasm_consumer, surface_io_port_raw,
+        io_port_raw, minimal_surface_raw, minimal_wasm_consumer, surface_description_channels,
+        surface_io_port_raw,
     };
 
     let worker = WasmConsumerConfigRaw {
@@ -688,29 +689,9 @@ fn spanning_link_config() -> brenn_lib::config::BrennConfig {
         ..minimal_surface_raw()
     }
     .implying_component_vocabularies();
-    let status_channel = ChannelConfigRaw {
-        address: Some(brenn_surface_server::description::surface_status_bare(
-            &brenn_surface_server::fixtures_config::description_params().prefix,
-            "deskbar",
-        )),
-        send_rate: None,
-        // A durable channel's uuid names its DB row, so config must state one.
-        uuid: Some(Uuid::new_v4().to_string()),
-        address_prefix: None,
-        description: None,
-        // Both depths are sizing decisions config must state; the status channel
-        // carries one latest-wins document.
-        push_depth: Some(Depth::Bounded(1)),
-        retain_depth: Some(Depth::Bounded(1)),
-        // A durable channel states the reaper's disk frontier too.
-        standing_retain_depth: Some(Depth::Bounded(1)),
-        noise: None,
-        sink: None,
-        wake_min: None,
-    };
     brenn_lib::config::BrennConfig {
         messaging: MessagingGlobalConfig::default(),
-        channels: vec![status_channel],
+        channels: surface_description_channels("deskbar", &["protobar", "chrome"]),
         wasm_consumers: vec![worker],
         surfaces: vec![deskbar],
         links: vec![LinkConfigRaw {

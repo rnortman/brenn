@@ -208,7 +208,7 @@ impl MqttClientHandle {
     /// Called by the supervisor when the connection drops.
     pub async fn fail_all_publishes(&self, last_error: Option<String>) {
         let error = MqttError::NotConnected {
-            client_slug: self.config.slug.clone(),
+            client_slug: self.config.identity.slug.clone(),
             last_error,
         };
 

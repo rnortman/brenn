@@ -35,7 +35,7 @@ pub const RESERVED_CONFIG_PREFIX: &str = "brenn.";
 
 /// Global WASM-host policy (`[wasm]` block). Omitting the block entirely
 /// produces the same defaults as an empty `[wasm]` block.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WasmConfig {
     /// Default store size cap applied to every `[[webhook_endpoint]]` with
     /// replay protection unless overridden per-store. Human-readable binary

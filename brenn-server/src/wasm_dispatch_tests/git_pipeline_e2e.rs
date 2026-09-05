@@ -418,6 +418,9 @@ async fn build_pipeline() -> Pipeline {
         mqtt_publish: None,
         tool_host: Some(tool_host),
     }));
+    // The store is opened at the start rather than at the load; this harness
+    // stands in for both.
+    consumer_component.open_store();
     let consumer_cfg = WasmConsumerConfig {
         slug: CONSUMER_SLUG.to_string(),
         component: consumer_component,
@@ -445,11 +448,10 @@ async fn build_pipeline() -> Pipeline {
 
     // --- Tool executor over the same messenger + registry + consumer grant. ---
     let executor_sub = ParticipantId::for_system(TOOL_EXECUTOR_COMPONENT);
-    let caller_grants: Arc<ToolCallerGrants> = {
-        let mut map: ToolCallerGrants = HashMap::new();
-        map.insert(consumer_sub.as_str().to_string(), tool_grants.clone());
-        Arc::new(map)
-    };
+    let caller_grants = Arc::new(ToolCallerGrants::new(HashMap::from([(
+        consumer_sub.as_str().to_string(),
+        tool_grants.clone(),
+    )])));
     let (exec_alert, _exec_alert_handle) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(
         Arc::clone(&messenger),

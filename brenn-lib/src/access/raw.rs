@@ -17,7 +17,7 @@
 
 /// Raw `[app.acl]` sub-table for an LLM app. An agent that states no `acl`
 /// leaves every list empty, which is deny-everything.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppAclRaw {
     /// `[[app.acl.mqtt_subscribe]]` entries: `(client, topic_filter)` pairs.
     pub mqtt_subscribe: Vec<MqttSubMatcherRaw>,

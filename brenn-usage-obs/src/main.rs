@@ -229,7 +229,7 @@ fn resolve_db_path(
         return Ok(p);
     }
     let cfg = config::load_config(config_path.as_deref(), module_roots);
-    Ok(cfg.database.path)
+    Ok(cfg.config.database.path)
 }
 
 /// Open a `BufWriter` over a file (if `path` is Some) or stdout.

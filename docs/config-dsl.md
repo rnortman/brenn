@@ -1070,3 +1070,76 @@ own tree, in its own CI, against the `brenn` binary it intends to run.
 Compilation is fail-closed and reports the whole document: a refusal is a
 positioned diagnostic, often with related sites in other files, and a document
 that does not compile is a boot panic rather than a degraded start.
+
+A document that passes comes back with its identity:
+`<root>: ok document_sha256=<hash>`. The hash is over every file the compile
+read — the root, its tree modules, and the packaged modules it imported — each
+named by its place inside the document, so it moves with the text and not with
+where the module roots happened to be or the order they were named in. A server
+logs the same hash for the document it booted (`config loaded`), which is how
+what an operator certified is held against what a process is running.
+
+## What reload converges
+
+A running server can be told to re-read the document it booted from and converge
+to it without restarting. Two doors, both off unless the document declares the
+reload pair (`docs/message-bus.md` §2.8): `systemctl --user reload brenn`, which
+is `SIGUSR1`, and a message published to `brenn:config.reload`. `SIGHUP` is not
+one of them — it reopens log files and nothing else — so nothing applies a
+document between the moment it lands on disk and the moment someone asks.
+
+The rule the facility is built to: **after a successful reload the process is in
+the state a fresh boot of the new document would have produced.** A change that
+cannot be brought to that state without restarting is refused, and refusing
+leaves the running system untouched.
+
+What converges is components and their wiring:
+
+- `channel` declarations — added, removed, retuned, redescribed.
+- `link` statements and the auto channels of `io` ports, which are ordinary
+  channels by the time reload sees them.
+- `wasm_consumer` instances — added, removed, and changed, where changed
+  includes a package whose artifact moved under an unmoved document, since the
+  process must not keep executing bytes the module roots no longer hold.
+
+Everything else needs a restart, and says so. Agents, surfaces, remotes, webhook
+endpoints, MQTT clients, PWA push, tool declarations, Claude profiles, and the
+`server` / `database` / `logging` / `messaging` / `observability` sections are
+all compared whole: any difference is a refusal naming the section, and for a
+block array the key that differs (`apps[assistant]`, `surfaces[wall]`).
+
+Three further refusals come from the wiring rather than from a section:
+
+- A channel that is added, removed or retuned may carry no subscriber other than
+  the consumers the same reload is adding or removing. An agent, a surface, a
+  remote or a live attached session on such a channel is a refusal naming it —
+  those belong to entities that do not converge, and re-wiring them to a
+  re-created channel would need their own convergence. An agent on a channel
+  that is *not* moving is untouched and unconstrained, which is the common case:
+  a new consumer joins a channel an agent already reads and neither the channel
+  nor the agent's subscription is disturbed.
+- A channel the *live* directory holds a subscriber on that the document cannot
+  see — a dynamic subscription, an attach-minted surface or remote — refuses the
+  same way. That one is asked again at the last moment before anything is
+  touched, because such a subscriber can arrive while the reload is still
+  deciding, so it is the one refusal that may appear seconds after the request.
+- Only `brenn:`, `ephemeral:` and `local:` channels converge. A `webhook:` or
+  `mqtt:` channel that changed — including one whose only edit was a tuning
+  block, and including an `mqtt:` ingress channel a consumer subscription was
+  the sole minter of — is a refusal naming the address.
+
+The outcome vocabulary, on `brenn:config.status` and in the journal:
+
+- `applied` — the delta went in; `generation` incremented.
+- `unchanged` — the file bytes differ but the projection does not (a comment, a
+  reordered ACL list, a convergible block edited back to the same value). The
+  process now reports the new document's hash as the one it projects.
+- `refused` — nothing changed. The body's `refusals` say why; a refusal ending
+  in "this change needs a restart" is the signal to restart instead of reload. A
+  refusal also fires a `Warning` alert, so an automation that failed to install
+  is not something an operator has to go looking for.
+- `booted` — published once at startup, `generation: 0`.
+
+The operator's sequence is unchanged from what it was before there was a reload,
+with one step added: sync the config tree, run `brenn config-check` on it, then
+reload, then read the outcome.

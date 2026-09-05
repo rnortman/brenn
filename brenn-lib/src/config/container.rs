@@ -4,7 +4,7 @@ use std::path::PathBuf;
 ///
 /// Multiple apps can share a container definition (at different working dirs).
 /// Each CC session gets its own ephemeral container instance (`--rm`).
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContainerConfig {
     /// Podman image name/tag (e.g. "brenn-cc:latest").
     pub image: String,

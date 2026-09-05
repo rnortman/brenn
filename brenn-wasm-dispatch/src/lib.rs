@@ -360,18 +360,68 @@ impl ProcessorAlerter for DispatcherAlerter {
     }
 }
 
-/// Spawn the off-loop dispatch task for one WASM consumer.
+/// A running consumer task and the stop signal that ends it.
 ///
-/// Returns a `tokio::task::JoinHandle`. The caller drops the handle (process-lifetime task).
-/// Same lifecycle/supervision policy as the deadline and deliver-after tasks: panics are
-/// logged + Critical-alerted by the global panic hook (`brenn-lib/src/obs/panic_hook.rs`);
-/// manual restart is the decided mitigation. Do NOT add per-task supervision.
-pub fn spawn_wasm_consumer_task(cfg: WasmConsumerConfig) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { run_consumer(cfg).await })
+/// The loop is process-lifetime by default and unsupervised — a panic is logged
+/// and Critical-alerted by the global panic hook, and manual restart is the
+/// decided mitigation, so do NOT add per-task supervision. What this handle
+/// adds is the one orderly exit: a holder that means to take the consumer out
+/// of service signals `stop` and awaits `join`, which resolves once the loop has
+/// finished whatever drain step it was in.
+pub struct ConsumerHandle {
+    /// Send `true` to end the loop. Dropping the sender ends it too: a receiver
+    /// whose sender is gone reads the closure as the signal.
+    pub stop: tokio::sync::watch::Sender<bool>,
+    pub join: tokio::task::JoinHandle<()>,
+}
+
+impl ConsumerHandle {
+    /// Signal the loop and wait for it to finish its current step.
+    ///
+    /// Unbounded on purpose: the step is a guest activation under
+    /// `epoch_interruption` and fuel, so a runaway traps rather than spins, and
+    /// the caller wants the step's publishes to have gone out before it treats
+    /// the consumer as gone. A guest that wedges anyway wedges this await, which
+    /// the caller reports rather than works around.
+    ///
+    /// A task that had already died of a panic before the stop was sent is
+    /// treated as stopped: its death was logged and `Critical`-alerted when it
+    /// happened, an operator taking the consumer out of service is the accepted
+    /// response to that, and re-raising a panic from before this call would
+    /// unwind the stopper for something the stopper did not do.
+    ///
+    /// # Panics
+    ///
+    /// If the task panicked *during* the stop, re-raising its panic here — the
+    /// loop's death is a host bug and the stopper is the first thing positioned
+    /// to see it.
+    pub async fn stop_and_join(self) {
+        let died_before_the_stop = self.join.is_finished();
+        // The send fails only when the task is already gone, which is the state
+        // the send is asking for.
+        let _ = self.stop.send(true);
+        match self.join.await {
+            Ok(()) => {}
+            Err(join) if join.is_panic() && died_before_the_stop => error!(
+                error = %join,
+                "wasm_dispatch: consumer task had already died before it was stopped; treating \
+                 it as stopped"
+            ),
+            Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+            Err(join) => panic!("wasm_dispatch: consumer task ended abnormally: {join}"),
+        }
+    }
+}
+
+/// Spawn the off-loop dispatch task for one WASM consumer.
+pub fn spawn_wasm_consumer_task(cfg: WasmConsumerConfig) -> ConsumerHandle {
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let join = tokio::spawn(async move { run_consumer(cfg, stop_rx).await });
+    ConsumerHandle { stop, join }
 }
 
 /// Main body of the consumer task. Runs the startup sweep then enters the drain loop.
-async fn run_consumer(cfg: WasmConsumerConfig) {
+async fn run_consumer(cfg: WasmConsumerConfig, mut stop: tokio::sync::watch::Receiver<bool>) {
     let subscriber = ParticipantId::for_wasm(&cfg.slug);
 
     // Per-component activation pacer. Every drain step — startup sweep and
@@ -394,8 +444,23 @@ async fn run_consumer(cfg: WasmConsumerConfig) {
     // A wake sets a one-permit flag; any wakes that arrive during a drain step
     // coalesce into one pending permit and the next iteration consumes it. Two
     // drain steps for the same consumer never overlap.
+    //
+    // The stop arm is the only exit. It is armed on the wait and not around the
+    // step: a step that has begun is owed to whoever published into it, so its
+    // publishes go out and the loop leaves afterwards.
     loop {
-        cfg.notify.notified().await;
+        tokio::select! {
+            () = cfg.notify.notified() => {}
+            result = stop.changed() => {
+                // Either a signal or a dropped sender: both mean nobody is
+                // holding this consumer in service any more.
+                if result.is_err() || *stop.borrow_and_update() {
+                    info!(slug = %cfg.slug, "wasm_dispatch: consumer task stopping");
+                    return;
+                }
+                continue;
+            }
+        }
         pacer.admit().await;
         drain_step(&cfg, &subscriber).await;
     }

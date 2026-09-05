@@ -1,5 +1,5 @@
 {
-  "checksum": "eabf117b0c4c4730eb5ec58bd07bbf229ed46d531cd1036895ce5cfc5825e437",
+  "checksum": "d2f4380dc9df38cc531a16661cc4065ab7487f6fe8a1aa7b9137b497de25f560",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2782,6 +2782,10 @@
             {
               "id": "futures 0.3.32",
               "target": "futures"
+            },
+            {
+              "id": "libc 0.2.186",
+              "target": "libc"
             },
             {
               "id": "tempfile 3.27.0",

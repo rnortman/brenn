@@ -165,10 +165,21 @@ fn load_mem_exhaust() -> ProcessorComponent {
     load_component("brenn_processor_mem_exhaust", "mem-exhaust")
 }
 
-/// Load a component that needs the `Store` grant (e.g. processor-store-rt).
+/// Load a component that needs the `Store` grant (e.g. processor-store-rt),
+/// with its store opened — the pair a running consumer is.
 fn load_store_component(name: &str, slug: &str) -> (ProcessorComponent, tempfile::NamedTempFile) {
     let db = tempfile::NamedTempFile::new().unwrap();
-    let comp = ProcessorComponent::load(ProcessorLoadSpec {
+    let comp = load_store_component_at(name, slug, db.path());
+    // The store is opened at the start rather than at the load, and this
+    // fixture is both.
+    comp.open_store();
+    (comp, db)
+}
+
+/// The same load without the open: what a host does when it instantiates a
+/// replacement for a consumer that is still running.
+fn load_store_component_at(name: &str, slug: &str, store: &std::path::Path) -> ProcessorComponent {
+    ProcessorComponent::load(ProcessorLoadSpec {
         component_path: &component_path(name),
         slug,
         declared_out_ports: std::collections::BTreeSet::new(),
@@ -176,7 +187,7 @@ fn load_store_component(name: &str, slug: &str) -> (ProcessorComponent, tempfile
         input_amplification_mt: common::amp_in(),
         mqtt_sinks: HashMap::new(),
         grants: [ComponentGrant::Store].into_iter().collect(),
-        store_path: Some(db.path()),
+        store_path: Some(store),
         max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1024 * 1024,
         config: HashMap::new(),
@@ -184,8 +195,37 @@ fn load_store_component(name: &str, slug: &str) -> (ProcessorComponent, tempfile
         output_acl: common::allow_all(),
         mqtt_publish: None,
         tool_host: None,
-    });
-    (comp, db)
+    })
+}
+
+/// Loading does not take the store file. A config reload instantiates a changed
+/// consumer's replacement *before* it retires the running one, and a store file
+/// admits exactly one holder — so if the load opened it, every reload of a
+/// store-bearing consumer would be refused for a conflict the operator did not
+/// cause.
+#[test]
+fn a_replacement_for_a_running_consumer_loads_against_a_held_store() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let running = load_store_component_at("brenn_processor_store_rt", "store-rt", db.path());
+    running.open_store();
+
+    let replacement = load_store_component_at("brenn_processor_store_rt", "store-rt", db.path());
+
+    // Only the open contends, and only while the old instance is alive.
+    drop(running);
+    replacement.open_store();
+}
+
+/// The other half: two instances holding one store file at once is a host
+/// wiring error, and the guard that says so is still there.
+#[test]
+#[should_panic(expected = "KvStore path already open")]
+fn two_open_stores_on_one_file_is_refused() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let running = load_store_component_at("brenn_processor_store_rt", "store-rt", db.path());
+    running.open_store();
+    let replacement = load_store_component_at("brenn_processor_store_rt", "store-rt", db.path());
+    replacement.open_store();
 }
 
 /// Minimal valid MessageEnvelope JSON for the demo component.

@@ -704,7 +704,7 @@ impl WasmConsumerConfigRaw {
 /// through to the off-loop dispatch task, which builds a `TokenBucket` from it.
 /// Sustained activation rate is one per `min_period`; up to `burst` activations
 /// may run back-to-back after idle.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivationPacing {
     /// Token-bucket capacity in activations (`>= 1`, validated at resolve).
     pub burst: u32,
@@ -1396,7 +1396,7 @@ pub struct ResolvedMessagingConfig {
 }
 
 /// Fully-resolved per-subscription config (inheritance already applied).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSubscription {
     pub channel_uuid: Uuid,
     /// Canonical `brenn:...` form.
@@ -1431,7 +1431,7 @@ impl ResolvedSubscription {
 /// documented structural derivation (the auto-channel fold), or a bounded
 /// per-family constant for a system-minted channel — never from a blanket
 /// fallback that would size retention without anyone deciding to.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedChannel {
     /// Channel-level default push depth (used as subscriber-inheritance template).
     pub push_depth: Depth,
@@ -1462,7 +1462,7 @@ pub struct WasmSinkBudget {
 }
 
 /// Resolved per-input port for a WASM consumer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmInputPort {
     /// Logical input port name presented to the guest (from config).
     pub port: String,
@@ -1476,7 +1476,7 @@ pub struct WasmInputPort {
 }
 
 /// Resolved per-output port for a WASM consumer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmOutputPort {
     /// Logical output port name.
     pub port: String,
@@ -1493,7 +1493,7 @@ pub struct WasmOutputPort {
 }
 
 /// Fully resolved `[[wasm_consumer]]` block, ready for use by bootstrap and dispatch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedWasmConsumer {
     pub slug: String,
     /// The installed component package the artifact is resolved from.

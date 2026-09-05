@@ -53,12 +53,93 @@ use super::tool::{RegisteredTool, ToolCtx};
 /// code-built policy (bootstrap) grants publish on exactly `brenn:tool-results/*`.
 pub const TOOL_EXECUTOR_COMPONENT: &str = "tool-executor";
 
+/// Per-caller resolved tool grants, keyed by the caller's `ParticipantId`
+/// string (`wasm:<slug>`) then by canonical tool name.
+///
+/// The value the messaging plan derives from the document's consumers and that
+/// [`ToolCallerGrants`] is built from and edited to.
+pub type CallerGrantTable = HashMap<String, BTreeMap<String, ResolvedToolGrant>>;
+
 /// Per-caller resolved tool grants, keyed by the caller's `ParticipantId` string
 /// (`wasm:<slug>`) then by canonical tool name. Built at bootstrap from the
-/// resolved WASM consumers; the executor re-checks each dequeued request against
-/// it because config may have changed between the request publish and its
-/// execution (belt-and-suspenders: the publish-side grant check already ran).
-pub type ToolCallerGrants = HashMap<String, BTreeMap<String, ResolvedToolGrant>>;
+/// resolved WASM consumers and edited as consumers join and leave; the executor
+/// re-checks each dequeued request against it because the grants may have
+/// changed between the request publish and its execution (belt-and-suspenders:
+/// the publish-side grant check already ran).
+///
+/// Behind an `RwLock` because the table outlives the set of callers it describes
+/// and the executor reads it per request; the read answers with an owned grant
+/// so no lock is held across a tool execution.
+#[derive(Default)]
+pub struct ToolCallerGrants {
+    inner: std::sync::RwLock<CallerGrantTable>,
+}
+
+impl std::fmt::Debug for ToolCallerGrants {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallerGrants")
+            .field("callers", &self.read().len())
+            .finish()
+    }
+}
+
+impl ToolCallerGrants {
+    /// The table as it stands at boot: one entry per caller with a non-empty
+    /// grant set.
+    pub fn new(grants: CallerGrantTable) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(grants),
+        }
+    }
+
+    /// The table as it stands, copied out.
+    ///
+    /// For a test reader that has to compare one process's authorization table
+    /// with another's. Behind `testutils` because holding the whole table is
+    /// exactly what this type's shape refuses a production caller: the lock is
+    /// taken per grant and never held across an execution, and a request path
+    /// that copied the table out would answer from a snapshot rather than from
+    /// the grants as they stand.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn snapshot(&self) -> CallerGrantTable {
+        self.read().clone()
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, CallerGrantTable> {
+        self.inner.read().expect("tool caller grants lock poisoned")
+    }
+
+    /// Install one caller's whole grant set, replacing whatever it held. A
+    /// caller with no grants is removed rather than stored empty, so presence in
+    /// the table means "may address some tool".
+    pub fn set_caller(&self, caller: String, grants: BTreeMap<String, ResolvedToolGrant>) {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("tool caller grants lock poisoned");
+        if grants.is_empty() {
+            inner.remove(&caller);
+        } else {
+            inner.insert(caller, grants);
+        }
+    }
+
+    /// Drop one caller's grants entirely. Idempotent: a caller that held none is
+    /// absent either way.
+    pub fn remove_caller(&self, caller: &str) {
+        self.inner
+            .write()
+            .expect("tool caller grants lock poisoned")
+            .remove(caller);
+    }
+
+    /// `caller`'s resolved grant for `tool` as the table stands now, or `None`
+    /// if the caller may not address it. Owned, so the lock is released before
+    /// the grant is acted on.
+    pub fn grant(&self, caller: &str, tool: &str) -> Option<ResolvedToolGrant> {
+        self.read().get(caller).and_then(|g| g.get(tool)).cloned()
+    }
+}
 
 /// The v1 async tool-call request body published to `brenn:tools/<tool>`. Extra
 /// fields (`v`, `idempotency_key`) are ignored — only what the executor acts on
@@ -315,8 +396,8 @@ async fn admit_and_dispatch(
     }
 
     // Re-check the caller's grant for this tool against the current config.
-    let grant = match caller_grants.get(&caller).and_then(|g| g.get(&tool)) {
-        Some(g) => g.clone(),
+    let grant = match caller_grants.grant(&caller, &tool) {
+        Some(g) => g,
         None => {
             warn!(seq, %caller, %tool, "tool executor: caller no longer granted this tool");
             finish(
@@ -792,9 +873,54 @@ mod tests {
     fn caller_grants(acl: Vec<AclClause>) -> Arc<ToolCallerGrants> {
         let mut per_caller = BTreeMap::new();
         per_caller.insert("apull".to_string(), grant(acl));
-        let mut map: ToolCallerGrants = HashMap::new();
-        map.insert(CALLER.to_string(), per_caller);
-        Arc::new(map)
+        Arc::new(ToolCallerGrants::new(HashMap::from([(
+            CALLER.to_string(),
+            per_caller,
+        )])))
+    }
+
+    /// The grant table is editable while the executor holds it: a caller's set
+    /// is installed and dropped whole, and a read answers with what stands now.
+    /// A caller with no grants is absent rather than stored empty, so presence
+    /// means "may address some tool".
+    #[test]
+    fn caller_grants_are_installed_and_dropped_whole() {
+        let grants = ToolCallerGrants::default();
+        assert!(grants.grant(CALLER, "apull").is_none());
+
+        grants.set_caller(
+            CALLER.to_string(),
+            BTreeMap::from([(
+                "apull".to_string(),
+                grant(vec![clause(&[("repo", "brenn")])]),
+            )]),
+        );
+        assert!(grants.grant(CALLER, "apull").is_some());
+        assert!(
+            grants.grant(CALLER, "other").is_none(),
+            "a tool the caller was not granted"
+        );
+        assert!(
+            grants.grant("wasm:stranger", "apull").is_none(),
+            "a caller the table does not name"
+        );
+
+        // Replacing the set is not merging it: the old tool is gone.
+        grants.set_caller(
+            CALLER.to_string(),
+            BTreeMap::from([(
+                "other".to_string(),
+                grant(vec![clause(&[("repo", "brenn")])]),
+            )]),
+        );
+        assert!(grants.grant(CALLER, "apull").is_none());
+        assert!(grants.grant(CALLER, "other").is_some());
+
+        // An empty set removes the caller; removing again is a no-op.
+        grants.set_caller(CALLER.to_string(), BTreeMap::new());
+        assert!(grants.grant(CALLER, "other").is_none());
+        grants.remove_caller(CALLER);
+        assert!(grants.grant(CALLER, "other").is_none());
     }
 
     fn registry(tool: StubAsync) -> Arc<ToolRegistry> {
@@ -877,7 +1003,7 @@ mod tests {
         let exec = executor(
             &h,
             registry(StubAsync::new(4, Duration::ZERO)),
-            Arc::new(HashMap::new()),
+            Arc::new(ToolCallerGrants::default()),
             alert,
         );
 
@@ -886,6 +1012,36 @@ mod tests {
         let result = read_result(&h).await;
         assert_eq!(result["call_id"], "c2");
         assert_eq!(result["outcome"]["err"]["kind"], "not_granted");
+    }
+
+    /// The reason the grant table is behind a lock: a request published while
+    /// its caller was granted, dequeued after the grant was withdrawn. The
+    /// re-check at dequeue is the only thing between a retired consumer's
+    /// in-flight request and an execution it is no longer authorized for, so
+    /// the stub must never be reached.
+    #[tokio::test]
+    async fn a_grant_withdrawn_between_publish_and_dequeue_denies() {
+        let h = harness().await;
+        let grants = caller_grants(vec![clause(&[("repo", "brenn")])]);
+        assert!(grants.grant(CALLER, "apull").is_some());
+        insert_request(&h, &request_body("c2b", "brenn"), Some(h.results_uuid)).await;
+
+        let (alert, _hg) = noop_alert_dispatcher();
+        let stub = StubAsync::new(4, Duration::ZERO);
+        let reached = Arc::clone(&stub.max_in_flight);
+        let exec = executor(&h, registry(stub), Arc::clone(&grants), alert);
+
+        grants.remove_caller(CALLER);
+        drain_and_join(&exec).await;
+
+        let result = read_result(&h).await;
+        assert_eq!(result["call_id"], "c2b");
+        assert_eq!(result["outcome"]["err"]["kind"], "not_granted");
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the tool must never have been invoked"
+        );
     }
 
     #[tokio::test]
@@ -1130,12 +1286,13 @@ mod tests {
             "ghost".to_string(),
             grant(vec![clause(&[("repo", "brenn")])]),
         );
-        let mut map: ToolCallerGrants = HashMap::new();
-        map.insert(CALLER.to_string(), per_caller);
         let exec = executor(
             &h,
             registry(StubAsync::new(4, Duration::ZERO)),
-            Arc::new(map),
+            Arc::new(ToolCallerGrants::new(HashMap::from([(
+                CALLER.to_string(),
+                per_caller,
+            )]))),
             alert,
         );
 

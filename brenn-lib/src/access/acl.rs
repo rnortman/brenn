@@ -13,7 +13,7 @@
 ///
 /// `PwaPush` has no per-channel scope today (design §2.4 / high-level failure
 /// mode 9), so it has no field here — it is a pure, scope-less grant.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AclSet {
     /// MQTT subscribe allowlist: `(client, topic-filter)` pairs.
     pub mqtt_subscribe: Vec<MqttSubMatcher>,

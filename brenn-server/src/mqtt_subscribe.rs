@@ -1488,7 +1488,10 @@ mod tests {
             .await
             .expect("core mqtt subscribe");
         let uuid = messenger.directory().resolve(addr).expect("channel").uuid;
-        messenger.directory().remove_subscriber(&uuid, "testapp");
+        messenger.directory().remove_subscriber(
+            &uuid,
+            &brenn_lib::messaging::SubscriberEntryKind::App("testapp".to_string()),
+        );
         assert!(
             !has_app_subscriber(&bridge, addr, "testapp"),
             "subscriber folded out → dormant"

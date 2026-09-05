@@ -132,7 +132,7 @@ pub async fn assert_ingress_unsubscribe(
 /// The single per-client session client id: `brenn:<client-slug>`. Formatted in
 /// one place so the options builder and the backoff-seed derivation cannot drift.
 pub(crate) fn client_id(broker: &MqttClientConfig) -> String {
-    format!("brenn:{}", broker.slug)
+    format!("brenn:{}", broker.identity.slug)
 }
 
 /// Build `MqttOptions` from broker config, using a pre-built `transport`.
@@ -142,30 +142,33 @@ pub(crate) fn client_id(broker: &MqttClientConfig) -> String {
 /// wrapper on every reconnect attempt, avoiding repeated disk I/O and crypto-provider
 /// allocation on the reconnect hot path.
 fn build_mqtt_options(broker: &MqttClientConfig, transport: Transport) -> MqttOptions {
-    let mut opts = MqttOptions::new(client_id(broker), (broker.host.clone(), broker.port));
+    let mut opts = MqttOptions::new(
+        client_id(broker),
+        (broker.identity.host.clone(), broker.identity.port),
+    );
     opts.set_clean_start(false);
-    opts.set_session_expiry_interval(Some(broker.session_expiry_secs));
+    opts.set_session_expiry_interval(Some(broker.identity.session_expiry_secs));
 
-    if let Some(secs) = broker.keepalive_secs {
+    if let Some(secs) = broker.identity.keepalive_secs {
         // rumqttc-next set_keep_alive takes u16 seconds (not Duration).
         let secs = secs.max(5) as u16; // rumqttc requires >= 5s
         opts.set_keep_alive(secs);
     }
 
-    if let Some(ref username) = broker.username {
+    if let Some(ref username) = broker.identity.username {
         let password = broker.password.as_deref().unwrap_or("").to_owned();
         opts.set_credentials(username.clone(), password);
     }
 
     // Inbound payload cap — advertised to broker in CONNECT. Validated to fit
     // `u32` at config resolution, so no cast is needed here.
-    opts.set_max_packet_size(Some(broker.inbound_payload_cap_bytes));
+    opts.set_max_packet_size(Some(broker.identity.inbound_payload_cap_bytes));
 
     // TLS transport pre-built by the caller (once per supervisor lifetime).
     opts.set_transport(transport);
 
     // Last Will.
-    if let Some(ref lw) = broker.last_will {
+    if let Some(ref lw) = broker.identity.last_will {
         let rumq_qos = match lw.qos {
             0 => QoS::AtMostOnce,
             1 => QoS::AtLeastOnce,
@@ -224,7 +227,7 @@ fn load_ca_cert_pem(broker_slug: &str, pem_bytes: &[u8]) -> (rustls::RootCertSto
 /// system trust store, shared by both the Tls12 and Tls13 branches.
 fn build_root_store(broker: &MqttClientConfig) -> rustls::RootCertStore {
     if let Some(pem_bytes) = &broker.ca_cert_pem {
-        let (store, _) = load_ca_cert_pem(&broker.slug, pem_bytes);
+        let (store, _) = load_ca_cert_pem(&broker.identity.slug, pem_bytes);
         store
     } else {
         let mut store = rustls::RootCertStore::empty();
@@ -235,7 +238,7 @@ fn build_root_store(broker: &MqttClientConfig) -> rustls::RootCertStore {
         {
             if let Err(e) = store.add(cert) {
                 tracing::warn!(
-                    broker = %broker.slug,
+                    broker = %broker.identity.slug,
                     cert_index = idx,
                     error = %e,
                     "system trust store: failed to add cert; skipping"
@@ -251,7 +254,7 @@ pub(crate) fn build_tls_transport(broker: &MqttClientConfig) -> Transport {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let root_store = build_root_store(broker);
 
-    match broker.tls_version_min {
+    match broker.identity.tls_version_min {
         TlsVersionMin::Tls13 => {
             let client_config = rustls::ClientConfig::builder_with_provider(provider.into())
                 .with_protocol_versions(&[&rustls::version::TLS13])
@@ -329,8 +332,7 @@ pub fn spawn_client_supervisor(
                 Ok(()) => break, // normal exit (stop signal / authoritative give-up)
                 Err(e) if e.is_panic() => {
                     tracing::error!(
-                        client = %handle.config.slug,
-                        broker = %handle.config.slug,
+                        client = %handle.config.identity.slug,
                         "MQTT supervisor task panicked; respawning. This is a bug.",
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -338,8 +340,7 @@ pub fn spawn_client_supervisor(
                 }
                 Err(e) => {
                     tracing::warn!(
-                        client = %handle.config.slug,
-                        broker = %handle.config.slug,
+                        client = %handle.config.identity.slug,
                         error = %e,
                         "MQTT supervisor task ended unexpectedly; not respawning",
                     );
@@ -361,7 +362,7 @@ async fn supervisor_body(
     // shares it with this supervisor (cheap Arc clone, once per supervisor
     // lifetime). Read broker coordinates/backoff/slug through it.
     let broker = handle.config.clone();
-    let client_slug = broker.slug.clone();
+    let client_slug = broker.identity.slug.clone();
     let rng_seed = client_id_seed(&client_id(&broker));
 
     let mut attempt: u32 = 0;
@@ -375,7 +376,7 @@ async fn supervisor_body(
 
     'supervisor: loop {
         if *stop_rx.borrow() {
-            tracing::info!(client = %client_slug, broker = %broker.slug, "supervisor stopping");
+            tracing::info!(client = %client_slug, "supervisor stopping");
             let client_opt = handle.client.lock().await.take();
             if let Some(client) = client_opt {
                 let _ = client.disconnect().await;
@@ -389,7 +390,7 @@ async fn supervisor_body(
             break;
         }
 
-        tracing::info!(client = %client_slug, broker = %broker.slug, attempt, "connecting to broker");
+        tracing::info!(client = %client_slug, attempt, "connecting to broker");
 
         {
             let mut state = handle.supervisor_state.write().await;
@@ -446,7 +447,7 @@ async fn supervisor_body(
                 if authoritative {
                     tracing::error!(
                         client = %client_slug,
-                        broker = %broker.slug,
+                        broker = %broker.identity.slug,
                         error = %error_str,
                         "broker connection failed with authoritative error; stopping retry",
                     );
@@ -458,7 +459,7 @@ async fn supervisor_body(
                 }
                 tracing::warn!(
                     client = %client_slug,
-                    broker = %broker.slug,
+                    broker = %broker.identity.slug,
                     error = %error_str,
                     "broker connection failed; will retry",
                 );
@@ -471,8 +472,8 @@ async fn supervisor_body(
                 }
                 let delay = backoff_duration(
                     attempt,
-                    broker.reconnect_backoff_initial_secs,
-                    broker.reconnect_backoff_max_secs,
+                    broker.identity.reconnect_backoff_initial_secs,
+                    broker.identity.reconnect_backoff_max_secs,
                     rng_seed,
                 );
                 attempt += 1;
@@ -506,7 +507,7 @@ async fn supervisor_body(
 
         tracing::info!(
             client = %client_slug,
-            broker = %broker.slug,
+            broker = %broker.identity.slug,
             session_present,
             "connected to broker",
         );
@@ -519,7 +520,7 @@ async fn supervisor_body(
             if let Err(e) = assert_ingress_subscription(&handle, &client, sub).await {
                 tracing::error!(
                     client = %client_slug,
-                    broker = %broker.slug,
+                    broker = %broker.identity.slug,
                     topic = %sub.topic_filter,
                     error = %e,
                     "failed to send subscribe — filter not asserted; channel will receive \
@@ -558,7 +559,7 @@ async fn supervisor_body(
                             if drain_result.is_err() {
                                 tracing::warn!(
                                     client = %client_slug,
-                                    broker = %broker.slug,
+                                    broker = %broker.identity.slug,
                                     "DISCONNECT drain timed out after {}s; broker may not have \
                                      closed the TCP connection promptly",
                                     DISCONNECT_DRAIN_TIMEOUT.as_secs(),
@@ -596,7 +597,7 @@ async fn supervisor_body(
         if disconnect_authoritative {
             tracing::error!(
                 client = %client_slug,
-                broker = %broker.slug,
+                broker = %broker.identity.slug,
                 reason = %disconnect_reason,
                 "broker connection lost with authoritative error; stopping retry",
             );
@@ -611,7 +612,7 @@ async fn supervisor_body(
 
         tracing::warn!(
             client = %client_slug,
-            broker = %broker.slug,
+            broker = %broker.identity.slug,
             reason = %disconnect_reason,
             "broker connection lost; reconnecting",
         );
@@ -625,8 +626,8 @@ async fn supervisor_body(
 
         let delay = backoff_duration(
             attempt,
-            broker.reconnect_backoff_initial_secs,
-            broker.reconnect_backoff_max_secs,
+            broker.identity.reconnect_backoff_initial_secs,
+            broker.identity.reconnect_backoff_max_secs,
             rng_seed,
         );
         attempt += 1;
@@ -732,7 +733,7 @@ async fn handle_event(
     handle: &Arc<MqttClientHandle>,
     router: &Arc<dyn MqttEventRouter>,
 ) {
-    let client_slug = handle.config.slug.as_str();
+    let client_slug = handle.config.identity.slug.as_str();
     match event {
         // --- Inbound publish ---
         // SECURITY: inbound payloads are untrusted. Any MQTT client with write
@@ -1396,7 +1397,7 @@ Lu2jWbIqZrx0\n\
     ) -> brenn_lib::mqtt::config::MqttClientConfig {
         let mut config = brenn_lib::mqtt::test_support::test_client_config("test-broker");
         config.ca_cert_pem = ca_cert_pem;
-        config.tls_version_min = tls_version_min;
+        config.identity.tls_version_min = tls_version_min;
         config
     }
 
@@ -1406,7 +1407,7 @@ Lu2jWbIqZrx0\n\
             Some(TEST_CA_PEM.to_vec()),
             brenn_lib::mqtt::config::TlsVersionMin::Tls13,
         );
-        let (store, added) = load_ca_cert_pem(&broker.slug, TEST_CA_PEM);
+        let (store, added) = load_ca_cert_pem(&broker.identity.slug, TEST_CA_PEM);
         assert_eq!(added, 1);
         assert_eq!(store.len(), 1);
         let transport = build_tls_transport(&broker);
@@ -1430,7 +1431,7 @@ Lu2jWbIqZrx0\n\
             Some(MALFORMED_CERT_PEM.to_vec()),
             brenn_lib::mqtt::config::TlsVersionMin::Tls13,
         );
-        let (store, added) = load_ca_cert_pem(&broker.slug, MALFORMED_CERT_PEM);
+        let (store, added) = load_ca_cert_pem(&broker.identity.slug, MALFORMED_CERT_PEM);
         assert_eq!(added, 0);
         assert_eq!(store.len(), 0);
         let transport = build_tls_transport(&broker);

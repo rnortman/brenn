@@ -1,7 +1,7 @@
 pub use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ServerConfig {
     /// Socket address to bind to (e.g. "0.0.0.0:3000").
     pub bind_address: SocketAddr,
@@ -58,7 +58,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DatabaseConfig {
     /// Path to the SQLite database file.
     pub path: PathBuf,

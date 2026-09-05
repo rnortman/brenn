@@ -138,6 +138,7 @@ operator's stamp of it is a delegation, not an endorsement.)
 | **B6** | Backend → hosted-app subprocess | risk is injection through the argument/input vector |
 | **B7** | Authenticated remote attacher (native daemon) → backend | daemon-supplied data untrusted; identity is bounded to the `[[remote]]` principal and its ACLs |
 | **B8** | Packaged module text → compiler | author-supplied configuration text untrusted; what an arrangement may confer is bounded by the ceiling the deployer stamped it under |
+| **B9** | Reload requester → running configuration | the requester chooses the *moment*, never the content; what a reload can do is bounded by what the document on disk says |
 
 ---
 
@@ -896,6 +897,52 @@ packaged text reaches the deployment's authority without passing the ceiling
 check — a new authority-bearing resolved entity that carries no stamp
 attribution, a conferral the fold does not count, or a refusal that degrades to a
 warning.
+
+## 9c. Boundary B9 — Reload Requester → Running Configuration
+
+**Who:** any principal holding `publish` on `brenn:config.reload`, plus anyone
+who can send the process `SIGUSR1` — which, on a `systemctl --user` unit, is the
+operator's own account and root.
+
+**Trust decision: the request is a *trigger*, not an input.** Its body is never
+read. What a reload applies is the document already on disk, compiled by the same
+compiler under the same refusals a boot uses, with a further set of refusals
+narrowing it to the changes the process can converge to (`docs/config-dsl.md`).
+So the authority a holder of that ACL has is exactly the authority it would have
+if it could restart the service with the same document — no more — and the
+request channel's ACL is the whole of the gate.
+
+**Threats:**
+
+- **Applying a document nobody intended yet.** A half-synced config tree, a
+  change staged for a maintenance window, a document that has not been checked.
+  This is why the reload doors are the *only* things that apply a document:
+  `SIGHUP` keeps its log-reopen-only meaning, and there is no file watcher and no
+  poll. Nothing converges on a schedule nobody set.
+- **Escalation through convergence.** A reload that left a consumer running
+  authority the new document does not describe, or that kept a channel a fresh
+  boot would not have, would be a running system no document describes. The
+  refusal set exists for this: anything that cannot reach the state a fresh boot
+  would have produced is refused whole, with the running system untouched.
+- **Denial of service by request flooding.** Requests coalesce — the channel is
+  a signal channel and the driver serializes — so N requests cost at most one
+  further reload each time the driver goes idle. A reload that refuses mutates
+  nothing.
+
+**What is *not* guarded here — the authorship gap.** Nothing in this boundary
+says who was allowed to *write* the file the reload reads. A principal that can
+edit the deployment's document can widen its own ceiling, and reload turns that
+edit into a running change a few seconds later rather than at the next bounce.
+The compile-time file-ownership rule that closes it — which principal may write
+which file — is designed with the tool that writes the file, and until it exists
+the config tree's filesystem permissions are the whole answer. A deployment that
+grants an agent `publish` on the request channel should grant it no write access
+to the config tree.
+
+**What the reviewer verifies:** any path by which the reload request's *content*
+influences what is applied is a finding, as is any convergence outcome that is
+not what a fresh boot of the same document would have produced. So is a refusal
+that mutates anything.
 
 ---
 

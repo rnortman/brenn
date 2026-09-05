@@ -13,7 +13,7 @@ load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("//bazel/release:defs.bzl", "release_package")
-load("//bazel/wasm:defs.bzl", "module_file_name")
+load("//bazel/wasm:defs.bzl", "config_fit_refusal_test", "config_fit_test", "module_file_name")
 
 policy_srcs()
 
@@ -23,7 +23,10 @@ policy_srcs()
 # *offers* the same directory is `//:modules`, and the two are held equal by
 # `//bazel/release/tests:config_specs_accounted_test`, which reads the names
 # below.
-BRENN_LIBRARY_MODULES = ["//:config/specs/surface-description.brenn"]
+BRENN_LIBRARY_MODULES = [
+    "//:config/specs/config-reload.brenn",
+    "//:config/specs/surface-description.brenn",
+]
 
 # What this release promises, as names, for that gate.
 write_file(
@@ -31,6 +34,26 @@ write_file(
     out = "library-module-names.txt",
     content = sorted([module_file_name(label) for label in BRENN_LIBRARY_MODULES]),
     visibility = ["//visibility:public"],
+)
+
+# The reload facility, stamped. `release_package`'s `library_module_test` per
+# library module compiles the module and stamps nothing, so an assembly body is
+# otherwise first resolved at a deployment's boot — and this pair's body is the
+# whole of it.
+config_fit_test(
+    name = "config_reload_fit_test",
+    config = "fit/config-reload.brenn",
+    modules = ["//:config/specs/config-reload.brenn"],
+)
+
+# One process, one document, one facility: the addresses are fixed, so a second
+# stamp is two channels at one address. The refusal is the compiler's own, which
+# is why the facility needs no rule of its own to say the pair is unique.
+config_fit_refusal_test(
+    name = "config_reload_twice_refusal_test",
+    config = "fit/config-reload-twice.brenn",
+    expect = "two channels declare the address `brenn:config.reload`",
+    modules = ["//:config/specs/config-reload.brenn"],
 )
 
 release_package(

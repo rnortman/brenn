@@ -48,7 +48,6 @@ use super::resolve_publish_millitokens;
 /// - `outputs` non-empty but `ports` not granted (dead config)
 /// - `[wasm_consumer.config]` table present but `config` not granted (dead config)
 /// - `store_path` or `store_size_limit` set without `store` grant; or `store` granted without `store_path`
-/// - `store_path` present but parent directory missing
 /// - `activation_burst` or `activation_min_period_ms` present but zero
 ///
 /// Identity-collision dedup: builds the set of all `wasm:<slug>`
@@ -58,16 +57,19 @@ pub(crate) fn resolve_wasm_consumers(
     raw_consumers: &[WasmConsumerConfigRaw],
     directory: &MessagingDirectory,
     global_store_size_limit: &str,
-    resolved_clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientConfig>,
+    mqtt_clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
     auto_wiring: &AutoWiring,
 ) -> Vec<ResolvedWasmConsumer> {
     use brenn_lib::config::wasm::{byte_size_to_max_page_count, resolve_component_config};
     use std::collections::{BTreeSet, HashMap, HashSet};
 
-    // Declared `[[mqtt_client]]` membership comes from the canonical resolved
-    // client map (the same one threaded into the LLM-side `validate_mqtt_client`),
-    // so this check is against the exact registry `MqttService` is populated from —
-    // no second, independently-derived slug set to drift out of sync.
+    // Declared `[[mqtt_client]]` membership comes from the canonical client
+    // identity map — the non-secret half of the same resolution the LLM-side
+    // `validate_mqtt_client` reads, so this check is against the exact registry
+    // `MqttService` is populated from, with no second independently-derived slug
+    // set to drift out of sync. Identities rather than resolved clients because
+    // this pass reads nothing but membership and must run where no broker
+    // credential is on disk.
 
     // Identity-collision dedup: panic on duplicate wasm: slugs.
     let mut seen_slugs: HashSet<&str> = HashSet::new();
@@ -140,16 +142,12 @@ pub(crate) fn resolve_wasm_consumers(
         }
 
         // Validate and resolve store_path (only when Store is granted).
+        // `std::path::absolute` consults the cwd and nothing on disk, so the
+        // resolved consumer carries the absolute path a boot on any machine
+        // would carry. Whether the parent directory exists is a fact about the
+        // deployment host and is asked at load time, where the store is opened.
         let store_path: Option<std::path::PathBuf> = if let Some(ref raw_path) = consumer.store_path
         {
-            let store_parent = raw_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            assert!(
-                store_parent.exists(),
-                "[[wasm_consumer]] {slug:?}: store_path {:?} — parent directory does not exist",
-                raw_path,
-            );
             let absolute = std::path::absolute(raw_path).unwrap_or_else(|e| {
                 panic!(
                     "[[wasm_consumer]] {slug:?}: failed to resolve store_path {:?}: {e}",
@@ -608,7 +606,7 @@ pub(crate) fn resolve_wasm_consumers(
         //      error, fail-fast (parallel to the LLM-side `validate_mqtt_client`).
         for matcher in &consumer.mqtt_publish_acl {
             assert!(
-                resolved_clients.contains_key(matcher.client.as_str()),
+                mqtt_clients.contains_key(matcher.client.as_str()),
                 "[[wasm_consumer]] {slug:?}: mqtt_publish ACL matcher names mqtt client {:?}, \
                  but no [[mqtt_client]] with that slug is declared; declare the client or remove \
                  the matcher",
@@ -624,7 +622,7 @@ pub(crate) fn resolve_wasm_consumers(
         //      for `mqtt_publish` and the LLM-side `validate_mqtt_client`).
         for matcher in &consumer.mqtt_subscribe_acl {
             assert!(
-                resolved_clients.contains_key(matcher.client.as_str()),
+                mqtt_clients.contains_key(matcher.client.as_str()),
                 "[[wasm_consumer]] {slug:?}: mqtt_subscribe ACL matcher names mqtt client {:?}, \
                  but no [[mqtt_client]] with that slug is declared; declare the client or remove \
                  the matcher",

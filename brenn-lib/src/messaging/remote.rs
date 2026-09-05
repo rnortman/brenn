@@ -314,11 +314,32 @@ pub fn resolve_remotes(
     raw_remotes: &[RemoteConfigRaw],
     globals: &MessagingGlobalConfig,
 ) -> Vec<ResolvedRemote> {
+    resolve_remote_facts_all(raw_remotes, globals)
+        .into_iter()
+        .map(RemoteFacts::load_token)
+        .collect()
+}
+
+/// Run every `[[remote]]` gate that reads only the config — gates 1 through 5
+/// of [`resolve_remotes`] — and return what they resolved, no bearer token
+/// loaded.
+///
+/// This is the derivation half of [`resolve_remotes`]: a pass with no
+/// deployment host resolves the whole set and hands each [`RemoteFacts`] to
+/// whoever does have one.
+///
+/// # Panics
+///
+/// On gates 1 through 5 of [`resolve_remotes`].
+pub fn resolve_remote_facts_all(
+    raw_remotes: &[RemoteConfigRaw],
+    globals: &MessagingGlobalConfig,
+) -> Vec<RemoteFacts> {
     assert_slugs_unique(raw_remotes);
 
     raw_remotes
         .iter()
-        .map(|remote| resolve_remote(remote, globals))
+        .map(|remote| resolve_remote_facts(remote, globals))
         .collect()
 }
 
@@ -336,10 +357,7 @@ pub fn resolve_remotes(
 ///
 /// On gates 1 through 5 of [`resolve_remotes`].
 pub fn check_remotes(raw_remotes: &[RemoteConfigRaw], globals: &MessagingGlobalConfig) {
-    assert_slugs_unique(raw_remotes);
-    for remote in raw_remotes {
-        resolve_remote_facts(remote, globals);
-    }
+    resolve_remote_facts_all(raw_remotes, globals);
 }
 
 /// Gate 1's first half: no two `[[remote]]` blocks may claim one slug.
@@ -361,9 +379,14 @@ fn assert_slugs_unique(raw_remotes: &[RemoteConfigRaw]) {
 /// Everything a `[[remote]]` resolves to except its bearer token.
 ///
 /// The split is the environment boundary: these fields are computed from the
-/// document alone, and the token is read off the deployment host's disk. Boot
-/// takes both; [`check_remotes`] takes only these.
-struct RemoteFacts {
+/// document alone, and the token is read off the deployment host's disk. A
+/// derivation pass produces these; whoever holds an environment turns each into
+/// a [`ResolvedRemote`] with [`RemoteFacts::load_token`].
+#[derive(Debug, Clone)]
+pub struct RemoteFacts {
+    /// The declared token file, carried so the load can happen away from the
+    /// raw block.
+    pub token_file: std::path::PathBuf,
     slug: String,
     policy: AppPolicy,
     subscribe_ceilings: RemoteSubscribeAcl,
@@ -375,6 +398,30 @@ struct RemoteFacts {
 }
 
 impl RemoteFacts {
+    /// The declared slug, for a caller that logs or keys on it before the token
+    /// is loaded.
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
+    /// The lowered access policy, for a caller building the subscriber registry
+    /// before any token is read.
+    pub fn policy(&self) -> &AppPolicy {
+        &self.policy
+    }
+
+    /// Read this remote's bearer token off the host and complete the
+    /// resolution.
+    ///
+    /// # Panics
+    ///
+    /// When the token file is missing, unreadable, empty, or readable by any
+    /// other local account.
+    pub fn load_token(self) -> ResolvedRemote {
+        let token = load_remote_token(&self.slug, &self.token_file.clone());
+        self.with_token(token)
+    }
+
     fn with_token(self, token: RemoteToken) -> ResolvedRemote {
         ResolvedRemote {
             slug: self.slug,
@@ -388,12 +435,6 @@ impl RemoteFacts {
             max_subscriptions: self.max_subscriptions,
         }
     }
-}
-
-fn resolve_remote(remote: &RemoteConfigRaw, globals: &MessagingGlobalConfig) -> ResolvedRemote {
-    let facts = resolve_remote_facts(remote, globals);
-    let token = load_remote_token(&facts.slug, &remote.token_file);
-    facts.with_token(token)
 }
 
 fn resolve_remote_facts(remote: &RemoteConfigRaw, globals: &MessagingGlobalConfig) -> RemoteFacts {
@@ -447,6 +488,7 @@ fn resolve_remote_facts(remote: &RemoteConfigRaw, globals: &MessagingGlobalConfi
     );
 
     RemoteFacts {
+        token_file: remote.token_file.clone(),
         slug: slug.clone(),
         policy: policy.clone(),
         subscribe_ceilings: zip_ceilings(&policy.acls.brenn_subscribe, &remote.subscribe_acl),
@@ -845,6 +887,36 @@ remote typo {
             ))
             .expect("a real grant word deserializes"),
             AttachGrant::EphemeralSubscribe,
+        );
+    }
+
+    /// Gates 1–5 answer for a remote whose token file exists on no machine
+    /// here, and gate 6 is what refuses it. That is the split a document check
+    /// away from the deployment target rests on.
+    #[test]
+    fn facts_resolve_without_the_token_file() {
+        let mut raw = remote_raw(
+            "pod",
+            std::path::Path::new("/nonexistent/remote.token"),
+            &[AttachGrant::Publish],
+        );
+        raw.publish_acl = vec![ChannelMatcherRaw::Prefix("brenn:reports.".to_string())];
+        let mut facts = resolve_remote_facts_all(
+            std::slice::from_ref(&raw),
+            &MessagingGlobalConfig::default(),
+        );
+        assert_eq!(facts.len(), 1);
+        let facts = facts.pop().expect("one remote");
+        assert_eq!(facts.slug(), "pod");
+        assert_eq!(
+            facts.token_file,
+            std::path::Path::new("/nonexistent/remote.token"),
+        );
+
+        let caught = std::panic::catch_unwind(|| facts.load_token());
+        assert!(
+            caught.is_err(),
+            "gate 6 must still refuse a token file that is not there",
         );
     }
 

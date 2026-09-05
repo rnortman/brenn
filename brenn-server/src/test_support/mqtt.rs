@@ -5,7 +5,7 @@
 //! crate's tests.
 
 use brenn_lib::messaging::Urgency;
-use brenn_lib::mqtt::config::{MqttClientConfig, TlsVersionMin};
+use brenn_lib::mqtt::config::{MqttClientConfig, MqttClientIdentity, TlsVersionMin};
 
 /// A resolved client config pointing at an unroutable localhost port, so any
 /// background supervisor an activation test spawns gets an immediate
@@ -14,20 +14,22 @@ use brenn_lib::mqtt::config::{MqttClientConfig, TlsVersionMin};
 /// variation (e.g. a non-default `urgency`/`qos`).
 pub fn test_client_config(slug: &str) -> MqttClientConfig {
     MqttClientConfig {
-        slug: slug.to_string(),
-        host: "127.0.0.1".to_string(),
-        port: 1,
-        username: None,
+        identity: MqttClientIdentity {
+            slug: slug.to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            username: None,
+            tls_version_min: TlsVersionMin::Tls12,
+            keepalive_secs: None,
+            inbound_payload_cap_bytes: 4096,
+            last_will: None,
+            reconnect_backoff_initial_secs: 1,
+            reconnect_backoff_max_secs: 60,
+            qos: 1,
+            urgency: Urgency::Normal,
+            session_expiry_secs: 0,
+        },
         password: None,
         ca_cert_pem: None,
-        tls_version_min: TlsVersionMin::Tls12,
-        keepalive_secs: None,
-        inbound_payload_cap_bytes: 4096,
-        last_will: None,
-        reconnect_backoff_initial_secs: 1,
-        reconnect_backoff_max_secs: 60,
-        qos: 1,
-        urgency: Urgency::Normal,
-        session_expiry_secs: 0,
     }
 }

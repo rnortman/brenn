@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use brenn_dsl::DocumentInputs;
 use brenn_dsl::diag::Diagnostic;
+use brenn_dsl::{DocumentInputs, SourceFile};
 
 use super::alerting::AlertingConfig;
 use super::app::AppConfigRaw;
@@ -71,7 +71,7 @@ pub const CC_KNOWN_TOOLS: &[&str] = &[
 ///
 /// Defaults are production-hardened (absolute paths, secure cookies on, etc.).
 /// Use `brenn.dev.brenn` for local development.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BrennConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -357,7 +357,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
 /// - `path` is `Some` and its extension is not `brenn`
 /// - `path` is `None` and whether the fallback name exists cannot be determined
 /// - `path` is `None` and the fallback that exists fails to load
-pub fn load_config(path: Option<&Path>, module_roots: &[PathBuf]) -> BrennConfig {
+pub fn load_config(path: Option<&Path>, module_roots: &[PathBuf]) -> LoadedDocument {
     let cwd = std::env::current_dir().expect("failed to determine current directory");
     load_config_from(path, module_roots, &cwd)
 }
@@ -372,12 +372,12 @@ pub(crate) fn load_config_from(
     path: Option<&Path>,
     module_roots: &[PathBuf],
     fallback_dir: &Path,
-) -> BrennConfig {
+) -> LoadedDocument {
     let root = match path {
         Some(p) => p.to_path_buf(),
         None => match fallback_config(fallback_dir) {
             Some(found) => found,
-            None => return BrennConfig::default(),
+            None => return LoadedDocument::defaults(),
         },
     };
     let inputs = DocumentInputs {
@@ -440,20 +440,72 @@ impl DslFailure {
     }
 }
 
+/// A configuration and the document it came from.
+///
+/// The configuration is what every pass downstream reads; the hash and the file
+/// list are how the process says *which* text it is projecting — logged at boot,
+/// printed by the check tool, and reported to whoever asks what is running.
+#[derive(Debug)]
+pub struct LoadedDocument {
+    pub config: BrennConfig,
+    /// The identity of the whole document: [`brenn_dsl::document_sha256`] over
+    /// `files`.
+    pub document_sha256: String,
+    /// Every file the compile read, in read order, root first.
+    pub files: Vec<SourceFile>,
+    /// Where this document was read from: the root path and the module roots
+    /// its packaged imports resolved against.
+    ///
+    /// `None` for the defaults a document-less boot projects — there is no tree
+    /// to re-read. Anything that has to read the *same* document again later
+    /// reads it from here rather than rebuilding the inputs from the flags,
+    /// which is how a re-read and the original cannot name different trees.
+    pub inputs: Option<DocumentInputs>,
+}
+
+impl LoadedDocument {
+    /// What a boot with no document at all is projecting: the defaults, and an
+    /// empty file list whose identity is still a hash a reader can compare.
+    fn defaults() -> Self {
+        Self::of(BrennConfig::default(), Vec::new(), None)
+    }
+
+    fn of(config: BrennConfig, files: Vec<SourceFile>, inputs: Option<DocumentInputs>) -> Self {
+        Self {
+            document_sha256: brenn_dsl::document_sha256(&files),
+            config,
+            files,
+            inputs,
+        }
+    }
+
+    /// The document's files as diagnostics and logs name them: their places
+    /// within the document, joined.
+    pub fn file_places(&self) -> String {
+        self.files
+            .iter()
+            .map(|file| file.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// A `.brenn` document, compiled and lowered, reporting rather than panicking.
 ///
 /// The root is the root module of its document tree, so its own directory is
 /// where `use` resolves from; the module roots are where `use @<name>::…`
 /// resolves from instead.
-fn read_dsl(inputs: &DocumentInputs) -> Result<BrennConfig, DslFailure> {
-    let config = brenn_dsl::compile(inputs).map_err(|diagnostics| DslFailure {
+fn read_dsl(inputs: &DocumentInputs) -> Result<LoadedDocument, DslFailure> {
+    let mut derived = brenn_dsl::compile(inputs).map_err(|diagnostics| DslFailure {
         stage: "compile",
         diagnostics,
     })?;
-    super::dsl_lower::lower(config).map_err(|diagnostics| DslFailure {
+    let files = std::mem::take(&mut derived.files);
+    let config = super::dsl_lower::lower(derived).map_err(|diagnostics| DslFailure {
         stage: "lower",
         diagnostics,
-    })
+    })?;
+    Ok(LoadedDocument::of(config, files, Some(inputs.clone())))
 }
 
 /// Validate a config file the way boot loads it, reporting instead of dying.
@@ -474,7 +526,7 @@ fn read_dsl(inputs: &DocumentInputs) -> Result<BrennConfig, DslFailure> {
 /// root file is — the caller asserts these are the module bytes to check
 /// against — and the boot-time hash binding is what catches a caller who
 /// asserted wrong.
-pub fn check_config(inputs: &DocumentInputs) -> Result<BrennConfig, String> {
+pub fn check_config(inputs: &DocumentInputs) -> Result<LoadedDocument, String> {
     let path = inputs.root.as_path();
     match path.extension().and_then(std::ffi::OsStr::to_str) {
         Some("brenn") => read_dsl(inputs).map_err(|failure| failure.render(path)),

@@ -33,7 +33,7 @@ use crate::mqtt::address::{parse_mqtt_address, validate_topic_filter_str};
 /// plugin) to restrict publish rights so only authorised clients can write to
 /// topics the app reads. The principle of least privilege applies: each client
 /// should be allowed to publish only to the topics it owns.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MqttClientConfigRaw {
     /// URL-safe identifier for this client; charset `[A-Za-z0-9._~-]+`.
     pub slug: String,
@@ -147,7 +147,7 @@ pub(crate) fn default_subscription_qos() -> u8 {
 ///
 /// Transport/sender-side feed properties (`qos`/`urgency`) live on
 /// `[[mqtt_client]]`, not here.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppMqttIngressSubscriptionRaw {
     /// Full channel address `mqtt:<client>:<topic>`; client segment mandatory.
     pub channel: String,
@@ -180,24 +180,26 @@ pub enum TlsVersionMin {
     Tls13,
 }
 
-/// Resolved `[[mqtt_client]]` entry, with secrets loaded and fields validated.
+/// Everything a `[[mqtt_client]]` resolves to that is not a secret.
 ///
-/// This is Brenn's *client* connection to a remote MQTT broker (server). The
-/// `slug` is the `<client>` segment of channel addresses; `host`/`port`/
-/// credentials are the coordinates of the broker (server) this client dials.
+/// This is Brenn's *client* connection to a remote MQTT broker (server), minus
+/// the credentials. The `slug` is the `<client>` segment of channel addresses;
+/// `host`/`port` are the coordinates of the broker (server) this client dials.
 /// The raw `[[mqtt_client]].url` is parsed into `host`/`port` once, here, at
 /// config resolution.
-#[derive(Clone)]
-pub struct MqttClientConfig {
+///
+/// The split from [`MqttClientConfig`] is the environment boundary. Every field
+/// here is a fact about the document, so a pass with no deployment host —
+/// `config-check` on a workstation, the boot-plan derivation — resolves the
+/// whole set. The credentials are read off the target host's disk and live on
+/// [`MqttClientConfig`] beside this.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MqttClientIdentity {
     pub slug: String,
     /// Broker hostname, or bare IP literal (IPv6 brackets stripped).
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
-    /// Password loaded from `password_file`, trimmed.
-    pub password: Option<String>,
-    /// CA certificate PEM bytes, if a `ca_file` was provided.
-    pub ca_cert_pem: Option<Vec<u8>>,
     pub tls_version_min: TlsVersionMin,
     pub keepalive_secs: Option<u32>,
     pub inbound_payload_cap_bytes: u32,
@@ -212,6 +214,20 @@ pub struct MqttClientConfig {
     pub session_expiry_secs: u32,
 }
 
+/// Resolved `[[mqtt_client]]` entry, with secrets loaded and fields validated.
+///
+/// The non-secret half is [`MqttClientIdentity`]; the two credential fields here
+/// are the only part of a `[[mqtt_client]]` that a machine other than the
+/// deployment target cannot answer.
+#[derive(Clone)]
+pub struct MqttClientConfig {
+    pub identity: MqttClientIdentity,
+    /// Password loaded from `password_file`, trimmed.
+    pub password: Option<String>,
+    /// CA certificate PEM bytes, if a `ca_file` was provided.
+    pub ca_cert_pem: Option<Vec<u8>>,
+}
+
 /// Manual `Debug` that never renders the broker `password` (a secret loaded from
 /// `password_file`; security-posture item 11 treats logging a secret as a High
 /// regression) and elides the bulky `ca_cert_pem` bytes to a length. The config
@@ -220,10 +236,7 @@ pub struct MqttClientConfig {
 impl std::fmt::Debug for MqttClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MqttClientConfig")
-            .field("slug", &self.slug)
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("username", &self.username)
+            .field("identity", &self.identity)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field(
                 "ca_cert_pem",
@@ -232,21 +245,6 @@ impl std::fmt::Debug for MqttClientConfig {
                     .as_ref()
                     .map(|b| format!("{} bytes", b.len())),
             )
-            .field("tls_version_min", &self.tls_version_min)
-            .field("keepalive_secs", &self.keepalive_secs)
-            .field("inbound_payload_cap_bytes", &self.inbound_payload_cap_bytes)
-            .field("last_will", &self.last_will)
-            .field(
-                "reconnect_backoff_initial_secs",
-                &self.reconnect_backoff_initial_secs,
-            )
-            .field(
-                "reconnect_backoff_max_secs",
-                &self.reconnect_backoff_max_secs,
-            )
-            .field("qos", &self.qos)
-            .field("urgency", &self.urgency)
-            .field("session_expiry_secs", &self.session_expiry_secs)
             .finish()
     }
 }
@@ -410,7 +408,13 @@ fn parse_broker_port(slug: &str, url: &str, port_str: &str) -> u16 {
     port
 }
 
-/// Resolve `[[mqtt_client]]` raw entries into a validated, indexed map.
+/// Resolve the non-secret half of every `[[mqtt_client]]` raw entry into a
+/// validated, indexed map, reading nothing off the host.
+///
+/// This is every `[[mqtt_client]]` gate that is a fact about the document. The
+/// two that are not — `password_file` and `ca_file`, whose contents are read
+/// from the deployment host's disk — belong to [`resolve_clients`], which is
+/// this pass plus those reads.
 ///
 /// # Panics
 ///
@@ -421,12 +425,13 @@ fn parse_broker_port(slug: &str, url: &str, port_str: &str) -> u16 {
 /// - `inbound_payload_cap_bytes` of `0` or greater than `u32::MAX`.
 /// - Invalid client slug charset.
 /// - Duplicate client slugs.
-/// - `password_file` missing or empty when present.
-/// - `ca_file` missing or unreadable when present.
 /// - Invalid `tls_version_min` value (must be `"1.2"` or `"1.3"`).
 /// - QoS on Last-Will out of range (must be 0, 1, or 2).
-pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, MqttClientConfig> {
-    let mut result = IndexMap::new();
+/// - Ingress SUBSCRIBE QoS out of range (must be 0, 1, or 2).
+pub fn resolve_client_identities(
+    raw_clients: &[MqttClientConfigRaw],
+) -> IndexMap<String, MqttClientIdentity> {
+    let mut result: IndexMap<String, MqttClientIdentity> = IndexMap::new();
 
     for raw in raw_clients {
         // Slug charset.
@@ -485,36 +490,6 @@ pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, 
             ),
         };
 
-        // Password file.
-        let password = raw.password_file.as_ref().map(|path| {
-            load_secret_file(
-                &format!("[[mqtt_client]] {:?} password_file", raw.slug),
-                path,
-            )
-        });
-
-        // CA file.
-        let ca_cert_pem = match &raw.ca_file {
-            None => None,
-            Some(path) => {
-                let bytes = std::fs::read(path).unwrap_or_else(|e| {
-                    panic!(
-                        "config: [[mqtt_client]] {:?} ca_file at {} is unreadable: {e}",
-                        raw.slug,
-                        path.display(),
-                    )
-                });
-                if bytes.is_empty() {
-                    panic!(
-                        "config: [[mqtt_client]] {:?} ca_file at {} is empty",
-                        raw.slug,
-                        path.display(),
-                    );
-                }
-                Some(bytes)
-            }
-        };
-
         // Last-Will QoS.
         if let Some(ref lw) = raw.last_will {
             assert!(
@@ -535,13 +510,11 @@ pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, 
 
         result.insert(
             raw.slug.clone(),
-            MqttClientConfig {
+            MqttClientIdentity {
                 slug: raw.slug.clone(),
                 host,
                 port,
                 username: raw.username.clone(),
-                password,
-                ca_cert_pem,
                 tls_version_min,
                 keepalive_secs: raw.keepalive_secs,
                 inbound_payload_cap_bytes,
@@ -556,6 +529,82 @@ pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, 
     }
 
     result
+}
+
+/// Resolve `[[mqtt_client]]` raw entries into a validated, indexed map, secrets
+/// loaded.
+///
+/// [`resolve_client_identities`] is the document half; this adds the host reads.
+/// Raw entry order is the identity map's order — duplicate slugs are refused
+/// there — so the zip below pairs each identity with the block it came from.
+///
+/// # Panics
+///
+/// Panics on anything [`resolve_client_identities`] panics on, plus:
+/// - `password_file` missing or empty when present.
+/// - `ca_file` missing, unreadable, or empty when present.
+pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, MqttClientConfig> {
+    resolve_client_identities(raw_clients)
+        .into_iter()
+        .zip(raw_clients)
+        .map(|((slug, identity), raw)| {
+            assert_eq!(
+                slug, raw.slug,
+                "mqtt: identity map order does not follow the raw [[mqtt_client]] order (host bug)",
+            );
+            let password = raw.password_file.as_ref().map(|path| {
+                load_secret_file(
+                    &format!("[[mqtt_client]] {:?} password_file", raw.slug),
+                    path,
+                )
+            });
+
+            let ca_cert_pem = match &raw.ca_file {
+                None => None,
+                Some(path) => {
+                    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+                        panic!(
+                            "config: [[mqtt_client]] {:?} ca_file at {} is unreadable: {e}",
+                            raw.slug,
+                            path.display(),
+                        )
+                    });
+                    assert!(
+                        !bytes.is_empty(),
+                        "config: [[mqtt_client]] {:?} ca_file at {} is empty",
+                        raw.slug,
+                        path.display(),
+                    );
+                    Some(bytes)
+                }
+            };
+
+            (
+                slug,
+                MqttClientConfig {
+                    identity,
+                    password,
+                    ca_cert_pem,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The identity half of an already-resolved client map.
+///
+/// Boot resolves clients once, secrets and all, and the derivation passes that
+/// need only the document's view of a client take this projection of that one
+/// resolution rather than re-running [`resolve_client_identities`] — the two
+/// agree by construction, and a second run would re-assert the same gates
+/// against the same blocks.
+pub fn client_identities(
+    clients: &IndexMap<String, MqttClientConfig>,
+) -> IndexMap<String, MqttClientIdentity> {
+    clients
+        .iter()
+        .map(|(slug, client)| (slug.clone(), client.identity.clone()))
+        .collect()
 }
 
 /// Resolve per-app `[[app.mqtt_subscription]]` (ingress) entries into validated,
@@ -592,7 +641,7 @@ pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, 
 /// - A push-enabled subscription on a non-singleton or multi-user app.
 pub fn resolve_app_mqtt_subscriptions(
     app: &AppConfigRaw,
-    clients: &IndexMap<String, MqttClientConfig>,
+    clients: &IndexMap<String, MqttClientIdentity>,
     tuning: &crate::messaging::config::SystemChannelTuning,
     global_messaging: &crate::messaging::config::MessagingGlobalConfig,
 ) -> Vec<ResolvedMqttIngressSubscription> {
@@ -703,7 +752,7 @@ pub fn parsed_address_canonical(client_slug: &str, topic: &str) -> String {
 /// derived channel entry) use this directly.
 pub fn resolve_mqtt_ingress_channel(
     channel: &str,
-    clients: &IndexMap<String, MqttClientConfig>,
+    clients: &IndexMap<String, MqttClientIdentity>,
     owner_desc: &str,
 ) -> ResolvedMqttIngressChannel {
     let parsed = parse_mqtt_address(channel).unwrap_or_else(|e| {
@@ -781,9 +830,9 @@ mod tests {
         let brokers = resolve_clients(&[raw_broker("ha", "mqtts://broker.example.com:8883")]);
         assert!(brokers.contains_key("ha"));
         let b = &brokers["ha"];
-        assert_eq!(b.slug, "ha");
-        assert_eq!(b.host, "broker.example.com");
-        assert_eq!(b.port, 8883);
+        assert_eq!(b.identity.slug, "ha");
+        assert_eq!(b.identity.host, "broker.example.com");
+        assert_eq!(b.identity.port, 8883);
         assert!(b.password.is_none());
     }
 
@@ -878,15 +927,53 @@ mod tests {
         resolve_clients(&[broker]);
     }
 
+    /// The identity pass reads no secret file. A document naming a
+    /// `password_file` and a `ca_file` that exist on no machine here resolves
+    /// its whole identity, which is what lets a config check run on a
+    /// workstation; the same blocks through `resolve_clients` die on the first
+    /// of the two.
+    #[test]
+    fn identities_resolve_with_no_secret_file_on_disk() {
+        let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
+        broker.password_file = Some(std::path::PathBuf::from("/nonexistent/mqtt.pass"));
+        broker.ca_file = Some(std::path::PathBuf::from("/nonexistent/ca.pem"));
+        let identities = resolve_client_identities(std::slice::from_ref(&broker));
+        assert_eq!(identities["ha"].host, "broker.example.com");
+        assert_eq!(identities["ha"].port, 8883);
+
+        let caught = std::panic::catch_unwind(|| resolve_clients(&[broker]));
+        assert!(
+            caught.is_err(),
+            "resolve_clients must still refuse a password_file that is not there",
+        );
+    }
+
+    /// The projection off a resolved map and the pass over the raw blocks are
+    /// one answer, so a caller that has already resolved clients never has to
+    /// re-run the gates to get identities.
+    #[test]
+    fn the_projection_and_the_pass_agree() {
+        let raw = vec![
+            raw_broker("ha", "mqtts://broker.example.com:8883"),
+            raw_broker("pod", "mqtts://[::1]:1884"),
+        ];
+        let projected = client_identities(&resolve_clients(&raw));
+        assert_eq!(
+            projected.keys().collect::<Vec<_>>(),
+            resolve_client_identities(&raw).keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(projected, resolve_client_identities(&raw));
+    }
+
     #[test]
     fn client_qos_urgency_defaults_applied_when_omitted() {
         // `raw_broker` states neither qos nor urgency, so it carries the
         // module's own defaults, 1 / Normal, and resolution carries them onto
         // the resolved broker.
         let brokers = resolve_clients(&[raw_broker("ha", "mqtts://broker.example.com:8883")]);
-        assert_eq!(brokers["ha"].qos, 1, "default ingress qos is 1");
+        assert_eq!(brokers["ha"].identity.qos, 1, "default ingress qos is 1");
         assert_eq!(
-            brokers["ha"].urgency,
+            brokers["ha"].identity.urgency,
             Urgency::Normal,
             "default injection urgency is Normal"
         );
@@ -904,12 +991,12 @@ mod tests {
     fn client_session_expiry_default_and_explicit() {
         // Unstated ⇒ 0 (ephemeral); `raw_broker` states nothing here.
         let brokers = resolve_clients(&[raw_broker("ha", "mqtts://broker.example.com:8883")]);
-        assert_eq!(brokers["ha"].session_expiry_secs, 0);
+        assert_eq!(brokers["ha"].identity.session_expiry_secs, 0);
         // An explicit value carries onto the resolved client.
         let mut broker = raw_broker("ha2", "mqtts://broker.example.com:8883");
         broker.session_expiry_secs = 3600;
         let brokers = resolve_clients(&[broker]);
-        assert_eq!(brokers["ha2"].session_expiry_secs, 3600);
+        assert_eq!(brokers["ha2"].identity.session_expiry_secs, 3600);
     }
 
     // --- parse_broker_host_port ---
@@ -1051,7 +1138,7 @@ mod tests {
         let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
         broker.inbound_payload_cap_bytes = u32::MAX as usize;
         let brokers = resolve_clients(&[broker]);
-        assert_eq!(brokers["ha"].inbound_payload_cap_bytes, u32::MAX);
+        assert_eq!(brokers["ha"].identity.inbound_payload_cap_bytes, u32::MAX);
     }
 
     #[test]
@@ -1063,8 +1150,8 @@ mod tests {
         resolve_clients(&[broker]);
     }
 
-    fn clients_map() -> IndexMap<String, MqttClientConfig> {
-        resolve_clients(&[raw_broker("ha", "mqtts://broker.example.com:8883")])
+    fn clients_map() -> IndexMap<String, MqttClientIdentity> {
+        resolve_client_identities(&[raw_broker("ha", "mqtts://broker.example.com:8883")])
     }
 
     // --- resolve_app_mqtt_subscriptions (ingress, channel-address form) ---

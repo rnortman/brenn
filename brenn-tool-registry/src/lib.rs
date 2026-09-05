@@ -32,7 +32,7 @@ pub use descriptor::{
     MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES, ToolClass,
     ToolDescriptor, ToolError,
 };
-pub use executor::{TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor};
+pub use executor::{CallerGrantTable, TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor};
 pub use git_repo_pull::GitRepoPullTool;
 pub use rate_limit::RateLimiter;
 pub use registry::ToolRegistry;

@@ -536,6 +536,7 @@ dependencies = [
  "clap",
  "futures",
  "indexmap",
+ "libc",
  "rusqlite",
  "serde_json",
  "similar",

@@ -41,6 +41,8 @@ pub mod resolved;
 pub mod roots;
 /// Guest source generated from a component specification.
 pub mod scaffold;
+/// The files a compile read, and the identity of the document they make up.
+pub mod source;
 pub mod unparser;
 
 use fltk_serde_core::ParseToTargetError;
@@ -48,6 +50,7 @@ use fltk_serde_core::ParseToTargetError;
 use diag::Diagnostic;
 
 pub use resolve::{DocumentInputs, compile, resolve_files};
+pub use source::{SourceFile, document_sha256};
 
 /// The position type every diagnostic and every resolved value carries.
 ///

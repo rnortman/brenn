@@ -1,0 +1,8 @@
+// A root that reaches every kind of file a document can hold: a tree module of
+// its own, and a packaged module that builds on a second packaged one.
+
+use wiring::deskbar::Deskbar;
+use @widget::*;
+
+new alice_desk: Deskbar(slug = "alice-desk");
+new alice_bench: Bench(slug = "alice-bench");

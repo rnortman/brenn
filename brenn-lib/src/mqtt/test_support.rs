@@ -5,7 +5,7 @@
 //! invisible cross-crate. The release configs clear the feature.
 
 use crate::messaging::Urgency;
-use crate::mqtt::config::{MqttClientConfig, TlsVersionMin};
+use crate::mqtt::config::{MqttClientConfig, MqttClientIdentity, TlsVersionMin};
 
 /// Minimal resolved client config for unit tests. Fields the mqtt paths do not
 /// read in a given test are filled with defaults; callers mutate fields before
@@ -18,12 +18,20 @@ use crate::mqtt::config::{MqttClientConfig, TlsVersionMin};
 /// own fixture (`brenn-mqtt/tests/common/mod.rs`), which takes an explicit port.
 pub fn test_client_config(slug: &str) -> MqttClientConfig {
     MqttClientConfig {
+        identity: test_client_identity(slug),
+        password: None,
+        ca_cert_pem: None,
+    }
+}
+
+/// The non-secret half of [`test_client_config`], for the passes that take an
+/// identity map rather than a resolved-client map.
+pub fn test_client_identity(slug: &str) -> MqttClientIdentity {
+    MqttClientIdentity {
         slug: slug.to_string(),
         host: "127.0.0.1".to_string(),
         port: 1,
         username: None,
-        password: None,
-        ca_cert_pem: None,
         tls_version_min: TlsVersionMin::Tls12,
         keepalive_secs: Some(30),
         inbound_payload_cap_bytes: 4 * 1024 * 1024,

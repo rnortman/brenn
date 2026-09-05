@@ -49,6 +49,7 @@ brenn-attach-proto = { version = "0.1.0", path = "../attach/proto" }
 brenn-dsl = { version = "0.1.0", path = "../brenn-dsl" }
 brenn-attach-server = { version = "0.1.0", path = "../attach/server", features = ["testutils"] }
 futures = "0.3.32"
+libc = "0.2.185"
 tempfile = "3.24.0"
 tokio-tungstenite = "0.29.0"
 brenn-db = { version = "0.1.0", path = "../brenn-db", features = ["testutils"] }

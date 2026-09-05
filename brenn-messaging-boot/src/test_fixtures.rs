@@ -16,17 +16,9 @@ use brenn_lib::messaging::config::{
 };
 pub use brenn_server::test_support::app_config::minimal_app_config;
 
-/// Builds `SystemChannelTuning` from `config`'s `[[channel]]` blocks.
-pub(crate) fn tuning_for(
-    config: &brenn_lib::config::BrennConfig,
-) -> brenn_lib::messaging::config::SystemChannelTuning {
-    brenn_lib::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging)
-}
-
-/// Boot `build_messaging` over `config` with an inert periphery: no webhook
-/// endpoints, no active bridges, no dynamic subscriptions, and an empty tool
-/// registry (so no `brenn:tools/*` channels or `system:tool-executor` policy are
-/// derived).
+/// Boot `build_messaging` over `config` with an inert periphery: no active
+/// bridges, no dynamic subscriptions, and an empty tool registry (so no
+/// `brenn:tools/*` channels or `system:tool-executor` policy are derived).
 pub async fn boot_messaging_with(
     config: &brenn_lib::config::BrennConfig,
     db: brenn_db::Db,
@@ -34,7 +26,49 @@ pub async fn boot_messaging_with(
     alert_dispatcher: AlertDispatcher,
     origin: &str,
 ) -> MessagingResult {
-    let webhooks: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
+    boot_messaging_with_tools(
+        config,
+        db,
+        apps,
+        alert_dispatcher,
+        origin,
+        &Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
+    )
+    .await
+}
+
+/// [`boot_messaging_with`] with a caller-supplied tool registry: the async tool
+/// substrate is the one part of the periphery a boot test may need real, and
+/// everything else — bridges, the origin, the client identities the document
+/// determines, the replay store paths — is the derivation's to compute or inert.
+///
+/// Every boot-lowering test goes through this, so a `build_messaging` parameter
+/// that moves sides is one edit here rather than one per test.
+pub async fn boot_messaging_with_tools(
+    config: &brenn_lib::config::BrennConfig,
+    db: brenn_db::Db,
+    apps: &Arc<IndexMap<String, AppConfig>>,
+    alert_dispatcher: AlertDispatcher,
+    origin: &str,
+    tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
+) -> MessagingResult {
+    boot_messaging_carrying(config, db, apps, alert_dispatcher, origin, tool_registry)
+        .await
+        .0
+}
+
+/// [`boot_messaging_with_tools`] keeping the plan-carried half: the ingress set
+/// the broker SUBSCRIBE union and the router's route table are built from, and
+/// the surface-error advisory. For the tests whose subject is what boot hands
+/// onward rather than what it installed.
+pub async fn boot_messaging_carrying(
+    config: &brenn_lib::config::BrennConfig,
+    db: brenn_db::Db,
+    apps: &Arc<IndexMap<String, AppConfig>>,
+    alert_dispatcher: AlertDispatcher,
+    origin: &str,
+    tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
+) -> (MessagingResult, PlanCarried) {
     build_messaging(
         config,
         db,
@@ -42,11 +76,9 @@ pub async fn boot_messaging_with(
         ActiveBridges::new(),
         alert_dispatcher,
         Some(Arc::from(origin)),
-        &webhooks,
+        &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
+        tool_registry,
         &[],
-        &tuning_for(config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
     )
     .await
 }
@@ -143,6 +175,137 @@ pub fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+    }
+}
+
+/// The one `[[channel]]` block every document that activates messaging owes the
+/// self-description derivation: `brenn:surface.index`, retained so a
+/// non-subscriber pull sees the latest document.
+///
+/// A document declaring `[[surface]]` blocks owes the per-surface and per-kind
+/// families beside it; this is the floor, which is what a document with no
+/// surface at all still has to declare.
+pub fn surface_index_channel() -> brenn_lib::messaging::config::ChannelConfigRaw {
+    brenn_lib::messaging::config::ChannelConfigRaw {
+        // Fixed rather than random: two boots of one fixture's document must
+        // name the same row, which is what the across-restart tests rest on.
+        uuid: Some("5f1d1a9e-0000-4000-8000-000000000001".to_string()),
+        ..durable_channel("brenn:surface.index", Depth::Bounded(1))
+    }
+}
+
+/// A durable `[[channel]]` block at `address`, retaining `standing` for a
+/// subscriber that was not there, at depth 1 everywhere else and every other
+/// knob defaulted.
+///
+/// The single base `ChannelConfigRaw` literal for the test modules of this
+/// crate and of the composition root above it: a fixture wanting a fixed uuid,
+/// a description or a different depth says so by struct update, so a new field
+/// on the block type is one edit rather than one per test module.
+pub fn durable_channel(
+    address: &str,
+    standing: Depth,
+) -> brenn_lib::messaging::config::ChannelConfigRaw {
+    brenn_lib::messaging::config::ChannelConfigRaw {
+        send_rate: None,
+        uuid: Some(uuid::Uuid::new_v4().to_string()),
+        address: Some(address.to_string()),
+        address_prefix: None,
+        description: None,
+        push_depth: Some(Depth::Bounded(1)),
+        retain_depth: Some(Depth::Bounded(1)),
+        standing_retain_depth: Some(standing),
+        noise: None,
+        sink: None,
+        wake_min: None,
+    }
+}
+
+/// Every `[[channel]]` block the self-description derivation requires of a
+/// document declaring one `[[surface]]` named `slug` whose components are
+/// `kinds`: the boot-published index and per-surface help, each kind's help and
+/// schema, the surface's runtime geometry/status pair, and its ephemeral
+/// bindings channel — each at the depths the derivation's validation demands.
+///
+/// The durable blocks take a uuid derived from the address, so a fixture's
+/// document names the same rows on a second boot.
+pub fn surface_description_channels(
+    slug: &str,
+    kinds: &[&str],
+) -> Vec<brenn_lib::messaging::config::ChannelConfigRaw> {
+    let retained = |address: String| brenn_lib::messaging::config::ChannelConfigRaw {
+        uuid: Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, address.as_bytes()).to_string()),
+        ..durable_channel(&address, Depth::Bounded(1))
+    };
+    let mut channels = vec![
+        surface_index_channel(),
+        retained(format!("brenn:surface.surface.{slug}.help")),
+        retained(format!("brenn:surface.surface.{slug}.geometry")),
+        retained(format!("brenn:surface.surface.{slug}.status")),
+    ];
+    for kind in kinds {
+        channels.push(retained(format!("brenn:surface.kind.{kind}.help")));
+        channels.push(retained(format!("brenn:surface.kind.{kind}.schema")));
+    }
+    // The bindings channel is ephemeral: its retain depth *is* its standing
+    // buffer, which is what a surface attaching later replays from.
+    channels.push(brenn_lib::messaging::config::ChannelConfigRaw {
+        uuid: None,
+        standing_retain_depth: None,
+        ..durable_channel(
+            &format!("ephemeral:surface.surface.{slug}.bindings"),
+            Depth::Bounded(1),
+        )
+    });
+    channels
+}
+
+/// A `[[webhook_endpoint]]` block stating only its slug: bearer-token scheme
+/// with no tokens, every other knob at its default. Enough for the boot
+/// derivation, which reads a block's slug, description and mount and nothing
+/// else; the secret material is `resolve_webhook_endpoints`' business.
+pub fn webhook_endpoint_raw(slug: &str) -> brenn_lib::webhook::WebhookEndpointConfigRaw {
+    brenn_lib::webhook::WebhookEndpointConfigRaw {
+        slug: slug.to_string(),
+        mount: None,
+        description: None,
+        transport_ceiling_bytes: 1024 * 1024,
+        content_type: "application/json".to_string(),
+        signature: brenn_lib::webhook::config::WebhookSignatureConfigRaw::BearerToken {
+            header: "authorization".to_string(),
+            token_id_header: None,
+        },
+        keys: vec![],
+        tokens: vec![],
+        replay_protection: None,
+        urgency: None,
+    }
+}
+
+/// An `[[mqtt_client]]` block on a stock broker URL, every other knob at its
+/// default — the client an `mqtt:<slug>:<topic>` address needs declared before
+/// it resolves.
+pub fn minimal_mqtt_client(slug: &str) -> brenn_lib::mqtt::config::MqttClientConfigRaw {
+    brenn_lib::mqtt::config::MqttClientConfigRaw::minimal(slug, "mqtts://broker.invalid:8883")
+}
+
+/// An `[[app]]` block whose only messaging content is one
+/// `[[app.mqtt_subscription]]` on `channel` — the shape that mints an
+/// `mqtt:<client>:<topic>` ingress channel from the app side.
+pub fn app_raw_with_mqtt_subscription(
+    slug: &str,
+    channel: &str,
+) -> brenn_lib::config::AppConfigRaw {
+    brenn_lib::config::AppConfigRaw {
+        slug: slug.to_string(),
+        mqtt_subscriptions: vec![brenn_lib::mqtt::config::AppMqttIngressSubscriptionRaw {
+            channel: channel.to_string(),
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: Some(Depth::Bounded(4)),
+            noise: None,
+            wake_min: None,
+        }],
+        ..Default::default()
     }
 }
 

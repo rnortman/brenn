@@ -20,6 +20,7 @@ pub mod directory;
 pub mod gates;
 pub mod identity;
 pub mod remote;
+pub mod tombstone;
 
 #[cfg(any(test, feature = "testutils"))]
 pub mod test_support;
@@ -48,6 +49,7 @@ pub use directory::{
 };
 pub use identity::{AttachKind, AttachScope, ParticipantId, SubscriberKind};
 pub use remote::{RemoteConfigRaw, RemoteDepths, RemoteToken, ResolvedRemote};
+pub use tombstone::{Lookup, TombstonedRegistry};
 
 // The wire contract between the Brenn host and WASM guest components lives in
 // `brenn-envelope` so guests can depend on that lightweight crate without

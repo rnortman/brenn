@@ -51,12 +51,6 @@ pub struct ResolvedConfig {
     /// Resolved webhook transport endpoints, keyed by slug. Empty when no
     /// `[[webhook_endpoint]]` blocks are declared.
     pub webhook_endpoints: IndexMap<String, Arc<crate::webhook::ResolvedWebhookEndpoint>>,
-    /// Distinct MQTT ingress channels (the client-in-address model), deduplicated
-    /// by `channel_uuid` across all apps' `[[app.mqtt_subscription]]` blocks.
-    /// Empty when no app declares an mqtt subscription. Each channel is one
-    /// `mqtt:<client>:<topic>` channel; the channel-entry derivation, ingress
-    /// union-set, and router routing table read this in the bootstrap layer.
-    pub mqtt_ingress_channels: Vec<crate::mqtt::config::ResolvedMqttIngressChannel>,
     /// Resolved `[[mqtt_client]]` map, keyed by slug, with secret files
     /// (`password_file`/`ca_file`) read exactly once during startup. Threaded to
     /// the bootstrap layer so the ingress-supervisor wiring (`start_mqtt`) looks
@@ -66,10 +60,6 @@ pub struct ResolvedConfig {
     pub mqtt_clients: IndexMap<String, crate::mqtt::config::MqttClientConfig>,
     /// Resolved PWA push config. `None` when no app has `pwa_push.enabled = true`.
     pub pwa_push: Option<crate::pwa_push::config::ResolvedPwaPushConfig>,
-    /// Tuning entries from `[[channel]]` blocks that address system-minted
-    /// channels, supplying depths without declaring a channel. All mint sites
-    /// must resolve against the same table.
-    pub system_channel_tuning: crate::messaging::config::SystemChannelTuning,
     /// Declared Claude accounts, keyed by profile name, with each token file
     /// read exactly once during startup.
     pub claude_profiles: std::collections::BTreeMap<String, super::ClaudeProfile>,
@@ -888,6 +878,9 @@ pub fn validate_and_resolve(
     // configs carry every fact a hot path needs.
     resolve_messaging_layer(&config.channels, &config.messaging, &config.apps, &mut apps);
 
+    // Local to this pass, and deliberately not returned: the tuning is a pure
+    // function of the document, and every mint site derives it from the
+    // document it is minting for rather than from a boot-time snapshot.
     let system_channel_tuning =
         crate::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging);
 
@@ -914,84 +907,20 @@ pub fn validate_and_resolve(
     }
 
     // Resolve per-app `[[app.mqtt_subscription]]` (ingress) blocks against the
-    // resolved client map, stamp them onto each
-    // `AppConfig::mqtt_subscriptions`, and collect the distinct ingress channels.
-    // Each subscription names its channel by full address `mqtt:<client>:<topic>`
-    // (client mandatory); address parsing, client validation, topic validation,
-    // and generic-param resolution all happen in `resolve_app_mqtt_subscriptions`,
-    // which panics on any config error (design §2.4). The distinct ingress
-    // channels (deduplicated by `channel_uuid`) are threaded to the bootstrap
-    // layer via `ResolvedConfig.mqtt_ingress_channels`, where they drive `mqtt:`
-    // channel derivation, the ingress union-set, and the router routing table.
-    //
-    // No conflict check is needed: `qos`/`urgency` are connection-level on
-    // `[[mqtt_client]]`, so the same `(client, topic)` across apps always carries
-    // identical delivery intent (design §2.3/§2.4).
-    let mut mqtt_ingress_channels: Vec<crate::mqtt::config::ResolvedMqttIngressChannel> =
-        Vec::new();
-    let mut seen_channel_uuids = std::collections::HashSet::new();
+    // resolved client map and stamp them onto each `AppConfig::mqtt_subscriptions`.
+    let client_identities = crate::mqtt::config::client_identities(&resolved_clients);
     for raw in &config.apps {
         if raw.mqtt_subscriptions.is_empty() {
             continue;
         }
         let subs = crate::mqtt::config::resolve_app_mqtt_subscriptions(
             raw,
-            &resolved_clients,
+            &client_identities,
             &system_channel_tuning,
             &config.messaging,
         );
-        for sub in &subs {
-            if seen_channel_uuids.insert(sub.channel_uuid) {
-                // Resolve the distinct ingress channel (carrying qos/urgency) via the
-                // shared helper, exactly as the WASM-consumer walk below does — the
-                // canonical sub address re-resolves to the same channel identity.
-                // `resolve_app_mqtt_subscriptions` already validated the address,
-                // client, and topic, so the helper's client/topic panics here are an
-                // invariant re-check: a firing panic is a host bug (diverged client
-                // maps), not operator config, despite its operator-shaped message.
-                let owner_desc = format!("app {:?}: [[app.mqtt_subscription]]", raw.slug);
-                let ch = crate::mqtt::config::resolve_mqtt_ingress_channel(
-                    &sub.channel_address,
-                    &resolved_clients,
-                    &owner_desc,
-                );
-                mqtt_ingress_channels.push(ch);
-            }
-        }
         if let Some(app) = apps.get_mut(&raw.slug) {
             app.mqtt_subscriptions = subs;
-        }
-    }
-
-    // WASM consumers contribute `mqtt:` ingress channels too. A
-    // `[[wasm_consumer.subscription]]` naming an `mqtt:<client>:<topic>` channel
-    // is a subscribe intent identical to an app's, and must drive the same
-    // `mqtt:` channel-entry derivation, broker SUBSCRIBE union, and router route
-    // — otherwise `directory.resolve` would panic on a channel no app declared.
-    // Walk after the apps and dedupe into the same set by `channel_uuid`: an app
-    // and a WASM consumer sharing a filter yield one channel, one SUBSCRIBE, one
-    // route, with subscriber fan-out delivering to both. Non-`mqtt:`
-    // subscriptions (`brenn:`/`webhook:`) are untouched by this walk. WASM sub
-    // params resolve later in `resolve_wasm_consumers` against the derived
-    // channel entry; here we need only the channel identity.
-    for consumer in &config.wasm_consumers {
-        for sub in &consumer.subscriptions {
-            // A free port rides an auto channel, never `mqtt:`.
-            let Some(channel) = sub.channel.as_deref() else {
-                continue;
-            };
-            if !crate::mqtt::address::is_mqtt_address(channel) {
-                continue;
-            }
-            let owner_desc = format!("[[wasm_consumer]] {:?}", consumer.slug);
-            let ch = crate::mqtt::config::resolve_mqtt_ingress_channel(
-                channel,
-                &resolved_clients,
-                &owner_desc,
-            );
-            if seen_channel_uuids.insert(ch.channel_uuid) {
-                mqtt_ingress_channels.push(ch);
-            }
         }
     }
 
@@ -1060,10 +989,8 @@ pub fn validate_and_resolve(
     ResolvedConfig {
         apps: Arc::new(apps),
         webhook_endpoints,
-        mqtt_ingress_channels,
         mqtt_clients: resolved_clients,
         pwa_push,
-        system_channel_tuning,
         claude_profiles,
     }
 }

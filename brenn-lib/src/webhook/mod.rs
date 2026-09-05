@@ -34,6 +34,6 @@ pub mod scheme;
 pub use config::{
     AppWebhookSubscriptionRaw, ResolvedWebhookEndpoint, ResolvedWebhookSubscription,
     WebhookEndpointConfigRaw, WebhookKeyConfigRaw, WebhookOwner, WebhookTokenConfigRaw,
-    resolve_webhook_endpoints,
+    resolve_webhook_endpoints, webhook_mount,
 };
 pub use scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};

@@ -774,3 +774,5 @@ mod pacing;
 mod renotify;
 #[cfg(test)]
 mod scan;
+#[cfg(test)]
+mod stop;

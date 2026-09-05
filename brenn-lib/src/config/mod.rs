@@ -35,6 +35,8 @@ pub(crate) use brenn::load_config_from;
 pub use brenn::*;
 /// What a document load or check reads: the root and its module roots.
 pub use brenn_dsl::DocumentInputs;
+/// One file of a loaded document: its place within the document, and its hash.
+pub use brenn_dsl::SourceFile;
 pub use claude_defaults::*;
 pub use claude_profile::*;
 pub use container::*;

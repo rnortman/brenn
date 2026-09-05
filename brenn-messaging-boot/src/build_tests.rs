@@ -1,8 +1,10 @@
 //! End-to-end tests for `build_messaging` and `build_apps_with_messaging`.
 
 use super::test_fixtures::{
-    boot_messaging_with, io_port_raw, local_sub_raw, minimal_app_config, minimal_surface_raw,
-    minimal_wasm_consumer, resolved_ingress_sub, surface_sub_raw, tuning_for,
+    app_raw_with_mqtt_subscription, boot_messaging_carrying, boot_messaging_with,
+    boot_messaging_with_tools, io_port_raw, local_sub_raw, minimal_app_config, minimal_mqtt_client,
+    minimal_surface_raw, minimal_wasm_consumer, resolved_ingress_sub, surface_description_channels,
+    surface_index_channel, surface_sub_raw, webhook_endpoint_raw,
 };
 use super::*;
 use brenn_lib::config::AppConfig;
@@ -10,14 +12,6 @@ use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig};
 use brenn_lib::mqtt::config::MqttClientConfigRaw;
 use brenn_lib::webhook::ResolvedWebhookSubscription;
-
-/// An empty tool registry for `build_messaging` calls that do not exercise the
-/// async tool substrate: with no async tools registered, no `brenn:tools/*`
-/// channels or `system:tool-executor` policy are derived, so these tests observe
-/// the pre-tool-substrate behavior unchanged.
-fn empty_tool_registry() -> std::sync::Arc<brenn_tool_registry::ToolRegistry> {
-    std::sync::Arc::new(brenn_tool_registry::ToolRegistry::new(vec![]))
-}
 
 /// A non-durable `[[channel]]` block at `depth` for both rungs. Standing is the
 /// retained window on a non-durable channel, so it is left unstated. Tests use
@@ -245,52 +239,61 @@ fn a_transport_only_apps_budget_survives_the_unmerged_map() {
     );
 }
 
-/// An ingress channel produces an `mqtt:<client>:<topic>` `ChannelEntry` in
-/// the directory. Drives the real
-/// `build_messaging` with one `ResolvedMqttIngressChannel` and asserts the
-/// resulting `Messenger` directory carries the `mqtt:<client>:<topic>` channel
-/// with `transport_type = Mqtt` and the resolved-address UUID. This is the
-/// only test that exercises the `mqtt_channel_entries` derivation loop
-/// end-to-end: if that loop were dropped, misconfigured, or used the wrong
-/// UUID namespace, this test would fail.
+/// An `[[app.mqtt_subscription]]` produces an `mqtt:<client>:<topic>`
+/// `ChannelEntry` in the directory. Drives the real `build_messaging` over a
+/// document whose only messaging content is that subscription and its
+/// `[[mqtt_client]]`, and asserts the resulting `Messenger` directory carries
+/// the `mqtt:<client>:<topic>` channel with `transport_type = Mqtt` and the
+/// resolved-address UUID. This is the only test that exercises the ingress
+/// derivation and the `mqtt_channel_entries` loop end-to-end: if either were
+/// dropped, misconfigured, or used the wrong UUID namespace, this test would
+/// fail.
 #[tokio::test]
 async fn build_messaging_derives_mqtt_channel_entry() {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::messaging::mqtt_channel_uuid_from_address;
-    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
     let address = "mqtt:homeassistant:home/+/state";
-    let channel_def = ResolvedMqttIngressChannel {
-        channel_address: address.to_string(),
-        channel_uuid: mqtt_channel_uuid_from_address(address),
-        client_slug: "homeassistant".to_string(),
-        topic: "home/+/state".to_string(),
-        qos: 1,
-        urgency: brenn_lib::messaging::Urgency::Normal,
+    let mut config = BrennConfig {
+        mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
+        apps: vec![app_raw_with_mqtt_subscription("someapp", address)],
+        ..BrennConfig::default()
     };
-
-    let config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
     let db = init_db_memory();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
+    let (result, carried) = boot_messaging_carrying(
         &config,
         db,
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        std::slice::from_ref(&channel_def),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
+        &Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
     )
     .await;
+
+    // The directory entry is half of it. The other half is the set boot carries
+    // onward: the broker SUBSCRIBE union and the router's ingress route table
+    // are built from nothing else, so an entry in the directory with no fact
+    // behind it is a channel that never receives.
+    let ingress = &carried.mqtt_ingress_channels;
+    assert_eq!(
+        ingress.len(),
+        1,
+        "one subscription on one filter mints one ingress fact"
+    );
+    assert_eq!(ingress[0].channel_address, address);
+    assert_eq!(ingress[0].client_slug, "homeassistant");
+    assert_eq!(ingress[0].topic, "home/+/state");
+    assert_eq!(
+        ingress[0].qos,
+        minimal_mqtt_client("homeassistant").qos,
+        "the fact carries the broker's own SUBSCRIBE qos"
+    );
 
     // Ingress channels alone bring the service up.
     let messenger = result
@@ -328,7 +331,6 @@ async fn build_messaging_derives_mqtt_channel_entry() {
 async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::messaging::mqtt_channel_uuid_from_address;
-    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
@@ -341,16 +343,12 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
     // the same client — it brings messaging up (the `any_messaging` gate) and
     // is exactly the design's "config that omits that filter" restart state.
     let static_address = "mqtt:homeassistant:home/static/state";
-    let static_channel = ResolvedMqttIngressChannel {
-        channel_address: static_address.to_string(),
-        channel_uuid: mqtt_channel_uuid_from_address(static_address),
-        client_slug: "homeassistant".to_string(),
-        topic: "home/static/state".to_string(),
-        qos: 1,
-        urgency: brenn_lib::messaging::Urgency::Normal,
+    let mut config = BrennConfig {
+        mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
+        apps: vec![app_raw_with_mqtt_subscription("someapp", static_address)],
+        ..BrennConfig::default()
     };
-
-    let config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
     let db = init_db_memory();
     // Seed the DB to look exactly like "a runtime dynamic subscribe created
     // this mqtt: channel and persisted its durable row" — but the channel is
@@ -396,24 +394,11 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
     apps_map.insert("graf".to_string(), graf_app);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
     // The runtime-created filter is absent from config; only the unrelated
     // static channel for the same client is present.
-    let result = build_messaging(
-        &config,
-        db.clone(),
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        std::slice::from_ref(&static_channel),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result =
+        boot_messaging_with(&config, db.clone(), &apps, alert_dispatcher, "brenn://test").await;
 
     let messenger = result
         .messenger
@@ -471,10 +456,11 @@ async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
 
     // One unrelated channel brings messaging up; the chat family is derived
     // from the conversation row, never declared.
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![nondurable_channel("ephemeral:inert", 1)],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
     let owner = "cchost";
     let peer = "cbpeer";
     let conversation_id = 1;
@@ -599,11 +585,11 @@ async fn build_messaging_holds_a_dynamic_subscription_dormant_while_its_block_is
     // The block that keeps messaging up when the declared one is commented out.
     let inert_block = nondurable_channel("ephemeral:inert", 1);
     let with_block = BrennConfig {
-        channels: vec![declared_block, inert_block.clone()],
+        channels: vec![declared_block, inert_block.clone(), surface_index_channel()],
         ..BrennConfig::default()
     };
     let without_block = BrennConfig {
-        channels: vec![inert_block],
+        channels: vec![inert_block, surface_index_channel()],
         ..BrennConfig::default()
     };
 
@@ -739,11 +725,11 @@ async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_d
     };
     let inert_block = nondurable_channel("ephemeral:inert", 1);
     let with_block = BrennConfig {
-        channels: vec![declared_block, inert_block.clone()],
+        channels: vec![declared_block, inert_block.clone(), surface_index_channel()],
         ..BrennConfig::default()
     };
     let without_block = BrennConfig {
-        channels: vec![inert_block],
+        channels: vec![inert_block, surface_index_channel()],
         ..BrennConfig::default()
     };
 
@@ -814,7 +800,6 @@ async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_d
 async fn build_messaging_does_not_reconstruct_orphan_channel() {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::messaging::mqtt_channel_uuid_from_address;
-    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
@@ -825,16 +810,12 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
 
     // An unrelated static ingress channel brings messaging up (any_messaging gate).
     let static_address = "mqtt:homeassistant:home/static/state";
-    let static_channel = ResolvedMqttIngressChannel {
-        channel_address: static_address.to_string(),
-        channel_uuid: mqtt_channel_uuid_from_address(static_address),
-        client_slug: "homeassistant".to_string(),
-        topic: "home/static/state".to_string(),
-        qos: 1,
-        urgency: brenn_lib::messaging::Urgency::Normal,
+    let mut config = BrennConfig {
+        mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
+        apps: vec![app_raw_with_mqtt_subscription("someapp", static_address)],
+        ..BrennConfig::default()
     };
-
-    let config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
     let db = init_db_memory();
     // Seed ONLY the channel row — NO messaging_dynamic_subscriptions row.
     {
@@ -861,22 +842,9 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
-        &config,
-        db.clone(),
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        std::slice::from_ref(&static_channel),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result =
+        boot_messaging_with(&config, db.clone(), &apps, alert_dispatcher, "brenn://test").await;
 
     let messenger = result
         .messenger
@@ -914,7 +882,6 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
 async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_restart() {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::messaging::{SubscriberEntryKind, mqtt_channel_uuid_from_address};
-    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
@@ -925,16 +892,12 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
     // omits that filter" restart state with one unrelated static ingress
     // channel for the same client (same shape as the persistence test above).
     let static_address = "mqtt:homeassistant:home/static/state";
-    let static_channel = ResolvedMqttIngressChannel {
-        channel_address: static_address.to_string(),
-        channel_uuid: mqtt_channel_uuid_from_address(static_address),
-        client_slug: "homeassistant".to_string(),
-        topic: "home/static/state".to_string(),
-        qos: 1,
-        urgency: brenn_lib::messaging::Urgency::Normal,
+    let mut config = BrennConfig {
+        mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
+        apps: vec![app_raw_with_mqtt_subscription("someapp", static_address)],
+        ..BrennConfig::default()
     };
-
-    let config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
     let db = init_db_memory();
     // Seed exactly as if a runtime dynamic subscribe created this mqtt: channel
     // and persisted its durable row — the channel is in NO config.
@@ -968,7 +931,6 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
     }
 
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
     // --- Phase 1: restart with the ACL REVOKED (graf's policy does not cover
     // the runtime channel — `AppPolicy::default()` has no covering matcher). ---
@@ -980,18 +942,12 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
         Arc::new(m)
     };
 
-    let revoked = build_messaging(
+    let revoked = boot_messaging_with(
         &config,
         db.clone(),
         &apps_revoked,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        std::slice::from_ref(&static_channel),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 
@@ -1045,18 +1001,12 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
         Arc::new(m)
     };
 
-    let resumed = build_messaging(
+    let resumed = boot_messaging_with(
         &config,
         db.clone(),
         &apps_restored,
-        ActiveBridges::new(),
         alert_dispatcher2,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        std::slice::from_ref(&static_channel),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 
@@ -1095,19 +1045,22 @@ fn config_with_one_brenn_channel(address: &str) -> (brenn_lib::config::BrennConf
     use brenn_lib::messaging::config::ChannelConfigRaw;
     let uuid = uuid::Uuid::new_v4();
     let config = brenn_lib::config::BrennConfig {
-        channels: vec![ChannelConfigRaw {
-            send_rate: None,
-            uuid: Some(uuid.to_string()),
-            address: Some(address.to_string()),
-            address_prefix: None,
-            description: None,
-            push_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
-            retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
-            standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
-            noise: None,
-            sink: None,
-            wake_min: None,
-        }],
+        channels: vec![
+            ChannelConfigRaw {
+                send_rate: None,
+                uuid: Some(uuid.to_string()),
+                address: Some(address.to_string()),
+                address_prefix: None,
+                description: None,
+                push_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+                retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+                standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+                noise: None,
+                sink: None,
+                wake_min: None,
+            },
+            surface_index_channel(),
+        ],
         ..brenn_lib::config::BrennConfig::default()
     };
     (config, uuid)
@@ -1168,21 +1121,14 @@ async fn build_messaging_panics_on_static_app_sub_without_covering_policy() {
     );
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
     // Panics in validate_static_subscriptions_deliverable before any DB work.
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -1214,20 +1160,13 @@ async fn build_messaging_accepts_static_app_sub_with_covering_policy() {
     );
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
+    let result = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
     // No panic: a covered static subscription is accepted, and messaging comes up.
@@ -1292,20 +1231,13 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -1359,20 +1291,13 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -1433,20 +1358,13 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -1515,20 +1433,13 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -1589,20 +1500,13 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
+    let result = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
     // No panic: a covered static WASM subscription is accepted and boots.
@@ -1615,36 +1519,6 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
 // -----------------------------------------------------------------------
 // WASM `webhook:` / `mqtt:` subscribe grants (receive path)
 // -----------------------------------------------------------------------
-
-/// One-endpoint webhook map for `build_messaging`, owned by `owning_app_slug`.
-fn webhook_endpoint_map(
-    endpoint_slug: &str,
-    owning_app_slug: &str,
-) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
-    use brenn_lib::webhook::{ResolvedWebhookEndpoint, SignatureScheme, WebhookOwner};
-    let mut m: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
-    m.insert(
-        endpoint_slug.to_string(),
-        Arc::new(ResolvedWebhookEndpoint {
-            slug: endpoint_slug.to_string(),
-            mount: format!("/webhooks/{endpoint_slug}"),
-            description: None,
-            transport_ceiling_bytes: 1024 * 1024,
-            content_type: "application/json".to_string(),
-            // Scheme is exercised only at HTTP ingress, not at build_messaging;
-            // any valid variant suffices for deriving the channel entry.
-            scheme: SignatureScheme::BearerToken {
-                header: "authorization".parse().unwrap(),
-                token_id_header: None,
-                tokens: std::collections::HashMap::new(),
-            },
-            owner: WebhookOwner::App(Arc::from(owning_app_slug)),
-            urgency: brenn_lib::messaging::Urgency::Normal,
-            replay_protection: None,
-        }),
-    );
-    m
-}
 
 /// New check 2e: a `[[wasm_consumer]]` whose `mqtt_subscribe` ACL matcher names
 /// a client that no `[[mqtt_client]]` declares must panic at boot — the client
@@ -1696,20 +1570,13 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -1731,6 +1598,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
     let endpoint_slug = "push-alice";
     // The bound output resolves against this brenn: channel; publish_acl covers it.
     let (mut config, _uuid) = config_with_one_brenn_channel("wasm-demo-out");
+    config.webhook_endpoints = vec![webhook_endpoint_raw(endpoint_slug)];
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-demo-alice".to_string(),
         package: "processor-demo".to_string(),
@@ -1778,22 +1646,12 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    // The endpoint is owned by an app that need not exist as an [[app]] here —
-    // the webhook channel entry + WASM subscriber are what this test exercises.
-    let webhook_endpoints = webhook_endpoint_map(endpoint_slug, "pa-alice");
-
-    let result = build_messaging(
+    let result = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 
@@ -1826,6 +1684,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
 
     let endpoint_slug = "push-alice";
     let (mut config, _uuid) = config_with_one_brenn_channel("unused");
+    config.webhook_endpoints = vec![webhook_endpoint_raw(endpoint_slug)];
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-demo-alice".to_string(),
         package: "processor-demo".to_string(),
@@ -1864,20 +1723,13 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints = webhook_endpoint_map(endpoint_slug, "pa-alice");
 
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -1893,25 +1745,16 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
     use brenn_lib::access::raw::MqttSubMatcherRaw;
     use brenn_lib::messaging::config::{WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw};
     use brenn_lib::messaging::{SubscriberEntryKind, mqtt_channel_uuid_from_address};
-    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
     let address = "mqtt:home:sensors/temp";
-    // The ingress channel derived from this WASM consumer's subscription.
-    let ingress = ResolvedMqttIngressChannel {
-        channel_address: address.to_string(),
-        channel_uuid: mqtt_channel_uuid_from_address(address),
-        client_slug: "home".to_string(),
-        topic: "sensors/temp".to_string(),
-        qos: 1,
-        urgency: brenn_lib::messaging::Urgency::Normal,
-    };
 
     let mut config = brenn_lib::config::BrennConfig {
         mqtt_clients: vec![MqttClientConfigRaw::minimal("home", "mqtts://127.0.0.1:1")],
         ..brenn_lib::config::BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
     config.wasm_consumers = vec![WasmConsumerConfigRaw {
         slug: "consume-mqtt".to_string(),
         package: "consume-mqtt".to_string(),
@@ -1952,20 +1795,13 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
+    let result = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        std::slice::from_ref(&ingress),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 
@@ -1998,23 +1834,10 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
 #[should_panic(expected = "can never deliver on")]
 async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
     use brenn_lib::messaging::config::{WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw};
-    use brenn_lib::messaging::mqtt_channel_uuid_from_address;
-    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
     let address = "mqtt:home:sensors/temp";
-    // The ingress channel is still derived from the subscription, so the
-    // channel resolves and the subscriber attaches — the empty mqtt_subscribe_acl
-    // is what makes delivery unauthorized.
-    let ingress = ResolvedMqttIngressChannel {
-        channel_address: address.to_string(),
-        channel_uuid: mqtt_channel_uuid_from_address(address),
-        client_slug: "home".to_string(),
-        topic: "sensors/temp".to_string(),
-        qos: 1,
-        urgency: brenn_lib::messaging::Urgency::Normal,
-    };
 
     let mut config = brenn_lib::config::BrennConfig {
         mqtt_clients: vec![MqttClientConfigRaw::minimal("home", "mqtts://127.0.0.1:1")],
@@ -2058,20 +1881,13 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let _ = build_messaging(
+    let _ = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        std::slice::from_ref(&ingress),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -2091,7 +1907,7 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![ChannelConfigRaw {
             send_rate: None,
             uuid: None,
@@ -2122,35 +1938,30 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
         }],
         ..BrennConfig::default()
     };
+    config.channels.extend(surface_description_channels(
+        "deskbar",
+        &["protobar", "chrome"],
+    ));
 
     let db = init_db_memory();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
-        &config,
-        db,
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result = boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await;
 
     assert!(
         result.messenger.is_some(),
         "a surface/ephemeral-only config must bring messaging up"
     );
-    assert_eq!(result.nondurable_channels.len(), 1);
-    assert_eq!(
-        result.nondurable_channels[0].address,
-        "ephemeral:protobar-demo"
+    assert_eq!(result.nondurable_channels.len(), 2);
+    assert!(
+        result
+            .nondurable_channels
+            .iter()
+            .any(|channel| channel.address == "ephemeral:protobar-demo"),
+        "the declared ephemeral channel is resolved, beside the surface's \
+         bindings channel: {:?}",
+        result.nondurable_channels,
     );
     assert_eq!(result.surfaces.len(), 1);
     assert_eq!(result.surfaces[0].slug, "deskbar");
@@ -2182,34 +1993,21 @@ async fn build_messaging_registers_nondurable_channels_with_stores() {
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![
             nondurable_channel("ephemeral:wired", 4),
             nondurable_channel("local:inert", 4),
         ],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let db = init_db_memory();
     let db_probe = db.clone();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
-        &config,
-        db,
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result = boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await;
 
     {
         let conn = db_probe.lock().await;
@@ -2332,11 +2130,12 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
         ..minimal_wasm_consumer()
     };
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![channel],
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let db = init_db_memory();
     let db_probe = db.clone();
@@ -2422,7 +2221,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("ring-in".to_string())],
         ..minimal_wasm_consumer()
     };
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![
             chan(
                 "brenn:durable-in",
@@ -2433,6 +2232,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let db = init_db_memory();
     let db_probe = db.clone();
@@ -2519,11 +2319,12 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         local_subscribe_acl: vec![ChannelMatcherRaw::Exact("scratch".to_string())],
         ..minimal_wasm_consumer()
     };
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![channel],
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let db = init_db_memory();
     let db_probe = db.clone();
@@ -2619,10 +2420,11 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
         ..minimal_wasm_consumer()
     }
     .implying_its_vocabulary();
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let result = boot_messaging(&config, init_db_memory()).await;
 
@@ -2745,10 +2547,11 @@ async fn build_messaging_gives_a_named_brenn_io_port_channel_a_db_row() {
         ..minimal_wasm_consumer()
     }
     .implying_its_vocabulary();
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
     let db = init_db_memory();
 
     let result = boot_messaging(&config, db.clone()).await;
@@ -2810,7 +2613,7 @@ async fn auto_channels_list_as_their_durability_says() {
         ..minimal_wasm_consumer()
     }
     .implying_its_vocabulary();
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![brenn_lib::messaging::config::ChannelConfigRaw {
             send_rate: None,
             uuid: Some("5b0e1c9a-2d44-4f18-9a3b-6c7e0d81f204".to_string()),
@@ -2827,6 +2630,7 @@ async fn auto_channels_list_as_their_durability_says() {
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     // A bystander app holding a real grant on an ordinary declared channel. Its
     // listing is non-empty, so "neither auto channel is in it" is the policy
@@ -2849,19 +2653,12 @@ async fn auto_channels_list_as_their_durability_says() {
     );
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
-    let result = build_messaging(
+    let result = boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
     let messenger = result.messenger.as_ref().unwrap();
@@ -2911,7 +2708,7 @@ async fn a_shared_local_name_across_the_two_realms_boots() {
     use brenn_lib::messaging::config::{Depth, SurfaceConfigRaw};
     use brenn_server::test_support::init_db_memory;
 
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![
             brenn_lib::messaging::config::WasmConsumerConfigRaw {
                 slug: "ticker".to_string(),
@@ -2938,6 +2735,10 @@ async fn a_shared_local_name_across_the_two_realms_boots() {
         }],
         ..BrennConfig::default()
     };
+    config.channels.extend(surface_description_channels(
+        "deskbar",
+        &["protobar", "chrome"],
+    ));
 
     let result = boot_messaging(&config, init_db_memory()).await;
     let messenger = result
@@ -2993,7 +2794,7 @@ fn warm_brenn_priming_configs(
         wake_min: None,
     };
     let channel_only = BrennConfig {
-        channels: vec![channel.clone()],
+        channels: vec![channel.clone(), surface_index_channel()],
         ..BrennConfig::default()
     };
     let consumer = WasmConsumerConfigRaw {
@@ -3012,7 +2813,7 @@ fn warm_brenn_priming_configs(
         ..minimal_wasm_consumer()
     };
     let with_consumer = BrennConfig {
-        channels: vec![channel],
+        channels: vec![channel, surface_index_channel()],
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
@@ -3202,11 +3003,12 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
         ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
         ..minimal_wasm_consumer()
     };
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![channel],
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let db = init_db_memory();
 
@@ -3236,10 +3038,9 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
 #[test]
 fn messaging_configured_covers_wasm_consumer_only() {
     use brenn_lib::config::BrennConfig;
-    let empty_webhooks: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
 
     assert!(
-        !messaging_configured(&BrennConfig::default(), &empty_webhooks, &[]),
+        !messaging_configured(&BrennConfig::default()),
         "a fully default config activates no messaging subsystem"
     );
 
@@ -3248,8 +3049,31 @@ fn messaging_configured_covers_wasm_consumer_only() {
         ..BrennConfig::default()
     };
     assert!(
-        messaging_configured(&config, &empty_webhooks, &[]),
+        messaging_configured(&config),
         "a wasm-consumer-only config must activate messaging"
+    );
+}
+
+/// A `[[webhook_endpoint]]`-only document configures messaging. Nothing else in
+/// such a document declares a channel, and the endpoint's own
+/// `webhook:<slug>` entry is minted by the planner — which does not run at all
+/// on the `None` arm, so every inbound webhook publish would be refused against
+/// a channel nothing declared.
+#[test]
+fn messaging_configured_covers_webhook_endpoint_only() {
+    use brenn_lib::config::BrennConfig;
+
+    let config = BrennConfig {
+        webhook_endpoints: vec![webhook_endpoint_raw("gh-events")],
+        ..BrennConfig::default()
+    };
+    assert!(
+        messaging_configured(&config),
+        "a webhook-endpoint-only config must activate messaging"
+    );
+    assert!(
+        !messaging_configured(&BrennConfig::default()),
+        "and a default config still must not"
     );
 }
 
@@ -3262,30 +3086,17 @@ async fn build_messaging_brings_up_wasm_consumer_only_config() {
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![minimal_wasm_consumer()],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let db = init_db_memory();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
-        &config,
-        db,
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result = boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await;
 
     assert!(
         result.messenger.is_some(),
@@ -3327,14 +3138,13 @@ fn minimal_remote(
 #[test]
 fn messaging_configured_covers_remote_only() {
     use brenn_lib::config::BrennConfig;
-    let empty_webhooks: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
     let (remote, _token) = minimal_remote("pod-kitchen");
     let config = BrennConfig {
         remotes: vec![remote],
         ..BrennConfig::default()
     };
     assert!(
-        messaging_configured(&config, &empty_webhooks, &[]),
+        messaging_configured(&config),
         "a remote-only config must activate messaging"
     );
 }
@@ -3352,30 +3162,17 @@ async fn build_messaging_brings_up_remote_only_config() {
     use indexmap::IndexMap as IM;
 
     let (remote, _token) = minimal_remote("pod-kitchen");
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         remotes: vec![remote],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let db = init_db_memory();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
-        &config,
-        db,
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result = boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await;
 
     let messenger = result
         .messenger
@@ -3415,11 +3212,15 @@ async fn a_remote_and_a_surface_of_one_slug_hold_separate_send_budgets() {
     use brenn_server::test_support::init_db_memory;
 
     let (remote, _token) = minimal_remote("deskbar");
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         remotes: vec![remote],
         surfaces: vec![minimal_surface_raw()],
         ..BrennConfig::default()
     };
+    config.channels.extend(surface_description_channels(
+        "deskbar",
+        &["protobar", "chrome"],
+    ));
 
     let result = boot_messaging(&config, init_db_memory()).await;
     let messenger = result
@@ -3510,26 +3311,21 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
         rate_limit: None,
     }];
 
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![consumer],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
     let db = init_db_memory();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
+    let result = boot_messaging_with_tools(
         &config,
         db,
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        "brenn://test",
         &async_tool_registry(),
     )
     .await;
@@ -3549,6 +3345,50 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
     );
     // A different consumer's inbox is not covered (the derivation is per-slug).
     assert!(!policy.allows_channel_access("brenn:tool-results/other"));
+}
+
+/// The grant table the planner derives survives the hop boot carries it over:
+/// off the plan, onto `PlanCarried`, and into the executor's table.
+#[tokio::test]
+async fn boot_carries_the_planned_tool_caller_grant_table() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let repo_clause = std::collections::BTreeMap::from([("repo".to_string(), "brenn".to_string())]);
+    let mut granted = minimal_wasm_consumer();
+    granted.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
+        tool: "apull".to_string(),
+        acl: vec![repo_clause],
+        rate_limit: None,
+    }];
+
+    let mut config = BrennConfig {
+        wasm_consumers: vec![granted],
+        ..BrennConfig::default()
+    };
+    config.channels.push(surface_index_channel());
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+
+    let (_result, carried) = boot_messaging_carrying(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+        &async_tool_registry(),
+    )
+    .await;
+
+    let callers: Vec<&String> = carried.tool_caller_grants.keys().collect();
+    assert_eq!(callers, vec!["wasm:probe"]);
+    assert_eq!(
+        carried.tool_caller_grants["wasm:probe"]
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["apull"],
+    );
 }
 
 /// The uuid uniqueness assert covers tool-substrate entries too. A channel uuid
@@ -3587,19 +3427,13 @@ async fn build_messaging_panics_when_a_channel_uuid_collides_with_a_tool_channel
     let db = init_db_memory();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    build_messaging(
+    boot_messaging_with_tools(
         &config,
         db,
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        "brenn://test",
         &async_tool_registry(),
     )
     .await;
@@ -3657,22 +3491,8 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
     apps_map.insert("some-reader".to_string(), reader);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
-        &config,
-        db,
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result = boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await;
 
     let messenger = result.messenger.as_ref().expect("messaging must be up");
 
@@ -3742,39 +3562,26 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
 #[tokio::test]
 async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     use brenn_lib::config::BrennConfig;
-    use brenn_lib::messaging::config::{ChannelConfigRaw, Depth, SurfaceConfigRaw};
+    use brenn_lib::messaging::config::SurfaceConfigRaw;
     use brenn_messaging::query::MessageQuery;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
-    let bounded_channel = |uuid: &str, address: &str| ChannelConfigRaw {
-        send_rate: None,
-        uuid: Some(uuid.to_string()),
-        address: Some(address.to_string()),
-        address_prefix: None,
-        description: None,
-        push_depth: Some(Depth::Bounded(1)),
-        retain_depth: Some(Depth::Bounded(1)),
-        standing_retain_depth: Some(Depth::Bounded(1)),
-        noise: None,
-        sink: None,
-        wake_min: None,
-    };
-
-    // One surface (`deskbar`). The status channel is the only derived channel
-    // this test writes/reads, so it is the only one declared — `build_messaging`
-    // injects the surface's geometry/status publish grant, and the boot-stamp
-    // path publishes only to the status channel.
-    let config = BrennConfig {
-        channels: vec![bounded_channel(
-            "77777777-7777-4777-8777-777777777777",
-            "surface.surface.deskbar.status",
-        )],
+    // One surface (`deskbar`), with the whole derived channel set declared. The
+    // status channel is the only one this test writes and reads — the boot-stamp
+    // path publishes only there — and it is declared through the shared fixture
+    // beside the rest.
+    let mut config = BrennConfig {
+        channels: vec![],
         surfaces: vec![SurfaceConfigRaw {
             ..minimal_surface_raw()
         }],
         ..BrennConfig::default()
     };
+    config.channels.extend(surface_description_channels(
+        "deskbar",
+        &["protobar", "chrome"],
+    ));
     let db = init_db_memory();
     // A non-subscriber reader with covering read access to the status channel.
     let mut reader = minimal_app_config("some-reader", None, vec![]);
@@ -3785,22 +3592,8 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     apps_map.insert("some-reader".to_string(), reader);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
 
-    let result = build_messaging(
-        &config,
-        db,
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoints,
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await;
+    let result = boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test").await;
 
     let messenger = result.messenger.as_ref().expect("messaging must be up");
     let epoch = messenger.ring_epoch();
@@ -3847,10 +3640,7 @@ fn surface_with_config_channel(max_body_bytes: usize) -> brenn_lib::config::Bren
     use brenn_lib::messaging::config::SurfaceConfigRaw;
 
     BrennConfig {
-        channels: vec![nondurable_channel(
-            "ephemeral:surface.surface.deskbar.bindings",
-            1,
-        )],
+        channels: surface_description_channels("deskbar", &["protobar", "chrome"]),
         surfaces: vec![SurfaceConfigRaw {
             ..minimal_surface_raw()
         }],
@@ -4007,13 +3797,14 @@ async fn a_named_auto_channel_lists_to_a_third_party_with_its_description() {
     use brenn_lib::config::BrennConfig;
     use brenn_server::test_support::init_db_memory;
 
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![io_port_consumer(
             "ticker",
             &[("timer", Some("brenn:etl.batches"))],
         )],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let mut policy = AppPolicy::default();
     policy.grants.insert(AppCapability::MessagingSubscribe);
@@ -4061,13 +3852,14 @@ async fn boot_logs_every_injected_auto_grant() {
     use brenn_lib::config::BrennConfig;
     use brenn_server::test_support::init_db_memory;
 
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![io_port_consumer(
             "ticker",
             &[("wake", None), ("batches", Some("brenn:etl.batches"))],
         )],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let result = boot_messaging(&config, init_db_memory()).await;
     let anonymous = result.wasm_consumers[0].outputs[0].channel_address.clone();
@@ -4111,12 +3903,7 @@ async fn boot_logs_every_injected_auto_grant() {
 #[should_panic(expected = "tunes a channel this config never mints")]
 fn a_tuning_block_for_an_undeclared_webhook_panics() {
     let tuning = tuning_of(&[tuning_raw("webhook:ghost")]);
-    validate_exact_tuning_blocks(
-        &tuning,
-        &IndexMap::new(),
-        &[],
-        &std::collections::HashSet::new(),
-    );
+    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), true);
 }
 
 /// Same for a tool that is not registered.
@@ -4126,9 +3913,10 @@ fn a_tuning_block_for_an_unregistered_tool_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:tools/nope")]);
     validate_exact_tuning_blocks(
         &tuning,
-        &IndexMap::new(),
+        &[],
         &["apull"],
         &std::collections::HashSet::new(),
+        true,
     );
 }
 
@@ -4140,9 +3928,10 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
     let tuning = tuning_of(&[tuning_raw("tools/nope")]);
     validate_exact_tuning_blocks(
         &tuning,
-        &IndexMap::new(),
+        &[],
         &["apull"],
         &std::collections::HashSet::new(),
+        true,
     );
 }
 
@@ -4152,7 +3941,26 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
 fn a_tuning_block_for_an_ungranted_inbox_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:tool-results/ghost")]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(&tuning, &IndexMap::new(), &["apull"], &slugs);
+    validate_exact_tuning_blocks(&tuning, &[], &["apull"], &slugs, true);
+}
+
+/// With no tool registry answering, the two tool families have no population
+/// to check a block against, so their blocks pass and the webhook arm still
+/// refuses. That is the pass a config check makes: a missed refusal on the tool
+/// families, never a false one, with boot authoritative.
+#[test]
+fn without_a_registry_the_tool_arms_are_skipped_and_the_webhook_arm_is_not() {
+    let tuning = tuning_of(&[
+        tuning_raw("brenn:tools/nope"),
+        tuning_raw("brenn:tool-results/ghost"),
+    ]);
+    validate_exact_tuning_blocks(&tuning, &[], &[], &std::collections::HashSet::new(), false);
+
+    let webhook = tuning_of(&[tuning_raw("webhook:ghost")]);
+    let refused = std::panic::catch_unwind(|| {
+        validate_exact_tuning_blocks(&webhook, &[], &[], &std::collections::HashSet::new(), false);
+    });
+    assert!(refused.is_err());
 }
 
 /// An exact `mqtt:` block naming a channel nothing has minted yet boots
@@ -4171,12 +3979,7 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
         tuning_raw("brenn:tool-results/sync"),
     ]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(
-        &tuning,
-        &webhook_endpoint_map("gh-events", "someapp"),
-        &["apull"],
-        &slugs,
-    );
+    validate_exact_tuning_blocks(&tuning, &["gh-events"], &["apull"], &slugs, true);
 }
 
 /// The tuning table reaches every site that mints a system channel.
@@ -4190,20 +3993,10 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
 async fn a_tuning_block_reaches_every_system_channel_mint_site() {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::messaging::config::Depth;
-    use brenn_lib::messaging::mqtt_channel_uuid_from_address;
-    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
 
     let mqtt_address = "mqtt:homeassistant:home/tuned/state";
-    let ingress_channel = ResolvedMqttIngressChannel {
-        channel_address: mqtt_address.to_string(),
-        channel_uuid: mqtt_channel_uuid_from_address(mqtt_address),
-        client_slug: "homeassistant".to_string(),
-        topic: "home/tuned/state".to_string(),
-        qos: 1,
-        urgency: brenn_lib::messaging::Urgency::Normal,
-    };
 
     let repo_clause = std::collections::BTreeMap::from([("repo".to_string(), "brenn".to_string())]);
     let mut consumer = minimal_wasm_consumer();
@@ -4229,7 +4022,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
             wake_min: None,
         }
     };
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         wasm_consumers: vec![consumer],
         channels: vec![
             tuned(Some("webhook:gh-events"), None, 30),
@@ -4237,22 +4030,21 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
             tuned(Some("brenn:tool-results/probe"), None, 7),
             tuned(None, Some("mqtt:homeassistant:"), 40),
         ],
+        webhook_endpoints: vec![webhook_endpoint_raw("gh-events")],
+        mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
+        apps: vec![app_raw_with_mqtt_subscription("someapp", mqtt_address)],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let result = build_messaging(
+    let result = boot_messaging_with_tools(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoint_map("gh-events", "someapp"),
-        std::slice::from_ref(&ingress_channel),
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        "brenn://test",
         &async_tool_registry(),
     )
     .await;
@@ -4359,23 +4151,18 @@ async fn build_messaging_refuses_a_tuning_block_that_mints_nothing() {
 
     let config = BrennConfig {
         channels: vec![tuning_raw("webhook:githbu")],
+        webhook_endpoints: vec![webhook_endpoint_raw("github")],
         ..BrennConfig::default()
     };
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
 
-    build_messaging(
+    boot_messaging_with(
         &config,
         init_db_memory(),
         &apps,
-        ActiveBridges::new(),
         alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhook_endpoint_map("github", "someapp"),
-        &[],
-        &tuning_for(&config),
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
+        "brenn://test",
     )
     .await;
 }
@@ -4427,10 +4214,11 @@ async fn build_messaging_publishes_a_roster_snapshot_per_app() {
     let quiet = "nobodyhome";
     // One unrelated channel brings messaging up; the rosters are derived from
     // the app set, never declared.
-    let config = BrennConfig {
+    let mut config = BrennConfig {
         channels: vec![nondurable_channel("ephemeral:inert", 1)],
         ..BrennConfig::default()
     };
+    config.channels.push(surface_index_channel());
     let roster = chat_roster_address(&config.llm_chat.prefix, owner);
 
     let db = init_db_memory();
@@ -4657,4 +4445,361 @@ fn an_auto_channel_lands_in_the_durable_half() {
         .map(|e| e.address.as_str())
         .collect();
     assert_eq!(durable, vec!["webhook:push-alice", "brenn:shared"]);
+}
+
+// -----------------------------------------------------------------------
+// The mqtt: ingress derivation
+// -----------------------------------------------------------------------
+
+/// The document a derivation test hands `derive_mqtt_ingress_channels`: one
+/// declared client, plus whatever `[[app]]` and `[[wasm_consumer]]` blocks the
+/// case needs.
+fn ingress_document(
+    clients: &[&str],
+    apps: Vec<brenn_lib::config::AppConfigRaw>,
+    consumers: Vec<brenn_lib::messaging::config::WasmConsumerConfigRaw>,
+) -> brenn_lib::config::BrennConfig {
+    brenn_lib::config::BrennConfig {
+        mqtt_clients: clients.iter().map(|s| minimal_mqtt_client(s)).collect(),
+        apps,
+        wasm_consumers: consumers,
+        ..brenn_lib::config::BrennConfig::default()
+    }
+}
+
+/// The identity map the derivation resolves clients against.
+fn ingress_identities(
+    config: &brenn_lib::config::BrennConfig,
+) -> IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity> {
+    brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients)
+}
+
+/// An `[[app.mqtt_subscription]]` mints its channel, carrying the broker's qos.
+#[test]
+fn an_app_subscription_mints_its_ingress_channel() {
+    let config = ingress_document(
+        &["ha"],
+        vec![app_raw_with_mqtt_subscription("pa", "mqtt:ha:home/+/state")],
+        vec![],
+    );
+    let channels = derive_mqtt_ingress_channels(&config, &ingress_identities(&config));
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].channel_address, "mqtt:ha:home/+/state");
+    assert_eq!(channels[0].client_slug, "ha");
+    assert_eq!(channels[0].qos, 1, "qos from the broker");
+}
+
+/// A `[[wasm_consumer.subscription]]` naming an `mqtt:` address mints its
+/// ingress channel the same way an app subscription does.
+#[test]
+fn a_consumer_subscription_mints_its_ingress_channel() {
+    let config = ingress_document(
+        &["ha"],
+        vec![],
+        vec![
+            brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+                "consume",
+                "consume",
+                &["mqtt:ha:home/+/state"],
+            ),
+        ],
+    );
+    let channels = derive_mqtt_ingress_channels(&config, &ingress_identities(&config));
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].channel_address, "mqtt:ha:home/+/state");
+}
+
+/// Two apps, or an app and a consumer, on one `(client, topic)` collapse to one
+/// channel — one upstream SUBSCRIBE, one route, fanned out to both subscribers.
+#[test]
+fn one_filter_declared_twice_mints_one_channel() {
+    let config = ingress_document(
+        &["ha"],
+        vec![
+            app_raw_with_mqtt_subscription("pa", "mqtt:ha:home/+/state"),
+            app_raw_with_mqtt_subscription("pb", "mqtt:ha:home/+/state"),
+        ],
+        vec![
+            brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+                "consume",
+                "consume",
+                &["mqtt:ha:home/+/state"],
+            ),
+        ],
+    );
+    let channels = derive_mqtt_ingress_channels(&config, &ingress_identities(&config));
+    assert_eq!(channels.len(), 1);
+}
+
+/// One topic on two clients is two channels: the client segment disambiguates.
+#[test]
+fn one_topic_on_two_clients_mints_two_channels() {
+    let config = ingress_document(
+        &["ha", "ha2"],
+        vec![
+            app_raw_with_mqtt_subscription("pa", "mqtt:ha:home/+/state"),
+            app_raw_with_mqtt_subscription("pb", "mqtt:ha2:home/+/state"),
+        ],
+        vec![],
+    );
+    let channels = derive_mqtt_ingress_channels(&config, &ingress_identities(&config));
+    assert_eq!(channels.len(), 2);
+}
+
+/// A non-`mqtt:` subscription mints nothing — the walk selects only `mqtt:`
+/// addresses, and a free port rides an auto channel.
+#[test]
+fn a_non_mqtt_subscription_mints_no_ingress_channel() {
+    let config = ingress_document(
+        &["ha"],
+        vec![],
+        vec![
+            brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+                "consume",
+                "consume",
+                &["brenn:some-channel"],
+            ),
+        ],
+    );
+    assert!(derive_mqtt_ingress_channels(&config, &ingress_identities(&config)).is_empty(),);
+}
+
+/// A filter naming a client no `[[mqtt_client]]` declares is a refusal: the
+/// client segment selects the session the delivery would arrive on.
+#[test]
+#[should_panic(expected = "not declared in any [[mqtt_client]] block")]
+fn a_filter_on_an_undeclared_client_is_refused() {
+    let config = ingress_document(
+        &[],
+        vec![],
+        vec![
+            brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+                "consume",
+                "consume",
+                &["mqtt:nonexistent:home/+/state"],
+            ),
+        ],
+    );
+    derive_mqtt_ingress_channels(&config, &ingress_identities(&config));
+}
+
+/// And a malformed topic filter (`#` not final) is a refusal too.
+#[test]
+#[should_panic(expected = "is invalid")]
+fn a_filter_with_a_misplaced_wildcard_is_refused() {
+    let config = ingress_document(
+        &["ha"],
+        vec![],
+        vec![
+            brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+                "consume",
+                "consume",
+                &["mqtt:ha:home/#/state"],
+            ),
+        ],
+    );
+    derive_mqtt_ingress_channels(&config, &ingress_identities(&config));
+}
+
+/// A document that configures no messaging hands its caller nothing to thread
+/// onward: an empty ingress set and no advisory, rather than a stale value from
+/// wherever the caller last looked.
+#[tokio::test]
+async fn a_document_with_no_messaging_carries_no_plan_values() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let (result, carried) = boot_messaging_carrying(
+        &BrennConfig::default(),
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+        &Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
+    )
+    .await;
+    assert!(result.messenger.is_none());
+    assert!(carried.mqtt_ingress_channels.is_empty());
+    assert!(carried.surface_error_advisory.is_none());
+}
+
+/// The `webhook:` directory entry carries the mount, description and
+/// slug-derived uuid from its `[[webhook_endpoint]]` block. The mount must
+/// agree with the HTTP layer's serving path; both must come from the same
+/// resolution or `list_channels` advertises a URL nothing serves.
+#[tokio::test]
+async fn build_messaging_derives_the_webhook_entry_from_its_block() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::webhook_channel_uuid_from_slug;
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let mut declared = webhook_endpoint_raw("git-v1");
+    declared.mount = Some("/webhooks/git/v1".to_string());
+    declared.description = Some("forge pushes".to_string());
+    let mut config = BrennConfig {
+        // Two blocks: one stating its mount and description, one stating
+        // neither, so the default is pinned beside the declared value.
+        webhook_endpoints: vec![declared, webhook_endpoint_raw("bare")],
+        ..BrennConfig::default()
+    };
+    config.channels.push(surface_index_channel());
+
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let directory = boot_messaging_with(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+    )
+    .await
+    .messenger
+    .expect("a webhook-endpoint document boots")
+    .directory()
+    .clone();
+
+    let entry = directory
+        .resolve("webhook:git-v1")
+        .expect("a declared endpoint is minted into the directory");
+    assert_eq!(entry.mount.as_deref(), Some("/webhooks/git/v1"));
+    assert_eq!(entry.description.as_deref(), Some("forge pushes"));
+    assert_eq!(entry.uuid, webhook_channel_uuid_from_slug("git-v1"));
+
+    let bare = directory
+        .resolve("webhook:bare")
+        .expect("an endpoint stating no mount is minted too");
+    assert_eq!(bare.mount.as_deref(), Some("/webhooks/bare"));
+    assert_eq!(bare.description, None);
+}
+
+/// Commit refuses an app map that is not the one the plan was derived from.
+/// The directory's `App` entries and the delivery gates must share one
+/// snapshot, not two equal-but-distinct maps.
+#[tokio::test]
+#[should_panic(expected = "not the one this plan was derived from")]
+async fn commit_refuses_an_apps_map_the_plan_was_not_derived_from() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    let planned: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let other: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let registry = Arc::new(brenn_tool_registry::ToolRegistry::new(vec![]));
+    let plan = plan_messaging(&PlanInputs {
+        config: &config,
+        apps: Some(&planned),
+        mqtt_clients: &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
+        tool_registry: Some(&registry),
+        replay_store_paths: &[],
+    })
+    .expect("a channel-declaring document configures messaging");
+
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    commit_messaging(
+        plan,
+        &other,
+        init_db_memory(),
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+    )
+    .await;
+}
+
+/// The carried directory is the *document's*, and stays the document's however
+/// the live one is edited afterwards.
+///
+/// It is the reload facility's baseline: the projection a fresh boot of the
+/// booted document produces, which is what every candidate is compared against.
+/// The live directory is not that — dynamic app subscriptions are merged into
+/// it at boot and attach-minted surface and remote entries arrive later — so a
+/// baseline taken from it would show the first reload phantom deltas, and
+/// either refuse a valid document or walk against entries the document never
+/// described. Nothing else asserts the difference, and "clone the live one" is
+/// the obvious-looking simplification.
+#[tokio::test]
+async fn the_carried_directory_is_the_documents_and_not_the_live_one() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::config::NoiseLevel;
+    use brenn_lib::messaging::{SubscriberEntry, SubscriberEntryKind};
+    use brenn_server::test_support::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.channels.push(durable_channel("brenn:work"));
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let (result, carried) = boot_messaging_carrying(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+        &Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
+    )
+    .await;
+    let messenger = result.messenger.as_ref().expect("messaging comes up");
+
+    let planned_before = rendered(&carried.planned_directory);
+    assert_eq!(
+        planned_before,
+        rendered(messenger.directory()),
+        "at boot the two agree; everything below is about what happens after",
+    );
+
+    // An attach session mints a subscriber on a channel the document never
+    // gave one.
+    let work = messenger
+        .directory()
+        .resolve("brenn:work")
+        .expect("the work channel is declared");
+    assert!(messenger.directory().add_subscriber(
+        &work.uuid,
+        SubscriberEntry {
+            kind: SubscriberEntryKind::Surface("wall".to_string()),
+            push_depth: Depth::Bounded(4),
+            retain_depth: Depth::Bounded(4),
+            noise: NoiseLevel::Silent,
+            wake_min: None,
+        },
+    ));
+
+    assert_ne!(
+        rendered(messenger.directory()),
+        planned_before,
+        "the live directory took the edit, so this is a real divergence",
+    );
+    assert_eq!(
+        rendered(&carried.planned_directory),
+        planned_before,
+        "the carried snapshot is detached: what the document lowered to, still",
+    );
+}
+
+/// A directory as comparable text: one line per entry with its subscribers.
+#[cfg(test)]
+fn rendered(directory: &brenn_lib::messaging::MessagingDirectory) -> Vec<String> {
+    let mut lines: Vec<String> = directory
+        .list()
+        .iter()
+        .map(|entry| {
+            let mut subscribers: Vec<String> = entry
+                .subscribers
+                .iter()
+                .map(|subscriber| format!("{:?}", subscriber.kind))
+                .collect();
+            subscribers.sort();
+            format!("{} [{}]", entry.address, subscribers.join(" | "))
+        })
+        .collect();
+    lines.sort();
+    lines
 }

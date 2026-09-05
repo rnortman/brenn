@@ -26,8 +26,8 @@ use similar::TextDiff;
 /// Panics if either file fails to load — the differ compares valid configs, and
 /// an invalid one is a louder failure than a diff.
 pub fn run_config_diff(a: &Path, b: &Path, module_roots: &[PathBuf]) -> bool {
-    let config_a = load_config(Some(a), module_roots);
-    let config_b = load_config(Some(b), module_roots);
+    let config_a = load_config(Some(a), module_roots).config;
+    let config_b = load_config(Some(b), module_roots).config;
     let (equal, rendering) = diff(
         config_a,
         config_b,

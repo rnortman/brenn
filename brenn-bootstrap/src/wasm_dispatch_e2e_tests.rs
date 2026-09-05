@@ -1249,7 +1249,7 @@ fn demo_consumer_raw(slug: &str) -> brenn_lib::messaging::config::WasmConsumerCo
     }
 }
 
-use brenn_messaging_boot::test_fixtures::io_port_raw;
+use brenn_messaging_boot::test_fixtures::{io_port_raw, surface_index_channel};
 
 /// A free input port: no channel of its own, tuned here, bound by a `link`.
 fn free_input_raw(port: &str) -> brenn_lib::messaging::config::WasmConsumerSubscriptionRaw {
@@ -1276,7 +1276,7 @@ async fn boot_dispatch(
     Vec<WasmConsumerConfig>,
     tokio::task::JoinHandle<()>,
 ) {
-    use crate::{ConsumerLoadParts, lower_consumer_load_parts};
+    use crate::consumers::{ConsumerLoadParts, lower_consumer_load_parts};
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let result = brenn_messaging_boot::test_fixtures::boot_messaging_with(
@@ -1392,7 +1392,7 @@ async fn an_io_port_timer_loop_delivers_the_guests_own_deferred_wake() {
     use brenn_lib::messaging::config::WasmConsumerConfigRaw;
 
     let config = BrennConfig {
-        channels: vec![trigger_channel()],
+        channels: vec![trigger_channel(), surface_index_channel()],
         wasm_consumers: vec![
             WasmConsumerConfigRaw {
                 io_ports: vec![io_port_raw(
@@ -1517,7 +1517,7 @@ fn link_config() -> brenn_lib::config::BrennConfig {
         ..brenn_messaging_boot::test_fixtures::minimal_wasm_consumer()
     };
     BrennConfig {
-        channels: vec![trigger_channel()],
+        channels: vec![trigger_channel(), surface_index_channel()],
         wasm_consumers: vec![producer, reader],
         links: vec![LinkConfigRaw {
             link: "hand-off".to_string(),
@@ -1622,7 +1622,7 @@ async fn a_durable_named_io_port_channel_carries_a_schedule_across_a_restart() {
     use brenn_lib::messaging::config::WasmConsumerConfigRaw;
 
     let config = BrennConfig {
-        channels: vec![trigger_channel()],
+        channels: vec![trigger_channel(), surface_index_channel()],
         wasm_consumers: vec![
             WasmConsumerConfigRaw {
                 io_ports: vec![io_port_raw(
@@ -1713,7 +1713,7 @@ async fn renaming_a_durable_auto_channel_writes_a_fresh_row() {
 
     let trigger = trigger_channel();
     let config_for = |address: &str| BrennConfig {
-        channels: vec![trigger.clone()],
+        channels: vec![trigger.clone(), surface_index_channel()],
         wasm_consumers: vec![
             WasmConsumerConfigRaw {
                 io_ports: vec![io_port_raw(
