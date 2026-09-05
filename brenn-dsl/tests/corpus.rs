@@ -46,8 +46,9 @@ fn the_lexical_corpus_deserializes() {
 }
 
 /// An import tolerates whitespace before its terminator, the way every other
-/// statement does, and tolerates it before the glob for the same reason: both
-/// sit at the one optional-whitespace position the rule has.
+/// statement does, and tolerates it before the glob as well: the rule has an
+/// optional-whitespace position at each, and each tolerates whitespace on its
+/// own — including both at once, in the glob form.
 #[test]
 fn an_import_tolerates_whitespace_before_its_terminator_and_its_glob() {
     let file = parse_str("use a::b ;\n", "t.brenn").expect("a space before the `;`");
@@ -56,12 +57,26 @@ fn an_import_tolerates_whitespace_before_its_terminator_and_its_glob() {
     let file = parse_str("use a ::*;\n", "t.brenn").expect("a space before the glob");
     assert!(file.uses[0].glob);
     assert!(file.uses[0].path.segs.is_empty());
+
+    let file = parse_str("use a::* ;\n", "t.brenn").expect("a space before the `;` of a glob");
+    assert!(file.uses[0].glob);
+}
+
+/// A `link` tolerates whitespace before its terminator too.  Nothing else in the
+/// corpus spells `link t ;`, so the position needs its own assertion.
+#[test]
+fn a_link_tolerates_whitespace_before_its_terminator() {
+    let file = parse_str("link relay ;\n", "t.brenn").expect("a space before the `;`");
+    let Item::Link(stmt) = file.items[0].value() else {
+        panic!("the only item is a link");
+    };
+    assert_eq!(stmt.handle.value(), "relay");
 }
 
 /// The sigil is glued to the module name and nothing else in the statement is:
 /// `@deskbar` is one token to a reader, so the grammar admits no whitespace
 /// between the two, while the glob keeps the tolerance every other statement
-/// has at its one optional-whitespace position.
+/// has at the optional-whitespace position that precedes it.
 #[test]
 fn a_packaged_import_admits_no_space_after_its_sigil_and_still_admits_one_before_its_glob() {
     assert!(

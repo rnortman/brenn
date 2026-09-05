@@ -61,13 +61,7 @@ chan_addr := is_prefix:"prefix"? , addr:str_like ;
 // `channel` is and targeted by bindings in a channel's place. There is no
 // address and no body: a link has neither, and the ports bound to it are what
 // bring it into existence.
-//
-// The terminator takes `.`, not `,`, for `use_stmt`'s reason: the handle is the
-// rule's last content, so a `,` there would be the one optional-whitespace
-// position in the statement, and the formatter re-emits a suppressed terminator
-// after the trivia it finds at one — putting the `;` below the blank line that
-// follows the statement.
-link_stmt := doc:doc? , %"link" : handle:name . %";" , ;
+link_stmt := doc:doc? , %"link" : handle:name , %";" , ;
 
 // Hand-minted uuids carried across a port, keyed by canonical address. A `Vec`,
 // not a keyed region: a region's key must reach text through a transparent
@@ -212,15 +206,7 @@ tail_attr := key:name , %"=" , value:value , %";" , ;
 // labeled literal for the same reason the glob is. It is glued to the path with
 // `.` so no whitespace may sit between the sigil and the name it leads: the two
 // are one token to a reader.
-//
-// The two separators differ on purpose. The `,` before the glob group is what
-// gives this statement the whitespace tolerance every other one has: it is the
-// last optional-whitespace position in the rule, so `use a::b ;` parses like
-// `const a = 1 ;`, and `use a ::*;` is tolerated with it. The terminator then
-// takes `.`, because at an optional-whitespace position the formatter re-emits a
-// suppressed terminator after the trivia it finds there — the blank line after
-// the last import would end up above a lone `;`. Both edges are pinned by tests.
-use_stmt := %"use" : pkg:"@"? . path:path , (%"::" . glob:"*")? . %";" , ;
+use_stmt := %"use" : pkg:"@"? . path:path , (%"::" . glob:"*")? , %";" , ;
 
 // A generic section: `server { ... }`, `webhook w { ... }`, and every named
 // sub-block inside an entity body. The kindword is data, not a keyword, so what
@@ -239,10 +225,14 @@ use_stmt := %"use" : pkg:"@"? . path:path , (%"::" . glob:"*")? . %";" , ;
 // decides each literal on its own. They are always written together and the
 // model reads them as one fact.
 //
-// The terminator takes `.`, not `,`, for `link_stmt`'s reason: a second
-// optional-whitespace position after the body would render as a stray space
-// before whatever follows the block, and would keep the closing brace's break
-// from collapsing into the enclosing body's.
+// The terminator takes `.`, not `,`, and this asymmetry with every `%";"`
+// statement — all of which admit whitespace before their terminator — is
+// deliberate. Here the terminator is optional, so when it is absent a `,`
+// before it would sit at the same physical gap as the rule's trailing `,`:
+// two optional-whitespace positions at one place, rendering as a stray space
+// before whatever follows the block and keeping the closing brace's break from
+// collapsing into the enclosing body's. Nothing wants `claude_profile main ;`
+// to be this language, so the terminator stays glued.
 section := doc:doc? , kindword:name , name:name? , (open:"{" , (attrs:attr | subs:section)* , close:"}")? . semi:";"? , ;
 
 // The one body-entry shape. The grammar knows no field names; the target struct

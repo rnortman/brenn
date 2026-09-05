@@ -2,8 +2,13 @@
 
 use wiring::alice::Deskbar;
 
+// Every statement below whose terminator is followed by a blank line or a
+// comment is a layout fixture as much as a syntax one: the terminator belongs
+// to its statement, and the trivia belongs to the gap it was written in.
 uuid_pins {
     "brenn:alice-desk.in.p1.messages" = "bced053b-841b-4551-9868-bfe9c47cc974";
+
+    // A pin, a blank line, and a comment, inside a braced body.
     "brenn:bob-pad.in.p1.messages" = "7d1f6c02-3a44-4c1b-9b0e-2f8f4d5a6b7c";
 }
 
@@ -29,6 +34,8 @@ channel at prefix "mqtt:broker:alice/" {
 /// Frames the echo stub hands the reserved-port demo.
 link relay;
 
+// A `link` is the shortest statement the language has, and the one that used
+// to strand its `;` under the blank line above.
 component Protobar {
     abi = processor;
     requires = [ports, log];
@@ -44,6 +51,8 @@ component EchoStub {
     optional = [takeover];
     in inbound: "brenn.panel.message@1";
     out outbound;
+
+    // A port declaration with no doctype ends on the terminator itself.
     optional io acks;
 }
 
@@ -66,6 +75,13 @@ agent PersonalAssistant(slug: String, user: String, ws: Repo, skin: String = "be
 
     mount ws { working_dir = true; }
     mount life;
+
+    // The blank line below this block is deleted by the formatter, and the
+    // canonical records that deletion — the defect TODO(dsl-fmt-tail-block-blank-line)
+    // names, not the intended layout. When that TODO closes, the blank comes back
+    // and the canonical hunk is expected.
+    mount notes { working_dir = false; // A tail statement keeps its `;` too.
+    }
 
     mcp_server graf;
     mcp_server pfin {
@@ -193,6 +209,11 @@ acl subscribe [prefix "brenn:alice-desk."];
 
 grant alice_pa publish exact wasm_demo_out;
 
+// A matcher with an inline-table tail ends on an absent optional, which is the
+// shape whose trivia used to drift past the terminator by a different route.
+grant alice_pa publish prefix "brenn:alice-desk.out." { publish_per_activation = 2.0, publish_capacity = 4.0 };
+
+
 /// Everything the arrangements this deployment stamps may ever hold.
 principal ui {
     grants = [dom, log, page-dom, ports, publish, subscribe];
@@ -202,6 +223,8 @@ principal ui {
 /// Fewer words, the same reach.
 principal ui_readonly under ui {
     grants = [dom, log, page-dom, ports];
+
+    // A list-valued attr, last in its body: its value ends on a suppressed `]`.
 }
 
 /// Exactly what `ui_readonly` holds, and no ceiling of its own.

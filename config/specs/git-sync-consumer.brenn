@@ -11,6 +11,12 @@
 /// issued without it; `alert` is how a failed pull reaches an operator, which
 /// is the whole point of running the pipeline unattended; `tools` is the
 /// authority to call `git-repo-pull` at all.
+///
+/// The map is written in the instance's `config = { ... };` attr, whose surface
+/// is flat: `repo_slugs` is a comma-separated index of the slugs this instance
+/// syncs, and one `remote_<slug>` entry per listed slug holds that repository's
+/// remote URL. A listed slug with no `remote_<slug>` entry, an empty remote
+/// value, or a slug listed twice fails the activation.
 component GitSyncConsumer {
   abi = processor;
   requires = [ports, log, store, alert, config, tools];

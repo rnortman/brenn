@@ -258,19 +258,19 @@ of that test.
 
 ## `dsl-fmt-trivia-placement`
 
-`brennfmt` renders a comment written after a statement's `;` *before* the
-semicolon, and renders a comment on its own line inside a body at column zero
-rather than at the body's indent. Both come from fltk's unparser: a suppressed
-terminal is re-emitted after the trivia that followed it, and trivia is written
-before the enclosing nest takes effect. A preserved blank line is trivia by the
-same rule, so a statement followed by a blank line can end up with its `;` alone
-on a line below the blank. Comments survive and the output is
-idempotent, so this is cosmetic — but it is what a `.brenn` file looks like
+`brennfmt` renders a comment written on its own line inside a body at column
+zero rather than at the body's indent. It comes from fltk's unparser: trivia is
+written before the enclosing nest takes effect. Comments survive and the output
+is idempotent, so this is cosmetic — but it is what a `.brenn` file looks like
 after formatting, so it is worth fixing upstream. The canonical goldens pin the
 current placement and will change when it is fixed.
 
-Done = a comment keeps its source-relative position and indentation through a
-format pass, with the fix in fltk and the goldens updated here.
+The other half of this entry — a comment after a statement's `;` rendering
+before the semicolon — is fixed: fltk binds trivia to the gap it was parsed
+from, so a terminator is emitted before whatever follows it in source.
+
+Done = a comment keeps its source-relative indentation through a format pass,
+with the fix in fltk and the goldens updated here.
 
 Code site (`TODO(dsl-fmt-trivia-placement)`): brenn-dsl/grammar/brenn.fltkfmt.
 
@@ -289,6 +289,24 @@ Done = a block-ended statement is followed by exactly one newline whatever
 follows it, with the fix in fltk and the goldens updated here.
 
 Code site (`TODO(dsl-fmt-block-blank-line)`): brenn-dsl/grammar/brenn.fltkfmt.
+
+
+## `dsl-fmt-tail-block-blank-line`
+
+The mirror image of the entry above: a blank line the author wrote *after* a
+tail-block statement — `mount ws { working_dir = true; }`, `subscribe c {
+push_depth = 1; }` — is deleted by a format pass, while the same blank after a
+body-block statement or a plain `;` statement survives. `tail_block`'s
+`after "}" { hard; }` stands at the same gap the blank was written in and wins,
+so `preserve_blanks: 1` never sees it. Cosmetic, idempotent, and older than the
+trivia-ownership fix (the pre-fix formatter drops it too). It is pinned by
+`brenn-dsl/tests/corpus/statements.canonical.brenn`, where the blank after
+`mount notes { … }` in `statements.brenn` does not survive.
+
+Done = a blank line after a tail-block statement survives a format pass like any
+other preserved blank, with the fix in fltk and the goldens updated here.
+
+Code site (`TODO(dsl-fmt-tail-block-blank-line)`): brenn-dsl/grammar/brenn.fltkfmt.
 
 
 ## `dsl-fmt-rawstring-indent`
@@ -312,22 +330,20 @@ Code site (`TODO(dsl-fmt-rawstring-indent)`): brenn-dsl/src/bin/brennfmt.rs.
 
 ## `dsl-fmt-orphan-terminator`
 
-Two layout warts in the formatter's statement handling. A comment or a blank
-line following a `;`-terminated item binds to that item, so the `;` is emitted
-*after* the comment and lands orphaned on a line of its own; and a tail-block
+One layout wart left in the formatter's statement handling: a tail-block
 statement (`mount r { working_dir = true; }`) immediately followed by a block
-statement inside the same body gains one extra leading space. Both are layout
-only — no value changes, and each output is its own fixed point, so `--check`
-accepts it and the canonical fixtures record it as intended output
-(`brenn-dsl/tests/corpus/lexical.canonical.brenn`,
-`entities.canonical.brenn`, `statements.canonical.brenn`). Every in-tree and
-out-of-tree `.brenn` written since carries the form too, so the fix is a mass
-golden churn: tracked here so it lands as one event with a stated before/after
-rather than as an unexplained reformat.
+statement inside the same body gains one extra leading space, and so does a
+body-less `section` followed by a blank line. Layout only — no value changes,
+and the output is its own fixed point, so `--check` accepts it. The trigger is
+a `section` with an absent body or a tail block before a block statement, not a
+terminator.
 
-Done = a comment or blank line after a `;`-terminated item leaves the `;` with
-its item, the tail-block/block pair indents like its neighbours, and every
-corpus golden is regenerated in one commit.
+The orphaned-terminator half of this entry is fixed: fltk now binds trivia to
+the gap it was parsed from, so a `;` stays with its item and the canonical
+goldens were regenerated in one commit.
+
+Done = the tail-block/block pair and the body-less `section` indent like their
+neighbours, with the fix in fltk and the goldens updated here.
 
 Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/src/bin/brennfmt.rs.
 

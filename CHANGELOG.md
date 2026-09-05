@@ -2,6 +2,25 @@
 
 All notable changes to Brenn are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Statement formatting no longer orphans terminators.** A `;` that ends a
+  statement used to drift below any trailing comment or blank line the author
+  wrote after it — `const p = ["a"];` followed by a blank line became two lines
+  with the blank above a bare `;`. The formatter now keeps the semicolon with
+  its statement and renders trailing trivia after it. Every corpus golden is
+  regenerated to match. The fix is in fltk (the grammar toolkit that generates
+  the formatter); brenn re-pins fltk and removes the grammar-level workarounds
+  that `link` and `use` statements carried for the bug, restoring an
+  optional-whitespace position before their terminators.
+- **`git-sync-consumer` config keys are writable in `.brenn`.** The per-repo
+  remote keys used a colon (`remote:<slug>`) that the DSL grammar cannot spell.
+  They are now `remote_<slug>`, with underscores. No backward compatibility —
+  the consumer has never been configured from a `.brenn` file in production.
+
+
 ## [0.19.0] — 2026-09-04
 
 Out-of-tree components are real — a separate repository can build and deploy

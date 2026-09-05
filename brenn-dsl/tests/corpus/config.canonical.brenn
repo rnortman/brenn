@@ -1,5 +1,6 @@
 // The server's own settings. Every one of these is a generic section: what it
 // is comes from its kindword, not from a keyword the grammar knows.
+
 /// Where the server listens and what it believes about the proxy in front.
 server {
   bind_address = "127.0.0.1:3000";

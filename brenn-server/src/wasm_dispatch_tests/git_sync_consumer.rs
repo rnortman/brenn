@@ -85,7 +85,7 @@ struct ConsumerHarness {
 fn valid_config() -> HashMap<String, String> {
     HashMap::from([
         ("repo_slugs".to_string(), SLUG.to_string()),
-        (format!("remote:{SLUG}"), REMOTE.to_string()),
+        (format!("remote_{SLUG}"), REMOTE.to_string()),
     ])
 }
 
@@ -295,6 +295,22 @@ async fn failure_count(messenger: &Messenger, sub: &ParticipantId) -> i64 {
         |r| r.get(0),
     )
     .expect("query failures")
+}
+
+/// The single quarantine row's diagnostic for a subscriber.
+///
+/// The count alone cannot tell the three misconfig lanes apart — every one of them
+/// quarantines — and the guest builds its `remote_<slug>` key literal by hand from the same
+/// spelling the host config uses, so the diagnostic is where the two are checked against each
+/// other rather than against a comment.
+async fn quarantine_diagnostic(messenger: &Messenger, sub: &ParticipantId) -> String {
+    let conn = messenger.db().lock().await;
+    conn.query_row(
+        "SELECT diagnostic FROM messaging_wasm_consume_failures WHERE subscriber = ?1",
+        rusqlite::params![sub.as_str()],
+        |r| r.get(0),
+    )
+    .expect("exactly one quarantine row")
 }
 
 /// A registry holding `git-repo-pull` over the fixture clone (behind by one, so
@@ -534,36 +550,12 @@ async fn outcome_err_alerts_and_publishes_nothing() {
 #[tokio::test]
 async fn missing_remote_config_quarantines() {
     let slug = "gsc-misconfig";
-    // repo_slugs lists a slug with no matching remote:<slug> key.
-    let config = HashMap::from([("repo_slugs".to_string(), format!("{SLUG},missing"))]);
-    let harness = consumer_harness(slug, empty_registry(), config, &[SLUG], false).await;
-    let guest_sub = harness.guest_sub.clone();
-
-    testutils::insert_bus_message(
-        &harness.messenger,
-        &harness.push_ch,
-        &push_event(&[REMOTE]),
-        ChannelScheme::Brenn,
-    )
-    .await;
-    drain_step(&harness.cfg, &guest_sub).await;
-
-    assert_eq!(
-        failure_count(&harness.messenger, &guest_sub).await,
-        1,
-        "a repo_slugs entry with no remote:<slug> key must quarantine"
-    );
-}
-
-#[tokio::test]
-async fn empty_remote_config_quarantines() {
-    let slug = "gsc-emptyremote";
-    // repo_slugs lists a slug whose remote:<slug> value is whitespace-only — a
-    // dead map entry that could never match any event. Fail fast rather than
-    // silently sync nothing.
+    // repo_slugs lists a second slug with no matching remote_<slug> key, while the
+    // first one resolves: the quarantine is about the slug that is missing its key,
+    // not about the map being empty.
     let config = HashMap::from([
-        ("repo_slugs".to_string(), SLUG.to_string()),
-        (format!("remote:{SLUG}"), "   ".to_string()),
+        ("repo_slugs".to_string(), format!("{SLUG},missing")),
+        (format!("remote_{SLUG}"), REMOTE.to_string()),
     ]);
     let harness = consumer_harness(slug, empty_registry(), config, &[SLUG], false).await;
     let guest_sub = harness.guest_sub.clone();
@@ -580,7 +572,50 @@ async fn empty_remote_config_quarantines() {
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
         1,
-        "an empty remote:<slug> value must quarantine"
+        "a repo_slugs entry with no remote_<slug> key must quarantine"
+    );
+    let diagnostic = quarantine_diagnostic(&harness.messenger, &guest_sub).await;
+    // The stored diagnostic is an escaped debug rendering, so match on fragments rather
+    // than on the guest's message verbatim: the key spelling and the lane, separately.
+    assert!(
+        diagnostic.contains("remote_missing") && diagnostic.contains("config has no"),
+        "the quarantine must be the missing-key lane, naming the key the guest looked \
+         up; got: {diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn empty_remote_config_quarantines() {
+    let slug = "gsc-emptyremote";
+    // repo_slugs lists a slug whose remote_<slug> value is whitespace-only — a
+    // dead map entry that could never match any event. Fail fast rather than
+    // silently sync nothing.
+    let config = HashMap::from([
+        ("repo_slugs".to_string(), SLUG.to_string()),
+        (format!("remote_{SLUG}"), "   ".to_string()),
+    ]);
+    let harness = consumer_harness(slug, empty_registry(), config, &[SLUG], false).await;
+    let guest_sub = harness.guest_sub.clone();
+
+    testutils::insert_bus_message(
+        &harness.messenger,
+        &harness.push_ch,
+        &push_event(&[REMOTE]),
+        ChannelScheme::Brenn,
+    )
+    .await;
+    drain_step(&harness.cfg, &guest_sub).await;
+
+    assert_eq!(
+        failure_count(&harness.messenger, &guest_sub).await,
+        1,
+        "an empty remote_<slug> value must quarantine"
+    );
+    let diagnostic = quarantine_diagnostic(&harness.messenger, &guest_sub).await;
+    assert!(
+        diagnostic.contains(&format!("remote_{SLUG}")) && diagnostic.contains("is empty"),
+        "the quarantine must be the empty-value lane, not the missing-key one; got: \
+         {diagnostic}"
     );
 }
 
@@ -591,7 +626,7 @@ async fn duplicate_slug_config_quarantines() {
     // fast rather than issue a doubled pull.
     let config = HashMap::from([
         ("repo_slugs".to_string(), format!("{SLUG},{SLUG}")),
-        (format!("remote:{SLUG}"), REMOTE.to_string()),
+        (format!("remote_{SLUG}"), REMOTE.to_string()),
     ]);
     let harness = consumer_harness(slug, empty_registry(), config, &[SLUG], false).await;
     let guest_sub = harness.guest_sub.clone();
@@ -609,6 +644,13 @@ async fn duplicate_slug_config_quarantines() {
         failure_count(&harness.messenger, &guest_sub).await,
         1,
         "a duplicate slug in repo_slugs must quarantine"
+    );
+    let diagnostic = quarantine_diagnostic(&harness.messenger, &guest_sub).await;
+    assert!(
+        diagnostic.contains("repo_slugs lists")
+            && diagnostic.contains(SLUG)
+            && diagnostic.contains("more than once"),
+        "the quarantine must be the duplicate-slug lane; got: {diagnostic}"
     );
 }
 

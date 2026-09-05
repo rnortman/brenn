@@ -141,7 +141,7 @@ fn an_agent_body_separates_its_statements_from_its_attrs() {
         "the last parameter has a default"
     );
 
-    assert_eq!(agent.mounts.len(), 2);
+    assert_eq!(agent.mounts.len(), 3);
     assert_eq!(agent.subs.len(), 2);
     assert_eq!(agent.acls.len(), 1);
     assert_eq!(agent.blocks.len(), 1, "start_hooks is a generic section");

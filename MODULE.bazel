@@ -39,7 +39,7 @@ bazel_dep(name = "rules_python", version = "1.7.0")
 bazel_dep(name = "fltk", version = "")
 git_override(
     module_name = "fltk",
-    commit = "555824e6b1dee22161260c2843bd4dec68efd11a",
+    commit = "72db6ea0b07967339ec0693030a7eafdbb143091",
     remote = "https://github.com/rnortman/fltk.git",
 )
 

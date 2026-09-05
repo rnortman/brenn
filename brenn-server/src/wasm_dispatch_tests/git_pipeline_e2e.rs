@@ -384,7 +384,7 @@ async fn build_pipeline() -> Pipeline {
     ));
     let consumer_config = HashMap::from([
         ("repo_slugs".to_string(), SLUG.to_string()),
-        (format!("remote:{SLUG}"), REMOTE.to_string()),
+        (format!("remote_{SLUG}"), REMOTE.to_string()),
     ]);
     let consumer_store = tempfile::NamedTempFile::new().unwrap();
     let mut consumer_amp = HashMap::new();

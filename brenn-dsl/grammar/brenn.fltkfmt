@@ -7,10 +7,9 @@
 
 // One comment form, one role: `//` survives formatting, `///` is a grammar rule
 // and never reaches trivia at all.
-// TODO(dsl-fmt-trivia-placement): a comment written after a statement's `;`
-// renders before it, because the suppressed terminator is re-emitted after the
-// following trivia. A preserved blank line is trivia too, so the same reordering
-// puts a lone `;` under a blank after some statements. The canonical goldens pin
+// TODO(dsl-fmt-trivia-placement): a comment written on its own line inside a
+// body renders at column zero rather than at the body's indent, because trivia
+// is written before the enclosing nest takes effect. The canonical goldens pin
 // the current placement.
 trivia_preserve: LineComment;
 preserve_blanks: 1;
@@ -157,6 +156,10 @@ rule webhook_def
 // A tail is the same content on one line: `{ push_depth = 8; }`. Its entries
 // are `tail_attr`, a rule of their own precisely so that saying "no hard break
 // after this `;`" here does not say it of every body entry in the language.
+//
+// TODO(dsl-fmt-tail-block-blank-line): `after "}"` stands at the same gap a
+// blank line following the statement was written in and wins over it, so that
+// blank is deleted. The canonical goldens pin it.
 rule tail_block
 {
     group;

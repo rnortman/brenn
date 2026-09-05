@@ -3203,6 +3203,91 @@ new sink: Sink {
     );
 }
 
+/// `git-sync-consumer` reads a comma-separated `repo_slugs` index plus one
+/// `remote_<slug>` key per listed slug, and repo slugs are hyphenated. Both
+/// spellings have to be writable as inline-table keys, which are plain DSL
+/// names: `[A-Za-z_]([A-Za-z0-9_-]*[A-Za-z0-9_])?`. A hyphen is legal inside a
+/// name and a colon is not, which is why the key is `remote_<slug>` and not
+/// `remote:<slug>`.
+///
+/// The key literals here are shared with the guest crate by hand — a wasm
+/// `cdylib` cannot be a host-test dependency — so this test and the
+/// component's header comment are the two places that must agree.
+#[test]
+fn a_consumers_config_map_spells_hyphenated_per_slug_keys() {
+    let document = concat!(
+        r#"
+// ── packaged ──
+component Sink {
+    "#,
+        processor_needs!("ports, config"),
+        r#"
+    io tick;
+}
+// ── packaged ──
+
+new sink: Sink {
+    grants = [ports, config];
+    config = {
+        repo_slugs = "alice-notes,bob-site",
+        remote_alice-notes = "ssh://git@git.example.com/alice/notes.git",
+        remote_bob-site = "https://git.example.com/bob/site.git",
+    };
+
+    io tick { push_depth = 1; retain_depth = 2; }
+}
+"#
+    );
+
+    let expected_table = toml::Table::from_iter([
+        (
+            "repo_slugs".to_string(),
+            toml::Value::String("alice-notes,bob-site".to_string()),
+        ),
+        (
+            "remote_alice-notes".to_string(),
+            toml::Value::String("ssh://git@git.example.com/alice/notes.git".to_string()),
+        ),
+        (
+            "remote_bob-site".to_string(),
+            toml::Value::String("https://git.example.com/bob/site.git".to_string()),
+        ),
+    ]);
+
+    assert_lowers(
+        document,
+        BrennConfig {
+            wasm_consumers: vec![WasmConsumerConfigRaw {
+                grants: vec![ComponentGrant::Ports, ComponentGrant::Config],
+                io_ports: vec![tick_io_port()],
+                config: Some(expected_table.clone()),
+                ..consumer_declaring("sink", &["tick"])
+            }],
+            ..Default::default()
+        },
+    );
+
+    let resolved = crate::config::wasm::resolve_component_config(
+        Some(&expected_table),
+        "wasm_consumer \"sink\" config",
+    );
+    assert_eq!(
+        resolved,
+        HashMap::from([
+            ("repo_slugs".to_string(), "alice-notes,bob-site".to_string()),
+            (
+                "remote_alice-notes".to_string(),
+                "ssh://git@git.example.com/alice/notes.git".to_string(),
+            ),
+            (
+                "remote_bob-site".to_string(),
+                "https://git.example.com/bob/site.git".to_string(),
+            ),
+        ]),
+        "the per-slug keys reach the guest unchanged",
+    );
+}
+
 /// A consumer's declared out-port vocabulary is the class's, not the
 /// instance's: every `out` and `io` port the class states travels, sorted,
 /// whether or not the instance binds it, and no `in` port does.

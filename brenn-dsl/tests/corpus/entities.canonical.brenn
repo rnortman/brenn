@@ -1,5 +1,6 @@
 // Every entity's attr vocabulary, exercised once. The key is the config
 // struct's field name, so this file doubles as the vocabulary's index.
+
 /// Everything a channel body can say.
 channel utterance at "brenn:alice-pod.out.utterance" {
   description = "What the pod host heard.";
@@ -23,9 +24,8 @@ surface alice_desk {
   skin = "bench";
   allowed_users = ["alice", "bob"];
   publish_burst = 32;
-  publish_per_sec = 4
+  publish_per_sec = 4;
 
-  ;
   acl subscribe [prefix "brenn:alice-desk."];
 }
 
@@ -71,9 +71,8 @@ remote reachy00 {
   publish_burst = 16;
   publish_per_sec = 2;
   max_sessions = 4;
-  max_subscriptions = 64
+  max_subscriptions = 64;
 
-  ;
   acl publish [prefix "brenn:reachy00.out."];
 }
 
@@ -82,9 +81,8 @@ webhook push_alice {
   description = "Pushes from alice's phone.";
   transport_ceiling_bytes = 65536;
   content_type = "application/json";
-  urgency = high
+  urgency = high;
 
-  ;
   signature {
     scheme = bearer-token;
     header = "authorization";

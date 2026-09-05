@@ -2,6 +2,9 @@
 
 use wiring::alice::Deskbar;
 use wiring::bob::*;
+
+// A glob import's terminator sits at its own optional-whitespace position, so a
+// blank line and a comment written after the `;` stay after it.
 use @deskbar::Panel;
 use @clock::*;
 
@@ -25,6 +28,17 @@ const defaults = { push_depth = 8, retain_depth = 64 };
 const scope = prefix "brenn:alice-desk.";
 const feed = topic_filter f"mqtt:broker:{alice}/#" { push_depth = 4 };
 const target = exact alice.desk.messages;
+
+// A value that ends on a suppressed closer — a list's `]`, a string's quote —
+// puts the statement's last optional-whitespace position inside the value. The
+// terminator still belongs to the statement.
+const trailing_list = ["a"];
+
+const trailing_string = "b"; // A same-line comment stays on the line.
+
+// A comment followed by a blank line survives as both.
+
+const after_a_comment = 1;
 
 /// The one generic body shape, and a sub-block of the same shape.
 server {

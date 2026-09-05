@@ -12,10 +12,24 @@
 //
 // Remote→slug mapping lives here (the parser is forge-specific and
 // repo-oblivious; this consumer owns the grant whose ACL is slug-vocabulary).
-// It is read from the flat `[wasm_consumer.config]` table: `repo_slugs` is a
-// comma-separated index and `remote:<slug>` holds each remote URL. A slug listed
-// in `repo_slugs` with no `remote:<slug>` key fails the activation
-// (`receive-error` → quarantine + alert: fail fast on operator misconfig).
+// It is read from the instance's `config` attr, whose surface is flat — the
+// host refuses a nested table, so structure is encoded in the key names.
+// `repo_slugs` is a comma-separated index and one `remote_<slug>` key holds
+// each remote URL:
+//
+//   new gitsync: GitSyncConsumer {
+//     grants = [ports, log, store, alert, config, tools];
+//     config = {
+//       repo_slugs         = "alice-notes,bob-site",
+//       remote_alice-notes = "ssh://git@git.example.com/alice/notes.git",
+//       remote_bob-site    = "https://git.example.com/bob/site.git",
+//     };
+//     // ports ...
+//   }
+//
+// A slug listed in `repo_slugs` with no `remote_<slug>` key fails the
+// activation (`receive-error` → quarantine + alert: fail fast on operator
+// misconfig).
 //
 // Two activation shapes, distinguished by the input port an envelope arrives on:
 //
@@ -114,8 +128,8 @@ struct GitSyncConsumer;
 
 /// Read the operator's remote→slug map from config, in `repo_slugs` order.
 /// Each of these is a fatal operator misconfig → `receive-error` (fail fast, the
-/// same lane as the missing-key case): a slug with no `remote:<slug>` key, a
-/// `remote:<slug>` value that is empty (or whitespace-only), or a slug that
+/// same lane as the missing-key case): a slug with no `remote_<slug>` key, a
+/// `remote_<slug>` value that is empty (or whitespace-only), or a slug that
 /// appears more than once in `repo_slugs`. Remote values are trimmed so a padded
 /// config value still matches the parser's trimmed event remotes.
 fn load_repo_map() -> Result<Vec<(String, String)>, Error> {
@@ -127,15 +141,15 @@ fn load_repo_map() -> Result<Vec<(String, String)>, Error> {
                 "git-sync-consumer: repo_slugs lists '{slug}' more than once"
             )));
         }
-        let remote = config::get(&format!("remote:{slug}")).ok_or_else(|| {
+        let remote = config::get(&format!("remote_{slug}")).ok_or_else(|| {
             Error::failed(format!(
-                "git-sync-consumer: repo_slugs lists '{slug}' but config has no 'remote:{slug}' key"
+                "git-sync-consumer: repo_slugs lists '{slug}' but config has no 'remote_{slug}' key"
             ))
         })?;
         let remote = remote.trim().to_string();
         if remote.is_empty() {
             return Err(Error::failed(format!(
-                "git-sync-consumer: 'remote:{slug}' is empty"
+                "git-sync-consumer: 'remote_{slug}' is empty"
             )));
         }
         map.push((slug.to_string(), remote));
