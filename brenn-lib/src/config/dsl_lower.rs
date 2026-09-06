@@ -51,11 +51,11 @@ use crate::access::raw::{
     AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
 };
 use crate::messaging::config::{
-    ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingConfigRaw,
-    MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel, SendRate, SurfaceComponentRaw,
-    SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw, SurfaceSubscriptionRaw,
-    WasmConsumerConfigRaw, WasmConsumerIoPortRaw, WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw,
-    WasmConsumerSubscriptionRaw,
+    BACKEND_FATAL_NOISE_REFUSAL, ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw,
+    LinkHostRaw, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel,
+    SendRate, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw,
+    SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
+    WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 use crate::messaging::{AttachGrant, ComponentGrant, Urgency, WakeMin};
@@ -845,6 +845,19 @@ impl<'a> Body<'a> {
         keep(token_text(&text, value.span(), key), errors)
     }
 
+    /// A token attr with its own word's span, for a refusal that must underline
+    /// the value rather than the block that holds it.
+    fn spanned_token<T: DeserializeOwned>(
+        &mut self,
+        key: &'static str,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<(T, Span)> {
+        let value = self.take(key)?;
+        let span = value.span().clone();
+        let text = keep(expect_str(value, key), errors)?;
+        keep(token_text(&text, &span, key), errors).map(|token| (token, span))
+    }
+
     /// A log level, through the config's own `deserialize_with`.
     fn level(&mut self, key: &'static str, errors: &mut Vec<Diagnostic>) -> Option<LevelFilter> {
         let value = self.take(key)?;
@@ -1360,6 +1373,26 @@ fn repo_sync(body: &mut Body, errors: &mut Vec<Diagnostic>) -> RepoSyncConfig {
     }
 }
 
+/// The global default noise level, which may not be `fatal`.
+///
+/// Every channel stating no `noise` of its own inherits this value, and the
+/// backend overflow path cannot enact `fatal`
+/// ([`NoiseLevel::is_backend_enactable`]). Refused here so the operator reads a
+/// diagnostic on the word instead of a boot panic from the first backend
+/// subscription — including the substrate's own subscription on a tool-result
+/// inbox, which has no `[[channel]]` block of its own to refuse.
+fn global_default_noise(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<NoiseLevel> {
+    let (noise, span) = body.spanned_token::<NoiseLevel>("default_noise", errors)?;
+    if !noise.is_backend_enactable() {
+        errors.push(Diagnostic::at(
+            format!("`default_noise`: {BACKEND_FATAL_NOISE_REFUSAL}"),
+            span,
+        ));
+        return None;
+    }
+    Some(noise)
+}
+
 fn messaging(body: &mut Body, errors: &mut Vec<Diagnostic>) -> MessagingGlobalConfig {
     let defaults = MessagingGlobalConfig::default();
     MessagingGlobalConfig {
@@ -1369,9 +1402,7 @@ fn messaging(body: &mut Body, errors: &mut Vec<Diagnostic>) -> MessagingGlobalCo
         max_body_bytes: body
             .int("max_body_bytes", errors)
             .unwrap_or(defaults.max_body_bytes),
-        default_noise: body
-            .token("default_noise", errors)
-            .unwrap_or(defaults.default_noise),
+        default_noise: global_default_noise(body, errors).unwrap_or(defaults.default_noise),
         default_sink: body
             .token("default_sink", errors)
             .unwrap_or(defaults.default_sink),

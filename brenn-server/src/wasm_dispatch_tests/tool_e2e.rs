@@ -27,8 +27,7 @@ use uuid::Uuid;
 
 use brenn_git::sync::CloneInfo;
 use brenn_tool_registry::bus_wiring::{
-    inbox_input_port, request_channel_entry, result_inbox_entry, tool_executor_spec,
-    tool_executor_system_policy,
+    inbox_input_port, request_channel_entry, tool_executor_spec, tool_executor_system_policy,
 };
 use brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT;
 use brenn_tool_registry::testutil::{clause, grant};
@@ -90,15 +89,8 @@ async fn tool_harness(
     // plus the consumer's own Wasm subscriber, which is what gives the consumer a
     // position on its own result inbox (and what `wasm_policies_from_entries`
     // derives its covering policy from).
-    let mut inbox = result_inbox_entry(slug, &SystemChannelTuning::default(), &defaults);
-    let inbox_window = inbox.resolved_channel.retain_depth;
-    inbox.subscribers.push(SubscriberEntry {
-        kind: SubscriberEntryKind::Wasm(slug.to_string()),
-        push_depth: inbox_window,
-        retain_depth: inbox_window,
-        noise: NoiseLevel::Silent,
-        wake_min: None,
-    });
+    let (inbox, inbox_channel) =
+        super::inbox_entry_with_own_subscriber(slug, &SystemChannelTuning::default(), &defaults);
 
     let inbox_ch = inbox.clone();
     let mut all_entries = vec![trigger.clone(), request_ch, inbox];
@@ -207,7 +199,7 @@ async fn tool_harness(
                 },
                 amplification_mt: 1000,
             },
-            inbox_input_port(slug, inbox_window),
+            inbox_input_port(slug, &inbox_channel),
         ],
         outputs: vec![],
         activation_pacing: unthrottled_pacing(),
@@ -408,11 +400,7 @@ async fn guest_trap_after_call_async_discards_the_buffered_request() {
 
     // The tool never runs in this test, but the registry must still hold it so
     // the guest's `WasmToolHost` resolves the async request at call time.
-    let clones = Arc::new(HashMap::new());
-    let remote_locks = Arc::new(HashMap::new());
-    let registry = Arc::new(ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(
-        GitRepoPullTool::new(clones, remote_locks, None),
-    ))]));
+    let registry = Arc::new(brenn_tool_registry::testutil::git_repo_pull_only());
 
     // No outputs and no executor policy: the trap must drop the request before
     // anything reaches the executor at all.

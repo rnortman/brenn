@@ -34,7 +34,7 @@ use bindings::brenn::processor::tools::call_async;
 use bindings::brenn::processor::types::{Activation, ReceiveError};
 
 /// Logical input port the async result inbox is delivered on
-/// (`bus_wiring::TOOL_RESULT_INPUT_PORT`). Any other port is a trigger.
+/// (`brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT`). Any other port is a trigger.
 const TOOL_RESULTS_PORT: &str = "tool-results";
 /// Output port bound to the channel the test reads.
 const OUT_PORT: &str = "out";

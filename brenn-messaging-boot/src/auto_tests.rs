@@ -1592,8 +1592,7 @@ fn io_port_name_colliding_with_an_output_panics() {
 #[should_panic(expected = "reserved for the async tool-result inbox")]
 fn io_port_named_tool_results_panics() {
     let mut consumers = vec![timer_consumer("etl")];
-    consumers[0].io_ports[0].port =
-        brenn_tool_registry::bus_wiring::TOOL_RESULT_INPUT_PORT.to_string();
+    consumers[0].io_ports[0].port = brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT.to_string();
     let wiring = lower_auto_wiring(&[], &consumers, &[], &[], &globals());
     let entries = wiring.nondurable_entries().to_vec();
     resolve_with_auto(&consumers, &dir_of(entries), &wiring);

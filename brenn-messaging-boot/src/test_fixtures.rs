@@ -207,17 +207,11 @@ pub fn durable_channel(
     standing: Depth,
 ) -> brenn_lib::messaging::config::ChannelConfigRaw {
     brenn_lib::messaging::config::ChannelConfigRaw {
-        send_rate: None,
         uuid: Some(uuid::Uuid::new_v4().to_string()),
-        address: Some(address.to_string()),
-        address_prefix: None,
-        description: None,
         push_depth: Some(Depth::Bounded(1)),
         retain_depth: Some(Depth::Bounded(1)),
         standing_retain_depth: Some(standing),
-        noise: None,
-        sink: None,
-        wake_min: None,
+        ..brenn_lib::messaging::config::ChannelConfigRaw::minimal(address)
     }
 }
 

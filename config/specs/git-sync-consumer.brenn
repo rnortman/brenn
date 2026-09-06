@@ -12,6 +12,12 @@
 /// is the whole point of running the pipeline unattended; `tools` is the
 /// authority to call `git-repo-pull` at all.
 ///
+/// `tool-results` is not the instance's to wire: the substrate mints
+/// `brenn:tool-results/<slug>` from the instance's `tool` grants and delivers
+/// each result there as an activation. An instance binds `push-events` and
+/// `outcomes` and nothing else, and sizes and tunes the inbox (depths, `noise`)
+/// with a `channel at "brenn:tool-results/<slug>" { ... }` block beside it.
+///
 /// The map is written in the instance's `config = { ... };` attr, whose surface
 /// is flat: `repo_slugs` is a comma-separated index of the slugs this instance
 /// syncs, and one `remote_<slug>` entry per listed slug holds that repository's

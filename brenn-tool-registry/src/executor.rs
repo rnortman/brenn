@@ -1305,7 +1305,9 @@ mod tests {
 
     #[tokio::test]
     async fn result_row_activates_on_tool_results_port_and_is_not_retired() {
-        use crate::bus_wiring::{TOOL_RESULT_INPUT_PORT, inbox_input_port};
+        use crate::bus_wiring::inbox_input_port;
+        use brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT;
+        use brenn_lib::messaging::config::{ResolvedChannel, SendRate, Sink};
 
         // Publish a result to the caller's inbox exactly as the executor does.
         let h = harness().await;
@@ -1328,9 +1330,20 @@ mod tests {
         // activates the consumer on the `tool-results` port rather than being
         // retired as residue.
         let caller = ParticipantId::for_wasm(CALLER_SLUG);
+        // Nothing here tunes the inbox; an unbounded window keeps every pending
+        // row in the snapshot.
+        let unbounded_inbox = ResolvedChannel {
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            standing_retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            sink: Sink::Drop,
+            wake_min: WakeMin::Normal,
+            send_rate: SendRate::default(),
+        };
         let snapshot = h
             .messenger
-            .load_activation_snapshot(&caller, &[inbox_input_port(CALLER_SLUG, Depth::Unbounded)])
+            .load_activation_snapshot(&caller, &[inbox_input_port(CALLER_SLUG, &unbounded_inbox)])
             .await
             .expect("a pending inbox row on a triggering input port yields an activation");
         let port = snapshot

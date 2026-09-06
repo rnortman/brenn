@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use brenn_lib::messaging::config::{
-    ActivationPacing, DEFAULT_WASM_INPUT_AMPLIFICATION, DEFAULT_WASM_PUBLISH_CAPACITY,
-    DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, NoiseLevel, ResolvedSubscription,
-    ResolvedWasmConsumer, WasmConsumerConfigRaw, WasmInputPort, WasmOutputPort, WasmSinkBudget,
+    ActivationPacing, BACKEND_FATAL_NOISE_REFUSAL, DEFAULT_WASM_INPUT_AMPLIFICATION,
+    DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth,
+    ResolvedSubscription, ResolvedWasmConsumer, WasmConsumerConfigRaw, WasmInputPort,
+    WasmOutputPort, WasmSinkBudget,
 };
 use brenn_lib::messaging::{
     ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, bindable_schemes,
@@ -205,12 +206,21 @@ pub(crate) fn resolve_wasm_consumers(
                 port,
             );
             assert!(
-                port != brenn_tool_registry::bus_wiring::TOOL_RESULT_INPUT_PORT,
+                port != brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT,
                 "[[wasm_consumer]] {slug:?}: {context} port name {:?} is reserved for the \
                  async tool-result inbox; a consumer holding an async tool grant has this \
                  port folded in automatically, so an operator-declared port of the same name \
                  would collide",
                 port,
+            );
+        };
+        // A port bound onto either tool namespace is a hand-rolled path around
+        // the substrate's wiring, refused here even though the executor
+        // re-checks every dequeued request.
+        let validate_bound_address = |address: &str, kind: &str, port: &str| {
+            crate::assert_not_tool_namespace(
+                &format!("[[wasm_consumer]] {slug:?}: {kind} port {port:?}"),
+                address,
             );
         };
         let mut seen_port_names: HashSet<String> = HashSet::new();
@@ -309,6 +319,7 @@ pub(crate) fn resolve_wasm_consumers(
                 }
                 _ => {}
             }
+            validate_bound_address(&entry.address, kind, &sub.port);
             assert!(
                 seen_addresses.insert(entry.address.clone()),
                 "[[wasm_consumer]] {slug:?}: duplicate subscription for channel {:?}",
@@ -347,15 +358,12 @@ pub(crate) fn resolve_wasm_consumers(
             }
             let noise = sub.noise.unwrap_or(ch.noise);
 
-            // `fatal` is the surface-only kill rung; the backend overflow path
-            // has no kill wire, so any subscription resolving to `fatal` is
-            // rejected at boot. The app/mqtt/webhook path rejects `fatal`
-            // separately; the two sites must stay in step.
-            if noise == NoiseLevel::Fatal {
+            // The backend cannot enact `fatal`; the rule and its reason live on
+            // `NoiseLevel::is_backend_enactable`.
+            if !noise.is_backend_enactable() {
                 panic!(
                     "[[wasm_consumer]] {slug:?}: {kind} on channel {:?} resolves to \
-                     noise = fatal, but fatal is surface-only (the backend overflow path has \
-                     no kill) — set a backend-valid noise level (silent/metered/alarm)",
+                     noise = fatal, but {BACKEND_FATAL_NOISE_REFUSAL}",
                     entry.address,
                 );
             }
@@ -460,6 +468,7 @@ pub(crate) fn resolve_wasm_consumers(
                      channel address",
                 )
             });
+            validate_bound_address(&entry.address, kind, &out.port);
             // `remove` rather than `get`: the exception admits one output per
             // input, so a third binding on the name finds nothing and collides.
             // The addresses must match, not merely both exist: two halves on

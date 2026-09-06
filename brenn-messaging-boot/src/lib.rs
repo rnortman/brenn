@@ -58,6 +58,38 @@ fn assert_port_name(context: &str, port: &str) {
     );
 }
 
+/// Hold one bound address out of the namespaces the tool substrate mints into.
+///
+/// The one statement of the rule for this crate's component-binding placements
+/// — a consumer's subscriptions, io_ports and outputs, and a surface
+/// component's bindings — matching the refusal the config language raises on
+/// the same addresses, so a document and a Rust-built config are refused alike.
+/// Components must not bind directly to these channels; the tool substrate
+/// wires them through grants.
+///
+/// The predicate is the `/` boundary form alone, which is what the substrate
+/// actually mints and what the language refuses; the `.` boundary form
+/// [`brenn_envelope::addressing::is_reserved_channel`] also reserves is held
+/// out at channel declaration instead.
+///
+/// `context` is a pre-formatted label naming the block, the placement and the
+/// port, in the same style [`assert_port_name`] takes.
+///
+/// # Panics
+///
+/// On a schemeless address, and on a `brenn:` address in either tool namespace.
+fn assert_not_tool_namespace(context: &str, address: &str) {
+    use brenn_lib::messaging::ChannelScheme;
+    let (scheme, bare) = ChannelScheme::split(address)
+        .unwrap_or_else(|| panic!("{context} address {address:?} carries no scheme prefix"));
+    assert!(
+        !(scheme == ChannelScheme::Brenn && brenn_envelope::addressing::in_a_tool_namespace(bare)),
+        "{context} is bound to {address:?}, which is in a namespace the tool substrate owns; \
+         component ports do not reach the tool substrate's channels — a result inbox is wired \
+         by a tool grant, and a request channel is reached only through the registry",
+    );
+}
+
 /// The channel address a static port binding resolves to.
 ///
 /// `declared` is the `channel` the operator wrote on the binding. A binding
@@ -752,7 +784,7 @@ pub(crate) fn validate_exact_tuning_blocks(
     inbox_slugs: &std::collections::HashSet<String>,
     check_tool_families: bool,
 ) {
-    use brenn_tool_registry::bus_wiring::{TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE};
+    use brenn_envelope::addressing::{TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE};
 
     for address in tuning.exact_addresses() {
         let (found, what) = if let Some(slug) = address.strip_prefix("webhook:") {

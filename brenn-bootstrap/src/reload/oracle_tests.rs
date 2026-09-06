@@ -220,6 +220,7 @@ fn document_with_a_tool_granted_consumer() -> String {
     abi = processor;
     requires = [ports, tools];
     in inbound;
+    in tool-results;
     out digest;
 }}
 
@@ -266,6 +267,7 @@ channel digested at "brenn:digested" {{
     abi = processor;
     requires = [ports, tools];
     in inbound;
+    in tool-results;
     out digest;
 }}
 

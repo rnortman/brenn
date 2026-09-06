@@ -31,8 +31,15 @@ use support::{
 /// becomes a right passes an empty list, so the fit check has nothing to say
 /// about it and the case's own refusal is the sole one.
 fn sink(requires: &str) -> String {
+    // A class requiring `tools` must declare the substrate-wired inbox port,
+    // and only such a class may. Present so a `tools` case's own refusal is
+    // the sole one, the same reason the ports are `optional`.
+    let inbox = match requires.contains("tools") {
+        true => "    in tool-results;\n",
+        false => "",
+    };
     format!(
-        "{}component Sink {{\n    {}\n    optional out events;\n}}\n{}",
+        "{}component Sink {{\n    {}\n{inbox}    optional out events;\n}}\n{}",
         PACKAGED,
         processor_header(requires),
         PACKAGED,
@@ -1056,6 +1063,71 @@ fn a_tool_namespace_address_stays_a_literal_and_derives_an_entry() {
     assert_eq!(
         patterns(&config.agents[0].acl.brenn_subscribe),
         ["tool-results/alice"]
+    );
+}
+
+/// The carve-out is an agent's alone. A component's own port binding onto the
+/// substrate's namespaces is the side door the port-name refusal would push an
+/// operator toward, and it is shut.
+#[test]
+fn a_component_port_cannot_name_a_tool_namespace_address() {
+    let doc = |ports: &str, statements: &str| {
+        format!(
+            "{}{PACKAGED}component Sync {{\n    abi = processor; requires = [ports, tools];\n\
+             {ports}    in tool-results;\n}}\n{PACKAGED}\
+             new alice_sync: Sync {{\n    grants = [ports, tools];\n    \
+             tool git-repo-pull {{}}\n{statements}}}\n",
+            durable("pushes", "brenn:pushes"),
+        )
+    };
+    assert_eq!(
+        derive_refusal(&doc(
+            "    in push-events;\n",
+            "    in push-events <- \"brenn:tool-results/other\";\n",
+        )),
+        "this binding of consumer `alice_sync` names `brenn:tool-results/other`, in a \
+         namespace the tool substrate owns: component ports do not reach the tool substrate's \
+         channels — a result inbox is wired by a `tool` grant, and a request channel is \
+         reached only through the registry"
+    );
+    assert_eq!(
+        derive_refusal(&doc(
+            "    in push-events;\n    out requests;\n",
+            "    in push-events <- pushes;\n    \
+             out requests -> \"brenn:tools/git-repo-pull\";\n",
+        )),
+        "this binding of consumer `alice_sync` names `brenn:tools/git-repo-pull`, in a \
+         namespace the tool substrate owns: component ports do not reach the tool substrate's \
+         channels — a result inbox is wired by a `tool` grant, and a request channel is \
+         reached only through the registry"
+    );
+}
+
+/// A component on a page is a component. The page owns its instances' bindings,
+/// so the refusal has to reach the page as well: the placed instance's own copy
+/// is dropped, and a rule that fired only on the instance would let a
+/// browser-facing binding compile and panic at boot instead.
+#[test]
+fn a_surface_placed_component_port_cannot_name_a_tool_namespace_address() {
+    assert_eq!(
+        derive_refusal(&placed_panel(
+            "ports",
+            "        in messages <- \"brenn:tool-results/other\";\n",
+        )),
+        "this binding of surface `alice_desk` names `brenn:tool-results/other`, in a \
+         namespace the tool substrate owns: component ports do not reach the tool substrate's \
+         channels — a result inbox is wired by a `tool` grant, and a request channel is \
+         reached only through the registry"
+    );
+    assert_eq!(
+        derive_refusal(&placed_panel(
+            "ports",
+            "        out acks -> \"brenn:tools/git-repo-pull\";\n",
+        )),
+        "this binding of surface `alice_desk` names `brenn:tools/git-repo-pull`, in a \
+         namespace the tool substrate owns: component ports do not reach the tool substrate's \
+         channels — a result inbox is wired by a `tool` grant, and a request channel is \
+         reached only through the registry"
     );
 }
 

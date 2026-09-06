@@ -1476,16 +1476,23 @@ channel spare at "brenn:spare" {
         );
     }
 
-    /// A consumer whose port names an address the candidate's channel
-    /// population does not hold. The compiler admits the literal — a
-    /// `brenn:tools/` address is a well-formed one — and the *planner* refuses
-    /// it, from inside the `catch_unwind` prepare wraps it in.
+    /// A consumer with an output and no input at all. The compiler admits it —
+    /// every declared port is bound, which is the whole of the language's
+    /// contract — and the *planner* refuses it, from inside the `catch_unwind`
+    /// prepare wraps it in: a consumer with no subscriptions never activates,
+    /// so its outputs are dead config.
     ///
     /// The refusal is spelled `[[wasm_consumer]] "slug": …` rather than with
     /// the resolvers' `config: ` marker, which is exactly the shape that used
     /// to be re-panicked as a host defect: a one-line edit to a *convergible*
     /// block would then have taken the process down instead of refusing a
     /// reload.
+    ///
+    /// The fixture is load-bearing on that asymmetry: it needs a document the
+    /// compiler admits and the planner refuses, and there are few left. Teaching
+    /// the language that an output-only consumer is dead config would take this
+    /// one away, and whoever does that owes this test another such document
+    /// rather than a weakened assertion.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_consumer_the_planner_refuses_is_a_refusal_and_not_an_unwind() {
         let tree = Tree::holding(&document(""));
@@ -1496,13 +1503,11 @@ channel spare at "brenn:spare" {
             r#"{PACKAGED}component Sifter {{
     abi = processor;
     requires = [ports];
-    in inbound;
     out digest;
 }}
 {PACKAGED}
 new sifter: Sifter {{
     grants = [ports];
-    in inbound <- "brenn:tools/nope" {{ push_depth = 4; }}
     out digest -> work;
 }}
 "#
@@ -1524,7 +1529,7 @@ new sifter: Sifter {{
         assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
         assert!(
             status.refusals[0].starts_with("[[wasm_consumer]] \"sifter\"")
-                && status.refusals[0].contains("is not a known channel address"),
+                && status.refusals[0].contains("has output port(s) but no subscriptions"),
             "{:?}",
             status.refusals
         );
@@ -2544,6 +2549,7 @@ channel extra at "brenn:extra" {
     abi = processor;
     requires = [ports, tools];
     in inbound;
+    in tool-results;
     out digest;
 }}
 {PACKAGED}
@@ -2666,6 +2672,7 @@ new grinder: Demo {
     abi = processor;
     requires = [ports, tools];
     in inbound;
+    in tool-results;
     out digest;
 }}
 

@@ -603,6 +603,36 @@ links no tools interface — so a surface-placed instance is refused at the word
 and at the statement alike. An agent needs no word: its tool authority is the
 statements themselves.
 
+#### The result inbox port
+
+A component's tool results do not come back from the call. They arrive later as
+ordinary activations, on a reserved input port named `tool-results`, and that
+port is neither the class's option nor the instance's to wire:
+
+- A class that requires `tools` **must** declare `in tool-results;`, and a class
+  that does not require `tools` may not use the name for anything. Both
+  directions are refused, because the substrate folds the port in from the tool
+  grant and a component handed an activation on a port its spec never declared
+  fails the delivery.
+- The port is never `optional`, and no `in`/`out`/`io` statement in any instance
+  body binds it. A binding that names it is refused. The instance's `tool`
+  statements are what wire it.
+- The channel behind it is `brenn:tool-results/<slug>`, minted by the substrate.
+  Size and tune it with a block beside the instance —
+  `channel at "brenn:tool-results/<slug>" { ... }` — the same way any
+  system-minted channel is tuned (`docs/message-bus.md` §2.7). The block's
+  `retain_depth` sizes both rungs of the substrate's own subscription on the
+  inbox, and its `noise` is that subscription's overflow noise (`fatal` is
+  refused when the document is planned, as on any backend subscription — the
+  config gate runs the planner, so `check.sh` catches it without a tool
+  registry). Its `push_depth` tunes the channel
+  rung only, which that subscription does not read, so `1` is the honest value
+  to write. A component port may not name that address, or any
+  `brenn:tools/<tool>` address, directly.
+
+So a tool-using instance's body holds its `tool` statements and the bindings for
+its own ports, and says nothing at all about `tool-results`.
+
 ### Surfaces
 
 A surface is a page: transport grants for the wire, a skin, and the component

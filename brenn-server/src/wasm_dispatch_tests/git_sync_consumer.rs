@@ -27,8 +27,7 @@ use tokio::sync::Mutex;
 
 use brenn_git::sync::CloneInfo;
 use brenn_tool_registry::bus_wiring::{
-    inbox_input_port, request_channel_entry, result_inbox_entry, tool_executor_spec,
-    tool_executor_system_policy,
+    inbox_input_port, request_channel_entry, tool_executor_spec, tool_executor_system_policy,
 };
 use brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT;
 use brenn_tool_registry::testutil::{clause, grant};
@@ -110,15 +109,8 @@ async fn consumer_harness(
 
     let request_ch =
         request_channel_entry("git-repo-pull", &SystemChannelTuning::default(), &defaults);
-    let mut inbox = result_inbox_entry(slug, &SystemChannelTuning::default(), &defaults);
-    let inbox_window = inbox.resolved_channel.retain_depth;
-    inbox.subscribers.push(SubscriberEntry {
-        kind: SubscriberEntryKind::Wasm(slug.to_string()),
-        push_depth: inbox_window,
-        retain_depth: inbox_window,
-        noise: NoiseLevel::Silent,
-        wake_min: None,
-    });
+    let (inbox, inbox_channel) =
+        super::inbox_entry_with_own_subscriber(slug, &SystemChannelTuning::default(), &defaults);
 
     let mut all_entries = vec![
         push_ch.clone(),
@@ -245,7 +237,7 @@ async fn consumer_harness(
                 },
                 amplification_mt: 1000,
             },
-            inbox_input_port(slug, inbox_window),
+            inbox_input_port(slug, &inbox_channel),
         ],
         outputs: vec![],
         activation_pacing: unthrottled_pacing(),
@@ -344,9 +336,7 @@ fn fixture_registry() -> (Arc<ToolRegistry>, tempfile::TempDir, tempfile::TempDi
 
 /// An empty-clone registry: the tool resolves at call time but never runs.
 fn empty_registry() -> Arc<ToolRegistry> {
-    Arc::new(ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(
-        GitRepoPullTool::new(Arc::new(HashMap::new()), Arc::new(HashMap::new()), None),
-    ))]))
+    Arc::new(brenn_tool_registry::testutil::git_repo_pull_only())
 }
 
 #[tokio::test]

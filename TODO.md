@@ -2766,3 +2766,31 @@ at `ReloadStatus::refusals`.
 Done = a refused outcome states its remedy in a field, `v` reflects the reshape,
 and the two producers in `brenn-bootstrap/src/reload/driver.rs` classify rather
 than concatenate.
+
+## `system-participant-noise-inert`
+
+A `[[channel]]` tuning block may carry `noise`, and on a
+`brenn:tools/<tool>` request channel nothing reads it: the only substrate
+subscriber there is the tool executor, folded in as a system participant, and
+`fold_spec_subscriptions` hard-codes `NoiseLevel::Silent` on every system
+participant's subscription. So an operator who sizes a request channel and asks
+for `noise = alarm` on its overflow gets silence, and `noise = fatal` there is
+accepted and ignored — while the same rung on a `brenn:tool-results/<slug>`
+block is now inherited by the consumer's folded-in subscription and `fatal` is
+refused. The two reserved namespaces disagree about what a block's `noise`
+means.
+
+The fix is a choice, and it is not the tool substrate's alone: every system
+participant on every family folds through the same site. Either the folded
+subscription inherits `ch.noise` the way `inbox_subscription` does — which means
+deciding what an alarm on a system participant's cursor should do and extending
+the backend-`fatal` refusal to those families — or `noise` is refused on the
+blocks whose subscribers cannot enact it, and `docs/message-bus.md` §2.7 says
+which families those are.
+
+Code site (`TODO(system-participant-noise-inert)`):
+`brenn-messaging/src/system.rs`, at the `SubscriberEntry` built by
+`fold_spec_subscriptions`.
+
+Done = a tuning block's `noise` is either enacted by the system participant
+subscribed to that channel or refused at load, with no family in between.

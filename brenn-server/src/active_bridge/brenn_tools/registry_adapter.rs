@@ -170,8 +170,8 @@ mod tests {
     use super::super::HandleBrennToolResult;
     use super::super::handle_brenn_tools;
     use brenn_tool_registry::{
-        AclDenied, DEFAULT_FAST_BUDGET, FastTool, GitRepoPullTool, Idempotency, RegisteredTool,
-        ToolClass, ToolCtx, ToolDescriptor, ToolError, ToolRegistry,
+        AclDenied, DEFAULT_FAST_BUDGET, FastTool, Idempotency, RegisteredTool, ToolClass, ToolCtx,
+        ToolDescriptor, ToolError, ToolRegistry,
     };
 
     const MCP_PULL: &str = "mcp__brenn__GitRepoPull";
@@ -231,14 +231,7 @@ mod tests {
     /// clone to resolve — execute returns per-repo "unknown", which is fine for
     /// exercising the adapter's Pre/Post routing, not the pull itself).
     fn registry() -> Arc<ToolRegistry> {
-        let tool = GitRepoPullTool::new(
-            Arc::new(Default::default()),
-            Arc::new(Default::default()),
-            None,
-        );
-        Arc::new(ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(
-            tool,
-        ))]))
+        Arc::new(brenn_tool_registry::testutil::git_repo_pull_only())
     }
 
     async fn bridge_with(

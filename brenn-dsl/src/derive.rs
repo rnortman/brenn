@@ -2472,9 +2472,32 @@ fn bound_address(
     let Some((scheme, bare)) = split_spellable(address) else {
         unreachable!("a resolved address names a scheme");
     };
+    // One reading of "this address is in a namespace the substrate mints",
+    // used by both the component refusal below and the literal carve-out after
+    // it, so the two cannot come apart.
+    let tool_namespace = scheme == ChannelScheme::Brenn && in_a_tool_namespace(bare);
+    // The carve-out below is an agent's alone (an operator watching the
+    // substrate). Every other kind here holds a component's port binding —
+    // placed instances and the pages that own them — and must not reach
+    // tool-namespace channels directly. The page must be refused too: a placed
+    // instance does not own its bindings, so its copy is dropped silently.
+    if tool_namespace && kind != EntityKind::Agent {
+        errors.push(Diagnostic::at(
+            format!(
+                "this {} of {} `{label}` names `{address}`, in a namespace the tool \
+                 substrate owns: component ports do not reach the tool substrate's \
+                 channels — a result inbox is wired by a `tool` grant, and a request \
+                 channel is reached only through the registry",
+                bound.what,
+                kind.label(),
+            ),
+            bound.span.clone(),
+        ));
+        return None;
+    }
     if matches!(bound.chan, RChanRef::Addr(_))
         && matches!(scheme, ChannelScheme::Brenn | ChannelScheme::Ephemeral)
-        && !(scheme == ChannelScheme::Brenn && in_a_tool_namespace(bare))
+        && !tool_namespace
     {
         errors.push(Diagnostic::at(
             format!(

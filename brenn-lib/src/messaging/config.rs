@@ -25,9 +25,9 @@ use uuid::Uuid;
 
 use super::{
     AttachGrant, ChannelEntry, ChannelScheme, ComponentGrant, MessagingDirectory,
-    SubscriberEntryKind, WakeMin, canonicalize_channel_address, ends_at_tuning_boundary,
-    in_a_tool_namespace, is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid,
-    tuning_boundary_list,
+    SubscriberEntryKind, TOOL_RESULTS_NAMESPACE, WakeMin, canonicalize_channel_address,
+    ends_at_tuning_boundary, in_a_tool_namespace, is_reserved_channel_name, is_unreserved_char,
+    nondurable_channel_uuid, tuning_boundary_list,
 };
 use crate::config::AppConfigRaw;
 
@@ -188,7 +188,22 @@ impl NoiseLevel {
             _ => None,
         }
     }
+
+    /// Whether the backend overflow path can enact this level. It cannot enact
+    /// `fatal`: that rung kills the overflowing instance and only the surface
+    /// kernel has a kill wire.
+    ///
+    /// The single statement of the rule. Callers supply their own refusal shape
+    /// with [`BACKEND_FATAL_NOISE_REFUSAL`] as the reason.
+    pub fn is_backend_enactable(self) -> bool {
+        self != Self::Fatal
+    }
 }
+
+/// The reason half of every refusal of a backend-side `fatal`, so the operator
+/// reads the same sentence wherever the rung is refused.
+pub const BACKEND_FATAL_NOISE_REFUSAL: &str = "fatal is surface-only (the backend overflow path \
+     has no kill) — set a backend-valid noise level (silent/metered/alarm)";
 
 /// Eviction sink for a channel (per-channel / global only, never per-subscriber).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -325,6 +340,41 @@ pub struct ChannelConfigRaw {
     /// Per-`(sender, channel)` send-rate gate. `None` ⇒ inherit from global
     /// default. Class-uniform: every scheme is rate-gated.
     pub send_rate: Option<SendRate>,
+}
+
+#[cfg(any(test, feature = "testutils"))]
+impl ChannelConfigRaw {
+    /// The base `[[channel]]` literal every fixture builds on: `address` set,
+    /// every other field unset. Not a valid block by itself — a declaring or
+    /// tuning block states its depths — so callers spell it as the tail of a
+    /// struct update:
+    ///
+    /// ```ignore
+    /// ChannelConfigRaw {
+    ///     push_depth: Some(Depth::Bounded(1)),
+    ///     retain_depth: Some(Depth::Bounded(20)),
+    ///     standing_retain_depth: Some(Depth::Bounded(20)),
+    ///     ..ChannelConfigRaw::minimal("brenn:tool-results/sync")
+    /// }
+    /// ```
+    ///
+    /// Shared across crate test modules so a new field on this struct lands in
+    /// one place instead of every hand-written literal.
+    pub fn minimal(address: &str) -> Self {
+        ChannelConfigRaw {
+            uuid: None,
+            address: Some(address.to_string()),
+            address_prefix: None,
+            description: None,
+            push_depth: None,
+            retain_depth: None,
+            standing_retain_depth: None,
+            noise: None,
+            sink: None,
+            wake_min: None,
+            send_rate: None,
+        }
+    }
 }
 
 /// A `link` declaration — an **auto channel** named by nothing, brought into
@@ -2411,6 +2461,26 @@ pub fn build_system_channel_tuning(
         if let Some(rate) = entry.send_rate {
             rate.validate(&format!("[[channel]] {label}"));
         }
+        // A result inbox's only substrate subscriber is the consumer's folded-in
+        // one, which is a backend subscription and inherits this block's noise.
+        // Refused here rather than at the fold-in alone: the family is decided by
+        // the address, so a config gate planning without a tool registry — which
+        // never reaches the fold-in — still catches the rung that would panic the
+        // service at its next boot.
+        if entry_key
+            .strip_prefix("brenn:")
+            .is_some_and(|name| name.starts_with(TOOL_RESULTS_NAMESPACE))
+            && !entry
+                .noise
+                .unwrap_or(defaults.default_noise)
+                .is_backend_enactable()
+        {
+            panic!(
+                "config: [[channel]] {label} tunes a tool-result inbox — the subscription \
+                 the substrate folds into the consumer there is a backend subscription — and \
+                 resolves to noise = fatal, but {BACKEND_FATAL_NOISE_REFUSAL}",
+            );
+        }
         // An archive sink with no archive_path panics in the hourly GC pass;
         // refuse at load time.
         if entry.sink.unwrap_or(defaults.default_sink) == Sink::Archive
@@ -2626,11 +2696,9 @@ pub fn resolve_subscription_params(
     }
     let resolved_noise = raw.noise.unwrap_or(rung.noise);
 
-    // `fatal` is the surface-only kill rung; a backend subscription can never
-    // enact it (the backend overflow path has no kill). Reject it here for
-    // app/mqtt/webhook subscriptions; WASM consumers reject `fatal` separately
-    // at boot — the two sites must stay in step.
-    if resolved_noise == NoiseLevel::Fatal {
+    // The backend cannot enact `fatal`; the rule and its reason live on
+    // `NoiseLevel::is_backend_enactable`.
+    if !resolved_noise.is_backend_enactable() {
         return Err(SubscribeError::FatalNoise {
             channel_address: raw.channel_address.clone(),
         });
@@ -3935,6 +4003,36 @@ channel demo at "ephemeral:protobar-demo" {
         let mut block = tuning_block("webhook:hook", 1, 8, 8);
         block.sink = Some(Sink::Archive);
         build_system_channel_tuning(&[block], &global_defaults());
+    }
+
+    /// The inbox refusal reads the resolved rung, not the stated one: a block
+    /// that states no `noise` inherits the global, and a global `fatal` is what
+    /// the substrate's subscription would be handed.
+    #[test]
+    #[should_panic(expected = "tunes a tool-result inbox")]
+    fn an_inbox_tuning_block_inheriting_a_fatal_global_panics() {
+        let defaults = MessagingGlobalConfig {
+            default_noise: NoiseLevel::Fatal,
+            ..global_defaults()
+        };
+        build_system_channel_tuning(
+            &[tuning_block("brenn:tool-results/sync", 1, 4, 4)],
+            &defaults,
+        );
+    }
+
+    /// The refusal is scoped to the inbox family by address. `fatal` stays a
+    /// legitimate channel-level template elsewhere — a surface subscriber can
+    /// enact it — so a block carrying it on another address still builds.
+    #[test]
+    fn a_fatal_tuning_block_off_the_inbox_family_still_builds() {
+        let mut block = tuning_block("webhook:hook", 1, 4, 4);
+        block.noise = Some(NoiseLevel::Fatal);
+        let tuning = tuning_of(&[block]);
+        assert_eq!(
+            resolve_system_channel("webhook:hook", &tuning, &global_defaults()).noise,
+            NoiseLevel::Fatal,
+        );
     }
 
     /// A system-minted channel that retains nothing leaves its system

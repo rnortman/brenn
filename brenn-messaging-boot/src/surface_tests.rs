@@ -603,6 +603,41 @@ fn an_empty_declared_surface_out_port_name_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
+/// A page-placed component subscribing to another consumer's result inbox would
+/// reach a channel that exists in the directory — nothing else here would refuse
+/// it. The namespace rule is the whole of the answer, and the same one a backend
+/// consumer gets.
+#[test]
+#[should_panic(expected = "which is in a namespace the tool substrate owns")]
+fn a_surface_subscription_on_a_tool_results_address_panics() {
+    let dir = dir_of(vec![
+        brenn_entry("brenn:alerts"),
+        brenn_entry("brenn:tool-results/git-sync-consumer"),
+    ]);
+    let mut raw = valid_surface_raw();
+    raw.subscriptions = vec![surface_sub_raw(
+        "brenn:tool-results/git-sync-consumer",
+        "protobar",
+        "messages",
+    )];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// The publish arm of the same rule: an output onto a tool's request channel
+/// would give a page direct publish access to a channel it must not reach.
+#[test]
+#[should_panic(expected = "which is in a namespace the tool substrate owns")]
+fn a_surface_output_on_a_tools_address_panics() {
+    let dir = dir_of(vec![
+        brenn_entry("brenn:alerts"),
+        brenn_entry("brenn:tools/git-repo-pull"),
+        ephem("protobar-demo"),
+    ]);
+    let mut raw = valid_surface_raw();
+    raw.outputs[0].channel = Some("brenn:tools/git-repo-pull".to_string());
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
 /// The field-by-field pin on what resolution puts on a `ResolvedComponent`.
 ///
 /// [`surface_resolves_happy_path`] compares whole values, but every literal in

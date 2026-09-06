@@ -52,8 +52,7 @@ use crate::routes::webhooks::inbound::{EndpointSlug, receive};
 use crate::webhook_router::WebhookEventRouterImpl;
 use brenn_git::sync::CloneInfo;
 use brenn_tool_registry::bus_wiring::{
-    inbox_input_port, request_channel_entry, result_inbox_entry, tool_executor_spec,
-    tool_executor_system_policy,
+    inbox_input_port, request_channel_entry, tool_executor_spec, tool_executor_system_policy,
 };
 use brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT;
 use brenn_tool_registry::testutil::{clause, grant};
@@ -210,15 +209,11 @@ async fn build_pipeline() -> Pipeline {
     let outcomes_ch = brenn_channel(&outcomes_addr, "git-sync-outcomes-reader");
     let request_ch =
         request_channel_entry("git-repo-pull", &SystemChannelTuning::default(), &defaults);
-    let mut inbox = result_inbox_entry(CONSUMER_SLUG, &SystemChannelTuning::default(), &defaults);
-    let inbox_window = inbox.resolved_channel.retain_depth;
-    inbox.subscribers.push(SubscriberEntry {
-        kind: SubscriberEntryKind::Wasm(CONSUMER_SLUG.to_string()),
-        push_depth: inbox_window,
-        retain_depth: inbox_window,
-        noise: NoiseLevel::Silent,
-        wake_min: None,
-    });
+    let (inbox, inbox_channel) = super::inbox_entry_with_own_subscriber(
+        CONSUMER_SLUG,
+        &SystemChannelTuning::default(),
+        &defaults,
+    );
 
     let inbox_ch = inbox.clone();
     let mut all_entries = vec![
@@ -440,7 +435,7 @@ async fn build_pipeline() -> Pipeline {
                 },
                 amplification_mt: 1000,
             },
-            inbox_input_port(CONSUMER_SLUG, inbox_window),
+            inbox_input_port(CONSUMER_SLUG, &inbox_channel),
         ],
         outputs: vec![],
         activation_pacing: unthrottled_pacing(),

@@ -24,8 +24,13 @@
 //       remote_alice-notes = "ssh://git@git.example.com/alice/notes.git",
 //       remote_bob-site    = "https://git.example.com/bob/site.git",
 //     };
-//     // ports ...
+//     tool git-repo-pull {}
+//     in push-events <- pushes;
+//     out outcomes -> git-outcomes;
 //   }
+//
+// `tool-results` is absent on purpose: the substrate wires that port from the
+// instance's tool grants, and a document that binds it is refused.
 //
 // A slug listed in `repo_slugs` with no `remote_<slug>` key fails the
 // activation (`receive-error` → quarantine + alert: fail fast on operator

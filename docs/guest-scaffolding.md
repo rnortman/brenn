@@ -44,6 +44,11 @@ The abi is read from the class's `abi` attribute, not passed as a flag.
   handled it; transposing two arms is a type error where the arms bind
   differently. A class with no inbound ports yields an uninhabited enum, which
   is correct — such a component is activated only for its own deferred views.
+  A class that requires `tools` declares `in tool-results;`, so its `InPort`
+  carries a `ToolResults` variant like any other — the declaration is what
+  generates it. Nothing in any document binds that port: the host wires it from
+  the instance's `tool` grants and delivers async tool results as activations on
+  it.
 - **`pub mod port`** — the raw name of every port, every direction, as a
   `&'static str` constant, for the parts of the SDK that take a name as text
   (`publish_deferred`, `deferred_for`, `defer_cancel`).

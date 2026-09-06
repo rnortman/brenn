@@ -26,13 +26,14 @@ pub mod tombstone;
 pub mod test_support;
 
 pub use brenn_envelope::addressing::{
-    AUTO_CHANNEL_SEGMENT, auto_channel_cid, auto_channel_name, canonical_address,
-    canonicalize_channel_address, chat_channel_uuid_from_address, durable_auto_channel_uuid,
-    ends_at_matcher_boundary, ends_at_tuning_boundary, ephemeral_channel_uuid_from_name,
-    in_a_tool_namespace, is_auto_channel_name, is_reserved_channel, is_reserved_channel_name,
-    is_unreserved_char, is_unreserved_name, local_channel_uuid_from_name, matcher_boundary_list,
-    mqtt_channel_uuid_from_address, nondurable_channel_uuid, tool_channel_uuid_from_address,
-    tuning_boundary_list, webhook_channel_uuid_from_slug,
+    AUTO_CHANNEL_SEGMENT, TOOL_RESULTS_NAMESPACE, auto_channel_cid, auto_channel_name,
+    canonical_address, canonicalize_channel_address, chat_channel_uuid_from_address,
+    durable_auto_channel_uuid, ends_at_matcher_boundary, ends_at_tuning_boundary,
+    ephemeral_channel_uuid_from_name, in_a_tool_namespace, is_auto_channel_name,
+    is_reserved_channel, is_reserved_channel_name, is_unreserved_char, is_unreserved_name,
+    local_channel_uuid_from_name, matcher_boundary_list, mqtt_channel_uuid_from_address,
+    nondurable_channel_uuid, tool_channel_uuid_from_address, tuning_boundary_list,
+    webhook_channel_uuid_from_slug,
 };
 pub use brenn_envelope::channel_model::ChannelBlockRole;
 pub use brenn_envelope::grants::{

@@ -556,7 +556,7 @@ fn reserved_tool_results_input_port_panics() {
         package: "a".to_string(),
         subscriptions: vec![sub_raw(
             "brenn:ch1",
-            brenn_tool_registry::bus_wiring::TOOL_RESULT_INPUT_PORT,
+            brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT,
         )],
         ..minimal_wasm_consumer()
     }];
@@ -576,9 +576,44 @@ fn reserved_tool_results_output_port_panics() {
         package: "a".to_string(),
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw(
-            brenn_tool_registry::bus_wiring::TOOL_RESULT_INPUT_PORT,
+            brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT,
             "brenn:out-ch",
         )],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// A subscription bound to another consumer's result inbox reaches a channel the
+/// tool substrate mints and wires from tool grants; refused whatever the port is
+/// named.
+#[test]
+#[should_panic(expected = "which is in a namespace the tool substrate owns")]
+fn subscription_on_a_tool_results_address_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:tool-results/other")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "inbox-thief".to_string(),
+        package: "a".to_string(),
+        subscriptions: vec![sub_raw("brenn:tool-results/other", "results")],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// An output bound to a tool's request channel would hand a component publish
+/// visibility on a channel only `derive_async_tool_bus_grants` grants; refused.
+#[test]
+#[should_panic(expected = "which is in a namespace the tool substrate owns")]
+fn output_on_a_tools_address_panics() {
+    let dir = dir_of(vec![
+        brenn_entry("brenn:in-ch"),
+        brenn_entry("brenn:tools/git-repo-pull"),
+    ]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "request-forger".to_string(),
+        package: "a".to_string(),
+        subscriptions: vec![sub_raw("brenn:in-ch", "in")],
+        outputs: vec![out_raw("requests", "brenn:tools/git-repo-pull")],
         ..minimal_wasm_consumer()
     }];
     resolve(&raw, &dir);

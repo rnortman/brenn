@@ -16,7 +16,7 @@
 //! Diagnostics accumulate rather than stopping at the first: independent errors
 //! in one document are all reported.
 
-use brenn_envelope::addressing::is_unreserved_name;
+use brenn_envelope::addressing::{TOOL_RESULT_INPUT_PORT, is_unreserved_name};
 use brenn_envelope::grants::ComponentGrant;
 
 use std::collections::{HashMap, HashSet};
@@ -3483,6 +3483,7 @@ fn class_ref(
             doctype,
         });
     }
+    check_tool_result_port(class, &ports, &needs.requires, errors);
     Some(ClassRef {
         name: class.name.clone(),
         abi,
@@ -3492,6 +3493,79 @@ fn class_ref(
         spec_sha256: spec_sha256.clone(),
         package: package.clone(),
     })
+}
+
+/// The `tool-results` port, which is the class's to declare and nobody's to
+/// bind, checked against the `tools` requirement that fills it.
+///
+/// The substrate folds an input port of this name into every consumer holding
+/// an async tool grant and delivers results on it. So the name carries one
+/// meaning: a class either declares it as the inbox, matched by the `tools`
+/// word, or does not use the name at all. Both halves of the coupling are
+/// refused, because a `tools` class without the declaration compiles and then
+/// fails its first result activation in the guest, where the port it was
+/// handed is one it never declared.
+fn check_tool_result_port(
+    class: &ComponentClass,
+    ports: &[RPort],
+    requires: &[Spanned<ComponentGrant>],
+    errors: &mut Vec<Diagnostic>,
+) {
+    let tools = requires
+        .iter()
+        .find(|word| *word.value() == ComponentGrant::Tools);
+    let inbox = ports
+        .iter()
+        .find(|port| port.name.value() == TOOL_RESULT_INPUT_PORT);
+    let Some(inbox) = inbox else {
+        if let Some(tools) = tools {
+            errors.push(two_site(
+                format!(
+                    "`{}` requires `tools` but declares no `in {TOOL_RESULT_INPUT_PORT};`; \
+                     the substrate delivers async tool results as activations on that port, \
+                     and a component that does not declare it fails the first result it is \
+                     handed",
+                    class.name.value()
+                ),
+                tools.span().clone(),
+                "the class is declared here",
+                class.name.span().clone(),
+            ));
+        }
+        return;
+    };
+    if inbox.dir != PortDir::In {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{TOOL_RESULT_INPUT_PORT}` is the async tool-result inbox, an `in` port the \
+                 substrate delivers on; it is not an `{}` port",
+                inbox.dir.as_str()
+            ),
+            inbox.name.span().clone(),
+        ));
+    }
+    if inbox.optional {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{TOOL_RESULT_INPUT_PORT}` cannot be `optional`: its presence is decided by \
+                 the class's `tools` requirement, not by an instance, which never binds it"
+            ),
+            inbox.name.span().clone(),
+        ));
+    }
+    if tools.is_none() {
+        errors.push(two_site(
+            format!(
+                "`{}` declares `{TOOL_RESULT_INPUT_PORT}` but does not require `tools`; the \
+                 substrate wires that port from a component's tool grants, so nothing would \
+                 ever deliver on it",
+                class.name.value()
+            ),
+            inbox.name.span().clone(),
+            "the class is declared here",
+            class.name.span().clone(),
+        ));
+    }
 }
 
 /// The two grant lists a class declares, checked as a pair.
@@ -4103,6 +4177,13 @@ fn bound_port(binding: &BindStmt) -> &Spanned<String> {
 /// reporting it unconnected too would answer one mistake twice. A name that
 /// matches no declared port is refused on its own by `check_port` and satisfies
 /// nothing here.
+///
+/// `tool-results` is skipped: the substrate wires it. Nothing further is
+/// checked at this site, because the chain that guarantees it gets wired is
+/// already closed — the port exists only on a class requiring `tools`, an
+/// instance of such a class must grant `tools` to fit its spec, and the `tools`
+/// word must come with at least one `tool` statement, which is what the fold-in
+/// keys on.
 fn check_required_ports(
     class: &ClassRef,
     named_ports: &[String],
@@ -4110,7 +4191,10 @@ fn check_required_ports(
     errors: &mut Vec<Diagnostic>,
 ) {
     for port in &class.ports {
-        if port.optional || named_ports.iter().any(|named| named == port.name.value()) {
+        if port.optional
+            || port.name.value() == TOOL_RESULT_INPUT_PORT
+            || named_ports.iter().any(|named| named == port.name.value())
+        {
             continue;
         }
         errors.push(two_site(
@@ -4244,6 +4328,20 @@ fn check_port(
     dir: PortDir,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<()> {
+    // Ahead of the class-port lookup, so the answer is what to do instead
+    // rather than the direction the class declared. The binding is dropped and
+    // the instance withheld, as an undeclared port's is.
+    if port.value() == TOOL_RESULT_INPUT_PORT {
+        errors.push(Diagnostic::at(
+            format!(
+                "port `{TOOL_RESULT_INPUT_PORT}` is the async tool-result inbox, wired by the \
+                 substrate from this instance's `tool` grants; nothing binds it. Its window is \
+                 tuned with `channel at \"brenn:tool-results/<slug>\" {{ … }}`"
+            ),
+            port.span().clone(),
+        ));
+        return None;
+    }
     match class
         .ports
         .iter()

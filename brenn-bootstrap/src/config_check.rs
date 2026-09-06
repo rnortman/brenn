@@ -1517,4 +1517,200 @@ new commons: SurfaceCommons;
             "{message}"
         );
     }
+
+    // ── the tool-result inbox port ───────────────────────────────────────────
+
+    /// A `tools`-requiring instance document with the given `bindings`.
+    fn inbox_doc(bindings: &str) -> String {
+        format!(
+            r#"{SURFACE_INDEX_DECL}
+channel pushes at "brenn:pushes" {{
+    push_depth = 8;
+    retain_depth = 8;
+    standing_retain_depth = 8;
+}}
+channel outcomes at "brenn:outcomes" {{
+    push_depth = 8;
+    retain_depth = 8;
+    standing_retain_depth = 8;
+}}
+// ── packaged ──
+component Sync {{
+    {header}
+    in push-events;
+    in tool-results;
+    out outcomes;
+}}
+// ── packaged ──
+new alice_sync: Sync {{
+    grants = [ports, tools];
+    tool git-repo-pull {{}}
+{bindings}}}
+"#,
+            header = processor_header("ports, tools"),
+        )
+    }
+
+    #[test]
+    fn a_document_leaving_the_tool_result_inbox_unbound_passes_the_gate() {
+        let (ok, report) = check(
+            "main.brenn",
+            &inbox_doc("    in push-events <- pushes;\n    out outcomes -> outcomes;\n"),
+        );
+        assert!(ok, "{report}");
+        assert_eq!(report, "");
+    }
+
+    #[test]
+    fn a_document_binding_the_tool_result_inbox_fails_the_gate_at_the_dsl_stage() {
+        let (ok, report) = check(
+            "main.brenn",
+            &inbox_doc(concat!(
+                "    in push-events <- pushes;\n",
+                "    out outcomes -> outcomes;\n",
+                "    in tool-results <- \"brenn:tool-results/alice_sync\" { push_depth = 4; }\n",
+            )),
+        );
+        assert!(!ok);
+        assert!(
+            report.contains("port `tool-results` is the async tool-result inbox"),
+            "{report}"
+        );
+        assert!(
+            report.contains("channel at \"brenn:tool-results/<slug>\""),
+            "{report}"
+        );
+    }
+
+    /// The gate plans with no tool registry and so never reaches the fold-in,
+    /// but a `fatal` inbox tuning block is still refused here: the only
+    /// subscription the substrate puts on a result inbox is a backend one, and
+    /// the address says which family the block tunes. Without this the document
+    /// passed `check.sh` and panicked the service at its next boot.
+    #[test]
+    fn a_fatal_inbox_tuning_block_fails_the_gate_with_no_registry() {
+        let message = staged_gate_refusal(&format!(
+            "{}{}",
+            inbox_doc("    in push-events <- pushes;\n    out outcomes -> outcomes;\n"),
+            r#"
+channel at "brenn:tool-results/alice_sync" {
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+    noise = fatal;
+}
+"#,
+        ));
+        assert!(message.contains("tunes a tool-result inbox"), "{message}");
+        assert!(message.contains("noise = fatal"), "{message}");
+    }
+
+    /// The config gate plans with no tool registry, so it cannot exercise
+    /// the fold-in. This test compiles the same document through
+    /// `plan_messaging` with a real registry to verify the fold-in produces
+    /// the inbox channel, wires the subscription, and grants access.
+    #[test]
+    fn a_lowered_tool_grant_reaches_the_planner_fold_in() {
+        let config = compiled_against_shipped_modules(&format!(
+            r#"use @git-sync-consumer::*;
+{SURFACE_INDEX_DECL}
+channel git_repo_sync at "brenn:git-repo-sync" {{
+    push_depth = 100;
+    retain_depth = 20;
+    standing_retain_depth = 100;
+}}
+channel git_repo_sync_outcomes at "brenn:git-repo-sync-outcomes" {{
+    push_depth = 100;
+    retain_depth = 100;
+    standing_retain_depth = 100;
+}}
+channel at "brenn:tool-results/git-sync-consumer" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+    noise = alarm;
+}}
+
+new git-sync-consumer: GitSyncConsumer {{
+    grants = [ports, log, store, alert, config, tools];
+    store_path = "/var/lib/brenn/git-sync-consumer.db";
+    in push-events <- git_repo_sync;
+    out outcomes -> git_repo_sync_outcomes;
+    tool git-repo-pull {{
+        allow {{ repo = "notes"; }}
+    }}
+    config = {{
+        repo_slugs = "notes",
+        remote_notes = "https://example.com/alice/notes.git"
+    }};
+}}
+"#
+        ));
+
+        let registry = brenn_tool_registry::testutil::git_repo_pull_only();
+        let plan = brenn_messaging_boot::plan_messaging(&brenn_messaging_boot::PlanInputs {
+            config: &config,
+            apps: None,
+            mqtt_clients: &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
+            tool_registry: Some(&registry),
+            replay_store_paths: &[],
+        })
+        .expect("a consumer-declaring document configures messaging");
+
+        let inbox = format!(
+            "brenn:{}",
+            brenn_tool_registry::bus_wiring::result_inbox_name("git-sync-consumer"),
+        );
+        assert!(
+            plan.directory.resolve(&inbox).is_some(),
+            "the planner must mint the instance's inbox channel",
+        );
+
+        let consumer = &plan.wasm_consumers[0];
+        assert_eq!(consumer.slug, "git-sync-consumer");
+        let folded = consumer
+            .inputs
+            .iter()
+            .find(|input| input.port == brenn_envelope::addressing::TOOL_RESULT_INPUT_PORT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the folded-in input port must be present: {:?}",
+                    consumer.inputs.iter().map(|i| &i.port).collect::<Vec<_>>(),
+                )
+            });
+        assert_eq!(folded.sub.channel_address, inbox);
+        // The whole path the tuning block travels: document → lowering → tuning
+        // table → fold-in. Each is the block's, not the family default. The
+        // block's two depths are written apart, so a subscription rung reading
+        // the channel's `push_depth` instead of its `retain_depth` fails here
+        // rather than coinciding.
+        assert_eq!(
+            folded.sub.noise,
+            brenn_lib::messaging::config::NoiseLevel::Alarm
+        );
+        assert_eq!(
+            folded.sub.push_depth,
+            brenn_lib::messaging::config::Depth::Bounded(4),
+        );
+        assert_eq!(
+            folded.sub.retain_depth,
+            brenn_lib::messaging::config::Depth::Bounded(4),
+        );
+        assert!(
+            consumer.policy.allows_channel_access(&inbox),
+            "the derived subscribe grant must admit delivery on the inbox",
+        );
+        assert!(
+            !consumer
+                .policy
+                .allows_channel_access("brenn:tool-results/other"),
+            "the grant is scoped to this instance's own inbox, not to the namespace",
+        );
+        assert_eq!(
+            plan.tool_caller_grants["wasm:git-sync-consumer"]
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["git-repo-pull"],
+        );
+    }
 }

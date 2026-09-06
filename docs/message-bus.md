@@ -320,6 +320,20 @@ and eager, so their window covers a burst arriving while the executor is busy.
 The channel-level push rung is near-inert on all four families — every
 subscriber on them states its own depths — so 1 is the honest floor.
 
+A consumer's `brenn:tool-results/<slug>` inbox feeds its reserved `tool-results`
+input port: the substrate subscribes the consumer to its own inbox at that
+window and delivers each result as an activation on that port, so the numbers
+tuned below are what the guest sees. That subscription inherits the channel's
+`noise` and `wake_min` as any configured one does, and takes both its depth
+rungs from the channel's `retain_depth`; the channel's own push rung is the
+near-inert one described just above.
+
+A `brenn:tools/<tool>` request channel is the other way round: its only
+substrate subscriber is the tool executor, folded in as a system participant,
+and a system participant's overflow rung is `Silent` whatever the channel says.
+A `noise` written on a request-channel block is inert today
+(`TODO(system-participant-noise-inert)`).
+
 **Tuning them.** A `[[channel]]` block addressing one of these channels does not
 declare it; it *tunes* it. Synthesis still owns creation, identity and
 description, so `uuid` and `description` are rejected on a tuning block, and all

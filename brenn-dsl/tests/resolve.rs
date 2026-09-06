@@ -1558,6 +1558,100 @@ fn a_processor_class_may_make_an_interfaceless_word_optional() {
     );
 }
 
+// ── the tool-result inbox port ───────────────────────────────────────────────
+
+/// The substrate delivers on the inbox; a class that points the name the other
+/// way is describing a port that cannot exist.
+#[test]
+fn the_tool_result_inbox_faces_in() {
+    for (dir, word) in [("out", "out"), ("io", "io")] {
+        let source = format!(
+            "component Sync {{\n    abi = processor; requires = [ports, tools];\n    {dir} tool-results;\n}}\n"
+        );
+        let errors = resolve_errors(&source);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].message,
+            format!(
+                "`tool-results` is the async tool-result inbox, an `in` port the substrate \
+                 delivers on; it is not an `{word}` port"
+            )
+        );
+        assert_eq!(errors[0].line_col(), at(&source, "tool-results"));
+    }
+}
+
+/// `optional` says an instance may leave the port unwired. No instance wires
+/// this one either way, so the word answers a question nobody asks.
+#[test]
+fn the_tool_result_inbox_is_not_optional() {
+    let source = concat!(
+        "component Sync {\n    abi = processor; requires = [ports, tools];\n",
+        "    optional in tool-results;\n}\n"
+    );
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`tool-results` cannot be `optional`: its presence is decided by the class's `tools` \
+         requirement, not by an instance, which never binds it"
+    );
+    assert_eq!(errors[0].line_col(), at(source, "tool-results"));
+}
+
+/// The fold-in is keyed on a tool grant, so without the `tools` word the port
+/// is one nothing ever publishes to.
+#[test]
+fn the_tool_result_inbox_needs_the_tools_word() {
+    let source =
+        "component Sync {\n    abi = processor; requires = [ports];\n    in tool-results;\n}\n";
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`Sync` declares `tool-results` but does not require `tools`; the substrate wires \
+         that port from a component's tool grants, so nothing would ever deliver on it"
+    );
+    assert_eq!(errors[0].line_col(), at(source, "tool-results"));
+    assert_eq!(errors[0].related[0].0, "the class is declared here");
+}
+
+/// The other direction of the same coupling, and the one that was a runtime
+/// failure: the host folds the port in regardless, and a guest handed an
+/// activation on a port its spec never declared fails the delivery.
+#[test]
+fn the_tools_word_needs_the_tool_result_inbox() {
+    let source =
+        "component Sync {\n    abi = processor; requires = [ports, tools];\n    in events;\n}\n";
+    let errors = resolve_errors(source);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "`Sync` requires `tools` but declares no `in tool-results;`; the substrate delivers \
+         async tool results as activations on that port, and a component that does not declare \
+         it fails the first result it is handed"
+    );
+    assert_eq!(errors[0].related[0].0, "the class is declared here");
+    assert_eq!(
+        errors[0].line_col(),
+        at(source, "tools"),
+        "the caret sits on the word that decides the port, not on the class",
+    );
+}
+
+/// The shape every tool-using class has, and the only one.
+#[test]
+fn a_tools_class_declaring_the_inbox_compiles() {
+    let config = resolved(concat!(
+        "component Sync {\n    abi = processor; requires = [ports, tools];\n",
+        "    in events;\n    in tool-results;\n    out outcomes;\n}\n"
+    ));
+    assert!(
+        config.consumers.is_empty(),
+        "declaring is not instantiating"
+    );
+}
+
 /// The words the class stated reach the instance, which is what the fit check
 /// has to compare against: dropping a host-questionable word here would leave
 /// an over-grant with nothing to contradict it.
@@ -3418,7 +3512,8 @@ fn tool_doc(statements: &str) -> String {
     format!(
         concat!(
             packaged!(),
-            "component Sink {{\n    abi = processor; requires = [tools];\n}}\n",
+            "component Sink {{\n    abi = processor; requires = [tools];\n",
+            "    in tool-results;\n}}\n",
             packaged!(),
             "new alice_sink: Sink {{\n",
             "    grants = [tools];\n",
@@ -3427,6 +3522,72 @@ fn tool_doc(statements: &str) -> String {
         ),
         statements
     )
+}
+
+/// A top-level instance of a class shaped like every tool-using component: an
+/// input, an output, and the substrate-wired inbox the class declares and the
+/// document says nothing about.
+fn sync_doc(bindings: &str) -> String {
+    format!(
+        concat!(
+            "channel pushes at \"brenn:pushes\";\n",
+            "channel outcomes at \"brenn:outcomes\";\n",
+            packaged!(),
+            "component Sync {{\n    abi = processor; requires = [ports, tools];\n",
+            "    in push-events;\n    in tool-results;\n    out outcomes;\n}}\n",
+            packaged!(),
+            "new alice_sync: Sync {{\n",
+            "    grants = [ports, tools];\n",
+            "    tool git-repo-pull {{}}\n",
+            "{}",
+            "}}\n",
+        ),
+        bindings
+    )
+}
+
+/// An instance binds the ports that are its to bind and leaves the inbox
+/// alone; that is the whole correct document.
+#[test]
+fn an_instance_never_binds_the_tool_result_inbox() {
+    let config = resolved(&sync_doc(concat!(
+        "    in push-events <- pushes;\n",
+        "    out outcomes -> outcomes;\n",
+    )));
+    let consumer = &config.consumers[0];
+    assert_eq!(consumer.slug.value(), "alice_sync");
+    assert!(
+        consumer
+            .bindings
+            .iter()
+            .all(|binding| binding.port.value() != "tool-results"),
+        "the substrate wires it, so nothing in the document does"
+    );
+}
+
+/// The operator's next attempt after the unconnected-port refusal, answered by
+/// the language with what to do instead.
+///
+/// Every direction gets that answer, which is what the refusal's position ahead
+/// of the class-port lookup buys: an `out` or `io` binding of the name would
+/// otherwise be told the class declares no such port, which is true and useless.
+#[test]
+fn binding_the_tool_result_inbox_is_refused() {
+    for binding in [
+        "    in tool-results <- \"brenn:tool-results/alice_sync\" { push_depth = 4; }\n",
+        "    out tool-results -> outcomes;\n",
+        "    io tool-results <-> outcomes;\n",
+    ] {
+        assert_eq!(
+            refusal(&sync_doc(&format!(
+                "    in push-events <- pushes;\n    out outcomes -> outcomes;\n{binding}"
+            ))),
+            "port `tool-results` is the async tool-result inbox, wired by the substrate from \
+             this instance's `tool` grants; nothing binds it. Its window is tuned with \
+             `channel at \"brenn:tool-results/<slug>\" { … }`",
+            "{binding}"
+        );
+    }
 }
 
 /// Two statements naming one tool are two answers to one question.

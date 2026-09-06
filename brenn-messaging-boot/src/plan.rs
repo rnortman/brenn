@@ -364,23 +364,35 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
             &system_channel_tuning,
             global_defaults,
         );
-        // The consumer's subscription follows its inbox's window, so the
-        // subscriber never reaches past what the channel block sized.
-        let inbox_window = inbox_entry.resolved_channel.retain_depth;
-        all_entries.push(inbox_entry);
-        let inbox_sub =
-            brenn_tool_registry::bus_wiring::inbox_subscription(&consumer.slug, inbox_window);
+        // The backend cannot enact `fatal`; the rule and its reason live on
+        // `NoiseLevel::is_backend_enactable`. `build_system_channel_tuning`
+        // already refuses a `fatal` inbox block without needing a registry, so
+        // this is the belt for a channel resolving there some other way.
+        assert!(
+            inbox_entry.resolved_channel.noise.is_backend_enactable(),
+            "[[wasm_consumer]] {:?}: the tool-result inbox {:?} resolves to noise = fatal, \
+             but {}",
+            consumer.slug,
+            inbox_entry.address,
+            brenn_lib::messaging::config::BACKEND_FATAL_NOISE_REFUSAL,
+        );
         let dir_entry = wasm_consumers_for_dir
             .iter_mut()
             .find(|(slug, _)| slug == &consumer.slug)
             .expect("wasm_consumers_for_dir has an entry per resolved consumer");
-        dir_entry.1.push(inbox_sub);
+        dir_entry
+            .1
+            .push(brenn_tool_registry::bus_wiring::inbox_subscription(
+                &consumer.slug,
+                &inbox_entry.resolved_channel,
+            ));
         consumer
             .inputs
             .push(brenn_tool_registry::bus_wiring::inbox_input_port(
                 &consumer.slug,
-                inbox_window,
+                &inbox_entry.resolved_channel,
             ));
+        all_entries.push(inbox_entry);
         tuned_inbox_slugs.insert(consumer.slug.clone());
     }
     // Each consumer's tool grants against the registry: a wasm policy is not in
@@ -936,6 +948,102 @@ mod tests {
         assert_eq!(callers, vec!["wasm:puller"]);
         let grants = &plan.tool_caller_grants["wasm:puller"];
         assert_eq!(grants.keys().collect::<Vec<_>>(), vec!["apull"]);
+    }
+
+    /// A `fatal` inbox tuning block is refused by the tuning-table build, before
+    /// the planner needs a registry at all. Planned here with
+    /// `tool_registry: None` — the shape the config gate runs, which never
+    /// reaches the fold-in — and the expectation is that guard's own wording, so
+    /// the test cannot be satisfied by the fold-in's belt instead.
+    #[test]
+    #[should_panic(expected = "tunes a tool-result inbox")]
+    fn a_fatal_inbox_tuning_block_is_refused_by_the_tuning_table() {
+        let mut granted = brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+            "puller",
+            "processor-demo",
+            &["brenn:work"],
+        );
+        granted.subscribe_acl = vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "work".to_string(),
+        )];
+        granted.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
+            tool: "git-repo-pull".to_string(),
+            acl: vec![std::collections::BTreeMap::from([(
+                "repo".to_string(),
+                "notes".to_string(),
+            )])],
+            rate_limit: None,
+        }];
+
+        let mut inbox_tuning = durable_channel("brenn:tool-results/puller", Depth::Bounded(4));
+        inbox_tuning.uuid = None;
+        inbox_tuning.noise = Some(brenn_lib::messaging::config::NoiseLevel::Fatal);
+
+        let mut config = BrennConfig::default();
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        config
+            .channels
+            .push(durable_channel("brenn:work", Depth::Bounded(4)));
+        config.channels.push(inbox_tuning);
+        config.wasm_consumers = vec![granted];
+
+        plan_messaging(&PlanInputs {
+            config: &config,
+            apps: None,
+            mqtt_clients: &indexmap::IndexMap::new(),
+            tool_registry: None,
+            replay_store_paths: &[],
+        })
+        .expect("a document declaring channels configures messaging");
+    }
+
+    /// The fold-in's own belt, exercised. An *untuned* inbox has no
+    /// `[[channel]]` block for the tuning-table guard to inspect, so a global
+    /// `default_noise = fatal` is the one way a `fatal` rung reaches the
+    /// substrate's subscription — and this crate is where it is caught. The
+    /// document is built in Rust because the DSL refuses that global outright;
+    /// every declared channel here states a backend-enactable `noise` of its
+    /// own, so the consumer's configured subscription does not refuse first.
+    #[test]
+    #[should_panic(expected = "the tool-result inbox")]
+    fn a_fatal_global_default_reaches_the_fold_in_belt() {
+        let mut granted = brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
+            "puller",
+            "processor-demo",
+            &["brenn:work"],
+        );
+        granted.subscribe_acl = vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "work".to_string(),
+        )];
+        granted.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
+            tool: "git-repo-pull".to_string(),
+            acl: vec![std::collections::BTreeMap::from([(
+                "repo".to_string(),
+                "notes".to_string(),
+            )])],
+            rate_limit: None,
+        }];
+
+        let mut config = BrennConfig::default();
+        config.messaging.default_noise = brenn_lib::messaging::config::NoiseLevel::Fatal;
+        for address in ["brenn:surface.index", "brenn:work"] {
+            let mut channel = durable_channel(address, Depth::Unbounded);
+            channel.noise = Some(brenn_lib::messaging::config::NoiseLevel::Silent);
+            config.channels.push(channel);
+        }
+        config.wasm_consumers = vec![granted];
+
+        let registry = brenn_tool_registry::testutil::git_repo_pull_only();
+        plan_messaging(&PlanInputs {
+            config: &config,
+            apps: None,
+            mqtt_clients: &indexmap::IndexMap::new(),
+            tool_registry: Some(&registry),
+            replay_store_paths: &[],
+        })
+        .expect("a document declaring channels configures messaging");
     }
 
     /// The mount is checked where the entry is minted. A block whose declared

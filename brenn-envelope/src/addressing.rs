@@ -100,6 +100,25 @@ pub fn nondurable_channel_uuid(scheme: ChannelScheme, name: &str) -> Uuid {
 /// may not fall in these namespaces.
 pub const RESERVED_CHANNEL_SEGMENTS: [&str; 2] = ["tools", "tool-results"];
 
+/// Reserved namespace of the async-tool request channels (`brenn:tools/<tool>`).
+pub const TOOLS_NAMESPACE: &str = "tools/";
+/// Reserved namespace of the per-consumer result inboxes
+/// (`brenn:tool-results/<slug>`).
+///
+/// Beside the segments rather than in the tool substrate because the config
+/// language classifies a tuning block by this namespace and cannot see that
+/// crate.
+pub const TOOL_RESULTS_NAMESPACE: &str = "tool-results/";
+
+/// Logical input port a consumer's async tool-result inbox is delivered on.
+///
+/// Reserved in both directions: the runtime folds a port of this name into
+/// every consumer holding an async tool grant, and the config language refuses
+/// to let anything else wear the name or bind it. Lives here because the
+/// language and the tool substrate must spell it identically and this crate is
+/// the one both depend on.
+pub const TOOL_RESULT_INPUT_PORT: &str = "tool-results";
+
 /// Does `address` (a scheme-stripped `brenn:` channel name) fall in a reserved
 /// tool namespace? True for an exact segment match (`"tools"`) or a leading
 /// segment followed by a `.`/`/` boundary (`"tools/x"`, `"tools.x"`), so a
@@ -623,6 +642,21 @@ mod tests {
         assert!(!is_reserved_channel("tool"));
         assert!(!is_reserved_channel("tool-results-archive"));
         assert!(!is_reserved_channel("alerts.high"));
+    }
+
+    #[test]
+    fn namespace_prefixes_are_reserved_channel_segments() {
+        // Two independently written spellings of the same two namespaces: the
+        // prefixes the substrate formats addresses with, and the segments
+        // `is_reserved_channel` refuses declarations in. Compared by content so
+        // a segment added later does not break the assertion.
+        for namespace in [TOOLS_NAMESPACE, TOOL_RESULTS_NAMESPACE] {
+            let segment = namespace.trim_end_matches('/');
+            assert!(
+                RESERVED_CHANNEL_SEGMENTS.contains(&segment),
+                "namespace {namespace:?} is not a reserved channel segment",
+            );
+        }
     }
 
     #[test]

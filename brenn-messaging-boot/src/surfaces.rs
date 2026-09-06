@@ -884,6 +884,12 @@ pub(crate) fn resolve_surfaces(
                  brenn:, ephemeral:, or local: address — surfaces bind only those three \
                  schemes (the scheme restriction that keeps surfaces off ingress paths)",
             );
+            // A surface-placed component is a component: the tool substrate's
+            // channels are as closed to it as to a backend one.
+            crate::assert_not_tool_namespace(
+                &format!("config: [[surface]] {slug:?}: {direction} port {port:?}"),
+                channel,
+            );
             match split {
                 // Both transportable schemes take one lookup in the one
                 // directory. The transport check is defense-in-depth for the

@@ -1,8 +1,9 @@
 // Generated from processor-full.brenn — do not edit.
 
 //! A specification exercising the whole generated processor surface: both port
-//! directions, an `io` port, an optional port, doctypes, and every capability
-//! word that names an SDK module.
+//! directions, an `io` port, an optional port, the substrate-wired tool-result
+//! inbox its `tools` requirement obliges, doctypes, and every capability word
+//! that names an SDK module.
 //!
 //! The prose is carried into the generated module, so this paragraph is part of
 //! what the golden pins.
@@ -21,18 +22,25 @@ pub enum InPort {
     /// Doctype: `brenn.scaffold.commands@1`.
     Commands,
     Retries,
+    ToolResults,
     Tick,
 }
 
 impl InPort {
     /// Every inbound port, in the order the specification declares them.
-    pub const ALL: [InPort; 3] = [InPort::Commands, InPort::Retries, InPort::Tick];
+    pub const ALL: [InPort; 4] = [
+        InPort::Commands,
+        InPort::Retries,
+        InPort::ToolResults,
+        InPort::Tick,
+    ];
 
     /// The name this port is published and bound under.
     pub const fn name(self) -> &'static str {
         match self {
             InPort::Commands => "commands",
             InPort::Retries => "retries",
+            InPort::ToolResults => "tool-results",
             InPort::Tick => "tick",
         }
     }
@@ -42,6 +50,7 @@ impl InPort {
         match name {
             "commands" => Some(InPort::Commands),
             "retries" => Some(InPort::Retries),
+            "tool-results" => Some(InPort::ToolResults),
             "tick" => Some(InPort::Tick),
             _ => None,
         }
@@ -103,6 +112,7 @@ pub mod port {
     /// Doctype: `brenn.scaffold.commands@1`.
     pub const COMMANDS: &str = "commands";
     pub const RETRIES: &str = "retries";
+    pub const TOOL_RESULTS: &str = "tool-results";
     /// Doctype: `brenn.scaffold.results@1`.
     pub const RESULTS: &str = "results";
     pub const TICK: &str = "tick";

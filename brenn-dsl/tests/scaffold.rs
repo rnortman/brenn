@@ -481,9 +481,11 @@ fn the_port_names_reach_the_host_build() {
     );
 }
 
-/// The corpus fixtures the goldens are built from parse and generate here too,
-/// so a fixture that stops being generatable fails as a test rather than as a
-/// build action nobody reads.
+/// The corpus fixtures the goldens are built from parse, resolve and generate
+/// here too, so a fixture that stops being generatable fails as a test rather
+/// than as a build action nobody reads — and one that stops being a document
+/// the language accepts fails at all, which generation alone never notices
+/// because it never resolves.
 #[test]
 fn every_golden_fixture_generates() {
     for name in ["processor-full", "no-inbound", "no-outbound", "no-ports"] {
@@ -491,5 +493,11 @@ fn every_golden_fixture_generates() {
         let file = parse_str(&source, name).unwrap_or_else(|error| panic!("{}", error.render()));
         generate(&file, None, name, name)
             .unwrap_or_else(|error| panic!("{name}: {}", error.render()));
+        if let Err(errors) = support::compile(&source) {
+            panic!(
+                "{name}: the fixture is not a document the language accepts: {:?}",
+                errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+            );
+        }
     }
 }

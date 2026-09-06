@@ -186,6 +186,9 @@ pub fn fold_spec_subscriptions(entries: &mut [ChannelEntry], specs: &[SystemPart
                  retain_depth to at least one",
                 spec.component,
             );
+            // TODO(system-participant-noise-inert): a system participant's
+            // overflow rung is `Silent` whatever its channel's `noise` says, so
+            // the setting is inert on every family folded here.
             entry.subscribers.push(SubscriberEntry {
                 kind: SubscriberEntryKind::System(spec.component.to_string()),
                 push_depth: window,

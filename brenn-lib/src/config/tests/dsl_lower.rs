@@ -1395,6 +1395,28 @@ fn a_bad_section_token_names_the_legal_spellings() {
     assert_eq!(diagnostic.span.text_str(), Some("loud"));
 }
 
+/// `fatal` is a legal noise spelling, but not as the global default: every
+/// channel stating no `noise` inherits it, and the backend overflow path cannot
+/// enact it — including the substrate's own subscription on a tool-result
+/// inbox, which has no `[[channel]]` block for the tuning-table guard to refuse.
+/// Refused on the word rather than at the first backend subscription boot
+/// resolves.
+#[test]
+fn a_fatal_global_default_noise_is_refused_on_the_word() {
+    let diagnostic = refusal("messaging { default_noise = fatal; }");
+    assert!(
+        diagnostic.message.starts_with("`default_noise`:"),
+        "{}",
+        diagnostic.render()
+    );
+    assert!(
+        diagnostic.message.contains("fatal is surface-only"),
+        "{}",
+        diagnostic.message
+    );
+    assert_eq!(diagnostic.span.text_str(), Some("fatal"));
+}
+
 /// A log level goes through the config module's own level parser, so lowering
 /// refuses exactly what that parser refuses.
 #[test]
@@ -5330,7 +5352,7 @@ new alice: Assistant();
 fn a_consumers_tool_statements_lower_to_raw_grants() {
     let config = config_from_dsl(concat!(
         "// ── packaged ──\n",
-        "component Sink {\n    abi = processor; requires = [tools];\n}\n",
+        "component Sink {\n    abi = processor; requires = [tools];\n    in tool-results;\n}\n",
         "// ── packaged ──\n",
         "new alice_sink: Sink {\n",
         "    grants = [tools];\n",
@@ -5353,6 +5375,63 @@ fn a_consumers_tool_statements_lower_to_raw_grants() {
                 burst: 2,
                 sustained_per_minute: 10,
             }),
+        }]
+    );
+}
+
+/// Stated as the whole subscription/output/io triple rather than a `tool-results`
+/// absence check, so a lowering arm that started synthesizing the inbox fails
+/// here whichever of the three it synthesized it into.
+#[test]
+fn the_tool_result_inbox_port_never_reaches_the_lowered_consumer() {
+    let config = config_from_dsl(concat!(
+        "channel pushes at \"brenn:pushes\" {\n",
+        "    push_depth = 8; retain_depth = 8; standing_retain_depth = 8;\n}\n",
+        "channel outcomes at \"brenn:outcomes\" {\n",
+        "    push_depth = 8; retain_depth = 8; standing_retain_depth = 8;\n}\n",
+        "// ── packaged ──\n",
+        "component Sync {\n    abi = processor; requires = [ports, tools];\n",
+        "    in push-events;\n    in tool-results;\n    out outcomes;\n}\n",
+        "// ── packaged ──\n",
+        "new alice_sync: Sync {\n",
+        "    grants = [ports, tools];\n",
+        "    tool git-repo-pull {}\n",
+        "    in push-events <- pushes;\n",
+        "    out outcomes -> outcomes;\n",
+        "}\n",
+    ));
+    let consumer = &config.wasm_consumers[0];
+    assert_eq!(
+        consumer.subscriptions,
+        vec![WasmConsumerSubscriptionRaw {
+            channel: Some("brenn:pushes".to_string()),
+            port: "push-events".to_string(),
+            push_depth: None,
+            retain_depth: None,
+            noise: None,
+            wake_min: None,
+            amplification: None,
+        }]
+    );
+    assert_eq!(
+        consumer.outputs,
+        vec![WasmConsumerOutputRaw {
+            port: "outcomes".to_string(),
+            channel: Some("brenn:outcomes".to_string()),
+            urgency: None,
+            publish_per_activation: None,
+            publish_capacity: None,
+        }]
+    );
+    assert_eq!(consumer.io_ports, vec![]);
+    // The inbox is an `in` port, so it is not in the outbound vocabulary either.
+    assert_eq!(consumer.declared_out_ports, vec!["outcomes".to_string()]);
+    assert_eq!(
+        consumer.tool_grants,
+        vec![crate::tools::config::ToolGrantRaw {
+            tool: "git-repo-pull".to_string(),
+            acl: vec![],
+            rate_limit: None,
         }]
     );
 }

@@ -803,11 +803,8 @@ mod tests {
     #[test]
     fn write_virtual_tools_file_projects_granted_registry_tool() {
         use std::collections::BTreeMap;
-        use std::sync::Arc;
 
         use brenn_lib::tools::{AclClause, ResolvedToolGrant};
-
-        use brenn_tool_registry::{GitRepoPullTool, RegisteredTool, ToolRegistry};
 
         let tmp = tempfile::tempdir().unwrap();
         let mut app = minimal_test_app_config();
@@ -824,12 +821,7 @@ mod tests {
             },
         )]);
 
-        let git_tool = GitRepoPullTool::new(
-            Arc::new(Default::default()),
-            Arc::new(Default::default()),
-            None,
-        );
-        let registry = ToolRegistry::new(vec![RegisteredTool::Async(Arc::new(git_tool))]);
+        let registry = brenn_tool_registry::testutil::git_repo_pull_only();
         let path = write_virtual_tools_file(&app, &registry);
 
         let json: serde_json::Value =

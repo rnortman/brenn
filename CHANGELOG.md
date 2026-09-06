@@ -49,6 +49,23 @@ All notable changes to Brenn are documented here.
   remote keys used a colon (`remote:<slug>`) that the DSL grammar cannot spell.
   They are now `remote_<slug>`, with underscores. No backward compatibility —
   the consumer has never been configured from a `.brenn` file in production.
+- **The `tool-results` inbox port is substrate-wired.** A component class
+  requiring `tools` declares `in tool-results;`, but an instance never binds
+  it — the runtime folds the inbox in from the instance's `tool` grants. The
+  DSL now knows this: it skips the port in its mandatory-binding check, refuses
+  any explicit binding of it, and enforces the coupling between `tools` in
+  `requires` and the port declaration in both directions. Previously no
+  `.brenn` document could instantiate a component holding an async tool grant —
+  leaving the port unbound was a compile error, binding it was a runtime
+  refusal. The shared constant `TOOL_RESULT_INPUT_PORT` moves to
+  `brenn-envelope` so both layers reference one name.
+- **Component bindings cannot reach tool-namespace channels.** A component
+  port bound to a `brenn:tool-results/` or `brenn:tools/` address is now
+  refused at compile time and at boot. Agents' `subscribe` statements are
+  unaffected.
+- **`fatal` noise on a tool-result inbox is refused.** A tuning block or
+  inherited global default that would set `fatal` on a `brenn:tool-results/`
+  channel is caught at compile time — the backend has no kill wire to enact it.
 
 
 ## [0.19.0] — 2026-09-04
