@@ -2,7 +2,17 @@
 
 All notable changes to Brenn are documented here.
 
-## [Unreleased]
+## [0.20.0] — 2026-09-06
+
+A running server can now be told to re-read its config document and converge to
+it. The reload is deliberately narrow: channels, links, and WASM consumers move
+in place, and anything else that differs is refused outright rather than
+half-applied. Both doors — `SIGUSR1` and a published message — are off unless
+the deployment declares the reload channel pair.
+
+The rest is DSL and formatter correctness: the substrate-wired `tool-results`
+port is now something a `.brenn` document can express, and `brennfmt` stops
+orphaning statement terminators.
 
 ### Added
 
