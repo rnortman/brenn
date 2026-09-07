@@ -2,7 +2,7 @@
 
 All notable changes to Brenn are documented here.
 
-## [Unreleased]
+## [0.20.1] — 2026-09-07
 
 Reload covers the full deployment surface. A running server can now pick up new
 WASM component packages, new surface kinds, new surface instances, and new MQTT
