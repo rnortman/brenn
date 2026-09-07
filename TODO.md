@@ -2820,21 +2820,57 @@ gone, and the per-endpoint body ceiling is enforced on a wildcard route.
 
 ## `reload-mqtt-sessions`
 
-An `mqtt:` channel converges — its filter and its ingress route follow the
-document — but the set of broker *sessions* does not. Supervisors are spawned
-once, at boot, for the referenced-client set, so a reload refuses in two
-directions: a binding on a client nothing referenced when the process booted has
-no session to subscribe on, and a change that removes a referenced client's last
-reference would leave a supervisor a fresh boot would not have spawned. Both
-are stated refusals asking for a restart, not silent limits.
+Every declared `mqtt_client` has a broker session for the life of the process, so
+an `mqtt:` channel converges in both directions. What does not converge is the
+`mqtt_clients` block itself: it is level-1 frozen (`compare.rs`, the
+`mqtt_clients` `keyed_vec` arm), so adding, removing or editing a client is a
+refusal asking for a restart.
 
-Converging them means starting and stopping supervisors at reload, which in turn
-means the whole MQTT subsystem — service, event router, `AppState` injection —
-has to be able to come up lazily, because a boot document referencing no client
+Converging it means starting a supervisor for an added client, stopping one for a
+removed client — a mutable `MqttService` registry with a `remove_client`, and a
+mutable `ShutdownHandle::mqtt_stop_txs` (`brenn-bootstrap/src/shutdown.rs`) —
+restarting one whose config changed, and building the service, the event router
+and the `AppState` injection lazily, because a boot document declaring no client
 builds none of it today.
 
-Code sites (`TODO(reload-mqtt-sessions)`): `brenn-bootstrap/src/reload/mqtt.rs`,
-at `session_refusals`; `brenn-bootstrap/src/mqtt.rs`, at `start_mqtt`.
+Code sites (`TODO(reload-mqtt-sessions)`): `brenn-bootstrap/src/mqtt.rs`, at
+`start_mqtt`; `brenn-bootstrap/src/reload/compare.rs`, at the `mqtt_clients`
+`keyed_vec` arm.
 
-Done = a reload that adds the first reference to a client, or drops the last
-one, applies — the supervisor is spawned or stopped and the status body says so.
+Done = a document that adds, removes or edits an `mqtt_client` applies at
+reload.
+
+## `mqtt-idle-client-visibility`
+
+A declared `mqtt_client` that nothing is bound through holds a broker session,
+and no runtime surface reports it. The channel-listing enrichment
+(`enrich_mqtt_listing`, `brenn-server/src/messaging_intercept.rs`) decorates
+`mqtt:` channel entries with per-client health, and an unbound client has no
+entry; `MqttService::client_slugs` has no non-test caller. So a placeholder
+broker whose credentials are wrong looks exactly like a healthy one that nobody
+uses: the only trace is the supervisor's own log line.
+
+Needs a decision on the surface before the code: enumerate declared clients
+with no channels in the connector health the listing already renders, or report
+the session set and its per-client health on `brenn:config.status` / the health
+endpoint. The first changes an LLM-facing tool result shape; the second changes
+a retained channel a deploy script reads.
+
+The same exposure has an alerting half. A supervisor that gives up on an
+authoritative failure — bad credentials, a rejected TLS chain — writes
+`tracing::error!` and exits, and nothing in `brenn-mqtt` dispatches an alert,
+whereas a reload refusal mails one. Now that every declared client dials at
+boot, a broker that will never work is a routine boot condition with the
+weakest reporting in the subsystem. Needs the same decision as the read
+surface: whether the terminal `Failed` write dispatches an alert directly, or
+whether it is the health surface above that alerts on what it finds.
+
+Code sites (`TODO(mqtt-idle-client-visibility)`):
+`brenn-server/src/messaging_intercept.rs`, at `enrich_mqtt_listing`;
+`brenn-mqtt/src/connection.rs`, at the supervisor's terminal-state tail.
+
+Done = an operator (or the LLM) can read, from a runtime surface, that a
+declared client has a session and what state it is in, whether or not any
+channel is bound through it, and a client that failed authoritatively reaches
+the operator by the route a reload refusal does rather than by a log line
+alone.

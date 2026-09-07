@@ -467,8 +467,20 @@ async fn supervisor_body(
                 handle.fail_all_publishes(None).await;
                 clear_subscribe_tracking(&handle).await;
                 {
+                    // The terminal state is written here, under the client
+                    // lock, and not only in the tail: a reader that finds the
+                    // client cell empty and then reads the supervisor state to
+                    // tell a deferral from a dead session must not see a
+                    // retrying state for a session that has already given up.
+                    // The tail rewrites the same value.
                     let mut client_guard = handle.client.lock().await;
                     *client_guard = None;
+                    if authoritative {
+                        let mut state = handle.supervisor_state.write().await;
+                        *state = SupervisorState::Failed {
+                            reason: error_str.clone(),
+                        };
+                    }
                 }
                 if authoritative {
                     tracing::error!(
@@ -610,8 +622,17 @@ async fn supervisor_body(
         // Connection lost.
         let (disconnect_reason, disconnect_authoritative) = disconnect_reason;
         {
+            // Terminal state under the client lock, for the reason the connect
+            // path writes it there too: an empty client cell paired with a
+            // retrying supervisor state is read as "will reconnect".
             let mut client_guard = handle.client.lock().await;
             *client_guard = None;
+            if disconnect_authoritative {
+                let mut state = handle.supervisor_state.write().await;
+                *state = SupervisorState::Failed {
+                    reason: disconnect_reason.clone(),
+                };
+            }
         }
         handle
             .fail_all_publishes(Some(disconnect_reason.clone()))
@@ -661,8 +682,14 @@ async fn supervisor_body(
         }
     }
 
+    // TODO(mqtt-idle-client-visibility): a `Failed` terminal state is the end
+    // of this client for the life of the process and reaches the operator
+    // through this task's log line and nothing else.
     // Terminal-state tail: every exit path must leave supervisor_state in a
-    // terminal (non-Connected) state. The tail is the single write site.
+    // terminal (non-Connected) state. Every path arrives here with its reason,
+    // and the two authoritative-failure paths have already written that same
+    // `Failed` beside clearing the client cell, so this write is idempotent
+    // rather than exclusive.
     match terminal_reason {
         Some(state) => {
             let mut guard = handle.supervisor_state.write().await;

@@ -15,7 +15,9 @@ use tokio::sync::RwLock;
 
 use crate::connection::{assert_ingress_subscription, assert_ingress_unsubscribe};
 use crate::payload::InboundPayload;
-use crate::state::{ConnectorHealthLabel, MqttClientHandle, PendingPublish, PubackOutcome};
+use crate::state::{
+    ConnectorHealthLabel, MqttClientHandle, PendingPublish, PubackOutcome, SupervisorState,
+};
 use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::error::MqttError;
 
@@ -59,9 +61,16 @@ pub trait MqttEventRouter: Send + Sync + 'static {
 pub enum IngressSubscribeOutcome {
     /// The client was live and the SUBSCRIBE was sent now.
     SubscribedLive,
-    /// The client is currently disconnected; the filter is registered and the
-    /// SUBSCRIBE is deferred to the next reconnect. Not an error.
+    /// The client is currently disconnected but its supervisor is still
+    /// retrying; the filter is registered and the SUBSCRIBE is deferred to the
+    /// next reconnect. Not an error.
     DeferredDisconnected,
+    /// The client's supervisor hit an authoritative failure and has stopped
+    /// retrying, so there is no reconnect for the filter to be deferred to. The
+    /// filter is registered — a later process with working credentials asserts
+    /// it — but nothing will be subscribed in this one. Carries the failure
+    /// reason.
+    ClientFailed(String),
     /// The client was live but the SUBSCRIBE *send* failed. The filter stays
     /// registered (the next reconnect re-asserts it). Carries the client error.
     SendFailed(String),
@@ -142,7 +151,11 @@ impl MqttService {
         clients.get(client_slug).cloned()
     }
 
-    /// Every client that has a registered session, in registration order.
+    /// Every client that has a registered session, sorted by slug.
+    ///
+    /// Sorted here rather than by each caller: the registry is a `HashMap`, so
+    /// an unsorted return is a different order on every run, and the callers
+    /// are assertions comparing the set element for element.
     ///
     /// Read under the same non-blocking lock `get_client` takes, and for the
     /// same reason: the registry is written only at startup, so a write lock
@@ -152,7 +165,9 @@ impl MqttService {
             "MqttService clients map write lock held unexpectedly — the registry is read-only \
              after startup",
         );
-        clients.keys().cloned().collect()
+        let mut slugs: Vec<String> = clients.keys().cloned().collect();
+        slugs.sort();
+        slugs
     }
 
     /// Snapshot the connection health for `client_slug`.
@@ -233,6 +248,14 @@ impl MqttService {
     /// MQTT client — the caller maps this to a tool error). This method does
     /// **not** touch the channel directory, the durable subscription row, or the
     /// router table — those are the caller's responsibility.
+    ///
+    /// A client with no live connection is two different answers: a supervisor
+    /// in backoff will assert the filter on its next connect
+    /// ([`IngressSubscribeOutcome::DeferredDisconnected`]), one that gave up on
+    /// an authoritative failure never will
+    /// ([`IngressSubscribeOutcome::ClientFailed`]). The supervisor state is the
+    /// only thing that distinguishes them, so it is read here rather than left
+    /// for a caller to guess from the empty client cell.
     pub async fn subscribe_filter(
         &self,
         client_slug: &str,
@@ -243,7 +266,12 @@ impl MqttService {
         let sub = handle.add_subscription(topic_filter, qos).await;
         let client = handle.client.lock().await.clone();
         let outcome = match client {
-            None => IngressSubscribeOutcome::DeferredDisconnected,
+            None => match &*handle.supervisor_state.read().await {
+                SupervisorState::Failed { reason } => {
+                    IngressSubscribeOutcome::ClientFailed(reason.clone())
+                }
+                _ => IngressSubscribeOutcome::DeferredDisconnected,
+            },
             Some(client) => match assert_ingress_subscription(&handle, &client, &sub).await {
                 Ok(()) => IngressSubscribeOutcome::SubscribedLive,
                 Err(e) => IngressSubscribeOutcome::SendFailed(e),
@@ -662,5 +690,52 @@ mod tests {
         assert_eq!(qos, Some(2));
         assert_eq!(label, ConnectorHealthLabel::Failed);
         assert_eq!(err.as_deref(), Some("authoritative disconnect: gone"));
+    }
+
+    /// An empty client cell is two different futures, and the caller's report
+    /// to an operator differs by which: a supervisor in backoff will assert the
+    /// filter on its next connect, one that gave up never will. Reporting the
+    /// second as deferred promises delivery that is not coming.
+    #[tokio::test]
+    async fn subscribe_on_a_disconnected_client_defers_and_on_a_failed_one_does_not() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        svc.add_client(handle.clone()).await;
+
+        // Fresh handle: no client installed, supervisor still retrying.
+        assert_eq!(
+            svc.subscribe_filter("home", "sensors/+/temp".to_string(), 1)
+                .await,
+            Some(IngressSubscribeOutcome::DeferredDisconnected)
+        );
+
+        *handle.supervisor_state.write().await = SupervisorState::Failed {
+            reason: "authoritative connect failure: bad user name or password".to_string(),
+        };
+        assert_eq!(
+            svc.subscribe_filter("home", "sensors/other".to_string(), 1)
+                .await,
+            Some(IngressSubscribeOutcome::ClientFailed(
+                "authoritative connect failure: bad user name or password".to_string()
+            ))
+        );
+        // Either way the filter is in the reconnect-survival set: a process with
+        // working credentials asserts it without the document changing.
+        assert_eq!(handle.subscriptions.read().await.len(), 2);
+    }
+
+    /// The registry is a `HashMap`, so an unsorted return is a fresh order on
+    /// every run and every caller comparing the set is intermittently red.
+    #[tokio::test]
+    async fn client_slugs_is_sorted() {
+        let svc = MqttService::new();
+        for slug in ["spare", "ha", "attic"] {
+            svc.add_client(make_handle(slug)).await;
+        }
+
+        assert_eq!(
+            svc.client_slugs(),
+            vec!["attic".to_string(), "ha".to_string(), "spare".to_string()]
+        );
     }
 }

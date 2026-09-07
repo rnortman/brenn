@@ -91,10 +91,12 @@ struct BrennPendingListResponse<'a> {
 /// Success response for `MessageSubscribe`.
 ///
 /// Fields alphabetical: address, note, ok, status. `status` is the activation
-/// status string (`"subscribed"`, `"subscribed_pending_reconnect"`, or
-/// `"already_subscribed"`) so the LLM gets an honest live-vs-deferred-vs-noop
-/// signal. `note` carries a channel-class caveat when there is one; omitted
-/// otherwise.
+/// status string (`"subscribed"`, `"subscribed_pending_reconnect"`,
+/// `"subscribed_client_failed"`, or `"already_subscribed"`) so the LLM gets an
+/// honest live-vs-deferred-vs-hopeless-vs-noop signal — the third means the
+/// subscription persisted but its broker session has stopped retrying, so
+/// nothing arrives until an operator fixes it. `note` carries a channel-class
+/// caveat when there is one; omitted otherwise.
 #[derive(Serialize)]
 struct MessageSubscribeOk<'a> {
     address: &'a str,
@@ -1320,6 +1322,9 @@ async fn parse_message_uuid(
 /// and the message-injection path, not in any `MqttService` ingress structure, so
 /// surfacing it would require adding net-new ingress state. Non-`mqtt:` entries
 /// are untouched.
+// TODO(mqtt-idle-client-visibility): a declared client with no `mqtt:` channel
+// has no entry here, so its session — connected, failed or reconnecting
+// forever — is reported nowhere.
 async fn enrich_mqtt_listing(listing: &mut [ChannelListing], mqtt_svc: &brenn_mqtt::MqttService) {
     for entry in listing.iter_mut() {
         enrich_mqtt_details(&mut entry.details, mqtt_svc).await;
@@ -1491,6 +1496,18 @@ async fn handle_message_subscribe(
                     error = %e,
                     "MessageSubscribe: broker SUBSCRIBE send failed; subscription durable, \
                      reconnect will retry"
+                );
+            }
+            // The client's supervisor has stopped retrying, so no reconnect will
+            // assert this filter. The subscription is durable all the same; it is
+            // an operator fix plus a restart away from delivering.
+            if let SubscribeActivation::MqttClientFailed(ref reason) = activation {
+                tracing::warn!(
+                    tool = tool_name,
+                    address = %sanitize_untrusted_str(&address, MAX_LOGGED_UNTRUSTED_BYTES),
+                    reason = %reason,
+                    "MessageSubscribe: the mqtt client's session failed authoritatively; \
+                     subscription durable but nothing will be delivered in this process"
                 );
             }
             let status = activation.status_str();
@@ -4158,6 +4175,33 @@ mod tests {
                 .is_some(),
             "mqtt channel created"
         );
+    }
+
+    /// The same subscribe on a client whose session failed authoritatively →
+    /// ok, and the status word that says so. This is the string the model reads
+    /// to decide between waiting for a reconnect and telling the operator;
+    /// collapsing it back into `subscribed_pending_reconnect` would have the
+    /// model wait for a reconnect that is not coming.
+    #[tokio::test]
+    async fn message_subscribe_on_a_failed_mqtt_client_reports_client_failed() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe().await;
+        let addr = "mqtt:home:sensors/+/temp";
+        let handle = bridge
+            .mqtt_service()
+            .expect("the fixture stands one up")
+            .get_client("home")
+            .expect("the configured client");
+        *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
+            reason: "authoritative connect failure: not authorized".to_string(),
+        };
+
+        let v = subscribe_result(
+            &bridge,
+            json!({ "address": addr, "push_depth": 0, "retain_depth": 5 }),
+        )
+        .await;
+        assert_eq!(v["ok"], json!(true), "expected ok: {v}");
+        assert_eq!(v["status"], json!("subscribed_client_failed"));
     }
 
     /// Subscribe to an `mqtt:` client the app *is* authorized for but which has

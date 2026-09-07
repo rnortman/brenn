@@ -1206,8 +1206,7 @@ mod tests {
                 "{direction}: rule 3 no longer holds mqtt back: {refusals:?}",
             );
             // The filter and the route follow the entry, in the direction it
-            // moved. Rule 6 — whether the client has a session at all — is the
-            // driver's, over the live service.
+            // moved. The client has a session either way: it is declared.
             let client = &delta.mqtt.clients[0];
             let (subscribed, unsubscribed) = (delta.mqtt.subscribed(), delta.mqtt.unsubscribed());
             assert_eq!(client.client, "ha");

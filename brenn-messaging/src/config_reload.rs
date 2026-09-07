@@ -176,11 +176,20 @@ pub struct StatusDelta {
     /// withdrew.
     pub mqtt_unsubscribed: Vec<String>,
     /// The subset of the two lists above the broker did not take at commit
-    /// time: the client was disconnected, or the send failed on a session whose
-    /// event loop is already dying. Both converge on the supervisor's next
-    /// connect, which re-asserts the whole set — so this is "not yet", not
-    /// "failed".
+    /// time, and will on the supervisor's next connect: the client was
+    /// disconnected, or the send failed on a session whose event loop is
+    /// already dying. Either way the reconnect re-asserts the whole set — so
+    /// this is "not yet", not "failed".
     pub mqtt_deferred: Vec<String>,
+    /// The subset of `mqtt_subscribed` no connect in this process will assert:
+    /// the client's supervisor gave up on an authoritative failure (bad
+    /// credentials, a rejected TLS chain) and is not retrying. The filter is
+    /// registered and would be asserted by a process whose client works, so the
+    /// reload applied — but nothing arrives on these channels until the
+    /// declaration is fixed and the process restarted. Listed apart from
+    /// `mqtt_deferred` because waiting is the right response to that list and
+    /// the wrong response to this one.
+    pub mqtt_failed: Vec<String>,
     /// Slugs of the surfaces this reload started, retired, and replaced. A
     /// surface whose resolved value did not move belongs in `surfaces_changed`
     /// too when a channel it binds or a kind it instantiates did: what it runs

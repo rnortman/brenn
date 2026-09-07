@@ -26,8 +26,6 @@ use brenn_mqtt::union_subscriptions;
 use brenn_server::mqtt_router::IngressRoute;
 use uuid::Uuid;
 
-use super::NEEDS_RESTART;
-
 /// One filter's place in a client's broker set after this reload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilterMove {
@@ -214,79 +212,6 @@ pub(crate) fn mqtt_delta(
     delta
 }
 
-/// Rule 6: a broker session is a boot-time fact, and this delta must not need
-/// one that is not there or leave one that is.
-///
-/// Starting or stopping a supervisor at reload is possible but requires the
-/// whole subsystem to exist lazily when the boot document referenced no client,
-/// so a reference-set change is a refusal in both directions. Both keep the
-/// oracle exact: a fresh boot has sessions for exactly the referenced set.
-///
-/// `sessions` is the set of clients that have a live handle right now;
-/// `referenced` is the candidate's referenced-client set, computed the way boot
-/// computes the set it spawns supervisors for, each with the thing in the
-/// candidate that named it.
-///
-/// The needs-a-session arm is over the whole referenced set and not only over
-/// the clients whose filters moved: a client enters the set through an
-/// `mqtt_publish` matcher as well as through an ingress channel, and a
-/// consumer authorized to publish on a client with no session panics the
-/// egress path on its first publish (or fails closed with no service at all).
-// TODO(reload-mqtt-sessions): start and stop broker supervisors at reload, so
-// both arms below converge instead of asking for a restart.
-pub(crate) fn session_refusals(
-    delta: &MqttDelta,
-    sessions: &[String],
-    referenced: &[ReferencedClient],
-) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut said: Vec<&str> = Vec::new();
-    // The filter-move arm first, so a client an ingress channel brought in is
-    // named by the address an operator wrote rather than by the derived
-    // reference. A client whose filters only leave is here and not in
-    // `referenced`; it cannot be unsubscribed without a session either.
-    let moving = delta.clients.iter().map(|client| {
-        let filter = client
-            .joining()
-            .chain(client.leaving())
-            .next()
-            .map(|filter| filter.topic_filter.as_str())
-            .unwrap_or_default();
-        (client.client.as_str(), address_of(&client.client, filter))
-    });
-    let named = referenced
-        .iter()
-        .map(|one| (one.client.as_str(), one.named_by.clone()));
-    for (client, named_by) in moving.chain(named) {
-        if sessions.iter().any(|live| live == client) || said.contains(&client) {
-            continue;
-        }
-        said.push(client);
-        out.push(format!(
-            "{named_by}: client {client:?} has no broker session (it was not referenced when the \
-             process booted): {NEEDS_RESTART}",
-        ));
-    }
-    for live in sessions {
-        if !referenced.iter().any(|one| &one.client == live) {
-            out.push(format!(
-                "mqtt client {live:?} would lose its last reference: {NEEDS_RESTART}"
-            ));
-        }
-    }
-    out
-}
-
-/// One client the candidate references, and what in the candidate names it.
-///
-/// The attribution lets a refusal name the line that asked for the session —
-/// as often an ACL matcher as an ingress binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReferencedClient {
-    pub client: String,
-    pub named_by: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,85 +359,5 @@ mod tests {
         assert_eq!(delta.routes_added.len(), 1);
         assert_eq!(delta.routes_added[0].channel_uuid, arriving.channel_uuid);
         assert!(delta.routes_removed.is_empty());
-    }
-
-    #[test]
-    fn a_client_without_a_session_is_a_restart() {
-        let arriving = ingress("chef", "a/b", 1);
-        let entry = entry(&arriving);
-        let delta = mqtt_delta(&[], &[arriving], &[], &[&entry]);
-        let refusals = session_refusals(&delta, &[], &[referenced("chef", "mqtt:chef:a/b")]);
-
-        assert_eq!(refusals.len(), 1, "{refusals:?}");
-        assert!(refusals[0].contains("mqtt:chef:a/b"), "{refusals:?}");
-        assert!(
-            refusals[0].contains("has no broker session"),
-            "{refusals:?}"
-        );
-        assert!(refusals[0].ends_with(NEEDS_RESTART), "{refusals:?}");
-    }
-
-    #[test]
-    fn losing_a_clients_last_reference_is_a_restart() {
-        let leaving = ingress("chef", "a/b", 1);
-        let entry = entry(&leaving);
-        let delta = mqtt_delta(&[leaving], &[], &[&entry], &[]);
-        let refusals = session_refusals(&delta, &["chef".to_string()], &[]);
-
-        assert_eq!(refusals.len(), 1, "{refusals:?}");
-        assert!(
-            refusals[0].contains("would lose its last reference"),
-            "{refusals:?}"
-        );
-    }
-
-    fn referenced(client: &str, named_by: &str) -> ReferencedClient {
-        ReferencedClient {
-            client: client.to_string(),
-            named_by: named_by.to_string(),
-        }
-    }
-
-    /// The arm no filter move reaches: a client enters the candidate's
-    /// reference set through an `mqtt_publish` matcher, with no ingress channel
-    /// anywhere. The egress path's "ACL-authorized implies a session" invariant
-    /// is a panic, so this has to be a refusal.
-    #[test]
-    fn a_publish_matcher_on_a_client_without_a_session_is_a_restart() {
-        let delta = mqtt_delta(&[], &[], &[], &[]);
-        let refusals = session_refusals(
-            &delta,
-            &["chef".to_string()],
-            &[
-                referenced("chef", "mqtt:chef:a/b"),
-                referenced("spare", "consumer `sifter`'s `mqtt_publish` matcher"),
-            ],
-        );
-
-        assert_eq!(refusals.len(), 1, "{refusals:?}");
-        assert!(
-            refusals[0].starts_with("consumer `sifter`'s `mqtt_publish` matcher: client \"spare\""),
-            "{refusals:?}",
-        );
-        assert!(
-            refusals[0].contains("has no broker session"),
-            "{refusals:?}"
-        );
-        assert!(refusals[0].ends_with(NEEDS_RESTART), "{refusals:?}");
-    }
-
-    #[test]
-    fn a_client_that_keeps_its_session_and_its_reference_is_not_refused() {
-        let arriving = ingress("chef", "a/b", 1);
-        let entry = entry(&arriving);
-        let delta = mqtt_delta(&[], &[arriving], &[], &[&entry]);
-        assert!(
-            session_refusals(
-                &delta,
-                &["chef".to_string()],
-                &[referenced("chef", "mqtt:chef:a/b")],
-            )
-            .is_empty()
-        );
     }
 }

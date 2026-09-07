@@ -77,6 +77,10 @@ impl From<&PlanDelta> for StatusDelta {
                 .into_iter()
                 .chain(delta.mqtt.unsubscribed())
                 .collect(),
+            // The same worst case for the list of filters no reconnect will
+            // assert: only a joining filter can land there, and any of them
+            // can. Commit sorts each moved filter into exactly one of the two.
+            mqtt_failed: delta.mqtt.subscribed(),
             surfaces_added: slugs(&delta.surfaces.added),
             surfaces_removed: slugs(&delta.surfaces.removed),
             surfaces_changed: delta
@@ -169,8 +173,10 @@ mod tests {
         assert_eq!(status.mqtt_subscribed, vec!["mqtt:chef:a/b".to_string()]);
         assert!(status.mqtt_unsubscribed.is_empty());
         // Prepare's worst case: every moved filter could come back deferred,
-        // and commit narrows the list to the ones that did.
+        // or — a joining one — on a client that has stopped retrying, and
+        // commit narrows each list to the filters that landed there.
         assert_eq!(status.mqtt_deferred, vec!["mqtt:chef:a/b".to_string()]);
+        assert_eq!(status.mqtt_failed, vec!["mqtt:chef:a/b".to_string()]);
         // A changed surface is named by the slug the candidate runs it under,
         // which is the slug an operator reads in the document.
         assert_eq!(status.surfaces_added, vec!["wall".to_string()]);

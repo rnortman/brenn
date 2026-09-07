@@ -27,7 +27,8 @@ use brenn_server::test_support::init_db_file;
 use super::driver::TriggerSource;
 use super::driver::tests::{
     BootFixture, Booted, DESKBAR_READS, READER, Tree, async_tool_registry, boot, boot_with,
-    document, document_with_a_consumer, install_package, install_package_from, seat_a_conversation,
+    document, document_with_a_broker_only, document_with_a_consumer,
+    document_with_an_mqtt_consumer, install_package, install_package_from, seat_a_conversation,
     staged_module, subscriber_debug_lines, surface_document, surfaces_document, write_surface_kind,
 };
 use brenn_messaging::config_reload::Outcome;
@@ -87,6 +88,16 @@ pub(crate) struct Snapshot {
     /// uuid is stable across the two processes but says nothing to a reader,
     /// and the address is what the rest of the snapshot is keyed by.
     mqtt_routes: Vec<String>,
+    /// The clients holding a broker session, sorted.
+    ///
+    /// Forward-looking, and cannot fail today: nothing writes the service's
+    /// registry after boot, so both sides of the comparison are the same
+    /// function of the same declaration set. It is here so that the change
+    /// which makes the registry mutable cannot land without the oracle
+    /// noticing. The claim that a session survives its last binding leaving is
+    /// pinned meanwhile by the direct read in
+    /// `a_last_mqtt_binding_leaving_matches_a_fresh_boot`.
+    mqtt_sessions: Vec<String>,
 }
 
 impl Snapshot {
@@ -112,6 +123,7 @@ impl Snapshot {
             retained,
             mqtt_filters,
             mqtt_routes,
+            mqtt_sessions,
         } = self;
         assert_lines("channels", channels, &fresh.channels);
         assert_lines("registrations", registrations, &fresh.registrations);
@@ -125,6 +137,7 @@ impl Snapshot {
         assert_lines("retained", retained, &fresh.retained);
         assert_lines("mqtt_filters", mqtt_filters, &fresh.mqtt_filters);
         assert_lines("mqtt_routes", mqtt_routes, &fresh.mqtt_routes);
+        assert_lines("mqtt_sessions", mqtt_sessions, &fresh.mqtt_sessions);
     }
 
     /// The broker SUBSCRIBE set, for a transition asserting it moved at all.
@@ -136,6 +149,11 @@ impl Snapshot {
     /// empty on both sides is a field testing nothing.
     pub(crate) fn mqtt_routes(&self) -> &[String] {
         &self.mqtt_routes
+    }
+
+    /// The session set, for a transition whose point is that it did *not* move.
+    pub(crate) fn mqtt_sessions(&self) -> &[String] {
+        &self.mqtt_sessions
     }
 }
 
@@ -300,6 +318,11 @@ async fn snapshot(booted: &Booted) -> Snapshot {
     surface_roots.push(format!("kernel {:?}", served.kernel));
 
     let (mqtt_filters, mqtt_routes) = mqtt_ingress(booted, &entries).await;
+    let mqtt_sessions: Vec<String> = booted
+        .mqtt
+        .as_ref()
+        .map(|(service, _)| service.client_slugs())
+        .unwrap_or_default();
 
     Snapshot {
         channels,
@@ -314,6 +337,7 @@ async fn snapshot(booted: &Booted) -> Snapshot {
         retained: retained_documents(booted, &entries).await,
         mqtt_filters,
         mqtt_routes,
+        mqtt_sessions,
     }
 }
 
@@ -1361,4 +1385,103 @@ async fn an_artifact_that_moved_under_an_unmoved_document_is_a_changed_consumer(
         running.verified.spec_sha256.as_deref(),
         Some(&*brenn_lib::util::sha256_hex(module.as_bytes())),
     );
+}
+
+// ── The oracle over the MQTT ingress transitions ──────────────────────────
+
+/// The rig both directions boot on: the plan-only MQTT runtime, which registers
+/// a handle per declared client and spawns no supervisor, so every SUBSCRIBE
+/// defers and no packet moves. The wire version is
+/// `mqtt_broker_tests::compare_over_the_broker`'s.
+fn mqtt_fixture(components: &std::path::Path) -> impl Fn(brenn_db::Db) -> BootFixture + use<'_> {
+    move |db| BootFixture {
+        db: Some(db),
+        components_roots: vec![components.to_path_buf()],
+        mqtt: true,
+        ..BootFixture::default()
+    }
+}
+
+/// **The first binding on a declared broker.** The running process has a
+/// session with nothing subscribed on it and no ingress route anywhere; one
+/// reload has to produce the filter, the route and the channel, and land where
+/// a restart onto the same document would have.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_mqtt_binding_matches_a_fresh_boot() {
+    const TOPIC: &str = "home/state";
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with_a_broker_only());
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        mqtt_fixture(components.path()),
+        async |booted| {
+            tree.write(&document_with_an_mqtt_consumer(&[TOPIC]));
+            install_package(components.path(), &staged_module(&tree));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.mqtt_subscribed,
+                vec![format!("mqtt:ha:{TOPIC}")],
+            );
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.mqtt_filters().len(),
+                1,
+                "{:?}",
+                reloaded.mqtt_filters()
+            );
+            assert_eq!(
+                reloaded.mqtt_routes().len(),
+                1,
+                "{:?}",
+                reloaded.mqtt_routes()
+            );
+        },
+    )
+    .await;
+}
+
+/// **The last binding on a declared broker leaving.** The filter and the route
+/// go, and the session does not — which is only a convergence if a fresh boot of
+/// the broker-only document has that session too, and is what the snapshot's
+/// session set is in the comparison for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_last_mqtt_binding_leaving_matches_a_fresh_boot() {
+    const TOPIC: &str = "home/state";
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with_an_mqtt_consumer(&[TOPIC]));
+    install_package(components.path(), &staged_module(&tree));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        mqtt_fixture(components.path()),
+        async |booted| {
+            tree.write(&document_with_a_broker_only());
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.mqtt_unsubscribed,
+                vec![format!("mqtt:ha:{TOPIC}")],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded.mqtt_filters().is_empty(),
+                "{:?}",
+                reloaded.mqtt_filters()
+            );
+            assert!(
+                reloaded.mqtt_routes().is_empty(),
+                "{:?}",
+                reloaded.mqtt_routes()
+            );
+            assert_eq!(
+                reloaded.mqtt_sessions(),
+                ["ha".to_string()],
+                "the session outlives its last binding on both sides, or this transition \
+                 compares nothing",
+            );
+        },
+    )
+    .await;
 }

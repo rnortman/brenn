@@ -49,6 +49,19 @@ use crate::reload::driver::ReloadEnv;
 use crate::reload::mqtt::address_of;
 use crate::reload::surfaces::{Arrival, SurfaceDocs};
 
+/// What the broker did not take during the walk, split by whether anything in
+/// this process will take it later.
+///
+/// Both lists are addresses of moved filters and both are reported in the
+/// status body; the split is the whole point, because `deferred` converges by
+/// waiting and `failed` converges only after an operator fixes the client
+/// declaration and restarts.
+#[derive(Debug, Default)]
+pub(crate) struct MqttCommitReport {
+    pub(crate) deferred: Vec<String>,
+    pub(crate) failed: Vec<String>,
+}
+
 /// Apply a prepared reload to the running process.
 ///
 /// One check runs before the first mutation and can still decline: the live
@@ -77,7 +90,7 @@ pub(crate) async fn apply(
     loaded: Vec<(String, LoadedConsumer)>,
     records: &HashMap<String, Verified>,
     surfaces: &SurfaceCommit<'_>,
-) -> Result<Vec<String>, Vec<String>> {
+) -> Result<MqttCommitReport, Vec<String>> {
     let arrived = live_subscriber_refusals(delta, env.messenger.directory());
     if !arrived.is_empty() {
         return Err(arrived);
@@ -100,10 +113,15 @@ pub(crate) async fn apply(
          departing consumers and surfaces had already stopped: {arrived:?}",
     );
     describe_channels(env, delta).await;
-    let mut deferred = mqtt_outgoing(env, delta).await;
+    let mut report = MqttCommitReport {
+        deferred: mqtt_outgoing(env, delta).await,
+        failed: Vec::new(),
+    };
     remove_channels(env, delta);
     add_channels(env, delta).await;
-    deferred.extend(mqtt_incoming(env, delta).await);
+    let incoming = mqtt_incoming(env, delta).await;
+    report.deferred.extend(incoming.deferred);
+    report.failed = incoming.failed;
     refresh_surface_roots(env, surfaces.roots.clone());
     swap_surface_registrations(env, surfaces.docs);
     publish_surface_docs(env, surfaces.docs).await;
@@ -116,7 +134,7 @@ pub(crate) async fn apply(
     // a verdict on the document — the document was accepted before any of this
     // ran.
     crate::assert_every_subscriber_wired(&env.messenger, &env.router);
-    Ok(deferred)
+    Ok(report)
 }
 
 /// The outgoing MQTT step, between the descriptions and the channel removals.
@@ -131,17 +149,14 @@ async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
         for filter in client.leaving() {
             let address = address_of(&client.client, &filter.topic_filter);
             let service = mqtt_service(env, &address);
-            let outcome = service
-                .unsubscribe_filter(&client.client, &filter.topic_filter)
-                .await
-                .unwrap_or_else(|| {
-                    panic!(
-                        "reload commit: {address} is being unsubscribed but client {:?} has no \
-                         broker session — rule 6 refused exactly this before the walk, so it is \
-                         a host bug",
-                        client.client,
-                    )
-                });
+            let outcome = session_or_bug(
+                service
+                    .unsubscribe_filter(&client.client, &filter.topic_filter)
+                    .await,
+                &client.client,
+                &address,
+                "unsubscribed",
+            );
             if record_unsubscribe(&outcome, &address) {
                 deferred.push(address);
             }
@@ -164,7 +179,7 @@ async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
 ///
 /// Route before SUBSCRIBE, so the first matching publish after the SUBACK has
 /// somewhere to go.
-async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
+async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
     for route in &delta.mqtt.routes_added {
         let address = route.channel_address.clone();
         // Idempotent on the channel uuid, and the uuid is the plan's, so a
@@ -178,28 +193,27 @@ async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
         );
         info!(address = %address, "reload: mqtt route added");
     }
-    let mut deferred = Vec::new();
+    let mut report = MqttCommitReport::default();
     for client in &delta.mqtt.clients {
         for filter in client.joining() {
             let address = address_of(&client.client, &filter.topic_filter);
             let service = mqtt_service(env, &address);
-            let outcome = service
-                .subscribe_filter(&client.client, filter.topic_filter.clone(), filter.qos)
-                .await
-                .unwrap_or_else(|| {
-                    panic!(
-                        "reload commit: {address} is being subscribed but client {:?} has no \
-                         broker session — rule 6 refused exactly this before the walk, so it is \
-                         a host bug",
-                        client.client,
-                    )
-                });
-            if record_subscribe(&outcome, &address) {
-                deferred.push(address);
+            let outcome = session_or_bug(
+                service
+                    .subscribe_filter(&client.client, filter.topic_filter.clone(), filter.qos)
+                    .await,
+                &client.client,
+                &address,
+                "subscribed",
+            );
+            match record_subscribe(&outcome, &address) {
+                SubscribeReport::AtBroker => {}
+                SubscribeReport::Deferred => report.deferred.push(address),
+                SubscribeReport::Failed => report.failed.push(address),
             }
         }
     }
-    deferred
+    report
 }
 
 /// Point every running consumer's record at the tree this reload resolved it
@@ -265,24 +279,75 @@ fn record_unsubscribe(outcome: &IngressUnsubscribeOutcome, address: &str) -> boo
     }
 }
 
+/// Where one SUBSCRIBE's filter belongs in the status body.
+#[derive(Debug, PartialEq, Eq)]
+enum SubscribeReport {
+    /// The broker has it now.
+    AtBroker,
+    /// The broker does not have it and a reconnect in this process will assert
+    /// it: `mqtt_deferred`.
+    Deferred,
+    /// The broker does not have it and nothing in this process will assert it:
+    /// `mqtt_failed`.
+    Failed,
+}
+
 /// The same for a SUBSCRIBE: the filter is in the reconnect-survival set in all
-/// three outcomes, and the two that did not reach the broker now are what the
-/// status body's `deferred` list reports.
-fn record_subscribe(outcome: &IngressSubscribeOutcome, address: &str) -> bool {
+/// four outcomes, and the three that did not reach the broker now are what the
+/// status body reports — as `mqtt_deferred` where a reconnect is coming, as
+/// `mqtt_failed` where the supervisor has stopped retrying.
+///
+/// Never a refusal and never a panic, for the reason `record_unsubscribe` is
+/// not either: the walk is past the point where anything may decline.
+fn record_subscribe(outcome: &IngressSubscribeOutcome, address: &str) -> SubscribeReport {
     match outcome {
         IngressSubscribeOutcome::SubscribedLive => {
             info!(address = %address, "reload: mqtt filter subscribed");
-            false
+            SubscribeReport::AtBroker
         }
         IngressSubscribeOutcome::DeferredDisconnected => {
             info!(address = %address, "reload: mqtt filter subscribed on reconnect");
-            true
+            SubscribeReport::Deferred
+        }
+        IngressSubscribeOutcome::ClientFailed(reason) => {
+            // The supervisor has stopped retrying, so there is no reconnect to
+            // defer to: this filter will not reach the broker in this process at
+            // all. The filter is registered and a fixed process asserts it, so
+            // the reload applied — but an operator reading `mqtt_deferred` would
+            // wait for a convergence that is not coming, which is why this one
+            // is reported in a list of its own.
+            warn!(
+                address = %address,
+                %reason,
+                "reload: mqtt filter registered but its client's session has failed \
+                 authoritatively; nothing will be subscribed until the client is fixed and the \
+                 process restarted"
+            );
+            SubscribeReport::Failed
         }
         IngressSubscribeOutcome::SendFailed(error) => {
             warn!(address = %address, %error, "reload: mqtt SUBSCRIBE send failed");
-            true
+            SubscribeReport::Deferred
         }
     }
+}
+
+/// Why a missing broker session or a missing service is a host bug in this walk
+/// and not a state the document could have asked for.
+const SESSION_INVARIANT: &str = "every `mqtt:` address a plan can carry names a declared client, \
+                                 and a declared client has a session on a service that exists \
+                                 whenever one is declared";
+
+/// One broker-subscription move's outcome, or the host bug of the named client
+/// having no session. `verb` is the past participle for the direction —
+/// `"subscribed"` or `"unsubscribed"`.
+fn session_or_bug<T>(outcome: Option<T>, client: &str, address: &str, verb: &str) -> T {
+    outcome.unwrap_or_else(|| {
+        panic!(
+            "reload commit: {address} is being {verb} but client {client:?} has no broker \
+             session — {SESSION_INVARIANT}, so it is a host bug"
+        )
+    })
 }
 
 /// The broker service this walk needs, or the host bug of not having one.
@@ -290,7 +355,7 @@ fn mqtt_service<'a>(env: &'a ReloadEnv, address: &str) -> &'a Arc<brenn_mqtt::Mq
     env.mqtt_service.as_ref().unwrap_or_else(|| {
         panic!(
             "reload commit: {address} moves a broker subscription but this process has no MQTT \
-             service — rule 6 refuses every client without a session, so it is a host bug"
+             service — {SESSION_INVARIANT}, so it is a host bug"
         )
     })
 }
@@ -1009,24 +1074,39 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// Every SUBSCRIBE outcome is a success; only two of the three are
-    /// "not at the broker yet". `deferred` is what the status body reports, so
-    /// a mapping that pushed the live arm onto it would make an operator read
-    /// a converged reload as a pending one.
+    /// Every SUBSCRIBE outcome is a success, and the status body sorts them
+    /// three ways: at the broker, coming on a reconnect, and coming only after
+    /// an operator fixes the client. A mapping that put the live arm on a list
+    /// would make an operator read a converged reload as a pending one; one
+    /// that put the failed arm on `mqtt_deferred` would have them wait forever.
     #[test]
-    fn a_live_subscribe_is_not_deferred_and_the_other_two_are() {
-        assert!(!record_subscribe(
-            &IngressSubscribeOutcome::SubscribedLive,
-            "mqtt:ha:a/b"
-        ));
-        assert!(record_subscribe(
-            &IngressSubscribeOutcome::DeferredDisconnected,
-            "mqtt:ha:a/b"
-        ));
-        assert!(record_subscribe(
-            &IngressSubscribeOutcome::SendFailed("the request channel is closed".to_string()),
-            "mqtt:ha:a/b",
-        ));
+    fn each_subscribe_outcome_lands_in_its_own_status_list() {
+        assert_eq!(
+            record_subscribe(&IngressSubscribeOutcome::SubscribedLive, "mqtt:ha:a/b"),
+            SubscribeReport::AtBroker
+        );
+        assert_eq!(
+            record_subscribe(
+                &IngressSubscribeOutcome::DeferredDisconnected,
+                "mqtt:ha:a/b"
+            ),
+            SubscribeReport::Deferred
+        );
+        assert_eq!(
+            record_subscribe(
+                &IngressSubscribeOutcome::ClientFailed("bad user name or password".to_string()),
+                "mqtt:ha:a/b",
+            ),
+            SubscribeReport::Failed
+        );
+        // A send failure on a dying event loop is the reconnect's to retry.
+        assert_eq!(
+            record_subscribe(
+                &IngressSubscribeOutcome::SendFailed("the request channel is closed".to_string()),
+                "mqtt:ha:a/b",
+            ),
+            SubscribeReport::Deferred
+        );
     }
 
     /// The same for the outgoing direction. `SendFailed` in particular must be

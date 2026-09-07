@@ -605,20 +605,12 @@ pub async fn run_server(
         guard.alert_dispatcher.clone(),
     );
 
-    // MQTT service: build a MqttService with one unified supervisor per referenced
-    // `[[mqtt_client]]` (referenced by an ingress channel, an `mqtt_publish` ACL
-    // matcher, or an `mqtt_subscribe` ACL matcher). Each session carries both the
-    // publish and the ingress-delivery paths.
+    // MQTT service: build a MqttService with one unified supervisor per declared
+    // `[[mqtt_client]]`. Each session carries both the publish and the
+    // ingress-delivery paths.
     //
-    // `None` when no `[[mqtt_client]]` is declared OR no client is referenced.
-    let mqtt_result = mqtt::start_mqtt(
-        &config,
-        &apps,
-        &messaging_result.wasm_consumers,
-        &mqtt_ingress_channels,
-        &mqtt_clients,
-    )
-    .await;
+    // `None` when no `[[mqtt_client]]` is declared.
+    let mqtt_result = mqtt::start_mqtt(&mqtt_ingress_channels, &mqtt_clients).await;
 
     // Webhook service: build from pre-resolved endpoint table.
     //

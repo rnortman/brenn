@@ -64,10 +64,16 @@ pub enum SubscribeActivation {
     /// `mqtt:` subscribe; the client was live and the broker SUBSCRIBE went out
     /// now (delivery — including any retained message — starts immediately).
     MqttLive,
-    /// `mqtt:` subscribe; the client is currently disconnected. The subscription
-    /// is durable and the route is added; the broker SUBSCRIBE is deferred to the
-    /// next reconnect (design §3). Not an error.
+    /// `mqtt:` subscribe; the client is currently disconnected but still
+    /// retrying. The subscription is durable and the route is added; the broker
+    /// SUBSCRIBE is deferred to the next reconnect. Not an error.
     MqttDeferredDisconnected,
+    /// `mqtt:` subscribe; the client's supervisor gave up on an authoritative
+    /// failure (bad credentials, TLS) and there is no reconnect coming. The
+    /// subscription is durable and the route is added, so a process with working
+    /// credentials will assert it, but nothing arrives in this one. Carries the
+    /// failure reason.
+    MqttClientFailed(String),
     /// `mqtt:` subscribe; the client was live but the broker SUBSCRIBE *send*
     /// failed (e.g. send-queue full). The subscription is durable and the route
     /// is added; the reconnect re-assert will retry. Carries the client error.
@@ -75,18 +81,24 @@ pub enum SubscribeActivation {
 }
 
 impl SubscribeActivation {
-    /// The LLM-facing status string for this outcome (design §2.4). Pure — the
-    /// caller logs a warn separately for [`Self::MqttSendFailed`]. A send failure
-    /// still leaves a durable subscription + route (the reconnect re-assert
-    /// retries), so it is reported as `subscribed_pending_reconnect`, never an
-    /// error — a future change that maps it to a hard error would lie to the LLM
-    /// about whether the subscription persisted (test-5 pins this).
+    /// The LLM-facing status string for this outcome. Pure — the caller logs a
+    /// warn separately for [`Self::MqttSendFailed`] and
+    /// [`Self::MqttClientFailed`]. A send failure still leaves a durable
+    /// subscription + route (the reconnect re-assert retries), so it is reported
+    /// as `subscribed_pending_reconnect`, never an error — a change that mapped
+    /// it to a hard error would lie to the LLM about whether the subscription
+    /// persisted (`activation_status_strings_are_stable` pins this).
+    ///
+    /// [`Self::MqttClientFailed`] gets a word of its own: the subscription
+    /// persisted just the same, but there is no reconnect coming, so reporting
+    /// it as pending would promise delivery that needs an operator first.
     pub fn status_str(&self) -> &'static str {
         match self {
             SubscribeActivation::AlreadySubscribed => "already_subscribed",
             SubscribeActivation::LocalOnly | SubscribeActivation::MqttLive => "subscribed",
             SubscribeActivation::MqttDeferredDisconnected
             | SubscribeActivation::MqttSendFailed(_) => "subscribed_pending_reconnect",
+            SubscribeActivation::MqttClientFailed(_) => "subscribed_client_failed",
         }
     }
 }
@@ -129,8 +141,8 @@ impl std::fmt::Display for SubscribeActivateError {
             ),
             SubscribeActivateError::UnconfiguredMqttClient { client } => write!(
                 f,
-                "mqtt client {client:?} is not a configured [[mqtt_client]] with a running \
-                 ingress supervisor; cannot subscribe (clients are not created at runtime)"
+                "mqtt client {client:?} is not a declared `mqtt_client`; cannot subscribe \
+                 (clients are not created at runtime)"
             ),
             SubscribeActivateError::Core(e) => write!(f, "{e}"),
             // Deliberately does NOT echo whether the client/channel exists — avoid
@@ -400,6 +412,9 @@ pub async fn subscribe_dynamic_activated(
         IngressSubscribeOutcome::SubscribedLive => SubscribeActivation::MqttLive,
         IngressSubscribeOutcome::DeferredDisconnected => {
             SubscribeActivation::MqttDeferredDisconnected
+        }
+        IngressSubscribeOutcome::ClientFailed(reason) => {
+            SubscribeActivation::MqttClientFailed(reason)
         }
         IngressSubscribeOutcome::SendFailed(e) => SubscribeActivation::MqttSendFailed(e),
     })
@@ -781,6 +796,63 @@ mod tests {
             .expect("count")
         };
         assert_eq!(stored, 1, "runtime-added route must route the delivery");
+    }
+
+    /// The same subscribe against a client whose supervisor gave up: the two
+    /// arms must differ only in the word reported. The durable row and the
+    /// route are the guarantee the variant exists to make — reporting the state
+    /// honestly is worth nothing if the subscription silently did not persist,
+    /// and a "fail-closed" refactor that mapped this to a
+    /// `SubscribeActivateError` would drop both and pass every other test.
+    #[tokio::test]
+    async fn subscribe_on_a_failed_mqtt_client_is_durable_and_reports_client_failed() {
+        const REASON: &str = "authoritative connect failure: not authorized";
+        let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
+        let addr = "mqtt:home:sensors/+/temp";
+        let handle = bridge
+            .mqtt_service()
+            .expect("the fixture stands one up")
+            .get_client("home")
+            .expect("the configured client");
+        *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
+            reason: REASON.to_string(),
+        };
+
+        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+            .await
+            .expect("a failed session is not a subscribe error");
+        assert_eq!(
+            outcome,
+            SubscribeActivation::MqttClientFailed(REASON.to_string()),
+            "no reconnect is coming, so this is not a deferral",
+        );
+
+        assert!(has_app_subscriber(&bridge, addr, "testapp"));
+        let rows = dynamic_rows(&bridge).await;
+        assert_eq!(rows.len(), 1, "the subscription is durable all the same");
+        assert_eq!(rows[0].qos, Some(2), "omitted qos still defaults");
+
+        // And the route: a process with working credentials asserts the filter
+        // without the app re-subscribing, which needs the route to be there.
+        let router = bridge.mqtt_event_router().unwrap().clone();
+        router
+            .deliver_inbound(
+                "home",
+                "sensors/kitchen/temp",
+                InboundPayload::Text("22.5".to_string()),
+                0,
+            )
+            .await;
+        let stored: i64 = {
+            let conn = bridge.messenger().unwrap().db().lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM messaging_messages WHERE envelope_type='mqtt'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(stored, 1, "the route was added on a failed client too");
     }
 
     /// A SECOND app subscribing to an already-routed `mqtt:` filter must NOT add a
@@ -1359,6 +1431,11 @@ mod tests {
             SubscribeActivation::MqttSendFailed("queue full".to_string()).status_str(),
             "subscribed_pending_reconnect",
             "a failed SUBSCRIBE send still leaves a durable subscription"
+        );
+        assert_eq!(
+            SubscribeActivation::MqttClientFailed("not authorized".to_string()).status_str(),
+            "subscribed_client_failed",
+            "a session that gave up retrying has no reconnect to be pending on"
         );
 
         assert_eq!(

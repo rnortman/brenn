@@ -1235,14 +1235,23 @@ Three further refusals come from the wiring rather than from a section:
 - An `mqtt:` channel converges its broker subscription and its ingress route
   with it: the filter is subscribed or unsubscribed on the live session and the
   route is added or removed, and the status body's `mqtt_subscribed`,
-  `mqtt_unsubscribed` and `mqtt_deferred` say which. A filter the broker could
-  not be told about now — the client is disconnected, or its event loop is
-  dying — is in `mqtt_deferred`: it is in the reconnect-survival set and the
-  supervisor asserts it on the next connect, so the reload still applied.
-  What does *not* converge is the set of broker **sessions**, which is a
-  boot-time fact: a binding on a client that was not referenced when the process
-  booted, and a change that removes a referenced client's last reference, are
-  both refusals asking for a restart.
+  `mqtt_unsubscribed`, `mqtt_deferred` and `mqtt_failed` say which. A filter the
+  broker could not be told about now — the client is disconnected, or its event
+  loop is dying — is in `mqtt_deferred`: it is in the reconnect-survival set and
+  the supervisor asserts it on the next connect, so the reload still applied.
+  One whose client's supervisor has *stopped* retrying — an authoritative
+  failure such as bad credentials or a rejected TLS chain — is in `mqtt_failed`
+  instead: the reload applied and the filter is registered, but no reconnect is
+  coming, so nothing arrives on that channel until the `mqtt_client`
+  declaration is fixed and the process restarted. Waiting is the right response
+  to `mqtt_deferred` and the wrong response to `mqtt_failed`.
+  Every declared `mqtt_client` has a broker session from boot, so a
+  `wasm_consumer`'s `mqtt:` binding on any declared client converges, including
+  the first binding a document ever puts on a broker and the removal of the
+  last. What does *not* converge is the `mqtt_client` declaration itself —
+  adding, removing or editing a client is a refusal asking for a restart
+  (level 1) — nor an `[[app.mqtt_subscription]]`, because `apps` is frozen at
+  level 1 and app subscriptions are lowered to ingress channels at boot.
 
 The outcome vocabulary, on `brenn:config.status` and in the journal:
 

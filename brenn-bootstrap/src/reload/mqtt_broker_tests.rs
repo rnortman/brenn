@@ -24,7 +24,7 @@ use rumqttc::mqttbytes::QoS;
 use super::driver::TriggerSource;
 use super::driver::tests::{
     BootFixture, Booted, Tree, bodies_on, boot_with, cursor_of, document, install_package,
-    staged_module,
+    staged_module, staged_module_opt,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -36,7 +36,31 @@ const TOPIC_PREFIX: &str = "brenn/itest/reload";
 ///
 /// The same shape as the plan-only fixture's document, with the broker the
 /// harness actually started in place of a port nothing listens on.
+///
+/// With `topics` empty it is the broker alone: no component and no consumer,
+/// because a consumer with an output port and no subscriptions is a boot-time
+/// assert. That is the shape a site declares before its first component ships,
+/// so a reload from it adds the component, the consumer and its `mqtt:` binding
+/// together.
 fn document_over_the_broker(port: u16, ca_file: &std::path::Path, topics: &[&str]) -> String {
+    // One copy of the client block for both shapes: the idle-broker test boots
+    // the empty-`topics` document and reloads onto a bound one, and a second
+    // copy that drifted in `url` or `qos` would make it converge onto a
+    // different client declaration than it booted — which the `mqtt_clients`
+    // level-1 refusal would answer, in a test whose whole point is the applied
+    // path.
+    let mut body = format!(
+        r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:{port}";
+    ca_file = "{ca}";
+    qos = 1;
+}}
+"#,
+        ca = ca_file.display(),
+    );
+    if topics.is_empty() {
+        return document(&body);
+    }
     let ports: String = (0..topics.len())
         .map(|index| format!("    in inbound{index};\n"))
         .collect();
@@ -50,14 +74,8 @@ fn document_over_the_broker(port: u16, ca_file: &std::path::Path, topics: &[&str
             )
         })
         .collect();
-    let ca = ca_file.display();
-    document(&format!(
-        r#"mqtt_client ha {{
-    url = "mqtts://127.0.0.1:{port}";
-    ca_file = "{ca}";
-    qos = 1;
-}}
-
+    body.push_str(&format!(
+        r#"
 channel sink at "brenn:sink" {{
     push_depth = 1;
     retain_depth = 4;
@@ -76,7 +94,8 @@ new sifter: Demo {{
 "#,
         brenn_lib::config::PACKAGED,
         brenn_lib::config::PACKAGED,
-    ))
+    ));
+    document(&body)
 }
 
 /// Boot against `harness` with `topics` bound, and wait for the session to
@@ -88,7 +107,13 @@ async fn boot_connected(
     topics: &[&str],
 ) -> (Tree, Booted) {
     let tree = Tree::holding(&document_over_the_broker(harness.port, ca_file, topics));
-    install_package(components, &staged_module(&tree));
+    // A broker-only document declares no component and so stages no module,
+    // and there is then no package to install; the reload that brings the first
+    // component installs it. Read off the tree rather than off `topics`, so the
+    // builder stays the only thing that knows which documents stage one.
+    if let Some(module) = staged_module_opt(&tree) {
+        install_package(components, &module);
+    }
     let booted = boot_with(
         &tree,
         BootFixture {
@@ -137,8 +162,7 @@ async fn a_binding_added_by_reload_receives_from_the_broker() {
     let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
     assert_eq!(service.ingress_filter_qos("ha", &arrived).await, None);
 
-    // The reload: one more binding on the same client, so no session moves and
-    // rule 6 has nothing to say.
+    // The reload: one more binding on the same client's existing session.
     tree.write(&document_over_the_broker(
         harness.port,
         &ca_file,
@@ -419,4 +443,75 @@ async fn poll_cursor_advanced(booted: &Booted, address: &str) -> bool {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// **End-to-end idle-broker deploy.** A site declares a broker and binds
+/// nothing through it; a later reload brings the first component, the first
+/// consumer and the first `mqtt:` binding at once, and the process receives on
+/// the topic without a restart.
+///
+/// The plan-level version is
+/// `driver::tests::the_first_binding_on_a_broker_only_document_converges`;
+/// this one is against a broker that is really listening, so the SUBSCRIBE is
+/// answered live and the message is the broker's own copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_binding_on_an_idle_broker_receives_from_the_broker() {
+    broker_gate!();
+
+    let topic = format!("{TOPIC_PREFIX}/idle-first");
+    let address = format!("mqtt:ha:{topic}");
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let components = tempfile::tempdir().expect("a components root");
+
+    let (tree, mut booted) = boot_connected(&harness, &ca_file, components.path(), &[]).await;
+    let (service, router) = booted.mqtt.clone().expect("a declared client gets one");
+    assert_eq!(service.client_slugs(), vec!["ha".to_string()]);
+    assert_eq!(service.ingress_filter_qos("ha", &topic).await, None);
+    assert!(router.route_uuids().is_empty());
+
+    tree.write(&document_over_the_broker(harness.port, &ca_file, &[&topic]));
+    install_package(components.path(), &staged_module(&tree));
+    booted.driver.reload(TriggerSource::Signal).await;
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+    assert!(
+        status.delta.mqtt_deferred.is_empty(),
+        "the idle session was connected, so it answers the SUBSCRIBE live: {:?}",
+        status.delta.mqtt_deferred,
+    );
+    let uuid = booted
+        .messenger
+        .directory()
+        .resolve(&address)
+        .expect("the reload minted the entry")
+        .uuid;
+    assert_eq!(router.route_uuids(), vec![uuid]);
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    publisher
+        .publish(topic.clone(), QoS::AtLeastOnce, false, b"first".to_vec())
+        .await
+        .expect("the broker took the publish");
+    await_puback(&mut acks, "the first topic's publish").await;
+
+    let bodies = booted.bodies_until(&address, 1).await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&bodies[0]).expect("the ingress envelope is JSON");
+    assert_eq!(envelope["client_slug"], "ha");
+    assert_eq!(envelope["topic"], topic.as_str());
+    assert_eq!(envelope["payload"]["text"], "first");
+
+    assert!(
+        poll_cursor_advanced(&booted, &address).await,
+        "the consumer the reload brought never moved its cursor",
+    );
+
+    booted.stop_mqtt();
 }

@@ -4,9 +4,10 @@
 //! `wasm_consumers` and `surfaces` — and this pass ignores exactly those. Every
 //! other section describes an entity whose runtime tables are boot snapshots:
 //! an app's policy is folded into the delivery gates, a remote's token is
-//! loaded once, an MQTT client's broker session is opened once, a webhook
-//! endpoint's route is an axum path built once. Converging any of them is a
-//! later slice's work; a difference in one of them here is a refusal.
+//! loaded once, an MQTT client's broker session is opened once for every
+//! declared client, a webhook endpoint's route is an axum path built once.
+//! Converging any of them is a later slice's work; a difference in one of them
+//! here is a refusal.
 //!
 //! The comparison is over *loaded* configs rather than document text, so
 //! defaults are applied, key order is gone, and a section rewritten into a
@@ -145,6 +146,9 @@ pub(crate) fn non_convergible_differences(
     plain("llm_chat", llm_chat, b_llm_chat, &mut out);
     plain("pwa_push", pwa_push, b_pwa_push, &mut out);
     plain("automation", automation, b_automation, &mut out);
+    // TODO(reload-mqtt-sessions): converge this block — start a supervisor for an
+    // added client, stop one for a removed client, restart one whose config
+    // changed.
     keyed_vec(
         "mqtt_clients",
         mqtt_clients,
@@ -256,6 +260,7 @@ mod tests {
     use brenn_lib::access::raw::{AppAclRaw, ChannelMatcherRaw};
     use brenn_lib::config::AppConfigRaw;
     use brenn_lib::messaging::config::{ChannelConfigRaw, Depth, WasmConsumerConfigRaw};
+    use brenn_lib::mqtt::config::MqttClientConfigRaw;
 
     /// An `[[app]]` block with nothing but a slug.
     fn app(slug: &str) -> AppConfigRaw {
@@ -348,6 +353,22 @@ mod tests {
                 "apps[assistant] removed: this change needs a restart".to_string(),
                 "apps[scribe] added: this change needs a restart".to_string(),
             ],
+        );
+    }
+
+    /// The boundary the `mqtt:` convergence rests on: a declared client has a
+    /// broker session for the life of the process, so adding one is a change
+    /// only a restart can make.
+    #[test]
+    fn an_added_mqtt_client_is_a_restart() {
+        let mut candidate = base();
+        candidate.mqtt_clients = vec![MqttClientConfigRaw::minimal(
+            "spare",
+            "mqtts://127.0.0.1:8884",
+        )];
+        assert_eq!(
+            non_convergible_differences(&base(), &candidate),
+            vec!["mqtt_clients[spare] added: this change needs a restart".to_string()],
         );
     }
 

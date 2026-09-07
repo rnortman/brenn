@@ -496,7 +496,10 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "placeholders, not instructions.\n\n",
                 "Success: `{ ok: true, address, status }` where `status` is one of ",
                 "`\"subscribed\"` (live now), `\"subscribed_pending_reconnect\"` (mqtt client ",
-                "currently disconnected; delivery starts on reconnect), or ",
+                "currently disconnected; delivery starts on reconnect), ",
+                "`\"subscribed_client_failed\"` (the mqtt client's broker session failed for ",
+                "good — bad credentials or TLS — so the subscription is recorded but nothing ",
+                "will be delivered until an operator fixes it), or ",
                 "`\"already_subscribed\"` (idempotent no-op). Errors: `{ ok: false, error }`."
             )
             .to_string(),

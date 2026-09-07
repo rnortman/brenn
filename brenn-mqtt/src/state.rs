@@ -2,9 +2,10 @@
 //!
 //! `MqttClientHandle` is the single handle type serving both the publish path
 //! (pending/inflight ack tracking) and the ingress delivery + reconnect
-//! re-assert path. One is built per `[[mqtt_client]]` that needs a session and
-//! held on `MqttService` in a `client_slug`-keyed registry, built once at
-//! startup and read-only thereafter.
+//! re-assert path. One is built per declared `[[mqtt_client]]`, whether or not
+//! anything is bound through it, and held on `MqttService` in a
+//! `client_slug`-keyed registry, built once at startup and read-only
+//! thereafter.
 
 use std::collections::HashMap;
 use std::sync::Arc;

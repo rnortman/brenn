@@ -2,6 +2,26 @@
 
 All notable changes to Brenn are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- **Declared MQTT clients hold sessions unconditionally.** Previously, a broker
+  session was spawned only for clients referenced by an ingress channel or ACL
+  matcher at boot. Now every `mqtt_client` block gets a supervisor at startup.
+  An idle connection costs one keepalive; the operator wrote the declaration, so
+  the connection is what they asked for.
+
+### Fixed
+
+- **Failed MQTT clients distinguished from deferred ones.** A broker supervisor
+  that gave up after an authoritative failure (bad credentials, rejected TLS
+  chain) was reported as "deferred, will converge on reconnect" in reload status
+  and in `MessageSubscribe` results. It is now reported separately:
+  `mqtt_failed` in the reload status body, `subscribed_client_failed` on the
+  subscribe response. The filter is still installed for reconnect survival, but
+  the operator sees that waiting is unlikely to help.
+
 ## [0.20.1] — 2026-09-07
 
 Reload covers the full deployment surface. A running server can now pick up new

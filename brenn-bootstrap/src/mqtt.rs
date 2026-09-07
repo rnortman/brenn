@@ -2,14 +2,10 @@
 
 use std::sync::Arc;
 
-use brenn_lib::access::AppPolicy;
-use brenn_lib::config::AppConfig;
-use brenn_lib::config::BrennConfig;
-use brenn_lib::messaging::config::ResolvedWasmConsumer;
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel};
 use brenn_mqtt::MqttService;
 use brenn_mqtt::{MqttClientHandle, spawn_client_supervisor, union_subscriptions};
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use tracing::info;
 
 use brenn_server::mqtt_router::{IngressRoute, MqttEventRouterImpl};
@@ -24,69 +20,49 @@ pub(crate) struct MqttResult {
     pub(crate) stop_txs: Vec<tokio::sync::watch::Sender<bool>>,
 }
 
-/// The set of clients that get a session: a client is **referenced** iff it is
-/// named by at least one resolved ingress channel, one `mqtt_publish` ACL matcher
-/// (app or WASM consumer), or one `mqtt_subscribe` ACL matcher (app only — WASM
-/// policies carry no subscribe matchers). Deduplicated, first-seen (config) order
-/// for deterministic supervisor spawn order.
+/// Build the MQTT service and spawn one unified supervisor per **declared**
+/// `[[mqtt_client]]`. Each session carries both the publish path and the
+/// ingress delivery + reconnect re-assert path.
 ///
-/// "ACL-authorized ⇒ session exists" holds in both directions: every client any
-/// matcher can authorize a publish or a dynamic subscribe against has a running
-/// session.
-pub(crate) fn referenced_clients<'a>(
-    ingress_channels: &'a [ResolvedMqttIngressChannel],
-    app_policies: impl Iterator<Item = &'a AppPolicy>,
-    wasm_policies: impl Iterator<Item = &'a AppPolicy>,
-) -> IndexSet<&'a str> {
-    let mut referenced: IndexSet<&str> = IndexSet::new();
-    for ch in ingress_channels {
-        referenced.insert(ch.client_slug.as_str());
-    }
-    for policy in app_policies {
-        for m in &policy.acls.mqtt_publish {
-            referenced.insert(m.client.as_str());
-        }
-        for m in &policy.acls.mqtt_subscribe {
-            referenced.insert(m.client.as_str());
-        }
-    }
-    for policy in wasm_policies {
-        for m in &policy.acls.mqtt_publish {
-            referenced.insert(m.client.as_str());
-        }
-    }
-    referenced
-}
-
-/// Build the MQTT service and spawn one unified supervisor per **referenced**
-/// `[[mqtt_client]]` (see [`referenced_clients`]). Each session carries both the
-/// publish path and the ingress delivery + reconnect re-assert path.
+/// Returns `None` values iff no `[[mqtt_client]]` is declared.
 ///
-/// Returns `None` values when no `[[mqtt_client]]` is declared OR no client is
-/// referenced by any ingress channel or ACL matcher.
+/// A declared client has a broker session for the life of the process, whether
+/// or not anything is bound through it: the operator wrote the declaration, and
+/// an idle session costs a keepalive. That is what lets a reload converge the
+/// first `mqtt:` binding a document ever puts on a broker.
 ///
 /// `AppState` injection (`set_state` + `set_router`) must happen after
 /// `AppState` construction — same deferred-state pattern as `WakeRouterImpl`.
 ///
-/// This runs once, at boot, which is why a reload refuses a change that would
-/// add or drop a session.
-// TODO(reload-mqtt-sessions): start and stop supervisors at reload — which
-// needs the whole subsystem to be able to come up lazily, since a boot document
-// referencing no client builds none of it.
+/// The declaration set itself is boot-only.
+///
+/// # Panics
+///
+/// Panics if an ingress channel names a client this map does not declare. Such
+/// a channel would get a router route and no subscription — a channel that
+/// exists and can never receive.
+// TODO(reload-mqtt-sessions): start, stop and restart supervisors at reload,
+// and build the service, router and `AppState` injection lazily so a boot
+// document declaring no client can gain one.
 pub(crate) async fn start_mqtt(
-    config: &BrennConfig,
-    apps: &Arc<IndexMap<String, AppConfig>>,
-    wasm_consumers: &[ResolvedWasmConsumer],
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
     clients: &IndexMap<String, MqttClientConfig>,
 ) -> MqttResult {
-    let referenced = referenced_clients(
-        mqtt_ingress_channels,
-        apps.values().map(|a| &a.policy),
-        wasm_consumers.iter().map(|c| &c.policy),
-    );
+    // The subscription union below silently skips a channel whose client is
+    // not the one being built, so an ingress channel on an undeclared client
+    // would subscribe nothing and still be routed — a channel that exists and
+    // can never receive. Callers must refuse such a channel before it reaches
+    // here; this assert is the tripwire for that invariant.
+    for channel in mqtt_ingress_channels {
+        assert!(
+            clients.contains_key(&channel.client_slug),
+            "mqtt ingress channel {:?} names client {:?}, which no `[[mqtt_client]]` declares",
+            channel.channel_address,
+            channel.client_slug,
+        );
+    }
 
-    if config.mqtt_clients.is_empty() || referenced.is_empty() {
+    if clients.is_empty() {
         return MqttResult {
             service: None,
             event_router: None,
@@ -99,20 +75,15 @@ pub(crate) async fn start_mqtt(
     let router_trait: Arc<dyn brenn_mqtt::MqttEventRouter> = router.clone();
     let mut stop_txs: Vec<tokio::sync::watch::Sender<bool>> = Vec::new();
 
-    // One unified supervisor per referenced client. A client's subscription set is
-    // the deduplicated union of its ingress-channel filters (empty for an
-    // egress-only client — a connected publisher with zero subscriptions).
-    for client_slug in &referenced {
-        let broker_cfg = clients.get(*client_slug).unwrap_or_else(|| {
-            // Every ACL matcher's client is boot-validated against the declared
-            // client set (LLM `validate_mqtt_client` + the WASM matcher check), and
-            // ingress channels likewise, so a referenced client absent from the
-            // resolved map is a host invariant break.
-            panic!(
-                "mqtt: referenced client {client_slug:?} is not in the resolved client map (bug)"
-            )
-        });
+    // One unified supervisor per declared client, in the map's order — which
+    // nothing observes: `client_slugs` sorts, and the handles are reached by
+    // slug. A client's subscription set is
+    // the deduplicated union of its ingress-channel filters (empty for a client
+    // nothing receives through — a connected publisher with zero
+    // subscriptions).
+    for (client_slug, broker_cfg) in clients {
         let subscriptions = union_subscriptions(client_slug, mqtt_ingress_channels);
+        let subscription_count = subscriptions.len();
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let config = Arc::new(broker_cfg.clone());
         let handle = MqttClientHandle::new(config, subscriptions, stop_tx.clone());
@@ -124,6 +95,18 @@ pub(crate) async fn start_mqtt(
         // per-client session state. The supervisor consumes the handle, so register
         // the clone first.
         svc.add_client(handle.clone()).await;
+
+        // Per client, because a declared client with no binding is otherwise
+        // invisible: the channel listing decorates `mqtt:` channel entries and
+        // an unbound client has none, so this line is where an operator reads
+        // that the process holds a session for it at all.
+        info!(
+            client = %client_slug,
+            host = %broker_cfg.identity.host,
+            port = broker_cfg.identity.port,
+            subscriptions = subscription_count,
+            "MQTT client supervisor spawned"
+        );
 
         spawn_client_supervisor(handle, router_trait.clone(), stop_rx);
     }
@@ -158,27 +141,34 @@ pub(crate) async fn wire_mqtt_state(
         .iter()
         .map(IngressRoute::from)
         .collect();
+    let route_count = routes.len();
     router.set_state(state, routes);
     service
         .set_router(router.clone() as Arc<dyn brenn_mqtt::MqttEventRouter>)
         .await;
-    info!("MQTT service started; supervisors running");
+    info!(
+        clients = service.client_slugs().len(),
+        routes = route_count,
+        "MQTT service started; supervisors running"
+    );
     stop_txs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brenn_lib::access::acl::{MqttClientMatcher, MqttSubMatcher};
     use brenn_lib::messaging::{Urgency, mqtt_channel_uuid_from_address};
-    use brenn_lib::mqtt::config::{MqttClientConfigRaw, parsed_address_canonical};
+    use brenn_lib::mqtt::config::parsed_address_canonical;
 
     fn test_client(slug: &str) -> MqttClientConfig {
         brenn_server::test_support::mqtt::test_client_config(slug)
     }
 
-    fn test_raw_client(slug: &str) -> MqttClientConfigRaw {
-        MqttClientConfigRaw::minimal(slug, "mqtts://127.0.0.1:1")
+    fn client_map(slugs: &[&str]) -> IndexMap<String, MqttClientConfig> {
+        slugs
+            .iter()
+            .map(|s| ((*s).to_string(), test_client(s)))
+            .collect()
     }
 
     fn test_ingress_channel(client: &str, topic: &str) -> ResolvedMqttIngressChannel {
@@ -193,78 +183,13 @@ mod tests {
         }
     }
 
-    fn policy_with_publish(client: &str) -> AppPolicy {
-        let mut p = AppPolicy::default();
-        p.acls.mqtt_publish.push(MqttClientMatcher {
-            client: client.to_string(),
-        });
-        p
-    }
-
-    fn policy_with_subscribe(client: &str) -> AppPolicy {
-        let mut p = AppPolicy::default();
-        p.acls.mqtt_subscribe.push(MqttSubMatcher {
-            client: client.to_string(),
-            topic_filter: "sensors/#".to_string(),
-        });
-        p
-    }
-
-    // --- referenced_clients derivation (spawn-set) ---
-
-    #[test]
-    fn referenced_ingress_only_client() {
-        let ch = vec![test_ingress_channel("ing", "sensors/#")];
-        let refs = referenced_clients(&ch, std::iter::empty(), std::iter::empty());
-        assert!(refs.contains("ing"));
-        assert_eq!(refs.len(), 1);
-    }
-
-    #[test]
-    fn referenced_egress_only_client_via_publish_matcher() {
-        let pol = policy_with_publish("egress");
-        let refs = referenced_clients(&[], std::iter::once(&pol), std::iter::empty());
-        assert!(refs.contains("egress"));
-    }
-
-    #[test]
-    fn referenced_subscribe_matcher_only_client() {
-        let pol = policy_with_subscribe("subonly");
-        let refs = referenced_clients(&[], std::iter::once(&pol), std::iter::empty());
-        assert!(refs.contains("subonly"));
-    }
-
-    #[test]
-    fn referenced_wasm_publish_matcher_client() {
-        let pol = policy_with_publish("wasmcl");
-        let refs = referenced_clients(&[], std::iter::empty(), std::iter::once(&pol));
-        assert!(refs.contains("wasmcl"));
-    }
-
-    #[test]
-    fn referenced_none_when_unreferenced() {
-        let refs = referenced_clients(&[], std::iter::empty(), std::iter::empty());
-        assert!(refs.is_empty());
-    }
-
     // --- start_mqtt activation ---
 
     #[tokio::test]
     async fn activates_with_ingress_only_no_connectors() {
-        let config = BrennConfig {
-            mqtt_clients: vec![test_raw_client("cl")],
-            ..Default::default()
-        };
-        let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IndexMap::new());
-        let mut clients: IndexMap<String, MqttClientConfig> = IndexMap::new();
-        clients.insert("cl".to_string(), test_client("cl"));
-
         let result = start_mqtt(
-            &config,
-            &apps,
-            &[],
             &[test_ingress_channel("cl", "sensors/#")],
-            &clients,
+            &client_map(&["cl"]),
         )
         .await;
 
@@ -275,35 +200,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_when_client_but_nothing_references_it() {
-        let config = BrennConfig {
-            mqtt_clients: vec![test_raw_client("cl")],
-            ..Default::default()
-        };
-        let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IndexMap::new());
-        let clients: IndexMap<String, MqttClientConfig> = IndexMap::new();
+    async fn activates_for_a_declared_client_nothing_references() {
+        let result = start_mqtt(&[], &client_map(&["cl"])).await;
 
-        let result = start_mqtt(&config, &apps, &[], &[], &clients).await;
-
-        assert!(result.service.is_none());
-        assert!(result.event_router.is_none());
-        assert!(result.stop_txs.is_empty());
+        let service = result.service.expect("a declared client gets a service");
+        assert!(result.event_router.is_some());
+        assert_eq!(result.stop_txs.len(), 1);
+        assert_eq!(service.client_slugs(), vec!["cl".to_string()]);
     }
 
     #[tokio::test]
-    async fn inactive_when_ingress_but_no_clients() {
-        let config = BrennConfig::default();
-        let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IndexMap::new());
-        let clients: IndexMap<String, MqttClientConfig> = IndexMap::new();
-
+    async fn spawns_one_session_per_declared_client() {
+        // Declared in non-alphabetical order, so the sorted `client_slugs`
+        // below is a statement about the set and not about the map's order.
         let result = start_mqtt(
-            &config,
-            &apps,
-            &[],
-            &[test_ingress_channel("cl", "sensors/#")],
-            &clients,
+            &[test_ingress_channel("ha", "home/state")],
+            &client_map(&["spare", "ha"]),
         )
         .await;
+
+        let service = result.service.expect("declared clients get a service");
+        assert_eq!(result.stop_txs.len(), 2);
+        assert_eq!(
+            service.client_slugs(),
+            vec!["ha".to_string(), "spare".to_string()]
+        );
+    }
+
+    /// A route with no subscription behind it is a channel that exists and can
+    /// never receive. Boot asserts the invariant rather than relying on callers
+    /// alone.
+    #[tokio::test]
+    #[should_panic(expected = "which no `[[mqtt_client]]` declares")]
+    async fn an_ingress_channel_on_an_undeclared_client_panics() {
+        start_mqtt(
+            &[test_ingress_channel("ghost", "sensors/#")],
+            &client_map(&["cl"]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn inactive_when_no_client_is_declared() {
+        let result = start_mqtt(&[], &IndexMap::new()).await;
 
         assert!(result.service.is_none());
         assert!(result.event_router.is_none());

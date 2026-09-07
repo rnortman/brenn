@@ -18,11 +18,10 @@ use brenn_obs::security::{DenialKind, DenialOrigin, SecurityEventType, signal_pu
 /// Build the synchronous MQTT-egress callback for a WASM consumer holding the
 /// `Mqtt` grant.
 ///
-/// `svc` is `Some` whenever at least one `[[mqtt_client]]` is *referenced* — by an
-/// ingress channel or by any `mqtt_publish`/`mqtt_subscribe` ACL matcher (see
-/// `bootstrap/mqtt::referenced_clients`); otherwise it is `None`, in which case the
-/// closure returns `NoConnector` — fail-closed. A consumer's own `mqtt_publish`
-/// matcher itself brings the service up.
+/// `svc` is `Some` whenever at least one `[[mqtt_client]]` is declared; otherwise
+/// it is `None`, in which case the closure returns `NoConnector` — fail-closed. A
+/// matcher's client is boot-validated as declared, and a declared client has a
+/// broker session, so a consumer with a publish matcher always finds one.
 ///
 /// The returned closure bridges async → sync via `block_on`, which is correct
 /// **only** because the WASM guest invocation runs on a `spawn_blocking`
@@ -58,16 +57,15 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
                 }
             };
             // No MQTT service configured on this server ⇒ fail-closed. This arm is
-            // reachable only when no `[[mqtt_client]]` is referenced by any ingress
-            // channel or ACL matcher (see `referenced_clients`); a consumer's own
-            // `mqtt_publish` matcher would itself bring the service up, so a
-            // consumer reaching here holds the `mqtt` grant with no publish matcher,
-            // or the server runs no MQTT at all. Same guest variant as
-            // `do_mqtt_publish`'s service-absent arm.
+            // reachable only when no `[[mqtt_client]]` is declared at all: a
+            // matcher's client is boot-validated as declared, and declared means a
+            // session. So a consumer reaching here holds the `mqtt` grant with no
+            // publish matcher, or the server runs no MQTT at all. Same guest variant
+            // as `do_mqtt_publish`'s service-absent arm.
             let Some(ref svc) = svc else {
                 tracing::warn!(
                     slug = %slug,
-                    "wasm mqtt-publish: no-connector — MQTT service not configured on this server (no [[mqtt_client]] referenced by any ingress channel or ACL matcher)"
+                    "wasm mqtt-publish: no-connector — MQTT service not configured on this server (no [[mqtt_client]] declared)"
                 );
                 return brenn_wasm::MqttPublishOutcome::NoConnector;
             };

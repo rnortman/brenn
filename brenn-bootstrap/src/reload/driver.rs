@@ -56,7 +56,6 @@ use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use crate::consumers::{ConsumerLoadContext, ConsumerRegistry, LoadedConsumer, load_consumer};
 use crate::reload::compare::non_convergible_differences;
 use crate::reload::delta::{PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
-use crate::reload::mqtt::ReferencedClient;
 use crate::reload::surfaces::{
     SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, arriving, build_surface_docs,
     system_participant_refusals,
@@ -486,19 +485,12 @@ impl ReloadDriver {
             &candidate_facts,
             kind_differences.into_keys().collect(),
         );
-        let mut refusals = convergibility_refusals(
+        let refusals = convergibility_refusals(
             &baseline_facts,
             &candidate_facts,
             &delta,
             self.env.messenger.directory(),
         );
-        // Rule 6, the one rule that reads the MQTT runtime rather than the two
-        // plans: a broker session is a boot-time fact in both directions.
-        refusals.extend(super::mqtt::session_refusals(
-            &delta.mqtt,
-            &self.sessions(),
-            &self.referenced_clients(&plan),
-        ));
         if !refusals.is_empty() {
             return refused(Some(sha), refusals);
         }
@@ -737,78 +729,6 @@ impl ReloadDriver {
         } else {
             Err(refusals)
         }
-    }
-
-    /// Which clients have a live broker session right now.
-    ///
-    /// The registry is written at boot and never after, so this is the set a
-    /// fresh boot of the *baseline* document produced — which is exactly what
-    /// rule 6 compares the candidate's reference set against.
-    fn sessions(&self) -> Vec<String> {
-        self.env
-            .mqtt_service
-            .as_ref()
-            .map(|service| service.client_slugs())
-            .unwrap_or_default()
-    }
-
-    /// The clients a fresh boot of the candidate would spawn a supervisor for,
-    /// each with what in the candidate names it.
-    ///
-    /// The same three sources boot's derivation reads, in the same order, over
-    /// the candidate's ingress channels and consumer policies and the booted
-    /// app policies — the apps are level-1 frozen, so theirs is the candidate's
-    /// set too. The attribution lets rule 6's refusal name the line that asked
-    /// for the session.
-    fn referenced_clients(&self, plan: &MessagingPlan) -> Vec<ReferencedClient> {
-        let mut out: Vec<ReferencedClient> = Vec::new();
-        let mut push = |client: &str, named_by: String| {
-            if !out.iter().any(|one| one.client == client) {
-                out.push(ReferencedClient {
-                    client: client.to_string(),
-                    named_by,
-                });
-            }
-        };
-        for channel in &plan.mqtt_ingress_channels {
-            push(&channel.client_slug, channel.channel_address.clone());
-        }
-        for (slug, app) in self.env.apps.iter() {
-            for matcher in &app.policy.acls.mqtt_publish {
-                push(
-                    &matcher.client,
-                    format!("app `{slug}`'s `mqtt_publish` matcher"),
-                );
-            }
-            for matcher in &app.policy.acls.mqtt_subscribe {
-                push(
-                    &matcher.client,
-                    format!("app `{slug}`'s `mqtt_subscribe` matcher"),
-                );
-            }
-        }
-        for consumer in &plan.wasm_consumers {
-            for matcher in &consumer.policy.acls.mqtt_publish {
-                push(
-                    &matcher.client,
-                    format!("consumer `{}`'s `mqtt_publish` matcher", consumer.slug),
-                );
-            }
-        }
-        debug_assert_eq!(
-            out.iter()
-                .map(|one| one.client.as_str())
-                .collect::<Vec<_>>(),
-            crate::mqtt::referenced_clients(
-                &plan.mqtt_ingress_channels,
-                self.env.apps.values().map(|app| &app.policy),
-                plan.wasm_consumers.iter().map(|consumer| &consumer.policy),
-            )
-            .into_iter()
-            .collect::<Vec<_>>(),
-            "rule 6's reference set has drifted from the one boot spawns sessions for",
-        );
-        out
     }
 
     /// The surface documents and registration swaps this reload owes, built
@@ -1090,7 +1010,7 @@ impl ReloadDriver {
         // The walk is `async` throughout — it awaits a stopping consumer's last
         // drain step and the database — so unlike prepare it is not the
         // blocking pool's to run.
-        let deferred = match super::commit::apply(
+        let mqtt_report = match super::commit::apply(
             &self.env,
             &mut self.registry,
             &plan,
@@ -1106,18 +1026,20 @@ impl ReloadDriver {
         )
         .await
         {
-            Ok(deferred) => deferred,
+            Ok(report) => report,
             Err(refusals) => {
                 self.report_refusal(source, Some(sha.clone()), refusals)
                     .await;
                 return;
             }
         };
-        // The one delta field prepare could not know: which filters the broker
-        // took now and which it will take on the next connect. Prepare measured
-        // the body with every moved filter listed here, so replacing that with
-        // the ones that actually deferred only shrinks it.
-        applied.delta.mqtt_deferred = deferred;
+        // The two delta fields prepare could not know: which filters the broker
+        // took now, which it will take on the next connect, and which no
+        // connect in this process will take. Prepare measured the body with
+        // every moved filter listed in both, so replacing that with the ones
+        // that actually deferred or failed only shrinks it.
+        applied.delta.mqtt_deferred = mqtt_report.deferred;
+        applied.delta.mqtt_failed = mqtt_report.failed;
         self.generation += 1;
         self.baseline = Baseline::of(document, mounts, &plan);
         // The delta on the line, not just in the retained body: an operator
@@ -1138,6 +1060,10 @@ impl ReloadDriver {
             surfaces_added = ?applied.delta.surfaces_added,
             surfaces_removed = ?applied.delta.surfaces_removed,
             surfaces_changed = ?applied.delta.surfaces_changed,
+            // Not on the line for the other mqtt lists, which the journal
+            // already carries per filter: this is the one an operator reading
+            // an applied reload has to act on.
+            mqtt_failed = ?applied.delta.mqtt_failed,
             "reload applied"
         );
         // The one field that is not prepare's: the outcome was reached now, not
@@ -1566,13 +1492,11 @@ channel scratch at "ephemeral:scratch" {{
         brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients)
     }
 
-    /// A live `MqttService` and ingress router over the plan's **referenced**
+    /// A live `MqttService` and ingress router over the document's **declared**
     /// clients, as boot builds them.
     ///
-    /// Referenced and not declared, because that is the set boot spawns a
-    /// session for and the set rule 6 is defined against: a client the document
-    /// declares and nothing binds has no session on a real host, and a fixture
-    /// that gave it one would be a fixture rule 6 cannot be tested on.
+    /// Declared and not referenced, because that is the set boot spawns a
+    /// session for.
     ///
     /// The handles are registered and no supervisor is spawned, so every session
     /// exists and none has a connection: a SUBSCRIBE at commit comes back
@@ -1581,7 +1505,7 @@ channel scratch at "ephemeral:scratch" {{
     /// read.
     async fn mqtt_runtime(
         plan: &MessagingPlan,
-        apps: &IndexMap<String, AppConfig>,
+        clients: &IndexMap<String, MqttClientIdentity>,
         db: &brenn_db::Db,
     ) -> (
         Arc<brenn_mqtt::MqttService>,
@@ -1589,13 +1513,8 @@ channel scratch at "ephemeral:scratch" {{
     ) {
         use brenn_server::mqtt_router::IngressRoute;
 
-        let referenced = crate::mqtt::referenced_clients(
-            &plan.mqtt_ingress_channels,
-            apps.values().map(|app| &app.policy),
-            plan.wasm_consumers.iter().map(|consumer| &consumer.policy),
-        );
         let service = brenn_mqtt::MqttService::new();
-        for slug in referenced {
+        for slug in clients.keys() {
             let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
             service
                 .add_client(brenn_mqtt::MqttClientHandle::new(
@@ -1625,7 +1544,6 @@ channel scratch at "ephemeral:scratch" {{
     /// answer it.
     async fn live_mqtt_runtime(
         config: &BrennConfig,
-        apps: &Arc<IndexMap<String, AppConfig>>,
         plan: &MessagingPlan,
         db: &brenn_db::Db,
         messenger: &Arc<Messenger>,
@@ -1637,20 +1555,11 @@ channel scratch at "ephemeral:scratch" {{
         Vec<tokio::sync::watch::Sender<bool>>,
     ) {
         let clients = brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients);
-        let result = crate::mqtt::start_mqtt(
-            config,
-            apps,
-            &plan.wasm_consumers,
-            &plan.mqtt_ingress_channels,
-            &clients,
-        )
-        .await;
-        let service = result
-            .service
-            .expect("a live fixture declares and references a client");
+        let result = crate::mqtt::start_mqtt(&plan.mqtt_ingress_channels, &clients).await;
+        let service = result.service.expect("a live fixture declares a client");
         let router = result
             .event_router
-            .expect("a live fixture declares and references a client");
+            .expect("a live fixture declares a client");
         // The state the router delivers through must carry the messenger this
         // process publishes with: an inbound packet reaches the bus through it,
         // and a state without one panics the delivery path on the first
@@ -1745,13 +1654,12 @@ channel scratch at "ephemeral:scratch" {{
         /// `processor/<kind>/` directory per kind it serves.
         pub(crate) surface_assets: Option<PathBuf>,
         /// Stand up a live `MqttService` and ingress router over the document's
-        /// `mqtt_client` declarations. Off by default: a process that never
-        /// referenced a client has neither, which is the shape rule 6's first
-        /// arm is about.
+        /// `mqtt_client` declarations. Off by default: a document declaring no
+        /// client has neither.
         pub(crate) mqtt: bool,
         /// Stand up the MQTT subsystem the way boot does, against whatever
         /// broker the document's `mqtt_client` names — one real supervisor per
-        /// referenced client, dialing and staying connected.
+        /// declared client, dialing and staying connected.
         ///
         /// Distinct from `mqtt`, which registers handles and spawns nothing:
         /// that fixture is for the cases about the *plan*, where every
@@ -1914,10 +1822,13 @@ channel scratch at "ephemeral:scratch" {{
         });
         let plan = plan_like_the_driver(&document.config, &apps, &tool_registry);
         let (mqtt, mqtt_stop_txs) = match (mqtt, mqtt_live) {
-            (true, _) => (Some(mqtt_runtime(&plan, &apps, &db).await), Vec::new()),
+            (true, _) => (
+                Some(mqtt_runtime(&plan, &client_identities(&document.config), &db).await),
+                Vec::new(),
+            ),
             (_, true) => {
                 let (runtime, stop_txs) =
-                    live_mqtt_runtime(&document.config, &apps, &plan, &db, &messenger).await;
+                    live_mqtt_runtime(&document.config, &plan, &db, &messenger).await;
                 (Some(runtime), stop_txs)
             }
             _ => (None, Vec::new()),
@@ -2426,8 +2337,18 @@ new sifter: Sifter {{
     /// The staged module's bytes — the file the instance's class was declared
     /// in, and therefore the spec the package record has to carry.
     pub(crate) fn staged_module(tree: &Tree) -> String {
-        std::fs::read_to_string(tree.modules().join(format!("{PACKAGED_MODULE}.brenn")))
-            .expect("the staged module is readable")
+        staged_module_opt(tree).expect("the document stages a module")
+    }
+
+    /// The same, `None` for a document that declares no component and so stages
+    /// no module. Lets a caller install a package iff there is one to install,
+    /// instead of re-deriving from the document's shape which documents have
+    /// one. Absence is the only tolerated failure; an unreadable file panics.
+    pub(crate) fn staged_module_opt(tree: &Tree) -> Option<String> {
+        let path = tree.modules().join(format!("{PACKAGED_MODULE}.brenn"));
+        path.try_exists()
+            .expect("the staged module directory is readable")
+            .then(|| std::fs::read_to_string(&path).expect("the staged module is readable"))
     }
 
     /// A document declaring one consumer of the `processor-config` fixture
@@ -2526,7 +2447,7 @@ new sifter: Demo {{
 
     /// Two declared brokers and a consumer bound to one `mqtt:` topic per
     /// `(client, topic)` pair. A client no pair names is declared and
-    /// referenced by nothing, so boot spawns no supervisor for it.
+    /// referenced by nothing, and has a session all the same.
     pub(crate) fn document_with_two_brokers(bindings: &[(&str, &str)]) -> String {
         let ports: String = (0..bindings.len())
             .map(|index| format!("    in inbound{index};\n"))
@@ -2571,11 +2492,11 @@ new sifter: Demo {{
         ))
     }
 
-    /// Rule 6's first arm on the arrangement it is actually about: a client the
-    /// document declares, with a live service beside it that holds no session
-    /// for it because nothing referenced it at boot.
+    /// A client the document declares and nothing binds still has a session, so
+    /// the first binding a reload puts on it converges.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_mqtt_binding_on_a_declared_but_unreferenced_client_is_refused() {
+    async fn an_mqtt_binding_on_a_declared_but_unreferenced_client_converges() {
+        const ADDRESS: &str = "mqtt:spare:home/other";
         let tree = Tree::holding(&document_with_two_brokers(&[("ha", "home/state")]));
         let components = tempfile::tempdir().expect("a components root");
         install_package(components.path(), &staged_module(&tree));
@@ -2588,6 +2509,11 @@ new sifter: Demo {{
             },
         )
         .await;
+        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+        assert_eq!(
+            service.ingress_filter_qos("spare", "home/other").await,
+            None
+        );
 
         tree.write(&document_with_two_brokers(&[
             ("ha", "home/state"),
@@ -2595,79 +2521,44 @@ new sifter: Demo {{
         ]));
         // The second binding adds a port, so the component's specification
         // moves with it; the installed package has to be the one the candidate
-        // document names or the refusal would be the spec-binding one.
+        // document names or the outcome would be the spec-binding refusal.
         install_package(components.path(), &staged_module(&tree));
-        assert!(
-            booted
-                .driver
-                .prepare_and_report(TriggerSource::Bus)
-                .await
-                .is_none()
-        );
+        booted.driver.reload(TriggerSource::Signal).await;
+
         let status = booted.last_status().await;
-        assert_eq!(status.outcome, Outcome::Refused);
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_subscribed, vec![ADDRESS.to_string()]);
+        assert_eq!(
+            status.delta.mqtt_deferred,
+            vec![ADDRESS.to_string()],
+            "a registered but disconnected client defers every SUBSCRIBE",
+        );
+        assert_eq!(
+            service.ingress_filter_qos("spare", "home/other").await,
+            Some(1),
+            "the arriving filter is not in the reconnect-survival set",
+        );
+        let uuid = booted
+            .messenger
+            .directory()
+            .resolve(ADDRESS)
+            .expect("the entry is in the directory")
+            .uuid;
         assert!(
-            status.refusals.iter().any(|line| {
-                line.contains("mqtt:spare:home/other")
-                    && line.contains("has no broker session")
-                    && line.ends_with(super::super::NEEDS_RESTART)
-            }),
-            "{:?}",
-            status.refusals,
+            router.route_uuids().contains(&uuid),
+            "{ADDRESS} has no route"
         );
     }
 
-    /// The broker document with nothing referencing it, which is a client a
-    /// fresh boot spawns no supervisor for.
-    pub(crate) fn document_with_a_broker_only() -> String {
-        document(
-            r#"mqtt_client ha {
-    url = "mqtts://127.0.0.1:8883";
-    qos = 1;
-}
-"#,
-        )
-    }
-
-    /// Rule 6's first arm. A client only ever named by a document is a client
-    /// with no supervisor: nothing spawned one at boot because nothing
-    /// referenced it, and a reload does not start one.
+    /// The same reload against a client whose supervisor has given up: the
+    /// reload applies and the filter is registered, but no connect in this
+    /// process will assert it, so the status body must say `mqtt_failed` and
+    /// not `mqtt_deferred`. Consumers of the status body treat the deferred
+    /// list as "wait" and would wait forever.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_mqtt_binding_on_a_client_with_no_session_is_refused() {
-        const TOPIC: &str = "home/state";
-        let tree = Tree::holding(&document_with_a_broker_only());
-        let components = tempfile::tempdir().expect("a components root");
-        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
-
-        tree.write(&document_with_an_mqtt_consumer(&[TOPIC]));
-        install_package(components.path(), &staged_module(&tree));
-
-        assert!(
-            booted
-                .driver
-                .prepare_and_report(TriggerSource::Bus)
-                .await
-                .is_none()
-        );
-        let status = booted.last_status().await;
-        assert_eq!(status.outcome, Outcome::Refused);
-        assert!(
-            status.refusals.iter().any(|line| {
-                line.contains(&format!("mqtt:ha:{TOPIC}"))
-                    && line.contains("has no broker session")
-                    && line.ends_with(super::super::NEEDS_RESTART)
-            }),
-            "{:?}",
-            status.refusals,
-        );
-    }
-
-    /// Rule 6's second arm. Dropping the last thing that referenced a client
-    /// would leave a supervisor a fresh boot would not have spawned, and
-    /// stopping one at reload is not something this facility does.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn dropping_a_clients_last_reference_is_refused() {
-        let tree = Tree::holding(&document_with_an_mqtt_consumer(&["home/state"]));
+    async fn a_binding_on_a_failed_client_is_reported_failed_not_deferred() {
+        const ADDRESS: &str = "mqtt:spare:home/other";
+        let tree = Tree::holding(&document_with_two_brokers(&[("ha", "home/state")]));
         let components = tempfile::tempdir().expect("a components root");
         install_package(components.path(), &staged_module(&tree));
         let mut booted = boot_with(
@@ -2679,23 +2570,130 @@ new sifter: Demo {{
             },
         )
         .await;
+        let (service, _router) = booted.mqtt.clone().expect("the fixture stood one up");
+        // A placeholder broker whose credentials are wrong: declared, dialled
+        // at boot, rejected authoritatively, not retrying.
+        let handle = service.get_client("spare").expect("a declared client");
+        *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
+            reason: "authoritative connect failure: bad user name or password".to_string(),
+        };
+
+        tree.write(&document_with_two_brokers(&[
+            ("ha", "home/state"),
+            ("spare", "home/other"),
+        ]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_subscribed, vec![ADDRESS.to_string()]);
+        assert_eq!(
+            status.delta.mqtt_failed,
+            vec![ADDRESS.to_string()],
+            "a client that stopped retrying has no reconnect to defer to",
+        );
+        assert!(
+            status.delta.mqtt_deferred.is_empty(),
+            "a filter is on one list or the other, never both: {:?}",
+            status.delta.mqtt_deferred,
+        );
+        assert_eq!(
+            service.ingress_filter_qos("spare", "home/other").await,
+            Some(1),
+            "the filter is registered all the same — a fixed process asserts it",
+        );
+    }
+
+    /// One declared broker and nothing bound through it: a client a fresh boot
+    /// spawns a supervisor for and subscribes nothing on.
+    pub(crate) fn document_with_a_broker_only() -> String {
+        document(
+            r#"mqtt_client ha {
+    url = "mqtts://127.0.0.1:8883";
+    qos = 1;
+}
+"#,
+        )
+    }
+
+    /// A document declares a broker and binds nothing through it; a later
+    /// reload brings the first consumer. The declaration gave the client a
+    /// session at boot, so the binding converges.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_binding_on_a_broker_only_document_converges() {
+        const TOPIC: &str = "home/state";
+        let address = format!("mqtt:ha:{TOPIC}");
+        let tree = Tree::holding(&document_with_a_broker_only());
+        let components = tempfile::tempdir().expect("a components root");
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                mqtt: true,
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone().expect("a declared client gets one");
+        assert_eq!(service.client_slugs(), vec!["ha".to_string()]);
+        assert!(router.route_uuids().is_empty());
+
+        tree.write(&document_with_an_mqtt_consumer(&[TOPIC]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+        assert_eq!(
+            service.ingress_filter_qos("ha", TOPIC).await,
+            Some(1),
+            "the first filter on the idle session is not in its set",
+        );
+        let uuid = booted
+            .messenger
+            .directory()
+            .resolve(&address)
+            .expect("the entry is in the directory")
+            .uuid;
+        assert_eq!(router.route_uuids(), vec![uuid]);
+    }
+
+    /// The other direction: the last binding on a client leaves, its filter and
+    /// route go with it, and the session stays — which is what a fresh boot of
+    /// the new document has too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_clients_last_binding_converges_and_keeps_the_session() {
+        const TOPIC: &str = "home/state";
+        let address = format!("mqtt:ha:{TOPIC}");
+        let tree = Tree::holding(&document_with_an_mqtt_consumer(&[TOPIC]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                mqtt: true,
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+        assert_eq!(service.ingress_filter_qos("ha", TOPIC).await, Some(1));
 
         tree.write(&document_with_a_broker_only());
-        assert!(
-            booted
-                .driver
-                .prepare_and_report(TriggerSource::Bus)
-                .await
-                .is_none()
-        );
+        booted.driver.reload(TriggerSource::Signal).await;
+
         let status = booted.last_status().await;
-        assert_eq!(status.outcome, Outcome::Refused);
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_unsubscribed, vec![address.clone()]);
+        assert_eq!(service.ingress_filter_qos("ha", TOPIC).await, None);
+        assert!(router.route_uuids().is_empty());
         assert_eq!(
-            status.refusals,
-            vec![
-                "mqtt client \"ha\" would lose its last reference: this change needs a restart"
-                    .to_string(),
-            ],
+            service.client_slugs(),
+            vec!["ha".to_string()],
+            "the session outlives its last binding",
         );
     }
 
@@ -2764,8 +2762,7 @@ new sifter: Demo {{
             .uuid;
         assert_eq!(router.route_uuids(), vec![kept_uuid, moved_uuid]);
 
-        // And back: the binding goes, and with it the filter and the route. The
-        // client keeps its other reference, so rule 6 has nothing to say.
+        // And back: the binding goes, and with it the filter and the route.
         tree.write(&document_with_an_mqtt_consumer(&[KEPT]));
         install_package(components.path(), &staged_module(&tree));
         booted.driver.reload(TriggerSource::Signal).await;

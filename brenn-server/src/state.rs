@@ -138,8 +138,7 @@ pub struct AppState {
     /// no app has `pwa_push.enabled = true` (push effectively disabled).
     pub pwa_push: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
     /// MQTT service (per-client session supervisors, event router). `None` when no
-    /// `[[mqtt_client]]` is referenced by any ingress channel or `mqtt_publish`/
-    /// `mqtt_subscribe` ACL matcher (`bootstrap/mqtt::referenced_clients`).
+    /// `[[mqtt_client]]` is declared; every declared client has a session.
     #[cfg_attr(test, allow(dead_code))]
     pub mqtt: Option<Arc<brenn_mqtt::MqttService>>,
     /// Concrete MQTT inbound event router. `None` when MQTT is not configured.
