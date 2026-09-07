@@ -2,7 +2,7 @@
 
 All notable changes to Brenn are documented here.
 
-## [Unreleased]
+## [0.20.2]
 
 ### Changed
 
@@ -11,6 +11,7 @@ All notable changes to Brenn are documented here.
   matcher at boot. Now every `mqtt_client` block gets a supervisor at startup.
   An idle connection costs one keepalive; the operator wrote the declaration, so
   the connection is what they asked for.
+- Fully hermetic toolchain via bazel
 
 ### Fixed
 
