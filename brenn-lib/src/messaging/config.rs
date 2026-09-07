@@ -1682,7 +1682,7 @@ pub struct ResolvedLocalChannel {
     pub ring_depth: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSurface {
     /// `surface:<slug>` participant identity source.
     pub slug: String,
@@ -1754,7 +1754,7 @@ impl ResolvedSurface {
 /// The instance is the *binding's* grain: a component's bindings resolve one
 /// subscription per (instance, channel), each with its own resolved depths and
 /// noise.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSurfaceSubscription {
     /// The component instance that declared this binding. Every surface
     /// subscription is an instance's; the bare `surface:<slug>` grain is
@@ -1766,7 +1766,7 @@ pub struct ResolvedSurfaceSubscription {
 }
 
 /// A resolved static surface input binding (channel → component/port).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceBinding {
     /// Full scheme-qualified channel address (`ephemeral:`/`brenn:`/`local:`).
     pub channel_address: String,
@@ -1807,7 +1807,7 @@ pub struct SurfaceBinding {
 /// no meaning for: the port's default publish urgency. Urgency is a property of
 /// *sending* — it tells the bus how hard to work to wake a subscriber — so
 /// there is nothing for an input binding to say about it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceOutput {
     /// Full scheme-qualified channel address (`ephemeral:`/`brenn:`/`local:`).
     pub channel_address: String,

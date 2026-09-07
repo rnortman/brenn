@@ -33,7 +33,7 @@ pub(crate) struct MqttResult {
 /// "ACL-authorized ⇒ session exists" holds in both directions: every client any
 /// matcher can authorize a publish or a dynamic subscribe against has a running
 /// session.
-fn referenced_clients<'a>(
+pub(crate) fn referenced_clients<'a>(
     ingress_channels: &'a [ResolvedMqttIngressChannel],
     app_policies: impl Iterator<Item = &'a AppPolicy>,
     wasm_policies: impl Iterator<Item = &'a AppPolicy>,
@@ -67,6 +67,12 @@ fn referenced_clients<'a>(
 ///
 /// `AppState` injection (`set_state` + `set_router`) must happen after
 /// `AppState` construction — same deferred-state pattern as `WakeRouterImpl`.
+///
+/// This runs once, at boot, which is why a reload refuses a change that would
+/// add or drop a session.
+// TODO(reload-mqtt-sessions): start and stop supervisors at reload — which
+// needs the whole subsystem to be able to come up lazily, since a boot document
+// referencing no client builds none of it.
 pub(crate) async fn start_mqtt(
     config: &BrennConfig,
     apps: &Arc<IndexMap<String, AppConfig>>,
@@ -145,20 +151,12 @@ pub(crate) async fn wire_mqtt_state(
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
     stop_txs: Vec<tokio::sync::watch::Sender<bool>>,
 ) -> Vec<tokio::sync::watch::Sender<bool>> {
-    // Build the router's routing table from the distinct ingress channels. One
-    // `IngressRoute` per channel: `(client_slug, topic_filter)` is the match key,
-    // `mqtt:<client>:<topic>` (uuid carried on the resolved channel) is the
-    // destination, and `urgency` is the client's `[[mqtt_client]].urgency`. The
-    // router fans inbound deliveries out to every matching route.
+    // Build the router's routing table from the distinct ingress channels, one
+    // route per channel. The router fans inbound deliveries out to every
+    // matching route.
     let routes: Vec<IngressRoute> = mqtt_ingress_channels
         .iter()
-        .map(|c| IngressRoute {
-            client_slug: c.client_slug.clone(),
-            topic_filter: c.topic.clone(),
-            channel_address: c.channel_address.clone(),
-            channel_uuid: c.channel_uuid,
-            urgency: c.urgency,
-        })
+        .map(IngressRoute::from)
         .collect();
     router.set_state(state, routes);
     service

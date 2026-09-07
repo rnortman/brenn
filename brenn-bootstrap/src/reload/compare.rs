@@ -1,12 +1,12 @@
 //! Level 1: everything a reload cannot converge must be equal.
 //!
-//! Three blocks of a document are convergible — `channels`, `links` and
-//! `wasm_consumers` — and this pass ignores exactly those. Every other section
-//! describes an entity whose runtime tables are boot snapshots: an app's policy
-//! is folded into the delivery gates, a surface's bindings document is
-//! published once, a remote's token is loaded once, an MQTT client's broker
-//! session is opened once. Converging any of them is a later slice's work; a
-//! difference in one of them here is a refusal.
+//! Four blocks of a document are convergible — `channels`, `links`,
+//! `wasm_consumers` and `surfaces` — and this pass ignores exactly those. Every
+//! other section describes an entity whose runtime tables are boot snapshots:
+//! an app's policy is folded into the delivery gates, a remote's token is
+//! loaded once, an MQTT client's broker session is opened once, a webhook
+//! endpoint's route is an axum path built once. Converging any of them is a
+//! later slice's work; a difference in one of them here is a refusal.
 //!
 //! The comparison is over *loaded* configs rather than document text, so
 //! defaults are applied, key order is gone, and a section rewritten into a
@@ -64,7 +64,7 @@ pub(crate) fn non_convergible_differences(
         webhook_endpoints,
         events,
         wasm_consumers: _,
-        surfaces,
+        surfaces: _,
         remotes,
         links: _,
         wasm,
@@ -94,7 +94,7 @@ pub(crate) fn non_convergible_differences(
         webhook_endpoints: b_webhook_endpoints,
         events: b_events,
         wasm_consumers: _,
-        surfaces: b_surfaces,
+        surfaces: _,
         remotes: b_remotes,
         links: _,
         wasm: b_wasm,
@@ -160,7 +160,6 @@ pub(crate) fn non_convergible_differences(
         &mut out,
     );
     plain("events", events, b_events, &mut out);
-    keyed_vec("surfaces", surfaces, b_surfaces, |s| &s.slug, &mut out);
     keyed_vec("remotes", remotes, b_remotes, |r| &r.slug, &mut out);
     plain("wasm", wasm, b_wasm, &mut out);
     plain("watchdog", watchdog, b_watchdog, &mut out);
@@ -380,8 +379,10 @@ mod tests {
         );
     }
 
+    /// Surfaces are the fourth convergible block: a difference between two
+    /// documents' surface lists is level 2's to walk, not level 1's to refuse.
     #[test]
-    fn a_surface_is_named_by_slug() {
+    fn a_surface_difference_is_not_a_level_1_refusal() {
         let surface = || brenn_messaging_boot::test_fixtures::minimal_surface_raw();
         let before = BrennConfig {
             surfaces: vec![surface()],
@@ -395,7 +396,17 @@ mod tests {
         };
         assert_eq!(
             non_convergible_differences(&before, &after),
-            vec!["surfaces[deskbar] differs: this change needs a restart".to_string()],
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            non_convergible_differences(
+                &before,
+                &BrennConfig {
+                    surfaces: Vec::new(),
+                    ..base()
+                }
+            ),
+            Vec::<String>::new(),
         );
     }
 

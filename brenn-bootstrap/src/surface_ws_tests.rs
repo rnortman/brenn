@@ -35,7 +35,7 @@ use brenn_server::test_support::TEST_BUILD_ID;
 use brenn_server::test_support::http::{
     TEST_USERNAME, assert_stale_client_close_and_no_alert, http_to_ws_url,
     setup_authenticated_user, spawn_test_server, surface_ws_open, ws_connect_first_frame,
-    ws_upgrade_status,
+    ws_upgrade_probe, ws_upgrade_status,
 };
 use brenn_surface_server::test_fixtures::{
     COMPONENT, EPH_ADDR, EPH_NAME, PORT, TEST_MAX_BODY_BYTES, deskbar_loop,
@@ -218,6 +218,51 @@ async fn surface_ws_unknown_slug_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     assert_single_alert(&flusher, &alerts, "unrecognized_url").await;
+}
+
+/// **The WS door answers a mid-swap slug with 503 and no security event.**
+/// This is the door a live page actually retries against while a reload swaps
+/// the surface: answering 404, or emitting `UnrecognizedUrl`, would point the
+/// kernel at a dead URL and feed fail2ban with the operator's own users.
+#[tokio::test]
+async fn surface_ws_mid_swap_returns_503_no_alert() {
+    let db = brenn_server::test_support::init_db_memory();
+    let SurfaceTestHarness {
+        state,
+        alerts,
+        flusher,
+        ..
+    } = deskbar_harness(&db, vec![], 4).await;
+    state.surfaces.begin_reconfigure("deskbar");
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+
+    let probe = ws_upgrade_probe(
+        &format!("{base}/surface/deskbar/ws"),
+        &[("cookie", &format!("brenn_session={token}"))],
+    )
+    .await;
+    assert_eq!(probe.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        probe
+            .headers
+            .iter()
+            .any(|(name, value)| name == "retry-after" && value == "1"),
+        "the kernel is told how long the window is expected to be: {:?}",
+        probe.headers,
+    );
+
+    assert!(
+        !probe
+            .headers
+            .iter()
+            .any(|(name, value)| name == "content-type" && value.contains("text/html")),
+        "the connector retries on its own, so only the page door is answered with a \
+         document: {:?}",
+        probe.headers,
+    );
+
+    assert_no_alerts(&flusher, &alerts, "a mid-swap WS attach").await;
 }
 
 #[tokio::test]

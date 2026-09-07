@@ -50,12 +50,14 @@ brenn-dsl = { version = "0.1.0", path = "../brenn-dsl" }
 brenn-attach-server = { version = "0.1.0", path = "../attach/server", features = ["testutils"] }
 futures = "0.3.32"
 libc = "0.2.185"
+rumqttc = { package = "rumqttc-next", version = "0.33.2", default-features = false, features = ["use-rustls-no-provider"] }
 tempfile = "3.24.0"
 tokio-tungstenite = "0.29.0"
 brenn-db = { version = "0.1.0", path = "../brenn-db", features = ["testutils"] }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
 brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
 brenn-messaging-boot = { version = "0.1.0", path = "../brenn-messaging-boot", features = ["testutils"] }
+brenn-mqtt = { version = "0.1.0", path = "../brenn-mqtt", features = ["testutils"] }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
 brenn-pwa-push = { version = "0.1.0", path = "../brenn-pwa-push", features = ["testutils"] }
 brenn-server = { version = "0.1.0", path = "../brenn-server", features = ["testutils"] }

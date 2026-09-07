@@ -8,41 +8,73 @@ use brenn_bootstrap::{self as bootstrap, cli};
 async fn main() -> ExitCode {
     use clap::Parser as _;
     let cli = cli::Cli::parse();
+    if let Err(error) = cli.validate() {
+        error.exit();
+    }
 
-    // The two config tools name the files they read, so neither reads
-    // `--config` and neither loads a third config to throw away.
+    // The four tools that read no config run before anything loads one: the two
+    // config tools name the files they read, so neither reads `--config`,
+    // `mounts` reads only the mounts document, and `config-status` reads only
+    // the store.
     match &cli.command {
+        Some(cli::Commands::Mounts) => {
+            let path = cli
+                .mounts
+                .as_deref()
+                .expect("`mounts` without --mounts is refused by Cli::validate");
+            return verdict(bootstrap::run_mounts(path));
+        }
+        Some(cli::Commands::ConfigStatus { db }) => {
+            return ExitCode::from(bootstrap::run_config_status(db));
+        }
         Some(cli::Commands::ConfigDiff { a, b }) => {
-            return verdict(bootstrap::run_config_diff(a, b, &cli.modules));
+            let module_roots = check_module_roots(&cli);
+            return verdict(bootstrap::run_config_diff(a, b, &module_roots));
         }
         Some(cli::Commands::ConfigCheck { file }) => {
-            return verdict(bootstrap::run_config_check(file, &cli.modules));
+            let module_roots = check_module_roots(&cli);
+            return verdict(bootstrap::run_config_check(file, &module_roots));
         }
         _ => {}
     }
 
-    let document = brenn_lib::config::load_config(cli.config.as_deref(), &cli.modules);
+    // A server's roots are the mounts', so the mounts document is read first:
+    // the deployment document's packaged imports resolve against roots it
+    // derives, and a mount that is declared but not installed is a boot panic
+    // rather than a document that compiles against half a host.
+    let mounts = brenn_lib::config::load_mounts(cli.mounts.as_deref());
+    let document =
+        brenn_lib::config::load_config(cli.config.as_deref(), &mounts.roots.module_roots);
 
-    match cli.command.unwrap_or(cli::Commands::Serve {
-        components: Vec::new(),
-        surface: Vec::new(),
-    }) {
+    match cli.command.unwrap_or(cli::Commands::Serve) {
         cli::Commands::Invite => bootstrap::run_invite(&document.config).await,
-        cli::Commands::Serve {
-            components,
-            surface,
-        } => {
-            let install_roots = cli::InstallRoots {
-                components,
-                surface,
-            };
-            bootstrap::run_server(document, cli.config, install_roots, build_info::BUILD_ID).await;
+        cli::Commands::Serve => {
+            bootstrap::run_server(document, cli.config, mounts, build_info::BUILD_ID).await;
         }
-        cli::Commands::ConfigDiff { .. } | cli::Commands::ConfigCheck { .. } => {
+        cli::Commands::Mounts
+        | cli::Commands::ConfigStatus { .. }
+        | cli::Commands::ConfigDiff { .. }
+        | cli::Commands::ConfigCheck { .. } => {
             unreachable!("handled above, before the config loads")
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The module roots a config tool checks against, as
+/// [`bootstrap::tool_module_roots`] derives them, with a fault printed and the
+/// process ended.
+///
+/// Exits rather than returning a verdict — the tool has not read its document
+/// yet, so there is no diff and no `ok` line to withhold.
+fn check_module_roots(cli: &cli::Cli) -> brenn_lib::config::RootList {
+    match bootstrap::tool_module_roots(cli.mounts.as_deref(), &cli.modules) {
+        Ok(roots) => roots,
+        Err(report) => {
+            eprintln!("{report}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// A tool's boolean answer as the process's.

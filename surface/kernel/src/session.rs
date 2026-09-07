@@ -123,6 +123,14 @@ pub enum Event {
     /// validated against any build-id shape. Render it as text only — never
     /// interpolate it into markup or a URL.
     ReloadRequired { server_build: String },
+    /// The peer closed with the reconfigured code: the surface this page is
+    /// attached to has been rebuilt under it. Terminal for the attachment; the
+    /// platform half must reload, which picks up the new page manifest and
+    /// bindings document.
+    Reconfigured,
+    /// The peer closed with the retired code: the surface no longer exists.
+    /// Terminal, and nothing to reload into.
+    Retired,
     /// The outcome of a publish issued through the handle, routed back by the
     /// `correlation` the caller was given.
     PublishResult {
@@ -268,10 +276,14 @@ impl Reactions {
                 self.detach(page);
             }
             ConnEvent::PeerClosedTerminal { code, reason } => {
-                tracing::warn!(code, %reason, "surface client: the peer closed with the terminal code");
-                self.emit(Event::ReloadRequired {
-                    server_build: reason,
-                });
+                tracing::warn!(code, %reason, "surface client: the peer closed with a terminal code");
+                match crate::logic::ClosePolicy::classify(code) {
+                    crate::logic::SurfaceClose::Stale => self.emit(Event::ReloadRequired {
+                        server_build: reason,
+                    }),
+                    crate::logic::SurfaceClose::Reconfigured => self.emit(Event::Reconfigured),
+                    crate::logic::SurfaceClose::Retired => self.emit(Event::Retired),
+                }
                 self.detach(page);
             }
         }

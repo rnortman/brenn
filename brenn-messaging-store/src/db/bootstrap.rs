@@ -100,6 +100,34 @@ pub struct ChannelReconstruction {
     pub skipped: Vec<(Uuid, String)>,
 }
 
+/// The uuid of the channel at `address`, or `None` when no row carries it.
+///
+/// The channel table is this crate's, and so is the uuid encoding in it; a
+/// reader outside this crate asks here rather than writing the query again.
+///
+/// Errors are returned rather than panicked on, because the callers that ask by
+/// address are out-of-process tools pointed at a path by an operator: a file
+/// that is not a brenn store at all is a wrong invocation for them to report,
+/// not host-written corruption.
+pub fn channel_uuid_by_address(
+    conn: &Connection,
+    address: &str,
+) -> Result<Option<Uuid>, rusqlite::Error> {
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT uuid FROM messaging_channels WHERE address = ?1",
+            rusqlite::params![address],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    Uuid::from_slice(&bytes).map(Some).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(err))
+    })
+}
+
 /// Load the channels for the given UUIDs from `messaging_channels`, decoded into
 /// [`ChannelEntry`] values, alongside a report of the rows that were present but
 /// not reconstructible.
@@ -272,6 +300,52 @@ mod tests {
             mount: None,
         };
         upsert_channels(conn, std::slice::from_ref(&entry));
+    }
+
+    /// The lookup an out-of-process tool uses: present, absent, and a uuid
+    /// column that is not sixteen bytes.
+    #[test]
+    fn channel_uuid_by_address_finds_the_row() {
+        let conn = test_conn();
+        let uuid = Uuid::new_v4();
+        seed_channel(&conn, uuid, "brenn:config.status");
+        assert_eq!(
+            channel_uuid_by_address(&conn, "brenn:config.status").expect("lookup"),
+            Some(uuid)
+        );
+        assert_eq!(
+            channel_uuid_by_address(&conn, "brenn:absent").expect("lookup"),
+            None
+        );
+    }
+
+    /// A uuid blob of the wrong width is host-written corruption. The tool that
+    /// asks reports it as an unreadable store rather than as an absent outcome,
+    /// so the error must name the column and carry the uuid error, not read as
+    /// an integer range fault.
+    #[test]
+    fn channel_uuid_by_address_reports_an_undecodable_uuid() {
+        let conn = test_conn();
+        seed_channel(&conn, Uuid::new_v4(), "brenn:config.status");
+        conn.execute(
+            "UPDATE messaging_channels SET uuid = ?1 WHERE address = ?2",
+            rusqlite::params![vec![0u8; 4], "brenn:config.status"],
+        )
+        .expect("write a short uuid");
+        let err = channel_uuid_by_address(&conn, "brenn:config.status")
+            .expect_err("a four-byte uuid is not decodable");
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Blob, _)
+            ),
+            "expected a blob conversion failure, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("Integer"),
+            "the message must not read as an integer range fault: {message}"
+        );
     }
 
     /// A second uuid claiming an address a row already holds is refused. Nothing

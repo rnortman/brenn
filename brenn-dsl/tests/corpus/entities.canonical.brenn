@@ -114,3 +114,10 @@ mcp_server graf {
   args = ["mcp"];
   env = { GRAF_ROOT = "/home/alice/kb" };
 }
+
+/// A mounts document's whole vocabulary. Written here because this file is the
+/// vocabulary index and nothing in it is resolved; the role discipline that
+/// refuses a `mount` in a deployment document is the resolver's, tested there.
+mount example-bundle {
+  path = "/home/alice/brenn/bundles/example-bundle";
+}

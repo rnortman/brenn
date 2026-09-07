@@ -1,5 +1,5 @@
 {
-  "checksum": "d2f4380dc9df38cc531a16661cc4065ab7487f6fe8a1aa7b9137b497de25f560",
+  "checksum": "a2620d89e5829c527c33874d257d40637d0e442ef5e674c762473ce61f69dba4",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2788,6 +2788,10 @@
               "target": "libc"
             },
             {
+              "id": "rumqttc-next 0.33.2",
+              "target": "rumqttc"
+            },
+            {
               "id": "tempfile 3.27.0",
               "target": "tempfile"
             },
@@ -4164,11 +4168,25 @@
         "compile_data_glob": [
           "**"
         ],
+        "crate_features": {
+          "common": [
+            "testutils"
+          ],
+          "selects": {}
+        },
         "deps": {
           "common": [
             {
               "id": "base64ct 1.8.3",
               "target": "base64ct"
+            },
+            {
+              "id": "libc 0.2.186",
+              "target": "libc"
+            },
+            {
+              "id": "rcgen 0.14.8",
+              "target": "rcgen"
             },
             {
               "id": "rumqttc-next 0.33.2",
@@ -4195,6 +4213,10 @@
               "target": "serde_json"
             },
             {
+              "id": "tempfile 3.27.0",
+              "target": "tempfile"
+            },
+            {
               "id": "tokio 1.52.3",
               "target": "tokio"
             },
@@ -4208,20 +4230,8 @@
         "deps_dev": {
           "common": [
             {
-              "id": "libc 0.2.186",
-              "target": "libc"
-            },
-            {
-              "id": "rcgen 0.14.8",
-              "target": "rcgen"
-            },
-            {
               "id": "rusqlite 0.39.0",
               "target": "rusqlite"
-            },
-            {
-              "id": "tempfile 3.27.0",
-              "target": "tempfile"
             },
             {
               "id": "uuid 1.24.0",
@@ -36831,6 +36841,7 @@
     "percent-encoding 2.3.2",
     "pulldown-cmark 0.13.4",
     "rand 0.10.1",
+    "rcgen 0.14.8",
     "regex 1.12.4",
     "reopen 1.0.3",
     "reqwest 0.13.4",
@@ -36874,7 +36885,6 @@
     "wit-parser 0.244.0"
   ],
   "direct_dev_deps": [
-    "rcgen 0.14.8",
     "tracing-test 0.2.6",
     "wasm-bindgen-test 0.3.75",
     "wat 1.252.0"

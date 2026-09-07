@@ -109,6 +109,28 @@ impl<V> TombstonedRegistry<V> {
         );
     }
 
+    /// Swap a live key's value for a new one, under one lock.
+    ///
+    /// The counterpart of [`Self::register`] for a subscriber that is being
+    /// *replaced* rather than joining: a reload rewiring a surface it is
+    /// already serving. Distinct from retire-then-register because there is no
+    /// instant in which the key resolves "gone", and distinct from a permissive
+    /// upsert because a key that is not live means the caller lost track of
+    /// what it was replacing.
+    ///
+    /// # Panics
+    ///
+    /// If the key is not live.
+    pub fn replace(&self, key: &SubscriberEntryKind, value: V) {
+        let mut tables = self.write();
+        let prev = tables.live.insert(key.clone(), value);
+        assert!(
+            prev.is_some(),
+            "{}: replace of unregistered {key:?} — wiring bug",
+            self.what
+        );
+    }
+
     /// Register a batch, on the same terms as [`Self::register`].
     pub fn register_all(&self, entries: HashMap<SubscriberEntryKind, V>) {
         for (key, value) in entries {
@@ -161,6 +183,18 @@ impl<V> TombstonedRegistry<V> {
         let tables = self.read();
         (tables.live.len(), tables.retired.len())
     }
+
+    /// Every live key, unordered.
+    ///
+    /// Behind `testutils`: nothing in production enumerates a registry — a
+    /// lookup is always by key. What a test asks is whether a participant that
+    /// arrived, moved or left took its key with it, and a publish-only
+    /// participant holds no directory entry to be found through, so the
+    /// registry itself is the only place it can be seen.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn live_keys(&self) -> Vec<SubscriberEntryKind> {
+        self.read().live.keys().cloned().collect()
+    }
 }
 
 impl<V: Clone> TombstonedRegistry<V> {
@@ -204,6 +238,39 @@ mod tests {
         assert!(registry.is_retired(&key("live")));
         assert!(!registry.is_live(&key("live")));
         assert_eq!(registry.counts(), (0, 1));
+    }
+
+    /// A replacement swaps the value and never passes through "gone": the key
+    /// is live before, after, and at every instant a reader could look.
+    #[test]
+    fn replacing_a_live_key_swaps_its_value_and_leaves_no_tombstone() {
+        let registry = TombstonedRegistry::new("test");
+        registry.register(key("x"), 1);
+        registry.replace(&key("x"), 2);
+        assert_eq!(registry.get(&key("x")), Lookup::Live(2));
+        assert!(!registry.is_retired(&key("x")));
+        assert_eq!(registry.counts(), (1, 0));
+    }
+
+    /// Replacing what was never there is a caller that lost track of what it
+    /// was replacing, not an insert.
+    #[test]
+    #[should_panic(expected = "replace of unregistered")]
+    fn replacing_an_unregistered_key_panics() {
+        let registry: TombstonedRegistry<u8> = TombstonedRegistry::new("test");
+        registry.replace(&key("ghost"), 1);
+    }
+
+    /// A retired key is not live, so it cannot be replaced either — a
+    /// subscriber that left rejoins through `register`, which is what clears
+    /// its tombstone.
+    #[test]
+    #[should_panic(expected = "replace of unregistered")]
+    fn replacing_a_retired_key_panics() {
+        let registry = TombstonedRegistry::new("test");
+        registry.register(key("x"), 1);
+        registry.retire(&key("x"));
+        registry.replace(&key("x"), 2);
     }
 
     #[test]

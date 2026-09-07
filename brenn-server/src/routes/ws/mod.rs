@@ -38,6 +38,13 @@ pub const STALE_CLIENT_CLOSE_CODE: u16 = 3001;
 
 const _: () = assert!(STALE_CLIENT_CLOSE_CODE == brenn_surface_schema::STALE_BUILD_CLOSE_CODE);
 
+/// The two codes a surface session is closed with when a reload replaces or
+/// retires its surface.
+pub use brenn_surface_schema::{SURFACE_RECONFIGURED_CLOSE_CODE, SURFACE_RETIRED_CLOSE_CODE};
+
+const _: () = assert!(SURFACE_RECONFIGURED_CLOSE_CODE != STALE_CLIENT_CLOSE_CODE);
+const _: () = assert!(SURFACE_RETIRED_CLOSE_CODE != SURFACE_RECONFIGURED_CLOSE_CODE);
+
 /// Query parameters for the WS endpoint.
 #[derive(serde::Deserialize)]
 pub struct WsQuery {

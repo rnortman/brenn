@@ -80,9 +80,10 @@ pub enum ConnEvent {
         ours: VersionRange,
         theirs: VersionRange,
     },
-    /// The peer closed with the code the embedder declared terminal
-    /// ([`ConnConfig::terminal_close_code`]). Terminal — no reconnect; what the
-    /// code means is the embedder's business. `reason` is opaque peer-supplied
+    /// The peer closed with one of the codes the embedder declared terminal
+    /// ([`ConnConfig::terminal_close_codes`]). Terminal — no reconnect; what the
+    /// code means is the embedder's business, and an embedder that declared more
+    /// than one reads `code` to tell them apart. `reason` is opaque peer-supplied
     /// text, bounded only by the websocket close-reason limit: render it as text,
     /// never interpolate it into markup or a URL.
     PeerClosedTerminal { code: u16, reason: String },
@@ -132,7 +133,7 @@ pub enum ConnInput {
     /// Every outcome short of an open socket arrives here, a peer close during
     /// the opening handshake included: the connector resolves the handshake
     /// before the connection is handed any event, so a close carrying
-    /// [`ConnConfig::terminal_close_code`] is only distinguishable once the
+    /// a [`ConnConfig::terminal_close_codes`] entry is only distinguishable once the
     /// socket is open. A peer that means the code to be honoured must therefore
     /// close an established socket, which is what a server closing after the
     /// upgrade does.
@@ -219,11 +220,15 @@ pub struct ConnConfig {
     /// in tests keeps the state machine deterministic. Only cross-attacher
     /// distinctness matters — this is load-spreading entropy, never a secret.
     pub backoff_jitter_seed: u64,
-    /// A peer close code the embedder declares terminal, if it has one. A close
-    /// carrying it stops the reconnect schedule and raises
-    /// [`ConnEvent::PeerClosedTerminal`] instead of backing off. Every other
-    /// close is an ordinary drop.
-    pub terminal_close_code: Option<u16>,
+    /// The peer close codes the embedder declares terminal, if it has any. A
+    /// close carrying one of them stops the reconnect schedule and raises
+    /// [`ConnEvent::PeerClosedTerminal`] with that code instead of backing off.
+    /// Every other close is an ordinary drop.
+    ///
+    /// A set and not a single code because one attacher can have several
+    /// terminal outcomes to tell apart — the code is what distinguishes them,
+    /// and folding them into one would make the event's `code` unreadable.
+    pub terminal_close_codes: Vec<u16>,
 }
 
 /// The sans-I/O connection state machine.
@@ -234,7 +239,7 @@ pub struct Connection {
     max_backoff_ms: u64,
     connect_timeout_ms: u64,
     liveness_multiplier: u32,
-    terminal_close_code: Option<u16>,
+    terminal_close_codes: Vec<u16>,
     /// Inbound-silence window in millis, computed at each `Welcome` from
     /// `heartbeat_secs × liveness_multiplier`. Zero until the first one.
     liveness_ms: u64,
@@ -264,7 +269,7 @@ impl Connection {
             max_backoff_ms: duration_ms(config.max_backoff),
             connect_timeout_ms: duration_ms(config.connect_timeout),
             liveness_multiplier: config.liveness_multiplier,
-            terminal_close_code: config.terminal_close_code,
+            terminal_close_codes: config.terminal_close_codes,
             liveness_ms: 0,
             state: ConnState::Backoff,
             backoff_step: 0,
@@ -399,7 +404,7 @@ impl Connection {
         now: Millis,
     ) -> Vec<ConnEffect> {
         if let Some(code) = code
-            && Some(code) == self.terminal_close_code
+            && self.terminal_close_codes.contains(&code)
         {
             self.state = ConnState::Terminal;
             return vec![

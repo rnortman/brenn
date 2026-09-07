@@ -28,6 +28,18 @@ native_test(
     target_compatible_with = HOST_ONLY,
 )
 
+# The generator is reached from a Makefile and from two other repositories'
+# Makefiles, and no gate runs any of them.
+native_test(
+    name = "dev_mounts_test",
+    size = "small",
+    src = "dev_mounts_test.sh",
+    args = ["$(rootpath //bazel/wasm:dev_mounts.sh)"],
+    data = ["//bazel/wasm:dev_mounts.sh"],
+    out = "dev_mounts_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
 native_test(
     name = "deployed_components_check_test",
     size = "small",

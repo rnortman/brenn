@@ -312,6 +312,14 @@ fn every_terminal_verdict_leaves_the_page_detached() {
             code: 4001,
             reason: "build=deadbeef".to_string(),
         },
+        ConnEvent::PeerClosedTerminal {
+            code: crate::schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            reason: "surface reconfigured".to_string(),
+        },
+        ConnEvent::PeerClosedTerminal {
+            code: crate::schema::SURFACE_RETIRED_CLOSE_CODE,
+            reason: "surface retired".to_string(),
+        },
     ] {
         let mut page = page();
         send_one_publish(&mut page);
@@ -1226,4 +1234,31 @@ fn park_notes(page: &mut SurfacePage, release_at: u64) {
         },
     );
     assert!(matches!(outcome, RouteOutcome::Parked { .. }));
+}
+
+/// The two surface-lifecycle close codes are told apart by the code alone, and
+/// each raises its own event: a reconfigured surface reloads, a retired one
+/// stops. Sharing `ReloadRequired` between them would send a page looking for a
+/// surface that no longer exists.
+#[test]
+fn the_surface_lifecycle_close_codes_raise_their_own_events() {
+    for (code, expected) in [
+        (
+            crate::schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            Event::Reconfigured,
+        ),
+        (crate::schema::SURFACE_RETIRED_CLOSE_CODE, Event::Retired),
+    ] {
+        let mut page = fresh();
+        let effects = fold(&mut page, |r, page| {
+            r.conn_event(
+                page,
+                ConnEvent::PeerClosedTerminal {
+                    code,
+                    reason: "whatever the peer said".to_string(),
+                },
+            );
+        });
+        assert_eq!(events(&effects), vec![&expected], "code {code}");
+    }
 }

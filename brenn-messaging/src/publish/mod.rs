@@ -512,11 +512,15 @@ impl Messenger {
             channel,
             tokens,
         } = draw;
-        let bucket = self.attach_send_budgets.get(principal).unwrap_or_else(|| {
+        let budgets = self
+            .attach_send_budgets
+            .read()
+            .expect("attach_send_budgets poisoned");
+        let bucket = budgets.get(principal).unwrap_or_else(|| {
             panic!(
                 "draw_attach_send_budget: attach principal {principal:?} has no send budget — \
-                 boot installs one per attacher and one per declared component instance, so a miss \
-                 is a broken boot invariant"
+                 one is installed per attacher and per declared component instance whenever that \
+                 attacher is wired, so a miss is a broken wiring invariant"
             )
         });
         match bucket

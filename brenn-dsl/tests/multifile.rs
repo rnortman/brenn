@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::resolved::StampId;
-use brenn_dsl::{DocumentInputs, compile};
+use brenn_dsl::roots::RootList;
+use brenn_dsl::{DocumentInputs, DocumentRole, compile};
 
 /// A scratch directory of this test's own, emptied first so a run never
 /// inherits what a previous one left behind.
@@ -63,7 +64,8 @@ fn modules(tree: &str) -> PathBuf {
 fn inputs(tree: &str, module_roots: &[PathBuf]) -> DocumentInputs {
     DocumentInputs {
         root: root(tree),
-        module_roots: module_roots.to_vec(),
+        module_roots: module_roots.to_vec().into(),
+        role: DocumentRole::Deployment,
     }
 }
 
@@ -247,6 +249,26 @@ fn a_packaged_import_with_no_module_root_names_the_flag() {
     assert_eq!(
         one_error("pkg-no-root"),
         "this document imports packaged modules; pass `--modules <dir>`",
+    );
+}
+
+/// The same document read by a *host*, whose roots come from the mounts. The
+/// remedy must not be `--modules`: `serve` refuses that flag, so a host telling
+/// an operator to pass it sends them to a second error.
+#[test]
+fn a_host_with_no_mount_offering_modules_says_so_instead_of_naming_the_flag() {
+    let errors = match compile(&DocumentInputs {
+        root: root("pkg-no-root"),
+        module_roots: RootList::mounts("modules", Vec::new()),
+        role: DocumentRole::Deployment,
+    }) {
+        Ok(_) => panic!("`pkg-no-root` was expected not to compile"),
+        Err(errors) => errors,
+    };
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert_eq!(
+        errors[0].message,
+        "this document imports packaged modules, but no declared mount offers a `modules/` tree",
     );
 }
 
@@ -826,7 +848,8 @@ fn staged_copy(name: &str) -> PathBuf {
 fn compiled_at(dir: &Path) -> brenn_dsl::derived::DerivedConfig {
     let inputs = DocumentInputs {
         root: dir.join("tree/main.brenn"),
-        module_roots: vec![dir.join("modules")],
+        module_roots: vec![dir.join("modules")].into(),
+        role: DocumentRole::Deployment,
     };
     compile(&inputs).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)))
 }

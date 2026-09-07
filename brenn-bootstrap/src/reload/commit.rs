@@ -11,12 +11,15 @@
 //! with it, because a half-applied reload is a running system no document
 //! describes.
 //!
-//! The order of the five steps below is the whole of the design. Consumers leave
-//! before channels move, so nothing wakes a task that is on its way out; channels
-//! are described, then removed, then added, so a rename frees its address before
-//! the new entry claims it; consumers arrive last, so every channel they are
-//! folded onto is already there. What each step touches is exactly what a fresh
-//! boot of the candidate would have produced, which is the property the whole
+//! The order of the steps below is the whole of the design. Consumers and
+//! surfaces leave before channels move, so nothing wakes a task that is on its
+//! way out; channels are described, then removed, then added, so a rename frees
+//! its address before the new entry claims it; the surface asset roots and the
+//! two surface-description registrations are swapped next, so the documents
+//! republished after them have a writer whose policy admits their addresses;
+//! surfaces and then consumers arrive last, so every channel they are folded
+//! onto is already there. What each step touches is exactly what a fresh boot
+//! of the candidate would have produced, which is the property the whole
 //! facility rests on.
 
 use std::collections::{HashMap, HashSet};
@@ -26,16 +29,25 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use brenn_lib::messaging::config::Depth;
-use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntryKind};
+use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntry, SubscriberEntryKind};
+use brenn_lib::wasm_package::Verified;
 use brenn_messaging::{Messenger, WASM_WINDOW_MAX_NEW};
 use brenn_messaging_boot::MessagingPlan;
 use brenn_server::messaging_router::DeliveryBinding;
 
 use brenn_wasm_dispatch::ConsumerHandle;
 
+use brenn_mqtt::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
+
+use brenn_lib::messaging::identity::AttachScope;
+use brenn_server::routes::surface::SurfaceCloseReason;
+use brenn_surface_server::SurfaceRuntime;
+
 use crate::consumers::{ConsumerRegistry, LoadedConsumer, RunningConsumer, start_consumer};
 use crate::reload::delta::{PlanDelta, live_subscriber_refusals};
 use crate::reload::driver::ReloadEnv;
+use crate::reload::mqtt::address_of;
+use crate::reload::surfaces::{Arrival, SurfaceDocs};
 
 /// Apply a prepared reload to the running process.
 ///
@@ -63,34 +75,507 @@ pub(crate) async fn apply(
     plan: &MessagingPlan,
     delta: &PlanDelta,
     loaded: Vec<(String, LoadedConsumer)>,
-) -> Result<(), Vec<String>> {
+    records: &HashMap<String, Verified>,
+    surfaces: &SurfaceCommit<'_>,
+) -> Result<Vec<String>, Vec<String>> {
     let arrived = live_subscriber_refusals(delta, env.messenger.directory());
     if !arrived.is_empty() {
         return Err(arrived);
     }
 
+    let channels = plan.directory.list();
+    let planned = PlannedSubscribers::of(&channels);
+
     retire_consumers(env, registry, plan, delta).await;
-    // Asked again, because step 1's wait for a stopping consumer is unbounded
-    // and a subscriber can arrive during it. Past the retirements nothing can
-    // be declined, so a hit here is the process's life against a subscriber
+    retire_surfaces(env, delta).await;
+    // Asked again, because the two retirements' waits — for a stopping consumer
+    // and for a closing attach session — are unbounded
+    // and a subscriber can arrive during either. Past them nothing can be
+    // declined, so a hit here is the process's life against a subscriber
     // silently dropped from a channel that is about to be re-created.
     let arrived = live_subscriber_refusals(delta, env.messenger.directory());
     assert!(
         arrived.is_empty(),
         "reload commit: a subscriber arrived on a channel this reload is taking away, after the \
-         departing consumers had already stopped: {arrived:?}",
+         departing consumers and surfaces had already stopped: {arrived:?}",
     );
     describe_channels(env, delta).await;
+    let mut deferred = mqtt_outgoing(env, delta).await;
     remove_channels(env, delta);
     add_channels(env, delta).await;
-    start_consumers(env, registry, plan, delta, loaded).await;
+    deferred.extend(mqtt_incoming(env, delta).await);
+    refresh_surface_roots(env, surfaces.roots.clone());
+    swap_surface_registrations(env, surfaces.docs);
+    publish_surface_docs(env, surfaces.docs).await;
+    start_surfaces(env, plan, delta, surfaces, &planned).await;
+    start_consumers(env, registry, plan, delta, loaded, &planned).await;
+    refresh_records(registry, records);
 
     // The same cross-check boot runs over its own wiring, asked of the wiring
     // this reload just produced. A failure is a defect in the steps above, not
     // a verdict on the document — the document was accepted before any of this
     // ran.
     crate::assert_every_subscriber_wired(&env.messenger, &env.router);
-    Ok(())
+    Ok(deferred)
+}
+
+/// The outgoing MQTT step, between the descriptions and the channel removals.
+///
+/// UNSUBSCRIBE before the route goes, so a publish already in flight finds its
+/// route; one that arrives after the route is gone is a benign zero-match drop.
+///
+/// Returns the filters the broker did not take now, for the status body.
+async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
+    let mut deferred = Vec::new();
+    for client in &delta.mqtt.clients {
+        for filter in client.leaving() {
+            let address = address_of(&client.client, &filter.topic_filter);
+            let service = mqtt_service(env, &address);
+            let outcome = service
+                .unsubscribe_filter(&client.client, &filter.topic_filter)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "reload commit: {address} is being unsubscribed but client {:?} has no \
+                         broker session — rule 6 refused exactly this before the walk, so it is \
+                         a host bug",
+                        client.client,
+                    )
+                });
+            if record_unsubscribe(&outcome, &address) {
+                deferred.push(address);
+            }
+        }
+    }
+    for route in &delta.mqtt.routes_removed {
+        let removed = mqtt_router(env, &route.channel_address).remove_route(route.channel_uuid);
+        assert!(
+            removed,
+            "reload commit: mqtt channel {:?} is in the delta but the router holds no route for \
+             it — host bug",
+            route.channel_address,
+        );
+        info!(address = %route.channel_address, "reload: mqtt route removed");
+    }
+    deferred
+}
+
+/// The incoming MQTT step, after the channels are in the directory.
+///
+/// Route before SUBSCRIBE, so the first matching publish after the SUBACK has
+/// somewhere to go.
+async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
+    for route in &delta.mqtt.routes_added {
+        let address = route.channel_address.clone();
+        // Idempotent on the channel uuid, and the uuid is the plan's, so a
+        // `false` here means the table already held a route the plan also
+        // wants — which rule 2's added arm refused before the walk.
+        let added = mqtt_router(env, &address).add_route(route.clone());
+        assert!(
+            added,
+            "reload commit: the router already holds a route for mqtt channel {address:?}, which \
+             this reload is adding — host bug",
+        );
+        info!(address = %address, "reload: mqtt route added");
+    }
+    let mut deferred = Vec::new();
+    for client in &delta.mqtt.clients {
+        for filter in client.joining() {
+            let address = address_of(&client.client, &filter.topic_filter);
+            let service = mqtt_service(env, &address);
+            let outcome = service
+                .subscribe_filter(&client.client, filter.topic_filter.clone(), filter.qos)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "reload commit: {address} is being subscribed but client {:?} has no \
+                         broker session — rule 6 refused exactly this before the walk, so it is \
+                         a host bug",
+                        client.client,
+                    )
+                });
+            if record_subscribe(&outcome, &address) {
+                deferred.push(address);
+            }
+        }
+    }
+    deferred
+}
+
+/// Point every running consumer's record at the tree this reload resolved it
+/// out of.
+///
+/// A consumer whose package moved but whose release did not is deliberately not
+/// restarted, so the record it was loaded with still names the versioned tree
+/// the previous install staged — a directory the installer prunes. Nothing
+/// reads the paths after the load, but the registry is what a later reload
+/// compares against and what an operator reads to learn where this process's
+/// bytes came from, so it is the new one that is kept.
+pub(crate) fn refresh_records(
+    registry: &mut ConsumerRegistry,
+    records: &HashMap<String, Verified>,
+) {
+    for (slug, record) in records {
+        if let Some(running) = registry.get_mut(slug) {
+            running.verified = record.clone();
+        }
+    }
+}
+
+/// Point the served surface asset tree at the roots this reload scanned.
+///
+/// A kind whose mount swapped its symlink onto a fresh versioned tree is
+/// byte-for-byte the installation this process is already serving, so nothing
+/// about it is refused and nothing about it moves — but the path the cell holds
+/// names the tree the installer is about to prune, and `/surface-static` would
+/// start answering 404 for every asset under it. Installing the scan's paths is
+/// what makes the relocation a relocation.
+///
+/// Runs on the applied and the unchanged path alike: a byte-identical
+/// re-install is exactly the case that produces no delta.
+pub(crate) fn refresh_surface_roots(env: &ReloadEnv, roots: brenn_surface_server::SurfaceRoots) {
+    *env.surface_roots
+        .write()
+        .expect("the surface-roots lock is held only for a clone and a swap") = Arc::new(roots);
+}
+
+/// Log one UNSUBSCRIBE outcome and say whether the filter left the broker only
+/// on the next connect.
+///
+/// Every outcome is a success: the filter is out of the reconnect-survival set
+/// in all three, so the state the process converges to is the planned one.
+/// `SendFailed` is a `warn!` and a `deferred` entry, never a refusal and never
+/// a panic, because the walk is past the point where anything may decline.
+fn record_unsubscribe(outcome: &IngressUnsubscribeOutcome, address: &str) -> bool {
+    match outcome {
+        IngressUnsubscribeOutcome::UnsubscribedLive => {
+            info!(address = %address, "reload: mqtt filter unsubscribed");
+            false
+        }
+        IngressUnsubscribeOutcome::DeferredDisconnected => {
+            // The filter left the reconnect-survival set, so the next connect
+            // does not re-assert it. Converged, just not now.
+            info!(address = %address, "reload: mqtt filter unsubscribed on reconnect");
+            true
+        }
+        IngressUnsubscribeOutcome::SendFailed(error) => {
+            warn!(address = %address, %error, "reload: mqtt UNSUBSCRIBE send failed");
+            true
+        }
+    }
+}
+
+/// The same for a SUBSCRIBE: the filter is in the reconnect-survival set in all
+/// three outcomes, and the two that did not reach the broker now are what the
+/// status body's `deferred` list reports.
+fn record_subscribe(outcome: &IngressSubscribeOutcome, address: &str) -> bool {
+    match outcome {
+        IngressSubscribeOutcome::SubscribedLive => {
+            info!(address = %address, "reload: mqtt filter subscribed");
+            false
+        }
+        IngressSubscribeOutcome::DeferredDisconnected => {
+            info!(address = %address, "reload: mqtt filter subscribed on reconnect");
+            true
+        }
+        IngressSubscribeOutcome::SendFailed(error) => {
+            warn!(address = %address, %error, "reload: mqtt SUBSCRIBE send failed");
+            true
+        }
+    }
+}
+
+/// The broker service this walk needs, or the host bug of not having one.
+fn mqtt_service<'a>(env: &'a ReloadEnv, address: &str) -> &'a Arc<brenn_mqtt::MqttService> {
+    env.mqtt_service.as_ref().unwrap_or_else(|| {
+        panic!(
+            "reload commit: {address} moves a broker subscription but this process has no MQTT \
+             service — rule 6 refuses every client without a session, so it is a host bug"
+        )
+    })
+}
+
+/// The ingress router this walk needs, or the host bug of not having one.
+fn mqtt_router<'a>(
+    env: &'a ReloadEnv,
+    address: &str,
+) -> &'a Arc<brenn_server::mqtt_router::MqttEventRouterImpl> {
+    env.mqtt_event_router.as_ref().unwrap_or_else(|| {
+        panic!(
+            "reload commit: {address} moves an ingress route but this process has no MQTT event \
+             router — it exists on exactly the terms the service does, so it is a host bug"
+        )
+    })
+}
+
+/// Everything the walk's surface steps install: the scanned asset roots, the
+/// arriving runtimes, and the documents to republish. All of it built in
+/// prepare, so none of it can fail here.
+pub(crate) struct SurfaceCommit<'a> {
+    /// The asset roots this reload's scan resolved, installed in the cell
+    /// `/surface-static` reads whether or not any surface moved.
+    pub roots: &'a brenn_surface_server::SurfaceRoots,
+    /// One runtime per arriving surface, by slug.
+    pub runtimes: &'a HashMap<String, Arc<SurfaceRuntime>>,
+    /// The description and bindings documents to republish, and the
+    /// surface-description registrations to swap before publishing them.
+    pub docs: &'a SurfaceDocs,
+    /// `[surface_description] prefix`, which roots the status channel an
+    /// arriving surface's `disconnected` stamp is written to.
+    pub prefix: &'a str,
+}
+
+/// Step 2: take every retired and replaced surface out of service.
+///
+/// The runtime leaves the table first, so no attach lands on
+/// a surface that is about to lose its wiring — a replaced slug is marked
+/// reconfiguring and answers `503` until step 6 installs its successor, a
+/// retired one answers `404` because that is the truth about it. The live
+/// sessions are then asked to close and awaited, so each page leaves through
+/// its own detach path and publishes the terminal stamp it owes. Only then do
+/// the registration, the binding and the budgets go, for a surface that is
+/// leaving for good; a replaced one keeps all three until step 6 overwrites
+/// them, so no window exists in which a publish finds a surface half-wired.
+///
+/// Every surface is marked and signalled before any of them is waited on.
+/// Nothing orders the departing surfaces against each other, and the whole
+/// reload is stalled for the length of this step, so the window is the longest
+/// surface's socket close rather than the sum of them — which is what a kind
+/// upgrade, promoting every surface mounting it, would otherwise pay.
+async fn retire_surfaces(env: &ReloadEnv, delta: &PlanDelta) {
+    let live = env.messenger.directory();
+    let departing = departing_surfaces(delta);
+
+    for (surface, reason) in &departing {
+        let slug = surface.slug.as_str();
+        match reason {
+            SurfaceCloseReason::Retired => env.surfaces.retire(slug),
+            SurfaceCloseReason::Reconfigured => env.surfaces.begin_reconfigure(slug),
+        }
+        let asked = env.attach_registry.close_all(slug, &reason.close());
+        info!(slug = %slug, sessions = asked, "reload: surface sessions asked to close");
+    }
+
+    for (surface, reason) in &departing {
+        let slug = surface.slug.as_str();
+        let kind = SubscriberEntryKind::Surface(slug.to_string());
+        report_while("surface sessions", slug, sessions_quiet(env, slug, reason)).await;
+
+        if *reason == SurfaceCloseReason::Retired {
+            env.router.retire_delivery_binding(&kind);
+            env.messenger.retire_subscriber_registration(&kind);
+            env.messenger
+                .remove_attach_send_budgets(AttachScope::surface(slug));
+        }
+
+        // Every entry the old value folded into, whether or not the channel
+        // itself moved: a replaced surface's entries are re-derived from the
+        // candidate's plan in step 6, and a retired one's are simply gone.
+        //
+        // By channel, not by binding: `wire_subscriptions` carries one entry
+        // per (instance, channel) and the directory folds a surface onto a
+        // channel once, so two components of one surface reading one channel
+        // are one subscriber to remove.
+        let mut unfolded: HashSet<Uuid> = HashSet::new();
+        for sub in &surface.wire_subscriptions {
+            let uuid = sub.subscription.channel_uuid;
+            if !unfolded.insert(uuid) {
+                continue;
+            }
+            assert!(
+                live.remove_subscriber(&uuid, &kind).is_some(),
+                "reload commit: surface {slug:?} was planned as a subscriber of channel {:?} and \
+                 the live directory does not hold it there — host bug",
+                sub.subscription.channel_address,
+            );
+        }
+        info!(slug = %slug, "reload: surface retired");
+    }
+}
+
+/// Resolves once nothing under `slug` is attached or still draining.
+///
+/// Polled rather than signalled: each session exits through its own task, and
+/// the registry going quiet is the only fact this step needs. The wait is
+/// unbounded, and [`report_while`] is what names a socket the OS will not close
+/// rather than stepping over it and installing a new runtime while an old page
+/// still holds the old one.
+///
+/// The close is re-asked on every pass, not only once before the loop. The
+/// surface door resolves the runtime before it registers its session, so a
+/// handler that passed that lookup before this step marked the slug can still
+/// register after [`AttachRegistry::close_all`] took its snapshot; a session
+/// nobody asked to leave would then hold this wait open until its user closed
+/// the tab. Asking again is documented as harmless, and it is what makes the
+/// wait independent of the door's internal ordering.
+async fn sessions_quiet(env: &ReloadEnv, slug: &str, reason: &SurfaceCloseReason) {
+    while !env.attach_registry.is_quiet(slug) {
+        env.attach_registry.close_all(slug, &reason.close());
+        tokio::time::sleep(SESSION_CLOSE_POLL_INTERVAL).await;
+    }
+}
+
+/// How often the wait above re-reads the registry.
+const SESSION_CLOSE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Step 5b: install the surface-description participants' new registrations.
+///
+/// Swapped under one lock, as an arriving surface's own registration is: both
+/// participants are pushed unconditionally by the planner, so the key is always
+/// live, and a replace leaves no moment in which it resolves "gone".
+///
+/// Runs on a removal-only delta too — the specs lose a matcher then, and the
+/// oracle's standard is the registrations a fresh boot of the candidate builds.
+fn swap_surface_registrations(env: &ReloadEnv, docs: &SurfaceDocs) {
+    for (kind, registration) in &docs.registrations {
+        env.messenger
+            .replace_subscriber_registration(kind, registration.clone());
+        info!(participant = ?kind, "reload: surface-description registration swapped");
+    }
+}
+
+/// Step 5c: republish the documents prepare built.
+///
+/// Under the two boot identities, which step 5b has just widened to admit every
+/// address in the set. Publishing before the arriving runtimes exist is safe
+/// and deliberate: the channels are in the directory as of step 3, every one of
+/// them is retained, and no page can attach to an arriving surface until step 6
+/// inserts its runtime — so the kernel reads a retained document on attach,
+/// exactly as at boot.
+///
+/// # Panics
+///
+/// On any publish that is not `Ok`. Prepare size-checked every body against the
+/// same ceiling the publisher enforces and step 5b installed the writer, so
+/// what is left is a host bug in a walk that is past declining.
+async fn publish_surface_docs(env: &ReloadEnv, docs: &SurfaceDocs) {
+    if let Err((address, outcome)) = brenn_surface_server::description::try_publish_description(
+        &env.messenger,
+        &docs.description,
+    )
+    .await
+    {
+        panic!(
+            "reload commit: publishing the surface description document onto {address} returned \
+             {outcome:?} — prepare proved the body publishable and step 5b installed the writer, \
+             so this is a host bug"
+        );
+    }
+    if let Err((address, outcome)) =
+        brenn_surface_server::bindings_doc::try_publish_bindings_documents(
+            &env.messenger,
+            &docs.bindings,
+        )
+        .await
+    {
+        panic!(
+            "reload commit: publishing the surface bindings document onto {address} returned \
+             {outcome:?} — prepare proved the body publishable and step 5b installed the writer, \
+             so this is a host bug"
+        );
+    }
+    for (address, _) in docs.description.iter().chain(docs.bindings.iter()) {
+        info!(address = %address, "reload: surface document republished");
+    }
+}
+
+/// Step 6: put every arriving and replaced surface into service.
+///
+/// The wiring goes in before the runtime, in boot's order: the registration
+/// first, because a delivery gate that finds a subscriber without one treats it
+/// as a host bug; then the subscriber entries, taken verbatim from the
+/// candidate's plan so the entry a surface joins a channel with is the one a
+/// fresh boot would have folded; then the send budgets and the delivery
+/// binding; then, for a surface that did not exist a moment ago, the
+/// `disconnected` stamp boot writes for every surface it configures. The
+/// runtime lands last, which is the write that reopens the door.
+async fn start_surfaces(
+    env: &ReloadEnv,
+    plan: &MessagingPlan,
+    delta: &PlanDelta,
+    arriving: &SurfaceCommit<'_>,
+    planned: &PlannedSubscribers<'_>,
+) {
+    let live = env.messenger.directory();
+    for (surface, arrival) in crate::reload::surfaces::arriving(&delta.surfaces) {
+        let slug = surface.slug.as_str();
+        let kind = SubscriberEntryKind::Surface(slug.to_string());
+        let registration = plan.registrations.get(&kind).cloned().unwrap_or_else(|| {
+            panic!(
+                "reload commit: the plan carries no subscriber registration for surface \
+                 {slug:?} — every resolved surface has one, so this is a host bug"
+            )
+        });
+        // Step 2 keeps the registration, binding, and budgets for a replaced
+        // surface, so the registration is swapped in place — never absent — and
+        // the binding, whose value is the same constant for every surface, is
+        // left standing.
+        let added = arrival == Arrival::Added;
+        match added {
+            true => env
+                .messenger
+                .register_subscriber_registration(kind.clone(), registration),
+            false => env
+                .messenger
+                .replace_subscriber_registration(&kind, registration),
+        }
+
+        planned.fold(live, &kind, "surface");
+
+        env.messenger.set_attach_send_budgets(
+            AttachScope::surface(slug),
+            brenn_messaging::attach_principal_budgets(
+                AttachScope::surface(slug),
+                surface.principal_send_budgets().collect(),
+            ),
+        );
+        if added {
+            env.router.register_surface_delivery_routes(surface);
+        }
+
+        let runtime = arriving.runtimes.get(slug).cloned().unwrap_or_else(|| {
+            panic!(
+                "reload commit: surface {slug:?} is arriving but prepare built no runtime for it \
+                 — host bug"
+            )
+        });
+        if added {
+            brenn_surface_server::telemetry::publish_boot_disconnected_stamps(
+                &env.messenger,
+                arriving.prefix,
+                std::slice::from_ref(surface),
+                env.messenger.ring_epoch(),
+            )
+            .await;
+        }
+        env.surfaces.install(slug.to_string(), runtime);
+        info!(slug = %slug, "reload: surface started");
+    }
+}
+
+/// The surfaces leaving service, each with the reason its pages are told.
+///
+/// A replacement's old value is what is walked: the entries to unfold and the
+/// sessions to close are the running surface's, not its successor's.
+fn departing_surfaces(
+    delta: &PlanDelta,
+) -> Vec<(
+    &brenn_lib::messaging::config::ResolvedSurface,
+    SurfaceCloseReason,
+)> {
+    delta
+        .surfaces
+        .removed
+        .iter()
+        .map(|surface| (surface, SurfaceCloseReason::Retired))
+        .chain(
+            delta
+                .surfaces
+                .changed
+                .iter()
+                .map(|change| (&change.old, SurfaceCloseReason::Reconfigured)),
+        )
+        .collect()
 }
 
 /// Step 1: take every departing and replaced consumer out of service.
@@ -174,7 +659,7 @@ async fn retire_consumers(
     }
 }
 
-/// How often a consumer that has not stopped is named in the journal.
+/// How often a wait that has not finished is named in the journal.
 const STOP_WAIT_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Stop one consumer's task and wait for it, saying so while the wait lasts.
@@ -187,29 +672,37 @@ const STOP_WAIT_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from
 /// await, and again every [`STOP_WAIT_REPORT_INTERVAL`] until it returns, which
 /// is what turns "reload does nothing" into a name and an elapsed time.
 async fn stop_and_report(slug: &str, handle: ConsumerHandle) {
-    report_while(slug, handle.stop_and_join()).await;
+    report_while("consumer", slug, handle.stop_and_join()).await;
 }
 
-/// Await `stopping`, naming `slug` in the journal until it resolves.
+/// Await `waiting`, naming `what` and `slug` in the journal until it resolves.
 ///
-/// Returns only when `stopping` does. The tick arm is a report and never an
-/// exit: returning early would drop the component — and with it the consumer's
-/// KV store handle — while the task that shares it is still alive, so a
-/// replacement under the same slug could not open the store.
-async fn report_while(slug: &str, stopping: impl Future<Output = ()>) {
-    info!(slug = %slug, "reload: stopping consumer");
+/// The one implementation of the reload's unbounded-but-reported wait, shared
+/// by the consumer stop and the surface session close: both are waits on
+/// something outside this process's control, both stall the whole reload, and
+/// an operator watching the journal during one has to be told the same three
+/// things.
+///
+/// Returns only when `waiting` does. The tick arm is a report and never an
+/// exit: for a consumer, returning early would drop the component — and with it
+/// the consumer's KV store handle — while the task that shares it is still
+/// alive, so a replacement under the same slug could not open the store; for a
+/// surface, it would install a new runtime while an old page still holds the
+/// old one.
+async fn report_while(what: &str, slug: &str, waiting: impl Future<Output = ()>) {
+    info!(slug = %slug, "reload: waiting for {what} to finish");
     let since = std::time::Instant::now();
-    let mut stopping = std::pin::pin!(stopping);
+    let mut waiting = std::pin::pin!(waiting);
     let mut ticks = tokio::time::interval(STOP_WAIT_REPORT_INTERVAL);
     // The first tick completes immediately; it is this moment, already logged.
     ticks.tick().await;
     loop {
         tokio::select! {
-            () = &mut stopping => return,
+            () = &mut waiting => return,
             _ = ticks.tick() => warn!(
                 slug = %slug,
                 waited_secs = since.elapsed().as_secs(),
-                "reload: consumer has not stopped"
+                "reload: {what} still has not finished"
             ),
         }
     }
@@ -319,6 +812,7 @@ async fn start_consumers(
     plan: &MessagingPlan,
     delta: &PlanDelta,
     loaded: Vec<(String, LoadedConsumer)>,
+    planned: &PlannedSubscribers<'_>,
 ) {
     let mut loaded: HashMap<String, LoadedConsumer> = loaded.into_iter().collect();
     let live = env.messenger.directory();
@@ -345,22 +839,7 @@ async fn start_consumers(
         env.messenger
             .register_subscriber_registration(kind.clone(), registration);
 
-        for entry in plan.directory.list() {
-            let Some(subscriber) = entry
-                .subscribers
-                .iter()
-                .find(|sub| sub.kind.same_principal(&kind))
-            else {
-                continue;
-            };
-            let applied = live.add_subscriber(&entry.uuid, subscriber.clone());
-            assert!(
-                applied,
-                "reload commit: consumer {slug:?} subscribes to channel {:?}, which the live \
-                 directory does not hold — host bug",
-                entry.address,
-            );
-        }
+        planned.fold(live, &kind, "consumer");
 
         let one = loaded.remove(&slug).unwrap_or_else(|| {
             panic!(
@@ -453,6 +932,59 @@ fn joining(delta: &PlanDelta) -> impl Iterator<Item = &Arc<ChannelEntry>> {
         .chain(delta.channels_changed.iter().map(|change| &change.new))
 }
 
+/// The plan's subscriber entries, grouped by the principal that holds them.
+///
+/// Built once per commit and read by both arrival steps, so the walk over the
+/// candidate's channels happens once rather than once per arriving principal.
+/// The key is the directory's own subscriber identity: for every kind, the
+/// derived equality this map hashes by and
+/// [`SubscriberEntryKind::same_principal`] are the same relation — every field
+/// either compares, one compares — which
+/// `a_planned_group_is_exactly_what_same_principal_matches` holds.
+struct PlannedSubscribers<'a> {
+    by_principal: HashMap<&'a SubscriberEntryKind, Vec<(&'a ChannelEntry, &'a SubscriberEntry)>>,
+}
+
+impl<'a> PlannedSubscribers<'a> {
+    fn of(channels: &'a [Arc<ChannelEntry>]) -> Self {
+        let mut by_principal: HashMap<_, Vec<_>> = HashMap::new();
+        for entry in channels {
+            for subscriber in &entry.subscribers {
+                by_principal
+                    .entry(&subscriber.kind)
+                    .or_default()
+                    .push((entry.as_ref(), subscriber));
+            }
+        }
+        Self { by_principal }
+    }
+
+    /// Fold one principal's planned entries onto the live directory.
+    ///
+    /// The one implementation of "put this principal on its channels", shared
+    /// by the arriving consumers and the arriving surfaces: the entry each one
+    /// joins with is the candidate plan's verbatim, so what the live directory
+    /// ends up holding is what a fresh boot would have folded. `what` names the
+    /// kind of principal in the panic.
+    fn fold(
+        &self,
+        live: &brenn_lib::messaging::MessagingDirectory,
+        kind: &SubscriberEntryKind,
+        what: &str,
+    ) {
+        for (entry, subscriber) in self.by_principal.get(kind).into_iter().flatten() {
+            let applied = live.add_subscriber(&entry.uuid, (*subscriber).clone());
+            assert!(
+                applied,
+                "reload commit: {what} {:?} subscribes to channel {:?}, which the live directory \
+                 does not hold — host bug",
+                kind.slug(),
+                entry.address,
+            );
+        }
+    }
+}
+
 /// Whether an entry carries this subscriber.
 fn holds(entry: &ChannelEntry, kind: &SubscriberEntryKind) -> bool {
     entry
@@ -477,6 +1009,83 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Every SUBSCRIBE outcome is a success; only two of the three are
+    /// "not at the broker yet". `deferred` is what the status body reports, so
+    /// a mapping that pushed the live arm onto it would make an operator read
+    /// a converged reload as a pending one.
+    #[test]
+    fn a_live_subscribe_is_not_deferred_and_the_other_two_are() {
+        assert!(!record_subscribe(
+            &IngressSubscribeOutcome::SubscribedLive,
+            "mqtt:ha:a/b"
+        ));
+        assert!(record_subscribe(
+            &IngressSubscribeOutcome::DeferredDisconnected,
+            "mqtt:ha:a/b"
+        ));
+        assert!(record_subscribe(
+            &IngressSubscribeOutcome::SendFailed("the request channel is closed".to_string()),
+            "mqtt:ha:a/b",
+        ));
+    }
+
+    /// The same for the outgoing direction. `SendFailed` in particular must be
+    /// a `deferred` entry and not an abort: the walk is past the point where
+    /// anything may decline, and the filter is out of the reconnect-survival
+    /// set either way.
+    #[test]
+    fn a_live_unsubscribe_is_not_deferred_and_the_other_two_are() {
+        assert!(!record_unsubscribe(
+            &IngressUnsubscribeOutcome::UnsubscribedLive,
+            "mqtt:ha:a/b"
+        ));
+        assert!(record_unsubscribe(
+            &IngressUnsubscribeOutcome::DeferredDisconnected,
+            "mqtt:ha:a/b"
+        ));
+        assert!(record_unsubscribe(
+            &IngressUnsubscribeOutcome::SendFailed("the request channel is closed".to_string()),
+            "mqtt:ha:a/b",
+        ));
+    }
+
+    /// The grouping key [`PlannedSubscribers`] hashes by is the identity the
+    /// fold uses to compute a principal at a time.
+    ///
+    /// Derived `Eq` and [`SubscriberEntryKind::same_principal`] must agree on
+    /// every pair of kinds. They do because each variant carries nothing but
+    /// the fields both compare; this test notices if one ever grows a field
+    /// that only the derived equality reads.
+    #[test]
+    fn a_planned_group_is_exactly_what_same_principal_matches() {
+        let kinds = [
+            SubscriberEntryKind::App("a".to_string()),
+            SubscriberEntryKind::App("b".to_string()),
+            SubscriberEntryKind::Wasm("a".to_string()),
+            SubscriberEntryKind::System("a".to_string()),
+            SubscriberEntryKind::Surface("a".to_string()),
+            SubscriberEntryKind::Surface("b".to_string()),
+            SubscriberEntryKind::Remote("a".to_string()),
+            SubscriberEntryKind::ChatConversation {
+                app_slug: "a".to_string(),
+                conversation_id: 1,
+            },
+            SubscriberEntryKind::ChatConversation {
+                app_slug: "a".to_string(),
+                conversation_id: 2,
+            },
+        ];
+        for left in &kinds {
+            for right in &kinds {
+                assert_eq!(
+                    left.same_principal(right),
+                    left == right,
+                    "{left:?} and {right:?} are one subscriber by one rule and two by the other",
+                );
+            }
+        }
+    }
+
     /// The wait loop returns when the stop does, and not on a report tick.
     ///
     /// Time is paused, so the several reporting intervals this passes through
@@ -492,7 +1101,7 @@ mod tests {
                 stopped.store(true, Ordering::SeqCst);
             }
         };
-        report_while("wedged", waiting).await;
+        report_while("consumer", "wedged", waiting).await;
         assert!(
             stopped.load(Ordering::SeqCst),
             "the wait returned before the consumer stopped, which would drop the component out \

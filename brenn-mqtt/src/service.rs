@@ -142,6 +142,19 @@ impl MqttService {
         clients.get(client_slug).cloned()
     }
 
+    /// Every client that has a registered session, in registration order.
+    ///
+    /// Read under the same non-blocking lock `get_client` takes, and for the
+    /// same reason: the registry is written only at startup, so a write lock
+    /// held here is a host bug rather than contention to wait out.
+    pub fn client_slugs(&self) -> Vec<String> {
+        let clients = self.clients.try_read().expect(
+            "MqttService clients map write lock held unexpectedly — the registry is read-only \
+             after startup",
+        );
+        clients.keys().cloned().collect()
+    }
+
     /// Snapshot the connection health for `client_slug`.
     ///
     /// Returns `(Disconnected, Some(NO_CLIENT_SESSION))` for a client with no

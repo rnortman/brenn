@@ -48,7 +48,7 @@ use crate::resolved::{
     RRemote, RSection, RStamp, RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal, RValue,
     RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId, str_value,
 };
-use crate::roots::scan_roots;
+use crate::roots::{RootList, RootSource, scan_roots};
 use crate::source::SourceFile;
 
 /// The module key of the root file: the crate root has no path to name it by.
@@ -56,9 +56,6 @@ const ROOT_KEY: &str = "";
 
 /// The extension a module file takes.
 const MODULE_EXT: &str = "brenn";
-
-/// The option that names the module roots, as diagnostics spell it.
-const MODULES_FLAG: &str = "--modules";
 
 /// What leads a packaged module's key, and the sigil that spells it in source.
 ///
@@ -78,23 +75,50 @@ const PKG_SIGIL: &str = "@";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentInputs {
     pub root: PathBuf,
-    pub module_roots: Vec<PathBuf>,
+    pub module_roots: RootList,
+    /// Which vocabulary this document is being read as.
+    pub role: DocumentRole,
+}
+
+/// What a document is, and with it what its top level admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DocumentRole {
+    /// The document the operator deploys: everything but `mount`.
+    #[default]
+    Deployment,
+    /// The document named by `--mounts`: `mount` and `const`, no imports.
+    Mounts,
+    /// A module that shipped inside a component package: vocabulary only.
+    /// Every `@`-keyed module is read as one whatever the root's role is; the
+    /// variant exists so a tool can read one directly as what it is.
+    Packaged,
 }
 
 impl DocumentInputs {
-    /// A document with no module roots.
+    /// A deployment document with no module roots.
     pub fn bare(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            module_roots: Vec::new(),
+            module_roots: RootList::default(),
+            role: DocumentRole::Deployment,
         }
     }
 
-    /// A document with one module root.
+    /// A deployment document with one module root.
     pub fn with_modules(root: impl Into<PathBuf>, module_root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            module_roots: vec![module_root.into()],
+            module_roots: vec![module_root.into()].into(),
+            role: DocumentRole::Deployment,
+        }
+    }
+
+    /// A mounts document. It imports nothing, so it has no module roots.
+    pub fn mounts(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            module_roots: RootList::default(),
+            role: DocumentRole::Mounts,
         }
     }
 }
@@ -105,7 +129,7 @@ impl DocumentInputs {
 /// not populate them (it takes modules already in memory).
 pub fn compile(inputs: &DocumentInputs) -> Result<DerivedConfig, Vec<Diagnostic>> {
     let Loaded { modules, sources } = load(inputs)?;
-    let config = resolve_files(modules, ROOT_KEY)?;
+    let config = resolve_files(modules, ROOT_KEY, inputs.role)?;
     Ok(crate::derive::derive(config)?.with_files(sources))
 }
 
@@ -121,13 +145,14 @@ pub fn compile(inputs: &DocumentInputs) -> Result<DerivedConfig, Vec<Diagnostic>
 pub fn resolve_files(
     files: Vec<(String, File)>,
     root: &str,
+    role: DocumentRole,
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     assert!(
         files.iter().any(|(key, _)| key == root),
         "the root key names one of the files"
     );
     let mut errors = Vec::new();
-    check_packaged_discipline(&files, &mut errors);
+    check_document_discipline(&files, role, &mut errors);
     let mut index = Index::build(&files, &mut errors);
     index.resolve_constants(&files, &mut errors);
     if !errors.is_empty() {
@@ -144,24 +169,44 @@ pub fn resolve_files(
     Ok(config)
 }
 
-// ── the packaged-module discipline ───────────────────────────────────────────
+// ── the document-role discipline ─────────────────────────────────────────────
 
 /// What a packaged module is refused with when it carries anything else.
 const DISCIPLINE_REFUSAL: &str = "a packaged module declares vocabulary — component classes, \
      assemblies, constants — and instantiates nothing";
 
-/// Refuse anything effectful in a module whose author is not the deployer.
+/// What a mounts document is refused with when it carries anything else.
+const MOUNTS_REFUSAL: &str = "a mounts document declares mounts and constants and nothing else; deployment statements \
+     belong in the document named by `--config`";
+
+/// What a deployment document is refused a `mount` with.
+const MOUNT_IN_DEPLOYMENT_REFUSAL: &str = "a `mount` is declared in the mounts document named by `--mounts`, not in a deployment \
+     document: a mount path is a fact about one host and a deployment document is \
+     host-independent";
+
+/// Hold every file to the discipline of the role it is read under.
 ///
-/// Loading a module instantiates its top-level `new` statements and effects its
-/// top-level channels, wherever it was written. That is right for a module the
-/// deployer wrote and wrong for one that shipped inside a component package: an
-/// import would otherwise inject instances, channels or grants into a document
-/// whose author consented to none of them. So a packaged module may declare
-/// component classes, assemblies and constants — vocabulary, which stamps
-/// nothing until someone writes `new` against it — and nothing else.
+/// Three roles, three top-level vocabularies:
 ///
-/// Its `use` statements are held to the same line: a packaged module may build
-/// on other packaged modules, but can know nothing of any deployment's tree.
+/// - A **packaged** module — every `@`-keyed module, whatever the root is —
+///   may declare component classes, assemblies and constants, and nothing
+///   else. Loading a module instantiates its top-level `new` statements and
+///   effects its top-level channels, wherever it was written. That is right for
+///   a module the deployer wrote and wrong for one that shipped inside a
+///   component package: an import would otherwise inject instances, channels or
+///   grants into a document whose author consented to none of them. Vocabulary
+///   stamps nothing until someone writes `new` against it.
+///
+///   Its `use` statements are held to the same line: a packaged module may
+///   build on other packaged modules, but can know nothing of any deployment's
+///   tree.
+///
+/// - A **mounts** document declares mounts and constants. It imports nothing at
+///   all: it is read before any module root is known, so there is nothing for a
+///   `use` to resolve against, and admitting one would make the file that says
+///   where vocabulary lives depend on vocabulary.
+///
+/// - A **deployment** document admits everything but `mount`.
 ///
 /// The walk stops at the item level on purpose: an assembly body may declare
 /// grants and a surface, and this pass does not look inside one. Nothing in an
@@ -172,33 +217,83 @@ const DISCIPLINE_REFUSAL: &str = "a packaged module declares vocabulary — comp
 ///
 /// Runs in the I/O-free core rather than in the loader so the in-memory path
 /// exercises it identically.
-fn check_packaged_discipline(files: &[(String, File)], errors: &mut Vec<Diagnostic>) {
+fn check_document_discipline(
+    files: &[(String, File)],
+    role: DocumentRole,
+    errors: &mut Vec<Diagnostic>,
+) {
     for (key, file) in files {
-        if !is_packaged(key) {
-            continue;
+        // A packaged module is packaged whatever the root is; every other file
+        // in the tree is read as the root's own role, which is what holds a
+        // tree module of a deployment document to the deployment vocabulary.
+        let role = if is_packaged(key) {
+            DocumentRole::Packaged
+        } else {
+            role
+        };
+        match role {
+            DocumentRole::Packaged => check_packaged_file(file, errors),
+            DocumentRole::Mounts => check_mounts_file(file, errors),
+            DocumentRole::Deployment => check_deployment_file(file, errors),
         }
-        for stmt in &file.uses {
-            if !stmt.pkg {
-                errors.push(Diagnostic::at(
-                    "a packaged module imports only packaged modules: `use @<module>::<Item>;`",
-                    stmt.path.head.span().clone(),
-                ));
-            }
+    }
+}
+
+/// Refuse anything effectful in a module whose author is not the deployer.
+fn check_packaged_file(file: &File, errors: &mut Vec<Diagnostic>) {
+    for stmt in &file.uses {
+        if !stmt.pkg {
+            errors.push(Diagnostic::at(
+                "a packaged module imports only packaged modules: `use @<module>::<Item>;`",
+                stmt.path.head.span().clone(),
+            ));
         }
-        for item in &file.items {
-            match item.value() {
-                Item::ConstDef(_) | Item::Component(_) | Item::Assembly(_) => {}
-                // Its own sentence: the general refusal is about effect, and a
-                // principal has none. What it would do is decide how much
-                // authority the arrangements it is delegated to may hold, which
-                // is the deployment's decision and not the author's.
-                Item::Principal(_) => errors.push(Diagnostic::at(
-                    "a packaged module declares no principal; what an arrangement holds is \
-                     the deployment's to give",
-                    item.span().clone(),
-                )),
-                _ => errors.push(Diagnostic::at(DISCIPLINE_REFUSAL, item.span().clone())),
-            }
+    }
+    for item in &file.items {
+        match item.value() {
+            Item::ConstDef(_) | Item::Component(_) | Item::Assembly(_) => {}
+            // Its own sentence: the general refusal is about effect, and a
+            // principal has none. What it would do is decide how much
+            // authority the arrangements it is delegated to may hold, which
+            // is the deployment's decision and not the author's.
+            Item::Principal(_) => errors.push(Diagnostic::at(
+                "a packaged module declares no principal; what an arrangement holds is \
+                 the deployment's to give",
+                item.span().clone(),
+            )),
+            Item::Mount(_) => errors.push(Diagnostic::at(
+                MOUNT_IN_DEPLOYMENT_REFUSAL,
+                item.span().clone(),
+            )),
+            _ => errors.push(Diagnostic::at(DISCIPLINE_REFUSAL, item.span().clone())),
+        }
+    }
+}
+
+/// Refuse anything in a mounts document but `mount` and `const`.
+fn check_mounts_file(file: &File, errors: &mut Vec<Diagnostic>) {
+    for stmt in &file.uses {
+        errors.push(Diagnostic::at(
+            "a mounts document imports nothing: it is read before any module root is known",
+            stmt.path.head.span().clone(),
+        ));
+    }
+    for item in &file.items {
+        match item.value() {
+            Item::ConstDef(_) | Item::Mount(_) => {}
+            _ => errors.push(Diagnostic::at(MOUNTS_REFUSAL, item.span().clone())),
+        }
+    }
+}
+
+/// Refuse a `mount` written where the deployment lives.
+fn check_deployment_file(file: &File, errors: &mut Vec<Diagnostic>) {
+    for item in &file.items {
+        if matches!(item.value(), Item::Mount(_)) {
+            errors.push(Diagnostic::at(
+                MOUNT_IN_DEPLOYMENT_REFUSAL,
+                item.span().clone(),
+            ));
         }
     }
 }
@@ -257,7 +352,24 @@ fn load(inputs: &DocumentInputs) -> Result<Loaded, Vec<Diagnostic>> {
 /// fact the document did not already consent to. The scan is a directory
 /// listing per root; no module is read. Roots are compared after
 /// canonicalization, so `a` and `a/` name the same directory.
-fn check_module_roots(module_roots: &[PathBuf], root: &Path) -> Vec<Diagnostic> {
+/// What to tell an author whose document imports a packaged module when no
+/// module root was named at all.
+///
+/// The remedy differs by who is asking: a workstation invocation is missing a
+/// flag, a host has no declared mount offering the tree.
+fn no_module_root(module_roots: &RootList) -> String {
+    match module_roots.source() {
+        RootSource::Flag(flag) => {
+            format!("this document imports packaged modules; pass `{flag} <dir>`")
+        }
+        RootSource::Mounts { tree, .. } => format!(
+            "this document imports packaged modules, but no declared mount offers a `{tree}/` \
+             tree"
+        ),
+    }
+}
+
+fn check_module_roots(module_roots: &RootList, root: &Path) -> Vec<Diagnostic> {
     let file = root.display().to_string();
     let suffix = format!(".{MODULE_EXT}");
     // Must agree with `locate`: only plain files are modules, so a directory
@@ -271,10 +383,13 @@ fn check_module_roots(module_roots: &[PathBuf], root: &Path) -> Vec<Diagnostic> 
             .strip_suffix(suffix.as_str())
             .map(str::to_string)
     };
-    scan_roots(MODULES_FLAG, module_roots, is_module)
+    scan_roots(module_roots, is_module)
         .iter()
         .map(|fault| {
-            Diagnostic::unpositioned(fault.describe(MODULES_FLAG, "packaged module"), &file)
+            Diagnostic::unpositioned(
+                fault.describe(module_roots.source(), "packaged module"),
+                &file,
+            )
         })
         .collect()
 }
@@ -283,12 +398,12 @@ struct Loader {
     root_dir: PathBuf,
     /// Where `@` imports resolve, in the order the caller named them. Empty is
     /// not a default: a document that reaches for a packaged module without one
-    /// is refused naming the flag. A module is under exactly one of them, held
-    /// by the cross-root scan before loading begins.
-    module_roots: Vec<PathBuf>,
+    /// is refused naming what should have offered one. A module is under exactly
+    /// one of them, held by the cross-root scan before loading begins.
+    module_roots: RootList,
     /// Whether the absent module root has already been reported. It is one
     /// fact about the invocation, not about any module, so a document importing
-    /// nine packaged modules gets one sentence naming the flag.
+    /// nine packaged modules gets one sentence.
     reported_missing_module_root: bool,
     /// Modules in the order they were reached, root first.
     files: Vec<(String, File)>,
@@ -357,10 +472,8 @@ impl Loader {
                 Located::NoModuleRoot => {
                     if !self.reported_missing_module_root {
                         self.reported_missing_module_root = true;
-                        self.errors.push(Diagnostic::at(
-                            "this document imports packaged modules; pass `--modules <dir>`",
-                            span,
-                        ));
+                        self.errors
+                            .push(Diagnostic::at(no_module_root(&self.module_roots), span));
                     }
                     // Poison it under a path that cannot exist, so a second
                     // `use` of this module is not a second walk of it.
@@ -573,6 +686,7 @@ pub enum SymKind {
     Repo,
     MqttClient,
     McpServer,
+    Mount,
 }
 
 impl SymKind {
@@ -580,6 +694,7 @@ impl SymKind {
     pub fn describe(self) -> &'static str {
         match self {
             SymKind::Const => "a constant",
+            SymKind::Mount => "a mount",
             SymKind::ComponentClass => "a component class",
             SymKind::AgentClass => "an agent class",
             SymKind::Assembly => "an assembly",
@@ -956,6 +1071,7 @@ fn declared_name(item: &Item) -> Option<(SymKind, &Spanned<String>)> {
         Item::Repo(def) => (SymKind::Repo, &def.name),
         Item::MqttClient(def) => (SymKind::MqttClient, &def.name),
         Item::McpServer(def) => (SymKind::McpServer, &def.name),
+        Item::Mount(def) => (SymKind::Mount, &def.name),
         Item::UuidPins(_) | Item::Acl(_) | Item::Grant(_) | Item::Section(_) => return None,
     })
 }
@@ -2452,6 +2568,7 @@ fn emit_item(
         }
         // An mcp server has no wire identity of its own, so nothing to check.
         Item::McpServer(def) => emit_named!(def, config.mcp_servers, None),
+        Item::Mount(def) => emit_named!(def, config.mounts, Some(Family::Mount)),
         Item::Acl(stmt) => errors.push(Diagnostic::at(
             "an acl statement needs an enclosing entity body (surface, agent, remote, \
              or a new instance); at top level, grant authority to a named running \
@@ -6649,6 +6766,9 @@ impl Marks {
             repos: _,
             mqtt_clients: _,
             mcp_servers: _,
+            // A mount is a host path, not a document declaration anything here
+            // reaches.
+            mounts: _,
             // Display metadata.
             sections: _,
         } = &**config;
@@ -6714,13 +6834,14 @@ enum Family {
     Agent,
     Repo,
     MqttClient,
+    Mount,
 }
 
 impl Family {
     /// The spelling rule this family's identities follow.
     fn charset(self) -> Charset {
         match self {
-            Family::Agent | Family::Repo => Charset::Kebab,
+            Family::Agent | Family::Repo | Family::Mount => Charset::Kebab,
             Family::Surface
             | Family::Consumer
             | Family::Webhook
@@ -6737,7 +6858,7 @@ impl Family {
     fn spells_slug(self) -> bool {
         match self {
             Family::Surface | Family::Consumer | Family::Webhook | Family::Agent => true,
-            Family::Remote | Family::Repo | Family::MqttClient => false,
+            Family::Remote | Family::Repo | Family::MqttClient | Family::Mount => false,
         }
     }
 
@@ -6751,6 +6872,7 @@ impl Family {
             Family::Agent => "agent",
             Family::Repo => "repo",
             Family::MqttClient => "mqtt client",
+            Family::Mount => "mount",
         }
     }
 }
@@ -6853,6 +6975,7 @@ fn check_identity(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     }
     let clients = handles(&config.mqtt_clients);
     check_family(clients.iter(), Family::MqttClient, errors);
+    check_family(handles(&config.mounts).iter(), Family::Mount, errors);
 }
 
 /// Every `grant`'s target names a running entity authority can be held by.
@@ -7076,6 +7199,8 @@ fn literal_addresses(config: &ResolvedConfig) -> Vec<(&str, &Span)> {
         repos: _,
         mqtt_clients: _,
         mcp_servers: _,
+        // A mount body holds a path, and paths are not addresses.
+        mounts: _,
         grants: _,
         sections: _,
     } = config;

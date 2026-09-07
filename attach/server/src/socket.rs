@@ -12,15 +12,16 @@ mod tests;
 use std::fmt::Display;
 use std::time::Duration;
 
-use axum::extract::ws::Message;
+use axum::extract::ws::{CloseFrame, Message};
 use brenn_attach_proto::{
     ClientFrame, SUPPORTED_VERSIONS, ServerFrame, VersionRange, max_client_frame_bytes, negotiate,
 };
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
+use super::registry::CloseReason;
 use super::session::{AttachSessionCtx, sanitize_client_detail};
 
 /// How long an upgraded socket may stay silent before its `Hello` is overdue.
@@ -206,8 +207,18 @@ pub fn classify_read_error(err: axum::Error) -> InboundError {
 ///
 /// Exits on any sink error, watchdog timeout, or sender drop; exiting drops `rx`,
 /// which is what tears the session down.
-pub async fn writer_task<S>(mut sink: S, mut rx: mpsc::Receiver<ServerFrame>, heartbeat: Duration)
-where
+///
+/// `close_rx` is the host-initiated close: a reason arriving there flushes
+/// whatever is already queued, writes the close frame carrying the code, and
+/// exits. Flushing first because the frames ahead of it were composed before the
+/// close was decided, and a peer that is about to reload should still see the
+/// answer to its last request; the queue is bounded, so the flush is too.
+pub async fn writer_task<S>(
+    mut sink: S,
+    mut rx: mpsc::Receiver<ServerFrame>,
+    mut close_rx: oneshot::Receiver<CloseReason>,
+    heartbeat: Duration,
+) where
     S: Sink<Message> + Unpin,
     S::Error: Display,
 {
@@ -216,6 +227,10 @@ where
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick
     let mut wrote_frame_since_tick = false;
+    // A resolved `oneshot` receiver stays ready forever, so the arm below is
+    // disarmed once it has answered — otherwise a dropped sender would spin the
+    // select instead of leaving the writer to exit on its `rx`.
+    let mut close_settled = false;
 
     loop {
         tokio::select! {
@@ -231,8 +246,33 @@ where
                         }
                         wrote_frame_since_tick = true;
                     }
-                    None => return,
+                    // The session dropped its sender. A host close it decided
+                    // in the same breath is already in flight, and the two
+                    // arrive together — so the close is read here rather than
+                    // raced against this arm in the select.
+                    None => {
+                        if let Ok(close) = close_rx.try_recv() {
+                            write_close(&mut sink, &close, watchdog).await;
+                        }
+                        return;
+                    }
                 }
+            }
+            close = &mut close_rx, if !close_settled => {
+                let Ok(close) = close else {
+                    // The session dropped its sender without closing: an
+                    // ordinary teardown, whose `rx` drop is the exit above.
+                    close_settled = true;
+                    continue;
+                };
+                while let Ok(frame) = rx.try_recv() {
+                    let json = serde_json::to_string(&frame).expect("ServerFrame serialization");
+                    if !write_with_watchdog(&mut sink, Message::Text(json.into()), watchdog).await {
+                        return;
+                    }
+                }
+                write_close(&mut sink, &close, watchdog).await;
+                return;
             }
             _ = ticker.tick() => {
                 if !write_with_watchdog(&mut sink, Message::Ping(Vec::new().into()), watchdog).await
@@ -250,6 +290,21 @@ where
             }
         }
     }
+}
+
+/// Write the host-initiated close frame, best-effort: the writer is exiting
+/// either way, and a peer that already hung up learns nothing from a retry.
+async fn write_close<S>(sink: &mut S, close: &CloseReason, watchdog: Duration)
+where
+    S: Sink<Message> + Unpin,
+    S::Error: Display,
+{
+    info!(code = close.code, reason = %close.detail, "closing attachment");
+    let msg = Message::Close(Some(CloseFrame {
+        code: close.code,
+        reason: close.detail.clone().into(),
+    }));
+    let _ = write_with_watchdog(sink, msg, watchdog).await;
 }
 
 /// One watchdog-bounded sink write. Returns `false` (caller must exit) on sink

@@ -15,19 +15,20 @@
 //! subscriber that only the live directory knows about, and an artifact that
 //! moved under a document that did not.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use brenn_lib::messaging::config::{Depth, NoiseLevel};
+use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedSurface};
 use brenn_lib::messaging::{SubscriberEntry, SubscriberEntryKind};
 use brenn_messaging::Messenger;
 use brenn_server::test_support::init_db_file;
 
 use super::driver::TriggerSource;
 use super::driver::tests::{
-    BootFixture, Booted, READER, Tree, async_tool_registry, boot, boot_with, document,
-    document_with_a_consumer, install_package, install_package_from, seat_a_conversation,
-    staged_module, subscriber_debug_lines,
+    BootFixture, Booted, DESKBAR_READS, READER, Tree, async_tool_registry, boot, boot_with,
+    document, document_with_a_consumer, install_package, install_package_from, seat_a_conversation,
+    staged_module, subscriber_debug_lines, surface_document, surfaces_document, write_surface_kind,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -39,8 +40,11 @@ use brenn_messaging::config_reload::Outcome;
 /// Every field is read off the running system rather than off the plan that
 /// produced it: a reload that told itself it had converged and had not would
 /// pass a comparison of plans and fail this one.
-#[derive(Debug, PartialEq, Eq)]
-struct Snapshot {
+/// `Debug` alone, deliberately: `assert_matches` is the comparison, and an
+/// `assert_eq!` on two whole snapshots is the tens-of-kilobytes diagnostic it
+/// exists to replace. Without the derive that assertion does not compile.
+#[derive(Debug)]
+pub(crate) struct Snapshot {
     /// Directory entries, one rendered line each, sorted by address.
     channels: Vec<String>,
     /// Every subscriber kind the directory names, and what the target resolver
@@ -55,6 +59,116 @@ struct Snapshot {
     /// The executor's per-caller tool grant table, one rendered line per
     /// caller, sorted by caller.
     grants: Vec<String>,
+    /// The surface runtime table the doors read: one line per served slug,
+    /// sorted by slug, carrying the resolved surface and its description
+    /// channels.
+    surfaces: Vec<String>,
+    /// The asset roots `/surface-static` is serving from: one line per kind,
+    /// sorted, with the mount, the root and both fingerprints.
+    surface_roots: Vec<String>,
+    /// The attach send budgets, one line per principal, sorted.
+    attach_budgets: Vec<String>,
+    /// The newest retained body on every channel that retains anything, one
+    /// line per address, sorted. What compares the bindings documents, the
+    /// description family and the disconnected stamps rather than only the
+    /// addresses they sit on.
+    retained: Vec<String>,
+    /// The broker SUBSCRIBE set each live session holds: one line per
+    /// `(client, filter)` with its qos, sorted.
+    ///
+    /// Read off the service rather than off the document: a filter subscribed
+    /// that no document names, or named that neither process holds, is exactly
+    /// the drift this field exists to see, and a plan-derived read would hide
+    /// both.
+    mqtt_filters: Vec<String>,
+    /// The ingress router's route table, one line per route, sorted.
+    ///
+    /// A route's uuid is its channel's, so the line renders the address: the
+    /// uuid is stable across the two processes but says nothing to a reader,
+    /// and the address is what the rest of the snapshot is keyed by.
+    mqtt_routes: Vec<String>,
+}
+
+impl Snapshot {
+    /// Compare against a fresh boot's, field by field, reporting only the lines
+    /// the two processes disagree about.
+    ///
+    /// Field by field rather than one `assert_eq!` on the whole struct: a
+    /// snapshot is ten lists of rendered lines, and a single differing byte in
+    /// one of them prints both processes whole — tens of kilobytes in which the
+    /// difference is the thing hardest to find. A convergence defect is
+    /// supposed to name itself.
+    fn assert_matches(&self, fresh: &Snapshot) {
+        let Snapshot {
+            channels,
+            registrations,
+            running,
+            rings,
+            rows,
+            grants,
+            surfaces,
+            surface_roots,
+            attach_budgets,
+            retained,
+            mqtt_filters,
+            mqtt_routes,
+        } = self;
+        assert_lines("channels", channels, &fresh.channels);
+        assert_lines("registrations", registrations, &fresh.registrations);
+        assert_lines("running", running, &fresh.running);
+        assert_lines("rings", rings, &fresh.rings);
+        assert_lines("rows", rows, &fresh.rows);
+        assert_lines("grants", grants, &fresh.grants);
+        assert_lines("surfaces", surfaces, &fresh.surfaces);
+        assert_lines("surface_roots", surface_roots, &fresh.surface_roots);
+        assert_lines("attach_budgets", attach_budgets, &fresh.attach_budgets);
+        assert_lines("retained", retained, &fresh.retained);
+        assert_lines("mqtt_filters", mqtt_filters, &fresh.mqtt_filters);
+        assert_lines("mqtt_routes", mqtt_routes, &fresh.mqtt_routes);
+    }
+
+    /// The broker SUBSCRIBE set, for a transition asserting it moved at all.
+    pub(crate) fn mqtt_filters(&self) -> &[String] {
+        &self.mqtt_filters
+    }
+
+    /// The ingress route table, for the same reason: a field compared while
+    /// empty on both sides is a field testing nothing.
+    pub(crate) fn mqtt_routes(&self) -> &[String] {
+        &self.mqtt_routes
+    }
+}
+
+/// One field of two snapshots, compared element for element and reported as
+/// the lines each holds and the other does not.
+///
+/// The predicate is equality on the two sorted slices, not a set difference:
+/// position and multiplicity are part of what a fresh boot must reproduce, and
+/// the tables that would hide a duplicate are the append-shaped ones — a route
+/// added twice, a filter subscribed beside itself — which is exactly the
+/// "moved and should not have" drift this comparison exists to see. The
+/// difference sets are for the message only.
+fn assert_lines(what: &str, reloaded: &[String], fresh: &[String]) {
+    if reloaded == fresh {
+        return;
+    }
+    let only_reloaded: Vec<&String> = reloaded.iter().filter(|l| !fresh.contains(l)).collect();
+    let only_fresh: Vec<&String> = fresh.iter().filter(|l| !reloaded.contains(l)).collect();
+    let difference = if only_reloaded.is_empty() && only_fresh.is_empty() {
+        format!(
+            "  the same lines, in a different order or a different number of times.\n  \
+             after the reload: {reloaded:#?}\n  after a fresh boot: {fresh:#?}"
+        )
+    } else {
+        format!(
+            "  only after the reload: {only_reloaded:#?}\n  only after a fresh boot: \
+             {only_fresh:#?}"
+        )
+    };
+    panic!(
+        "{what}: the reloaded process is not where a fresh boot of the same document would \
+         have left it.\n{difference}",
+    );
 }
 
 /// One directory entry as a line: its identity, its tuning, its metadata and
@@ -91,19 +205,42 @@ async fn snapshot(booted: &Booted) -> Snapshot {
             }
         }
     }
+    // Every key the messenger holds a live registration for, beside the ones
+    // the directory names: `surface-help` and `surface-config` are registered
+    // publish-only, so they hold no subscriber entry on any channel and the
+    // directory walk above cannot see them. Their matchers are what a reload
+    // narrows as surfaces come and go, and this is the field that compares
+    // them.
+    for kind in booted.messenger.registered_subscriber_kinds() {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+
+    // The whole registration, not its `wake` alone: a registration's policy is
+    // what decides whether a participant may publish where, and the two
+    // surface-description participants' matchers move with every surface a
+    // reload adds or retires. A narrowing the reload forgot is a difference
+    // here and nowhere else.
     let mut registrations: Vec<String> = kinds
         .iter()
         .map(|kind| {
-            let wake = booted
-                .messenger
-                .subscriber_registration(kind)
-                .map(|registration| registration.wake);
-            format!("{kind:?} wake={wake:?}")
+            let registration = booted.messenger.subscriber_registration(kind);
+            format!("{kind:?} {registration:?}")
         })
         .collect();
     registrations.sort();
 
-    let mut running: Vec<String> = booted.driver.registry().keys().cloned().collect();
+    // Each running consumer with the root its package was resolved out of: a
+    // mount swap moves the root under an unchanged document, and a reload that
+    // kept serving the old tree would agree with a fresh boot on every other
+    // field.
+    let mut running: Vec<String> = booted
+        .driver
+        .registry()
+        .iter()
+        .map(|(slug, consumer)| format!("{slug} root={}", consumer.verified.root.display()))
+        .collect();
     running.sort();
 
     let mut rings: Vec<String> = booted
@@ -128,6 +265,42 @@ async fn snapshot(booted: &Booted) -> Snapshot {
     // processes.
     grants.sort();
 
+    let table = booted.driver.env().surfaces.with_table(|table| {
+        assert!(
+            table.reconfiguring.is_empty(),
+            "a process at rest holds no mid-swap mark: {:?}",
+            table.reconfiguring,
+        );
+        let mut lines: Vec<String> = table
+            .runtimes
+            .iter()
+            .map(|(slug, runtime)| {
+                format!(
+                    "{slug} resolved={:?} geometry={} status={} config={}",
+                    runtime.resolved,
+                    runtime.description.geometry_channel,
+                    runtime.description.status_channel,
+                    runtime.description.config_channel,
+                )
+            })
+            .collect();
+        // Sorted rather than taken in map order: `runtimes` is a `HashMap`,
+        // and the oracle compares two distinct processes.
+        lines.sort();
+        lines
+    });
+
+    let served = booted.driver.env().surface_roots();
+    let mut surface_roots: Vec<String> = served
+        .kinds
+        .iter()
+        .map(|(kind, root)| format!("{kind} {root:?}"))
+        .collect();
+    surface_roots.sort();
+    surface_roots.push(format!("kernel {:?}", served.kernel));
+
+    let (mqtt_filters, mqtt_routes) = mqtt_ingress(booted, &entries).await;
+
     Snapshot {
         channels,
         registrations,
@@ -135,7 +308,69 @@ async fn snapshot(booted: &Booted) -> Snapshot {
         rings,
         rows: durable_rows(&booted.messenger).await,
         grants,
+        surfaces: table,
+        surface_roots,
+        attach_budgets: booted.messenger.attach_send_budget_lines(),
+        retained: retained_documents(booted, &entries).await,
+        mqtt_filters,
+        mqtt_routes,
     }
+}
+
+/// The two MQTT ingress fields: the filter set every live session holds, and
+/// the router's route table.
+///
+/// Both are enumerated off the running subsystem — the service's registered
+/// clients, then each handle's own subscription list — rather than off the
+/// plan's ingress channels. A process with no MQTT runtime at all answers two
+/// empty lists, which is what a document naming no client leaves behind on both
+/// sides.
+///
+/// `sub_id` is deliberately not rendered: it is a per-session counter handed out
+/// in subscription order, so the process that subscribed one filter at boot and
+/// one at reload holds different numbers from the one that subscribed both at
+/// boot, for the same set of filters. The filter and its qos are the whole of
+/// what the broker was told.
+async fn mqtt_ingress(
+    booted: &Booted,
+    entries: &[Arc<brenn_lib::messaging::ChannelEntry>],
+) -> (Vec<String>, Vec<String>) {
+    let Some((service, router)) = &booted.mqtt else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut filters = Vec::new();
+    for slug in service.client_slugs() {
+        let handle = service
+            .get_client(&slug)
+            .expect("a slug the registry just listed has a handle");
+        for subscription in handle.subscriptions.read().await.iter() {
+            filters.push(format!(
+                "{slug} {} qos={}",
+                subscription.topic_filter, subscription.qos,
+            ));
+        }
+    }
+    filters.sort();
+
+    let mut routes: Vec<String> = router
+        .route_uuids()
+        .into_iter()
+        .map(
+            |uuid| match entries.iter().find(|entry| entry.uuid == uuid) {
+                Some(entry) => entry.address.clone(),
+                // A route whose channel the directory does not hold is the defect
+                // this field is here to catch, so it is rendered rather than
+                // skipped.
+                None => format!("(no directory entry) {uuid}"),
+            },
+        )
+        .collect();
+    // Sorted rather than taken in table order: `add_route` appends, so a
+    // reload's order is arrival order and a fresh boot's is plan order.
+    routes.sort();
+
+    (filters, routes)
 }
 
 /// The channel rows and the subscriber positions, as lines.
@@ -182,6 +417,147 @@ async fn durable_rows(messenger: &Messenger) -> Vec<String> {
 
     rows.sort();
     rows
+}
+
+/// The newest retained body on every channel that retains anything, as lines.
+///
+/// Every channel that retains anything at all — `Bounded(n >= 1)` or
+/// `Unbounded` — rather than the ones retaining exactly one: the surface status
+/// channels retain four here, a durable channel may retain without bound, and a
+/// selector keyed to one depth or one variant would silently drop a channel a
+/// deployment retuned.
+///
+/// Bodies are compared verbatim, with three exclusions, each a value minted per
+/// process at a named site and nowhere else:
+///
+/// - `brenn:config.status`, whose whole purpose is to differ between a reloaded
+///   process and a fresh one.
+/// - The generation timestamp of the description family — the `- generated:`
+///   line of the index and the two help documents, and the `"ts"` member of a
+///   kind schema. `build_description_docs_selected` mints one `Utc::now()` per
+///   publish and threads it into every body it builds, so the reload side's is
+///   its reload time and the fresh side's its boot time. Every other byte —
+///   the surface and kind tables, the channel pointers, the schema and
+///   dimensions, the build line — stays.
+/// - The `ts` and `epoch` of a surface's `disconnected` stamp, minted from the
+///   server clock and the process's own bus epoch as `resume_epoch` is.
+///
+/// A comparison that fails is a convergence defect and is fixed in the commit
+/// step; this list is never widened to make one pass.
+async fn retained_documents(
+    booted: &Booted,
+    entries: &[Arc<brenn_lib::messaging::ChannelEntry>],
+) -> Vec<String> {
+    let prefix = &booted
+        .driver
+        .baseline()
+        .document
+        .config
+        .surface_description
+        .prefix;
+    let families = description_families(prefix, booted.driver.baseline().surfaces());
+    let mut lines = Vec::new();
+    for entry in entries {
+        if entry.address == brenn_messaging::config_reload::STATUS_ADDRESS {
+            continue;
+        }
+        let retains = match entry.resolved_channel.retain_depth {
+            Depth::Unbounded => true,
+            Depth::Bounded(n) => n >= 1,
+        };
+        if !retains {
+            continue;
+        }
+        let store = booted.messenger.store_for(entry);
+        let Some(newest) = store.retained_tail(Depth::Bounded(1)).await.pop() else {
+            lines.push(format!("{} (nothing retained)", entry.address));
+            continue;
+        };
+        lines.push(format!(
+            "{} {}",
+            entry.address,
+            narrowed(families.get(&entry.address).copied(), &newest.body),
+        ));
+    }
+    lines.sort();
+    lines
+}
+
+/// Which per-process value a retained body carries, and therefore which line or
+/// member the comparison elides from it.
+#[derive(Clone, Copy)]
+enum Family {
+    /// A markdown description document — the index, a surface's help, a kind's
+    /// help — carrying `- generated: <ts>`.
+    Markdown,
+    /// A kind schema document, carrying a `"ts"` member.
+    KindSchema,
+    /// A surface's `disconnected` stamp, carrying `ts` and `epoch`.
+    SurfaceStatus,
+}
+
+/// Every address whose body carries a per-process value, built with the same
+/// constructors the publishers derive their addresses from.
+///
+/// Built rather than parsed: the address grammar has one owner
+/// (`brenn_surface_server::description`), and an oracle that re-derived it from
+/// string surgery would be a second informal copy living in the one test meant
+/// to notice when the real one moves. An address this map does not hold is
+/// compared verbatim, which is the correct default for anything new.
+fn description_families(prefix: &str, surfaces: &[ResolvedSurface]) -> HashMap<String, Family> {
+    use brenn_surface_server::description::{
+        distinct_kinds, index_channel, kind_help_channel, kind_schema_channel,
+        surface_help_channel, surface_status_channel,
+    };
+
+    let mut families = HashMap::new();
+    families.insert(index_channel(prefix), Family::Markdown);
+    for surface in surfaces {
+        families.insert(
+            surface_help_channel(prefix, &surface.slug),
+            Family::Markdown,
+        );
+        families.insert(
+            surface_status_channel(prefix, &surface.slug),
+            Family::SurfaceStatus,
+        );
+    }
+    for kind in distinct_kinds(surfaces) {
+        families.insert(kind_help_channel(prefix, &kind), Family::Markdown);
+        families.insert(kind_schema_channel(prefix, &kind), Family::KindSchema);
+    }
+    families
+}
+
+/// One retained body as the comparison sees it: verbatim, unless its address is
+/// one of the description family's, whose body carries a per-process value at a
+/// known line.
+fn narrowed(family: Option<Family>, body: &str) -> String {
+    match family {
+        None => body.to_string(),
+        Some(Family::Markdown) => body
+            .lines()
+            .filter(|line| !line.starts_with("- generated: "))
+            .collect::<Vec<&str>>()
+            .join("\n"),
+        Some(Family::KindSchema) => {
+            let mut doc: serde_json::Value =
+                serde_json::from_str(body).expect("a kind schema document is JSON");
+            doc.as_object_mut()
+                .expect("a kind schema document is a JSON object")
+                .remove("ts")
+                .expect("a kind schema document carries its generation timestamp");
+            doc.to_string()
+        }
+        Some(Family::SurfaceStatus) => {
+            let stamp = brenn_surface_schema::telemetry::DisconnectedStamp::parse(body)
+                .expect("a server-written status body is a disconnected stamp");
+            format!(
+                "v={} session={:?} health={:?} reason={}",
+                stamp.v, stamp.session, stamp.health, stamp.reason,
+            )
+        }
+    }
 }
 
 /// Copy the database as it stands, consistently, to `to`.
@@ -299,89 +675,441 @@ new grinder: Demo {{
     ))
 }
 
-/// The correctness oracle: reload A→A′ and boot A′ fresh over the database as
-/// it stood before the reload, then compare the two processes.
+/// Boot A, reload it to A', boot A' fresh over the database as it stood before
+/// the reload, and compare the two processes.
 ///
 /// The database is copied *before* the reload rather than after, so the fresh
 /// boot starts from what a restart at that moment would have started from —
 /// and every row the reload wrote is the reload's own claim, which is exactly
 /// what is under test.
 ///
-/// **What "a fresh boot" means here.** The other side is `boot_with`, the test
-/// fixture's boot, not `run_server`: it lowers the document with the same
-/// planner, then loads, wires and starts what the plan names, and builds the
-/// baseline the same way production does. What it does not reproduce is the
-/// rest of the composition root — the dispatcher, session, ingress and GC
-/// lifetime tasks, the HTTP and attach surfaces, the webhook and MQTT
-/// peripheries, the tool executor's own drain task, and the boot-time
-/// `booted` status publish. Those are boot's, not the reload's, and the
-/// comparison is over the six things a reload edits: directory entries with
-/// their subscribers, subscriber registrations, running consumer tasks, ring
-/// stores, durable rows, and the executor's tool grant table. The wiring a
-/// reload edits that the fixture *does* reproduce is asserted to be
-/// production's shape by another test — the planned baseline directory, by
-/// `brenn-messaging-boot`'s carried-directory test.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_reloaded_process_matches_a_fresh_boot() {
+/// `fixture` is asked for a `BootFixture` twice, once per process, because the
+/// two differ in the database they boot over and in nothing else: a fresh side
+/// standing on a different rig would be comparing rigs. `arrive` writes
+/// whatever the transition is — the new document, a rewritten kind tree, a
+/// newly declared mount — and reloads; `worth_comparing` is the assertion that
+/// the transition happened at all, since two processes that both did nothing
+/// compare equal.
+///
+/// Where the fresh side does not reproduce a piece of state the reload edits,
+/// the fixture is extended rather than the comparison narrowed.
+pub(crate) async fn a_reload_matches_a_fresh_boot(
+    tree: &Tree,
+    fixture: impl Fn(brenn_db::Db) -> BootFixture,
+    arrive: impl AsyncFnOnce(&mut Booted),
+    worth_comparing: impl FnOnce(&Snapshot),
+) {
     let store = tempfile::tempdir().expect("a directory for the databases");
-    let components = tempfile::tempdir().expect("a components root");
-    let roots = vec![components.path().to_path_buf()];
-
-    let tree = Tree::holding(&document_with_a_tool_granted_consumer());
-    install_package(components.path(), &staged_module(&tree));
     let mut booted = boot_with(
-        &tree,
-        BootFixture {
-            db: Some(init_db_file(&store.path().join("running.db"))),
-            components_roots: roots.clone(),
-            tool_registry: Some(async_tool_registry()),
-            ..BootFixture::default()
-        },
+        tree,
+        fixture(init_db_file(&store.path().join("running.db"))),
     )
     .await;
 
     let restart_point = store.path().join("restart.db");
     copy_database(&booted.db, &restart_point).await;
 
-    tree.write(&document_with_two_consumers());
-    install_package(components.path(), &staged_module(&tree));
-    booted.driver.reload(TriggerSource::Signal).await;
+    arrive(&mut booted).await;
     let status = booted.last_status().await;
     assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
-    assert_eq!(status.delta.consumers_added, vec!["grinder".to_string()]);
 
     let reloaded = snapshot(&booted).await;
-    // The comparison is only worth anything if there is something to compare:
-    // both consumers running, and the added channel in the directory.
-    assert_eq!(reloaded.running, vec!["grinder", "quiet", "sifter"]);
-    assert!(
-        reloaded
-            .channels
-            .iter()
-            .any(|line| line.starts_with("brenn:digested ")),
-        "{:?}",
-        reloaded.channels
-    );
-    assert_eq!(
-        reloaded.grants.len(),
-        2,
-        "the two granted consumers hold a caller key each and the grantless one holds none: {:?}",
-        reloaded.grants
-    );
+    worth_comparing(&reloaded);
+
+    // The reload side's broker session is done: nothing below reads its MQTT
+    // runtime, and leaving it up would have the two processes' supervisors
+    // taking the same session over from each other — both boot one document, so
+    // both connect under one client id — for the whole of the fresh side's
+    // life. A no-op when the fixture stood no supervisor up.
+    booted.stop_mqtt();
 
     // A fresh boot of A′ over the database as it stood before the reload:
     // what the operator would have got by restarting the service instead.
-    let restarted = boot_with(
+    let restarted = boot_with(tree, fixture(init_db_file(&restart_point))).await;
+    let fresh = snapshot(&restarted).await;
+    // And the fresh side's, explicitly: dropping `restarted` stops nothing,
+    // because each supervisor holds a sender of its own, so an unsignalled
+    // supervisor stays connected under the document's client id for the rest of
+    // the binary. A second transition over the same broker would then be
+    // contending with a session this one is finished with.
+    restarted.stop_mqtt();
+    reloaded.assert_matches(&fresh);
+}
+
+/// The correctness oracle over the transition the facility was built for: a
+/// consumer and a channel arrive.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reloaded_process_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    let roots = vec![components.path().to_path_buf()];
+
+    let tree = Tree::holding(&document_with_a_tool_granted_consumer());
+    install_package(components.path(), &staged_module(&tree));
+
+    a_reload_matches_a_fresh_boot(
         &tree,
-        BootFixture {
-            db: Some(init_db_file(&restart_point)),
-            components_roots: roots,
+        |db| BootFixture {
+            db: Some(db),
+            components_roots: roots.clone(),
             tool_registry: Some(async_tool_registry()),
             ..BootFixture::default()
         },
+        async |booted| {
+            tree.write(&document_with_two_consumers());
+            install_package(components.path(), &staged_module(&tree));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.consumers_added,
+                vec!["grinder".to_string()]
+            );
+        },
+        // The comparison is only worth anything if there is something to
+        // compare: both consumers running, and the added channel in the
+        // directory.
+        |reloaded| {
+            assert_eq!(reloaded.running.len(), 3, "{:?}", reloaded.running);
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:digested ")),
+                "{:?}",
+                reloaded.channels
+            );
+            assert_eq!(
+                reloaded.grants.len(),
+                2,
+                "the two granted consumers hold a caller key each and the grantless one holds \
+                 none: {:?}",
+                reloaded.grants
+            );
+        },
     )
     .await;
-    assert_eq!(reloaded, snapshot(&restarted).await);
+}
+
+// ── The oracle over the surface transitions ───────────────────────────────
+
+/// The rig every surface transition boots on: a document tree, the `panel`
+/// kind's deployed assets beside it, and the fixture both processes boot under.
+///
+/// The asset tree is a `TempDir` the caller has to hold — dropping it takes the
+/// mount out from under both processes.
+fn panel_fixture(assets: &std::path::Path) -> impl Fn(brenn_db::Db) -> BootFixture + use<'_> {
+    move |db| BootFixture {
+        db: Some(db),
+        surface_assets: Some(assets.to_path_buf()),
+        reader_reads: DESKBAR_READS.to_vec(),
+        ..BootFixture::default()
+    }
+}
+
+/// Rewrite the document and reload.
+async fn reload_onto(booted: &mut Booted, tree: &Tree, document: &str) {
+    tree.write(document);
+    booted.driver.reload(TriggerSource::Signal).await;
+}
+
+/// **The first surface in a document that had none.** Nothing surface-shaped
+/// exists in the running process — no runtime, no matcher for a slug, no
+/// budget, and an index that says `_none configured_` — and one reload has to
+/// produce all of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_surface_matches_a_fresh_boot() {
+    let assets = tempfile::tempdir().expect("a surface asset tree");
+    let tree = Tree::holding(&document(""));
+    write_surface_kind(&tree, assets.path(), "panel", "Panel");
+    tree.write(&document(""));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        panel_fixture(assets.path()),
+        async |booted| {
+            reload_onto(
+                booted,
+                &tree,
+                &surface_document("deskbar", "panel", "Panel", ""),
+            )
+            .await;
+            assert_eq!(
+                booted.last_status().await.delta.surfaces_added,
+                vec!["deskbar".to_string()]
+            );
+        },
+        |reloaded| {
+            assert_eq!(reloaded.surfaces.len(), 1, "{:?}", reloaded.surfaces);
+            assert!(
+                reloaded
+                    .retained
+                    .iter()
+                    .any(|line| line.contains("surface.deskbar.bindings")),
+                "{:?}",
+                reloaded.retained
+            );
+            assert!(
+                reloaded
+                    .attach_budgets
+                    .iter()
+                    .any(|line| line.contains("deskbar")),
+                "the arriving surface's principals hold send budgets, or the budget field is \
+                 empty on both sides and compares nothing: {:?}",
+                reloaded.attach_budgets,
+            );
+        },
+    )
+    .await;
+}
+
+/// **A surface whose declaration moved.** The one value edit the rig can make
+/// without moving a channel: the runtime, the registration, the budgets and the
+/// documents that carry the skin are all replaced, and everything else must be
+/// where a fresh boot would have left it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_surface_matches_a_fresh_boot() {
+    let assets = tempfile::tempdir().expect("a surface asset tree");
+    let tree = Tree::new();
+    write_surface_kind(&tree, assets.path(), "panel", "Panel");
+    tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        panel_fixture(assets.path()),
+        async |booted| {
+            reload_onto(
+                booted,
+                &tree,
+                &surface_document("deskbar", "panel", "Panel", "    skin = \"foundry\";\n"),
+            )
+            .await;
+            assert_eq!(
+                booted.last_status().await.delta.surfaces_changed,
+                vec!["deskbar".to_string()]
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .surfaces
+                    .iter()
+                    .any(|line| line.contains("foundry")),
+                "the served runtime carries the new skin: {:?}",
+                reloaded.surfaces
+            );
+        },
+    )
+    .await;
+}
+
+/// **The only surface removed.** The emptied document: the two
+/// surface-description participants must hold no matcher for the retired slug
+/// or its kind, the index must be back to `_none configured_`, and the runtime
+/// table must be empty — none of it enumerated, all of it compared.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_only_surface_matches_a_fresh_boot() {
+    let assets = tempfile::tempdir().expect("a surface asset tree");
+    let tree = Tree::new();
+    write_surface_kind(&tree, assets.path(), "panel", "Panel");
+    tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        panel_fixture(assets.path()),
+        async |booted| {
+            // The emptied document: the surface and the description stamps
+            // it derived leave together, which is the one change an operator
+            // makes. A stamp left behind keeps its channels declared and
+            // keeps whatever they last retained, which is the arrangement the
+            // design admits rather than converges.
+            reload_onto(booted, &tree, &document("")).await;
+            assert_eq!(
+                booted.last_status().await.delta.surfaces_removed,
+                vec!["deskbar".to_string()]
+            );
+        },
+        |reloaded| {
+            assert!(reloaded.surfaces.is_empty(), "{:?}", reloaded.surfaces);
+            assert!(
+                reloaded
+                    .registrations
+                    .iter()
+                    .any(|line| line.starts_with("System(\"surface-help\")")),
+                "the publish-only participants are in the comparison, or the narrowing this \
+                 transition exists for is compared against nothing: {:?}",
+                reloaded.registrations,
+            );
+            assert!(
+                reloaded
+                    .retained
+                    .iter()
+                    .any(|line| line.starts_with("brenn:surface.index ")
+                        && line.contains("_none configured_")),
+                "{:?}",
+                reloaded.retained
+            );
+        },
+    )
+    .await;
+}
+
+/// **A second surface of an existing kind arrives, and one of two leaves.** The
+/// kind's help document lists every instance mounting it, so both directions
+/// republish a document neither surface owns — and the surviving surface's own
+/// documents must be exactly what a fresh boot writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_surface_of_a_kind_matches_a_fresh_boot() {
+    let assets = tempfile::tempdir().expect("a surface asset tree");
+    let tree = Tree::new();
+    write_surface_kind(&tree, assets.path(), "panel", "Panel");
+    let one = surfaces_document("panel", "Panel", &[("deskbar", "")]);
+    let two = surfaces_document("panel", "Panel", &[("deskbar", ""), ("ticker", "")]);
+    tree.write(&one);
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        panel_fixture(assets.path()),
+        async |booted| {
+            reload_onto(booted, &tree, &two).await;
+            assert_eq!(
+                booted.last_status().await.delta.surfaces_added,
+                vec!["ticker".to_string()]
+            );
+        },
+        |reloaded| assert_eq!(reloaded.surfaces.len(), 2, "{:?}", reloaded.surfaces),
+    )
+    .await;
+
+    let tree = Tree::new();
+    write_surface_kind(&tree, assets.path(), "panel", "Panel");
+    tree.write(&two);
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        panel_fixture(assets.path()),
+        async |booted| {
+            reload_onto(booted, &tree, &one).await;
+            assert_eq!(
+                booted.last_status().await.delta.surfaces_removed,
+                vec!["ticker".to_string()]
+            );
+        },
+        |reloaded| assert_eq!(reloaded.surfaces.len(), 1, "{:?}", reloaded.surfaces),
+    )
+    .await;
+}
+
+/// **A kind upgraded under its mount, with the document untouched.** The bundle
+/// install a reload is supposed to make possible: new artifact bytes under an
+/// unmoved specification. Nothing in the text moved, so every field a fresh
+/// boot reproduces has to be reproduced by the kind closure alone — the served
+/// roots, the replaced runtime, and the documents the promotion rebuilt.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgraded_kind_matches_a_fresh_boot() {
+    let assets = tempfile::tempdir().expect("a surface asset tree");
+    let tree = Tree::new();
+    write_surface_kind(&tree, assets.path(), "panel", "Panel");
+    tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+    // The specification the document was compiled against, carried into the
+    // upgraded tree unchanged: a release that moved the spec too is the stale
+    // -document refusal, which is a different case.
+    let spec = std::fs::read(tree.modules().join("panel.brenn")).expect("the class module");
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        panel_fixture(assets.path()),
+        async |booted| {
+            brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+                assets.path(),
+                "panel",
+                UPGRADED_ARTIFACT,
+                &spec,
+                Vec::new(),
+                true,
+                |_| {},
+            );
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.surfaces_changed,
+                vec!["deskbar".to_string()]
+            );
+        },
+        |reloaded| {
+            let upgraded = brenn_lib::util::sha256_hex(UPGRADED_ARTIFACT);
+            assert!(
+                reloaded
+                    .surface_roots
+                    .iter()
+                    .any(|line| line.contains(&upgraded)),
+                "the served roots must carry the bytes the reload was decided against: {:?}",
+                reloaded.surface_roots,
+            );
+        },
+    )
+    .await;
+}
+
+const UPGRADED_ARTIFACT: &[u8] = b"the-upgraded-artifact";
+
+/// **A mount declared since boot, holding a module and a package.** The
+/// deployment story the slice exists for: the operator installs a bundle, adds
+/// its `mount` line, and the document reaches vocabulary and bytes the booted
+/// process could not see. The consumer's package root is in the snapshot, so
+/// "running out of the new mount" is compared rather than asserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_added_since_boot_matches_a_fresh_boot() {
+    let bundle = tempfile::tempdir().expect("a bundle tree");
+    let modules = bundle.path().join("modules");
+    let components = bundle.path().join("components");
+    std::fs::create_dir_all(&modules).expect("the bundle's module root");
+    std::fs::create_dir_all(&components).expect("the bundle's components root");
+
+    // The two halves by hand rather than through [`Tree::write`]'s fence: the
+    // fence stages the module into the tree's own module root, and the whole
+    // point of this transition is that the module arrives under the mount.
+    let (module, root) = brenn_lib::config::split_packaged(&document_with_a_consumer())
+        .expect("the consumer fixture is fenced");
+
+    let tree = Tree::holding(&document(""));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        |db| BootFixture {
+            db: Some(db),
+            ..BootFixture::default()
+        },
+        async |booted| {
+            std::fs::write(
+                modules.join(format!("{}.brenn", brenn_lib::config::PACKAGED_MODULE)),
+                &module,
+            )
+            .expect("the bundle's module is writable");
+            install_package(&components, &module);
+            std::fs::write(tree.root(), &root).expect("the document is writable");
+            booted.mounts.install(
+                "bundle",
+                &[
+                    ("modules", modules.as_path()),
+                    ("components", components.as_path()),
+                ],
+            );
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.consumers_added,
+                vec!["sifter".to_string()]
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .running
+                    .iter()
+                    .any(|line| line.starts_with("sifter root=")
+                        && line.ends_with("/bundle/components")),
+                "the consumer runs out of the arriving mount: {:?}",
+                reloaded.running,
+            );
+        },
+    )
+    .await;
 }
 
 /// A channel under a continuous publisher while its only consumer is retired.

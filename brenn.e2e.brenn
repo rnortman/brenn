@@ -8,6 +8,7 @@
 // Authoring conventions for this tree: `docs/config-dsl.md`.
 use config::bar::*;
 use @chrome::*;
+use @config-reload::*;
 use @echo-stub::*;
 use @git-forge-parser::*;
 use @git-sync-consumer::*;
@@ -76,6 +77,8 @@ uuid_pins {
   "brenn:bar-b" = "2ccd9df1-08b1-4554-9745-fc3ade11ed98";
   "brenn:bar-c" = "0d0f95db-13aa-4214-a461-aa1fbf788351";
 }
+
+new config_reload: ConfigReload();
 
 new surface_commons: SurfaceCommons;
 new bar_desc: SurfaceDescription(slug = "bar");
@@ -161,6 +164,10 @@ new demo: DemoLoop(slug = "e2e-demo", source = bar_a) {
 new bar: BarSurface(slug = "bar", skin = "bench");
 new bar_pixel: BarSurface(slug = "bar-pixel", skin = "foundry");
 
+// `e2e/tests/surface-reload.spec.ts` deletes everything between these two
+// markers, markers included, and reloads the server: that is how a surface is
+// retired out from under an open page. Keep the pair together.
+// e2e:retire-block:begin
 /// Browser-driven publisher for the bar: one echo-stub per bar channel plus the
 /// layout channel. The specs type bodies and layout JSON and click send, driving
 /// the bar end to end.
@@ -200,3 +207,5 @@ surface bar-feeder {
   }
 
 }
+// e2e:retire-block:end
+

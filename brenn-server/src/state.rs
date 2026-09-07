@@ -86,7 +86,11 @@ pub struct AppState {
     /// and the flat sidecars, and one root per installed component kind. Served
     /// under `/surface-static`, whose URL namespace is one tree even where the
     /// filesystem behind it is several.
-    pub surface_roots: brenn_surface_server::SurfaceRoots,
+    ///
+    /// Swappable: a reload re-scans the declared mounts and installs the answer
+    /// here. Read through [`AppState::surface_roots`], which clones the `Arc`
+    /// under the lock and never holds it across an await.
+    pub surface_roots: Arc<std::sync::RwLock<Arc<brenn_surface_server::SurfaceRoots>>>,
     /// Cached available models from CC's init ack, keyed by app slug.
     /// Populated on first CC spawn per app; refreshed on subsequent spawns.
     pub cached_models: Arc<RwLock<HashMap<String, Vec<ModelInfo>>>>,
@@ -176,9 +180,13 @@ pub struct AppState {
     /// this many seconds after `last_activity_at` closes the prior session and
     /// opens a new one. Default (and test fixture value): 1800 (30 minutes).
     pub usage_session_gap_secs: u32,
-    /// Boot-resolved surfaces, keyed by slug. Empty when no `[[surface]]`
-    /// blocks are configured.
-    pub surfaces: Arc<HashMap<String, Arc<brenn_surface_server::SurfaceRuntime>>>,
+    /// The surfaces this process serves, keyed by slug, and the slugs a reload
+    /// is presently swapping. Empty when no `[[surface]]` block is configured.
+    ///
+    /// Swappable for the same reason the roots are. Read through
+    /// [`SurfaceCell::lookup`]; written only by a reload's commit, through
+    /// the three mutators beside it.
+    pub surfaces: SurfaceCell,
     /// Boot-resolved remotes, keyed by slug. Empty when no `[[remote]]` blocks
     /// are configured.
     pub remotes: Arc<HashMap<String, Arc<brenn_remote_server::RemoteRuntime>>>,
@@ -389,7 +397,161 @@ pub(crate) async fn run_wake_attempt(
     state.record_spawn_outcome(conversation_id, outcome.map(|_| ()));
 }
 
+/// The surfaces a process serves, plus the slugs a reload is in the middle of
+/// swapping.
+///
+/// One structure rather than two locks because the two answers have to be
+/// consistent: a route asking about a slug must never see it absent from
+/// `runtimes` and absent from `reconfiguring` while a commit is between the
+/// two writes, which is exactly the window that would turn a legitimate
+/// reloading page into a fail2ban signal.
+#[derive(Default)]
+pub struct SurfaceTable {
+    /// Slug → the runtime the routes hand to an attaching session.
+    pub runtimes: HashMap<String, Arc<brenn_surface_server::SurfaceRuntime>>,
+    /// Slugs whose runtime has been withdrawn and whose replacement has not
+    /// been installed yet. Answered `503`, not `404`.
+    pub reconfiguring: std::collections::HashSet<String>,
+}
+
+impl SurfaceTable {
+    /// Withdraw a runtime and mark the slug mid-swap, so the door answers `503`
+    /// until [`SurfaceTable::install`] lands its replacement.
+    pub fn begin_reconfigure(&mut self, slug: &str) {
+        self.runtimes.remove(slug);
+        self.reconfiguring.insert(slug.to_string());
+    }
+
+    /// Withdraw a surface for good. The slug `404`s afterwards, which is the
+    /// truth: it no longer exists.
+    pub fn retire(&mut self, slug: &str) {
+        self.runtimes.remove(slug);
+        self.reconfiguring.remove(slug);
+    }
+
+    /// Publish a runtime, clearing any mid-swap mark.
+    pub fn install(&mut self, slug: String, runtime: Arc<brenn_surface_server::SurfaceRuntime>) {
+        self.reconfiguring.remove(&slug);
+        self.runtimes.insert(slug, runtime);
+    }
+}
+
+/// The one handle on the surface table: the doors read it, a reload's commit
+/// writes it, and both do so through the methods below.
+///
+/// A newtype rather than a bare `Arc<RwLock<..>>` on two structs because the
+/// locking discipline is one decision — every operation is a lookup or a swap,
+/// none of them is held across an await, and the poisoning `expect` is written
+/// once. `AppState` and the reload's `ReloadEnv` hold clones of the same cell.
+#[derive(Clone, Default)]
+pub struct SurfaceCell(Arc<std::sync::RwLock<SurfaceTable>>);
+
+impl SurfaceCell {
+    /// The cell a boot hands over, holding the runtimes it built.
+    pub fn holding(runtimes: HashMap<String, Arc<brenn_surface_server::SurfaceRuntime>>) -> Self {
+        let cell = Self::default();
+        cell.set_runtimes(runtimes);
+        cell
+    }
+
+    /// Resolve a slug.
+    pub fn lookup(&self, slug: &str) -> SurfaceLookup {
+        let table = self.read();
+        match table.runtimes.get(slug) {
+            Some(runtime) => SurfaceLookup::Ready(runtime.clone()),
+            None if table.reconfiguring.contains(slug) => SurfaceLookup::Reconfiguring,
+            None => SurfaceLookup::Unknown,
+        }
+    }
+
+    /// Withdraw a surface's runtime and mark the slug as mid-swap, so the door
+    /// answers `503` rather than `404` until [`SurfaceCell::install`] lands its
+    /// replacement.
+    pub fn begin_reconfigure(&self, slug: &str) {
+        self.write().begin_reconfigure(slug);
+    }
+
+    /// Withdraw a surface for good. The slug `404`s afterwards.
+    pub fn retire(&self, slug: &str) {
+        self.write().retire(slug);
+    }
+
+    /// Publish a surface's runtime, clearing any mid-swap mark.
+    pub fn install(&self, slug: String, runtime: Arc<brenn_surface_server::SurfaceRuntime>) {
+        self.write().install(slug, runtime);
+    }
+
+    /// Install a whole runtime table at once, discarding any mid-swap marks.
+    /// Boot's installer, and the fixtures'.
+    pub fn set_runtimes(
+        &self,
+        runtimes: HashMap<String, Arc<brenn_surface_server::SurfaceRuntime>>,
+    ) {
+        *self.write() = SurfaceTable {
+            runtimes,
+            reconfiguring: std::collections::HashSet::new(),
+        };
+    }
+
+    /// Read the whole table under one lock.
+    ///
+    /// For a caller that has to see the runtimes and the mid-swap marks as one
+    /// consistent answer — comparing two processes' tables, where a slug read
+    /// from one snapshot and a mark from another would be a difference neither
+    /// process ever held.
+    ///
+    /// Behind `testutils`: it is the general escape hatch from the discipline
+    /// the rest of this type encapsulates, and a production caller wanting
+    /// "just one more field" is supposed to add a named operation here instead.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn with_table<R>(&self, read: impl FnOnce(&SurfaceTable) -> R) -> R {
+        read(&self.read())
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, SurfaceTable> {
+        self.0.read().expect(SURFACE_TABLE_LOCK)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, SurfaceTable> {
+        self.0.write().expect(SURFACE_TABLE_LOCK)
+    }
+}
+
+/// Why the surface-table lock cannot be poisoned: nothing panics under it.
+const SURFACE_TABLE_LOCK: &str = "the surface-table lock is held only for a lookup and a swap";
+
+/// What the surface table says about one slug.
+pub enum SurfaceLookup {
+    /// No such surface. A probe: `404` and a security event.
+    Unknown,
+    /// A reload is swapping this surface right now. `503` with a `Retry-After`,
+    /// and no security event — the page asking is a legitimate one.
+    Reconfiguring,
+    /// The runtime to serve.
+    Ready(Arc<brenn_surface_server::SurfaceRuntime>),
+}
+
 impl AppState {
+    /// The asset roots currently installed. Clones one `Arc` under the lock, so
+    /// a caller may hold the result across an await; the lock itself never is.
+    pub fn surface_roots(&self) -> Arc<brenn_surface_server::SurfaceRoots> {
+        self.surface_roots
+            .read()
+            .expect("the surface-roots lock is held only for a clone and a swap")
+            .clone()
+    }
+
+    /// Install a freshly scanned root set. Every subsequent `/surface-static`
+    /// request resolves against it; requests already inside `ServeDir` finish
+    /// against the roots they resolved with, which is the same file either way
+    /// unless the mount moved under them.
+    pub fn set_surface_roots(&self, roots: Arc<brenn_surface_server::SurfaceRoots>) {
+        *self
+            .surface_roots
+            .write()
+            .expect("the surface-roots lock is held only for a clone and a swap") = roots;
+    }
+
     /// Fire-and-forget eager wake for a **user-initiated** trigger: a browser
     /// attaching, switching conversation, or replacing a CC that died under a
     /// live session. Never declined by the spawn backoff — a human retry is
@@ -767,7 +929,7 @@ impl AppState {
             bridge_notify_tx: broadcast::channel(64).0,
             pending_uploads: Default::default(),
             static_dir: std::path::PathBuf::from("frontend/dist"),
-            surface_roots: brenn_surface_server::SurfaceRoots::default(),
+            surface_roots: Default::default(),
             cached_models: Default::default(),
             tool_registry: Default::default(),
             tools: Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
@@ -783,7 +945,7 @@ impl AppState {
             webhook: None,
             automation_engine: None,
             usage_session_gap_secs: 1800,
-            surfaces: Arc::new(HashMap::new()),
+            surfaces: Default::default(),
             remotes: Arc::new(HashMap::new()),
             attach_registry: Default::default(),
             attach_heartbeat_secs: 1,

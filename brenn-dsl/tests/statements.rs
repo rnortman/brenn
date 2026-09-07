@@ -36,6 +36,7 @@ fn the_statement_corpus_covers_every_top_level_form() {
             Item::Repo(_) => "repo",
             Item::MqttClient(_) => "mqtt_client",
             Item::McpServer(_) => "mcp_server",
+            Item::Mount(_) => "mount",
             Item::Acl(_) => "acl",
             Item::Grant(_) => "grant",
             Item::Principal(_) => "principal",

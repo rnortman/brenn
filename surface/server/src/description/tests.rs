@@ -13,6 +13,7 @@ use brenn_lib::messaging::config::{
 use super::*;
 use crate::SingleWriterPrincipals;
 use crate::test_fixtures::{directory_with, surface_outputting_to};
+use brenn_lib::messaging::Urgency;
 
 const PREFIX: &str = "surface";
 
@@ -20,11 +21,16 @@ const PREFIX: &str = "surface";
 /// arrangement the sidecar readers see in tree.
 fn roots(dir: &Path, surfaces: &[ResolvedSurface]) -> crate::SurfaceRoots {
     crate::SurfaceRoots {
-        kernel: Some(dir.to_path_buf()),
+        kernel: Some(crate::KernelRoot::for_test(dir)),
         kinds: surfaces
             .iter()
             .flat_map(|surface| surface.components.iter())
-            .map(|comp| (comp.kind.clone(), dir.to_path_buf()))
+            .map(|comp| {
+                (
+                    comp.kind.clone(),
+                    crate::KindRoot::for_test(dir.to_path_buf()),
+                )
+            })
             .collect(),
     }
 }
@@ -252,6 +258,158 @@ fn doc_addresses_match_boot_published_set() {
 
 // ── Document builders ──────────────────────────────────────────────────────
 
+// -- DescriptionSelection ---------------------------------------------------
+
+#[test]
+fn everything_selects_every_surface_and_every_kind() {
+    let surfaces = multi_surface_config();
+    let want = DescriptionSelection::everything(&surfaces);
+    assert!(want.index);
+    assert_eq!(
+        want.surfaces,
+        BTreeSet::from(["bar".to_string(), "dev-stub".to_string()]),
+    );
+    assert_eq!(
+        want.kinds,
+        BTreeSet::from([
+            "echo-stub".to_string(),
+            "mode-clock".to_string(),
+            "protobar".to_string(),
+        ]),
+    );
+    assert!(!want.is_empty());
+    assert!(DescriptionSelection::default().is_empty());
+}
+
+/// The whole-topology call is the selected call over `everything`, addresses
+/// and all — so a caller rebuilding part of the set publishes onto the same
+/// channels boot does.
+#[test]
+fn the_boot_builder_is_the_selected_builder_over_everything() {
+    let surfaces = multi_surface_config();
+    let roots = roots(Path::new("/nonexistent"), &surfaces);
+    let whole = build_description_docs(PREFIX, "b", &surfaces, &roots);
+    let selected = build_description_docs_selected(
+        PREFIX,
+        "b",
+        &surfaces,
+        &roots,
+        &DescriptionSelection::everything(&surfaces),
+    );
+    let addrs = |docs: &[(String, String)]| -> Vec<String> {
+        docs.iter().map(|(a, _)| a.clone()).collect()
+    };
+    assert_eq!(addrs(&whole), addrs(&selected));
+}
+
+#[test]
+fn an_empty_selection_builds_nothing() {
+    let surfaces = multi_surface_config();
+    let docs = build_description_docs_selected(
+        PREFIX,
+        "b",
+        &surfaces,
+        &roots(Path::new("/nonexistent"), &surfaces),
+        &DescriptionSelection::default(),
+    );
+    assert!(docs.is_empty());
+}
+
+/// One surface's help document alone: the index and every kind pair stay out,
+/// and the body is still the whole-topology one — a per-surface document is a
+/// function of that surface.
+#[test]
+fn a_selection_of_one_surface_builds_only_its_help_document() {
+    let surfaces = multi_surface_config();
+    let roots = roots(Path::new("/nonexistent"), &surfaces);
+    let docs = build_description_docs_selected(
+        PREFIX,
+        "b",
+        &surfaces,
+        &roots,
+        &DescriptionSelection {
+            index: false,
+            surfaces: BTreeSet::from(["bar".to_string()]),
+            kinds: BTreeSet::new(),
+        },
+    );
+    assert_eq!(
+        docs.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+        vec!["brenn:surface.surface.bar.help"],
+    );
+    assert!(docs[0].1.contains("Surface `bar`"));
+}
+
+/// A kind's pair is built against the whole candidate list, so its "Mounted by"
+/// section names every surface mounting it and not only the selected ones.
+#[test]
+fn a_selected_kind_builds_its_pair_over_the_whole_surface_list() {
+    let mut surfaces = multi_surface_config();
+    surfaces.push(surface("second", "bench", &[("also", "protobar")]));
+    let docs = build_description_docs_selected(
+        PREFIX,
+        "b",
+        &surfaces,
+        &roots(Path::new("/nonexistent"), &surfaces),
+        &DescriptionSelection {
+            index: false,
+            surfaces: BTreeSet::new(),
+            kinds: BTreeSet::from(["protobar".to_string()]),
+        },
+    );
+    assert_eq!(
+        docs.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+        vec![
+            "brenn:surface.kind.protobar.help",
+            "brenn:surface.kind.protobar.schema",
+        ],
+    );
+    assert!(docs[0].1.contains("surface `bar`"));
+    assert!(docs[0].1.contains("surface `second`"));
+}
+
+/// The selection is a request, not an assertion: a slug or a kind the candidate
+/// list does not hold names no document rather than panicking.
+#[test]
+fn a_selection_naming_an_absent_surface_or_kind_builds_nothing_for_it() {
+    let surfaces = multi_surface_config();
+    let docs = build_description_docs_selected(
+        PREFIX,
+        "b",
+        &surfaces,
+        &roots(Path::new("/nonexistent"), &surfaces),
+        &DescriptionSelection {
+            index: false,
+            surfaces: BTreeSet::from(["retired".to_string()]),
+            kinds: BTreeSet::from(["gone".to_string()]),
+        },
+    );
+    assert!(docs.is_empty());
+}
+
+/// The index is a function of the whole list, so selecting it alone still
+/// produces the document a fresh boot of this topology would.
+#[test]
+fn the_index_can_be_rebuilt_on_its_own() {
+    let surfaces = multi_surface_config();
+    let roots = roots(Path::new("/nonexistent"), &surfaces);
+    let docs = build_description_docs_selected(
+        PREFIX,
+        "build-xyz",
+        &surfaces,
+        &roots,
+        &DescriptionSelection {
+            index: true,
+            surfaces: BTreeSet::new(),
+            kinds: BTreeSet::new(),
+        },
+    );
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].0, "brenn:surface.index");
+    assert!(docs[0].1.contains("brenn:surface.surface.dev-stub.help"));
+    assert!(docs[0].1.contains("brenn:surface.kind.protobar.help"));
+}
+
 #[test]
 fn index_lists_every_surface_and_kind_address() {
     let surfaces = multi_surface_config();
@@ -368,10 +526,16 @@ fn each_kind_reads_the_sidecars_of_the_root_that_installed_it() {
 
     let surfaces = multi_surface_config();
     let roots = crate::SurfaceRoots {
-        kernel: Some(brenn.path().to_path_buf()),
+        kernel: Some(crate::KernelRoot::for_test(brenn.path())),
         kinds: [
-            ("protobar".to_string(), brenn.path().to_path_buf()),
-            ("mode-clock".to_string(), bundle.path().to_path_buf()),
+            (
+                "protobar".to_string(),
+                crate::KindRoot::for_test(brenn.path().to_path_buf()),
+            ),
+            (
+                "mode-clock".to_string(),
+                crate::KindRoot::for_test(bundle.path().to_path_buf()),
+            ),
         ]
         .into_iter()
         .collect(),

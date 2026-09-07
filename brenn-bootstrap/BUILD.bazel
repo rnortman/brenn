@@ -47,19 +47,28 @@ rust_library(
 # family. The binary links `brenn-server` with `testutils` on, since these tests
 # build on the fixtures the crate below tests with.
 #
-# 214 tests, each booting a real messaging layer and most loading a guest
-# component; the binary finishes in 21.9s locally and 134.0s at
-# `--test-threads=1`. `large` (900s), not `medium` (300s): the repo's one
-# measured local-to-CD-runner factor for a suite of this shape is ~21x
-# (brenn-server's 22s local against 472s on the forgejo runner), which puts
-# this binary near 460s on a cold 4-vCPU runner — past the medium budget,
-# inside the large one. `size` reserves the same 1 CPU at either tier, so this
-# buys timeout honesty and nothing else. Re-measure both numbers when the suite
-# grows again rather than carrying this arithmetic forward: a stale
-# justification is what stops the next person from measuring.
+# 321 tests, each booting a real messaging layer and most loading a guest
+# component, and several booting two processes to compare them; the binary
+# finishes in 22.6s locally and 166.4s at `--test-threads=1`. `large` (900s),
+# not `medium` (300s): the repo's one measured local-to-CD-runner factor for a
+# suite of this shape is ~21x (brenn-server's 22s local against 472s on the
+# forgejo runner), which puts this binary near 475s on a cold 4-vCPU runner —
+# past the medium budget, inside the large one, and with the headroom now worth
+# watching. `size` reserves the same 1 CPU at either tier, so this buys timeout
+# honesty and nothing else. Re-measure both numbers when the suite grows again
+# rather than carrying this arithmetic forward: a stale justification is what
+# stops the next person from measuring.
 rust_test(
     name = "brenn-bootstrap_test",
     size = "large",
+    # The broker cases are `:brenn-bootstrap_mqtt_broker_test`'s: they need a
+    # `mosquitto` on the host, which every other test here does not. The skip
+    # and that target's filter name the same module, so a case moving out of it
+    # runs in both places rather than in neither.
+    args = [
+        "--skip",
+        "reload::mqtt_broker_tests::",
+    ],
     crate = ":brenn-bootstrap",
     # The moved dispatch suite and the verified-load acceptance cases load the
     # demo guest, and the replay acceptance case its own; the harness names them as
@@ -90,6 +99,83 @@ rust_test(
         "//brenn-common",
         "//brenn-db",
         # Test-only: fixture-text macros.
+        "//brenn-dsl",
+        "//brenn-git",
+        "//brenn-graf",
+        "//brenn-hooks",
+        "//brenn-envelope",
+        "//brenn-lib",
+        "//brenn-cc-profile",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-messaging-boot",
+        "//brenn-mqtt",
+        "//brenn-obs",
+        "//brenn-pfin",
+        "//brenn-pwa-push",
+        "//brenn-remote-server",
+        "//brenn-render",
+        "//brenn-server",
+        "//brenn-tool-registry",
+        "//brenn-wasm",
+        "//brenn-wasm-dispatch",
+        "//brenn-usage-db",
+        "//brenn-webhook",
+        "//surface/schema",
+        "//surface/server",
+    ],
+)
+
+# Reload's MQTT convergence against a real broker. Same binary as the suite
+# above, filtered to the one module that spawns `mosquitto` — a second target
+# rather than a second binary, so the cases live beside the fixtures they boot
+# and the hermetic suite keeps its hermeticity.
+#
+# The env gate and the PATH pin match `//brenn-mqtt:mqtt_integration`: an unset
+# gate is a target that lost its `env`, which the module panics on rather than
+# skipping, and Debian-family packaging puts the daemon in /usr/sbin, off a test
+# action's default PATH.
+#
+# Three cases. Two are a broker spawn and a reload each; the third compares a
+# reloaded process against a fresh boot, twice, and each comparison boots two
+# processes and reloads once against the broker. The binary finishes in 14.5s
+# locally — 4.9s for the first two cases, 9.6s for the comparison case.
+# `large` (900s), not `medium` (300s): at the repo's one measured
+# local-to-CD-runner factor for a suite of this shape, ~21x (see the wiring
+# suite above), that is ~330s on a loaded capacity-1 runner, past the medium
+# budget and inside the large one. The budget is sized for the readiness and
+# connect waits on that runner, not the assertions. Re-measure both numbers
+# when the suite grows again rather than carrying this arithmetic forward: a
+# stale justification is what stops the next person from measuring.
+rust_test(
+    name = "brenn-bootstrap_mqtt_broker_test",
+    size = "large",
+    args = ["reload::mqtt_broker_tests::"],
+    crate = ":brenn-bootstrap",
+    data = [
+        "//:brenn_configs",
+        "//brenn-wasm:fixture_processor_config",
+        "//brenn-wasm:fixture_processor_demo",
+        "//brenn-wasm:fixture_processor_dual",
+        "//brenn-wasm:fixture_replay",
+    ],
+    edition = "2024",
+    # BRENN_MQTT_INTEGRATION is brenn_mqtt::test_support::BROKER_GATE, read by
+    # broker_available(); dropping it here turns every broker case into a panic
+    # rather than a silent skip.
+    env = {
+        "BRENN_MQTT_INTEGRATION": "1",
+        "PATH": "/bin:/usr/bin:/usr/local/bin:/usr/sbin:/usr/local/sbin",
+    },
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-bootstrap"},
+    tags = ["requires-network"],
+    deps = all_crate_deps(normal_dev = True) + [
+        "//attach/proto",
+        "//attach/server",
+        "//brenn-automation",
+        "//brenn-common",
+        "//brenn-db",
         "//brenn-dsl",
         "//brenn-git",
         "//brenn-graf",

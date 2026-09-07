@@ -359,6 +359,8 @@ pub fn render_connect_indicator(state: ConnectIndicatorState) {
         // Terminal: generic text only (the fatal detail stays in the diagnostic
         // path), styled as a dead end via the `failed` state hook.
         ConnectIndicatorState::Failed => ("Connection failed", "failed"),
+        // Distinct from `Failed`: the connection was fine, the surface was removed.
+        ConnectIndicatorState::Retired => ("This surface has been retired", "retired"),
     };
     indicator.set_text_content(Some(text));
     indicator

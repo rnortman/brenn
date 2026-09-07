@@ -142,9 +142,13 @@ async fn surface_static(
     req: Request<Body>,
 ) -> Response {
     let path = req.uri().path().trim_start_matches('/');
+    // One clone of the current root set, resolved before any await: a reload
+    // swapping the roots mid-request leaves this request serving the tree it
+    // resolved against, which is the tree the page manifest was written for.
+    let roots = state.surface_roots();
     let root = match brenn_surface_server::processor_kind_from_path(path) {
-        Some(kind) => state.surface_roots.kind_root(kind),
-        None => state.surface_roots.kernel.as_deref(),
+        Some(kind) => roots.kind_root(kind),
+        None => roots.kernel.as_ref().map(|kernel| kernel.root.as_path()),
     };
     let Some(root) = root else {
         // The nested service sees the path with `/surface-static` stripped, and
@@ -387,10 +391,15 @@ pub fn build_router(
         .route("/remote/{slug}/ws", get(remote::remote_ws_handler));
 
     // Per-endpoint inbound webhook routes. Registered only when a WebhookService
-    // is configured. Each endpoint gets its own literal mount path (e.g.
-    // `/webhooks/phonebuddy`) with a per-endpoint `DefaultBodyLimit` and an
-    // `Extension(EndpointSlug(...))` so the shared handler knows which endpoint
-    // is being addressed.
+    // is configured. Each endpoint gets its own literal mount path, built once
+    // here, which is why a reload refuses a `webhook:` channel that moved.
+    // TODO(reload-webhooks): one wildcard `/webhooks/{*tail}` route over a
+    // swappable endpoint table, with the per-endpoint body ceiling applied
+    // in-handler, so the endpoint set converges.
+    //
+    // Each endpoint's path (e.g. `/webhooks/phonebuddy`) carries a
+    // per-endpoint `DefaultBodyLimit` and an `Extension(EndpointSlug(..))`
+    // so the shared handler knows which endpoint is being addressed.
     let utility_routes = if let Some(ref webhook_svc) = state.webhook {
         let endpoints: Vec<_> = webhook_svc.all_endpoints().cloned().collect();
         endpoints.iter().fold(utility_routes, |router, ep| {
@@ -1849,16 +1858,22 @@ mod tests {
         );
 
         let db = crate::test_support::init_db_memory();
-        let mut state = test_state(&db);
-        state.surface_roots = brenn_surface_server::SurfaceRoots {
-            kernel: Some(brenn.path().to_path_buf()),
+        let state = test_state(&db);
+        state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+            kernel: Some(brenn_surface_server::KernelRoot::for_test(brenn.path())),
             kinds: [
-                ("chrome".to_string(), brenn.path().to_path_buf()),
-                ("demo-panel".to_string(), bundle.path().to_path_buf()),
+                (
+                    "chrome".to_string(),
+                    brenn_surface_server::KindRoot::for_test(brenn.path().to_path_buf()),
+                ),
+                (
+                    "demo-panel".to_string(),
+                    brenn_surface_server::KindRoot::for_test(bundle.path().to_path_buf()),
+                ),
             ]
             .into_iter()
             .collect(),
-        };
+        }));
         let app = build_router(state, None, 0, 2576)
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
         let (session_token, _) = setup_authenticated_user(&db).await;
@@ -1907,15 +1922,76 @@ mod tests {
         assert_eq!(unmapped.status(), StatusCode::NOT_FOUND);
     }
 
-    /// A surface-less deployment — no `--surface` at all, which is legal and is
+    #[tokio::test]
+    async fn surface_static_serves_from_whichever_roots_are_installed() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let write = |dir: &std::path::Path, name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write(first.path(), "processor/chrome/chrome.js", "// v1");
+        write(second.path(), "processor/chrome/chrome.js", "// v2");
+
+        let roots = |dir: &std::path::Path| {
+            std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+                kernel: Some(brenn_surface_server::KernelRoot::for_test(dir)),
+                kinds: [(
+                    "chrome".to_string(),
+                    brenn_surface_server::KindRoot::for_test(dir.to_path_buf()),
+                )]
+                .into_iter()
+                .collect(),
+            })
+        };
+
+        let db = crate::test_support::init_db_memory();
+        let state = test_state(&db);
+        state.set_surface_roots(roots(first.path()));
+        let app = build_router(state.clone(), None, 0, 2576)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+        let (session_token, _) = setup_authenticated_user(&db).await;
+
+        let fetch = async |path: &str| {
+            app.clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("cookie", format!("brenn_session={session_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+
+        let before = fetch("/surface-static/processor/chrome/chrome.js").await;
+        assert_eq!(before.status(), StatusCode::OK);
+        assert_eq!(body_string(before.into_body()).await, "// v1");
+
+        state.set_surface_roots(roots(second.path()));
+        let after = fetch("/surface-static/processor/chrome/chrome.js").await;
+        assert_eq!(after.status(), StatusCode::OK);
+        assert_eq!(body_string(after.into_body()).await, "// v2");
+
+        state.set_surface_roots(std::sync::Arc::new(
+            brenn_surface_server::SurfaceRoots::default(),
+        ));
+        let withdrawn = fetch("/surface-static/processor/chrome/chrome.js").await;
+        assert_eq!(withdrawn.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A surface-less deployment — no mount offers a surface tree, which is legal and is
     /// what `SurfaceRoots::default()` is. There is no tree to fall back to, so
     /// every request under the prefix is a 404 rather than a read rooted at
     /// whatever the process's working directory happens to be.
     #[tokio::test]
     async fn surface_static_404s_everything_on_a_surface_less_deployment() {
         let db = crate::test_support::init_db_memory();
-        let mut state = test_state(&db);
-        state.surface_roots = brenn_surface_server::SurfaceRoots::default();
+        let state = test_state(&db);
+        state.set_surface_roots(std::sync::Arc::new(
+            brenn_surface_server::SurfaceRoots::default(),
+        ));
         let app = build_router(state, None, 0, 2576)
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
         let (session_token, _) = setup_authenticated_user(&db).await;
@@ -2305,10 +2381,10 @@ mod tests {
         let db = crate::test_support::init_db_memory();
         let mut state = test_state(&db);
         state.static_dir = tmp.path().to_path_buf();
-        state.surface_roots = brenn_surface_server::SurfaceRoots {
-            kernel: Some(tmp.path().to_path_buf()),
+        state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+            kernel: Some(brenn_surface_server::KernelRoot::for_test(tmp.path())),
             kinds: std::collections::BTreeMap::new(),
-        };
+        }));
         let app = build_router(state, Some(sec), 1, 2576)
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
         let (session_token, _) = setup_authenticated_user(&db).await;

@@ -236,8 +236,12 @@ mod tests {
     fn parsed_span() -> Span {
         let file = crate::parse_str("acl subscribe [exact \"brenn:alice.cmd\"];\n", "main.brenn")
             .expect("a top-level acl parses");
-        let mut errors = crate::resolve_files(vec![(String::new(), file)], "")
-            .expect_err("a top-level acl is refused at resolve");
+        let mut errors = crate::resolve_files(
+            vec![(String::new(), file)],
+            "",
+            crate::DocumentRole::Deployment,
+        )
+        .expect_err("a top-level acl is refused at resolve");
         errors.pop().expect("one refusal").span
     }
 

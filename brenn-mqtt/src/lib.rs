@@ -20,15 +20,22 @@
 //! - `service`    — `MqttService`, `MqttEventRouter` trait.
 //! - `connection` — unified per-client supervisor (`spawn_client_supervisor`) plus
 //!   subscription helpers (`union_subscriptions`, `assert_ingress_subscription`).
+//! - `test_support` — a `mosquitto` harness and its throwaway TLS material, for
+//!   this crate's integration suite and for the crates above that drive ingress
+//!   through a real broker. Behind the `testutils` feature.
 
 pub mod connection;
 pub mod egress;
 pub mod payload;
 pub mod service;
 pub mod state;
+#[cfg(feature = "testutils")]
+pub mod test_support;
 
 pub use connection::{spawn_client_supervisor, union_subscriptions};
 pub use egress::{MqttEgressError, SendBudget, enforce_and_publish};
 pub use payload::{InboundPayload, OutboundPayload, classify_inbound, decode_outbound_body};
-pub use service::{MqttEventRouter, MqttService};
+pub use service::{
+    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService,
+};
 pub use state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle};

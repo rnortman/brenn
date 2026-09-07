@@ -203,6 +203,23 @@ impl<'a> AttachScope<'a> {
         }
     }
 
+    /// Whether `principal` is this scope's own — the attacher's bare identity or
+    /// one of its sub-identities.
+    ///
+    /// The keyspace test behind every whole-scope operation on a principal-keyed
+    /// map: a surface owns `surface:<slug>` and every `surface:<slug>#<instance>`
+    /// and nothing else. The `#` is what stops a prefix match from claiming a
+    /// sibling whose slug merely starts with this one's, since neither slug
+    /// charset admits it.
+    pub fn covers(&self, principal: &str) -> bool {
+        let bare = self.principal(None);
+        let bare = bare.as_str();
+        principal == bare
+            || (principal.len() > bare.len()
+                && principal.starts_with(bare)
+                && principal.as_bytes()[bare.len()] == b'#')
+    }
+
     /// The key this attacher's live sessions are registered under in the shared
     /// attach registry.
     ///
@@ -795,6 +812,30 @@ mod tests {
     }
 
     // --- surface sub-identity (`surface:<slug>#<instance>`) ---
+
+    /// The keyspace test behind every whole-scope budget operation: a surface
+    /// owns its bare identity and its instances, and nothing that merely starts
+    /// with its name.
+    #[test]
+    fn a_scope_covers_its_own_principals_and_no_others() {
+        let scope = AttachScope::surface("kitchen");
+        assert!(scope.covers("surface:kitchen"));
+        assert!(scope.covers("surface:kitchen#agenda"));
+        assert!(!scope.covers("surface:kitchenette"));
+        assert!(!scope.covers("surface:kitchenette#agenda"));
+        assert!(!scope.covers("surface:kitche"));
+        assert!(!scope.covers("remote:kitchen"));
+    }
+
+    /// The two attach keyspaces may carry the same slug, and a scope in one of
+    /// them must not claim the other's principals.
+    #[test]
+    fn a_remote_scope_covers_only_the_remote_keyspace() {
+        let scope = AttachScope::remote("kitchen");
+        assert!(scope.covers("remote:kitchen"));
+        assert!(!scope.covers("surface:kitchen"));
+        assert!(!scope.covers("remote:kitchen-2"));
+    }
 
     #[test]
     fn for_surface_component_format() {

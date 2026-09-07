@@ -35,6 +35,7 @@
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::access::acl::ChannelMatcher;
+use brenn_lib::config::MountsConfig;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -167,6 +168,70 @@ pub struct StatusDelta {
     /// routes, sizes or authorizes, which is why they are listed apart from
     /// `channels_changed`.
     pub channels_described: Vec<String>,
+    /// `mqtt:<client>:<filter>` for every broker subscription this reload
+    /// asserted. A filter whose qos moved is here and in `mqtt_unsubscribed`
+    /// both: raising a qos is taking the filter out and putting it back.
+    pub mqtt_subscribed: Vec<String>,
+    /// `mqtt:<client>:<filter>` for every broker subscription this reload
+    /// withdrew.
+    pub mqtt_unsubscribed: Vec<String>,
+    /// The subset of the two lists above the broker did not take at commit
+    /// time: the client was disconnected, or the send failed on a session whose
+    /// event loop is already dying. Both converge on the supervisor's next
+    /// connect, which re-asserts the whole set — so this is "not yet", not
+    /// "failed".
+    pub mqtt_deferred: Vec<String>,
+    /// Slugs of the surfaces this reload started, retired, and replaced. A
+    /// surface whose resolved value did not move belongs in `surfaces_changed`
+    /// too when a channel it binds or a kind it instantiates did: what it runs
+    /// is re-derived either way. Every slug here had its live pages closed and
+    /// its wiring rebuilt by the reload that reported it.
+    pub surfaces_added: Vec<String>,
+    pub surfaces_removed: Vec<String>,
+    pub surfaces_changed: Vec<String>,
+    /// Surface component kinds the declared mounts install differently than the
+    /// process was serving them — a bundle upgrade, a kind withdrawn with its
+    /// mount, a kind a newly declared mount offers.
+    ///
+    /// A kind named here promoted every surface instantiating it into
+    /// `surfaces_changed`; one that no surface instantiates is reported and
+    /// nothing else.
+    pub kinds_changed: Vec<String>,
+}
+
+/// One declared mount, as the status body reports it.
+///
+/// The whole of what the host may read and serve is under these paths, so a
+/// reader asking "which release of that bundle is this process running" is
+/// asking this list. `path` is the canonical path — the symlink an installer
+/// swaps is resolved once, at the read this body reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusMount {
+    pub name: String,
+    pub path: String,
+    pub version: String,
+    /// Which of `components`, `surface`, `modules` the mount offers.
+    pub trees: Vec<String>,
+}
+
+impl StatusMount {
+    /// The mounts a [`MountsConfig`] holds, in declaration order.
+    pub fn of(mounts: &MountsConfig) -> Vec<Self> {
+        mounts
+            .mounts
+            .iter()
+            .map(|mount| Self {
+                name: mount.name.clone(),
+                path: mount.path.display().to_string(),
+                version: mount.version.clone(),
+                trees: mount
+                    .trees
+                    .iter()
+                    .map(|tree| tree.dir_name().to_string())
+                    .collect(),
+            })
+            .collect()
+    }
 }
 
 /// One outcome, as published.
@@ -192,6 +257,10 @@ pub struct ReloadStatus {
     /// reader compares against a hash of the tree on disk.
     pub running_document_sha256: String,
     pub delta: StatusDelta,
+    /// The mounts the host is reading trees out of: the candidate's on
+    /// `applied` and `unchanged`, the running document's on `refused`, since a
+    /// refusal changed nothing.
+    pub mounts: Vec<StatusMount>,
     /// Why the document was not applied, one line per reason. Empty unless the
     /// outcome is `refused`.
     ///
@@ -208,7 +277,7 @@ pub struct ReloadStatus {
 impl ReloadStatus {
     /// The outcome boot publishes: this process now projects this document, and
     /// nothing has been asked of it yet.
-    pub fn booted(document_sha256: String, root: Option<String>) -> Self {
+    pub fn booted(document_sha256: String, root: Option<String>, mounts: &MountsConfig) -> Self {
         Self {
             v: STATUS_VERSION,
             outcome: Outcome::Booted,
@@ -219,6 +288,7 @@ impl ReloadStatus {
             root,
             running_document_sha256: document_sha256,
             delta: StatusDelta::default(),
+            mounts: StatusMount::of(mounts),
             refusals: Vec::new(),
         }
     }
@@ -454,7 +524,11 @@ mod tests {
             outcome: Outcome::Refused,
             trigger: Trigger::Bus,
             refusals,
-            ..ReloadStatus::booted("abc".to_string(), Some("/etc/brenn/main.brenn".to_string()))
+            ..ReloadStatus::booted(
+                "abc".to_string(),
+                Some("/etc/brenn/main.brenn".to_string()),
+                &MountsConfig::default(),
+            )
         }
     }
 
@@ -508,7 +582,11 @@ mod tests {
                     .collect(),
                 ..StatusDelta::default()
             },
-            ..ReloadStatus::booted("abc".to_string(), Some("/etc/brenn/main.brenn".to_string()))
+            ..ReloadStatus::booted(
+                "abc".to_string(),
+                Some("/etc/brenn/main.brenn".to_string()),
+                &MountsConfig::default(),
+            )
         };
         assert!(status.body().len() > 65_536, "the fixture must not fit");
         assert!(fitted(&status, 65_536).is_none());
@@ -598,7 +676,11 @@ mod tests {
     }
 
     fn booted() -> ReloadStatus {
-        ReloadStatus::booted("abc123".to_string(), Some("/etc/brenn.brenn".to_string()))
+        ReloadStatus::booted(
+            "abc123".to_string(),
+            Some("/etc/brenn.brenn".to_string()),
+            &MountsConfig::default(),
+        )
     }
 
     #[test]
@@ -631,6 +713,12 @@ mod tests {
                 channels_described: vec!["brenn:notes".to_string()],
                 ..Default::default()
             },
+            mounts: vec![StatusMount {
+                name: "brenn".to_string(),
+                path: "/home/brenn/brenn/release".to_string(),
+                version: "0.20.0".to_string(),
+                trees: vec!["components".to_string(), "modules".to_string()],
+            }],
             refusals: vec!["apps[assistant] differs: this change needs a restart".to_string()],
         };
         let parsed: ReloadStatus =

@@ -4,7 +4,7 @@
 //! `webhook_router.rs`: an inbound MQTT message is wrapped in a typed
 //! `MqttEnvelope` and published to its `mqtt:<client>:<topic>` bus channel via
 //! `Messenger::publish_transport_ingress`. There is no singleton conversation,
-//! no `submit_ingress`, and no per-app conversation cache (design §2.6/§2.8).
+//! no `submit_ingress`, and no per-app conversation cache.
 //!
 //! Uses the same deferred-state pattern as `WebhookEventRouterImpl`: the
 //! `AppState` is not yet constructed when the connection supervisors are spawned,
@@ -34,7 +34,7 @@ use crate::state::AppState;
 /// `set_state` time. The router matches inbound `(client_slug, topic)` against
 /// the `(client_slug, topic_filter)` of each route and, on a match, publishes an
 /// `MqttEnvelope` to the route's `mqtt:<client>:<topic>` channel with `urgency`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngressRoute {
     /// Client this channel subscribes on (the ACL/provenance boundary).
     pub client_slug: String,
@@ -49,10 +49,24 @@ pub struct IngressRoute {
     pub urgency: Urgency,
 }
 
+impl From<&brenn_lib::mqtt::config::ResolvedMqttIngressChannel> for IngressRoute {
+    /// The single projection both boot and reload share, so the two cannot
+    /// diverge in what they carry.
+    fn from(channel: &brenn_lib::mqtt::config::ResolvedMqttIngressChannel) -> Self {
+        Self {
+            client_slug: channel.client_slug.clone(),
+            topic_filter: channel.topic.clone(),
+            channel_address: channel.channel_address.clone(),
+            channel_uuid: channel.channel_uuid,
+            urgency: channel.urgency,
+        }
+    }
+}
+
 /// State bundle stored in `MqttEventRouterImpl`'s inner `OnceCell`.
 ///
 /// `app_state` is write-once (set at `set_state`, never replaced). `routes` is
-/// behind an `RwLock` so a runtime `mqtt:` subscribe (design §2.3) can push a new
+/// behind an `RwLock` so a runtime `mqtt:` subscribe can push a new
 /// `IngressRoute` while `deliver_inbound` keeps scanning the table under a brief
 /// read-lock. The `OnceCell` itself is still set exactly once (the deferred
 /// `AppState` wiring); only the route set inside it mutates afterward.
@@ -61,7 +75,7 @@ struct RouterState {
     /// Ingress routing table. One entry per distinct ingress channel.
     /// Matching is linear; the table is small (one entry per declared channel)
     /// and only consulted per inbound message. Mutable so runtime subscribes
-    /// (§2.3) can add a route; `deliver_inbound` reads under a read-lock.
+    /// can add a route; `deliver_inbound` reads under a read-lock.
     routes: RwLock<Vec<IngressRoute>>,
 }
 
@@ -96,9 +110,9 @@ impl MqttEventRouterImpl {
             .expect("MqttEventRouterImpl state already set");
     }
 
-    /// Add an ingress route at runtime (design §2.3 step 6: a dynamic `mqtt:`
-    /// subscribe to a new topic filter needs a matching `IngressRoute` so
-    /// `deliver_inbound` routes the broker's deliveries to the new channel).
+    /// Add an ingress route at runtime. A dynamic `mqtt:` subscribe to a new
+    /// topic filter needs a matching `IngressRoute` so `deliver_inbound` routes
+    /// the broker's deliveries to the new channel.
     ///
     /// **Idempotent on `channel_uuid`** (correctness-1): a route is added only if
     /// no route for that channel already exists; a second subscriber joining an
@@ -129,11 +143,32 @@ impl MqttEventRouterImpl {
         true
     }
 
-    /// Remove the ingress route for `channel_uuid` at runtime (design §2.3
-    /// unsubscribe: a dynamic `mqtt:` unsubscribe that removes the last subscriber
-    /// on a filter drops the matching `IngressRoute` so the broker's deliveries on
-    /// that filter — should any still arrive before the UNSUBSCRIBE takes effect —
-    /// no longer route to the now-unsubscribed channel).
+    /// The channel uuid of every route in the table, in insertion order.
+    ///
+    /// The route set is the half of an `mqtt:` channel's runtime that nothing
+    /// else can be asked about: the directory knows the entry and the service
+    /// knows the filter, and a reload that moved one without the other is
+    /// exactly the drift a test has to be able to see.
+    ///
+    /// Empty before `set_state`, which is honest — there is no table yet.
+    pub fn route_uuids(&self) -> Vec<Uuid> {
+        let Some(router_state) = self.inner.get() else {
+            return Vec::new();
+        };
+        router_state
+            .routes
+            .read()
+            .expect("mqtt router routes lock poisoned")
+            .iter()
+            .map(|route| route.channel_uuid)
+            .collect()
+    }
+
+    /// Remove the ingress route for `channel_uuid` at runtime. A dynamic `mqtt:`
+    /// unsubscribe that removes the last subscriber on a filter drops the matching
+    /// `IngressRoute` so the broker's deliveries on that filter — should any still
+    /// arrive before the UNSUBSCRIBE takes effect — no longer route to the
+    /// now-unsubscribed channel.
     ///
     /// `channel_uuid` is the route's stable identity (one route per distinct
     /// ingress channel), so the removal is keyed on it rather than the

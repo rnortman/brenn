@@ -9,6 +9,19 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
+/// The components trees of the named mounts, as a host derives them: every
+/// cross-root refusal names the mount, so a fixture that named roots any other
+/// way would assert wording no host produces.
+fn mount_roots(mounts: &[(&str, &Path)]) -> RootList {
+    RootList::mounts(
+        "components",
+        mounts
+            .iter()
+            .map(|(name, path)| ((*name).to_string(), path.to_path_buf()))
+            .collect(),
+    )
+}
+
 const NAME: &str = "probe";
 
 /// The artifact's built basename, deliberately unrelated to the package name:
@@ -60,8 +73,8 @@ impl Root {
         self.dir.path()
     }
 
-    /// This root as the one-entry list a host started with one `--components`
-    /// resolves against.
+    /// This root as the one-entry list a host with one mount offering a
+    /// `components/` tree resolves against.
     fn roots(&self) -> Vec<PathBuf> {
         vec![self.dir.path().to_path_buf()]
     }
@@ -386,8 +399,8 @@ fn an_empty_package_name_is_refused_before_it_resolves_to_the_root() {
 }
 
 #[test]
-#[should_panic(expected = "without --components")]
-fn a_load_with_no_components_root_names_the_flag_that_is_missing() {
+#[should_panic(expected = "no declared mount offers a `components/` tree")]
+fn a_load_with_no_components_root_names_what_should_have_offered_one() {
     require_components_root(&[], "consumer \"demo\"");
 }
 
@@ -398,14 +411,14 @@ fn a_components_root_that_was_passed_is_handed_straight_back() {
         require_components_root(&root.roots(), "consumer \"demo\""),
         root.roots()
     );
-    assert_components_root(root.path());
+    assert_components_roots(&mount_roots(&[("brenn", root.path())]));
 }
 
 #[test]
-#[should_panic(expected = "which is not a directory")]
+#[should_panic(expected = "is not a directory")]
 fn a_components_root_that_is_not_a_directory_is_refused_at_startup() {
     let root = Root::replay(b"replay bytes");
-    assert_components_root(&root.package().join(ARTIFACT));
+    assert_components_roots(&mount_roots(&[("brenn", &root.package().join(ARTIFACT))]));
 }
 
 // ── the config↔package binding ───────────────────────────────────────────────
@@ -450,8 +463,8 @@ fn a_replay_endpoint_pointed_at_a_processor_package_is_refused() {
 
 // ── more than one components root ────────────────────────────────────────────
 //
-// A host started with one `--components` per installed release. A package is
-// under exactly one of them.
+// A host with one mount per installed release. A package is under exactly one
+// of them.
 
 #[test]
 fn a_package_resolves_in_whichever_root_holds_it() {
@@ -463,7 +476,10 @@ fn a_package_resolves_in_whichever_root_holds_it() {
     let verified = verify_consumer(&roots, NAME, "demo", &sha256_hex(SPEC.as_bytes()));
     assert_eq!(verified.artifact, brenn.package().join(ARTIFACT));
     assert_eq!(verified.root, brenn.path());
-    assert_disjoint_components_roots(&roots);
+    assert_disjoint_components_roots(&mount_roots(&[
+        ("demo", bundle.path()),
+        ("brenn", brenn.path()),
+    ]));
 }
 
 /// The text of the refusal `f` panics with.
@@ -484,7 +500,8 @@ fn a_package_no_root_holds_is_refused_naming_every_root() {
         verify_consumer(&roots, "panel", "demo", &sha256_hex(SPEC.as_bytes()));
     });
     assert!(
-        message.contains("is not an installed package directory under any --components root"),
+        message
+            .contains("is not an installed package directory under any mount's `components/` tree"),
         "{message}"
     );
     assert!(
@@ -507,7 +524,7 @@ fn a_package_under_two_roots_is_refused_at_resolution() {
     });
     assert!(
         message.contains(&format!(
-            "is installed under more than one --components root: {}, {}.",
+            "is installed under more than one mount's `components/` tree: {}, {}.",
             first.package().display(),
             second.package().display()
         )),
@@ -516,8 +533,8 @@ fn a_package_under_two_roots_is_refused_at_resolution() {
 }
 
 #[test]
-#[should_panic(expected = "without --components")]
-fn a_resolution_against_no_roots_names_the_flag_rather_than_an_empty_list() {
+#[should_panic(expected = "no declared mount offers a `components/` tree")]
+fn a_resolution_against_no_roots_names_the_mounts_rather_than_an_empty_list() {
     // The public `verify_*` entry points do not rely on their caller having
     // gone through `require_components_root` first.
     verify_replay(&[], NAME, "tap");
@@ -533,38 +550,37 @@ fn every_cross_root_fault_is_in_the_one_refusal() {
     std::fs::create_dir(second.path().join("relay")).unwrap();
     let mut trailing = first.path().as_os_str().to_os_string();
     trailing.push("/");
-    let roots = [
-        first.path().to_path_buf(),
-        second.path().to_path_buf(),
-        PathBuf::from(trailing),
-    ];
+    let roots = mount_roots(&[
+        ("brenn", first.path()),
+        ("demo", second.path()),
+        ("brenn", &PathBuf::from(trailing)),
+    ]);
     let message = refusal(|| assert_disjoint_components_roots(&roots));
     assert!(message.contains("name the same directory"), "{message}");
     assert!(
         message.contains(&format!(
-            "component package `{NAME}` is installed under more than one --components root: {}, {}.",
-            first.path().display(),
-            second.path().display()
+            "component package `{NAME}` is installed under more than one mount: brenn, demo."
         )),
         "{message}"
     );
     assert!(
-        message.contains(&format!(
-            "component package `relay` is installed under more than one --components root: {}, {}.",
-            first.path().display(),
-            second.path().display()
-        )),
+        message.contains(
+            "component package `relay` is installed under more than one mount: brenn, demo."
+        ),
         "{message}"
     );
 }
 
 #[test]
-#[should_panic(expected = "is installed under more than one --components root")]
+#[should_panic(expected = "is installed under more than one mount")]
 fn a_package_under_two_roots_is_refused_before_anything_resolves_it() {
     // Same install, checked at startup with no consumer configured at all.
     let first = Root::processor(b"artifact bytes", SPEC);
     let second = Root::replay(b"replay bytes");
-    assert_disjoint_components_roots(&[first.path().to_path_buf(), second.path().to_path_buf()]);
+    assert_disjoint_components_roots(&mount_roots(&[
+        ("brenn", first.path()),
+        ("demo", second.path()),
+    ]));
 }
 
 #[test]
@@ -573,7 +589,10 @@ fn the_same_root_named_twice_is_refused_as_one_directory() {
     let root = Root::replay(b"replay bytes");
     let mut trailing = root.path().as_os_str().to_os_string();
     trailing.push("/");
-    assert_disjoint_components_roots(&[root.path().to_path_buf(), PathBuf::from(trailing)]);
+    assert_disjoint_components_roots(&mount_roots(&[
+        ("brenn", root.path()),
+        ("brenn", &PathBuf::from(trailing)),
+    ]));
 }
 
 #[test]
@@ -584,5 +603,8 @@ fn a_plain_file_in_a_root_is_not_a_package_name() {
     let first = Root::replay(b"replay bytes");
     let second = tempfile::tempdir().unwrap();
     std::fs::write(second.path().join(NAME), b"a stray file").unwrap();
-    assert_disjoint_components_roots(&[first.path().to_path_buf(), second.path().to_path_buf()]);
+    assert_disjoint_components_roots(&mount_roots(&[
+        ("brenn", first.path()),
+        ("demo", second.path()),
+    ]));
 }

@@ -228,7 +228,8 @@ fn resolve_db_path(
     if let Some(p) = explicit {
         return Ok(p);
     }
-    let cfg = config::load_config(config_path.as_deref(), module_roots);
+    let module_roots = config::RootList::from(module_roots.to_vec());
+    let cfg = config::load_config(config_path.as_deref(), &module_roots);
     Ok(cfg.config.database.path)
 }
 

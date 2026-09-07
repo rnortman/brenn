@@ -1,7 +1,7 @@
 // MQTT integration test suite.
 //
-// Gate: `BRENN_MQTT_INTEGRATION=1`, which the test target sets. Without it every
-// test panics rather than skipping, so a missing gate cannot read as a pass.
+// Gate: `brenn_mqtt::broker_gate!`, which lives beside the broker harness so
+// every suite that needs a broker makes the run-or-skip decision one way.
 //
 // Run: bazel test //brenn-mqtt:mqtt_integration
 
@@ -15,42 +15,17 @@ use brenn_lib::access::acl::{AclSet, MqttClientMatcher};
 use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::mqtt::address::MqttAddress;
 use brenn_lib::mqtt::config::TlsVersionMin;
+use brenn_mqtt::broker_gate;
 use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
 use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
 use common::{
-    BrokerHarness, SpawnedClient, TcpRelay, await_puback, certs, direct_publisher_acked,
-    direct_subscriber, recv_delivery, spawn_client, spawn_client_tls13, spawn_client_with_config,
-    subscribe_live_confirmed, test_client_config, wait_for_health,
+    BrokerHarness, SpawnedClient, TcpRelay, await_puback, broker_auth, broker_tls13, certs,
+    direct_publisher_acked, direct_subscriber, recv_delivery, spawn_client, spawn_client_tls13,
+    spawn_client_with_config, subscribe_live_confirmed, test_client_config, wait_for_health,
 };
 use rumqttc::mqttbytes::QoS;
-
-/// Set by Bazel's test runner in every test action; no other runner sets it.
-const BAZEL_TEST_MARKER: &str = "TEST_SRCDIR";
-
-/// The suite's opt-in gate: unset, every test early-returns without spawning a
-/// broker.
-///
-/// Cargo leaves the gate to the developer. Bazel's `mqtt_integration` target
-/// sets it unconditionally, so an unset gate under Bazel means the target lost
-/// its `env` entry — a skip would silently pass over nothing asserted. Under
-/// Bazel it is a panic.
-macro_rules! integration_gate {
-    () => {
-        if std::env::var_os("BRENN_MQTT_INTEGRATION").is_none() {
-            assert!(
-                std::env::var_os(BAZEL_TEST_MARKER).is_none(),
-                "BRENN_MQTT_INTEGRATION is unset under Bazel's test runner \
-                 ({BAZEL_TEST_MARKER} is set), so every test here would skip and \
-                 report a pass over nothing asserted. The `mqtt_integration` \
-                 rule sets it in `env`; restore it in brenn-lib/BUILD.bazel."
-            );
-            eprintln!("skipping: set BRENN_MQTT_INTEGRATION=1 to run");
-            return;
-        }
-    };
-}
 
 /// A WASM-egress `AppPolicy`: the `MqttPublish` grant plus a `mqtt_publish`
 /// matcher for `client`. Hand-rolled literal-field construction because
@@ -76,7 +51,7 @@ fn wasm_egress_policy(client: &str) -> AppPolicy {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_qos1_text_delivers() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -115,7 +90,7 @@ async fn publish_qos1_text_delivers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_binary_content_type_delivers() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -149,7 +124,7 @@ async fn publish_binary_content_type_delivers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_returns_not_connected_promptly() {
-    integration_gate!();
+    broker_gate!();
 
     let mut harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -207,7 +182,7 @@ async fn disconnect_returns_not_connected_promptly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qos0_publish_returns_success_and_delivers() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -248,9 +223,9 @@ async fn qos0_publish_returns_success_and_delivers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls13_connect_publish_delivers() {
-    integration_gate!();
+    broker_gate!();
 
-    let harness = BrokerHarness::start_tls13();
+    let harness = broker_tls13();
     let ca = certs::ca_pem_bytes();
     let SpawnedClient { svc, handle, .. } =
         spawn_client_tls13("tls13", &harness, ca.clone(), vec![]).await;
@@ -281,7 +256,7 @@ async fn tls13_connect_publish_delivers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_reports_disconnected_broker_alive() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -324,7 +299,7 @@ async fn stop_reports_disconnected_broker_alive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn self_publish_echoes_back_on_same_session() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -382,7 +357,7 @@ async fn self_publish_echoes_back_on_same_session() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_egress_publish_reaches_broker() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -418,7 +393,7 @@ async fn wasm_egress_publish_reaches_broker() {
 // broker-rejected publish maps to BrokerRejected with a non-empty reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_egress_broker_rejected_maps_reason() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -468,7 +443,7 @@ async fn wasm_egress_broker_rejected_maps_reason() {
 // brenn-side ACL deny (client not in the policy's mqtt_publish matcher).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_egress_acl_denied() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -504,7 +479,7 @@ async fn wasm_egress_acl_denied() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_subscribe_filter_live_delivers() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -596,7 +571,7 @@ async fn ingress_subscribe_filter_live_delivers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_unsubscribe_filter_live_stops_delivery() {
-    integration_gate!();
+    broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
@@ -702,7 +677,7 @@ async fn ingress_unsubscribe_filter_live_stops_delivery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_reasserts_filters_and_fails_pending_publish() {
-    integration_gate!();
+    broker_gate!();
 
     let broker = BrokerHarness::start();
     let relay = TcpRelay::start(broker.port).await;
@@ -836,9 +811,9 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_good_credentials_connects() {
-    integration_gate!();
+    broker_gate!();
 
-    let broker = BrokerHarness::start_auth();
+    let broker = broker_auth();
     let ca = certs::ca_pem_bytes();
 
     let mut config =
@@ -872,9 +847,9 @@ async fn auth_good_credentials_connects() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_bad_credentials_drives_failed_with_reason() {
-    integration_gate!();
+    broker_gate!();
 
-    let broker = BrokerHarness::start_auth();
+    let broker = broker_auth();
     let ca = certs::ca_pem_bytes();
 
     let auth_filter = "brenn/itest/auth/#";

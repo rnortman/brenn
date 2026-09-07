@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use tokio::sync::Mutex;
 
 pub mod auth;
@@ -35,6 +35,14 @@ pub fn format_ts_for_db(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
+/// How long any connection to this store waits on a held lock before giving up.
+///
+/// WAL admits one writer and many readers, but a checkpoint or a commit still
+/// holds the lock for a moment. One number for every connection: a reader that
+/// waited less than the writer holds would report a missing row rather than a
+/// busy database.
+const BUSY_TIMEOUT_MS: i32 = 5000;
+
 /// Open (or create) the SQLite database file with the production pragmas set,
 /// and no migrations run.
 ///
@@ -48,11 +56,30 @@ pub fn open_connection(path: &Path) -> Connection {
     // Enforce foreign key constraints (SQLite has them off by default).
     conn.pragma_update(None, "foreign_keys", "ON")
         .expect("failed to enable foreign keys");
-    // Busy timeout: wait up to 5s if the DB is locked (WAL writer contention).
-    conn.pragma_update(None, "busy_timeout", 5000)
+    // Busy timeout: wait if the DB is locked (WAL writer contention).
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
         .expect("failed to set busy timeout");
 
     conn
+}
+
+/// Open an existing database read-only, for a reader out of process while the
+/// server holds the store.
+///
+/// Never creates and never migrates: `SQLITE_OPEN_READ_ONLY` without
+/// `SQLITE_OPEN_CREATE` fails on a missing file rather than minting an empty
+/// one, and `query_only` makes the read-only-ness a property of the connection
+/// as well as of the flags, so a statement that would write is refused by
+/// sqlite instead of by review.
+///
+/// Returns the sqlite error rather than panicking: the caller is a command-line
+/// tool whose whole job is to say which of "wrong path", "not a brenn store"
+/// and "nothing published yet" happened.
+pub fn open_connection_read_only(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    conn.pragma_update(None, "query_only", true)?;
+    Ok(conn)
 }
 
 /// Open an in-memory database with the same pragmas and no migrations run.

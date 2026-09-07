@@ -49,7 +49,7 @@ use fltk_serde_core::ParseToTargetError;
 
 use diag::Diagnostic;
 
-pub use resolve::{DocumentInputs, compile, resolve_files};
+pub use resolve::{DocumentInputs, DocumentRole, compile, resolve_files};
 pub use source::{SourceFile, document_sha256};
 
 /// The position type every diagnostic and every resolved value carries.

@@ -17,21 +17,39 @@
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use brenn_lib::config::{BrennConfig, DocumentInputs, check_config};
+use brenn_lib::config::{BrennConfig, DocumentInputs, DocumentRole, RootList, check_config};
 use brenn_lib::panic_util::{CONFIG_REFUSAL, catch_quietly, panic_message};
 use brenn_messaging_boot::resolve_messaging_offline;
+
+/// The module roots a config tool certifies against, from whichever of the two
+/// flag families the operator used.
+///
+/// Precondition: `Cli::validate` has already refused both flags at once.
+/// A declared mount that is not installed is an `Err`, because a check against
+/// roots the host does not have is a check of nothing. Neither flag yields the
+/// empty workstation list — a document with no packaged import needs no root.
+pub fn tool_module_roots(
+    mounts: Option<&Path>,
+    modules: &[std::path::PathBuf],
+) -> Result<RootList, String> {
+    let Some(path) = mounts else {
+        return Ok(modules.to_vec().into());
+    };
+    brenn_lib::config::try_load_mounts(Some(path)).map(|mounts| mounts.roots.module_roots)
+}
 
 /// Check one config file, print the verdict. Returns whether it would load.
 ///
 /// Strictly stronger than [`check_config`]: a document that compiles and lowers
 /// clean can still be refused here, by a messaging gate that reads only the
 /// configuration.
-pub fn run_config_check(file: &Path, module_roots: &[PathBuf]) -> bool {
+pub fn run_config_check(file: &Path, module_roots: &RootList) -> bool {
     let inputs = DocumentInputs {
         root: file.to_path_buf(),
-        module_roots: module_roots.to_vec(),
+        module_roots: module_roots.clone(),
+        role: DocumentRole::Deployment,
     };
     let document = match check_config(&inputs) {
         Ok(document) => document,
@@ -181,6 +199,59 @@ mod tests {
     use brenn_lib::panic_util::HOST_DEFECT;
 
     use super::*;
+
+    /// The `--mounts` arm: the roots a config tool certifies against are the
+    /// `modules/` trees the *installed* mounts offer. A bundle installer runs
+    /// this before it writes anything, so a derivation that returned an empty
+    /// list would certify a document against no vocabulary at all — a green
+    /// check for a document that panics at boot.
+    #[test]
+    fn the_mounts_arm_derives_the_installed_mounts_modules_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("release");
+        std::fs::create_dir_all(mount.join("modules")).unwrap();
+        std::fs::create_dir_all(mount.join("components")).unwrap();
+        std::fs::write(mount.join("VERSION"), "0.20.0\n").unwrap();
+        let file = dir.path().join("mounts.brenn");
+        std::fs::write(
+            &file,
+            format!("mount release {{ path = \"{}\"; }}\n", mount.display()),
+        )
+        .unwrap();
+
+        let roots = tool_module_roots(Some(&file), &[]).expect("the mount is installed");
+        assert_eq!(*roots, [mount.join("modules")]);
+    }
+
+    /// A declared mount with nothing behind it is an error rather than a
+    /// narrower root list: the tool cannot say which trees it offers.
+    #[test]
+    fn a_declared_but_missing_mount_is_an_error_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mounts.brenn");
+        std::fs::write(
+            &file,
+            format!(
+                "mount later {{ path = \"{}\"; }}\n",
+                dir.path().join("later").display()
+            ),
+        )
+        .unwrap();
+
+        let report = tool_module_roots(Some(&file), &[]).expect_err("the mount is not installed");
+        assert!(report.contains("later"), "{report}");
+    }
+
+    /// Neither flag is the empty workstation list, not a mounts read of
+    /// nothing: a document with no packaged import is checkable with no roots.
+    #[test]
+    fn neither_flag_is_the_empty_flag_sourced_list() {
+        let roots = tool_module_roots(None, &[]).expect("no flag is not a failure");
+        assert!(roots.is_empty());
+        let roots = tool_module_roots(None, &[PathBuf::from("/srv/specs")])
+            .expect("the workstation form reads no environment");
+        assert_eq!(*roots, [PathBuf::from("/srv/specs")]);
+    }
 
     /// Exercises both `run_config_check` (the boolean) and `check_config` (the
     /// text), asserting the one implication that survives their layering:
@@ -431,13 +502,13 @@ new alice_sink: Sink {
     #[test]
     fn a_document_importing_packaged_modules_checks_against_the_module_root() {
         let (_dir, file, modules) = packaged_document();
-        assert!(run_config_check(&file, &[modules]));
+        assert!(run_config_check(&file, &vec![modules].into()));
     }
 
     #[test]
     fn the_same_document_without_a_module_root_is_refused_naming_the_flag() {
         let (_dir, file, _modules) = packaged_document();
-        assert!(!run_config_check(&file, &[]));
+        assert!(!run_config_check(&file, &Default::default()));
         let report =
             check_config(&DocumentInputs::bare(file)).expect_err("the document must be refused");
         assert!(report.contains("pass `--modules <dir>`"), "{report}");
@@ -506,12 +577,16 @@ new relay: Relay {
             .concat(),
         )
         .unwrap();
-        assert!(run_config_check(&file, &[modules.clone(), bundle.clone()]));
+        assert!(run_config_check(
+            &file,
+            &vec![modules.clone(), bundle.clone()].into()
+        ));
         // Either root alone leaves exactly the other's import unresolved.
         for (root, missing) in [(&modules, "bundle"), (&bundle, "sink")] {
             let inputs = DocumentInputs {
                 root: file.clone(),
-                module_roots: vec![root.clone()],
+                module_roots: vec![root.clone()].into(),
+                role: DocumentRole::Deployment,
             };
             assert!(!run_config_check(&inputs.root, &inputs.module_roots));
             let report = check_config(&inputs).expect_err("one import must be unresolved");
@@ -537,7 +612,8 @@ new relay: Relay {
         let copy = duplicate_release(dir.path(), &modules);
         let inputs = DocumentInputs {
             root: file,
-            module_roots: vec![modules.clone(), copy.clone()],
+            module_roots: vec![modules.clone(), copy.clone()].into(),
+            role: DocumentRole::Deployment,
         };
         assert!(!run_config_check(&inputs.root, &inputs.module_roots));
         let report = check_config(&inputs).expect_err("the duplicate must be refused");
@@ -558,10 +634,11 @@ new relay: Relay {
         let copy = duplicate_release(dir.path(), &modules);
         let plain = dir.path().join("plain.brenn");
         std::fs::write(&plain, "const host = \"example.com\";\n").unwrap();
-        assert!(run_config_check(&plain, std::slice::from_ref(&modules)));
+        assert!(run_config_check(&plain, &vec![modules.clone()].into()));
         let inputs = DocumentInputs {
             root: plain,
-            module_roots: vec![modules, copy],
+            module_roots: vec![modules, copy].into(),
+            role: DocumentRole::Deployment,
         };
         assert!(!run_config_check(&inputs.root, &inputs.module_roots));
         let report = check_config(&inputs).expect_err("the duplicate must be refused");
@@ -587,13 +664,13 @@ new relay: Relay {
     /// `run_config_check` refuses it (so the pass is actually wired into the
     /// verdict).
     fn boot_gate_refusal(contents: &str) -> String {
-        gate_refusal(contents, &[])
+        gate_refusal(contents, &Default::default())
     }
 
     /// Check a document against the shipped `config/specs` module root and
     /// return the offline pass's own refusal.
     fn shipped_module_refusal(contents: &str) -> String {
-        gate_refusal(contents, &[repo_root().join("config/specs")])
+        gate_refusal(contents, &vec![repo_root().join("config/specs")].into())
     }
 
     /// A document whose classes are fenced into a packaged module, refused.
@@ -611,13 +688,14 @@ new relay: Relay {
 
     /// The body of both: write `contents` to a temporary root, check it against
     /// `module_roots`, and return the offline pass's refusal text.
-    fn gate_refusal(contents: &str, module_roots: &[PathBuf]) -> String {
+    fn gate_refusal(contents: &str, module_roots: &RootList) -> String {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let file = dir.path().join("main.brenn");
         std::fs::write(&file, contents).expect("the document is writable");
         refusal_of(&DocumentInputs {
             root: file,
-            module_roots: module_roots.to_vec(),
+            module_roots: module_roots.clone(),
+            role: DocumentRole::Deployment,
         })
     }
 
@@ -1054,7 +1132,7 @@ new alice: Assistant();
         let root = repo_root();
         let specs = root.join("config/specs");
         assert!(
-            run_config_check(&root.join(filename), std::slice::from_ref(&specs)),
+            run_config_check(&root.join(filename), &vec![specs.clone()].into()),
             "{filename} must pass config-check"
         );
         // The outcome, not the mechanism: a shipped root that stamps the
@@ -1141,7 +1219,8 @@ new alice: Assistant();
         std::fs::write(&root, contents).expect("the document is writable");
         let inputs = DocumentInputs {
             root,
-            module_roots: vec![repo_root().join("config/specs")],
+            module_roots: vec![repo_root().join("config/specs")].into(),
+            role: DocumentRole::Deployment,
         };
         match check_config(&inputs) {
             Ok(document) => document.config,
@@ -1240,7 +1319,8 @@ new alice: Assistant();
 
         let inputs = DocumentInputs {
             root,
-            module_roots: vec![repo_root().join("config/specs")],
+            module_roots: vec![repo_root().join("config/specs")].into(),
+            role: DocumentRole::Deployment,
         };
         let report = check_config(&inputs).expect_err("the pins name channels nothing declares");
         assert!(
@@ -1345,7 +1425,7 @@ surface panel {{
         )
         .expect("the document is writable");
         assert!(
-            run_config_check(&file, &[repo_root().join("config/specs")]),
+            run_config_check(&file, &vec![repo_root().join("config/specs")].into()),
             "the stamps each case below omits are the whole of what it owes",
         );
     }
@@ -1488,7 +1568,10 @@ channel surface_errors at "brenn:surface-errors" {
             "{}",
             advisories[0],
         );
-        assert!(run_config_check(&file, &[]), "advice is not a refusal");
+        assert!(
+            run_config_check(&file, &Default::default()),
+            "advice is not a refusal"
+        );
     }
 
     /// The error-lane validator's `[messaging]` refusal, which rides along

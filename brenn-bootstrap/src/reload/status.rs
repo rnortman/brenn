@@ -31,6 +31,7 @@ pub(crate) async fn attach_and_publish_booted(
     messenger: &std::sync::Arc<Messenger>,
     document_sha256: &str,
     root: Option<String>,
+    mounts: &brenn_lib::config::MountsConfig,
 ) {
     if !participants
         .iter()
@@ -41,7 +42,7 @@ pub(crate) async fn attach_and_publish_booted(
     SystemInbox::attach_for(CONFIG_RELOAD_COMPONENT, messenger).await;
     publish_status(
         messenger,
-        &ReloadStatus::booted(document_sha256.to_string(), root),
+        &ReloadStatus::booted(document_sha256.to_string(), root, mounts),
     )
     .await;
     info!(
@@ -64,8 +65,36 @@ impl From<&PlanDelta> for StatusDelta {
                 .map(|change| change.new.address.clone())
                 .collect(),
             channels_described: addresses(&delta.channels_described),
+            mqtt_subscribed: delta.mqtt.subscribed(),
+            mqtt_unsubscribed: delta.mqtt.unsubscribed(),
+            // The worst case, which is what prepare has to measure: any of
+            // these filters can come back deferred at commit, and commit
+            // narrows the list to the ones that did. Narrowing only shrinks the
+            // body, so the size prepare proved publishable stands.
+            mqtt_deferred: delta
+                .mqtt
+                .subscribed()
+                .into_iter()
+                .chain(delta.mqtt.unsubscribed())
+                .collect(),
+            surfaces_added: slugs(&delta.surfaces.added),
+            surfaces_removed: slugs(&delta.surfaces.removed),
+            surfaces_changed: delta
+                .surfaces
+                .changed
+                .iter()
+                .map(|change| change.new.slug.clone())
+                .collect(),
+            kinds_changed: delta.kinds_changed.iter().cloned().collect(),
         }
     }
+}
+
+fn slugs(surfaces: &[brenn_lib::messaging::config::ResolvedSurface]) -> Vec<String> {
+    surfaces
+        .iter()
+        .map(|surface| surface.slug.clone())
+        .collect()
 }
 
 fn addresses(entries: &[std::sync::Arc<brenn_lib::messaging::ChannelEntry>]) -> Vec<String> {
@@ -90,6 +119,10 @@ mod tests {
             Arc::new(entry)
         }
 
+        fn surface(slug: &str) -> brenn_lib::messaging::config::ResolvedSurface {
+            brenn_surface_server::fixtures_config::SurfaceFixture::new(slug, "chart").build()
+        }
+
         let changed = entry("brenn:moved");
         let plan_delta = PlanDelta {
             channels_added: vec![entry("brenn:new")],
@@ -102,6 +135,26 @@ mod tests {
             consumers_added: vec!["watcher".to_string()],
             consumers_removed: vec!["old".to_string()],
             consumers_changed: vec!["rewired".to_string()],
+            mqtt: super::super::mqtt::MqttDelta {
+                clients: vec![super::super::mqtt::MqttClientDelta {
+                    client: "chef".to_string(),
+                    subscribe: vec![super::super::mqtt::FilterMove {
+                        topic_filter: "a/b".to_string(),
+                        qos: 1,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            surfaces: super::super::surfaces::SurfaceDelta {
+                added: vec![surface("wall")],
+                removed: vec![surface("kiosk")],
+                changed: vec![super::super::surfaces::SurfaceChange {
+                    old: surface("deskbar"),
+                    new: surface("deskbar"),
+                }],
+            },
+            kinds_changed: ["chart".to_string()].into_iter().collect(),
         };
         let status: StatusDelta = (&plan_delta).into();
         assert_eq!(status.channels_added, vec!["brenn:new".to_string()]);
@@ -113,6 +166,17 @@ mod tests {
         assert_eq!(status.consumers_added, vec!["watcher".to_string()]);
         assert_eq!(status.consumers_removed, vec!["old".to_string()]);
         assert_eq!(status.consumers_changed, vec!["rewired".to_string()]);
+        assert_eq!(status.mqtt_subscribed, vec!["mqtt:chef:a/b".to_string()]);
+        assert!(status.mqtt_unsubscribed.is_empty());
+        // Prepare's worst case: every moved filter could come back deferred,
+        // and commit narrows the list to the ones that did.
+        assert_eq!(status.mqtt_deferred, vec!["mqtt:chef:a/b".to_string()]);
+        // A changed surface is named by the slug the candidate runs it under,
+        // which is the slug an operator reads in the document.
+        assert_eq!(status.surfaces_added, vec!["wall".to_string()]);
+        assert_eq!(status.surfaces_removed, vec!["kiosk".to_string()]);
+        assert_eq!(status.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(status.kinds_changed, vec!["chart".to_string()]);
     }
 
     /// The facility's own identity publishes onto the operator's status
@@ -163,7 +227,11 @@ mod tests {
         .await;
         let messenger = result.messenger.as_ref().expect("messaging must be up");
 
-        let status = ReloadStatus::booted("abc123".to_string(), None);
+        let status = ReloadStatus::booted(
+            "abc123".to_string(),
+            None,
+            &brenn_lib::config::MountsConfig::default(),
+        );
         publish_status(messenger, &status).await;
 
         let envelopes = messenger
@@ -263,6 +331,7 @@ mod tests {
                 &messenger,
                 "d0cd0c",
                 Some("/etc/brenn/main.brenn".to_string()),
+                &brenn_lib::config::MountsConfig::default(),
             )
             .await;
 

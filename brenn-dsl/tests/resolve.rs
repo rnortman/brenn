@@ -10,8 +10,8 @@ use brenn_dsl::resolved::{ChanId, MatcherKind, RChanRef, RMatcherVal, RTail, RVa
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use support::{
-    at, compile, compile_tree, messages, packaged, refusal, refusal_tree, refusals, refusals_tree,
-    resolve_errors, resolved, resolved_tree,
+    at, compile, compile_tree, messages, mounts_refusals, packaged, refusal, refusal_tree,
+    refusals, refusals_tree, resolve_errors, resolved, resolved_mounts, resolved_tree,
 };
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -3825,6 +3825,7 @@ fn a_file_built_without_a_source_hash_is_refused_at_class_resolution() {
     let _ = brenn_dsl::resolve_files(
         vec![(String::new(), root), ("@spec".to_string(), module)],
         "",
+        brenn_dsl::DocumentRole::Deployment,
     );
 }
 
@@ -4473,5 +4474,142 @@ fn the_unbounded_spelling_is_refused_at_a_declaration() {
             "`unbounded` is the word a depth spells an unbounded window with, and cannot be \
              a parameter's name"
         ]
+    );
+}
+
+// ── the mounts document ──────────────────────────────────────────────────────
+//
+// A second root vocabulary, disjoint from the deployment document's. What each
+// role admits is one table, and these are its two directions.
+
+/// A mounts document resolves its declarations and nothing else: one entry per
+/// `mount`, in source order, carrying the body's `path`.
+#[test]
+fn a_mounts_document_resolves_its_mounts() {
+    let config = resolved_mounts(
+        "const BUNDLES = \"/home/alice/brenn/bundles\";\n\
+         mount brenn { path = \"/home/alice/brenn/release\"; }\n\
+         mount demo { path = f\"{BUNDLES}/brenn-component-demo\"; }\n",
+    );
+
+    let names: Vec<String> = config
+        .mounts
+        .iter()
+        .map(|mount| mount.handle.dotted())
+        .collect();
+    assert_eq!(names, ["brenn", "demo"]);
+
+    let paths: Vec<&str> = config
+        .mounts
+        .iter()
+        .map(|mount| match mount.attrs.path.value.value() {
+            brenn_dsl::resolved::RValue::Str(text) => text.as_str(),
+            other => panic!("a path is a string, got {}", other.kind()),
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/home/alice/brenn/release",
+            // The constant interpolated: a mounts document admits `const`
+            // precisely so a deployment's bundle root is written once.
+            "/home/alice/brenn/bundles/brenn-component-demo",
+        ]
+    );
+}
+
+/// A mount's name is an identity, held to the kebab charset every non-addressable
+/// family's is.
+#[test]
+fn a_mount_name_is_kebab() {
+    assert_eq!(
+        mounts_refusals("mount Brenn_Release { path = \"/home/alice/x\"; }\n"),
+        [
+            "`Brenn_Release` is not a legal mount identity (lowercase, digits, `-`); \
+          rename the mount `brenn-release`"
+        ]
+    );
+}
+
+/// Everything a mounts document is not: the whole deployment vocabulary, and
+/// every import form.
+#[test]
+fn a_mounts_document_admits_nothing_else() {
+    assert_eq!(
+        mounts_refusals(
+            "channel out at \"brenn:alice-desk.out\";\n\
+             mount brenn { path = \"/home/alice/brenn/release\"; }\n"
+        ),
+        [
+            "a mounts document declares mounts and constants and nothing else; deployment \
+          statements belong in the document named by `--config`"
+        ]
+    );
+
+    assert_eq!(
+        mounts_refusals("use @deskbar::*;\nmount brenn { path = \"/home/alice/x\"; }\n"),
+        ["a mounts document imports nothing: it is read before any module root is known"]
+    );
+
+    assert_eq!(
+        mounts_refusals("use wiring::deskbar;\nmount brenn { path = \"/home/alice/x\"; }\n"),
+        ["a mounts document imports nothing: it is read before any module root is known"]
+    );
+}
+
+/// The other direction: a `mount` in the document the operator deploys. A mount
+/// path is a fact about one host, and the deployment document is the one that
+/// holds none.
+#[test]
+fn a_deployment_document_declares_no_mount() {
+    let expected = "a `mount` is declared in the mounts document named by `--mounts`, not in a \
+                    deployment document: a mount path is a fact about one host and a deployment \
+                    document is host-independent";
+
+    assert_eq!(
+        refusals("mount brenn { path = \"/home/alice/brenn/release\"; }\n"),
+        [expected]
+    );
+
+    // A tree module of a deployment document is read under the same role, so
+    // the refusal does not depend on which file the line was written in.
+    assert_eq!(
+        refusals_tree(&[
+            ("", "use wiring::*;\n"),
+            (
+                "wiring",
+                "mount brenn { path = \"/home/alice/brenn/release\"; }\n"
+            ),
+        ]),
+        [expected]
+    );
+
+    // And a packaged module, whose author is not the deployer, gets the same
+    // sentence rather than the generic vocabulary-only one: the fix is the
+    // same file either way.
+    assert_eq!(
+        refusals(concat!(
+            packaged!(),
+            "mount brenn { path = \"/home/alice/brenn/release\"; }\n",
+            packaged!(),
+            "channel out at \"brenn:alice-desk.out\";\n",
+        )),
+        [expected]
+    );
+}
+
+/// A mounts document holds one identity space, so two mounts of one name
+/// collide the way two repos of one name do.
+#[test]
+fn two_mounts_of_one_name_collide() {
+    let refusals = mounts_refusals(
+        "mount brenn { path = \"/home/alice/a\"; }\n\
+         mount brenn { path = \"/home/alice/b\"; }\n",
+    );
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("brenn"),
+        "the collision names the mount: {}",
+        refusals[0]
     );
 }

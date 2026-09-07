@@ -1,31 +1,30 @@
-// Shared integration-test harness for the MQTT integration suite.
-// All public items are re-exported at module root so test functions
-// can `use common::*;` without multi-level path disambiguation.
+// Shared harness for the MQTT integration suite.
 //
-// Per-test brokers: one mosquitto per test rather than a process singleton,
-// because each
-// #[tokio::test(flavor="multi_thread")] creates its own tokio runtime and a
-// tokio::sync::Mutex cannot be shared across runtimes. A std::sync::Mutex
-// process-singleton would work, but 7 broker spawns × 10 review-gate runs is
-// acceptable on a developer machine, and per-test brokers make each test fully
-// independent without any teardown coordination.
+// The broker itself, the throwaway TLS material and the raw publisher live in
+// `brenn_mqtt::test_support`, which the crates above this one use too. What
+// stays here is what only this suite needs: the capturing router, the TCP relay
+// that drops a connection mid-session, and the `spawn_client` family built on
+// them.
+//
+// All public items are re-exported at module root so test functions can
+// `use common::*;` without multi-level path disambiguation.
 //
 // NOTE: the retained-message suite's `assert_eq!(retained.len(), 100)` is an
 // exact count; it relies on each test starting with a fresh broker
 // (persistence=false eliminates bleed). If the harness is ever refactored to a
 // shared broker, verify that assertion still holds across test ordering.
 
-pub mod certs;
 pub mod relay;
 pub mod router;
 
+pub use brenn_mqtt::test_support::broker::{BrokerHarness, DEFAULT_ACL};
+pub use brenn_mqtt::test_support::certs;
+pub use brenn_mqtt::test_support::client::{
+    await_puback, direct_publisher_acked, drain_until_incoming, wait_for_health,
+};
 pub use relay::TcpRelay;
 pub use router::{CapturingRouter, DeliveredMessage};
 
-use std::io::Read as _;
-use std::net::TcpListener;
-use std::os::unix::process::CommandExt as _;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 use brenn_lib::messaging::Urgency;
@@ -34,269 +33,39 @@ use brenn_mqtt::service::IngressSubscribeOutcome;
 use brenn_mqtt::state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle};
 use brenn_mqtt::{InboundPayload, MqttEventRouter, MqttService, spawn_client_supervisor};
 use rumqttc::{AsyncClient, MqttOptions, Transport};
-use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-// ---------------------------------------------------------------------------
-// BrokerHarness: one mosquitto process per test
-// ---------------------------------------------------------------------------
-
-/// Owns the `mosquitto` child process and its temp directory.
-///
-/// Dropped via `Drop`: kills the process and waits for it to exit.
-/// `prctl(PR_SET_PDEATHSIG, SIGTERM)` on spawn ensures the broker is also
-/// killed if the test runner process dies abnormally (SIGKILL, Ctrl-C, panic).
-pub struct BrokerHarness {
-    pub port: u16,
-    child: Option<Child>,
-    /// Kept alive so broker log / config files outlive the process.
-    _tempdir: TempDir,
-    /// Absolute path to the mosquitto log file for failure diagnostics.
-    #[allow(dead_code)]
-    log_path: std::path::PathBuf,
+/// Returns the absolute path to the `mqtt_assets` directory shipped alongside
+/// this test crate. Asset files are resolved relative to `CARGO_MANIFEST_DIR`,
+/// which the test target pins to this package and which resolves from the
+/// runfiles root the test starts in.
+pub fn mqtt_assets_dir() -> std::path::PathBuf {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest.join("tests").join("mqtt_assets")
 }
 
-impl BrokerHarness {
-    /// Spawn `mosquitto` with the default TLS 1.2+ config and wait for it to become ready.
-    ///
-    /// # Panics
-    ///
-    /// - `mosquitto` binary not found.
-    /// - TCP-connect readiness poll exceeds 2 seconds.
-    pub fn start() -> Self {
-        Self::start_with_conf_template("mosquitto.conf.tmpl")
-    }
-
-    /// Spawn `mosquitto` configured to accept TLS 1.3 connections only.
-    ///
-    /// Uses `mosquitto.conf.tls13.tmpl` which sets `tls_version tlsv1.3`.
-    ///
-    /// # Panics
-    ///
-    /// Same as [`start`].
-    pub fn start_tls13() -> Self {
-        Self::start_with_conf_template("mosquitto.conf.tls13.tmpl")
-    }
-
-    /// Spawn `mosquitto` configured to require username/password authentication
-    /// (`allow_anonymous false` + a `password_file`). The checked-in `passwd`
-    /// asset holds one user (`brenn-itest` / `brenn-itest-password`).
-    ///
-    /// # Panics
-    ///
-    /// Same as [`start`].
-    pub fn start_auth() -> Self {
-        Self::start_with_conf_template("mosquitto.conf.auth.tmpl")
-    }
-
-    fn start_with_conf_template(tmpl_name: &str) -> Self {
-        let assets = certs::mqtt_assets_dir();
-
-        // 2. Write static assets into a temp dir once; the config is rewritten on each attempt.
-        let tempdir = TempDir::new().expect("failed to create tempdir for mosquitto");
-        let tmp = tempdir.path();
-        let log_path = tmp.join("mosquitto.log");
-
-        // Copy static assets into tempdir. `passwd` is copied unconditionally
-        // (harmless for the non-auth templates, which never reference it).
-        for name in &["acl", "passwd"] {
-            std::fs::copy(assets.join(name), tmp.join(name))
-                .unwrap_or_else(|e| panic!("failed to copy {name} into tempdir: {e}"));
-        }
-        // TLS assets are generated per-run (no key material in the repo). Write
-        // the shared CA + server cert/key so mosquitto's cafile/certfile/keyfile
-        // resolve to real files.
-        for (name, contents) in &[
-            ("ca.pem", certs::ca_pem()),
-            ("server.crt", certs::server_cert_pem()),
-            ("server.key", certs::server_key_pem()),
-        ] {
-            std::fs::write(tmp.join(name), contents)
-                .unwrap_or_else(|e| panic!("failed to write generated {name} into tempdir: {e}"));
-        }
-        // mosquitto warns on (and some versions reject) a world-readable password
-        // file; chmod 0600 so the question is moot.
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(tmp.join("passwd"), std::fs::Permissions::from_mode(0o600))
-                .expect("failed to chmod passwd to 0600");
-        }
-
-        let tmpl = std::fs::read_to_string(assets.join(tmpl_name))
-            .unwrap_or_else(|e| panic!("failed to read {tmpl_name}: {e}"));
-
-        // 3. Resolve mosquitto binary.
-        let bin = std::env::var("BRENN_MOSQUITTO_BIN").unwrap_or_else(|_| "mosquitto".to_string());
-
-        // Retry loop: pick a port, write config, spawn, poll readiness.
-        // If mosquitto exits early due to a bind/address-in-use error (TOCTOU: the port
-        // was taken between our bind-then-drop and mosquitto's own bind), retry with a
-        // fresh ephemeral port. Any other early exit or timeout panics immediately
-        // (fail-fast; do not mask real misconfigurations).
-        const MAX_BIND_RETRIES: usize = 5;
-        let mut last_log_tail = String::new();
-
-        for attempt in 1..=MAX_BIND_RETRIES {
-            // 1. Assign an ephemeral port by binding then dropping.
-            // TOCTOU window: another process may claim this port before mosquitto binds it.
-            // The retry loop above is the mitigation.
-            let port = {
-                let listener =
-                    TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-                let p = listener.local_addr().expect("local_addr").port();
-                drop(listener);
-                p
-            };
-
-            // Substitute template with the chosen port.
-            let config_str = tmpl
-                .replace("__PORT__", &port.to_string())
-                .replace("__CA_PEM__", &tmp.join("ca.pem").display().to_string())
-                .replace(
-                    "__SERVER_CRT__",
-                    &tmp.join("server.crt").display().to_string(),
-                )
-                .replace(
-                    "__SERVER_KEY__",
-                    &tmp.join("server.key").display().to_string(),
-                )
-                .replace("__ACL__", &tmp.join("acl").display().to_string())
-                .replace("__PASSWD__", &tmp.join("passwd").display().to_string())
-                .replace("__LOG__", &log_path.display().to_string());
-            let config_path = tmp.join("mosquitto.conf");
-            std::fs::write(&config_path, &config_str).expect("failed to write mosquitto.conf");
-
-            // 4. Spawn; set PR_SET_PDEATHSIG so the process is killed if the test runner dies.
-            let mut cmd = Command::new(&bin);
-            cmd.arg("-c")
-                .arg(&config_path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-
-            // SAFETY: prctl is a simple syscall with no allocator interaction.
-            // Linux-only (Brenn is Linux-only per design).
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-                    Ok(())
-                });
-            }
-
-            let mut child = cmd.spawn().unwrap_or_else(|e| {
-                panic!(
-                    "mosquitto binary not found in PATH; install mosquitto or set \
-                     BRENN_MOSQUITTO_BIN=/path/to/mosquitto. Tried: {bin:?}. Error: {e}"
-                )
-            });
-
-            eprintln!("[BrokerHarness] mosquitto spawned on port {port} (attempt {attempt})");
-
-            // 5. Poll TCP-connect readiness (every 25ms, cap 2s).
-            // Also check whether mosquitto exited early.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            loop {
-                if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-                    // Ready.
-                    eprintln!("[BrokerHarness] mosquitto ready on port {port}");
-                    return Self {
-                        port,
-                        child: Some(child),
-                        _tempdir: tempdir,
-                        log_path,
-                    };
-                }
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let tail = read_tail_4k(&log_path);
-                        // Distinguish TOCTOU bind failure from other failures.
-                        // Mosquitto logs "Address already in use" or "Error: Unable to start"
-                        // (with the bind error) when it cannot bind the configured port.
-                        // Only retry on a clearly identified bind/address error; panic on
-                        // anything else so real misconfigurations are not silently swallowed.
-                        if tail.contains("Address already in use")
-                            || (tail.contains("Error:") && tail.contains("Unable to start"))
-                        {
-                            eprintln!(
-                                "[BrokerHarness] attempt {attempt}: mosquitto exited (bind \
-                                 collision on port {port}); retrying with a new port. Log \
-                                 tail:\n{tail}"
-                            );
-                            last_log_tail = tail;
-                            break; // bind failure; retry
-                        }
-                        // Non-retryable: config error, cert problem, etc. Panic immediately.
-                        panic!(
-                            "mosquitto exited with status {status} before binding port {port} \
-                             (attempt {attempt}; not a bind collision)\n\
-                             Log ({}):\n{tail}",
-                            log_path.display()
-                        );
-                    }
-                    Ok(None) => {} // still running; fall through to deadline check
-                    Err(e) => panic!(
-                        "try_wait failed for mosquitto (attempt {attempt}, port {port}): {e}"
-                    ),
-                }
-                if std::time::Instant::now() > deadline {
-                    let tail = read_tail_4k(&log_path);
-                    // Kill the timed-out child before panicking.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "mosquitto readiness timeout on port {port} (attempt {attempt})\n\
-                         Log ({}):\n{tail}",
-                        log_path.display()
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-
-            // Only reached via `break` on bind failure (the ready path returns above).
-        }
-
-        // All retries exhausted due to repeated bind collisions.
-        panic!(
-            "BrokerHarness: failed to start mosquitto after {MAX_BIND_RETRIES} attempts; \
-             repeated ephemeral-port collisions (TOCTOU). Last log tail:\n{last_log_tail}"
-        );
-    }
-
-    /// Kill the broker and wait for exit. Idempotent.
-    pub fn stop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            // kill() fails with ESRCH if the process already exited — benign.
-            // wait() failure is also benign in teardown; we just need the zombie reaped.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.child = None;
-        eprintln!("[BrokerHarness] mosquitto stopped");
-    }
-
-    /// Loopback host the broker binds to.
-    pub const HOST: &'static str = "127.0.0.1";
+fn conf_template(name: &str) -> String {
+    std::fs::read_to_string(mqtt_assets_dir().join(name))
+        .unwrap_or_else(|e| panic!("failed to read {name}: {e}"))
 }
 
-impl Drop for BrokerHarness {
-    fn drop(&mut self) {
-        self.stop();
-    }
+/// Spawn a broker that accepts TLS 1.3 connections only.
+pub fn broker_tls13() -> BrokerHarness {
+    BrokerHarness::start_with(
+        &conf_template("mosquitto.conf.tls13.tmpl"),
+        &[("acl", DEFAULT_ACL.as_bytes())],
+    )
 }
 
-fn read_tail_4k(path: &std::path::Path) -> String {
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return "<log file not found>".to_string(),
-    };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if len > 4096 {
-        use std::io::Seek;
-        // seek failure means we read from the beginning — still useful, just not the tail.
-        let _ = file.seek(std::io::SeekFrom::End(-4096));
-    }
-    let mut buf = String::new();
-    let _ = file.read_to_string(&mut buf); // best-effort; empty on I/O error
-    buf
+/// Spawn a broker that requires username/password authentication
+/// (`allow_anonymous false` + a `password_file`). The checked-in `passwd` asset
+/// holds one user (`brenn-itest` / `brenn-itest-password`).
+pub fn broker_auth() -> BrokerHarness {
+    let passwd = std::fs::read(mqtt_assets_dir().join("passwd")).expect("failed to read passwd");
+    BrokerHarness::start_with(
+        &conf_template("mosquitto.conf.auth.tmpl"),
+        &[("acl", DEFAULT_ACL.as_bytes()), ("passwd", &passwd)],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -391,24 +160,6 @@ where
     }
 }
 
-/// Poll `eventloop` until an incoming packet satisfies `wanted`, discarding every
-/// other event. Panics on eventloop error or after 5s; `what` names the awaited
-/// packet for diagnostics. Shared by the raw-rumqttc helpers.
-async fn drain_until_incoming<F>(eventloop: &mut rumqttc::EventLoop, mut wanted: F, what: &str)
-where
-    F: FnMut(&rumqttc::Incoming) -> bool,
-{
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match tokio::time::timeout_at(deadline, eventloop.poll()).await {
-            Ok(Ok(rumqttc::Event::Incoming(pkt))) if wanted(&pkt) => return,
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => panic!("{what}: eventloop error before {what}: {e}"),
-            Err(_) => panic!("{what}: not received within 5s"),
-        }
-    }
-}
-
 /// Await one delivery on `rx` (3s cap). Panics on a closed channel or timeout,
 /// naming `what`. The strict 3s cap is the ingress suite's shared convention.
 pub async fn recv_delivery(
@@ -419,17 +170,6 @@ pub async fn recv_delivery(
         Ok(Some(msg)) => msg,
         Ok(None) => panic!("{what}: router receiver closed"),
         Err(_) => panic!("{what}: not delivered within 3s"),
-    }
-}
-
-/// Await one PubAck on `ack_rx` (3s cap). Panics on a closed channel or timeout,
-/// naming `what`. Callers await one ack per QoS-1 publish to confirm the broker
-/// processed it.
-pub async fn await_puback(ack_rx: &mut mpsc::UnboundedReceiver<()>, what: &str) {
-    match tokio::time::timeout(std::time::Duration::from_secs(3), ack_rx.recv()).await {
-        Ok(Some(())) => {}
-        Ok(None) => panic!("{what}: PubAck channel closed"),
-        Err(_) => panic!("{what}: PubAck not received within 3s"),
     }
 }
 
@@ -497,31 +237,6 @@ pub async fn spawn_client_with_config(
         client_slug,
         handle,
         rx,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// wait_for_health: poll until any of the accepted labels is reached
-// ---------------------------------------------------------------------------
-
-/// Poll `svc.ingress_health(client_slug)` at 25ms intervals until the label is in
-/// `accepted`, then return that label. Panics with `msg` if no accepted label is
-/// seen within `timeout_secs`.
-pub async fn wait_for_health(
-    svc: &brenn_mqtt::MqttService,
-    client_slug: &str,
-    accepted: &[ConnectorHealthLabel],
-    timeout_secs: u64,
-    msg: &str,
-) -> ConnectorHealthLabel {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        let (label, _) = svc.ingress_health(client_slug).await;
-        if accepted.contains(&label) {
-            return label;
-        }
-        assert!(std::time::Instant::now() < deadline, "{msg}");
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -595,62 +310,6 @@ pub async fn direct_subscriber(
     });
 
     deliver_rx
-}
-
-// ---------------------------------------------------------------------------
-// direct_publisher_acked: a raw rumqttc publisher that surfaces PubAcks
-// ---------------------------------------------------------------------------
-
-/// Connect a direct rumqttc v5 client and return it plus a channel that receives
-/// one `()` per PubAck the eventloop observes. Await one ack per QoS-1 publish to
-/// confirm the broker has processed it — the retained-barrier handshake needs
-/// "the broker stored this retained publish" as a hard fact, not a sleep.
-///
-/// The returned client is connected (ConnAck received) before this returns. The
-/// background task forwards PubAcks (unbounded, so unread acks never block the
-/// drain) and otherwise keeps draining until the eventloop errors at teardown.
-///
-/// # TEST-ONLY TLS note
-/// Uses `Transport::tls(ca_pem, None, None)` with an IP-literal host — acceptable
-/// for loopback test brokers; MUST NOT be copied into production connection code.
-pub async fn direct_publisher_acked(
-    broker_port: u16,
-    ca_pem: Vec<u8>,
-) -> (AsyncClient, mpsc::UnboundedReceiver<()>) {
-    let client_id = format!("brenn-direct-acked-{}", uuid_v4_simple());
-    let mut opts = MqttOptions::new(client_id, ("127.0.0.1", broker_port));
-    opts.set_clean_start(true);
-    opts.set_transport(Transport::tls(ca_pem, None, None));
-    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
-
-    drain_until_incoming(
-        &mut eventloop,
-        |pkt| matches!(pkt, rumqttc::Incoming::ConnAck(_)),
-        "direct_publisher_acked: ConnAck",
-    )
-    .await;
-
-    let (ack_tx, ack_rx) = mpsc::unbounded_channel::<()>();
-    tokio::spawn(async move {
-        loop {
-            match eventloop.poll().await {
-                Ok(rumqttc::Event::Incoming(rumqttc::Incoming::PubAck(_))) => {
-                    // Receiver-dropped at teardown is benign; ignore the send result.
-                    ack_tx.send(()).ok();
-                }
-                Ok(_) => {}
-                // A mid-test transport drop stops PubAcks; surface it so a downstream
-                // barrier timeout can be told apart from a code regression, matching
-                // direct_subscriber's convention.
-                Err(e) => {
-                    eprintln!("direct_publisher_acked: eventloop error: {e}");
-                    return;
-                }
-            }
-        }
-    });
-
-    (client, ack_rx)
 }
 
 // ---------------------------------------------------------------------------

@@ -63,8 +63,8 @@ pub use budget::{
 
 mod bootstrap;
 pub use bootstrap::{
-    ChannelReconstruction, load_channels_by_uuids, prune_dropped_dynamic_subscriptions,
-    upsert_channels,
+    ChannelReconstruction, channel_uuid_by_address, load_channels_by_uuids,
+    prune_dropped_dynamic_subscriptions, upsert_channels,
 };
 
 mod dynamic;

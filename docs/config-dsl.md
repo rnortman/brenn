@@ -48,24 +48,32 @@ use @chrome::Chrome;
 ```
 
 The `@` sigil says the name is not a path under the root's directory. It names
-one file, `<module root>/<name>.brenn`, in a directory named on the command
-line:
+one file, `<module root>/<name>.brenn`, in a directory the invocation supplies.
+A server takes its module roots from the mounts document — the `modules/` tree
+of every declared mount (*The mounts document*, below):
 
 ```
-brenn --config brenn.dev.brenn --modules config/specs serve
+brenn --config brenn.dev.brenn --mounts dev-mounts.brenn serve
+```
+
+The compiler tools take them from `--modules DIR`, repeatable, which is the
+workstation form and reads no host:
+
+```
+brenn --modules config/specs config-check brenn.dev.brenn
 ```
 
 The module root is deliberately not in the document. Where the authored modules
 live is an environment fact: on a workstation it is a source checkout, on a
-deployment host it is the tree the release installed. The same document must
-mean the same thing in both places, so the document names the module and the
-invocation names the root. A document with a `@` import and no `--modules` is
-refused naming the flag, and a `--modules` that is not a readable directory is
-refused whether or not anything imports.
+deployment host it is the tree a release installed under a mount. The same
+document must mean the same thing in both places, so the document names the
+module and the invocation names the root. A document with a `@` import and no
+root at all is refused naming the flag, and a root that is not a readable
+directory is refused whether or not anything imports.
 
-`--modules` may be given more than once — one root per installed release, brenn's
-own beside each component bundle's (`component-packages.md`, *Bundles and
-multiple roots*). The roots are searched as one namespace: `@<name>` resolves
+There may be more than one root — one per installed release, brenn's own beside
+each component bundle's (`component-packages.md`, *Mounts*). The roots are
+searched as one namespace: `@<name>` resolves
 to `<root>/<name>.brenn` in exactly one of them. A name in none is refused
 naming every root searched. A basename present under two roots is refused
 naming the module and both roots, and it is refused whether or not the document
@@ -146,6 +154,40 @@ The same refusal is what a pin bump surfaces. A new bundle revision whose
 arrangement grew a grant word or an `acl` line turns the next `config-check`
 into a refusal naming the word and the stamp — authority a bundle grows is
 authority the deployment re-consents to, before any host is touched.
+
+### The mounts document
+
+A server reads a second document, named by `--mounts FILE`, that says which
+installed trees it may read at all:
+
+```
+mount brenn { path = "/home/brenn/brenn/release"; }
+mount caser { path = "/home/brenn/brenn/bundles/caser"; }
+```
+
+Each `path` is an absolute directory holding a `VERSION` file and at least one
+of `components/`, `surface/` and `modules/`; those are the components roots, the
+surface roots and the module roots, derived rather than named one flag at a
+time (`component-packages.md`, *Mounts*). Paths are absolute, distinct, and
+non-nesting, and they are canonicalized once per read, so a mount path may be
+the symlink an installer swaps.
+
+The document admits `mount` and `const` and nothing else, and it imports
+nothing. Symmetrically, a `mount` in the deployment document is refused: mount
+paths are environment facts, and the deployment document is host-independent by
+contract — which is exactly what lets `config-check` certify it on a
+workstation.
+
+`brenn mounts --mounts FILE` lists what is declared and what is installed:
+
+```
+brenn      /home/brenn/brenn/release          ok:0.20.0:components,surface,modules
+caser      /home/brenn/brenn/bundles/caser    missing
+```
+
+It exits on the document's validity, not the filesystem's, so an installer can
+read the declaration of a mount it is about to create. Boot and reload apply the
+strict form: every declared mount must be installed.
 
 ### Settings sections
 
@@ -1075,8 +1117,8 @@ describes the old shape, the three rules below were true and are not any more.
   used to be a class attr, which made a specification deployment-specific — the
   one fact in it that cannot be an author's statement. It moved to the consumer
   instance, and then off the vocabulary entirely: the package name is the whole
-  reference and the host resolves it against the root `serve --components`
-  names. A document that still states it is refused as an unknown key.
+  reference and the host resolves it against the `components/` tree of every
+  declared mount. A document that still states it is refused as an unknown key.
 - **Component grants were a backend-only notion.** A surface-placed component
   held no capability list of its own; its page's transport grants were the whole
   authority statement, and the grant vocabulary differed between the two ABIs.
@@ -1123,7 +1165,7 @@ the state a fresh boot of the new document would have produced.** A change that
 cannot be brought to that state without restarting is refused, and refusing
 leaves the running system untouched.
 
-What converges is components and their wiring:
+What converges is components, surfaces and their wiring:
 
 - `channel` declarations — added, removed, retuned, redescribed.
 - `link` statements and the auto channels of `io` ports, which are ordinary
@@ -1131,20 +1173,51 @@ What converges is components and their wiring:
 - `wasm_consumer` instances — added, removed, and changed, where changed
   includes a package whose artifact moved under an unmoved document, since the
   process must not keep executing bytes the module roots no longer hold.
+- `surface` instances — added, removed, and changed. A surface is *changed* when
+  its own block moved, when a channel it binds moved, or when the installed
+  bytes of a kind it instantiates moved, which is what a bundle upgrade under a
+  declared mount looks like. Its live pages are closed with a reason they
+  understand: a replaced surface's pages reload themselves once onto the new
+  runtime, a retired surface's pages say so and stop, and the slug `404`s
+  afterwards. A page that arrives during the swap is answered `503` with a
+  `Retry-After`, not `404`, so a legitimate reload is never a security event; a
+  browser following the URL gets that `503` as a document that comes back on its
+  own, since `Retry-After` is advisory and a reloading page would otherwise sit
+  on an error page for the width of the swap.
+  The rebuilt self-description and bindings documents are republished as part of
+  the same walk, and the status body's `surfaces_added`, `surfaces_removed`,
+  `surfaces_changed` and `kinds_changed` say what moved. A bundle whose upgrade
+  moved only kinds no surface mounts yet is `unchanged` — the projection really
+  did not move — and the body still carries `kinds_changed`, so the install that
+  swapped the tree in has the retained evidence that the new bytes are the ones
+  being served.
 
-Everything else needs a restart, and says so. Agents, surfaces, remotes, webhook
+The **mounts document is re-read first**, before the deployment document is
+compiled, so the roots every step below reads are the ones declared right now: a
+bundle installed and declared since boot is in reach without a restart, and a
+mount whose line went away takes its trees with it. A mounts document that does
+not compile, or that declares a path which is not an installed mount, is a
+refusal on its own — nothing about the deployment document is read. The outcome
+body's `mounts` array names what the process is reading: the candidate's on
+`applied` and `unchanged`, the running one's on `refused`.
+
+Everything else needs a restart, and says so. Agents, remotes, webhook
 endpoints, MQTT clients, PWA push, tool declarations, Claude profiles, and the
-`server` / `database` / `logging` / `messaging` / `observability` sections are
-all compared whole: any difference is a refusal naming the section, and for a
-block array the key that differs (`apps[assistant]`, `surfaces[wall]`).
+`server` / `database` / `logging` / `messaging` / `observability` /
+`surface_description` sections are all compared whole: any difference is a
+refusal naming the section, and for a block array the key that differs
+(`apps[assistant]`, `remotes[laptop]`). The surface *kernel* is in that group
+too: every page loads it, and a reload reloads only the pages of surfaces that
+moved, so a mount offering a different kernel than the one being served is a
+refusal.
 
 Three further refusals come from the wiring rather than from a section:
 
 - A channel that is added, removed or retuned may carry no subscriber other than
-  the consumers the same reload is adding or removing. An agent, a surface, a
-  remote or a live attached session on such a channel is a refusal naming it —
-  those belong to entities that do not converge, and re-wiring them to a
-  re-created channel would need their own convergence. An agent on a channel
+  the consumers and surfaces the same reload is moving. An agent, a remote or a
+  live attached session on such a channel is a refusal naming it — those belong
+  to entities that do not converge, and re-wiring them to a re-created channel
+  would need their own convergence. An agent on a channel
   that is *not* moving is untouched and unconstrained, which is the common case:
   a new consumer joins a channel an agent already reads and neither the channel
   nor the agent's subscription is disturbed.
@@ -1153,10 +1226,23 @@ Three further refusals come from the wiring rather than from a section:
   same way. That one is asked again at the last moment before anything is
   touched, because such a subscriber can arrive while the reload is still
   deciding, so it is the one refusal that may appear seconds after the request.
-- Only `brenn:`, `ephemeral:` and `local:` channels converge. A `webhook:` or
-  `mqtt:` channel that changed — including one whose only edit was a tuning
-  block, and including an `mqtt:` ingress channel a consumer subscription was
-  the sole minter of — is a refusal naming the address.
+  The mirror of it refuses too: a channel the document *starts* declaring at an
+  address a dynamic subscription already minted.
+- `brenn:`, `ephemeral:`, `local:` and `mqtt:` channels converge; `webhook:`
+  does not. A `webhook:` channel that changed — including one whose only edit
+  was a tuning block — is a refusal naming the address, because its route is a
+  literal path built once into the HTTP router.
+- An `mqtt:` channel converges its broker subscription and its ingress route
+  with it: the filter is subscribed or unsubscribed on the live session and the
+  route is added or removed, and the status body's `mqtt_subscribed`,
+  `mqtt_unsubscribed` and `mqtt_deferred` say which. A filter the broker could
+  not be told about now — the client is disconnected, or its event loop is
+  dying — is in `mqtt_deferred`: it is in the reconnect-survival set and the
+  supervisor asserts it on the next connect, so the reload still applied.
+  What does *not* converge is the set of broker **sessions**, which is a
+  boot-time fact: a binding on a client that was not referenced when the process
+  booted, and a change that removes a referenced client's last reference, are
+  both refusals asking for a restart.
 
 The outcome vocabulary, on `brenn:config.status` and in the journal:
 

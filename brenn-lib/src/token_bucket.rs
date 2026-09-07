@@ -40,6 +40,17 @@ pub enum TokenBucketOutcome {
     Denied { first: bool },
 }
 
+/// A bucket's configured shape: what two processes running one configuration
+/// agree on, as against the balance, which they never do.
+#[cfg(any(test, feature = "testutils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenBucketConfig {
+    /// The burst ceiling.
+    pub capacity: u32,
+    pub refill_interval: Duration,
+    pub refill_amount: u32,
+}
+
 /// A burst-capacity bucket refilled by `refill_amount` tokens every
 /// `refill_interval`.
 pub struct TokenBucket {
@@ -126,6 +137,26 @@ impl TokenBucket {
             let first = !self.in_suppression;
             self.in_suppression = true;
             TokenBucketOutcome::Denied { first }
+        }
+    }
+
+    /// The bucket's configured shape, with nothing about how full it is right
+    /// now.
+    ///
+    /// A fill level is per-process by construction: two processes running the
+    /// same configuration hold the same parameters and different balances, so
+    /// this is the half of a bucket another process's can be compared with.
+    ///
+    /// Behind `testutils` to match its only consumer, and named rather than
+    /// positional: `capacity` and `refill_amount` are both `u32`, and a tuple
+    /// lets a call site swap them in a way that type-checks and reports the
+    /// wrong number forever.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn configured(&self) -> TokenBucketConfig {
+        TokenBucketConfig {
+            capacity: self.capacity,
+            refill_interval: self.refill_interval,
+            refill_amount: self.refill_amount,
         }
     }
 

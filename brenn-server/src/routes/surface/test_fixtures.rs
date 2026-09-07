@@ -114,7 +114,7 @@ pub async fn surface_harness_with_siblings(
         TEST_MAX_BODY_BYTES,
     );
     state.messenger = Some(Arc::clone(&messenger));
-    state.surfaces = Arc::new(install_surface_runtimes(
+    state.surfaces.set_runtimes(install_surface_runtimes(
         surfaces,
         Some(Arc::clone(&messenger)),
         TEST_MAX_BODY_BYTES,

@@ -20,6 +20,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::AssetContext;
+
 /// Manifest schema version this server understands. A tree written by a
 /// different version is a deploy/toolchain mismatch, not something to
 /// best-effort parse.
@@ -123,39 +125,76 @@ fn spec_artifact(kind: &str) -> String {
 /// missing or divergent packaged specification, a backend-only import, or an
 /// import name no WIT interface defines.
 pub fn validate_processor_kind(surface_root: &Path, kind: &str) -> ProcessorManifest {
+    validate_processor_kind_in(AssetContext::BOOT, surface_root, kind)
+}
+
+/// The same validation, framed for whoever asked for it.
+///
+/// # Panics
+///
+/// On everything [`validate_processor_kind`] panics on.
+pub fn validate_processor_kind_in(
+    cx: AssetContext,
+    surface_root: &Path,
+    kind: &str,
+) -> ProcessorManifest {
+    let manifest = read_processor_record_in(cx, surface_root, kind);
+    verify_processor_artifacts_in(cx, surface_root, kind, &manifest);
+    manifest
+}
+
+/// The record half: everything a kind's tree can be judged on without reading
+/// the artifacts it ships.
+///
+/// Split from the byte verification below because this half is what every
+/// installed kind is held to — including one no configuration instantiates,
+/// whose manifest is read for its fingerprint — while re-hashing a multi-megabyte
+/// component nothing runs buys nothing and is paid again on every reload.
+///
+/// # Panics
+///
+/// On a missing/unparseable manifest, a wrong schema version, a kind/directory
+/// mismatch, a missing listed file, a specification name that is not the one
+/// the kind derives, a backend-only import, or an import name no WIT interface
+/// defines.
+pub fn read_processor_record_in(
+    cx: AssetContext,
+    surface_root: &Path,
+    kind: &str,
+) -> ProcessorManifest {
+    let AssetContext { when, verdict } = cx;
     let dir = kind_dir(surface_root, kind);
     let manifest_path = dir.join("manifest.json");
 
     let raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|err| {
         panic!(
-            "boot: processor component {kind:?} has no readable asset manifest at {} ({err}) — \
+            "{when}: processor component {kind:?} has no readable asset manifest at {} ({err}) — \
              the transpiled tree is not built/deployed (build the surface assets; on deploy \
-             ensure the surface install ran). Refusing to start (fail-fast on invalid \
-             config).",
+             ensure the surface install ran).{verdict}",
             manifest_path.display(),
         )
     });
     let manifest: ProcessorManifest = serde_json::from_str(&raw).unwrap_or_else(|err| {
         panic!(
-            "boot: processor component {kind:?} asset manifest at {} does not parse ({err}) — the \
+            "{when}: processor component {kind:?} asset manifest at {} does not parse ({err}) — the \
              build wrote a manifest this server does not understand. Rebuild the surface assets \
-             with a matching toolchain. Refusing to start (fail-fast on invalid config).",
+             with a matching toolchain.{verdict}",
             manifest_path.display(),
         )
     });
 
     assert!(
         manifest.v == MANIFEST_VERSION,
-        "boot: processor component {kind:?} asset manifest declares v = {}, but this server reads \
+        "{when}: processor component {kind:?} asset manifest declares v = {}, but this server reads \
          v = {MANIFEST_VERSION} — the deployed surface assets were built by a different version. \
-         Rebuild and redeploy. Refusing to start (fail-fast on invalid config).",
+         Rebuild and redeploy.{verdict}",
         manifest.v,
     );
     assert!(
         manifest.kind == kind,
-        "boot: processor asset tree at {} carries a manifest for kind {:?} — the tree and its \
+        "{when}: processor asset tree at {} carries a manifest for kind {:?} — the tree and its \
          manifest disagree about which component this is, which means a partial or crossed \
-         deploy. Rebuild and redeploy. Refusing to start (fail-fast on invalid config).",
+         deploy. Rebuild and redeploy.{verdict}",
         dir.display(),
         manifest.kind,
     );
@@ -164,44 +203,86 @@ pub fn validate_processor_kind(surface_root: &Path, kind: &str) -> ProcessorMani
         let path = dir.join(file);
         assert!(
             path.exists(),
-            "boot: processor component {kind:?} asset manifest lists {file:?}, which is missing at \
+            "{when}: processor component {kind:?} asset manifest lists {file:?}, which is missing at \
              {} — the transpiled tree is incomplete (run `make build`; on deploy ensure \
-             the surface install ran). Refusing to start (fail-fast on invalid config).",
+             the surface install ran).{verdict}",
             path.display(),
         );
     }
 
-    assert_source_hash_matches(&dir, kind, &manifest);
-    assert_spec_hash_matches(&dir, kind, &manifest);
-    assert_import_profile(kind, &manifest);
+    assert_spec_name_derives(cx, kind, &manifest);
+    assert_import_profile(cx, kind, &manifest);
 
     manifest
+}
+
+/// The byte half: the two digests that bind the record to the artifacts beside
+/// it.
+///
+/// Run for the kinds a configuration actually instantiates. A kind an installed
+/// mount merely offers is held to its record alone until something names it,
+/// and this is the pass that pays for the whole component artifact and the
+/// packaged specification being read and hashed.
+///
+/// # Panics
+///
+/// On an unreadable or divergent component artifact or packaged specification.
+pub fn verify_processor_artifacts_in(
+    cx: AssetContext,
+    surface_root: &Path,
+    kind: &str,
+    manifest: &ProcessorManifest,
+) {
+    let dir = kind_dir(surface_root, kind);
+    assert_source_hash_matches(cx, &dir, kind, manifest);
+    assert_spec_hash_matches(cx, &dir, kind, manifest);
 }
 
 /// The stale-transpile check: the manifest's `source_sha256` was computed from
 /// the transpile's *input*, so a component rebuilt without re-transpiling — or a
 /// partially synced deploy — produces a mismatch here rather than a page-load
 /// surprise.
-fn assert_source_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManifest) {
+fn assert_source_hash_matches(
+    cx: AssetContext,
+    dir: &Path,
+    kind: &str,
+    manifest: &ProcessorManifest,
+) {
+    let AssetContext { when, verdict } = cx;
     let artifact = component_artifact(kind);
     let path = dir.join(&artifact);
     let bytes = std::fs::read(&path).unwrap_or_else(|err| {
         panic!(
-            "boot: processor component {kind:?} source artifact {artifact} is unreadable at {} \
+            "{when}: processor component {kind:?} source artifact {artifact} is unreadable at {} \
              ({err}) — without it the transpiled tree's provenance cannot be verified. Rebuild the \
-             surface assets (`make build`) and redeploy. Refusing to start (fail-fast on \
-             invalid config).",
+             surface assets (`make build`) and redeploy.{verdict}",
             path.display(),
         )
     });
     let actual = brenn_lib::util::sha256_hex(&bytes);
     assert!(
         actual == manifest.source_sha256,
-        "boot: processor component {kind:?} has a stale transpile: {artifact} hashes to {actual}, \
+        "{when}: processor component {kind:?} has a stale transpile: {artifact} hashes to {actual}, \
          but its manifest was written from {} — the component was rebuilt without re-transpiling, \
          or the deploy synced only part of the tree. Re-run `make build` and redeploy the \
-         whole surface root. Refusing to start (fail-fast on invalid config).",
+         whole surface root.{verdict}",
         manifest.source_sha256,
+    );
+}
+
+/// The record states the specification it hashed and the kind derives that
+/// name, so a stated name the kind does not derive is drift in the emitter
+/// rather than a stale deploy. No file is read to answer it, which is why it
+/// belongs with the record checks and is asked before any byte is hashed.
+fn assert_spec_name_derives(cx: AssetContext, kind: &str, manifest: &ProcessorManifest) {
+    let AssetContext { when, verdict } = cx;
+    let derived = spec_artifact(kind);
+    assert!(
+        manifest.spec == derived,
+        "{when}: processor component {kind:?} asset manifest names its specification {:?}, but this \
+         kind's packaged specification is {derived:?} — the record and the tree's naming disagree, \
+         which is build drift. Rebuild the surface assets with a matching toolchain.{verdict}",
+        manifest.spec,
     );
 }
 
@@ -209,42 +290,34 @@ fn assert_source_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManife
 /// author's file verbatim, and its hash is what a configured instance's own
 /// spec hash is bound to.
 ///
-/// The name is checked before the bytes: the manifest states the file it hashed
-/// and the kind derives that name, so a record naming something else is drift in
-/// the emitter rather than a stale deploy, and says so.
-///
 /// The window between this check and any later read of the tree is not defended:
 /// this is anti-drift, not anti-attacker — a writer to the surface asset
 /// directory already owns the host. The backend record's statement of the same
 /// stance is in `wasm_package.rs`.
-fn assert_spec_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManifest) {
+fn assert_spec_hash_matches(
+    cx: AssetContext,
+    dir: &Path,
+    kind: &str,
+    manifest: &ProcessorManifest,
+) {
+    let AssetContext { when, verdict } = cx;
     let derived = spec_artifact(kind);
-    assert!(
-        manifest.spec == derived,
-        "boot: processor component {kind:?} asset manifest names its specification {:?}, but this \
-         kind's packaged specification is {derived:?} — the record and the tree's naming disagree, \
-         which is build drift. Rebuild the surface assets with a matching toolchain. Refusing to \
-         start (fail-fast on invalid config).",
-        manifest.spec,
-    );
     let path = dir.join(&derived);
     let bytes = std::fs::read(&path).unwrap_or_else(|err| {
         panic!(
-            "boot: processor component {kind:?} packaged specification {derived} is unreadable at \
+            "{when}: processor component {kind:?} packaged specification {derived} is unreadable at \
              {} ({err}) — without it the configuration's specification cannot be bound to this \
-             tree. Rebuild the surface assets (`make build`) and redeploy. Refusing to \
-             start (fail-fast on invalid config).",
+             tree. Rebuild the surface assets (`make build`) and redeploy.{verdict}",
             path.display(),
         )
     });
     let actual = brenn_lib::util::sha256_hex(&bytes);
     assert!(
         actual == manifest.spec_sha256,
-        "boot: processor component {kind:?} has a specification that does not match its record: \
+        "{when}: processor component {kind:?} has a specification that does not match its record: \
          {derived} hashes to {actual}, but its manifest was written from {} — the tree was \
          assembled from mismatched parts, or the packaged specification was edited in place. \
-         Rebuild the surface assets and redeploy the whole surface root. Refusing to start \
-         (fail-fast on invalid config).",
+         Rebuild the surface assets and redeploy the whole surface root.{verdict}",
         manifest.spec_sha256,
     );
 }
@@ -261,21 +334,21 @@ fn assert_spec_hash_matches(dir: &Path, kind: &str, manifest: &ProcessorManifest
 /// # Panics
 ///
 /// On an import with no `<pkg>/<iface>` shape, or one outside [`PROCESSOR_PACKAGE`].
-fn processor_import_interface<'a>(kind: &str, import: &'a str) -> &'a str {
+fn processor_import_interface<'a>(cx: AssetContext, kind: &str, import: &'a str) -> &'a str {
+    let AssetContext { when, verdict } = cx;
     let (package, interface) = import.rsplit_once('/').unwrap_or_else(|| {
         panic!(
-            "boot: processor component {kind:?} asset manifest lists import {import:?}, which is \
+            "{when}: processor component {kind:?} asset manifest lists import {import:?}, which is \
              not a `<package>/<interface>` name — the build wrote a manifest this server cannot \
-             read. Rebuild the surface assets with a matching toolchain. Refusing to start \
-             (fail-fast on invalid config)."
+             read. Rebuild the surface assets with a matching toolchain.{verdict}"
         )
     });
     assert!(
         package == PROCESSOR_PACKAGE,
-        "boot: processor component {kind:?} imports {import:?}, from package {package:?} — no \
+        "{when}: processor component {kind:?} imports {import:?}, from package {package:?} — no \
          surface host provides anything outside {PROCESSOR_PACKAGE:?} (a stray dependency import). \
          A surface-hosted processor's imports must all live under {PROCESSOR_PACKAGE:?}; drop the \
-         import or move it backend-side. Refusing to start (fail-fast on invalid config).",
+         import or move it backend-side.{verdict}",
     );
     interface
 }
@@ -283,23 +356,24 @@ fn processor_import_interface<'a>(kind: &str, import: &'a str) -> &'a str {
 /// The import-profile check, mirroring wasmtime's ungranted-import load panic:
 /// a backend-only import on a surface-declared kind is rejected at boot, never
 /// discovered at page runtime.
-fn assert_import_profile(kind: &str, manifest: &ProcessorManifest) {
+fn assert_import_profile(cx: AssetContext, kind: &str, manifest: &ProcessorManifest) {
+    let AssetContext { when, verdict } = cx;
     for import in &manifest.imports {
-        let interface = processor_import_interface(kind, import);
+        let interface = processor_import_interface(cx, kind, import);
         assert!(
             KNOWN_IMPORTS.contains(&interface),
-            "boot: processor component {kind:?} asset manifest lists import {import:?}, which \
+            "{when}: processor component {kind:?} asset manifest lists import {import:?}, which \
              names no interface the processor world defines. Known: {}. This is manifest or \
              toolchain drift, not operator error — rebuild the surface assets with a matching \
-             toolchain. Refusing to start (fail-fast on invalid config).",
+             toolchain.{verdict}",
             KNOWN_IMPORTS.join(", "),
         );
         assert!(
             SURFACE_IMPORTS.contains(&interface),
-            "boot: processor component {kind:?} imports {import:?}, which no surface can satisfy — \
+            "{when}: processor component {kind:?} imports {import:?}, which no surface can satisfy — \
              it is backend-only in v1. A surface-hosted processor's imports must be a subset of \
              {}. The same artifact runs fine under [[wasm_consumer]]; declare it there, or drop \
-             the import. Refusing to start (fail-fast on invalid config).",
+             the import.{verdict}",
             SURFACE_IMPORTS.join(", "),
         );
     }
@@ -329,24 +403,25 @@ fn assert_import_profile(kind: &str, manifest: &ProcessorManifest) {
 ///
 /// When an instance's kind imports an interface the instance was not granted.
 pub fn assert_imports_granted(
+    cx: AssetContext,
     slug: &str,
     instance: &str,
     kind: &str,
     manifest: &ProcessorManifest,
     grants: &BTreeSet<brenn_envelope::grants::ComponentGrant>,
 ) {
+    let AssetContext { when, verdict } = cx;
     for import in &manifest.imports {
-        let interface = processor_import_interface(kind, import);
+        let interface = processor_import_interface(cx, kind, import);
         let Some(grant) = brenn_envelope::grants::ComponentGrant::parse(interface) else {
             continue;
         };
         assert!(
             grants.contains(&grant),
-            "boot: [[surface]] {slug:?}: component {instance:?} runs processor kind {kind:?}, \
+            "{when}: [[surface]] {slug:?}: component {instance:?} runs processor kind {kind:?}, \
              which imports the {interface} interface, but {:?} is not in the component's grants — \
              a component is given what it is granted and nothing else. Add {interface:?} to its \
-             grants, or ship a build that does not import it. Refusing to start (fail-fast on \
-             invalid config).",
+             grants, or ship a build that does not import it.{verdict}",
             grant.word(),
         );
     }

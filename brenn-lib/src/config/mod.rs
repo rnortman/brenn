@@ -13,6 +13,7 @@ mod hooks;
 mod llm_chat;
 mod logging;
 mod mcp;
+mod mounts;
 mod observability;
 mod path_mapper;
 mod repo;
@@ -35,8 +36,12 @@ pub(crate) use brenn::load_config_from;
 pub use brenn::*;
 /// What a document load or check reads: the root and its module roots.
 pub use brenn_dsl::DocumentInputs;
+/// Which vocabulary a document is read as.
+pub use brenn_dsl::DocumentRole;
 /// One file of a loaded document: its place within the document, and its hash.
 pub use brenn_dsl::SourceFile;
+/// A list of install roots and how it was named — a flag, or the mounts.
+pub use brenn_dsl::roots::RootList;
 pub use claude_defaults::*;
 pub use claude_profile::*;
 pub use container::*;
@@ -46,6 +51,7 @@ pub use hooks::*;
 pub use llm_chat::*;
 pub use logging::*;
 pub use mcp::*;
+pub use mounts::*;
 pub use observability::*;
 pub use path_mapper::*;
 pub use repo::*;

@@ -22,7 +22,7 @@ use crate::WebSysConnector;
 use crate::front::{self, EventStream, SurfaceHandle};
 use crate::page::SurfacePage;
 use crate::runner::SurfaceRunner;
-use crate::schema::{LogLevel, STALE_BUILD_CLOSE_CODE};
+use crate::schema::LogLevel;
 use crate::session::Event;
 
 use crate::dom;
@@ -91,7 +91,7 @@ pub fn start() -> KernelHandle {
         // Seeded from per-page entropy so a fleet reconnecting in lockstep after
         // a deploy restart decorrelates its reconnects.
         backoff_jitter_seed: crate::entropy::seed(),
-        terminal_close_code: Some(STALE_BUILD_CLOSE_CODE),
+        terminal_close_codes: crate::logic::ClosePolicy::terminal_codes(),
     };
     // The page's store epoch, minted here for the same reason as the jitter seed:
     // nothing below this edge reads entropy. `Uuid::new_v4` reads the platform

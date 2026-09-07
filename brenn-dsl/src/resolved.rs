@@ -28,9 +28,9 @@ use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 
 use crate::model::{
-    AgentAttrs, ChannelAttrs, DocComment, InTail, IntOrWord, IoTail, McpServerAttrs, MountTail,
-    MqttClientAttrs, OutTail, RemoteAttrs, RepoAttrs, SubscribeTail, SurfaceAttrs, WebhookAttrs,
-    Word, WordList,
+    AgentAttrs, ChannelAttrs, DocComment, InTail, IntOrWord, IoTail, McpServerAttrs, MountAttrs,
+    MountTail, MqttClientAttrs, OutTail, RemoteAttrs, RepoAttrs, SubscribeTail, SurfaceAttrs,
+    WebhookAttrs, Word, WordList,
 };
 
 /// A whole configuration, resolved.
@@ -76,6 +76,10 @@ pub struct ResolvedConfig {
     /// Top-level `mcp_server` definitions only; an agent's inline ones ride on
     /// the agent.
     pub mcp_servers: Vec<RNamed<McpServerAttrs<RVal>>>,
+    /// Declared mounts. Only a mounts document carries any: the resolver
+    /// refuses a `mount` written in a deployment document, and a mounts
+    /// document is the only thing that admits one.
+    pub mounts: Vec<RNamed<MountAttrs<RVal>>>,
     pub grants: Vec<RGrant>,
     /// The server's own configuration sections, typed by their kindword.
     pub sections: Vec<RSection>,

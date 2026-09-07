@@ -351,6 +351,35 @@ pub fn spawn_client_supervisor(
     });
 }
 
+/// Whether the supervisor has been asked to stop, right now.
+///
+/// A closed channel counts, as defence against a future ownership change
+/// rather than against anything reachable today: each client's channel has two
+/// senders, one held by the process's shutdown handle and one inside the
+/// `MqttClientHandle` this supervisor itself holds, so a running supervisor
+/// cannot observe the channel closed. Should the handle stop carrying one, a
+/// closed channel means the owner is gone and there is nothing left to keep a
+/// broker session up for.
+fn stopping_now(stop_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *stop_rx.borrow() || stop_rx.has_changed().is_err()
+}
+
+/// Resolve when the supervisor has been asked to stop, and not before.
+///
+/// The counterpart of [`stopping_now`] for a `select!` arm: a write of `false`
+/// onto the channel is not a stop, so this waits again rather than handing the
+/// arm a wake its caller has to re-examine.
+async fn stop_requested(stop_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if stopping_now(stop_rx) {
+            return;
+        }
+        if stop_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// The actual supervisor body, wrapped by the watchdog in
 /// `spawn_client_supervisor`.
 async fn supervisor_body(
@@ -375,7 +404,7 @@ async fn supervisor_body(
     let mut terminal_reason: Option<SupervisorState> = None;
 
     'supervisor: loop {
-        if *stop_rx.borrow() {
+        if stopping_now(&stop_rx) {
             tracing::info!(client = %client_slug, "supervisor stopping");
             let client_opt = handle.client.lock().await.take();
             if let Some(client) = client_opt {
@@ -406,11 +435,8 @@ async fn supervisor_body(
         let connack: Option<Result<bool, ConnectionError>> = loop {
             tokio::select! {
                 biased;
-                _ = stop_rx.changed() => {
-                    if *stop_rx.borrow() {
-                        break None;
-                    }
-                    continue;
+                _ = stop_requested(&mut stop_rx) => {
+                    break None;
                 }
                 event = eventloop.poll() => {
                     match event {
@@ -479,7 +505,7 @@ async fn supervisor_body(
                 attempt += 1;
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = stop_rx.changed() => {}
+                    _ = stop_requested(&mut stop_rx) => {}
                 }
                 continue;
             }
@@ -533,41 +559,39 @@ async fn supervisor_body(
         let disconnect_reason = loop {
             tokio::select! {
                 biased;
-                _ = stop_rx.changed() => {
-                    if *stop_rx.borrow() {
-                        // Write Disconnected BEFORE the drain so the observable
-                        // health transition does not gate on broker liveness.
-                        if terminal_reason.is_none() {
-                            let disconnected = SupervisorState::Disconnected {
-                                last_error: None,
-                                next_attempt_at: Instant::now(),
-                            };
-                            {
-                                let mut state = handle.supervisor_state.write().await;
-                                *state = disconnected.clone();
-                            }
-                            terminal_reason = Some(disconnected);
+                _ = stop_requested(&mut stop_rx) => {
+                    // Write Disconnected BEFORE the drain so the observable
+                    // health transition does not gate on broker liveness.
+                    if terminal_reason.is_none() {
+                        let disconnected = SupervisorState::Disconnected {
+                            last_error: None,
+                            next_attempt_at: Instant::now(),
+                        };
+                        {
+                            let mut state = handle.supervisor_state.write().await;
+                            *state = disconnected.clone();
                         }
-                        let client_opt = handle.client.lock().await.take();
-                        if let Some(c) = client_opt {
-                            let _ = c.disconnect().await;
-                            let drain_result = tokio::time::timeout(
-                                DISCONNECT_DRAIN_TIMEOUT,
-                                async { while eventloop.poll().await.is_ok() {} },
-                            )
-                            .await;
-                            if drain_result.is_err() {
-                                tracing::warn!(
-                                    client = %client_slug,
-                                    broker = %broker.identity.slug,
-                                    "DISCONNECT drain timed out after {}s; broker may not have \
-                                     closed the TCP connection promptly",
-                                    DISCONNECT_DRAIN_TIMEOUT.as_secs(),
-                                );
-                            }
-                        }
-                        break 'supervisor;
+                        terminal_reason = Some(disconnected);
                     }
+                    let client_opt = handle.client.lock().await.take();
+                    if let Some(c) = client_opt {
+                        let _ = c.disconnect().await;
+                        let drain_result = tokio::time::timeout(
+                            DISCONNECT_DRAIN_TIMEOUT,
+                            async { while eventloop.poll().await.is_ok() {} },
+                        )
+                        .await;
+                        if drain_result.is_err() {
+                            tracing::warn!(
+                                client = %client_slug,
+                                broker = %broker.identity.slug,
+                                "DISCONNECT drain timed out after {}s; broker may not have \
+                                 closed the TCP connection promptly",
+                                DISCONNECT_DRAIN_TIMEOUT.as_secs(),
+                            );
+                        }
+                    }
+                    break 'supervisor;
                 }
                 event = eventloop.poll() => {
                     match event {
@@ -633,7 +657,7 @@ async fn supervisor_body(
         attempt += 1;
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            _ = stop_rx.changed() => {}
+            _ = stop_requested(&mut stop_rx) => {}
         }
     }
 

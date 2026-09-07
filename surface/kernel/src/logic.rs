@@ -238,6 +238,62 @@ pub enum ConnectIndicatorState {
     /// screen with static error styling so a pre-chrome fatal is not mistaken
     /// for a slow connect.
     Failed,
+    /// The surface this page was serving has been retired. Terminal, and its own
+    /// state rather than [`ConnectIndicatorState::Failed`]: nothing failed, and
+    /// "Connection failed" would send an operator looking for a broken link.
+    Retired,
+}
+
+/// What a terminal peer close means to a surface page.
+///
+/// The mapping from close code to page behaviour is the kernel's because the
+/// kernel owns the surface socket: the transport below it declares which codes
+/// end the reconnect schedule and carries the number through, and nothing there
+/// knows what a surface is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SurfaceClose {
+    /// The page's assets predate the peer's build: reload to pick them up.
+    Stale,
+    /// The surface was reconfigured under this page — new bindings, new page
+    /// manifest, or new kind bytes. Reload; the runtime it reloads into is
+    /// already the new one.
+    Reconfigured,
+    /// The surface no longer exists. Terminal: nothing to reload into.
+    Retired,
+}
+
+/// The close codes a surface page treats as terminal, and what each one means.
+///
+/// One place so the list handed to the transport and the classification applied
+/// to what comes back cannot drift into a code that ends the schedule and then
+/// falls through to a default.
+pub struct ClosePolicy;
+
+impl ClosePolicy {
+    /// Every code that ends the reconnect schedule, for the transport's config.
+    pub fn terminal_codes() -> Vec<u16> {
+        vec![
+            crate::schema::STALE_BUILD_CLOSE_CODE,
+            crate::schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            crate::schema::SURFACE_RETIRED_CLOSE_CODE,
+        ]
+    }
+
+    /// What one terminal close code means.
+    ///
+    /// A code outside [`ClosePolicy::terminal_codes`] cannot arrive — the
+    /// transport raises the terminal event only for codes it was given — so the
+    /// fallthrough is unreachable in this build and reads as the mildest of the
+    /// three rather than as a page that refuses to come back.
+    pub fn classify(code: u16) -> SurfaceClose {
+        if code == crate::schema::SURFACE_RECONFIGURED_CLOSE_CODE {
+            SurfaceClose::Reconfigured
+        } else if code == crate::schema::SURFACE_RETIRED_CLOSE_CODE {
+            SurfaceClose::Retired
+        } else {
+            SurfaceClose::Stale
+        }
+    }
 }
 
 /// An effect an executor must apply, in order — most by the DOM executor, but
@@ -883,6 +939,33 @@ impl KernelCore {
                 actions.push(KernelAction::RequestReload {
                     reason: "stale build".to_string(),
                 });
+                actions
+            }
+            // Capped by the bootstrap like every other reload request, so a
+            // surface being rewritten in a loop costs the page a bounded number
+            // of navigations.
+            Event::Reconfigured => {
+                let mut actions = self.set_link_state(LinkState::Reloading);
+                actions.push(KernelAction::RequestReload {
+                    reason: "surface reconfigured".to_string(),
+                });
+                actions
+            }
+            // The one terminal outcome a reload cannot heal: the surface is
+            // gone, so the URL answers 404 from here. Own indicator text
+            // because this is not a broken connection.
+            Event::Retired => {
+                let mut actions = vec![KernelAction::Report {
+                    level: LogLevel::Warn,
+                    message: "this surface has been retired".to_string(),
+                    subject: None,
+                }];
+                actions.extend(self.set_link_state(LinkState::Fatal));
+                if self.connect_indicator_active {
+                    actions.push(KernelAction::SetConnectIndicator(
+                        ConnectIndicatorState::Retired,
+                    ));
+                }
                 actions
             }
             // The link-state plane carries no detail: chrome renders the banner
@@ -2168,6 +2251,82 @@ mod tests {
             r#"{"v":1,"state":"reloading"}"#
         );
         assert_eq!(core.link_state(), &LinkState::Reloading);
+    }
+
+    /// A reconfigured surface is a reload with its own reason, so the
+    /// bootstrap's capped-reload counter can tell it from a stale build.
+    #[test]
+    fn a_reconfigured_surface_publishes_reloading_and_requests_reload() {
+        let mut core = KernelCore::new();
+        let actions = core.on_event(&Event::Reconfigured);
+        assert_eq!(
+            without_platform_planes(&actions),
+            vec![KernelAction::RequestReload {
+                reason: "surface reconfigured".to_string()
+            }]
+        );
+        assert_eq!(
+            control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
+            r#"{"v":1,"state":"reloading"}"#
+        );
+        assert_eq!(core.link_state(), &LinkState::Reloading);
+    }
+
+    /// A retired surface is the one terminal outcome no reload can heal: the
+    /// fatal link state, no reload request, and the pre-chrome indicator driven
+    /// to its own retired text rather than to "Connection failed".
+    #[test]
+    fn a_retired_surface_is_terminal_and_never_reloads() {
+        let mut core = KernelCore::new();
+        let actions = core.on_event(&Event::Retired);
+        assert_eq!(
+            without_platform_planes(&actions),
+            vec![
+                KernelAction::Report {
+                    level: LogLevel::Warn,
+                    message: "this surface has been retired".to_string(),
+                    subject: None,
+                },
+                KernelAction::SetConnectIndicator(ConnectIndicatorState::Retired),
+            ]
+        );
+        assert_eq!(
+            control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
+            r#"{"v":1,"state":"fatal"}"#
+        );
+        assert_eq!(core.link_state(), &LinkState::Fatal);
+    }
+
+    /// Every code the page declares terminal classifies to a distinct outcome,
+    /// and the declared list is exactly the codes `classify` knows: a code that
+    /// ended the reconnect schedule and then fell through to the default would
+    /// be a page that silently reloads on a meaning nobody wrote.
+    #[test]
+    fn the_close_policy_classifies_every_code_it_declares() {
+        assert_eq!(
+            ClosePolicy::classify(crate::schema::STALE_BUILD_CLOSE_CODE),
+            SurfaceClose::Stale
+        );
+        assert_eq!(
+            ClosePolicy::classify(crate::schema::SURFACE_RECONFIGURED_CLOSE_CODE),
+            SurfaceClose::Reconfigured
+        );
+        assert_eq!(
+            ClosePolicy::classify(crate::schema::SURFACE_RETIRED_CLOSE_CODE),
+            SurfaceClose::Retired
+        );
+        // Deduped as a set, not by `dedup()`: a code appended to the end of
+        // `terminal_codes` that falls through to the default verdict yields a
+        // repeat that is not adjacent to its twin, which `dedup()` would keep.
+        let outcomes: std::collections::HashSet<SurfaceClose> = ClosePolicy::terminal_codes()
+            .into_iter()
+            .map(ClosePolicy::classify)
+            .collect();
+        assert_eq!(
+            outcomes.len(),
+            ClosePolicy::terminal_codes().len(),
+            "two declared codes mean the same thing"
+        );
     }
 
     #[test]

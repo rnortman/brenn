@@ -43,13 +43,20 @@ pub(crate) mod compare;
 pub(crate) mod delta;
 pub(crate) mod doors;
 pub(crate) mod driver;
+pub(crate) mod mqtt;
 pub(crate) mod status;
+pub(crate) mod surfaces;
 
 /// The correctness rule above, checked against a running process, and the
 /// cases that need one: they live beside the driver's own tests rather than
 /// inside them because their subject is the process, not the verdict.
 #[cfg(test)]
 mod oracle_tests;
+
+/// Reload's MQTT convergence against a real broker. Filtered out of the
+/// hermetic test target and run by one that spawns `mosquitto`.
+#[cfg(test)]
+pub(crate) mod mqtt_broker_tests;
 
 /// The tail every level-1 and level-2 refusal ends with: what the operator does
 /// about it.

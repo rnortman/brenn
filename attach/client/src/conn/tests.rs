@@ -17,7 +17,7 @@ fn config() -> ConnConfig {
         connect_timeout: Duration::from_secs(10),
         liveness_multiplier: 3,
         backoff_jitter_seed: 0x5EED,
-        terminal_close_code: Some(4001),
+        terminal_close_codes: vec![4001],
     }
 }
 
@@ -47,7 +47,12 @@ fn frame(frame: ServerFrame) -> ConnInput {
 /// A connection driven to `Active` at `now = 0`, with the effects of getting
 /// there discarded.
 fn attached() -> Connection {
-    let (mut conn, _) = Connection::start(config(), Millis(0));
+    attached_with(config())
+}
+
+/// [`attached`] over a stated config, for the tests that vary one of its fields.
+fn attached_with(config: ConnConfig) -> Connection {
+    let (mut conn, _) = Connection::start(config, Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
     conn.on_input(peer_hello(SUPPORTED_VERSIONS), Millis(0));
     conn.on_input(frame(welcome_frame(SUPPORTED_VERSIONS.max)), Millis(0));
@@ -407,6 +412,64 @@ fn the_embedder_declared_close_code_is_terminal_rather_than_a_backoff() {
             }),
             ConnEffect::SetWakeup(None),
         ]
+    );
+}
+
+/// An embedder with several terminal outcomes declares several codes, and each
+/// one arrives with its own number: the connection ends the schedule on any of
+/// them and hands the code through so the embedder can tell them apart.
+#[test]
+fn every_declared_close_code_is_terminal_and_carries_its_own_number() {
+    for code in [4001u16, 4002, 4003] {
+        let mut conn = {
+            let mut config = config();
+            config.terminal_close_codes = vec![4001, 4002, 4003];
+            attached_with(config)
+        };
+        let step = conn.on_input(
+            ConnInput::Disconnected {
+                code: Some(code),
+                reason: "why".to_string(),
+            },
+            Millis(1_000),
+        );
+        assert_eq!(conn.state(), ConnState::Terminal, "code {code}");
+        assert_eq!(
+            step.effects,
+            vec![
+                ConnEffect::Emit(ConnEvent::PeerClosedTerminal {
+                    code,
+                    reason: "why".to_string(),
+                }),
+                ConnEffect::SetWakeup(None),
+            ]
+        );
+    }
+}
+
+/// A code outside the declared set is an ordinary drop: the schedule backs off
+/// and reconnects, which is what every close that means nothing to the embedder
+/// must do.
+#[test]
+fn an_undeclared_close_code_backs_off_instead() {
+    let mut conn = attached();
+    let step = conn.on_input(
+        ConnInput::Disconnected {
+            code: Some(4002),
+            reason: "why".to_string(),
+        },
+        Millis(1_000),
+    );
+    assert_ne!(conn.state(), ConnState::Terminal);
+    assert!(
+        step.effects.iter().any(|e| matches!(
+            e,
+            ConnEffect::Emit(ConnEvent::Detached {
+                reason: DetachReason::TransportClosed { .. }
+            })
+        )),
+        "expected an ordinary detach, got {:?}",
+        step.effects
     );
 }
 

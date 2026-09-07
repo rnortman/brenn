@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e dev-mounts
 # Delete partially-written targets on recipe failure. Without this, a failing
 # recipe leaves the target file with a fresh mtime, causing subsequent
 # incremental builds to skip it entirely.
@@ -283,14 +283,35 @@ npm-audit: e2e/node_modules
 
 DEV_PIDFILE := .dev-server.pid
 
+# A dev server's roots come from a mounts document, and a mount is one directory
+# holding `components/`, `surface/` and/or `modules/` beside a `VERSION` — a
+# shape no build output has. So the document is synthesized: one mount, `brenn`,
+# whose three trees are symlinks onto the loose outputs `run-artifacts` builds
+# and onto the authored spec root. Regenerated on every spawn so a rebuilt tree
+# is never served through a stale link.
+DEV_MOUNTS_DIR := .dev-mounts
+DEV_MOUNTS := $(DEV_MOUNTS_DIR)/mounts.brenn
+
+dev-mounts: run-artifacts
+	@./bazel/wasm/dev_mounts.sh $(DEV_MOUNTS_DIR) \
+	    "brenn=components:$(BAZEL_BIN)/brenn-wasm/install_tree,surface:$(BAZEL_BIN)/surface/dist,modules:config/specs" \
+	    > /dev/null
+
 # Hermetic e2e config server settings, mirrored from brenn.e2e.brenn.
 E2E_BIN := $(BAZEL_BIN)/brenn/brenn
 E2E_BASE_URL := http://127.0.0.1:3100
+# The document the harness actually serves is a copy: the reload specs rewrite
+# it in place and signal the server, and the checked-in original must not move.
+# It sits at the workspace root because `use config::bar::*` resolves relative
+# to the document's own directory.
+E2E_LIVE_CONFIG := .e2e-live.brenn
+E2E_DB := target/e2e/brenn.db
 
 # Browser-level end-to-end tests (Playwright). Deliberately NOT part of
 # `make check`: needs installed Playwright browsers and a live server. Fresh DB
 # every run (rm -rf target/e2e) keeps it hermetic. Mints an invite via the
-# built binary, starts the hermetic server backgrounded (launchdev pattern —
+# built binary, copies the document to the writable live path the reload specs
+# rewrite, starts the hermetic server backgrounded (launchdev pattern —
 # no output redirection, which would hang the pipe against the backgrounded
 # process), polls the login page until ready (checking server liveness first
 # each iteration so a bind failure is reported, not masked by a foreign
@@ -302,7 +323,7 @@ E2E_BASE_URL := http://127.0.0.1:3100
 # TODO(e2e-in-ci): no gate runs this suite, so it can rot red indefinitely —
 # blocked on chromium provisioning on the runner and on the port-3100 server
 # this target boots.
-e2e: run-artifacts e2e/node_modules
+e2e: run-artifacts dev-mounts e2e/node_modules
 	@cd e2e && node -e "const{chromium}=require('@playwright/test');const fs=require('fs');const p=chromium.executablePath();if(!fs.existsSync(p)){console.error('ERROR: Playwright chromium browser not installed. Run: cd e2e && npx playwright install chromium');process.exit(1);}"
 	@rm -rf target/e2e
 	@mkdir -p target/e2e
@@ -310,10 +331,9 @@ e2e: run-artifacts e2e/node_modules
 	if curl -sf -o /dev/null $(E2E_BASE_URL)/auth/login 2>/dev/null; then \
 	    echo "ERROR: $(E2E_BASE_URL) is already serving before we started — a leaked e2e server or a port clash on 3100. Kill it before running make e2e."; exit 1; \
 	fi; \
-	invite=$$($(E2E_BIN) --config brenn.e2e.brenn --modules config/specs invite); \
-	$(E2E_BIN) --config brenn.e2e.brenn --modules config/specs serve \
-	    --components $(BAZEL_BIN)/brenn-wasm/install_tree \
-	    --surface $(BAZEL_BIN)/surface/dist & \
+	cp brenn.e2e.brenn $(E2E_LIVE_CONFIG); \
+	invite=$$($(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(DEV_MOUNTS) invite); \
+	$(E2E_BIN) --config $(E2E_LIVE_CONFIG) --mounts $(DEV_MOUNTS) serve & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null || true' EXIT INT TERM; \
 	echo "e2e: server PID $$srv; polling $(E2E_BASE_URL)/auth/login ..."; \
@@ -324,19 +344,23 @@ e2e: run-artifacts e2e/node_modules
 	    sleep 1; \
 	done; \
 	[ "$$ready" -eq 1 ] || { echo "ERROR: e2e server not ready within 60s"; exit 1; }; \
-	cd e2e && BRENN_E2E_BASE_URL=$(E2E_BASE_URL) BRENN_E2E_INVITE=$$invite npx playwright test
+	cd e2e && BRENN_E2E_BASE_URL=$(E2E_BASE_URL) BRENN_E2E_INVITE=$$invite \
+	    BRENN_E2E_CONFIG=$(abspath $(E2E_LIVE_CONFIG)) \
+	    BRENN_E2E_CONFIG_SOURCE=$(abspath brenn.e2e.brenn) \
+	    BRENN_E2E_SERVER_PID=$$srv \
+	    BRENN_E2E_BIN=$(abspath $(E2E_BIN)) \
+	    BRENN_E2E_DB=$(abspath $(E2E_DB)) \
+	    npx playwright test
 
 # Start the dev server in the background. Builds what the server reads, then
 # execs the built binary from the workspace root so the relative paths in
 # brenn.dev.brenn — the database, the log dir, the asset trees — resolve where
 # they always did.
-launchdev: run-artifacts
+launchdev: run-artifacts dev-mounts
 	@if [ -f $(DEV_PIDFILE) ] && kill -0 $$(cat $(DEV_PIDFILE)) 2>/dev/null; then \
 		echo "Dev server already running (PID $$(cat $(DEV_PIDFILE)))"; \
 	else \
-		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn --modules config/specs serve \
-		    --components $(BAZEL_BIN)/brenn-wasm/install_tree \
-		    --surface $(BAZEL_BIN)/surface/dist & \
+		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn --mounts $(DEV_MOUNTS) serve & \
 		echo $$! > $(DEV_PIDFILE); \
 		echo "Dev server started (PID $$!)"; \
 		sleep 1; \
@@ -354,3 +378,4 @@ stopdev:
 clean:
 	bazel clean
 	rm -rf target/e2e
+	rm -f $(E2E_LIVE_CONFIG)

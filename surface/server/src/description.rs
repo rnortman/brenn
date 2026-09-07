@@ -29,7 +29,7 @@ use std::path::Path;
 use brenn_lib::config::SurfaceDescriptionConfig;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
 use brenn_lib::messaging::gates::well_formed_name;
-use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency, is_unreserved_name};
+use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, is_unreserved_name};
 use brenn_lib::panic_util::{CONFIG_REFUSAL, HOST_DEFECT};
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_messaging::{Messenger, PublishResult};
@@ -179,7 +179,7 @@ pub fn instance_config_channel(prefix: &str, slug: &str, name: &str) -> String {
 
 /// Distinct component kinds appearing across `surfaces`, sorted for a stable
 /// derived-channel set and stable documents.
-fn distinct_kinds(surfaces: &[ResolvedSurface]) -> BTreeSet<String> {
+pub fn distinct_kinds(surfaces: &[ResolvedSurface]) -> BTreeSet<String> {
     surfaces
         .iter()
         .flat_map(|s| s.components.iter().map(|c| c.kind.clone()))
@@ -252,10 +252,68 @@ pub fn surface_config_spec(bare_channels: &[String]) -> SystemParticipantSpec {
 
 // ── Document builders ──────────────────────────────────────────────────────
 
-/// Build every boot-published document as `(address, body)` pairs, in publish
-/// order. Reads each kind's sidecar files from the root that serves that kind,
-/// which is the only place they can be: a bundle installs its kinds into a root
-/// of its own. A missing `.help.md` warns and yields a generated stub; a missing
+/// Build every document these surfaces derive, as `(address, body)` pairs in
+/// publish order: what boot publishes. See
+/// [`build_description_docs_selected`], which this is the whole-topology case
+/// of.
+pub fn build_description_docs(
+    prefix: &str,
+    build_id: &str,
+    surfaces: &[ResolvedSurface],
+    roots: &crate::SurfaceRoots,
+) -> Vec<(String, String)> {
+    build_description_docs_selected(
+        prefix,
+        build_id,
+        surfaces,
+        roots,
+        &DescriptionSelection::everything(surfaces),
+    )
+}
+
+/// Which of the derived documents to build: the whole set at boot, a subset
+/// when only part of the topology moved.
+///
+/// Named by slug and by kind rather than by value, because what decides the set
+/// is *which* surfaces and kinds moved while the bodies are functions of the
+/// whole candidate list — the index lists every surface, a kind's help doc lists
+/// every instance mounting it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescriptionSelection {
+    /// Whether to rebuild the index.
+    pub index: bool,
+    /// Surface slugs whose own help document to rebuild.
+    pub surfaces: BTreeSet<String>,
+    /// Kinds whose help and schema documents to rebuild.
+    pub kinds: BTreeSet<String>,
+}
+
+impl DescriptionSelection {
+    /// Every document these surfaces derive: what boot publishes.
+    pub fn everything(surfaces: &[ResolvedSurface]) -> Self {
+        Self {
+            index: true,
+            surfaces: surfaces.iter().map(|s| s.slug.clone()).collect(),
+            kinds: distinct_kinds(surfaces),
+        }
+    }
+
+    /// Whether this selection names no document at all.
+    pub fn is_empty(&self) -> bool {
+        !self.index && self.surfaces.is_empty() && self.kinds.is_empty()
+    }
+}
+
+/// Build the selected documents as `(address, body)` pairs, in publish order.
+///
+/// `surfaces` and `roots` are always the *whole* candidate topology, whatever
+/// the selection names: a document's body is a function of all of it. A
+/// selection naming a slug or a kind the list does not hold builds nothing for
+/// it — the caller's set is a request, not an assertion.
+///
+/// Reads each kind's sidecar files from the root that serves that kind, which is
+/// the only place they can be: a bundle installs its kinds into a root of its
+/// own. A missing `.help.md` warns and yields a generated stub; a missing
 /// `.schema.json` yields `schema: null`; a malformed `.schema.json` panics (a
 /// shipped machine-readable artifact that is not valid JSON is operator/vendor
 /// error, worse to publish than to fail fast).
@@ -263,21 +321,27 @@ pub fn surface_config_spec(bare_channels: &[String]) -> SystemParticipantSpec {
 /// A kind with no root at all reads no sidecar and takes the same stub, without
 /// the warning: at boot that arrangement is unreachable, because a configured
 /// kind no installed root offers is refused before this runs.
-pub fn build_description_docs(
+pub fn build_description_docs_selected(
     prefix: &str,
     build_id: &str,
     surfaces: &[ResolvedSurface],
     roots: &crate::SurfaceRoots,
+    want: &DescriptionSelection,
 ) -> Vec<(String, String)> {
     let ts = chrono::Utc::now().to_rfc3339();
     let mut docs = Vec::new();
 
-    docs.push((
-        index_channel(prefix),
-        build_index(prefix, build_id, surfaces, &ts),
-    ));
+    if want.index {
+        docs.push((
+            index_channel(prefix),
+            build_index(prefix, build_id, surfaces, &ts),
+        ));
+    }
 
     for surface in surfaces {
+        if !want.surfaces.contains(&surface.slug) {
+            continue;
+        }
         docs.push((
             surface_help_channel(prefix, &surface.slug),
             build_surface_help(prefix, build_id, surface, &ts),
@@ -285,6 +349,9 @@ pub fn build_description_docs(
     }
 
     for kind in distinct_kinds(surfaces) {
+        if !want.kinds.contains(&kind) {
+            continue;
+        }
         let root = roots.kind_root(&kind);
         docs.push((
             kind_help_channel(prefix, &kind),
@@ -1005,6 +1072,15 @@ fn assert_no_own_config_binding(surface: &ResolvedSurface, channel: &str) {
 
 // ── Boot publish ───────────────────────────────────────────────────────────
 
+/// Publish the given documents under the reserved `system:surface-help`
+/// identity, reporting the first that does not succeed.
+pub async fn try_publish_description(
+    messenger: &Messenger,
+    docs: &[(String, String)],
+) -> Result<(), (String, PublishResult)> {
+    crate::publish::try_publish_from_system(messenger, SURFACE_HELP_COMPONENT, docs).await
+}
+
 /// Publish every boot document under the `system:surface-help` identity, once at
 /// boot after the messenger is built.
 ///
@@ -1017,25 +1093,19 @@ fn assert_no_own_config_binding(surface: &ResolvedSurface, channel: &str) {
 /// while `max_body_bytes` is operator-set — so it gets a config-flavored message
 /// naming the channel, the size, and the remedy.
 pub async fn publish_description(messenger: &Messenger, docs: &[(String, String)]) {
-    for (address, body) in docs {
-        let result = messenger
-            .publish_from_system(SURFACE_HELP_COMPONENT, address, body, Urgency::Normal, None)
-            .await;
-        match result {
-            PublishResult::Ok { .. } => {}
-            PublishResult::BodyTooLarge { len, max } => panic!(
-                "boot: surface-description publish to {address:?} rejected — the document is {len} \
-                 bytes but [messaging] max_body_bytes is {max}. Per-kind help docs grow with their \
-                 sidecar content; raise max_body_bytes above {len} (or shrink the sidecar). \
-                 Refusing to start (fail-fast on invalid config)."
-            ),
-            other => panic!(
-                "boot: surface-description publish to {address:?} did not succeed ({other:?}) — the \
-                 reserved system publisher's policy and the boot-validated channels make this \
-                 unreachable, so a failure is a host bug. Refusing to start."
-            ),
-        }
-    }
+    crate::publish::publish_from_system_or_panic(
+        messenger,
+        SURFACE_HELP_COMPONENT,
+        docs,
+        "surface-description",
+        |len| {
+            format!(
+                "Per-kind help docs grow with their sidecar content; raise max_body_bytes above \
+                 {len} (or shrink the sidecar)."
+            )
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]

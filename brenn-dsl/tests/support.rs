@@ -10,7 +10,7 @@ use brenn_dsl::derived::DerivedConfig;
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::model::File;
 use brenn_dsl::resolved::ResolvedConfig;
-use brenn_dsl::{parse_str, resolve_files};
+use brenn_dsl::{DocumentRole, parse_str, resolve_files};
 
 /// The directory the corpus fixtures live in.
 ///
@@ -132,6 +132,14 @@ const PACKAGED_KEY: &str = concat!("@", brenn_dsl::packaged_module!());
 
 /// Resolve a tree of modules; the entry keyed `""` is the root.
 pub fn compile_tree(modules: &[(&str, &str)]) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    compile_tree_as(modules, DocumentRole::Deployment)
+}
+
+/// Resolve a tree of modules read under one document role.
+pub fn compile_tree_as(
+    modules: &[(&str, &str)],
+    role: DocumentRole,
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let mut files: Vec<(String, File)> = Vec::new();
     for (key, source) in modules {
         let filename = if key.is_empty() { "main" } else { key };
@@ -153,7 +161,7 @@ pub fn compile_tree(modules: &[(&str, &str)]) -> Result<ResolvedConfig, Vec<Diag
             )),
         }
     }
-    resolve_files(files, "")
+    resolve_files(files, "", role)
 }
 
 /// One fixture source, parsed. A fixture that does not parse is a broken test
@@ -195,6 +203,16 @@ pub fn refusal_tree(modules: &[(&str, &str)]) -> String {
 /// The one message a one-file document is refused with.
 pub fn refusal(source: &str) -> String {
     refusal_tree(&[("", source)])
+}
+
+/// The config a one-file mounts document produces.
+pub fn resolved_mounts(source: &str) -> ResolvedConfig {
+    value_of(compile_tree_as(&[("", source)], DocumentRole::Mounts))
+}
+
+/// The messages a one-file mounts document is refused with.
+pub fn mounts_refusals(source: &str) -> Vec<String> {
+    refusals_of(compile_tree_as(&[("", source)], DocumentRole::Mounts))
 }
 
 // ── deriving a document in a test ────────────────────────────────────────────

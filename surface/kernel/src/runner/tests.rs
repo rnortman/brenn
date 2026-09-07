@@ -60,7 +60,7 @@ fn config() -> ConnConfig {
         connect_timeout: Duration::from_secs(15),
         liveness_multiplier: 3,
         backoff_jitter_seed: 0,
-        terminal_close_code: Some(3001),
+        terminal_close_codes: vec![3001],
     }
 }
 

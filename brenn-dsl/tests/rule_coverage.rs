@@ -173,6 +173,11 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
     ),
     ("repo_def", "entities.brenn", Some("repo life {")),
     (
+        "mount_def",
+        "entities.brenn",
+        Some("mount example-bundle {"),
+    ),
+    (
         "mqtt_client_def",
         "entities.brenn",
         Some("mqtt_client broker {"),

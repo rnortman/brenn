@@ -349,7 +349,8 @@ async fn the_writer_serializes_in_order_and_exits_when_the_session_drops_its_sen
     let (tx, rx) = mpsc::channel(4);
     // A heartbeat far past the test's own lifetime: this test is about the frame
     // path, and an idle tick would add frames nobody enqueued.
-    let writer = tokio::spawn(writer_task(sink, rx, Duration::from_secs(3600)));
+    let (_close_tx, close_rx) = oneshot::channel();
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
 
     tx.send(server_hello("brenn-server-test")).await.unwrap();
     tx.send(ServerFrame::Heartbeat).await.unwrap();
@@ -368,7 +369,8 @@ async fn the_writer_serializes_in_order_and_exits_when_the_session_drops_its_sen
 async fn an_idle_tick_writes_a_ping_and_a_heartbeat() {
     let (sink, written) = TestSink::new(SinkMode::Record);
     let (tx, rx) = mpsc::channel(4);
-    let writer = tokio::spawn(writer_task(sink, rx, Duration::from_secs(10)));
+    let (_close_tx, close_rx) = oneshot::channel();
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(10)));
 
     tokio::time::sleep(Duration::from_secs(11)).await;
     assert_eq!(written_pings(&written), 1);
@@ -387,7 +389,8 @@ async fn an_idle_tick_writes_a_ping_and_a_heartbeat() {
 async fn a_frame_written_since_the_tick_suppresses_the_idle_heartbeat() {
     let (sink, written) = TestSink::new(SinkMode::Record);
     let (tx, rx) = mpsc::channel(4);
-    let writer = tokio::spawn(writer_task(sink, rx, Duration::from_secs(10)));
+    let (_close_tx, close_rx) = oneshot::channel();
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(10)));
 
     tx.send(server_hello("brenn-server-test")).await.unwrap();
     tokio::time::sleep(Duration::from_secs(11)).await;
@@ -410,7 +413,8 @@ async fn a_frame_written_since_the_tick_suppresses_the_idle_heartbeat() {
 async fn a_sink_error_exits_the_writer() {
     let (sink, written) = TestSink::new(SinkMode::Fail);
     let (tx, rx) = mpsc::channel(4);
-    let writer = tokio::spawn(writer_task(sink, rx, Duration::from_secs(3600)));
+    let (_close_tx, close_rx) = oneshot::channel();
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
 
     tx.send(ServerFrame::Heartbeat).await.unwrap();
     writer.await.unwrap();
@@ -425,10 +429,123 @@ async fn a_sink_error_exits_the_writer() {
 async fn a_stalled_sink_exits_the_writer_after_the_watchdog() {
     let (sink, written) = TestSink::new(SinkMode::Stall);
     let (tx, rx) = mpsc::channel(4);
-    let writer = tokio::spawn(writer_task(sink, rx, Duration::from_secs(10)));
+    let (_close_tx, close_rx) = oneshot::channel();
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(10)));
 
     tx.send(ServerFrame::Heartbeat).await.unwrap();
     writer.await.unwrap();
     assert!(written_frames(&written).is_empty());
     assert!(tx.send(ServerFrame::Heartbeat).await.is_err());
+}
+
+fn written_closes(written: &Arc<Mutex<Vec<Message>>>) -> Vec<(u16, String)> {
+    written
+        .lock()
+        .expect("written poisoned")
+        .iter()
+        .filter_map(|msg| match msg {
+            Message::Close(Some(frame)) => Some((frame.code, frame.reason.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A host-initiated close writes the code and reason the caller named, and ends
+/// the writer — which is what tears the session down.
+#[tokio::test]
+async fn a_host_close_writes_the_close_frame_and_exits_the_writer() {
+    let (sink, written) = TestSink::new(SinkMode::Record);
+    let (tx, rx) = mpsc::channel(4);
+    let (close_tx, close_rx) = oneshot::channel();
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+
+    close_tx
+        .send(CloseReason::new(3003, "surface retired"))
+        .expect("writer is listening");
+    writer.await.unwrap();
+
+    assert_eq!(
+        written_closes(&written),
+        vec![(3003, "surface retired".to_string())]
+    );
+    assert!(tx.send(ServerFrame::Heartbeat).await.is_err());
+}
+
+/// Frames already queued when the close is decided still reach the peer: they
+/// answer requests it made before anything was retired, and the queue is bounded
+/// so the flush is too.
+#[tokio::test]
+async fn a_host_close_flushes_what_was_already_queued_first() {
+    let (sink, written) = TestSink::new(SinkMode::Record);
+    let (tx, rx) = mpsc::channel(4);
+    let (close_tx, close_rx) = oneshot::channel();
+
+    tx.send(server_hello("brenn-server-test")).await.unwrap();
+    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    close_tx
+        .send(CloseReason::new(3002, "surface reconfigured"))
+        .expect("receiver is alive");
+
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+    writer.await.unwrap();
+
+    assert!(matches!(
+        written_frames(&written).as_slice(),
+        [ServerFrame::Hello { .. }, ServerFrame::Heartbeat]
+    ));
+    assert_eq!(
+        written_closes(&written),
+        vec![(3002, "surface reconfigured".to_string())]
+    );
+}
+
+/// A session that drops its close sender without using it is an ordinary
+/// teardown: no close frame, and the writer still exits on its receiver.
+#[tokio::test]
+async fn dropping_the_close_sender_writes_no_close_frame() {
+    let (sink, written) = TestSink::new(SinkMode::Record);
+    let (tx, rx) = mpsc::channel(4);
+    let (close_tx, close_rx) = oneshot::channel();
+    let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+
+    tx.send(ServerFrame::Heartbeat).await.unwrap();
+    drop(close_tx);
+    drop(tx);
+    writer.await.unwrap();
+
+    assert!(written_closes(&written).is_empty());
+    assert!(matches!(
+        written_frames(&written).as_slice(),
+        [ServerFrame::Heartbeat]
+    ));
+}
+
+/// **The production ordering: the session hands over the close reason and drops
+/// its frame sender in the same breath.** Both select arms are then ready on the
+/// first poll and `select!` picks between them at random, so the close arm and
+/// the `rx`-closed arm's `try_recv` recovery are each reached. Repeated because
+/// that is what makes the coin land both ways: without the `try_recv` the run
+/// where the closed-`rx` arm wins writes no close frame, and the peer
+/// reconnect-loops instead of learning why it was closed.
+#[tokio::test]
+async fn a_close_racing_the_senders_drop_still_writes_the_close_frame() {
+    for attempt in 0..64 {
+        let (sink, written) = TestSink::new(SinkMode::Record);
+        let (tx, rx) = mpsc::channel(4);
+        let (close_tx, close_rx) = oneshot::channel();
+
+        close_tx
+            .send(CloseReason::new(3002, "surface reconfigured"))
+            .expect("receiver is alive");
+        drop(tx);
+
+        let writer = tokio::spawn(writer_task(sink, rx, close_rx, Duration::from_secs(3600)));
+        writer.await.unwrap();
+
+        assert_eq!(
+            written_closes(&written),
+            vec![(3002, "surface reconfigured".to_string())],
+            "attempt {attempt}: whichever arm won the tie, the peer is told why",
+        );
+    }
 }

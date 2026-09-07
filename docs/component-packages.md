@@ -93,9 +93,9 @@ processor-demo/
 The package name is the whole reference. A configuration states no location at
 all: it imports the author's vocabulary as `use @processor-demo::*;`, and the
 host resolves `<components root>/processor-demo/` from that same name when it
-loads an instance of a class the module declares. The components roots are
-named on the command line, `serve --components <dir>`, once per root; exactly
-one of them may hold the directory (*Bundles and multiple roots*, below).
+loads an instance of a class the module declares. The components roots are the
+`components/` trees of the declared mounts; exactly one of them may hold the
+directory (*Mounts*, below).
 
 So the package name, the module name and the directory's basename are one name,
 and the packaged specification carries it too. Only the artifact keeps its own
@@ -184,13 +184,13 @@ Immediately before loading a component, per instance:
    separator, `.` or `..` names a location rather than a package, and a
    dot-named directory is one no release installs and one a glob-driven
    install sweep would leave behind — all refused before the name resolves to
-   anything. A name with no directory under any root is a panic naming every
-   root searched and the instantiation; a name present under two roots is a
-   panic naming both. A configuration
+   anything. A name with no directory under any mount's `components/` tree is a
+   panic naming every tree searched and the instantiation. A configuration
    may import any module the module root ships, but only a component the
    release ships as a backend package is top-level loadable — a surface kind
    ships its module and no package, and this is where instantiating one lands.
-   A host started without `--components` panics naming the flag.
+   A name present under two mounts is a panic naming both mounts; so is a host
+   whose declared mounts offer no `components/` tree at all.
 1. Read `package.json` in that directory. Missing, unreadable, unparseable,
    wrong `v`, unknown field, unknown world, spec fields inconsistent with the
    world, or a `name`/`artifact`/`spec` the layout contradicts — each is a
@@ -552,8 +552,8 @@ modules/mode-clock.brenn            a surface kind's, harvested from surface/
 modules/protobar.brenn
 ```
 
-That is the directory a deployment's `--modules` names and its `use @<name>::…`
-imports resolve against (`config-dsl.md`, *Packaged-module imports*), so the
+That is the tree a deployment's mount offers as `modules/` and its
+`use @<name>::…` imports resolve against (`config-dsl.md`, *Packaged-module imports*), so the
 staged name is the authored basename — the wire kind — rather than the
 artifact's stem. Every component the release ships contributes one, backend and
 surface alike, so a deployment can import whatever it instantiates; the backend
@@ -606,82 +606,135 @@ something stamps it, and that root stamps nothing, so a body that names a depth
 no constant or parameter resolves to, or reaches for anything else the resolver
 refuses, passes here and is refused at a deployment's `config-check` instead.
 
-## Bundles and multiple roots
+## Mounts
 
 brenn's release installs its packages and modules into one components root and
 one module root, and the installer empties both on every deploy — each is
 exclusively that release's. A component built elsewhere cannot land in either:
-the next brenn deploy deletes it. So the host takes more than one of each.
+the next brenn deploy deletes it. So the host takes more than one of each, and
+learns the whole list from one place.
 
-`--modules DIR` and `serve --components DIR` are repeatable. Every root is a
-directory of the same shape as brenn's own — `<name>.brenn` files flat in a
-module root, `<name>/` package directories in a components root — and the host
-treats the list as one namespace with a rule: **a name may appear under exactly
-one root.** A module basename present in two module roots, or a package
-directory name present in two components roots, is a boot refusal naming the
-name and both roots, whether or not the configuration imports or instantiates
-it — a broken install is refused independently of what today's configuration
-happens to touch. The same path given twice is refused too, compared after
-canonicalization. Identical bytes under two roots are still refused: two
-releases shipping one module means one of them is stale the moment the other
-updates. The module scan runs when the configuration loads; the package scan
-runs immediately after, before anything is served.
+A **mount** is one directory holding up to three trees plus a `VERSION` file,
+which the operator has *declared* to the host. The declaration is the act of
+consent: what is under a declared mount may be resolved, loaded and served; what
+is not declared is invisible. Nothing discovers a mount — no directory scan, no
+installer — so the only way a tree becomes readable is that someone wrote a line
+naming it. brenn's own release is a mount like any other.
 
-A **bundle** is the release of a component repository — a tree carrying up to
-three of the subdirectories brenn's tarball has, and only the ones it ships:
-
-| tree | what it holds | installs as |
+| tree | what it holds | read by |
 |---|---|---|
-| `components/` | one `<name>/` package directory per backend component, plus `components/deployed-components.txt` and the `scripts/manifest_names.sh` an installer execs to read it | one `serve --components` root |
-| `surface/` | `processor/<kind>/` per page-hosted kind — the transpiled tree, the component bytes, the packaged spec, the record binding them | one `serve --surface` root |
-| `modules/` | the authored module of every one of them, flat | one `--modules` root |
+| `components/` | one `<name>/` package directory per backend component, plus `components/deployed-components.txt` and the `scripts/manifest_names.sh` an installer execs to read it | the WASM loader |
+| `surface/` | `processor/<kind>/` per page-hosted kind — the transpiled tree, the component bytes, the packaged spec, the record binding them | the HTTP server |
+| `modules/` | the authored module of every one of them, flat | the compiler |
 
-No kernel bundle and no flat sidecars: exactly one surface root holds the
-kernel, and that one is brenn's. Every `--surface` root must offer one or the
-other — the kernel pair, or at least one `processor/<kind>/` — so a flag pointed
-one directory off (a bundle's install root rather than its `surface/` tree) is
-refused at that boot instead of at the later one that first stamps the kind.
+A mount ships the trees its release has and no others; a mount holding none of
+the three is refused, which is what a path pointed one directory off looks like.
+`modules/` is present and empty when a bundle owes it nothing: a replay-world
+package ships no specification, so a bundle whose packages are all replay-world
+is imported by no configuration and named instead by a `replay_protection`
+block's `component =`.
 
-`modules/` is always present and is empty when the bundle owes it nothing: a
-replay-world package ships no specification, so a bundle whose packages are all
-replay-world is imported by no configuration and named instead by a
-`replay_protection` block's `component =`.
+### The mounts document
 
-The repository is the store of record; the bundle is what its CI builds from a
-pinned ref, the way brenn's tarball is built from brenn's. `component_bundle`
-stages it and pairs it with the same contract gate brenn's own tarball passes,
-so a record that does not bind the bytes beside it fails the bundle's build
-rather than the target host's next boot. A bundle installs into roots of **its
-own**, one per tree it ships, exclusively its own in the same sense as brenn's,
-and the service is started with one flag more per root:
+Mounts are declared in a small `.brenn` document of their own, named by one flag
+on the unit:
 
 ```
-brenn --config prod.brenn --modules /srv/brenn/modules --modules /srv/caser/modules \
-  serve --components /srv/brenn/lib --components /srv/caser/components \
-  --surface /srv/brenn/surface --surface /srv/caser/surface
+brenn --config /home/brenn/config/brenn-prod.brenn \
+      --mounts /home/brenn/mounts.brenn serve
 ```
+
+```
+mount brenn { path = "/home/brenn/brenn/release"; }
+mount caser { path = "/home/brenn/brenn/bundles/caser"; }
+```
+
+The document admits `mount` and `const` statements and nothing else; it imports
+nothing, and a `mount` in the deployment document is refused just as firmly.
+Every `path` is absolute, no two are the same, and no one nests inside another —
+a nested mount would make one release's tree part of another's. Each declared
+path must be a directory holding a readable `VERSION` and at least one of the
+three trees, or the host refuses to start and a reload refuses to converge.
+
+The paths are canonicalized once per read, which is what makes the symlink
+install scheme below atomic from the host's side.
+
+`brenn mounts --mounts FILE` prints one line per declared mount — name, declared
+path, and either `ok:<version>:<trees>`, `missing`, or `fault:<message>` — and
+exits on the document's own validity rather than the filesystem's, so an
+installer can read the declaration of a mount it is about to create.
+
+### One name, one mount
+
+The host treats the union of the mounts' trees as one namespace with a rule: **a
+name may appear under exactly one mount.** A module basename present in two
+`modules/` trees, a package directory name present in two `components/` trees,
+or a surface kind present in two `surface/` trees is a refusal naming the name
+and both roots, whether or not the configuration imports or instantiates it — a
+broken install is refused independently of what today's configuration happens to
+touch. Identical bytes under two mounts are still refused: two releases shipping
+one module means one of them is stale the moment the other updates. The module
+scan runs when the configuration loads; the package scan runs immediately after,
+before anything is served. Both run again on every reload, so a mount installed
+since boot is checked against the ones that were already there.
+
+No kernel bundle and no flat sidecars: exactly one `surface/` tree holds the
+kernel, and that one is brenn's.
+
+### Bundles
+
+A **bundle** is the release of a component repository — a tree in the mount
+shape, carrying the subdirectories its build ships. The repository is the store
+of record; the bundle is what its CI builds from a pinned ref, the way brenn's
+tarball is built from brenn's. `component_bundle` stages it and pairs it with
+the same contract gate brenn's own tarball passes, so a record that does not
+bind the bytes beside it fails the bundle's build rather than the target host's
+next boot.
+
+The recommended layout on a host makes an install atomic: the declared mount
+path is a **symlink** to a versioned sibling.
+
+```
+/home/brenn/brenn/bundles/caser        -> caser.v1.4.2/
+/home/brenn/brenn/bundles/caser.v1.4.2/
+/home/brenn/brenn/bundles/caser.v1.4.1/
+```
+
+The installer stages the whole tree into a fresh directory, renames it into
+place, and swaps the symlink; the host canonicalizes on read, so a reload
+running concurrently sees either the old tree or the new and never a half-copy.
+One previous version is kept, so a rollback is a re-pin rather than a rebuild.
+
+A mount is declared **before** its first install, and the declaration takes
+effect at the next reload — not at a restart. Between adding the line and
+running the install the document names a path that does not exist, which a
+reload refuses; that window is the operator's own and is closed by running the
+install.
 
 The exclusivity rule brenn's installer checks among its own install directories
-covers bundle roots too: the deploying side names the directory bundles install
-under alongside brenn's own, and refuses a layout in which one equals or nests
-inside another. Without that, a bundle root placed inside one of brenn's sync
-directories is deleted by brenn's next deploy, and the service then fails to
-start with the "not an installed package directory" refusal naming the missing
-package and every root searched. Give each bundle directories of its own. A bundle whose package name collides
-with a brenn package is refused at boot as a cross-root duplicate; the name is
-the author's to change.
+covers mount paths too: the deploying side refuses a layout in which a mount
+path equals or nests inside one of brenn's install directories. Without that, a
+mount placed inside one of brenn's sync directories is deleted by brenn's next
+deploy, and the service then fails with the "not an installed package directory"
+refusal naming the missing package and every root searched. Give each mount a
+directory of its own. A bundle whose package name collides with a brenn package
+is refused as a cross-mount duplicate; the name is the author's to change.
 
 One shared root with per-release ownership manifests was considered and
 rejected: two bundles shipping one package name would overwrite each other
-silently, and a single root has no second copy for the host to compare. Multiple
-roots give the host the collision, and it refuses.
+silently, and a single root has no second copy for the host to compare. Separate
+mounts give the host the collision, and it refuses.
 
 ### Upgrading a bundle under a running host
 
-Installing a bundle is an rsync into its roots and a service bounce. On a
-deployment that declares the reload facility (`docs/message-bus.md` §2.8) the
-bounce can be a reload instead, for the case that matters most — a new build of
-a component whose configuration did not move.
+Installing a bundle is staging its tree, swapping its mount, and reloading. On a
+deployment that declares the reload facility (`docs/message-bus.md` §2.8) no
+bounce is needed for the case that matters most — a new build of a component
+whose configuration did not move. The roots are re-derived from the mounts
+document on every reload, so a mount declared since boot is in reach without a
+restart, and one whose line went away takes its packages with it: a consumer
+whose package no mount holds any more is a refusal, and the process keeps
+running the bytes it has.
 
 The host does not take the document's word for what is running. Each running
 consumer is held against the package record on disk — artifact hash and spec hash
@@ -697,9 +750,11 @@ Two things about the upgrade path are worth knowing before relying on it:
   tree that moved under an unmoved document is not noticed — the served tree and
   the self-description publishes are both boot-time facts. Only backend packages
   are held against their records.
-- **The roots can move while a reload is preparing** — an rsync into a directory
-  is not atomic. Verify the install, then ask for the reload, rather than the
-  other way round; a reload that reads a half-synced root refuses on a hash
+- **The trees can move while a reload is preparing** if the install is an rsync
+  into a live directory, which is not atomic. The versioned-tree-plus-symlink
+  layout above is the answer: the swap is one rename and the host resolves the
+  symlink once. Installing over a live tree instead, verify first and ask for
+  the reload after; a reload that reads a half-synced tree refuses on a hash
   mismatch, which is the correct outcome but not a pleasant way to learn the
   rsync had not finished.
 

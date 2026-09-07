@@ -107,6 +107,12 @@ impl TargetResolver {
         self.subscribers.register_all(registrations);
     }
 
+    /// Swap a live subscriber's registration for a new one, under one lock —
+    /// the same subscriber, rewired. Panics if the key is not live.
+    pub fn replace(&self, kind: &SubscriberEntryKind, registration: SubscriberRegistration) {
+        self.subscribers.replace(kind, registration);
+    }
+
     /// Retire one registration: the key leaves the live map and becomes a
     /// tombstone, so a lookup racing the departure answers "gone" rather than
     /// panicking.
@@ -117,6 +123,14 @@ impl TargetResolver {
     /// twice, is a wiring bug.
     pub fn retire(&self, kind: &SubscriberEntryKind) {
         self.subscribers.retire(kind);
+    }
+
+    /// Every subscriber kind the registry holds live, unordered. App
+    /// subscribers are absent, as they are from every other reader here: their
+    /// policy lives in the apps map.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn registered_kinds(&self) -> Vec<SubscriberEntryKind> {
+        self.subscribers.live_keys()
     }
 
     /// Whether `kind` holds a tombstone: registered once, retired since, and not

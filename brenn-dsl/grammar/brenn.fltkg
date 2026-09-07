@@ -37,6 +37,7 @@ item := const_def:const_def
       | repo:repo_def
       | mqtt_client:mqtt_client_def
       | mcp_server:mcp_server_def
+      | mount:mount_def
       | acl:acl_stmt
       | grant:grant_stmt
       | section:section ;
@@ -176,6 +177,15 @@ webhook_def := doc:doc? , %"webhook" : name:name , %"{" , (attrs:attr | blocks:s
 repo_def := doc:doc? , %"repo" : name:name , body:body_block , ;
 mqtt_client_def := doc:doc? , %"mqtt_client" : name:name , body:body_block , ;
 mcp_server_def := doc:doc? , %"mcp_server" : name:name , body:body_block , ;
+
+// A declared mount: one directory of installed trees the host may read. Legal
+// only in a mounts document, which the resolver holds; the grammar admits the
+// form wherever an item goes, and `name` is the mount's slug.
+//
+// Shaped like `repo_def` rather than carrying attrs of its own, so the body
+// goes through `body_block` and the layout is the one every named definition
+// already has.
+mount_def := doc:doc? , %"mount" : name:name , body:body_block , ;
 
 // Inside an agent body the bare form references a top-level definition and the
 // braced form defines one inline — the language's only inline-definition site,

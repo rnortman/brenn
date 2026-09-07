@@ -18,6 +18,7 @@ pub mod boot_policy;
 pub mod description;
 pub mod processor_assets;
 pub mod profile;
+mod publish;
 pub mod telemetry;
 
 #[cfg(any(test, feature = "testutils"))]
@@ -25,7 +26,7 @@ pub mod fixtures_config;
 #[cfg(any(test, feature = "testutils"))]
 pub mod test_fixtures;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use brenn_envelope::{channel_capabilities, is_local_channel};
@@ -36,11 +37,16 @@ use brenn_lib::messaging::{ChannelScheme, MessagingDirectory};
 use brenn_lib::panic_util::CONFIG_REFUSAL;
 use brenn_messaging::Messenger;
 use brenn_messaging::system::SystemParticipantSpec;
-use brenn_surface_contract::{KERNEL_ARTIFACT, PROCESSOR_DIR};
 
 pub use brenn_surface_contract::processor_kind_from_path;
+/// Re-exported so a caller that stages or asserts on a surface tree names the
+/// same constants the scan does.
+pub use brenn_surface_contract::{KERNEL_ARTIFACT, PROCESSOR_DIR};
 
-const SURFACE_FLAG: &str = "--surface";
+/// What a message calls the tree a surface kind is served from. Where it comes
+/// from is the mounts document, not a flag: the host reads `<mount>/surface/`,
+/// once per declared mount that offers one.
+const SURFACE_TREE: &str = "`surface/` tree";
 use brenn_surface_schema::surface_bindable_address;
 
 use self::profile::SurfaceProfile;
@@ -316,18 +322,194 @@ pub fn build_surface_runtimes(
 /// root a kind came from, so this map is the whole of that knowledge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SurfaceRoots {
-    /// The one root that holds the kernel module pair and the flat sidecars.
-    /// `None` iff no `--surface` was given — a surface-less deployment.
-    pub kernel: Option<std::path::PathBuf>,
-    /// Wire kind → the one root whose `processor/<kind>/` holds it.
-    pub kinds: std::collections::BTreeMap<String, std::path::PathBuf>,
+    /// The one root that holds the kernel module pair and the flat sidecars,
+    /// with the fingerprint of the pair it holds. `None` iff no declared mount
+    /// offers a surface tree — a surface-less deployment.
+    pub kernel: Option<KernelRoot>,
+    /// Wire kind → the one root whose `processor/<kind>/` holds it, and what
+    /// that tree currently holds.
+    pub kinds: std::collections::BTreeMap<String, KindRoot>,
+}
+
+/// The installed surface kernel: the tree serving the module pair every page
+/// loads, and the fingerprint of that pair.
+///
+/// **The fingerprint is here because the path is not the identity.** Nothing
+/// about the kernel is recorded in a manifest, so an in-place rewrite of the
+/// pair — a `make build` under a dev mount, a sync into an unmoved release
+/// mount — leaves the root exactly where it was. A page that keeps running is
+/// running the bytes this fingerprint names, and the reload's refusal is what
+/// keeps that from silently becoming untrue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelRoot {
+    /// The surface tree holding the kernel module pair.
+    pub root: std::path::PathBuf,
+    /// SHA-256 over the JS module and its wasm sibling, in that order.
+    pub module_sha256: String,
+}
+
+impl KernelRoot {
+    /// A kernel root with a placeholder fingerprint, for tests that exercise
+    /// path resolution alone.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn for_test(root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            module_sha256: String::new(),
+        }
+    }
+}
+
+/// One installed component kind: which mount offers it, the tree currently
+/// serving it, and the fingerprint of the artifact and specification that tree
+/// holds.
+///
+/// **The change identity is the mount and the two fingerprints, never the
+/// path.** An install under the versioned-tree scheme swaps the mount symlink
+/// onto a fresh directory, so the canonical root of every kind under that mount
+/// moves on every deploy whether or not a byte of the kind did. The
+/// fingerprints are what say a kind changed; `root` is only where to read it
+/// today, and it is refreshed rather than compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindRoot {
+    /// The mount offering this kind, as its root list names it (a mount name on
+    /// a host, a path under the workstation's `--surface` form).
+    pub mount: String,
+    /// The surface tree whose `processor/<kind>/` holds this kind, as the
+    /// current scan resolved it.
+    pub root: std::path::PathBuf,
+    /// SHA-256 of the component artifact the transpiled tree was built from.
+    pub source_sha256: String,
+    /// SHA-256 of the authored specification packaged beside it.
+    pub spec_sha256: String,
+}
+
+impl KindRoot {
+    /// A kind root with placeholder fingerprints, for tests that exercise path
+    /// resolution alone.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn for_test(root: std::path::PathBuf) -> Self {
+        Self {
+            mount: root.display().to_string(),
+            root,
+            source_sha256: String::new(),
+            spec_sha256: String::new(),
+        }
+    }
+
+    /// Whether two scans found the same installation of this kind: the same
+    /// mount offering the same bytes. A root path that moved under one mount
+    /// with both fingerprints intact is a relocation — the installer swapped a
+    /// symlink onto a fresh versioned tree — and not a change.
+    fn same_installation(&self, other: &KindRoot) -> bool {
+        self.mount == other.mount
+            && self.source_sha256 == other.source_sha256
+            && self.spec_sha256 == other.spec_sha256
+    }
 }
 
 impl SurfaceRoots {
     /// The root serving one kind, or `None` where no installed root offers it.
     pub fn kind_root(&self, kind: &str) -> Option<&std::path::Path> {
-        self.kinds.get(kind).map(std::path::PathBuf::as_path)
+        self.kinds.get(kind).map(|held| held.root.as_path())
     }
+
+    /// Every kind on which `self` and `other` disagree, keyed by kind name.
+    ///
+    /// `self` is the set held — what is being served — and `other` the set just
+    /// scanned. A kind absent from the result is byte-for-byte the same
+    /// installation in both, which is what makes this map the closure input for
+    /// "which surfaces does an installed tree move".
+    pub fn kind_differences(&self, other: &SurfaceRoots) -> BTreeMap<String, KindDifference> {
+        let mut out = BTreeMap::new();
+        for (kind, held) in &self.kinds {
+            let difference = match other.kinds.get(kind) {
+                // Includes the relocation: one mount, the same bytes, a fresh
+                // versioned tree behind the symlink. Nothing about the kind
+                // changed, so it is not a difference — only the path to read it
+                // from moved, which the roots cell is refreshed with.
+                Some(now) if now.same_installation(held) => continue,
+                Some(now) if now.mount != held.mount => KindDifference::Moved {
+                    from: held.mount.clone(),
+                    to: now.mount.clone(),
+                },
+                // One mount, different bytes: the tree it offers was replaced,
+                // which is what a bundle upgrade looks like.
+                Some(now) => KindDifference::Reinstalled {
+                    mount: now.mount.clone(),
+                    root: now.root.clone(),
+                },
+                None => KindDifference::Withdrawn {
+                    mount: held.mount.clone(),
+                    root: held.root.clone(),
+                },
+            };
+            out.insert(kind.clone(), difference);
+        }
+        for (kind, now) in &other.kinds {
+            if !self.kinds.contains_key(kind) {
+                out.insert(
+                    kind.clone(),
+                    KindDifference::Offered {
+                        mount: now.mount.clone(),
+                    },
+                );
+            }
+        }
+        out
+    }
+}
+
+/// How one kind's installation differs between two scans of the declared
+/// mounts, phrased from the held set's point of view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KindDifference {
+    /// A different mount offers the kind now.
+    Moved { from: String, to: String },
+    /// The same mount offers it, with different bytes behind it — a bundle
+    /// upgrade. `root` is the tree the new scan found it in.
+    Reinstalled {
+        mount: String,
+        root: std::path::PathBuf,
+    },
+    /// No declared mount offers it any more.
+    Withdrawn {
+        mount: String,
+        root: std::path::PathBuf,
+    },
+    /// A declared mount offers it and the held set has never seen it.
+    Offered { mount: String },
+}
+
+/// How a surface-asset validation failure is framed for whoever reads it.
+///
+/// The same checks run at boot, where the process is about to refuse to start,
+/// and at reload, where the process keeps serving the document it already has
+/// and the caller turns the panic into a refusal. The body of every message is
+/// the same; only the moment it names and the instruction it ends with differ,
+/// so a reload refusal never tells an operator that a running process refused
+/// to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetContext {
+    /// The moment the check ran, as the first word of every message.
+    pub when: &'static str,
+    /// What the reader should do, appended to every message. Empty where the
+    /// caller frames the outcome itself.
+    pub verdict: &'static str,
+}
+
+impl AssetContext {
+    /// Boot: a failure ends the process before it serves anything.
+    pub const BOOT: Self = Self {
+        when: "boot",
+        verdict: " Refusing to start (fail-fast on invalid config).",
+    };
+    /// Reload: a failure refuses the candidate and the process carries on
+    /// serving what it already has, so the message names no restart.
+    pub const RELOAD: Self = Self {
+        when: "reload",
+        verdict: "",
+    };
 }
 
 /// Boot-time surface-asset existence check, over every installed root.
@@ -360,26 +542,82 @@ impl SurfaceRoots {
 /// offers, and everything the per-kind and per-instance passes already panic
 /// on.
 pub fn validate_surface_assets(
-    roots: &[std::path::PathBuf],
+    roots: &brenn_dsl::roots::RootList,
     surfaces: &[ResolvedSurface],
 ) -> SurfaceRoots {
+    validate_surface_assets_in(AssetContext::BOOT, roots, surfaces)
+}
+
+/// The same validation, framed for whoever asked for it.
+///
+/// A reload re-runs every check here against the trees the declared mounts
+/// offer now, with the process still serving the document it already has, so
+/// the messages must not tell the operator that a process refused to start.
+///
+/// # Panics
+///
+/// On everything [`validate_surface_assets`] panics on.
+pub fn validate_surface_assets_in(
+    cx: AssetContext,
+    roots: &brenn_dsl::roots::RootList,
+    surfaces: &[ResolvedSurface],
+) -> SurfaceRoots {
+    let AssetContext { when, verdict } = cx;
     if roots.is_empty() {
         assert!(
             surfaces.is_empty(),
-            "boot: {} [[surface]] block(s) are configured but the server was started without \
-             {SURFACE_FLAG}. The surface asset tree is an artifact fact, so it is named on the command \
-             line and never in the document: pass one --surface per installed release. Refusing to \
-             start (fail-fast on invalid config).",
+            "{when}: {} [[surface]] block(s) are configured but no declared mount offers a \
+             {SURFACE_TREE}. The surface asset tree is an artifact fact, so it comes from the \
+             mounts document (`--mounts`) and never from the deployment document: declare a \
+             mount per installed release.{verdict}",
             surfaces.len(),
         );
         return SurfaceRoots::default();
     }
-    let kinds = scan_surface_roots(roots);
-    let kernel = sole_kernel_root(roots);
-    assert_every_root_offers_something(roots, &kernel, &kinds);
-    // The kernel pair is not a component — no kind, no class, no specification —
-    // so the root it was served from is the whole of its identity.
-    tracing::info!(root = %kernel.display(), "surface kernel root resolved");
+    let holders = scan_surface_roots(cx, roots);
+    let kernel = sole_kernel_root(cx, roots);
+    assert_every_root_offers_something(cx, roots, &kernel.root, &holders);
+    // The kernel pair is not a component — no kind, no class, no specification,
+    // nothing recorded about it anywhere — so the scan hashes the two files it
+    // found, which is the only witness a later comparison has that the bytes
+    // under an unmoved path were rewritten.
+    tracing::info!(
+        root = %kernel.root.display(),
+        module_sha256 = %kernel.module_sha256,
+        "surface kernel root resolved"
+    );
+    // Kind-grain record checks (manifest, listed files, naming, import profile)
+    // run once per kind any root offers, whether or not a surface instantiates
+    // it: the manifest read is what produces the kind's fingerprint, and a
+    // fingerprint for a kind nothing uses yet is what lets the next comparison
+    // of two root sets see the upgrade that installed it. The artifact digests
+    // are not run here — hashing a whole component nothing runs would be paid
+    // again on every reload for a tree no page can reach — they run below, per
+    // instantiated kind.
+    let mut manifests: HashMap<String, processor_assets::ProcessorManifest> = HashMap::new();
+    let mut kinds: std::collections::BTreeMap<String, KindRoot> = std::collections::BTreeMap::new();
+    for (kind, root) in holders {
+        let manifest = processor_assets::read_processor_record_in(cx, &root, &kind);
+        // Together with the kernel line above, this is the operator's answer to
+        // which release each installed kind came from.
+        tracing::info!(
+            kind = %kind,
+            root = %root.display(),
+            spec_sha256 = %manifest.spec_sha256,
+            source_sha256 = %manifest.source_sha256,
+            "surface processor kind resolved"
+        );
+        kinds.insert(
+            kind.clone(),
+            KindRoot {
+                mount: roots.source().name(&root),
+                root,
+                source_sha256: manifest.source_sha256.clone(),
+                spec_sha256: manifest.spec_sha256.clone(),
+            },
+        );
+        manifests.insert(kind, manifest);
+    }
     let roots = SurfaceRoots {
         kernel: Some(kernel),
         kinds,
@@ -387,22 +625,20 @@ pub fn validate_surface_assets(
     if surfaces.is_empty() {
         return roots;
     }
-    // Kind-grain checks (asset existence, record, profile) run once per distinct
-    // kind across the whole config — several instances, on one surface or
-    // several, share one artifact. Import⊆grants and the specification binding
-    // are per instance, so what those need is kept for the second pass.
-    let mut kinds: HashMap<&str, KindAssets> = HashMap::new();
+    // Sibling instances of one kind may hold different grants, and each carries
+    // its own class's hash — the kind fold admits comment-divergent class
+    // copies, so both questions are asked once per declaration rather than once
+    // per kind. The artifact digests are the third question and are per kind, so
+    // the first instance naming a kind pays for them and the rest do not.
+    let mut verified: BTreeSet<&str> = BTreeSet::new();
     for surface in surfaces {
         for comp in &surface.components {
-            if kinds.contains_key(comp.kind.as_str()) {
-                continue;
-            }
-            let root = roots.kind_root(&comp.kind).unwrap_or_else(|| {
+            let manifest = manifests.get(comp.kind.as_str()).unwrap_or_else(|| {
                 panic!(
-                    "boot: [[surface]] {:?} component {:?} names kind {:?}, which no installed \
-                     surface root offers. The roots scanned were {}, and between them they offer \
-                     {}. Install the release carrying that kind, or name its root with another \
-                     --surface. Refusing to start (fail-fast on invalid config).",
+                    "{when}: [[surface]] {:?} component {:?} names kind {:?}, which no installed \
+                     surface tree offers. The trees scanned were {}, and between them they offer \
+                     {}. Install the release carrying that kind, or declare the mount that \
+                     holds it.{verdict}",
                     surface.slug,
                     comp.instance,
                     comp.kind,
@@ -410,48 +646,25 @@ pub fn validate_surface_assets(
                     offered_kinds(&roots),
                 )
             });
-            let manifest = processor_assets::validate_processor_kind(root, &comp.kind);
-            // Together with the kernel line above, this is the operator's answer
-            // to which release each installed kind came from.
-            tracing::info!(
-                kind = %comp.kind,
-                root = %root.display(),
-                spec_sha256 = %manifest.spec_sha256,
-                source_sha256 = %manifest.source_sha256,
-                "surface processor kind resolved"
-            );
-            kinds.insert(
-                comp.kind.as_str(),
-                KindAssets {
-                    spec_sha256: manifest.spec_sha256.clone(),
+            if verified.insert(comp.kind.as_str()) {
+                processor_assets::verify_processor_artifacts_in(
+                    cx,
+                    roots
+                        .kind_root(&comp.kind)
+                        .expect("the kind resolved to a manifest, so it has a root"),
+                    &comp.kind,
                     manifest,
-                },
-            );
-        }
-    }
-    // Sibling instances of one kind may hold different grants, and each carries
-    // its own class's hash — the kind fold admits comment-divergent class
-    // copies, so both questions are asked once per declaration rather than once
-    // per kind.
-    for surface in surfaces {
-        for comp in &surface.components {
-            let assets = kinds.get(comp.kind.as_str()).unwrap_or_else(|| {
-                // The kind-grain pass above visited every configured kind, so a
-                // missing entry is this function's own bug, not a tree state.
-                unreachable!(
-                    "component {:?} of surface {:?} names kind {:?}, which the kind-grain pass \
-                     did not record",
-                    comp.instance, surface.slug, comp.kind,
-                )
-            });
+                );
+            }
             processor_assets::assert_imports_granted(
+                cx,
                 &surface.slug,
                 &comp.instance,
                 &comp.kind,
-                &assets.manifest,
+                manifest,
                 &comp.grants,
             );
-            assert_spec_bound(&surface.slug, comp, &assets.spec_sha256);
+            assert_spec_bound(cx, &surface.slug, comp, &manifest.spec_sha256);
         }
     }
     roots
@@ -464,24 +677,26 @@ pub fn validate_surface_assets(
 /// because which root owns a kind has to be settled before the per-kind pass
 /// can ask a root anything.
 fn scan_surface_roots(
-    roots: &[std::path::PathBuf],
+    cx: AssetContext,
+    roots: &brenn_dsl::roots::RootList,
 ) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    let AssetContext { when, verdict } = cx;
     let is_kind = |entry: &std::fs::DirEntry| {
         if !entry.path().is_dir() {
             return None;
         }
         Some(entry.file_name().to_string_lossy().into_owned())
     };
-    let (faults, holders) =
-        brenn_dsl::roots::scan_roots_in(SURFACE_FLAG, roots, Some(PROCESSOR_DIR), is_kind);
+    let (faults, holders) = brenn_dsl::roots::scan_roots_in(roots, Some(PROCESSOR_DIR), is_kind);
     assert!(
         faults.is_empty(),
-        "boot: the {SURFACE_FLAG} roots are not a set of distinct releases:\n{}\nA kind is served \
+        "{when}: {} are not a set of distinct releases:\n{}\nA kind is served \
          from exactly one tree, and the page manifest names no root, so which one served it would \
-         be an accident of scan order. Refusing to start (fail-fast on invalid config).",
+         be an accident of scan order.{verdict}",
+        roots.source().all(),
         faults
             .iter()
-            .map(|fault| fault.describe(SURFACE_FLAG, "surface kind"))
+            .map(|fault| fault.describe(roots.source(), "surface kind"))
             .collect::<Vec<_>>()
             .join("\n"),
     );
@@ -494,7 +709,7 @@ fn scan_surface_roots(
 /// Every declared root must be one release's surface tree, and a release's
 /// surface tree offers something: brenn's holds the kernel pair, a bundle's
 /// holds at least one `processor/<kind>/` (a bundle with no kind stages no
-/// `surface/` at all). A root that offers neither is a `--surface` pointed one
+/// `surface/` at all). A root that offers neither is a mount path one
 /// directory off — at a bundle's install root rather than its `surface/` — and
 /// nothing else downstream would notice: the scan finds no kinds, the kernel
 /// rule is satisfied by brenn's own root, and boot succeeds until some later
@@ -504,23 +719,29 @@ fn scan_surface_roots(
 ///
 /// Naming every root that offers nothing, and what a surface root holds.
 fn assert_every_root_offers_something(
-    roots: &[std::path::PathBuf],
+    cx: AssetContext,
+    roots: &brenn_dsl::roots::RootList,
     kernel: &std::path::Path,
     kinds: &std::collections::BTreeMap<String, std::path::PathBuf>,
 ) {
+    let AssetContext { when, verdict } = cx;
     let empty: Vec<&std::path::PathBuf> = roots
         .iter()
         .filter(|root| root.as_path() != kernel && !kinds.values().any(|held| held == *root))
         .collect();
     assert!(
         empty.is_empty(),
-        "boot: {} {SURFACE_FLAG} root(s) offer nothing: {}. Every root is one installed \
+        "{when}: {} {SURFACE_TREE}(s) offer nothing: {}. Every one is one installed \
          release's surface tree — brenn's own carries the kernel module pair, a component \
-         bundle's carries at least one processor/<kind>/ directory — so a root with neither \
-         is a flag pointed one directory off (a bundle's install root rather than its \
-         surface/ tree). Refusing to start (fail-fast on invalid config).",
+         bundle's carries at least one processor/<kind>/ directory — so one with neither \
+         is a mount path one directory off (a bundle's install root rather than its \
+         surface/ tree).{verdict}",
         empty.len(),
-        brenn_dsl::roots::display_list(&empty),
+        empty
+            .iter()
+            .map(|root| roots.source().locate(root))
+            .collect::<Vec<_>>()
+            .join(", "),
     );
 }
 
@@ -529,30 +750,63 @@ fn assert_every_root_offers_something(
 /// Exactly one, because every surface page references the kernel by a path with
 /// no kind in it: two candidates leave the served bytes to scan order, and none
 /// is a deploy with no shell to boot. A bundle's surface root carries no kernel
-/// by construction, so a second candidate is a mis-pointed `--surface`.
-fn sole_kernel_root(roots: &[std::path::PathBuf]) -> std::path::PathBuf {
+/// by construction, so a second candidate is a mis-pointed mount.
+fn sole_kernel_root(cx: AssetContext, roots: &brenn_dsl::roots::RootList) -> KernelRoot {
+    let AssetContext { when, verdict } = cx;
     let wasm = kernel_wasm_artifact();
     let holders: Vec<&std::path::PathBuf> = roots
         .iter()
         .filter(|root| root.join(KERNEL_ARTIFACT).exists() && root.join(&wasm).exists())
         .collect();
     match holders.as_slice() {
-        [only] => (*only).clone(),
+        [only] => KernelRoot {
+            root: (*only).clone(),
+            module_sha256: kernel_module_sha256(cx, only, &wasm),
+        },
         [] => panic!(
-            "boot: no --surface root holds the kernel module pair ({KERNEL_ARTIFACT} + {wasm}), \
-             which every surface page references. The roots scanned were {}. One of them must be \
-             brenn's own installed surface tree (run `make build`; on deploy ensure the surface \
-             install ran). Refusing to start (fail-fast on invalid config).",
-            brenn_dsl::roots::display_list(roots),
+            "{when}: no declared mount's {SURFACE_TREE} holds the kernel module pair \
+             ({KERNEL_ARTIFACT} + {wasm}), which every surface page references. The trees \
+             scanned were {}. One of them must be brenn's own installed surface tree (run \
+             `make build`; on deploy ensure the surface install ran).{verdict}",
+            brenn_dsl::roots::display_list(roots.paths()),
         ),
         many => panic!(
-            "boot: {} --surface roots hold the kernel module pair ({KERNEL_ARTIFACT} + {wasm}): \
-             {}. Exactly one root is brenn's own surface tree; a component bundle's root carries \
-             kinds alone. Refusing to start (fail-fast on invalid config).",
+            "{when}: {} declared mounts' {SURFACE_TREE}s hold the kernel module pair \
+             ({KERNEL_ARTIFACT} + {wasm}): {}. Exactly one is brenn's own surface tree; a \
+             component bundle's carries kinds alone.{verdict}",
             many.len(),
-            brenn_dsl::roots::display_list(many),
+            roots.source().names(
+                many.iter()
+                    .map(|root| root.as_path())
+                    .collect::<Vec<_>>()
+                    .iter()
+            ),
         ),
     }
+}
+
+/// The fingerprint of the kernel module pair: one digest over the JS module
+/// followed by its wasm sibling.
+///
+/// One digest and not two because the pair is one artifact — wasm-bindgen emits
+/// the glue and the module together and neither is servable without the other,
+/// so there is no state in which one moved and the answer is not "the kernel
+/// moved".
+fn kernel_module_sha256(cx: AssetContext, root: &std::path::Path, wasm: &str) -> String {
+    let AssetContext { when, verdict } = cx;
+    let mut bytes = Vec::new();
+    for name in [KERNEL_ARTIFACT, wasm] {
+        let path = root.join(name);
+        let read = std::fs::read(&path).unwrap_or_else(|err| {
+            panic!(
+                "{when}: reading the surface kernel artifact {} failed ({err}) — the pair was \
+                 found a moment ago, so the tree is being written under the scan.{verdict}",
+                path.display(),
+            )
+        });
+        bytes.extend_from_slice(&read);
+    }
+    brenn_lib::util::sha256_hex(&bytes)
 }
 
 /// The kernel's wasm sibling, derived from the JS artifact name the contract
@@ -568,10 +822,11 @@ fn kernel_wasm_artifact() -> String {
 
 /// The distinct roots a scan reached, for a refusal that has to name them.
 fn root_list(roots: &SurfaceRoots) -> String {
-    let mut seen: Vec<&std::path::PathBuf> = roots.kernel.iter().collect();
-    for root in roots.kinds.values() {
-        if !seen.contains(&root) {
-            seen.push(root);
+    let mut seen: Vec<&std::path::PathBuf> =
+        roots.kernel.iter().map(|kernel| &kernel.root).collect();
+    for held in roots.kinds.values() {
+        if !seen.contains(&&held.root) {
+            seen.push(&held.root);
         }
     }
     seen.iter()
@@ -592,14 +847,6 @@ fn offered_kinds(roots: &SurfaceRoots) -> String {
         .join(", ")
 }
 
-/// What one validated component kind's installed assets tell the per-instance
-/// pass: the specification hash every instance of the kind is bound to, and the
-/// record carrying the reflected import profile the grants must cover.
-struct KindAssets {
-    spec_sha256: String,
-    manifest: processor_assets::ProcessorManifest,
-}
-
 /// Bind one configured instance to the specification its kind's installed
 /// artifacts were built against.
 ///
@@ -615,23 +862,23 @@ struct KindAssets {
 /// On an empty configured hash — the class fact is `serde(skip)` in the
 /// document layer, so a lowering that stopped filling it must fail loudly
 /// rather than match anything — and on a hash that is not the packaged one.
-fn assert_spec_bound(slug: &str, comp: &ResolvedComponent, packaged: &str) {
+fn assert_spec_bound(cx: AssetContext, slug: &str, comp: &ResolvedComponent, packaged: &str) {
+    let AssetContext { when, verdict } = cx;
     assert!(
         !comp.spec_sha256.is_empty(),
-        "boot: [[surface]] {slug:?} component {:?} carries no specification hash — the class fact \
+        "{when}: [[surface]] {slug:?} component {:?} carries no specification hash — the class fact \
          is filled at lowering, so an empty one would match nothing a record can carry and this \
-         is a lowering bug, not a deployment state. Refusing to start (fail-fast on invalid \
-         config).",
+         is a lowering bug, not a deployment state.{verdict}",
         comp.instance,
     );
     assert!(
         comp.spec_sha256 == packaged,
-        "boot: [[surface]] {slug:?} component {:?} of kind {:?} was configured against a \
+        "{when}: [[surface]] {slug:?} component {:?} of kind {:?} was configured against a \
          specification that hashes to {}, but the installed surface assets for that kind were \
          built against one that hashes to {packaged}. The author's specification travels with the \
          component; a deployment's copy of it is verbatim. Re-copy the specification from the \
          release that carries these assets, or install the release the configuration was written \
-         for. Refusing to start (fail-fast on invalid config).",
+         for.{verdict}",
         comp.instance,
         comp.kind,
         comp.spec_sha256,
@@ -1306,26 +1553,29 @@ mod tests {
         );
     }
 
-    fn touch(dir: &std::path::Path, name: &str) {
-        std::fs::write(dir.join(name), b"").expect("write test artifact");
-    }
-
-    fn write_kernel_pair(dir: &std::path::Path) {
-        touch(dir, "brenn_surface_kernel.js");
-        touch(dir, "brenn_surface_kernel_bg.wasm");
-    }
-
-    /// A conforming transpiled tree for `kind` that imports nothing, so it
-    /// satisfies asset validation under a component holding no grants.
-    fn write_valid_kind(dir: &std::path::Path, kind: &str) {
-        write_processor_tree(dir, kind, &[], |_| {});
-    }
-
     /// Every fixture below installs one root, which is what a deployment
     /// without bundles has. The multi-root arrangement gets its own cases at
     /// the end of this module.
     fn validate_one_root(root: &std::path::Path, surfaces: &[ResolvedSurface]) -> SurfaceRoots {
-        validate_surface_assets(&[root.to_path_buf()], surfaces)
+        validate_surface_assets(&mount_roots(&[("brenn", root)]), surfaces)
+    }
+
+    /// The surface trees of the named mounts, as a host derives them: the
+    /// refusals name the mount, so a fixture that named roots any other way
+    /// would be testing wording no host produces.
+    use crate::test_fixtures::{
+        fixture_spec_hash, spec_bytes_for, write_kernel_pair, write_processor_tree,
+        write_processor_tree_from_bytes, write_valid_kind,
+    };
+
+    fn mount_roots(mounts: &[(&str, &std::path::Path)]) -> brenn_dsl::roots::RootList {
+        brenn_dsl::roots::RootList::mounts(
+            "surface",
+            mounts
+                .iter()
+                .map(|(name, path)| ((*name).to_string(), path.to_path_buf()))
+                .collect(),
+        )
     }
 
     /// An offered kind whose directory holds nothing, so the scan maps it and
@@ -1336,16 +1586,17 @@ mod tests {
 
     #[test]
     fn validate_surface_assets_returns_empty_roots_when_neither_exists() {
-        // No --surface and no surface: a surface-less deployment, which serves
-        // nothing under /surface-static and is asked for nothing.
-        let roots = validate_surface_assets(&[], &[]);
+        // No mount offers a surface tree and no surface is configured: a
+        // surface-less deployment, which serves nothing under /surface-static
+        // and is asked for nothing.
+        let roots = validate_surface_assets(&mount_roots(&[]), &[]);
         assert_eq!(roots, SurfaceRoots::default());
     }
 
     #[test]
-    #[should_panic(expected = "started without --surface")]
+    #[should_panic(expected = "no declared mount offers a `surface/` tree")]
     fn validate_surface_assets_panics_on_a_surface_with_no_root() {
-        validate_surface_assets(&[], &[resolved("deskbar")]);
+        validate_surface_assets(&mount_roots(&[]), &[resolved("deskbar")]);
     }
 
     #[test]
@@ -1360,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no --surface root holds the kernel module pair")]
+    #[should_panic(expected = "no declared mount's `surface/` tree holds the kernel module pair")]
     fn validate_surface_assets_panics_on_missing_kernel_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
         let surface = resolved("deskbar");
@@ -1385,116 +1636,6 @@ mod tests {
         surface.outputs = vec![];
         surface
     }
-
-    /// Write a conforming transpiled tree for `kind`: a stand-in component
-    /// artifact, one transpiled file, a stand-in packaged specification, and a
-    /// manifest whose `source_sha256` and `spec_sha256` actually hash those
-    /// bytes. `imports` and any manifest edits are applied by the caller through
-    /// `tweak` before serialization, so each failure test perturbs exactly one
-    /// field of an otherwise valid tree.
-    fn write_processor_tree(
-        dist: &std::path::Path,
-        kind: &str,
-        imports: &[&str],
-        tweak: impl FnOnce(&mut serde_json::Value),
-    ) {
-        // The manifest carries fully qualified import names (as the build emitter
-        // does). A caller passing a bare interface name gets it qualified under
-        // the processor package; a caller passing an already-qualified name (to
-        // exercise a foreign namespace) keeps it verbatim.
-        let qualified: Vec<String> = imports
-            .iter()
-            .map(|i| {
-                if i.contains(':') {
-                    (*i).to_string()
-                } else {
-                    format!("brenn:processor/{i}")
-                }
-            })
-            .collect();
-        let component_bytes = format!("component-bytes-for-{kind}").into_bytes();
-        write_processor_tree_from_bytes(
-            dist,
-            kind,
-            &component_bytes,
-            &spec_bytes_for(kind),
-            qualified,
-            true,
-            tweak,
-        );
-    }
-
-    /// A stand-in authored specification for `kind`. Boot validation binds
-    /// hashes, never parses the document, so a per-kind byte string is a
-    /// faithful stand-in and keeps two kinds' specifications distinguishable.
-    fn spec_bytes_for(kind: &str) -> Vec<u8> {
-        format!("// specification for {kind}\n").into_bytes()
-    }
-
-    /// What a configured instance of `kind` carries as its class hash when the
-    /// configuration was compiled against the very bytes the fixture tree
-    /// packages — the bound case, computed rather than pasted.
-    fn fixture_spec_hash(kind: &str) -> String {
-        brenn_lib::util::sha256_hex(&spec_bytes_for(kind))
-    }
-
-    /// The one place test code constructs a deployed processor tree and its
-    /// manifest schema. `component_bytes` are the shipped artifact (a stand-in
-    /// string for the synthetic tests, real artifact bytes for the real-artifact
-    /// test), `spec_bytes` the packaged specification, `imports` the profile
-    /// verbatim, and `with_module` controls whether a stand-in transpiled
-    /// `<kind>.js` is written and listed.
-    fn write_processor_tree_from_bytes(
-        dist: &std::path::Path,
-        kind: &str,
-        component_bytes: &[u8],
-        spec_bytes: &[u8],
-        imports: Vec<String>,
-        with_module: bool,
-        tweak: impl FnOnce(&mut serde_json::Value),
-    ) {
-        let dir = processor_assets::kind_dir(dist, kind);
-        std::fs::create_dir_all(&dir).expect("create processor dir");
-        let component_name = format!("{kind}.component.wasm");
-        std::fs::write(dir.join(&component_name), component_bytes).expect("write component");
-
-        let mut files = Vec::new();
-        if with_module {
-            let module = format!("{kind}.js");
-            std::fs::write(dir.join(&module), b"export function instantiate() {}")
-                .expect("write module");
-            files.push(module);
-        }
-        files.push(component_name);
-
-        // The build stages the specification before the emitter's file walk, so
-        // the record lists it like any other staged file.
-        let spec_name = format!("{kind}.spec.brenn");
-        std::fs::write(dir.join(&spec_name), spec_bytes).expect("write spec");
-        files.push(spec_name.clone());
-
-        use sha2::Digest as _;
-        let mut manifest = serde_json::json!({
-            "v": 2,
-            "kind": kind,
-            "source_sha256": hex::encode(sha2::Sha256::digest(component_bytes)),
-            "jco_version": PINNED_JCO_VERSION_FOR_TESTS,
-            "spec": spec_name,
-            "spec_sha256": hex::encode(sha2::Sha256::digest(spec_bytes)),
-            "imports": imports,
-            "files": files,
-        });
-        tweak(&mut manifest);
-        std::fs::write(
-            dir.join("manifest.json"),
-            serde_json::to_string(&manifest).expect("serialize manifest"),
-        )
-        .expect("write manifest");
-    }
-
-    /// Provenance only — boot validation never checks it (the source hash is the
-    /// staleness authority), so any well-formed value serves.
-    const PINNED_JCO_VERSION_FOR_TESTS: &str = "1.4.0";
 
     /// The valid-tree case: manifest parses, every listed file exists, the
     /// source hash matches the shipped bytes, and the imports are within the
@@ -1533,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "which no installed surface root offers")]
+    #[should_panic(expected = "which no installed surface tree offers")]
     fn validate_surface_assets_panics_on_a_kind_no_root_offers() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
@@ -2325,18 +2466,274 @@ mod tests {
         });
 
         let roots = validate_surface_assets(
-            &[brenn.path().to_path_buf(), bundle.path().to_path_buf()],
+            &mount_roots(&[("brenn", brenn.path()), ("bundle", bundle.path())]),
             &[surface],
         );
-        assert_eq!(roots.kernel.as_deref(), Some(brenn.path()));
+        assert_eq!(
+            roots.kernel.as_ref().map(|kernel| kernel.root.as_path()),
+            Some(brenn.path())
+        );
         assert_eq!(roots.kind_root("chrome"), Some(brenn.path()));
         assert_eq!(roots.kind_root("demo-panel"), Some(bundle.path()),);
+    }
+
+    /// The kind-grain pass is not driven by the configuration either: a kind a
+    /// mount offers and nothing instantiates is read, verified and
+    /// fingerprinted, which is what lets a later comparison of two root sets
+    /// see the install that changed it.
+    #[test]
+    fn an_offered_kind_is_fingerprinted_even_when_nothing_instantiates_it() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_valid_kind(brenn.path(), "chrome");
+        write_valid_kind(bundle.path(), "demo-panel");
+
+        let scan = || {
+            validate_surface_assets(
+                &mount_roots(&[("brenn", brenn.path()), ("bundle", bundle.path())]),
+                &[],
+            )
+        };
+        let before = scan();
+        let held = before.kinds.get("demo-panel").expect("the kind is mapped");
+        assert_eq!(held.root, bundle.path());
+        assert_eq!(held.spec_sha256, fixture_spec_hash("demo-panel"));
+        assert_eq!(
+            held.source_sha256,
+            brenn_lib::util::sha256_hex(b"component-bytes-for-demo-panel"),
+        );
+
+        write_processor_tree_from_bytes(
+            bundle.path(),
+            "demo-panel",
+            b"component-bytes-for-demo-panel-v2",
+            &spec_bytes_for("demo-panel"),
+            Vec::new(),
+            true,
+            |_| {},
+        );
+        let after = scan();
+        assert_ne!(before, after, "the upgrade moves the root set");
+        assert_eq!(
+            after.kinds["demo-panel"].root, before.kinds["demo-panel"].root,
+            "the path is unmoved; the fingerprint is the whole of the difference",
+        );
+        assert_ne!(
+            after.kinds["demo-panel"].source_sha256, held.source_sha256,
+            "the artifact hash follows the installed bytes",
+        );
+    }
+
+    // -- SurfaceRoots::kind_differences -----------------------------------
+
+    /// A `SurfaceRoots` spelled directly, as `(kind, mount, root, source, spec)`:
+    /// these cases are about the comparison, not about what a scan produces.
+    fn roots_with(kinds: &[(&str, &str, &str, &str, &str)]) -> SurfaceRoots {
+        SurfaceRoots {
+            kernel: Some(KernelRoot::for_test("/kernel")),
+            kinds: kinds
+                .iter()
+                .map(|(kind, mount, root, source, spec)| {
+                    (
+                        (*kind).to_string(),
+                        KindRoot {
+                            mount: (*mount).to_string(),
+                            root: std::path::PathBuf::from(root),
+                            source_sha256: (*source).to_string(),
+                            spec_sha256: (*spec).to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn two_identical_root_sets_differ_on_no_kind() {
+        let held = roots_with(&[
+            ("chart", "brenn", "/a", "s1", "p1"),
+            ("chrome", "brenn", "/a", "s2", "p2"),
+        ]);
+        assert!(held.kind_differences(&held.clone()).is_empty());
+    }
+
+    /// The versioned-tree install: the mount symlink is swapped onto a fresh
+    /// directory, so every kind under it resolves to a new canonical path with
+    /// byte-identical contents. That is a relocation, not a change — treating
+    /// it as one would make every bundle deploy a restart.
+    #[test]
+    fn a_kind_whose_tree_relocated_under_one_mount_is_not_a_difference() {
+        let held = roots_with(&[("chart", "bundle", "/bundle.v1/surface", "s1", "p1")]);
+        let scanned = roots_with(&[("chart", "bundle", "/bundle.v2/surface", "s1", "p1")]);
+        assert!(
+            held.kind_differences(&scanned).is_empty(),
+            "same mount, same bytes, new path",
+        );
+    }
+
+    #[test]
+    fn a_kind_offered_by_another_mount_is_moved() {
+        let held = roots_with(&[("chart", "brenn", "/a", "s1", "p1")]);
+        let scanned = roots_with(&[("chart", "bundle", "/b", "s1", "p1")]);
+        assert_eq!(
+            held.kind_differences(&scanned),
+            BTreeMap::from([(
+                "chart".to_string(),
+                KindDifference::Moved {
+                    from: "brenn".to_string(),
+                    to: "bundle".to_string(),
+                },
+            )]),
+        );
+    }
+
+    /// The bundle-upgrade shape: the symlink is swapped, so the path an
+    /// operator reads is unchanged and only the fingerprints move.
+    #[test]
+    fn a_kind_whose_bytes_moved_under_one_mount_is_reinstalled() {
+        let held = roots_with(&[("chart", "bundle", "/a", "s1", "p1")]);
+        let source = roots_with(&[("chart", "bundle", "/a", "s2", "p1")]);
+        let spec = roots_with(&[("chart", "bundle", "/a", "s1", "p2")]);
+        let expected = BTreeMap::from([(
+            "chart".to_string(),
+            KindDifference::Reinstalled {
+                mount: "bundle".to_string(),
+                root: std::path::PathBuf::from("/a"),
+            },
+        )]);
+        assert_eq!(held.kind_differences(&source), expected);
+        assert_eq!(held.kind_differences(&spec), expected);
+    }
+
+    #[test]
+    fn a_kind_no_mount_offers_any_more_is_withdrawn_and_a_new_one_is_offered() {
+        let held = roots_with(&[("chart", "brenn", "/a", "s1", "p1")]);
+        let scanned = roots_with(&[("gauge", "bundle", "/b", "s3", "p3")]);
+        assert_eq!(
+            held.kind_differences(&scanned),
+            BTreeMap::from([
+                (
+                    "chart".to_string(),
+                    KindDifference::Withdrawn {
+                        mount: "brenn".to_string(),
+                        root: std::path::PathBuf::from("/a"),
+                    },
+                ),
+                (
+                    "gauge".to_string(),
+                    KindDifference::Offered {
+                        mount: "bundle".to_string(),
+                    },
+                ),
+            ]),
+        );
+    }
+
+    /// The comparison is directional: what the held set calls withdrawn the
+    /// scanned set calls newly offered.
+    #[test]
+    fn the_comparison_reads_from_the_held_sets_side() {
+        let held = roots_with(&[("chart", "brenn", "/a", "s1", "p1")]);
+        let scanned = roots_with(&[]);
+        assert_eq!(
+            held.kind_differences(&scanned)["chart"],
+            KindDifference::Withdrawn {
+                mount: "brenn".to_string(),
+                root: std::path::PathBuf::from("/a"),
+            },
+        );
+        assert_eq!(
+            scanned.kind_differences(&held)["chart"],
+            KindDifference::Offered {
+                mount: "brenn".to_string(),
+            },
+        );
+    }
+
+    /// The reload framing of an asset failure. A running process is still
+    /// serving the document it has, so the message names the reload and must
+    /// never tell the operator that anything refused to start.
+    #[test]
+    #[should_panic(expected = "reload:")]
+    fn a_reload_framed_asset_failure_names_the_reload() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_empty_kind_dir(bundle.path(), "demo-panel");
+        validate_surface_assets_in(
+            AssetContext::RELOAD,
+            &mount_roots(&[("brenn", brenn.path()), ("bundle", bundle.path())]),
+            &[],
+        );
+    }
+
+    /// The other half of the same contract, which `should_panic` alone cannot
+    /// see: the reload framing appends no verdict, so "Refusing to start" is
+    /// not in the message a live process produces.
+    #[test]
+    fn a_reload_framed_asset_failure_does_not_say_refusing_to_start() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_empty_kind_dir(bundle.path(), "demo-panel");
+        let roots = mount_roots(&[("brenn", brenn.path()), ("bundle", bundle.path())]);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_surface_assets_in(AssetContext::RELOAD, &roots, &[]);
+        }))
+        .expect_err("a kind with no manifest is refused");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("the panic payload is a formatted message")
+            .clone();
+        assert!(message.starts_with("reload:"), "{message}");
+        assert!(!message.contains("Refusing to start"), "{message}");
+    }
+
+    /// The cost of fingerprinting every offered kind: a mount shipping a broken
+    /// tree is refused at boot whether or not today's document names it. That
+    /// is the intent — the tree is installed and would be served the moment a
+    /// surface stamped it.
+    #[test]
+    #[should_panic(expected = "has no readable asset manifest")]
+    fn an_offered_kind_with_no_manifest_is_refused_even_when_unconfigured() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_empty_kind_dir(bundle.path(), "demo-panel");
+        validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("bundle", bundle.path())]),
+            &[],
+        );
+    }
+
+    /// The limit of that cost: an offered kind is held to its record, not to a
+    /// digest of its bytes. A tree whose artifact hash does not match its
+    /// manifest boots while nothing instantiates it, because re-hashing every
+    /// installed component on every scan buys nothing for a kind no page can
+    /// reach — and the same tree is refused the moment a surface names it (the
+    /// stale-transpile case above).
+    #[test]
+    fn an_offered_kind_that_nothing_instantiates_is_not_rehashed() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(brenn.path(), "transplant", &["ports"], |m| {
+            m["source_sha256"] = serde_json::json!("00".repeat(32));
+        });
+        let roots = validate_surface_assets(&mount_roots(&[("brenn", brenn.path())]), &[]);
+        assert_eq!(
+            roots.kinds["transplant"].source_sha256,
+            "00".repeat(32),
+            "the fingerprint is the record's, which is what a scan comparison reads",
+        );
     }
 
     /// The scan is not driven by the configuration: a kind installed twice is
     /// an ambiguous deploy whether or not anything mounts it today.
     #[test]
-    #[should_panic(expected = "installed under more than one --surface root")]
+    #[should_panic(
+        expected = "surface kind `chrome` is installed under more than one mount: brenn, bundle"
+    )]
     fn a_kind_offered_by_two_roots_is_refused_even_when_unconfigured() {
         let brenn = tempfile::tempdir().expect("tempdir");
         let bundle = tempfile::tempdir().expect("tempdir");
@@ -2344,37 +2741,41 @@ mod tests {
         write_valid_kind(brenn.path(), "chrome");
         write_valid_kind(bundle.path(), "chrome");
         validate_surface_assets(
-            &[brenn.path().to_path_buf(), bundle.path().to_path_buf()],
+            &mount_roots(&[("brenn", brenn.path()), ("bundle", bundle.path())]),
             &[],
         );
     }
 
     #[test]
-    #[should_panic(expected = "roots hold the kernel module pair")]
+    #[should_panic(expected = "trees hold the kernel module pair")]
     fn two_kernel_roots_are_refused() {
         let one = tempfile::tempdir().expect("tempdir");
         let two = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(one.path());
         write_kernel_pair(two.path());
-        validate_surface_assets(&[one.path().to_path_buf(), two.path().to_path_buf()], &[]);
+        validate_surface_assets(
+            &mount_roots(&[("brenn", one.path()), ("other", two.path())]),
+            &[],
+        );
     }
 
-    /// A bundle root alone: kinds and no kernel, which is a mis-pointed
-    /// `--surface` rather than a bundle's fault.
+    /// A bundle root alone: kinds and no kernel, which is a mis-declared mount
+    /// rather than a bundle's fault.
     #[test]
-    #[should_panic(expected = "no --surface root holds the kernel module pair")]
+    #[should_panic(expected = "no declared mount's `surface/` tree holds the kernel module pair")]
     fn a_root_set_with_no_kernel_is_refused() {
         let bundle = tempfile::tempdir().expect("tempdir");
         write_valid_kind(bundle.path(), "demo-panel");
-        validate_surface_assets(&[bundle.path().to_path_buf()], &[]);
+        validate_surface_assets(&mount_roots(&[("bundle", bundle.path())]), &[]);
     }
 
-    /// The realistic mis-pointing: `--surface $BUNDLES_DIR/<bundle>` instead of
-    /// `.../<bundle>/surface`. It holds no kernel and no `processor/`, so
+    /// The realistic mis-pointing: a mount whose `surface/` tree is the
+    /// bundle's install root one level up. It holds no kernel and no
+    /// `processor/`, so
     /// nothing downstream would notice until some later configuration first
     /// stamps the kind that was supposed to be there.
     #[test]
-    #[should_panic(expected = "root(s) offer nothing")]
+    #[should_panic(expected = "`surface/` tree(s) offer nothing")]
     fn a_root_offering_neither_the_kernel_nor_a_kind_is_refused() {
         let brenn = tempfile::tempdir().expect("tempdir");
         let one_directory_off = tempfile::tempdir().expect("tempdir");
@@ -2385,12 +2786,12 @@ mod tests {
                 .path()
                 .join("surface/processor/demo-panel"),
         )
-        .expect("the bundle's real surface tree, one level below the flag");
+        .expect("the bundle's real surface tree, one level below the mount's");
         validate_surface_assets(
-            &[
-                brenn.path().to_path_buf(),
-                one_directory_off.path().to_path_buf(),
-            ],
+            &mount_roots(&[
+                ("brenn", brenn.path()),
+                ("bundle", one_directory_off.path()),
+            ]),
             &[],
         );
     }
@@ -2401,7 +2802,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
         validate_surface_assets(
-            &[dir.path().to_path_buf(), dir.path().join(".").to_path_buf()],
+            &mount_roots(&[("brenn", dir.path()), ("other", &dir.path().join("."))]),
             &[],
         );
     }

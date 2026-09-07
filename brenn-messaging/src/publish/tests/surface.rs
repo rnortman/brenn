@@ -2088,3 +2088,275 @@ fn a_batch_draw_for_an_unbudgeted_instance_panics() {
         );
     });
 }
+
+/// A surface's budgets are replaceable while the process runs, and the swap is
+/// whole-scope: every principal the new set names gets a fresh bucket, a
+/// principal the new set drops loses its bucket outright, and no other surface's
+/// buckets — drained or not — are touched.
+#[tokio::test(start_paused = true)]
+async fn setting_one_scopes_budgets_replaces_that_scope_and_no_other() {
+    let (m, addr) = build_multi_surface_publish_messenger(&["durabar", "kiosk"]).await;
+
+    // Drain the sibling surface's bare bucket, so a bucket carried across the
+    // swap below would be observable as an admission it should not grant.
+    for _ in 0..SURFACE_SEND_BURST {
+        assert!(matches!(
+            m.publish_from_attacher(
+                AttachScope::surface("kiosk"),
+                None,
+                &addr,
+                "x",
+                Urgency::Normal
+            )
+            .await,
+            PublishResult::Ok { .. }
+        ));
+    }
+    let denied = m
+        .publish_from_attacher(
+            AttachScope::surface("kiosk"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
+        .await;
+    assert!(
+        matches!(denied, PublishResult::BudgetExhausted),
+        "the sibling's bucket is drained, got {denied:?}"
+    );
+
+    // Drain the replaced surface's instance bucket too: the fresh one must not
+    // inherit the drain.
+    for _ in 0..SURFACE_SEND_BURST {
+        assert!(matches!(
+            m.publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &addr,
+                "x",
+                Urgency::Normal
+            )
+            .await,
+            PublishResult::Ok { .. }
+        ));
+    }
+
+    // The replacement names a different instance set: `clock` stays, `todos`
+    // (one of the fixture instances) is gone, `weather` is new.
+    m.set_attach_send_budgets(
+        AttachScope::surface("durabar"),
+        crate::attach_principal_budgets(
+            AttachScope::surface("durabar"),
+            default_principals(&["clock", "weather"]),
+        ),
+    );
+
+    assert!(
+        matches!(
+            m.publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &addr,
+                "x",
+                Urgency::Normal
+            )
+            .await,
+            PublishResult::Ok { .. }
+        ),
+        "the replaced principal was rebuilt, not carried across drained"
+    );
+    assert!(matches!(
+        m.publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("weather"),
+            &addr,
+            "x",
+            Urgency::Normal
+        )
+        .await,
+        PublishResult::Ok { .. }
+    ));
+
+    // The sibling surface never entered the swap, so its drain survives it.
+    let still_denied = m
+        .publish_from_attacher(
+            AttachScope::surface("kiosk"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
+        .await;
+    assert!(
+        matches!(still_denied, PublishResult::BudgetExhausted),
+        "the swap reached a scope it was not given, got {still_denied:?}"
+    );
+}
+
+/// A principal the replacement does not name has no bucket afterwards, and an
+/// unbudgeted principal reaching the publish path is a wiring bug, not a silent
+/// admission.
+#[tokio::test]
+#[should_panic(expected = "has no send budget")]
+async fn a_principal_dropped_by_a_swap_has_no_bucket() {
+    let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
+    m.set_attach_send_budgets(
+        AttachScope::surface("durabar"),
+        crate::attach_principal_budgets(
+            AttachScope::surface("durabar"),
+            default_principals(&["clock"]),
+        ),
+    );
+    let _ = m
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("todos"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
+        .await;
+}
+
+/// The survival half of "removing a scope's budgets removes exactly that
+/// scope's": every other scope still publishes. The removal half is the case
+/// below.
+#[tokio::test]
+async fn removing_a_scopes_budgets_leaves_every_other_scope() {
+    let (m, addr) = build_multi_surface_publish_messenger(&["durabar", "kiosk"]).await;
+    m.remove_attach_send_budgets(AttachScope::surface("durabar"));
+
+    assert!(matches!(
+        m.publish_from_attacher(
+            AttachScope::surface("kiosk"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal
+        )
+        .await,
+        PublishResult::Ok { .. }
+    ));
+}
+
+/// The removal half: the scope that was removed has no bucket left, so a
+/// publish under it reaches the unbudgeted-principal panic rather than a
+/// silent admission. Without this the removal could be a no-op and the case
+/// above would still pass.
+#[tokio::test]
+#[should_panic(expected = "has no send budget")]
+async fn a_removed_scope_has_no_bucket() {
+    let (m, addr) = build_multi_surface_publish_messenger(&["durabar", "kiosk"]).await;
+    m.remove_attach_send_budgets(AttachScope::surface("durabar"));
+    let _ = m
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
+        .await;
+}
+
+/// A publish racing a swap of the same scope finds a bucket — the old one or
+/// the fresh one, never none. A swap is not a window in which an attacher
+/// cannot publish.
+///
+/// The interleaving is made observable rather than hoped for: the swap loop
+/// runs its whole course *and* waits for the publisher to report
+/// [`RACING_PUBLISHES`] before it stops, so a scheduler that ran every swap
+/// before the publisher's first poll hangs the case rather than passing it
+/// having proved nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_concurrent_with_a_swap_always_finds_a_bucket() {
+    let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let landed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    let publisher = {
+        let m = Arc::clone(&m);
+        let addr = addr.clone();
+        let stop = Arc::clone(&stop);
+        let landed = Arc::clone(&landed);
+        tokio::spawn(async move {
+            let mut publishes = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let result = m
+                    .publish_from_attacher(
+                        AttachScope::surface("durabar"),
+                        None,
+                        &addr,
+                        "x",
+                        Urgency::Normal,
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        result,
+                        PublishResult::Ok { .. } | PublishResult::BudgetExhausted
+                    ),
+                    "a publish across a swap is metered, not refused for another reason: \
+                     {result:?}"
+                );
+                publishes += 1;
+                landed.store(publishes, std::sync::atomic::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+            publishes
+        })
+    };
+
+    // The bare attacher principal is in every one of these sets, so it is the
+    // one whose bucket a racing publish must always find.
+    for _ in 0..200 {
+        m.set_attach_send_budgets(
+            AttachScope::surface("durabar"),
+            crate::attach_principal_budgets(
+                AttachScope::surface("durabar"),
+                default_principals(&[]),
+            ),
+        );
+        tokio::task::yield_now().await;
+    }
+    // Not `stop` yet: a swap loop that outran the publisher proved nothing, so
+    // the case keeps swapping until the publisher has been through the window
+    // enough times for the interleaving to be real.
+    while landed.load(std::sync::atomic::Ordering::Relaxed) < RACING_PUBLISHES {
+        m.set_attach_send_budgets(
+            AttachScope::surface("durabar"),
+            crate::attach_principal_budgets(
+                AttachScope::surface("durabar"),
+                default_principals(&[]),
+            ),
+        );
+        tokio::task::yield_now().await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let publishes = publisher.await.expect("the publishing task found a bucket");
+    assert!(
+        publishes >= RACING_PUBLISHES,
+        "only {publishes} publishes crossed the swap loop",
+    );
+}
+
+/// How many publishes have to cross the swap loop before the case will accept
+/// that the two ran concurrently.
+const RACING_PUBLISHES: u32 = 50;
+
+/// The scope and the principals it is given must agree: a foreign key would
+/// leave a bucket no removal under any scope could reach.
+#[test]
+#[should_panic(expected = "is outside scope")]
+fn a_budget_outside_the_scope_it_is_installed_under_is_a_wiring_bug() {
+    let messenger = crate::testutils::empty_directory_messenger("test-origin");
+    messenger.set_attach_send_budgets(
+        AttachScope::surface("durabar"),
+        crate::attach_principal_budgets(
+            AttachScope::surface("kiosk"),
+            default_principals(&["clock"]),
+        ),
+    );
+}

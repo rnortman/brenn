@@ -38,7 +38,7 @@ pub mod testutils;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
@@ -632,6 +632,17 @@ pub trait WakeRouter: Send + Sync + 'static {
     }
 }
 
+/// One token bucket from one resolved budget. The `1` is the refill quantum:
+/// budgets are stated as burst plus a refill interval, and every attach bucket
+/// hands back one token per interval.
+fn bucket_for(budget: &config::AttachSendBudget) -> Mutex<brenn_lib::token_bucket::TokenBucket> {
+    Mutex::new(brenn_lib::token_bucket::TokenBucket::new(
+        budget.burst,
+        budget.refill,
+        1,
+    ))
+}
+
 /// Flatten one attacher's declared principals onto the `(principal, budget)`
 /// pairs [`Messenger::with_attach_send_budgets`] installs.
 ///
@@ -857,8 +868,14 @@ pub struct Messenger {
     /// The `publish_core` Attach arm consults it for every durable publish an
     /// attacher makes under its own identity. Empty on a `Messenger` with no
     /// attachers; an Attach publish whose key is absent is a broken boot
-    /// invariant (panic). The `std::sync::Mutex` holds no lock across an await.
-    pub(crate) attach_send_budgets: HashMap<String, Mutex<brenn_lib::token_bucket::TokenBucket>>,
+    /// invariant (panic). Neither the outer `RwLock` nor a bucket's
+    /// `std::sync::Mutex` is held across an await.
+    ///
+    /// The outer lock is what makes a scope's budgets replaceable while the
+    /// process runs: a surface arriving or leaving rewrites its own keys and
+    /// leaves every other scope's buckets — and their drained state — alone.
+    pub(crate) attach_send_budgets:
+        RwLock<HashMap<String, Mutex<brenn_lib::token_bucket::TokenBucket>>>,
     /// The unified send-rate gate: one token bucket per `(sender, channel)`,
     /// created on that pair's first publish at the channel's resolved rate.
     /// Every publish on every scheme draws from it.
@@ -1070,7 +1087,7 @@ impl Messenger {
             acl_denied_warned: Mutex::new(HashSet::new()),
             dynamic_subscribe_gate: tokio::sync::Mutex::new(()),
             deferred_view_gate: tokio::sync::Mutex::new(()),
-            attach_send_budgets: HashMap::new(),
+            attach_send_budgets: RwLock::new(HashMap::new()),
             send_rate_buckets: Mutex::new(HashMap::new()),
             publish_rate_limited: Mutex::new(HashMap::new()),
             publish_denied: Mutex::new(HashMap::new()),
@@ -1201,12 +1218,12 @@ impl Messenger {
     /// backend `[[app]]` slug, so twelve instances of one kind are twelve buckets
     /// and a runaway one drains only its own.
     ///
-    /// Same boot-only, uniquely-owned discipline as
-    /// [`Messenger::with_subscriber_registrations`]: the `Arc` is populated at
-    /// boot while still uniquely owned, so `Arc::get_mut` always succeeds; a
-    /// share before this call is a boot-ordering bug and panics. A duplicate
-    /// principal is a boot-wiring bug and panics — boot resolution already proved
-    /// slugs unique per route and instances unique per surface.
+    /// The boot installer: it takes the `Arc` in the builder chain's shape, but
+    /// the map behind it is mutable for the life of the process
+    /// ([`Messenger::set_attach_send_budgets`]), so this is an insert rather than
+    /// a unique-ownership write. A duplicate principal is a boot-wiring bug and
+    /// panics — boot resolution already proved slugs unique per route and
+    /// instances unique per surface.
     ///
     /// Each principal arrives with its own resolved
     /// [`AttachSendBudget`](config::AttachSendBudget) — the instance's declared
@@ -1214,25 +1231,18 @@ impl Messenger {
     /// this function to meter identically. Boot resolution owns the parameters;
     /// this owns the buckets.
     pub fn with_attach_send_budgets(
-        mut self: Arc<Self>,
+        self: Arc<Self>,
         principals: impl IntoIterator<Item = (ParticipantId, config::AttachSendBudget)>,
     ) -> Arc<Self> {
-        let inner = Arc::get_mut(&mut self).expect(
-            "with_attach_send_budgets must run before the Messenger Arc is shared \
-             (boot-ordering bug)",
-        );
+        let mut map = self
+            .attach_send_budgets
+            .write()
+            .expect("attach_send_budgets poisoned");
         // The bare grain rides in the principal set like any other: a surface's
         // geometry/status skip the budget via the platform path, but the kernel's
         // own error reports do not, so its bucket must exist.
         for (principal, budget) in principals {
-            let prev = inner.attach_send_budgets.insert(
-                principal.as_str().to_owned(),
-                Mutex::new(brenn_lib::token_bucket::TokenBucket::new(
-                    budget.burst,
-                    budget.refill,
-                    1,
-                )),
-            );
+            let prev = map.insert(principal.as_str().to_owned(), bucket_for(&budget));
             assert!(
                 prev.is_none(),
                 "with_attach_send_budgets: duplicate budget for attach principal {} — principals \
@@ -1240,7 +1250,96 @@ impl Messenger {
                 principal.as_str(),
             );
         }
+        drop(map);
         self
+    }
+
+    /// Install (or replace) every send budget under one attacher's scope,
+    /// leaving every other scope's buckets untouched.
+    ///
+    /// The replacement is whole-scope, not per-key: an arriving surface's
+    /// instance set is whatever its resolved value declares, so a key the new
+    /// set does not name must not survive from the old one. A principal whose
+    /// budget did not move still gets a fresh bucket — the surface it belongs to
+    /// is being rebuilt, and a bucket carried across that is state from a
+    /// configuration that no longer exists.
+    ///
+    /// Panics on a principal outside `scope`: the caller composes the pairs from
+    /// the scope itself ([`attach_principal_budgets`]), so a foreign key is a
+    /// wiring bug that would leave a bucket no `remove_attach_send_budgets` can
+    /// reach.
+    pub fn set_attach_send_budgets(
+        &self,
+        scope: AttachScope<'_>,
+        principals: impl IntoIterator<Item = (ParticipantId, config::AttachSendBudget)>,
+    ) {
+        let fresh: Vec<(String, Mutex<brenn_lib::token_bucket::TokenBucket>)> = principals
+            .into_iter()
+            .map(|(principal, budget)| {
+                assert!(
+                    scope.covers(principal.as_str()),
+                    "set_attach_send_budgets: principal {} is outside scope {}",
+                    principal.as_str(),
+                    scope.principal(None).as_str(),
+                );
+                (principal.as_str().to_owned(), bucket_for(&budget))
+            })
+            .collect();
+        let mut map = self
+            .attach_send_budgets
+            .write()
+            .expect("attach_send_budgets poisoned");
+        map.retain(|principal, _| !scope.covers(principal));
+        for (principal, bucket) in fresh {
+            let prev = map.insert(principal.clone(), bucket);
+            assert!(
+                prev.is_none(),
+                "set_attach_send_budgets: duplicate budget for attach principal {principal}"
+            );
+        }
+    }
+
+    /// Drop every send budget under one attacher's scope. The counterpart of
+    /// [`Messenger::set_attach_send_budgets`], for an attacher that is leaving
+    /// rather than being replaced.
+    pub fn remove_attach_send_budgets(&self, scope: AttachScope<'_>) {
+        self.attach_send_budgets
+            .write()
+            .expect("attach_send_budgets poisoned")
+            .retain(|principal, _| !scope.covers(principal));
+    }
+
+    /// Every attach principal holding a send budget, with the bucket's
+    /// configured rate, one line each, sorted.
+    ///
+    /// Behind `testutils`: the bucket map has no production reader — the
+    /// publish path reaches one bucket by key and never enumerates. The
+    /// question worth asking of it from outside is whether an attacher that
+    /// arrived, moved or left took its keys with it, which is a comparison of
+    /// the whole table. Configured rates only: a bucket's fill is per-process
+    /// by construction, so two processes running one configuration agree on
+    /// these lines and on nothing else about a bucket.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn attach_send_budget_lines(&self) -> Vec<String> {
+        let map = self
+            .attach_send_budgets
+            .read()
+            .expect("attach_send_budgets poisoned");
+        let mut lines: Vec<String> = map
+            .iter()
+            .map(|(principal, bucket)| {
+                let configured = bucket
+                    .lock()
+                    .expect("an attach send bucket is locked only for a draw")
+                    .configured();
+                format!(
+                    "{principal} capacity={} refill={:?} amount={}",
+                    configured.capacity, configured.refill_interval, configured.refill_amount,
+                )
+            })
+            .collect();
+        lines.sort();
+        lines
     }
 
     /// Install the config-resolved non-durable stores before the `Messenger` is
@@ -2201,6 +2300,17 @@ impl Messenger {
         self.targets.registration(kind)
     }
 
+    /// Every subscriber kind holding a live registration, unordered.
+    ///
+    /// Behind `testutils`: production resolves one key at a time. The two
+    /// surface-description participants publish and never subscribe, so they
+    /// appear in no directory entry and this is the only place a test can see
+    /// that their registrations arrived, moved or left.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn registered_subscriber_kinds(&self) -> Vec<SubscriberEntryKind> {
+        self.targets.registered_kinds()
+    }
+
     /// Register one subscriber after boot, keyed by its
     /// [`SubscriberEntryKind`] — the runtime counterpart of
     /// [`Self::with_subscriber_registrations`], for a subscriber that joins a
@@ -2217,6 +2327,24 @@ impl Messenger {
         registration: SubscriberRegistration,
     ) {
         self.targets.register(HashMap::from([(kind, registration)]));
+    }
+
+    /// Swap a live subscriber's registration for a new one, under one lock: the
+    /// same subscriber, rewired. A reload replacing a surface it is already
+    /// serving uses this rather than retire-then-register, so no publish sees a
+    /// moment in which the key resolves "gone".
+    ///
+    /// # Panics
+    ///
+    /// If the key is not live. Replacing what was never registered is a wiring
+    /// bug; [`Self::register_subscriber_registration`] is how a subscriber
+    /// joins.
+    pub fn replace_subscriber_registration(
+        &self,
+        kind: &SubscriberEntryKind,
+        registration: SubscriberRegistration,
+    ) {
+        self.targets.replace(kind, registration);
     }
 
     /// Retire one subscriber's registration: the key leaves the live registry

@@ -2794,3 +2794,47 @@ Code site (`TODO(system-participant-noise-inert)`):
 
 Done = a tuning block's `noise` is either enacted by the system participant
 subscribed to that channel or refused at load, with no family in between.
+
+## `reload-webhooks`
+
+A reload converges `brenn:`, `ephemeral:`, `local:` and `mqtt:` channels;
+`webhook:` is the one scheme left refusing. The reason is structural rather than
+residual: each endpoint is a literal axum path built once into the router, with
+its own `DefaultBodyLimit` and an `Extension(EndpointSlug(..))`, and the
+`WebhookService` behind them is immutable after boot. So an endpoint added,
+removed or retuned in the document has nowhere to go, and the delta refuses the
+channel rather than applying half of it.
+
+Converging it is one wildcard `/webhooks/{*tail}` route over a swappable
+endpoint table, with the per-endpoint body ceiling applied in-handler instead of
+per-route, plus a swappable `WebhookService`. That is a self-contained slice —
+the routing change and the ceiling change are both load-bearing on their own,
+and the in-handler ceiling has to refuse a body the route-level limit used to
+reject before it was read.
+
+Code sites (`TODO(reload-webhooks)`): `brenn-bootstrap/src/reload/delta.rs`, at
+rule 3; `brenn-server/src/router.rs`, at the per-endpoint route registration.
+
+Done = a `webhook:` channel that moved is applied rather than refused, rule 3 is
+gone, and the per-endpoint body ceiling is enforced on a wildcard route.
+
+## `reload-mqtt-sessions`
+
+An `mqtt:` channel converges — its filter and its ingress route follow the
+document — but the set of broker *sessions* does not. Supervisors are spawned
+once, at boot, for the referenced-client set, so a reload refuses in two
+directions: a binding on a client nothing referenced when the process booted has
+no session to subscribe on, and a change that removes a referenced client's last
+reference would leave a supervisor a fresh boot would not have spawned. Both
+are stated refusals asking for a restart, not silent limits.
+
+Converging them means starting and stopping supervisors at reload, which in turn
+means the whole MQTT subsystem — service, event router, `AppState` injection —
+has to be able to come up lazily, because a boot document referencing no client
+builds none of it today.
+
+Code sites (`TODO(reload-mqtt-sessions)`): `brenn-bootstrap/src/reload/mqtt.rs`,
+at `session_refusals`; `brenn-bootstrap/src/mqtt.rs`, at `start_mqtt`.
+
+Done = a reload that adds the first reference to a client, or drops the last
+one, applies — the supervisor is spawned or stopped and the status body says so.

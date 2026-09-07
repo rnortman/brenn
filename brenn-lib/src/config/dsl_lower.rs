@@ -256,7 +256,7 @@ fn channel(
 /// A refused value leaves its field absent, so the walk reaches every other
 /// value in the document and reports all of them at once. The config built
 /// around the hole is discarded — `lower` returns the errors instead.
-fn keep<T>(result: Result<T, Diagnostic>, errors: &mut Vec<Diagnostic>) -> Option<T> {
+pub(crate) fn keep<T>(result: Result<T, Diagnostic>, errors: &mut Vec<Diagnostic>) -> Option<T> {
     match result {
         Ok(value) => Some(value),
         Err(diagnostic) => {
@@ -279,7 +279,7 @@ fn mismatch(value: &RVal, key: &str, expected: &str) -> Diagnostic {
     Diagnostic::at(message, value.span().clone())
 }
 
-fn expect_str(value: &RVal, key: &str) -> Result<String, Diagnostic> {
+pub(crate) fn expect_str(value: &RVal, key: &str) -> Result<String, Diagnostic> {
     match value.value() {
         RValue::Str(text) => Ok(text.clone()),
         _ => Err(mismatch(value, key, "a string")),

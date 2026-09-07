@@ -115,7 +115,8 @@ fn main() -> ExitCode {
             dump,
         } => match brenn_dsl::compile(&brenn_dsl::DocumentInputs {
             root: root.clone(),
-            module_roots: modules,
+            module_roots: modules.into(),
+            role: brenn_dsl::DocumentRole::Deployment,
         }) {
             Ok(config) => {
                 if dump {

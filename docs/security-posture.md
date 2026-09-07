@@ -846,7 +846,7 @@ rejection emits no security event.
 ## 9b. Boundary B8 — Packaged Module Text → Compiler
 
 **Who:** the author of a component package or bundle, through the `.brenn` files
-under every `--modules` root. Those files are the author's specifications and,
+under every declared mount's `modules/` tree. Those files are the author's specifications and,
 where the author ships assemblies, whole arrangements — surfaces, channels,
 component instances, grants and ACL statements — that a deployment brings into
 its own configuration with one `use` and one `new`.
@@ -928,6 +928,17 @@ request channel's ACL is the whole of the gate.
   a signal channel and the driver serializes — so N requests cost at most one
   further reload each time the driver goes idle. A reload that refuses mutates
   nothing.
+
+**The mounts document is a second operator-owned input, and it is consent.**
+What the host may resolve, load and serve is exactly what a declared mount
+holds; nothing discovers a mount, so an attacker who can write a tree somewhere
+on the host has gained nothing until an operator writes a line naming it. That
+puts the mounts file in the same class as the unit: its path is on the command
+line, it is owned by the operator, and nothing the process runs may write it.
+A deployment that lets any principal write the mounts document has given that
+principal the packaged-module and component authority of boundary B8 over any
+tree it can also write, at the next reload rather than at the next bounce — the
+same authorship gap as below, with a wider blast radius.
 
 **What is *not* guarded here — the authorship gap.** Nothing in this boundary
 says who was allowed to *write* the file the reload reads. A principal that can

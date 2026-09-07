@@ -12,7 +12,9 @@ mod cleanup;
 pub mod cli;
 mod config_check;
 mod config_diff;
+mod config_status;
 mod consumers;
+mod mounts_cmd;
 mod mqtt;
 mod obs_config;
 mod pid_file;
@@ -31,7 +33,9 @@ mod webhook;
 
 use std::path::PathBuf;
 
-use brenn_lib::config::{BrennConfig, LoadedDocument, ResolvedConfig, validate_and_resolve};
+use brenn_lib::config::{
+    BrennConfig, LoadedDocument, LoadedMounts, ResolvedConfig, Roots, validate_and_resolve,
+};
 use brenn_lib::integration::IntegrationRegistry;
 use brenn_obs as obs;
 use tokio::net::TcpListener;
@@ -39,8 +43,10 @@ use tracing::info;
 
 use brenn_server::state::AppState;
 
-pub use config_check::run_config_check;
+pub use config_check::{run_config_check, tool_module_roots};
 pub use config_diff::run_config_diff;
+pub use config_status::run_config_status;
+pub use mounts_cmd::run_mounts;
 
 pub async fn run_invite(config: &BrennConfig) {
     let db = brenn_server::db::init_db(&config.database.path);
@@ -63,7 +69,7 @@ fn assert_build_id_valid(build_id: &str) {
 /// What a server refuses to start on, before any of it is used.
 ///
 /// The components roots are checked here rather than where a consumer resolves
-/// against them, so a flag pointed at nothing is an operator error reported at
+/// against them, so a root pointed at nothing is an operator error reported at
 /// startup instead of one that hides until some later release happens to
 /// configure a consumer. The same goes for a package name installed under two
 /// roots: a broken install is refused whether or not this configuration
@@ -72,22 +78,106 @@ fn assert_build_id_valid(build_id: &str) {
 /// TODO(mcp-script-path-precondition): `claude_defaults.mcp_script_path` is not
 /// among the artifact facts checked here, so a configuration naming a file that
 /// does not exist boots and fails at the first session spawn instead.
-fn assert_boot_preconditions(build_id: &str, roots: &cli::InstallRoots) {
+fn assert_boot_preconditions(build_id: &str, roots: &Roots) {
     assert_build_id_valid(build_id);
-    for root in &roots.components {
-        brenn_lib::wasm_package::assert_components_root(root);
+    brenn_lib::wasm_package::assert_components_roots(&roots.components_roots);
+    brenn_lib::wasm_package::assert_disjoint_components_roots(&roots.components_roots);
+}
+
+/// One line per mount, before anything reads a tree.
+///
+/// The mounts document is the whole of what this process may load and serve, so
+/// which trees it resolved to is the first thing a journal should be able to
+/// answer — including the empty case, which is otherwise indistinguishable from
+/// a unit that forgot the flag.
+fn log_mounts(mounts: &LoadedMounts) {
+    if mounts.config.mounts.is_empty() {
+        info!("boot: no mounts declared");
+        return;
     }
-    brenn_lib::wasm_package::assert_disjoint_components_roots(&roots.components);
+    for mount in &mounts.config.mounts {
+        let trees: Vec<&str> = mount.trees.iter().map(|tree| tree.dir_name()).collect();
+        info!(
+            mount = %mount.name,
+            path = %mount.path.display(),
+            version = %mount.version,
+            trees = ?trees,
+            "boot: mount",
+        );
+    }
+}
+
+/// Publish the surface self-description family a boot publishes: the topology
+/// index, every surface's and every kind's help, each kind's schema, one
+/// bindings document per surface, and a boot `disconnected` stamp per surface.
+///
+/// One function rather than a block inside `run_server` because the reload
+/// suite's fresh-boot side has to publish exactly what boot publishes: a
+/// comparison whose other side transcribed these bodies would be comparing the
+/// transcription, and one that skipped them would read back whatever the
+/// pre-reload database still retained.
+///
+/// # Panics
+///
+/// On any publish outcome that is not `Ok`, including an oversized body: a
+/// retained document that never landed is a topology no attaching page can
+/// read, and starting anyway would hide it.
+pub(crate) async fn publish_boot_surface_documents(
+    messenger: &brenn_messaging::Messenger,
+    config: &BrennConfig,
+    build_id: &str,
+    surfaces: &[brenn_lib::messaging::config::ResolvedSurface],
+    surface_roots: &brenn_surface_server::SurfaceRoots,
+) {
+    let prefix = &config.surface_description.prefix;
+    let docs = brenn_surface_server::description::build_description_docs(
+        prefix,
+        build_id,
+        surfaces,
+        surface_roots,
+    );
+    brenn_surface_server::description::publish_description(messenger, &docs).await;
+
+    // Bindings documents: one retained document per surface on its own
+    // ephemeral config channel, published here — before the server accepts
+    // connections — so an attaching surface always finds a retained copy and
+    // an empty replay is a server invariant failure rather than a race.
+    let bindings_docs = brenn_surface_server::bindings_doc::build_bindings_documents(
+        surfaces,
+        &brenn_surface_server::bindings_doc::BindingsDocParams {
+            prefix,
+            status_interval_secs: config.surface_description.status_interval_secs,
+            error_report: config
+                .observability
+                .surface_error_channel
+                .as_deref()
+                .map(|addr| (addr, config.observability.surface_error_publish_floor)),
+        },
+    );
+    brenn_surface_server::bindings_doc::publish_bindings_documents(messenger, &bindings_docs).await;
+
+    // A `disconnected` status snapshot (reason "server restart", the new
+    // non-durable incarnation epoch, empty instances) per configured surface,
+    // after the documents above. A durable status channel's retained row
+    // survives the restart; without this a dead or not-yet-connected wall would
+    // read "healthy as of before the restart" until a reader did timestamp
+    // math.
+    let epoch = messenger.ring_epoch();
+    brenn_surface_server::telemetry::publish_boot_disconnected_stamps(
+        messenger, prefix, surfaces, epoch,
+    )
+    .await;
 }
 
 pub async fn run_server(
     document: LoadedDocument,
     config_path: Option<PathBuf>,
-    install_roots: cli::InstallRoots,
+    mounts: LoadedMounts,
     build_id: &'static str,
 ) {
-    assert_boot_preconditions(build_id, &install_roots);
-    let components_roots = install_roots.components;
+    assert_boot_preconditions(build_id, &mounts.roots);
+    let components_roots = mounts.roots.components_roots.clone();
+    let surface_asset_roots = mounts.roots.surface_roots.clone();
 
     let obs_config = obs_config::build(&document.config, config_path.as_ref());
     obs::install_pending_panic_hook(&obs_config);
@@ -106,6 +196,7 @@ pub async fn run_server(
         files = %document.file_places(),
         "config loaded"
     );
+    log_mounts(&mounts);
     // The document's own answer, not the flag's: with no `--config` the loader
     // probes for a fallback file, and a reload re-reads *that* root. Reporting
     // the flag here would leave a fallback boot publishing no root while
@@ -353,6 +444,11 @@ pub async fn run_server(
         tool_caller_grants: planned_tool_caller_grants,
     } = plan_carried;
 
+    // What a fresh boot of this document derives, before the durable dynamic
+    // subscriptions below are folded in: the reload baseline's broker set is
+    // the plan's, not the process's, for the same reason its directory is.
+    let planned_mqtt_ingress_channels = mqtt_ingress_channels.clone();
+
     // Boot re-activation of durable dynamic `mqtt:` subscriptions: the
     // boot merge folded them into the directory, but the ingress supervisor's
     // broker SUBSCRIBE union and the router's `IngressRoute` table (built below by
@@ -436,53 +532,17 @@ pub async fn run_server(
     // config touches, and the kind → root map it returns is what the router
     // serves from.
     let surface_roots = brenn_surface_server::validate_surface_assets(
-        &install_roots.surface,
+        &surface_asset_roots,
         &messaging_result.surfaces,
     );
 
-    // Publish surface self-description documents so any app can pull them via
-    // `MessageChannelGet`.
     if let Some(messenger) = messenger {
-        let prefix = &config.surface_description.prefix;
-        let docs = brenn_surface_server::description::build_description_docs(
-            prefix,
+        publish_boot_surface_documents(
+            messenger,
+            &config,
             build_id,
             &messaging_result.surfaces,
             &surface_roots,
-        );
-        brenn_surface_server::description::publish_description(messenger, &docs).await;
-
-        // Bindings documents: one retained document per surface on its own
-        // ephemeral config channel, published here — before the server accepts
-        // connections — so an attaching surface always finds a retained copy and
-        // an empty replay is a server invariant failure rather than a race.
-        let bindings_docs = brenn_surface_server::bindings_doc::build_bindings_documents(
-            &messaging_result.surfaces,
-            &brenn_surface_server::bindings_doc::BindingsDocParams {
-                prefix,
-                status_interval_secs: config.surface_description.status_interval_secs,
-                error_report: config
-                    .observability
-                    .surface_error_channel
-                    .as_deref()
-                    .map(|addr| (addr, config.observability.surface_error_publish_floor)),
-            },
-        );
-        brenn_surface_server::bindings_doc::publish_bindings_documents(messenger, &bindings_docs)
-            .await;
-
-        // Boot disconnected stamps: after the boot-published docs, write a
-        // `disconnected` status snapshot (reason "server restart", the new
-        // non-durable incarnation epoch, empty instances) per configured surface. A durable status
-        // channel's retained row survives the restart; without this a dead or
-        // not-yet-connected wall would read "healthy as of before the restart"
-        // until a reader did timestamp math.
-        let epoch = messenger.ring_epoch();
-        brenn_surface_server::telemetry::publish_boot_disconnected_stamps(
-            messenger,
-            prefix,
-            &messaging_result.surfaces,
-            epoch,
         )
         .await;
     }
@@ -490,6 +550,9 @@ pub async fn run_server(
     // Build the per-surface runtime bundle map, keyed by slug. Any non-empty
     // `[[surface]]` list forces messaging on (`any_messaging` above), so a
     // `Messenger` exists whenever surfaces do; the `expect` cites that gate.
+    // Cloned before the take: the reload baseline needs the planned surfaces,
+    // and `surface_runtimes` below consumes the original.
+    let planned_surfaces = messaging_result.surfaces.clone();
     let surface_runtimes = {
         let surfaces = std::mem::take(&mut messaging_result.surfaces);
         if surfaces.is_empty() {
@@ -796,7 +859,9 @@ pub async fn run_server(
         bridge_notify_tx: tokio::sync::broadcast::channel(64).0,
         pending_uploads: pending_uploads.clone(),
         static_dir: config.server.static_dir.clone(),
-        surface_roots: surface_roots.clone(),
+        surface_roots: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+            surface_roots.clone(),
+        ))),
         cached_models: Default::default(),
         tool_registry,
         tools: tool_registry_core,
@@ -812,7 +877,7 @@ pub async fn run_server(
         webhook: webhook_result.service.clone(),
         automation_engine: automation_result.engine.clone(),
         usage_session_gap_secs: config.observability.usage.session_gap_minutes * 60,
-        surfaces: std::sync::Arc::new(surface_runtimes),
+        surfaces: brenn_server::state::SurfaceCell::holding(surface_runtimes),
         remotes: std::sync::Arc::new(remote_runtimes),
         attach_registry: brenn_attach_server::registry::AttachRegistry::default(),
         attach_heartbeat_secs: brenn_surface_server::HEARTBEAT_SECS,
@@ -852,6 +917,7 @@ pub async fn run_server(
             messenger,
             &document.document_sha256,
             root_path.clone(),
+            &mounts.config,
         )
         .await;
 
@@ -922,17 +988,23 @@ pub async fn run_server(
         // a consumer after this point.
         if let Some(notify) = reload_notify {
             let env = reload::driver::ReloadEnv {
-                inputs: document
+                config_path: document
                     .inputs
-                    .clone()
-                    .expect("a document that declares channels was read from a tree"),
+                    .as_ref()
+                    .expect("a document that declares channels was read from a tree")
+                    .root
+                    .clone(),
                 root: root_path.clone(),
+                build_id,
                 apps: apps.clone(),
                 mqtt_clients: mqtt_client_identities,
                 tool_registry: state.tools.clone(),
                 replay_store_paths: replay_store_paths.clone(),
-                components_roots: components_roots.clone(),
+                surface_roots: state.surface_roots.clone(),
+                surfaces: state.surfaces.clone(),
+                attach_registry: state.attach_registry.clone(),
                 mqtt_service: mqtt_result.service.clone(),
+                mqtt_event_router: mqtt_result.event_router.clone(),
                 max_payload_bytes: config.messaging.max_body_bytes,
                 messenger: messenger.clone(),
                 router: router.clone(),
@@ -941,8 +1013,12 @@ pub async fn run_server(
             };
             let baseline = reload::driver::Baseline::from_parts(
                 document,
+                mounts,
                 planned_directory,
                 messaging_result.wasm_consumers.clone(),
+                planned_mqtt_ingress_channels,
+                messaging_result.system_participants.clone(),
+                planned_surfaces,
             );
             let requests = reload::doors::spawn_driver(reload::driver::ReloadDriver::new(
                 env,
@@ -1204,10 +1280,19 @@ fn assert_every_subscriber_wired(
 mod tests {
     use super::*;
 
-    fn components_only<const N: usize>(components: [PathBuf; N]) -> cli::InstallRoots {
-        cli::InstallRoots {
-            components: components.into(),
-            ..cli::InstallRoots::default()
+    /// The components trees of the named mounts, as a host derives them: a
+    /// refusal names the mount, so a fixture naming roots any other way would
+    /// assert wording no host produces.
+    fn components_only<const N: usize>(components: [(&str, PathBuf); N]) -> Roots {
+        Roots {
+            components_roots: brenn_lib::config::RootList::mounts(
+                "components",
+                components
+                    .into_iter()
+                    .map(|(mount, path)| (mount.to_string(), path))
+                    .collect(),
+            ),
+            ..Roots::default()
         }
     }
 
@@ -1222,19 +1307,22 @@ mod tests {
     #[test]
     fn boot_preconditions_pass_on_a_real_components_root() {
         let dir = tempfile::tempdir().unwrap();
-        assert_boot_preconditions("test-build", &components_only([dir.path().to_path_buf()]));
-        assert_boot_preconditions("test-build", &cli::InstallRoots::default());
+        assert_boot_preconditions(
+            "test-build",
+            &components_only([("brenn", dir.path().to_path_buf())]),
+        );
+        assert_boot_preconditions("test-build", &Roots::default());
     }
 
     /// The root is checked at startup, with no consumer configured and nothing
     /// yet resolved against it.
     #[test]
-    #[should_panic(expected = "which is not a directory")]
+    #[should_panic(expected = "is not a directory")]
     fn boot_preconditions_refuse_a_components_root_that_is_not_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("brenn_demo.wasm");
         std::fs::write(&file, b"not a directory").unwrap();
-        assert_boot_preconditions("test-build", &components_only([file]));
+        assert_boot_preconditions("test-build", &components_only([("brenn", file)]));
     }
 
     /// Two releases' roots with disjoint package names boot; the same name
@@ -1245,18 +1333,24 @@ mod tests {
         let bundle = tempfile::tempdir().unwrap();
         std::fs::create_dir(brenn.path().join("demo")).unwrap();
         std::fs::create_dir(bundle.path().join("relay")).unwrap();
-        let roots = components_only([brenn.path().to_path_buf(), bundle.path().to_path_buf()]);
+        let roots = components_only([
+            ("brenn", brenn.path().to_path_buf()),
+            ("demo", bundle.path().to_path_buf()),
+        ]);
         assert_boot_preconditions("test-build", &roots);
     }
 
     #[test]
-    #[should_panic(expected = "is installed under more than one --components root")]
+    #[should_panic(expected = "is installed under more than one mount: brenn, demo")]
     fn boot_preconditions_refuse_a_package_present_in_two_roots() {
         let brenn = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::create_dir(brenn.path().join("demo")).unwrap();
         std::fs::create_dir(bundle.path().join("demo")).unwrap();
-        let roots = components_only([brenn.path().to_path_buf(), bundle.path().to_path_buf()]);
+        let roots = components_only([
+            ("brenn", brenn.path().to_path_buf()),
+            ("demo", bundle.path().to_path_buf()),
+        ]);
         assert_boot_preconditions("test-build", &roots);
     }
 

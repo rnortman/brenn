@@ -55,7 +55,7 @@ pub async fn booted_surface_harness(
     db: &brenn_db::Db,
     config: &brenn_lib::config::BrennConfig,
 ) -> BootedSurfaceHarness {
-    let (mut state, alerts, _handle) = test_state_with_capturing_alerter(db);
+    let (state, alerts, _handle) = test_state_with_capturing_alerter(db);
     let flusher = state.alert_dispatcher.clone();
     let apps: Arc<indexmap::IndexMap<String, brenn_lib::config::AppConfig>> =
         Arc::new(indexmap::IndexMap::new());
@@ -70,7 +70,7 @@ pub async fn booted_surface_harness(
     let messenger = result
         .messenger
         .expect("a config with a surface configures messaging");
-    state.surfaces = Arc::new(install_surface_runtimes(
+    state.surfaces.set_runtimes(install_surface_runtimes(
         result.surfaces.clone(),
         Some(Arc::clone(&messenger)),
         TEST_MAX_BODY_BYTES,

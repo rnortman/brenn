@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "brenn", about = "Brenn application server")]
@@ -9,12 +10,26 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
+    /// Path to the mounts document: the `.brenn` file declaring which
+    /// installed trees the host may read. Every root a server uses — the
+    /// packaged modules `use @<name>::…` resolves against, the component
+    /// packages a consumer loads from, the surface asset trees a page is
+    /// served out of — is derived from it, so this is the whole of the
+    /// server's environment-fact surface. Absent means zero mounts: a dev
+    /// server with no components, no surfaces and no packaged vocabulary.
+    ///
+    /// Global so that the `mounts` subcommand, which an installer runs to read
+    /// the operator's declaration, spells it after the subcommand the way the
+    /// unit spells it before `serve`.
+    #[arg(long, value_name = "FILE", global = true)]
+    pub mounts: Option<PathBuf>,
+
     /// Directory holding the packaged component modules `use @<name>::…`
-    /// imports resolve against. An environment fact, so it is named here and
-    /// never in the document: the same document checks on a workstation against
-    /// a source checkout and boots on a host against the installed tree.
-    /// Repeatable, one per installed release; a module must be under exactly
-    /// one of them.
+    /// imports resolve against. A **check-only** flag: it is the workstation
+    /// form, for certifying a document against a source checkout that holds no
+    /// mounts. A server derives its module roots from `--mounts` and refuses
+    /// this flag.
+    /// Repeatable; a module must be under exactly one of them.
     #[arg(long, value_name = "DIR")]
     pub modules: Vec<PathBuf>,
 
@@ -25,25 +40,24 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start the web server (default if no subcommand given).
-    Serve {
-        /// Directory holding the installed component packages, one directory
-        /// per package, named by the package. A boot fact only: config
-        /// validation never resolves artifacts, so a document checks without
-        /// components installed. Repeatable, one per installed release; a
-        /// package must be under exactly one of them.
-        #[arg(long, value_name = "DIR")]
-        components: Vec<PathBuf>,
-
-        /// Directory holding an installed surface asset tree, served under
-        /// `/surface-static`. An artifact fact, so it is named here and never
-        /// in the document. Repeatable, one per installed release; exactly one
-        /// root carries the kernel module pair, and a kind must be under
-        /// exactly one of them.
-        #[arg(long, value_name = "DIR")]
-        surface: Vec<PathBuf>,
-    },
+    Serve,
     /// Generate an invite code and print it to stdout.
     Invite,
+    /// List what the mounts document declares and what each declaration looks
+    /// like on disk: one line per mount, `name<TAB>declared path<TAB>status`.
+    /// Exits 0 whenever the document itself is a valid mounts document, even
+    /// when a declared mount is not installed yet — an installer needs to read
+    /// the declaration of the mount it is about to create.
+    Mounts,
+    /// Print the retained body of `brenn:config.status` — the outcome of this
+    /// host's last boot or reload — as JSON on stdout. Exits 0 with a body, 2
+    /// when the status channel holds none, 1 when the database cannot be read.
+    /// Read-only: it runs while the server holds the store.
+    ConfigStatus {
+        /// The sqlite store the server was started against.
+        #[arg(long, value_name = "PATH")]
+        db: PathBuf,
+    },
     /// Compare two `.brenn` config documents as configurations, not as
     /// documents. Exits 0 when they are the same config, 1 with a unified diff
     /// when they are not.
@@ -57,20 +71,72 @@ pub enum Commands {
     ConfigCheck { file: PathBuf },
 }
 
-/// The install-root lists a *server* boot was given, as one value.
-///
-/// Two lists: the component packages a consumer loads from, and the surface
-/// asset trees a page is served out of. They are named on the command line
-/// rather than in the document because where a release is installed is an
-/// environment fact, and they are one value because named fields are what keeps
-/// two lists of the same type from being handed over in each other's place.
-///
-/// The module roots are the third root type and are deliberately not here:
-/// they are resolved before a server exists.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InstallRoots {
-    pub components: Vec<PathBuf>,
-    pub surface: Vec<PathBuf>,
+impl Commands {
+    /// The subcommand as the operator spelled it, for a refusal to quote.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Invite => "invite",
+            Self::Mounts => "mounts",
+            Self::ConfigStatus { .. } => "config-status",
+            Self::ConfigDiff { .. } => "config-diff",
+            Self::ConfigCheck { .. } => "config-check",
+        }
+    }
+
+    /// Whether this subcommand reads module roots off a workstation checkout
+    /// rather than off an install. Only the two config tools do; everything
+    /// else is a host operation whose roots are the mounts'.
+    fn takes_modules(&self) -> bool {
+        matches!(self, Self::ConfigDiff { .. } | Self::ConfigCheck { .. })
+    }
+}
+
+impl Cli {
+    /// The rules clap cannot state.
+    ///
+    /// Two flag families name module roots and exactly one of them applies to
+    /// any invocation: `--mounts` is what a host is installed as, `--modules`
+    /// is what a workstation checks against. Clap's `conflicts_with` names
+    /// arguments and not subcommands, and `args_conflicts_with_subcommands`
+    /// would take `--config` down with it, so the rule is a post-parse check
+    /// that produces the same clap-formatted error and the same exit code an
+    /// argument conflict does.
+    pub fn validate(&self) -> Result<(), clap::Error> {
+        let command = self.command.as_ref().unwrap_or(&Commands::Serve);
+        if !self.modules.is_empty() && !command.takes_modules() {
+            return Err(Self::conflict(format!(
+                "`{}` does not take --modules: a host's module roots come from --mounts, \
+                 so that a bundle installed after boot is one reload away rather than one \
+                 unit edit and one restart. --modules is the workstation form, and only \
+                 `config-check` and `config-diff` take it",
+                command.name(),
+            )));
+        }
+        if !self.modules.is_empty() && self.mounts.is_some() {
+            return Err(Self::conflict(
+                "--mounts and --modules both name module roots: pass --mounts to check \
+                 against an installed tree, or --modules to check against a source \
+                 checkout, never both"
+                    .to_string(),
+            ));
+        }
+        if matches!(command, Commands::Mounts) && self.mounts.is_none() {
+            return Err(Self::command_error(
+                ErrorKind::MissingRequiredArgument,
+                "`mounts` reads the mounts document, so it needs --mounts <FILE>".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn conflict(message: String) -> clap::Error {
+        Self::command_error(ErrorKind::ArgumentConflict, message)
+    }
+
+    fn command_error(kind: ErrorKind, message: String) -> clap::Error {
+        Self::command().error(kind, message)
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +154,8 @@ mod tests {
         let cli = Cli::try_parse_from(["brenn", "--modules", "/srv/modules", "config-check", "x"])
             .expect("the flag precedes the subcommand");
         assert_eq!(cli.modules, [PathBuf::from("/srv/modules")]);
+        cli.validate()
+            .expect("config-check takes the workstation form");
         let Some(Commands::ConfigCheck { file }) = cli.command else {
             panic!("the subcommand still parses");
         };
@@ -100,75 +168,130 @@ mod tests {
         );
     }
 
+    /// The unit spells `--mounts` before `serve`; the installer spells it after
+    /// `mounts`. Both are contracts, which is what the flag is global for.
     #[test]
-    fn the_components_root_is_a_serve_flag_and_not_a_config_tool_flag() {
-        let cli = Cli::try_parse_from(["brenn", "serve", "--components", "/srv/components"])
-            .expect("serve takes the flag");
-        let Some(Commands::Serve { components, .. }) = cli.command else {
-            panic!("the subcommand parses");
-        };
-        assert_eq!(components, [PathBuf::from("/srv/components")]);
+    fn the_mounts_file_parses_on_either_side_of_the_subcommand() {
+        let before = Cli::try_parse_from(["brenn", "--mounts", "/etc/mounts.brenn", "serve"])
+            .expect("the unit's form parses");
+        assert_eq!(before.mounts, Some(PathBuf::from("/etc/mounts.brenn")));
+        before.validate().expect("serve takes the mounts file");
 
+        let after = Cli::try_parse_from(["brenn", "mounts", "--mounts", "/etc/mounts.brenn"])
+            .expect("the installer's form parses");
+        assert_eq!(after.mounts, Some(PathBuf::from("/etc/mounts.brenn")));
+        after.validate().expect("mounts takes the mounts file");
+    }
+
+    /// The retired flags are parse errors, not silently-ignored words: a unit
+    /// carrying them must fail the installer's pre-stop argv check rather than
+    /// boot a server serving nothing.
+    #[test]
+    fn serve_no_longer_takes_the_components_and_surface_roots() {
         assert!(
-            Cli::try_parse_from([
+            Cli::try_parse_from(["brenn", "serve", "--components", "/srv/components"]).is_err(),
+            "the components root comes from a mount"
+        );
+        assert!(
+            Cli::try_parse_from(["brenn", "serve", "--surface", "/srv/surface"]).is_err(),
+            "the surface root comes from a mount"
+        );
+    }
+
+    /// A server's module roots are the mounts'. The refusal is clap-shaped so
+    /// the exit code and the rendering match every other bad command line.
+    #[test]
+    fn a_server_refuses_the_workstation_module_flag() {
+        for argv in [
+            vec!["brenn", "--modules", "/srv/modules", "serve"],
+            vec!["brenn", "--modules", "/srv/modules", "invite"],
+            vec![
                 "brenn",
-                "config-check",
-                "--components",
-                "/srv/components",
-                "x"
-            ])
-            .is_err(),
-            "config-check does not take the flag"
-        );
-        assert!(
-            Cli::try_parse_from(["brenn", "--components", "/srv/components", "serve"]).is_err(),
-            "the flag belongs to the subcommand, not the root parser"
-        );
+                "--modules",
+                "/srv/modules",
+                "--mounts",
+                "/etc/mounts.brenn",
+                "mounts",
+            ],
+            // No subcommand at all is `serve`.
+            vec!["brenn", "--modules", "/srv/modules"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("it parses; it does not validate");
+            let error = cli
+                .validate()
+                .expect_err(&format!("{argv:?} names module roots a host derives"));
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        }
     }
 
-    /// The surface asset tree is an artifact fact, so it sits beside
-    /// `--components` on `serve` and not in the config document. The config
-    /// tools never resolve artifacts, so they do not take it.
+    /// Either form of module root, never both: a check run against two module
+    /// universes is not a real operation.
     #[test]
-    fn the_surface_root_is_a_serve_flag_and_not_a_config_tool_flag() {
-        let cli = Cli::try_parse_from(["brenn", "serve", "--surface", "/srv/surface"])
-            .expect("serve takes the flag");
-        let Some(Commands::Serve { surface, .. }) = cli.command else {
-            panic!("the subcommand parses");
-        };
-        assert_eq!(surface, [PathBuf::from("/srv/surface")]);
+    fn the_two_module_root_forms_are_exclusive_on_the_config_tools() {
+        let cli = Cli::try_parse_from([
+            "brenn",
+            "--mounts",
+            "/etc/mounts.brenn",
+            "--modules",
+            "/srv/modules",
+            "config-check",
+            "x",
+        ])
+        .expect("it parses");
+        let error = cli.validate().expect_err("two universes");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
 
-        assert!(
-            Cli::try_parse_from(["brenn", "config-check", "--surface", "/srv/surface", "x"])
-                .is_err(),
-            "config-check does not take the flag"
-        );
-        assert!(
-            Cli::try_parse_from(["brenn", "--surface", "/srv/surface", "serve"]).is_err(),
-            "the flag belongs to the subcommand, not the root parser"
-        );
+        Cli::try_parse_from([
+            "brenn",
+            "--mounts",
+            "/etc/mounts.brenn",
+            "config-check",
+            "x",
+        ])
+        .expect("it parses")
+        .validate()
+        .expect("the installed form checks");
+        Cli::try_parse_from([
+            "brenn",
+            "--modules",
+            "/srv/modules",
+            "config-diff",
+            "a",
+            "b",
+        ])
+        .expect("it parses")
+        .validate()
+        .expect("the workstation form checks");
+        Cli::try_parse_from(["brenn", "config-check", "x"])
+            .expect("it parses")
+            .validate()
+            .expect("no module root at all is a document that imports nothing");
     }
 
-    /// One flag per installed release, in the order written: brenn's roots and
-    /// then each bundle's, or whatever order the unit spells. Parsing keeps the
+    /// `mounts` with nothing to read is an operator error, not an empty
+    /// listing: the empty listing is what "no mount is declared" looks like,
+    /// and a forgotten flag must not be mistaken for it.
+    #[test]
+    fn the_mounts_listing_needs_a_mounts_file() {
+        let error = Cli::try_parse_from(["brenn", "mounts"])
+            .expect("it parses")
+            .validate()
+            .expect_err("there is nothing to list");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    /// One flag per installed release, in the order written. Parsing keeps the
     /// order because the refusals that list the roots quote it.
     #[test]
-    fn each_root_flag_repeats_once_per_installed_release() {
+    fn the_module_root_flag_repeats_once_per_checked_tree() {
         let cli = Cli::try_parse_from([
             "brenn",
             "--modules",
             "/srv/brenn/modules",
             "--modules",
             "/srv/bundle/modules",
-            "serve",
-            "--components",
-            "/srv/brenn/components",
-            "--components",
-            "/srv/bundle/components",
-            "--surface",
-            "/srv/brenn/surface",
-            "--surface",
-            "/srv/bundle/surface",
+            "config-check",
+            "x",
         ])
         .expect("every flag repeats");
         assert_eq!(
@@ -178,38 +301,10 @@ mod tests {
                 PathBuf::from("/srv/bundle/modules")
             ]
         );
-        let Some(Commands::Serve {
-            components,
-            surface,
-        }) = cli.command
-        else {
-            panic!("the subcommand parses");
-        };
-        assert_eq!(
-            components,
-            [
-                PathBuf::from("/srv/brenn/components"),
-                PathBuf::from("/srv/bundle/components")
-            ]
-        );
-        assert_eq!(
-            surface,
-            [
-                PathBuf::from("/srv/brenn/surface"),
-                PathBuf::from("/srv/bundle/surface")
-            ]
-        );
 
         let cli = Cli::try_parse_from(["brenn", "serve"]).expect("no flag is required");
         assert!(cli.modules.is_empty());
-        let Some(Commands::Serve {
-            components,
-            surface,
-        }) = cli.command
-        else {
-            panic!("the subcommand parses");
-        };
-        assert!(components.is_empty());
-        assert!(surface.is_empty());
+        assert!(cli.mounts.is_none());
+        cli.validate().expect("a dev server declares no mount");
     }
 }

@@ -137,15 +137,18 @@ pub fn test_app_with_surface_roots(
             .strip_prefix("processor/")
             .and_then(|rest| rest.split('/').next())
         {
-            kinds.insert(kind.to_string(), tmp.path().to_path_buf());
+            kinds.insert(
+                kind.to_string(),
+                brenn_surface_server::KindRoot::for_test(tmp.path().to_path_buf()),
+            );
         }
     }
     let db = crate::test_support::init_db_memory();
-    let mut state = test_state(&db);
-    state.surface_roots = brenn_surface_server::SurfaceRoots {
-        kernel: Some(tmp.path().to_path_buf()),
+    let state = test_state(&db);
+    state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+        kernel: Some(brenn_surface_server::KernelRoot::for_test(tmp.path())),
         kinds,
-    };
+    }));
     let app = build_router(state, None, 0, 2576)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
     (app, db, tmp)

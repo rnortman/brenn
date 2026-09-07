@@ -498,9 +498,9 @@ mod tests {
         /// path itself, so these cases cover the sequence `run_server` runs
         /// rather than a copy of it.
         ///
-        /// `root` is an `Option` because a host started without `--components`
-        /// has no root to resolve against, and the refusal that fact earns is
-        /// part of the path under test.
+        /// `root` is an `Option` because a host whose declared mounts offer no
+        /// `components/` tree has no root to resolve against, and the refusal
+        /// that fact earns is part of the path under test.
         fn verify_then_load(
             root: Option<&Path>,
             package: &str,
@@ -638,8 +638,8 @@ mod tests {
         }
 
         #[test]
-        #[should_panic(expected = "without --components")]
-        fn a_consumer_configured_on_a_host_started_without_the_flag_never_reaches_the_loader() {
+        #[should_panic(expected = "no declared mount offers a `components/` tree")]
+        fn a_consumer_configured_on_a_host_with_no_components_tree_never_reaches_the_loader() {
             verify_then_load(
                 None,
                 "demo",

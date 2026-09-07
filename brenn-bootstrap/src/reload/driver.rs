@@ -32,7 +32,7 @@
 //!   defect misread as a refusal costs one reload, while a refusal misread as a
 //!   defect kills a healthy process over a document it never had to accept.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,11 +40,13 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use tracing::{info, warn};
 
-use brenn_lib::config::{AppConfig, DocumentInputs, LoadedDocument, check_config};
+use brenn_lib::config::{
+    AppConfig, DocumentInputs, LoadedDocument, LoadedMounts, Roots, check_config, try_load_mounts,
+};
 use brenn_lib::messaging::MessagingDirectory;
-use brenn_lib::messaging::config::ResolvedWasmConsumer;
+use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
 use brenn_lib::messaging::gates::{BodySizeExceeded, check_body_size};
-use brenn_lib::mqtt::config::MqttClientIdentity;
+use brenn_lib::mqtt::config::{MqttClientIdentity, ResolvedMqttIngressChannel};
 use brenn_lib::panic_util::{catch_quietly, panic_message};
 use brenn_lib::wasm_package::Verified;
 use brenn_messaging::Messenger;
@@ -54,10 +56,16 @@ use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use crate::consumers::{ConsumerLoadContext, ConsumerRegistry, LoadedConsumer, load_consumer};
 use crate::reload::compare::non_convergible_differences;
 use crate::reload::delta::{PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
+use crate::reload::mqtt::ReferencedClient;
+use crate::reload::surfaces::{
+    SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, arriving, build_surface_docs,
+    system_participant_refusals,
+};
 use brenn_messaging::config_reload::{
-    Outcome, ReloadStatus, STATUS_VERSION, StatusDelta, Trigger, now, publish_status,
+    Outcome, ReloadStatus, STATUS_VERSION, StatusDelta, StatusMount, Trigger, now, publish_status,
     refusal_alert_body,
 };
+use brenn_messaging::system::SystemParticipantSpec;
 
 /// Which door a reload came through.
 ///
@@ -86,20 +94,50 @@ impl From<TriggerSource> for Trigger {
 /// Every plan input here is a *booted* value, which is legitimate exactly
 /// because level 1 refuses any candidate that would have moved one: an app map,
 /// a client identity, a tool registry and a replay store path are all
-/// projections of blocks a reload cannot converge.
+/// projections of blocks a reload cannot converge. The roots are not among
+/// them: they are the mounts document's answer, re-read on every reload, so a
+/// bundle installed since boot is a tree this process may read the moment the
+/// operator declared it.
 pub(crate) struct ReloadEnv {
-    /// Where the document is, and what its packaged imports resolve against.
-    /// Re-read on every reload: the point of the facility is that the bytes may
-    /// have changed since.
-    pub inputs: DocumentInputs,
+    /// Where the deployment document is. Re-read on every reload: the point of
+    /// the facility is that the bytes may have changed since.
+    ///
+    /// What its packaged imports resolve against is *not* here: the module
+    /// roots are the mounts document's, re-derived on every reload, so the
+    /// inputs a candidate compiles under are built per reload rather than held.
+    pub config_path: PathBuf,
     /// The root document's path as the status body reports it.
     pub root: Option<String>,
+    /// This binary's build identifier, stamped into the description documents a
+    /// reload rebuilds. A process constant: the documents boot published carry
+    /// it too, and a rebuilt one that carried a different value would advertise
+    /// a build that nothing is running.
+    pub build_id: &'static str,
     pub apps: Arc<IndexMap<String, AppConfig>>,
     pub mqtt_clients: IndexMap<String, MqttClientIdentity>,
     pub tool_registry: Arc<brenn_tool_registry::ToolRegistry>,
     pub replay_store_paths: Vec<PathBuf>,
-    pub components_roots: Vec<PathBuf>,
+    /// The cell holding the surface asset roots this process is serving from —
+    /// the same cell `/surface-static` resolves against, not a copy of it.
+    ///
+    /// Held rather than snapshotted: a reload compares the declared mounts'
+    /// answer against what is actually being served, and then installs the new
+    /// answer in this same cell, so a kind whose bytes moved is served from the
+    /// tree the reload scanned.
+    pub surface_roots: Arc<std::sync::RwLock<Arc<brenn_surface_server::SurfaceRoots>>>,
+    /// The runtime table the surface doors read, and the mid-swap marks that
+    /// keep a page reconnecting through a reconfiguration out of the security
+    /// event log. The commit's surface steps write it.
+    pub surfaces: brenn_server::state::SurfaceCell,
+    /// The live attach sessions, by attacher. A retired or replaced surface's
+    /// pages are closed through it, with the reason that tells each page
+    /// whether to reload or to stop.
+    pub attach_registry: brenn_attach_server::registry::AttachRegistry,
     pub mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
+    /// The concrete ingress router, whose route table the commit adds to and
+    /// removes from. Present on exactly the terms `mqtt_service` is: both come
+    /// off the one `MqttResult`.
+    pub mqtt_event_router: Option<Arc<brenn_server::mqtt_router::MqttEventRouterImpl>>,
     pub max_payload_bytes: usize,
     pub messenger: Arc<Messenger>,
     /// The wake router, whose delivery bindings a consumer joins and leaves
@@ -113,6 +151,16 @@ pub(crate) struct ReloadEnv {
     pub alert_dispatcher: AlertDispatcher,
 }
 
+impl ReloadEnv {
+    /// The asset roots the process is serving right now, as one `Arc` clone.
+    pub(crate) fn surface_roots(&self) -> Arc<brenn_surface_server::SurfaceRoots> {
+        self.surface_roots
+            .read()
+            .expect("the surface-roots lock is held only for a clone and a swap")
+            .clone()
+    }
+}
+
 /// The document the process is projecting, and the projection itself.
 ///
 /// The directory is a detached **snapshot** rather than the live one: the live
@@ -124,17 +172,42 @@ pub(crate) struct ReloadEnv {
 /// they stood.
 pub(crate) struct Baseline {
     pub document: LoadedDocument,
+    /// The mounts document as this process last read it, and the roots it
+    /// derived. The status body reports these on a refusal, which is the one
+    /// outcome where what the process is reading is not what the candidate
+    /// declared.
+    pub mounts: LoadedMounts,
     directory: MessagingDirectory,
     consumers: Vec<ResolvedWasmConsumer>,
+    /// The plan's static `mqtt:` ingress channels — what the broker set of a
+    /// fresh boot of this document would be. Boot's own list has the
+    /// re-activated dynamic subscriptions appended to it; those are not here,
+    /// for the same reason the directory is a plan snapshot rather than the
+    /// live one.
+    mqtt_ingress: Vec<ResolvedMqttIngressChannel>,
+    /// The system participants a fresh boot of this document derives. Held so
+    /// rule 7 has a previous value: every one of them but the
+    /// surface-description pair comes off a block that level 1 has frozen, and
+    /// a participant that moved anyway is not something a walk can converge.
+    system_participants: Vec<SystemParticipantSpec>,
+    /// The surfaces a fresh boot of this document resolves. The surface delta's
+    /// previous value; like the directory, it is the *planned* list and not
+    /// whatever the runtime table happens to hold.
+    surfaces: Vec<ResolvedSurface>,
 }
 
 impl Baseline {
-    /// Build a baseline from a document and the plan it lowered to.
-    pub fn of(document: LoadedDocument, plan: &MessagingPlan) -> Self {
+    /// Build a baseline from a document, the mounts it was read against, and
+    /// the plan it lowered to.
+    pub fn of(document: LoadedDocument, mounts: LoadedMounts, plan: &MessagingPlan) -> Self {
         Self {
             document,
+            mounts,
             directory: snapshot(&plan.directory),
             consumers: plan.wasm_consumers.clone(),
+            mqtt_ingress: plan.mqtt_ingress_channels.clone(),
+            system_participants: plan.system_participants.clone(),
+            surfaces: plan.surfaces.clone(),
         }
     }
 
@@ -145,14 +218,30 @@ impl Baseline {
     /// [`Baseline`].
     pub fn from_parts(
         document: LoadedDocument,
+        mounts: LoadedMounts,
         directory: MessagingDirectory,
         consumers: Vec<ResolvedWasmConsumer>,
+        mqtt_ingress: Vec<ResolvedMqttIngressChannel>,
+        system_participants: Vec<SystemParticipantSpec>,
+        surfaces: Vec<ResolvedSurface>,
     ) -> Self {
         Self {
             document,
+            mounts,
             directory,
             consumers,
+            mqtt_ingress,
+            system_participants,
+            surfaces,
         }
+    }
+}
+
+#[cfg(test)]
+impl Baseline {
+    /// The surfaces a fresh boot of the running document resolves.
+    pub(crate) fn surfaces(&self) -> &[ResolvedSurface] {
+        &self.surfaces
     }
 }
 
@@ -165,12 +254,33 @@ fn snapshot(directory: &MessagingDirectory) -> MessagingDirectory {
 /// can refuse.
 pub(crate) struct ReadyReload {
     pub document: LoadedDocument,
+    /// The mounts this candidate was read against, which the baseline adopts
+    /// when the walk is done.
+    pub mounts: LoadedMounts,
     pub plan: MessagingPlan,
     pub delta: PlanDelta,
     /// One loaded component per consumer the delta adds or changes, by slug.
     /// Instantiated during prepare so that commit's "start this consumer" step
     /// cannot fail on an artifact.
     pub loaded: Vec<(String, LoadedConsumer)>,
+    /// What every consumer in the candidate resolved to, by slug. Commit points
+    /// the registry at these, so a package whose paths moved without its bytes
+    /// moving — a re-deploy under the versioned-tree scheme — is recorded
+    /// without a restart.
+    pub records: HashMap<String, Verified>,
+    /// The surface asset roots this reload's scan resolved. Commit installs
+    /// them in the cell `/surface-static` reads, so a mount whose symlink was
+    /// swapped onto a fresh versioned tree is served out of the tree that is
+    /// still on disk rather than the one the installer is about to prune.
+    pub surface_roots: brenn_surface_server::SurfaceRoots,
+    /// One runtime per surface the delta brings into service, by slug. Built
+    /// during prepare for the reason the consumers are: commit's "serve this
+    /// surface" step must have nothing left to fail on.
+    pub surface_runtimes: HashMap<String, Arc<brenn_surface_server::SurfaceRuntime>>,
+    /// The description and bindings documents this reload republishes, and the
+    /// surface-description registrations it swaps first. Built and size-checked
+    /// in prepare, so commit publishes bodies already proved publishable.
+    pub surface_docs: SurfaceDocs,
     /// The `applied` outcome this reload will publish, built and measured in
     /// prepare.
     ///
@@ -183,7 +293,23 @@ pub(crate) struct ReadyReload {
 /// A document and what it lowers to: the pair a baseline is made of.
 pub(crate) struct Projection {
     pub document: LoadedDocument,
+    pub mounts: LoadedMounts,
     pub plan: MessagingPlan,
+    /// What every consumer resolved to under this reload's roots. Adopted like
+    /// the rest of the projection: an install that moved a package's paths
+    /// without moving its bytes is `unchanged`, and the record the registry
+    /// holds must still name the tree this process is now reading.
+    pub records: HashMap<String, Verified>,
+    /// The surface asset roots this reload's scan resolved. Adopted for the
+    /// same reason the records are: a byte-identical re-install relocates every
+    /// tree under the mount and produces no delta at all.
+    pub surface_roots: brenn_surface_server::SurfaceRoots,
+    /// The kinds whose installed bytes moved. Empty for every `unchanged`
+    /// reload but one: a mount upgraded a kind no surface instantiates, which
+    /// moves the roots this process serves from and moves nothing else. It is
+    /// reported because the retained outcome is the installer's only evidence
+    /// that the tree it just swapped in is the tree being served.
+    pub kinds_changed: BTreeSet<String>,
 }
 
 /// What prepare decided.
@@ -229,6 +355,11 @@ impl ReloadDriver {
     pub(crate) fn registry(&self) -> &ConsumerRegistry {
         &self.registry
     }
+
+    /// The surface table, served asset roots, and attach registry.
+    pub(crate) fn env(&self) -> &ReloadEnv {
+        &self.env
+    }
 }
 
 impl ReloadDriver {
@@ -255,8 +386,23 @@ impl ReloadDriver {
     /// that body's fields: a body measured under one trigger and published under
     /// another is not the body that was measured.
     pub fn prepare(&self, source: TriggerSource) -> Prepared {
-        // 1. The document, compiled and lowered exactly as boot would.
-        let candidate = match check_config(&self.env.inputs) {
+        // 0. The mounts document, re-read and re-verified before anything asks
+        //    what is installed. It is what says which trees this host may read
+        //    at all, so the deployment document's imports, the cross-root scans
+        //    and every package resolution below are all statements about the
+        //    roots it derives *now* — a bundle installed since boot is visible
+        //    the moment its mount line is there, and a mount declared but not
+        //    installed is a refusal rather than a host serving half a document.
+        // Where to re-read from is the loaded mounts' own answer, so the file a
+        // reload reads cannot drift from the one the running mounts came from.
+        let mounts = match try_load_mounts(self.baseline.mounts.path.as_deref()) {
+            Ok(mounts) => mounts,
+            Err(report) => return refused(None, vec![report]),
+        };
+
+        // 1. The document, compiled and lowered exactly as boot would, against
+        //    the module roots the mounts just derived.
+        let candidate = match check_config(&self.inputs(&mounts.roots)) {
             Ok(document) => document,
             Err(report) => return refused(None, vec![report]),
         };
@@ -275,7 +421,7 @@ impl ReloadDriver {
         //    is not a set of distinct releases resolves a name ambiguously, and
         //    the record read out of the wrong root is what the delta would then
         //    compare.
-        if let Err(refusals) = self.check_roots() {
+        if let Err(refusals) = self.check_roots(&mounts.roots) {
             return refused(Some(sha), refusals);
         }
 
@@ -284,7 +430,39 @@ impl ReloadDriver {
             Ok(plan) => plan,
             Err(refusals) => return refused(Some(sha), refusals),
         };
-        let candidate_records = match self.records_of(&plan.wasm_consumers) {
+        // 4a. Rule 7, before the surface trees: the two plans must derive the
+        //     same system participants. Everything but the surface-description
+        //     pair comes off a block that level 1 froze, so a difference is a
+        //     derivation reading something the comparison does not.
+        let participants = system_participant_refusals(
+            &self.baseline.system_participants,
+            &plan.system_participants,
+        );
+        if !participants.is_empty() {
+            return refused(Some(sha), participants);
+        }
+        // 4b. Surface assets, over the *whole* candidate surface list: an
+        //     unchanged surface loses its kind when the mount offering it
+        //     goes away, so every surface the candidate would run is
+        //     re-validated, not only the ones that moved.
+        let candidate_surface_roots = match self.scan_surface_roots(&mounts.roots, &plan.surfaces) {
+            Ok(scanned) => scanned,
+            Err(refusals) => return refused(Some(sha), refusals),
+        };
+        // 4c. A kind whose installed bytes moved is convergible — the surfaces
+        //     instantiating it are promoted to `changed` by the delta's kind
+        //     closure and their pages reload onto the new tree. The kernel is
+        //     not: every page loads it, nothing republishes a page manifest for
+        //     a surface that did not otherwise move, and a kernel from another
+        //     tree than the running binary's release is a restart.
+        let serving_surface_roots = self.env.surface_roots();
+        let kind_differences = serving_surface_roots.kind_differences(&candidate_surface_roots);
+        if let Err(refusals) =
+            surface_kernel_refusal(&serving_surface_roots, &candidate_surface_roots)
+        {
+            return refused(Some(sha), refusals);
+        }
+        let candidate_records = match self.records_of(&plan.wasm_consumers, &mounts.roots) {
             Ok(records) => records,
             Err(refusals) => return refused(Some(sha), refusals),
         };
@@ -293,19 +471,34 @@ impl ReloadDriver {
             directory: &self.baseline.directory,
             consumers: &self.baseline.consumers,
             records: &baseline_records,
+            mqtt_ingress: &self.baseline.mqtt_ingress,
+            surfaces: &self.baseline.surfaces,
         };
         let candidate_facts = PlanFacts {
             directory: &plan.directory,
             consumers: &plan.wasm_consumers,
             records: &candidate_records,
+            mqtt_ingress: &plan.mqtt_ingress_channels,
+            surfaces: &plan.surfaces,
         };
-        let delta = plan_delta(&baseline_facts, &candidate_facts);
-        let refusals = convergibility_refusals(
+        let delta = plan_delta(
+            &baseline_facts,
+            &candidate_facts,
+            kind_differences.into_keys().collect(),
+        );
+        let mut refusals = convergibility_refusals(
             &baseline_facts,
             &candidate_facts,
             &delta,
             self.env.messenger.directory(),
         );
+        // Rule 6, the one rule that reads the MQTT runtime rather than the two
+        // plans: a broker session is a boot-time fact in both directions.
+        refusals.extend(super::mqtt::session_refusals(
+            &delta.mqtt,
+            &self.sessions(),
+            &self.referenced_clients(&plan),
+        ));
         if !refusals.is_empty() {
             return refused(Some(sha), refusals);
         }
@@ -315,7 +508,11 @@ impl ReloadDriver {
         if delta.is_empty() {
             return Prepared::Unchanged(Box::new(Projection {
                 document: candidate,
+                mounts,
                 plan,
+                records: candidate_records,
+                surface_roots: candidate_surface_roots,
+                kinds_changed: delta.kinds_changed,
             }));
         }
 
@@ -326,7 +523,7 @@ impl ReloadDriver {
         //    `[messaging] max_body_bytes` with no bug anywhere, and the
         //    design's answer for a change that cannot be applied live is a
         //    refusal in this phase rather than a panic after the walk.
-        let applied = self.applied_status(source, &sha, &delta);
+        let applied = self.applied_status(source, &sha, &delta, &mounts);
         // Through the publisher's own gate, so prepare's verdict and the
         // publish-side verdict cannot drift apart at the boundary.
         if let Err(BodySizeExceeded { len, max }) =
@@ -353,16 +550,33 @@ impl ReloadDriver {
                     || delta.consumers_changed.contains(&consumer.slug)
             })
             .collect();
-        let loaded = match self.load_arriving(&arriving, &candidate_records) {
+        let loaded = match self.load_arriving(&arriving, &candidate_records, &mounts.roots) {
             Ok(loaded) => loaded,
             Err(refusals) => return refused(Some(sha), refusals),
         };
 
+        // 8. What the reload republishes about surfaces, and the runtimes it
+        //    installs. Both are built here for the reason step 7 is: a
+        //    malformed sidecar or an oversize body is a refusal that leaves the
+        //    process untouched, and commit's surface steps then have nothing
+        //    left that can decline.
+        let surface_docs =
+            match self.surface_docs(&candidate.config, &plan, &delta, &candidate_surface_roots) {
+                Ok(docs) => docs,
+                Err(refusals) => return refused(Some(sha), refusals),
+            };
+        let surface_runtimes = self.arriving_surface_runtimes(&candidate.config, &delta);
+
         Prepared::Ready(Box::new(ReadyReload {
             document: candidate,
+            mounts,
             plan,
             delta,
             loaded,
+            records: candidate_records,
+            surface_roots: candidate_surface_roots,
+            surface_runtimes,
+            surface_docs,
             applied,
         }))
     }
@@ -380,6 +594,7 @@ impl ReloadDriver {
         source: TriggerSource,
         document_sha256: &str,
         delta: &PlanDelta,
+        mounts: &LoadedMounts,
     ) -> ReloadStatus {
         ReloadStatus {
             v: STATUS_VERSION,
@@ -391,7 +606,18 @@ impl ReloadDriver {
             root: self.env.root.clone(),
             running_document_sha256: document_sha256.to_string(),
             delta: StatusDelta::from(delta),
+            mounts: StatusMount::of(&mounts.config),
             refusals: Vec::new(),
+        }
+    }
+
+    /// What a candidate compiles under: the deployment document, read against
+    /// the module roots this reload's mounts derive.
+    fn inputs(&self, roots: &Roots) -> DocumentInputs {
+        DocumentInputs {
+            root: self.env.config_path.clone(),
+            module_roots: roots.module_roots.clone(),
+            role: brenn_lib::config::DocumentRole::Deployment,
         }
     }
 
@@ -427,17 +653,18 @@ impl ReloadDriver {
     fn records_of(
         &self,
         consumers: &[ResolvedWasmConsumer],
+        roots: &Roots,
     ) -> Result<HashMap<String, Verified>, Vec<String>> {
         if consumers.is_empty() {
             return Ok(HashMap::new());
         }
-        // Asked once for the whole walk: the flag list is a field of the
-        // environment. What is under those roots can move while prepare runs —
-        // a bundle install is an rsync into them — which is why the records
+        // Asked once for the whole walk: the root list is this reload's mounts'
+        // answer. What is under those roots can move while prepare runs — a
+        // bundle install is a symlink swap over them — which is why the records
         // this reads are the ones handed to the load rather than read again.
         let roots = match catch_quietly(AssertUnwindSafe(|| {
             brenn_lib::wasm_package::require_components_root(
-                &self.env.components_roots,
+                &roots.components_roots,
                 "the candidate document's components",
             )
         })) {
@@ -487,9 +714,10 @@ impl ReloadDriver {
         &self,
         arriving: &[&ResolvedWasmConsumer],
         records: &HashMap<String, Verified>,
+        roots: &Roots,
     ) -> Result<Vec<(String, LoadedConsumer)>, Vec<String>> {
         let ctx = ConsumerLoadContext {
-            components_roots: &self.env.components_roots,
+            components_roots: &roots.components_roots,
             alert_dispatcher: &self.env.alert_dispatcher,
             mqtt_service: self.env.mqtt_service.clone(),
             tool_registry: &self.env.tool_registry,
@@ -511,13 +739,207 @@ impl ReloadDriver {
         }
     }
 
-    /// Boot's cross-root preconditions, asked again.
-    fn check_roots(&self) -> Result<(), Vec<String>> {
-        catch_quietly(AssertUnwindSafe(|| {
-            for root in &self.env.components_roots {
-                brenn_lib::wasm_package::assert_components_root(root);
+    /// Which clients have a live broker session right now.
+    ///
+    /// The registry is written at boot and never after, so this is the set a
+    /// fresh boot of the *baseline* document produced — which is exactly what
+    /// rule 6 compares the candidate's reference set against.
+    fn sessions(&self) -> Vec<String> {
+        self.env
+            .mqtt_service
+            .as_ref()
+            .map(|service| service.client_slugs())
+            .unwrap_or_default()
+    }
+
+    /// The clients a fresh boot of the candidate would spawn a supervisor for,
+    /// each with what in the candidate names it.
+    ///
+    /// The same three sources boot's derivation reads, in the same order, over
+    /// the candidate's ingress channels and consumer policies and the booted
+    /// app policies — the apps are level-1 frozen, so theirs is the candidate's
+    /// set too. The attribution lets rule 6's refusal name the line that asked
+    /// for the session.
+    fn referenced_clients(&self, plan: &MessagingPlan) -> Vec<ReferencedClient> {
+        let mut out: Vec<ReferencedClient> = Vec::new();
+        let mut push = |client: &str, named_by: String| {
+            if !out.iter().any(|one| one.client == client) {
+                out.push(ReferencedClient {
+                    client: client.to_string(),
+                    named_by,
+                });
             }
-            brenn_lib::wasm_package::assert_disjoint_components_roots(&self.env.components_roots);
+        };
+        for channel in &plan.mqtt_ingress_channels {
+            push(&channel.client_slug, channel.channel_address.clone());
+        }
+        for (slug, app) in self.env.apps.iter() {
+            for matcher in &app.policy.acls.mqtt_publish {
+                push(
+                    &matcher.client,
+                    format!("app `{slug}`'s `mqtt_publish` matcher"),
+                );
+            }
+            for matcher in &app.policy.acls.mqtt_subscribe {
+                push(
+                    &matcher.client,
+                    format!("app `{slug}`'s `mqtt_subscribe` matcher"),
+                );
+            }
+        }
+        for consumer in &plan.wasm_consumers {
+            for matcher in &consumer.policy.acls.mqtt_publish {
+                push(
+                    &matcher.client,
+                    format!("consumer `{}`'s `mqtt_publish` matcher", consumer.slug),
+                );
+            }
+        }
+        debug_assert_eq!(
+            out.iter()
+                .map(|one| one.client.as_str())
+                .collect::<Vec<_>>(),
+            crate::mqtt::referenced_clients(
+                &plan.mqtt_ingress_channels,
+                self.env.apps.values().map(|app| &app.policy),
+                plan.wasm_consumers.iter().map(|consumer| &consumer.policy),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "rule 6's reference set has drifted from the one boot spawns sessions for",
+        );
+        out
+    }
+
+    /// The surface documents and registration swaps this reload owes, built
+    /// against the candidate's own parameters.
+    ///
+    /// Under `catch_quietly` because the description builders read each kind's
+    /// sidecar files off the mount that serves it: a `.schema.json` that is not
+    /// JSON is a boot panic and must be a refusal here.
+    fn surface_docs(
+        &self,
+        config: &brenn_lib::config::BrennConfig,
+        plan: &MessagingPlan,
+        delta: &PlanDelta,
+        roots: &brenn_surface_server::SurfaceRoots,
+    ) -> Result<SurfaceDocs, Vec<String>> {
+        if delta.surfaces.is_empty() && delta.kinds_changed.is_empty() {
+            return Ok(SurfaceDocs::default());
+        }
+        let inputs = SurfaceDocInputs {
+            surfaces: &plan.surfaces,
+            roots,
+            delta: &delta.surfaces,
+            kinds_changed: &delta.kinds_changed,
+            baseline_participants: &self.baseline.system_participants,
+            candidate_participants: &plan.system_participants,
+            candidate_registrations: &plan.registrations,
+        };
+        let params = SurfaceDocParams {
+            prefix: &config.surface_description.prefix,
+            build_id: self.env.build_id,
+            status_interval_secs: config.surface_description.status_interval_secs,
+            error_report: config
+                .observability
+                .surface_error_channel
+                .as_deref()
+                .map(|address| (address, config.observability.surface_error_publish_floor)),
+            max_body_bytes: config.messaging.max_body_bytes,
+        };
+        match catch_quietly(AssertUnwindSafe(|| build_surface_docs(&inputs, &params))) {
+            Ok(result) => result,
+            Err(payload) => Err(vec![environment_refusal(payload)]),
+        }
+    }
+
+    /// One runtime per arriving surface, built exactly as boot builds them.
+    ///
+    /// Not fallible: everything a runtime is built from is resolved config the
+    /// plan already produced, and the asset scan above has already refused a
+    /// surface whose kind no declared mount offers.
+    fn arriving_surface_runtimes(
+        &self,
+        config: &brenn_lib::config::BrennConfig,
+        delta: &PlanDelta,
+    ) -> HashMap<String, Arc<brenn_surface_server::SurfaceRuntime>> {
+        let surfaces: Vec<ResolvedSurface> = arriving(&delta.surfaces)
+            .into_iter()
+            .map(|(surface, _)| surface.clone())
+            .collect();
+        if surfaces.is_empty() {
+            return HashMap::new();
+        }
+        brenn_surface_server::build_surface_runtimes(
+            surfaces,
+            Some(self.env.messenger.clone()),
+            config.messaging.max_body_bytes,
+            config.observability.surface_error_channel.clone(),
+            brenn_surface_server::SurfaceDescriptionParams {
+                prefix: config.surface_description.prefix.clone(),
+            },
+        )
+    }
+
+    /// Boot's surface-asset validation, re-run over this reload's roots and the
+    /// whole candidate surface list. Over the whole list because a surface
+    /// nobody edited loses its kind the moment the mount offering it stops
+    /// being declared.
+    fn scan_surface_roots(
+        &self,
+        roots: &Roots,
+        surfaces: &[ResolvedSurface],
+    ) -> Result<brenn_surface_server::SurfaceRoots, Vec<String>> {
+        catch_quietly(AssertUnwindSafe(|| {
+            brenn_surface_server::validate_surface_assets_in(
+                brenn_surface_server::AssetContext::RELOAD,
+                &roots.surface_roots,
+                surfaces,
+            )
+        }))
+        .map_err(|payload| vec![environment_refusal(payload)])
+    }
+}
+
+/// The surface kernel the declared mounts offer, held against the one this
+/// process is serving.
+///
+/// Kinds converge; the kernel does not. Every surface page loads it, and a
+/// reload only reloads the pages of surfaces that moved — so a kernel swapped
+/// under an untouched surface would leave that page running bytes from a tree
+/// no longer installed, with nothing to tell it. It moves with the release that
+/// builds it, which is a restart anyway.
+///
+/// Bytes as well as path, because the claim above is about bytes: the kernel
+/// carries no manifest, so an in-place rewrite of the pair under an unmoved
+/// root is exactly the mixed state this refusal exists to prevent and is the
+/// one shape a path comparison cannot see.
+fn surface_kernel_refusal(
+    serving: &brenn_surface_server::SurfaceRoots,
+    scanned: &brenn_surface_server::SurfaceRoots,
+) -> Result<(), Vec<String>> {
+    match (&scanned.kernel, &serving.kernel) {
+        (scanned, serving) if scanned == serving => Ok(()),
+        (Some(scanned), Some(serving)) if scanned.root == serving.root => Err(vec![format!(
+            "the surface kernel under {} has been rewritten in place since this process started \
+             serving it: {}",
+            serving.root.display(),
+            super::NEEDS_RESTART,
+        )]),
+        _ => Err(vec![format!(
+            "the surface kernel root the declared mounts offer is not the one this process is \
+             serving: {}",
+            super::NEEDS_RESTART,
+        )]),
+    }
+}
+
+impl ReloadDriver {
+    /// Boot's cross-root preconditions, asked again over this reload's roots.
+    fn check_roots(&self, roots: &Roots) -> Result<(), Vec<String>> {
+        catch_quietly(AssertUnwindSafe(|| {
+            brenn_lib::wasm_package::assert_components_roots(&roots.components_roots);
+            brenn_lib::wasm_package::assert_disjoint_components_roots(&roots.components_roots);
         }))
         .map_err(|payload| vec![environment_refusal(payload)])
     }
@@ -555,13 +977,22 @@ impl ReloadDriver {
                 None
             }
             Prepared::Unchanged(projection) => {
-                let Projection { document, plan } = *projection;
+                let Projection {
+                    document,
+                    mounts,
+                    plan,
+                    records,
+                    surface_roots,
+                    kinds_changed,
+                } = *projection;
+                super::commit::refresh_records(&mut self.registry, &records);
+                super::commit::refresh_surface_roots(&self.env, surface_roots);
                 // The running state already *is* this document's projection, so
                 // adopting it is an identity update and nothing else. Without
                 // it the retained status would keep naming a document nobody
                 // has on disk.
                 let sha = document.document_sha256.clone();
-                self.baseline = Baseline::of(document, &plan);
+                self.baseline = Baseline::of(document, mounts, &plan);
                 info!(
                     trigger = ?source,
                     document_sha256 = %sha,
@@ -571,7 +1002,10 @@ impl ReloadDriver {
                     Outcome::Unchanged,
                     source,
                     Some(sha),
-                    StatusDelta::default(),
+                    StatusDelta {
+                        kinds_changed: kinds_changed.into_iter().collect(),
+                        ..StatusDelta::default()
+                    },
                     Vec::new(),
                 )
                 .await;
@@ -642,24 +1076,50 @@ impl ReloadDriver {
     async fn commit(&mut self, source: TriggerSource, ready: ReadyReload) {
         let ReadyReload {
             document,
+            mounts,
             plan,
             delta,
             loaded,
+            records,
+            surface_roots,
+            surface_runtimes,
+            surface_docs,
             mut applied,
         } = ready;
         let sha = document.document_sha256.clone();
         // The walk is `async` throughout — it awaits a stopping consumer's last
         // drain step and the database — so unlike prepare it is not the
         // blocking pool's to run.
-        if let Err(refusals) =
-            super::commit::apply(&self.env, &mut self.registry, &plan, &delta, loaded).await
+        let deferred = match super::commit::apply(
+            &self.env,
+            &mut self.registry,
+            &plan,
+            &delta,
+            loaded,
+            &records,
+            &super::commit::SurfaceCommit {
+                roots: &surface_roots,
+                runtimes: &surface_runtimes,
+                docs: &surface_docs,
+                prefix: &document.config.surface_description.prefix,
+            },
+        )
+        .await
         {
-            self.report_refusal(source, Some(sha.clone()), refusals)
-                .await;
-            return;
-        }
+            Ok(deferred) => deferred,
+            Err(refusals) => {
+                self.report_refusal(source, Some(sha.clone()), refusals)
+                    .await;
+                return;
+            }
+        };
+        // The one delta field prepare could not know: which filters the broker
+        // took now and which it will take on the next connect. Prepare measured
+        // the body with every moved filter listed here, so replacing that with
+        // the ones that actually deferred only shrinks it.
+        applied.delta.mqtt_deferred = deferred;
         self.generation += 1;
-        self.baseline = Baseline::of(document, &plan);
+        self.baseline = Baseline::of(document, mounts, &plan);
         // The delta on the line, not just in the retained body: an operator
         // reading the journal during an incident is exactly the reader who
         // cannot reach the bus to ask what moved. Read off the very struct that
@@ -675,6 +1135,9 @@ impl ReloadDriver {
             channels_removed = ?applied.delta.channels_removed,
             channels_changed = ?applied.delta.channels_changed,
             channels_described = ?applied.delta.channels_described,
+            surfaces_added = ?applied.delta.surfaces_added,
+            surfaces_removed = ?applied.delta.surfaces_removed,
+            surfaces_changed = ?applied.delta.surfaces_changed,
             "reload applied"
         );
         // The one field that is not prepare's: the outcome was reached now, not
@@ -707,6 +1170,10 @@ impl ReloadDriver {
                 root: self.env.root.clone(),
                 running_document_sha256: self.baseline.document.document_sha256.clone(),
                 delta,
+                // The baseline's, which for `unchanged` is the candidate the
+                // caller has already adopted and for `refused` is what the
+                // process is still reading — the mounts a refusal did not move.
+                mounts: StatusMount::of(&self.baseline.mounts.config),
                 refusals,
             },
         )
@@ -789,6 +1256,14 @@ pub(crate) mod tests {
     /// the read gate open.
     pub(crate) const READER: &str = "some-reader";
 
+    /// The build identifier every fixture process stamps into the description
+    /// documents it publishes. One value for boot's publish and for the
+    /// reload's, so a rebuilt document differs from the one it replaced only
+    /// where the topology did — and the same one the server's own fixtures
+    /// stamp, so the description documents the oracle compares verbatim and the
+    /// handshake cases are tied at compile time rather than by coincidence.
+    pub(crate) use brenn_server::test_support::TEST_BUILD_ID;
+
     /// The floor every fixture document stands on: the description index, the
     /// reload facility's declared pair — without which no outcome can be
     /// published at all — one work channel to move around, and one
@@ -840,10 +1315,16 @@ channel scratch at "ephemeral:scratch" {{
     }
 
     impl Tree {
-        pub(crate) fn holding(text: &str) -> Self {
-            let tree = Self {
+        /// An empty tree, for a case that has to build what its document names
+        /// — a kind's asset tree, say — before it can write the document.
+        pub(crate) fn new() -> Self {
+            Self {
                 dir: tempfile::tempdir().expect("a temporary directory"),
-            };
+            }
+        }
+
+        pub(crate) fn holding(text: &str) -> Self {
+            let tree = Self::new();
             tree.write(text);
             tree
         }
@@ -883,10 +1364,137 @@ channel scratch at "ephemeral:scratch" {{
             DocumentInputs::with_modules(self.root(), self.modules())
         }
 
+        /// A mounts document over this tree, in the shape a host reads: one
+        /// mount per tree the fixture offers, each a directory holding a
+        /// symlink to the real tree and a `VERSION`, exactly as the dev-mounts
+        /// generator builds them.
+        ///
+        /// The mount directories live in a tempdir of their own rather than
+        /// under this one: a mount may not nest inside another, and the
+        /// document's own tree is where the fixture's `modules/` is.
+        pub(crate) fn mounts(&self, components_roots: &[PathBuf]) -> Mounts {
+            Mounts::over(
+                self.dir.path().join(".mounts"),
+                &self.modules(),
+                components_roots,
+            )
+        }
+
         pub(crate) fn load(&self) -> LoadedDocument {
             check_config(&self.inputs()).expect("the fixture document must load")
         }
     }
+
+    /// A mounts document and the mount directories it declares.
+    ///
+    /// The directories live under the [`Tree`]'s own tempdir, so a case that
+    /// holds its tree holds its mounts — including the cases that destructure
+    /// [`Booted`] and drop everything they did not name.
+    #[derive(Clone)]
+    pub(crate) struct Mounts {
+        dir: PathBuf,
+    }
+
+    impl Mounts {
+        /// One mount offering `modules`, and one per components root.
+        ///
+        /// Split that way because a fixture's module root and its components
+        /// roots are separate directories with no common parent, and a mount is
+        /// one directory holding its trees — so each becomes a mount of its
+        /// own, reaching the real tree through a symlink the way a dev mount
+        /// does.
+        fn over(dir: PathBuf, modules: &std::path::Path, components_roots: &[PathBuf]) -> Self {
+            let mounts = Self { dir };
+            std::fs::create_dir_all(&mounts.dir).expect("a mounts directory");
+            mounts.declare("tree", &[("modules", modules)]);
+            for (index, root) in components_roots.iter().enumerate() {
+                mounts.declare(&format!("components-{index}"), &[("components", root)]);
+            }
+            mounts.write();
+            mounts
+        }
+
+        /// Add one mount directory, with a symlink per tree it offers.
+        fn declare(&self, name: &str, trees: &[(&str, &std::path::Path)]) {
+            let path = self.dir.join(name);
+            std::fs::create_dir_all(&path).expect("a mount directory");
+            std::fs::write(path.join("VERSION"), "test\n").expect("a VERSION");
+            for (tree, target) in trees {
+                let link = path.join(tree);
+                // A case may boot twice over one tree — the oracle does — and
+                // the second boot re-declares the mounts it already has.
+                if std::fs::symlink_metadata(&link).is_ok() {
+                    std::fs::remove_file(&link).expect("the stale tree symlink is removable");
+                }
+                std::os::unix::fs::symlink(target, link).expect("a tree symlink");
+            }
+        }
+
+        /// Rewrite the document over whatever mount directories exist now, so a
+        /// case can retire one between reloads.
+        pub(crate) fn write(&self) {
+            let mut names: Vec<String> = std::fs::read_dir(&self.dir)
+                .expect("the mounts directory is readable")
+                .map(|entry| entry.expect("a readable entry").file_name())
+                .filter_map(|name| name.into_string().ok())
+                .filter(|name| name != MOUNTS_FILE)
+                .collect();
+            names.sort();
+            let mut text = String::new();
+            for name in names {
+                let path = self.dir.join(&name);
+                text.push_str(&format!(
+                    "mount {name} {{ path = \"{}\"; }}\n",
+                    path.display()
+                ));
+            }
+            std::fs::write(self.path(), text).expect("the mounts document is writable");
+        }
+
+        /// Declare one more mount and put it in the document, the way an
+        /// operator installing a bundle between reloads does.
+        pub(crate) fn install(&self, name: &str, trees: &[(&str, &std::path::Path)]) -> PathBuf {
+            self.declare(name, trees);
+            self.write();
+            self.dir.join(name)
+        }
+
+        /// Declare a mount whose path is a *symlink* to a versioned tree, which
+        /// is the layout the bundle installer produces: an install stages
+        /// `<mount>.v<VERSION>/` and swaps the link onto it, so the mount's
+        /// canonical path moves on every deploy. Re-pointing an existing link is
+        /// the upgrade.
+        pub(crate) fn link(&self, name: &str, target: &std::path::Path) {
+            let path = self.dir.join(name);
+            if std::fs::symlink_metadata(&path).is_ok() {
+                std::fs::remove_file(&path).expect("the stale mount symlink is removable");
+            }
+            std::os::unix::fs::symlink(target, &path).expect("a mount symlink");
+            self.write();
+        }
+
+        /// Drop a declared mount's directory, the way an operator retiring a
+        /// bundle does. The document still names it until [`Mounts::write`].
+        pub(crate) fn uninstall(&self, name: &str) {
+            std::fs::remove_dir_all(self.dir.join(name)).expect("the mount is removable");
+        }
+
+        pub(crate) fn path(&self) -> PathBuf {
+            self.dir.join(MOUNTS_FILE)
+        }
+
+        /// What the document declares one mount's path as.
+        pub(crate) fn declared_path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
+        pub(crate) fn load(&self) -> LoadedMounts {
+            brenn_lib::config::load_mounts(Some(&self.path()))
+        }
+    }
+
+    /// The mounts document's name inside a fixture's mounts directory.
+    const MOUNTS_FILE: &str = "mounts.brenn";
 
     /// A booted process the driver decides against: the messaging layer the
     /// document brought up, the driver holding that document as its baseline,
@@ -903,6 +1511,25 @@ channel scratch at "ephemeral:scratch" {{
         /// the terms `run_server` builds one on: a document with an async tool
         /// grant somewhere in it, which is what mints the executor's spec.
         pub(crate) tool_caller_grants: Option<Arc<brenn_tool_registry::ToolCallerGrants>>,
+        /// The mounts document the driver re-reads on every reload, and the
+        /// directories it declares. Held because dropping it would take the
+        /// mount trees with it.
+        pub(crate) mounts: Mounts,
+        /// The MQTT runtime the reload walks, when the fixture asked for one.
+        pub(crate) mqtt: Option<(
+            Arc<brenn_mqtt::MqttService>,
+            Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
+        )>,
+        /// The stop signals of the live supervisors, when the fixture booted
+        /// against a real broker.
+        ///
+        /// Held so a fixture can fire them. Dropping them stops nothing: each
+        /// supervisor holds a sender of its own inside its
+        /// `MqttClientHandle`, so the channel never closes while the
+        /// supervisor runs. A fixture that does not call `stop_mqtt()` leaves
+        /// a connected supervisor under the document's client id for the rest
+        /// of the test binary.
+        pub(crate) mqtt_stop_txs: Vec<tokio::sync::watch::Sender<bool>>,
         /// The dispatcher task, when the fixture asked for one.
         ///
         /// Held rather than detached so that a wait for something the
@@ -924,11 +1551,121 @@ channel scratch at "ephemeral:scratch" {{
         plan_messaging(&PlanInputs {
             config,
             apps: Some(apps),
-            mqtt_clients: &IndexMap::new(),
+            // The document's own, so a fixture declaring an `mqtt_client`
+            // derives the ingress channels a host would. The driver reads the
+            // booted identities for the same reason.
+            mqtt_clients: &client_identities(config),
             tool_registry: Some(tool_registry),
             replay_store_paths: &[],
         })
         .expect("the fixture document configures messaging")
+    }
+
+    /// The `[[mqtt_client]]` identities a fixture document declares.
+    fn client_identities(config: &BrennConfig) -> IndexMap<String, MqttClientIdentity> {
+        brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients)
+    }
+
+    /// A live `MqttService` and ingress router over the plan's **referenced**
+    /// clients, as boot builds them.
+    ///
+    /// Referenced and not declared, because that is the set boot spawns a
+    /// session for and the set rule 6 is defined against: a client the document
+    /// declares and nothing binds has no session on a real host, and a fixture
+    /// that gave it one would be a fixture rule 6 cannot be tested on.
+    ///
+    /// The handles are registered and no supervisor is spawned, so every session
+    /// exists and none has a connection: a SUBSCRIBE at commit comes back
+    /// `DeferredDisconnected`, which is the outcome a broker-down reload has and
+    /// the one that leaves the filter in the reconnect-survival set for a test to
+    /// read.
+    async fn mqtt_runtime(
+        plan: &MessagingPlan,
+        apps: &IndexMap<String, AppConfig>,
+        db: &brenn_db::Db,
+    ) -> (
+        Arc<brenn_mqtt::MqttService>,
+        Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
+    ) {
+        use brenn_server::mqtt_router::IngressRoute;
+
+        let referenced = crate::mqtt::referenced_clients(
+            &plan.mqtt_ingress_channels,
+            apps.values().map(|app| &app.policy),
+            plan.wasm_consumers.iter().map(|consumer| &consumer.policy),
+        );
+        let service = brenn_mqtt::MqttService::new();
+        for slug in referenced {
+            let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+            service
+                .add_client(brenn_mqtt::MqttClientHandle::new(
+                    Arc::new(brenn_server::test_support::mqtt::test_client_config(slug)),
+                    brenn_mqtt::union_subscriptions(slug, &plan.mqtt_ingress_channels),
+                    stop_tx,
+                ))
+                .await;
+        }
+        let router = Arc::new(brenn_server::mqtt_router::MqttEventRouterImpl::new());
+        router.set_state(
+            brenn_server::test_support::state::test_state(db),
+            plan.mqtt_ingress_channels
+                .iter()
+                .map(IngressRoute::from)
+                .collect(),
+        );
+        (service, router)
+    }
+
+    /// The MQTT subsystem boot builds, over a broker that is really listening.
+    ///
+    /// This is `start_mqtt` and `wire_mqtt_state` themselves rather than a
+    /// fixture-shaped imitation of them: the question a live case asks is
+    /// whether a filter the reload SUBSCRIBEs on is one the process then
+    /// receives on, and an imitation of the wiring is the one thing that cannot
+    /// answer it.
+    async fn live_mqtt_runtime(
+        config: &BrennConfig,
+        apps: &Arc<IndexMap<String, AppConfig>>,
+        plan: &MessagingPlan,
+        db: &brenn_db::Db,
+        messenger: &Arc<Messenger>,
+    ) -> (
+        (
+            Arc<brenn_mqtt::MqttService>,
+            Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
+        ),
+        Vec<tokio::sync::watch::Sender<bool>>,
+    ) {
+        let clients = brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients);
+        let result = crate::mqtt::start_mqtt(
+            config,
+            apps,
+            &plan.wasm_consumers,
+            &plan.mqtt_ingress_channels,
+            &clients,
+        )
+        .await;
+        let service = result
+            .service
+            .expect("a live fixture declares and references a client");
+        let router = result
+            .event_router
+            .expect("a live fixture declares and references a client");
+        // The state the router delivers through must carry the messenger this
+        // process publishes with: an inbound packet reaches the bus through it,
+        // and a state without one panics the delivery path on the first
+        // message.
+        let mut state = brenn_server::test_support::state::test_state(db);
+        state.messenger = Some(messenger.clone());
+        let stop_txs = crate::mqtt::wire_mqtt_state(
+            &service,
+            &router,
+            state,
+            &plan.mqtt_ingress_channels,
+            result.stop_txs,
+        )
+        .await;
+        ((service, router), stop_txs)
     }
 
     /// The reader app's resolved subscriptions on `addresses`.
@@ -995,6 +1732,32 @@ channel scratch at "ephemeral:scratch" {{
         /// policy alone does not. The reader's policy is also extended to match
         /// each address.
         pub(crate) reader_subscriptions: Vec<&'static str>,
+        /// Addresses the reader app may *read* without holding a subscriber
+        /// entry on them.
+        ///
+        /// Separate from `reader_subscriptions` because seating an `App`
+        /// subscriber on a substrate-owned channel — a surface's config
+        /// channel, a description document — would change the topology the
+        /// case is about; a policy alone is all a `query` needs.
+        pub(crate) reader_reads: Vec<&'static str>,
+        /// A deployed surface asset tree to declare as one more mount, in the
+        /// shape a release installs: the kernel pair at its root and one
+        /// `processor/<kind>/` directory per kind it serves.
+        pub(crate) surface_assets: Option<PathBuf>,
+        /// Stand up a live `MqttService` and ingress router over the document's
+        /// `mqtt_client` declarations. Off by default: a process that never
+        /// referenced a client has neither, which is the shape rule 6's first
+        /// arm is about.
+        pub(crate) mqtt: bool,
+        /// Stand up the MQTT subsystem the way boot does, against whatever
+        /// broker the document's `mqtt_client` names — one real supervisor per
+        /// referenced client, dialing and staying connected.
+        ///
+        /// Distinct from `mqtt`, which registers handles and spawns nothing:
+        /// that fixture is for the cases about the *plan*, where every
+        /// SUBSCRIBE defers and no packet moves. This one is for the cases
+        /// about the wire, and it needs a broker to be listening.
+        pub(crate) mqtt_live: bool,
         /// Run a dispatcher over this process. Off by default: a published row
         /// is then stored and nobody is woken, so nothing advances a cursor
         /// behind a test's back — which is what the oracle's comparison of two
@@ -1023,13 +1786,36 @@ channel scratch at "ephemeral:scratch" {{
             components_roots,
             tool_registry,
             reader_subscriptions,
+            reader_reads,
+            surface_assets,
+            mqtt,
+            mqtt_live,
             dispatcher,
         } = fixture;
+        assert!(
+            !(mqtt && mqtt_live),
+            "a fixture asks for one MQTT runtime or the other, not both",
+        );
+        // The roots every load below reads are the mounts document's, exactly
+        // as `run_server` derives them: a record read out of a path the reload
+        // would not name is a baseline that disagrees with every candidate.
+        let mounts = tree.mounts(&components_roots);
+        if let Some(assets) = &surface_assets {
+            mounts.install(SURFACE_MOUNT, &[("surface", assets)]);
+        }
+        let loaded_mounts = mounts.load();
+        let components_roots = loaded_mounts.roots.components_roots.clone();
+        let module_roots = loaded_mounts.roots.module_roots.clone();
         let db = db.unwrap_or_else(init_db_memory);
         let tool_registry = tool_registry
             .unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
         let reader_subscriptions = reader_subscriptions.as_slice();
-        let document = tree.load();
+        let document = check_config(&DocumentInputs {
+            root: tree.root(),
+            module_roots,
+            role: brenn_lib::config::DocumentRole::Deployment,
+        })
+        .expect("the fixture document must load");
         let subscriptions = static_subscriptions(&document.config, reader_subscriptions);
         let messaging = (!subscriptions.is_empty()).then_some(
             brenn_lib::messaging::config::ResolvedMessagingConfig {
@@ -1045,7 +1831,9 @@ channel scratch at "ephemeral:scratch" {{
         // and a reload outlasting it would fail on the budget instead.
         reader.messaging_default_send_budget = 1_000_000;
         reader.policy = delivery_policy_for_addresses(
-            std::iter::once(STATUS_ADDRESS).chain(reader_subscriptions.iter().copied()),
+            std::iter::once(STATUS_ADDRESS)
+                .chain(reader_subscriptions.iter().copied())
+                .chain(reader_reads.iter().copied()),
         );
         reader
             .policy
@@ -1125,6 +1913,15 @@ channel scratch at "ephemeral:scratch" {{
             handle
         });
         let plan = plan_like_the_driver(&document.config, &apps, &tool_registry);
+        let (mqtt, mqtt_stop_txs) = match (mqtt, mqtt_live) {
+            (true, _) => (Some(mqtt_runtime(&plan, &apps, &db).await), Vec::new()),
+            (_, true) => {
+                let (runtime, stop_txs) =
+                    live_mqtt_runtime(&document.config, &apps, &plan, &db, &messenger).await;
+                (Some(runtime), stop_txs)
+            }
+            _ => (None, Vec::new()),
+        };
 
         // The async tool executor's grant table: the plan's own value, installed
         // where the executor's spec exists — which is when some consumer holds
@@ -1165,28 +1962,72 @@ channel scratch at "ephemeral:scratch" {{
             );
         }
 
+        // The surface wiring boot installs beside the runtimes: one delivery
+        // binding per surface, and the runtime table the doors read. Held so a
+        // case can watch a reload retire and start a surface in it.
+        let surfaces_cell =
+            brenn_server::state::SurfaceCell::holding(match plan.surfaces.is_empty() {
+                true => std::collections::HashMap::new(),
+                false => brenn_surface_server::build_surface_runtimes(
+                    plan.surfaces.clone(),
+                    Some(messenger.clone()),
+                    document.config.messaging.max_body_bytes,
+                    document.config.observability.surface_error_channel.clone(),
+                    brenn_surface_server::SurfaceDescriptionParams {
+                        prefix: document.config.surface_description.prefix.clone(),
+                    },
+                ),
+            });
+        for surface in &plan.surfaces {
+            router.register_surface_delivery_routes(surface);
+        }
+        let attach_registry = brenn_attach_server::registry::AttachRegistry::default();
+
+        let surface_roots = brenn_surface_server::validate_surface_assets(
+            &loaded_mounts.roots.surface_roots,
+            &plan.surfaces,
+        );
+
+        // Without this the fresh side would read back whatever the database
+        // it booted over still retained rather than what boot publishes.
+        crate::publish_boot_surface_documents(
+            &messenger,
+            &document.config,
+            TEST_BUILD_ID,
+            &plan.surfaces,
+            &surface_roots,
+        )
+        .await;
+
         let root = tree.root().display().to_string();
         let driver = ReloadDriver::new(
             ReloadEnv {
-                inputs: tree.inputs(),
+                config_path: tree.root(),
                 root: Some(root),
+                build_id: TEST_BUILD_ID,
                 apps,
-                mqtt_clients: IndexMap::new(),
+                mqtt_clients: client_identities(&document.config),
                 tool_registry,
                 replay_store_paths: Vec::new(),
-                components_roots,
-                mqtt_service: None,
+                surface_roots: Arc::new(std::sync::RwLock::new(Arc::new(surface_roots))),
+                surfaces: surfaces_cell,
+                attach_registry,
+                mqtt_service: mqtt.as_ref().map(|(service, _)| service.clone()),
+                mqtt_event_router: mqtt.as_ref().map(|(_, router)| router.clone()),
                 max_payload_bytes: document.config.messaging.max_body_bytes,
                 messenger: messenger.clone(),
                 router: router.clone(),
                 tool_caller_grants: tool_caller_grants.clone(),
                 alert_dispatcher,
             },
-            Baseline::of(document, &plan),
+            Baseline::of(document, loaded_mounts, &plan),
             registry,
         );
         Booted {
             driver,
+            mounts,
+            mqtt,
+            mqtt_stop_txs,
             messenger,
             router,
             captured,
@@ -1641,6 +2482,398 @@ new sifter: Demo {{
         ))
     }
 
+    /// A document declaring one broker and a consumer bound to one `mqtt:`
+    /// topic per entry in `topics`. The channels are literal addresses: an
+    /// `mqtt:` entry is minted by the binding, never declared.
+    pub(crate) fn document_with_an_mqtt_consumer(topics: &[&str]) -> String {
+        let ports: String = (0..topics.len())
+            .map(|index| format!("    in inbound{index};\n"))
+            .collect();
+        let bindings: String = topics
+            .iter()
+            .enumerate()
+            .map(|(index, topic)| {
+                format!(
+                    "    in inbound{index} <- \"mqtt:ha:{topic}\" {{ push_depth = 4; \
+                     retain_depth = 4; }}\n"
+                )
+            })
+            .collect();
+        document(&format!(
+            r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:8883";
+    qos = 1;
+}}
+
+channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [ports];
+{ports}    out digest;
+}}
+{PACKAGED}
+new sifter: Demo {{
+    grants = [ports];
+{bindings}    out digest -> sink;
+}}
+"#
+        ))
+    }
+
+    /// Two declared brokers and a consumer bound to one `mqtt:` topic per
+    /// `(client, topic)` pair. A client no pair names is declared and
+    /// referenced by nothing, so boot spawns no supervisor for it.
+    pub(crate) fn document_with_two_brokers(bindings: &[(&str, &str)]) -> String {
+        let ports: String = (0..bindings.len())
+            .map(|index| format!("    in inbound{index};\n"))
+            .collect();
+        let wiring: String = bindings
+            .iter()
+            .enumerate()
+            .map(|(index, (client, topic))| {
+                format!(
+                    "    in inbound{index} <- \"mqtt:{client}:{topic}\" {{ push_depth = 4; \
+                     retain_depth = 4; }}\n"
+                )
+            })
+            .collect();
+        document(&format!(
+            r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:8883";
+    qos = 1;
+}}
+
+mqtt_client spare {{
+    url = "mqtts://127.0.0.1:8884";
+    qos = 1;
+}}
+
+channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [ports];
+{ports}    out digest;
+}}
+{PACKAGED}
+new sifter: Demo {{
+    grants = [ports];
+{wiring}    out digest -> sink;
+}}
+"#
+        ))
+    }
+
+    /// Rule 6's first arm on the arrangement it is actually about: a client the
+    /// document declares, with a live service beside it that holds no session
+    /// for it because nothing referenced it at boot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mqtt_binding_on_a_declared_but_unreferenced_client_is_refused() {
+        let tree = Tree::holding(&document_with_two_brokers(&[("ha", "home/state")]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                mqtt: true,
+                ..BootFixture::default()
+            },
+        )
+        .await;
+
+        tree.write(&document_with_two_brokers(&[
+            ("ha", "home/state"),
+            ("spare", "home/other"),
+        ]));
+        // The second binding adds a port, so the component's specification
+        // moves with it; the installed package has to be the one the candidate
+        // document names or the refusal would be the spec-binding one.
+        install_package(components.path(), &staged_module(&tree));
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status.refusals.iter().any(|line| {
+                line.contains("mqtt:spare:home/other")
+                    && line.contains("has no broker session")
+                    && line.ends_with(super::super::NEEDS_RESTART)
+            }),
+            "{:?}",
+            status.refusals,
+        );
+    }
+
+    /// The broker document with nothing referencing it, which is a client a
+    /// fresh boot spawns no supervisor for.
+    pub(crate) fn document_with_a_broker_only() -> String {
+        document(
+            r#"mqtt_client ha {
+    url = "mqtts://127.0.0.1:8883";
+    qos = 1;
+}
+"#,
+        )
+    }
+
+    /// Rule 6's first arm. A client only ever named by a document is a client
+    /// with no supervisor: nothing spawned one at boot because nothing
+    /// referenced it, and a reload does not start one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mqtt_binding_on_a_client_with_no_session_is_refused() {
+        const TOPIC: &str = "home/state";
+        let tree = Tree::holding(&document_with_a_broker_only());
+        let components = tempfile::tempdir().expect("a components root");
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&document_with_an_mqtt_consumer(&[TOPIC]));
+        install_package(components.path(), &staged_module(&tree));
+
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status.refusals.iter().any(|line| {
+                line.contains(&format!("mqtt:ha:{TOPIC}"))
+                    && line.contains("has no broker session")
+                    && line.ends_with(super::super::NEEDS_RESTART)
+            }),
+            "{:?}",
+            status.refusals,
+        );
+    }
+
+    /// Rule 6's second arm. Dropping the last thing that referenced a client
+    /// would leave a supervisor a fresh boot would not have spawned, and
+    /// stopping one at reload is not something this facility does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_clients_last_reference_is_refused() {
+        let tree = Tree::holding(&document_with_an_mqtt_consumer(&["home/state"]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                mqtt: true,
+                ..BootFixture::default()
+            },
+        )
+        .await;
+
+        tree.write(&document_with_a_broker_only());
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert_eq!(
+            status.refusals,
+            vec![
+                "mqtt client \"ha\" would lose its last reference: this change needs a restart"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// Ingress convergence against a live service and router: a second `mqtt:`
+    /// entry arrives, its filter joins the client's reconnect-survival set and
+    /// its route joins the table; it leaves, and both go — while the first
+    /// entry's filter and route are untouched, which is what keeps
+    /// `unsubscribe_filter`'s contract. The client is registered and
+    /// disconnected, so each SUBSCRIBE is deferred to the next connect, which
+    /// is a success and is what the status body's `deferred` list is for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mqtt_binding_converges_its_filter_and_its_route() {
+        const KEPT: &str = "home/state";
+        const MOVED: &str = "home/power";
+        let address = format!("mqtt:ha:{MOVED}");
+        let tree = Tree::holding(&document_with_an_mqtt_consumer(&[KEPT]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                mqtt: true,
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+        let kept_uuid = booted
+            .messenger
+            .directory()
+            .resolve(&format!("mqtt:ha:{KEPT}"))
+            .expect("the booted entry is in the directory")
+            .uuid;
+        assert_eq!(router.route_uuids(), vec![kept_uuid]);
+        assert_eq!(service.ingress_filter_qos("ha", MOVED).await, None);
+
+        tree.write(&document_with_an_mqtt_consumer(&[KEPT, MOVED]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(
+            status.delta.channels_added.contains(&address),
+            "{:?}",
+            status.delta.channels_added,
+        );
+        assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+        assert!(status.delta.mqtt_unsubscribed.is_empty());
+        assert_eq!(
+            status.delta.mqtt_deferred,
+            vec![address.clone()],
+            "a registered but disconnected client defers every SUBSCRIBE",
+        );
+        assert_eq!(
+            service.ingress_filter_qos("ha", MOVED).await,
+            Some(1),
+            "the arriving filter is not in the reconnect-survival set",
+        );
+        let moved_uuid = booted
+            .messenger
+            .directory()
+            .resolve(&address)
+            .expect("the entry is in the directory")
+            .uuid;
+        assert_eq!(router.route_uuids(), vec![kept_uuid, moved_uuid]);
+
+        // And back: the binding goes, and with it the filter and the route. The
+        // client keeps its other reference, so rule 6 has nothing to say.
+        tree.write(&document_with_an_mqtt_consumer(&[KEPT]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_unsubscribed, vec![address.clone()]);
+        assert!(status.delta.mqtt_subscribed.is_empty());
+        assert_eq!(service.ingress_filter_qos("ha", MOVED).await, None);
+        assert_eq!(
+            service.ingress_filter_qos("ha", KEPT).await,
+            Some(1),
+            "the surviving filter was unsubscribed",
+        );
+        assert_eq!(router.route_uuids(), vec![kept_uuid]);
+        assert!(booted.messenger.directory().resolve(&address).is_none());
+    }
+
+    /// A filter a dynamic subscribe minted, across a reload that moves another
+    /// filter on the same client.
+    ///
+    /// This is the case the whole plan-only diff rests on: a purely dynamic
+    /// filter is in neither plan and its route is keyed by a uuid no plan entry
+    /// carries, so nothing in the walk can reach either. Driven through the two
+    /// steps `mqtt_subscribe` composes — the transport-blind core that mints
+    /// the channel and folds the subscriber, then the activation that
+    /// SUBSCRIBEs and adds the route — because a delta computed off the live
+    /// router table instead of the plan would pass every unit test and take
+    /// this filter down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dynamically_minted_filter_and_route_survive_a_reload() {
+        const KEPT: &str = "home/state";
+        const ARRIVING: &str = "home/power";
+        const DYNAMIC: &str = "home/dynamic";
+        let tree = Tree::holding(&document_with_an_mqtt_consumer(&[KEPT]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                mqtt: true,
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+
+        let address = format!("mqtt:ha:{DYNAMIC}");
+        booted
+            .messenger
+            .subscribe_dynamic(
+                READER,
+                &address,
+                brenn_messaging::subscribe::DynamicSubscribeParams {
+                    push_depth: brenn_lib::messaging::config::Depth::Bounded(0),
+                    retain_depth: brenn_lib::messaging::config::Depth::Bounded(1),
+                    noise: None,
+                    wake_min: None,
+                    qos: Some(1),
+                },
+            )
+            .await
+            .expect("a dynamic subscribe on a filter the document does not declare");
+        let dynamic = brenn_lib::mqtt::config::ResolvedMqttIngressChannel {
+            channel_uuid: brenn_lib::messaging::mqtt_channel_uuid_from_address(&address),
+            channel_address: address.clone(),
+            client_slug: "ha".to_string(),
+            topic: DYNAMIC.to_string(),
+            qos: 1,
+            urgency: brenn_lib::messaging::Urgency::Normal,
+        };
+        assert!(
+            router.add_route(brenn_server::mqtt_router::IngressRoute::from(&dynamic)),
+            "the dynamic route is new to the table",
+        );
+        service
+            .subscribe_filter("ha", DYNAMIC.to_string(), 1)
+            .await
+            .expect("the client has a session");
+
+        // An unrelated reload: another filter on the same client arrives.
+        tree.write(&document_with_an_mqtt_consumer(&[KEPT, ARRIVING]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.mqtt_subscribed,
+            vec![format!("mqtt:ha:{ARRIVING}")],
+        );
+        assert!(
+            status.delta.mqtt_unsubscribed.is_empty(),
+            "{:?}",
+            status.delta.mqtt_unsubscribed,
+        );
+        assert_eq!(
+            service.ingress_filter_qos("ha", DYNAMIC).await,
+            Some(1),
+            "the dynamic filter left the reconnect-survival set",
+        );
+        assert!(
+            router.route_uuids().contains(&dynamic.channel_uuid),
+            "the dynamic route left the table",
+        );
+    }
+
     /// The consumer half of prepare, end to end: the candidate's records are
     /// read off the roots and every arriving consumer is instantiated, so that
     /// commit has no artifact left to be refused by. Nothing else here declares
@@ -1835,6 +3068,21 @@ new sifter: Demo {{
     }
 
     impl Booted {
+        /// Signal every live supervisor to disconnect, for a case that booted
+        /// against a real broker.
+        ///
+        /// Teardown rather than assertion: the broker is killed a moment later
+        /// either way, and a session that leaves with a DISCONNECT keeps the
+        /// broker's log free of the abnormal-close lines a failing case has to
+        /// read past.
+        pub(crate) fn stop_mqtt(&self) {
+            for stop in &self.mqtt_stop_txs {
+                // A supervisor that already exited is a closed channel, which
+                // is the state this asks for.
+                let _ = stop.send(true);
+            }
+        }
+
         /// Poll until `address` holds at least `wanted` messages, and answer
         /// with them.
         ///
@@ -2315,15 +3563,17 @@ new sifter: Demo {{
         );
     }
 
-    /// The cross-root scan prepare re-runs, which is the boot precondition a
-    /// bundle installed since boot can invalidate. Reached only once the
-    /// document itself has been accepted, so the fixture has to be a document
-    /// that would otherwise commit.
+    /// A mount that was uninstalled under a running process. The roots are the
+    /// mounts document's answer and it is re-read first, so the reload refuses
+    /// on the mount rather than resolving a document against half a host.
+    /// Reached before anything reads the deployment document at all.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_components_root_that_went_missing_is_refused_in_boots_words() {
+    async fn a_mount_that_went_missing_is_refused_naming_it() {
+        let components = tempfile::tempdir().expect("a components root");
         let tree = Tree::holding(&document(""));
-        let absent = tree.dir.path().join("no-such-root");
-        let mut booted = boot(&tree, vec![absent.clone()]).await;
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        let absent = booted.mounts.declared_path("components-0");
+        booted.mounts.uninstall("components-0");
 
         tree.write(&document(
             r#"
@@ -2347,6 +3597,510 @@ channel spare at "brenn:spare" {
         assert_eq!(status.refusals.len(), 1);
         assert!(
             status.refusals[0].contains(&absent.display().to_string()),
+            "{:?}",
+            status.refusals
+        );
+    }
+
+    /// The whole point of the mounts document: a bundle installed after boot is
+    /// a tree this process may read, with no restart and no argv edit. The
+    /// consumer's record must name the *mount* as its root, since that is the
+    /// path every later reload will resolve it under.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mount_declared_since_boot_brings_its_package_into_reach() {
+        let components = tempfile::tempdir().expect("a components root");
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        // The install an operator does between two reloads: stage the tree,
+        // then write the mount line.
+        tree.write(&document_with_a_consumer());
+        install_package(components.path(), &staged_module(&tree));
+        let mount = booted
+            .mounts
+            .install("bundle", &[("components", components.path())]);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.consumers_added, vec!["sifter".to_string()]);
+        let verified = &booted.driver.registry()["sifter"].verified;
+        assert_eq!(
+            verified.root,
+            mount.join("components"),
+            "the record must name the mount the package was resolved under",
+        );
+    }
+
+    /// A package that moved on disk without its bytes moving.
+    ///
+    /// The install scheme a mount is deployed under stages each release into a
+    /// fresh versioned tree and swaps the symlink, so a re-deploy or a rollback
+    /// of identical bytes moves every canonical path under the mount. A
+    /// consumer's identity is its world and its two digests, not those paths:
+    /// restarting it here would drop its in-memory state for no change at all.
+    /// The record is still pointed at the tree the process is now reading,
+    /// because the one the consumer was loaded from is what the installer
+    /// prunes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_package_that_moved_without_changing_does_not_restart_its_consumer() {
+        let first = tempfile::tempdir().expect("a components root");
+        let tree = Tree::holding(&document_with_a_consumer());
+        install_package(first.path(), &staged_module(&tree));
+        let mut booted = boot(&tree, vec![first.path().to_path_buf()]).await;
+        let started = booted.driver.registry()["sifter"].verified.clone();
+
+        // The same release under a different tree, and the mount list moved
+        // onto it in one edit — two mounts offering one package name at once
+        // would be a cross-root refusal.
+        let second = tempfile::tempdir().expect("the next versioned tree");
+        install_package(second.path(), &staged_module(&tree));
+        booted.mounts.uninstall("components-0");
+        let mount = booted
+            .mounts
+            .install("components-1", &[("components", second.path())]);
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(
+            status.outcome,
+            Outcome::Unchanged,
+            "a byte-identical install moved the projection: {:?}",
+            status.delta.consumers_changed,
+        );
+        let now = &booted.driver.registry()["sifter"].verified;
+        assert_eq!(now.artifact_sha256, started.artifact_sha256);
+        assert_eq!(
+            now.root,
+            mount.join("components"),
+            "the record still names the tree the install replaced",
+        );
+    }
+
+    /// **A mount that newly offers the surface kernel is a restart.** Every
+    /// page loads the kernel, and a reload reloads only the pages of surfaces
+    /// that moved, so a kernel arriving under a mount this process was not
+    /// serving one from cannot be walked to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_surface_kernel_that_arrived_under_a_mount_is_refused() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        let surface = release_surface_tree("chart");
+        booted
+            .mounts
+            .install("release", &[("surface", surface.path())]);
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status.refusals.iter().any(|line| {
+                line.contains("surface kernel root") && line.ends_with(super::super::NEEDS_RESTART)
+            }),
+            "{:?}",
+            status.refusals,
+        );
+    }
+
+    /// **A kind a newly declared mount offers converges.** No surface
+    /// instantiates it, so nothing in the document moved — but the served roots
+    /// must carry it afterwards, or the first surface to use it would be
+    /// planned against a kind `/surface-static` cannot find.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kind_offered_by_a_new_mount_converges_into_the_served_roots() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        let release = release_surface_tree("chart");
+        booted
+            .mounts
+            .install("release", &[("surface", release.path())]);
+        serve_current_roots(&booted);
+
+        let home = tempfile::tempdir().expect("a bundle home");
+        let v1 = versioned_bundle(home.path(), "bundle", "1", "widget");
+        booted.mounts.link("bundle", &v1);
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(
+            status.outcome,
+            Outcome::Unchanged,
+            "a kind nothing instantiates moves no part of the document: {:?}",
+            status.refusals,
+        );
+        let serving = booted
+            .driver
+            .env
+            .surface_roots
+            .read()
+            .expect("the cell is uncontended")
+            .clone();
+        assert!(
+            serving.kinds.contains_key("widget"),
+            "the served roots must offer the kind the new mount installed: {:?}",
+            serving.kinds.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// A `SurfaceRoots` spelled directly, for the message-level cases below.
+    fn roots_of(kernel: &str, kinds: &[(&str, &str, &str)]) -> brenn_surface_server::SurfaceRoots {
+        brenn_surface_server::SurfaceRoots {
+            kernel: Some(brenn_surface_server::KernelRoot::for_test(kernel)),
+            kinds: kinds
+                .iter()
+                .map(|(kind, mount, root)| {
+                    (
+                        (*kind).to_string(),
+                        brenn_surface_server::KindRoot {
+                            mount: (*mount).to_string(),
+                            root: PathBuf::from(root),
+                            source_sha256: "s".to_string(),
+                            spec_sha256: "p".to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Kinds converge and the kernel does not, which is the whole of what this
+    /// check is left holding. Every kind-grain difference — offered by another
+    /// mount, reinstalled, withdrawn, newly offered — passes it, because each
+    /// promotes the surfaces instantiating it into the surface delta; a kernel
+    /// from a different tree is the one restart.
+    #[test]
+    fn only_a_moved_kernel_root_is_refused() {
+        let serving = roots_of("/brenn/surface", &[("chart", "bundle", "/b.v1/surface")]);
+
+        for scanned in [
+            roots_of("/brenn/surface", &[("chart", "other", "/o/surface")]),
+            roots_of("/brenn/surface", &[("chart", "bundle", "/b.v2/surface")]),
+            roots_of("/brenn/surface", &[]),
+            roots_of(
+                "/brenn/surface",
+                &[
+                    ("chart", "bundle", "/b.v1/surface"),
+                    ("gauge", "extra", "/e/surface"),
+                ],
+            ),
+        ] {
+            assert!(
+                surface_kernel_refusal(&serving, &scanned).is_ok(),
+                "a kind-grain difference is the surface delta's to walk, not a refusal",
+            );
+        }
+
+        let other_kernel = roots_of("/other/surface", &[("chart", "bundle", "/b.v1/surface")]);
+        let refusals = surface_kernel_refusal(&serving, &other_kernel)
+            .expect_err("a moved kernel root is refused");
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert!(refusals[0].contains("surface kernel root"), "{refusals:?}");
+        assert!(
+            refusals[0].ends_with(super::super::NEEDS_RESTART),
+            "{refusals:?}",
+        );
+    }
+
+    /// A release's surface tree: the kernel module pair every page references,
+    /// plus one conforming kind.
+    fn release_surface_tree(kind: &str) -> tempfile::TempDir {
+        let surface = tempfile::tempdir().expect("a surface root");
+        brenn_surface_server::test_fixtures::write_kernel_pair(surface.path());
+        brenn_surface_server::test_fixtures::write_valid_kind(surface.path(), kind);
+        surface
+    }
+
+    /// **The bundle-upgrade shape converges.** The mount is a symlink to a
+    /// versioned tree, so an install moves the bytes under a path that never
+    /// changes; only the kind's fingerprint says it happened. No surface
+    /// instantiates the kind here, so the whole of the reload's work is
+    /// installing the roots it scanned — which is what lets the next surface of
+    /// that kind be planned against the bytes on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_surface_kind_reinstalled_under_its_mount_converges() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        let surface = release_surface_tree("chart");
+        booted
+            .mounts
+            .install("release", &[("surface", surface.path())]);
+        serve_current_roots(&booted);
+        let before = booted
+            .driver
+            .env
+            .surface_roots
+            .read()
+            .expect("the cell is uncontended")
+            .kinds["chart"]
+            .source_sha256
+            .clone();
+
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            surface.path(),
+            "chart",
+            b"chart-v2",
+            &brenn_surface_server::test_fixtures::spec_bytes_for("chart"),
+            Vec::new(),
+            true,
+            |_| {},
+        );
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(
+            status.outcome,
+            Outcome::Unchanged,
+            "an upgraded kind nothing instantiates moves no part of the document: {:?}",
+            status.refusals,
+        );
+        let after = booted
+            .driver
+            .env
+            .surface_roots
+            .read()
+            .expect("the cell is uncontended")
+            .kinds["chart"]
+            .source_sha256
+            .clone();
+        assert_ne!(
+            before, after,
+            "the served roots must carry the reinstalled kind's fingerprint",
+        );
+    }
+
+    /// **An asset failure found at reload is framed as a reload.** The process
+    /// is still serving the document it has, so the refusal names the reload
+    /// and must not end in boot's "Refusing to start" — which is the whole
+    /// reason the validator takes a context at all, and the only production
+    /// site that passes `RELOAD` is the scan this drives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_asset_refusal_is_framed_as_a_reload_and_not_as_a_boot() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        let surface = tempfile::tempdir().expect("a surface root");
+        brenn_surface_server::test_fixtures::write_kernel_pair(surface.path());
+        // A kind directory with no manifest: the scan maps it, and only the
+        // validator's per-kind record pass can refuse it.
+        std::fs::create_dir_all(surface.path().join("processor").join("broken"))
+            .expect("a kind directory");
+        booted
+            .mounts
+            .install("release", &[("surface", surface.path())]);
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        let line = status
+            .refusals
+            .iter()
+            .find(|line| line.contains("broken"))
+            .unwrap_or_else(|| panic!("{:?}", status.refusals));
+        assert!(line.starts_with("reload:"), "{line}");
+        assert!(!line.contains("Refusing to start"), "{line}");
+    }
+
+    /// One versioned tree of a bundle mount: `<home>/<name>.v<version>/`,
+    /// holding a `VERSION` and a `surface/` tree with one kind. The kind's
+    /// bytes are a function of its name alone, so two versions of one kind are
+    /// byte-identical — which is the point of the case below.
+    fn versioned_bundle(home: &std::path::Path, name: &str, version: &str, kind: &str) -> PathBuf {
+        let versioned = home.join(format!("{name}.v{version}"));
+        let surface = versioned.join("surface");
+        std::fs::create_dir_all(&surface).expect("a versioned surface tree");
+        std::fs::write(versioned.join("VERSION"), format!("{version}\n")).expect("a VERSION");
+        brenn_surface_server::test_fixtures::write_valid_kind(&surface, kind);
+        versioned
+    }
+
+    /// Seed the roots cell with what the declared mounts offer right now, which
+    /// is what boot does before the driver is built.
+    fn serve_current_roots(booted: &Booted) {
+        let mounts = brenn_lib::config::load_mounts(Some(&booted.mounts.path()));
+        let serving =
+            brenn_surface_server::validate_surface_assets(&mounts.roots.surface_roots, &[]);
+        *booted
+            .driver
+            .env
+            .surface_roots
+            .write()
+            .expect("the cell is uncontended") = Arc::new(serving);
+    }
+
+    /// **A bundle re-installed at byte-identical contents converges.** The
+    /// installer swaps the mount symlink onto a fresh versioned tree, so every
+    /// canonical root under that mount moves — but nothing about any kind
+    /// changed, so this is a relocation and not a restart. The roots cell must
+    /// follow it: the tree it was serving from is the one the installer prunes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bundle_whose_tree_relocated_converges_and_the_served_roots_follow() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        let release = release_surface_tree("chart");
+        booted
+            .mounts
+            .install("release", &[("surface", release.path())]);
+        let home = tempfile::tempdir().expect("a bundle home");
+        let v1 = versioned_bundle(home.path(), "bundle", "1", "widget");
+        booted.mounts.link("bundle", &v1);
+        serve_current_roots(&booted);
+
+        let v2 = versioned_bundle(home.path(), "bundle", "2", "widget");
+        booted.mounts.link("bundle", &v2);
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(
+            status.outcome,
+            Outcome::Unchanged,
+            "a byte-identical re-install moves nothing: {:?}",
+            status.refusals,
+        );
+        let serving = booted
+            .driver
+            .env
+            .surface_roots
+            .read()
+            .expect("the cell is uncontended")
+            .clone();
+        assert_eq!(
+            serving.kinds["widget"].root,
+            v2.canonicalize()
+                .expect("the new tree exists")
+                .join("surface"),
+            "the served root follows the swapped symlink",
+        );
+        assert_eq!(
+            serving.kinds["chart"].root,
+            booted
+                .mounts
+                .declared_path("release")
+                .canonicalize()
+                .expect("the release mount exists")
+                .join("surface"),
+            "the mount that did not move is untouched",
+        );
+    }
+
+    /// The mounts array in the outcome body: what a reader asks to learn which
+    /// revision of which bundle this process is serving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_status_body_names_the_mounts_the_process_reads() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&one_more_channel());
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        let named: Vec<&str> = status
+            .mounts
+            .iter()
+            .map(|mount| mount.name.as_str())
+            .collect();
+        assert_eq!(named, vec!["tree"]);
+        assert_eq!(status.mounts[0].version, "test");
+        assert_eq!(status.mounts[0].trees, vec!["modules".to_string()]);
+    }
+
+    /// A refusal changed nothing, so the mounts it reports are the ones the
+    /// process is still reading — not the candidate's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_reports_the_running_mounts() {
+        let components = tempfile::tempdir().expect("a components root");
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        // A mount whose VERSION went away is not a mount: the reload refuses
+        // before it reads a line of the deployment document.
+        std::fs::remove_file(booted.mounts.declared_path("components-0").join("VERSION"))
+            .expect("the VERSION is removable");
+        tree.write(&one_more_channel());
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status.refusals[0].contains("VERSION"),
+            "{:?}",
+            status.refusals
+        );
+        let named: Vec<&str> = status
+            .mounts
+            .iter()
+            .map(|mount| mount.name.as_str())
+            .collect();
+        assert_eq!(named, vec!["components-0", "tree"]);
+    }
+
+    /// A mount whose line is gone takes its packages with it. The document
+    /// still declares the consumer, so the refusal is the package's: the
+    /// process keeps running the bytes it has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_mount_under_a_running_consumer_is_refused() {
+        let components = tempfile::tempdir().expect("a components root");
+        let tree = Tree::holding(&document_with_a_consumer());
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        booted.mounts.uninstall("components-0");
+        booted.mounts.write();
+        // The document is untouched; only the mount line went.
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status.refusals[0].contains("components"),
+            "{:?}",
+            status.refusals
+        );
+        assert!(
+            booted
+                .driver
+                .registry()
+                .iter()
+                .any(|(slug, _)| slug == "sifter"),
+            "the running consumer is untouched by a refusal",
+        );
+    }
+
+    /// Two mounts offering one packaged module: the module scan the compile
+    /// runs refuses the pair, because a name resolved out of two releases is
+    /// resolved out of neither.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_module_under_two_mounts_is_refused() {
+        let tree = Tree::holding(&document_with_a_consumer());
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        let second = tempfile::tempdir().expect("a second module root");
+        std::fs::write(
+            second.path().join(format!("{PACKAGED_MODULE}.brenn")),
+            staged_module(&tree),
+        )
+        .expect("the duplicate module is writable");
+        booted
+            .mounts
+            .install("other", &[("modules", second.path())]);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status.refusals[0].contains(PACKAGED_MODULE),
             "{:?}",
             status.refusals
         );
@@ -3151,5 +4905,947 @@ channel spill at "ephemeral:spill" {
             .iter()
             .map(|store| store.address().to_string())
             .collect()
+    }
+
+    // ── surface convergence ─────────────────────────────────────────────────
+    //
+    // The rig a `[[surface]]` needs is heavier than any other block's: a
+    // deployed asset tree under a mount, a packaged class module whose bytes
+    // the tree's manifest hashes, and the seven derived self-description
+    // channels declared in the document. Built once here so the cases below
+    // read as what they are about.
+
+    /// The mount a fixture's deployed surface tree is declared under.
+    pub(crate) const SURFACE_MOUNT: &str = "surface-release";
+
+    /// The prefix `[surface_description]` defaults to, and so the root of every
+    /// derived address a surface-carrying document declares.
+    const SURFACE_PREFIX: &str = "surface";
+
+    /// Write `kind`'s class module into the tree's module root and its deployed
+    /// assets into `assets`, bound to each other by bytes.
+    ///
+    /// A placed component carries the hash of the file its class was declared
+    /// in, and a kind's manifest carries the hash of the packaged specification
+    /// shipped beside its artifact; boot refuses a surface whose two disagree.
+    /// So the module text *is* the specification bytes.
+    ///
+    /// Written straight into the module root rather than through the fixture
+    /// fence: the fenced half is as tall as the whole fixture, so a document
+    /// that gained a line would move the class hash and with it the kind's
+    /// fingerprint — which is exactly what a case about a document edit must
+    /// not do.
+    pub(crate) fn write_surface_kind(
+        tree: &Tree,
+        assets: &std::path::Path,
+        kind: &str,
+        class: &str,
+    ) {
+        write_surface_kind_needing(tree, assets, kind, class, "dom, page-dom");
+    }
+
+    /// [`write_surface_kind`] with the class's grant list stated, for a case
+    /// that needs a second kind a non-chrome component may hold.
+    fn write_surface_kind_needing(
+        tree: &Tree,
+        assets: &std::path::Path,
+        kind: &str,
+        class: &str,
+        needs: &str,
+    ) {
+        let modules = tree.modules();
+        std::fs::create_dir_all(&modules).expect("a module root");
+        let spec = format!(
+            "component {class} {{\n    {}\n    in feed;\n}}\n",
+            brenn_dsl::fixture_text::processor_header(needs),
+        );
+        std::fs::write(modules.join(format!("{kind}.brenn")), &spec)
+            .expect("the class module is writable");
+        std::fs::create_dir_all(assets).expect("a surface asset tree");
+        brenn_surface_server::test_fixtures::write_kernel_pair(assets);
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            assets,
+            kind,
+            format!("component-bytes-for-{kind}").as_bytes(),
+            spec.as_bytes(),
+            Vec::new(),
+            true,
+            |_| {},
+        );
+    }
+
+    /// The seven channels one surface of one kind derives, declared with the
+    /// retention each family requires.
+    ///
+    /// The index is in [`document`] already, so it is not repeated here; the
+    /// kind pair is emitted once per kind and a caller declaring two surfaces
+    /// of one kind passes it an empty kind list for the second.
+    fn description_channels(slug: &str, kinds: &[&str]) -> String {
+        let mut text = String::new();
+        for kind in kinds {
+            for family in ["help", "schema"] {
+                text.push_str(&format!(
+                    "channel {kind}_{family} at \"brenn:{SURFACE_PREFIX}.kind.{kind}.{family}\" {{\
+                     \n    push_depth = 1;\n    retain_depth = 1;\n    \
+                     standing_retain_depth = 1;\n}}\n\n",
+                ));
+            }
+        }
+        text.push_str(&format!(
+            "channel {slug}_help at \"brenn:{SURFACE_PREFIX}.surface.{slug}.help\" {{\
+             \n    push_depth = 1;\n    retain_depth = 1;\n    standing_retain_depth = 1;\n}}\n\n",
+        ));
+        for family in ["geometry", "status"] {
+            text.push_str(&format!(
+                "channel {slug}_{family} at \"brenn:{SURFACE_PREFIX}.surface.{slug}.{family}\" {{\
+                 \n    push_depth = 1;\n    retain_depth = 4;\n    \
+                 standing_retain_depth = 4;\n}}\n\n",
+            ));
+        }
+        text.push_str(&format!(
+            "channel {slug}_bindings at \"ephemeral:{SURFACE_PREFIX}.surface.{slug}.bindings\" {{\
+             \n    push_depth = 1;\n    retain_depth = 1;\n}}\n\n",
+        ));
+        text
+    }
+
+    /// A document declaring every `(slug, attrs)` in `surfaces` as an instance
+    /// of `kind`, each reading `feed` off a channel of its own.
+    ///
+    /// `attrs` is whatever a case varies on the surface block itself, which is
+    /// how a case moves one surface's resolved value without touching a
+    /// channel. The kind's help/schema pair is declared once however many
+    /// surfaces mount it.
+    pub(crate) fn surfaces_document(kind: &str, class: &str, surfaces: &[(&str, &str)]) -> String {
+        let only = [kind];
+        let mut extra = String::new();
+        for (index, (slug, attrs)) in surfaces.iter().enumerate() {
+            extra.push_str(&description_channels(
+                slug,
+                match index {
+                    0 => &only,
+                    _ => &[],
+                },
+            ));
+            extra.push_str(&format!(
+                "channel {slug}_feed at \"ephemeral:{slug}.feed\" {{\n    push_depth = 4;\n    \
+                 retain_depth = 16;\n}}\n\n\
+                 surface {slug} {{\n    grants = [subscribe];\n{attrs}\
+                 \n    new panel: {class} {{\n        grants = [dom, page-dom];\n        \
+                 chrome = true;\n        in feed <- {slug}_feed {{ push_depth = 2; }}\n    \
+                 }}\n}}\n\n",
+            ));
+        }
+        format!("use @{kind}::*;\n{}", document(&extra))
+    }
+
+    /// The one-surface form, which most cases want.
+    pub(crate) fn surface_document(slug: &str, kind: &str, class: &str, attrs: &str) -> String {
+        surfaces_document(kind, class, &[(slug, attrs)])
+    }
+
+    /// The bindings document the kernel replays on attach.
+    const DESKBAR_BINDINGS: &str = "ephemeral:surface.surface.deskbar.bindings";
+    /// The retained index, a function of the whole surface list.
+    const SURFACE_INDEX: &str = "brenn:surface.index";
+    /// The surface's own help document.
+    const DESKBAR_HELP: &str = "brenn:surface.surface.deskbar.help";
+    /// The kind's help document, which lists every surface mounting it.
+    const PANEL_HELP: &str = "brenn:surface.kind.panel.help";
+    /// The kind's schema document.
+    const PANEL_SCHEMA: &str = "brenn:surface.kind.panel.schema";
+
+    /// Every address a surface case reads back.
+    pub(crate) const DESKBAR_READS: [&str; 5] = [
+        DESKBAR_BINDINGS,
+        SURFACE_INDEX,
+        DESKBAR_HELP,
+        PANEL_HELP,
+        PANEL_SCHEMA,
+    ];
+
+    /// The rig every one-surface case opens with: a tree, the `panel` kind's
+    /// deployed assets beside it, a document declaring one surface of that kind
+    /// with `attrs`, and the booted process serving it.
+    ///
+    /// The asset tree is returned because it is a `TempDir` — dropping it takes
+    /// the mount out from under the running process — and the tree because
+    /// every case rewrites the document it booted from.
+    pub(crate) async fn boot_one_panel_surface(attrs: &str) -> (Tree, tempfile::TempDir, Booted) {
+        let tree = Tree::new();
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        tree.write(&surface_document("deskbar", "panel", "Panel", attrs));
+        let booted = boot_with_panel(&tree, assets.path()).await;
+        (tree, assets, booted)
+    }
+
+    /// Boot a process with the panel kind installed under a mount.
+    pub(crate) async fn boot_with_panel(tree: &Tree, assets: &std::path::Path) -> Booted {
+        boot_with(
+            tree,
+            BootFixture {
+                surface_assets: Some(assets.to_path_buf()),
+                reader_reads: DESKBAR_READS.to_vec(),
+                ..BootFixture::default()
+            },
+        )
+        .await
+    }
+
+    /// The newest retained envelope on `address`, or nothing.
+    ///
+    /// The envelope rather than the body where a case has to tell "republished
+    /// with the same bytes" from "never rewritten": the two are one string, and
+    /// only the envelope's own identity says which happened.
+    async fn newest_envelope(
+        messenger: &Arc<Messenger>,
+        address: &str,
+    ) -> Option<brenn_envelope::MessageEnvelope> {
+        messenger
+            .query(&MessageQuery {
+                channel: address.to_string(),
+                limit: 1,
+                before: None,
+                after: None,
+                sender: None,
+                search: None,
+                calling_app_slug: READER.to_string(),
+            })
+            .await
+            .expect("the fixture reader may read every address it is given")
+            .into_iter()
+            .next()
+    }
+
+    /// The newest retained body on `address`, or nothing.
+    async fn newest_body(messenger: &Arc<Messenger>, address: &str) -> Option<String> {
+        messenger
+            .query(&MessageQuery {
+                channel: address.to_string(),
+                limit: 1,
+                before: None,
+                after: None,
+                sender: None,
+                search: None,
+                calling_app_slug: READER.to_string(),
+            })
+            .await
+            .expect("the fixture reader may read every address it is given")
+            .into_iter()
+            .next()
+            .map(|envelope| envelope.body)
+    }
+
+    /// Whether the runtime table serves `slug`.
+    fn serves_surface(booted: &Booted, slug: &str) -> bool {
+        matches!(
+            booted.driver.env.surfaces.lookup(slug),
+            brenn_server::state::SurfaceLookup::Ready(_)
+        )
+    }
+
+    /// **A surface added to the document converges.** Every part of a surface's
+    /// runtime footprint arrives in one reload: the entry the doors read, the
+    /// subscriber entries its input bindings fold into, the registration its
+    /// publishes are gated by, and the retained bindings document the kernel
+    /// replays on attach.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_surface_added_to_the_document_converges() {
+        let tree = Tree::holding(&document(""));
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        let mut booted = boot_with_panel(&tree, assets.path()).await;
+        assert!(!serves_surface(&booted, "deskbar"));
+
+        tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_added, vec!["deskbar".to_string()]);
+        assert!(status.delta.surfaces_removed.is_empty());
+        assert!(serves_surface(&booted, "deskbar"), "the door must find it");
+        assert!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::Surface("deskbar".to_string())
+            )
+            .contains(&"ephemeral:deskbar.feed".to_string()),
+            "the surface's input binding must be folded into the directory",
+        );
+        let bindings = newest_body(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is retained on the config channel");
+        assert!(bindings.contains("deskbar"), "{bindings}");
+        assert!(
+            newest_body(&booted.messenger, PANEL_HELP)
+                .await
+                .expect("the kind's help document is republished")
+                .contains("deskbar"),
+            "the kind help lists every surface mounting it",
+        );
+    }
+
+    /// A stand-in attached page on `slug`, leaving the way a real session does:
+    /// the task holds the registry guard, wakes on the host-close watch and
+    /// drops the guard on its way out, so the commit step's wait for the
+    /// registry to empty is answered by the session and not by the fixture.
+    ///
+    /// The task reports the close code it was sent, which is what a page's
+    /// behaviour is decided by.
+    fn attach_a_session(booted: &Booted, slug: &str) -> tokio::task::JoinHandle<u16> {
+        use brenn_attach_server::registry::{AttachSessionHandle, SessionCaps};
+
+        let handle = AttachSessionHandle::for_test(READER);
+        let mut close_rx = handle.close.subscribe();
+        let guard = booted
+            .driver
+            .env
+            .attach_registry
+            .try_register(slug, handle, SessionCaps::UNCAPPED)
+            .expect("uncapped registration");
+        tokio::spawn(async move {
+            let _guard = guard;
+            loop {
+                close_rx
+                    .changed()
+                    .await
+                    .expect("the registry holds the sender until this guard drops");
+                let reason = close_rx.borrow_and_update().clone();
+                if let Some(reason) = reason {
+                    return reason.code;
+                }
+            }
+        })
+    }
+
+    /// The `Surface(slug)` registration the messenger gates that surface's
+    /// publishes on, if it holds one.
+    fn holds_surface_registration(booted: &Booted, slug: &str) -> bool {
+        booted
+            .messenger
+            .subscriber_registration(&SubscriberEntryKind::Surface(slug.to_string()))
+            .is_some()
+    }
+
+    /// **A surface whose declaration moved is replaced in place.** The value
+    /// moved and no channel did, so the whole of the work is the surface's own:
+    /// every open page is closed with the reconfigured code, the runtime the
+    /// doors hand out is the new one, and the documents that carry the moved
+    /// value are rebuilt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changed_surface_closes_its_pages_and_is_replaced() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        assert!(serves_surface(&booted, "deskbar"));
+        let page = attach_a_session(&booted, "deskbar");
+        let before = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("boot published the surface's bindings document");
+
+        tree.write(&surface_document(
+            "deskbar",
+            "panel",
+            "Panel",
+            "    skin = \"foundry\";\n",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert!(status.delta.surfaces_added.is_empty());
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "a replaced surface's pages reload rather than reporting a retirement",
+        );
+        assert!(serves_surface(&booted, "deskbar"), "the new runtime is in");
+        assert!(holds_surface_registration(&booted, "deskbar"));
+        let after = newest_envelope(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the bindings document is still retained");
+        // Rebuilt, and rebuilt to the same bytes: the message is a different
+        // one, so the reload did write it, and its body is what boot's said,
+        // because a skin is not part of the wiring. Comparing bodies alone
+        // would be satisfied by boot's own copy and would pass a reload that
+        // stopped republishing for a changed surface altogether.
+        assert_ne!(
+            before.message_id, after.message_id,
+            "the bindings document is republished rather than left where boot put it",
+        );
+        assert_eq!(
+            before.body, after.body,
+            "a skin is not part of the wiring, so the rebuilt bindings document says what the \
+             one boot published said",
+        );
+        // What the skin *is* part of: the surface's own help document.
+        let help = newest_body(&booted.messenger, DESKBAR_HELP)
+            .await
+            .expect("the surface help document is retained");
+        assert!(
+            help.contains("- skin: `foundry`"),
+            "the rebuilt help document carries the new skin: {help}",
+        );
+    }
+
+    /// **A surface removed from the document leaves nothing behind.** The pages
+    /// are told it is retired, the door stops answering for the slug, and every
+    /// piece of runtime wiring a surface holds — registration, delivery binding,
+    /// send budgets, subscriber entries — is gone. This is also the
+    /// removal-only shape: nothing arrives, and the two surface-description
+    /// participants still have to be renarrowed and their documents rebuilt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_surface_retires_its_pages_and_its_wiring() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let page = attach_a_session(&booted, "deskbar");
+
+        // The surface leaves; its channels stay declared, as a document that
+        // dropped only the block does.
+        tree.write(&document(&description_channels("deskbar", &["panel"])));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_removed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RETIRED_CLOSE_CODE,
+            "a retired surface's pages must not try to come back",
+        );
+        assert!(!serves_surface(&booted, "deskbar"), "the door must 404 it");
+        assert!(!holds_surface_registration(&booted, "deskbar"));
+        assert!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::Surface("deskbar".to_string())
+            )
+            .is_empty(),
+            "no directory entry may still name a surface that no longer exists",
+        );
+        // The index is a function of the whole surface list, so a removal
+        // republishes it even though nothing arrived.
+        let index = newest_body(&booted.messenger, SURFACE_INDEX)
+            .await
+            .expect("the index is retained");
+        assert!(
+            !index.contains("deskbar"),
+            "the retained index still lists the retired surface: {index}",
+        );
+    }
+
+    /// Every publish matcher one surface-description participant's registration
+    /// carries, across both schemes: the help participant writes `brenn:`
+    /// documents and the config participant `ephemeral:` ones, and what a case
+    /// asks is whether either can still name a retired surface.
+    fn description_matchers(booted: &Booted, component: &str) -> Vec<String> {
+        let acls = booted
+            .messenger
+            .subscriber_registration(&SubscriberEntryKind::System(component.to_string()))
+            .unwrap_or_else(|| panic!("boot registers {component}"))
+            .policy
+            .acls
+            .clone();
+        acls.brenn_publish
+            .iter()
+            .chain(acls.ephemeral_publish.iter())
+            .map(|matcher| format!("{matcher:?}"))
+            .collect()
+    }
+
+    /// Boot a two-surface document, so the cases below can move one surface and
+    /// watch what happens to the other.
+    async fn boot_two_surfaces(tree: &Tree, assets: &std::path::Path) -> Booted {
+        tree.write(&surfaces_document(
+            "panel",
+            "Panel",
+            &[("deskbar", ""), ("sidebar", "")],
+        ));
+        boot_with(
+            tree,
+            BootFixture {
+                surface_assets: Some(assets.to_path_buf()),
+                reader_reads: [
+                    DESKBAR_READS.as_slice(),
+                    ["brenn:surface.surface.sidebar.help"].as_slice(),
+                ]
+                .concat(),
+                ..BootFixture::default()
+            },
+        )
+        .await
+    }
+
+    /// **A second surface of an existing kind republishes that kind's document
+    /// and leaves the first surface's alone.** The document set a reload owes
+    /// is decided by what each document is a function of: a kind's help lists
+    /// every surface mounting it, so an arrival moves it; an untouched
+    /// surface's own help is a function of that surface, so it is not
+    /// rebuilt and not restamped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_surface_of_a_kind_republishes_only_what_moved() {
+        let tree = Tree::new();
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(assets.path().to_path_buf()),
+                reader_reads: DESKBAR_READS.to_vec(),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        booted.driver.reload(TriggerSource::Signal).await;
+        let deskbar_help = newest_body(&booted.messenger, DESKBAR_HELP).await;
+        let kind_help = newest_body(&booted.messenger, PANEL_HELP).await;
+
+        tree.write(&surfaces_document(
+            "panel",
+            "Panel",
+            &[("deskbar", ""), ("sidebar", "")],
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_added, vec!["sidebar".to_string()]);
+        assert!(
+            status.delta.surfaces_changed.is_empty(),
+            "the first surface did not move: {:?}",
+            status.delta.surfaces_changed,
+        );
+        let after_kind = newest_body(&booted.messenger, PANEL_HELP).await;
+        assert_ne!(kind_help, after_kind, "the kind help lists both now");
+        assert!(
+            after_kind
+                .as_deref()
+                .is_some_and(|body| body.contains("sidebar")),
+            "{after_kind:?}",
+        );
+        assert_eq!(
+            deskbar_help,
+            newest_body(&booted.messenger, DESKBAR_HELP).await,
+            "an untouched surface's own help must not be restamped",
+        );
+    }
+
+    /// **Removing one of two surfaces of a kind narrows what the description
+    /// participants may write and rebuilds that kind's help.** The removal-only
+    /// half of step 5b: nothing arrives, and the two participants must still
+    /// lose every matcher naming the retired surface — the registrations a
+    /// fresh boot of the emptied document would build.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_surface_narrows_the_description_participants() {
+        let tree = Tree::holding(&document(""));
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        let mut booted = boot_two_surfaces(&tree, assets.path()).await;
+        assert!(
+            description_matchers(
+                &booted,
+                brenn_surface_server::description::SURFACE_HELP_COMPONENT
+            )
+            .iter()
+            .any(|matcher| matcher.contains("sidebar")),
+            "boot admits every surface's own help address",
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+        let kind_help = newest_body(&booted.messenger, PANEL_HELP).await;
+
+        let mut text = surface_document("deskbar", "panel", "Panel", "");
+        text.push_str(&description_channels("sidebar", &[]));
+        tree.write(&text);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_removed, vec!["sidebar".to_string()]);
+        for component in [
+            brenn_surface_server::description::SURFACE_HELP_COMPONENT,
+            brenn_surface_server::description::SURFACE_CONFIG_COMPONENT,
+        ] {
+            let matchers = description_matchers(&booted, component);
+            assert!(
+                !matchers.iter().any(|matcher| matcher.contains("sidebar")),
+                "{component} may still write the retired surface's addresses: {matchers:?}",
+            );
+            assert!(
+                matchers.iter().any(|matcher| matcher.contains("deskbar")),
+                "{component} lost the surviving surface's addresses: {matchers:?}",
+            );
+        }
+        let after_kind = newest_body(&booted.messenger, PANEL_HELP).await;
+        assert_ne!(kind_help, after_kind, "the kind help lost an instance");
+        assert!(
+            after_kind
+                .as_deref()
+                .is_some_and(|body| !body.contains("sidebar")),
+            "{after_kind:?}",
+        );
+    }
+
+    /// **A kind whose installed bytes moved promotes every surface mounting
+    /// it.** The bundle-upgrade case with the document untouched: nothing in
+    /// the configuration says anything happened, and the kind's fingerprint is
+    /// the only witness, so the surface is replaced and its pages reload onto
+    /// the new assets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kind_upgrade_replaces_every_surface_mounting_it() {
+        let (tree, assets, mut booted) = boot_one_panel_surface("").await;
+        let page = attach_a_session(&booted, "deskbar");
+
+        // The installer's shape: the same specification, new artifact bytes.
+        let spec = std::fs::read(tree.modules().join("panel.brenn")).expect("the class module");
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            assets.path(),
+            "panel",
+            b"the-upgraded-artifact",
+            &spec,
+            Vec::new(),
+            true,
+            |_| {},
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.kinds_changed, vec!["panel".to_string()]);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "the page has to come back for the new assets",
+        );
+        assert_eq!(
+            booted
+                .driver
+                .env
+                .surface_roots
+                .read()
+                .expect("the cell is uncontended")
+                .kinds["panel"]
+                .source_sha256,
+            brenn_lib::util::sha256_hex(b"the-upgraded-artifact"),
+            "the served roots must be the ones the reload was decided against",
+        );
+    }
+
+    /// **A kind upgraded past the specification the document was written
+    /// against is refused.** The mount landed and the configuration was not
+    /// re-checked, so the class hash the surface carries no longer matches the
+    /// specification shipped with the assets. Nothing moves; the process keeps
+    /// serving what it has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kind_whose_specification_moved_under_the_document_is_refused() {
+        let (_tree, assets, mut booted) = boot_one_panel_surface("").await;
+
+        // Only the assets move: a release whose specification changed, with the
+        // document still compiled against the old one.
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            assets.path(),
+            "panel",
+            b"the-upgraded-artifact",
+            b"component Panel { abi = processor; requires = [dom, page-dom]; in feed; }\n",
+            Vec::new(),
+            true,
+            |_| {},
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        assert!(
+            status.refusals[0].contains("deskbar") && status.refusals[0].contains("panel"),
+            "{:?}",
+            status.refusals,
+        );
+        assert!(serves_surface(&booted, "deskbar"), "nothing was touched");
+    }
+
+    /// A document whose one surface mounts two instances of the kind, both
+    /// reading the same channel — the shape in which the surface's declared
+    /// bindings outnumber the directory entries they fold into.
+    fn two_instance_document(slug: &str, attrs: &str) -> String {
+        let mut extra = description_channels(slug, &["panel", "aside"]);
+        extra.push_str(&format!(
+            "channel {slug}_feed at \"ephemeral:{slug}.feed\" {{\n    push_depth = 4;\n    \
+             retain_depth = 16;\n}}\n\n\
+             surface {slug} {{\n    grants = [subscribe];\n{attrs}\
+             \n    new panel-a: Panel {{\n        grants = [dom, page-dom];\n        \
+             chrome = true;\n        in feed <- {slug}_feed {{ push_depth = 2; }}\n    }}\n    \
+             new aside-b: Aside {{\n        grants = [dom];\n        \
+             in feed <- {slug}_feed {{ push_depth = 3; }}\n    }}\n}}\n\n",
+        ));
+        format!("use @panel::*;\nuse @aside::*;\n{}", document(&extra))
+    }
+
+    /// **A surface whose components share a channel unfolds once.** A surface's
+    /// wire subscriptions are one per (instance, channel) and the directory
+    /// carries one subscriber per (surface, channel), so a surface with two
+    /// components on one channel has two bindings and one entry. Both halves of
+    /// the departure walk — a replacement and a retirement — must ask the
+    /// directory once, and a walk that asked twice would take the second answer
+    /// as a host bug and kill the process mid-commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_surface_whose_components_share_a_channel_is_replaced_and_retired() {
+        let tree = Tree::new();
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        write_surface_kind_needing(&tree, assets.path(), "aside", "Aside", "dom");
+        tree.write(&two_instance_document("deskbar", ""));
+        let mut booted = boot_with_panel(&tree, assets.path()).await;
+        assert_eq!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::Surface("deskbar".to_string())
+            )
+            .len(),
+            1,
+            "two bindings on one channel are one directory subscriber",
+        );
+
+        tree.write(&two_instance_document(
+            "deskbar",
+            "    skin = \"foundry\";\n",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert!(serves_surface(&booted, "deskbar"));
+        assert_eq!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::Surface("deskbar".to_string())
+            )
+            .len(),
+            1,
+            "the replacement re-folded the entry rather than doubling it",
+        );
+
+        tree.write(&document(&description_channels(
+            "deskbar",
+            &["panel", "aside"],
+        )));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_removed, vec!["deskbar".to_string()]);
+        assert!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::Surface("deskbar".to_string())
+            )
+            .is_empty(),
+        );
+    }
+
+    /// **A corrupt sidecar under an upgraded kind is a refusal, not a panic.**
+    /// The description builders read each kind's `.schema.json` off the mount
+    /// and a malformed one is a boot panic; at reload the process is already
+    /// serving a document, so the honest answer is that nothing happens. The
+    /// artifact moves too, because a sidecar alone is in no fingerprint and
+    /// would leave the reload with no document to rebuild.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kind_upgraded_with_an_unparseable_schema_sidecar_is_refused() {
+        let (tree, assets, mut booted) = boot_one_panel_surface("").await;
+
+        let spec = std::fs::read(tree.modules().join("panel.brenn")).expect("the class module");
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            assets.path(),
+            "panel",
+            b"the-upgraded-artifact",
+            &spec,
+            Vec::new(),
+            true,
+            |_| {},
+        );
+        std::fs::write(
+            assets.path().join("brenn_panel.schema.json"),
+            b"{ this is not json",
+        )
+        .expect("the sidecar is writable");
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        assert!(
+            status.refusals[0].contains("schema sidecar")
+                && status.refusals[0].contains("not valid JSON"),
+            "{:?}",
+            status.refusals,
+        );
+        assert!(serves_surface(&booted, "deskbar"), "nothing was touched");
+    }
+
+    /// A stand-in page that leaves the way the surface door's session really
+    /// does: the registry slot goes first, and the terminal telemetry the route
+    /// owes is published *after* it, under the surface's own identity.
+    ///
+    /// The gap between the two is a close-frame flush to a real client, which
+    /// is tens to hundreds of milliseconds on anything but loopback; the sleep
+    /// stands in for it. The task reports whether that publish succeeded — a
+    /// reload that took the registration away while the page still owed a stamp
+    /// answers `MissingSender`, which is a panic at the real call site.
+    fn attach_a_session_that_owes_a_stamp(
+        booted: &Booted,
+        slug: &str,
+    ) -> tokio::task::JoinHandle<brenn_messaging::PublishResult> {
+        use brenn_attach_server::registry::{AttachSessionHandle, SessionCaps};
+
+        let handle = AttachSessionHandle::for_test(READER);
+        let mut close_rx = handle.close.subscribe();
+        let registry = booted.driver.env.attach_registry.clone();
+        let guard = registry
+            .try_register(slug, handle, SessionCaps::UNCAPPED)
+            .expect("uncapped registration");
+        let ticket = registry.drain_ticket(slug);
+        let messenger = Arc::clone(&booted.messenger);
+        let channel = format!("brenn:{SURFACE_PREFIX}.surface.{slug}.status");
+        let slug = slug.to_string();
+        tokio::spawn(async move {
+            let _ticket = ticket;
+            loop {
+                close_rx
+                    .changed()
+                    .await
+                    .expect("the registry holds the sender until this guard drops");
+                if close_rx.borrow_and_update().is_some() {
+                    break;
+                }
+            }
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            messenger
+                .publish_from_surface_platform(
+                    &slug,
+                    &channel,
+                    "{}",
+                    brenn_messaging::Urgency::Normal,
+                )
+                .await
+        })
+    }
+
+    /// **A retired surface keeps its wiring until its last page has finished
+    /// leaving.** The session releases its registry slot before the route
+    /// publishes the terminal stamp, and that publish resolves the surface's
+    /// own registration — so a wait that ended at "the slot list is empty"
+    /// would retire the writer out from under a publish that panics on any
+    /// answer but `Ok`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_surface_keeps_its_registration_until_the_stamp_is_written() {
+        let (tree, _assets, mut booted) = boot_one_panel_surface("").await;
+        let page = attach_a_session_that_owes_a_stamp(&booted, "deskbar");
+
+        tree.write(&document(&description_channels("deskbar", &["panel"])));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let published = page.await.expect("the stand-in page task");
+        assert!(
+            matches!(published, brenn_messaging::PublishResult::Ok { .. }),
+            "the page still owed a stamp when the reload took the wiring: {published:?}",
+        );
+        assert!(!holds_surface_registration(&booted, "deskbar"));
+        assert!(!serves_surface(&booted, "deskbar"));
+    }
+
+    /// **A kind nothing mounts moves the served roots and nothing else, and
+    /// the retained outcome says so.** The projection is identical, so the
+    /// verdict is `unchanged` — but the process is serving bytes it was not
+    /// serving a moment ago, and the retained body is the only evidence the
+    /// installer that just swapped the tree in ever sees.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kind_no_surface_mounts_is_named_on_the_unchanged_outcome() {
+        let (_tree, assets, mut booted) = boot_one_panel_surface("").await;
+
+        // A second kind arrives under the mount with no surface instantiating
+        // it — a bundle upgrade landing ahead of the document that uses it.
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            assets.path(),
+            "aside",
+            b"the-aside-artifact",
+            b"component Aside { abi = processor; requires = [dom]; }\n",
+            Vec::new(),
+            true,
+            |_| {},
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Unchanged, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.kinds_changed,
+            vec!["aside".to_string()],
+            "the one thing that moved has to be in the body",
+        );
+        assert!(
+            booted
+                .driver
+                .env
+                .surface_roots
+                .read()
+                .expect("the cell is uncontended")
+                .kinds
+                .contains_key("aside"),
+            "the roots the doors serve from are the ones just scanned",
+        );
+    }
+
+    /// **A kernel rewritten in place is refused.** The kernel carries no
+    /// manifest, so its root does not move when a sync or a rebuild overwrites
+    /// the pair under it — and a page of an untouched surface keeps running the
+    /// old bytes while every fresh load takes the new ones. That mixed state is
+    /// what the refusal exists for, so the comparison has to be of bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kernel_rewritten_under_an_unmoved_root_is_refused() {
+        let (_tree, assets, mut booted) = boot_one_panel_surface("").await;
+
+        std::fs::write(
+            assets.path().join(brenn_surface_server::KERNEL_ARTIFACT),
+            b"export function instantiate() { /* the next release */ }",
+        )
+        .expect("the kernel module is writable");
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        assert!(
+            status.refusals[0].contains("rewritten in place")
+                && status.refusals[0].ends_with(super::super::NEEDS_RESTART),
+            "{:?}",
+            status.refusals,
+        );
+        assert!(serves_surface(&booted, "deskbar"), "nothing was touched");
+    }
+
+    /// **A mount withdrawn from under a running surface's kind is refused.**
+    /// The surface is unchanged and its assets are gone; converging would mean
+    /// serving a page whose kind no root offers, so the honest answer is that
+    /// nothing happens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mount_withdrawn_from_under_a_running_surface_is_refused() {
+        let (_tree, _assets, mut booted) = boot_one_panel_surface("").await;
+
+        booted.mounts.uninstall(SURFACE_MOUNT);
+        booted.mounts.write();
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|line| line.contains("`surface/` tree")),
+            "{:?}",
+            status.refusals,
+        );
+        assert!(serves_surface(&booted, "deskbar"), "nothing was touched");
     }
 }

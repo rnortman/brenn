@@ -2,6 +2,76 @@
 
 All notable changes to Brenn are documented here.
 
+## [Unreleased]
+
+Reload covers the full deployment surface. A running server can now pick up new
+WASM component packages, new surface kinds, new surface instances, and new MQTT
+ingress subscriptions without restarting -- the four things the v0.20.0 reload
+left non-convergible that operators actually hit on every deploy. The unit of
+deployment is a "mount": one directory declared in a new mounts document that
+replaces the three `--modules`/`--components`/`--surface` flags and is re-read
+on every reload, so a bundle installed into a declared mount is live after a
+`systemctl --user reload` with no unit edit and no bounce.
+
+### Added
+
+- **Mounts.** A small `.brenn` document (`--mounts FILE`) declares the
+  directories the host reads components, surface assets, and packaged modules
+  from. Brenn's own release is a mount; each out-of-tree bundle is another.
+  Roots are derived from the mounts on every reload rather than fixed at boot,
+  so a bundle installed after the process started is visible to the next reload.
+  Two new subcommands: `brenn mounts` lists declared mounts and their on-disk
+  status (the bundle installer calls it), `brenn config-status` reads the
+  retained reload outcome off the database (the installer polls it to learn
+  whether a reload landed). The retired `--components` and `--surface` flags are
+  parse errors; `--modules` is accepted only on `config-check` and `config-diff`
+  for workstation use.
+- **Surface convergence.** Surfaces join channels, links, and WASM consumers as
+  convergible blocks. Adding a surface, changing one (including upgrading the
+  kind's assets under a mount), or removing one is applied in place. Open pages
+  of a changed surface receive close code 3002 and reload themselves; pages of a
+  removed surface receive 3003 and show "this surface has been retired". A page
+  that lands during the brief swap window gets a 503 with a meta-refresh rather
+  than an error. The retained `brenn:config.status` body reports
+  `surfaces_added`, `surfaces_removed`, `surfaces_changed`, and
+  `kinds_changed`.
+- **MQTT ingress convergence.** Adding or removing an `mqtt:` channel on reload
+  issues the broker SUBSCRIBE/UNSUBSCRIBE and wires or unwires the ingress
+  route. A binding on a client the process has no broker session for (because
+  the client was not referenced when it booted) is a stated refusal asking for
+  a restart, not a silent failure.
+- **Dev mounts generator** (`bazel/wasm/dev_mounts.sh`): synthesises a mounts
+  document and symlinked mount directories from build outputs, so `make
+  launchdev` and out-of-tree bundle repositories can run under the same
+  `--mounts` path the production host uses.
+
+### Changed
+
+- **Reload rule 1 generalized.** A subscriber on a moving channel entry is now
+  accepted when it is a surface the surface delta is also moving, not only a
+  WASM consumer.
+- **Kind fingerprints recorded unconditionally.** Every surface kind offered by
+  any mount is fingerprinted at boot and at every reload, whether or not a
+  surface currently instantiates it. A kind upgrade under a mount promotes
+  every surface mounting it to "changed" through the delta's kind closure.
+- **Consumer change identity is release content, not path.** A WASM package
+  whose world and digests are identical across a mount's versioned-tree swap is
+  left running; only a real artifact or specification change restarts it.
+- **Attach send budgets are swappable.** The per-principal rate-limit buckets
+  for surface attach sessions can be replaced or removed at reload without a
+  restart.
+
+### Fixed
+
+- **Reload rule 2 covers dynamically minted channels.** A channel address that
+  a dynamic MQTT subscription or an attach session created at runtime is now
+  refused if the reloaded document tries to declare the same address, rather
+  than hitting an assert in the commit path.
+- **Surface reconfigure swap-window page load.** A page that reloads itself on
+  close code 3002 and lands before the new runtime is installed gets a 503 with
+  a `<meta http-equiv="refresh">` document instead of an empty error page, so
+  the browser retries automatically.
+
 ## [0.20.0] — 2026-09-06
 
 A running server can now be told to re-read its config document and converge to

@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use brenn_dsl::roots::{display_list, scan_roots};
+use brenn_dsl::roots::{RootList, display_list, scan_roots};
 use serde::Deserialize;
 
 use crate::util::sha256_hex;
@@ -53,9 +53,10 @@ const WORLD_REPLAY: &str = "brenn:replay";
 /// Where to read about the contract when a component arrives without one.
 const CONTRACT_DOC: &str = "docs/component-packages.md";
 
-/// The flag that names the components root, for the messages that have to tell
-/// an operator which one is missing.
-const COMPONENTS_FLAG: &str = "--components";
+/// What a message calls the tree a component package is installed under. Where
+/// it comes from is the mounts document, not a flag: a host resolves packages
+/// under `<mount>/components/`, once per declared mount that offers one.
+const COMPONENTS_TREE: &str = "`components/` tree";
 
 /// One component package's binding record, as the build emits it.
 ///
@@ -112,6 +113,22 @@ pub struct Verified {
     /// processor-world package; `None` for a replay-world one, which carries no
     /// specification.
     pub spec_sha256: Option<String>,
+}
+
+impl Verified {
+    /// Whether two verifications bound the same release.
+    ///
+    /// Identity is the world and the two digests, and deliberately not the
+    /// paths: an install scheme that stages each release into a versioned tree
+    /// and swaps a symlink over it — which is what a mount is — moves both
+    /// paths on every install, including a re-deploy or a rollback whose bytes
+    /// are identical. Restarting a consumer for that would drop its in-memory
+    /// state for no change at all.
+    pub fn same_release(&self, other: &Self) -> bool {
+        self.world == other.world
+            && self.artifact_sha256 == other.artifact_sha256
+            && self.spec_sha256 == other.spec_sha256
+    }
 }
 
 /// The record's path within a package directory.
@@ -317,7 +334,7 @@ fn resolve_dir(components_roots: &[PathBuf], package: &str, what: &str) -> (Path
     assert!(
         hits.len() < 2,
         "boot: {what} names component package {package:?}, which is installed under more than \
-         one {COMPONENTS_FLAG} root: {}. A package ships with exactly one release; two copies \
+         one mount's {COMPONENTS_TREE}: {}. A package ships with exactly one release; two copies \
          mean a stale install or two bundles claiming one name. Remove or rename one. Refusing \
          to start (fail-fast on invalid config).",
         display_list(hits.iter().map(|(_, dir)| dir)),
@@ -325,11 +342,11 @@ fn resolve_dir(components_roots: &[PathBuf], package: &str, what: &str) -> (Path
     let Some(hit) = hits.pop() else {
         panic!(
             "boot: {what} names component package {package:?}, but {package} is not an installed \
-             package directory under any {COMPONENTS_FLAG} root (searched: {}). A configuration \
+             package directory under any mount's {COMPONENTS_TREE} (searched: {}). A configuration \
              may import any module the module roots ship, but only a component the release ships \
              as a backend package can be instantiated at top level — a surface kind ships its \
              module and no package. Check the name against the installed releases' components, \
-             or the {COMPONENTS_FLAG} roots this host was started with. Refusing to start \
+             or the mounts this host was declared with. Refusing to start \
              (fail-fast on invalid config).",
             display_list(components_roots),
         )
@@ -359,7 +376,7 @@ fn assert_package_name(package: &str, what: &str) {
     assert!(
         sole_normal,
         "boot: {what} names component package {package:?}, which is not a package name. A \
-         package name is one directory name under the {COMPONENTS_FLAG} root — empty names, \
+         package name is one directory name under a mount's {COMPONENTS_TREE} — empty names, \
          path separators, `.` and `..` all name a location instead, and where a component is \
          installed is not a fact a configuration states. Refusing to start (fail-fast on \
          invalid config).",
@@ -442,10 +459,10 @@ pub fn verify_replay(components_roots: &[PathBuf], package: &str, slug: &str) ->
 pub fn require_components_root<'a>(components_roots: &'a [PathBuf], what: &str) -> &'a [PathBuf] {
     assert!(
         !components_roots.is_empty(),
-        "boot: {what} loads an installed component package, but this host was started without \
-         {COMPONENTS_FLAG} <DIR>. Where components are installed is an environment fact the \
-         configuration never states, so it has to be named on the command line, once per \
-         installed release. Refusing to start (fail-fast on invalid config).",
+        "boot: {what} loads an installed component package, but no declared mount offers a \
+         {COMPONENTS_TREE}. Where components are installed is an environment fact the \
+         configuration never states, so it comes from the mounts document (`--mounts`), one \
+         mount per installed release. Refusing to start (fail-fast on invalid config).",
     );
     components_roots
 }
@@ -461,21 +478,22 @@ pub fn require_components_root<'a>(components_roots: &'a [PathBuf], what: &str) 
 /// canonicalization, so the same directory named twice is refused as one
 /// directory rather than as a duplicate of everything in it. Directory names
 /// only — a plain file in a root is the installer's refusal, not this one.
-pub fn assert_disjoint_components_roots(components_roots: &[PathBuf]) {
+pub fn assert_disjoint_components_roots(components_roots: &RootList) {
     let is_package = |entry: &std::fs::DirEntry| {
         if !entry.path().is_dir() {
             return None;
         }
         entry.file_name().to_str().map(str::to_string)
     };
-    let faults = scan_roots(COMPONENTS_FLAG, components_roots, is_package);
+    let faults = scan_roots(components_roots, is_package);
     assert!(
         faults.is_empty(),
-        "boot: the {COMPONENTS_FLAG} roots are not a set of distinct releases:\n{}\nRefusing to \
+        "boot: {} are not a set of distinct releases:\n{}\nRefusing to \
          start (fail-fast on invalid config).",
+        components_roots.source().all(),
         faults
             .iter()
-            .map(|fault| fault.describe(COMPONENTS_FLAG, "component package"))
+            .map(|fault| fault.describe(components_roots.source(), "component package"))
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -484,17 +502,19 @@ pub fn assert_disjoint_components_roots(components_roots: &[PathBuf]) {
 /// Refuse a components root that is not a directory, whatever the configuration
 /// goes on to load.
 ///
-/// Parity with the module root: a flag pointed at nothing is an operator error
-/// worth reporting at startup, not one that hides until some later release
-/// happens to configure a consumer.
-pub fn assert_components_root(components_root: &Path) {
-    assert!(
-        components_root.is_dir(),
-        "boot: {COMPONENTS_FLAG} names {}, which is not a directory. The components root holds \
-         one directory per installed component package. Refusing to start (fail-fast on invalid \
-         config).",
-        components_root.display(),
-    );
+/// Parity with the module root: a mount whose tree is not there is an operator
+/// error worth reporting at startup, not one that hides until some later
+/// release happens to configure a consumer.
+pub fn assert_components_roots(components_roots: &RootList) {
+    for root in components_roots.iter() {
+        assert!(
+            root.is_dir(),
+            "boot: {} is not a directory. A mount's {COMPONENTS_TREE} holds \
+             one directory per installed component package. Refusing to start (fail-fast on \
+             invalid config).",
+            components_roots.source().locate(root),
+        );
+    }
 }
 
 /// Read a package file, or die naming it and what it was.

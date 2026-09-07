@@ -35,6 +35,7 @@ mod integrations;
 mod invariants;
 mod load_config;
 mod mcp_servers;
+mod mounts;
 mod path_mapper;
 mod podman_args;
 mod primary;

@@ -35,6 +35,7 @@ use super::{
 /// the boot deliverability validator, and — for specs with subscriptions — a
 /// parked-notify delivery binding whose `Notify` is handed to the
 /// participant's drain task.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemParticipantSpec {
     /// Component name; the participant's identity is `system:<component>`.
     pub component: &'static str,

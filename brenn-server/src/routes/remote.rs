@@ -58,6 +58,9 @@ pub async fn remote_ws_handler(
     let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
     let active_channels = Arc::new(Mutex::new(HashSet::new()));
     let drain_notify = Arc::new(tokio::sync::Notify::new());
+    // The sender rides in the registry handle, so whoever holds the registry can
+    // close this session; the receiver goes to the session task.
+    let (close_tx, close_rx) = tokio::sync::watch::channel(None);
     let account = runtime.profile.attacher().as_str().to_string();
     let handle = AttachSessionHandle {
         session_id,
@@ -65,6 +68,7 @@ pub async fn remote_ws_handler(
         push_tx,
         active_channels: active_channels.clone(),
         drain_notify: drain_notify.clone(),
+        close: close_tx,
     };
     let caps = runtime.profile.session_caps();
     let guard = match state
@@ -130,6 +134,7 @@ pub async fn remote_ws_handler(
                 push_rx,
                 active_channels,
                 drain_notify,
+                close_rx,
                 socket,
             })
             .await;

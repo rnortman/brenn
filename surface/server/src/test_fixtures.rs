@@ -321,3 +321,137 @@ pub fn project_surface_subscribers(
         })
         .collect()
 }
+
+// ── deployed surface asset trees ─────────────────────────────────────────────
+//
+// The one place test code constructs the on-disk shape `validate_surface_assets`
+// reads. Shared rather than per-crate because a reload test and a boot test that
+// disagreed about what a deployed kind looks like would be testing two different
+// deployments.
+
+fn touch(dir: &std::path::Path, name: &str) {
+    std::fs::write(dir.join(name), b"").expect("write test artifact");
+}
+
+/// The kernel module pair every surface page references, at the root of a
+/// release's surface tree. Empty files: nothing reads their contents.
+pub fn write_kernel_pair(dir: &std::path::Path) {
+    touch(dir, "brenn_surface_kernel.js");
+    touch(dir, "brenn_surface_kernel_bg.wasm");
+}
+
+/// A conforming transpiled tree for `kind` that imports nothing, so it
+/// satisfies asset validation under a component holding no grants.
+pub fn write_valid_kind(dir: &std::path::Path, kind: &str) {
+    write_processor_tree(dir, kind, &[], |_| {});
+}
+
+/// Write a conforming transpiled tree for `kind`: a stand-in component
+/// artifact, one transpiled file, a stand-in packaged specification, and a
+/// manifest whose `source_sha256` and `spec_sha256` actually hash those bytes.
+/// `imports` and any manifest edits are applied by the caller through `tweak`
+/// before serialization, so each failure test perturbs exactly one field of an
+/// otherwise valid tree.
+pub fn write_processor_tree(
+    dist: &std::path::Path,
+    kind: &str,
+    imports: &[&str],
+    tweak: impl FnOnce(&mut serde_json::Value),
+) {
+    // The manifest carries fully qualified import names (as the build emitter
+    // does). A caller passing a bare interface name gets it qualified under
+    // the processor package; a caller passing an already-qualified name (to
+    // exercise a foreign namespace) keeps it verbatim.
+    let qualified: Vec<String> = imports
+        .iter()
+        .map(|i| {
+            if i.contains(':') {
+                (*i).to_string()
+            } else {
+                format!("brenn:processor/{i}")
+            }
+        })
+        .collect();
+    let component_bytes = format!("component-bytes-for-{kind}").into_bytes();
+    write_processor_tree_from_bytes(
+        dist,
+        kind,
+        &component_bytes,
+        &spec_bytes_for(kind),
+        qualified,
+        true,
+        tweak,
+    );
+}
+
+/// A stand-in authored specification for `kind`. Boot validation binds
+/// hashes, never parses the document, so a per-kind byte string is a
+/// faithful stand-in and keeps two kinds' specifications distinguishable.
+pub fn spec_bytes_for(kind: &str) -> Vec<u8> {
+    format!("// specification for {kind}\n").into_bytes()
+}
+
+/// What a configured instance of `kind` carries as its class hash when the
+/// configuration was compiled against the very bytes the fixture tree
+/// packages — the bound case, computed rather than pasted.
+pub fn fixture_spec_hash(kind: &str) -> String {
+    brenn_lib::util::sha256_hex(&spec_bytes_for(kind))
+}
+
+/// The one place test code constructs a deployed processor tree and its
+/// manifest schema. `component_bytes` are the shipped artifact (a stand-in
+/// string for the synthetic tests, real artifact bytes for the real-artifact
+/// test), `spec_bytes` the packaged specification, `imports` the profile
+/// verbatim, and `with_module` controls whether a stand-in transpiled
+/// `<kind>.js` is written and listed.
+pub fn write_processor_tree_from_bytes(
+    dist: &std::path::Path,
+    kind: &str,
+    component_bytes: &[u8],
+    spec_bytes: &[u8],
+    imports: Vec<String>,
+    with_module: bool,
+    tweak: impl FnOnce(&mut serde_json::Value),
+) {
+    let dir = crate::processor_assets::kind_dir(dist, kind);
+    std::fs::create_dir_all(&dir).expect("create processor dir");
+    let component_name = format!("{kind}.component.wasm");
+    std::fs::write(dir.join(&component_name), component_bytes).expect("write component");
+
+    let mut files = Vec::new();
+    if with_module {
+        let module = format!("{kind}.js");
+        std::fs::write(dir.join(&module), b"export function instantiate() {}")
+            .expect("write module");
+        files.push(module);
+    }
+    files.push(component_name);
+
+    // The build stages the specification before the emitter's file walk, so
+    // the record lists it like any other staged file.
+    let spec_name = format!("{kind}.spec.brenn");
+    std::fs::write(dir.join(&spec_name), spec_bytes).expect("write spec");
+    files.push(spec_name.clone());
+
+    use sha2::Digest as _;
+    let mut manifest = serde_json::json!({
+        "v": 2,
+        "kind": kind,
+        "source_sha256": hex::encode(sha2::Sha256::digest(component_bytes)),
+        "jco_version": PINNED_JCO_VERSION_FOR_TESTS,
+        "spec": spec_name,
+        "spec_sha256": hex::encode(sha2::Sha256::digest(spec_bytes)),
+        "imports": imports,
+        "files": files,
+    });
+    tweak(&mut manifest);
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+}
+
+/// Provenance only — boot validation never checks it (the source hash is the
+/// staleness authority), so any well-formed value serves.
+const PINNED_JCO_VERSION_FOR_TESTS: &str = "1.4.0";

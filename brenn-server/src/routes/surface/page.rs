@@ -10,13 +10,12 @@
 
 use axum::Extension;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::Response;
 use brenn_db::auth::session::Session;
 use brenn_surface_contract::{KERNEL_ARTIFACT, SURFACE_ROOT_ID, processor_module_path};
 use serde::Serialize;
 
-use super::authorize_surface;
+use super::{SurfaceDenial, authorize_surface};
 use crate::client_ip::ClientIp;
 use crate::router::RelaxedWasmCsp;
 use crate::routes::app::page_html;
@@ -66,7 +65,7 @@ pub async fn surface_page(
     Extension(session): Extension<Session>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
     State(state): State<AppState>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, SurfaceDenial> {
     // 1-2. Surface must exist and the user must pass its access check.
     let runtime = authorize_surface(&state, &slug, &session.user.username, ip, false)?;
 
@@ -151,7 +150,6 @@ pub async fn surface_page(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use crate::test_support::TEST_BUILD_ID;
     use axum::body::Body;
@@ -164,7 +162,7 @@ mod tests {
 
     use crate::router::build_router;
     use crate::test_support::http::{body_string, setup_authenticated_user};
-    use crate::test_support::state::test_state;
+    use crate::test_support::state::{test_state, test_state_with_capturing_alerter};
     use brenn_surface_server::fixtures_config::SurfaceFixture;
     use brenn_surface_server::test_fixtures::{TEST_MAX_BODY_BYTES, install_surface_runtimes};
 
@@ -180,9 +178,30 @@ mod tests {
     /// Build a router with the given surface installed and a seeded, logged-in
     /// user. Returns `(router, db, session_token)`.
     async fn surface_router(resolved: ResolvedSurface) -> (axum::Router, brenn_db::Db, String) {
+        let (router, db, token, _state) = surface_router_with_state(resolved).await;
+        (router, db, token)
+    }
+
+    /// As [`surface_router`], plus the state handle, so the caller can mutate
+    /// the surface table against a live router.
+    async fn surface_router_with_state(
+        resolved: ResolvedSurface,
+    ) -> (axum::Router, brenn_db::Db, String, crate::state::AppState) {
         let db = crate::test_support::init_db_memory();
-        let mut state = test_state(&db);
-        state.surfaces = Arc::new(install_surface_runtimes(
+        let state = test_state(&db);
+        let (router, token) = router_over(&db, state.clone(), resolved).await;
+        (router, db, token, state)
+    }
+
+    /// Install the surface on the given state and stand a router and a logged-in
+    /// user over it. Split out so a case can bring its own state — a capturing
+    /// alerter, say — and still get the fixture's wiring.
+    async fn router_over(
+        db: &brenn_db::Db,
+        state: crate::state::AppState,
+        resolved: ResolvedSurface,
+    ) -> (axum::Router, String) {
+        state.surfaces.set_runtimes(install_surface_runtimes(
             vec![resolved],
             // The page renders from the resolved bindings alone, but the surface
             // carries them, and boot gives every wire-binding surface a
@@ -196,8 +215,123 @@ mod tests {
         ));
         let router = build_router(state, None, 0, 2576)
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
-        let (token, _) = setup_authenticated_user(&db).await;
-        (router, db, token)
+        let (token, _) = setup_authenticated_user(db).await;
+        (router, token)
+    }
+
+    /// One authenticated GET of a surface page.
+    async fn get_surface(
+        router: &axum::Router,
+        slug: &str,
+        token: &str,
+    ) -> axum::response::Response {
+        router
+            .clone()
+            .oneshot(
+                Request::get(format!("/surface/{slug}"))
+                    .header("cookie", format!("brenn_session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The retire→start window of a reload's surface swap. A page arriving in
+    /// it is a legitimate page, so it is told to come back rather than told the
+    /// surface does not exist — and no security event is emitted, which is what
+    /// keeps first-party traffic out of fail2ban. The retired slug afterwards is
+    /// the contrast: that one *is* an unrecognized URL and does raise the event,
+    /// so the empty capture above is the mid-swap arm and not a rig that never
+    /// alerts.
+    #[tokio::test]
+    async fn a_surface_mid_swap_answers_503_with_a_retry_hint_and_no_security_event() {
+        let db = crate::test_support::init_db_memory();
+        let (state, alerts, _handle) = test_state_with_capturing_alerter(&db);
+        let flusher = state.alert_dispatcher.clone();
+        let (router, token) = router_over(&db, state.clone(), deskbar(vec![])).await;
+        assert_eq!(
+            get_surface(&router, "deskbar", &token).await.status(),
+            StatusCode::OK
+        );
+
+        state.surfaces.begin_reconfigure("deskbar");
+        let response = get_surface(&router, "deskbar", &token).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("retry-after").unwrap(),
+            crate::routes::surface::RECONFIGURING_RETRY_AFTER_SECS
+                .to_string()
+                .as_str(),
+            "the page is told how long the window is expected to be"
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8",
+            "a navigation is answered with a document, not an empty body"
+        );
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store",
+            "the swap-window document is built by the shared page builder, so it inherits the \
+             cache policy every other page this server emits has"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains(&format!(
+                "<meta http-equiv=\"refresh\" content=\"{}\">",
+                crate::routes::surface::RECONFIGURING_RETRY_AFTER_SECS
+            )),
+            "the browser acts on the refresh, not on Retry-After: {body}"
+        );
+        assert!(
+            !body.contains("<script"),
+            "the swap-window document is inert markup: {body}"
+        );
+        flusher.flush().await;
+        assert!(
+            alerts.lock().unwrap().is_empty(),
+            "a page reloading through a config change is not a probe: {:?}",
+            alerts.lock().unwrap(),
+        );
+
+        state.surfaces.retire("deskbar");
+        assert_eq!(
+            get_surface(&router, "deskbar", &token).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        flusher.flush().await;
+        assert!(
+            !alerts.lock().unwrap().is_empty(),
+            "a request for a slug that does not exist is the probe signal",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_swapped_surface_serves_again_and_a_retired_one_404s() {
+        let (router, _db, token, state) = surface_router_with_state(deskbar(vec![])).await;
+        let runtime = match state.surfaces.lookup("deskbar") {
+            crate::state::SurfaceLookup::Ready(runtime) => runtime,
+            _ => panic!("the fixture installed the surface"),
+        };
+
+        state.surfaces.begin_reconfigure("deskbar");
+        state.surfaces.install("deskbar".to_string(), runtime);
+        assert_eq!(
+            get_surface(&router, "deskbar", &token).await.status(),
+            StatusCode::OK,
+            "installing the replacement clears the mid-swap mark"
+        );
+
+        state.surfaces.retire("deskbar");
+        assert_eq!(
+            get_surface(&router, "deskbar", &token).await.status(),
+            StatusCode::NOT_FOUND,
+            "a retired slug no longer exists, and saying so is the truth"
+        );
     }
 
     #[tokio::test]

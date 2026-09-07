@@ -16,6 +16,11 @@ policy_srcs()
 # test both read records, and a scrape that reaches one and not the other goes
 # on matching nothing, which reads as a field that is not stated.
 #
+# `dev_mounts.sh` is exported because a dev server's roots come from a mounts
+# document and nothing a build produces is mount-shaped: brenn's own `launchdev`
+# and `e2e` targets synthesize one, and so must every out-of-tree component
+# repository's `run`/`e2e`, which reach this through `$(BRENN_EXEC)`.
+#
 # `wit_lib.sh` is the artifact-import scrape, exported for the same reason:
 # `//surface`'s manifest emitter reads the same `wasm-tools` output, so one
 # implementation, two callers, and a wasm-tools format change cannot reach one
@@ -23,6 +28,7 @@ policy_srcs()
 exports_files([
     "bundle_assemble.sh",
     "config_fit_refusal.sh",
+    "dev_mounts.sh",
     "deployed_components_check.sh",
     "emit_package.sh",
     "grant_parity_check.sh",

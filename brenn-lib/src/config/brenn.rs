@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use brenn_dsl::diag::Diagnostic;
-use brenn_dsl::{DocumentInputs, SourceFile};
+use brenn_dsl::roots::RootList;
+use brenn_dsl::{DocumentInputs, DocumentRole, SourceFile};
 
 use super::alerting::AlertingConfig;
 use super::app::AppConfigRaw;
@@ -357,7 +358,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
 /// - `path` is `Some` and its extension is not `brenn`
 /// - `path` is `None` and whether the fallback name exists cannot be determined
 /// - `path` is `None` and the fallback that exists fails to load
-pub fn load_config(path: Option<&Path>, module_roots: &[PathBuf]) -> LoadedDocument {
+pub fn load_config(path: Option<&Path>, module_roots: &RootList) -> LoadedDocument {
     let cwd = std::env::current_dir().expect("failed to determine current directory");
     load_config_from(path, module_roots, &cwd)
 }
@@ -370,7 +371,7 @@ pub fn load_config(path: Option<&Path>, module_roots: &[PathBuf]) -> LoadedDocum
 /// document at all, so the struct is built only once the fallback has found one.
 pub(crate) fn load_config_from(
     path: Option<&Path>,
-    module_roots: &[PathBuf],
+    module_roots: &RootList,
     fallback_dir: &Path,
 ) -> LoadedDocument {
     let root = match path {
@@ -382,7 +383,8 @@ pub(crate) fn load_config_from(
     };
     let inputs = DocumentInputs {
         root,
-        module_roots: module_roots.to_vec(),
+        module_roots: module_roots.clone(),
+        role: DocumentRole::Deployment,
     };
     // Boot is `check_config` plus the one thing a boot does that a check does
     // not: it dies on the report. One dispatch, so what the check tool accepts

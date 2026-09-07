@@ -631,6 +631,23 @@ pub const MAX_LOG_SOURCE_BYTES: usize = 256;
 /// because both ends of *that* check compile against this crate.
 pub const STALE_BUILD_CLOSE_CODE: u16 = 3001;
 
+/// WS close code (same private range) signalling that the surface this page is
+/// attached to has been reconfigured under it: its resolved value, one of its
+/// channels, or the bytes of its kind moved, so the page manifest and the
+/// bindings document the page is running against are both stale. The kernel
+/// maps this to a capped page reload, which re-reads both.
+///
+/// A close rather than a `WiringChanged` document because the runtime the page
+/// would reload *into* is swapped after the close: a page that reloaded first
+/// would read the outgoing manifest.
+pub const SURFACE_RECONFIGURED_CLOSE_CODE: u16 = 3002;
+
+/// WS close code (same private range) signalling that the surface no longer
+/// exists: the deployment document that declared it does not any more. Terminal
+/// — the kernel renders the retired message and does not reconnect, and the
+/// route answers 404 for the slug from here on.
+pub const SURFACE_RETIRED_CLOSE_CODE: u16 = 3003;
+
 /// Maximum number of subscription bindings a single `[[surface]]` may declare.
 ///
 /// The kernel composes one `Subscribe` per bound channel in a single

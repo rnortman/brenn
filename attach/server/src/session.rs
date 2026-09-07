@@ -29,7 +29,7 @@ use brenn_messaging::Messenger;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity as NativeAlertSeverity};
 use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use futures::{Sink, Stream, StreamExt};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{Instrument, info, info_span, warn};
 use uuid::Uuid;
@@ -39,7 +39,7 @@ use super::publish::{
     PublishBatchRequest, PublishRequest, admit_attribution_or_violate, handle_publish,
     handle_publish_batch, seed_deferred_views,
 };
-use super::registry::{AttachRegistry, AttachSessionGuard, SessionPush};
+use super::registry::{AttachRegistry, AttachSessionGuard, CloseReason, SessionPush};
 use super::socket::{
     HELLO_TIMEOUT, Handshake, InboundError, classify_read_error, read_client_hello, server_hello,
     welcome, writer_task,
@@ -359,6 +359,10 @@ pub struct AttachSessionParams<S> {
     pub active_channels: Arc<Mutex<HashSet<String>>>,
     /// Drain nudge, notified by the router to flush parked/quiet rows.
     pub drain_notify: Arc<Notify>,
+    /// Host-initiated close, paired with the `close` sender in this session's
+    /// registry handle. A reason arriving here ends the read loop and is handed
+    /// to the writer as the close frame.
+    pub close_rx: watch::Receiver<Option<CloseReason>>,
     pub socket: S,
 }
 
@@ -427,16 +431,21 @@ where
         mut push_rx,
         active_channels,
         drain_notify,
+        mut close_rx,
         socket,
     } = params;
     let heartbeat = Duration::from_secs(u64::from(heartbeat_secs));
 
     let (sink, mut ws_stream) = socket.split();
     let (tx, rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE_FRAMES);
+    // The writer owns the sink, so a close frame is the writer's to send: this
+    // task decides the reason and hands it over.
+    let (writer_close_tx, writer_close_rx) = oneshot::channel::<CloseReason>();
     // Instrument the writer with the session span so its logs carry the same
     // attacher/session/account/ip attribution as this task's.
-    let writer =
-        tokio::spawn(writer_task(sink, rx, heartbeat).instrument(tracing::Span::current()));
+    let writer = tokio::spawn(
+        writer_task(sink, rx, writer_close_rx, heartbeat).instrument(tracing::Span::current()),
+    );
 
     // The shared per-connection context. It owns `tx`, so dropping it at teardown
     // closes the writer channel and exits the writer.
@@ -465,15 +474,27 @@ where
     .await
     {
         Opening::Attached => {
-            read_frames(
+            match read_frames(
                 &ctx,
                 &mut ws_stream,
                 &mut push_rx,
                 &drain_notify,
+                &mut close_rx,
                 heartbeat,
                 &mut state,
             )
             .await
+            {
+                ReadExit::Peer => None,
+                ReadExit::Violation(detail) => Some(detail),
+                ReadExit::HostClose(reason) => {
+                    // Hand the reason over before the context drops: once the
+                    // context drops, the writer channel closes, so the close
+                    // frame must precede that.
+                    let _ = writer_close_tx.send(reason);
+                    None
+                }
+            }
         }
         Opening::Closed(detail) => detail,
     };
@@ -584,19 +605,33 @@ where
     Opening::Attached
 }
 
+/// Why the read loop stopped. Exactly one of these is true of any exit, which
+/// is why it is one value: a violation and a host close are different endings,
+/// and a caller must be made to say which it is handling.
+enum ReadExit {
+    /// The peer hung up, the socket died, or liveness reaped the attachment.
+    /// Nothing to report and nothing to send.
+    Peer,
+    /// The attacher broke the protocol, with the rendered detail the security
+    /// event carries.
+    Violation(String),
+    /// The host asked for this session to end, with the reason the peer is owed
+    /// in a close frame.
+    HostClose(CloseReason),
+}
+
 /// Read the socket until the attachment ends, servicing the three other things
 /// that can wake this task: pushes from the router, the eager-wake drain nudge,
 /// and the liveness tick.
-///
-/// Returns the rendered security detail iff the attachment ended on a violation.
 async fn read_frames<St>(
     ctx: &AttachSessionCtx,
     ws_stream: &mut St,
     push_rx: &mut mpsc::Receiver<SessionPush>,
     drain_notify: &Notify,
+    close_rx: &mut watch::Receiver<Option<CloseReason>>,
     heartbeat: Duration,
     state: &mut SessionState,
-) -> Option<String>
+) -> ReadExit
 where
     St: Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
@@ -630,7 +665,7 @@ where
                 )
                 .await
                 {
-                    return None;
+                    return ReadExit::Peer;
                 }
             }
             // Eager-wake nudge: serve every active subscription its suffix. The
@@ -652,7 +687,7 @@ where
                     )
                     .await
                 {
-                    return None;
+                    return ReadExit::Peer;
                 }
                 if let FrameOutcome::Disconnect = drain_all(
                     ctx,
@@ -662,7 +697,7 @@ where
                 )
                 .await
                 {
-                    return None;
+                    return ReadExit::Peer;
                 }
             }
             incoming = ws_stream.next() => {
@@ -671,15 +706,15 @@ where
                         state.counters.frames_in += 1;
                         match handle_client_frame(ctx, text.as_str(), state).await {
                             FrameOutcome::Continue => last_inbound = Instant::now(),
-                            FrameOutcome::Violation(detail) => return Some(detail),
+                            FrameOutcome::Violation(detail) => return ReadExit::Violation(detail),
                             // Writer gone (socket died mid-send): tear down.
-                            FrameOutcome::Disconnect => return None,
+                            FrameOutcome::Disconnect => return ReadExit::Peer,
                         }
                     }
                     // The protocol is JSON text in both directions, so a binary
                     // frame is not a frame this attachment could have meant.
                     Some(Ok(Message::Binary(_))) => {
-                        return Some(ctx.violation_detail("binary frame"));
+                        return ReadExit::Violation(ctx.violation_detail("binary frame"));
                     }
                     // Inbound pings are auto-ponged by axum; an inbound pong is
                     // the peer answering our liveness probe.
@@ -688,25 +723,33 @@ where
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         info!("attachment closed by peer");
-                        return None;
+                        return ReadExit::Peer;
                     }
                     Some(Err(e)) => {
                         return match classify_read_error(e) {
-                            InboundError::Oversized => {
-                                Some(ctx.violation_detail("inbound frame exceeds size cap"))
-                            }
+                            InboundError::Oversized => ReadExit::Violation(
+                                ctx.violation_detail("inbound frame exceeds size cap"),
+                            ),
                             InboundError::Transport(detail) => {
                                 warn!("attachment WS read error: {detail}");
-                                None
+                                ReadExit::Peer
                             }
                         };
                     }
                 }
             }
+            // Host-initiated close. Must leave through the ordinary detach
+            // path so counters, the registry slot and the route's terminal
+            // action run exactly as on a peer hangup.
+            Ok(()) = close_rx.changed() => {
+                if let Some(reason) = close_rx.borrow_and_update().clone() {
+                    return ReadExit::HostClose(reason);
+                }
+            }
             _ = liveness.tick() => {
                 if last_inbound.elapsed() > reap_after {
                     info!("attachment reaped: no inbound liveness within 3x heartbeat");
-                    return None;
+                    return ReadExit::Peer;
                 }
             }
         }

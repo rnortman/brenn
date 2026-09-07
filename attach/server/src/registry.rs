@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use brenn_attach_proto::DeferredViewEntry;
 use brenn_lib::messaging::MessageEnvelope;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -71,6 +71,36 @@ pub struct LiveDelivery {
     pub retained_seq: u64,
 }
 
+/// A host-initiated close of one live session: the WS close code the peer sees
+/// and the short text carried beside it.
+///
+/// Opaque to the registry and to the session, which only relay it: what a code
+/// means is the route's contract with its own client, and the attach transport
+/// has no application layer to name one. Both fields are peer-visible, so the
+/// text is a fixed host string, never anything an attacher supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseReason {
+    /// RFC 6455 §7.4.2 private-range code (3000-3999).
+    pub code: u16,
+    /// Short reason text, inside the 123-byte websocket close-reason limit.
+    pub detail: String,
+}
+
+impl CloseReason {
+    /// The websocket close-reason field is capped at 123 bytes; a longer one is
+    /// a protocol error rather than a truncated message, so the constructor is
+    /// where that is caught.
+    pub fn new(code: u16, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        assert!(
+            detail.len() <= 123,
+            "CloseReason: reason text is {} bytes, over the websocket close-reason limit of 123",
+            detail.len()
+        );
+        Self { code, detail }
+    }
+}
+
 /// Session caps enforced by `try_register`. A struct (not two adjacent
 /// `usize` params) so call sites cannot transpose the shared and per-account
 /// caps.
@@ -109,6 +139,17 @@ impl SessionCaps {
 #[derive(Clone, Default)]
 pub struct AttachRegistry {
     inner: Arc<Mutex<HashMap<String, Vec<Arc<AttachSessionHandle>>>>>,
+    /// Per-attacher count of sessions that have released their registry slot
+    /// and whose route has not finished the work it owes on their behalf.
+    ///
+    /// Separate from `inner` because the two answer different questions. A cap
+    /// is about how many sockets are open, and a draining session's socket is
+    /// closed — counting it would refuse a reconnecting page a slot it is
+    /// entitled to. A host waiting for an attacher to go silent is asking
+    /// something else: the terminal action a route runs after its session
+    /// returns still publishes under the attacher's identity, so an attacher
+    /// with a draining session is not silent yet.
+    draining: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 /// Per-connection record for one attached session.
@@ -135,6 +176,16 @@ pub struct AttachSessionHandle {
     /// Eager-wake nudge: the router notifies it so the session runs a drain pass
     /// (flushing quiet/parked rows the live path did not carry).
     pub drain_notify: Arc<Notify>,
+    /// Host-initiated close. The session task holds the receiving half and exits
+    /// through its normal detach path when a reason lands here, so a close costs
+    /// the same teardown as a peer hangup — counters, terminal stamp, registry
+    /// slot — and differs only in the frame the peer is sent.
+    ///
+    /// A `watch` and not a `oneshot` because the sender is shared: a handle is
+    /// cloned out of the registry by whoever is closing, and a second closer
+    /// arriving on a session already asked to leave must not panic on a consumed
+    /// channel. Last write wins; the session reads once.
+    pub close: watch::Sender<Option<CloseReason>>,
 }
 
 impl AttachSessionHandle {
@@ -170,6 +221,7 @@ impl AttachSessionHandle {
             push_tx,
             active_channels: Arc::new(Mutex::new(HashSet::new())),
             drain_notify: Arc::new(Notify::new()),
+            close: watch::channel(None).0,
         }
     }
 }
@@ -250,10 +302,90 @@ impl AttachRegistry {
         }
     }
 
-    /// Count of sessions attached to `attacher`.
+    /// Ask every session attached to `attacher` to close with `reason`, and
+    /// report how many were asked.
+    ///
+    /// Asks, and does not wait: each session leaves through its own task's
+    /// detach path, which sends the close frame, publishes whatever its route's
+    /// terminal action owes and releases its registry slot. A caller that needs
+    /// the attacher quiet before it proceeds polls [`AttachRegistry::count`] to
+    /// zero.
+    ///
+    /// A session already asked to close is asked again harmlessly: the session
+    /// reads the value once and the second write lands on a receiver nobody is
+    /// waiting on any more.
+    pub fn close_all(&self, attacher: &str, reason: &CloseReason) -> usize {
+        let sessions = self.sessions(attacher);
+        for handle in &sessions {
+            // The receiver lives in the session task, which drops it only as it
+            // exits — a send error therefore means "already gone", which is the
+            // outcome asked for.
+            let _ = handle.close.send(Some(reason.clone()));
+        }
+        sessions.len()
+    }
+
+    /// Count of sessions attached to `attacher`. Draining sessions are not
+    /// counted: their slot is released and their socket is gone.
     pub fn count(&self, attacher: &str) -> usize {
         let map = self.inner.lock().expect("attach_registry poisoned");
         map.get(attacher).map_or(0, Vec::len)
+    }
+
+    /// Whether `attacher` has neither an attached session nor a draining one.
+    ///
+    /// What a host asks before it takes an attacher's wiring away. A session
+    /// that has left the registry may still owe its route a publish under the
+    /// attacher's identity — the terminal telemetry a surface writes when its
+    /// last page goes — so "the slot list is empty" is the wrong question and
+    /// this is the right one.
+    pub fn is_quiet(&self, attacher: &str) -> bool {
+        if self.count(attacher) != 0 {
+            return false;
+        }
+        let draining = self.draining.lock().expect("attach_registry poisoned");
+        draining.get(attacher).copied().unwrap_or(0) == 0
+    }
+
+    /// Mark one session of `attacher` as owing post-session work, until the
+    /// returned ticket is dropped.
+    ///
+    /// Taken by the route *before* it hands the session off, so there is no
+    /// moment between the session releasing its registry slot and the ticket
+    /// existing. Released when the route's terminal action has run.
+    pub fn drain_ticket(&self, attacher: &str) -> AttachDrainTicket {
+        let mut draining = self.draining.lock().expect("attach_registry poisoned");
+        *draining.entry(attacher.to_string()).or_insert(0) += 1;
+        drop(draining);
+        AttachDrainTicket {
+            registry: self.clone(),
+            attacher: attacher.to_string(),
+        }
+    }
+}
+
+/// Held by a route for as long as one of its sessions owes work that publishes
+/// under the attacher's identity. While one exists,
+/// [`AttachRegistry::is_quiet`] answers `false` for that attacher.
+pub struct AttachDrainTicket {
+    registry: AttachRegistry,
+    attacher: String,
+}
+
+impl Drop for AttachDrainTicket {
+    fn drop(&mut self) {
+        let mut draining = self
+            .registry
+            .draining
+            .lock()
+            .expect("attach_registry poisoned");
+        let Some(count) = draining.get_mut(&self.attacher) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            draining.remove(&self.attacher);
+        }
     }
 }
 
@@ -307,6 +439,70 @@ mod tests {
             attribution: Some(attribution.to_string()),
             entries: Vec::new(),
         }
+    }
+
+    /// The registry slot and the route's post-session work are two facts, and
+    /// a host taking an attacher's wiring away has to wait for both. A slot
+    /// released while the route still owes a publish under the attacher's
+    /// identity leaves `count` at zero and the attacher anything but quiet.
+    #[test]
+    fn a_drain_ticket_keeps_an_attacher_from_reading_quiet() {
+        let registry = AttachRegistry::default();
+        assert!(registry.is_quiet("deskbar"));
+
+        let guard = registry
+            .try_register("deskbar", handle_for("operator"), UNCAPPED)
+            .unwrap();
+        let ticket = registry.drain_ticket("deskbar");
+        assert!(!registry.is_quiet("deskbar"));
+
+        drop(guard);
+        assert_eq!(
+            registry.count("deskbar"),
+            0,
+            "the slot is free for a reattach"
+        );
+        assert!(
+            !registry.is_quiet("deskbar"),
+            "the route still owes this attacher a publish",
+        );
+        assert!(registry.is_quiet("sidebar"), "the ticket is scoped");
+
+        drop(ticket);
+        assert!(registry.is_quiet("deskbar"));
+    }
+
+    /// Two sessions draining at once are two tickets, and the attacher is quiet
+    /// only when both are done — a per-attacher flag would go quiet on the
+    /// first.
+    #[test]
+    fn two_drain_tickets_both_have_to_go() {
+        let registry = AttachRegistry::default();
+        let first = registry.drain_ticket("deskbar");
+        let second = registry.drain_ticket("deskbar");
+        drop(first);
+        assert!(!registry.is_quiet("deskbar"));
+        drop(second);
+        assert!(registry.is_quiet("deskbar"));
+    }
+
+    /// What the reload's wait relies on when it re-asks on every poll: a
+    /// session that registered after an earlier `close_all` took its snapshot
+    /// is closed by the next one. Without the re-ask that session is a page
+    /// nobody told to leave, holding an unbounded wait open.
+    #[test]
+    fn a_session_registered_after_a_close_is_closed_by_the_next_one() {
+        let registry = AttachRegistry::default();
+        let reason = CloseReason::new(3002, "surface reconfigured");
+        assert_eq!(registry.close_all("deskbar", &reason), 0);
+
+        let handle = handle_for("operator");
+        let mut close_rx = handle.close.subscribe();
+        let _guard = registry.try_register("deskbar", handle, UNCAPPED).unwrap();
+        assert_eq!(*close_rx.borrow_and_update(), None);
+
+        assert_eq!(registry.close_all("deskbar", &reason), 1);
+        assert_eq!(close_rx.borrow_and_update().as_ref(), Some(&reason));
     }
 
     #[test]

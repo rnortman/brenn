@@ -197,7 +197,7 @@ impl AttachClient {
                 backoff_jitter_seed: 0x5eed_c0de,
                 // No close code means anything special to a conformance run:
                 // every peer close is an ordinary drop to reconnect from.
-                terminal_close_code: None,
+                terminal_close_codes: Vec::new(),
             },
             connector,
         );

@@ -9,9 +9,9 @@
 //! stamped from assemblies, refactored any other way — is still the config they
 //! were running.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use brenn_lib::config::{BrennConfig, load_config, sort_order_dead_collections};
+use brenn_lib::config::{BrennConfig, RootList, load_config, sort_order_dead_collections};
 use similar::TextDiff;
 
 /// Load both files, compare, print the verdict. Returns whether they are equal,
@@ -25,7 +25,7 @@ use similar::TextDiff;
 ///
 /// Panics if either file fails to load — the differ compares valid configs, and
 /// an invalid one is a louder failure than a diff.
-pub fn run_config_diff(a: &Path, b: &Path, module_roots: &[PathBuf]) -> bool {
+pub fn run_config_diff(a: &Path, b: &Path, module_roots: &RootList) -> bool {
     let config_a = load_config(Some(a), module_roots).config;
     let config_b = load_config(Some(b), module_roots).config;
     let (equal, rendering) = diff(
@@ -168,7 +168,7 @@ channel alerts at "brenn:alice-alerts" {
 }
 "#,
         );
-        assert!(run_config_diff(&a, &b, &[]));
+        assert!(run_config_diff(&a, &b, &Default::default()));
     }
 
     /// The packaged module both sides of the diff reach for, and the two
@@ -231,7 +231,7 @@ new alice_sink: Sink {{
     #[test]
     fn both_sides_of_a_diff_resolve_against_the_module_root() {
         let (_dir, modules, a, same, other) = packaged_pair();
-        let roots = [modules];
+        let roots = vec![modules].into();
         assert!(run_config_diff(&a, &same, &roots));
         assert!(!run_config_diff(&a, &other, &roots));
     }
@@ -252,7 +252,7 @@ channel alerts at "brenn:alice-alerts" {
 }
 "#,
         );
-        assert!(!run_config_diff(&a, &b, &[]));
+        assert!(!run_config_diff(&a, &b, &Default::default()));
     }
 
     /// A `nan` compares false against its own copy, so the equality check and

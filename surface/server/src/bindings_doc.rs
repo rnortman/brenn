@@ -13,7 +13,6 @@
 //! a reconnecting surface can compare what it is handed against what it is
 //! running and reload only on a real difference.
 
-use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{ResolvedSurface, SurfaceBinding, SurfaceOutput};
 use brenn_messaging::{Messenger, PublishResult};
 use brenn_surface_schema::bindings::{
@@ -143,8 +142,12 @@ pub fn build_bindings_document(
     }
 }
 
-/// Build every surface's bindings document as `(config channel address, body)`
-/// pairs, in surface declaration order — the publish loop's input.
+/// Build one bindings document per given surface, as `(config channel address,
+/// body)` pairs in the order they arrive — the publish loop's input.
+///
+/// Takes an iterator rather than the whole resolved list because a document is a
+/// pure function of its own surface: a caller rebuilding part of the topology
+/// passes the part.
 ///
 /// # Panics
 ///
@@ -152,19 +155,19 @@ pub fn build_bindings_document(
 /// only writer these documents ever have, so a document it cannot validate means
 /// the resolver and the schema disagree about what wiring is representable —
 /// worse to publish than to refuse.
-pub fn build_bindings_documents(
-    surfaces: &[ResolvedSurface],
+pub fn build_bindings_documents<'a>(
+    surfaces: impl IntoIterator<Item = &'a ResolvedSurface>,
     params: &BindingsDocParams<'_>,
 ) -> Vec<(String, String)> {
     surfaces
-        .iter()
+        .into_iter()
         .map(|resolved| {
             let doc = build_bindings_document(resolved, params);
             doc.validate().unwrap_or_else(|err| {
                 panic!(
-                    "boot: built bindings document for surface {:?} does not validate ({err}) — \
-                     the surface resolver and the document schema disagree about representable \
-                     wiring. Refusing to start.",
+                    "built bindings document for surface {:?} does not validate ({err}) — the \
+                     surface resolver and the document schema disagree about representable \
+                     wiring, which is a host defect.",
                     resolved.slug,
                 )
             });
@@ -174,6 +177,15 @@ pub fn build_bindings_documents(
             )
         })
         .collect()
+}
+
+/// Publish the given bindings documents under the reserved
+/// `system:surface-config` identity, reporting the first that does not succeed.
+pub async fn try_publish_bindings_documents(
+    messenger: &Messenger,
+    docs: &[(String, String)],
+) -> Result<(), (String, PublishResult)> {
+    crate::publish::try_publish_from_system(messenger, SURFACE_CONFIG_COMPONENT, docs).await
 }
 
 /// Publish every bindings document under the `system:surface-config` identity,
@@ -188,31 +200,19 @@ pub fn build_bindings_documents(
 /// host bug made unreachable by the code-built policy and the boot-validated
 /// channels.
 pub async fn publish_bindings_documents(messenger: &Messenger, docs: &[(String, String)]) {
-    for (address, body) in docs {
-        let result = messenger
-            .publish_from_system(
-                SURFACE_CONFIG_COMPONENT,
-                address,
-                body,
-                Urgency::Normal,
-                None,
+    crate::publish::publish_from_system_or_panic(
+        messenger,
+        SURFACE_CONFIG_COMPONENT,
+        docs,
+        "bindings-document",
+        |len| {
+            format!(
+                "A surface cannot boot without it; raise max_body_bytes above {len} \
+                 (or shrink the surface's component config maps)."
             )
-            .await;
-        match result {
-            PublishResult::Ok { .. } => {}
-            PublishResult::BodyTooLarge { len, max } => panic!(
-                "boot: bindings-document publish to {address:?} rejected — the document is {len} \
-                 bytes but [messaging] max_body_bytes is {max}. A surface cannot boot without it; \
-                 raise max_body_bytes above {len} (or shrink the surface's component config maps). \
-                 Refusing to start (fail-fast on invalid config)."
-            ),
-            other => panic!(
-                "boot: bindings-document publish to {address:?} did not succeed ({other:?}) — the \
-                 reserved system publisher's policy and the boot-validated channels make this \
-                 unreachable, so a failure is a host bug. Refusing to start."
-            ),
-        }
-    }
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]

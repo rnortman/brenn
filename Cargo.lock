@@ -537,6 +537,7 @@ dependencies = [
  "futures",
  "indexmap",
  "libc",
+ "rumqttc-next",
  "rusqlite",
  "serde_json",
  "similar",

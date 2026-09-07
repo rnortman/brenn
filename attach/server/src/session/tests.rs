@@ -646,6 +646,7 @@ impl Attachment {
         let session_id = handle.session_id;
         let active_channels = handle.active_channels.clone();
         let drain_notify = handle.drain_notify.clone();
+        let close_rx = handle.close.subscribe();
         let guard = registry
             .try_register(ATTACHER, handle, SessionCaps::UNCAPPED)
             .expect("uncapped registration");
@@ -667,6 +668,7 @@ impl Attachment {
             push_rx,
             active_channels,
             drain_notify: drain_notify.clone(),
+            close_rx,
             socket: TestSocket {
                 inbound: inbound_rx,
                 outbound: outbound_tx,
@@ -729,6 +731,20 @@ impl Attachment {
     async fn finish(self) -> (AttachSessionOutcome, Vec<ServerFrame>) {
         self.send(Message::Close(None));
         self.join_session().await
+    }
+
+    /// Wait for a session that ends on its own, and collect the close frames it
+    /// wrote — the host-initiated-close counterpart of
+    /// [`Attachment::join_session`], which reads only application frames.
+    async fn join_for_closes(mut self) -> (AttachSessionOutcome, Vec<(u16, String)>) {
+        let outcome = self.join.await.expect("session task");
+        let mut closes = Vec::new();
+        while let Ok(message) = self.outbound.try_recv() {
+            if let Message::Close(Some(frame)) = message {
+                closes.push((frame.code, frame.reason.to_string()));
+            }
+        }
+        (outcome, closes)
     }
 
     /// Wait for a session that ends on its own, and collect what it wrote and
@@ -1157,4 +1173,49 @@ async fn a_silent_attachment_is_reaped_and_a_talking_one_is_not() {
         "a reaped attachment is gone, not misbehaving"
     );
     assert!(outcome.last_detach);
+}
+
+/// A host-initiated close ends the attachment through its ordinary detach path:
+/// the peer gets the code and reason the caller named, the registry slot is
+/// released, and nothing about it reads as a protocol violation.
+#[tokio::test]
+async fn a_registry_close_sends_the_code_and_detaches_normally() {
+    let attachment = Attachment::start();
+    attachment.send_hello(SUPPORTED_VERSIONS);
+    // Wait for the opening frames so the close cannot race the handshake.
+    let mut attachment = attachment;
+    let _hello = attachment.next_frame().await;
+    let _welcome = attachment.next_frame().await;
+
+    let asked = attachment
+        .registry
+        .close_all(ATTACHER, &CloseReason::new(3003, "surface retired"));
+    assert_eq!(asked, 1);
+
+    let registry = attachment.registry.clone();
+    let (outcome, closes) = attachment.join_for_closes().await;
+    assert!(!outcome.violation, "a host close is not a violation");
+    assert!(outcome.last_detach);
+    assert_eq!(closes, vec![(3003, "surface retired".to_string())]);
+    assert_eq!(registry.count(ATTACHER), 0);
+}
+
+/// Closing an attacher with no sessions asks nobody and says so, and a close
+/// aimed at one attacher leaves another's sessions running.
+#[tokio::test]
+async fn a_close_reaches_only_the_named_attacher() {
+    let mut attachment = Attachment::start();
+    attachment.send_hello(SUPPORTED_VERSIONS);
+    let _hello = attachment.next_frame().await;
+    let _welcome = attachment.next_frame().await;
+
+    let reason = CloseReason::new(3002, "surface reconfigured");
+    assert_eq!(attachment.registry.close_all("somebody-else", &reason), 0);
+    assert_eq!(attachment.registry.count(ATTACHER), 1);
+
+    // The session is still live: it answers a frame after the miss.
+    attachment.send(Message::Ping(Vec::new().into()));
+    assert_eq!(attachment.registry.close_all(ATTACHER, &reason), 1);
+    let (_outcome, closes) = attachment.join_for_closes().await;
+    assert_eq!(closes, vec![(3002, "surface reconfigured".to_string())]);
 }

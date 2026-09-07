@@ -88,6 +88,7 @@ pub enum Item {
     Repo(Box<NamedAttrDef<RepoAttrs>>),
     MqttClient(Box<NamedAttrDef<MqttClientAttrs>>),
     McpServer(Box<NamedAttrDef<McpServerAttrs>>),
+    Mount(Box<NamedAttrDef<MountAttrs>>),
     Acl(Box<AclStmt>),
     Grant(Box<GrantStmt>),
     Section(SectionNode),
@@ -130,6 +131,7 @@ impl File {
         repos => Repo(NamedAttrDef<RepoAttrs>),
         mqtt_clients => MqttClient(NamedAttrDef<MqttClientAttrs>),
         mcp_servers => McpServer(NamedAttrDef<McpServerAttrs>),
+        mounts => Mount(NamedAttrDef<MountAttrs>),
         acls => Acl(AclStmt),
         grants => Grant(GrantStmt),
         }
@@ -1195,6 +1197,11 @@ vocabulary! {
         opt transport_ceiling_bytes: V,
         opt content_type: V,
         opt urgency: Word,
+    }
+
+    /// A `mount` body's attrs: where the mount's installed trees live.
+    struct MountAttrs<V> {
+        req path: V,
     }
 
     /// A `repo` body's attrs.
