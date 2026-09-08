@@ -2,7 +2,9 @@
 
 All notable changes to Brenn are documented here.
 
-## [0.20.2]
+## [Unreleased]
+
+## [0.20.3]
 
 ### Added
 
@@ -25,11 +27,6 @@ All notable changes to Brenn are documented here.
 
 ### Changed
 
-- **Declared MQTT clients hold sessions unconditionally.** Previously, a broker
-  session was spawned only for clients referenced by an ingress channel or ACL
-  matcher at boot. Now every `mqtt_client` block gets a supervisor at startup.
-  An idle connection costs one keepalive; the operator wrote the declaration, so
-  the connection is what they asked for.
 - **MQTT ingress diff covers dynamic subscriptions.** The broker
   SUBSCRIBE/UNSUBSCRIBE set is now computed over static channels plus
   kept-dynamic rows, matching what a fresh boot derives, rather than the
@@ -38,6 +35,16 @@ All notable changes to Brenn are documented here.
   a user, the reload pulses every open WebSocket; each re-checks and closes
   itself when denied. An owner change reaps the old owner's delivery positions
   and seats the new owner's conversation.
+
+## [0.20.2]
+
+### Changed
+
+- **Declared MQTT clients hold sessions unconditionally.** Previously, a broker
+  session was spawned only for clients referenced by an ingress channel or ACL
+  matcher at boot. Now every `mqtt_client` block gets a supervisor at startup.
+  An idle connection costs one keepalive; the operator wrote the declaration, so
+  the connection is what they asked for.
 - Fully hermetic toolchain via bazel
 
 ### Fixed
