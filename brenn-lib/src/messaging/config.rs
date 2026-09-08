@@ -48,7 +48,7 @@ use crate::config::AppConfigRaw;
 /// the semantically correct total order — `Bounded(a) < Bounded(b)` iff `a < b`,
 /// and every `Bounded(_) < Unbounded` (a bounded window is shallower than the
 /// infinite one). Do not reorder the variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Depth {
     Bounded(u64),
     Unbounded,
@@ -159,7 +159,7 @@ impl Depth {
 /// `Fatal` is enacted only on the surface (kernel-side), never on the backend
 /// overflow path: a backend subscription that resolves to `Fatal` is rejected
 /// where its noise resolves ([`resolve_subscription_params`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NoiseLevel {
     /// No signal on overflow.
@@ -1435,11 +1435,9 @@ pub struct SurfaceIoPortRaw {
 
 /// Resolved per-app messaging config, attached to `AppConfig`.
 ///
-/// The legacy `enabled` authorization boolean was removed alongside
-/// `MessagingConfigRaw::enabled` (access-control design §2.5.1 / §8 decision-2):
-/// messaging authorization is now decided by the app's `AppPolicy`
-/// (`AppConfig::messaging_enabled()`), not by a field on this struct.
-#[derive(Debug, Clone)]
+/// Messaging authorization is decided by `AppConfig::messaging_enabled()`,
+/// not by a field on this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMessagingConfig {
     pub send_budget: u32,
     pub subscriptions: Vec<ResolvedSubscription>,
@@ -3011,20 +3009,13 @@ pub fn merge_dynamic_subscriptions<'p>(
             // standing depth gets. Deleting the channel's row is the retirement
             // path, and that is the case that still drops.
             if let Some(address) = unreconstructible.get(&row.channel_uuid) {
-                tracing::warn!(
-                    channel_uuid = %row.channel_uuid,
-                    channel = %address,
-                    app = %row.app_slug,
-                    "merge_dynamic_subscriptions: dynamic subscription dormant — the \
-                     channel row exists but no `[[channel]]` block declares it; \
-                     durable row retained (not pruned), dormant until the channel \
-                     is redeclared",
-                );
-                outcome.revoked.push(DormantSubscription {
+                let dormant = DormantSubscription {
                     channel_uuid: row.channel_uuid,
                     app_slug: row.app_slug.clone(),
                     channel_address: address.clone(),
-                });
+                };
+                dormant.warn();
+                outcome.revoked.push(dormant);
                 continue;
             }
             tracing::warn!(
@@ -3148,6 +3139,24 @@ pub struct DormantSubscription {
     pub channel_uuid: Uuid,
     pub app_slug: String,
     pub channel_address: String,
+}
+
+impl DormantSubscription {
+    /// The journal line for this state, in one wording at one level wherever it
+    /// is reached: the boot merge finds the row already dormant, and a
+    /// reload that removes the channel under it produces the same three facts —
+    /// no directory entry, the durable row kept, the cursor kept. An operator
+    /// or a log watcher keying on either has to see both.
+    pub fn warn(&self) {
+        tracing::warn!(
+            channel_uuid = %self.channel_uuid,
+            channel = %self.channel_address,
+            app = %self.app_slug,
+            "dynamic subscription dormant — the channel row exists but no `[[channel]]` block \
+             declares it; durable row retained (not pruned), dormant until the channel is \
+             redeclared and the process restarted",
+        );
+    }
 }
 
 /// Result of [`merge_dynamic_subscriptions`]: which durable dynamic rows were

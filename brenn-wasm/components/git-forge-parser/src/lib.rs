@@ -23,9 +23,7 @@
 mod spec;
 
 use crate::spec::{InPort, log};
-use brenn_guest::{
-    Activation, Error, MessageEnvelopeExt, Processor, WebhookEnvelope, serde_json,
-};
+use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor, WebhookEnvelope, serde_json};
 use serde::{Deserialize, Serialize};
 
 /// Subset of a forge push payload we extract remotes from. Both Forgejo and

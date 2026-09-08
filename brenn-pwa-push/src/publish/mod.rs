@@ -16,12 +16,10 @@ use uuid::Uuid;
 
 use crate::targets::PwaPushAddress;
 use brenn_db::Db;
-use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::MessagingGlobalConfig;
 use brenn_lib::pwa_push::config::EndpointPolicy;
 use brenn_lib::pwa_push::config::ResolvedPwaPushConfig;
 use brenn_obs::alerting::AlertDispatcher;
-use indexmap::IndexMap;
 
 mod delivery;
 mod http_poster;
@@ -144,7 +142,7 @@ pub trait PwaPushSender: Send + Sync {
 pub struct PwaPushService {
     db: Db,
     config: ResolvedPwaPushConfig,
-    apps: Arc<IndexMap<String, AppConfig>>,
+    apps: brenn_lib::config::AppTable,
     defaults: MessagingGlobalConfig,
     /// Server origin used to derive publisher identity (`app:<slug>@<server>`).
     /// Same value as the one fed to `messaging::resolve_source`.
@@ -159,7 +157,7 @@ impl PwaPushService {
     pub fn new(
         db: Db,
         config: ResolvedPwaPushConfig,
-        apps: Arc<IndexMap<String, AppConfig>>,
+        apps: impl Into<brenn_lib::config::AppTable>,
         defaults: MessagingGlobalConfig,
         server_origin: Arc<str>,
         alert_dispatcher: AlertDispatcher,
@@ -174,7 +172,7 @@ impl PwaPushService {
         Self {
             db,
             config,
-            apps,
+            apps: apps.into(),
             defaults,
             server_origin,
             http_client: Arc::new(ReqwestPoster {
@@ -190,7 +188,7 @@ impl PwaPushService {
     pub(super) fn new_with_poster(
         db: Db,
         config: ResolvedPwaPushConfig,
-        apps: Arc<IndexMap<String, AppConfig>>,
+        apps: impl Into<brenn_lib::config::AppTable>,
         defaults: MessagingGlobalConfig,
         server_origin: Arc<str>,
         alert_dispatcher: AlertDispatcher,
@@ -199,7 +197,7 @@ impl PwaPushService {
         Self {
             db,
             config,
-            apps,
+            apps: apps.into(),
             defaults,
             server_origin,
             http_client: poster,

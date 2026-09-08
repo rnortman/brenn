@@ -3,8 +3,9 @@
 //! fallback, the single-budget-unit invariant, and invalid-endpoint / allowlist-miss
 //! row purging.
 
-use super::super::*; // production items: PwaPushService, PushSendResult, Urgency, MessagingGlobalConfig, IndexMap, Arc
-use super::{make_app_config, make_db_with_users, make_pwa_push_config, make_service}; // pub(super) fixtures
+use super::super::*; // production items: PwaPushService, PushSendResult, Urgency, MessagingGlobalConfig, Arc
+use super::{make_app_config, make_db_with_users, make_pwa_push_config, make_service};
+use indexmap::IndexMap;
 // Types imported privately in `tests/mod.rs` and therefore not re-exported via the
 // `super::super::*` glob (private imports don't re-export). Imported directly here.
 use crate::db::upsert_subscription;

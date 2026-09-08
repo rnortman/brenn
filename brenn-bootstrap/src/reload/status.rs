@@ -90,8 +90,68 @@ impl From<&PlanDelta> for StatusDelta {
                 .map(|change| change.new.slug.clone())
                 .collect(),
             kinds_changed: delta.kinds_changed.iter().cloned().collect(),
+            agents_changed: delta
+                .agents_changed
+                .iter()
+                .map(|change| change.slug.clone())
+                .collect(),
+            subscriptions_added: subscriptions(&delta.agents_changed, |change| &change.subs_added),
+            subscriptions_removed: subscriptions(&delta.agents_changed, |change| {
+                &change.subs_removed
+            }),
+            dynamic_revoked: dynamic(&delta.agents_changed, |change| {
+                change
+                    .dynamic
+                    .revoke
+                    .iter()
+                    .map(|revoked| &revoked.moved)
+                    .collect()
+            }),
+            dynamic_revived: dynamic(&delta.agents_changed, |change| {
+                change.dynamic.revive.iter().collect()
+            }),
+            dynamic_pruned: dynamic(&delta.agents_changed, |change| {
+                change.dynamic.prune.iter().collect()
+            }),
+            // Commit's, like the two mqtt lists above: which live sessions were
+            // killable at the swap is a question about the process a moment
+            // later, not about the two documents.
+            sessions_retired: Vec::new(),
+            sessions_retire_pending: Vec::new(),
         }
     }
+}
+
+/// One side of every changed agent's static subscriptions, as the status body
+/// spells them: the agent's slug and the channel address, one string per pair.
+fn subscriptions(
+    changes: &[super::agents::AgentChange],
+    side: impl Fn(&super::agents::AgentChange) -> &[(uuid::Uuid, String)],
+) -> Vec<String> {
+    changes
+        .iter()
+        .flat_map(|change| {
+            side(change)
+                .iter()
+                .map(|(_, address)| format!("{} {address}", change.slug))
+        })
+        .collect()
+}
+
+/// One arm of every changed agent's dynamic re-merge, as the status body
+/// spells it: the agent's slug and the channel address, one string per pair.
+fn dynamic(
+    changes: &[super::agents::AgentChange],
+    arm: impl Fn(&super::agents::AgentChange) -> Vec<&super::dynamic::DynamicMove>,
+) -> Vec<String> {
+    changes
+        .iter()
+        .flat_map(|change| {
+            arm(change)
+                .into_iter()
+                .map(|moved| format!("{} {}", change.slug, moved.address))
+        })
+        .collect()
 }
 
 fn slugs(surfaces: &[brenn_lib::messaging::config::ResolvedSurface]) -> Vec<String> {
@@ -129,6 +189,7 @@ mod tests {
 
         let changed = entry("brenn:moved");
         let plan_delta = PlanDelta {
+            agents_changed: Vec::new(),
             channels_added: vec![entry("brenn:new")],
             channels_removed: vec![entry("brenn:gone")],
             channels_changed: vec![super::super::delta::ChannelChange {
@@ -159,6 +220,7 @@ mod tests {
                 }],
             },
             kinds_changed: ["chart".to_string()].into_iter().collect(),
+            dynamic_observed: Default::default(),
         };
         let status: StatusDelta = (&plan_delta).into();
         assert_eq!(status.channels_added, vec!["brenn:new".to_string()]);
@@ -215,8 +277,9 @@ mod tests {
         // back out through the ordinary read gate.
         let mut reader =
             brenn_server::test_support::app_config::minimal_app_config("some-reader", None, vec![]);
-        reader.policy =
-            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([STATUS_ADDRESS]);
+        reader.policy = std::sync::Arc::new(
+            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([STATUS_ADDRESS]),
+        );
         let mut apps_map: indexmap::IndexMap<String, brenn_lib::config::AppConfig> =
             indexmap::IndexMap::new();
         apps_map.insert("some-reader".to_string(), reader);
@@ -312,10 +375,12 @@ mod tests {
                 None,
                 vec![],
             );
-            reader.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses([
-                STATUS_ADDRESS,
-                "brenn:work",
-            ]);
+            reader.policy = std::sync::Arc::new(
+                brenn_lib::access::test_fixtures::delivery_policy_for_addresses([
+                    STATUS_ADDRESS,
+                    "brenn:work",
+                ]),
+            );
             let mut apps_map: indexmap::IndexMap<String, brenn_lib::config::AppConfig> =
                 indexmap::IndexMap::new();
             apps_map.insert("some-reader".to_string(), reader);

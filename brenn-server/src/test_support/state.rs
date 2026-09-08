@@ -32,7 +32,7 @@ pub fn test_app() -> (Router, brenn_db::Db) {
 /// Build an AppState with a custom apps map (for access-control tests).
 pub fn test_state_with_apps(db: &brenn_db::Db, apps: Arc<IndexMap<String, AppConfig>>) -> AppState {
     let mut state = test_state(db);
-    state.apps = apps;
+    state.apps = brenn_lib::config::AppTable::new(apps);
     state
 }
 
@@ -222,9 +222,9 @@ pub fn test_state_with_user_and_app(
     let mut apps = IndexMap::new();
     apps.insert(app_slug.to_string(), cfg);
     let mut state = test_state(&db);
-    state.apps = Arc::new(apps);
+    state.apps = brenn_lib::config::AppTable::new(Arc::new(apps));
     assert_eq!(
-        state.apps.len(),
+        state.apps.load().len(),
         1,
         "test_state_with_user_and_app: expected exactly 1 app"
     );
@@ -239,7 +239,7 @@ pub async fn landing_page_router_two_apps() -> (Router, brenn_db::Db, String) {
     use super::http::setup_authenticated_user;
     let db = crate::test_support::init_db_memory();
     let mut state = test_state(&db);
-    state.apps = test_apps_multi(&["alpha", "beta"]);
+    state.apps = brenn_lib::config::AppTable::new(test_apps_multi(&["alpha", "beta"]));
     let app = build_router(state, None, 0, 2576)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
     let (session_token, _) = setup_authenticated_user(&db).await;

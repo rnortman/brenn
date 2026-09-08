@@ -22,7 +22,8 @@ impl WsConnection {
         conversation_id: i64,
         from_seq: Option<i64>,
     ) -> Result<(), ()> {
-        let Some(app) = self.state.apps.get(&self.app_slug) else {
+        let apps = self.state.apps.load();
+        let Some(app) = apps.get(&self.app_slug) else {
             warn!(slug = %self.app_slug, "send_history: app not found");
             return Ok(()); // Nothing to send — vacuously successful.
         };

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -58,7 +58,8 @@ pub struct ResolvedConfig {
     /// re-read every secret from disk a second time). Empty when no
     /// `[[mqtt_client]]` is declared.
     pub mqtt_clients: IndexMap<String, crate::mqtt::config::MqttClientConfig>,
-    /// Resolved PWA push config. `None` when no app has `pwa_push.enabled = true`.
+    /// Resolved PWA push config. `Some` iff `[pwa_push]` is declared; an agent
+    /// granted `PwaPush` without the section is refused in `resolve_apps`.
     pub pwa_push: Option<crate::pwa_push::config::ResolvedPwaPushConfig>,
     /// Declared Claude accounts, keyed by profile name, with each token file
     /// read exactly once during startup.
@@ -162,6 +163,77 @@ pub fn validate_and_resolve(
             );
         }
     }
+
+    // The frozen-input subsystems resolve first: `resolve_apps` is the single
+    // body boot and reload share, and it takes the MQTT client identities and
+    // the webhook subscription stamps as inputs rather than deriving them.
+    let resolved_clients = crate::mqtt::config::resolve_clients(&config.mqtt_clients);
+    let client_identities = crate::mqtt::config::client_identities(&resolved_clients);
+
+    let (webhook_endpoints, webhook_subscriptions) =
+        crate::webhook::config::resolve_webhook_endpoints(
+            &config.webhook_endpoints,
+            &config.apps,
+            &config.wasm_consumers,
+            &config.wasm,
+            &config.messaging,
+        );
+
+    let apps = resolve_apps(
+        config,
+        integration_registry,
+        runtime_dir,
+        &FrozenInputs {
+            mqtt_clients: &client_identities,
+            webhook_subscriptions: &webhook_subscriptions,
+        },
+    );
+
+    let pwa_push = crate::pwa_push::config::resolve_pwa_push_layer(&config.pwa_push);
+
+    // Read once here, like every other secret the bootstrap layer is handed:
+    // a declared profile whose token file is missing, empty, or readable by
+    // another local account is a misconfiguration and stops the process.
+    let claude_profiles = super::load_claude_profiles(&config.claude_profiles);
+
+    ResolvedConfig {
+        apps: Arc::new(apps),
+        webhook_endpoints,
+        mqtt_clients: resolved_clients,
+        pwa_push,
+        claude_profiles,
+    }
+}
+
+/// The inputs to `resolve_apps` that are resolved outside it and held fixed
+/// across a reload: everything reload's level-1 comparison freezes.
+pub struct FrozenInputs<'a> {
+    /// Client identities, keyed by client slug.
+    pub mqtt_clients: &'a IndexMap<String, crate::mqtt::config::MqttClientIdentity>,
+    /// Per-app webhook subscriptions, keyed by app slug.
+    pub webhook_subscriptions:
+        &'a BTreeMap<String, Vec<crate::webhook::config::ResolvedWebhookSubscription>>,
+}
+
+/// Resolve the app map from `config`. Boot and reload both call this, so a
+/// document reload accepts is a document boot would have accepted, resolved to
+/// the same map.
+///
+/// # Side effects
+///
+/// Reads `working_dir` and container `home_dir` stats; calls `create_dir_all`
+/// for each app's state directory.
+///
+/// # Panics
+///
+/// On any app-level config error (see `validate_and_resolve`).
+pub fn resolve_apps(
+    config: &BrennConfig,
+    integration_registry: &IntegrationRegistry,
+    runtime_dir: Option<&std::path::Path>,
+    frozen: &FrozenInputs,
+) -> IndexMap<String, AppConfig> {
+    let slug_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*$").unwrap();
 
     let mut apps = IndexMap::new();
 
@@ -834,14 +906,13 @@ pub fn validate_and_resolve(
             // Access policy is built in the `resolve_access_policies` follow-up
             // phase (after all other phases). Default (empty, deny-everything)
             // here; populated from explicit `grants`/`[app.acl.*]` later.
-            policy: crate::access::AppPolicy::default(),
+            policy: std::sync::Arc::new(crate::access::AppPolicy::default()),
             // Derived in the same follow-up phase, from the app slug and the
             // `[llm_chat]` prefix. Default (deny-everything) here.
-            chat_harness_policy: crate::access::AppPolicy::default(),
+            chat_harness_policy: std::sync::Arc::new(crate::access::AppPolicy::default()),
             // Per-app pwa_push block: carry through as-is; validation happens
-            // in `resolve_pwa_push_layer` (Phase 5 below).
+            // in `resolve_pwa_push_layer`.
             pwa_push: raw.pwa_push.clone(),
-            // Webhook subscriptions resolved in Phase 7 below.
             webhook_subscriptions: vec![],
             mqtt_subscriptions: vec![],
         };
@@ -849,8 +920,7 @@ pub fn validate_and_resolve(
         let prev = apps.insert(raw.slug.clone(), resolved);
         assert!(prev.is_none(), "duplicate app slug {:?}", raw.slug,);
     }
-
-    // --- Phase 2: per-clone validation (primary ownership, webhook prereqs) ---
+    // --- Per-clone validation (primary ownership, webhook prereqs) ---
     //
     // Primary ownership is scoped to a clone (a slug), which can be mounted
     // by multiple apps. We have to wait until all apps are resolved to see
@@ -869,7 +939,7 @@ pub fn validate_and_resolve(
     // Non-RW (ReadOnly) mounts are never primary.
     validate_primary_ownership(&mut apps);
 
-    // --- Phase 4: messaging ---
+    // --- Messaging ---
     //
     // Validate channels / per-app `messaging` blocks and stash the
     // resolved messaging config on each `AppConfig`. The directory itself
@@ -883,12 +953,6 @@ pub fn validate_and_resolve(
     // document it is minting for rather than from a boot-time snapshot.
     let system_channel_tuning =
         crate::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging);
-
-    // --- Phase 6: MQTT clients ---
-    //
-    // Resolve `[[mqtt_client]]` entries (validate URLs, load secrets). Panics on
-    // any config error.
-    let resolved_clients = crate::mqtt::config::resolve_clients(&config.mqtt_clients);
 
     // WASM-consumer / app slug disjointness is a namespace invariant that
     // directory-keyed WASM resources rely on: identities and other per-owner
@@ -906,16 +970,13 @@ pub fn validate_and_resolve(
         );
     }
 
-    // Resolve per-app `[[app.mqtt_subscription]]` (ingress) blocks against the
-    // resolved client map and stamp them onto each `AppConfig::mqtt_subscriptions`.
-    let client_identities = crate::mqtt::config::client_identities(&resolved_clients);
     for raw in &config.apps {
         if raw.mqtt_subscriptions.is_empty() {
             continue;
         }
         let subs = crate::mqtt::config::resolve_app_mqtt_subscriptions(
             raw,
-            &client_identities,
+            frozen.mqtt_clients,
             &system_channel_tuning,
             &config.messaging,
         );
@@ -924,75 +985,71 @@ pub fn validate_and_resolve(
         }
     }
 
-    // --- Phase 7: webhook transport endpoints ---
-    //
-    // Resolve `[[webhook_endpoint]]` entries (validate slugs, load secrets,
-    // pre-parse header names). Also resolves per-app `[[app.webhook_subscription]]`
-    // references, enforces the singleton invariant, and stamps resolved
-    // subscriptions onto each app's `AppConfig`. Panics on any config error.
-    // The resolved table is threaded to the bootstrap layer via
-    // `ResolvedConfig.webhook_endpoints` so each secret file is read exactly
-    // once during startup.
-    let webhook_endpoints = crate::webhook::config::resolve_webhook_endpoints(
-        &config.webhook_endpoints,
+    for (app_slug, subs) in frozen.webhook_subscriptions {
+        if let Some(app) = apps.get_mut(app_slug) {
+            app.webhook_subscriptions = subs.clone();
+        }
+    }
+
+    // Runs after the other phases so MQTT client slugs in ACL matchers can be
+    // cross-checked against the resolved client set.
+    resolve_access_policies(
         &config.apps,
-        &config.wasm_consumers,
         &mut apps,
-        &config.wasm,
-        &config.messaging,
+        frozen.mqtt_clients,
+        &config.llm_chat,
     );
 
-    // --- Phase 8: access policies ---
-    //
-    // Build each LLM app's `AppPolicy` from its explicit `grants` + `[app.acl.*]`
-    // config. Runs after the other phases so it can cross-check matchers against
-    // already-resolved state — every `mqtt_subscribe`/`mqtt_publish` matcher's
-    // client slug is verified against the resolved MQTT client map (Phase 6,
-    // `resolved_clients`) so an ACL naming a nonexistent client fails fast here
-    // rather than silently never-matching at runtime. The policy itself is built
-    // *solely* from the operator's explicit grants/acl. Panics on any invalid
-    // matcher or duplicate grant (operator-authored config, fail-fast).
-    resolve_access_policies(&config.apps, &mut apps, &resolved_clients, &config.llm_chat);
-
-    // --- Phase 9: pwa_push ---
-    //
-    // Validate global `[pwa_push]` block and load/generate the VAPID keypair
-    // iff any app actually has the PwaPush capability. This **must** run after
-    // Phase 8 (access policies): `resolve_pwa_push_layer` gates on
-    // `AppConfig::pwa_push_enabled()`, which reads `policy.has_grant(PwaPush)`
-    // (access-control Phase 0, §2.5.1/§2.7) — the single source of truth for
-    // "this app has push capability". Running it earlier (when every app's
-    // policy is still `AppPolicy::default()`) would see no grants and never load
-    // the keypair. Keeping the keypair-required decision co-extensive with the
-    // grant restores the invariant the WS dispatch handlers assert
-    // (`pwa_push_enabled() ⟹ AppState.pwa_push.is_some()`,
-    // `routes/ws/dispatch.rs`); they were decoupled when `pwa_push_enabled()`
-    // moved to the policy while this layer still read `[app.pwa_push].enabled`,
-    // making a browser-triggerable `expect()` reachable on a config where the
-    // grant and the section disagreed.
-    //
-    // Panics on any config error (missing subject, missing keypair file,
-    // invalid subject format). The resolved value is threaded to the bootstrap
-    // layer via `ResolvedConfig.pwa_push` so the VAPID keypair file is read
-    // exactly once during startup.
-    //
-    // Note: in test environments the call generates/loads the VAPID keypair file
-    // when any app has the PwaPush grant. Tests whose apps carry no PwaPush grant
-    // (the common case) skip this entirely.
-    let pwa_push = crate::pwa_push::config::resolve_pwa_push_layer(&config.pwa_push, &apps);
-
-    // Read once here, like every other secret the bootstrap layer is handed:
-    // a declared profile whose token file is missing, empty, or readable by
-    // another local account is a misconfiguration and stops the process.
-    let claude_profiles = super::load_claude_profiles(&config.claude_profiles);
-
-    ResolvedConfig {
-        apps: Arc::new(apps),
-        webhook_endpoints,
-        mqtt_clients: resolved_clients,
-        pwa_push,
-        claude_profiles,
+    if let Some(refusal) = pwa_push_grant_without_section(config) {
+        panic!("{refusal}");
     }
+    // The document-level predicate above checks the raw grant list; this
+    // checks the resolved map. Both must agree: a resolved PwaPush grant
+    // without a [pwa_push] section panics at runtime in the push dispatch
+    // handler, and any future grant source the raw list does not name would
+    // slip past the predicate above.
+    if config.pwa_push.subject.is_none() {
+        for app in apps.values() {
+            assert!(
+                !app.pwa_push_enabled(),
+                "app {:?} resolves to a PwaPush grant but no [pwa_push] section is declared — \
+                 declare [pwa_push] with a subject and keypair_file, or drop the grant",
+                app.slug,
+            );
+        }
+    }
+
+    apps
+}
+
+/// The refusal an agent whose `grants` name `PwaPush` earns while no
+/// `[pwa_push]` section is declared, or `None` when the pairing holds.
+///
+/// The push layer exists for the life of the process iff `[pwa_push]` is
+/// declared, so a grant that converges at reload must not be what decides
+/// whether the layer is present.
+///
+/// A predicate over the document rather than over the resolved map, so the
+/// question is askable where no map exists — `config-check` runs no resolver
+/// and reads no environment.
+///
+/// Returns the first offending agent in document order.
+pub fn pwa_push_grant_without_section(config: &BrennConfig) -> Option<String> {
+    if config.pwa_push.subject.is_some() {
+        return None;
+    }
+    let slug = config
+        .apps
+        .iter()
+        .find(|raw| {
+            raw.grants
+                .contains(&brenn_envelope::grants::AppCapability::PwaPush)
+        })
+        .map(|raw| raw.slug.clone())?;
+    Some(format!(
+        "app {slug:?} has the PwaPush policy grant but no [pwa_push] section is declared — \
+         declare [pwa_push] with a subject and keypair_file, or drop the grant",
+    ))
 }
 
 /// Validate top-level `[[channel]]` and per-app `[app.messaging]` blocks,
@@ -1028,7 +1085,7 @@ fn resolve_messaging_layer(
 /// `build_app_policy` panics on a duplicate grant or an invalid matcher
 /// (operator-authored config, fail-fast), including an
 /// `mqtt_subscribe`/`mqtt_publish` matcher naming a client absent from
-/// `resolved_clients` (the Phase 6 MQTT client map).
+/// the frozen MQTT client identity map.
 ///
 /// The app's derived chat-harness policy is stamped beside the authored one, on
 /// its own field: the harness's chat-tree authority never enters `policy`, so
@@ -1036,18 +1093,18 @@ fn resolve_messaging_layer(
 fn resolve_access_policies(
     raw_apps: &[AppConfigRaw],
     apps: &mut IndexMap<String, AppConfig>,
-    resolved_clients: &IndexMap<String, crate::mqtt::config::MqttClientConfig>,
+    mqtt_clients: &IndexMap<String, crate::mqtt::config::MqttClientIdentity>,
     llm_chat: &crate::config::llm_chat::LlmChatConfig,
 ) {
     for raw in raw_apps {
         let Some(app) = apps.get_mut(&raw.slug) else {
             continue;
         };
-        app.policy = crate::access::resolve::build_app_policy(
+        let mut policy = crate::access::resolve::build_app_policy(
             &raw.slug,
             &raw.grants,
             &raw.acl,
-            resolved_clients,
+            mqtt_clients,
         );
         // Resolve tool grants into the same policy: explicit `[[app.tool_grant]]`
         // tables plus an implicit `git-repo-pull` grant derived from the app's
@@ -1055,10 +1112,11 @@ fn resolve_access_policies(
         // phase, so `app.mounts` is fully populated here.
         let owner = format!("app {:?}", raw.slug);
         let mount_slugs: Vec<String> = app.mounts.iter().map(|m| m.slug.clone()).collect();
-        app.policy.tool_grants =
+        policy.tool_grants =
             crate::tools::config::resolve_app_tool_grants(&owner, &raw.tool_grants, &mount_slugs);
-        warn_granted_publish_no_matcher(&raw.slug, &app.policy);
-        app.chat_harness_policy = llm_chat.harness_policy(&raw.slug);
+        warn_granted_publish_no_matcher(&raw.slug, &policy);
+        app.policy = std::sync::Arc::new(policy);
+        app.chat_harness_policy = std::sync::Arc::new(llm_chat.harness_policy(&raw.slug));
     }
 }
 

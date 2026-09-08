@@ -8,7 +8,10 @@
 //!
 //! Tools CC never had declared to it (ungranted) are anomalous — the adapter
 //! denies them with a warn log (defense in depth; the declaration source only
-//! ever emits granted tools).
+//! ever emits granted tools). One case is not anomalous: a session spawned
+//! before a grant was revoked still has the tool declared to it and can still
+//! call it. The adapter denies it from the agent's current grant table, and the
+//! warn is the expected trace of that case.
 
 use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
@@ -30,14 +33,19 @@ pub(super) async fn handle(
     match &req.kind {
         ApprovalKind::PreToolUse { tool_name, .. } => {
             // Copy the canonical name + auto_approve out so the immutable borrow
-            // of the registry ends before we touch `bridge.tool_grants`.
+            // of the registry ends before the grant table is read.
             let (canonical, auto_approve) = {
                 let tool = bridge.tools.get_by_mcp_name(tool_name)?;
                 let desc = tool.descriptor();
                 (desc.name, desc.auto_approve)
             };
 
-            if !bridge.tool_grants.contains_key(canonical) {
+            if !bridge
+                .app_config()
+                .policy
+                .tool_grants
+                .contains_key(canonical)
+            {
                 // Declared tools are granted tools, so CC calling an ungranted
                 // one is anomalous — surface it, deny it.
                 warn!(
@@ -70,7 +78,13 @@ pub(super) async fn handle(
         } => {
             let canonical = bridge.tools.get_by_mcp_name(tool_name)?.descriptor().name;
 
-            let Some(grant) = bridge.tool_grants.get(canonical).cloned() else {
+            let Some(grant) = bridge
+                .app_config()
+                .policy
+                .tool_grants
+                .get(canonical)
+                .cloned()
+            else {
                 // Ungranted at execution (Pre already denied; belt-and-suspenders).
                 warn!(
                     tool = %tool_name,
@@ -166,7 +180,7 @@ mod tests {
     use tokio::sync::{broadcast, oneshot};
 
     use super::super::super::ActiveBridge;
-    use super::super::super::test_fixtures::TestBridgeConfig;
+    use super::super::super::test_fixtures::{TestBridgeConfig, single_app_table, swap_single_app};
     use super::super::HandleBrennToolResult;
     use super::super::handle_brenn_tools;
     use brenn_tool_registry::{
@@ -262,6 +276,36 @@ mod tests {
         )
     }
 
+    /// Same as `bridge_with`, but the caller keeps the table so it can install a
+    /// new agent map under the live bridge — a reload's swap, in one line.
+    async fn bridge_with_table(
+        tools: Arc<ToolRegistry>,
+        apps: brenn_lib::config::AppTable,
+    ) -> Arc<ActiveBridge> {
+        let db = init_db_memory();
+        let (uid, cid) = {
+            let conn = db.lock().await;
+            let uid = brenn_db::auth::user::create_user(&conn, "swap-user", "$argon2id$fake");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
+            (uid, cid)
+        };
+        let (tx, _rx) = broadcast::channel(16);
+        let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
+        ActiveBridge::inject_for_test_full(
+            uid,
+            cid,
+            "testapp",
+            db,
+            tx,
+            alert,
+            TestBridgeConfig {
+                tools: Some(tools),
+                apps: Some(apps),
+                ..Default::default()
+            },
+        )
+    }
+
     fn pre_req(tool: &str) -> (ApprovalRequest, oneshot::Receiver<CcApprovalDecision>) {
         let (resp_tx, resp_rx) = oneshot::channel();
         (
@@ -306,6 +350,69 @@ mod tests {
                 assert!(reason.contains("git-repo-pull"), "reason: {reason}");
             }
             other => panic!("ungranted tool should Deny, got {other:?}"),
+        }
+    }
+
+    /// A grant revoked by a reload after this session was spawned. The tool is
+    /// still declared to the running CC process, so it can still call it; the
+    /// adapter decides on the agent's grants as they are now.
+    #[tokio::test]
+    async fn pre_tool_use_denies_a_tool_the_agent_lost_after_spawn() {
+        let grants = BTreeMap::from([(
+            "git-repo-pull".to_string(),
+            ResolvedToolGrant {
+                acl: vec![clause("brenn")],
+                rate_limit: None,
+            },
+        )]);
+        let table = single_app_table("testapp", |app| {
+            app.policy_mut().tool_grants = grants;
+        });
+        let bridge = bridge_with_table(registry(), table.clone()).await;
+
+        let (req, _rx) = pre_req(MCP_PULL);
+        match handle_brenn_tools(&bridge, &req).await {
+            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Allow { .. })) => {}
+            other => panic!("granted tool should Allow before the swap, got {other:?}"),
+        }
+
+        swap_single_app(&table, "testapp", |_| {});
+
+        let (req, _rx) = pre_req(MCP_PULL);
+        match handle_brenn_tools(&bridge, &req).await {
+            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Deny { reason })) => {
+                assert!(reason.contains("git-repo-pull"), "reason: {reason}");
+            }
+            other => panic!("revoked tool should Deny after the swap, got {other:?}"),
+        }
+    }
+
+    /// The other direction: a grant the agent did not hold at spawn.
+    #[tokio::test]
+    async fn pre_tool_use_allows_a_tool_the_agent_gained_after_spawn() {
+        let table = single_app_table("testapp", |_| {});
+        let bridge = bridge_with_table(registry(), table.clone()).await;
+
+        let (req, _rx) = pre_req(MCP_PULL);
+        match handle_brenn_tools(&bridge, &req).await {
+            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Deny { .. })) => {}
+            other => panic!("ungranted tool should Deny before the swap, got {other:?}"),
+        }
+
+        swap_single_app(&table, "testapp", |app| {
+            app.policy_mut().tool_grants = BTreeMap::from([(
+                "git-repo-pull".to_string(),
+                ResolvedToolGrant {
+                    acl: vec![clause("brenn")],
+                    rate_limit: None,
+                },
+            )]);
+        });
+
+        let (req, _rx) = pre_req(MCP_PULL);
+        match handle_brenn_tools(&bridge, &req).await {
+            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Allow { .. })) => {}
+            other => panic!("newly granted tool should Allow after the swap, got {other:?}"),
         }
     }
 

@@ -420,7 +420,7 @@ impl Messenger {
         //    a dynamic subscribe states both — so what it actually carries here
         //    is noise and wake_min.
         let rung = SubscriptionParamDefaults::from_channel(&entry.resolved_channel);
-        let (singleton, allowed_users) = match self.apps.get(app_slug) {
+        let (singleton, allowed_users) = match self.apps.load().get(app_slug) {
             Some(app) => (app.singleton, app.allowed_users.len()),
             // No app config ⇒ not a singleton, zero allowed users. A push-enabled
             // sub would then fail the resolver invariants (correct); a pull-only
@@ -863,10 +863,10 @@ mod tests {
     fn ephemeral_subscriber_app(slug: &str, users: &[&str]) -> AppConfig {
         let mut app = test_app_config(slug, None, users.iter().map(|u| u.to_string()).collect());
         app.singleton = true;
-        app.policy
+        app.policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::EphemeralSubscribe);
-        app.policy
+        app.policy_mut()
             .acls
             .ephemeral_subscribe
             .push(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));
@@ -2065,9 +2065,9 @@ mod tests {
         // one that covers the channel or the drain serves nothing to race with.
         let mut app = test_app_config("graf", None, vec!["u".to_string()]);
         app.singleton = true;
-        app.policy = crate::test_support::brenn_delivery_policy(
+        app.policy = std::sync::Arc::new(crate::test_support::brenn_delivery_policy(
             brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()),
-        );
+        ));
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         apps.insert("graf".to_string(), app);
         let m = messenger_with_apps(vec![ch], apps).await;

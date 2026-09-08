@@ -45,7 +45,8 @@ pub async fn file_view(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     // Look up app config.
-    let app = match state.apps.get(&slug) {
+    let apps = state.apps.load();
+    let app = match apps.get(&slug) {
         Some(app) => app,
         None => {
             log_and_alert_security_event(
@@ -95,7 +96,8 @@ pub async fn mount_file_view(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     // Look up app config.
-    let app = match state.apps.get(&slug) {
+    let apps = state.apps.load();
+    let app = match apps.get(&slug) {
         Some(app) => app,
         None => {
             log_and_alert_security_event(

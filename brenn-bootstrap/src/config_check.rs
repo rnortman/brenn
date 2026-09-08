@@ -58,6 +58,13 @@ pub fn run_config_check(file: &Path, module_roots: &RootList) -> bool {
             return false;
         }
     };
+    // The resolver panics on this pairing, but this tool cannot run it: the
+    // resolver stats paths and reads secrets, and a workstation must be able
+    // to check a config destined for another host.
+    if let Some(refusal) = brenn_lib::config::pwa_push_grant_without_section(&document.config) {
+        eprintln!("{}: refused:\n{refusal}", file.display());
+        return false;
+    }
     match offline_messaging_outcome(&document.config) {
         Ok(advisories) => {
             // Advice, not a verdict: the document is a config either way, and
@@ -1123,6 +1130,64 @@ new alice: Assistant();
         );
         assert!(message.contains("surface_error_channel"), "{message}");
         assert!(message.contains("no messaging is configured"), "{message}");
+    }
+
+    /// A `pwa_push` grant with no `[pwa_push]` section is refused here, not
+    /// only at service start: the operator gets the answer before the deploy
+    /// rather than as a boot panic.
+    #[test]
+    fn a_push_grant_with_no_push_section_is_refused() {
+        let granted = format!(
+            r#"{SURFACE_INDEX_DECL}
+agent Assistant() {{
+    grants = [pwa_push];
+}}
+
+new alice: Assistant();
+"#
+        );
+        let (ok, report) = check("main.brenn", &granted);
+        assert!(!ok, "the verdict must refuse it");
+        // The front end accepts it, so the refusal is this pairing's and not
+        // the compiler's.
+        assert!(report.is_empty(), "{report}");
+        let config = check_config(&brenn_lib::config::stage_fixture(
+            tempfile::tempdir().expect("a temporary directory").path(),
+            "main.brenn",
+            &granted,
+        ))
+        .expect("the document compiles")
+        .config;
+        let refusal = brenn_lib::config::pwa_push_grant_without_section(&config)
+            .expect("the pairing is what refuses this document");
+        assert!(refusal.contains("\"alice\""), "{refusal}");
+        assert!(refusal.contains("[pwa_push]"), "{refusal}");
+    }
+
+    /// The same document with the section declared passes, so the refusal above
+    /// is about the missing section and not about the grant. The keypair file
+    /// the section names is the deployment host's, and this tool reads no
+    /// environment, so a path that does not exist here is no obstacle.
+    #[test]
+    fn the_declared_section_is_the_whole_of_what_a_push_grant_owes() {
+        let (ok, report) = check(
+            "main.brenn",
+            &format!(
+                r#"{SURFACE_INDEX_DECL}
+pwa_push {{
+    subject = "mailto:alice@example.com";
+    keypair_file = "/nonexistent/alice/state/vapid.json";
+}}
+
+agent Assistant() {{
+    grants = [pwa_push];
+}}
+
+new alice: Assistant();
+"#
+            ),
+        );
+        assert!(ok, "{report}");
     }
 
     /// The shipped configs pass the strengthened check. Without the offline

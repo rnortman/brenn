@@ -7,10 +7,6 @@
 
 use std::path::PathBuf;
 
-use indexmap::IndexMap;
-
-use crate::config::AppConfig;
-
 use super::vapid::VapidKeypair;
 
 /// Default allowlist of known push service hosts.
@@ -134,9 +130,8 @@ impl EndpointPolicy {
 
 /// Resolved, validated pwa_push configuration produced at startup.
 ///
-/// Only produced when at least one app has the `PwaPush` grant
-/// (`pwa_push_enabled()`) *and* all required global fields (`keypair_file`,
-/// `subject`) are present.
+/// Produced iff the global `[pwa_push]` section is declared, i.e. `subject` is
+/// set.
 #[derive(Debug, Clone)]
 pub struct ResolvedPwaPushConfig {
     /// VAPID keypair (public key + key pair bytes for signing).
@@ -147,35 +142,22 @@ pub struct ResolvedPwaPushConfig {
     pub endpoint_policy: EndpointPolicy,
 }
 
-/// Validate the global `[pwa_push]` block and load/generate the VAPID keypair
-/// iff some app actually has push capability. Returns `None` (keypair never
-/// loaded) when no app does. Panics on any config error.
+/// Validate the global `[pwa_push]` block and load or generate the VAPID
+/// keypair iff the section is declared. Returns `None` (keypair never loaded)
+/// when it is not. Panics on any config error.
 ///
-/// "Has push capability" is decided by `AppConfig::pwa_push_enabled()`, i.e. the
-/// `PwaPush` policy grant — the single source of truth post-access-control
-/// Phase 0 (§2.5.1/§2.7). This is deliberately the *same* gate the per-app
-/// authorization checks use (`pwa_push_enabled()` at the WS dispatch handlers),
-/// so the keypair-required decision and the per-app gate cannot diverge: an app
-/// granted `pwa_push` always has a built `PwaPushService`, keeping the
-/// `pwa_push_enabled() ⟹ AppState.pwa_push.is_some()` invariant the dispatch
-/// `expect()`s rely on structurally true. (This requires the policy to be
-/// populated first — the caller runs this *after* the access-policy resolution
-/// phase; see `validate_and_resolve`.)
-pub fn resolve_pwa_push_layer(
-    raw_global: &PwaPushGlobalConfig,
-    apps: &IndexMap<String, AppConfig>,
-) -> Option<ResolvedPwaPushConfig> {
-    let any_enabled = apps.values().any(|a| a.pwa_push_enabled());
-
-    if !any_enabled {
-        return None;
-    }
-
+/// "Declared" is `subject` being set: the section's two required keys are
+/// `subject` and `keypair_file`, and one without the other is a config error.
+///
+/// The layer's existence is deliberately a property of the *document's*
+/// section, not of any app's `PwaPush` grant. Grants converge at reload while
+/// the layer does not, so gating the layer on a grant would let the first app
+/// to gain one arm the browser-reachable `expect` at the WS dispatch handlers
+/// (`pwa_push_enabled() => AppState.pwa_push.is_some()`). The other side of that
+/// invariant — a grant with no declared section — is refused in `resolve_apps`.
+pub fn resolve_pwa_push_layer(raw_global: &PwaPushGlobalConfig) -> Option<ResolvedPwaPushConfig> {
     let subject = match raw_global.subject.as_deref() {
-        None => panic!(
-            "config: [pwa_push].subject is required when any app has the pwa_push grant \
-             (must be a mailto: or https:// URI)"
-        ),
+        None => return None,
         Some(s) if s.trim().is_empty() => panic!(
             "config: [pwa_push].subject must not be empty or whitespace-only \
              (must be a mailto: or https:// URI)"
@@ -188,7 +170,7 @@ pub fn resolve_pwa_push_layer(
     );
 
     let keypair_file = raw_global.keypair_file.as_ref().unwrap_or_else(|| {
-        panic!("config: [pwa_push].keypair_file is required when any app has the pwa_push grant")
+        panic!("config: [pwa_push].keypair_file is required when [pwa_push] is declared")
     });
 
     let vapid = super::vapid::load_or_generate(keypair_file);
@@ -231,102 +213,41 @@ mod tests {
     fn policy_panics_on_whitespace_entry() {
         let _ = EndpointPolicy::new(vec!["   ".to_string()], false);
     }
-    use crate::config::AppConfig;
-    use crate::pwa_push::config::AppPwaPushBlock;
-
-    fn make_app(slug: &str, pwa_push: Option<AppPwaPushBlock>, push_authorized: bool) -> AppConfig {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        // `resolve_pwa_push_layer` gates on the PwaPush *grant*
-        // (`pwa_push_enabled()`). The legacy `[app.pwa_push].enabled` boolean was
-        // removed (access-control §2.5.1), so push authorization is now an explicit
-        // grant decoupled from block presence: `push_authorized` drives the grant
-        // exactly as the operator's `pwa_push` grant would.
-        let mut policy = crate::access::AppPolicy::default();
-        if push_authorized {
-            policy
-                .grants
-                .insert(brenn_envelope::grants::AppCapability::PwaPush);
-        }
-        // AppConfig is a large struct; use a minimal builder approach.
-        AppConfig {
-            working_dir: tempdir.path().to_path_buf(),
-            model: "claude-sonnet".to_string(),
-            start_hooks: Default::default(),
-            post_pull_hooks: Default::default(),
-            startup_hooks: Default::default(),
-            state_dir: tempdir.path().to_path_buf(),
-            policy,
-            pwa_push,
-            ..crate::config::test_app_config(slug)
-        }
-    }
-
-    fn make_apps(entries: Vec<AppConfig>) -> IndexMap<String, AppConfig> {
-        let mut map = IndexMap::new();
-        for app in entries {
-            map.insert(app.slug.clone(), app);
-        }
-        map
-    }
-
+    /// A declared `[pwa_push]` section is what produces the layer, whatever any
+    /// app's grants say: no app is consulted at all.
     #[test]
-    fn no_apps_gate_pwa_push_returns_none_even_with_global_block_set() {
-        let global = PwaPushGlobalConfig {
-            keypair_file: Some("/tmp/vapid.json".into()),
-            subject: Some("mailto:admin@example.com".to_string()),
-            ..Default::default()
-        };
-        // Neither app is push-authorized: app1 has no block and no grant; app2
-        // has a delivery-settings block present but no `PwaPush` grant (the
-        // legacy "block present ⇒ enabled" coupling was removed, §2.5.1).
-        let apps = make_apps(vec![
-            make_app("app1", None, false),
-            make_app(
-                "app2",
-                Some(AppPwaPushBlock {
-                    default_title: None,
-                }),
-                false,
-            ),
-        ]);
-        let result = resolve_pwa_push_layer(&global, &apps);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "[pwa_push].subject is required")]
-    fn apps_gate_pwa_push_but_no_subject_panics() {
+    fn undeclared_section_returns_none() {
+        // `keypair_file` alone is not a declaration — `subject` is.
         let global = PwaPushGlobalConfig {
             keypair_file: Some("/tmp/vapid.json".into()),
             subject: None,
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let _ = resolve_pwa_push_layer(&global, &apps);
+        assert!(resolve_pwa_push_layer(&global).is_none());
+    }
+
+    #[test]
+    fn declared_section_resolves_with_no_granted_app() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let global = PwaPushGlobalConfig {
+            keypair_file: Some(tempdir.path().join("vapid.json")),
+            subject: Some("mailto:admin@example.com".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_pwa_push_layer(&global)
+            .expect("a declared section has a layer for the life of the process");
+        assert_eq!(resolved.subject, "mailto:admin@example.com");
     }
 
     #[test]
     #[should_panic(expected = "must not be empty or whitespace-only")]
-    fn apps_gate_pwa_push_empty_subject_panics() {
+    fn empty_subject_panics() {
         let global = PwaPushGlobalConfig {
             keypair_file: Some("/tmp/vapid.json".into()),
             subject: Some("   ".to_string()),
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let _ = resolve_pwa_push_layer(&global, &apps);
+        let _ = resolve_pwa_push_layer(&global);
     }
 
     #[test]
@@ -337,36 +258,22 @@ mod tests {
             subject: Some("ftp://bad.example.com".to_string()),
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let _ = resolve_pwa_push_layer(&global, &apps);
+        let _ = resolve_pwa_push_layer(&global);
     }
 
     #[test]
     #[should_panic(expected = "[pwa_push].keypair_file is required")]
-    fn apps_gate_pwa_push_but_no_keypair_file_panics() {
+    fn declared_section_without_keypair_file_panics() {
         let global = PwaPushGlobalConfig {
             keypair_file: None,
             subject: Some("mailto:admin@example.com".to_string()),
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let _ = resolve_pwa_push_layer(&global, &apps);
+        let _ = resolve_pwa_push_layer(&global);
     }
 
     #[test]
-    fn apps_gate_pwa_push_subject_present_resolves_ok() {
+    fn subject_present_resolves_ok() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let keypair_path = tempdir.path().join("vapid.json");
         let global = PwaPushGlobalConfig {
@@ -374,14 +281,7 @@ mod tests {
             subject: Some("mailto:admin@example.com".to_string()),
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let result = resolve_pwa_push_layer(&global, &apps);
+        let result = resolve_pwa_push_layer(&global);
         assert!(result.is_some());
         let resolved = result.unwrap();
         assert_eq!(resolved.subject, "mailto:admin@example.com");
@@ -390,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn apps_gate_pwa_push_resolve_round_trips_same_public_key() {
+    fn resolve_round_trips_same_public_key() {
         // Calling resolve_pwa_push_layer twice on the same keypair_file must
         // return the same public key (second call reads the file; first
         // generates it). Guards against parse / consistency-check regressions.
@@ -401,15 +301,8 @@ mod tests {
             subject: Some("mailto:admin@example.com".to_string()),
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let r1 = resolve_pwa_push_layer(&global, &apps).unwrap();
-        let r2 = resolve_pwa_push_layer(&global, &apps).unwrap();
+        let r1 = resolve_pwa_push_layer(&global).unwrap();
+        let r2 = resolve_pwa_push_layer(&global).unwrap();
         assert_eq!(
             r1.vapid.public_b64url, r2.vapid.public_b64url,
             "round-trip must return same public key"
@@ -425,14 +318,7 @@ mod tests {
             subject: Some("https://example.com/push".to_string()),
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let result = resolve_pwa_push_layer(&global, &apps).unwrap();
+        let result = resolve_pwa_push_layer(&global).unwrap();
         assert_eq!(result.subject, "https://example.com/push");
     }
 
@@ -445,14 +331,7 @@ mod tests {
             subject: Some("mailto:admin@example.com".to_string()),
             ..Default::default()
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let result = resolve_pwa_push_layer(&global, &apps).unwrap();
+        let result = resolve_pwa_push_layer(&global).unwrap();
         assert!(result.endpoint_policy.enforce_allowlist);
         let list = &result.endpoint_policy.allowlist;
         assert!(list.contains(&"fcm.googleapis.com".to_string()));
@@ -471,14 +350,7 @@ mod tests {
             endpoint_host_allowlist: vec![],
             endpoint_host_allowlist_enforce: false,
         };
-        let apps = make_apps(vec![make_app(
-            "graf",
-            Some(AppPwaPushBlock {
-                default_title: None,
-            }),
-            true,
-        )]);
-        let result = resolve_pwa_push_layer(&global, &apps).unwrap();
+        let result = resolve_pwa_push_layer(&global).unwrap();
         assert!(!result.endpoint_policy.enforce_allowlist);
         assert!(result.endpoint_policy.allowlist.is_empty());
     }

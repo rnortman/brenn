@@ -1,5 +1,6 @@
 //! One-cycle reaction: fetch+classify+notify for a single trigger.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use brenn_messaging::repo_sync_cursor::{self, EnqueueRow};
@@ -717,11 +718,13 @@ async fn handle_advanced(
                 let app = app.clone();
                 let slug = info.slug.clone();
                 let alert = ctx.alert_dispatcher.clone();
-                let lock = ctx
-                    .post_pull_hook_locks
-                    .get(app_slug)
-                    .expect("BUG: app has post_pull_hooks but no lock entry")
-                    .clone();
+                let lock = Arc::clone(
+                    ctx.post_pull_hook_locks
+                        .lock()
+                        .expect("post_pull_hook_locks mutex poisoned")
+                        .entry(app_slug.clone())
+                        .or_default(),
+                );
                 tokio::spawn(async move {
                     // try_lock: if another hook invocation is already
                     // running for this app, skip. The running hook
@@ -1063,8 +1066,8 @@ mod tests {
             failure_state: Arc::new(std::sync::Mutex::new(
                 crate::repo_sync::PersistentFailureState::default(),
             )),
-            apps: Arc::new(indexmap::IndexMap::new()),
-            post_pull_hook_locks: Arc::new(HashMap::new()),
+            apps: brenn_lib::config::AppTable::empty(),
+            post_pull_hook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pre_fanout_gate: None,
             post_lock_release_notify: None,
         };
@@ -2407,15 +2410,8 @@ mod tests {
         let mut remote_locks: HashMap<String, Arc<TokioMutex<()>>> = HashMap::new();
         remote_locks.insert(remote_url.clone(), Arc::new(TokioMutex::new(())));
 
-        let has_hooks =
-            !app.post_pull_hooks.host.is_empty() || !app.post_pull_hooks.container.is_empty();
         let mut apps = indexmap::IndexMap::new();
         apps.insert(app_slug.to_string(), app);
-        let mut hook_locks: HashMap<String, Arc<TokioMutex<()>>> = HashMap::new();
-        if has_hooks {
-            hook_locks.insert(app_slug.to_string(), Arc::new(TokioMutex::new(())));
-        }
-
         let ctx = RepoSyncCtx {
             db,
             active_bridges: ActiveBridges::new(),
@@ -2427,8 +2423,8 @@ mod tests {
             failure_state: Arc::new(std::sync::Mutex::new(
                 crate::repo_sync::PersistentFailureState::default(),
             )),
-            apps: Arc::new(apps),
-            post_pull_hook_locks: Arc::new(hook_locks),
+            apps: brenn_lib::config::AppTable::new(Arc::new(apps)),
+            post_pull_hook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pre_fanout_gate: None,
             post_lock_release_notify: None,
         };
@@ -2470,6 +2466,63 @@ mod tests {
         assert!(
             wait_for_marker(&marker, 5000).await,
             "post-pull hook should have created marker file on Pulled advance"
+        );
+    }
+
+    /// `post_pull_hooks` converges at reload, so an agent can have hooks now
+    /// and have had none when this context was built. The per-app coalescing
+    /// lock is minted on first use.
+    #[tokio::test]
+    async fn post_pull_hook_fires_for_an_agent_that_gained_hooks_after_boot() {
+        let (remote, clone) = scratch_remote_and_clone();
+        let hook_dir = tempfile::tempdir().unwrap();
+        let marker = hook_dir.path().join("hook_ran");
+
+        // An agent that has no hooks at all — no lock entry exists yet.
+        let hookless = AppConfig {
+            working_dir: hook_dir.path().to_path_buf(),
+            ..brenn_lib::config::test_app_config("appa")
+        };
+        let db = crate::test_support::init_db_memory();
+        let _conv_id = mk_conv(&db, "appa").await;
+        let (ctx, remote_url) = build_ctx_with_hooks(
+            db.clone(),
+            clone.path().to_path_buf(),
+            "src-x",
+            "appa",
+            hookless,
+        );
+        assert!(
+            ctx.post_pull_hook_locks
+                .lock()
+                .expect("lock table poisoned")
+                .is_empty(),
+            "the lock table starts empty"
+        );
+
+        run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
+
+        // The reload's swap: the agent now declares a hook.
+        let mut apps = indexmap::IndexMap::new();
+        apps.insert(
+            "appa".to_string(),
+            mk_hook_app("appa", hook_dir.path().to_path_buf(), "hook_ran"),
+        );
+        ctx.apps.store(Arc::new(apps));
+
+        push_sibling_commit(remote.path(), "external commit");
+        run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
+
+        assert!(
+            wait_for_marker(&marker, 5000).await,
+            "an agent that gained hooks at reload must run them on the next pull"
+        );
+        assert!(
+            ctx.post_pull_hook_locks
+                .lock()
+                .expect("lock table poisoned")
+                .contains_key("appa"),
+            "the lock entry is minted on first use"
         );
     }
 

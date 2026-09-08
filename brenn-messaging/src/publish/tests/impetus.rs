@@ -43,18 +43,22 @@ fn publisher(mint: Mint) -> brenn_lib::config::AppConfig {
         }),
         vec!["bob".to_string()],
     );
-    cfg.policy.grants.insert(AppCapability::EphemeralPublish);
-    cfg.policy
+    cfg.policy_mut()
+        .grants
+        .insert(AppCapability::EphemeralPublish);
+    cfg.policy_mut()
         .acls
         .ephemeral_publish
         .push(ChannelMatcher::Prefix(String::new()));
-    cfg.policy.grants.insert(AppCapability::EphemeralSubscribe);
-    cfg.policy
+    cfg.policy_mut()
+        .grants
+        .insert(AppCapability::EphemeralSubscribe);
+    cfg.policy_mut()
         .acls
         .ephemeral_subscribe
         .push(ChannelMatcher::Prefix(String::new()));
     if mint == Mint::Granted {
-        cfg.policy.grants.insert(AppCapability::MintImpetus);
+        cfg.policy_mut().grants.insert(AppCapability::MintImpetus);
     }
     cfg
 }
@@ -175,12 +179,16 @@ async fn the_same_claim_lands_under_a_policy_holding_the_grant() {
 async fn minting_confers_no_channel_reach() {
     let m = messenger(Mint::Granted).await;
     let new_apps = {
-        let mut apps = (*m.apps).clone();
-        apps.get_mut(APP).unwrap().policy.acls.brenn_publish.clear();
+        let mut apps = (*m.apps.load()).clone();
+        apps.get_mut(APP)
+            .unwrap()
+            .policy_mut()
+            .acls
+            .brenn_publish
+            .clear();
         Arc::new(apps)
     };
-    let mut m = m;
-    Arc::get_mut(&mut m).unwrap().apps = new_apps;
+    m.apps.store(new_apps);
 
     let result = publish_with(&m, &durable_addr(), Some(Impetus::Replenish)).await;
     assert!(
@@ -196,13 +204,14 @@ async fn minting_confers_no_channel_reach() {
 async fn a_sender_without_publish_authority_still_hears_missing_sender() {
     let m = messenger(Mint::Granted).await;
     let new_apps = {
-        let mut apps = (*m.apps).clone();
+        let mut apps = (*m.apps.load()).clone();
         let app = apps.get_mut(APP).unwrap();
-        app.policy = brenn_lib::access::AppPolicy::with_grants(&[AppCapability::MintImpetus]);
+        app.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::with_grants(&[
+            AppCapability::MintImpetus,
+        ]));
         Arc::new(apps)
     };
-    let mut m = m;
-    Arc::get_mut(&mut m).unwrap().apps = new_apps;
+    m.apps.store(new_apps);
 
     let result = publish_with(&m, &durable_addr(), Some(Impetus::Replenish)).await;
     assert!(

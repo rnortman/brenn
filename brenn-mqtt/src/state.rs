@@ -20,6 +20,17 @@ use brenn_lib::mqtt::error::MqttError;
 // Supervisor state (visible to the registry for health reporting)
 // ---------------------------------------------------------------------------
 
+/// What the broker answered for one topic filter's SUBSCRIBE on the current
+/// session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubAckOutcome {
+    /// Granted: the broker delivers on this filter until the session ends.
+    Granted,
+    /// Refused, carrying the SUBACK's own words. Final for the session — the
+    /// broker does not change its answer without a new SUBSCRIBE.
+    Refused(String),
+}
+
 /// The live connection state of a supervisor, as readable from outside.
 #[derive(Debug, Clone)]
 pub enum SupervisorState {
@@ -171,6 +182,17 @@ pub struct MqttClientHandle {
     /// Inflight subscribes (pkid → filter), resolved at SubAck by `ack.pkid`.
     pub inflight_subscribes: Mutex<HashMap<u16, String>>,
 
+    /// What the broker answered for each topic filter on the *current* session,
+    /// as the SubAck arm attributed the answers by pkid.
+    ///
+    /// Observation only: nothing in the process decides on this map. It answers
+    /// "how did my SUBSCRIBE fare at the broker right now", which is a stronger
+    /// fact than "the SUBSCRIBE was sent". An entry exists only while
+    /// [`Self::subscriptions`] holds the filter, and the map is cleared with the
+    /// rest of the per-connect bookkeeping, so it is empty across a session drop
+    /// until the re-assert loop's SUBSCRIBEs are answered again.
+    subscribe_outcomes: Mutex<HashMap<String, SubAckOutcome>>,
+
     /// The wake channel used to send a "stop" signal to the supervisor task.
     pub stop_tx: tokio::sync::watch::Sender<bool>,
 }
@@ -193,6 +215,7 @@ impl MqttClientHandle {
             inflight_publishes: Mutex::new(HashMap::new()),
             pending_subscribes: Mutex::new(std::collections::VecDeque::new()),
             inflight_subscribes: Mutex::new(HashMap::new()),
+            subscribe_outcomes: Mutex::new(HashMap::new()),
             stop_tx,
         })
     }
@@ -261,11 +284,79 @@ impl MqttClientHandle {
 
     /// Remove the subscription for `topic_filter` from the runtime set if present,
     /// returning `true` if a matching entry was removed. Does not touch the broker.
+    ///
+    /// The broker's answer for the filter goes with it, whether or not an entry
+    /// was present: a filter being taken down is not a filter granted on this
+    /// session, and no caller has to remember the pairing.
     pub async fn remove_subscription(&self, topic_filter: &str) -> bool {
-        let mut subs = self.subscriptions.write().await;
-        let before = subs.len();
-        subs.retain(|s| s.topic_filter != topic_filter);
-        subs.len() != before
+        let removed = {
+            let mut subs = self.subscriptions.write().await;
+            let before = subs.len();
+            subs.retain(|s| s.topic_filter != topic_filter);
+            subs.len() != before
+        };
+        self.forget_outcome(topic_filter).await;
+        removed
+    }
+
+    /// Record the broker's answer for `topic_filter` on the current session.
+    ///
+    /// A filter the runtime set no longer holds records nothing: an UNSUBSCRIBE
+    /// and a SUBACK can cross, and an answer for a filter this process has taken
+    /// down would outlive every reader's meaning of it.
+    async fn record_outcome(&self, topic_filter: &str, outcome: SubAckOutcome) {
+        let held = {
+            let subs = self.subscriptions.read().await;
+            subs.iter().any(|s| s.topic_filter == topic_filter)
+        };
+        if !held {
+            return;
+        }
+        self.subscribe_outcomes
+            .lock()
+            .await
+            .insert(topic_filter.to_string(), outcome);
+    }
+
+    /// Record `topic_filter` as granted by the broker on the current session.
+    pub async fn record_grant(&self, topic_filter: &str) {
+        self.record_outcome(topic_filter, SubAckOutcome::Granted)
+            .await;
+    }
+
+    /// Record the broker's refusal of `topic_filter`, in the SUBACK's own words.
+    pub async fn record_refusal(&self, topic_filter: &str, reason: String) {
+        self.record_outcome(topic_filter, SubAckOutcome::Refused(reason))
+            .await;
+    }
+
+    /// Forget the broker's answer for `topic_filter`. Idempotent.
+    pub async fn forget_outcome(&self, topic_filter: &str) {
+        self.subscribe_outcomes.lock().await.remove(topic_filter);
+    }
+
+    /// Whether the broker has granted `topic_filter` on the current session.
+    pub async fn is_granted(&self, topic_filter: &str) -> bool {
+        matches!(
+            self.subscribe_outcomes.lock().await.get(topic_filter),
+            Some(SubAckOutcome::Granted)
+        )
+    }
+
+    /// The broker's answer for `topic_filter`, or `None` if none has come back
+    /// on this session.
+    pub async fn subscribe_outcome(&self, topic_filter: &str) -> Option<SubAckOutcome> {
+        self.subscribe_outcomes
+            .lock()
+            .await
+            .get(topic_filter)
+            .cloned()
+    }
+
+    /// Forget every answer — the per-connect clear, since a SUBACK belongs to
+    /// the session that sent it.
+    pub async fn clear_outcomes(&self) {
+        self.subscribe_outcomes.lock().await.clear();
     }
 
     /// Signal the supervisor to stop (sends `true` on the stop watch channel).
@@ -367,12 +458,41 @@ mod tests {
         let _ = handle.add_subscription("home/+/state".into(), 2).await;
     }
 
+    /// Removing a filter reports whether an entry went, and takes the broker's
+    /// answer with it either way — including the second call, where no entry is
+    /// present.
     #[tokio::test]
     async fn remove_subscription_reports_match() {
         let handle = make_handle("broker");
         handle.add_subscription("sensors/#".into(), 1).await;
+        handle.record_grant("sensors/#").await;
+        assert!(handle.is_granted("sensors/#").await);
+
         assert!(handle.remove_subscription("sensors/#").await);
+        assert!(!handle.is_granted("sensors/#").await);
+
         assert!(!handle.remove_subscription("sensors/#").await);
+        assert!(!handle.is_granted("sensors/#").await);
+    }
+
+    /// An answer is recorded only for a filter the runtime set holds: with the
+    /// filter gone, the SubAck arm's `record_*` is a no-op rather than an entry
+    /// no reader can retire.
+    #[tokio::test]
+    async fn an_outcome_for_an_unheld_filter_is_not_recorded() {
+        let handle = make_handle("broker");
+        handle.record_grant("sensors/#").await;
+        handle
+            .record_refusal("sensors/#", "Failure".to_string())
+            .await;
+        assert_eq!(handle.subscribe_outcome("sensors/#").await, None);
+
+        handle.add_subscription("sensors/#".into(), 1).await;
+        handle.record_grant("sensors/#").await;
+        assert_eq!(
+            handle.subscribe_outcome("sensors/#").await,
+            Some(SubAckOutcome::Granted)
+        );
     }
 
     #[test]

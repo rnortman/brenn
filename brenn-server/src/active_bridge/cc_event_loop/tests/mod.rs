@@ -234,10 +234,10 @@ fn drain_test_app_config(allowed_user: &str) -> brenn_lib::config::AppConfig {
     let mut app = crate::test_support::app_config::minimal_app_config("testapp", None, vec![]);
     app.singleton = true;
     app.allowed_users = vec![allowed_user.to_string()];
-    app.policy
+    app.policy_mut()
         .grants
         .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
-    app.policy
+    app.policy_mut()
         .acls
         .brenn_subscribe
         .push(brenn_lib::access::acl::ChannelMatcher::Prefix(

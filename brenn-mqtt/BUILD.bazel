@@ -24,10 +24,12 @@ rust_library(
     ],
 )
 
-# 69 tests, all in-process: payload classification, session bookkeeping under
+# 94 tests, all in-process: payload classification, session bookkeeping under
 # tokio's test runtime, and egress enforcement over an in-memory sqlite. No
-# broker is spawned here — that is `:mqtt_integration`. 0.05s locally against a
-# 60s budget, so `small` holds with room on a cold 4-vCPU runner.
+# broker is spawned here — that is `:mqtt_integration`. 0.08s locally against a
+# 60s budget, so `small` holds with room on a cold 4-vCPU runner. The count is
+# `.bazel-bin/brenn-mqtt/brenn-mqtt_test --list`'s own total, which is what to
+# re-read rather than increment; the timing is the load-bearing half.
 #
 # The test binary links brenn-lib with `testutils` for the resolved-client-config
 # fixture and the grant-set builders; the release configs clear the flag.
@@ -60,7 +62,7 @@ rust_test(
 # A static string, so the action key stays machine-independent; the operator's
 # BRENN_MOSQUITTO_BIN override reaches the test through .bazelrc's --test_env.
 #
-# `medium` (300s): 15 tests, each spawning its own broker and waiting for it to
+# `medium` (300s): 16 tests, each spawning its own broker and waiting for it to
 # bind a TLS port, finish in 1.3s locally. The budget is sized for the readiness
 # wait, not the assertions — a loaded runner pays seconds per spawn, not minutes.
 rust_test(

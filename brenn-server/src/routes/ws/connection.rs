@@ -183,6 +183,10 @@ pub(super) struct WsConnection {
     /// Receives notifications when bridges spawn. Allows auto-attach when
     /// another connection spawns a bridge for this connection's conversation.
     pub(super) bridge_notify_rx: broadcast::Receiver<crate::state::BridgeSpawned>,
+    /// Receives a pulse whenever a reload installs a new agent map. This
+    /// connection was authorized once, at connect; the pulse is when it asks
+    /// again, and closes itself if the answer is now no.
+    pub(super) apps_swapped_rx: broadcast::Receiver<()>,
     /// True after `send_history` has been called for the current conversation.
     /// Cleared by `detach()`. No longer suppresses re-replay on BridgeSpawned
     /// (see `last_sent_seq`), but still used to distinguish first-connect from
@@ -213,7 +217,7 @@ pub(super) struct WsConnection {
 // impl WsConnection — primitive accessors and core send/attach/detach helpers
 impl WsConnection {
     /// Get the app config for this connection's app slug.
-    pub(super) fn app_config(&self) -> &brenn_lib::config::AppConfig {
+    pub(super) fn app_config(&self) -> brenn_lib::config::AppRef {
         self.state
             .apps
             .get(&self.app_slug)
@@ -266,7 +270,7 @@ impl WsConnection {
 
     /// Thin wrapper over `build_graf_env_from` — see that function for docs.
     pub(super) async fn build_graf_env(&self) -> Vec<(String, String)> {
-        super::usage::build_graf_env_from(self.app_config(), self.effective_timezone().await)
+        super::usage::build_graf_env_from(&self.app_config(), self.effective_timezone().await)
     }
 
     /// Compute both the graf environment and today's date under one DB lock.
@@ -286,7 +290,7 @@ impl WsConnection {
         let conn = self.state.db.lock().await;
         let du = brenn_db::auth::device::load_device_user(&conn, self.device_id, self.user_id);
         let tz = brenn_db::auth::device::effective_timezone(&du, self.timezone, now);
-        let env = super::usage::build_graf_env_from(self.app_config(), tz);
+        let env = super::usage::build_graf_env_from(&self.app_config(), tz);
         let today = now.with_timezone(&tz).date_naive();
         (env, today)
     }
@@ -742,7 +746,7 @@ impl WsConnection {
         }
 
         // Send initial todo state after conversation selection.
-        if let Some(config) = brenn_graf::graf_config(self.app_config()) {
+        if let Some(config) = brenn_graf::graf_config(&self.app_config()) {
             self.send_todo_state(config).await;
         }
 

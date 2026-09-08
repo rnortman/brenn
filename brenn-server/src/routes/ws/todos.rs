@@ -26,7 +26,7 @@ impl WsConnection {
         // or expiry crossing between the two DB reads produces an env and today from
         // different zones — the exact divergence this feature exists to close.
         let (env, today) = self.build_graf_env_and_today().await;
-        match brenn_graf::subprocess::query_todos(config, ac, &env).await {
+        match brenn_graf::subprocess::query_todos(config, &ac, &env).await {
             Ok(result) => {
                 let lint_errors = result.lint_errors;
                 let _ = self.send_ws(WsServerMessage::TodoState {
@@ -74,7 +74,8 @@ impl WsConnection {
 
     pub(super) async fn handle_todo_refresh(&self) {
         self.touch_ui_activity("TodoRefresh").await;
-        let Some(config) = brenn_graf::graf_config(self.app_config()) else {
+        let app_config = self.app_config();
+        let Some(config) = brenn_graf::graf_config(&app_config) else {
             self.reject_todo_no_graf("TodoRefresh");
             return;
         };
@@ -105,7 +106,7 @@ impl WsConnection {
         Fut: std::future::Future<Output = Result<T, String>>,
     {
         let ac = self.app_config();
-        let Some(config) = brenn_graf::graf_config(ac) else {
+        let Some(config) = brenn_graf::graf_config(&ac) else {
             self.reject_todo_no_graf(msg_type);
             return false;
         };
@@ -147,7 +148,7 @@ impl WsConnection {
     ) {
         self.touch_ui_activity("TodoDone").await;
         let ac = self.app_config();
-        let Some(config) = brenn_graf::graf_config(ac) else {
+        let Some(config) = brenn_graf::graf_config(&ac) else {
             self.reject_todo_no_graf("TodoDone");
             return;
         };
@@ -156,7 +157,8 @@ impl WsConnection {
         // in the wire format; serde rejects the message at deserialize if
         // the field is absent, so no defensive Option-unwrap is needed here.
         let env = self.build_graf_env().await;
-        match brenn_graf::subprocess::todo_done(config, path, repo, completion_date, ac, &env).await
+        match brenn_graf::subprocess::todo_done(config, path, repo, completion_date, &ac, &env)
+            .await
         {
             Ok(result) => {
                 // Prefer on_date, fall back to end_date for the

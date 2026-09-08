@@ -16,9 +16,8 @@ use std::sync::Arc;
 
 use brenn_cc::session::ModelOption;
 use brenn_db::Db;
-use brenn_lib::config::AppConfig;
+use brenn_lib::config::AppTable;
 use brenn_ws_types::ModelInfo;
-use indexmap::IndexMap;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -27,7 +26,7 @@ use tracing::warn;
 #[derive(Clone)]
 pub(crate) struct ModelCache {
     pub db: Db,
-    pub apps: Arc<IndexMap<String, AppConfig>>,
+    pub apps: AppTable,
     pub cached: Arc<RwLock<HashMap<String, Vec<ModelInfo>>>>,
 }
 
@@ -95,7 +94,10 @@ impl ModelCache {
     /// This app's model allow-list, or `None` when it offers everything CC
     /// reports.
     pub(crate) fn allow_list(&self, app_slug: &str) -> Option<Vec<String>> {
-        self.apps.get(app_slug).and_then(|a| a.models.clone())
+        self.apps
+            .load()
+            .get(app_slug)
+            .and_then(|a| a.models.clone())
     }
 }
 
@@ -159,7 +161,10 @@ mod tests {
         let db = crate::test_support::init_db_memory();
         let mut app = brenn_lib::config::test_app_config("testapp");
         app.models = Some(vec!["sonnet".to_string(), "typo".to_string()]);
-        let apps = Arc::new(IndexMap::from([("testapp".to_string(), app)]));
+        let apps = AppTable::new(Arc::new(indexmap::IndexMap::from([(
+            "testapp".to_string(),
+            app,
+        )])));
         let cache = ModelCache {
             db,
             apps,

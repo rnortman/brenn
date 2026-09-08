@@ -147,7 +147,7 @@ mod tests {
 
     fn app_with_policy(slug: &str, policy: AppPolicy) -> (String, AppConfig) {
         let mut app = test_app_config(slug, None, vec![]);
-        app.policy = policy;
+        app.policy = std::sync::Arc::new(policy);
         (slug.to_string(), app)
     }
 

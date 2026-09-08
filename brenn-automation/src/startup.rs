@@ -138,7 +138,7 @@ pub async fn run_startup_consistency_checks(engine: &AutomationEngine) {
     };
 
     for slug in enabled_slugs {
-        if engine.apps.contains_key(&slug) {
+        if engine.apps.load().contains_key(&slug) {
             continue;
         }
 

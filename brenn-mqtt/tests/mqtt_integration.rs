@@ -22,7 +22,8 @@ use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
 use common::{
     BrokerHarness, SpawnedClient, TcpRelay, await_puback, broker_auth, broker_tls13, certs,
-    direct_publisher_acked, direct_subscriber, recv_delivery, spawn_client, spawn_client_tls13,
+    direct_publisher_acked, direct_subscriber, log_records_publish_to_subscriber,
+    log_records_unsubscribe, recv_delivery, session_client_id, spawn_client, spawn_client_tls13,
     spawn_client_with_config, subscribe_live_confirmed, test_client_config, wait_for_health,
 };
 use rumqttc::mqttbytes::QoS;
@@ -660,6 +661,100 @@ async fn ingress_unsubscribe_filter_live_stops_delivery() {
         ),
         Ok(None) => panic!("router receiver closed"),
     }
+}
+
+/// **The broker-log matchers, read against a real broker's wording.**
+///
+/// The unit cases beside `log_records_unsubscribe` and
+/// `log_records_publish_to_subscriber` parse a literal transcript, so both sides
+/// of that pairing are written in this repository: a `mosquitto` release that
+/// renames a line, drops the tab before a listed filter or re-spells
+/// `Sending PUBLISH to` leaves them green and turns every broker-side wait in
+/// the tree into a ten-second timeout attributed to whatever the wait was
+/// about. This case puts the same two matchers on a log an actual broker wrote,
+/// so that rename fails here, where the diagnostic is the wording.
+///
+/// Both discriminations the matchers make are asserted against the real thing,
+/// not only the recognition: a filter the broker has merely granted must not
+/// read as withdrawn — its SUBSCRIBE lists it in the same tab-indented shape —
+/// and a send to this session must not read as a send to a client id that is a
+/// strict prefix of it, which is the one form of that discrimination whose
+/// wrong answer is reachable, because the prefix is in the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_matchers_read_a_live_brokers_wording() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        mut rx,
+        ..
+    } = spawn_client("logfmt", &harness, ca.clone(), vec![]).await;
+    let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca).await;
+
+    let withdrawn = "brenn/itest/logfmt/withdrawn";
+    let kept = "brenn/itest/logfmt/kept";
+
+    // Both filters granted, and their retained barriers delivered — so the log
+    // holds this session's SUBSCRIBEs and a `Sending PUBLISH` to it on each
+    // topic before anything is withdrawn.
+    assert_eq!(
+        subscribe_live_confirmed(&svc, &client_slug, withdrawn, &pubc, &mut ack_rx, &mut rx).await,
+        IngressSubscribeOutcome::SubscribedLive
+    );
+    assert_eq!(
+        subscribe_live_confirmed(&svc, &client_slug, kept, &pubc, &mut ack_rx, &mut rx).await,
+        IngressSubscribeOutcome::SubscribedLive
+    );
+
+    let subscriber = session_client_id(&client_slug);
+    let granted = harness
+        .wait_for_log(
+            0,
+            5,
+            &format!("the broker never recorded sending the barrier to {subscriber} on {kept}"),
+            |log| log_records_publish_to_subscriber(log, &subscriber, kept),
+        )
+        .await;
+    for filter in [withdrawn, kept] {
+        assert!(
+            !log_records_unsubscribe(&granted, &subscriber, filter),
+            "{filter} was only ever subscribed, and its SUBSCRIBE listed it in the shape an \
+             UNSUBSCRIBE uses: {granted}",
+        );
+    }
+    // A strict prefix of the subscriber's id, so the substring is in the log
+    // and only the bracket that opens the packet's fields keeps it out. An id
+    // absent from the log would pass against any matcher that read the
+    // subscriber at all, including one that ignored it.
+    let prefix_of_subscriber = &subscriber[..subscriber.len() - 1];
+    assert!(
+        !log_records_publish_to_subscriber(&granted, prefix_of_subscriber, kept),
+        "a send to {subscriber} read as a send to {prefix_of_subscriber}: {granted}",
+    );
+
+    // What the broker appends from here is the withdrawal's own record.
+    let before_withdrawal = harness.log_len();
+    assert_eq!(
+        svc.unsubscribe_filter(&client_slug, withdrawn).await,
+        Some(IngressUnsubscribeOutcome::UnsubscribedLive)
+    );
+
+    let withdrawn_log = harness
+        .wait_for_log(
+            before_withdrawal,
+            5,
+            &format!("the broker never recorded the UNSUBSCRIBE for {withdrawn}"),
+            |log| log_records_unsubscribe(log, &subscriber, withdrawn),
+        )
+        .await;
+    assert!(
+        !log_records_unsubscribe(&withdrawn_log, &subscriber, kept),
+        "the filter still subscribed read as withdrawn: {withdrawn_log}",
+    );
 }
 
 // ===========================================================================

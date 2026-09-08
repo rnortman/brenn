@@ -54,8 +54,10 @@ use brenn_messaging_boot::{MessagingPlan, PlanInputs, plan_messaging};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 
 use crate::consumers::{ConsumerLoadContext, ConsumerRegistry, LoadedConsumer, load_consumer};
+use crate::reload::agents::AgentInputs;
 use crate::reload::compare::non_convergible_differences;
-use crate::reload::delta::{PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
+use crate::reload::delta::{LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
+use crate::reload::dynamic::DynamicSnapshot;
 use crate::reload::surfaces::{
     SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, arriving, build_surface_docs,
     system_participant_refusals,
@@ -112,7 +114,16 @@ pub(crate) struct ReloadEnv {
     /// it too, and a rebuilt one that carried a different value would advertise
     /// a build that nothing is running.
     pub build_id: &'static str,
-    pub apps: Arc<IndexMap<String, AppConfig>>,
+    /// The agent table this process reads through. Held rather than
+    /// snapshotted: a reload plans against the map the gates are reading now.
+    pub apps: brenn_lib::config::AppTable,
+    /// The integration factories this process was built with. Immutable after
+    /// construction; every reload resolves the same factories.
+    pub integration_registry: Arc<brenn_lib::integration::IntegrationRegistry>,
+    /// The validated `XDG_RUNTIME_DIR` boot resolved, present exactly when some
+    /// agent is bare. A candidate cannot change that: `container` is refused at
+    /// level 1, so the same answer serves every reload.
+    pub runtime_dir: Option<PathBuf>,
     pub mqtt_clients: IndexMap<String, MqttClientIdentity>,
     pub tool_registry: Arc<brenn_tool_registry::ToolRegistry>,
     pub replay_store_paths: Vec<PathBuf>,
@@ -138,6 +149,15 @@ pub(crate) struct ReloadEnv {
     /// off the one `MqttResult`.
     pub mqtt_event_router: Option<Arc<brenn_server::mqtt_router::MqttEventRouterImpl>>,
     pub max_payload_bytes: usize,
+    /// The live Claude Code sessions. A reload condemns the ones whose agent's
+    /// per-process view moved, or whose conversation belongs to a user the
+    /// candidate no longer allows; each dies at its next idle moment and the
+    /// wake path spawns its successor from the swapped table.
+    pub active_bridges: brenn_server::active_bridge::ActiveBridges,
+    /// Pulsed once per commit that removed a user from some agent, so every
+    /// open WebSocket re-asks the connect-time access question against the
+    /// swapped table and closes itself when the answer changed.
+    pub apps_swapped_tx: tokio::sync::broadcast::Sender<()>,
     pub messenger: Arc<Messenger>,
     /// The wake router, whose delivery bindings a consumer joins and leaves
     /// through.
@@ -384,7 +404,7 @@ impl ReloadDriver {
     /// it stamps the `applied` body commit will publish, and `trigger` is one of
     /// that body's fields: a body measured under one trigger and published under
     /// another is not the body that was measured.
-    pub fn prepare(&self, source: TriggerSource) -> Prepared {
+    pub fn prepare(&self, source: TriggerSource, dynamic: &DynamicSnapshot) -> Prepared {
         // 0. The mounts document, re-read and re-verified before anything asks
         //    what is installed. It is what says which trees this host may read
         //    at all, so the deployment document's imports, the cross-root scans
@@ -407,12 +427,23 @@ impl ReloadDriver {
         };
         let sha = candidate.document_sha256.clone();
 
-        // 2. Level 1: everything a reload cannot converge must be equal.
-        let differences =
+        // 2. Level 1: everything a reload cannot converge must be equal, and
+        //    for each agent that survives it, which of its convergible field
+        //    classes moved.
+        let level_one =
             non_convergible_differences(&self.baseline.document.config, &candidate.config);
-        if !differences.is_empty() {
-            return refused(Some(sha), differences);
+        if !level_one.refusals.is_empty() {
+            return refused(Some(sha), level_one.refusals);
         }
+        let app_diffs = level_one.app_diffs;
+
+        // 2a. The candidate's agent map — must be the candidate's, not the
+        //     booted one, because the plan derives static subscriptions from it
+        //     and the gates read authority per call through the swapped table.
+        let candidate_apps = match self.resolve_candidate_apps(&candidate.config) {
+            Ok(apps) => apps,
+            Err(refusals) => return refused(Some(sha), refusals),
+        };
 
         // 3. The cross-root scans boot runs before anything else, re-run because
         //    a bundle installed since boot may have landed a name brenn's own
@@ -425,7 +456,7 @@ impl ReloadDriver {
         }
 
         // 4. The candidate's plan, and level 2 over it.
-        let plan = match self.plan_of(&candidate) {
+        let plan = match self.plan_of(&candidate, &candidate_apps) {
             Ok(plan) => plan,
             Err(refusals) => return refused(Some(sha), refusals),
         };
@@ -466,8 +497,10 @@ impl ReloadDriver {
             Err(refusals) => return refused(Some(sha), refusals),
         };
         let baseline_records = self.baseline_records();
+        let baseline_apps = self.env.apps.load();
         let baseline_facts = PlanFacts {
             directory: &self.baseline.directory,
+            apps: &baseline_apps,
             consumers: &self.baseline.consumers,
             records: &baseline_records,
             mqtt_ingress: &self.baseline.mqtt_ingress,
@@ -475,6 +508,7 @@ impl ReloadDriver {
         };
         let candidate_facts = PlanFacts {
             directory: &plan.directory,
+            apps: &candidate_apps,
             consumers: &plan.wasm_consumers,
             records: &candidate_records,
             mqtt_ingress: &plan.mqtt_ingress_channels,
@@ -484,6 +518,15 @@ impl ReloadDriver {
             &baseline_facts,
             &candidate_facts,
             kind_differences.into_keys().collect(),
+            &AgentInputs {
+                app_diffs: &app_diffs,
+                tool_registry: &self.env.tool_registry,
+            },
+            &LiveFacts {
+                directory: self.env.messenger.directory(),
+                dynamic,
+                mqtt_clients: &self.env.mqtt_clients,
+            },
         );
         let refusals = convergibility_refusals(
             &baseline_facts,
@@ -559,6 +602,15 @@ impl ReloadDriver {
             };
         let surface_runtimes = self.arriving_surface_runtimes(&candidate.config, &delta);
 
+        // 9. The last thing prepare does, because it is the only thing it
+        //    writes. Each changed agent whose tool list moved gets the
+        //    candidate's rendering staged beside the file its running
+        //    `noop_mcp.py` read; commit renames. A write failure is an
+        //    environment refusal and takes every staged file with it.
+        if let Err(refusals) = self.stage_virtual_tools(&delta, &candidate_apps) {
+            return refused(Some(sha), refusals);
+        }
+
         Prepared::Ready(Box::new(ReadyReload {
             document: candidate,
             mounts,
@@ -571,6 +623,65 @@ impl ReloadDriver {
             surface_docs,
             applied,
         }))
+    }
+
+    /// Write each changed agent's candidate virtual-tools rendering beside the
+    /// file its sessions were spawned against.
+    ///
+    /// Staged rather than written in place because a reload that refuses after
+    /// this point must leave the running process reading exactly what it was
+    /// reading; commit's rename is what makes the new list the live one, and it
+    /// happens in the same step as the map swap.
+    fn stage_virtual_tools(
+        &self,
+        delta: &PlanDelta,
+        apps: &IndexMap<String, AppConfig>,
+    ) -> Result<(), Vec<String>> {
+        let mut written = Vec::new();
+        for change in &delta.agents_changed {
+            if !change.virtual_tools_staged {
+                continue;
+            }
+            let app = apps.get(&change.slug).unwrap_or_else(|| {
+                panic!(
+                    "reload prepare: agent {:?} is in the delta but not in the candidate map it \
+                     was computed from — host bug",
+                    change.slug,
+                )
+            });
+            let path = super::agents::staged_virtual_tools_path(app);
+            let rendered =
+                brenn_server::active_bridge::render_virtual_tools(app, &self.env.tool_registry);
+            if let Err(error) = std::fs::write(&path, rendered) {
+                for path in &written {
+                    let _: std::io::Result<()> = std::fs::remove_file(path);
+                }
+                return Err(vec![format!(
+                    "agent {:?}: writing the new virtual tools list to {} failed: {error}",
+                    change.slug,
+                    path.display(),
+                )]);
+            }
+            written.push(path);
+        }
+        Ok(())
+    }
+
+    /// Remove every staged tool list, for a reload that refused after prepare
+    /// staged them.
+    fn discard_staged_virtual_tools(&self, delta: &PlanDelta, plan: &MessagingPlan) {
+        let Some(apps) = plan.planned_apps() else {
+            return;
+        };
+        for change in &delta.agents_changed {
+            if !change.virtual_tools_staged {
+                continue;
+            }
+            if let Some(app) = apps.get(&change.slug) {
+                let _: std::io::Result<()> =
+                    std::fs::remove_file(super::agents::staged_virtual_tools_path(app));
+            }
+        }
     }
 
     /// The `applied` outcome a ready reload will publish, exactly as commit
@@ -613,12 +724,46 @@ impl ReloadDriver {
         }
     }
 
-    /// Lower a candidate document with the booted plan inputs.
-    fn plan_of(&self, candidate: &LoadedDocument) -> Result<MessagingPlan, Vec<String>> {
+    /// The candidate's agent map, resolved as boot resolves it.
+    ///
+    /// Frozen inputs are the booted process's (MQTT client identities and
+    /// webhook subscription stamps), which level 1 has proved equal. A panic
+    /// out of the resolver is classified as a refusal.
+    fn resolve_candidate_apps(
+        &self,
+        candidate: &brenn_lib::config::BrennConfig,
+    ) -> Result<Arc<IndexMap<String, AppConfig>>, Vec<String>> {
+        let booted = self.env.apps.load();
+        let webhook_subscriptions: std::collections::BTreeMap<String, Vec<_>> = booted
+            .iter()
+            .map(|(slug, app)| (slug.clone(), app.webhook_subscriptions.clone()))
+            .collect();
+        let frozen = brenn_lib::config::FrozenInputs {
+            mqtt_clients: &self.env.mqtt_clients,
+            webhook_subscriptions: &webhook_subscriptions,
+        };
+        let registry = &self.env.integration_registry;
+        let runtime_dir = self.env.runtime_dir.as_deref();
+        let resolved = catch_quietly(AssertUnwindSafe(|| {
+            let apps = brenn_lib::config::resolve_apps(candidate, registry, runtime_dir, &frozen);
+            self.env.tool_registry.validate_config(&apps);
+            apps
+        }))
+        .map_err(|payload| vec![app_resolver_refusal(payload)])?;
+        Ok(Arc::new(resolved))
+    }
+
+    /// Lower a candidate document with the candidate's agents and the booted
+    /// plan inputs level 1 froze.
+    fn plan_of(
+        &self,
+        candidate: &LoadedDocument,
+        apps: &Arc<IndexMap<String, AppConfig>>,
+    ) -> Result<MessagingPlan, Vec<String>> {
         let planned = catch_quietly(AssertUnwindSafe(|| {
             plan_messaging(&PlanInputs {
                 config: &candidate.config,
-                apps: Some(&self.env.apps),
+                apps: Some(apps),
                 mqtt_clients: &self.env.mqtt_clients,
                 tool_registry: Some(&self.env.tool_registry),
                 replay_store_paths: &self.env.replay_store_paths,
@@ -864,6 +1009,25 @@ impl ReloadDriver {
         .map_err(|payload| vec![environment_refusal(payload)])
     }
 
+    /// The dynamic subscriptions this process holds right now: every durable
+    /// row in the table and every non-durable registration the messenger keeps.
+    ///
+    /// Read once per reload, before prepare, and carried through to commit. The
+    /// set is the one input to a reload that a live session can move while
+    /// prepare runs — a `MessageSubscribe` mints a row at any moment, on the
+    /// old document's authority — so commit compares what it reads against
+    /// this and declines a reload whose subject moved underneath it.
+    pub(crate) async fn dynamic_snapshot(&self) -> DynamicSnapshot {
+        let rows = {
+            let conn = self.env.messenger.db().lock().await;
+            brenn_messaging_store::db::load_dynamic_subscriptions(&conn)
+        };
+        DynamicSnapshot {
+            rows,
+            nondurable: self.env.messenger.nondurable_dynamic_subs(),
+        }
+    }
+
     /// Run prepare and report every outcome that is settled without touching
     /// the running system.
     ///
@@ -887,7 +1051,12 @@ impl ReloadDriver {
         // them. That needs the multi-threaded runtime. The driver still decides
         // one reload at a time — this is where the reload waits, not a second
         // one starting.
-        let prepared = tokio::task::block_in_place(|| self.prepare(source));
+        // The one input prepare cannot read for itself: the durable dynamic
+        // rows are behind the database's async mutex, and prepare is
+        // synchronous. Read here, classified in there, and re-read at commit,
+        // which is where a set that moved in between is caught.
+        let dynamic = self.dynamic_snapshot().await;
+        let prepared = tokio::task::block_in_place(|| self.prepare(source, &dynamic));
         match prepared {
             Prepared::Refused {
                 document_sha256,
@@ -1010,7 +1179,7 @@ impl ReloadDriver {
         // The walk is `async` throughout — it awaits a stopping consumer's last
         // drain step and the database — so unlike prepare it is not the
         // blocking pool's to run.
-        let mqtt_report = match super::commit::apply(
+        let report = match super::commit::apply(
             &self.env,
             &mut self.registry,
             &plan,
@@ -1028,6 +1197,10 @@ impl ReloadDriver {
         {
             Ok(report) => report,
             Err(refusals) => {
+                // The staged tool lists go with the refusal: nothing was
+                // touched, so nothing may be left beside a running agent's file
+                // for a later commit to rename into place.
+                self.discard_staged_virtual_tools(&delta, &plan);
                 self.report_refusal(source, Some(sha.clone()), refusals)
                     .await;
                 return;
@@ -1038,8 +1211,10 @@ impl ReloadDriver {
         // connect in this process will take. Prepare measured the body with
         // every moved filter listed in both, so replacing that with the ones
         // that actually deferred or failed only shrinks it.
-        applied.delta.mqtt_deferred = mqtt_report.deferred;
-        applied.delta.mqtt_failed = mqtt_report.failed;
+        applied.delta.mqtt_deferred = report.mqtt.deferred;
+        applied.delta.mqtt_failed = report.mqtt.failed;
+        applied.delta.sessions_retired = report.sessions_retired;
+        applied.delta.sessions_retire_pending = report.sessions_retire_pending;
         self.generation += 1;
         self.baseline = Baseline::of(document, mounts, &plan);
         // The delta on the line, not just in the retained body: an operator
@@ -1064,8 +1239,17 @@ impl ReloadDriver {
             // already carries per filter: this is the one an operator reading
             // an applied reload has to act on.
             mqtt_failed = ?applied.delta.mqtt_failed,
+            // An agent's authority widening is the most security-relevant thing
+            // a reload can do, and the journal is where an operator who cannot
+            // reach the bus reads what moved.
+            agents_changed = ?applied.delta.agents_changed,
+            subscriptions_added = ?applied.delta.subscriptions_added,
+            subscriptions_removed = ?applied.delta.subscriptions_removed,
+            sessions_retired = ?applied.delta.sessions_retired,
+            sessions_retire_pending = ?applied.delta.sessions_retire_pending,
             "reload applied"
         );
+        fit_session_lists(&mut applied, self.env.messenger.max_body_bytes());
         // The one field that is not prepare's: the outcome was reached now, not
         // when it was decided. Fixed width, so the size prepare measured stands.
         applied.at = now();
@@ -1107,11 +1291,74 @@ impl ReloadDriver {
     }
 }
 
+/// Keep the `applied` body publishable when commit's session lists push it past
+/// the limit prepare measured.
+///
+/// Prepare measures the body with both session lists empty, and cannot do
+/// otherwise: which live sessions were killable at the swap is a fact about the
+/// process a moment later, and the bridge registry is behind an async lock a
+/// synchronous prepare may not take. Unlike the two mqtt lists, which prepare
+/// measures at their maximum and commit only shrinks, these two only grow — so
+/// a host with many live sessions of a changed agent could measure as fitting
+/// and then publish oversize, and an `applied` the publish gate rejects never
+/// reaches the retained status channel, which reads to a bundle installer as a
+/// failed reload over a successful one.
+///
+/// The names are the part that can be given up: they are replaced by their
+/// counts, and cleared outright if even that does not fit, which restores the
+/// body prepare proved publishable. The journal line above carries them in full
+/// either way.
+fn fit_session_lists(applied: &mut ReloadStatus, max: usize) {
+    if check_body_size(&applied.body(), max).is_ok() {
+        return;
+    }
+    let retired = applied.delta.sessions_retired.len();
+    let pending = applied.delta.sessions_retire_pending.len();
+    warn!(
+        retired,
+        pending,
+        max,
+        "the applied status body does not fit with the session lists; publishing their counts"
+    );
+    applied.delta.sessions_retired = vec![format!("{retired} sessions retired; names omitted")];
+    applied.delta.sessions_retire_pending = vec![format!(
+        "{pending} sessions retiring at turn end; names omitted"
+    )];
+    if check_body_size(&applied.body(), max).is_ok() {
+        return;
+    }
+    applied.delta.sessions_retired.clear();
+    applied.delta.sessions_retire_pending.clear();
+}
+
 fn refused(document_sha256: Option<String>, refusals: Vec<String>) -> Prepared {
     Prepared::Refused {
         document_sha256,
         refusals,
     }
+}
+
+/// Read a caught agent-resolver panic as a refusal, whatever it says.
+///
+/// Unlike the messaging planner, [`brenn_lib::config::resolve_apps`] is a pure
+/// function of the document plus three filesystem stats and one mkdir: every
+/// assert in it is a verdict on what the operator wrote or on the directory it
+/// named. Most of them are spelled in boot's own words rather than with the
+/// [`CONFIG_REFUSAL`](brenn_lib::panic_util::CONFIG_REFUSAL) prefix, because on
+/// the boot path nothing classifies the text — so classifying by prefix here
+/// would report a `working_dir` typo as a possible host defect and burn the one
+/// log line that is supposed to mean "a resolver is broken". The message is
+/// reported verbatim instead, which is what it already is: the refusal a fresh
+/// boot of this document would have printed.
+fn app_resolver_refusal(payload: Box<dyn std::any::Any + Send>) -> String {
+    panic_message(&*payload).map_or_else(
+        || {
+            "the agent resolver panicked with a payload carrying no message, which is a host \
+             defect rather than a verdict on the document"
+                .to_string()
+        },
+        ToString::to_string,
+    )
 }
 
 /// Read a caught planner panic as a refusal, whatever it says.
@@ -1165,7 +1412,6 @@ fn environment_refusal(payload: Box<dyn std::any::Any + Send>) -> String {
 pub(crate) mod tests {
     use super::*;
 
-    use brenn_lib::access::test_fixtures::delivery_policy_for_addresses;
     use brenn_lib::config::{BrennConfig, PACKAGED, PACKAGED_MODULE};
     use brenn_lib::messaging::SubscriberEntryKind;
     use brenn_messaging::config_reload::{RELOAD_ADDRESS, STATUS_ADDRESS};
@@ -1174,6 +1420,7 @@ pub(crate) mod tests {
     use brenn_server::messaging_router::DeliveryBinding;
     use brenn_server::test_support::init_db_memory;
     use rusqlite::OptionalExtension;
+    use tracing_test::traced_test;
 
     pub(crate) type Captured = Arc<std::sync::Mutex<Vec<(AlertSeverity, String, String)>>>;
 
@@ -1196,6 +1443,162 @@ pub(crate) mod tests {
     /// `ephemeral:` channel, so that the ring stores are a live part of every
     /// comparison rather than an empty list compared with an empty list.
     pub(crate) fn document(extra: &str) -> String {
+        document_subscribing(extra, &[])
+    }
+
+    /// [`document`] with the reader agent subscribing to the channels
+    /// `subscribes` names by their handles.
+    ///
+    /// Pull-only (`push_depth = 0`) on purpose: an `App` subscriber entry is
+    /// what these cases want on the channel, and a push-enabled one would put
+    /// the conversation-delivery path between the publish and the consumer this
+    /// is about.
+    pub(crate) fn document_subscribing(extra: &str, subscribes: &[&str]) -> String {
+        document_subscribing_acl(extra, subscribes, &[])
+    }
+
+    /// [`document_subscribing`] with `extra_acl`'s clauses added to the
+    /// agent's subscribe ACL — `exact work`, `topic_filter "mqtt:ha:x"` — for
+    /// the cases about a channel the ACL covers with no `subscribe` statement
+    /// on it, which is what a dynamic subscription needs.
+    ///
+    /// A parameter rather than a `.replace` on this function's own output: the
+    /// anchor would be this fixture's formatting, and a reflow of the ACL line
+    /// would silently produce documents without the clause the caller asked
+    /// for.
+    pub(crate) fn document_subscribing_acl(
+        extra: &str,
+        subscribes: &[&str],
+        extra_acl: &[&str],
+    ) -> String {
+        let subscriptions: String = subscribes
+            .iter()
+            .map(|channel| {
+                format!("    subscribe {channel} {{ push_depth = 0; retain_depth = 4; }}\n")
+            })
+            .collect();
+        // An explicit `acl subscribe` is the whole of the plane's authority, so
+        // a `subscribe` statement beside it derives nothing and has to be
+        // covered by hand.
+        let subscribe_acl: String = subscribes
+            .iter()
+            .map(|channel| format!(", exact {channel}"))
+            .chain(extra_acl.iter().map(|clause| format!(", {clause}")))
+            .collect();
+        document_with_agent(
+            extra,
+            &format!(
+                r#"
+agent Reader() {{
+    working_dir = ".";
+    grants = [subscribe, publish];
+    send_budget = 1000000;
+    acl subscribe [exact reload_outcomes, prefix "brenn:surface.", prefix "ephemeral:surface."{subscribe_acl}];
+    acl publish [exact reload_requests, exact work];
+{subscriptions}}}
+
+new some-reader: Reader();
+"#
+            ),
+        )
+    }
+
+    /// [`document_subscribing`], but the agent is a singleton owned by one
+    /// user and its subscriptions are push-enabled — the shape that holds a
+    /// position under the agent's own conversation, which is what makes the
+    /// attach half of the commit reachable.
+    ///
+    /// `owner` is the whole of `allowed_users`: a push-enabled subscription is
+    /// only resolvable on a singleton agent with exactly one user, and the
+    /// first entry is the conversation the bus path targets.
+    pub(crate) fn document_push_subscribing(
+        extra: &str,
+        owner: &[&str],
+        subscribes: &[&str],
+    ) -> String {
+        document_push_subscribing_acl(extra, owner, subscribes, &[], &[])
+    }
+
+    /// [`document_push_subscribing`] with two more knobs, for the same reason
+    /// [`document_subscribing_acl`] has one: `mqtt_addresses` adds a
+    /// push-enabled `subscribe` on each raw `mqtt:<client>:<topic>` address
+    /// with the matching `topic_filter` clause, and `extra_acl` adds bare
+    /// clauses to the subscribe ACL.
+    ///
+    /// An `mqtt:` subscription is spelled by address because the channel is
+    /// system-synthesized and has no `[[channel]]` block to name. That is also
+    /// why it states its own `wake_min`: there is no operator rung to inherit
+    /// one from, and the family default would have the dispatcher wake a
+    /// conversation this rig seats no bridge for.
+    pub(crate) fn document_push_subscribing_acl(
+        extra: &str,
+        owner: &[&str],
+        subscribes: &[&str],
+        mqtt_addresses: &[&str],
+        extra_acl: &[&str],
+    ) -> String {
+        let subscriptions: String = subscribes
+            .iter()
+            .map(|channel| {
+                format!("    subscribe {channel} {{ push_depth = 1; retain_depth = 4; }}\n")
+            })
+            .chain(mqtt_addresses.iter().map(|address| {
+                format!(
+                    "    subscribe \"{address}\" {{ push_depth = 1; retain_depth = 4; \
+                     wake_min = never; }}\n"
+                )
+            }))
+            .collect();
+        let subscribe_acl: String = subscribes
+            .iter()
+            .map(|channel| format!(", exact {channel}"))
+            .chain(
+                mqtt_addresses
+                    .iter()
+                    .map(|address| format!(", topic_filter \"{address}\"")),
+            )
+            .chain(extra_acl.iter().map(|clause| format!(", {clause}")))
+            .collect();
+        let users: String = owner
+            .iter()
+            .map(|user| format!("\"{user}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        document_with_agent(
+            extra,
+            &format!(
+                r#"
+agent Reader() {{
+    working_dir = ".";
+    singleton = true;
+    // A singleton agent is required to state at least one compaction setting.
+    compact_soft_pct = 70;
+    allowed_users = [{users}];
+    grants = [subscribe, publish];
+    send_budget = 1000000;
+    acl subscribe [exact reload_outcomes, prefix "brenn:surface.", prefix "ephemeral:surface."{subscribe_acl}];
+    acl publish [exact reload_requests, exact work];
+{subscriptions}}}
+
+new some-reader: Reader();
+"#
+            ),
+        )
+    }
+
+    /// [`document`] with no agent at all.
+    ///
+    /// Only for the case about the planner's "configures no messaging" arm: an
+    /// agent is itself enough to configure messaging, so a candidate that
+    /// reaches that arm has no agent, and level 1 refuses a candidate whose
+    /// agent set moved.
+    pub(crate) fn document_agentless(extra: &str) -> String {
+        document_with_agent(extra, "")
+    }
+
+    /// The channel floor every fixture stands on, `agent` between it and
+    /// `extra`.
+    fn document_with_agent(extra: &str, agent: &str) -> String {
         format!(
             r#"
 channel index at "brenn:surface.index" {{
@@ -1220,6 +1623,11 @@ channel work at "brenn:work" {{
     push_depth = 4;
     retain_depth = 16;
     standing_retain_depth = 64;
+    // The rung an agent's pull-only subscription inherits. A `subscribe` at
+    // `push_depth = 0` may not state a `wake_min` of its own, and the default
+    // rung would have the dispatcher eager-wake a conversation these fixtures
+    // never seat a bridge for.
+    wake_min = never;
     // Effectively unrated: the case that publishes continuously across a
     // reload asks what a publish meets while a subscriber is leaving, and a
     // throttle inside that window would answer a different question.
@@ -1230,6 +1638,7 @@ channel scratch at "ephemeral:scratch" {{
     push_depth = 1;
     retain_depth = 4;
 }}
+{agent}
 {extra}
 "#
         )
@@ -1284,6 +1693,15 @@ channel scratch at "ephemeral:scratch" {{
 
         pub(crate) fn modules(&self) -> PathBuf {
             self.dir.path().join("modules")
+        }
+
+        /// The runtime directory the agent state dirs are minted under, in the
+        /// role `XDG_RUNTIME_DIR` plays for a bare agent at boot. Under this
+        /// tree so that dropping it takes the state dirs with it.
+        pub(crate) fn runtime_dir(&self) -> PathBuf {
+            let dir = self.dir.path().join("runtime");
+            std::fs::create_dir_all(&dir).expect("a runtime directory");
+            dir
         }
 
         pub(crate) fn inputs(&self) -> DocumentInputs {
@@ -1427,6 +1845,11 @@ channel scratch at "ephemeral:scratch" {{
     /// and the alerts anything raised.
     pub(crate) struct Booted {
         pub(crate) driver: ReloadDriver,
+        /// The pulse the WS event loops re-check their user against.
+        pub(crate) apps_swapped_tx: tokio::sync::broadcast::Sender<()>,
+        /// The live bridge registry the commit's session step sweeps. Held so a
+        /// case can seat a session and watch a reload retire it.
+        pub(crate) active_bridges: brenn_server::active_bridge::ActiveBridges,
         pub(crate) messenger: Arc<Messenger>,
         pub(crate) router: Arc<brenn_server::messaging_router::WakeRouterImpl>,
         pub(crate) captured: Captured,
@@ -1545,6 +1968,7 @@ channel scratch at "ephemeral:scratch" {{
     async fn live_mqtt_runtime(
         config: &BrennConfig,
         plan: &MessagingPlan,
+        dynamic_ingress: &[brenn_messaging_boot::DynamicMqttIngress],
         db: &brenn_db::Db,
         messenger: &Arc<Messenger>,
     ) -> (
@@ -1555,7 +1979,31 @@ channel scratch at "ephemeral:scratch" {{
         Vec<tokio::sync::watch::Sender<bool>>,
     ) {
         let clients = brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients);
-        let result = crate::mqtt::start_mqtt(&plan.mqtt_ingress_channels, &clients).await;
+        // The supervisor's SUBSCRIBE union and the router's route table are
+        // built from the static ingress set alone, so a durable dynamic `mqtt:`
+        // row the boot merge kept is appended here, with `urgency` filled from
+        // the client the row was created against. Without it a dormant row
+        // revived by a reload would be the first filter this process ever
+        // asserted for its channel, and the case about revoking one would have
+        // nothing to revoke.
+        let mut ingress = plan.mqtt_ingress_channels.clone();
+        for kept in dynamic_ingress {
+            let client = clients.get(&kept.client_slug).unwrap_or_else(|| {
+                panic!(
+                    "the fixture document declares no client {:?} for the dynamic row on {:?}",
+                    kept.client_slug, kept.channel_address,
+                )
+            });
+            ingress.push(brenn_lib::mqtt::config::ResolvedMqttIngressChannel {
+                channel_address: kept.channel_address.clone(),
+                channel_uuid: kept.channel_uuid,
+                client_slug: kept.client_slug.clone(),
+                topic: kept.topic.clone(),
+                qos: kept.qos,
+                urgency: client.identity.urgency,
+            });
+        }
+        let result = crate::mqtt::start_mqtt(&ingress, &clients).await;
         let service = result.service.expect("a live fixture declares a client");
         let router = result
             .event_router
@@ -1566,59 +2014,31 @@ channel scratch at "ephemeral:scratch" {{
         // message.
         let mut state = brenn_server::test_support::state::test_state(db);
         state.messenger = Some(messenger.clone());
-        let stop_txs = crate::mqtt::wire_mqtt_state(
-            &service,
-            &router,
-            state,
-            &plan.mqtt_ingress_channels,
-            result.stop_txs,
-        )
-        .await;
+        let stop_txs =
+            crate::mqtt::wire_mqtt_state(&service, &router, state, &ingress, result.stop_txs).await;
         ((service, router), stop_txs)
     }
 
-    /// The reader app's resolved subscriptions on `addresses`.
+    /// A fixture document's agent map, resolved as boot resolves it.
     ///
-    /// Pull-only (`push_depth = 0`) on purpose: an `App` subscriber entry is
-    /// what these cases want on the channel, and a push-enabled one would put
-    /// the conversation-delivery path between the publish and the consumer this
-    /// is about.
-    fn static_subscriptions(
+    /// The integration registry is empty and the webhook stamps are: no
+    /// fixture document declares an integration or a webhook subscription. The
+    /// client identities are the document's own, as boot derives them and as
+    /// the driver's `ReloadEnv` holds them — an agent whose ACL names a
+    /// declared broker resolves on both paths or on neither.
+    pub(crate) fn resolve_fixture_apps(
         config: &BrennConfig,
-        addresses: &[&str],
-    ) -> Vec<brenn_lib::messaging::config::ResolvedSubscription> {
-        use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedSubscription};
-        use brenn_lib::messaging::directory::WakeMin;
-
-        addresses
-            .iter()
-            .map(|address| {
-                let raw = config
-                    .channels
-                    .iter()
-                    .find(|channel| channel.address.as_deref() == Some(*address))
-                    .unwrap_or_else(|| panic!("the fixture document declares {address}"));
-                let uuid = raw
-                    .uuid
-                    .as_deref()
-                    .expect("a durable channel carries the uuid its row is named by");
-                // A subscriber may not retain more than the channel's standing
-                // buffer holds, so the block's own number is the ceiling; four
-                // is deep enough for anything these fixtures read.
-                let retain_depth = match raw.standing_retain_depth {
-                    Some(Depth::Bounded(standing)) => Depth::Bounded(standing.min(4)),
-                    _ => Depth::Bounded(4),
-                };
-                ResolvedSubscription {
-                    channel_uuid: uuid::Uuid::parse_str(uuid).expect("a lowered uuid parses"),
-                    channel_address: (*address).to_string(),
-                    push_depth: Depth::Bounded(0),
-                    retain_depth,
-                    noise: NoiseLevel::Silent,
-                    wake_min: WakeMin::Never,
-                }
-            })
-            .collect()
+        runtime_dir: &std::path::Path,
+    ) -> IndexMap<String, AppConfig> {
+        brenn_lib::config::resolve_apps(
+            config,
+            &brenn_lib::integration::IntegrationRegistry::new(vec![]),
+            Some(runtime_dir),
+            &brenn_lib::config::FrozenInputs {
+                mqtt_clients: &client_identities(config),
+                webhook_subscriptions: &std::collections::BTreeMap::new(),
+            },
+        )
     }
 
     /// The axes a fixture boot varies. Every field defaults to what most cases
@@ -1635,20 +2055,6 @@ channel scratch at "ephemeral:scratch" {{
         /// The tool registry, for the documents whose consumers hold async tool
         /// grants; absent mints an empty one.
         pub(crate) tool_registry: Option<Arc<brenn_tool_registry::ToolRegistry>>,
-        /// `brenn:` addresses the reader app holds a **static subscription** on.
-        ///
-        /// An address here seats an `App` subscriber entry on the channel; a
-        /// policy alone does not. The reader's policy is also extended to match
-        /// each address.
-        pub(crate) reader_subscriptions: Vec<&'static str>,
-        /// Addresses the reader app may *read* without holding a subscriber
-        /// entry on them.
-        ///
-        /// Separate from `reader_subscriptions` because seating an `App`
-        /// subscriber on a substrate-owned channel — a surface's config
-        /// channel, a description document — would change the topology the
-        /// case is about; a policy alone is all a `query` needs.
-        pub(crate) reader_reads: Vec<&'static str>,
         /// A deployed surface asset tree to declare as one more mount, in the
         /// shape a release installs: the kernel pair at its root and one
         /// `processor/<kind>/` directory per kind it serves.
@@ -1693,8 +2099,6 @@ channel scratch at "ephemeral:scratch" {{
             db,
             components_roots,
             tool_registry,
-            reader_subscriptions,
-            reader_reads,
             surface_assets,
             mqtt,
             mqtt_live,
@@ -1717,69 +2121,39 @@ channel scratch at "ephemeral:scratch" {{
         let db = db.unwrap_or_else(init_db_memory);
         let tool_registry = tool_registry
             .unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
-        let reader_subscriptions = reader_subscriptions.as_slice();
         let document = check_config(&DocumentInputs {
             root: tree.root(),
             module_roots,
             role: brenn_lib::config::DocumentRole::Deployment,
         })
         .expect("the fixture document must load");
-        let subscriptions = static_subscriptions(&document.config, reader_subscriptions);
-        let messaging = (!subscriptions.is_empty()).then_some(
-            brenn_lib::messaging::config::ResolvedMessagingConfig {
-                send_budget: 1_000_000,
-                subscriptions,
-            },
-        );
-        let mut reader =
-            brenn_server::test_support::app_config::minimal_app_config(READER, messaging, vec![]);
-        // The conversation send budget these fixtures publish against. Raised
-        // off the default of 100 for the case that publishes continuously
-        // across a reload: the budget is not what any of these tests is about,
-        // and a reload outlasting it would fail on the budget instead.
-        reader.messaging_default_send_budget = 1_000_000;
-        reader.policy = delivery_policy_for_addresses(
-            std::iter::once(STATUS_ADDRESS)
-                .chain(reader_subscriptions.iter().copied())
-                .chain(reader_reads.iter().copied()),
-        );
-        reader
-            .policy
-            .grants
-            .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
-        reader
-            .policy
-            .acls
-            .brenn_publish
-            .push(brenn_lib::access::acl::ChannelMatcher::Exact(
-                RELOAD_ADDRESS
-                    .strip_prefix("brenn:")
-                    .expect("the request channel is a brenn: address")
-                    .to_string(),
-            ));
-        // The work channel too: the cases that publish across a reload do it as
-        // this app, which is the only principal these fixtures seat.
-        reader
-            .policy
-            .acls
-            .brenn_publish
-            .push(brenn_lib::access::acl::ChannelMatcher::Exact(
-                "work".to_string(),
-            ));
-        let mut map: IndexMap<String, AppConfig> = IndexMap::new();
-        map.insert(READER.to_string(), reader);
-        let apps = Arc::new(map);
+        // Resolved by the same function boot and reload call, so the
+        // document and the map cannot disagree.
+        let runtime_dir = tree.runtime_dir();
+        let apps = Arc::new(resolve_fixture_apps(&document.config, &runtime_dir));
+        // What boot writes for every agent, so the file the reload renames onto
+        // has a predecessor and a fresh boot of the same rig produces its own.
+        // Without it the oracle's virtual-tools field would compare a file the
+        // reload wrote against one nothing wrote.
+        for app in apps.values() {
+            brenn_server::active_bridge::write_virtual_tools_file(app, &tool_registry);
+        }
         let (alert_dispatcher, captured, _drain) = make_capturing_alerter_with_severity();
 
-        let result = brenn_messaging_boot::test_fixtures::boot_messaging_with_tools(
+        // One registry for the whole rig: the reload's session steps, the wake
+        // router and a case that seats a session all read the same one.
+        let active_bridges = brenn_server::active_bridge::ActiveBridges::new();
+        let result = brenn_messaging_boot::test_fixtures::boot_messaging_over_bridges(
             &document.config,
             db.clone(),
             &apps,
             alert_dispatcher.clone(),
             "brenn://test",
             &tool_registry,
+            active_bridges.clone(),
         )
-        .await;
+        .await
+        .0;
         let messenger = result.messenger.clone().expect("messaging must be up");
         let router = result.router.clone().expect("the wake router must be up");
         // The delivery bindings boot registers for everything that is not a
@@ -1827,8 +2201,14 @@ channel scratch at "ephemeral:scratch" {{
                 Vec::new(),
             ),
             (_, true) => {
-                let (runtime, stop_txs) =
-                    live_mqtt_runtime(&document.config, &plan, &db, &messenger).await;
+                let (runtime, stop_txs) = live_mqtt_runtime(
+                    &document.config,
+                    &plan,
+                    &result.dynamic_mqtt_ingress,
+                    &db,
+                    &messenger,
+                )
+                .await;
                 (Some(runtime), stop_txs)
             }
             _ => (None, Vec::new()),
@@ -1911,12 +2291,20 @@ channel scratch at "ephemeral:scratch" {{
         .await;
 
         let root = tree.root().display().to_string();
+        // The pulse is held by the fixture too, so a case can watch the commit
+        // ask every open socket to re-check its user.
+        let bridges_for_fixture = active_bridges.clone();
+        let apps_swapped_tx = tokio::sync::broadcast::channel(16).0;
         let driver = ReloadDriver::new(
             ReloadEnv {
                 config_path: tree.root(),
                 root: Some(root),
                 build_id: TEST_BUILD_ID,
-                apps,
+                apps: messenger.app_table(),
+                integration_registry: Arc::new(brenn_lib::integration::IntegrationRegistry::new(
+                    vec![],
+                )),
+                runtime_dir: Some(runtime_dir),
                 mqtt_clients: client_identities(&document.config),
                 tool_registry,
                 replay_store_paths: Vec::new(),
@@ -1926,6 +2314,8 @@ channel scratch at "ephemeral:scratch" {{
                 mqtt_service: mqtt.as_ref().map(|(service, _)| service.clone()),
                 mqtt_event_router: mqtt.as_ref().map(|(_, router)| router.clone()),
                 max_payload_bytes: document.config.messaging.max_body_bytes,
+                active_bridges,
+                apps_swapped_tx: apps_swapped_tx.clone(),
                 messenger: messenger.clone(),
                 router: router.clone(),
                 tool_caller_grants: tool_caller_grants.clone(),
@@ -1936,6 +2326,8 @@ channel scratch at "ephemeral:scratch" {{
         );
         Booted {
             driver,
+            apps_swapped_tx,
+            active_bridges: bridges_for_fixture,
             mounts,
             mqtt,
             mqtt_stop_txs,
@@ -2194,7 +2586,8 @@ channel spare at "brenn:spare" {
 }
 "#,
         ));
-        let ready = match booted.driver.prepare(TriggerSource::Signal) {
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -2355,7 +2748,37 @@ new sifter: Sifter {{
     /// component: it reads the work channel, and each directive it takes off it
     /// is answered on the sink channel with what its `config` map holds.
     pub(crate) fn document_with_a_configured_consumer(value: &str) -> String {
-        document(&format!(
+        configured_consumer_document(value, &[])
+    }
+
+    /// A document with a consumer and a push-enabled reader agent that
+    /// subscribes to each channel `subscribes` names.
+    ///
+    /// Both sides of the reload this fixture drives must be the same height:
+    /// the spec hash the installed package's record is bound to moves with
+    /// line count. A filler comment stands where the candidate's `subscribe`
+    /// line goes.
+    pub(crate) fn consumer_and_push_subscriber(subscribes: &[&str]) -> String {
+        let document = document_push_subscribing(&consumer_block("answer"), &["alice"], subscribes);
+        if !subscribes.is_empty() {
+            return document;
+        }
+        document.replace(
+            "    send_budget = 1000000;\n",
+            "    send_budget = 1000000;\n    // Nothing subscribed yet.\n",
+        )
+    }
+
+    /// [`document_with_a_configured_consumer`] with the reader agent
+    /// subscribing to the channels `subscribes` names.
+    pub(crate) fn configured_consumer_document(value: &str, subscribes: &[&str]) -> String {
+        document_subscribing(&consumer_block(value), subscribes)
+    }
+
+    /// The sink channel and the configured consumer that writes it, answering
+    /// every directive with `value`.
+    fn consumer_block(value: &str) -> String {
+        format!(
             r#"channel sink at "brenn:sink" {{
     push_depth = 1;
     retain_depth = 4;
@@ -2375,7 +2798,7 @@ new prober: Prober {{
     out out -> sink;
 }}
 "#
-        ))
+        )
     }
 
     /// A document declaring one consumer of the demo component, reading the
@@ -2887,7 +3310,8 @@ new sifter: Demo {{
         tree.write(&text);
         install_package(components.path(), &staged_module(&tree));
 
-        let ready = match booted.driver.prepare(TriggerSource::Signal) {
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -2934,31 +3358,29 @@ new sifter: Demo {{
         );
     }
 
-    /// A candidate that configures no messaging at all. The planner answers
-    /// `None` there, and a process running the reload facility has messaging by
-    /// construction — so this is a document for some other process.
+    /// A candidate that configures no messaging at all is refused: a process
+    /// running the reload facility has messaging by construction.
+    ///
+    /// Booted agentless and verdict read off `prepare`: an agent alone
+    /// configures messaging, so the reader agent other fixtures use would
+    /// prevent the candidate from reaching the `None` arm.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_candidate_that_configures_no_messaging_is_refused() {
-        let tree = Tree::holding(&document(""));
-        let mut booted = boot(&tree, Vec::new()).await;
+        let tree = Tree::holding(&document_agentless(""));
+        let booted = boot(&tree, Vec::new()).await;
 
         tree.write("// a document that configures nothing at all\n");
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let Prepared::Refused { refusals, .. } =
+            booted.driver.prepare(TriggerSource::Signal, &dynamic)
+        else {
+            panic!("a candidate that configures no messaging must be refused");
+        };
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
         assert!(
-            booted
-                .driver
-                .prepare_and_report(TriggerSource::Signal)
-                .await
-                .is_none()
-        );
-
-        let status = booted.last_status().await;
-        assert_eq!(status.outcome, Outcome::Refused);
-        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
-        assert!(
-            status.refusals[0].contains("configures no messaging")
-                && status.refusals[0].ends_with(super::super::NEEDS_RESTART),
-            "{:?}",
-            status.refusals
+            refusals[0].contains("configures no messaging")
+                && refusals[0].ends_with(super::super::NEEDS_RESTART),
+            "{refusals:?}",
         );
     }
 
@@ -3191,12 +3613,11 @@ new sifter: Demo {{
     #[tokio::test(flavor = "multi_thread")]
     async fn a_consumer_joins_and_leaves_a_channel_an_app_already_reads() {
         let components = tempfile::tempdir().expect("a components root");
-        let tree = Tree::holding(&document(""));
+        let tree = Tree::holding(&document_subscribing("", &["work"]));
         let mut booted = boot_with(
             &tree,
             BootFixture {
                 components_roots: vec![components.path().to_path_buf()],
-                reader_subscriptions: vec!["brenn:work"],
                 dispatcher: true,
                 ..BootFixture::default()
             },
@@ -3230,7 +3651,7 @@ new sifter: Demo {{
         );
 
         // The consumer arrives on the channel the app already reads.
-        tree.write(&document_with_a_configured_consumer("v1"));
+        tree.write(&configured_consumer_document("v1", &["work"]));
         install_package_from(
             components.path(),
             &staged_module(&tree),
@@ -3280,7 +3701,7 @@ new sifter: Demo {{
 
         // The other direction: the automation leaves and the agent's
         // subscription is exactly where it was.
-        tree.write(&document(""));
+        tree.write(&document_subscribing("", &["work"]));
         booted.driver.reload(TriggerSource::Signal).await;
 
         let status = booted.last_status().await;
@@ -4606,7 +5027,8 @@ new sifter: Sifter {{
         let mut booted = boot(&tree, Vec::new()).await;
 
         tree.write(&document(&padding_channels(40)));
-        let measured = match booted.driver.prepare(TriggerSource::Signal) {
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let measured = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
             Prepared::Ready(ready) => ready.applied,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -4712,25 +5134,19 @@ new sifter: Sifter {{
     }
 
     /// The same retune, on a channel an agent declares a subscription to:
-    /// refused, and nothing moves.
-    ///
-    /// Rule 1's other half.  A retune must not re-create a subscriber
-    /// entry that belongs to a live conversation.  The rule is
-    /// unit-tested; this case covers the operator-facing verdict for the
-    /// likeliest shape: retuning a channel an agent reads.
+    /// applied, with the agent promoted into the delta by closure. The agent's
+    /// subscription is on both sides, so the commit folds the entry out with
+    /// the old channel and back in from the candidate's plan.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_retune_of_a_channel_an_agent_subscribes_to_is_refused() {
-        let tree = Tree::holding(&document(""));
+    async fn a_retune_of_a_channel_an_agent_subscribes_to_moves_the_agent_with_it() {
+        let tree = Tree::holding(&document_subscribing("", &["work"]));
         let mut booted = boot_with(
             &tree,
             BootFixture {
-                reader_subscriptions: vec!["brenn:work"],
                 ..BootFixture::default()
             },
         )
         .await;
-        let booted_sha = booted.driver.baseline().document.document_sha256.clone();
-        let before = subscriber_lines(&booted.messenger, "brenn:work");
         assert_eq!(
             subscribed_anywhere(
                 &booted.messenger,
@@ -4740,29 +5156,24 @@ new sifter: Sifter {{
             "the fixture seats the declared subscriber this case is about",
         );
 
-        tree.write(&document("").replace(
+        tree.write(&document_subscribing("", &["work"]).replace(
             "    standing_retain_depth = 64;",
             "    standing_retain_depth = 32;",
         ));
         booted.driver.reload(TriggerSource::Signal).await;
 
         let status = booted.last_status().await;
-        assert_eq!(status.outcome, Outcome::Refused);
-        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
-        assert!(
-            status.refusals[0].contains("brenn:work")
-                && status.refusals[0].contains(READER)
-                && status.refusals[0].ends_with(super::super::NEEDS_RESTART),
-            "{:?}",
-            status.refusals
-        );
-        // Refused means untouched: the process still projects what it booted,
-        // and the entry the retune would have re-created is where it was.
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
         assert_eq!(
-            booted.driver.baseline().document.document_sha256,
-            booted_sha
+            status.delta.channels_changed,
+            vec!["brenn:work".to_string()]
         );
-        assert_eq!(subscriber_lines(&booted.messenger, "brenn:work"), before);
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        // Both sides: the entry the commit takes out sits on the old channel
+        // entry and the one it puts back on the new.
+        let moved = format!("{READER} brenn:work");
+        assert_eq!(status.delta.subscriptions_removed, vec![moved.clone()]);
+        assert_eq!(status.delta.subscriptions_added, vec![moved]);
         assert_eq!(
             booted
                 .messenger
@@ -4771,8 +5182,1729 @@ new sifter: Sifter {{
                 .expect("the work channel is still declared")
                 .resolved_channel
                 .standing_retain_depth,
-            brenn_lib::messaging::config::Depth::Bounded(64),
-            "the live entry keeps the tuning it booted with",
+            brenn_lib::messaging::config::Depth::Bounded(32),
+            "the live entry carries the candidate's tuning",
+        );
+        // The point of the case: the channel left and came back, and the agent
+        // came back with it.
+        assert_eq!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::App(READER.to_string())
+            ),
+            ["brenn:work"],
+            "the agent is folded back onto the re-added channel",
+        );
+    }
+
+    /// An edit to nothing but the agent's authority: applied, with the agent
+    /// named and no channel and no subscription moved. The reload swaps the
+    /// map and every gate reads the new authority per call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_authority_only_edit_applies_and_names_the_agent() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&document("").replace(
+            "acl subscribe [exact reload_outcomes",
+            "acl subscribe [prefix \"brenn:automation.\", exact reload_outcomes",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        assert!(status.delta.subscriptions_added.is_empty());
+        assert!(status.delta.subscriptions_removed.is_empty());
+        for moved in [
+            &status.delta.channels_added,
+            &status.delta.channels_removed,
+            &status.delta.channels_changed,
+        ] {
+            assert!(moved.is_empty(), "no channel moved: {moved:?}");
+        }
+        // The effect, not the report: the map every gate reads is the
+        // candidate's, so the widened matcher decides the next publish.
+        let apps = booted.messenger.app_table().load();
+        assert!(
+            apps[READER]
+                .policy
+                .acls
+                .brenn_subscribe
+                .iter()
+                .any(|matcher| matches!(
+                    matcher,
+                    brenn_lib::access::acl::ChannelMatcher::Prefix(p) if p == "automation."
+                )),
+            "the swapped table carries the candidate's ACL: {:?}",
+            apps[READER].policy.acls.brenn_subscribe,
+        );
+        assert!(
+            status.delta.sessions_retired.is_empty()
+                && status.delta.sessions_retire_pending.is_empty(),
+            "an authority-only edit is live at once; nothing a process holds is stale",
+        );
+        // The baseline moved *and* the process did, so the same bytes read
+        // again are a no-op rather than a second application of an edit that
+        // never landed.
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Unchanged);
+    }
+
+    /// A per-call field alone — nothing an agent's authority view carries.
+    /// Level 1's word is what puts the agent in the delta, which is what makes
+    /// the reload commit rather than adopt the candidate as baseline with the
+    /// edit unapplied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_per_call_edit_alone_applies_and_names_the_agent() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&document("").replace(
+            "    working_dir = \".\";",
+            "    working_dir = \".\";\n    icon = \"🧪\";",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        assert!(status.delta.subscriptions_added.is_empty());
+        assert!(status.delta.subscriptions_removed.is_empty());
+        assert!(
+            status.delta.sessions_retired.is_empty()
+                && status.delta.sessions_retire_pending.is_empty(),
+            "a per-call field reaches a live process through the table, not a respawn",
+        );
+        // What a route would serve: the per-call readers take the icon off the
+        // table on each request, so the swap is the whole of the convergence.
+        assert_eq!(
+            booted.messenger.app_table().load()[READER].icon,
+            "\u{1f9ea}",
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Unchanged);
+    }
+
+    /// A `subscribe` line added to an agent: the motivating half of the
+    /// request. The entry lands on the live channel, which is what makes the
+    /// agent a delivery target.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscription_added_to_an_agent_is_folded_onto_the_live_channel() {
+        let tree = Tree::holding(&document_subscribing("", &[]));
+        let mut booted = boot(&tree, Vec::new()).await;
+        assert!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::App(READER.to_string())
+            )
+            .is_empty(),
+            "the agent starts with no static subscription",
+        );
+
+        tree.write(&document_subscribing("", &["work"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        assert_eq!(
+            status.delta.subscriptions_added,
+            vec![format!("{READER} brenn:work")]
+        );
+        assert!(status.delta.subscriptions_removed.is_empty());
+        assert_eq!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::App(READER.to_string())
+            ),
+            ["brenn:work"],
+        );
+    }
+
+    /// And its inverse: the line removed takes the entry off the channel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscription_removed_from_an_agent_leaves_the_live_channel() {
+        let tree = Tree::holding(&document_subscribing("", &["work"]));
+        let mut booted = boot(&tree, Vec::new()).await;
+
+        tree.write(&document_subscribing("", &[]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.subscriptions_removed,
+            vec![format!("{READER} brenn:work")]
+        );
+        assert!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::App(READER.to_string())
+            )
+            .is_empty(),
+        );
+    }
+
+    /// A grant that changes what the agent's `noop_mcp.py` would list: the
+    /// staged rendering is renamed onto the live path at the swap, and nothing
+    /// is left staged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grant_that_moves_the_tool_list_rewrites_the_virtual_tools_file() {
+        // A declared broker, so the candidate's `client` matcher — which is
+        // what derives the MQTT publish grant, and with it the tool — names a
+        // client both documents hold.
+        const BROKER: &str =
+            "mqtt_client ha {\n    url = \"mqtts://127.0.0.1:8883\";\n    qos = 1;\n}\n";
+        let tree = Tree::holding(&document(BROKER));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let before = booted.messenger.app_table().load();
+        let path = before[READER].virtual_tools_path();
+        let staged = super::super::agents::staged_virtual_tools_path(&before[READER]);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("MqttSend"));
+
+        tree.write(&document(BROKER).replace(
+            "acl publish [exact reload_requests, exact work];",
+            "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("the live file is still there")
+                .contains("MqttSend"),
+            "the staged rendering was renamed onto the live path",
+        );
+        assert!(
+            !staged.exists(),
+            "the rename consumed the staged file: {}",
+            staged.display(),
+        );
+    }
+
+    /// A user dropped from `allowed_users`: their session is retired and the
+    /// commit pulses every open socket, which is what makes each re-ask the
+    /// connect-time question against the swapped table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_user_retires_their_session_and_pulses_the_open_connections() {
+        let tree = Tree::holding(&document("").replace(
+            "    working_dir = \".\";",
+            "    working_dir = \".\";\n    allowed_users = [\"alice\", \"bob\"];",
+        ));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let alice = seat_user(&booted.db, "alice").await;
+        let bob = seat_user(&booted.db, "bob").await;
+        let alices = seat_bridge(&booted, alice).await;
+        let bobs = seat_bridge(&booted, bob).await;
+        let mut pulses = booted.apps_swapped_tx.subscribe();
+
+        tree.write(&document("").replace(
+            "    working_dir = \".\";",
+            "    working_dir = \".\";\n    allowed_users = [\"alice\"];",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        assert_eq!(
+            status.delta.sessions_retired,
+            vec![format!("{READER} conv {}", bobs.conversation_id)],
+            "the dropped user's session is retired",
+        );
+        assert!(
+            booted
+                .active_bridges
+                .get(alices.conversation_id)
+                .await
+                .is_some(),
+            "the user still named keeps theirs",
+        );
+        assert_eq!(
+            pulses.try_recv(),
+            Ok(()),
+            "every WS loop is asked to re-check its user",
+        );
+    }
+
+    /// The agent's singleton conversation, or `None` where nothing has minted
+    /// one. Read through the owner the document names, as the bus path does.
+    pub(crate) async fn conversation_of(booted: &Booted, slug: &str) -> Option<i64> {
+        let owner = booted.messenger.app_table().load()[slug]
+            .allowed_users
+            .first()?
+            .clone();
+        let conn = booted.db.lock().await;
+        let user = brenn_db::auth::user::get_user_by_username(&conn, &owner)?;
+        brenn_db::conversation::get_singleton_conversation_id(&conn, user.id, slug)
+    }
+
+    /// Seat a user row and return its id. The bus path resolves an agent's
+    /// owner through this table, and a bridge is keyed on it.
+    pub(crate) async fn seat_user(db: &brenn_db::Db, username: &str) -> i64 {
+        let conn = db.lock().await;
+        brenn_db::auth::user::create_user(&conn, username, "$argon2id$fake")
+    }
+
+    /// A registered session for the reader agent, owned by `user_id`: what the
+    /// commit's session step sweeps.
+    pub(crate) async fn seat_bridge(
+        booted: &Booted,
+        user_id: i64,
+    ) -> Arc<brenn_server::active_bridge::ActiveBridge> {
+        let conversation_id = {
+            let conn = booted.db.lock().await;
+            brenn_db::conversation::create_conversation(&conn, user_id, READER, false)
+        };
+        let bridge = brenn_server::active_bridge::test_bridge_for_reload(
+            booted.db.clone(),
+            user_id,
+            conversation_id,
+            READER,
+            booted.messenger.app_table(),
+            booted.active_bridges.clone(),
+        );
+        booted
+            .active_bridges
+            .insert(conversation_id, bridge.clone())
+            .await;
+        bridge
+    }
+
+    /// A registered session for the reader agent on `conversation_id` — the
+    /// conversation the agent's subscriptions hold their positions under — that
+    /// can take a delivery: the messenger the drain reads through and a
+    /// recording session in place of the CC process.
+    ///
+    /// The returned receiver is held by the caller for as long as the delivery
+    /// matters: it is what keeps the recording session's channel open.
+    pub(crate) async fn seat_receiving_bridge(
+        booted: &Booted,
+        user_id: i64,
+        conversation_id: i64,
+    ) -> (
+        Arc<brenn_server::active_bridge::ActiveBridge>,
+        brenn_server::active_bridge::RecordedSession,
+    ) {
+        let (bridge, recorded) = brenn_server::active_bridge::test_bridge_receiving_bus(
+            booted.db.clone(),
+            user_id,
+            conversation_id,
+            READER,
+            booted.messenger.app_table(),
+            booted.active_bridges.clone(),
+            booted.messenger.clone(),
+        )
+        .await;
+        booted
+            .active_bridges
+            .insert(conversation_id, bridge.clone())
+            .await;
+        (bridge, recorded)
+    }
+
+    /// The motivating shape, end to end: one reload adds an agent's
+    /// push-enabled `subscribe` to a channel a consumer writes, and a publish
+    /// through that consumer afterwards reaches the agent's conversation — its
+    /// cursor passes the message the consumer produced.
+    ///
+    /// Every other case here asserts the wiring the reload leaves behind. This
+    /// one asserts what the wiring is for, over the whole path: the agent's
+    /// directive on the work channel, the consumer's answer on the sink
+    /// channel, the wake walk that finds the agent owed it, the delivery into
+    /// its conversation, and the position that moves past it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_through_the_consumer_reaches_the_agent_the_reload_subscribed() {
+        let components = tempfile::tempdir().expect("a components root");
+        let tree = Tree::holding(&consumer_and_push_subscriber(&[]));
+        install_package_from(
+            components.path(),
+            &staged_module(&tree),
+            "brenn_processor_config.wasm",
+        );
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                // The consumer must receive its directive through the shared
+                // dispatch loop for the end-to-end path to be exercised.
+                dispatcher: true,
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        // The directive's own sender, seated first so it takes user id 1 as
+        // `probe` assumes, and the agent's owner after it.
+        seat_a_conversation(&booted.db, 1).await;
+        let alice = seat_user(&booted.db, "alice").await;
+        // Seated before the reload: the attach publishes the chat roster,
+        // and with the dispatcher running that wakes the conversation. A
+        // missing session would trigger a CC spawn this rig has no stand-in
+        // for.
+        let conversation = {
+            let conn = booted.db.lock().await;
+            brenn_db::conversation::get_or_create_singleton_conversation(&conn, alice, READER).id
+        };
+        let participant = brenn_lib::messaging::ParticipantId::for_conversation(conversation);
+        let (_bridge, mut recorded) = seat_receiving_bridge(&booted, alice, conversation).await;
+
+        tree.write(&consumer_and_push_subscriber(&["sink"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.subscriptions_added,
+            vec![format!("{READER} brenn:sink")],
+        );
+        assert_eq!(
+            conversation_of(&booted, READER).await,
+            Some(conversation),
+            "the attach seated the agent's own conversation",
+        );
+        let seated = cursor_of(&booted.messenger, "brenn:sink", &participant)
+            .await
+            .expect("with a position on the channel it now reads")
+            .next_owed_seq;
+
+        probe(&booted.messenger).await;
+        assert_eq!(
+            booted.bodies_until("brenn:sink", 1).await,
+            vec!["answer".to_string()],
+            "the consumer answered on the sink channel",
+        );
+
+        // The dispatcher is running, so the wake walk happens on its own; this
+        // one is belt-and-braces, and harmless because the walk is idempotent.
+        // What the case is about is what the walk finds — the wiring the reload
+        // installed — not which caller ran it. The delivery task the router
+        // spawns is asynchronous, so the advance is polled for.
+        let mut advanced = None;
+        for _ in 0..100 {
+            booted
+                .messenger
+                .wake_owed_subscribers(chrono::Utc::now())
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let owed = cursor_of(&booted.messenger, "brenn:sink", &participant)
+                .await
+                .expect("the position is still there")
+                .next_owed_seq;
+            if owed > seated {
+                advanced = Some(owed);
+                break;
+            }
+        }
+        assert!(
+            advanced.is_some(),
+            "the agent's conversation cursor moves past the consumer's message \
+             (still at {seated})",
+        );
+        let texts = recorded.texts();
+        assert!(
+            texts.iter().any(|text| text.contains("answer")),
+            "and the consumer's message is what the agent's process was handed: {texts:?}",
+        );
+    }
+
+    /// The motivating shape's other half: a push-enabled `subscribe` added to
+    /// an agent that had none mints its conversation, provisions that
+    /// conversation's chat channel family into the live directory and gives it
+    /// a position on the channel — the sequence a fresh boot of the candidate
+    /// would run for the same entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_push_subscription_mints_the_agents_conversation_and_position() {
+        let tree = Tree::holding(&document_push_subscribing("", &["alice"], &[]));
+        let mut booted = boot(&tree, Vec::new()).await;
+        seat_user(&booted.db, "alice").await;
+        assert!(
+            conversation_of(&booted, READER).await.is_none(),
+            "the agent has no conversation before it reads anything",
+        );
+
+        tree.write(&document_push_subscribing("", &["alice"], &["work"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.subscriptions_added,
+            vec![format!("{READER} brenn:work")]
+        );
+        let conversation = conversation_of(&booted, READER)
+            .await
+            .expect("the attach minted the agent's singleton conversation");
+        assert!(
+            cursor_of(
+                &booted.messenger,
+                "brenn:work",
+                &brenn_lib::messaging::ParticipantId::for_conversation(conversation),
+            )
+            .await
+            .is_some(),
+            "and gave it a position on the channel it now reads",
+        );
+        assert!(
+            booted.messenger.directory().list().iter().any(|entry| entry
+                .address
+                .contains(&format!("chat.app.{READER}.in.{conversation}"))),
+            "the conversation's chat channel family is in the live directory: {:?}",
+            booted
+                .messenger
+                .directory()
+                .list()
+                .iter()
+                .map(|e| e.address.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// And its inverse: the line removed takes the position with it — the
+    /// orphan cursor a fresh boot's reconcile would reap — while the channel's
+    /// retained messages stay where they are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_push_subscription_deletes_the_agents_cursor() {
+        let tree = Tree::holding(&document_push_subscribing("", &["alice"], &["work"]));
+        let mut booted = boot(&tree, Vec::new()).await;
+        seat_user(&booted.db, "alice").await;
+        // Boot's own attach runs before the user row exists in this rig, so the
+        // position is minted by a reload that re-states the same document.
+        booted
+            .messenger
+            .attach_conversation(
+                "brenn:work",
+                READER,
+                brenn_lib::messaging::config::Depth::Bounded(1),
+            )
+            .await;
+        let conversation = conversation_of(&booted, READER)
+            .await
+            .expect("the agent has a conversation");
+        let participant = brenn_lib::messaging::ParticipantId::for_conversation(conversation);
+        assert!(
+            cursor_of(&booted.messenger, "brenn:work", &participant)
+                .await
+                .is_some(),
+        );
+
+        tree.write(&document_push_subscribing("", &["alice"], &[]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(
+            cursor_of(&booted.messenger, "brenn:work", &participant)
+                .await
+                .is_none(),
+            "a genuine removal deletes the cursor row",
+        );
+        assert!(
+            booted.messenger.directory().resolve("brenn:work").is_some(),
+            "the channel and its retained messages are untouched",
+        );
+    }
+
+    /// The owner moved: positions are held under the owner's conversation, so
+    /// the new owner has none until every push-enabled entry is re-attached —
+    /// not only the ones this reload moved, of which there are none here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owner_change_attaches_the_new_owners_conversation() {
+        let tree = Tree::holding(&document_push_subscribing("", &["alice"], &["work"]));
+        let mut booted = boot(&tree, Vec::new()).await;
+        seat_user(&booted.db, "alice").await;
+        seat_user(&booted.db, "bob").await;
+        booted
+            .messenger
+            .attach_conversation(
+                "brenn:work",
+                READER,
+                brenn_lib::messaging::config::Depth::Bounded(1),
+            )
+            .await;
+        let alices = conversation_of(&booted, READER)
+            .await
+            .expect("alice's conversation");
+        let alices_participant = brenn_lib::messaging::ParticipantId::for_conversation(alices);
+
+        tree.write(&document_push_subscribing("", &["bob"], &["work"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(
+            status.delta.subscriptions_added.is_empty(),
+            "no subscription moved: what moved is whose conversation holds them",
+        );
+        let bobs = conversation_of(&booted, READER)
+            .await
+            .expect("the new owner's conversation was minted");
+        assert_ne!(bobs, alices, "the owner is a different conversation");
+        assert!(
+            cursor_of(
+                &booted.messenger,
+                "brenn:work",
+                &brenn_lib::messaging::ParticipantId::for_conversation(bobs),
+            )
+            .await
+            .is_some(),
+            "with a position on every push-enabled channel",
+        );
+        assert!(
+            cursor_of(&booted.messenger, "brenn:work", &alices_participant)
+                .await
+                .is_none(),
+            "and the old owner's position on the agent's channel is reaped, as a fresh boot's \
+             reconcile reaps it",
+        );
+        assert!(
+            conversation_row_exists(&booted, alices).await,
+            "its conversation and chat history are not the reload's to delete",
+        );
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .list()
+                .iter()
+                .any(|entry| entry.address.contains(&format!(".{READER}.in.{alices}"))),
+            "nor its chat channel family, which its own entries justify",
+        );
+    }
+
+    /// The same owner change with a live push-enabled dynamic row: boot seats
+    /// the new owner on every push-enabled `App` entry the directory holds,
+    /// dynamic ones included, so the reload has to walk the live directory
+    /// rather than the candidate plan's static entries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owner_change_seats_the_new_owner_on_a_dynamic_channel_too() {
+        let tree = Tree::holding(&push_owner_covering_work(&["alice"]));
+        let mut booted = boot(&tree, Vec::new()).await;
+        seat_user(&booted.db, "alice").await;
+        seat_user(&booted.db, "bob").await;
+        let uuid = insert_push_dynamic_row(&booted, "brenn:work").await;
+        booted
+            .messenger
+            .attach_conversation(
+                "brenn:work",
+                READER,
+                brenn_lib::messaging::config::Depth::Bounded(1),
+            )
+            .await;
+        let alices = conversation_of(&booted, READER)
+            .await
+            .expect("alice's conversation");
+        let alices_participant = brenn_lib::messaging::ParticipantId::for_conversation(alices);
+
+        tree.write(&push_owner_covering_work(&["bob"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        let bobs = conversation_of(&booted, READER)
+            .await
+            .expect("the new owner's conversation was minted");
+        assert!(
+            cursor_of(
+                &booted.messenger,
+                "brenn:work",
+                &brenn_lib::messaging::ParticipantId::for_conversation(bobs),
+            )
+            .await
+            .is_some(),
+            "the new owner is positioned on the dynamic channel, as a fresh boot positions it",
+        );
+        assert!(
+            cursor_of(&booted.messenger, "brenn:work", &alices_participant)
+                .await
+                .is_none(),
+            "and the old owner's position on it is reaped",
+        );
+        let rows = dynamic_rows(&booted).await;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.channel_uuid, row.app_slug.clone()))
+                .collect::<Vec<_>>(),
+            vec![(uuid, READER.to_string())],
+            "the row itself is untouched: what moved is whose conversation holds its position",
+        );
+    }
+
+    /// An owner change with a position on a channel the directory no longer
+    /// holds — a dormant dynamic row whose `[[channel]]` block is gone, which a
+    /// restart between the two edits leaves behind. The reap reaches it through
+    /// the cursor table rather than through the directory, so it neither
+    /// survives nor panics.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owner_change_reaps_a_position_on_an_undeclared_channel() {
+        let tree = Tree::holding(&document_push_subscribing("", &["alice"], &["work"]));
+        let mut booted = boot(&tree, Vec::new()).await;
+        seat_user(&booted.db, "alice").await;
+        seat_user(&booted.db, "bob").await;
+        booted
+            .messenger
+            .attach_conversation(
+                "brenn:work",
+                READER,
+                brenn_lib::messaging::config::Depth::Bounded(1),
+            )
+            .await;
+        let alices = conversation_of(&booted, READER)
+            .await
+            .expect("alice's conversation");
+        let alices_participant = brenn_lib::messaging::ParticipantId::for_conversation(alices);
+        let ghost = seat_undeclared_cursor(&booted, &alices_participant).await;
+
+        tree.write(&document_push_subscribing("", &["bob"], &["work"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        let conn = booted.db.lock().await;
+        assert!(
+            brenn_messaging_store::db::load_subscriber_cursor(&conn, ghost, &alices_participant)
+                .is_none(),
+            "the row on the undeclared channel is reaped through the cursor table",
+        );
+    }
+
+    /// A push-subscribing owner document whose ACL covers `work` without
+    /// declaring a static `subscribe` on it: what a dynamic row on that channel
+    /// needs to stay kept rather than be revoked.
+    pub(crate) fn push_owner_covering_work(owner: &[&str]) -> String {
+        document_push_subscribing_acl("", owner, &[], &[], &["exact work"])
+    }
+
+    /// Whether the conversation row is still there — the reap deletes positions,
+    /// never conversations.
+    async fn conversation_row_exists(booted: &Booted, conversation: i64) -> bool {
+        let conn = booted.db.lock().await;
+        brenn_db::conversation::get_conversation_opt(&conn, conversation).is_some()
+    }
+
+    /// One position for `participant` on `uuid`, at the depth a push-enabled
+    /// dynamic subscription holds: what a dormant row resumes from, and the row
+    /// a fresh boot's reconcile keeps because the dormant row justifies it.
+    pub(crate) async fn seat_position(
+        booted: &Booted,
+        uuid: uuid::Uuid,
+        participant: &brenn_lib::messaging::ParticipantId,
+    ) {
+        let conn = booted.db.lock().await;
+        brenn_messaging_store::db::ensure_subscriber_cursor(
+            &conn,
+            uuid,
+            participant,
+            READER,
+            brenn_lib::messaging::config::Depth::Bounded(1),
+            0,
+        );
+    }
+
+    /// A durable channel row with no directory entry, carrying one position for
+    /// `participant`: what a removed `[[channel]]` block leaves behind for a
+    /// dormant dynamic subscription.
+    ///
+    /// Returns the channel uuid.
+    async fn seat_undeclared_cursor(
+        booted: &Booted,
+        participant: &brenn_lib::messaging::ParticipantId,
+    ) -> uuid::Uuid {
+        let entry = booted
+            .messenger
+            .directory()
+            .resolve("brenn:work")
+            .expect("the channel is declared");
+        let mut undeclared = (*entry).clone();
+        undeclared.uuid = uuid::Uuid::new_v4();
+        undeclared.address = "brenn:gone".to_string();
+        {
+            let conn = booted.db.lock().await;
+            brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&undeclared));
+        }
+        seat_position(booted, undeclared.uuid, participant).await;
+        undeclared.uuid
+    }
+
+    /// A per-process edit with two live sessions: the idle one dies at the
+    /// swap, the busy one is named pending and dies at its turn end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_per_process_edit_retires_the_idle_session_and_defers_the_busy_one() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let user = seat_user(&booted.db, "alice").await;
+        let idle = seat_bridge(&booted, user).await;
+        let busy = seat_bridge(&booted, user).await;
+        busy.set_cc_idle_for_test(false);
+
+        tree.write(&document("").replace(
+            "    working_dir = \".\";",
+            "    working_dir = \".\";\n    model = \"sonnet\";",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        assert_eq!(
+            status.delta.sessions_retired,
+            vec![format!("{READER} conv {}", idle.conversation_id)],
+        );
+        assert_eq!(
+            status.delta.sessions_retire_pending,
+            vec![format!("{READER} conv {}", busy.conversation_id)],
+        );
+        assert!(
+            booted
+                .active_bridges
+                .get(idle.conversation_id)
+                .await
+                .is_none(),
+            "the idle session's process is gone",
+        );
+        assert!(
+            booted
+                .active_bridges
+                .get(busy.conversation_id)
+                .await
+                .is_some(),
+            "the busy one finishes its turn first",
+        );
+    }
+
+    /// An agent restricted from open-to-all to one user: the document names no
+    /// removed user, and every other user's session is still severed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restricting_an_open_agent_retires_the_sessions_it_now_denies() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let alice = seat_user(&booted.db, "alice").await;
+        let bob = seat_user(&booted.db, "bob").await;
+        let alices = seat_bridge(&booted, alice).await;
+        let bobs = seat_bridge(&booted, bob).await;
+        let mut pulses = booted.apps_swapped_tx.subscribe();
+
+        tree.write(&document("").replace(
+            "    working_dir = \".\";",
+            "    working_dir = \".\";\n    allowed_users = [\"alice\"];",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.sessions_retired,
+            vec![format!("{READER} conv {}", bobs.conversation_id)],
+            "the user the candidate no longer allows loses their session",
+        );
+        assert!(
+            booted
+                .active_bridges
+                .get(alices.conversation_id)
+                .await
+                .is_some(),
+            "the user it names keeps theirs",
+        );
+        assert_eq!(
+            pulses.try_recv(),
+            Ok(()),
+            "and every open socket is asked to re-check its user",
+        );
+    }
+
+    /// Prepare measures the `applied` body with the session lists empty — the
+    /// live bridge set is a fact about the process a moment later — and commit
+    /// then fills them. On a host with many sessions of a changed agent that
+    /// body would be published oversize and rejected, which reads to a bundle
+    /// installer as a failed reload over a successful one. The names give way,
+    /// the outcome does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_swarm_of_retired_sessions_does_not_push_the_applied_body_oversize() {
+        const LIMIT: &str = "\nmessaging {\n    max_body_bytes = 1500;\n}\n";
+        let tree = Tree::holding(&document(LIMIT));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let user = seat_user(&booted.db, "alice").await;
+        for _ in 0..30 {
+            seat_bridge(&booted, user).await;
+        }
+
+        tree.write(&document(LIMIT).replace(
+            "    working_dir = \".\";",
+            "    working_dir = \".\";\n    model = \"sonnet\";",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.sessions_retired,
+            vec!["30 sessions retired; names omitted".to_string()],
+            "the names gave way so the outcome could be published",
+        );
+    }
+
+    /// The staging step's own refusal: a state directory that cannot be
+    /// written is an environment refusal in prepare, with nothing touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_list_that_cannot_be_staged_is_an_environment_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const BROKER: &str =
+            "mqtt_client ha {\n    url = \"mqtts://127.0.0.1:8883\";\n    qos = 1;\n}\n";
+        let tree = Tree::holding(&document(BROKER));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let before = booted.messenger.app_table().load();
+        let state_dir = before[READER]
+            .virtual_tools_path()
+            .parent()
+            .expect("the file sits in the agent's state directory")
+            .to_path_buf();
+        let original = std::fs::metadata(&state_dir)
+            .expect("the state directory exists")
+            .permissions();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("the directory is ours to lock");
+
+        tree.write(&document(BROKER).replace(
+            "acl publish [exact reload_requests, exact work];",
+            "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        std::fs::set_permissions(&state_dir, original).expect("and ours to unlock");
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.refusals);
+        assert!(
+            status.refusals.iter().any(|refusal| refusal
+                .contains("writing the new virtual tools list")
+                && refusal.contains(READER)),
+            "the refusal names the agent and what could not be written: {:?}",
+            status.refusals,
+        );
+        // Untouched: the swap never ran, so the booted policy is still what
+        // every gate reads.
+        assert!(
+            booted.messenger.app_table().load()[READER]
+                .policy
+                .acls
+                .mqtt_publish
+                .is_empty(),
+            "the candidate's mqtt publish matcher never reached the table",
+        );
+    }
+
+    /// A refusal after prepare has staged a tool list leaves nothing beside the
+    /// running agent's file: a surviving `.next` would be renamed onto the live
+    /// path by the next commit that touches this agent, handing a successor
+    /// process a tool list from a document that was refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_reload_leaves_no_staged_tool_list() {
+        const BROKER: &str =
+            "mqtt_client ha {\n    url = \"mqtts://127.0.0.1:8883\";\n    qos = 1;\n}\n";
+        let tree = Tree::holding(&document(BROKER));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let before = booted.messenger.app_table().load();
+        let path = before[READER].virtual_tools_path();
+        let staged = super::super::agents::staged_virtual_tools_path(&before[READER]);
+        let booted_rendering = brenn_server::active_bridge::render_virtual_tools(
+            &before[READER],
+            booted.driver.env().tool_registry.as_ref(),
+        );
+        std::fs::write(&path, &booted_rendering).expect("the rig writes the live file");
+
+        tree.write(&document(BROKER).replace(
+            "acl publish [exact reload_requests, exact work];",
+            "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+        ));
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+            Prepared::Ready(ready) => ready,
+            other => panic!("the candidate is applicable: {}", outcome_of(&other)),
+        };
+
+        // The window, and what refuses this reload at commit after prepare has
+        // already staged the candidate's rendering: the agent subscribes
+        // dynamically while prepare is working, so the set commit would act on
+        // is not the one the re-merge classified.
+        insert_dynamic_row(&booted, "brenn:work", false).await;
+
+        booted.driver.commit(TriggerSource::Signal, *ready).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.refusals);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the live file is still there"),
+            booted_rendering,
+            "the running agent's tool list is untouched",
+        );
+        assert!(
+            !staged.exists(),
+            "and the staged one was discarded: {}",
+            staged.display(),
+        );
+    }
+
+    /// The base document with the reader's subscribe ACL widened to cover the
+    /// work channel — the shape a dynamic subscription to it needs.
+    pub(crate) fn document_covering_work(extra: &str) -> String {
+        document_subscribing_acl(extra, &[], &["exact work"])
+    }
+
+    /// Give the reader a durable dynamic subscription to `address`, as a
+    /// runtime `MessageSubscribe` would have left it: the row in the table, and
+    /// — when `folded` — the subscriber entry in the live directory.
+    pub(crate) async fn insert_dynamic_row(
+        booted: &Booted,
+        address: &str,
+        folded: bool,
+    ) -> uuid::Uuid {
+        insert_dynamic_row_at(
+            booted,
+            address,
+            folded,
+            brenn_lib::messaging::config::Depth::Bounded(0),
+            None,
+        )
+        .await
+    }
+
+    /// The same, push-enabled and folded: a dynamic subscription that holds a
+    /// position, which is what an owner change has to move.
+    pub(crate) async fn insert_push_dynamic_row(booted: &Booted, address: &str) -> uuid::Uuid {
+        insert_dynamic_row_at(
+            booted,
+            address,
+            true,
+            brenn_lib::messaging::config::Depth::Bounded(1),
+            None,
+        )
+        .await
+    }
+
+    /// The same on an `mqtt:` channel: the row carries the SUBSCRIBE QoS.
+    /// Boot and reload both require it when re-asserting the broker filter.
+    pub(crate) async fn insert_dynamic_mqtt_row(
+        booted: &Booted,
+        address: &str,
+        folded: bool,
+        qos: u8,
+    ) -> uuid::Uuid {
+        insert_dynamic_row_at(
+            booted,
+            address,
+            folded,
+            brenn_lib::messaging::config::Depth::Bounded(0),
+            Some(qos),
+        )
+        .await
+    }
+
+    async fn insert_dynamic_row_at(
+        booted: &Booted,
+        address: &str,
+        folded: bool,
+        push_depth: brenn_lib::messaging::config::Depth,
+        qos: Option<u8>,
+    ) -> uuid::Uuid {
+        let uuid = booted
+            .messenger
+            .directory()
+            .resolve(address)
+            .expect("the channel is declared")
+            .uuid;
+        {
+            let conn = booted.db.lock().await;
+            brenn_messaging_store::db::insert_dynamic_subscription(
+                &conn,
+                &brenn_lib::messaging::DynamicSubscriptionRow {
+                    channel_uuid: uuid,
+                    app_slug: READER.to_string(),
+                    push_depth,
+                    retain_depth: brenn_lib::messaging::config::Depth::Bounded(2),
+                    noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+                    wake_min: brenn_lib::messaging::WakeMin::Never,
+                    qos,
+                    created_at: "2026-09-07T00:00:00Z".to_string(),
+                },
+            );
+        }
+        if folded {
+            assert!(booted.messenger.directory().add_subscriber(
+                &uuid,
+                brenn_lib::messaging::SubscriberEntry {
+                    kind: SubscriberEntryKind::App(READER.to_string()),
+                    push_depth,
+                    retain_depth: brenn_lib::messaging::config::Depth::Bounded(2),
+                    noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+                    wake_min: Some(brenn_lib::messaging::WakeMin::Never),
+                },
+            ));
+        }
+        uuid
+    }
+
+    /// The reader's subscriber entry on `address`, as the live directory holds
+    /// it now.
+    pub(crate) fn live_entry_of_reader(
+        booted: &Booted,
+        address: &str,
+    ) -> Option<brenn_lib::messaging::SubscriberEntry> {
+        booted
+            .messenger
+            .directory()
+            .resolve(address)
+            .expect("the channel is declared")
+            .subscribers
+            .iter()
+            .find(|subscriber| {
+                matches!(&subscriber.kind, SubscriberEntryKind::App(slug) if slug == READER)
+            })
+            .cloned()
+    }
+
+    /// Every durable dynamic row the store holds.
+    pub(crate) async fn dynamic_rows(
+        booted: &Booted,
+    ) -> Vec<brenn_lib::messaging::DynamicSubscriptionRow> {
+        let conn = booted.db.lock().await;
+        brenn_messaging_store::db::load_dynamic_subscriptions(&conn)
+    }
+
+    /// An ACL narrowed under a live dynamic subscription: the entry is folded
+    /// out and the durable row is kept, which is the dormant state a fresh boot
+    /// of the same document would put it in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acl_narrowed_under_a_dynamic_subscription_revokes_it_to_dormant() {
+        let tree = Tree::holding(&document_covering_work(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        insert_dynamic_row(&booted, "brenn:work", true).await;
+
+        tree.write(&document(""));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.dynamic_revoked,
+            vec![format!("{READER} brenn:work")],
+        );
+        assert!(
+            live_entry_of_reader(&booted, "brenn:work").is_none(),
+            "the revoked subscription is still folded",
+        );
+        assert_eq!(
+            dynamic_rows(&booted).await.len(),
+            1,
+            "the durable row is kept, so the subscription resumes if the ACL comes back",
+        );
+        // And the state the reload left is the one a restart leaves: the
+        // agent's next `MessageSubscribe` on the address is told to
+        // unsubscribe first rather than colliding with the row.
+        let err = booted
+            .messenger
+            .subscribe_dynamic(
+                READER,
+                "brenn:work",
+                brenn_messaging::subscribe::DynamicSubscribeParams {
+                    push_depth: brenn_lib::messaging::config::Depth::Bounded(0),
+                    retain_depth: brenn_lib::messaging::config::Depth::Bounded(2),
+                    noise: None,
+                    wake_min: None,
+                    qos: None,
+                },
+            )
+            .await
+            .expect_err("the dormant row is in the way");
+        assert!(
+            matches!(
+                err,
+                brenn_messaging::subscribe::RuntimeSubscribeError::DormantSubscriptionExists { .. }
+            ),
+            "{err:?}",
+        );
+    }
+
+    /// The mirror: a dormant row the candidate authorizes again is folded back
+    /// in at the depths it was granted, not at any the document names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acl_widened_over_a_dormant_row_revives_it_at_its_own_depths() {
+        let tree = Tree::holding(&document(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        insert_dynamic_row(&booted, "brenn:work", false).await;
+
+        tree.write(&document_covering_work(""));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.dynamic_revived,
+            vec![format!("{READER} brenn:work")],
+        );
+        let entry = live_entry_of_reader(&booted, "brenn:work").expect("the subscription is back");
+        assert_eq!(
+            entry.retain_depth,
+            brenn_lib::messaging::config::Depth::Bounded(2),
+            "the row's own depth, not the document's",
+        );
+    }
+
+    /// Static config wins: a `subscribe` line declared where a dynamic row
+    /// already sits deletes the row and replaces the entry with the document's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_static_subscription_declared_over_a_dynamic_row_prunes_it() {
+        let tree = Tree::holding(&document_covering_work(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        insert_dynamic_row(&booted, "brenn:work", true).await;
+
+        tree.write(&document_subscribing("", &["work"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.dynamic_pruned,
+            vec![format!("{READER} brenn:work")],
+        );
+        assert!(
+            dynamic_rows(&booted).await.is_empty(),
+            "the row the static declaration overrides is gone",
+        );
+        let entry = live_entry_of_reader(&booted, "brenn:work").expect("the static entry is there");
+        assert_eq!(
+            entry.retain_depth,
+            brenn_lib::messaging::config::Depth::Bounded(4),
+            "the document's depth, which is what a fresh boot would fold",
+        );
+    }
+
+    /// The document with the reader authorized on the base document's
+    /// `ephemeral:` channel — the non-durable shape, where a dynamic
+    /// subscription is an in-memory registration and no durable row.
+    fn document_covering_scratch(extra: &str) -> String {
+        document_subscribing_acl(extra, &[], &["exact scratch"])
+    }
+
+    /// Give the reader a non-durable dynamic subscription to `address` the way
+    /// a runtime `MessageSubscribe` does: through the messenger, so the
+    /// registration set and the directory entry are both what the live path
+    /// left.
+    async fn subscribe_nondurable(booted: &Booted, address: &str) {
+        booted
+            .messenger
+            .subscribe_dynamic(
+                READER,
+                address,
+                brenn_messaging::subscribe::DynamicSubscribeParams {
+                    push_depth: brenn_lib::messaging::config::Depth::Bounded(0),
+                    retain_depth: brenn_lib::messaging::config::Depth::Bounded(2),
+                    noise: None,
+                    wake_min: None,
+                    qos: None,
+                },
+            )
+            .await
+            .expect("the channel is declared and the policy covers it");
+        assert_eq!(
+            booted.messenger.nondurable_dynamic_subs().len(),
+            1,
+            "a non-durable channel keeps its dynamic subscription in memory",
+        );
+    }
+
+    /// An ACL narrowed under a *non-durable* dynamic subscription: the entry is
+    /// folded out and the in-memory registration goes with it, since there is
+    /// no row to keep dormant and a restart would have lost it anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acl_narrowed_under_a_nondurable_dynamic_subscription_revokes_it() {
+        let tree = Tree::holding(&document_covering_scratch(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        subscribe_nondurable(&booted, "ephemeral:scratch").await;
+
+        tree.write(&document(""));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.dynamic_revoked,
+            vec![format!("{READER} ephemeral:scratch")],
+        );
+        assert!(
+            live_entry_of_reader(&booted, "ephemeral:scratch").is_none(),
+            "the revoked subscription is still folded",
+        );
+        assert!(
+            booted.messenger.nondurable_dynamic_subs().is_empty(),
+            "and the registration went with it, so the agent's next subscribe is a fresh one \
+             rather than a collision with a registration the candidate denies",
+        );
+        assert!(
+            dynamic_rows(&booted).await.is_empty(),
+            "a non-durable channel never had a row",
+        );
+    }
+
+    /// The same registration, replaced by a static declaration: the prune arm's
+    /// non-durable branch. Nothing is deleted from the durable table — there
+    /// was never a row — and the registration is dropped so the document's
+    /// entry is the only subscription on the channel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_static_subscription_declared_over_a_nondurable_registration_prunes_it() {
+        let tree = Tree::holding(&document_covering_scratch(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        subscribe_nondurable(&booted, "ephemeral:scratch").await;
+
+        tree.write(&document_subscribing("", &["scratch"]));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.dynamic_pruned,
+            vec![format!("{READER} ephemeral:scratch")],
+        );
+        assert!(
+            booted.messenger.nondurable_dynamic_subs().is_empty(),
+            "the registration the static declaration overrides is gone",
+        );
+        let entry =
+            live_entry_of_reader(&booted, "ephemeral:scratch").expect("the static entry is there");
+        assert_eq!(
+            entry.retain_depth,
+            brenn_lib::messaging::config::Depth::Bounded(4),
+            "the document's depth, which is what a fresh boot would fold",
+        );
+    }
+
+    /// A second durable channel, for the two cases that need one this reload
+    /// can remove or retune: every channel the base document declares is
+    /// load-bearing for the facility itself.
+    ///
+    /// `standing` is what the retune moves. The stated depths are at the floor
+    /// so that lowering standing to 1 is a legal document — standing is the
+    /// ceiling on every depth a channel states.
+    pub(crate) fn spill_channel(standing: u64) -> String {
+        format!(
+            r#"
+channel spill at "brenn:spill" {{
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = {standing};
+    wake_min = never;
+}}
+"#
+        )
+    }
+
+    /// The subscribe-ACL clause covering [`spill_channel`] for a candidate
+    /// that *removes* the channel: by address, because there is no handle left
+    /// to name — and the compiler insists on the handle wherever there is one.
+    pub(crate) const SPILL_ACL_BY_ADDRESS: &str = r#"exact "brenn:spill""#;
+
+    /// A dormant durable row on a channel this reload *removes* is left where
+    /// a fresh boot of the candidate leaves it: dormant, row and position kept.
+    ///
+    /// This is the two-step retirement of a channel an agent subscribed to
+    /// dynamically — narrow the ACL (the row goes dormant), then remove the
+    /// block — and the second step must not need a restart. A fresh boot of the
+    /// candidate finds the channel's store row but no `[[channel]]` block
+    /// declaring it, so it mints no entry and holds the row dormant with its
+    /// cursor; the commit's channel walk keeps the durable row too, so touching
+    /// nothing reproduces that exactly. The ACL is re-granted in the same
+    /// document, which is what would otherwise classify the row `revive` off
+    /// the entry still in the directory at prepare.
+    ///
+    /// The position is seeded as well as the row: without it the cursor
+    /// assertion below, and the oracle transition beside it, compare an empty
+    /// set on both sides and prove nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn a_dormant_row_on_a_removed_channel_is_left_dormant() {
+        let tree = Tree::holding(&document_push_subscribing_acl(
+            &spill_channel(4),
+            &["alice"],
+            &["work"],
+            &[],
+            &[],
+        ));
+        let mut booted = boot(&tree, Vec::new()).await;
+        seat_user(&booted.db, "alice").await;
+        // The agent's conversation: what `app_conversation` resolves the
+        // dormant row's position through, on both sides of the comparison.
+        booted
+            .messenger
+            .attach_conversation(
+                "brenn:work",
+                READER,
+                brenn_lib::messaging::config::Depth::Bounded(1),
+            )
+            .await;
+        let conversation = conversation_of(&booted, READER)
+            .await
+            .expect("alice's conversation");
+        let participant = brenn_lib::messaging::ParticipantId::for_conversation(conversation);
+        let spill_uuid = insert_dynamic_row(&booted, "brenn:spill", false).await;
+        seat_position(&booted, spill_uuid, &participant).await;
+
+        // The cleanup edit: the ACL re-granted and the block dropped at once.
+        let candidate =
+            document_push_subscribing_acl("", &["alice"], &["work"], &[], &[SPILL_ACL_BY_ADDRESS]);
+        tree.write(&candidate);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve("brenn:spill")
+                .is_none(),
+            "the channel the document no longer declares is out of the directory",
+        );
+        assert_eq!(
+            dynamic_rows(&booted).await.len(),
+            1,
+            "the durable row is retained, which is what dormancy is",
+        );
+        {
+            let conn = booted.db.lock().await;
+            assert!(
+                brenn_messaging_store::db::load_subscriber_cursor(&conn, spill_uuid, &participant)
+                    .is_some(),
+                "and so is the position it resumes from",
+            );
+        }
+        assert!(
+            status.delta.dynamic_revived.is_empty()
+                && status.delta.dynamic_revoked.is_empty()
+                && status.delta.dynamic_pruned.is_empty(),
+            "nothing moved, so the re-merge names nothing: {:?}",
+            status.delta,
+        );
+
+        // The journal is the whole operator-facing surface of the carve-out —
+        // the status body deliberately names nothing — so it is asserted here
+        // rather than left to a refactor of the channel walk to drop.
+        assert!(
+            logs_contain("dynamic subscription dormant"),
+            "the removal walk journals the row it left dormant",
+        );
+        assert!(
+            logs_contain("brenn:spill") && logs_contain(READER),
+            "naming the channel and the agent",
+        );
+
+        // And the reload converged: the same document again is a no-op.
+        tree.write(&candidate);
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(
+            booted.last_status().await.outcome,
+            Outcome::Unchanged,
+            "{:?}",
+            booted.last_status().await.refusals,
+        );
+
+        // Re-declaring the block is the state `TODO(reload-revive-on-redeclared-
+        // channel)` tracks: the entry comes back, the row stays dormant where a
+        // fresh boot of the same document would fold it, and the operator is
+        // told so at the one moment they are looking. The ACL is spelled by
+        // handle again, because the compiler insists on the handle wherever a
+        // `channel` block declares one.
+        tree.write(&document_push_subscribing_acl(
+            &spill_channel(4),
+            &["alice"],
+            &["work"],
+            &[],
+            &["exact spill"],
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve("brenn:spill")
+                .is_some(),
+            "the re-declared channel is back in the directory",
+        );
+        assert_eq!(
+            dynamic_rows(&booted).await.len(),
+            1,
+            "the row is still there, and still dormant",
+        );
+        assert!(
+            live_entry_of_reader(&booted, "brenn:spill").is_none(),
+            "and it is not folded onto the arriving entry: nothing re-classifies \
+             after the channel walk",
+        );
+        assert!(
+            status.delta.dynamic_revived.is_empty(),
+            "which is why the re-merge names no revival: {:?}",
+            status.delta,
+        );
+        assert!(
+            logs_contain("still dormant"),
+            "the arrival walk journals that delivery does not resume yet",
+        );
+    }
+
+    /// The same re-declaration, with the document also declaring a *static*
+    /// subscription for the pair: the row is pruned, as boot's rule 3 prunes it.
+    ///
+    /// This is the arm the re-merge does answer on an arriving channel, and it
+    /// has to: leaving the row beside the static entry puts the process in the
+    /// one pairing the runtime treats as impossible — a directory subscriber
+    /// with a durable row behind it (`RuntimeUnsubscribeError::
+    /// StaticSubscription`'s "structurally unreachable" invariant).
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn a_static_subscribe_on_a_redeclared_channel_prunes_the_dormant_row() {
+        let tree = Tree::holding(&document_push_subscribing_acl(
+            &spill_channel(4),
+            &["alice"],
+            &["work"],
+            &[],
+            &[],
+        ));
+        let mut booted = boot(&tree, Vec::new()).await;
+        seat_user(&booted.db, "alice").await;
+        booted
+            .messenger
+            .attach_conversation(
+                "brenn:work",
+                READER,
+                brenn_lib::messaging::config::Depth::Bounded(1),
+            )
+            .await;
+        let conversation = conversation_of(&booted, READER)
+            .await
+            .expect("alice's conversation");
+        let participant = brenn_lib::messaging::ParticipantId::for_conversation(conversation);
+        let spill_uuid = insert_dynamic_row(&booted, "brenn:spill", false).await;
+        seat_position(&booted, spill_uuid, &participant).await;
+
+        // Step one of the pair: the block goes, the row is left dormant.
+        tree.write(&document_push_subscribing_acl(
+            "",
+            &["alice"],
+            &["work"],
+            &[],
+            &[SPILL_ACL_BY_ADDRESS],
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Applied);
+
+        // Step two: the block comes back and the agent subscribes to it in the
+        // document.
+        tree.write(&document_push_subscribing_acl(
+            &spill_channel(4),
+            &["alice"],
+            &["work", "spill"],
+            &[],
+            &[],
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(
+            dynamic_rows(&booted).await.is_empty(),
+            "static config wins: the row is deleted, as a fresh boot deletes it",
+        );
+        assert_eq!(
+            status.delta.dynamic_pruned,
+            vec![format!("{READER} brenn:spill")],
+            "and the status body names it: {:?}",
+            status.delta,
+        );
+        assert!(
+            live_entry_of_reader(&booted, "brenn:spill").is_some(),
+            "the static entry the document declares is what serves the channel now",
+        );
+        assert!(
+            !logs_contain("still dormant"),
+            "so nothing is left dormant to journal",
+        );
+    }
+
+    /// A candidate that declares an address under a uuid other than the one its
+    /// store row carries is refused, with the running document still in force.
+    ///
+    /// `messaging_channels.address` is unique and a channel's row is never
+    /// deleted by a reload, so there is nowhere for such a declaration to
+    /// write: the insert is refused by the index, the update by uuid matches
+    /// nothing, and the directory would hold a channel with no row until the
+    /// first publish failed the foreign key. Boot answers this with a panic in
+    /// the store; the reload has a door and uses it.
+    ///
+    /// A declared durable channel derives its uuid from its address, so
+    /// reaching this needs a `uuid_pins` entry moving one — the shape an
+    /// operator writes when they re-declare a removed channel and mint a fresh
+    /// uuid rather than reusing the row's. Two reloads, because that is the
+    /// only way there: while the block is still declared, the address is in the
+    /// live directory and the arriving entry is refused earlier, as a channel
+    /// "newly minted but already exists".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_channel_declared_under_another_rows_uuid_is_refused() {
+        let tree = Tree::holding(&document(&spill_channel(4)));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let derived = booted
+            .messenger
+            .directory()
+            .resolve("brenn:spill")
+            .expect("the declared channel")
+            .uuid;
+
+        // The block goes first, which leaves the store row behind — that is
+        // what makes the address free in the directory and taken in the table.
+        tree.write(&document(""));
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(booted.last_status().await.outcome, Outcome::Applied);
+
+        let pinned = uuid::Uuid::new_v4();
+        tree.write(&document(&format!(
+            "{}\nuuid_pins {{\n    \"brenn:spill\" = \"{pinned}\";\n}}\n",
+            spill_channel(4),
+        )));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.refusals);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains("brenn:spill")
+                    && refusal.contains("already belongs")
+                    && refusal.contains(&derived.to_string())),
+            "naming the address and the uuid its row carries: {:?}",
+            status.refusals,
+        );
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve("brenn:spill")
+                .is_none(),
+            "and the running process still projects the document it applied — the \
+             one with no spill block",
+        );
+        {
+            let conn = booted.db.lock().await;
+            assert_eq!(
+                brenn_messaging_store::db::channel_uuid_by_address(&conn, "brenn:spill")
+                    .expect("the channel table reads"),
+                Some(derived),
+                "the row the pin collided with is untouched",
+            );
+        }
+    }
+
+    /// The same question on a channel this reload *retunes*.
+    ///
+    /// The uuid survives a retune, so the fold would succeed here — onto an
+    /// entry whose standing depth the conformance gate never read. The row is
+    /// granted more retain depth than the candidate stands behind, so a fresh
+    /// boot of this document holds it dormant while the pre-refusal reload
+    /// read the old standing depth off the live entry and revived it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dormant_row_on_a_channel_this_reload_retunes_is_refused() {
+        let tree = Tree::holding(&document(&spill_channel(4)));
+        let mut booted = boot(&tree, Vec::new()).await;
+        // The row is granted retain depth 2, which the candidate's standing
+        // depth of 1 no longer stands behind.
+        insert_dynamic_row(&booted, "brenn:spill", false).await;
+
+        tree.write(&document_subscribing_acl(
+            &spill_channel(1),
+            &[],
+            &["exact spill"],
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{status:?}");
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|line| line.contains("brenn:spill") && line.contains("dormant")),
+            "{:?}",
+            status.refusals,
+        );
+        assert!(
+            live_entry_of_reader(&booted, "brenn:spill").is_none(),
+            "the row is still dormant, which is what a restart would re-classify",
+        );
+        assert_eq!(
+            booted
+                .messenger
+                .directory()
+                .resolve("brenn:spill")
+                .expect("the spill channel is still declared")
+                .resolved_channel
+                .standing_retain_depth,
+            brenn_lib::messaging::config::Depth::Bounded(4),
+            "the running tuning is the booted one",
+        );
+    }
+
+    /// A dynamic subscription minted by a changed agent *after* prepare read
+    /// the row set.
+    ///
+    /// The row set is the one input to a reload a live session can change while
+    /// prepare runs: a `MessageSubscribe` is authorized under the old policy
+    /// until the swap, so a row minted in that window is one the re-merge never
+    /// classified — and leaving it folded past the swap is an entry the
+    /// candidate's ACL denies. Prepare's answer is re-asked before the walk
+    /// touches anything, so a hit is an ordinary refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dynamic_subscription_minted_after_prepare_refuses_the_commit() {
+        let tree = Tree::holding(&document_covering_work(""));
+        let mut booted = boot(&tree, Vec::new()).await;
+        let booted_sha = booted.driver.baseline().document.document_sha256.clone();
+
+        // The candidate narrows the reader's ACL, which is what makes it a
+        // changed agent and its dynamic rows this reload's business.
+        tree.write(&document(""));
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
+            Prepared::Ready(ready) => ready,
+            other => panic!("the candidate is applicable: {}", outcome_of(&other)),
+        };
+
+        // The window: the agent subscribes to the channel it is about to lose
+        // its authority over.
+        insert_dynamic_row(&booted, "brenn:work", true).await;
+
+        booted.driver.commit(TriggerSource::Signal, *ready).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{status:?}");
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        assert!(
+            status.refusals[0].contains(READER) && status.refusals[0].contains("brenn:work"),
+            "{:?}",
+            status.refusals,
+        );
+        // Refused means untouched: the row is still folded, the table still
+        // holds it, and the baseline is still the booted document.
+        assert_eq!(status.generation, 0);
+        assert_eq!(
+            booted.driver.baseline().document.document_sha256,
+            booted_sha
+        );
+        assert!(live_entry_of_reader(&booted, "brenn:work").is_some());
+        assert_eq!(dynamic_rows(&booted).await.len(), 1);
+        assert!(
+            booted.messenger.app_table().load()[READER]
+                .policy
+                .allows_brenn_delivery("work"),
+            "the old policy is still the one every gate reads",
         );
     }
 
@@ -4844,7 +6976,8 @@ channel spill at "ephemeral:spill" {
         // The candidate retires the consumer, and with it the channel only it
         // read.
         tree.write(&document(""));
-        let ready = match booted.driver.prepare(TriggerSource::Signal) {
+        let dynamic = booted.driver.dynamic_snapshot().await;
+        let ready = match booted.driver.prepare(TriggerSource::Signal, &dynamic) {
             Prepared::Ready(ready) => ready,
             other => panic!("the candidate is applicable: {}", outcome_of(&other)),
         };
@@ -5049,17 +7182,6 @@ channel spill at "ephemeral:spill" {
     const DESKBAR_HELP: &str = "brenn:surface.surface.deskbar.help";
     /// The kind's help document, which lists every surface mounting it.
     const PANEL_HELP: &str = "brenn:surface.kind.panel.help";
-    /// The kind's schema document.
-    const PANEL_SCHEMA: &str = "brenn:surface.kind.panel.schema";
-
-    /// Every address a surface case reads back.
-    pub(crate) const DESKBAR_READS: [&str; 5] = [
-        DESKBAR_BINDINGS,
-        SURFACE_INDEX,
-        DESKBAR_HELP,
-        PANEL_HELP,
-        PANEL_SCHEMA,
-    ];
 
     /// The rig every one-surface case opens with: a tree, the `panel` kind's
     /// deployed assets beside it, a document declaring one surface of that kind
@@ -5083,7 +7205,6 @@ channel spill at "ephemeral:spill" {
             tree,
             BootFixture {
                 surface_assets: Some(assets.to_path_buf()),
-                reader_reads: DESKBAR_READS.to_vec(),
                 ..BootFixture::default()
             },
         )
@@ -5362,11 +7483,6 @@ channel spill at "ephemeral:spill" {
             tree,
             BootFixture {
                 surface_assets: Some(assets.to_path_buf()),
-                reader_reads: [
-                    DESKBAR_READS.as_slice(),
-                    ["brenn:surface.surface.sidebar.help"].as_slice(),
-                ]
-                .concat(),
                 ..BootFixture::default()
             },
         )
@@ -5389,7 +7505,6 @@ channel spill at "ephemeral:spill" {
             &tree,
             BootFixture {
                 surface_assets: Some(assets.path().to_path_buf()),
-                reader_reads: DESKBAR_READS.to_vec(),
                 ..BootFixture::default()
             },
         )

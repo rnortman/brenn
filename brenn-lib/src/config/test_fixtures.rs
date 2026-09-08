@@ -67,11 +67,11 @@ pub fn test_app_config(slug: &str) -> AppConfig {
         state_dir: PathBuf::from("/tmp/.brenn/test-state"),
         messaging: None,
         messaging_default_send_budget: 100,
-        policy: AppPolicy::default(),
+        policy: std::sync::Arc::new(AppPolicy::default()),
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
-        chat_harness_policy: AppPolicy::default(),
+        chat_harness_policy: std::sync::Arc::new(AppPolicy::default()),
     }
 }
 

@@ -217,6 +217,33 @@ pub(crate) const PROVISIONED_LEAVES: [ChatLeaf; 4] = [
 ];
 
 impl Messenger {
+    /// The uuids [`Messenger::provision_conversation_chat_channels`] spells for
+    /// this conversation, whether or not they exist.
+    ///
+    /// Addresses and uuids are derived from the conversation id and the leaf, so
+    /// this answers without reading the directory or the database — which is
+    /// what a caller enumerating cursor rows needs, since a row can outlive the
+    /// channel entry that would otherwise name it.
+    pub(crate) fn conversation_chat_channel_uuids(
+        &self,
+        app_slug: &str,
+        conversation_id: i64,
+    ) -> Vec<Uuid> {
+        PROVISIONED_LEAVES
+            .iter()
+            .map(|leaf| {
+                chat_channel_entry(
+                    &self.llm_chat,
+                    app_slug,
+                    *leaf,
+                    conversation_id,
+                    &self.defaults,
+                )
+                .uuid
+            })
+            .collect()
+    }
+
     /// Give a conversation its chat channels, idempotently.
     ///
     /// Called wherever a conversation is created, and by
@@ -370,7 +397,7 @@ impl Messenger {
 
         let mut provisioned = 0;
         for (id, app_slug) in rows {
-            if !self.apps.contains_key(&app_slug) {
+            if !self.apps.load().contains_key(&app_slug) {
                 continue;
             }
             self.provision_conversation_chat_channels(conn, &app_slug, id);
@@ -609,8 +636,8 @@ mod tests {
             }),
             vec!["bob".to_string()],
         );
-        app.policy = brenn_lib::access::AppPolicy::default();
-        app.chat_harness_policy = LlmChatConfig::default().harness_policy(APP);
+        app.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
+        app.chat_harness_policy = std::sync::Arc::new(LlmChatConfig::default().harness_policy(APP));
         apps.insert(APP.to_string(), app);
 
         let router = Arc::new(RecordingRouter::default());

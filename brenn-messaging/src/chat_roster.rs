@@ -128,7 +128,7 @@ impl Messenger {
     ///
     /// Takes the database lock itself, so a caller must not be holding it.
     pub async fn publish_chat_roster(&self, app_slug: &str) -> Option<PublishResult> {
-        if !self.apps.contains_key(app_slug) {
+        if !self.apps.load().contains_key(app_slug) {
             return None;
         }
         let address = chat_roster_address(&self.llm_chat.prefix, app_slug);
@@ -214,7 +214,7 @@ mod tests {
         let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
         for slug in [APP, OTHER] {
             let mut app = crate::test_support::test_app_config(slug, None, vec![]);
-            app.chat_harness_policy = chat.harness_policy(slug);
+            app.chat_harness_policy = std::sync::Arc::new(chat.harness_policy(slug));
             apps.insert(slug.to_string(), app);
         }
 

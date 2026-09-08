@@ -16,7 +16,8 @@ use tokio::sync::RwLock;
 use crate::connection::{assert_ingress_subscription, assert_ingress_unsubscribe};
 use crate::payload::InboundPayload;
 use crate::state::{
-    ConnectorHealthLabel, MqttClientHandle, PendingPublish, PubackOutcome, SupervisorState,
+    ConnectorHealthLabel, MqttClientHandle, PendingPublish, PubackOutcome, SubAckOutcome,
+    SupervisorState,
 };
 use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::error::MqttError;
@@ -81,8 +82,13 @@ pub enum IngressSubscribeOutcome {
 pub enum IngressUnsubscribeOutcome {
     /// The client was live and the UNSUBSCRIBE was sent now.
     UnsubscribedLive,
-    /// The client is currently disconnected; the filter is removed from the
-    /// reconnect set, so the next reconnect will not re-subscribe it. Not an error.
+    /// The client is currently disconnected, so no UNSUBSCRIBE was sent. The
+    /// filter is out of the reconnect set, so the next reconnect does not
+    /// re-assert it — but the session is persistent (`clean_start(false)` with
+    /// a session expiry), so the broker resumes it holding the filter and keeps
+    /// publishing on it. Nothing in the process converges that; see
+    /// `TODO(mqtt-deferred-unsubscribe-not-withdrawn)` at
+    /// [`MqttService::unsubscribe_filter`].
     DeferredDisconnected,
     /// The client was live but the UNSUBSCRIBE *send* failed. Carries the client
     /// error string.
@@ -200,6 +206,37 @@ impl MqttService {
             .map(|s| s.qos)
     }
 
+    /// Whether the broker has granted `topic_filter` on `client_slug`'s current
+    /// session, as the SubAck arm saw it.
+    ///
+    /// `None` if `client_slug` has no registered session. This is the SubAck as
+    /// the process observed it, not the state of the reconnect-survival set: it
+    /// answers "the filter reached the broker" rather than "the SUBSCRIBE was
+    /// sent", and it goes false again on a session drop.
+    pub async fn subscription_acked(&self, client_slug: &str, topic_filter: &str) -> Option<bool> {
+        let handle = self.get_client(client_slug)?;
+        Some(handle.is_granted(topic_filter).await)
+    }
+
+    /// The broker's refusal of `topic_filter` on `client_slug`'s current
+    /// session, in the SUBACK's own words.
+    ///
+    /// `None` if the client has no registered session, if no SUBACK has come
+    /// back for the filter, or if the answer was a grant. A refusal is final for
+    /// the session, so a reader waiting for the filter can stop waiting on it
+    /// rather than wait out a deadline the broker has already answered.
+    pub async fn subscription_refusal(
+        &self,
+        client_slug: &str,
+        topic_filter: &str,
+    ) -> Option<String> {
+        let handle = self.get_client(client_slug)?;
+        match handle.subscribe_outcome(topic_filter).await {
+            Some(SubAckOutcome::Refused(reason)) => Some(reason),
+            Some(SubAckOutcome::Granted) | None => None,
+        }
+    }
+
     /// Combined `(qos, health, last_error)` for one `mqtt:` channel's
     /// `(client, topic_filter)`, resolving the handle **once**.
     pub async fn ingress_filter_status(
@@ -305,6 +342,8 @@ impl MqttService {
         }
         let client = handle.client.lock().await.clone();
         let outcome = match client {
+            // TODO(mqtt-deferred-unsubscribe-not-withdrawn): the filter stays
+            // at the broker for the life of the persistent session.
             None => IngressUnsubscribeOutcome::DeferredDisconnected,
             Some(client) => match assert_ingress_unsubscribe(&client, topic_filter).await {
                 Ok(()) => IngressUnsubscribeOutcome::UnsubscribedLive,
@@ -466,6 +505,124 @@ mod tests {
         let (client, eventloop) = AsyncClient::builder(opts).capacity(1).build();
         drop(eventloop);
         client
+    }
+
+    /// A client whose eventloop is still alive: a request send lands in its
+    /// channel, so the SUBSCRIBE is answered on the spot.
+    fn live_client() -> (rumqttc::AsyncClient, rumqttc::EventLoop) {
+        use rumqttc::{AsyncClient, MqttOptions};
+        let opts = MqttOptions::new("test-live", ("127.0.0.1", 1));
+        AsyncClient::builder(opts).capacity(10).build()
+    }
+
+    /// The live arm: a client installed in the cell answers the SUBSCRIBE now
+    /// rather than deferring it. The broker cases can only assert this
+    /// tolerantly — a session drop mid-test is a deferral they cannot prevent —
+    /// so the distinction between the two answers is pinned here.
+    #[tokio::test]
+    async fn subscribe_filter_live_client_reports_subscribed_live() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        let (client, _eventloop) = live_client();
+        *handle.client.lock().await = Some(client);
+        svc.add_client(handle.clone()).await;
+
+        let outcome = svc
+            .subscribe_filter("home", "sensors/+/temp".to_string(), 1)
+            .await;
+        assert_eq!(outcome, Some(IngressSubscribeOutcome::SubscribedLive));
+        assert_eq!(
+            svc.ingress_filter_qos("home", "sensors/+/temp").await,
+            Some(1)
+        );
+    }
+
+    /// `subscription_acked` answers for the session, not for the
+    /// reconnect-survival set: an unregistered client has no answer, and a
+    /// registered filter nothing has acked is not granted.
+    #[tokio::test]
+    async fn subscription_acked_reports_the_session_grant() {
+        let svc = MqttService::new();
+        assert_eq!(svc.subscription_acked("home", "sensors/#").await, None);
+
+        let handle = make_handle("home");
+        let (client, _eventloop) = live_client();
+        *handle.client.lock().await = Some(client);
+        svc.add_client(handle.clone()).await;
+        svc.subscribe_filter("home", "sensors/#".to_string(), 1)
+            .await;
+        assert_eq!(
+            svc.subscription_acked("home", "sensors/#").await,
+            Some(false),
+            "the SUBSCRIBE went out; no SubAck has come back",
+        );
+    }
+
+    /// `subscription_refusal` is the broker's own answer, and only the broker's:
+    /// no session, no SubAck and a grant are all "not refused", and a refusal
+    /// carries the reason a waiting reader stops on.
+    #[tokio::test]
+    async fn subscription_refusal_reports_the_brokers_reason() {
+        let svc = MqttService::new();
+        assert_eq!(svc.subscription_refusal("home", "sensors/#").await, None);
+
+        let handle = make_handle("home");
+        let (client, _eventloop) = live_client();
+        *handle.client.lock().await = Some(client);
+        svc.add_client(handle.clone()).await;
+        svc.subscribe_filter("home", "sensors/#".to_string(), 1)
+            .await;
+        assert_eq!(
+            svc.subscription_refusal("home", "sensors/#").await,
+            None,
+            "no SubAck has come back, which is not a refusal",
+        );
+
+        handle.record_grant("sensors/#").await;
+        assert_eq!(
+            svc.subscription_refusal("home", "sensors/#").await,
+            None,
+            "a grant is not a refusal",
+        );
+
+        handle
+            .record_refusal("sensors/#", "Failure".to_string())
+            .await;
+        assert_eq!(
+            svc.subscription_refusal("home", "sensors/#").await,
+            Some("Failure".to_string()),
+        );
+        assert_eq!(
+            svc.subscription_acked("home", "sensors/#").await,
+            Some(false),
+            "a refused filter is not granted",
+        );
+    }
+
+    /// Taking a filter down drops its grant, whether or not the UnsubAck has
+    /// arrived: the set answers "granted on this session", and an unsubscribed
+    /// filter is not.
+    #[tokio::test]
+    async fn unsubscribe_filter_drops_the_grant() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        let (client, _eventloop) = live_client();
+        *handle.client.lock().await = Some(client);
+        svc.add_client(handle.clone()).await;
+        svc.subscribe_filter("home", "sensors/#".to_string(), 1)
+            .await;
+        handle.record_grant("sensors/#").await;
+        assert_eq!(
+            svc.subscription_acked("home", "sensors/#").await,
+            Some(true),
+            "the grant the broker gave is the answer the barrier reads",
+        );
+
+        svc.unsubscribe_filter("home", "sensors/#").await;
+        assert_eq!(
+            svc.subscription_acked("home", "sensors/#").await,
+            Some(false)
+        );
     }
 
     #[tokio::test]

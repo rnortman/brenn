@@ -1039,7 +1039,9 @@ mod tests {
             });
             // The delivery-time ACL gate re-authorizes every push against the
             // app's policy; without a covering matcher the row is denied.
-            cfg.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses([ch_addr]);
+            cfg.policy = std::sync::Arc::new(
+                brenn_lib::access::test_fixtures::delivery_policy_for_addresses([ch_addr]),
+            );
             cfg
         };
         let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();

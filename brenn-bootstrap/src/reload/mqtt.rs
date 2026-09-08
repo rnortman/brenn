@@ -17,7 +17,7 @@
 //! is the pair of convergibility rules in [`super::delta`]: a live subscriber
 //! the plan does not hold refuses the reload before any UNSUBSCRIBE is issued.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use brenn_envelope::ChannelScheme;
 use brenn_lib::messaging::ChannelEntry;
@@ -124,20 +124,71 @@ pub(crate) fn address_of(client: &str, topic_filter: &str) -> String {
     format!("mqtt:{client}:{topic_filter}")
 }
 
+/// One side's whole `mqtt:` ingress: what a process running this document
+/// would have subscribed at the broker and routed.
+///
+/// Two parts, because they are derived from two places and only one of them is
+/// in the plan. `static_` is the document's own `mqtt_subscription` lines.
+/// `dynamic` is the live dynamic `mqtt:` subscriptions that side stands behind —
+/// on the baseline the ones this process holds folded, on the candidate the ones
+/// it would still hold after the re-merge. Both are the oracle's: a fresh boot
+/// derives its SUBSCRIBE union and its route table from the static channels
+/// *plus* every dynamic row its merge kept, so a diff over the static half alone
+/// would unsubscribe filters the candidate still needs.
+///
+/// A uuid in `static_` is never also in `dynamic`: the merge that produces the
+/// dynamic half excludes the side's own static channels, because one filter on
+/// one client is one channel and the static declaration is the one that stands.
+pub(crate) struct MqttIngressSet<'a> {
+    pub static_: &'a [ResolvedMqttIngressChannel],
+    pub dynamic: Vec<ResolvedMqttIngressChannel>,
+}
+
+impl<'a> MqttIngressSet<'a> {
+    /// A side that stands behind no dynamic subscription. Only a test is ever
+    /// that side: a running process reaches this through the two sets the
+    /// re-merge derives, empty or not.
+    #[cfg(test)]
+    pub(crate) fn only_static(static_: &'a [ResolvedMqttIngressChannel]) -> Self {
+        Self {
+            static_,
+            dynamic: Vec::new(),
+        }
+    }
+
+    /// Both halves as one list, which is the grain the broker's union and the
+    /// route table are built at.
+    fn all(&self) -> Vec<ResolvedMqttIngressChannel> {
+        self.static_.iter().chain(&self.dynamic).cloned().collect()
+    }
+
+    fn uuids(&self) -> HashSet<Uuid> {
+        self.static_
+            .iter()
+            .chain(&self.dynamic)
+            .map(|channel| channel.channel_uuid)
+            .collect()
+    }
+}
+
 /// The MQTT half of the plan delta.
 ///
-/// `baseline` and `candidate` are the two plans' *static* ingress channel
-/// lists. A filter a dynamic subscription minted is in neither, which is what
-/// keeps it out of both unions and out of every step below — its route is keyed
-/// by a uuid no plan entry carries, so it is not in `routes_removed` either.
+/// The broker's SUBSCRIBE set is diffed over the two sides' whole ingress —
+/// static and dynamic — because that is the set a fresh boot of each document
+/// would assert. The route table is diffed at two grains: a static channel's
+/// route moves when the channel delta moves the channel, and a dynamic
+/// subscription's route moves when the re-merge revoked or revived it, which no
+/// channel delta can see.
 pub(crate) fn mqtt_delta(
-    baseline: &[ResolvedMqttIngressChannel],
-    candidate: &[ResolvedMqttIngressChannel],
+    baseline: &MqttIngressSet<'_>,
+    candidate: &MqttIngressSet<'_>,
     channels_leaving: &[&ChannelEntry],
     channels_joining: &[&ChannelEntry],
 ) -> MqttDelta {
+    let baseline_all = baseline.all();
+    let candidate_all = candidate.all();
     let mut clients: Vec<&str> = Vec::new();
-    for channel in candidate.iter().chain(baseline) {
+    for channel in candidate_all.iter().chain(&baseline_all) {
         if !clients.contains(&channel.client_slug.as_str()) {
             clients.push(channel.client_slug.as_str());
         }
@@ -145,8 +196,8 @@ pub(crate) fn mqtt_delta(
 
     let mut delta = MqttDelta::default();
     for client in clients {
-        let before = union_subscriptions(client, baseline);
-        let after = union_subscriptions(client, candidate);
+        let before = union_subscriptions(client, &baseline_all);
+        let after = union_subscriptions(client, &candidate_all);
         let mut moved = MqttClientDelta {
             client: client.to_string(),
             ..MqttClientDelta::default()
@@ -181,6 +232,7 @@ pub(crate) fn mqtt_delta(
     }
 
     let by_uuid: BTreeMap<Uuid, &ResolvedMqttIngressChannel> = candidate
+        .static_
         .iter()
         .map(|channel| (channel.channel_uuid, channel))
         .collect();
@@ -208,6 +260,28 @@ pub(crate) fn mqtt_delta(
             channel_uuid: entry.uuid,
             channel_address: entry.address.clone(),
         });
+    }
+
+    // The dynamic half of the route table, which the channel delta cannot
+    // name: a revived subscription needs the route a dormant row never had, and
+    // a revoked one leaves a route nothing will match. Both are asked against
+    // the *whole* other side, so a row the candidate declares statically
+    // instead — its route already in the table, its channel already in the
+    // directory — moves nothing.
+    let baseline_uuids = baseline.uuids();
+    let candidate_uuids = candidate.uuids();
+    for channel in &candidate.dynamic {
+        if !baseline_uuids.contains(&channel.channel_uuid) {
+            delta.routes_added.push(IngressRoute::from(channel));
+        }
+    }
+    for channel in &baseline.dynamic {
+        if !candidate_uuids.contains(&channel.channel_uuid) {
+            delta.routes_removed.push(RouteRemoval {
+                channel_uuid: channel.channel_uuid,
+                channel_address: channel.channel_address.clone(),
+            });
+        }
     }
     delta
 }
@@ -251,7 +325,12 @@ mod tests {
     fn a_new_ingress_channel_subscribes_its_filter_and_adds_its_route() {
         let arriving = ingress("chef", "a/b", 1);
         let entry = entry(&arriving);
-        let delta = mqtt_delta(&[], std::slice::from_ref(&arriving), &[], &[&entry]);
+        let delta = mqtt_delta(
+            &MqttIngressSet::only_static(&[]),
+            &MqttIngressSet::only_static(std::slice::from_ref(&arriving)),
+            &[],
+            &[&entry],
+        );
 
         assert_eq!(delta.clients.len(), 1);
         assert_eq!(filters(&delta.clients[0].subscribe), vec![("a/b", 1)]);
@@ -267,7 +346,12 @@ mod tests {
     fn a_departing_ingress_channel_unsubscribes_and_loses_its_route() {
         let leaving = ingress("chef", "a/b", 1);
         let entry = entry(&leaving);
-        let delta = mqtt_delta(std::slice::from_ref(&leaving), &[], &[&entry], &[]);
+        let delta = mqtt_delta(
+            &MqttIngressSet::only_static(std::slice::from_ref(&leaving)),
+            &MqttIngressSet::only_static(&[]),
+            &[&entry],
+            &[],
+        );
 
         assert_eq!(filters(&delta.clients[0].unsubscribe), vec![("a/b", 1)]);
         assert!(delta.clients[0].subscribe.is_empty());
@@ -289,9 +373,10 @@ mod tests {
         let stays = ingress("chef", "a/b", 1);
         let goes = ingress("chef", "c/d", 1);
         let goes_entry = entry(&goes);
+        let both = [stays.clone(), goes.clone()];
         let delta = mqtt_delta(
-            &[stays.clone(), goes.clone()],
-            std::slice::from_ref(&stays),
+            &MqttIngressSet::only_static(&both),
+            &MqttIngressSet::only_static(std::slice::from_ref(&stays)),
             &[&goes_entry],
             &[],
         );
@@ -314,7 +399,12 @@ mod tests {
     fn a_qos_move_is_an_unsubscribe_then_a_subscribe() {
         let before = ingress("chef", "a/b", 0);
         let after = ingress("chef", "a/b", 2);
-        let delta = mqtt_delta(&[before], &[after], &[], &[]);
+        let delta = mqtt_delta(
+            &MqttIngressSet::only_static(&[before]),
+            &MqttIngressSet::only_static(&[after]),
+            &[],
+            &[],
+        );
 
         assert!(delta.clients[0].subscribe.is_empty());
         assert!(delta.clients[0].unsubscribe.is_empty());
@@ -345,9 +435,10 @@ mod tests {
         let kept = ingress("chef", "a/b", 1);
         let arriving = ingress("chef", "c/d", 1);
         let arriving_entry = entry(&arriving);
+        let candidate = [kept.clone(), arriving.clone()];
         let delta = mqtt_delta(
-            std::slice::from_ref(&kept),
-            &[kept.clone(), arriving.clone()],
+            &MqttIngressSet::only_static(std::slice::from_ref(&kept)),
+            &MqttIngressSet::only_static(&candidate),
             &[],
             &[&arriving_entry],
         );
@@ -359,5 +450,149 @@ mod tests {
         assert_eq!(delta.routes_added.len(), 1);
         assert_eq!(delta.routes_added[0].channel_uuid, arriving.channel_uuid);
         assert!(delta.routes_removed.is_empty());
+    }
+
+    /// A dynamic subscription the re-merge revoked leaves the broker set and
+    /// takes its route with it — the state a fresh boot of the candidate would
+    /// be in, where the merge holds the row dormant and derives neither.
+    #[test]
+    fn a_revoked_dynamic_subscription_unsubscribes_its_filter_and_loses_its_route() {
+        let dynamic = ingress("chef", "a/b", 1);
+        let delta = mqtt_delta(
+            &MqttIngressSet {
+                static_: &[],
+                dynamic: vec![dynamic.clone()],
+            },
+            &MqttIngressSet::only_static(&[]),
+            &[],
+            &[],
+        );
+
+        assert_eq!(filters(&delta.clients[0].unsubscribe), vec![("a/b", 1)]);
+        assert_eq!(delta.routes_removed.len(), 1);
+        assert_eq!(delta.routes_removed[0].channel_uuid, dynamic.channel_uuid);
+        assert!(delta.routes_added.is_empty());
+    }
+
+    /// The mirror: a dormant row the candidate authorizes again is subscribed
+    /// and routed, which is what boot does with the same row once the ACL is
+    /// back.
+    #[test]
+    fn a_revived_dynamic_subscription_subscribes_its_filter_and_gains_its_route() {
+        let dynamic = ingress("chef", "a/b", 1);
+        let delta = mqtt_delta(
+            &MqttIngressSet::only_static(&[]),
+            &MqttIngressSet {
+                static_: &[],
+                dynamic: vec![dynamic.clone()],
+            },
+            &[],
+            &[],
+        );
+
+        assert_eq!(filters(&delta.clients[0].subscribe), vec![("a/b", 1)]);
+        assert_eq!(delta.routes_added.len(), 1);
+        assert_eq!(delta.routes_added[0].channel_uuid, dynamic.channel_uuid);
+        assert!(delta.routes_removed.is_empty());
+    }
+
+    /// The case the plan-only diff got wrong, at the filter grain: a static
+    /// channel departs while a dynamic subscription on the *same* filter stands
+    /// on both sides. The union still holds the filter after, so nothing is
+    /// unsubscribed — which is `unsubscribe_filter`'s "only when the last
+    /// subscriber leaves" contract, discharged by the diff rather than argued
+    /// around it.
+    ///
+    /// The pairing itself is unreachable in production and is not a state this
+    /// asserts is desirable: an `mqtt:` channel's uuid is derived from its
+    /// address, so one filter is one channel, and rule 2
+    /// (`live_subscriber_refusals`) refuses any reload that takes a channel
+    /// away under a dynamic row on it. What is under test is the union
+    /// arithmetic, not a shape the walk should ever produce — the route
+    /// assertion below records that the static channel's route goes with the
+    /// channel, which is what leaves the filter with nothing to route to and
+    /// is exactly why rule 2 refuses first.
+    #[test]
+    fn a_dynamic_subscription_on_a_departing_filter_keeps_it_subscribed() {
+        let shared = ingress("chef", "a/b", 1);
+        let entry = entry(&shared);
+        let delta = mqtt_delta(
+            &MqttIngressSet {
+                static_: std::slice::from_ref(&shared),
+                dynamic: Vec::new(),
+            },
+            &MqttIngressSet {
+                static_: &[],
+                dynamic: vec![shared.clone()],
+            },
+            &[&entry],
+            &[],
+        );
+
+        assert!(
+            delta.clients.is_empty() || delta.clients[0].unsubscribe.is_empty(),
+            "a filter the candidate still stands behind was unsubscribed",
+        );
+        // The static channel's own route still goes: the channel delta is what
+        // says the entry left, and the dynamic side keeps the filter, not the
+        // channel.
+        assert_eq!(delta.routes_removed.len(), 1);
+    }
+
+    /// The reachable shape of the same arithmetic: a static channel departs
+    /// while a dynamic subscription on a *different* topic stands on both
+    /// sides. The departing filter is unsubscribed and its route removed; the
+    /// dynamic one keeps both.
+    #[test]
+    fn a_dynamic_subscription_beside_a_departing_one_keeps_its_filter_and_route() {
+        let departing = ingress("chef", "a/b", 1);
+        let kept = ingress("chef", "c/d", 1);
+        let entry = entry(&departing);
+        let delta = mqtt_delta(
+            &MqttIngressSet {
+                static_: std::slice::from_ref(&departing),
+                dynamic: vec![kept.clone()],
+            },
+            &MqttIngressSet {
+                static_: &[],
+                dynamic: vec![kept.clone()],
+            },
+            &[&entry],
+            &[],
+        );
+
+        assert_eq!(filters(&delta.clients[0].unsubscribe), vec![("a/b", 1)]);
+        assert_eq!(
+            delta
+                .routes_removed
+                .iter()
+                .map(|removal| removal.channel_uuid)
+                .collect::<Vec<_>>(),
+            vec![departing.channel_uuid],
+            "the kept dynamic channel's route stays",
+        );
+        assert!(delta.routes_added.is_empty());
+    }
+
+    /// A dynamic subscription both sides stand behind moves nothing at all —
+    /// the common case, and the one that says the dynamic half is a set
+    /// comparison rather than a re-derivation.
+    #[test]
+    fn a_dynamic_subscription_on_both_sides_moves_nothing() {
+        let dynamic = ingress("chef", "a/b", 1);
+        let delta = mqtt_delta(
+            &MqttIngressSet {
+                static_: &[],
+                dynamic: vec![dynamic.clone()],
+            },
+            &MqttIngressSet {
+                static_: &[],
+                dynamic: vec![dynamic],
+            },
+            &[],
+            &[],
+        );
+
+        assert!(delta.is_empty());
     }
 }

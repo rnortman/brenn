@@ -12,9 +12,16 @@
 pub mod broker;
 pub mod certs;
 pub mod client;
+pub mod poll;
 
-pub use broker::{BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE};
-pub use client::{await_puback, direct_publisher_acked, wait_for_health};
+pub use broker::{
+    BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, log_records_publish_to_subscriber,
+    log_records_unsubscribe,
+};
+pub use client::{
+    await_puback, direct_publisher_acked, session_client_id, wait_for_filter_acked, wait_for_health,
+};
+pub use poll::{POLL_INTERVAL, poll_until};
 
 /// The environment variable a broker-backed test target sets to opt in.
 ///

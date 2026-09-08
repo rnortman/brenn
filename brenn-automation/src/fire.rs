@@ -1566,7 +1566,7 @@ mod tests {
                 frontmatter: Default::default(),
                 state_dir: std::path::PathBuf::from("/tmp"),
                 messaging: Some(messaging_cfg),
-                policy: brenn_lib::access::AppPolicy::messaging_sender_policy(),
+                policy: std::sync::Arc::new(brenn_lib::access::AppPolicy::messaging_sender_policy()),
                 ..brenn_lib::config::test_app_config("test-app")
             };
             apps.insert("test-app".to_string(), app_cfg);
@@ -1675,7 +1675,7 @@ mod tests {
                 frontmatter: Default::default(),
                 state_dir: std::path::PathBuf::from("/tmp"),
                 messaging: Some(messaging_cfg),
-                policy: brenn_lib::access::AppPolicy::messaging_sender_policy(),
+                policy: std::sync::Arc::new(brenn_lib::access::AppPolicy::messaging_sender_policy()),
                 ..brenn_lib::config::test_app_config("test-app")
             };
             apps.insert("test-app".to_string(), app_cfg);
@@ -1863,7 +1863,7 @@ mod tests {
                 frontmatter: Default::default(),
                 state_dir: std::path::PathBuf::from("/tmp"),
                 messaging: Some(messaging_cfg),
-                policy: brenn_lib::access::AppPolicy::messaging_sender_policy(),
+                policy: std::sync::Arc::new(brenn_lib::access::AppPolicy::messaging_sender_policy()),
                 ..brenn_lib::config::test_app_config("test-app")
             };
             apps.insert("test-app".to_string(), app_cfg);
@@ -2179,7 +2179,7 @@ mod tests {
             true,
             subscriptions,
         );
-        app_cfg.policy = policy;
+        app_cfg.policy = std::sync::Arc::new(policy);
         let mut apps = indexmap::IndexMap::new();
         apps.insert("test-app".to_string(), app_cfg);
         let apps = Arc::new(apps);

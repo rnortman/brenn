@@ -697,7 +697,7 @@ fn messaging_enabled_reads_grant_not_section_grant_without_block() {
     // Subscribe arm.
     let mut app = minimal_app_config_for_budget_test(None, 100);
     assert!(app.messaging.is_none());
-    app.policy
+    std::sync::Arc::make_mut(&mut app.policy)
         .grants
         .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
     assert!(app.messaging_enabled());
@@ -705,8 +705,7 @@ fn messaging_enabled_reads_grant_not_section_grant_without_block() {
     // Publish arm (a distinct app holding only `MessagingPublish`).
     let mut publish_only = minimal_app_config_for_budget_test(None, 100);
     assert!(publish_only.messaging.is_none());
-    publish_only
-        .policy
+    std::sync::Arc::make_mut(&mut publish_only.policy)
         .grants
         .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
     assert!(
@@ -743,7 +742,7 @@ fn pwa_push_enabled_reads_grant_not_section_grant_without_block() {
     // `pwa_push_enabled()` is `true` (the grant is the sole authority).
     let mut app = minimal_app_config_for_budget_test(None, 100);
     assert!(app.pwa_push.is_none());
-    app.policy
+    std::sync::Arc::make_mut(&mut app.policy)
         .grants
         .insert(brenn_envelope::grants::AppCapability::PwaPush);
     assert!(app.pwa_push_enabled());

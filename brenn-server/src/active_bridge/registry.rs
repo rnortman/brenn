@@ -108,6 +108,11 @@ impl ActiveBridges {
             let mut map = self.inner.write().await;
             map.insert(conversation_id, bridge.clone());
         }
+        // A reload that swapped the table while this spawn was in flight has
+        // already run its retirement sweep over a registry this bridge was not
+        // in yet. Asked here, under no lock the sweep holds, so the bridge is
+        // condemned by whichever of the two happens second.
+        bridge.condemn_if_spawned_before_a_swap();
         if let Some(messenger) = bridge.messenger() {
             messenger.dispatch_kick();
         }

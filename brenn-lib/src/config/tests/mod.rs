@@ -41,6 +41,7 @@ mod podman_args;
 mod primary;
 mod repo_mount;
 mod resolve;
+mod resolve_apps;
 mod resolved_config;
 mod server;
 mod webhook;
@@ -140,11 +141,11 @@ fn minimal_app_config_for_budget_test(
         state_dir: PathBuf::from("/tmp/.brenn/test-state"),
         messaging,
         messaging_default_send_budget: global_default,
-        policy: crate::access::AppPolicy::default(),
+        policy: std::sync::Arc::new(crate::access::AppPolicy::default()),
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
-        chat_harness_policy: crate::access::AppPolicy::default(),
+        chat_harness_policy: std::sync::Arc::new(crate::access::AppPolicy::default()),
     }
 }
 

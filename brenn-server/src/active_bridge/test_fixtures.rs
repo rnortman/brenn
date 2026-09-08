@@ -2,7 +2,10 @@
 //! with mock services, mount fixtures, sync hooks, and the pending-permission
 //! preseeder.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "testutils"))]
+// Compiled twice: for this crate's own tests, which use all of it, and under
+// `testutils` for the crates above, which reach only the entry points below.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -15,8 +18,10 @@ use brenn_db::Db;
 use brenn_lib::config::PathMapper;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_ws_types::{ViewportClass, WsServerMessage};
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
-use tokio::sync::{broadcast, watch};
+#[cfg(test)]
+use tokio::sync::watch;
 
 use super::ActiveBridge;
 use super::compaction::CompactionState;
@@ -60,6 +65,8 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     /// subscribe-activation path needs it.
     pub mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
     /// App-level user allowlist. Empty = open app (all users visible). Non-empty = restricted.
+    /// Written into the agent this fixture's `AppTable` holds, where the device
+    /// tools read it per call.
     pub allowed_users: Vec<String>,
     /// Optional automation engine. `None` = no automation. Threaded into
     /// `inject_for_test_full` so inline `Arc::new(Self { ... })` literals in
@@ -72,12 +79,18 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     /// `Some` injects one so the `registry_adapter` intercept can be exercised.
     pub tools: Option<Arc<brenn_tool_registry::ToolRegistry>>,
     /// This app's resolved tool grants. Empty (default) = no registry tools
-    /// granted.
+    /// granted. Written into the agent this fixture's `AppTable` holds.
     pub tool_grants: std::collections::BTreeMap<String, brenn_lib::tools::ResolvedToolGrant>,
     /// The app's `messaging_send_budget`: the ceiling of the conversation's
     /// impetus pool, and of the outbound draws that share it. `0` makes the
-    /// conversation attended-only.
+    /// conversation attended-only. Written into the agent this fixture's
+    /// `AppTable` holds.
     pub send_budget: u32,
+    /// The registry the bridge reads authority through. `None` (default) mints
+    /// a private one holding just this bridge's agent, built from the authority
+    /// fields above. `Some` hands the bridge a table the test also holds, which
+    /// is how a test drives a reload's swap under a live session.
+    pub apps: Option<brenn_lib::config::AppTable>,
     /// The CC event sender the bridge hands to a replacement process. `None`
     /// (default) mints a throwaway whose receiver is already gone.
     pub cc_event_tx: Option<tokio::sync::mpsc::Sender<brenn_cc::session::SessionEvent>>,
@@ -111,6 +124,7 @@ impl Default for TestBridgeConfig {
             tools: None,
             tool_grants: std::collections::BTreeMap::new(),
             send_budget: 100,
+            apps: None,
             cc_event_tx: None,
             cc_profiles: None,
             swap_host: None,
@@ -121,6 +135,10 @@ impl Default for TestBridgeConfig {
 /// Build a test integrations map containing a pfin integration with a minimal
 /// config (`command = "pf"`, empty env). Used by tests that exercise pfin
 /// tool paths and need `bridge.pfin_config()` to return `Some`.
+///
+/// This crate's own tests only: it spells a `toml` value, which is a dev
+/// dependency here and not part of what `testutils` offers the crates above.
+#[cfg(test)]
 pub(in crate::active_bridge) fn pfin_test_integrations()
 -> HashMap<String, std::sync::Arc<dyn brenn_lib::integration::Integration>> {
     let config_value: toml::Value =
@@ -134,7 +152,135 @@ pub(in crate::active_bridge) fn pfin_test_integrations()
     map
 }
 
+/// A one-agent `AppTable` for a test bridge: `test_app_config(slug)` with
+/// `edit` applied. The bridge reads its authority out of this, so a test that
+/// wants to change an agent mid-session keeps a clone of the returned table and
+/// `store`s a new map into it.
+pub(in crate::active_bridge) fn single_app_table(
+    slug: &str,
+    edit: impl FnOnce(&mut brenn_lib::config::AppConfig),
+) -> brenn_lib::config::AppTable {
+    let mut app = brenn_lib::config::test_app_config(slug);
+    edit(&mut app);
+    let mut map = indexmap::IndexMap::new();
+    map.insert(slug.to_string(), app);
+    brenn_lib::config::AppTable::new(Arc::new(map))
+}
+
+/// Install a fresh one-agent map into `table` — a reload's swap, for a test
+/// that wants to see a live bridge decide on the new agent.
+pub(in crate::active_bridge) fn swap_single_app(
+    table: &brenn_lib::config::AppTable,
+    slug: &str,
+    edit: impl FnOnce(&mut brenn_lib::config::AppConfig),
+) {
+    table.store(single_app_table(slug, edit).load());
+}
+
+/// A bridge a reload test above this crate can register and watch retire: one
+/// agent's table, one conversation, and no CC process behind it.
+///
+/// The reload facility's own suite lives in `brenn-bootstrap`, where the driver
+/// is, and its session steps have nothing to act on without a registered
+/// bridge. What a reload reads off one is its slug, its owner and its guards,
+/// all of which this fixture carries.
+pub fn test_bridge_for_reload(
+    db: Db,
+    user_id: i64,
+    conversation_id: i64,
+    app_slug: &str,
+    apps: brenn_lib::config::AppTable,
+    registry: ActiveBridges,
+) -> Arc<ActiveBridge> {
+    let (broadcast_tx, _rx) = broadcast::channel(16);
+    let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
+    ActiveBridge::inject_for_test_full(
+        user_id,
+        conversation_id,
+        app_slug,
+        db,
+        broadcast_tx,
+        alert_dispatcher,
+        TestBridgeConfig {
+            active_bridges: Some(registry),
+            apps: Some(apps),
+            ..Default::default()
+        },
+    )
+}
+
+/// [`test_bridge_for_reload`] that can also take a bus delivery: a recording
+/// session stands in for the CC subprocess.
+///
+/// The caller must hold the returned [`RecordedSession`] for as long as the
+/// delivery matters — dropping it closes the session's channel and fails every
+/// subsequent send.
+pub async fn test_bridge_receiving_bus(
+    db: Db,
+    user_id: i64,
+    conversation_id: i64,
+    app_slug: &str,
+    apps: brenn_lib::config::AppTable,
+    registry: ActiveBridges,
+    messenger: Arc<brenn_messaging::Messenger>,
+) -> (Arc<ActiveBridge>, RecordedSession) {
+    let (broadcast_tx, _rx) = broadcast::channel(16);
+    let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
+    let bridge = ActiveBridge::inject_for_test_full(
+        user_id,
+        conversation_id,
+        app_slug,
+        db,
+        broadcast_tx,
+        alert_dispatcher,
+        TestBridgeConfig {
+            active_bridges: Some(registry),
+            apps: Some(apps),
+            messenger: Some(messenger),
+            ..Default::default()
+        },
+    );
+    let recorded = bridge.install_recording_session_for_test().await;
+    (bridge, RecordedSession(recorded))
+}
+
+/// The live end of a [`test_bridge_receiving_bus`] bridge's recording session:
+/// what the bridge sent its process, in order.
+///
+/// Owning it is what keeps that session usable — the recording session's
+/// channel closes with its receiver, and a bridge whose channel is closed fails
+/// every send. It is opaque on purpose: a caller above this crate holds one
+/// without naming the CC protocol types.
+pub struct RecordedSession(tokio::sync::mpsc::Receiver<brenn_cc::session::OutgoingEnvelope>);
+
+impl RecordedSession {
+    /// The text of every message sent so far, draining what has arrived.
+    ///
+    /// Panics on anything that is not a user message carrying text, which is
+    /// the only shape a bus delivery takes.
+    pub fn texts(&mut self) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(envelope) = self.0.try_recv() {
+            let brenn_cc::protocol::CcOutgoing::User { message } = &envelope.msg else {
+                panic!("a bus delivery is a user message, got {:?}", envelope.msg);
+            };
+            texts.extend(message.content.iter().filter_map(|block| match block {
+                brenn_cc::protocol::outgoing::UserContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            }));
+        }
+        texts
+    }
+}
+
 impl ActiveBridge {
+    /// Whether this bridge's CC is between turns, as a test wants to state it.
+    /// A busy bridge is one a reload may not retire until its turn ends.
+    pub fn set_cc_idle_for_test(&self, idle: bool) {
+        self.cc_idle
+            .store(idle, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Test-only: overwrite `bridge.session` with `CcSession::recording_for_test()`
     /// and return the receiver that captures every `OutgoingEnvelope` sent. Access
     /// the `CcOutgoing` via `.msg`; `.ack` holds the optional flush-ack sender.
@@ -385,6 +531,7 @@ impl ActiveBridge {
             tools,
             tool_grants,
             send_budget,
+            apps,
             cc_event_tx,
             cc_profiles,
             swap_host,
@@ -394,6 +541,19 @@ impl ActiveBridge {
         // Default: an empty first-class tool registry (no tools registered).
         let tools =
             tools.unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
+        let apps = apps.unwrap_or_else(|| {
+            single_app_table(app_slug, |app| {
+                app.allowed_users = allowed_users;
+                app.messaging_default_send_budget = send_budget;
+                app.messaging = None;
+                app.policy_mut().tool_grants = tool_grants;
+            })
+        });
+        // The per-process snapshot fields production takes from the map its
+        // spawn read: this fixture's table is that map.
+        let spawned_persistent = apps.get(app_slug).is_some_and(|app| app.persistent);
+        let spawned_generation = apps.generation();
+        #[cfg(test)]
         let (epoch_tx, _epoch_rx) = watch::channel(0u64);
         // Same rule as production: the bus door exists exactly where a messenger
         // does.
@@ -421,7 +581,7 @@ impl ActiveBridge {
             active_bridges,
             tool_registry: Arc::new(HashMap::new()),
             tools,
-            tool_grants,
+            apps,
             server_origin: Arc::from("test-origin"),
             // Mirror the production auto-approve base exactly so fixture-based
             // tests see the same approval policy as real bridges. ExportUsage is
@@ -442,7 +602,6 @@ impl ActiveBridge {
             idle_hooks: std::sync::Mutex::new(Vec::new()),
             idle_hook_timer: std::sync::Mutex::new(None),
             frontmatter: brenn_lib::config::FrontmatterRenderConfig::default(),
-            allowed_users,
             viewport_class: std::sync::Mutex::new(ViewportClass::Wide),
             singleton,
             compaction: tokio::sync::Mutex::new(CompactionState::default()),
@@ -463,7 +622,6 @@ impl ActiveBridge {
             mqtt_event_router,
             automation_engine,
             usage_session_gap_secs: 1800,
-            messaging_default_send_budget: send_budget,
             last_cost_prune_at: AtomicI64::new(0),
             last_lint_snapshot: std::sync::Mutex::new(None),
             event_loop_handle: std::sync::Mutex::new(None),
@@ -472,9 +630,14 @@ impl ActiveBridge {
             cc_profile: std::sync::Mutex::new(None),
             cc_profiles,
             swap_host,
+            reload_stale: AtomicBool::new(false),
+            reload_killing: AtomicBool::new(false),
+            spawned_generation,
+            spawned_persistent,
             swapping: AtomicBool::new(false),
             swap_ack: std::sync::Mutex::new(None),
             cc_event_tx: cc_event_tx.unwrap_or_else(|| tokio::sync::mpsc::channel(1).0),
+            #[cfg(test)]
             event_loop_epoch: epoch_tx,
         })
     }
@@ -593,33 +756,29 @@ impl ActiveBridge {
         // publish (the Seam-A publish gate, design §2.2, requires both the
         // MessagingPublish grant and a covering brenn_publish matcher).
         testapp_cfg
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         testapp_cfg
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         // Layer-2 publish ACL: authorize publishing to `test-channel` so the
         // happy-path send/cancel/edit intercept tests pass the Seam-A
         // brenn_publish gate (mirrors the brenn_subscribe matcher below;
         // scoped to the exact channel the tests use).
-        testapp_cfg
-            .policy
-            .acls
-            .brenn_publish
-            .push(brenn_lib::access::acl::ChannelMatcher::Exact(
-                "test-channel".to_string(),
-            ));
+        testapp_cfg.policy_mut().acls.brenn_publish.push(
+            brenn_lib::access::acl::ChannelMatcher::Exact("test-channel".to_string()),
+        );
         // Phase-1 non-MQTT gate: authorize a runtime brenn: subscribe to
         // `test-channel` so the static-sub-conflict test reaches (and asserts)
         // the lib core's conflict error rather than being PolicyDenied first.
         // Scoped to the exact channel the test uses (minimal grant).
         testapp_cfg
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::DynamicSubscribe);
-        testapp_cfg.policy.acls.brenn_subscribe.push(
+        testapp_cfg.policy_mut().acls.brenn_subscribe.push(
             brenn_lib::access::acl::ChannelMatcher::Exact("test-channel".to_string()),
         );
         messenger_apps.insert("testapp".to_string(), testapp_cfg);
@@ -723,11 +882,11 @@ impl ActiveBridge {
         let mut testapp_cfg =
             crate::test_support::app_config::default_test_app_config("testapp", "testapp");
         testapp_cfg
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         testapp_cfg
-            .policy
+            .policy_mut()
             .acls
             .mqtt_subscribe
             .push(brenn_lib::access::acl::MqttSubMatcher {
@@ -916,7 +1075,7 @@ impl ActiveBridge {
         // policy (the default `mqtt_subscribe_test_policy` admits every filter the
         // activation/intercept tests request; gate tests pass a narrower/empty
         // policy to exercise the deny paths).
-        testapp_cfg.policy = policy.clone();
+        testapp_cfg.policy = std::sync::Arc::new(policy.clone());
         let allowed_users = testapp_cfg.allowed_users.clone();
         apps.insert("testapp".to_string(), testapp_cfg);
         // A SECOND app on the same filter (the no-duplicate-route test). It too
@@ -927,7 +1086,7 @@ impl ActiveBridge {
             crate::test_support::app_config::default_test_app_config("otherapp", "otherapp");
         otherapp_cfg.singleton = singleton;
         otherapp_cfg.allowed_users = allowed_users;
-        otherapp_cfg.policy = policy;
+        otherapp_cfg.policy = std::sync::Arc::new(policy);
         apps.insert("otherapp".to_string(), otherapp_cfg);
 
         let messenger = brenn_messaging::Messenger::new(
@@ -1085,7 +1244,7 @@ impl ActiveBridge {
                         .push(brenn_lib::access::acl::ChannelMatcher::Exact(
                             "test-channel".to_string(),
                         ));
-                    p
+                    std::sync::Arc::new(p)
                 },
                 ..brenn_lib::config::test_app_config("testapp")
             },
@@ -1452,17 +1611,15 @@ fn make_test_messenger_with_mqtt_publish(
     let mut testapp_cfg =
         crate::test_support::app_config::default_test_app_config("testapp", "testapp");
     testapp_cfg
-        .policy
+        .policy_mut()
         .grants
         .insert(brenn_envelope::grants::AppCapability::MqttPublish);
     for client in clients {
-        testapp_cfg
-            .policy
-            .acls
-            .mqtt_publish
-            .push(brenn_lib::access::acl::MqttClientMatcher {
+        testapp_cfg.policy_mut().acls.mqtt_publish.push(
+            brenn_lib::access::acl::MqttClientMatcher {
                 client: (*client).to_string(),
-            });
+            },
+        );
     }
     let mut messenger_apps = indexmap::IndexMap::new();
     messenger_apps.insert("testapp".to_string(), testapp_cfg);
@@ -1526,7 +1683,7 @@ fn make_test_push_app_config(
                 p.grants
                     .insert(brenn_envelope::grants::AppCapability::PwaPush);
             }
-            p
+            std::sync::Arc::new(p)
         },
         pwa_push: Some(brenn_lib::pwa_push::config::AppPwaPushBlock {
             default_title: None,

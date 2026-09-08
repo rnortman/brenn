@@ -104,14 +104,20 @@ pub struct RepoSyncCtx {
     /// fails never has an entry. `std::sync::Mutex` — never held across
     /// awaits.
     pub failure_state: Arc<std::sync::Mutex<PersistentFailureState>>,
-    /// Resolved app configs, for looking up post-pull hook definitions.
-    pub apps: Arc<IndexMap<String, brenn_lib::config::AppConfig>>,
+    /// The agent table, for looking up post-pull hook definitions per pull
+    /// event — so an agent whose hooks changed at reload runs the new ones.
+    pub apps: brenn_lib::config::AppTable,
     /// Per-app mutex for coalescing concurrent post-pull hook invocations.
-    /// Keyed by app slug. Built at startup from all apps that have
-    /// non-empty `post_pull_hooks`. If a hook is already running for an
-    /// app, the next trigger skips rather than queuing — the running hook
-    /// already sees the latest repo state.
-    pub post_pull_hook_locks: Arc<HashMap<String, Arc<Mutex<()>>>>,
+    /// Keyed by app slug. If a hook is already running for an app, the next
+    /// trigger skips rather than queuing — the running hook already sees the
+    /// latest repo state.
+    ///
+    /// Populated on first use, not at startup: `post_pull_hooks` converges at
+    /// reload, so an agent that has hooks now may have had none when this
+    /// context was built. `std::sync::Mutex` around the map because the only
+    /// critical section is the `entry` lookup, which awaits nothing; the
+    /// per-app `tokio::Mutex` inside it is the one a hook holds.
+    pub post_pull_hook_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     // NOTE: drain-time staleness is NOT stored here. `main.rs` forwards
     // `[repo_sync].stale_conversation_days` to the process-global atomic
     // in `event_queue` at startup; the drain code reads it from there.
@@ -160,7 +166,7 @@ impl RepoSyncManager {
         clones: Arc<HashMap<String, CloneInfo>>,
         remote_locks: Arc<HashMap<String, Arc<Mutex<()>>>>,
         repo_sync_cfg: &RepoSyncConfig,
-        apps: &Arc<IndexMap<String, AppConfig>>,
+        apps: &brenn_lib::config::AppTable,
     ) -> Option<Self> {
         if clones.is_empty() {
             info!("repo_sync: no clones configured — manager not spawned");
@@ -191,15 +197,6 @@ impl RepoSyncManager {
             brenn_messaging::repo_sync_cursor::load_all(&conn)
         };
 
-        // Build per-app coalescing mutexes for post-pull hooks.
-        let post_pull_hook_locks: HashMap<String, Arc<Mutex<()>>> = apps
-            .iter()
-            .filter(|(_, app)| {
-                !app.post_pull_hooks.host.is_empty() || !app.post_pull_hooks.container.is_empty()
-            })
-            .map(|(slug, _)| (slug.clone(), Arc::new(Mutex::new(()))))
-            .collect();
-
         let ctx = RepoSyncCtx {
             db,
             active_bridges,
@@ -210,7 +207,7 @@ impl RepoSyncManager {
             last_notified_head: Arc::new(std::sync::Mutex::new(seeded_cursor)),
             failure_state: Arc::new(std::sync::Mutex::new(PersistentFailureState::default())),
             apps: apps.clone(),
-            post_pull_hook_locks: Arc::new(post_pull_hook_locks),
+            post_pull_hook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             pre_fanout_gate: None,
             #[cfg(test)]

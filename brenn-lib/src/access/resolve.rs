@@ -17,16 +17,15 @@ use crate::access::acl::{
 };
 use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
 use crate::access::{AppPolicy, GrantSet};
-use crate::mqtt::config::MqttClientConfig;
+use crate::mqtt::config::MqttClientIdentity;
 use brenn_envelope::grants::AppCapability;
 
 /// Build the resolved `AppPolicy` for an LLM app from its authored `grants` and
 /// `[app.acl.*]` block.
 ///
-/// `resolved_clients` is the already-resolved MQTT client map (Phase 6 output):
-/// every `mqtt_subscribe`/`mqtt_publish` matcher's `client` slug is cross-checked
-/// against it so an ACL referencing a nonexistent client fails fast at
-/// resolution rather than silently never-matching at runtime.
+/// MQTT `client` slugs in ACL matchers are cross-checked against
+/// `mqtt_clients` so a nonexistent client fails fast at resolution rather than
+/// silently never-matching at runtime.
 ///
 /// # Panics
 ///
@@ -48,7 +47,7 @@ pub fn build_app_policy(
     app_slug: &str,
     grants: &[AppCapability],
     acl: &AppAclRaw,
-    resolved_clients: &IndexMap<String, MqttClientConfig>,
+    mqtt_clients: &IndexMap<String, MqttClientIdentity>,
 ) -> AppPolicy {
     let mut grant_set = GrantSet::default();
     for &cap in grants {
@@ -77,7 +76,7 @@ pub fn build_app_policy(
             .mqtt_subscribe
             .iter()
             .map(|m| {
-                validate_mqtt_client(app_slug, "mqtt_subscribe", &m.client, resolved_clients);
+                validate_mqtt_client(app_slug, "mqtt_subscribe", &m.client, mqtt_clients);
                 crate::mqtt::address::validate_topic_filter_str(&m.topic_filter).unwrap_or_else(
                     |e| {
                         panic!(
@@ -97,7 +96,7 @@ pub fn build_app_policy(
             .mqtt_publish
             .iter()
             .map(|m| {
-                validate_mqtt_client(app_slug, "mqtt_publish", &m.client, resolved_clients);
+                validate_mqtt_client(app_slug, "mqtt_publish", &m.client, mqtt_clients);
                 MqttClientMatcher {
                     client: m.client.clone(),
                 }
@@ -184,7 +183,7 @@ pub fn build_app_policy(
 /// charset-validated here (`is_valid_client_slug`); the cross-check that each slug
 /// names a configured `[[mqtt_client]]` is a boot-time validation in `bootstrap`,
 /// where the resolved client set is in scope — `build_wasm_policy` does not take a
-/// `resolved_clients` map. `mqtt_subscribe_acl` topic filters are validated here
+/// client identity map. `mqtt_subscribe_acl` topic filters are validated here
 /// (`validate_topic_filter_str`).
 ///
 /// The resolved policy backs **delivery-time ACL enforcement** over `Wasm(slug)`
@@ -541,14 +540,14 @@ fn validate_mqtt_client(
     app_slug: &str,
     list: &str,
     client: &str,
-    resolved_clients: &IndexMap<String, MqttClientConfig>,
+    mqtt_clients: &IndexMap<String, MqttClientIdentity>,
 ) {
     assert!(
         crate::mqtt::config::is_valid_client_slug(client),
         "app {app_slug:?}: {list} matcher has invalid client slug {client:?}",
     );
     assert!(
-        resolved_clients.contains_key(client),
+        mqtt_clients.contains_key(client),
         "app {app_slug:?}: {list} matcher names unconfigured MQTT client {client:?} \
          (no matching [[mqtt_client]])",
     );
@@ -616,14 +615,14 @@ mod tests {
         AttachAclsRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WasmAclsRaw, WebhookMatcherRaw,
     };
 
-    /// A minimal resolved `MqttClientConfig` for the given slug, for the
-    /// matcher-client cross-check (only the map key matters).
-    fn test_client(slug: &str) -> MqttClientConfig {
-        crate::mqtt::test_support::test_client_config(slug)
+    /// A minimal client identity for the given slug, for the matcher-client
+    /// cross-check (only the map key matters).
+    fn test_client(slug: &str) -> MqttClientIdentity {
+        crate::mqtt::test_support::test_client_config(slug).identity
     }
 
-    /// A resolved-client map containing the given slugs.
-    fn clients(slugs: &[&str]) -> IndexMap<String, MqttClientConfig> {
+    /// A client identity map containing the given slugs.
+    fn clients(slugs: &[&str]) -> IndexMap<String, MqttClientIdentity> {
         slugs
             .iter()
             .map(|s| (s.to_string(), test_client(s)))

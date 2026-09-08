@@ -1873,13 +1873,13 @@ mod tests {
         let mut apps = indexmap::IndexMap::new();
         let mut testapp_cfg =
             crate::test_support::app_config::default_test_app_config("testapp", "testapp");
-        testapp_cfg.policy = brenn_lib::access::AppPolicy::default();
+        testapp_cfg.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         if grant {
             testapp_cfg
-                .policy
+                .policy_mut()
                 .grants
                 .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
-            testapp_cfg.policy.acls.brenn_publish.push(
+            testapp_cfg.policy_mut().acls.brenn_publish.push(
                 brenn_lib::access::acl::ChannelMatcher::Exact("known".to_string()),
             );
         }
@@ -1887,11 +1887,11 @@ mod tests {
         // visibility, so an unresolved one surfaces as `UnknownChannel` rather
         // than the reply_to gate's `AclDenied`.
         testapp_cfg
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
         testapp_cfg
-            .policy
+            .policy_mut()
             .acls
             .brenn_subscribe
             .push(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));
@@ -2256,11 +2256,11 @@ mod tests {
         let mut testapp_cfg =
             crate::test_support::app_config::default_test_app_config("testapp", "testapp");
         testapp_cfg
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         testapp_cfg
-            .policy
+            .policy_mut()
             .acls
             .mqtt_subscribe
             .push(brenn_lib::access::acl::MqttSubMatcher {
@@ -3012,11 +3012,11 @@ mod tests {
         let mut testapp_cfg =
             crate::test_support::app_config::default_test_app_config("testapp", "testapp");
         testapp_cfg
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::Webhook);
         testapp_cfg
-            .policy
+            .policy_mut()
             .acls
             .webhook
             .push(brenn_lib::access::acl::WebhookMatcher {
@@ -3248,10 +3248,10 @@ mod tests {
             crate::test_support::app_config::default_test_app_config("testapp", "testapp");
         if grant {
             testapp_cfg
-                .policy
+                .policy_mut()
                 .grants
                 .insert(brenn_envelope::grants::AppCapability::EphemeralPublish);
-            testapp_cfg.policy.acls.ephemeral_publish.push(
+            testapp_cfg.policy_mut().acls.ephemeral_publish.push(
                 brenn_lib::access::acl::ChannelMatcher::Exact("protobar".to_string()),
             );
             // Carries the `brenn:` grant with no matcher behind it: inert for
@@ -3259,7 +3259,7 @@ mod tests {
             // and it is what makes the app's messaging identity resolvable, which
             // the recall tools ask for before they look a message up.
             testapp_cfg
-                .policy
+                .policy_mut()
                 .grants
                 .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         }

@@ -950,6 +950,18 @@ the config tree's filesystem permissions are the whole answer. A deployment that
 grants an agent `publish` on the request channel should grant it no write access
 to the config tree.
 
+The gap's reach grew with what a reload converges, and the shape is worth stating
+plainly: such a principal can now widen any agent's authority, its own included
+— grants, ACLs, tool grants, subscriptions, send budget — and change what that
+agent's sessions *run with*, meaning its model, its MCP servers, its disabled
+tools and its working directory, and have the running process pick all of it up
+without a restart. Nothing here is new in kind: the same principal could already
+confer authority on itself by adding a consumer and a channel, and a restart
+would have applied every one of these edits anyway. What changed is the latency
+— the edit lands at the next reload and, for the spawn-shaped half, at each
+session's next turn boundary — which is why the answer stays "grant the request
+channel to no principal that can write the document".
+
 **What the reviewer verifies:** any path by which the reload request's *content*
 influences what is applied is a finding, as is any convergence outcome that is
 not what a fresh boot of the same document would have produced. So is a refusal

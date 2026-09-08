@@ -34,7 +34,8 @@ impl WsConnection {
             return;
         };
 
-        let Some(app) = self.state.apps.get(&self.app_slug) else {
+        let apps = self.state.apps.load();
+        let Some(app) = apps.get(&self.app_slug) else {
             // App config should always exist for an active WS connection
             // — same shape as `handle_load_artifact_snapshot`.
             warn!(slug = %self.app_slug, "ReopenArtifact: app not found");
@@ -90,7 +91,8 @@ impl WsConnection {
     /// Handle LoadArtifactSnapshot: load a stored artifact by message id.
     pub(super) async fn handle_load_artifact_snapshot(&self, message_id: i64) {
         self.touch_ui_activity("LoadArtifactSnapshot").await;
-        let Some(app) = self.state.apps.get(&self.app_slug) else {
+        let apps = self.state.apps.load();
+        let Some(app) = apps.get(&self.app_slug) else {
             // App config should always exist for an active WS connection.
             warn!(slug = %self.app_slug, "LoadArtifactSnapshot: app not found");
             let _ = self.send_ws(WsServerMessage::Error {

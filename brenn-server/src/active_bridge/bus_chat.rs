@@ -1677,23 +1677,20 @@ mod tests {
             send_budget: ceiling,
             subscriptions: vec![],
         });
-        app.policy = brenn_lib::access::AppPolicy::default();
+        app.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         if ambience {
             // The operator-authored half: the app reads one ordinary channel,
             // and its conversation is the delivery target for what lands there.
             app.singleton = true;
             app.allowed_users = vec!["bob".to_string()];
-            app.policy
+            app.policy_mut()
                 .grants
                 .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
-            app.policy
-                .acls
-                .brenn_subscribe
-                .push(brenn_lib::access::acl::ChannelMatcher::Prefix(
-                    "ambience".to_string(),
-                ));
+            app.policy_mut().acls.brenn_subscribe.push(
+                brenn_lib::access::acl::ChannelMatcher::Prefix("ambience".to_string()),
+            );
         }
-        app.chat_harness_policy = LlmChatConfig::default().harness_policy(APP);
+        app.chat_harness_policy = std::sync::Arc::new(LlmChatConfig::default().harness_policy(APP));
         let mut apps = indexmap::IndexMap::new();
         apps.insert(APP.to_string(), app);
 
@@ -3891,20 +3888,19 @@ mod tests {
                 send_budget: ceiling,
                 subscriptions: vec![],
             });
-            app.policy = brenn_lib::access::AppPolicy::default();
-            app.policy
+            app.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
+            app.policy_mut()
                 .grants
                 .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
-            app.policy
-                .acls
-                .brenn_subscribe
-                .push(brenn_lib::access::acl::ChannelMatcher::Prefix(
+            app.policy_mut().acls.brenn_subscribe.push(
+                brenn_lib::access::acl::ChannelMatcher::Prefix(
                     peer_record
                         .strip_prefix(brenn_lib::messaging::ChannelScheme::Brenn.prefix())
                         .expect("a record address is a brenn: address")
                         .to_string(),
-                ));
-            app.chat_harness_policy = chat.harness_policy(slug);
+                ),
+            );
+            app.chat_harness_policy = std::sync::Arc::new(chat.harness_policy(slug));
             app
         };
         let mut apps = indexmap::IndexMap::new();

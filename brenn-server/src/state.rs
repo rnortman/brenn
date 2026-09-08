@@ -8,7 +8,7 @@ use brenn_wasm::ReplayComponent;
 
 use brenn_db::Db;
 use brenn_lib::app::AppTool;
-use brenn_lib::config::AppConfig;
+use brenn_lib::config::AppTable;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_ws_types::ModelInfo;
 use indexmap::IndexMap;
@@ -73,11 +73,20 @@ pub struct AppState {
     pub mcp_script_path: PathBuf,
     /// Per-app configurations, keyed by slug. Iteration order is the
     /// declaration order of `agent` blocks in the config document.
-    pub apps: Arc<IndexMap<String, AppConfig>>,
+    ///
+    /// Swapped whole by a reload commit, so every read takes a snapshot for the
+    /// operation it serves and never caches one past it.
+    pub apps: AppTable,
     /// Notification channel for bridge spawn events.
     /// WS connections subscribe to auto-attach when a bridge spawns
     /// for a conversation they're viewing.
     pub bridge_notify_tx: broadcast::Sender<BridgeSpawned>,
+    /// Pulsed once by a reload commit after it installs a new agent map.
+    ///
+    /// A websocket connection is authorized once, at connect, and nothing
+    /// re-asks; this is what makes a user the new document denies re-ask and
+    /// close their own socket. Carries no payload: the answer is in the table.
+    pub apps_swapped_tx: broadcast::Sender<()>,
     /// Uploads awaiting reference in a SendMessage. Keyed by upload_id (UUID).
     pub pending_uploads: PendingUploads,
     /// Directory containing static frontend assets (JS, CSS, manifest).
@@ -701,8 +710,11 @@ impl AppState {
             return Ok(bridge);
         }
 
-        let app_config = self
-            .apps
+        // Read together: the process this spawn builds is described by that
+        // map, and a reload swapping the table while the spawn is in flight
+        // condemns the bridge when it registers.
+        let (apps, apps_generation) = self.apps.load_versioned();
+        let app_config = apps
             .get(&conv.app_slug)
             .ok_or_else(|| format!("unknown app: {}", conv.app_slug))?;
 
@@ -734,6 +746,8 @@ impl AppState {
                 log_dir: &self.log_dir,
                 mcp_script_path: &self.mcp_script_path,
                 app_config,
+                apps: self.apps.clone(),
+                apps_generation,
                 model_override: None,
                 tool_registry: self.tool_registry.clone(),
                 tools: self.tools.clone(),
@@ -915,7 +929,7 @@ impl AppState {
     ) -> Self {
         use tokio::sync::broadcast;
         let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
-        let apps = apps.unwrap_or_else(crate::test_support::app_config::test_apps);
+        let apps = AppTable::new(apps.unwrap_or_else(crate::test_support::app_config::test_apps));
         AppState {
             build_id: crate::test_support::TEST_BUILD_ID,
             db,
@@ -926,6 +940,7 @@ impl AppState {
             mcp_script_path: std::path::PathBuf::from("noop_mcp.py"),
             apps,
             bridge_notify_tx: broadcast::channel(64).0,
+            apps_swapped_tx: broadcast::channel(16).0,
             pending_uploads: Default::default(),
             static_dir: std::path::PathBuf::from("frontend/dist"),
             surface_roots: Default::default(),

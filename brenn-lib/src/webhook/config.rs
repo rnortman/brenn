@@ -7,7 +7,7 @@
 //! Validation and resolution in `resolve_webhook_endpoints` and
 //! `resolve_app_webhook_subscriptions`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use http::HeaderName;
 use indexmap::IndexMap;
 
 use crate::config::wasm::{WasmConfig, byte_size_to_max_page_count, resolve_component_config};
-use crate::config::{AppConfig, AppConfigRaw, load_secret_file};
+use crate::config::{AppConfigRaw, load_secret_file};
 use crate::messaging::config::Depth;
 use crate::messaging::{Urgency, WakeMin};
 use crate::webhook::is_valid_key_id;
@@ -770,31 +770,32 @@ fn resolve_and_check_replay_protection(
     Some(rp)
 }
 
-/// Validate and resolve all `[[webhook_endpoint]]` raw entries, producing
-/// a map of endpoint slug → `Arc<ResolvedWebhookEndpoint>`.
+/// Validate and resolve all `[[webhook_endpoint]]` raw entries, producing a map
+/// of endpoint slug → `Arc<ResolvedWebhookEndpoint>` and the resolved per-app
+/// subscription lists keyed by app slug.
 ///
 /// Also validates cross-app binding constraints (one endpoint → one owning
-/// app; every endpoint must be bound; singleton invariant) against `apps`.
-///
-/// `wasm_config` supplies the global WASM-host defaults (e.g.
-/// `store_size_limit`) used when a per-store override is absent.
+/// app; every endpoint must be bound; singleton invariant).
 ///
 /// # Panics
 ///
-/// Panics on any config error — see design §2.4 rules 1–9.
+/// On any config error (invalid slug, missing secret, duplicate endpoint,
+/// binding violations).
 pub fn resolve_webhook_endpoints(
     raw_endpoints: &[WebhookEndpointConfigRaw],
     raw_apps: &[AppConfigRaw],
     raw_wasm_consumers: &[crate::messaging::config::WasmConsumerConfigRaw],
-    apps: &mut IndexMap<String, AppConfig>,
     wasm_config: &WasmConfig,
     global_messaging: &crate::messaging::config::MessagingGlobalConfig,
-) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
+) -> (
+    IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
+    BTreeMap<String, Vec<ResolvedWebhookSubscription>>,
+) {
     use crate::messaging::WEBHOOK_ADDRESS_PREFIX;
     use crate::messaging::is_unreserved_name;
 
     if raw_endpoints.is_empty() && raw_apps.iter().all(|a| a.webhook_subscriptions.is_empty()) {
-        return IndexMap::new();
+        return (IndexMap::new(), BTreeMap::new());
     }
 
     // Build a map: endpoint_slug → (app_slug, the subscription block) for each
@@ -850,6 +851,7 @@ pub fn resolve_webhook_endpoints(
 
     // Resolve each endpoint.
     let mut result: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
+    let mut app_subs: BTreeMap<String, Vec<ResolvedWebhookSubscription>> = BTreeMap::new();
     let mut mount_set: HashSet<String> = HashSet::new();
     // Duplicate-store-path guard: canonical store_path must be unique across endpoints.
     let mut store_path_set: HashSet<PathBuf> = HashSet::new();
@@ -989,16 +991,17 @@ pub fn resolve_webhook_endpoints(
 
         result.insert(slug.clone(), endpoint.clone());
 
-        // Stamp resolved subscriptions onto the owning AppConfig (app-owned only).
-        if let Some((app_slug, push_depth, retain_depth, wake_min)) = app_stamp
-            && let Some(app) = apps.get_mut(&app_slug)
-        {
-            app.webhook_subscriptions.push(ResolvedWebhookSubscription {
-                endpoint_slug: slug.clone(),
-                push_depth,
-                retain_depth,
-                wake_min,
-            });
+        // Record the resolved subscription under its owning app (app-owned only).
+        if let Some((app_slug, push_depth, retain_depth, wake_min)) = app_stamp {
+            app_subs
+                .entry(app_slug)
+                .or_default()
+                .push(ResolvedWebhookSubscription {
+                    endpoint_slug: slug.clone(),
+                    push_depth,
+                    retain_depth,
+                    wake_min,
+                });
         }
     }
 
@@ -1015,7 +1018,7 @@ pub fn resolve_webhook_endpoints(
         }
     }
 
-    result
+    (result, app_subs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,17 +1101,7 @@ mod tests {
         }
     }
 
-    // A test-only stand-in for AppConfig that we don't actually need to fully
-    // populate — we only test config.rs which only calls `resolve_webhook_endpoints`.
-    // That function modifies `app.webhook_subscriptions`, so we need real AppConfig
-    // instances. We use a helper in the brenn-lib integration test style.
-    //
-    // Rather than constructing a full AppConfig (which requires a real working_dir etc.),
-    // the tests for resolve_webhook_endpoints are structured to test the raw-side
-    // resolution logic (panics) without needing to construct full AppConfig instances.
-    // We pass an empty `apps` IndexMap and verify the resolved endpoint fields directly.
-
-    // Helper to call resolve with real (empty) apps map and default WasmConfig.
+    // Helper to call resolve with default WasmConfig, keeping the endpoint map.
     fn resolve(
         endpoints: &[WebhookEndpointConfigRaw],
         app_raws: &[AppConfigRaw],
@@ -1122,15 +1115,66 @@ mod tests {
         app_raws: &[AppConfigRaw],
         wasm_consumers: &[crate::messaging::config::WasmConsumerConfigRaw],
     ) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
-        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        resolve_full(endpoints, app_raws, wasm_consumers).0
+    }
+
+    // Helper keeping both halves: the endpoint table and the per-app stamps.
+    fn resolve_full(
+        endpoints: &[WebhookEndpointConfigRaw],
+        app_raws: &[AppConfigRaw],
+        wasm_consumers: &[crate::messaging::config::WasmConsumerConfigRaw],
+    ) -> (
+        IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
+        BTreeMap<String, Vec<ResolvedWebhookSubscription>>,
+    ) {
         resolve_webhook_endpoints(
             endpoints,
             app_raws,
             wasm_consumers,
-            &mut apps,
             &WasmConfig::default(),
             &crate::messaging::config::MessagingGlobalConfig::default(),
         )
+    }
+
+    /// The resolver returns the per-app subscription lists rather than stamping
+    /// them: `resolve_apps` is the one place an `AppConfig` field is written.
+    #[test]
+    fn per_app_subscriptions_are_returned_keyed_by_app_slug() {
+        let secret = secret_file(b"mysecret");
+        let ep1 = raw_hmac_endpoint("ep1", vec![raw_key("k1", &secret)]);
+        let ep2 = raw_hmac_endpoint("ep2", vec![raw_key("k1", &secret)]);
+        let mut app = minimal_app_raw("myapp", true, vec!["dev".to_string()]);
+        app.webhook_subscriptions = vec![
+            AppWebhookSubscriptionRaw {
+                endpoint: "ep1".to_string(),
+                push_depth: Some(Depth::Bounded(3)),
+                retain_depth: Some(Depth::Bounded(9)),
+                wake_min: None,
+            },
+            AppWebhookSubscriptionRaw {
+                endpoint: "ep2".to_string(),
+                push_depth: Some(Depth::Bounded(1)),
+                retain_depth: Some(Depth::Bounded(2)),
+                wake_min: None,
+            },
+        ];
+        let (_endpoints, subs) = resolve_full(&[ep1, ep2], &[app], &[]);
+        let mine = &subs["myapp"];
+        assert_eq!(mine.len(), 2);
+        assert_eq!(mine[0].endpoint_slug, "ep1");
+        assert_eq!(mine[0].push_depth, Depth::Bounded(3));
+        assert_eq!(mine[0].retain_depth, Depth::Bounded(9));
+        assert_eq!(mine[1].endpoint_slug, "ep2");
+    }
+
+    /// A WASM-owned endpoint stamps nothing on any app.
+    #[test]
+    fn wasm_owned_endpoint_produces_no_app_stamp() {
+        let secret = secret_file(b"mysecret");
+        let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
+        let consumer = wasm_consumer_with_webhook_subs("myconsumer", &["ep"]);
+        let (_endpoints, subs) = resolve_full(&[ep], &[], &[consumer]);
+        assert!(subs.is_empty());
     }
 
     /// Minimal `[[wasm_consumer]]` raw with the given `webhook:<endpoint>`
@@ -2118,15 +2162,14 @@ mod tests {
         app_raws: &[AppConfigRaw],
         wasm_config: &WasmConfig,
     ) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
-        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         resolve_webhook_endpoints(
             endpoints,
             app_raws,
             &[],
-            &mut apps,
             wasm_config,
             &crate::messaging::config::MessagingGlobalConfig::default(),
         )
+        .0
     }
 
     #[test]

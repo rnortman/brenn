@@ -32,16 +32,25 @@ pub(in crate::active_bridge) use streaming::handle_assistant_message;
 use streaming::handle_stream_event;
 
 /// Reason CC's process exited. Computed once at the `SessionEvent::Died`
-/// boundary from the two bridge-level flags that indicate intentional teardown.
+/// boundary from the bridge-level flags that indicate intentional teardown.
 ///
 /// A profile swap's own teardown is deliberately not among them: the swap
 /// claims the death of the process it retires (`ActiveBridge::swap_ack`) and
 /// the `Died` arm answers that claim before it classifies anything. A flag
 /// would have to be read at exactly the right instant to mean the same thing,
 /// and would swallow a replacement's death if it were read a moment late.
+#[derive(Debug)]
 pub(in crate::active_bridge) enum ShutdownReason {
     /// Intentional teardown — suppress alert and leave conversation Active.
-    Intentional { drain: bool, server: bool },
+    Intentional {
+        drain: bool,
+        server: bool,
+        /// A reload's retirement killed this process because what it was
+        /// spawned with moved. The wake path spawns its successor from the new
+        /// agent. Set by the kill itself, not by the condemnation: a crash
+        /// while a condemned bridge waits out its turn is still unexpected.
+        reload: bool,
+    },
     /// Unexpected death — fire alert, mark conversation Error.
     Unexpected,
 }
@@ -50,8 +59,13 @@ impl ShutdownReason {
     pub(in crate::active_bridge) fn from_bridge(bridge: &ActiveBridge) -> Self {
         let drain = bridge.drain_on_idle.load(Ordering::SeqCst);
         let server = bridge.server_shutting_down.load(Ordering::SeqCst);
-        if drain || server {
-            ShutdownReason::Intentional { drain, server }
+        let reload = bridge.is_reload_killing();
+        if drain || server || reload {
+            ShutdownReason::Intentional {
+                drain,
+                server,
+                reload,
+            }
         } else {
             ShutdownReason::Unexpected
         }
@@ -224,12 +238,18 @@ pub(super) async fn cc_event_loop(
                         conversation_id = bridge.conversation_id,
                         "CC session died, but death already handled — skipping duplicate reset"
                     );
-                } else if let ShutdownReason::Intentional { drain, server } = shutdown_reason {
+                } else if let ShutdownReason::Intentional {
+                    drain,
+                    server,
+                    reload,
+                } = shutdown_reason
+                {
                     // Intentional shutdown — not an error. `drain` is a
-                    // per-conversation drain (tab close, idle); `server`
-                    // is a process-wide SIGTERM. Both skip the Warning alert
+                    // per-conversation drain (tab close, idle); `server` is a
+                    // process-wide SIGTERM; `reload` is a retirement whose
+                    // successor the wake path spawns. All skip the Warning alert
                     // and leave the conversation in Active state so the next
-                    // restart can resume it. See docs/designs/silence-known-cc-warnings.md.
+                    // restart can resume it.
                     // Still clear runtime state so a reconnecting CC sees a
                     // clean slate, and mark the death handled so the watchdog
                     // does not treat the ended loop as a wedge.
@@ -241,6 +261,7 @@ pub(super) async fn cc_event_loop(
                         conversation_id = bridge.conversation_id,
                         drain_shutdown = drain,
                         server_shutdown = server,
+                        reload_retire = reload,
                         "CC session ended (intentional shutdown)"
                     );
                 } else {

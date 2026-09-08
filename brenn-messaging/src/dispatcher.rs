@@ -1231,9 +1231,9 @@ mod tests {
         use crate::MessagingGlobalConfig;
         use indexmap::IndexMap;
         let mut app = crate::test_support::test_app_config("target", None, vec!["u".to_string()]);
-        app.policy = crate::test_support::brenn_delivery_policy(
+        app.policy = std::sync::Arc::new(crate::test_support::brenn_delivery_policy(
             brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()),
-        );
+        ));
         let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
         apps.insert("target".to_string(), app);
         let router: Arc<dyn super::super::WakeRouter> = Arc::new(FakeRouter::default());

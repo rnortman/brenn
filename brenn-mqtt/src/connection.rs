@@ -29,6 +29,11 @@ use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsV
 // task indefinitely after the terminal state is already written.
 const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+// What the SubAck arm logs as the filter when no pending SUBSCRIBE was bound to
+// the acked pkid — a broker resending a SubAck from a session brenn did not
+// issue the SUBSCRIBE on.
+const UNATTRIBUTED_FILTER: &str = "<unknown>";
+
 // ---------------------------------------------------------------------------
 // Union subscription set
 // ---------------------------------------------------------------------------
@@ -132,7 +137,13 @@ pub async fn assert_ingress_unsubscribe(
 /// The single per-client session client id: `brenn:<client-slug>`. Formatted in
 /// one place so the options builder and the backoff-seed derivation cannot drift.
 pub(crate) fn client_id(broker: &MqttClientConfig) -> String {
-    format!("brenn:{}", broker.identity.slug)
+    client_id_of_slug(&broker.identity.slug)
+}
+
+/// [`client_id`] from the slug alone, for a caller that holds no config — the
+/// test fixtures naming the id the broker logs for a session.
+pub(crate) fn client_id_of_slug(slug: &str) -> String {
+    format!("brenn:{slug}")
 }
 
 /// Build `MqttOptions` from broker config, using a pre-built `transport`.
@@ -603,6 +614,10 @@ async fn supervisor_body(
                             );
                         }
                     }
+                    // A stop is terminal for this session, so the broker's
+                    // answers go with the client here as they do on every other
+                    // path out of a connection.
+                    clear_subscribe_tracking(&handle).await;
                     break 'supervisor;
                 }
                 event = eventloop.poll() => {
@@ -706,9 +721,14 @@ async fn supervisor_body(
 
 /// Clear the per-connect SUBSCRIBE attribution bookkeeping on disconnect so a
 /// stale pkid cannot mis-attribute a SubAck after reconnect.
+///
+/// The broker's answers go with them: a SUBACK belongs to the session that sent
+/// it, and the next session's answers arrive when its own re-asserted
+/// SUBSCRIBEs are acked.
 async fn clear_subscribe_tracking(handle: &Arc<MqttClientHandle>) {
     handle.pending_subscribes.lock().await.clear();
     handle.inflight_subscribes.lock().await.clear();
+    handle.clear_outcomes().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -832,39 +852,65 @@ async fn handle_event(
             }
         }
 
-        // --- SubAck: log reason codes with the attributed filter ---
+        // --- SubAck: record and log the broker's answer for the attributed filter ---
         //
-        // Each SUBSCRIBE carries one filter, so a SUBACK has exactly one return
-        // code; the filter is resolved by pkid (bound in the Outgoing::Subscribe
-        // arm), not by positional index into the whole subscription set.
+        // Each SUBSCRIBE carries one filter, so a SUBACK carries exactly one
+        // return code.
         Event::Incoming(Incoming::SubAck(ack)) => {
-            let topic_filter = handle
-                .inflight_subscribes
-                .lock()
-                .await
-                .remove(&ack.pkid)
-                .unwrap_or_else(|| "<unknown>".to_string());
-            for code in ack.return_codes.iter() {
-                match code {
-                    SubscribeReasonCode::Success(qos) => {
-                        tracing::info!(
-                            client = %client_slug,
-                            topic = %topic_filter,
-                            granted_qos = ?qos,
-                            "SUBACK: subscription granted",
-                        );
+            let attributed = handle.inflight_subscribes.lock().await.remove(&ack.pkid);
+            let topic_filter = attributed.as_deref().unwrap_or(UNATTRIBUTED_FILTER);
+            match ack.return_codes.as_slice() {
+                [SubscribeReasonCode::Success(qos)] => {
+                    tracing::info!(
+                        client = %client_slug,
+                        topic = %topic_filter,
+                        granted_qos = ?qos,
+                        "SUBACK: subscription granted",
+                    );
+                    if let Some(filter) = &attributed {
+                        handle.record_grant(filter).await;
                     }
-                    // A rejection is an authoritative broker decision (ACL
-                    // misconfiguration, broker policy): the bridge receives no
-                    // messages for this filter until it is fixed. Log at ERROR.
-                    other => {
-                        tracing::error!(
-                            client = %client_slug,
-                            topic = %topic_filter,
-                            reason = ?other,
-                            "SUBACK: subscription rejected by ACL or broker — bridge will \
-                             receive no messages for this filter",
-                        );
+                }
+                // A rejection is an authoritative broker decision (ACL
+                // misconfiguration, broker policy): the bridge receives no
+                // messages for this filter until it is fixed.
+                [other] => {
+                    tracing::error!(
+                        client = %client_slug,
+                        topic = %topic_filter,
+                        reason = ?other,
+                        "SUBACK: subscription rejected by ACL or broker — bridge will \
+                         receive no messages for this filter",
+                    );
+                    if let Some(filter) = &attributed {
+                        handle.record_refusal(filter, format!("{other:?}")).await;
+                    }
+                }
+                // Brenn sends one filter per SUBSCRIBE, so a SUBACK with any
+                // other number of return codes is a broker protocol violation.
+                // The filter is recorded as refused rather than interpreted: a
+                // grant read out of a packet this process cannot attribute to
+                // one answer is the one wrong direction for this map. The
+                // process is not taken down for a peer's malformed packet.
+                codes => {
+                    tracing::error!(
+                        client = %client_slug,
+                        topic = %topic_filter,
+                        return_codes = ?codes,
+                        "SUBACK carries {} return codes for a one-filter SUBSCRIBE — protocol \
+                         violation; treating the filter as refused",
+                        codes.len(),
+                    );
+                    if let Some(filter) = &attributed {
+                        handle
+                            .record_refusal(
+                                filter,
+                                format!(
+                                    "SUBACK carried {} return codes for a one-filter SUBSCRIBE",
+                                    codes.len()
+                                ),
+                            )
+                            .await;
                     }
                 }
             }
@@ -1020,7 +1066,7 @@ async fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{PendingPublish, PubackOutcome};
+    use crate::state::{PendingPublish, PubackOutcome, SubAckOutcome};
     use brenn_lib::messaging::Urgency;
 
     fn channel(client: &str, topic: &str, qos: u8) -> ResolvedMqttIngressChannel {
@@ -1156,6 +1202,151 @@ mod tests {
             handle.inflight_subscribes.lock().await.get(&10).cloned(),
             Some("home/+/state".to_string()),
         );
+    }
+
+    /// Deliver a SUBACK for `pkid` carrying `codes`.
+    async fn suback(
+        handle: &Arc<MqttClientHandle>,
+        router: &Arc<dyn MqttEventRouter>,
+        pkid: u16,
+        codes: Vec<SubscribeReasonCode>,
+    ) {
+        handle_event(
+            Event::Incoming(Incoming::SubAck(rumqttc::SubAck {
+                pkid,
+                return_codes: codes,
+                properties: None,
+            })),
+            handle,
+            router,
+        )
+        .await;
+    }
+
+    /// A granted SubAck records its attributed filter, a rejected one records the
+    /// broker's refusal, an unattributed one records nothing, and the per-connect
+    /// clear empties the map — the four facts the broker suite's grant wait rests
+    /// on.
+    #[tokio::test]
+    async fn suback_records_only_granted_filters() {
+        let handle = test_handle();
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        handle.add_subscription("home/+/state".into(), 1).await;
+        handle.add_subscription("sensors/#".into(), 0).await;
+
+        handle
+            .pending_subscribes
+            .lock()
+            .await
+            .push_back("home/+/state".to_string());
+        handle
+            .pending_subscribes
+            .lock()
+            .await
+            .push_back("sensors/#".to_string());
+        handle_event(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
+        handle_event(Event::Outgoing(Outgoing::Subscribe(11)), &handle, &router).await;
+
+        suback(
+            &handle,
+            &router,
+            10,
+            vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+        )
+        .await;
+        suback(&handle, &router, 11, vec![SubscribeReasonCode::Failure]).await;
+        // pkid 12 was never bound: the broker answered a SUBSCRIBE this session
+        // does not hold, which is what a SubAck landing after the per-connect
+        // clear looks like.
+        suback(
+            &handle,
+            &router,
+            12,
+            vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+        )
+        .await;
+
+        assert!(handle.is_granted("home/+/state").await);
+        assert!(
+            !handle.is_granted("sensors/#").await,
+            "a broker rejection is not a grant",
+        );
+        assert_eq!(
+            handle.subscribe_outcome("sensors/#").await,
+            Some(SubAckOutcome::Refused("Failure".to_string())),
+            "the refusal carries the SUBACK's own words",
+        );
+        assert_eq!(
+            handle.subscribe_outcome(UNATTRIBUTED_FILTER).await,
+            None,
+            "an unattributed SubAck records nothing under the log's display value",
+        );
+
+        clear_subscribe_tracking(&handle).await;
+        assert!(!handle.is_granted("home/+/state").await);
+        assert_eq!(handle.subscribe_outcome("sensors/#").await, None);
+    }
+
+    /// A SubAck that arrives after its filter was taken down records nothing: the
+    /// UNSUBSCRIBE and the SUBACK crossed, and the broker holds no filter for it
+    /// once the UnsubAck lands. Without this the grant would outlive the
+    /// subscription and answer a later wait before its own SUBSCRIBE went out.
+    #[tokio::test]
+    async fn suback_for_an_unsubscribed_filter_records_nothing() {
+        let handle = test_handle();
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        handle.add_subscription("home/+/state".into(), 1).await;
+        handle
+            .pending_subscribes
+            .lock()
+            .await
+            .push_back("home/+/state".to_string());
+        handle_event(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
+
+        assert!(handle.remove_subscription("home/+/state").await);
+        suback(
+            &handle,
+            &router,
+            10,
+            vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+        )
+        .await;
+
+        assert!(!handle.is_granted("home/+/state").await);
+        assert_eq!(handle.subscribe_outcome("home/+/state").await, None);
+    }
+
+    /// Brenn sends one filter per SUBSCRIBE, so a multi-code SUBACK is a broker
+    /// protocol violation: the attributed filter is refused, never granted off a
+    /// `Success` sitting beside a `Failure`.
+    #[tokio::test]
+    async fn suback_with_several_return_codes_refuses_the_filter() {
+        let handle = test_handle();
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        handle.add_subscription("home/+/state".into(), 1).await;
+        handle
+            .pending_subscribes
+            .lock()
+            .await
+            .push_back("home/+/state".to_string());
+        handle_event(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
+
+        suback(
+            &handle,
+            &router,
+            10,
+            vec![
+                SubscribeReasonCode::Failure,
+                SubscribeReasonCode::Success(QoS::AtLeastOnce),
+            ],
+        )
+        .await;
+
+        assert!(!handle.is_granted("home/+/state").await);
+        assert!(matches!(
+            handle.subscribe_outcome("home/+/state").await,
+            Some(SubAckOutcome::Refused(reason)) if reason.contains("2 return codes"),
+        ));
     }
 
     // --- PubRec rejection (QoS2 caller-hang guard) ---

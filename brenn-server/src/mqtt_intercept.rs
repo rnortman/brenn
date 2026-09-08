@@ -219,7 +219,7 @@ pub async fn try_handle_mqtt_tool(
             // connection guard.
             let outcome = enforce_and_publish(
                 svc,
-                policy,
+                &policy,
                 &addr,
                 outbound.bytes,
                 outbound.content_type,

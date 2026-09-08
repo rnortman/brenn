@@ -1211,8 +1211,9 @@ mod tests {
             );
             app_cfg.allowed_users = vec!["alice".to_string()];
             // Delivery-time ACL gate: cover the webhook channel.
-            app_cfg.policy =
-                brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
+            app_cfg.policy = std::sync::Arc::new(
+                brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]),
+            );
             app_cfg.messaging = Some(ResolvedMessagingConfig {
                 send_budget: 100,
                 subscriptions: vec![ResolvedSubscription {

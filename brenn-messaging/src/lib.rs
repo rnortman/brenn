@@ -41,11 +41,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
-use indexmap::IndexMap;
 use uuid::Uuid;
 
 use brenn_db::{Db, format_ts_for_db};
-use brenn_lib::config::{AppConfig, ServerConfig};
+use brenn_lib::config::{AppTable, ServerConfig};
 #[cfg(any(test, feature = "testutils"))]
 pub use brenn_lib::messaging::test_support;
 // Glob re-export: the vocabulary lives in `brenn_lib::messaging`; one list,
@@ -714,7 +713,7 @@ pub struct Messenger {
     /// Resolved at startup; see `resolve_source`. The publish hot path
     /// reads this directly.
     pub(crate) source: Arc<str>,
-    pub(crate) apps: Arc<IndexMap<String, AppConfig>>,
+    pub(crate) apps: AppTable,
     /// Who a channel's messages are owed to, and on what terms: the unified
     /// subscriber registry (one entry per registered non-app subscriber, holding
     /// its resolved access-control policy and declared [`WakeEconomics`]) plus
@@ -1031,15 +1030,17 @@ impl Messenger {
         db: Db,
         directory: Arc<MessagingDirectory>,
         source: Arc<str>,
-        apps: Arc<IndexMap<String, AppConfig>>,
+        apps: impl Into<AppTable>,
         router: Arc<dyn WakeRouter>,
         defaults: MessagingGlobalConfig,
     ) -> Arc<Self> {
         // Defense-in-depth: slug uniqueness makes collision structurally unreachable,
         // but assert explicitly anyway (better dead than wrong).
+        let apps: AppTable = apps.into();
         {
+            let snapshot = apps.load();
             let mut seen: HashMap<String, &str> = HashMap::new();
-            for (slug, app) in apps.iter() {
+            for (slug, app) in snapshot.iter() {
                 if app.messaging_enabled() {
                     let id = ParticipantId::for_app(slug, &source).as_str().to_owned();
                     if let Some(prev_slug) = seen.insert(id.clone(), slug.as_str()) {
@@ -1785,6 +1786,25 @@ impl Messenger {
             .contains(&(*channel_uuid, app_slug.to_string()))
     }
 
+    /// Every non-durable dynamic subscription registration this process holds,
+    /// as `(channel_uuid, app_slug)` in a stable order.
+    ///
+    /// The in-memory half of "what dynamic subscriptions does this process
+    /// hold", read by a reload that re-authorizes each of them against the
+    /// candidate document. Non-durable registrations survive nothing: a fresh
+    /// boot has none, so a reload that folds one out leaves nothing behind.
+    pub fn nondurable_dynamic_subs(&self) -> Vec<(Uuid, String)> {
+        let mut subs: Vec<(Uuid, String)> = self
+            .nondurable_dynamic_subs
+            .lock()
+            .expect("messaging: nondurable_dynamic_subs lock poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        subs.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        subs
+    }
+
     /// Record `app_slug`'s dynamic subscription registration on the non-durable
     /// channel `channel_uuid`. Panics if one is already recorded: the caller
     /// classifies the re-subscribe case and writes under one hold of
@@ -1808,11 +1828,7 @@ impl Messenger {
     /// channel `channel_uuid`, reporting whether one was held — the in-memory
     /// analogue of the durable row delete, and the same authority on "was there
     /// a dynamic subscription to remove".
-    pub(crate) fn remove_nondurable_dynamic_sub(
-        &self,
-        channel_uuid: &Uuid,
-        app_slug: &str,
-    ) -> bool {
+    pub fn remove_nondurable_dynamic_sub(&self, channel_uuid: &Uuid, app_slug: &str) -> bool {
         self.nondurable_dynamic_subs
             .lock()
             .expect("messaging: nondurable_dynamic_subs lock poisoned")
@@ -2269,24 +2285,20 @@ impl Messenger {
         uuids
     }
 
-    /// Read-only `(slug, policy)` iterator over the post-injection app map the
-    /// publish gates consult (`resolve_publish_sender` reads this exact map,
-    /// `messaging/gates.rs`). Exposed for boot-time single-writer validation of
-    /// `surface_error_channel`: the validator must sweep the same map enforcement
-    /// uses, so what is validated cannot drift from what is enforced. A narrow
-    /// view — callers see only the policies, not the map's container type or the
-    /// rest of each `AppConfig` the Messenger mediates.
-    pub fn app_policies(&self) -> impl Iterator<Item = (&str, &brenn_lib::access::AppPolicy)> {
-        self.apps
-            .iter()
-            .map(|(slug, cfg)| (slug.as_str(), &cfg.policy))
+    /// The shared agent table this messenger reads through. Callers that need
+    /// to swap the map all gates see must operate on this handle, not a copy.
+    pub fn app_table(&self) -> AppTable {
+        self.apps.clone()
     }
 
     /// Resolved access-control policy for the app with the given slug, or `None`
     /// if no such app is registered. Every resolved app carries a (possibly
     /// empty) policy, so a `None` for a live app slug indicates a host wiring bug.
-    pub fn app_policy(&self, app_slug: &str) -> Option<&brenn_lib::access::AppPolicy> {
-        self.apps.get(app_slug).map(|a| &a.policy)
+    pub fn app_policy(&self, app_slug: &str) -> Option<Arc<brenn_lib::access::AppPolicy>> {
+        self.apps
+            .load()
+            .get(app_slug)
+            .map(|a| Arc::clone(&a.policy))
     }
 
     /// The registration for a non-app subscriber (`Wasm`/`Surface`/`System`),
@@ -2379,7 +2391,7 @@ impl Messenger {
     pub fn subscriber_policy(
         &self,
         kind: &SubscriberEntryKind,
-    ) -> Option<brenn_lib::access::PolicyRef<'_>> {
+    ) -> Option<Arc<brenn_lib::access::AppPolicy>> {
         self.targets.policy(kind)
     }
 
@@ -3299,7 +3311,7 @@ mod tests {
         let mut map = indexmap::IndexMap::new();
         for (slug, policy) in apps {
             let mut cfg = super::test_support::test_app_config(slug, None, vec![]);
-            cfg.policy = policy.clone();
+            cfg.policy = std::sync::Arc::new(policy.clone());
             map.insert((*slug).to_string(), cfg);
         }
         Messenger::new(
@@ -3612,7 +3624,7 @@ mod tests {
         // default (empty) one — proving the accessor returns the *registered*
         // app's actual policy, not a fresh default.
         let mut app = super::test_support::test_app_config("known-app", None, vec![]);
-        app.policy
+        app.policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         let mut apps = indexmap::IndexMap::new();
@@ -3652,7 +3664,7 @@ mod tests {
         use std::sync::Arc;
 
         let mut app = super::test_support::test_app_config("known-app", None, vec![]);
-        app.policy
+        app.policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         let mut apps = indexmap::IndexMap::new();
@@ -5693,9 +5705,9 @@ mod tests {
     /// same app at either class of channel.
     fn wake_apps(slug: &str) -> indexmap::IndexMap<String, brenn_lib::config::AppConfig> {
         let mut app = test_support::test_app_config(slug, None, vec![]);
-        app.policy = crate::testutils::bus_delivery_policy(
+        app.policy = std::sync::Arc::new(crate::testutils::bus_delivery_policy(
             brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()),
-        );
+        ));
         let mut apps = indexmap::IndexMap::new();
         apps.insert(slug.to_string(), app);
         apps
@@ -6301,7 +6313,7 @@ mod tests {
         }];
         let mut apps = wake_apps("assistant");
         {
-            let policy = &mut apps.get_mut("assistant").expect("fixture app").policy;
+            let policy = apps.get_mut("assistant").expect("fixture app").policy_mut();
             policy
                 .grants
                 .insert(brenn_envelope::grants::AppCapability::EphemeralSubscribe);
@@ -6347,7 +6359,7 @@ mod tests {
         let channel = conversation_wake_channel("assistant", "denied-ch", WakeMin::Normal);
         let mut apps = wake_apps("assistant");
         apps.get_mut("assistant").expect("fixture app").policy =
-            brenn_lib::access::AppPolicy::default();
+            std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         let (messenger, router) =
             wake_walk_messenger_with_apps(std::slice::from_ref(&channel), apps).await;
         let conversation = ParticipantId::for_conversation(22);

@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use brenn_lib::config::{AppConfig, BrennConfig};
+use brenn_lib::config::BrennConfig;
 use brenn_lib::pwa_push::config::ResolvedPwaPushConfig;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_pwa_push::PwaPushSender;
 use brenn_pwa_push::PwaPushService;
-use indexmap::IndexMap;
 
 /// Construct the `PwaPushService` from the already-resolved config produced by
 /// `validate_and_resolve`.
@@ -23,7 +22,7 @@ use indexmap::IndexMap;
 pub(crate) fn build_pwa_push(
     config: &BrennConfig,
     db: brenn_db::Db,
-    apps: &Arc<IndexMap<String, AppConfig>>,
+    apps: &brenn_lib::config::AppTable,
     alert_dispatcher: AlertDispatcher,
     pwa_push: Option<ResolvedPwaPushConfig>,
     server_origin: Option<Arc<str>>,

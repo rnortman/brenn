@@ -9,7 +9,7 @@ use crate::db::init_db_memory;
 use crate::db::schema::table_exists;
 use crate::db::{
     delete_subscriber_cursor, ensure_subscriber_cursor, load_subscriber_cursor,
-    run_messaging_migrations,
+    run_messaging_migrations, subscriber_cursors_of,
 };
 use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::Depth;
@@ -168,6 +168,30 @@ fn a_sampled_subscriber_cannot_be_given_a_cursor() {
         Depth::Bounded(0),
         1,
     );
+}
+
+/// The participant-keyed read: one subscriber's positions, on every channel it
+/// holds one, and nobody else's.
+#[test]
+fn the_participant_read_returns_one_subscribers_positions() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let one = seed_channel(&conn, "brenn:of-one", 2);
+    let two = seed_channel(&conn, "brenn:of-two", 2);
+    let mine = ParticipantId::for_conversation(7);
+    let theirs = ParticipantId::for_conversation(9);
+
+    ensure_subscriber_cursor(&conn, one, &mine, "reader", Depth::Bounded(4), 1);
+    ensure_subscriber_cursor(&conn, two, &mine, "reader", Depth::Bounded(4), 2);
+    ensure_subscriber_cursor(&conn, one, &theirs, "reader", Depth::Bounded(4), 1);
+
+    let mut rows = subscriber_cursors_of(&conn, &mine);
+    rows.sort_by_key(|(_, row)| row.next_owed_seq);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, one);
+    assert_eq!(rows[1].0, two);
+    assert!(rows.iter().all(|(_, row)| row.subscriber == mine));
+    assert_eq!(subscriber_cursors_of(&conn, &theirs).len(), 1);
 }
 
 #[test]

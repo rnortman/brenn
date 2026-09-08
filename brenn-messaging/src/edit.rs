@@ -208,8 +208,8 @@ impl Messenger {
                     Some(n) => n,
                     None => return EditResult::MalformedAddress(addr.clone()),
                 };
-                let policy = &self
-                    .apps
+                let apps = self.apps.load();
+                let policy = &apps
                     .get(sender_app_slug)
                     .expect("edit: sender app resolved at step 2 must be present")
                     .policy;
@@ -325,7 +325,8 @@ impl Messenger {
     /// `messaging_subscribe`), i.e. `messaging_enabled()` is false.
     /// Host-derived from app slug + server origin.
     pub(crate) fn resolve_sender(&self, app_slug: &str) -> Option<String> {
-        let app = self.apps.get(app_slug)?;
+        let apps = self.apps.load();
+        let app = apps.get(app_slug)?;
         if !app.messaging_enabled() {
             return None;
         }
@@ -902,7 +903,7 @@ mod tests {
             }),
             vec!["bob".to_string()],
         );
-        bob.policy = {
+        bob.policy = std::sync::Arc::new({
             let mut p = AppPolicy::default();
             p.grants.insert(AppCapability::MessagingPublish);
             p.grants.insert(AppCapability::MessagingSubscribe);
@@ -913,7 +914,7 @@ mod tests {
                 .brenn_subscribe
                 .push(ChannelMatcher::Exact("pa-alice".to_string()));
             p
-        };
+        });
         let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
         apps.insert("pa-bob".to_string(), bob);
         apps.insert(

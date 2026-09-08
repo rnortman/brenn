@@ -618,7 +618,7 @@ pub(crate) fn validate_static_subscriptions_deliverable(
         for sub in &entry.subscribers {
             let (kind, slug, policy) = match &sub.kind {
                 SubscriberEntryKind::App(slug) => {
-                    ("app", slug.as_str(), apps.get(slug).map(|a| &a.policy))
+                    ("app", slug.as_str(), apps.get(slug).map(|a| &*a.policy))
                 }
                 SubscriberEntryKind::Wasm(slug) => (
                     "wasm_consumer",
@@ -648,7 +648,7 @@ pub(crate) fn validate_static_subscriptions_deliverable(
                 SubscriberEntryKind::ChatConversation { app_slug, .. } => (
                     "chat conversation",
                     app_slug.as_str(),
-                    apps.get(app_slug).map(|a| &a.chat_harness_policy),
+                    apps.get(app_slug).map(|a| &*a.chat_harness_policy),
                 ),
             };
             match policy {
@@ -858,7 +858,7 @@ pub(crate) fn validate_exact_tuning_blocks(
 pub async fn build_messaging(
     config: &BrennConfig,
     db: brenn_db::Db,
-    apps: &Arc<IndexMap<String, AppConfig>>,
+    app_table: &brenn_lib::config::AppTable,
     active_bridges: ActiveBridges,
     alert_dispatcher: AlertDispatcher,
     server_origin: Option<Arc<str>>,
@@ -866,9 +866,13 @@ pub async fn build_messaging(
     tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
     replay_store_paths: &[std::path::PathBuf],
 ) -> (MessagingResult, PlanCarried) {
+    // The map the plan is derived from is the table's own, so the identity
+    // `commit_messaging` asserts holds structurally: there is no second map for
+    // a caller to hand in beside the table.
+    let apps = app_table.load();
     let plan = plan_messaging(&PlanInputs {
         config,
-        apps: Some(apps),
+        apps: Some(&apps),
         mqtt_clients,
         tool_registry: Some(tool_registry),
         replay_store_paths,
@@ -887,7 +891,7 @@ pub async fn build_messaging(
     };
     let result = commit_messaging(
         plan,
-        apps,
+        app_table,
         db,
         active_bridges,
         alert_dispatcher,
@@ -908,14 +912,15 @@ pub async fn build_messaging(
 ///
 /// # Panics
 ///
-/// On an `apps` map that is not the one the plan was derived from, on an
+/// On an agent table holding a map that is not the one the plan was derived
+/// from, on an
 /// absent `server_origin` (a bootstrap bug past the plan), on a
 /// `[[remote]]` token file that is missing, unreadable, empty or
 /// group/world-readable, and on a roster publish or a stored dynamic `mqtt:`
 /// row the host cannot make sense of.
 pub async fn commit_messaging(
     plan: MessagingPlan,
-    apps: &Arc<IndexMap<String, AppConfig>>,
+    app_table: &brenn_lib::config::AppTable,
     db: brenn_db::Db,
     active_bridges: ActiveBridges,
     alert_dispatcher: AlertDispatcher,
@@ -926,9 +931,10 @@ pub async fn commit_messaging(
     // derived from. Two snapshots of one document are still two, and a
     // directory computed against one with gates consulting the other is an
     // authorization drift nothing downstream can detect.
+    let apps = app_table.load();
     assert!(
-        plan.was_derived_from(apps),
-        "commit_messaging: the apps map is not the one this plan was derived from",
+        plan.was_derived_from(&apps),
+        "commit_messaging: the agent table does not hold the map this plan was derived from",
     );
     let MessagingPlan {
         directory,
@@ -1000,7 +1006,7 @@ pub async fn commit_messaging(
         db,
         directory,
         source,
-        Arc::clone(apps),
+        app_table.clone(),
         router.clone() as Arc<dyn messaging::WakeRouter>,
         messaging_globals.clone(),
     )
@@ -1112,7 +1118,7 @@ pub async fn commit_messaging(
             directory,
             &dynamic_rows,
             &undeclared,
-            &|slug| apps.get(slug).map(|a| &a.policy),
+            &|slug| apps.get(slug).map(|a| &*a.policy),
         );
         // Prune the dropped rows from the durable table so the conflict does not
         // recur next boot. The surviving (`kept`) rows need no write: the merge

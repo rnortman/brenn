@@ -89,7 +89,8 @@ pub async fn ws_handler(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Validate app exists.
-    let app = match state.apps.get(&slug) {
+    let apps = state.apps.load();
+    let app = match apps.get(&slug) {
         Some(app) => app,
         None => {
             log_and_alert_security_event(
@@ -237,8 +238,8 @@ mod tests {
     use super::testing::poll_until_db_count;
     use crate::test_support::app_config::default_test_app_config;
     use crate::test_support::http::{
-        assert_stale_client_close_and_no_alert, http_to_ws_url, setup_authenticated_user,
-        spawn_test_server, ws_connect_first_frame, ws_upgrade_status,
+        TEST_USERNAME, assert_stale_client_close_and_no_alert, http_to_ws_url,
+        setup_authenticated_user, spawn_test_server, ws_connect_first_frame, ws_upgrade_status,
     };
     use crate::test_support::state::{
         test_state, test_state_with_apps, test_state_with_capturing_alerter,
@@ -585,5 +586,207 @@ mod tests {
             event_rows[0], event_rows[1],
             "two tabs must produce distinct device_id values in usage_events"
         );
+    }
+
+    /// The swap pulse over a real socket: a reload that drops the connected
+    /// user from `allowed_users` severs the connection it authorized at
+    /// connect, with the connect path's own security event.
+    ///
+    /// `survives_apps_swap` is unit-tested on a bare `WsConnection`; what needs
+    /// a socket is the arm that acts on its answer — the `break` out of the
+    /// event loop, and the teardown the client sees.
+    #[tokio::test]
+    async fn a_reload_that_denies_the_user_closes_the_live_socket() {
+        let db = crate::test_support::init_db_memory();
+        let (state, alerts, _alert_handle) = test_state_with_capturing_alerter(&db);
+        let (session_token, _) = setup_authenticated_user(&db).await;
+        // The table and the pulse the commit's swap step drives, held by the
+        // test as well as by the server.
+        let apps = state.apps.clone();
+        let swapped_tx = state.apps_swapped_tx.clone();
+
+        let (base_url, _shutdown) = spawn_test_server(state).await;
+        let mut ws = open_app_socket(&base_url, &session_token).await;
+
+        let mut denied = (*apps.load()).clone();
+        denied["test"].allowed_users = vec!["bob".to_string()];
+        apps.store(Arc::new(denied));
+        swapped_tx
+            .send(())
+            .expect("the event loop holds a receiver");
+
+        assert!(
+            socket_ends(&mut ws).await,
+            "the socket of a user the swapped map denies is closed",
+        );
+        for _ in 0..100 {
+            if !alerts.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let captured = alerts.lock().unwrap().clone();
+        let combined = captured
+            .iter()
+            .map(|(title, body)| format!("{title} {body}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("auth_failure") && combined.contains(TEST_USERNAME),
+            "the close carries the connect path's security event: {captured:?}",
+        );
+    }
+
+    /// And a swap that still names the user leaves the socket alone: the pulse
+    /// is a question, not a teardown.
+    #[tokio::test]
+    async fn a_reload_that_keeps_the_user_leaves_the_live_socket_open() {
+        let db = crate::test_support::init_db_memory();
+        let state = test_state(&db);
+        let (session_token, _) = setup_authenticated_user(&db).await;
+        let apps = state.apps.clone();
+        let swapped_tx = state.apps_swapped_tx.clone();
+
+        let (base_url, _shutdown) = spawn_test_server(state).await;
+        let mut ws = open_app_socket(&base_url, &session_token).await;
+
+        let mut still_allowed = (*apps.load()).clone();
+        still_allowed["test"].allowed_users = vec![TEST_USERNAME.to_string(), "bob".to_string()];
+        apps.store(Arc::new(still_allowed));
+        swapped_tx
+            .send(())
+            .expect("the event loop holds a receiver");
+
+        assert!(
+            !socket_ends(&mut ws).await,
+            "a user the swapped map still names sees no teardown",
+        );
+    }
+
+    /// A client-initiated close ends the socket, cleanly. The two swap cases
+    /// beside this one cover the server-initiated direction only.
+    ///
+    /// This is the regression test for the teardown leak: the event loop's
+    /// return dropped its own `ws_tx` while `WsConnection` still held the other
+    /// sender, so the writer task parked on a channel that could not close and
+    /// the sink was never dropped. The case exists because the fix is one line
+    /// in a function nothing else observes returning — with `drop(conn)` removed
+    /// from the teardown this case fails here, the client seeing neither a
+    /// `Close` reply nor a stream end within the helper's second.
+    ///
+    /// Asserted through [`socket_completes_close`] rather than
+    /// [`socket_ends`]: the property is that the server *completes the closing
+    /// handshake*, and the tolerant helper answers `true` to an abort — a panic
+    /// in the event loop, a dropped socket, a task tearing the TCP connection
+    /// down without replying — which is exactly the regression this case has to
+    /// catch.
+    #[tokio::test]
+    async fn a_client_close_ends_the_socket() {
+        use futures::SinkExt;
+
+        let db = crate::test_support::init_db_memory();
+        let state = test_state(&db);
+        let (session_token, _) = setup_authenticated_user(&db).await;
+
+        let (base_url, _shutdown) = spawn_test_server(state).await;
+        let mut ws = open_app_socket(&base_url, &session_token).await;
+
+        ws.send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .expect("the socket takes a close frame");
+
+        assert!(
+            socket_completes_close(&mut ws).await,
+            "the server completes the teardown the client began",
+        );
+    }
+
+    /// A live socket on the fixture app, past the `Welcome` frame so the event
+    /// loop is running its `select!` by the time the caller pulses it.
+    async fn open_app_socket(
+        base_url: &str,
+        session_token: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        use futures::StreamExt;
+        let path = format!(
+            "/app/test/ws?build={}&viewport=Compact",
+            crate::test_support::TEST_BUILD_ID
+        );
+        let mut ws = crate::test_support::http::surface_ws_open(
+            &http_to_ws_url(base_url, &path),
+            session_token,
+        )
+        .await;
+        let first = ws
+            .next()
+            .await
+            .expect("the server sends a first frame")
+            .expect("WS frame error");
+        assert!(
+            matches!(&first, tokio_tungstenite::tungstenite::Message::Text(text) if text
+                .contains("\"Welcome\"")),
+            "the connect succeeded: {first:?}",
+        );
+        ws
+    }
+
+    /// Whether the server tears the socket down within a second — a `Close`
+    /// frame or the stream ending. `false` is the socket still being there,
+    /// which is what the negative case asserts.
+    async fn socket_ends(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> bool {
+        use futures::StreamExt;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await;
+            match frame {
+                Err(_) => continue,
+                Ok(None) => return true,
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => return true,
+                // A frame error is the connection going away under us, which
+                // for this question is the same answer.
+                Ok(Some(Err(_))) => return true,
+                Ok(Some(Ok(_))) => continue,
+            }
+        }
+        false
+    }
+
+    /// Whether the server answers a client's `Close` with its own and then ends
+    /// the stream — the closing handshake, not merely the socket going away.
+    ///
+    /// Strict where [`socket_ends`] is tolerant: a frame error is a failure
+    /// here, because the question is whether the server's own teardown ran to
+    /// completion, and an aborted connection answers a tolerant helper the same
+    /// way a completed handshake does.
+    async fn socket_completes_close(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> bool {
+        use futures::StreamExt;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut replied = false;
+        while std::time::Instant::now() < deadline {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await;
+            match frame {
+                Err(_) => continue,
+                // The stream ends only after the reply; ending without one is
+                // the server dropping the socket rather than closing it.
+                Ok(None) => return replied,
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => replied = true,
+                Ok(Some(Err(error))) => panic!(
+                    "the server aborted the connection instead of completing the close: {error}",
+                ),
+                Ok(Some(Ok(_))) => continue,
+            }
+        }
+        false
     }
 }

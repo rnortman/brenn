@@ -267,6 +267,7 @@ impl WsConnBuilder {
             broadcast_rx: self.broadcast_rx,
             ws_tx: self.ws_tx,
             bridge_notify_rx: self.state.bridge_notify_tx.subscribe(),
+            apps_swapped_rx: self.state.apps_swapped_tx.subscribe(),
             state: self.state,
             timezone: chrono_tz::Tz::UTC,
             viewport_class: self.viewport_class,
@@ -545,7 +546,7 @@ pub(super) async fn test_ws_conn_on_the_bus(
 
     let mut cfg = default_test_app_config(TEST_APP_SLUG, "Test App");
     cfg.singleton = singleton;
-    cfg.chat_harness_policy = chat.harness_policy(TEST_APP_SLUG);
+    cfg.chat_harness_policy = std::sync::Arc::new(chat.harness_policy(TEST_APP_SLUG));
     let mut apps = IndexMap::new();
     apps.insert(TEST_APP_SLUG.to_string(), cfg);
     let apps = Arc::new(apps);
@@ -862,7 +863,7 @@ pub(super) fn test_apps_with_pwa_push() -> Arc<IndexMap<String, AppConfig>> {
     // Push authorization is the `PwaPush` grant (the legacy
     // `[app.pwa_push].enabled` boolean was removed; §2.5.1); grant it so the gate
     // (pwa_push_enabled()) passes for this push-enabled fixture.
-    cfg.policy
+    cfg.policy_mut()
         .grants
         .insert(brenn_envelope::grants::AppCapability::PwaPush);
     apps.insert("test".to_string(), cfg);

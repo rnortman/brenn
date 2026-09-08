@@ -134,6 +134,12 @@ pub struct MessagingPlan {
 }
 
 impl MessagingPlan {
+    /// The agent map this plan was derived from, for the commit that installs
+    /// it. `None` where the planner ran without one.
+    pub fn planned_apps(&self) -> Option<&Arc<IndexMap<String, AppConfig>>> {
+        self.planned_apps.as_ref()
+    }
+
     /// Whether `apps` is the very map this plan was derived from.
     ///
     /// Identity rather than equality: two equal maps are still two boot-time
@@ -594,7 +600,7 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
     if inputs.apps.is_some() {
         let app_policies: Vec<(&str, &brenn_lib::access::AppPolicy)> = apps
             .iter()
-            .map(|(slug, cfg)| (slug.as_str(), &cfg.policy))
+            .map(|(slug, cfg)| (slug.as_str(), &*cfg.policy))
             .collect();
         brenn_surface_server::description::validate_surface_description_writers(
             &description_channels,

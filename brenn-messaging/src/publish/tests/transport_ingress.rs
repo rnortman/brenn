@@ -100,11 +100,11 @@ async fn build_webhook_messenger(
     // only) does not stamp. Omit it for the deny variant (test-2).
     if cover {
         myapp
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::Webhook);
         myapp
-            .policy
+            .policy_mut()
             .acls
             .webhook
             .push(brenn_lib::access::acl::WebhookMatcher {
@@ -201,11 +201,11 @@ async fn build_mqtt_messenger(
     // `(homeassistant, home/+/state)`. Omit it for the deny variant (test-2).
     if cover {
         myapp
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
         myapp
-            .policy
+            .policy_mut()
             .acls
             .mqtt_subscribe
             .push(brenn_lib::access::acl::MqttSubMatcher {

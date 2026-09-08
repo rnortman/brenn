@@ -50,18 +50,18 @@ async fn publish_unknown_channel_returns_error() {
 
 #[tokio::test]
 async fn publish_missing_sender_returns_error() {
-    let (mut m, _, _, _, _) = build_messenger(0).await;
+    let (m, _, _, _, _) = build_messenger(0).await;
     // Replace pa-bob's app config without messaging. Clear the grants too:
     // messaging_enabled() reads the policy, so dropping only the `messaging`
     // field would leave the app still authorized.
     let new_apps = {
-        let mut a = (*m.apps).clone();
+        let mut a = (*m.apps.load()).clone();
         let pa_bob = a.get_mut("pa-bob").unwrap();
         pa_bob.messaging = None;
-        pa_bob.policy = brenn_lib::access::AppPolicy::default();
+        pa_bob.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         Arc::new(a)
     };
-    Arc::get_mut(&mut m).unwrap().apps = new_apps;
+    m.apps.store(new_apps);
     let result = m
         .publish(
             crate::PublishOrigin::Conversation { id: 1 },
@@ -83,18 +83,18 @@ async fn publish_messaging_disabled_returns_missing_sender() {
     // post-Phase-0, messaging_enabled() reads the policy, so a present-but-
     // ungranted block does not authorize (the new equivalent of the old
     // `enabled = false`). The gate must deny.
-    let (mut m, _, _, _, _) = build_messenger(0).await;
+    let (m, _, _, _, _) = build_messenger(0).await;
     let new_apps = {
-        let mut a = (*m.apps).clone();
+        let mut a = (*m.apps.load()).clone();
         let pa_bob = a.get_mut("pa-bob").unwrap();
         pa_bob.messaging = Some(ResolvedMessagingConfig {
             send_budget: 100,
             subscriptions: vec![],
         });
-        pa_bob.policy = brenn_lib::access::AppPolicy::default();
+        pa_bob.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         Arc::new(a)
     };
-    Arc::get_mut(&mut m).unwrap().apps = new_apps;
+    m.apps.store(new_apps);
     let result = m
         .publish(
             crate::PublishOrigin::Conversation { id: 1 },
@@ -118,27 +118,27 @@ async fn publish_with_grant_but_no_messaging_block_uses_global_default_budget() 
     // the global default (`messaging_default_send_budget`, 100 in the fixture)
     // rather than panicking on the old `.messaging.expect(...)`. This pins that
     // fallback end-to-end through the publish gate (test review test-2).
-    let (mut m, _, _, _, _) = build_messenger(1).await;
+    let (m, _, _, _, _) = build_messenger(1).await;
     let new_apps = {
-        let mut a = (*m.apps).clone();
+        let mut a = (*m.apps.load()).clone();
         let pa_bob = a.get_mut("pa-bob").unwrap();
         pa_bob.messaging = None;
-        pa_bob.policy = brenn_lib::access::AppPolicy::default();
+        pa_bob.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         pa_bob
-            .policy
+            .policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
         // Phase-2 Seam A also requires a covering `brenn_publish` matcher; stamp a
         // universal one so this test continues to exercise the budget fallback,
         // not the new ACL gate.
         pa_bob
-            .policy
+            .policy_mut()
             .acls
             .brenn_publish
             .push(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));
         Arc::new(a)
     };
-    Arc::get_mut(&mut m).unwrap().apps = new_apps;
+    m.apps.store(new_apps);
     let result = m
         .publish(
             crate::PublishOrigin::Conversation { id: 1 },
@@ -538,11 +538,11 @@ async fn a_past_deliver_after_publishes_immediately_with_a_retention_position() 
 
 #[tokio::test]
 async fn publish_budget_exhaustion() {
-    let (mut m, _, _, _, _) = build_messenger(1).await;
+    let (m, _, _, _, _) = build_messenger(1).await;
     // Lower the global default to 1, then override the app's resolved
     // messaging budget.
     let new_apps = {
-        let mut a = (*m.apps).clone();
+        let mut a = (*m.apps.load()).clone();
         a.get_mut("pa-bob")
             .unwrap()
             .messaging
@@ -551,7 +551,7 @@ async fn publish_budget_exhaustion() {
             .send_budget = 1;
         Arc::new(a)
     };
-    Arc::get_mut(&mut m).unwrap().apps = new_apps;
+    m.apps.store(new_apps);
 
     // First publish ok.
     let r = m
@@ -633,13 +633,13 @@ async fn bus_publish_stores_structured_sender_in_db() {
 
 /// Replace `pa-bob`'s resolved policy with `policy`, leaving the rest of the
 /// messenger fixture intact.
-fn set_bob_policy(m: &mut Arc<Messenger>, policy: brenn_lib::access::AppPolicy) {
+fn set_bob_policy(m: &Messenger, policy: brenn_lib::access::AppPolicy) {
     let new_apps = {
-        let mut a = (*m.apps).clone();
-        a.get_mut("pa-bob").unwrap().policy = policy;
+        let mut a = (*m.apps.load()).clone();
+        a.get_mut("pa-bob").unwrap().policy = std::sync::Arc::new(policy);
         Arc::new(a)
     };
-    Arc::get_mut(m).unwrap().apps = new_apps;
+    m.apps.store(new_apps);
 }
 
 /// Grant held but the target `brenn:` channel is not covered by any
@@ -647,7 +647,7 @@ fn set_bob_policy(m: &mut Arc<Messenger>, policy: brenn_lib::access::AppPolicy) 
 /// `MissingSender`.
 #[tokio::test]
 async fn publish_acl_denied_when_channel_not_in_brenn_publish() {
-    let (mut m, _, _, _, _) = build_messenger(1).await;
+    let (m, _, _, _, _) = build_messenger(1).await;
     // MessagingPublish granted, but the only matcher covers a *different*
     // channel, so `brenn:pa-alice` is out of scope.
     let mut p = brenn_lib::access::AppPolicy::default();
@@ -658,7 +658,7 @@ async fn publish_acl_denied_when_channel_not_in_brenn_publish() {
         .push(brenn_lib::access::acl::ChannelMatcher::Exact(
             "other".to_string(),
         ));
-    set_bob_policy(&mut m, p);
+    set_bob_policy(&m, p);
 
     let result = m
         .publish(
@@ -685,7 +685,7 @@ async fn publish_acl_denied_when_channel_not_in_brenn_publish() {
 /// absence), even though `messaging_enabled()` is still `true` for it.
 #[tokio::test]
 async fn publish_subscribe_only_app_is_missing_sender() {
-    let (mut m, _, _, _, _) = build_messenger(1).await;
+    let (m, _, _, _, _) = build_messenger(1).await;
     // Subscribe-only: MessagingSubscribe but NOT MessagingPublish. A covering
     // brenn_publish matcher is present to prove the deny is on the grant, not the
     // ACL.
@@ -698,13 +698,13 @@ async fn publish_subscribe_only_app_is_missing_sender() {
     // Sanity: still a messaging participant.
     assert!(
         {
-            let mut a = (*m.apps).clone();
-            a.get_mut("pa-bob").unwrap().policy = p.clone();
+            let mut a = (*m.apps.load()).clone();
+            a.get_mut("pa-bob").unwrap().policy = std::sync::Arc::new(p.clone());
             a.get("pa-bob").unwrap().messaging_enabled()
         },
         "subscribe-only app must still read as messaging_enabled()"
     );
-    set_bob_policy(&mut m, p);
+    set_bob_policy(&m, p);
 
     let result = m
         .publish(
@@ -727,7 +727,7 @@ async fn publish_subscribe_only_app_is_missing_sender() {
 /// Grant + a covering matcher both hold ⇒ `Ok`.
 #[tokio::test]
 async fn publish_allowed_with_grant_and_covering_matcher() {
-    let (mut m, _, _, _, _) = build_messenger(1).await;
+    let (m, _, _, _, _) = build_messenger(1).await;
     let mut p = brenn_lib::access::AppPolicy::default();
     p.grants
         .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
@@ -736,7 +736,7 @@ async fn publish_allowed_with_grant_and_covering_matcher() {
         .push(brenn_lib::access::acl::ChannelMatcher::Exact(
             "pa-alice".to_string(),
         ));
-    set_bob_policy(&mut m, p);
+    set_bob_policy(&m, p);
 
     let result = m
         .publish(
@@ -762,7 +762,7 @@ async fn publish_allowed_with_grant_and_covering_matcher() {
 /// publish leaves the row unchanged at 99.
 #[tokio::test]
 async fn publish_acl_denied_consumes_no_budget() {
-    let (mut m, _, _, _, _) = build_messenger(1).await;
+    let (m, _, _, _, _) = build_messenger(1).await;
     // Prime: one successful publish (universal brenn_publish from the fixture)
     // drops the row 100 → 99.
     let prep = m
@@ -793,7 +793,7 @@ async fn publish_acl_denied_consumes_no_budget() {
         .push(brenn_lib::access::acl::ChannelMatcher::Exact(
             "other".to_string(),
         ));
-    set_bob_policy(&mut m, p);
+    set_bob_policy(&m, p);
 
     let denied = m
         .publish(
@@ -898,7 +898,7 @@ async fn reply_to_gate_messenger() -> Arc<Messenger> {
         }),
         vec![],
     );
-    cfg.policy = policy;
+    cfg.policy = std::sync::Arc::new(policy);
     let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
     apps.insert("pa-bob".to_string(), cfg);
 

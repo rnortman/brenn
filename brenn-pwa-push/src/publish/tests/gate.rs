@@ -7,7 +7,9 @@
 
 use super::super::*;
 use super::{make_app_config, make_db_with_users, make_pwa_push_config, make_service};
+use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::ResolvedMessagingConfig;
+use indexmap::IndexMap;
 
 #[tokio::test]
 async fn push_disabled_returns_missing_sender() {

@@ -47,8 +47,8 @@ fn resolve_user_scope(
         None => Ok(UserScope::BridgeOwner),
         Some(uname) => {
             // When allowed_users is non-empty, validate the requested username is in the list.
-            if !bridge.allowed_users.is_empty() && !bridge.allowed_users.iter().any(|u| u == uname)
-            {
+            let allowed_users = bridge.app_config().allowed_users.clone();
+            if !allowed_users.is_empty() && !allowed_users.iter().any(|u| u == uname) {
                 warn!(
                     app = %bridge.app_slug,
                     username = %uname,
@@ -141,7 +141,7 @@ pub(super) async fn handle(
                 let visibility = match scope {
                     UserScope::Explicit(uid) => vec![uid],
                     UserScope::BridgeOwner => {
-                        resolve_device_visibility_set(&conn, &bridge.allowed_users)
+                        resolve_device_visibility_set(&conn, &bridge.app_config().allowed_users)
                     }
                 };
 
@@ -211,7 +211,7 @@ pub(super) async fn handle(
                 let visibility = match scope {
                     UserScope::Explicit(uid) => vec![uid],
                     UserScope::BridgeOwner => {
-                        resolve_device_visibility_set(&conn, &bridge.allowed_users)
+                        resolve_device_visibility_set(&conn, &bridge.app_config().allowed_users)
                     }
                 };
                 let mut device_ids = brenn_db::auth::device::resolve_device_ids_for_get(
@@ -352,6 +352,7 @@ mod tests {
     use super::super::super::mcp_constants::{
         MCP_DEVICE_ASSIGN_SLUG_TOOL, MCP_DEVICE_GET_TOOL, MCP_DEVICE_LIST_TOOL,
     };
+    use super::super::super::test_fixtures::swap_single_app;
     use super::super::super::test_support::{
         create_test_device_for_user, post_tool_use_req, test_bridge,
         test_bridge_with_allowed_users, test_shared_bridge,
@@ -1114,6 +1115,81 @@ mod tests {
                 );
             }
             other => panic!("expected Continue with user_not_in_app error, got {other:?}"),
+        }
+    }
+
+    /// `allowed_users` converges at reload, and this session was spawned before
+    /// the swap. The device tools decide on the agent as it is now: a user the
+    /// candidate dropped is rejected on the next call, and their devices leave
+    /// the app's visibility set.
+    #[tokio::test]
+    async fn device_tools_follow_allowed_users_narrowed_after_spawn() {
+        let (bridge, _event_tx, _broadcast_rx, _ab) =
+            test_bridge_with_allowed_users(vec!["testuser".to_string(), "kept".to_string()]).await;
+
+        let kept_id = {
+            let conn = bridge.db.lock().await;
+            brenn_db::auth::user::create_user(&conn, "kept", "$argon2id$fake")
+        };
+        let kept_device =
+            create_test_device_for_user(&bridge.db, kept_id, "Mozilla/5.0 Chrome/125").await;
+
+        // Before the swap "kept" is in the list: DeviceGet by id resolves.
+        let req = post_tool_use_req(
+            MCP_DEVICE_GET_TOOL,
+            serde_json::json!({"device": kept_device.to_string(), "username": "kept"}),
+        );
+        match handle_brenn_tools(&bridge, &req).await {
+            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(output),
+            })) => {
+                let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+                assert!(
+                    parsed.get("error").is_none(),
+                    "an allowed user must resolve before the swap: {parsed}"
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+
+        swap_single_app(&bridge.apps, "test", |app| {
+            app.allowed_users = vec!["testuser".to_string()];
+        });
+
+        // The same call, decided on the candidate: rejected.
+        let req = post_tool_use_req(
+            MCP_DEVICE_GET_TOOL,
+            serde_json::json!({"device": kept_device.to_string(), "username": "kept"}),
+        );
+        match handle_brenn_tools(&bridge, &req).await {
+            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(output),
+            })) => {
+                let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+                assert_eq!(
+                    parsed["error"], "user_not_in_app",
+                    "a removed user must be rejected on the next call: {parsed}"
+                );
+            }
+            other => panic!("expected Continue with user_not_in_app, got {other:?}"),
+        }
+
+        // And their device has left the owner-scoped visibility set.
+        let req = post_tool_use_req(MCP_DEVICE_LIST_TOOL, serde_json::json!({}));
+        match handle_brenn_tools(&bridge, &req).await {
+            Some(HandleBrennToolResult::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(output),
+            })) => {
+                let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+                let devices = parsed["devices"].as_array().expect("devices array");
+                assert!(
+                    devices
+                        .iter()
+                        .all(|d| d["id"].as_i64() != Some(kept_device)),
+                    "a removed user's device must leave the visibility set: {parsed}"
+                );
+            }
+            other => panic!("expected Continue with devices, got {other:?}"),
         }
     }
 

@@ -11,9 +11,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rumqttc::{AsyncClient, MqttOptions, Transport};
 use tokio::sync::mpsc;
 
-use crate::{MqttService, state::ConnectorHealthLabel};
+use crate::{MqttService, state::ConnectorHealthLabel, test_support::poll};
 
-/// Poll `svc.ingress_health(client_slug)` at 25ms intervals until the label is
+/// The MQTT client id a brenn session for `client_slug` connects with.
+///
+/// What the broker writes beside every packet it sends that session, so a test
+/// reading the broker's own log can name the subscriber it means instead of
+/// transcribing the format.
+pub fn session_client_id(client_slug: &str) -> String {
+    crate::connection::client_id_of_slug(client_slug)
+}
+
+/// [`poll::poll_until`] with the client's current health appended to `msg` on
+/// the failing path: every wait here is a wait on a session, and the health
+/// label is what says whether it was even connected.
+async fn poll_health<T, F, Fut>(
+    svc: &MqttService,
+    client_slug: &str,
+    timeout_secs: u64,
+    msg: &str,
+    state: F,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    poll::poll_until(timeout_secs, state, || async {
+        let (label, error) = svc.ingress_health(client_slug).await;
+        format!("{msg} (health while waiting: {label:?} {error:?})")
+    })
+    .await
+}
+
+/// Poll `svc.ingress_health(client_slug)` until the label is
 /// in `accepted`, then return that label. Panics with `msg` if no accepted label
 /// is seen within `timeout_secs`.
 pub async fn wait_for_health(
@@ -23,15 +53,51 @@ pub async fn wait_for_health(
     timeout_secs: u64,
     msg: &str,
 ) -> ConnectorHealthLabel {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
+    poll_health(svc, client_slug, timeout_secs, msg, || async {
         let (label, _) = svc.ingress_health(client_slug).await;
-        if accepted.contains(&label) {
-            return label;
+        accepted.contains(&label).then_some(label)
+    })
+    .await
+}
+
+/// Poll `svc.subscription_acked(client_slug, topic_filter)` until the broker
+/// has granted the filter on the current session. Panics with
+/// `msg` if no grant is seen within `timeout_secs`.
+///
+/// This is the barrier a test crosses before publishing from outside brenn: it
+/// proves the filter is at the broker, where a health wait proves only that the
+/// session reconnected and the SUBSCRIBE went out. It does not hold the session
+/// up afterwards — a drop between the grant and the publish clears the grant
+/// with the client.
+///
+/// A broker refusal ends the wait at once, carrying the SUBACK's reason: the
+/// broker has answered, and polling out a ten-second deadline for an answer
+/// already given reads as a lost session instead of the refusal it is.
+///
+/// # Panics
+///
+/// If `client_slug` is not a registered client: the caller named a client the
+/// document does not declare. If the broker refused the filter.
+pub async fn wait_for_filter_acked(
+    svc: &MqttService,
+    client_slug: &str,
+    topic_filter: &str,
+    timeout_secs: u64,
+    msg: &str,
+) {
+    poll_health(svc, client_slug, timeout_secs, msg, || async {
+        let acked = svc
+            .subscription_acked(client_slug, topic_filter)
+            .await
+            .unwrap_or_else(|| {
+                panic!("wait_for_filter_acked: no session registered for client {client_slug:?}")
+            });
+        if !acked && let Some(reason) = svc.subscription_refusal(client_slug, topic_filter).await {
+            panic!("{msg}: the broker refused the subscription for {topic_filter}: {reason}");
         }
-        assert!(std::time::Instant::now() < deadline, "{msg}");
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+        acked.then_some(())
+    })
+    .await
 }
 
 /// A raw rumqttc client plus a receiver that yields one item per PubAck.

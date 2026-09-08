@@ -44,6 +44,12 @@ pub(in crate::active_bridge) async fn set_idle_and_drain(bridge: &Arc<ActiveBrid
         // only change account between turns. Cheap and synchronous unless this
         // bridge is actually on the wrong one.
         bridge.reconsider_profile();
+        // Same moment, same reason, for a reload that moved what this process
+        // was spawned with: a bridge condemned mid-turn dies here, and the wake
+        // path resumes the conversation on a process built from the new agent.
+        if bridge.retire_if_stale_and_idle().await {
+            return;
+        }
         // Normal path: arm the shared timer fresh from this moment.
         bridge.maybe_arm_idle_hook_timer().await;
     }

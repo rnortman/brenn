@@ -263,17 +263,17 @@ fn registry_virtual_tools(
     out
 }
 
-/// Write the virtual tools JSON file for the noop MCP server.
+/// The virtual tools JSON the noop MCP server reads for one agent: core virtual
+/// tools + granted registry tools + integration-contributed virtual tools.
 ///
-/// Collects core virtual tools + granted registry tools + integration-
-/// contributed virtual tools and writes them to `<state_dir>/virtual-tools.json`.
-/// The state_dir is guaranteed to exist (created at config-resolve time).
-///
-/// Called once per app at startup (not per CC spawn).
-pub fn write_virtual_tools_file(
+/// Split from the write because a reload compares the two documents' renderings
+/// to decide whether a live session's tool list went stale — `noop_mcp.py` reads
+/// this file once at its start, so a difference is a process to retire rather
+/// than a table to swap.
+pub fn render_virtual_tools(
     app_config: &brenn_lib::config::AppConfig,
     registry: &brenn_tool_registry::ToolRegistry,
-) -> PathBuf {
+) -> String {
     use brenn_lib::integration::{VirtualToolDef, core_virtual_tools, repo_virtual_tools};
 
     let tools: Vec<VirtualToolDef> = core_virtual_tools(app_config)
@@ -288,15 +288,26 @@ pub fn write_virtual_tools_file(
         )
         .collect();
 
+    serde_json::to_string_pretty(&tools).expect("virtual tools serialization should not fail")
+}
+
+/// Write the virtual tools JSON file for the noop MCP server.
+///
+/// Writes [`render_virtual_tools`] to `<state_dir>/virtual-tools.json`. The
+/// state_dir is guaranteed to exist (created at config-resolve time).
+///
+/// Called once per app at startup (not per CC spawn).
+pub fn write_virtual_tools_file(
+    app_config: &brenn_lib::config::AppConfig,
+    registry: &brenn_tool_registry::ToolRegistry,
+) -> PathBuf {
     let path = app_config.virtual_tools_path();
-    let json =
-        serde_json::to_string_pretty(&tools).expect("virtual tools serialization should not fail");
+    let json = render_virtual_tools(app_config, registry);
     std::fs::write(&path, json)
         .unwrap_or_else(|e| panic!("failed to write virtual tools file {}: {e}", path.display()));
 
     info!(
         app = %app_config.slug,
-        tools = tools.len(),
         path = %path.display(),
         "wrote virtual tools file for noop MCP server",
     );
@@ -810,7 +821,7 @@ mod tests {
         let mut app = minimal_test_app_config();
         app.state_dir = tmp.path().to_path_buf();
         // Grant the app git-repo-pull so `registry_virtual_tools` projects it.
-        app.policy.tool_grants = BTreeMap::from([(
+        app.policy_mut().tool_grants = BTreeMap::from([(
             "git-repo-pull".to_string(),
             ResolvedToolGrant {
                 acl: vec![AclClause::new(BTreeMap::from([(

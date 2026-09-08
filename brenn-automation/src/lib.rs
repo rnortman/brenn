@@ -28,12 +28,11 @@ mod test_support;
 use std::sync::Arc;
 
 use chrono::Utc;
-use indexmap::IndexMap;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 use brenn_db::Db;
-use brenn_lib::config::AppConfig;
+use brenn_lib::config::AppTable;
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_messaging::Messenger;
 use brenn_obs::alerting::AlertDispatcher;
@@ -146,7 +145,7 @@ pub enum ListResult {
 pub struct AutomationEngine {
     pub(crate) db: Db,
     pub(crate) messenger: Arc<Messenger>,
-    pub(crate) apps: Arc<IndexMap<String, AppConfig>>,
+    pub(crate) apps: AppTable,
     pub(crate) directory: Arc<MessagingDirectory>,
     /// Used by fire/error_route to submit ingress error reports.
     pub(crate) ingress_router: Arc<dyn IngressRouter>,
@@ -158,12 +157,19 @@ pub struct AutomationEngine {
 }
 
 impl AutomationEngine {
+    /// The shared agent table this engine's fire gates read through. Exposed so
+    /// boot can assert every subsystem holds one handle: an engine given a copy
+    /// would keep firing on the booted document past a reload.
+    pub fn app_table(&self) -> AppTable {
+        self.apps.clone()
+    }
+
     /// Construct an `AutomationEngine`. The caller owns the `Arc` for sharing
     /// with the background loop task.
     pub fn new(
         db: Db,
         messenger: Arc<Messenger>,
-        apps: Arc<IndexMap<String, AppConfig>>,
+        apps: impl Into<AppTable>,
         directory: Arc<MessagingDirectory>,
         ingress_router: Arc<dyn IngressRouter>,
         defaults: AutomationGlobalConfig,
@@ -172,7 +178,7 @@ impl AutomationEngine {
         Arc::new(Self {
             db,
             messenger,
-            apps,
+            apps: apps.into(),
             directory,
             ingress_router,
             defaults,
@@ -773,7 +779,7 @@ mod tests {
         app_cfg.messaging = None; // no sender → MissingSender / Unauthorized
         // Clear the messaging grants so this app is genuinely not a messaging
         // sender (messaging_enabled() returns false).
-        app_cfg.policy = brenn_lib::access::AppPolicy::default();
+        app_cfg.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         let mut apps = indexmap::IndexMap::new();
         apps.insert("no-sender-app".to_string(), app_cfg);
         let apps = Arc::new(apps);
@@ -806,9 +812,9 @@ mod tests {
         // Replace the default sender policy (which grants MessagingPublish) with
         // a subscribe-only one. `messaging_enabled()` reads the grant set, so it
         // is still true; only the publish grant is missing.
-        app_cfg.policy = brenn_lib::access::AppPolicy::with_grants(&[
+        app_cfg.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::with_grants(&[
             brenn_envelope::grants::AppCapability::MessagingSubscribe,
-        ]);
+        ]));
         let mut apps = indexmap::IndexMap::new();
         apps.insert("test-app".to_string(), app_cfg);
         // Reuse the canonical engine-wiring helper rather than re-inlining the
@@ -1150,7 +1156,7 @@ mod tests {
     ) -> Arc<AutomationEngine> {
         let db = init_db_memory();
         let mut app_cfg = crate::test_support::default_app_cfg("test-app", true);
-        app_cfg.policy = policy;
+        app_cfg.policy = std::sync::Arc::new(policy);
         let mut apps = indexmap::IndexMap::new();
         apps.insert("test-app".to_string(), app_cfg);
         let apps = Arc::new(apps);

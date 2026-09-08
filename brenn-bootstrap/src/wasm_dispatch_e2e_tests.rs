@@ -1565,9 +1565,12 @@ async fn a_third_party_publishing_to_an_anonymous_auto_channel_is_denied() {
 
     let mut bystander =
         brenn_server::test_support::app_config::default_test_app_config("graf", "Graf Test");
-    bystander.policy.grants.insert(AppCapability::LocalPublish);
     bystander
-        .policy
+        .policy_mut()
+        .grants
+        .insert(AppCapability::LocalPublish);
+    bystander
+        .policy_mut()
         .acls
         .local_publish
         .push(ChannelMatcher::Exact("graf.scratch".to_string()));

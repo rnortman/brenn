@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use brenn_lib::access::PolicyRef;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::token_bucket::TokenBucketOutcome;
 
 pub use super::config::{SURFACE_SEND_BURST, SURFACE_SEND_REFILL};
@@ -795,16 +795,14 @@ impl Messenger {
             ChannelScheme::Local => AppCapability::LocalPublish,
             _ => AppCapability::MessagingPublish,
         };
+        let apps = self.apps.load();
         let (policy_ref, conversation_send_budget) = match principal {
             PublishPrincipal::App { slug } => {
-                let app = match resolve_publish_sender(&self.apps, slug, grant) {
+                let app = match resolve_publish_sender(&apps, slug, grant) {
                     Some(a) => a,
                     None => return PublishResult::MissingSender,
                 };
-                (
-                    PolicyRef::Borrowed(&app.policy),
-                    Some(app.messaging_send_budget()),
-                )
+                (Arc::clone(&app.policy), Some(app.messaging_send_budget()))
             }
             PublishPrincipal::Attach { scope, .. } => {
                 // Attachers are not in `self.apps`; their boot-resolved policy
@@ -820,7 +818,7 @@ impl Messenger {
                 let policy = match self
                     .targets
                     .registration(&SubscriberEntryKind::for_attach(scope))
-                    .map(|r| PolicyRef::Shared(r.policy))
+                    .map(|r| r.policy)
                     .filter(|p| p.has_grant(grant))
                 {
                     Some(p) => p,
@@ -843,7 +841,7 @@ impl Messenger {
                 let policy = match self
                     .targets
                     .registration(&SubscriberEntryKind::System(component.to_string()))
-                    .map(|r| PolicyRef::Shared(r.policy))
+                    .map(|r| r.policy)
                     .filter(|p| p.has_grant(grant))
                 {
                     Some(p) => p,
@@ -864,10 +862,9 @@ impl Messenger {
                 // harness policy is defensive — the four transport grants are
                 // there by construction — and a failure is a resolution bug, not
                 // a quiet bypass.
-                let policy = match self
-                    .apps
+                let policy = match apps
                     .get(app_slug)
-                    .map(|app| PolicyRef::Borrowed(&app.chat_harness_policy))
+                    .map(|app| Arc::clone(&app.chat_harness_policy))
                     .filter(|p| p.has_grant(grant))
                 {
                     Some(p) => p,
@@ -882,7 +879,7 @@ impl Messenger {
                 )
             }
         };
-        let policy: &brenn_lib::access::AppPolicy = &policy_ref;
+        let policy: &AppPolicy = &policy_ref;
         // Layer-2: the target scheme's per-channel publish ACL against the bare
         // channel name captured at gate 1. This is a pure in-memory policy read
         // against the already-resolved channel and runs BEFORE the budget

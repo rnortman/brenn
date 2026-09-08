@@ -8,7 +8,9 @@
 //!   equal, and a difference anywhere else is a refusal naming the section.
 //! - [`delta`] is level 2, over the two lowered plans. It says which channel
 //!   entries and which consumers moved, and refuses the moves that cannot be
-//!   made without restarting.
+//!   made without restarting. [`agents`] is its agent half: which agents moved,
+//!   which of their static subscriptions have to be re-folded, and which of
+//!   them need their live sessions retired.
 //! - [`driver`] is those two asked about *this* process: it holds the baseline
 //!   the running system is the projection of, re-reads the tree on disk, and
 //!   turns the answers into an outcome.
@@ -38,13 +40,16 @@
 //! document or the host is wrong, and a restart makes it worse — that text ends
 //! the way boot ends it. Both land in the same list of lines.
 
+pub(crate) mod agents;
 pub(crate) mod commit;
 pub(crate) mod compare;
 pub(crate) mod delta;
 pub(crate) mod doors;
 pub(crate) mod driver;
+pub(crate) mod dynamic;
 pub(crate) mod mqtt;
 pub(crate) mod status;
+pub(crate) mod subscribers;
 pub(crate) mod surfaces;
 
 /// The correctness rule above, checked against a running process, and the

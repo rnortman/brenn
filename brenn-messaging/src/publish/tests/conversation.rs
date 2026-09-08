@@ -34,8 +34,8 @@ fn chat_app(slug: &str) -> brenn_lib::config::AppConfig {
         }),
         vec!["bob".to_string()],
     );
-    cfg.policy = brenn_lib::access::AppPolicy::default();
-    cfg.chat_harness_policy = LlmChatConfig::default().harness_policy(slug);
+    cfg.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
+    cfg.chat_harness_policy = std::sync::Arc::new(LlmChatConfig::default().harness_policy(slug));
     cfg
 }
 
@@ -142,12 +142,14 @@ async fn the_authored_policy_is_not_what_authorizes_the_adapter() {
     // detail.
     let m = chat_messenger().await;
     assert!(
-        !m.apps[OWNER].policy.allows_brenn_publish(&chat_bare_name(
-            CHAT_PREFIX,
-            OWNER,
-            ChatLeaf::Out,
-            CONVERSATION
-        )),
+        !m.apps.load()[OWNER]
+            .policy
+            .allows_brenn_publish(&chat_bare_name(
+                CHAT_PREFIX,
+                OWNER,
+                ChatLeaf::Out,
+                CONVERSATION
+            )),
         "the fixture's authored policy must reach nothing"
     );
     assert!(matches!(

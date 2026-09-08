@@ -255,7 +255,7 @@ impl std::fmt::Debug for MqttClientConfig {
 /// the subscriber-side generic params are resolved sub → channel. The
 /// parsed `client_slug`/`topic` are retained for the router table and ingress
 /// union-set derivation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMqttIngressSubscription {
     /// Canonical channel address `mqtt:<client>:<topic>` (the channel identity).
     pub channel_address: String,

@@ -22,6 +22,7 @@ use super::{make_app_config, make_db_with_users, make_service, make_service_with
 use crate::db::upsert_subscription;
 use crate::endpoint_validator::ValidatedEndpoint;
 use crate::test_helpers::{fake_auth, fake_p256dh};
+use indexmap::IndexMap;
 
 const T1: &str = "2024-01-01T00:00:00Z";
 const T2: &str = "2024-06-01T00:00:00Z";

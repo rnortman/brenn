@@ -55,7 +55,7 @@ pub fn test_app_config(
                     .brenn_publish
                     .push(crate::access::acl::ChannelMatcher::Prefix(String::new()));
             }
-            p
+            std::sync::Arc::new(p)
         },
         messaging,
         ..crate::config::test_app_config(slug)

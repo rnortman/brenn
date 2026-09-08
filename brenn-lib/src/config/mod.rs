@@ -1,5 +1,6 @@
 mod alerting;
 mod app;
+mod app_table;
 mod attachment;
 mod automation;
 mod brenn;
@@ -29,11 +30,16 @@ mod watchdog;
 
 pub use alerting::*;
 pub use app::*;
+pub use app_table::{AppRef, AppTable};
 pub use attachment::*;
 pub use automation::*;
 #[cfg(test)]
 pub(crate) use brenn::load_config_from;
 pub use brenn::*;
+/// The approval-rule shape `AppConfigRaw::approval_rules` holds, re-exported
+/// so a caller that reads or builds an agent block need not name the crate the
+/// matcher lives in.
+pub use brenn_approval_rules::ApprovalRuleConfig;
 /// What a document load or check reads: the root and its module roots.
 pub use brenn_dsl::DocumentInputs;
 /// Which vocabulary a document is read as.
@@ -57,7 +63,10 @@ pub use path_mapper::*;
 pub use repo::*;
 #[cfg(test)]
 pub(crate) use resolve::shallow_merge_toml;
-pub use resolve::{ResolvedConfig, validate_and_resolve};
+pub use resolve::{
+    FrozenInputs, ResolvedConfig, pwa_push_grant_without_section, resolve_apps,
+    validate_and_resolve,
+};
 pub use secret::SecretString;
 pub(crate) use secret::{load_secret_file, load_secret_file_private};
 pub use security::*;

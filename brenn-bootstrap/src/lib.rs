@@ -220,10 +220,12 @@ pub async fn run_server(
     // when we have ContainerSpawnConfig for container-side clones.
     apps::prepare_repo_dirs(&config);
 
-    let integration_registry = IntegrationRegistry::new(vec![
+    // Shared with the reload driver; the factory set is a compile-time
+    // constant of the binary, so every reload resolves the same factories.
+    let integration_registry = std::sync::Arc::new(IntegrationRegistry::new(vec![
         Box::new(brenn_pfin::PfinFactory),
         Box::new(brenn_graf::GrafFactory),
-    ]);
+    ]));
     // Resolve XDG_RUNTIME_DIR at most once, and only when the config contains
     // at least one bare (non-containerized) app. Container-only configs pay zero
     // cost and never touch the env. The validated PathBuf is borrowed into
@@ -241,6 +243,11 @@ pub async fn run_server(
         pwa_push: resolved_pwa_push,
         claude_profiles,
     } = validate_and_resolve(&config, &integration_registry, runtime_dir.as_deref());
+
+    // The one agent table of this process. Every gate that decides on an agent
+    // reads it through a clone of this handle, so a reload converges them all by
+    // swapping the map inside it.
+    let app_table = brenn_lib::config::AppTable::new(apps.clone());
 
     // A token is opaque: Brenn cannot read its lifetime, so the only expiry
     // signal there is is the date the operator wrote down. One alert per
@@ -337,6 +344,7 @@ pub async fn run_server(
         &config.repos,
         &config.repo_sync,
         &apps,
+        &app_table,
     )
     .await;
 
@@ -427,7 +435,7 @@ pub async fn run_server(
     let (mut messaging_result, plan_carried) = brenn_messaging_boot::build_messaging(
         &config,
         db.clone(),
-        &apps,
+        &app_table,
         active_bridges.clone(),
         guard.alert_dispatcher.clone(),
         messaging_server_origin.clone(),
@@ -586,7 +594,7 @@ pub async fn run_server(
     let pwa_push_service = pwa_push::build_pwa_push(
         &config,
         db.clone(),
-        &apps,
+        &app_table,
         guard.alert_dispatcher.clone(),
         resolved_pwa_push,
         messaging_server_origin,
@@ -600,7 +608,7 @@ pub async fn run_server(
     let automation_result = automation::build_automation(
         &config,
         db.clone(),
-        &apps,
+        &app_table,
         messaging_result.messenger.as_ref(),
         guard.alert_dispatcher.clone(),
     );
@@ -847,8 +855,9 @@ pub async fn run_server(
         secure_cookies: config.server.secure_cookies,
         log_dir: config.logging.log_dir,
         mcp_script_path: config.claude_defaults.mcp_script_path,
-        apps: apps.clone(),
+        apps: app_table.clone(),
         bridge_notify_tx: tokio::sync::broadcast::channel(64).0,
+        apps_swapped_tx: tokio::sync::broadcast::channel(16).0,
         pending_uploads: pending_uploads.clone(),
         static_dir: config.server.static_dir.clone(),
         surface_roots: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
@@ -877,6 +886,30 @@ pub async fn run_server(
         replay_locks,
         cc_profiles: cc_profiles.clone(),
     };
+
+    // One table, or a reload swaps a map some gate is not reading.
+    assert_one_app_table(
+        &app_table,
+        &[
+            ("AppState", &state.apps),
+            (
+                "Messenger",
+                &messaging_result
+                    .messenger
+                    .as_ref()
+                    .map(|m| m.app_table())
+                    .unwrap_or_else(|| app_table.clone()),
+            ),
+            (
+                "AutomationEngine",
+                &automation_result
+                    .engine
+                    .as_ref()
+                    .map(|e| e.app_table())
+                    .unwrap_or_else(|| app_table.clone()),
+            ),
+        ],
+    );
 
     // Attach the AppState to the WakeRouter, then spawn the background
     // tasks. Doing the attach first means any past-deadline /
@@ -988,7 +1021,9 @@ pub async fn run_server(
                     .clone(),
                 root: root_path.clone(),
                 build_id,
-                apps: apps.clone(),
+                apps: app_table.clone(),
+                integration_registry: integration_registry.clone(),
+                runtime_dir: runtime_dir.clone(),
                 mqtt_clients: mqtt_client_identities,
                 tool_registry: state.tools.clone(),
                 replay_store_paths: replay_store_paths.clone(),
@@ -998,6 +1033,8 @@ pub async fn run_server(
                 mqtt_service: mqtt_result.service.clone(),
                 mqtt_event_router: mqtt_result.event_router.clone(),
                 max_payload_bytes: config.messaging.max_body_bytes,
+                active_bridges: state.active_bridges.clone(),
+                apps_swapped_tx: state.apps_swapped_tx.clone(),
                 messenger: messenger.clone(),
                 router: router.clone(),
                 tool_caller_grants: reload_tool_caller_grants,
@@ -1089,7 +1126,7 @@ pub async fn run_server(
 
     // Spawn orphan cleanup background task.
     tokio::spawn(brenn_server::routes::upload::orphan_cleanup_loop(
-        apps,
+        app_table.clone(),
         pending_uploads,
         state.db.clone(),
     ));
@@ -1219,6 +1256,32 @@ pub(crate) fn load_verified_replay(
     (component, verified)
 }
 
+/// Every subsystem that decides on an agent reads one table, so that a reload's
+/// swap reaches all of them at once.
+///
+/// The failure this catches is a subsystem threaded with a *copy* of the map
+/// rather than the handle: it keeps deciding on the booted document while the
+/// reload publishes `applied` and moves its baseline, and nothing else in the
+/// process can tell. Boot builds exactly one table, and every holder below is
+/// given a clone of it.
+///
+/// Not every holder is reachable here — the push sender is behind a trait
+/// object and repo sync's context is private to its task — so this asserts what
+/// boot can ask and the rest hold by construction: each is handed the table at
+/// its one construction site.
+fn assert_one_app_table(
+    canonical: &brenn_lib::config::AppTable,
+    holders: &[(&str, &brenn_lib::config::AppTable)],
+) {
+    for (name, held) in holders {
+        assert!(
+            canonical.ptr_eq(held),
+            "{name} holds its own agent table rather than the one this process built: a reload \
+             would swap a map it never reads",
+        );
+    }
+}
+
 /// Boot cross-check: every directory subscriber must resolve to both a
 /// wake-economics registration and a delivery binding. This is what makes "a
 /// new subscriber kind silently inherits nothing and strands its messages"
@@ -1344,6 +1407,27 @@ mod tests {
             ("demo", bundle.path().to_path_buf()),
         ]);
         assert_boot_preconditions("test-build", &roots);
+    }
+
+    /// The wiring assert's two directions: clones of one table pass, and a
+    /// subsystem given its own copy of the same map is caught by name.
+    #[test]
+    fn one_agent_table_shared_by_every_holder_passes() {
+        let apps = std::sync::Arc::new(indexmap::IndexMap::new());
+        let table = brenn_lib::config::AppTable::new(apps);
+        let clone = table.clone();
+        super::assert_one_app_table(&table, &[("AppState", &clone), ("Messenger", &table)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "AutomationEngine holds its own agent table")]
+    fn a_holder_given_its_own_table_is_named() {
+        let apps = std::sync::Arc::new(indexmap::IndexMap::new());
+        let table = brenn_lib::config::AppTable::new(apps.clone());
+        // The same map, a second table: exactly what threading a subsystem with
+        // the map instead of the handle produces.
+        let split = brenn_lib::config::AppTable::new(apps);
+        super::assert_one_app_table(&table, &[("AutomationEngine", &split)]);
     }
 
     /// An empty build id must panic: it would produce a zero-length WS

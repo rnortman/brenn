@@ -152,6 +152,47 @@ pub fn channel_subscriber_cursors(
         .collect()
 }
 
+/// Every cursor `subscriber` holds, by channel uuid.
+///
+/// The "positions of one participant" read: a conversation whose owner moved
+/// off an agent holds rows on channels the reload has to reap, and the whole
+/// table is the wrong grain to find a handful of them by — cursor rows grow as
+/// channels x subscribers, every conversation's chat family included, and the
+/// global db lock is held while the statement runs.
+///
+/// Unlike [`all_subscriber_cursors`] this is not joined onto
+/// `messaging_channels`: a row outlives its channel entry — that is what a
+/// dormant dynamic subscription on an undeclared channel is — and the caller
+/// asks about positions, not about retention.
+pub fn subscriber_cursors_of(
+    conn: &Connection,
+    subscriber: &ParticipantId,
+) -> Vec<(Uuid, SubscriberCursorRow)> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT channel_uuid, subscriber, app_slug, push_depth, next_owed_seq
+             FROM messaging_subscriber_cursors
+             WHERE subscriber = ?1",
+        )
+        .expect("prepare subscriber_cursors_of");
+    let rows = stmt
+        .query_map(rusqlite::params![subscriber.as_str()], |row| {
+            let uuid = Uuid::from_slice(&row.get::<_, Vec<u8>>(0)?)
+                .expect("messaging_subscriber_cursors.channel_uuid is a 16-byte uuid");
+            Ok((
+                uuid,
+                SubscriberCursorRow {
+                    subscriber: ParticipantId::from_stored(row.get::<_, String>(1)?),
+                    app_slug: row.get(2)?,
+                    push_depth: depth_from_sql(&row.get::<_, String>(3)?),
+                    next_owed_seq: row.get(4)?,
+                },
+            ))
+        })
+        .expect("query subscriber_cursors_of");
+    rows.map(|r| r.expect("read subscriber cursor")).collect()
+}
+
 /// Every cursor row in the database, each paired with the head of the channel
 /// it stands on (`last_retained_seq`, the high-water eviction does not lower).
 ///

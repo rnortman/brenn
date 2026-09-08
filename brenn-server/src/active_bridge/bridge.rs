@@ -95,10 +95,10 @@ pub struct ActiveBridge {
     /// First-class tool registry (grant-governed tools). The `registry_adapter`
     /// intercept routes CC's `mcp__brenn__*` calls that resolve here through it.
     pub(super) tools: Arc<brenn_tool_registry::ToolRegistry>,
-    /// This app's resolved tool grants (from `AppPolicy.tool_grants`). The
-    /// authorization side of a registry tool call; joined with the descriptor's
-    /// `auto_approve` in the adapter.
-    pub(super) tool_grants: std::collections::BTreeMap<String, brenn_lib::tools::ResolvedToolGrant>,
+    /// The agent registry, shared with every other gate. Authority is read
+    /// through it per call — tool grants, `allowed_users`, the send budget —
+    /// so a reload's swap reaches a session that is already running.
+    pub(super) apps: brenn_lib::config::AppTable,
     /// Origin string for this app's tool-caller `ParticipantId`
     /// (`app:<slug>@<origin>`).
     pub(super) server_origin: Arc<str>,
@@ -145,9 +145,6 @@ pub struct ActiveBridge {
     /// Per-app frontmatter rendering rules. Read by the DisplayFile
     /// PreToolUse intercept when rendering markdown files.
     pub(super) frontmatter: brenn_lib::config::FrontmatterRenderConfig,
-    /// Allowed users for this app. Empty means open to all users.
-    /// Used by device tools to compute the app-visibility set.
-    pub(super) allowed_users: Vec<String>,
     /// Last reported viewport class from any connected client. Used for
     /// rendering viewport-appropriate HTML in approval dialogs (e.g., batch
     /// reconcile table vs swipe view). Defaults to Wide. Updated by WS
@@ -235,10 +232,6 @@ pub struct ActiveBridge {
     /// `AppState::usage_session_gap_secs`; carried here so `handle_turn_completed`
     /// can record usage without threading the AppState through.
     pub(super) usage_session_gap_secs: u32,
-    /// Per-app messaging send budget (or the global default when the app has no
-    /// `[app.messaging]` block). Used by MQTT send to check/decrement the shared
-    /// budget without threading `AppState` through the intercept.
-    pub(super) messaging_default_send_budget: u32,
     /// Epoch second when `cost_samples::prune_before` last ran. Zero = never.
     /// Pruning is at most once per hour; the DELETE is a no-op ~99.96% of the
     /// time without this gate.
@@ -277,6 +270,29 @@ pub struct ActiveBridge {
     /// How a swap reaches the world: the replacement spawn and the model cache.
     /// `None` on test bridges that never spawned a process.
     pub(in crate::active_bridge) swap_host: Option<Arc<dyn super::profile_swap::ProfileSwapHost>>,
+    /// Set when a reload moved this bridge's per-process view — what its CC
+    /// process was spawned with — or when its conversation's owner is a user
+    /// the candidate no longer allows. The process is killed at the next moment
+    /// it may be (`retire_if_stale_and_idle`) and the wake path spawns its
+    /// successor from the table, resuming the conversation.
+    pub(in crate::active_bridge) reload_stale: AtomicBool,
+    /// Set by `retire_if_stale_and_idle` in the instant before it kills the
+    /// process, and never cleared. This, and not `reload_stale`, is what makes
+    /// a death intentional: a condemned bridge can wait out a whole turn or an
+    /// attached tab before it is killed, and a genuine crash in that window is
+    /// an unexpected death that must still alert.
+    pub(in crate::active_bridge) reload_killing: AtomicBool,
+    /// The agent table generation the map this process was spawned from was
+    /// read at. A reload's swap bumps it, so a bridge that registers with a
+    /// stale one was built from a map the reload has already replaced and is
+    /// condemned at registration.
+    pub(in crate::active_bridge) spawned_generation: u64,
+    /// Whether the agent was persistent in the map this process was spawned
+    /// from. The retire guard asks this and not the table: what a non-persistent
+    /// bridge does at its tab's detach is decided by the `LifetimeArbiter` built
+    /// from the same snapshot, and `persistent` is exactly a field a reload
+    /// moves.
+    pub(in crate::active_bridge) spawned_persistent: bool,
     /// Set for the window in which a profile swap has torn the old CC process
     /// down and not yet installed its replacement. Keeps a second swap and the
     /// wedge watchdog off a bridge that is mid-swap; it says nothing about which
@@ -319,6 +335,13 @@ pub struct SpawnContext<'a> {
     pub log_dir: &'a Path,
     pub mcp_script_path: &'a Path,
     pub app_config: &'a brenn_lib::config::AppConfig,
+    /// The agent registry the spawned bridge reads authority through. The
+    /// `app_config` beside it is the snapshot this spawn builds its process
+    /// from; the table is what every later per-call read goes to.
+    pub apps: brenn_lib::config::AppTable,
+    /// The table generation `app_config` was read at, so a swap that lands
+    /// while this spawn is in flight condemns the process it produces.
+    pub apps_generation: u64,
     pub model_override: Option<&'a str>,
     pub tool_registry: Arc<HashMap<String, Arc<dyn AppTool>>>,
     /// First-class tool registry, for the LLM tool-call adapter.
@@ -398,6 +421,8 @@ impl ActiveBridge {
             log_dir,
             mcp_script_path,
             app_config,
+            apps,
+            apps_generation,
             model_override,
             tool_registry,
             tools,
@@ -555,7 +580,7 @@ impl ActiveBridge {
             active_bridges: active_bridges.clone(),
             tool_registry,
             tools,
-            tool_grants: app_config.policy.tool_grants.clone(),
+            apps,
             server_origin,
             approval_rules,
             approval_outcomes: tokio::sync::Mutex::new(HashMap::new()),
@@ -569,7 +594,6 @@ impl ActiveBridge {
             idle_hooks: std::sync::Mutex::new(Vec::new()),
             idle_hook_timer: std::sync::Mutex::new(None),
             frontmatter: app_config.frontmatter.clone(),
-            allowed_users: app_config.allowed_users.clone(),
             viewport_class: std::sync::Mutex::new(ViewportClass::Wide),
             singleton: app_config.singleton,
             compaction: tokio::sync::Mutex::new(CompactionState::default()),
@@ -590,7 +614,6 @@ impl ActiveBridge {
             mqtt_event_router,
             automation_engine,
             usage_session_gap_secs,
-            messaging_default_send_budget: app_config.messaging_send_budget(),
             last_cost_prune_at: AtomicI64::new(0),
             last_lint_snapshot: std::sync::Mutex::new(None),
             event_loop_handle: std::sync::Mutex::new(None),
@@ -611,6 +634,10 @@ impl ActiveBridge {
                     server_shutting_down: swap_shutdown,
                 }) as Arc<dyn super::profile_swap::ProfileSwapHost>
             }),
+            reload_stale: AtomicBool::new(false),
+            reload_killing: AtomicBool::new(false),
+            spawned_generation: apps_generation,
+            spawned_persistent: app_config.persistent,
             swapping: AtomicBool::new(false),
             swap_ack: std::sync::Mutex::new(None),
             cc_event_tx,
@@ -788,7 +815,19 @@ impl ActiveBridge {
     /// share the same budget). Falls back to the global default when the app
     /// has no `[app.messaging]` block.
     pub fn app_config_default_send_budget(&self) -> u32 {
-        self.messaging_default_send_budget
+        self.app_config().messaging_send_budget()
+    }
+
+    /// This bridge's agent, read out of the registry at this moment.
+    ///
+    /// The slug set is frozen for the life of the process, so a miss is a host
+    /// bug. Every read of an agent's *authority* goes through here rather than
+    /// through a field copied at spawn, so a reload's swap decides the next
+    /// call this session makes.
+    pub(crate) fn app_config(&self) -> brenn_lib::config::AppRef {
+        self.apps
+            .get(&self.app_slug)
+            .expect("BUG: live bridge for an agent the table does not hold")
     }
 
     /// Returns the typed config for an integration by name, or `None` if
@@ -1043,6 +1082,27 @@ mod tests {
         assert_eq!(
             spawn_model_and_seed(Some("opus"), "sonnet", true),
             ("opus".to_string(), None)
+        );
+    }
+
+    /// The send budget is an agent field read per call, so a reload's swap
+    /// moves it under a session that was spawned at the old figure. Both
+    /// consumers — the impetus pool's ceiling and MQTT egress's budget — go
+    /// through this one accessor.
+    #[tokio::test]
+    async fn send_budget_follows_a_swap_under_a_live_session() {
+        let (bridge, _event_tx, _broadcast_rx, _ab) =
+            crate::active_bridge::test_support::test_bridge().await;
+        assert_eq!(bridge.app_config_default_send_budget(), 100);
+
+        crate::active_bridge::test_fixtures::swap_single_app(&bridge.apps, "test", |app| {
+            app.messaging_default_send_budget = 7;
+        });
+
+        assert_eq!(
+            bridge.app_config_default_send_budget(),
+            7,
+            "the accessor must read the agent the table holds now"
         );
     }
 

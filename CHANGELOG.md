@@ -4,6 +4,25 @@ All notable changes to Brenn are documented here.
 
 ## [0.20.2]
 
+### Added
+
+- **Agent reload.** An agent's authority -- grants, ACLs, tool grants,
+  subscriptions, and send budget -- converges on reload without a restart.
+  Display and behavioural fields (name, icon, allowed users, model allowlist,
+  replay limit, and others) also converge. Spawn-shaped fields (model, MCP
+  servers, working directory, approval rules, compaction settings, idle
+  timeouts) take effect at each live session's next idle moment: the reload
+  retires the session and the wake path respawns it, resuming the conversation.
+  The status body names the sessions it retired and the ones it left finishing a
+  turn. Adding, removing, or renaming an agent, and a handful of boot-shaped
+  fields (`mounts`, `container`, `integrations`, Claude profiles, startup hooks,
+  webhook subscriptions), are still refused with a diagnostic naming the field.
+- **Dynamic subscription re-merge.** Dynamic subscriptions held by a changed
+  agent are re-authorized against the candidate's policy on every reload:
+  revoked to dormant with the broker filter dropped, revived at the granted
+  depths with filter and route restored, or pruned when a static declaration
+  supersedes them.
+
 ### Changed
 
 - **Declared MQTT clients hold sessions unconditionally.** Previously, a broker
@@ -11,6 +30,14 @@ All notable changes to Brenn are documented here.
   matcher at boot. Now every `mqtt_client` block gets a supervisor at startup.
   An idle connection costs one keepalive; the operator wrote the declaration, so
   the connection is what they asked for.
+- **MQTT ingress diff covers dynamic subscriptions.** The broker
+  SUBSCRIBE/UNSUBSCRIBE set is now computed over static channels plus
+  kept-dynamic rows, matching what a fresh boot derives, rather than the
+  plan's static list alone.
+- **Removed-user connections are closed on reload.** When `allowed_users` drops
+  a user, the reload pulses every open WebSocket; each re-checks and closes
+  itself when denied. An owner change reaps the old owner's delivery positions
+  and seats the new owner's conversation.
 - Fully hermetic toolchain via bazel
 
 ### Fixed

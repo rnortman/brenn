@@ -205,7 +205,7 @@ fn a_transport_only_apps_budget_survives_the_unmerged_map() {
     // The stamp `config/resolve.rs` puts on every app, from the same global the
     // synthesised block below is built from.
     app.messaging_default_send_budget = budget;
-    app.policy
+    app.policy_mut()
         .grants
         .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
     let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
@@ -390,7 +390,9 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
     // policy — a separate test pins the revoked path.
     let mut apps_map: IM<String, AppConfig> = IM::new();
     let mut graf_app = minimal_app_config("graf", None, vec![]);
-    graf_app.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address]);
+    graf_app.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address]),
+    );
     apps_map.insert("graf".to_string(), graf_app);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
@@ -520,8 +522,9 @@ async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
     let mut apps_map: IM<String, AppConfig> = IM::new();
     apps_map.insert(owner.to_string(), minimal_app_config(owner, None, vec![]));
     let mut peer_app = minimal_app_config(peer, None, vec![]);
-    peer_app.policy =
-        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([record.as_str()]);
+    peer_app.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([record.as_str()]),
+    );
     apps_map.insert(peer.to_string(), peer_app);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
@@ -612,8 +615,9 @@ async fn build_messaging_holds_a_dynamic_subscription_dormant_while_its_block_is
 
     let mut apps_map: IM<String, AppConfig> = IM::new();
     let mut app = minimal_app_config(app_slug, None, vec![]);
-    app.policy =
-        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
+    app.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]),
+    );
     apps_map.insert(app_slug.to_string(), app);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
 
@@ -735,8 +739,9 @@ async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_d
 
     let mut apps_map: IM<String, AppConfig> = IM::new();
     let mut app = minimal_app_config(app_slug, None, vec![]);
-    app.policy =
-        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
+    app.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]),
+    );
     apps_map.insert(app_slug.to_string(), app);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
 
@@ -995,8 +1000,9 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
     let apps_restored: Arc<IndexMap<String, AppConfig>> = {
         let mut m: IM<String, AppConfig> = IM::new();
         let mut graf_app = minimal_app_config("graf", None, vec![]);
-        graf_app.policy =
-            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address]);
+        graf_app.policy = std::sync::Arc::new(
+            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address]),
+        );
         m.insert("graf".to_string(), graf_app);
         Arc::new(m)
     };
@@ -1089,7 +1095,7 @@ fn app_subscribing_to(
         }),
         vec![],
     );
-    app.policy = policy;
+    app.policy = std::sync::Arc::new(policy);
     app
 }
 
@@ -2647,7 +2653,7 @@ async fn auto_channels_list_as_their_durability_says() {
     apps_map.insert(
         "graf".to_string(),
         AppConfig {
-            policy,
+            policy: std::sync::Arc::new(policy),
             ..minimal_app_config("graf", None, vec![])
         },
     );
@@ -3485,8 +3491,9 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
     // The reader must hold covering channel access to pass the read gate; it is a
     // non-subscriber (no subscription config), which is what the clamp exercises.
     let mut reader = minimal_app_config("some-reader", None, vec![]);
-    reader.policy =
-        brenn_lib::access::test_fixtures::delivery_policy_for_addresses(["brenn:surface.index"]);
+    reader.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses(["brenn:surface.index"]),
+    );
     let mut apps_map: IM<String, AppConfig> = IM::new();
     apps_map.insert("some-reader".to_string(), reader);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
@@ -3585,9 +3592,11 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     let db = init_db_memory();
     // A non-subscriber reader with covering read access to the status channel.
     let mut reader = minimal_app_config("some-reader", None, vec![]);
-    reader.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses([
-        "brenn:surface.surface.deskbar.status",
-    ]);
+    reader.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([
+            "brenn:surface.surface.deskbar.status",
+        ]),
+    );
     let mut apps_map: IM<String, AppConfig> = IM::new();
     apps_map.insert("some-reader".to_string(), reader);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
@@ -3670,9 +3679,11 @@ async fn boot_bindings_document_is_published_and_pullable() {
     // A non-subscriber reader with covering read access: the retained window is
     // pullable, which is the shape the attaching surface's replay reads.
     let mut reader = minimal_app_config("some-reader", None, vec![]);
-    reader.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses([
-        "ephemeral:surface.surface.deskbar.bindings",
-    ]);
+    reader.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([
+            "ephemeral:surface.surface.deskbar.bindings",
+        ]),
+    );
     let mut apps_map: IM<String, AppConfig> = IM::new();
     apps_map.insert("some-reader".to_string(), reader);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
@@ -3813,7 +3824,7 @@ async fn a_named_auto_channel_lists_to_a_third_party_with_its_description() {
     apps_map.insert(
         "graf".to_string(),
         AppConfig {
-            policy,
+            policy: std::sync::Arc::new(policy),
             ..minimal_app_config("graf", None, vec![])
         },
     );
@@ -4124,7 +4135,9 @@ async fn build_messaging_refuses_a_subscriber_above_the_channel_ceiling() {
         }),
         vec![],
     );
-    app.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address]);
+    app.policy = std::sync::Arc::new(
+        brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address]),
+    );
     let mut apps_map: IM<String, AppConfig> = IM::new();
     apps_map.insert("deep".to_string(), app);
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
@@ -4677,11 +4690,11 @@ async fn build_messaging_derives_the_webhook_entry_from_its_block() {
     assert_eq!(bare.description, None);
 }
 
-/// Commit refuses an app map that is not the one the plan was derived from.
-/// The directory's `App` entries and the delivery gates must share one
-/// snapshot, not two equal-but-distinct maps.
+/// Commit refuses an agent table holding a map that is not the one the plan was
+/// derived from. The directory's `App` entries and the delivery gates must share
+/// one snapshot, not two equal-but-distinct maps.
 #[tokio::test]
-#[should_panic(expected = "not the one this plan was derived from")]
+#[should_panic(expected = "does not hold the map this plan was derived from")]
 async fn commit_refuses_an_apps_map_the_plan_was_not_derived_from() {
     use brenn_lib::config::BrennConfig;
     use brenn_server::test_support::init_db_memory;
@@ -4704,7 +4717,7 @@ async fn commit_refuses_an_apps_map_the_plan_was_not_derived_from() {
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
     commit_messaging(
         plan,
-        &other,
+        &brenn_lib::config::AppTable::new(other),
         init_db_memory(),
         ActiveBridges::new(),
         alert_dispatcher,

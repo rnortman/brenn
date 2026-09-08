@@ -35,6 +35,7 @@ pub(crate) async fn start_repo_sync(
     repos: &[brenn_lib::config::RepoDeclRaw],
     repo_sync_config: &RepoSyncConfig,
     apps: &Arc<IndexMap<String, AppConfig>>,
+    app_table: &brenn_lib::config::AppTable,
 ) -> RepoSyncResult {
     // Build the shared clone index + per-remote locks once. Both are handed to
     // the manager (when it spawns) and to the git-repo-pull tool.
@@ -53,7 +54,7 @@ pub(crate) async fn start_repo_sync(
         clones.clone(),
         remote_locks.clone(),
         repo_sync_config,
-        apps,
+        app_table,
     )
     .await;
 

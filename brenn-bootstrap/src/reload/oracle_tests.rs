@@ -26,10 +26,13 @@ use brenn_server::test_support::init_db_file;
 
 use super::driver::TriggerSource;
 use super::driver::tests::{
-    BootFixture, Booted, DESKBAR_READS, READER, Tree, async_tool_registry, boot, boot_with,
-    document, document_with_a_broker_only, document_with_a_consumer,
-    document_with_an_mqtt_consumer, install_package, install_package_from, seat_a_conversation,
-    staged_module, subscriber_debug_lines, surface_document, surfaces_document, write_surface_kind,
+    BootFixture, Booted, READER, SPILL_ACL_BY_ADDRESS, Tree, async_tool_registry, boot, boot_with,
+    conversation_of, document, document_covering_work, document_push_subscribing,
+    document_push_subscribing_acl, document_subscribing, document_with_a_broker_only,
+    document_with_a_consumer, document_with_an_mqtt_consumer, insert_dynamic_row,
+    insert_push_dynamic_row, install_package, install_package_from, push_owner_covering_work,
+    seat_a_conversation, seat_position, seat_user, spill_channel, staged_module,
+    subscriber_debug_lines, surface_document, surfaces_document, write_surface_kind,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -98,6 +101,35 @@ pub(crate) struct Snapshot {
     /// pinned meanwhile by the direct read in
     /// `a_last_mqtt_binding_leaving_matches_a_fresh_boot`.
     mqtt_sessions: Vec<String>,
+    /// The authority view of every agent, one line per slug, sorted.
+    ///
+    /// Read off the table the gates read, not off the plan: a reload that
+    /// converged its subscriber entries and forgot to swap the map agrees with
+    /// a fresh boot on every channel line and differs here.
+    agent_authority: Vec<String>,
+    /// The class-B view of every agent — what a Claude Code process is spawned
+    /// with — one line per slug, sorted.
+    agent_spawn: Vec<String>,
+    /// The class-A view of every agent — what a route reads per request — one
+    /// line per slug, sorted.
+    agent_per_call: Vec<String>,
+    /// Every row of `messaging_dynamic_subscriptions`, sorted.
+    ///
+    /// Nothing is excluded, `created_at` included: a row is minted once when
+    /// the agent subscribed and is carried across a restart verbatim, so two
+    /// processes over the same database must hold the same timestamps. A
+    /// revoked row that a fresh boot classifies dormant is still a row on both
+    /// sides; a row the reload deleted where boot keeps it is the drift this
+    /// field is here to see.
+    dynamic_subs: Vec<String>,
+    /// The virtual-tools file each agent's `noop_mcp.py` would read at its
+    /// next start: one line per slug carrying the file's whole content, sorted.
+    ///
+    /// Read off the filesystem rather than re-rendered from the map, because
+    /// the rename is the step under test: an agent whose grant moved and whose
+    /// staged rendering never landed holds the old bytes here while a fresh
+    /// boot holds the new.
+    virtual_tools: Vec<String>,
 }
 
 impl Snapshot {
@@ -124,6 +156,11 @@ impl Snapshot {
             mqtt_filters,
             mqtt_routes,
             mqtt_sessions,
+            agent_authority,
+            agent_spawn,
+            agent_per_call,
+            dynamic_subs,
+            virtual_tools,
         } = self;
         assert_lines("channels", channels, &fresh.channels);
         assert_lines("registrations", registrations, &fresh.registrations);
@@ -138,6 +175,32 @@ impl Snapshot {
         assert_lines("mqtt_filters", mqtt_filters, &fresh.mqtt_filters);
         assert_lines("mqtt_routes", mqtt_routes, &fresh.mqtt_routes);
         assert_lines("mqtt_sessions", mqtt_sessions, &fresh.mqtt_sessions);
+        assert_lines("agent_authority", agent_authority, &fresh.agent_authority);
+        assert_lines("agent_spawn", agent_spawn, &fresh.agent_spawn);
+        assert_lines("agent_per_call", agent_per_call, &fresh.agent_per_call);
+        assert_lines("dynamic_subs", dynamic_subs, &fresh.dynamic_subs);
+        assert_lines("virtual_tools", virtual_tools, &fresh.virtual_tools);
+    }
+
+    /// The authority view, for a transition asserting the agent moved at all.
+    pub(crate) fn agent_authority(&self) -> &[String] {
+        &self.agent_authority
+    }
+
+    /// The class-B view, for the transitions whose point is a respawn.
+    pub(crate) fn agent_spawn(&self) -> &[String] {
+        &self.agent_spawn
+    }
+
+    /// The durable dynamic rows, for the transitions that revoke, revive or
+    /// prune one: a field compared while empty on both sides tests nothing.
+    pub(crate) fn dynamic_subs(&self) -> &[String] {
+        &self.dynamic_subs
+    }
+
+    /// The rendered tool lists, for the transition that moves one.
+    pub(crate) fn virtual_tools(&self) -> &[String] {
+        &self.virtual_tools
     }
 
     /// The broker SUBSCRIBE set, for a transition asserting it moved at all.
@@ -317,6 +380,39 @@ async fn snapshot(booted: &Booted) -> Snapshot {
     surface_roots.sort();
     surface_roots.push(format!("kernel {:?}", served.kernel));
 
+    let apps = booted.driver.env().apps.load();
+    let mut agent_authority: Vec<String> = apps
+        .values()
+        .map(|app| format!("{} {:?}", app.slug, app.authority()))
+        .collect();
+    agent_authority.sort();
+    // The two class views, rendered as `brenn-lib` spells them: their field
+    // lists are one exhaustive destructuring of `AppConfig`, so a new field
+    // cannot be classified in `compare.rs` and silently missed here.
+    let mut agent_spawn: Vec<String> = apps
+        .values()
+        .map(|app| format!("{:?}", app.class_views().0))
+        .collect();
+    agent_spawn.sort();
+    let mut agent_per_call: Vec<String> = apps
+        .values()
+        .map(|app| format!("{:?}", app.class_views().1))
+        .collect();
+    agent_per_call.sort();
+    let mut virtual_tools: Vec<String> = apps
+        .values()
+        .map(|app| {
+            let path = app.virtual_tools_path();
+            match std::fs::read_to_string(&path) {
+                Ok(content) => format!("{} {content}", app.slug),
+                // Rendered rather than skipped: an agent whose file the process
+                // never wrote is a difference from one whose file it did.
+                Err(e) => format!("{} (unreadable: {e})", app.slug),
+            }
+        })
+        .collect();
+    virtual_tools.sort();
+
     let (mqtt_filters, mqtt_routes) = mqtt_ingress(booted, &entries).await;
     let mqtt_sessions: Vec<String> = booted
         .mqtt
@@ -338,7 +434,41 @@ async fn snapshot(booted: &Booted) -> Snapshot {
         mqtt_filters,
         mqtt_routes,
         mqtt_sessions,
+        agent_authority,
+        agent_spawn,
+        agent_per_call,
+        dynamic_subs: dynamic_subs(&booted.messenger).await,
+        virtual_tools,
     }
+}
+
+/// Every durable dynamic-subscription row, as lines.
+///
+/// The channel is rendered by uuid rather than by address: a row survives its
+/// channel leaving the directory — that is what dormancy is — so a join would
+/// drop exactly the rows a revoke case is about. The uuid is stable across the
+/// two processes because the row carries it.
+async fn dynamic_subs(messenger: &Messenger) -> Vec<String> {
+    let conn = messenger.db().lock().await;
+    let mut rows: Vec<String> = brenn_messaging_store::db::load_dynamic_subscriptions(&conn)
+        .into_iter()
+        .map(|row| {
+            format!(
+                "{} on {} push_depth={:?} retain_depth={:?} noise={:?} wake_min={:?} qos={:?} \
+             created_at={}",
+                row.app_slug,
+                row.channel_uuid,
+                row.push_depth,
+                row.retain_depth,
+                row.noise,
+                row.wake_min,
+                row.qos,
+                row.created_at,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
 }
 
 /// The two MQTT ingress fields: the filter set every live session holds, and
@@ -723,12 +853,35 @@ pub(crate) async fn a_reload_matches_a_fresh_boot(
     arrive: impl AsyncFnOnce(&mut Booted),
     worth_comparing: impl FnOnce(&Snapshot),
 ) {
+    a_seeded_reload_matches_a_fresh_boot(tree, fixture, async |_| {}, arrive, worth_comparing)
+        .await;
+}
+
+/// [`a_reload_matches_a_fresh_boot`] with a hook that runs on the booted
+/// process **before** the database is copied.
+///
+/// For the transitions whose starting state is not the document alone: a user
+/// row the agent's `allowed_users` names, a durable dynamic subscription the
+/// agent minted at runtime. Both sides have to start from that state, and only
+/// what is in the database when the copy is taken reaches the fresh side.
+///
+/// The seed writes rows, never the document tree: a change to the tree is the
+/// transition and belongs in `arrive`.
+pub(crate) async fn a_seeded_reload_matches_a_fresh_boot(
+    tree: &Tree,
+    fixture: impl Fn(brenn_db::Db) -> BootFixture,
+    seed: impl AsyncFnOnce(&Booted),
+    arrive: impl AsyncFnOnce(&mut Booted),
+    worth_comparing: impl FnOnce(&Snapshot),
+) {
     let store = tempfile::tempdir().expect("a directory for the databases");
     let mut booted = boot_with(
         tree,
         fixture(init_db_file(&store.path().join("running.db"))),
     )
     .await;
+
+    seed(&booted).await;
 
     let restart_point = store.path().join("restart.db");
     copy_database(&booted.db, &restart_point).await;
@@ -823,7 +976,6 @@ fn panel_fixture(assets: &std::path::Path) -> impl Fn(brenn_db::Db) -> BootFixtu
     move |db| BootFixture {
         db: Some(db),
         surface_assets: Some(assets.to_path_buf()),
-        reader_reads: DESKBAR_READS.to_vec(),
         ..BootFixture::default()
     }
 }
@@ -1480,6 +1632,598 @@ async fn a_last_mqtt_binding_leaving_matches_a_fresh_boot() {
                 ["ha".to_string()],
                 "the session outlives its last binding on both sides, or this transition \
                  compares nothing",
+            );
+        },
+    )
+    .await;
+}
+
+// ── The oracle over the agent transitions ─────────────────────────────────
+
+/// The rig every agent transition boots on: a database per process and
+/// nothing else. An agent needs no mount, no asset tree and no broker.
+fn agent_fixture(db: brenn_db::Db) -> BootFixture {
+    BootFixture {
+        db: Some(db),
+        ..BootFixture::default()
+    }
+}
+
+/// **The motivating shape.** The agent's `acl subscribe` is widened and a
+/// `subscribe` line added: the entry has to appear on the live channel with
+/// the candidate's depths, and the swapped table has to carry the widened
+/// policy every gate reads per call.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acl_widened_and_a_subscription_added_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_subscribing("", &[]));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            reload_onto(booted, &tree, &document_subscribing("", &["work"])).await;
+            assert_eq!(
+                booted.last_status().await.delta.subscriptions_added,
+                vec![format!("{READER} brenn:work")],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:work ") && line.contains(READER)),
+                "the agent's entry is on the channel it now reads: {:?}",
+                reloaded.channels,
+            );
+            assert!(
+                reloaded
+                    .agent_authority()
+                    .iter()
+                    .any(|line| line.contains("brenn:work")),
+                "and the swapped table carries the widened authority: {:?}",
+                reloaded.agent_authority(),
+            );
+        },
+    )
+    .await;
+}
+
+/// **The agent's whole `messaging` block removed.** Its send budget and every
+/// `subscribe` line go at once, so the candidate map holds `None` where the
+/// booted one held a resolved config, and every static entry leaves the
+/// directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agents_messaging_block_removed_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_subscribing("", &["work"]));
+    let unconfigured = document_subscribing("", &[]).replace("    send_budget = 1000000;\n", "");
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            reload_onto(booted, &tree, &unconfigured).await;
+            assert_eq!(
+                booted.last_status().await.delta.subscriptions_removed,
+                vec![format!("{READER} brenn:work")],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:work ") && !line.contains(READER)),
+                "the entry left the channel: {:?}",
+                reloaded.channels,
+            );
+        },
+    )
+    .await;
+}
+
+/// **A channel retuned under a subscribed agent.** The channel departs and
+/// arrives again, and the agent is promoted by closure so that its entry comes
+/// back with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retune_under_a_subscribed_agent_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_subscribing("", &["work"]));
+    let retuned = document_subscribing("", &["work"]).replace(
+        "    standing_retain_depth = 64;",
+        "    standing_retain_depth = 32;",
+    );
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            reload_onto(booted, &tree, &retuned).await;
+            let status = booted.last_status().await;
+            assert_eq!(
+                status.delta.channels_changed,
+                vec!["brenn:work".to_string()]
+            );
+            assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:work ") && line.contains(READER)),
+                "the agent came back with the channel: {:?}",
+                reloaded.channels,
+            );
+        },
+    )
+    .await;
+}
+
+/// **A grant that moves the rendered tool list.** The reload stages the
+/// candidate's rendering and renames it onto the live path at the swap; a
+/// fresh boot writes the same bytes at startup. An agent whose file never
+/// landed holds the old list here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tool_grant_added_matches_a_fresh_boot() {
+    // A declared broker, so the `client` matcher that derives the MQTT publish
+    // grant — and with it the tool — names a client both documents hold.
+    const BROKER: &str =
+        "mqtt_client ha {\n    url = \"mqtts://127.0.0.1:8883\";\n    qos = 1;\n}\n";
+    let tree = Tree::holding(&document(BROKER));
+    let granted = document(BROKER).replace(
+        "acl publish [exact reload_requests, exact work];",
+        "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+    );
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            reload_onto(booted, &tree, &granted).await;
+            assert_eq!(
+                booted.last_status().await.delta.agents_changed,
+                vec![READER.to_string()],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .virtual_tools()
+                    .iter()
+                    .any(|line| line.contains("MqttSend")),
+                "the renamed rendering lists the tool the grant added: {:?}",
+                reloaded.virtual_tools(),
+            );
+        },
+    )
+    .await;
+}
+
+/// **A first push-enabled `subscribe` on an agent that had none.** The commit
+/// mints the agent's singleton conversation, provisions that conversation's
+/// chat channel family into the live directory and gives it a position — the
+/// sequence boot runs for the same entry, compared against boot running it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_push_subscription_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_push_subscribing("", &["alice"], &[]));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        // The owner's row, so both processes resolve the same owner.
+        // Without it `allowed_users.first()` finds no matching user and
+        // the conversation is never minted.
+        async |booted| {
+            seat_user(&booted.db, "alice").await;
+        },
+        async |booted| {
+            reload_onto(
+                booted,
+                &tree,
+                &document_push_subscribing("", &["alice"], &["work"]),
+            )
+            .await;
+            assert!(
+                conversation_of(booted, READER).await.is_some(),
+                "the attach minted the agent's conversation",
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.contains(&format!("chat.app.{READER}.in."))),
+                "the conversation's chat family is in the directory: {:?}",
+                reloaded.channels,
+            );
+            assert!(
+                reloaded
+                    .rows
+                    .iter()
+                    .any(|line| line.starts_with("cursor ") && line.contains("on brenn:work")),
+                "and it holds a position on the channel it now reads: {:?}",
+                reloaded.rows,
+            );
+        },
+    )
+    .await;
+}
+
+/// **An ACL narrowed under a live dynamic subscription.** The entry is folded
+/// out and the durable row kept — the dormant state a fresh boot's merge puts
+/// the same row in.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acl_narrowed_under_a_dynamic_row_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_covering_work(""));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            insert_dynamic_row(booted, "brenn:work", true).await;
+        },
+        async |booted| {
+            reload_onto(booted, &tree, &document("")).await;
+            assert_eq!(
+                booted.last_status().await.delta.dynamic_revoked,
+                vec![format!("{READER} brenn:work")],
+            );
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.dynamic_subs().len(),
+                1,
+                "the row is kept, which is what dormancy is: {:?}",
+                reloaded.dynamic_subs(),
+            );
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:work ") && !line.contains(READER)),
+                "and folded out of the directory: {:?}",
+                reloaded.channels,
+            );
+        },
+    )
+    .await;
+}
+
+/// **An ACL widened over a dormant row.** The row is folded back in at its own
+/// depths, which is what the boot merge does with the same row.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acl_widened_over_a_dormant_row_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document(""));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        // Dormant: the row exists but the entry is not in the directory.
+        async |booted| {
+            insert_dynamic_row(booted, "brenn:work", false).await;
+        },
+        async |booted| {
+            reload_onto(booted, &tree, &document_covering_work("")).await;
+            assert_eq!(
+                booted.last_status().await.delta.dynamic_revived,
+                vec![format!("{READER} brenn:work")],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:work ") && line.contains(READER)),
+                "the row is folded back onto the channel: {:?}",
+                reloaded.channels,
+            );
+        },
+    )
+    .await;
+}
+
+/// **A static `subscribe` declared where the agent holds a dynamic row.**
+/// Static config wins: the row is deleted and the static entry takes its
+/// place.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_static_subscription_over_a_dynamic_row_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_covering_work(""));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            insert_dynamic_row(booted, "brenn:work", true).await;
+        },
+        async |booted| {
+            reload_onto(booted, &tree, &document_subscribing("", &["work"])).await;
+            assert_eq!(
+                booted.last_status().await.delta.dynamic_pruned,
+                vec![format!("{READER} brenn:work")],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded.dynamic_subs().is_empty(),
+                "the row is gone: {:?}",
+                reloaded.dynamic_subs(),
+            );
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:work ") && line.contains(READER)),
+                "and the static entry took its place: {:?}",
+                reloaded.channels,
+            );
+        },
+    )
+    .await;
+}
+
+/// **A dormant row on a channel the candidate removes.** The two-step
+/// retirement of a channel an agent subscribed to dynamically: the ACL is
+/// re-granted and the `[[channel]]` block dropped in one document, and the row
+/// must be left exactly where a fresh boot leaves it — dormant, with its
+/// position, and no directory entry for the address.
+///
+/// The position is seeded along with the row. Without it the `rows` view
+/// compares an empty position set on both sides and the transition proves
+/// nothing about the cursor, which is the state the carve-out is really about:
+/// a fresh boot's reconcile keeps the position only because the dormant row
+/// justifies it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dormant_row_on_a_removed_channel_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_push_subscribing_acl(
+        &spill_channel(4),
+        &["alice"],
+        &["work"],
+        &[],
+        &[],
+    ));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            seat_user(&booted.db, "alice").await;
+            // The conversation both `app_conversation` calls resolve through —
+            // the reload's and the fresh boot's reconcile.
+            booted
+                .messenger
+                .attach_conversation("brenn:work", READER, Depth::Bounded(1))
+                .await;
+            let conversation = conversation_of(booted, READER)
+                .await
+                .expect("alice's conversation");
+            let uuid = insert_dynamic_row(booted, "brenn:spill", false).await;
+            seat_position(
+                booted,
+                uuid,
+                &brenn_lib::messaging::ParticipantId::for_conversation(conversation),
+            )
+            .await;
+        },
+        async |booted| {
+            reload_onto(
+                booted,
+                &tree,
+                &document_push_subscribing_acl(
+                    "",
+                    &["alice"],
+                    &["work"],
+                    &[],
+                    &[SPILL_ACL_BY_ADDRESS],
+                ),
+            )
+            .await;
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.dynamic_subs().len(),
+                1,
+                "the row is still there: {:?}",
+                reloaded.dynamic_subs(),
+            );
+            assert!(
+                !reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with("brenn:spill ")),
+                "and the channel it names is not in the directory: {:?}",
+                reloaded.channels,
+            );
+            assert!(
+                reloaded
+                    .rows
+                    .iter()
+                    .any(|line| line.starts_with("cursor ") && line.contains("on brenn:spill")),
+                "while the position it resumes from is: {:?}",
+                reloaded.rows,
+            );
+        },
+    )
+    .await;
+}
+
+/// **An owner change on a push-subscribed singleton.** The owner is
+/// `allowed_users.first()`, and every position the agent's channels hold is
+/// held under that owner's singleton conversation — so moving it mints the new
+/// owner's conversation with positions, and leaves the old owner's positions
+/// unjustified. A fresh boot's `reconcile_subscriber_cursors` deletes those;
+/// the reload has to delete them too, while leaving the old owner's
+/// conversation and chat family, which their own entries justify.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_change_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_push_subscribing("", &["alice"], &["work"]));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        // Both owners' rows, and alice's conversation with its position: the
+        // starting state both processes have to walk away from.
+        async |booted| {
+            seat_user(&booted.db, "alice").await;
+            seat_user(&booted.db, "bob").await;
+            booted
+                .messenger
+                .attach_conversation("brenn:work", READER, Depth::Bounded(1))
+                .await;
+        },
+        async |booted| {
+            reload_onto(
+                booted,
+                &tree,
+                &document_push_subscribing("", &["bob"], &["work"]),
+            )
+            .await;
+            assert_eq!(
+                booted.last_status().await.delta.agents_changed,
+                vec![READER.to_string()],
+            );
+        },
+        |reloaded| {
+            let positions: Vec<&String> = reloaded
+                .rows
+                .iter()
+                .filter(|line| line.starts_with("cursor ") && line.contains("on brenn:work"))
+                .collect();
+            assert_eq!(
+                positions.len(),
+                1,
+                "one conversation holds the channel's position, the new owner's: {:?}",
+                reloaded.rows,
+            );
+            assert_eq!(
+                reloaded
+                    .channels
+                    .iter()
+                    .filter(|line| line.contains(&format!("chat.app.{READER}.in.")))
+                    .count(),
+                2,
+                "both owners' chat families are still in the directory: {:?}",
+                reloaded.channels,
+            );
+        },
+    )
+    .await;
+}
+
+/// **The same with a live push-enabled dynamic row.** A fresh boot seats the
+/// new owner after the dynamic merge, so it is positioned on the dynamic
+/// channel too — which a reload seating it off the candidate plan's static
+/// entries alone would miss.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_change_under_a_dynamic_row_matches_a_fresh_boot() {
+    let tree = Tree::holding(&push_owner_covering_work(&["alice"]));
+
+    a_seeded_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            seat_user(&booted.db, "alice").await;
+            seat_user(&booted.db, "bob").await;
+            insert_push_dynamic_row(booted, "brenn:work").await;
+            booted
+                .messenger
+                .attach_conversation("brenn:work", READER, Depth::Bounded(1))
+                .await;
+        },
+        async |booted| {
+            reload_onto(booted, &tree, &push_owner_covering_work(&["bob"])).await;
+            assert_eq!(
+                booted.last_status().await.delta.agents_changed,
+                vec![READER.to_string()],
+            );
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.dynamic_subs().len(),
+                1,
+                "the row is untouched: what moved is whose conversation holds its position: {:?}",
+                reloaded.dynamic_subs(),
+            );
+            assert_eq!(
+                reloaded
+                    .rows
+                    .iter()
+                    .filter(|line| line.starts_with("cursor ") && line.contains("on brenn:work"))
+                    .count(),
+                1,
+                "and the new owner holds it: {:?}",
+                reloaded.rows,
+            );
+        },
+    )
+    .await;
+}
+
+/// **A class-B edit.** `model` is what a Claude Code process is spawned with,
+/// so the swapped table has to carry it for the next spawn while nothing else
+/// about the process moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_process_edit_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document(""));
+    let remodelled = document("").replace(
+        "    working_dir = \".\";",
+        "    working_dir = \".\";\n    model = \"opus\";",
+    );
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            reload_onto(booted, &tree, &remodelled).await;
+            assert_eq!(
+                booted.last_status().await.delta.agents_changed,
+                vec![READER.to_string()],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .agent_spawn()
+                    .iter()
+                    .any(|line| line.contains("model: \"opus\"")),
+                "the swapped table carries what the next spawn reads: {:?}",
+                reloaded.agent_spawn(),
+            );
+        },
+    )
+    .await;
+}
+
+/// **A class-A edit.** `icon` is read off the map per request, so the reload's
+/// only work is the swap — and a reload that skipped it serves the old value
+/// where a fresh boot serves the new.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_call_edit_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document(""));
+    let redecorated = document("").replace(
+        "    working_dir = \".\";",
+        "    working_dir = \".\";\n    icon = \"telescope\";",
+    );
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        agent_fixture,
+        async |booted| {
+            reload_onto(booted, &tree, &redecorated).await;
+            assert_eq!(
+                booted.last_status().await.delta.agents_changed,
+                vec![READER.to_string()],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .agent_per_call
+                    .iter()
+                    .any(|line| line.contains("telescope")),
+                "the swapped table carries what the route reads: {:?}",
+                reloaded.agent_per_call,
             );
         },
     )

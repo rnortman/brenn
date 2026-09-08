@@ -28,8 +28,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use brenn_lib::messaging::config::Depth;
-use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntry, SubscriberEntryKind};
+use brenn_lib::messaging::config::{Depth, DormantSubscription};
+use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntryKind};
 use brenn_lib::wasm_package::Verified;
 use brenn_messaging::{Messenger, WASM_WINDOW_MAX_NEW};
 use brenn_messaging_boot::MessagingPlan;
@@ -44,9 +44,12 @@ use brenn_server::routes::surface::SurfaceCloseReason;
 use brenn_surface_server::SurfaceRuntime;
 
 use crate::consumers::{ConsumerRegistry, LoadedConsumer, RunningConsumer, start_consumer};
+use crate::reload::agents::AgentChange;
 use crate::reload::delta::{PlanDelta, live_subscriber_refusals};
 use crate::reload::driver::ReloadEnv;
+use crate::reload::dynamic::{DynamicSnapshot, RevokeReason};
 use crate::reload::mqtt::address_of;
+use crate::reload::subscribers::PlannedSubscribers;
 use crate::reload::surfaces::{Arrival, SurfaceDocs};
 
 /// What the broker did not take during the walk, split by whether anything in
@@ -62,15 +65,29 @@ pub(crate) struct MqttCommitReport {
     pub(crate) failed: Vec<String>,
 }
 
+/// The two halves of the walk prepare could not measure: what the broker did
+/// with each moved filter, and which condemned sessions died at the swap.
+#[derive(Debug, Default)]
+pub(crate) struct CommitReport {
+    pub(crate) mqtt: MqttCommitReport,
+    /// `"<slug> conv <id>"`, the sessions killed now and the ones left to die
+    /// at their turn end.
+    pub(crate) sessions_retired: Vec<String>,
+    pub(crate) sessions_retire_pending: Vec<String>,
+}
+
 /// Apply a prepared reload to the running process.
 ///
-/// One check runs before the first mutation and can still decline: the live
-/// directory is asked again whether a subscriber the plan cannot see has landed
-/// on a channel this walk would take away. Prepare asked that question too, but
-/// the answer can change between the two — a dynamic app subscription or an
-/// attach-minted surface entry arrives on the channel while prepare is hashing
-/// and compiling the arriving components. Nothing has been touched yet at that
-/// point, so it is a refusal like any other.
+/// Three checks run before the first mutation and can still decline. Two of
+/// them ask a question prepare asked whose answer can change between the two —
+/// whether a subscriber the plan cannot see has landed on a channel this walk
+/// would take away (a dynamic app subscription or an attach-minted surface
+/// entry arriving while prepare hashes and compiles the arriving components),
+/// and whether a changed agent's dynamic subscriptions still are what the
+/// re-merge classified. The third is asked here alone, because it reads the
+/// store: whether an arriving channel's address already belongs to a different
+/// channel row. Nothing has been touched yet at that point, so each is a
+/// refusal like any other.
 ///
 /// # Panics
 ///
@@ -90,10 +107,18 @@ pub(crate) async fn apply(
     loaded: Vec<(String, LoadedConsumer)>,
     records: &HashMap<String, Verified>,
     surfaces: &SurfaceCommit<'_>,
-) -> Result<MqttCommitReport, Vec<String>> {
+) -> Result<CommitReport, Vec<String>> {
     let arrived = live_subscriber_refusals(delta, env.messenger.directory());
     if !arrived.is_empty() {
         return Err(arrived);
+    }
+    let moved = dynamic_subscriptions_moved(env, delta).await;
+    if !moved.is_empty() {
+        return Err(moved);
+    }
+    let collisions = channel_rows_collide(env, delta).await;
+    if !collisions.is_empty() {
+        return Err(collisions);
     }
 
     let channels = plan.directory.list();
@@ -112,6 +137,17 @@ pub(crate) async fn apply(
         "reload commit: a subscriber arrived on a channel this reload is taking away, after the \
          departing consumers and surfaces had already stopped: {arrived:?}",
     );
+    // The same input hazard, for the same reason: a live session of a changed
+    // agent can mint a dynamic row at any moment, authorized under the old
+    // policy, and a row minted during either wait is one the re-merge never
+    // classified. Past the retirements nothing can be declined.
+    let moved = dynamic_subscriptions_moved(env, delta).await;
+    assert!(
+        moved.is_empty(),
+        "reload commit: a changed agent's dynamic subscriptions moved after the departing \
+         consumers and surfaces had already stopped: {moved:?}",
+    );
+    retire_agent_subscriptions(env, delta).await;
     describe_channels(env, delta).await;
     let mut report = MqttCommitReport {
         deferred: mqtt_outgoing(env, delta).await,
@@ -119,6 +155,9 @@ pub(crate) async fn apply(
     };
     remove_channels(env, delta);
     add_channels(env, delta).await;
+    swap_agents(env, plan, delta);
+    let sessions = retire_stale_sessions(env, delta).await;
+    start_agent_subscriptions(env, delta, &planned).await;
     let incoming = mqtt_incoming(env, delta).await;
     report.deferred.extend(incoming.deferred);
     report.failed = incoming.failed;
@@ -134,7 +173,495 @@ pub(crate) async fn apply(
     // a verdict on the document — the document was accepted before any of this
     // ran.
     crate::assert_every_subscriber_wired(&env.messenger, &env.router);
-    Ok(report)
+    Ok(CommitReport {
+        mqtt: report,
+        sessions_retired: sessions.retired,
+        sessions_retire_pending: sessions.pending,
+    })
+}
+
+/// Whether a changed agent's dynamic subscriptions still are what prepare
+/// classified.
+///
+/// The re-merge is a verdict about a set of rows, and that set is the one input
+/// to a reload a live session can change while prepare runs: `MessageSubscribe`
+/// mints a durable row or a non-durable registration at any moment, authorized
+/// under the *old* policy until the swap. A pair minted after prepare read the
+/// set would be left folded on terms neither document describes — an entry and
+/// a cursor the candidate's ACL denies, and for `mqtt:` a broker filter and a
+/// route the delta did not account for. A row dropped and re-minted at other
+/// depths is the same hazard: the commit would fold it back in at the depths
+/// prepare saw, so the comparison is on each pair's whole identity and not on
+/// its channel.
+///
+/// Asked of exactly the agents this reload walks, because they are the only
+/// ones whose classification this reload acts on. Asked before anything is
+/// touched, so it declines like any other refusal, and once more after the
+/// unbounded waits, where it can only assert.
+async fn dynamic_subscriptions_moved(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
+    if delta.agents_changed.is_empty() {
+        return Vec::new();
+    }
+    let rows = {
+        let conn = env.messenger.db().lock().await;
+        brenn_messaging_store::db::load_dynamic_subscriptions(&conn)
+    };
+    let now = DynamicSnapshot {
+        rows,
+        nondurable: env.messenger.nondurable_dynamic_subs(),
+    };
+    let live = env.messenger.directory();
+    let mut refusals = Vec::new();
+    for change in &delta.agents_changed {
+        let held = now.keys_of(&change.slug);
+        let classified = delta.dynamic_observed.keys_of(&change.slug);
+        if held == classified {
+            continue;
+        }
+        // Named by address wherever the directory holds the channel, and by
+        // uuid where it does not: a dormant row can outlive its channel entry,
+        // and an operator reading this needs the pair that moved either way.
+        // Deduplicated because a row re-minted on other terms is two keys on
+        // one channel, which the operator reads as one moved subscription.
+        let mut moved: Vec<String> = held
+            .symmetric_difference(&classified)
+            .map(|key| {
+                let uuid = key.channel_uuid();
+                match live.by_uuid(&uuid) {
+                    Some(entry) => entry.address.clone(),
+                    None => uuid.to_string(),
+                }
+            })
+            .collect();
+        moved.sort();
+        moved.dedup();
+        refusals.push(format!(
+            "agent {:?} subscribed or unsubscribed dynamically while this reload was being \
+             prepared ({}); reload again",
+            change.slug,
+            moved.join(", "),
+        ));
+    }
+    refusals
+}
+
+/// Whether an arriving durable channel's address already belongs to a different
+/// channel row.
+///
+/// `messaging_channels.address` is unique and a channel's store row is never
+/// deleted — removing a `[[channel]]` block takes the directory entry away and
+/// leaves the row for the operator to delete deliberately. So a candidate that
+/// declares an address under a uuid other than the one the row carries has no
+/// place to write: the insert is refused by the unique index, the update by uuid
+/// matches nothing, and the directory would hold a channel with no row of its
+/// own until the first publish failed the foreign key. Boot answers this with a
+/// panic in the store; a reload can still decline, and does, because the whole
+/// point of the door is that a document the process cannot run leaves the
+/// running one alone.
+///
+/// A declared durable channel derives its uuid from its address, so reaching
+/// this needs a `uuid_pins` entry moving one — which is exactly the shape an
+/// operator re-declaring a removed channel writes when they mint a fresh uuid
+/// instead of reusing the row's. Only reachable once the block's own removal has
+/// been applied: while the address is still in the live directory, the arriving
+/// entry is refused at prepare as a channel newly minted over one that exists.
+async fn channel_rows_collide(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
+    let arriving: Vec<(Uuid, String)> = delta
+        .joining()
+        .filter(|entry| entry.capabilities().durable)
+        .map(|entry| (entry.uuid, entry.address.clone()))
+        .collect();
+    if arriving.is_empty() {
+        return Vec::new();
+    }
+    let conn = env.messenger.db().lock().await;
+    arriving
+        .into_iter()
+        .filter_map(|(uuid, address)| {
+            let held = brenn_messaging_store::db::channel_uuid_by_address(&conn, &address)
+                .unwrap_or_else(|e| {
+                    panic!("reload commit: reading the channel row for {address:?}: {e}")
+                })?;
+            (held != uuid).then(|| {
+                format!(
+                    "channel {address:?} is declared under uuid {uuid}, but its address already \
+                     belongs to the channel row under uuid {held}; reuse that uuid or delete the \
+                     row",
+                )
+            })
+        })
+        .collect()
+}
+
+/// Step 3: take every changed agent off the channels the candidate no longer
+/// has it reading.
+///
+/// Runs before the channel steps because the detach resolves an address in the
+/// live directory, and a genuine removal — an entry that does not come back on
+/// this reload's other side — owes the cursor row a deletion, which is the
+/// orphan a fresh boot's reconcile would reap. A retune and a moved channel put
+/// the same uuid on both sides, so neither detaches: the position is kept and
+/// step 6 re-attaches it where it was.
+async fn retire_agent_subscriptions(env: &ReloadEnv, delta: &PlanDelta) {
+    let live = env.messenger.directory();
+    let mut pruned_rows: Vec<(Uuid, String)> = Vec::new();
+    for change in &delta.agents_changed {
+        let kind = SubscriberEntryKind::App(change.slug.clone());
+        let returning: HashSet<Uuid> = change.subs_added.iter().map(|(uuid, _)| *uuid).collect();
+        for (uuid, address) in &change.subs_removed {
+            let removed = live.remove_subscriber(uuid, &kind);
+            assert!(
+                removed.is_some(),
+                "reload commit: agent {:?} is losing its subscription to {address:?}, which the \
+                 live directory does not hold — host bug",
+                change.slug,
+            );
+            if !returning.contains(uuid) {
+                env.messenger
+                    .detach_conversation(address, &change.slug)
+                    .await;
+            }
+            info!(agent = %change.slug, address = %address, "reload: agent subscription removed");
+        }
+        for revoked in &change.dynamic.revoke {
+            let moved = &revoked.moved;
+            let removed = live.remove_subscriber(&moved.channel_uuid, &kind);
+            assert!(
+                removed.is_some(),
+                "reload commit: agent {:?} has its dynamic subscription to {:?} revoked, which \
+                 the live directory does not hold — host bug",
+                change.slug,
+                moved.address,
+            );
+            if moved.row.is_none() {
+                let held = env
+                    .messenger
+                    .remove_nondurable_dynamic_sub(&moved.channel_uuid, &change.slug);
+                assert!(
+                    held,
+                    "reload commit: agent {:?} has its non-durable dynamic subscription to {:?} \
+                     revoked, but the messenger holds no registration for it — the in-memory set \
+                     and the directory disagree (host bug)",
+                    change.slug, moved.address,
+                );
+            }
+            // The durable row and the cursor both stay: dormancy preserves
+            // the cursor position so the subscription can resume if the ACL
+            // comes back.
+            match &revoked.reason {
+                RevokeReason::AclDenies => info!(
+                    agent = %change.slug,
+                    address = %moved.address,
+                    "reload: agent dynamic subscription revoked — the agent's policy no longer \
+                     authorizes delivery on this channel; durable row retained (not pruned), \
+                     subscription dormant until the ACL is re-granted",
+                ),
+                RevokeReason::OverStanding {
+                    field,
+                    granted,
+                    standing,
+                } => info!(
+                    agent = %change.slug,
+                    address = %moved.address,
+                    field,
+                    granted = ?granted,
+                    standing = ?standing,
+                    "reload: agent dynamic subscription revoked — its depth exceeds the \
+                     channel's current standing_retain_depth; durable row retained (not pruned), \
+                     subscription dormant until the operator raises standing or the agent \
+                     re-subscribes with a conforming depth",
+                ),
+            }
+        }
+        for pruned in &change.dynamic.prune {
+            // The entry itself is not removed here: the static replacement
+            // is on `subs_added` and applied when those are started. Only the
+            // durable row is deleted, below, in one lock scope for the whole
+            // reload.
+            if pruned.row.is_some() {
+                pruned_rows.push((pruned.channel_uuid, change.slug.clone()));
+            } else {
+                // Not asserted, unlike the revoke arm: the prune arm classifies
+                // a pair the candidate declares statically whether or not it is
+                // folded, so a dormant durable row and a registration this
+                // process never held both reach here legitimately.
+                env.messenger
+                    .remove_nondurable_dynamic_sub(&pruned.channel_uuid, &change.slug);
+            }
+            info!(
+                agent = %change.slug,
+                address = %pruned.address,
+                "reload: agent dynamic subscription replaced by a static one",
+            );
+        }
+        reap_previous_owner_positions(env, change).await;
+    }
+    // One lock scope and one batch call for every pruned row of every agent:
+    // the global db mutex is what publish, delivery and wake need, and this
+    // walk is inside the window where nothing can be declined.
+    if !pruned_rows.is_empty() {
+        let conn = env.messenger.db().lock().await;
+        brenn_messaging_store::db::prune_dropped_dynamic_subscriptions(&conn, &pruned_rows);
+    }
+}
+
+/// The departure an owner change is: every position the old owner's
+/// conversation held on the agent's channels.
+///
+/// Must match what a fresh boot's reconcile would delete for the same owner
+/// change: static, dynamic-live and dormant positions alike, but not the
+/// conversation itself or its chat family.
+///
+/// The conversation is resolved in a lock scope of its own: the db mutex is not
+/// reentrant and every messenger method called below takes it itself. A user or
+/// conversation that does not exist held no positions.
+async fn reap_previous_owner_positions(env: &ReloadEnv, change: &AgentChange) {
+    if !change.owner_changed {
+        return;
+    }
+    let Some(previous) = &change.previous_owner else {
+        // Open to all: no owner resolved, so no position was held under one.
+        return;
+    };
+    let conversation = {
+        let conn = env.messenger.db().lock().await;
+        brenn_db::auth::user::get_user_by_username(&conn, previous).and_then(|user| {
+            brenn_db::conversation::get_singleton_conversation_id(&conn, user.id, &change.slug)
+        })
+    };
+    let Some(conversation) = conversation else {
+        return;
+    };
+    env.messenger
+        .reap_conversation_positions(&change.slug, conversation)
+        .await;
+    info!(
+        agent = %change.slug,
+        previous_owner = %previous,
+        conversation,
+        "reload: the former owner's positions on the agent's channels are reaped",
+    );
+}
+
+/// Step 5: install the candidate's agent map, and with it the tool list every
+/// successor process will read.
+///
+/// From this instant every gate decides on the candidate's authority, every
+/// per-call reader serves the candidate's value, and every new spawn — wake or
+/// browser — builds from the candidate's per-process fields. The rename is
+/// atomic on one filesystem; a failure is a host bug, because the file was
+/// written into that directory a moment ago.
+fn swap_agents(env: &ReloadEnv, plan: &MessagingPlan, delta: &PlanDelta) {
+    let apps = plan.planned_apps().unwrap_or_else(|| {
+        panic!(
+            "reload commit: the plan carries no agent map, but a reload only ever plans with one \
+             — host bug"
+        )
+    });
+    env.apps.store(Arc::clone(apps));
+    for change in &delta.agents_changed {
+        if !change.virtual_tools_staged {
+            continue;
+        }
+        let app = apps.get(&change.slug).unwrap_or_else(|| {
+            panic!(
+                "reload commit: agent {:?} is in the delta but not in the map being installed — \
+                 host bug",
+                change.slug,
+            )
+        });
+        let staged = crate::reload::agents::staged_virtual_tools_path(app);
+        let live = app.virtual_tools_path();
+        std::fs::rename(&staged, &live).unwrap_or_else(|error| {
+            panic!(
+                "reload commit: renaming {} onto {} failed: {error} — the staged file was written \
+                 into that directory in prepare, so this is a host bug",
+                staged.display(),
+                live.display(),
+            )
+        });
+    }
+}
+
+/// Step 5b: condemn the sessions this reload moved out from under.
+///
+/// After the swap, so a successor is spawned from the candidate; before the
+/// fold-in, so a bridge retired here is not the target of step 6's roster
+/// publish. A denied user's bridge is retired whether or not the process view
+/// moved: no allowed user can attach to it and no delivery targets its
+/// conversation. Denied is asked of the candidate's own list, so restricting an
+/// agent that was open to all severs the users it now denies even though the
+/// document names none of them.
+async fn retire_stale_sessions(env: &ReloadEnv, delta: &PlanDelta) -> SessionRetirements {
+    let mut retired = Vec::new();
+    let mut pending = Vec::new();
+    let mut any_user_restricted = false;
+    for change in &delta.agents_changed {
+        if !change.respawn && !change.users_restricted {
+            continue;
+        }
+        any_user_restricted |= change.users_restricted;
+        if !change.users_removed.is_empty() {
+            info!(
+                agent = %change.slug,
+                users = ?change.users_removed,
+                "reload: agent no longer allows these users",
+            );
+        }
+        // The candidate's list, resolved to ids: a bridge whose owner it does
+        // not name is one no allowed user can attach to. Asked this way round
+        // because an agent that was open to all and is now restricted names no
+        // removed user at all.
+        let allowed_ids = if change.users_restricted {
+            Some(user_ids(env, &change.allowed_users).await)
+        } else {
+            None
+        };
+        let outcome = env
+            .active_bridges
+            .retire_for_reload(&change.slug, change.respawn, allowed_ids.as_deref())
+            .await;
+        retired.extend(
+            outcome
+                .retired
+                .iter()
+                .map(|id| format!("{} conv {id}", change.slug)),
+        );
+        pending.extend(
+            outcome
+                .pending
+                .iter()
+                .map(|id| format!("{} conv {id}", change.slug)),
+        );
+    }
+    if any_user_restricted {
+        // A connection is authorized once, at connect. The pulse is what makes
+        // every open socket ask the swapped table again, so a user the
+        // candidate denies is severed here rather than at their next reconnect
+        // — which is what a restart would have done to them.
+        // The one expected error is "no subscribers": a host with no open
+        // sockets has nobody to re-ask. Every open connection is a receiver.
+        let _: Result<usize, tokio::sync::broadcast::error::SendError<()>> =
+            env.apps_swapped_tx.send(());
+    }
+    SessionRetirements { retired, pending }
+}
+
+/// The session lists the status body carries: `"<slug> conv <id>"` for what
+/// died at the swap and for what is condemned and finishing its turn.
+#[derive(Default)]
+struct SessionRetirements {
+    retired: Vec<String>,
+    pending: Vec<String>,
+}
+
+/// The user ids of `usernames`, skipping any the users table does not hold.
+///
+/// A username in `allowed_users` with no row is a config/wiring mismatch that
+/// `app_owner` already reports per delivery; a user who has never existed owns
+/// no bridge, so their absence from the resolved list denies nothing that
+/// exists.
+async fn user_ids(env: &ReloadEnv, usernames: &[String]) -> Vec<i64> {
+    if usernames.is_empty() {
+        return Vec::new();
+    }
+    let conn = env.messenger.db().lock().await;
+    usernames
+        .iter()
+        .filter_map(|name| {
+            brenn_db::auth::user::get_user_by_username(&conn, name).map(|user| user.id)
+        })
+        .collect()
+}
+
+/// Step 6: put every changed agent on the channels the candidate says it reads.
+///
+/// The entry each subscription joins with is the candidate plan's verbatim, so
+/// what the live directory ends up holding is what a fresh boot would have
+/// folded. The attach is not an in-memory edit: on an agent's *first*
+/// push-enabled subscription it mints the agent's singleton conversation,
+/// provisions its chat channel family into the live directory and republishes
+/// the agent's roster — the same sequence a runtime `MessageSubscribe` runs, and
+/// the same one boot runs for the same entry.
+///
+/// An agent whose owner moved is re-attached over every push-enabled `App`
+/// entry the *live* directory holds for it — its unmoved static entries, the
+/// ones just folded, kept dynamic ones and revived ones alike — not only the
+/// ones this reload moved: positions are held under the owner's conversation,
+/// so a new owner has none until this runs.
+async fn start_agent_subscriptions(
+    env: &ReloadEnv,
+    delta: &PlanDelta,
+    planned: &PlannedSubscribers<'_>,
+) {
+    let live = env.messenger.directory();
+    for change in &delta.agents_changed {
+        let kind = SubscriberEntryKind::App(change.slug.clone());
+        let arriving: HashSet<Uuid> = change.subs_added.iter().map(|(uuid, _)| *uuid).collect();
+        planned.fold_onto(live, &kind, "agent", &arriving);
+        for (entry, subscriber) in planned.of_principal(&kind) {
+            if !subscriber.push_depth.is_push_enabled() {
+                continue;
+            }
+            if !arriving.contains(&entry.uuid) {
+                continue;
+            }
+            env.messenger
+                .attach_conversation(&entry.address, &change.slug, subscriber.push_depth)
+                .await;
+        }
+        for (_, address) in &change.subs_added {
+            info!(agent = %change.slug, address = %address, "reload: agent subscription started");
+        }
+        for revived in &change.dynamic.revive {
+            // At the row's own depths, which is what boot folds a restored row
+            // back in at — the subscription the agent asked for, not the one
+            // the document would have given it.
+            let row = revived.row.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "reload commit: agent {:?} has its dynamic subscription to {:?} restored, but \
+                     the re-merge carried no durable row for it — a non-durable registration is \
+                     registered folded and can only be revoked (host bug)",
+                    change.slug, revived.address,
+                )
+            });
+            let applied = live.add_subscriber(
+                &revived.channel_uuid,
+                brenn_lib::messaging::SubscriberEntry {
+                    kind: kind.clone(),
+                    push_depth: row.push_depth,
+                    retain_depth: row.retain_depth,
+                    noise: row.noise,
+                    wake_min: Some(row.wake_min),
+                },
+            );
+            assert!(
+                applied,
+                "reload commit: agent {:?} has its dynamic subscription to {:?} restored, but the \
+                 live directory holds no such channel — host bug",
+                change.slug, revived.address,
+            );
+            if row.push_depth.is_push_enabled() {
+                env.messenger
+                    .attach_conversation(&revived.address, &change.slug, row.push_depth)
+                    .await;
+            }
+            info!(
+                agent = %change.slug,
+                address = %revived.address,
+                "reload: agent dynamic subscription revived",
+            );
+        }
+        if change.owner_changed {
+            env.messenger
+                .attach_conversation_subscribers_of(&change.slug)
+                .await;
+            info!(
+                agent = %change.slug,
+                "reload: the new owner is seated on every push-enabled entry the agent holds",
+            );
+        }
+    }
 }
 
 /// The outgoing MQTT step, between the descriptions and the channel removals.
@@ -253,13 +780,17 @@ pub(crate) fn refresh_surface_roots(env: &ReloadEnv, roots: brenn_surface_server
         .expect("the surface-roots lock is held only for a clone and a swap") = Arc::new(roots);
 }
 
-/// Log one UNSUBSCRIBE outcome and say whether the filter left the broker only
-/// on the next connect.
+/// Log one UNSUBSCRIBE outcome and say whether the filter is still at the
+/// broker after it.
 ///
-/// Every outcome is a success: the filter is out of the reconnect-survival set
-/// in all three, so the state the process converges to is the planned one.
-/// `SendFailed` is a `warn!` and a `deferred` entry, never a refusal and never
-/// a panic, because the walk is past the point where anything may decline.
+/// Every outcome is a success *in this process*: the filter is out of the
+/// reconnect-survival set in all three, so brenn's own ingress set is the
+/// planned one. On the two deferred outcomes the packet never went out, and
+/// the session is persistent, so the broker keeps the filter and keeps
+/// publishing on it until the session expires — see
+/// `TODO(mqtt-deferred-unsubscribe-not-withdrawn)`. `SendFailed` is a `warn!`
+/// and a `deferred` entry, never a refusal and never a panic, because the walk
+/// is past the point where anything may decline.
 fn record_unsubscribe(outcome: &IngressUnsubscribeOutcome, address: &str) -> bool {
     match outcome {
         IngressUnsubscribeOutcome::UnsubscribedLive => {
@@ -267,9 +798,10 @@ fn record_unsubscribe(outcome: &IngressUnsubscribeOutcome, address: &str) -> boo
             false
         }
         IngressUnsubscribeOutcome::DeferredDisconnected => {
-            // The filter left the reconnect-survival set, so the next connect
-            // does not re-assert it. Converged, just not now.
-            info!(address = %address, "reload: mqtt filter unsubscribed on reconnect");
+            // No packet went out. The filter left the reconnect-survival set,
+            // so nothing re-asserts it, but the broker's copy of the persistent
+            // session still holds it.
+            info!(address = %address, "reload: mqtt filter not withdrawn at the broker");
             true
         }
         IngressUnsubscribeOutcome::SendFailed(error) => {
@@ -807,10 +1339,24 @@ async fn describe_channels(env: &ReloadEnv, delta: &PlanDelta) {
 /// `upsert_channels`' contract is that a UUID the config no longer names is kept
 /// for an operator to delete deliberately, which is what a restart does with it,
 /// so it is what a reload does with it.
+///
+/// A durable dynamic subscription row on a leaving entry is left where it is,
+/// and journalled here rather than in the status body: nothing about it moved.
+/// The line is the boot merge's own, at the boot merge's level, because the
+/// state is identical — anything watching the journal for a dormant
+/// subscription has to see a reload-produced one too.
+/// Every row that reaches this walk is one both dynamic refusals deliberately
+/// passed over — a folded row's channel is rule 2's refusal and a dormant row
+/// on a reconstructible address is the other's, and either would have stopped
+/// the reload at prepare — so what is left is the dormant row on a removed
+/// operator-declared channel, which a fresh boot of the candidate holds dormant
+/// with its cursor. Logged at commit and not at prepare because prepare may
+/// still refuse for another reason, and a "left dormant" line for a reload that
+/// changed nothing would be false.
 fn remove_channels(env: &ReloadEnv, delta: &PlanDelta) {
     let live = env.messenger.directory();
     let mut forgotten: Vec<Uuid> = Vec::new();
-    for entry in leaving(delta) {
+    for entry in delta.leaving() {
         let removed = live.remove_channel(&entry.uuid);
         assert!(
             removed,
@@ -822,6 +1368,19 @@ fn remove_channels(env: &ReloadEnv, delta: &PlanDelta) {
         }
         forgotten.push(entry.uuid);
         info!(address = %entry.address, "reload: channel removed");
+        for row in delta
+            .dynamic_observed
+            .rows
+            .iter()
+            .filter(|row| row.channel_uuid == entry.uuid)
+        {
+            DormantSubscription {
+                channel_uuid: row.channel_uuid,
+                app_slug: row.app_slug.clone(),
+                channel_address: entry.address.clone(),
+            }
+            .warn();
+        }
     }
     env.messenger.forget_send_rate_buckets(&forgotten);
 }
@@ -834,9 +1393,23 @@ fn remove_channels(env: &ReloadEnv, delta: &PlanDelta) {
 /// consumer the delta also moves, and step 5 folds each of those in as it
 /// starts — so an entry that arrives empty here is an entry that is complete
 /// here.
+///
+/// A dormant durable dynamic subscription row on an *arriving* uuid is the
+/// mirror of the removal walk above, and the one case that reaches it is a
+/// channel this reload re-declares under a row an earlier reload left dormant.
+/// A declared durable channel's uuid is derived from its address unless the
+/// document pins one, so the re-declared block lands on the same uuid the row
+/// names; a pin that moves it is refused before any of this runs, because the
+/// address already belongs to another channel row. A fresh boot of this
+/// document re-classifies such a row — folding it, holding it dormant, or
+/// deleting it where the candidate declares a static subscription — and this
+/// reload re-classifies only the last of those, so the rest wait for a restart.
+/// Journalled at the one moment the operator is looking, because they just
+/// re-declared the block and expect delivery to resume.
 async fn add_channels(env: &ReloadEnv, delta: &PlanDelta) {
     let live = env.messenger.directory();
-    let arriving: Vec<ChannelEntry> = joining(delta)
+    let arriving: Vec<ChannelEntry> = delta
+        .joining()
         .map(|entry| {
             let mut fresh = ChannelEntry::clone(entry);
             fresh.subscribers.clear();
@@ -857,8 +1430,39 @@ async fn add_channels(env: &ReloadEnv, delta: &PlanDelta) {
             env.messenger.ring_stores().register(&entry);
         }
         info!(address = %entry.address, "reload: channel added");
+        for row in delta
+            .dynamic_observed
+            .rows
+            .iter()
+            .filter(|row| row.channel_uuid == entry.uuid)
+            .filter(|row| !pruned_here(delta, row.channel_uuid, &row.app_slug))
+        {
+            warn!(
+                channel_uuid = %row.channel_uuid,
+                channel = %entry.address,
+                app = %row.app_slug,
+                "reload: dynamic subscription still dormant — the channel is declared again but \
+                 the reload does not re-classify the row against it; a restart does, and folds \
+                 it back in if the agent's policy still authorizes delivery here",
+            );
+        }
         live.add_channel(entry);
     }
+}
+
+/// Whether this reload deleted the dynamic row for `(channel, agent)` because
+/// the candidate declares a static subscription in its place.
+///
+/// The row is still in `dynamic_observed`, which is the set prepare classified
+/// against, so the "still dormant" line has to ask: a pruned row is gone and
+/// the static entry the arrival step folds in is what serves the channel.
+fn pruned_here(delta: &PlanDelta, channel_uuid: Uuid, app_slug: &str) -> bool {
+    delta
+        .agents_changed
+        .iter()
+        .filter(|change| change.slug == app_slug)
+        .flat_map(|change| &change.dynamic.prune)
+        .any(|pruned| pruned.channel_uuid == channel_uuid)
 }
 
 /// Step 4: put every arriving and replaced consumer into service.
@@ -977,77 +1581,6 @@ fn arriving(delta: &PlanDelta) -> Vec<String> {
         .chain(delta.consumers_changed.iter())
         .cloned()
         .collect()
-}
-
-/// The entries leaving the directory: removed outright, or the old side of a
-/// change, which the commit treats as a removal followed by an addition.
-fn leaving(delta: &PlanDelta) -> impl Iterator<Item = &Arc<ChannelEntry>> {
-    delta
-        .channels_removed
-        .iter()
-        .chain(delta.channels_changed.iter().map(|change| &change.old))
-}
-
-/// The entries joining the directory: added outright, or the new side of a
-/// change.
-fn joining(delta: &PlanDelta) -> impl Iterator<Item = &Arc<ChannelEntry>> {
-    delta
-        .channels_added
-        .iter()
-        .chain(delta.channels_changed.iter().map(|change| &change.new))
-}
-
-/// The plan's subscriber entries, grouped by the principal that holds them.
-///
-/// Built once per commit and read by both arrival steps, so the walk over the
-/// candidate's channels happens once rather than once per arriving principal.
-/// The key is the directory's own subscriber identity: for every kind, the
-/// derived equality this map hashes by and
-/// [`SubscriberEntryKind::same_principal`] are the same relation — every field
-/// either compares, one compares — which
-/// `a_planned_group_is_exactly_what_same_principal_matches` holds.
-struct PlannedSubscribers<'a> {
-    by_principal: HashMap<&'a SubscriberEntryKind, Vec<(&'a ChannelEntry, &'a SubscriberEntry)>>,
-}
-
-impl<'a> PlannedSubscribers<'a> {
-    fn of(channels: &'a [Arc<ChannelEntry>]) -> Self {
-        let mut by_principal: HashMap<_, Vec<_>> = HashMap::new();
-        for entry in channels {
-            for subscriber in &entry.subscribers {
-                by_principal
-                    .entry(&subscriber.kind)
-                    .or_default()
-                    .push((entry.as_ref(), subscriber));
-            }
-        }
-        Self { by_principal }
-    }
-
-    /// Fold one principal's planned entries onto the live directory.
-    ///
-    /// The one implementation of "put this principal on its channels", shared
-    /// by the arriving consumers and the arriving surfaces: the entry each one
-    /// joins with is the candidate plan's verbatim, so what the live directory
-    /// ends up holding is what a fresh boot would have folded. `what` names the
-    /// kind of principal in the panic.
-    fn fold(
-        &self,
-        live: &brenn_lib::messaging::MessagingDirectory,
-        kind: &SubscriberEntryKind,
-        what: &str,
-    ) {
-        for (entry, subscriber) in self.by_principal.get(kind).into_iter().flatten() {
-            let applied = live.add_subscriber(&entry.uuid, (*subscriber).clone());
-            assert!(
-                applied,
-                "reload commit: {what} {:?} subscribes to channel {:?}, which the live directory \
-                 does not hold — host bug",
-                kind.slug(),
-                entry.address,
-            );
-        }
-    }
 }
 
 /// Whether an entry carries this subscriber.

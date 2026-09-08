@@ -140,7 +140,7 @@ async fn peer_messenger(peers: &[&Peer]) -> Arc<Messenger> {
             }),
             vec!["bob".to_string()],
         );
-        cfg.policy = peer.policy.clone();
+        cfg.policy = std::sync::Arc::new(peer.policy.clone());
         apps.insert(peer.slug.to_string(), cfg);
     }
 

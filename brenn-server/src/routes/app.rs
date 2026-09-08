@@ -40,15 +40,15 @@ pub async fn landing_page(
     let username = &session.user.username;
 
     // Collect apps this user has access to.
-    let accessible: Vec<_> = state
-        .apps
+    let apps = state.apps.load();
+    let accessible: Vec<_> = apps
         .values()
         .filter(|app| app.user_has_access(username))
         .collect();
 
     // Single app (total, not just accessible): redirect directly.
     // This matches the common case of a single-app deployment.
-    if state.apps.len() == 1
+    if apps.len() == 1
         && let Some(app) = accessible.first()
     {
         return Redirect::to(&format!("/app/{}", app.slug)).into_response();
@@ -171,7 +171,8 @@ fn render_app_shell(
     max_image_long_edge: u32,
     state: &AppState,
 ) -> Result<Response, StatusCode> {
-    let app = match state.apps.get(slug) {
+    let apps = state.apps.load();
+    let app = match apps.get(slug) {
         Some(app) => app,
         None => {
             log_and_alert_security_event(

@@ -172,7 +172,6 @@ mod tests {
     use brenn_lib::db;
     use brenn_obs::alerting::make_capturing_alerter;
     use http_body_util::BodyExt;
-    use indexmap::IndexMap;
     use tower::ServiceExt;
 
     use super::*;
@@ -213,8 +212,9 @@ mod tests {
             secure_cookies: false,
             log_dir: std::path::PathBuf::from("/tmp"),
             mcp_script_path: std::path::PathBuf::from("/tmp/mcp.py"),
-            apps: Arc::new(IndexMap::new()),
+            apps: brenn_lib::config::AppTable::empty(),
             bridge_notify_tx: tokio::sync::broadcast::channel(1).0,
+            apps_swapped_tx: tokio::sync::broadcast::channel(1).0,
             pending_uploads: PendingUploads::default(),
             static_dir: std::path::PathBuf::from("/tmp"),
             surface_roots: Default::default(),

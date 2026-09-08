@@ -206,6 +206,44 @@ pub struct StatusDelta {
     /// `surfaces_changed`; one that no surface instantiates is reported and
     /// nothing else.
     pub kinds_changed: Vec<String>,
+    /// Slugs of the agents whose authority, per-call settings, per-process view
+    /// or static subscriptions moved. An agent here decides every gate on the
+    /// new document's terms from the moment the reload applied.
+    ///
+    /// An agent whose edit resolved to the same thing it already was — a
+    /// reordered list, a re-spelled grant — is not here: the comparison is on
+    /// what the document projects to, not on its bytes.
+    pub agents_changed: Vec<String>,
+    /// `"<slug> <address>"` for every static subscription this reload folded in
+    /// for an agent, and every one it folded out. A retuned subscription, or
+    /// one on a channel this reload moved, is in both lists.
+    pub subscriptions_added: Vec<String>,
+    pub subscriptions_removed: Vec<String>,
+    /// `"<slug> <address>"` for every dynamic subscription this reload
+    /// re-authorized against the new document, split by what it did with it.
+    ///
+    /// A dynamic subscription is one an agent asked for at runtime, and it is
+    /// in no document — so a reload re-asks of it exactly what a fresh boot
+    /// asks: `dynamic_revoked` is a subscription the new document's ACLs (or
+    /// its channel depths) no longer stand behind, folded out and left dormant
+    /// with its durable row and its cursor intact; `dynamic_revived` is a
+    /// dormant one the new document authorizes again, folded back in at the
+    /// depths it was granted; `dynamic_pruned` is one the document now declares
+    /// statically, whose row is deleted because static config wins.
+    pub dynamic_revoked: Vec<String>,
+    pub dynamic_revived: Vec<String>,
+    pub dynamic_pruned: Vec<String>,
+    /// `"<slug> conv <id>"` for every Claude Code session this reload killed,
+    /// and for every one it condemned but could not kill yet.
+    ///
+    /// A session is condemned when its agent's per-process view moved — what it
+    /// was *spawned* with, which no swap can reach — or when its conversation
+    /// belongs to a user the candidate no longer allows. A condemned session
+    /// mid-turn finishes its turn and dies at the turn end, which is what
+    /// `sessions_retire_pending` names. Either way the wake path spawns the
+    /// successor from the new document and resumes the conversation.
+    pub sessions_retired: Vec<String>,
+    pub sessions_retire_pending: Vec<String>,
 }
 
 /// One declared mount, as the status body reports it.

@@ -3,8 +3,6 @@
 //! `POST /app/{slug}/upload` — multipart file upload to the app's working directory.
 //! `GET /app/{slug}/attachment/{upload_id}/{filename}` — serve an attached file.
 
-use std::sync::Arc;
-
 use axum::Extension;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::{StatusCode, header};
@@ -12,10 +10,8 @@ use axum::response::{IntoResponse, Json, Response};
 use brenn_db::Db;
 use brenn_db::auth::session::Session;
 use brenn_db::conversation;
-use brenn_lib::config::AppConfig;
 use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use brenn_ws_types::AttachmentMeta;
-use indexmap::IndexMap;
 use serde::Serialize;
 use tokio::time::Instant;
 use tracing::warn;
@@ -72,7 +68,8 @@ pub async fn upload(
     mut multipart: Multipart,
 ) -> Result<Response, (StatusCode, String)> {
     // Validate app and access.
-    let app = match state.apps.get(&slug) {
+    let apps = state.apps.load();
+    let app = match apps.get(&slug) {
         Some(app) => app,
         None => {
             log_and_alert_security_event(
@@ -384,7 +381,8 @@ pub async fn serve_attachment(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     // Validate app and access.
-    let app = match state.apps.get(&slug) {
+    let apps = state.apps.load();
+    let app = match apps.get(&slug) {
         Some(app) => app,
         None => {
             log_and_alert_security_event(
@@ -704,7 +702,7 @@ fn human_file_size(bytes: u64) -> String {
 ///
 /// Also prunes expired entries from the in-memory pending uploads map.
 pub async fn orphan_cleanup_loop(
-    apps: Arc<IndexMap<String, AppConfig>>,
+    apps: brenn_lib::config::AppTable,
     pending: PendingUploads,
     db: Db,
 ) {
@@ -726,7 +724,9 @@ pub async fn orphan_cleanup_loop(
             });
         }
 
-        // Scan each app's attachments directory.
+        // Snapshot is per cycle: a reload between cycles changes `working_dir`
+        // and the next cycle sweeps the new one.
+        let apps = apps.load();
         for app in apps.values() {
             let dir = app.working_dir.join("attachments");
             let mut entries = match tokio::fs::read_dir(&dir).await {

@@ -592,7 +592,7 @@ impl MessagingDirectory {
 /// Default subscription policy: `Normal` (migration parity — rows published
 /// at `Normal` or above wake, rows at `Low` park, matching the old
 /// binary `immediate`/`none` split at `push_depth > 0`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WakeMin {
     VeryLow,

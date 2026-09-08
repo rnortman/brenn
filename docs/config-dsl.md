@@ -1191,6 +1191,74 @@ What converges is components, surfaces and their wiring:
   did not move — and the body still carries `kinds_changed`, so the install that
   swapped the tree in has the retained evidence that the new bytes are the ones
   being served.
+- `agent` blocks — compared **field by field**, not whole. An agent's grants,
+  ACLs, tool grants, `subscribe` lines, `mqtt_subscription`s, `send_budget`, and
+  its display and door settings (`name`, `icon`, `models`, `multiuser`,
+  `allowed_users`, the `prefix_*` flags, `attachment_targets`,
+  `history_replay_limit`, `start_hooks`, `post_pull_hooks`, …) converge at once:
+  every gate and every route reads them off the agent map per call, and the
+  reload swaps that map whole. A user dropped from `allowed_users` has their
+  open connections closed and their sessions retired, because a connection is
+  authorized once, at connect. The same happens to every user an agent that was
+  open to all — an empty `allowed_users` — no longer names once the list is
+  written; going the other way, a list that becomes empty opens the agent and
+  severs nobody. Changing the *first* entry moves the agent's owner, and with it
+  the conversation the bus delivers to: the new owner gets a conversation and a
+  position on every channel the agent reads, and the old owner keeps its
+  conversation and its chat history but loses its delivery positions and is no
+  longer woken — the same as after a restart.
+  What a Claude Code process was *spawned* with — `model`, `mcp_servers`,
+  `disabled_tools`, `working_dir`, `approval_rules`, the compaction thresholds,
+  the idle timeouts, `singleton`, and the virtual tools list its MCP shim read
+  at its start — cannot be changed under a running process. Those converge at
+  each live session's next idle moment: the reload retires the session and the
+  wake path resumes the conversation from the new document, which the browser
+  sees as `Connecting → Idle`, as on a Claude profile switch. **A reload can
+  therefore bounce Claude Code sessions**, one turn boundary at a time, where it
+  used to leave every session alone. The status body's `agents_changed`,
+  `subscriptions_added`, `subscriptions_removed`, `sessions_retired` and
+  `sessions_retire_pending` say what moved and which conversations were
+  affected.
+  Refused, each naming the field (`apps[assistant].mounts`): `mounts`,
+  `container`, `integrations`, `integration_config`, `startup_hooks`,
+  `claude_profiles`, `webhook_subscriptions` — boot folds each of those into
+  another subsystem's tables or runs an operator script for it — and adding,
+  removing, renaming or reordering an agent, which is its existence rather than
+  its configuration.
+  A *dynamic* subscription — one a running session created with
+  `MessageSubscribe`, which no document declares — is re-authorized against the
+  new document exactly as a restart would re-authorize it: one the new ACLs no
+  longer cover is folded out and left dormant, with its durable row and its
+  cursor intact, so it resumes if the ACL comes back; a dormant one the new
+  document authorizes again is folded back in at the depths it was granted; and
+  one the document now declares as a `subscribe` line is replaced by the static
+  entry and its row deleted. The status body reports the three as
+  `dynamic_revoked`, `dynamic_revived` and `dynamic_pruned`. A reload is refused
+  when the agent subscribes or unsubscribes dynamically while it is being
+  prepared — reload again. It is also refused, naming the channel, when it would
+  **retune** a channel a dynamic subscription sits on, folded or dormant, and
+  when it would **remove** one the subscription is still folded into, or one
+  carrying a *dormant* subscription on a **system-minted** address — `mqtt:`,
+  `webhook:`, `brenn:tools/…` or `brenn:tool-results/…`, the addresses a fresh
+  boot rebuilds from their stored rows without any `[[channel]]` block: the
+  subscription is in no document, so nothing can re-derive it against the entry
+  the reload would put there instead. Those pairings need a restart. Removing an
+  **operator-declared** channel — one a fresh boot cannot rebuild from its
+  stored row alone — that carries only a *dormant* subscription is applied, and
+  leaves the subscription exactly as a restart would — dormant, with its durable
+  row and its cursor kept — which is what makes the two-step retirement of such
+  a channel restart-free: narrow the ACL and reload, then remove the block and
+  reload. Re-declaring the block later does **not** revive the subscription at
+  that reload; it revives at the next restart — unless the same document also
+  declares a `subscribe` line for the pair, which deletes the row and folds the
+  static entry in, as a restart would. Re-declare with the channel's original
+  identity: a declaration derives its uuid from its address, so simply writing
+  the block back is enough, and a `uuid_pins` entry that moves it is refused —
+  the address still belongs to the stored row the dormant subscription names.
+  A subscription on an
+  `ephemeral:` or `local:` channel is never dormant — a non-durable channel
+  keeps its dynamic subscription in memory, so it is always folded, and removing
+  such a channel under one is the folded refusal above.
 
 The **mounts document is re-read first**, before the deployment document is
 compiled, so the roots every step below reads are the ones declared right now: a
@@ -1201,12 +1269,12 @@ refusal on its own — nothing about the deployment document is read. The outcom
 body's `mounts` array names what the process is reading: the candidate's on
 `applied` and `unchanged`, the running one's on `refused`.
 
-Everything else needs a restart, and says so. Agents, remotes, webhook
+Everything else needs a restart, and says so. Remotes, webhook
 endpoints, MQTT clients, PWA push, tool declarations, Claude profiles, and the
 `server` / `database` / `logging` / `messaging` / `observability` /
 `surface_description` sections are all compared whole: any difference is a
 refusal naming the section, and for a block array the key that differs
-(`apps[assistant]`, `remotes[laptop]`). The surface *kernel* is in that group
+(`remotes[laptop]`). The surface *kernel* is in that group
 too: every page loads it, and a reload reloads only the pages of surfaces that
 moved, so a mount offering a different kernel than the one being served is a
 refusal.

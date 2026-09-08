@@ -1,5 +1,6 @@
 use super::*;
 use base64ct::{Base64UrlUnpadded, Encoding as _};
+use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{MessagingGlobalConfig, ResolvedMessagingConfig};
 use brenn_lib::pwa_push::config::{AppPwaPushBlock, ResolvedPwaPushConfig};
 use brenn_lib::pwa_push::vapid::load_or_generate;
@@ -55,7 +56,7 @@ pub(super) fn make_app_config(
                 p.grants
                     .insert(brenn_envelope::grants::AppCapability::PwaPush);
             }
-            p
+            std::sync::Arc::new(p)
         },
         pwa_push: if pwa_push_enabled {
             Some(AppPwaPushBlock {

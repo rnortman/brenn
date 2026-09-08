@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use tracing::debug;
+use uuid::Uuid;
 
 use super::config::NoiseLevel;
 use super::store::MessageSeq;
@@ -128,12 +129,29 @@ impl Messenger {
     /// an app wired to receive is a delivery target whether or not anything has
     /// been published to it yet.
     pub async fn attach_conversation_subscribers(&self) {
+        self.attach_conversation_subscribers_matching(|_| true)
+            .await;
+    }
+
+    /// [`Messenger::attach_conversation_subscribers`] restricted to one app.
+    ///
+    /// For the caller that has moved one app's owner and owes the new owner the
+    /// positions the old one held: the set to seat is every push-enabled `App`
+    /// entry the *live* directory carries for that slug — its static
+    /// subscriptions, the ones just folded, and its dynamic rows — which is the
+    /// same set the unrestricted pass walks for it.
+    pub async fn attach_conversation_subscribers_of(&self, app_slug: &str) {
+        self.attach_conversation_subscribers_matching(|slug| slug == app_slug)
+            .await;
+    }
+
+    async fn attach_conversation_subscribers_matching(&self, wanted: impl Fn(&str) -> bool) {
         for entry in self.directory.list() {
             for sub in &entry.subscribers {
                 let SubscriberEntryKind::App(slug) = &sub.kind else {
                     continue;
                 };
-                if !sub.push_depth.is_push_enabled() {
+                if !sub.push_depth.is_push_enabled() || !wanted(slug) {
                     continue;
                 }
                 self.attach_conversation(&entry.address, slug, sub.push_depth)
@@ -207,6 +225,64 @@ impl Messenger {
                 &ParticipantId::for_conversation(conversation),
             )
             .await;
+        }
+    }
+
+    /// Delete every position `conversation` holds except on its own chat
+    /// channel family.
+    ///
+    /// Must match what boot's [`Messenger::reconcile_subscriber_cursors`] would
+    /// delete for a conversation no `App(slug)` entry resolves to: static,
+    /// dynamic-live and dormant positions alike. The conversation itself and its
+    /// chat family survive, justified by their own `ChatConversation` entries.
+    ///
+    /// A live-directory channel goes through [`Messenger::detach_subscriber`] so
+    /// the row and the in-process metered-drop tally go together; a row whose
+    /// channel the directory does not hold is deleted from the table directly,
+    /// in one lock scope for all of them.
+    pub async fn reap_conversation_positions(&self, app_slug: &str, conversation: i64) {
+        let participant = ParticipantId::for_conversation(conversation);
+        let spared: Vec<Uuid> = self.conversation_chat_channel_uuids(app_slug, conversation);
+        let rows: Vec<Uuid> = {
+            let conn = self.db.lock().await;
+            crate::db::subscriber_cursors_of(&conn, &participant)
+                .into_iter()
+                .map(|(uuid, _)| uuid)
+                .filter(|uuid| !spared.contains(uuid))
+                .collect()
+        };
+        let mut undeclared: Vec<Uuid> = Vec::new();
+        for uuid in rows {
+            let address = self
+                .directory
+                .by_uuid(&uuid)
+                .map(|entry| entry.address.clone());
+            match address {
+                Some(address) => {
+                    // The entry came out of the directory a line ago, so the
+                    // method's directory panic cannot fire.
+                    self.detach_subscriber(&address, &participant).await;
+                    tracing::info!(
+                        app = %app_slug,
+                        address = %address,
+                        conversation,
+                        "messaging: reaping a former owner's position",
+                    );
+                }
+                None => undeclared.push(uuid),
+            }
+        }
+        if !undeclared.is_empty() {
+            let conn = self.db.lock().await;
+            for uuid in undeclared {
+                crate::db::delete_subscriber_cursor(&conn, uuid, &participant);
+                tracing::info!(
+                    app = %app_slug,
+                    channel = %uuid,
+                    conversation,
+                    "messaging: reaping a former owner's position on an undeclared channel",
+                );
+            }
         }
     }
 
@@ -394,7 +470,7 @@ mod tests {
         }
         let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
         app.singleton = true;
-        app.policy = policy;
+        app.policy = std::sync::Arc::new(policy);
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         apps.insert(APP.to_string(), app);
         Messenger::new(
@@ -732,7 +808,7 @@ mod tests {
     fn revoked_messenger(m: &Messenger) -> Arc<Messenger> {
         let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
         app.singleton = true;
-        app.policy = brenn_lib::access::AppPolicy::default();
+        app.policy = std::sync::Arc::new(brenn_lib::access::AppPolicy::default());
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         apps.insert(APP.to_string(), app);
         Messenger::new(
@@ -869,8 +945,9 @@ mod tests {
         }
         let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
         app.singleton = true;
-        app.policy =
-            brenn_delivery_policy(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));
+        app.policy = std::sync::Arc::new(brenn_delivery_policy(
+            brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()),
+        ));
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         apps.insert(APP.to_string(), app);
 
@@ -1125,6 +1202,101 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["before-revocation", "during-revocation"],
             "a restored ACL is a window over the history the subscriber missed"
+        );
+    }
+
+    /// **The former owner's positions.** An agent whose owner moves leaves its
+    /// old owner's conversation holding rows no `App` entry resolves to any
+    /// more — the orphans boot's reconcile deletes. The reap deletes exactly
+    /// those: the conversation's own chat family and any other conversation's
+    /// row on the same channel are not its business.
+    #[tokio::test]
+    async fn reaping_a_conversations_positions_spares_its_chat_family_and_its_peers() {
+        let ch = channel("work", Depth::Bounded(5));
+        let work = ch.uuid;
+        let m = chat_messenger(vec![ch.clone()]).await;
+        m.attach_conversation(&ch.address, APP, Depth::Bounded(5))
+            .await;
+        let conversation = conversation_of(&m).await;
+        let participant = ParticipantId::for_conversation(conversation);
+        let command = m
+            .directory
+            .resolve(&command_leaf_address(conversation))
+            .expect("the command leaf is provisioned")
+            .uuid;
+
+        // A second conversation of the same app with a position on the same
+        // channel: the new owner's, as the commit's attach will have left it.
+        let peer = {
+            let conn = m.db.lock().await;
+            let other = brenn_db::auth::user::create_user(&conn, "other", "$argon2id$fake");
+            brenn_db::conversation::get_or_create_singleton_conversation(&conn, other, APP).id
+        };
+        let peers_participant = ParticipantId::for_conversation(peer);
+        {
+            let conn = m.db.lock().await;
+            crate::db::ensure_subscriber_cursor(
+                &conn,
+                work,
+                &peers_participant,
+                APP,
+                Depth::Bounded(5),
+                0,
+            );
+        }
+
+        m.reap_conversation_positions(APP, conversation).await;
+
+        let conn = m.db.lock().await;
+        assert!(
+            crate::db::load_subscriber_cursor(&conn, work, &participant).is_none(),
+            "the position on the agent's channel is what a fresh boot reaps",
+        );
+        assert!(
+            crate::db::load_subscriber_cursor(&conn, command, &participant).is_some(),
+            "its own chat family is justified by its `ChatConversation` entries and stays",
+        );
+        assert!(
+            crate::db::load_subscriber_cursor(&conn, work, &peers_participant).is_some(),
+            "and another conversation's row on the same channel is not this one's to delete",
+        );
+    }
+
+    /// A dormant dynamic row whose channel is no longer declared: the directory
+    /// holds no entry to detach through, and the row is still an orphan once
+    /// the owner has moved. Reachable after a restart between the channel's
+    /// removal and the reload.
+    #[tokio::test]
+    async fn reaping_reaches_a_position_on_a_channel_the_directory_does_not_hold() {
+        let ch = channel("work", Depth::Bounded(5));
+        let m = chat_messenger(vec![ch.clone()]).await;
+        m.attach_conversation(&ch.address, APP, Depth::Bounded(5))
+            .await;
+        let conversation = conversation_of(&m).await;
+        let participant = ParticipantId::for_conversation(conversation);
+
+        // In the channels table, out of the directory: the shape a removed
+        // `[[channel]]` block leaves a durable channel in.
+        let undeclared = channel("gone", Depth::Bounded(5));
+        {
+            let conn = m.db.lock().await;
+            upsert_channels(&conn, std::slice::from_ref(&undeclared));
+            crate::db::ensure_subscriber_cursor(
+                &conn,
+                undeclared.uuid,
+                &participant,
+                APP,
+                Depth::Bounded(5),
+                0,
+            );
+        }
+
+        m.reap_conversation_positions(APP, conversation).await;
+
+        let conn = m.db.lock().await;
+        assert!(
+            crate::db::load_subscriber_cursor(&conn, undeclared.uuid, &participant).is_none(),
+            "the row is deleted from the table directly, no directory entry needed",
         );
     }
 }

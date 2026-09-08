@@ -899,10 +899,10 @@ mod tests {
         let mut app = crate::test_support::app_config::minimal_app_config("test-app", None, vec![]);
         app.singleton = true;
         app.allowed_users = vec!["wake-user".to_string()];
-        app.policy
+        app.policy_mut()
             .grants
             .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
-        app.policy
+        app.policy_mut()
             .acls
             .brenn_subscribe
             .push(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));

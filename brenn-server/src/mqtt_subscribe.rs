@@ -180,10 +180,10 @@ impl From<RuntimeSubscribeError> for SubscribeActivateError {
 /// every live app carries a (possibly empty) policy; a missing one is a host
 /// wiring bug, not bad input — hence a panic rather than a returned error (design
 /// §3.1/§3.2).
-fn app_policy<'a>(
-    messenger: &'a brenn_messaging::Messenger,
+fn app_policy(
+    messenger: &brenn_messaging::Messenger,
     app_slug: &str,
-) -> &'a brenn_lib::access::AppPolicy {
+) -> std::sync::Arc<brenn_lib::access::AppPolicy> {
     messenger.app_policy(app_slug).unwrap_or_else(|| {
         panic!(
             "subscribe_dynamic_activated: no resolved AppPolicy for app {app_slug:?} \

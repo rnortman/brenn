@@ -15,6 +15,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use indexmap::IndexMap;
+
+use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
@@ -24,7 +27,11 @@ use brenn_lib::wasm_package::Verified;
 use uuid::Uuid;
 
 use super::NEEDS_RESTART;
-use super::mqtt::{MqttDelta, mqtt_delta};
+use super::agents::{AgentChange, AgentClosure, AgentInputs, agent_delta};
+use super::dynamic::{
+    DynamicSnapshot, dormant_rows_the_reload_cannot_follow, dynamic_ingress, folded_now,
+};
+use super::mqtt::{MqttDelta, MqttIngressSet, mqtt_delta};
 use super::surfaces::{SurfaceClosure, SurfaceDelta, surface_delta};
 
 /// One side of the comparison: everything a reload reads off a plan.
@@ -36,15 +43,37 @@ use super::surfaces::{SurfaceClosure, SurfaceDelta, surface_delta};
 /// unchanged document a change rather than an invisible drift.
 pub(crate) struct PlanFacts<'a> {
     pub directory: &'a MessagingDirectory,
+    /// The resolved agent map this side's plan was derived from — the booted
+    /// one for the baseline, the candidate's own for the candidate. The agent
+    /// half of the delta compares the two.
+    pub apps: &'a IndexMap<String, AppConfig>,
     pub consumers: &'a [ResolvedWasmConsumer],
     pub records: &'a HashMap<String, Verified>,
-    /// The plan's *static* `mqtt:` ingress channels, which is what the broker's
-    /// SUBSCRIBE union is diffed over. Boot appends re-activated dynamic
-    /// subscriptions to its own copy of this list; those are deliberately not
-    /// here, because a fresh boot of this document would not derive them.
+    /// The plan's *static* `mqtt:` ingress channels: the ones this side's
+    /// document declares. Only half of what the broker's SUBSCRIBE union is
+    /// diffed over — a fresh boot of this document would also derive every
+    /// dynamic `mqtt:` subscription its merge kept, so the other half comes off
+    /// the live process ([`LiveFacts`]) and the two are unioned per side.
     pub mqtt_ingress: &'a [ResolvedMqttIngressChannel],
     /// The plan's resolved surfaces, which the surface delta is keyed on.
     pub surfaces: &'a [ResolvedSurface],
+}
+
+/// What a reload reads off the running process rather than off either plan.
+///
+/// Everything here is a fact about *this* process that no document describes: a
+/// dynamic subscription an agent asked for at runtime, and the directory it was
+/// folded into. Both sides of the comparison need them — the baseline stands
+/// behind what the process holds now, and the candidate behind what it would
+/// hold after the re-merge — so they are one input rather than a member of
+/// either side.
+pub(crate) struct LiveFacts<'a> {
+    pub directory: &'a MessagingDirectory,
+    pub dynamic: &'a DynamicSnapshot,
+    /// The declared MQTT clients, which is where a dynamic `mqtt:`
+    /// subscription's injection urgency comes from — the row carries the qos
+    /// and the address carries the filter, and neither carries that.
+    pub mqtt_clients: &'a IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
 }
 
 /// A channel entry that is in both plans under one uuid but is not the same
@@ -95,6 +124,61 @@ pub(crate) struct PlanDelta {
     /// the declared mounts disagrees with the trees the process is serving,
     /// which is every case this set could name.
     pub kinds_changed: BTreeSet<String>,
+    /// The agents whose authority, per-call settings, per-process view or
+    /// static subscriptions moved.
+    pub agents_changed: Vec<AgentChange>,
+    /// The dynamic subscriptions the agent half was classified against, as they
+    /// stood when prepare read them.
+    ///
+    /// An input rather than a difference, carried here because it is the one
+    /// input to a reload that a live session can change while prepare runs: the
+    /// commit re-reads the set and declines a walk whose subject moved
+    /// underneath it. Deliberately absent from [`PlanDelta::is_empty`] — it
+    /// says nothing about whether the two documents project differently.
+    pub dynamic_observed: DynamicSnapshot,
+}
+
+/// The channel delta's uuids, split by which way each entry goes.
+///
+/// A named set per side because the rules that read them answer differently on
+/// each, and three same-typed `HashSet<Uuid>` parameters in a row are a
+/// transposition waiting to happen: a dormant dynamic row on a *retuned*
+/// channel is refused while one on a *removed* operator-declared channel is
+/// applied, so swapping the two sets swaps refuse for apply.
+pub(crate) struct ChannelSides {
+    /// Entries the candidate has and the baseline did not.
+    pub added: HashSet<Uuid>,
+    /// Entries the candidate drops outright.
+    pub removed: HashSet<Uuid>,
+    /// The old side of every retune. Equal to `retuned_new` today — a retune
+    /// keeps its uuid — and named apart because nothing here depends on that.
+    pub retuned_old: HashSet<Uuid>,
+    /// The new side of every retune.
+    pub retuned_new: HashSet<Uuid>,
+}
+
+impl ChannelSides {
+    /// Every uuid either side of the delta names. What the consumer, surface
+    /// and agent closures read: an entry wired to a channel that moved is
+    /// re-derived against the new entry, whichever way it moved.
+    pub(crate) fn moved(&self) -> HashSet<Uuid> {
+        self.added
+            .union(&self.removed)
+            .chain(self.retuned_new.iter())
+            .copied()
+            .collect()
+    }
+
+    /// The narrower set this commit takes *away*: removed outright, or the old
+    /// side of a retune. No dynamic pair may be classified against one, because
+    /// the entry the classification would read is one the channel walk deletes.
+    ///
+    /// Deliberately not `moved`, which also carries the arrivals: a channel
+    /// this reload adds is one the live directory does not hold yet, and the
+    /// re-merge skips it for that reason instead.
+    pub(crate) fn departing(&self) -> HashSet<Uuid> {
+        self.removed.union(&self.retuned_old).copied().collect()
+    }
 }
 
 impl PlanDelta {
@@ -111,30 +195,52 @@ impl PlanDelta {
             && self.consumers_changed.is_empty()
             && self.mqtt.is_empty()
             && self.surfaces.is_empty()
+            && self.agents_changed.is_empty()
     }
 
-    /// The uuids of every entry in the *channel delta* — added, removed or
-    /// changed. Description updates are deliberately absent: they change no
-    /// wiring, so they promote no consumer and they answer to no rule.
-    fn moved_channels(&self) -> HashSet<Uuid> {
-        self.channels_added
+    /// The slugs of every agent this reload walks.
+    fn moving_agents(&self) -> HashSet<&str> {
+        self.agents_changed
             .iter()
-            .map(|e| e.uuid)
-            .chain(self.channels_removed.iter().map(|e| e.uuid))
-            .chain(self.channels_changed.iter().map(|c| c.new.uuid))
+            .map(|change| change.slug.as_str())
             .collect()
     }
 
-    /// The addresses of the same entries. Both sides of a changed entry are
-    /// named: an entry cannot change its address without changing its uuid
-    /// today, but nothing here depends on that staying true.
-    fn moved_addresses(&self) -> HashSet<String> {
+    /// The channel delta's uuids, one set per side, so every rule that asks
+    /// "which uuids move, and which way" reads one derivation instead of
+    /// walking the three lists itself.
+    pub(crate) fn channel_sides(&self) -> ChannelSides {
+        ChannelSides {
+            added: self.channels_added.iter().map(|e| e.uuid).collect(),
+            removed: self.channels_removed.iter().map(|e| e.uuid).collect(),
+            retuned_old: self.channels_changed.iter().map(|c| c.old.uuid).collect(),
+            retuned_new: self.channels_changed.iter().map(|c| c.new.uuid).collect(),
+        }
+    }
+
+    /// The entries leaving the directory: removed outright, or the old side of
+    /// a change, which the commit treats as a removal followed by an addition.
+    pub(crate) fn leaving(&self) -> impl Iterator<Item = &Arc<ChannelEntry>> {
+        self.channels_removed
+            .iter()
+            .chain(self.channels_changed.iter().map(|change| &change.old))
+    }
+
+    /// The entries joining the directory: added outright, or the new side of a
+    /// change.
+    pub(crate) fn joining(&self) -> impl Iterator<Item = &Arc<ChannelEntry>> {
         self.channels_added
             .iter()
+            .chain(self.channels_changed.iter().map(|change| &change.new))
+    }
+
+    /// The addresses of both sets. Both sides of a changed entry are named: an
+    /// entry cannot change its address without changing its uuid today, but
+    /// nothing here depends on that staying true.
+    fn moved_addresses(&self) -> HashSet<String> {
+        self.leaving()
+            .chain(self.joining())
             .map(|e| e.address.clone())
-            .chain(self.channels_removed.iter().map(|e| e.address.clone()))
-            .chain(self.channels_changed.iter().map(|c| c.old.address.clone()))
-            .chain(self.channels_changed.iter().map(|c| c.new.address.clone()))
             .collect()
     }
 }
@@ -163,6 +269,8 @@ pub(crate) fn plan_delta(
     baseline: &PlanFacts<'_>,
     candidate: &PlanFacts<'_>,
     kinds_changed: BTreeSet<String>,
+    agents: &AgentInputs<'_>,
+    live: &LiveFacts<'_>,
 ) -> PlanDelta {
     let old_entries = Entries::of(baseline.directory);
     let new_entries = Entries::of(candidate.directory);
@@ -189,7 +297,8 @@ pub(crate) fn plan_delta(
 
     let old_consumers = by_slug(baseline.consumers);
     let new_consumers = by_slug(candidate.consumers);
-    let moved = delta.moved_channels();
+    let sides = delta.channel_sides();
+    let moved = sides.moved();
     for consumer in candidate.consumers {
         match old_consumers.get(consumer.slug.as_str()) {
             None => delta.consumers_added.push(consumer.slug.clone()),
@@ -224,30 +333,8 @@ pub(crate) fn plan_delta(
         }
     }
 
-    // The MQTT half, last: it reads the channel delta above for its routes and
-    // the two plans' ingress lists for the broker set, which are two different
-    // grains of the same move.
-    let leaving: Vec<&ChannelEntry> = delta
-        .channels_removed
-        .iter()
-        .map(Arc::as_ref)
-        .chain(delta.channels_changed.iter().map(|c| c.old.as_ref()))
-        .collect();
-    let joining: Vec<&ChannelEntry> = delta
-        .channels_added
-        .iter()
-        .map(Arc::as_ref)
-        .chain(delta.channels_changed.iter().map(|c| c.new.as_ref()))
-        .collect();
-    delta.mqtt = mqtt_delta(
-        baseline.mqtt_ingress,
-        candidate.mqtt_ingress,
-        &leaving,
-        &joining,
-    );
-
     // Surface half — depends on the channel delta and the kind fingerprints.
-    let moved_channels = delta.moved_channels();
+    let moved_channels = moved.clone();
     let moved_addresses = delta.moved_addresses();
     delta.kinds_changed = kinds_changed;
     delta.surfaces = surface_delta(
@@ -259,7 +346,117 @@ pub(crate) fn plan_delta(
             kinds_changed: &delta.kinds_changed,
         },
     );
+
+    // Agent half — must run after the channel delta so `moved_channels` is
+    // complete, and before the MQTT half, which reads the dynamic
+    // subscriptions it re-authorized.
+    delta.agents_changed = agent_delta(
+        baseline.apps,
+        candidate.apps,
+        &old_entries.list,
+        &new_entries.list,
+        &AgentClosure {
+            moved: &moved_channels,
+            departing: &sides.departing(),
+        },
+        agents,
+        live,
+    );
+
+    delta.dynamic_observed = live.dynamic.clone();
+
+    // The MQTT half, last: it reads the channel delta for its static routes,
+    // the two plans' ingress lists and the two sides' dynamic subscriptions for
+    // the broker set, which are three grains of the same move.
+    let leaving: Vec<&ChannelEntry> = delta.leaving().map(Arc::as_ref).collect();
+    let joining: Vec<&ChannelEntry> = delta.joining().map(Arc::as_ref).collect();
+    let (baseline_dynamic, candidate_dynamic) =
+        dynamic_ingress_sides(baseline, candidate, &delta, live);
+    delta.mqtt = mqtt_delta(
+        &MqttIngressSet {
+            static_: baseline.mqtt_ingress,
+            dynamic: baseline_dynamic,
+        },
+        &MqttIngressSet {
+            static_: candidate.mqtt_ingress,
+            dynamic: candidate_dynamic,
+        },
+        &leaving,
+        &joining,
+    );
     delta
+}
+
+/// The dynamic `mqtt:` ingress each side of this reload stands behind.
+///
+/// The baseline's is what the process holds folded right now. The candidate's
+/// is that set less what the re-merge revoked or pruned, plus what it revived —
+/// which is exactly what a fresh boot of the candidate would derive from the
+/// same rows. Each is taken against its own side's static channels, because a
+/// filter the document declares is subscribed and routed as a static channel
+/// and must not be counted twice.
+///
+/// One channel folded by two agents is one filter and one route: the
+/// projection dedupes by channel uuid, so a revoke by one agent while another
+/// still holds it folded leaves the filter in the candidate's set.
+fn dynamic_ingress_sides(
+    baseline: &PlanFacts<'_>,
+    candidate: &PlanFacts<'_>,
+    delta: &PlanDelta,
+    live: &LiveFacts<'_>,
+) -> (
+    Vec<ResolvedMqttIngressChannel>,
+    Vec<ResolvedMqttIngressChannel>,
+) {
+    let folded: Vec<&brenn_lib::messaging::DynamicSubscriptionRow> = live
+        .dynamic
+        .rows
+        .iter()
+        .filter(|row| folded_now(live.directory, &row.channel_uuid, &row.app_slug))
+        .collect();
+    let withdrawn: HashSet<(&str, Uuid)> = delta
+        .agents_changed
+        .iter()
+        .flat_map(|change| {
+            change
+                .dynamic
+                .revoke
+                .iter()
+                .map(|revoked| &revoked.moved)
+                .chain(&change.dynamic.prune)
+                .map(|moved| (change.slug.as_str(), moved.channel_uuid))
+        })
+        .collect();
+
+    let before: Vec<brenn_lib::messaging::DynamicSubscriptionRow> =
+        folded.iter().map(|row| (*row).clone()).collect();
+    let mut after: Vec<brenn_lib::messaging::DynamicSubscriptionRow> = folded
+        .iter()
+        .filter(|row| !withdrawn.contains(&(row.app_slug.as_str(), row.channel_uuid)))
+        .map(|row| (*row).clone())
+        .collect();
+    for change in &delta.agents_changed {
+        for revived in &change.dynamic.revive {
+            if let Some(row) = &revived.row {
+                after.push(row.clone());
+            }
+        }
+    }
+
+    let baseline_static: HashSet<Uuid> = baseline
+        .mqtt_ingress
+        .iter()
+        .map(|channel| channel.channel_uuid)
+        .collect();
+    let candidate_static: HashSet<Uuid> = candidate
+        .mqtt_ingress
+        .iter()
+        .map(|channel| channel.channel_uuid)
+        .collect();
+    (
+        dynamic_ingress(&before, live.directory, live.mqtt_clients, &baseline_static),
+        dynamic_ingress(&after, live.directory, live.mqtt_clients, &candidate_static),
+    )
 }
 
 /// The uuid of every channel a consumer reads or writes.
@@ -324,7 +521,7 @@ pub(crate) fn convergibility_refusals(
     let mut out = Vec::new();
     // The one derivation of "what moved", shared by rule 2's live check and the
     // corollary assert below, so the two cannot come to disagree about it.
-    let moved = delta.moved_channels();
+    let moved = delta.channel_sides().moved();
     let departing: HashSet<&str> = delta
         .consumers_removed
         .iter()
@@ -359,11 +556,28 @@ pub(crate) fn convergibility_refusals(
     // its entries are folded onto the new channel from the candidate's plan.
     let leaving_surfaces = departing_surfaces(delta);
     let joining_surfaces = arriving_surfaces(delta);
+    // An agent on a moving channel qualifies on the same terms as a surface:
+    // the commit folds its subscriber entries out and back in.
+    let moving_agents = delta.moving_agents();
     for entry in &delta.channels_added {
-        rule_1(entry, "added", &arriving, &joining_surfaces, &mut out);
+        rule_1(
+            entry,
+            "added",
+            &arriving,
+            &joining_surfaces,
+            &moving_agents,
+            &mut out,
+        );
     }
     for entry in &delta.channels_removed {
-        rule_1(entry, "removed", &departing, &leaving_surfaces, &mut out);
+        rule_1(
+            entry,
+            "removed",
+            &departing,
+            &leaving_surfaces,
+            &moving_agents,
+            &mut out,
+        );
     }
     for change in &delta.channels_changed {
         rule_1(
@@ -371,6 +585,7 @@ pub(crate) fn convergibility_refusals(
             "changed",
             &departing,
             &leaving_surfaces,
+            &moving_agents,
             &mut out,
         );
         rule_1(
@@ -378,19 +593,38 @@ pub(crate) fn convergibility_refusals(
             "changed",
             &arriving,
             &joining_surfaces,
+            &moving_agents,
             &mut out,
         );
     }
 
     // Rule 2: the same question asked of the directory as it actually stands.
     out.extend(live_subscriber_refusals(delta, live));
+    // Rule 2's other half, over the dynamic subscriptions the directory holds
+    // no subscriber entry for. Separate because it reads the row set rather
+    // than the directory, and because it needs no re-asking at commit: a
+    // dormant row cannot arrive while a reload runs.
+    for (slug, address) in
+        dormant_rows_the_reload_cannot_follow(&delta.dynamic_observed, live, &delta.channel_sides())
+    {
+        out.push(format!(
+            "{address} is going away but agent {slug:?} holds a dormant dynamic subscription to \
+             it: {NEEDS_RESTART}",
+        ));
+    }
 
     // Every surface the delta walks, either side: the corollary assert below
     // measures what did *not* move, and a moving surface's entries move with
     // it whether or not the channel they sit on did.
     let moving_surfaces: HashSet<&str> =
         leaving_surfaces.union(&joining_surfaces).copied().collect();
-    assert_unchanged_entries_agree(baseline, candidate, &moved, &moving_surfaces);
+    assert_unchanged_entries_agree(
+        baseline,
+        candidate,
+        &moved,
+        &moving_surfaces,
+        &moving_agents,
+    );
     // A changed entry is read on both sides, so a subscriber that sits on it in
     // both plans states its refusal twice. One problem, one line.
     let mut seen = HashSet::new();
@@ -436,11 +670,7 @@ pub(crate) fn live_subscriber_refusals(
             ));
         }
     }
-    for entry in delta
-        .channels_removed
-        .iter()
-        .chain(delta.channels_changed.iter().map(|c| &c.old))
-    {
+    for entry in delta.leaving() {
         let Some(live_entry) = live.by_uuid(&entry.uuid) else {
             continue;
         };
@@ -451,8 +681,15 @@ pub(crate) fn live_subscriber_refusals(
             // has answered for them. What is left is what boot did not put
             // there: a dynamic app row, an attach-minted surface or remote, a
             // live session streaming from the channel.
+            // No agent is accounted here: only *dynamic* rows reach this
+            // arm, and those are in neither plan.
             if !planned.contains(&subscriber.kind)
-                && !accounted(&subscriber.kind, &departing, &leaving_surfaces)
+                && !accounted(
+                    &subscriber.kind,
+                    &departing,
+                    &leaving_surfaces,
+                    &HashSet::new(),
+                )
             {
                 out.push(format!(
                     "{} is going away but {} subscribes to it right now: {NEEDS_RESTART}",
@@ -511,17 +748,18 @@ fn arriving_surfaces(delta: &PlanDelta) -> HashSet<&str> {
         .collect()
 }
 
-/// Rule 1: every subscriber on a moving entry must be a consumer or a surface
-/// that moves with it.
+/// Rule 1: every subscriber on a moving entry must be a consumer, a surface or
+/// an agent that moves with it.
 fn rule_1(
     entry: &ChannelEntry,
     what: &str,
     moving: &HashSet<&str>,
     moving_surfaces: &HashSet<&str>,
+    moving_agents: &HashSet<&str>,
     out: &mut Vec<String>,
 ) {
     for subscriber in &entry.subscribers {
-        if !accounted(&subscriber.kind, moving, moving_surfaces) {
+        if !accounted(&subscriber.kind, moving, moving_surfaces, moving_agents) {
             out.push(format!(
                 "{} is {what} but {} subscribes to it: {NEEDS_RESTART}",
                 entry.address,
@@ -537,10 +775,12 @@ fn accounted(
     kind: &SubscriberEntryKind,
     moving: &HashSet<&str>,
     moving_surfaces: &HashSet<&str>,
+    moving_agents: &HashSet<&str>,
 ) -> bool {
     match kind {
         SubscriberEntryKind::Wasm(slug) => moving.contains(slug.as_str()),
         SubscriberEntryKind::Surface(slug) => moving_surfaces.contains(slug.as_str()),
+        SubscriberEntryKind::App(slug) => moving_agents.contains(slug.as_str()),
         _ => false,
     }
 }
@@ -568,6 +808,7 @@ fn assert_unchanged_entries_agree(
     candidate: &PlanFacts<'_>,
     moved: &HashSet<Uuid>,
     moving_surfaces: &HashSet<&str>,
+    moving_agents: &HashSet<&str>,
 ) {
     let old_entries = Entries::of(baseline.directory);
     for entry in candidate.directory.list() {
@@ -577,8 +818,8 @@ fn assert_unchanged_entries_agree(
         let Some(old) = old_entries.by_uuid.get(&entry.uuid) else {
             continue;
         };
-        let old_foreign = foreign_subscribers(old, moving_surfaces);
-        let new_foreign = foreign_subscribers(&entry, moving_surfaces);
+        let old_foreign = foreign_subscribers(old, moving_surfaces, moving_agents);
+        let new_foreign = foreign_subscribers(&entry, moving_surfaces, moving_agents);
         assert!(
             old_foreign == new_foreign,
             "channel {:?} did not move but its non-component subscribers did — {} before, {} \
@@ -592,10 +833,9 @@ fn assert_unchanged_entries_agree(
 }
 
 /// Every subscriber on an entry that this reload does not walk: not a WASM
-/// consumer, and not a surface the surface delta moves. A moving surface's
-/// entries are re-folded from the candidate's plan on a channel that stayed
-/// exactly as they are on one that moved, so a difference in them is expected
-/// rather than evidence of a non-convergible entity.
+/// consumer, not a surface the surface delta moves, and not an agent the agent
+/// delta moves. A difference in any of those is expected (they re-fold from the
+/// candidate's plan), not evidence of a non-convergible entity.
 ///
 /// Kinds, not their rendered text: the identity of a subscriber is the value,
 /// and refusal wording is free to change without silently making two of them
@@ -603,12 +843,14 @@ fn assert_unchanged_entries_agree(
 fn foreign_subscribers<'a>(
     entry: &'a ChannelEntry,
     moving_surfaces: &HashSet<&str>,
+    moving_agents: &HashSet<&str>,
 ) -> HashSet<&'a SubscriberEntryKind> {
     entry
         .subscribers
         .iter()
         .filter(|s| !matches!(&s.kind, SubscriberEntryKind::Wasm(_)))
         .filter(|s| !matches!(&s.kind, SubscriberEntryKind::Surface(slug) if moving_surfaces.contains(slug.as_str())))
+        .filter(|s| !matches!(&s.kind, SubscriberEntryKind::App(slug) if moving_agents.contains(slug.as_str())))
         .map(|s: &SubscriberEntry| &s.kind)
         .collect()
 }
@@ -626,6 +868,45 @@ fn named(kinds: &HashSet<&SubscriberEntryKind>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No agents on either side: these cases are about channels, consumers and
+    /// surfaces, and an empty map on both sides keeps the agent half of the
+    /// delta out of them.
+    use std::collections::BTreeMap;
+
+    static NO_APPS: std::sync::LazyLock<IndexMap<String, AppConfig>> =
+        std::sync::LazyLock::new(IndexMap::new);
+    static NO_DIFFS: std::sync::LazyLock<BTreeMap<String, crate::reload::compare::AppFieldDiff>> =
+        std::sync::LazyLock::new(BTreeMap::new);
+
+    static NO_TOOLS: std::sync::LazyLock<brenn_tool_registry::ToolRegistry> =
+        std::sync::LazyLock::new(|| brenn_tool_registry::ToolRegistry::new(vec![]));
+
+    fn no_agents() -> AgentInputs<'static> {
+        AgentInputs {
+            app_diffs: &NO_DIFFS,
+            tool_registry: &NO_TOOLS,
+        }
+    }
+
+    static EMPTY_DIRECTORY: std::sync::LazyLock<MessagingDirectory> =
+        std::sync::LazyLock::new(|| MessagingDirectory::with_entries(Vec::new()));
+    static NO_DYNAMIC: std::sync::LazyLock<DynamicSnapshot> =
+        std::sync::LazyLock::new(DynamicSnapshot::default);
+    static NO_CLIENTS: std::sync::LazyLock<
+        IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
+    > = std::sync::LazyLock::new(IndexMap::new);
+
+    /// A process holding no dynamic subscription at all, which is every case in
+    /// this module: they are about two plans, and a dynamic subscription is in
+    /// neither.
+    fn no_live() -> LiveFacts<'static> {
+        LiveFacts {
+            directory: &EMPTY_DIRECTORY,
+            dynamic: &NO_DYNAMIC,
+            mqtt_clients: &NO_CLIENTS,
+        }
+    }
 
     /// Every plan in this module is compared with an empty `kinds_changed`:
     /// these cases are about channels and consumers, and a kind set that never
@@ -727,6 +1008,7 @@ mod tests {
     fn facts<'a>(plan: &'a MessagingPlan, records: &'a HashMap<String, Verified>) -> PlanFacts<'a> {
         PlanFacts {
             directory: &plan.directory,
+            apps: &NO_APPS,
             consumers: &plan.wasm_consumers,
             records,
             mqtt_ingress: &plan.mqtt_ingress_channels,
@@ -743,6 +1025,8 @@ mod tests {
             &facts(&plan_a, &records_a),
             &facts(&plan_b, &records_b),
             BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
         )
     }
 
@@ -778,7 +1062,13 @@ mod tests {
             surfaces: surfaces_b,
             ..facts(&plan_b, &records_b)
         };
-        plan_delta(&facts_a, &facts_b, BTreeSet::new())
+        plan_delta(
+            &facts_a,
+            &facts_b,
+            BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
+        )
     }
 
     /// The wiring the surface half of `plan_delta` rests on: the channel delta
@@ -808,7 +1098,8 @@ mod tests {
         );
         assert!(
             delta
-                .moved_channels()
+                .channel_sides()
+                .moved()
                 .contains(&delta.channels_changed[0].new.uuid),
             "and its uuid is what the subscription closure reads",
         );
@@ -1126,7 +1417,7 @@ mod tests {
         let (plan_a, plan_b) = (plan_of(&before), plan_of(&after));
         let (records_a, records_b) = (records(&plan_a, "aa"), records(&plan_b, "aa"));
         let (old, new) = (facts(&plan_a, &records_a), facts(&plan_b, &records_b));
-        let delta = plan_delta(&old, &new, BTreeSet::new());
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
 
         assert_eq!(
             delta.consumers_added,
@@ -1193,7 +1484,7 @@ mod tests {
             let (plan_a, plan_b) = (plan_of(before), plan_of(after));
             let (records_a, records_b) = (records(&plan_a, "aa"), records(&plan_b, "aa"));
             let (old, new) = (facts(&plan_a, &records_a), facts(&plan_b, &records_b));
-            let delta = plan_delta(&old, &new, BTreeSet::new());
+            let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
             let moved: Vec<&str> = if direction == "added" {
                 addresses(&delta.channels_added)
             } else {
@@ -1256,6 +1547,7 @@ mod tests {
         }];
         let empty = HashMap::new();
         let old = PlanFacts {
+            apps: &NO_APPS,
             directory: &before,
             consumers: &[],
             records: &empty,
@@ -1263,13 +1555,14 @@ mod tests {
             surfaces: &[],
         };
         let new = PlanFacts {
+            apps: &NO_APPS,
             directory: &after,
             consumers: &[],
             records: &empty,
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new());
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         // The delta does hold the UNSUBSCRIBE; the refusal is what stops it
         // from ever being issued.
         assert_eq!(delta.mqtt.unsubscribed(), vec![ADDRESS.to_string()]);
@@ -1317,6 +1610,7 @@ mod tests {
             let live = one_entry(live_entry);
             let empty = HashMap::new();
             let old = PlanFacts {
+                apps: &NO_APPS,
                 directory: &before,
                 consumers: &[],
                 records: &empty,
@@ -1324,13 +1618,14 @@ mod tests {
                 surfaces: &[],
             };
             let new = PlanFacts {
+                apps: &NO_APPS,
                 directory: &after,
                 consumers: &[],
                 records: &empty,
                 mqtt_ingress: &ingress,
                 surfaces: &[],
             };
-            let delta = plan_delta(&old, &new, BTreeSet::new());
+            let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
             assert_eq!(delta.channels_added.len(), 1);
             assert_eq!(
                 convergibility_refusals(&old, &new, &delta, &live),
@@ -1367,6 +1662,8 @@ mod tests {
             &facts(&plan_a, &empty),
             &facts(&plan_b, &empty),
             BTreeSet::new(),
+            &no_agents(),
+            &no_live(),
         );
         assert_eq!(
             delta
@@ -1443,6 +1740,7 @@ mod tests {
         let after = one_entry(entry("brenn:work", uuid, 16, subscribers));
         let empty = HashMap::new();
         let old = PlanFacts {
+            apps: &NO_APPS,
             directory: &before,
             consumers: &[],
             records: &empty,
@@ -1450,16 +1748,159 @@ mod tests {
             surfaces: &[],
         };
         let new = PlanFacts {
+            apps: &NO_APPS,
             directory: &after,
             consumers: &[],
             records: &empty,
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let mut delta = plan_delta(&old, &new, BTreeSet::new());
+        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         assert_eq!(delta.channels_changed.len(), 1);
         delta.consumers_changed = moving.iter().map(|slug| (*slug).to_string()).collect();
         convergibility_refusals(&old, &new, &delta, &before)
+    }
+
+    /// One changed agent, as the agent delta would carry it: the fields rule 1
+    /// and the corollary assert read are the slug alone.
+    fn changed_agent(slug: &str) -> super::super::agents::AgentChange {
+        super::super::agents::AgentChange {
+            slug: slug.to_string(),
+            subs_removed: Vec::new(),
+            subs_added: Vec::new(),
+            dynamic: crate::reload::dynamic::DynamicRemerge::default(),
+            respawn: false,
+            virtual_tools_staged: false,
+            owner_changed: false,
+            previous_owner: None,
+            allowed_users: Vec::new(),
+            users_restricted: false,
+            users_removed: Vec::new(),
+        }
+    }
+
+    /// The same retune, with `agents` naming the agents the delta moves.
+    fn refusals_for_retune_with_agents(
+        subscribers: Vec<SubscriberEntry>,
+        agents: &[&str],
+    ) -> Vec<String> {
+        let uuid = Uuid::from_u128(7);
+        let before = one_entry(entry("brenn:work", uuid, 4, subscribers.clone()));
+        let after = one_entry(entry("brenn:work", uuid, 16, subscribers));
+        let empty = HashMap::new();
+        let old = PlanFacts {
+            apps: &NO_APPS,
+            directory: &before,
+            consumers: &[],
+            records: &empty,
+            mqtt_ingress: &[],
+            surfaces: &[],
+        };
+        let new = PlanFacts {
+            apps: &NO_APPS,
+            directory: &after,
+            consumers: &[],
+            records: &empty,
+            mqtt_ingress: &[],
+            surfaces: &[],
+        };
+        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        assert_eq!(delta.channels_changed.len(), 1);
+        delta.agents_changed = agents.iter().map(|slug| changed_agent(slug)).collect();
+        convergibility_refusals(&old, &new, &delta, &before)
+    }
+
+    /// Rule 1's agent arm: an agent the delta re-folds onto the re-created
+    /// channel is accounted for, and every other kind on the same entry still
+    /// refuses. Widening the arm to account *any* agent would silently drop a
+    /// non-converging agent's subscription from a channel this reload takes
+    /// away and puts back.
+    #[test]
+    fn a_moving_entry_whose_agent_moves_with_it_is_accepted_while_a_remote_still_refuses() {
+        let assistant = subscriber(SubscriberEntryKind::App("assistant".into()));
+        let pod = subscriber(SubscriberEntryKind::Remote("pod".into()));
+
+        assert!(
+            refusals_for_retune_with_agents(vec![assistant.clone()], &["assistant"]).is_empty(),
+            "the agent this delta re-folds is accounted for",
+        );
+        assert_eq!(
+            refusals_for_retune_with_agents(vec![assistant.clone()], &["scribe"]),
+            vec![
+                "brenn:work is changed but agent \"assistant\" subscribes to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+            "another agent moving accounts for nothing here",
+        );
+        assert_eq!(
+            refusals_for_retune_with_agents(vec![assistant, pod], &["assistant"]),
+            vec![
+                "brenn:work is changed but remote \"pod\" subscribes to it: \
+                 this change needs a restart"
+                    .to_string(),
+            ],
+            "a kind no delta walks is refused beside an accounted agent",
+        );
+    }
+
+    /// The corollary assert, both directions: a changed agent's entries on an
+    /// unchanged channel legitimately differ between the two plans, and an
+    /// unchanged agent's do not.
+    #[test]
+    fn the_unchanged_entries_assert_tolerates_a_changed_agent_and_no_other() {
+        let uuid = Uuid::from_u128(9);
+        let assistant = subscriber(SubscriberEntryKind::App("assistant".into()));
+        let before = one_entry(entry("brenn:work", uuid, 4, vec![]));
+        let after = one_entry(entry("brenn:work", uuid, 4, vec![assistant]));
+        let empty = HashMap::new();
+        let old = PlanFacts {
+            apps: &NO_APPS,
+            directory: &before,
+            consumers: &[],
+            records: &empty,
+            mqtt_ingress: &[],
+            surfaces: &[],
+        };
+        let new = PlanFacts {
+            apps: &NO_APPS,
+            directory: &after,
+            consumers: &[],
+            records: &empty,
+            mqtt_ingress: &[],
+            surfaces: &[],
+        };
+        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        delta.agents_changed = vec![changed_agent("assistant")];
+        assert!(convergibility_refusals(&old, &new, &delta, &before).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "did not move but its non-component subscribers did")]
+    fn the_unchanged_entries_assert_still_fires_for_an_agent_no_delta_moves() {
+        let uuid = Uuid::from_u128(9);
+        let assistant = subscriber(SubscriberEntryKind::App("assistant".into()));
+        let before = one_entry(entry("brenn:work", uuid, 4, vec![]));
+        let after = one_entry(entry("brenn:work", uuid, 4, vec![assistant]));
+        let empty = HashMap::new();
+        let old = PlanFacts {
+            apps: &NO_APPS,
+            directory: &before,
+            consumers: &[],
+            records: &empty,
+            mqtt_ingress: &[],
+            surfaces: &[],
+        };
+        let new = PlanFacts {
+            apps: &NO_APPS,
+            directory: &after,
+            consumers: &[],
+            records: &empty,
+            mqtt_ingress: &[],
+            surfaces: &[],
+        };
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
+        let _ = convergibility_refusals(&old, &new, &delta, &before);
     }
 
     /// Rule 1's accepted shape, which every successful reload has: the entry
@@ -1508,6 +1949,7 @@ mod tests {
         let after = one_entry(entry("brenn:work", uuid, 16, vec![wall]));
         let empty = HashMap::new();
         let facts = |directory| PlanFacts {
+            apps: &NO_APPS,
             directory,
             consumers: &[],
             records: &empty,
@@ -1519,7 +1961,7 @@ mod tests {
         let surface =
             || brenn_surface_server::fixtures_config::SurfaceFixture::new("wall", "chart").build();
 
-        let stationary = plan_delta(&old, &new, BTreeSet::new());
+        let stationary = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         assert_eq!(
             convergibility_refusals(&old, &new, &stationary, &before),
             vec![
@@ -1529,7 +1971,7 @@ mod tests {
             ],
         );
 
-        let mut moving = plan_delta(&old, &new, BTreeSet::new());
+        let mut moving = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         moving
             .surfaces
             .changed
@@ -1561,6 +2003,7 @@ mod tests {
         let after = one_entry(entry("brenn:work", uuid, 4, vec![agent]));
         let empty = HashMap::new();
         let facts = |directory| PlanFacts {
+            apps: &NO_APPS,
             directory,
             consumers: &[],
             records: &empty,
@@ -1570,7 +2013,7 @@ mod tests {
         let old = facts(&before);
         let new = facts(&after);
 
-        let mut delta = plan_delta(&old, &new, BTreeSet::new());
+        let mut delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         assert!(
             delta.channels_changed.is_empty() && delta.channels_removed.is_empty(),
             "the channel itself did not move",
@@ -1598,6 +2041,7 @@ mod tests {
         let after = one_entry(entry("brenn:work", uuid, 4, vec![agent]));
         let empty = HashMap::new();
         let facts = |directory| PlanFacts {
+            apps: &NO_APPS,
             directory,
             consumers: &[],
             records: &empty,
@@ -1606,7 +2050,7 @@ mod tests {
         };
         let old = facts(&before);
         let new = facts(&after);
-        let delta = plan_delta(&old, &new, BTreeSet::new());
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         let _ = convergibility_refusals(&old, &new, &delta, &before);
     }
 
@@ -1704,6 +2148,7 @@ mod tests {
         ));
         let empty = HashMap::new();
         let old = PlanFacts {
+            apps: &NO_APPS,
             directory: &before,
             consumers: &[],
             records: &empty,
@@ -1711,13 +2156,14 @@ mod tests {
             surfaces: &[],
         };
         let new = PlanFacts {
+            apps: &NO_APPS,
             directory: &after,
             consumers: &[],
             records: &empty,
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new());
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         assert!(delta.is_empty(), "a subscriber list is not an identity");
         assert!(convergibility_refusals(&old, &new, &delta, &before).is_empty());
     }
@@ -1739,6 +2185,7 @@ mod tests {
         ));
         let empty = HashMap::new();
         let old = PlanFacts {
+            apps: &NO_APPS,
             directory: &before,
             consumers: &[],
             records: &empty,
@@ -1746,13 +2193,14 @@ mod tests {
             surfaces: &[],
         };
         let new = PlanFacts {
+            apps: &NO_APPS,
             directory: &after,
             consumers: &[],
             records: &empty,
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new());
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         assert_eq!(delta.channels_removed.len(), 1);
         assert_eq!(
             convergibility_refusals(&old, &new, &delta, &live),
@@ -1780,6 +2228,7 @@ mod tests {
         ));
         let empty = HashMap::new();
         let old = PlanFacts {
+            apps: &NO_APPS,
             directory: &before,
             consumers: &[],
             records: &empty,
@@ -1787,13 +2236,143 @@ mod tests {
             surfaces: &[],
         };
         let new = PlanFacts {
+            apps: &NO_APPS,
             directory: &after,
             consumers: &[],
             records: &empty,
             mqtt_ingress: &[],
             surfaces: &[],
         };
-        let delta = plan_delta(&old, &new, BTreeSet::new());
+        let delta = plan_delta(&old, &new, BTreeSet::new(), &no_agents(), &no_live());
         convergibility_refusals(&old, &new, &delta, &before);
+    }
+
+    // -----------------------------------------------------------------------
+    // The dynamic `mqtt:` projection at the seam: which filters each side of
+    // this reload stands behind.
+    // -----------------------------------------------------------------------
+
+    /// A durable `mqtt:` row as a dynamic subscribe leaves it, with the
+    /// SUBSCRIBE QoS the projection re-asserts the filter at.
+    fn mqtt_row(uuid: Uuid, slug: &str) -> brenn_lib::messaging::DynamicSubscriptionRow {
+        brenn_lib::messaging::DynamicSubscriptionRow {
+            channel_uuid: uuid,
+            app_slug: slug.to_string(),
+            push_depth: Depth::Bounded(0),
+            retain_depth: Depth::Bounded(1),
+            noise: NoiseLevel::Metered,
+            wake_min: brenn_lib::messaging::WakeMin::Never,
+            qos: Some(1),
+            created_at: "2026-09-07T00:00:00Z".to_string(),
+        }
+    }
+
+    /// One changed agent whose only move is the revoke of `row`.
+    fn revoking(
+        slug: &str,
+        address: &str,
+        row: &brenn_lib::messaging::DynamicSubscriptionRow,
+    ) -> AgentChange {
+        AgentChange {
+            slug: slug.to_string(),
+            subs_removed: Vec::new(),
+            subs_added: Vec::new(),
+            dynamic: crate::reload::dynamic::DynamicRemerge {
+                revoke: vec![crate::reload::dynamic::DynamicRevoke {
+                    moved: crate::reload::dynamic::DynamicMove {
+                        channel_uuid: row.channel_uuid,
+                        address: address.to_string(),
+                        row: Some(row.clone()),
+                    },
+                    reason: crate::reload::dynamic::RevokeReason::AclDenies,
+                }],
+                revive: Vec::new(),
+                prune: Vec::new(),
+            },
+            respawn: false,
+            virtual_tools_staged: false,
+            owner_changed: false,
+            previous_owner: None,
+            allowed_users: Vec::new(),
+            users_restricted: false,
+            users_removed: Vec::new(),
+        }
+    }
+
+    /// Two agents hold one `mqtt:` channel folded and the reload revokes one of
+    /// them. One channel is one filter and one route, so the candidate's set
+    /// still carries it: unsubscribing here would take the broker filter and
+    /// the ingress route out from under the agent that keeps the subscription,
+    /// which no test above can see because every `mqtt_delta` case is handed a
+    /// set built by hand and every broker case has one agent on the channel.
+    #[test]
+    fn a_revoke_by_one_agent_leaves_a_filter_another_still_holds() {
+        const ADDRESS: &str = "mqtt:ha:home/state";
+        let mut entry = test_channel_entry(ADDRESS, vec![]);
+        // Spelled rather than canonicalized, and folded by hand: this is the
+        // state a pair of dynamic subscribes leaves, which no plan describes.
+        entry.address = ADDRESS.to_string();
+        entry.transport_type = ChannelScheme::Mqtt;
+        entry.subscribers = ["reader", "writer"]
+            .into_iter()
+            .map(|slug| SubscriberEntry {
+                kind: SubscriberEntryKind::App(slug.to_string()),
+                push_depth: Depth::Bounded(0),
+                retain_depth: Depth::Bounded(1),
+                noise: NoiseLevel::Metered,
+                wake_min: Some(brenn_lib::messaging::WakeMin::Never),
+            })
+            .collect();
+        let uuid = entry.uuid;
+        let directory = MessagingDirectory::with_entries(vec![entry]);
+        let rows = vec![mqtt_row(uuid, "reader"), mqtt_row(uuid, "writer")];
+        let dynamic = DynamicSnapshot {
+            rows: rows.clone(),
+            nondurable: Vec::new(),
+        };
+        let clients: IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity> =
+            IndexMap::from([(
+                "ha".to_string(),
+                brenn_lib::mqtt::test_support::test_client_identity("ha"),
+            )]);
+        let live = LiveFacts {
+            directory: &directory,
+            dynamic: &dynamic,
+            mqtt_clients: &clients,
+        };
+        // Two plans that declare nothing: the filter under test is purely
+        // dynamic, so it is in neither side's static ingress list.
+        let no_consumers: Vec<ResolvedWasmConsumer> = Vec::new();
+        let no_records: HashMap<String, Verified> = HashMap::new();
+        let no_ingress: Vec<ResolvedMqttIngressChannel> = Vec::new();
+        let no_surfaces: Vec<ResolvedSurface> = Vec::new();
+        let facts = PlanFacts {
+            directory: &EMPTY_DIRECTORY,
+            apps: &NO_APPS,
+            consumers: &no_consumers,
+            records: &no_records,
+            mqtt_ingress: &no_ingress,
+            surfaces: &no_surfaces,
+        };
+
+        let mut delta = PlanDelta {
+            agents_changed: vec![revoking("reader", ADDRESS, &rows[0])],
+            ..PlanDelta::default()
+        };
+        let (before, after) = dynamic_ingress_sides(&facts, &facts, &delta, &live);
+        assert_eq!(before.len(), 1, "one filter for the two folded rows");
+        assert_eq!(
+            after.iter().map(|c| c.channel_uuid).collect::<Vec<_>>(),
+            vec![uuid],
+            "the writer still holds it folded, so the candidate still needs it",
+        );
+
+        // Both revoked, and the filter leaves: the withdrawal is keyed on the
+        // pair, so it takes exactly the rows the two agents' re-merges name.
+        delta
+            .agents_changed
+            .push(revoking("writer", ADDRESS, &rows[1]));
+        let (_, after) = dynamic_ingress_sides(&facts, &facts, &delta, &live);
+        assert!(after.is_empty(), "nobody holds it any more");
     }
 }

@@ -23,8 +23,11 @@ mod mcp_constants;
 mod permission_sync;
 mod profile_swap;
 mod registry;
-#[cfg(test)]
-mod test_fixtures;
+mod reload_retire;
+#[cfg(any(test, feature = "testutils"))]
+pub mod test_fixtures;
+#[cfg(any(test, feature = "testutils"))]
+pub use test_fixtures::{RecordedSession, test_bridge_for_reload, test_bridge_receiving_bus};
 #[cfg(test)]
 pub mod test_support;
 mod tool_card;
@@ -40,10 +43,11 @@ pub use bridge::ActiveBridge;
 #[cfg(not(test))]
 pub use bridge::SpawnContext;
 pub(crate) use cc_event_loop::drain::deliver_conversation_backlog;
-pub use cc_spawn_config::write_virtual_tools_file;
+pub use cc_spawn_config::{render_virtual_tools, write_virtual_tools_file};
 pub(in crate::active_bridge) use compaction::CompactionPhase;
 pub use profile_swap::SwapHostSeed;
 pub use registry::ActiveBridges;
+pub use reload_retire::RetireOutcome;
 pub(in crate::active_bridge) use tool_summary::{
     PendingToolUse, emit_prerendered_summary, emit_tool_result_summaries,
 };

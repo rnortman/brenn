@@ -89,7 +89,7 @@ impl WsConnection {
         // after switching, without waiting for the next mutation.
         // Guard on graf_config: switching to a non-graf app is legitimate and
         // should silently skip rather than reject; only send if graf is configured.
-        if let Some(config) = brenn_graf::graf_config(self.app_config()) {
+        if let Some(config) = brenn_graf::graf_config(&self.app_config()) {
             self.send_todo_state(config).await;
         }
 

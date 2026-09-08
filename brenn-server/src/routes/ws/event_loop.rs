@@ -9,7 +9,7 @@ use brenn_usage_db as usage;
 use brenn_ws_types::{CcState, ViewportClass, WsServerMessage};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::connection::{SendResult, WsConnection};
 use super::dispatch::handle_client_message;
@@ -39,6 +39,12 @@ async fn recv_broadcast(rx: &mut Option<broadcast::Receiver<WsServerMessage>>) -
 }
 
 /// Write WsServerMessages to the WebSocket sink.
+///
+/// The channel closing is the teardown, and the sink is closed rather than
+/// dropped: closing flushes a Close frame — the reply queued when the client
+/// sent one, or a server-initiated one — so the peer sees the closing handshake
+/// instead of a connection reset. A peer that has already gone is the ordinary
+/// case here, not an error.
 async fn ws_writer(
     mut sink: futures::stream::SplitSink<WebSocket, Message>,
     mut rx: mpsc::Receiver<WsServerMessage>,
@@ -49,6 +55,9 @@ async fn ws_writer(
             warn!("WS write failed: {e}");
             break;
         }
+    }
+    if let Err(e) = sink.close().await {
+        debug!("WS close handshake did not complete: {e}");
     }
 }
 
@@ -107,6 +116,7 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
         viewport_class,
         device_id,
         bridge_notify_rx: state.bridge_notify_tx.subscribe(),
+        apps_swapped_rx: state.apps_swapped_tx.subscribe(),
         history_sent: false,
         last_sent_seq: None,
         queued_responses: Vec::new(),
@@ -345,6 +355,15 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
                 }
                 reload_pending = false;
             }
+            // A reload installed a new agent map. Ask the connect-time
+            // question again: `allowed_users` converges with the swap, and a
+            // socket opened under the old document is the only place a user
+            // the new one denies is still holding authority.
+            swapped = conn.apps_swapped_rx.recv() => {
+                if !conn.survives_apps_swap(&session.user.username, client_ip, swapped) {
+                    break;
+                }
+            }
             // Bridge spawn notification — another connection spawned a bridge
             // for a conversation we might be viewing.
             notification = conn.bridge_notify_rx.recv() => {
@@ -446,9 +465,54 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
     // The bridge stays alive independently.
     conn.detach().await;
 
-    drop(ws_tx); // Signal the writer task to stop.
+    // Signal the writer task to stop: it ends when every sender is gone, and
+    // the connection holds one of the two. Both go here, so a teardown the
+    // server initiated — a denied user after an agent-map swap — actually
+    // reaches the socket: the writer returns, closes the sink, and the client's
+    // stream ends. Keeping the connection alive across the await below would
+    // park the writer on a channel that can never close.
+    drop(conn);
+    drop(ws_tx);
     if let Err(e) = writer_handle.await {
         error!("ws_writer task panicked: {e}");
+    }
+}
+
+impl super::connection::WsConnection {
+    /// Whether this connection outlives an agent-map swap.
+    ///
+    /// A connection is authorized once, at connect, and nothing re-asks —
+    /// so this is where a user the candidate document no longer allows is
+    /// severed, which is what a restart would have done to them. The answer
+    /// comes off the table, which the commit has already swapped.
+    ///
+    /// A missed pulse (`Lagged`) is still a swap and asks the same question;
+    /// a closed channel is the server going down, and the connection goes with
+    /// it.
+    pub(super) fn survives_apps_swap(
+        &self,
+        username: &str,
+        client_ip: std::net::IpAddr,
+        swapped: Result<(), broadcast::error::RecvError>,
+    ) -> bool {
+        match swapped {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                if self.app_config().user_has_access(username) {
+                    return true;
+                }
+                brenn_obs::security::log_and_alert_security_event(
+                    &self.state.alert_dispatcher,
+                    brenn_obs::security::SecurityEventType::AuthFailure,
+                    client_ip,
+                    &format!(
+                        "user {username} denied WS access to app {} after a reload",
+                        self.app_slug
+                    ),
+                );
+                false
+            }
+            Err(broadcast::error::RecvError::Closed) => false,
+        }
     }
 }
 
@@ -458,6 +522,51 @@ mod tests {
     use brenn_ws_types::{CcState, PaneLayout, WsServerMessage};
 
     use super::super::testing::*;
+
+    /// The swap arm: a socket whose user the candidate no longer allows is
+    /// closed, and one it still allows is left alone. A missed pulse asks the
+    /// same question; a closed channel is the server going down.
+    #[tokio::test]
+    async fn a_swap_closes_the_socket_of_a_user_the_new_map_denies() {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let (conn, _ws_rx, _db, _user_id) = test_ws_conn_for_app(test_apps()).await;
+        assert!(
+            conn.survives_apps_swap(TEST_USERNAME, TEST_CLIENT_IP, Ok(())),
+            "the booted map allows this user",
+        );
+
+        // The reload's swap, as commit performs it: a new map in the one table
+        // every gate reads.
+        let mut denied = (*conn.state.apps.load()).clone();
+        denied[TEST_APP_SLUG].allowed_users = vec!["someone-else".to_string()];
+        conn.state.apps.store(std::sync::Arc::new(denied));
+
+        assert!(
+            !conn.survives_apps_swap(TEST_USERNAME, TEST_CLIENT_IP, Ok(())),
+            "a user the swapped map denies is severed rather than left holding authority",
+        );
+        assert!(
+            !conn.survives_apps_swap(TEST_USERNAME, TEST_CLIENT_IP, Err(RecvError::Lagged(3))),
+            "a missed pulse is still a swap",
+        );
+        assert!(
+            !conn.survives_apps_swap(TEST_USERNAME, TEST_CLIENT_IP, Err(RecvError::Closed)),
+            "a closed channel is the server going down",
+        );
+    }
+
+    /// The same swap, for a user the candidate still names: nothing happens.
+    #[tokio::test]
+    async fn a_swap_leaves_an_allowed_users_socket_open() {
+        let (conn, _ws_rx, _db, _user_id) = test_ws_conn_for_app(test_apps()).await;
+        let mut still_allowed = (*conn.state.apps.load()).clone();
+        still_allowed[TEST_APP_SLUG].allowed_users =
+            vec![TEST_USERNAME.to_string(), "someone-else".to_string()];
+        conn.state.apps.store(std::sync::Arc::new(still_allowed));
+
+        assert!(conn.survives_apps_swap(TEST_USERNAME, TEST_CLIENT_IP, Ok(())));
+    }
 
     #[tokio::test]
     async fn send_layout_on_connect_defaults_to_two_column() {

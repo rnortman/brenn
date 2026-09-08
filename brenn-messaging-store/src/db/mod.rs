@@ -112,7 +112,7 @@ pub use cursors::{
     SubscriberCursorRow, all_subscriber_cursors, channel_subscriber_cursors,
     cursor_has_deliverable, delete_subscriber_cursor, deliverable_cursor_subscribers,
     ensure_subscriber_cursor, load_subscriber_cursor, retune_subscriber_cursor_depth,
-    set_subscriber_cursor_position,
+    set_subscriber_cursor_position, subscriber_cursors_of,
 };
 
 mod deferral;

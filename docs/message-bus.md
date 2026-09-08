@@ -370,6 +370,35 @@ each boot — so retuning takes effect on restart with no migration. Lowering
 `standing_retain_depth` lets the next reap pass evict; raising it cannot
 resurrect what was already evicted.
 
+**Dynamic subscriptions on these channels are re-authorized at every
+convergence, not only at boot.** An `mqtt:` channel is more often minted by a
+running session's `MessageSubscribe` than by any block, and the subscription
+behind it is authority the document grants and can take back. A reload asks the
+question a boot asks, over the same rules: a row the new ACLs no longer cover is
+folded out and left dormant — durable row and cursor kept, and its broker filter
+dropped when no other subscriber needs it — a dormant row the new document
+authorizes again is folded back in at the depths it was granted, with its filter
+and route restored, and a row on a channel the document now declares as a
+`subscribe` line is replaced by the static entry and deleted. The status body
+reports the three as `dynamic_revoked`, `dynamic_revived` and `dynamic_pruned`.
+A reload that would **retune** the channel itself while a dynamic subscription
+sits on it — folded or dormant — is refused instead, and needs a restart; so is
+one that **removes** a channel the subscription is still folded into, or one
+carrying a dormant subscription on a system-minted address — `mqtt:`,
+`webhook:`, `brenn:tools/…`, `brenn:tool-results/…` — whose channel a fresh boot
+rebuilds from its stored row with no block declaring it. Removing an
+operator-declared channel — one a fresh boot cannot rebuild that way — under a
+*dormant* subscription is applied and leaves it as a restart leaves it: dormant,
+durable row and cursor kept. Only a durable channel's subscription can be
+dormant at all: a non-durable one lives in memory and is always folded.
+Re-declaring the channel revives it at the next restart,
+not at the reload that re-declares it — unless the same document also declares a
+`subscribe` line for the pair, which the reload answers as a boot does, by
+deleting the row and folding the static entry in. The re-declared block keeps
+the channel's identity by construction, since a declaration derives its uuid
+from its address; a `uuid_pins` entry that moves it is refused, because the
+address still belongs to the stored row the dormant subscription names.
+
 ### 2.8 The reload pair
 
 Two channels are the config-reload facility, and they are **declared, not

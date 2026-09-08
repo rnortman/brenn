@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::integration::Integration;
@@ -311,7 +311,7 @@ pub struct AppConfig {
     /// the operator's explicit `grant`/`acl` statements. `Default` (empty,
     /// deny-everything) until populated by the access-policy resolution phase.
     /// See `crate::access::AppPolicy`.
-    pub policy: crate::access::AppPolicy,
+    pub policy: std::sync::Arc<crate::access::AppPolicy>,
     /// Authority for the server-side chat harness of this app's conversations:
     /// the adapter that publishes a conversation's record and token stream and
     /// reads its command channel.
@@ -322,7 +322,92 @@ pub struct AppConfig {
     ///
     /// `Default` (empty, deny-everything) until the access-policy resolution
     /// phase stamps it.
-    pub chat_harness_policy: crate::access::AppPolicy,
+    pub chat_harness_policy: std::sync::Arc<crate::access::AppPolicy>,
+}
+
+/// The fields of an [`AppConfig`] that decide what the agent is allowed to do,
+/// borrowed for comparison.
+///
+/// Two agents with equal `AppAuthority`s are the same agent as far as every
+/// bus gate is concerned: the publish ladder, the delivery and query gates,
+/// the listing filter, dynamic subscribe, MQTT ingress, automation fire and
+/// PWA push all decide from these fields and nothing else. What is *not* here
+/// is per-call display settings and everything a Claude Code process is
+/// spawned with; those move an agent for other reasons and are compared
+/// elsewhere.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AppAuthority<'a> {
+    /// Layer-1 grants, layer-2 ACLs and tool grants.
+    pub policy: &'a Arc<crate::access::AppPolicy>,
+    /// The derived authority of the conversation's chat harness.
+    pub chat_harness: &'a Arc<crate::access::AppPolicy>,
+    /// Static subscriptions and the agent's own send budget.
+    pub messaging: Option<&'a crate::messaging::config::ResolvedMessagingConfig>,
+    /// The global default budget stamped on every agent, which
+    /// `messaging_send_budget()` falls back to.
+    pub messaging_default_send_budget: u32,
+    /// Static MQTT ingress subscriptions.
+    pub mqtt_subscriptions: &'a [crate::mqtt::config::ResolvedMqttIngressSubscription],
+}
+
+/// The fields of an [`AppConfig`] that a Claude Code process is spawned with,
+/// borrowed for comparison and for rendering.
+///
+/// A live process is the snapshot unit for these: they are read at spawn, or
+/// copied onto the bridge at construction, and never refreshed under a running
+/// process. A reload brings a changed one to the agent by retiring the process
+/// at its next idle moment and letting the wake path spawn its successor from
+/// the current map.
+///
+/// Built by [`AppConfig::class_views`], whose destructuring is exhaustive, so a
+/// new `AppConfig` field cannot be left out of both this view and
+/// [`AppPerCall`] without a compile error.
+#[derive(Debug)]
+pub struct AppSpawn<'a> {
+    pub slug: &'a str,
+    pub model: &'a str,
+    /// Ordered, unlike the `HashMap` it comes from: a `Debug` of this view is
+    /// compared across two processes, and a `HashMap`'s iteration order is
+    /// per-instance.
+    pub mcp_servers: std::collections::BTreeMap<&'a str, &'a McpServerConfig>,
+    pub disabled_tools: &'a [String],
+    pub cc_extra_args: &'a [String],
+    pub working_dir: &'a Path,
+    pub container_spawn: Option<&'a ContainerSpawnConfig>,
+    pub approval_rules: &'a [brenn_approval_rules::ApprovalRuleConfig],
+    pub persistent: bool,
+    pub idle_timeout: Option<std::time::Duration>,
+    pub idle_hook_secs: u64,
+    pub compaction: Option<&'a CompactionConfig>,
+    pub frontmatter: &'a FrontmatterRenderConfig,
+    pub singleton: bool,
+}
+
+/// The fields of an [`AppConfig`] that a route, a door or a delivery gate reads
+/// off the map per request, borrowed for comparison and for rendering.
+///
+/// Nothing holds these beyond one operation, so a reload converges them by
+/// swapping the map and doing nothing else. Built by
+/// [`AppConfig::class_views`]; see [`AppSpawn`] for what the exhaustive
+/// destructuring buys.
+#[derive(Debug)]
+pub struct AppPerCall<'a> {
+    pub slug: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub icon: &'a str,
+    pub models: Option<&'a [String]>,
+    pub multiuser: bool,
+    pub single_instance: bool,
+    pub history_replay_limit: usize,
+    pub prefix_username: bool,
+    pub prefix_timestamp: bool,
+    pub prefix_device: bool,
+    pub attachment_targets: &'a [AttachmentTarget],
+    pub allowed_users: &'a [String],
+    pub pwa_push: Option<&'a crate::pwa_push::config::AppPwaPushBlock>,
+    pub start_hooks: &'a StartHooksConfig,
+    pub post_pull_hooks: &'a PostPullHooksConfig,
 }
 
 /// Whether `alias` is permitted by a model allow-list.
@@ -333,6 +418,136 @@ pub fn model_allowed(allow: Option<&[String]>, alias: &str) -> bool {
 }
 
 impl AppConfig {
+    /// Copy-on-write access to the resolved policy.
+    ///
+    /// Clones the inner `Arc` when shared, so the mutation is never visible to
+    /// another holder of the same map snapshot.
+    pub fn policy_mut(&mut self) -> &mut crate::access::AppPolicy {
+        std::sync::Arc::make_mut(&mut self.policy)
+    }
+
+    /// Copy-on-write access to the derived chat-harness policy. Same contract
+    /// as [`Self::policy_mut`].
+    pub fn chat_harness_policy_mut(&mut self) -> &mut crate::access::AppPolicy {
+        std::sync::Arc::make_mut(&mut self.chat_harness_policy)
+    }
+
+    /// The authority half of this agent, as a comparable borrow.
+    ///
+    /// Every gate that decides what an agent may do reads one of these fields
+    /// per call, so two configs whose `AppAuthority`s are equal are
+    /// indistinguishable to every gate. A reload compares the two maps through
+    /// this view to decide whether an agent's authority moved; `AppConfig`
+    /// itself has no `PartialEq` because it holds resolved integrations behind
+    /// trait objects.
+    pub fn authority(&self) -> AppAuthority<'_> {
+        AppAuthority {
+            policy: &self.policy,
+            chat_harness: &self.chat_harness_policy,
+            messaging: self.messaging.as_ref(),
+            messaging_default_send_budget: self.messaging_default_send_budget,
+            mqtt_subscriptions: &self.mqtt_subscriptions,
+        }
+    }
+
+    /// The per-process and per-call halves of this agent, as comparable
+    /// borrows.
+    ///
+    /// The two classes a reload treats differently: the per-call half converges
+    /// at the map swap, the per-process half at the next spawn. They are built
+    /// together out of one exhaustive destructuring, so a field added to
+    /// `AppConfig` has to be placed in one of them — or explicitly in neither,
+    /// beside the authority fields and the boot-shaped ones — before this
+    /// compiles. `AppConfig` itself has no `Debug`: it holds resolved
+    /// integrations behind trait objects.
+    pub fn class_views(&self) -> (AppSpawn<'_>, AppPerCall<'_>) {
+        let AppConfig {
+            slug,
+            name,
+            description,
+            icon,
+            working_dir,
+            model,
+            models,
+            single_instance,
+            singleton,
+            persistent,
+            idle_timeout,
+            compaction,
+            idle_hook_secs,
+            allowed_users,
+            disabled_tools,
+            mcp_servers,
+            multiuser,
+            prefix_username,
+            prefix_timestamp,
+            prefix_device,
+            container_spawn,
+            start_hooks,
+            post_pull_hooks,
+            cc_extra_args,
+            approval_rules,
+            attachment_targets,
+            history_replay_limit,
+            frontmatter,
+            pwa_push,
+            // Derived placements, not authored fields.
+            path_mapper: _,
+            state_dir: _,
+            // Boot-shaped: refused at reload, each for its own reason.
+            startup_hooks: _,
+            claude_profiles: _,
+            integrations: _,
+            mounts: _,
+            webhook_subscriptions: _,
+            // Authority: compared through `AppAuthority`.
+            messaging: _,
+            messaging_default_send_budget: _,
+            mqtt_subscriptions: _,
+            policy: _,
+            chat_harness_policy: _,
+        } = self;
+        (
+            AppSpawn {
+                slug,
+                model,
+                mcp_servers: mcp_servers
+                    .iter()
+                    .map(|(name, server)| (name.as_str(), server))
+                    .collect(),
+                disabled_tools,
+                cc_extra_args,
+                working_dir,
+                container_spawn: container_spawn.as_ref(),
+                approval_rules,
+                persistent: *persistent,
+                idle_timeout: *idle_timeout,
+                idle_hook_secs: *idle_hook_secs,
+                compaction: compaction.as_ref(),
+                frontmatter,
+                singleton: *singleton,
+            },
+            AppPerCall {
+                slug,
+                name,
+                description,
+                icon,
+                models: models.as_deref(),
+                multiuser: *multiuser,
+                single_instance: *single_instance,
+                history_replay_limit: *history_replay_limit,
+                prefix_username: *prefix_username,
+                prefix_timestamp: *prefix_timestamp,
+                prefix_device: *prefix_device,
+                attachment_targets,
+                allowed_users,
+                pwa_push: pwa_push.as_ref(),
+                start_hooks,
+                post_pull_hooks,
+            },
+        )
+    }
+
     /// Host-side path to the virtual tools JSON consumed by noop_mcp.
     /// Callers that need the CC-visible path for a containerized app must run
     /// the returned path through `self.path_mapper.to_container`.

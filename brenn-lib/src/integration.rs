@@ -1441,7 +1441,7 @@ mod tests {
             frontmatter: Default::default(),
             state_dir: std::path::PathBuf::from("/tmp"),
             messaging,
-            policy,
+            policy: std::sync::Arc::new(policy),
             pwa_push,
             ..crate::config::test_app_config("test-app")
         }

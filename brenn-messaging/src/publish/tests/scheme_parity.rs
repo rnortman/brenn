@@ -40,13 +40,15 @@ fn publisher(slug: &str) -> brenn_lib::config::AppConfig {
         }),
         vec!["bob".to_string()],
     );
-    cfg.policy.grants.insert(AppCapability::EphemeralPublish);
-    cfg.policy
+    cfg.policy_mut()
+        .grants
+        .insert(AppCapability::EphemeralPublish);
+    cfg.policy_mut()
         .acls
         .ephemeral_publish
         .push(ChannelMatcher::Prefix(String::new()));
-    cfg.policy.grants.insert(AppCapability::LocalPublish);
-    cfg.policy
+    cfg.policy_mut().grants.insert(AppCapability::LocalPublish);
+    cfg.policy_mut()
         .acls
         .local_publish
         .push(ChannelMatcher::Prefix(String::new()));
@@ -72,8 +74,10 @@ fn brenn_only(slug: &str) -> brenn_lib::config::AppConfig {
 /// covering every bare name including `durable-chan`.
 fn eph_only(slug: &str) -> brenn_lib::config::AppConfig {
     let mut cfg = test_app_config(slug, None, vec!["bob".to_string()]);
-    cfg.policy.grants.insert(AppCapability::EphemeralPublish);
-    cfg.policy
+    cfg.policy_mut()
+        .grants
+        .insert(AppCapability::EphemeralPublish);
+    cfg.policy_mut()
         .acls
         .ephemeral_publish
         .push(ChannelMatcher::Prefix(String::new()));

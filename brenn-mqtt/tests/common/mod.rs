@@ -17,11 +17,14 @@
 pub mod relay;
 pub mod router;
 
-pub use brenn_mqtt::test_support::broker::{BrokerHarness, DEFAULT_ACL};
+pub use brenn_mqtt::test_support::broker::{
+    BrokerHarness, DEFAULT_ACL, log_records_publish_to_subscriber, log_records_unsubscribe,
+};
 pub use brenn_mqtt::test_support::certs;
 pub use brenn_mqtt::test_support::client::{
-    await_puback, direct_publisher_acked, drain_until_incoming, wait_for_health,
+    await_puback, direct_publisher_acked, drain_until_incoming, session_client_id, wait_for_health,
 };
+pub use brenn_mqtt::test_support::poll::poll_until;
 pub use relay::TcpRelay;
 pub use router::{CapturingRouter, DeliveredMessage};
 
@@ -143,21 +146,20 @@ pub fn test_client_config(
     }
 }
 
-/// Poll `probe` at 25ms intervals until it reports `Connected`, capping at 5s and
-/// panicking with `msg` on timeout. Shared by both harness spawners.
-async fn wait_until_connected<F, Fut>(mut probe: F, msg: &str)
+/// Poll `probe` until it reports `Connected`, capping at 5s and panicking with
+/// `msg` on timeout. Shared by both harness spawners.
+async fn wait_until_connected<F, Fut>(probe: F, msg: &str)
 where
-    F: FnMut() -> Fut,
+    F: Fn() -> Fut,
     Fut: std::future::Future<Output = ConnectorHealthLabel>,
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if probe().await == ConnectorHealthLabel::Connected {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "{msg}");
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    let probe = &probe;
+    poll_until(
+        5,
+        || async move { (probe().await == ConnectorHealthLabel::Connected).then_some(()) },
+        || async move { msg.to_string() },
+    )
+    .await
 }
 
 /// Await one delivery on `rx` (3s cap). Panics on a closed channel or timeout,

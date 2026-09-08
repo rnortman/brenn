@@ -143,7 +143,7 @@ pub(super) fn default_app_cfg_with_subscriptions(
         messaging: Some(messaging_cfg),
         // Grant MessagingPublish + a universal brenn_publish matcher so the
         // publish gate authorizes.
-        policy: brenn_lib::access::AppPolicy::messaging_sender_policy(),
+        policy: std::sync::Arc::new(brenn_lib::access::AppPolicy::messaging_sender_policy()),
         ..brenn_lib::config::test_app_config(slug)
     }
 }

@@ -136,13 +136,20 @@ rust_test(
 # skipping, and Debian-family packaging puts the daemon in /usr/sbin, off a test
 # action's default PATH.
 #
-# Three cases. Two are a broker spawn and a reload each; the third compares a
-# reloaded process against a fresh boot, twice, and each comparison boots two
-# processes and reloads once against the broker. The binary finishes in 14.5s
-# locally — 4.9s for the first two cases, 9.6s for the comparison case.
-# `large` (900s), not `medium` (300s): at the repo's one measured
+# Eight cases, each spawning a broker of its own: six are a boot and a reload
+# apiece — a consumer binding arriving and leaving, the first binding on an idle
+# broker, an agent's binding arriving, and a dynamic subscription revived and
+# revoked, those two over a store a first boot seeded — and two compare a
+# reloaded process against a fresh boot, twice each, with every comparison
+# booting two processes and reloading once against the broker. The two removal
+# cases additionally poll their broker's own log for the UNSUBSCRIBE it
+# processed, which is a local file read and moves the number by tenths, and the
+# consumer-binding one publishes and waits for a body on both sides of its
+# reload rather than only after it. The binary finishes in 15.0s locally,
+# re-measured over three runs, the eight brokers running
+# concurrently. `large` (900s), not `medium` (300s): at the repo's one measured
 # local-to-CD-runner factor for a suite of this shape, ~21x (see the wiring
-# suite above), that is ~330s on a loaded capacity-1 runner, past the medium
+# suite above), that is ~315s on a loaded capacity-1 runner, past the medium
 # budget and inside the large one. The budget is sized for the readiness and
 # connect waits on that runner, not the assertions. Re-measure both numbers
 # when the suite grows again rather than carrying this arithmetic forward: a

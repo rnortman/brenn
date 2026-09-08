@@ -3,11 +3,9 @@
 use std::sync::Arc;
 
 use brenn_automation::AutomationEngine;
-use brenn_lib::config::AppConfig;
 use brenn_lib::config::BrennConfig;
 use brenn_messaging::Messenger;
 use brenn_obs::alerting::AlertDispatcher;
-use indexmap::IndexMap;
 
 use brenn_server::state::IngressRouterImpl;
 
@@ -27,7 +25,7 @@ pub(crate) struct AutomationResult {
 pub(crate) fn build_automation(
     config: &BrennConfig,
     db: brenn_db::Db,
-    apps: &Arc<IndexMap<String, AppConfig>>,
+    apps: &brenn_lib::config::AppTable,
     messenger: Option<&Arc<Messenger>>,
     alert_dispatcher: AlertDispatcher,
 ) -> AutomationResult {

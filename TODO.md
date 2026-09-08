@@ -2812,11 +2812,22 @@ the routing change and the ceiling change are both load-bearing on their own,
 and the in-handler ceiling has to refuse a body the route-level limit used to
 reject before it was read.
 
+It also unlocks the second half: an agent's `webhook_subscriptions` block.
+The subscriber entry on a `webhook:` channel is an ordinary in-place edit, but
+`resolve_webhook_endpoints` computes endpoint *ownership* from the subscribing
+agent and stamps it into the endpoint table the HTTP layer holds frozen, so
+moving the subscription without moving the ownership leaves the router's view
+and the document's apart. Once that table is swappable, the field leaves the
+level-1 refusal list with the endpoints.
+
 Code sites (`TODO(reload-webhooks)`): `brenn-bootstrap/src/reload/delta.rs`, at
-rule 3; `brenn-server/src/router.rs`, at the per-endpoint route registration.
+rule 3; `brenn-server/src/router.rs`, at the per-endpoint route registration;
+`brenn-bootstrap/src/reload/compare.rs`, at the `webhook_subscriptions` arm of
+`compare_app`.
 
 Done = a `webhook:` channel that moved is applied rather than refused, rule 3 is
-gone, and the per-endpoint body ceiling is enforced on a wildcard route.
+gone, the per-endpoint body ceiling is enforced on a wildcard route, and an
+agent's `webhook_subscriptions` converge.
 
 ## `reload-mqtt-sessions`
 
@@ -2874,3 +2885,160 @@ declared client has a session and what state it is in, whether or not any
 channel is bound through it, and a client that failed authoritatively reaches
 the operator by the route a reload refusal does rather than by a log line
 alone.
+
+## `reload-agent-lifecycle`
+
+A reload converges an agent's authority, its per-call settings and — at the
+session's next idle moment — what its Claude Code process was spawned with.
+What it still refuses is the agent *set*: adding, removing, renaming or
+reordering an `agent` block.
+
+An agent's existence is wired into more than its own map entry: a
+`ConversationBridge` delivery binding, a per-app state directory, per-app HTTP
+routes, integration `prepare`/`validate`, startup hooks, repo sync's clone
+index, and the chat roster. Standing one up at reload means minting all of
+those in commit order and tearing them down in the inverse; a rename is both at
+once, over a slug that participant ids are built from.
+
+Code sites (`TODO(reload-agent-lifecycle)`): `brenn-bootstrap/src/reload/compare.rs`,
+at `keyed_apps`.
+
+Done = an `agent` block added to or removed from a document is applied rather
+than refused, with the same post-commit state a fresh boot of that document
+would have produced.
+
+## `reload-repo-mounts`
+
+An agent's `mounts` block, and the top-level `[[repo]]` it references, are the
+last boot-shaped fields with a subsystem behind them. Boot flattens every
+agent's mounts into repo sync's tables: the clone index with its
+consumer/primary/sync-enabled sets, the per-remote lock table, the
+`RepoSyncManager` whose existence at all depends on some mount asking for
+auto-pull, the pull tool's clone table, the clone-container choice, and the
+cross-agent primary-ownership validation. Graf's integration `prepare` rescans
+every mount and writes a manifest.
+
+Converging `mounts` is therefore converging repo sync, the way the MQTT slice
+converged broker sessions: the tables become swappable or rebuildable, and the
+manager has to be able to come into existence at a reload rather than only at
+boot.
+
+Code sites (`TODO(reload-repo-mounts)`): `brenn-bootstrap/src/reload/compare.rs`,
+at the `mounts` arm of `compare_app`.
+
+Done = a mount added to or removed from an agent is applied rather than
+refused, and `[[repo]]` leaves the level-1 frozen set.
+
+## `reload-integrations`
+
+An agent's `integrations`, `integration_config` and `container` are refused at
+reload for one shared reason: the `Integration` trait has two boot-only
+environment steps, `prepare` and `validate`, which scan the filesystem, write
+manifests and shell out — `podman` for a containerized agent, the integration's
+own CLI otherwise — under a panic-on-failure contract. Running them inside a
+reload commit turns what is today an operator-facing refusal into a process
+death.
+
+`container` is inseparable from them: changing which container an agent runs in,
+or flipping it between bare and containerized, relocates the agent's state
+directory and with it the virtual-tools file and every integration manifest,
+and a container→bare flip on an all-container host has no runtime directory
+resolved to relocate into.
+
+The slice is an `Integration` lifecycle whose environment steps can run for one
+agent under a refusal contract rather than a panic, plus state-directory
+relocation for `container`.
+
+Code sites (`TODO(reload-integrations)`): `brenn-bootstrap/src/reload/compare.rs`,
+at the `container`, `integrations` and `integration_config` arms of
+`compare_app`.
+
+Done = an integration enabled, disabled or reconfigured on an agent, and an
+agent moved between containers, are applied rather than refused, with a failed
+`prepare` refusing the reload instead of killing the process.
+
+## `reload-claude-profiles`
+
+An agent's `claude_profiles` block is refused at reload. Boot builds the
+profile-goal state from every agent's block — the per-agent allowed list, the
+goal-channel → agents index, and the current profile seeded from the retained
+goal channel — and plans a `cc-profile` system participant whose subscriptions
+are exactly those goal addresses. It also decides, per bridge, whether a
+profile-swap host exists at all.
+
+Converging it is converging a system participant's subscription set (the shape
+a consumer's convergence already has) plus re-deriving and re-seeding the goal
+index, on a participant the planner treats as boot-only.
+
+Code sites (`TODO(reload-claude-profiles)`): `brenn-bootstrap/src/reload/compare.rs`,
+at the `claude_profiles` arm of `compare_app`.
+
+Done = a profile added to or removed from an agent's allowed list, or a goal
+channel moved, is applied rather than refused, with the `cc-profile`
+participant's subscriptions converged to match.
+
+## `reload-revive-on-redeclared-channel`
+
+A reload that re-declares a `[[channel]]` block under an agent's dormant
+durable dynamic subscription leaves the row dormant, where a fresh boot of the
+same document folds it. (The other verdict a fresh boot can reach on such a row
+— deleting it because the same document declares a static subscription for the
+pair — the re-merge does answer: the prune arm needs no directory entry.) Two
+things in the way of the fold, both in the code as it stands: a
+channel *addition* alone does not promote the agent into the reload's changed
+set, because the promotion closure runs over an agent's *static* subscriptions
+on moved channels; and when the agent is changed for another reason, the
+re-merge skips any pair whose channel the *live* directory does not hold, and a
+channel this reload adds is not live until the commit's channel walk. Nothing
+re-classifies after that walk.
+
+The state is fail-closed — the agent receives nothing it is not folded into —
+and it predates the reload facility for agents: a restart between a channel's
+removal and its re-declaration reached the same place. What is new is that the
+removal half no longer needs a restart, so the pair "remove the block, redeclare
+it" is now reachable entirely by reload.
+
+Doing it needs the agent promoted by a closure over its *dynamic* rows on added
+channels, a `revive` arm that resolves the entry from the candidate plan rather
+than from the live directory, and the fold deferred to after the entry is added.
+
+Code sites (`TODO(reload-revive-on-redeclared-channel)`):
+`brenn-bootstrap/src/reload/dynamic.rs`, at `remerge_of`'s `live.by_uuid` skip.
+
+Done = the oracle transition "remove the block (reload), redeclare it (reload)"
+matches a fresh boot with the row folded.
+
+## `mqtt-deferred-unsubscribe-not-withdrawn`
+
+An ingress UNSUBSCRIBE issued while the client's session is disconnected — or
+whose send fails — is never sent to the broker, and nothing sends it later.
+`MqttService::unsubscribe_filter` takes the filter out of the reconnect-survival
+set and answers `DeferredDisconnected` / `SendFailed`; the supervisor's
+reconnect asserts the surviving set and withdraws nothing. The session is
+persistent (`clean_start(false)` with a session expiry, `connection.rs`), so the
+broker resumes it with its filter set intact.
+
+Consequence: the broker keeps publishing every message matching that filter for
+as long as the session lives, and brenn's router discards them, having no route.
+Not a leak, and bounded by the topic's traffic — unbounded wasted ingress on a
+`#`-shaped filter. The reload's status body is the second half: it reports the
+address in `mqtt_deferred`, which reads as "converged, just not yet", and the
+filter is in fact still at the broker. Both callers are affected — reload's
+ingress walk (`brenn-bootstrap/src/reload/commit.rs`, `record_unsubscribe`) and
+the runtime `MessageUnsubscribe` (`brenn-server/src/mqtt_subscribe.rs`).
+
+Doing it is a supervisor contract, which is why this is an entry and not a
+patch: the handle needs a pending-withdrawals set — filters removed from
+`subscriptions` while no client was installed, or whose send failed — that the
+reconnect drains with UNSUBSCRIBEs when the broker reports `session_present`,
+cleared on send, and reconciled against a filter re-subscribed in the meantime.
+The status vocabulary follows: a deferred withdrawal is a different fact from a
+deferred assertion and should not share `mqtt_deferred`'s wording.
+
+Code sites (`TODO(mqtt-deferred-unsubscribe-not-withdrawn)`):
+`brenn-mqtt/src/service.rs`, at `unsubscribe_filter`'s disconnected arm.
+
+Done = a withdrawal issued while disconnected reaches the broker on the next
+connect, observed the way the removal cases observe the live one (the broker's
+own `Received UNSUBSCRIBE` record), and the status body says which of the two
+things a deferral was.

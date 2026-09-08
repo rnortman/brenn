@@ -177,8 +177,9 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
         // Guard (app owners): the owning app must exist in the apps map
         // (config-invariant). WASM owners have no app entry — their existence is
         // checked against the messaging directory after channel resolution below.
+        let apps = state.apps.load();
         if let WebhookOwner::App(app_slug) = owner
-            && state.apps.get(app_slug.as_ref()).is_none()
+            && apps.get(app_slug.as_ref()).is_none()
         {
             let msg = format!(
                 "webhook_router: unknown owning app '{app_slug}' for endpoint \
@@ -424,8 +425,9 @@ mod tests {
             crate::test_support::app_config::default_test_app_config(app_slug, app_slug);
         app_cfg.allowed_users = allowed_users;
         // Delivery-time ACL gate: cover the webhook channel.
-        app_cfg.policy =
-            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
+        app_cfg.policy = std::sync::Arc::new(
+            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]),
+        );
         app_cfg.messaging = Some(ResolvedMessagingConfig {
             send_budget: 100,
             subscriptions: vec![ResolvedSubscription {
@@ -1028,8 +1030,9 @@ mod tests {
             crate::test_support::app_config::default_test_app_config("myapp", "myapp");
         app_cfg.allowed_users = vec!["alice".to_string()];
         // Delivery-time ACL gate: cover the webhook channel.
-        app_cfg.policy =
-            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
+        app_cfg.policy = std::sync::Arc::new(
+            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]),
+        );
         app_cfg.messaging = Some(ResolvedMessagingConfig {
             send_budget: 0, // zero budget — must not block host-originated ingress
             subscriptions: vec![ResolvedSubscription {

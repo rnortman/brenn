@@ -38,4 +38,4 @@ pub use payload::{InboundPayload, OutboundPayload, classify_inbound, decode_outb
 pub use service::{
     IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService,
 };
-pub use state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle};
+pub use state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle, SubAckOutcome};

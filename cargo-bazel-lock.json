@@ -1,5 +1,5 @@
 {
-  "checksum": "a2620d89e5829c527c33874d257d40637d0e442ef5e674c762473ce61f69dba4",
+  "checksum": "b38953dd1bf79338292f68d5ec2d27360c79ca7d53900711648c39948d13fe6f",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2798,6 +2798,10 @@
             {
               "id": "tokio-tungstenite 0.29.0",
               "target": "tokio_tungstenite"
+            },
+            {
+              "id": "tracing-test 0.2.6",
+              "target": "tracing_test"
             }
           ],
           "selects": {}

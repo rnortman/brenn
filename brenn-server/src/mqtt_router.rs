@@ -388,8 +388,10 @@ mod tests {
             // subscribed `mqtt:` channel (grant + matcher), else the wake pass
             // skips the app without advancing its position. Stamp a covering
             // policy derived from the subscription addresses.
-            app_cfg.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses(
-                subs.iter().map(|(_, a)| a.as_str()),
+            app_cfg.policy = std::sync::Arc::new(
+                brenn_lib::access::test_fixtures::delivery_policy_for_addresses(
+                    subs.iter().map(|(_, a)| a.as_str()),
+                ),
             );
             app_cfg.messaging = Some(ResolvedMessagingConfig {
                 send_budget: 0, // zero budget must not block host ingress

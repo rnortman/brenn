@@ -69,11 +69,35 @@ pub async fn boot_messaging_carrying(
     origin: &str,
     tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
 ) -> (MessagingResult, PlanCarried) {
-    build_messaging(
+    boot_messaging_over_bridges(
         config,
         db,
         apps,
+        alert_dispatcher,
+        origin,
+        tool_registry,
         ActiveBridges::new(),
+    )
+    .await
+}
+
+/// [`boot_messaging_carrying`] over a caller-held bridge registry: the wake
+/// router serves conversations through the registry it was built with, so
+/// delivery tests must share a registry with the boot.
+pub async fn boot_messaging_over_bridges(
+    config: &brenn_lib::config::BrennConfig,
+    db: brenn_db::Db,
+    apps: &Arc<IndexMap<String, AppConfig>>,
+    alert_dispatcher: AlertDispatcher,
+    origin: &str,
+    tool_registry: &Arc<brenn_tool_registry::ToolRegistry>,
+    active_bridges: ActiveBridges,
+) -> (MessagingResult, PlanCarried) {
+    build_messaging(
+        config,
+        db,
+        &brenn_lib::config::AppTable::new(Arc::clone(apps)),
+        active_bridges,
         alert_dispatcher,
         Some(Arc::from(origin)),
         &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),

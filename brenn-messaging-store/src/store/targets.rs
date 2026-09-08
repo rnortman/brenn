@@ -11,13 +11,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
 use tracing::{debug, warn};
 
 use brenn_db::auth::user::get_user_by_username;
 use brenn_db::conversation::{get_or_create_singleton_conversation, get_singleton_conversation_id};
-use brenn_lib::access::PolicyRef;
-use brenn_lib::config::AppConfig;
+use brenn_lib::access::AppPolicy;
+use brenn_lib::config::AppTable;
 use brenn_lib::messaging::{
     ParticipantId, SubscriberEntry, SubscriberEntryKind, SubscriberRegistration,
     TombstonedRegistry, Urgency, WakeEconomics, WakeMin,
@@ -67,7 +66,7 @@ impl AttachFeedTarget {
 /// subscriber joins or leaves, so it sits behind an `RwLock` and every read
 /// answers with owned values rather than borrows into the guard.
 pub struct TargetResolver {
-    apps: Arc<IndexMap<String, AppConfig>>,
+    apps: AppTable,
     /// One entry per registered non-app subscriber (WASM consumer, surface,
     /// remote, or system component), keyed by its directory
     /// [`SubscriberEntryKind`]. App subscribers are absent: their policy and
@@ -80,7 +79,7 @@ impl std::fmt::Debug for TargetResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (live, retired) = self.subscribers.counts();
         f.debug_struct("TargetResolver")
-            .field("apps", &self.apps.len())
+            .field("apps", &self.apps.load().len())
             .field("subscribers", &live)
             .field("retired", &retired)
             .finish_non_exhaustive()
@@ -89,11 +88,11 @@ impl std::fmt::Debug for TargetResolver {
 
 impl TargetResolver {
     pub fn new(
-        apps: Arc<IndexMap<String, AppConfig>>,
+        apps: impl Into<AppTable>,
         subscribers: HashMap<SubscriberEntryKind, SubscriberRegistration>,
     ) -> Self {
         Self {
-            apps,
+            apps: apps.into(),
             subscribers: TombstonedRegistry::with_live("target resolver", subscribers),
         }
     }
@@ -156,20 +155,14 @@ impl TargetResolver {
     /// policy is per-app rather than per-conversation is also why a subscription
     /// minted at runtime needs no registration of its own — there is nothing per
     /// conversation to register.
-    pub fn policy(&self, kind: &SubscriberEntryKind) -> Option<PolicyRef<'_>> {
+    pub fn policy(&self, kind: &SubscriberEntryKind) -> Option<Arc<AppPolicy>> {
+        let apps = self.apps.load();
         match kind {
-            SubscriberEntryKind::App(slug) => self
-                .apps
-                .get(slug)
-                .map(|app| PolicyRef::Borrowed(&app.policy)),
-            SubscriberEntryKind::ChatConversation { app_slug, .. } => self
-                .apps
+            SubscriberEntryKind::App(slug) => apps.get(slug).map(|app| Arc::clone(&app.policy)),
+            SubscriberEntryKind::ChatConversation { app_slug, .. } => apps
                 .get(app_slug)
-                .map(|app| PolicyRef::Borrowed(&app.chat_harness_policy)),
-            other => self
-                .subscribers
-                .map(other, |r| PolicyRef::Shared(r.policy.clone()))
-                .live(),
+                .map(|app| Arc::clone(&app.chat_harness_policy)),
+            other => self.subscribers.map(other, |r| r.policy.clone()).live(),
         }
     }
 
@@ -184,16 +177,13 @@ impl TargetResolver {
         match kind {
             // Both wake the same subprocess, so both are priced the same.
             SubscriberEntryKind::App(slug)
-            | SubscriberEntryKind::ChatConversation { app_slug: slug, .. } => {
-                self.apps.get(slug).map(|_| WakeEconomics::UrgencyGated)
-            }
+            | SubscriberEntryKind::ChatConversation { app_slug: slug, .. } => self
+                .apps
+                .load()
+                .get(slug)
+                .map(|_| WakeEconomics::UrgencyGated),
             other => self.subscribers.map(other, |r| r.wake).live(),
         }
-    }
-
-    /// The apps map, for callers that need an app's non-policy configuration.
-    pub fn apps(&self) -> &Arc<IndexMap<String, AppConfig>> {
-        &self.apps
     }
 
     /// The user an `App(slug)` subscriber's messages belong to: the app's single
@@ -208,7 +198,8 @@ impl TargetResolver {
         slug: &str,
         channel_address: &str,
     ) -> Option<i64> {
-        let app = match self.apps.get(slug) {
+        let apps = self.apps.load();
+        let app = match apps.get(slug) {
             Some(a) => a,
             None => {
                 warn!(

@@ -862,7 +862,7 @@ pub mod tests {
             );
             // Covering read ACL so the query passes the gate; the clamp under test
             // reads the directory subscriber, not this policy.
-            sub_app.policy = covering_policy(&canonical_address("sub-clamp"));
+            sub_app.policy = std::sync::Arc::new(covering_policy(&canonical_address("sub-clamp")));
             let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
             apps.insert("sub-app".to_string(), sub_app);
 
@@ -1030,7 +1030,7 @@ pub mod tests {
     /// the calling app passes the read gate.
     fn app_with_access(slug: &str, address: &str) -> brenn_lib::config::AppConfig {
         let mut cfg = crate::test_support::test_app_config(slug, None, vec![]);
-        cfg.policy = covering_policy(address);
+        cfg.policy = std::sync::Arc::new(covering_policy(address));
         cfg
     }
 
@@ -1180,7 +1180,7 @@ pub mod tests {
 
         let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
         let mut graf = test_app_config("graf", None, vec!["u".to_string()]);
-        graf.policy = covering_policy(&canonical_address("e2e"));
+        graf.policy = std::sync::Arc::new(covering_policy(&canonical_address("e2e")));
         apps.insert("graf".to_string(), graf);
         let messenger = clamp_messenger(
             &canonical_address("e2e"),
@@ -1227,7 +1227,7 @@ pub mod tests {
 
         let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
         let mut graf = test_app_config("graf", None, vec!["u".to_string()]);
-        graf.policy = covering_policy(&canonical_address("capped"));
+        graf.policy = std::sync::Arc::new(covering_policy(&canonical_address("capped")));
         apps.insert("graf".to_string(), graf);
         // Bounded standing depth of 2; five messages published.
         let messenger = clamp_messenger(
@@ -1290,7 +1290,7 @@ pub mod tests {
                     p.grants
                         .insert(brenn_envelope::grants::AppCapability::PwaPush);
                 }
-                p
+                std::sync::Arc::new(p)
             },
             pwa_push: if pwa_push_enabled {
                 Some(AppPwaPushBlock {
@@ -1381,7 +1381,7 @@ pub mod tests {
         let mut p = brenn_lib::access::AppPolicy::default();
         p.grants
             .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
-        cfg.policy = p;
+        cfg.policy = std::sync::Arc::new(p);
         apps.insert("app".to_string(), cfg);
         let messenger = clamp_messenger(
             &canonical_address("gated"),
@@ -1409,7 +1409,7 @@ pub mod tests {
         let mut cfg = crate::test_support::test_app_config("app", None, vec![]);
         let mut p = brenn_lib::access::AppPolicy::default();
         p.acls.brenn_subscribe = vec![ChannelMatcher::Prefix(String::new())];
-        cfg.policy = p;
+        cfg.policy = std::sync::Arc::new(p);
         apps.insert("app".to_string(), cfg);
         let messenger = clamp_messenger(
             &canonical_address("gated"),
@@ -1437,7 +1437,7 @@ pub mod tests {
         let mut p = brenn_lib::access::AppPolicy::default();
         p.grants
             .insert(brenn_envelope::grants::AppCapability::Webhook);
-        cfg.policy = p;
+        cfg.policy = std::sync::Arc::new(p);
         apps.insert("app".to_string(), cfg);
         let messenger = clamp_messenger(
             "webhook:gated-hook",
@@ -1463,7 +1463,7 @@ pub mod tests {
         let mut p = brenn_lib::access::AppPolicy::default();
         p.grants
             .insert(brenn_envelope::grants::AppCapability::MqttSubscribe);
-        cfg.policy = p;
+        cfg.policy = std::sync::Arc::new(p);
         apps.insert("app".to_string(), cfg);
         let messenger = clamp_messenger(
             "mqtt:home:sensors/temp",
@@ -2117,7 +2117,7 @@ pub mod tests {
         policy.grants.insert(AppCapability::LocalSubscribe);
         policy.acls.local_subscribe = vec![ChannelMatcher::Prefix(String::new())];
         let mut app = crate::test_support::test_app_config("reader", None, vec![]);
-        app.policy = policy;
+        app.policy = std::sync::Arc::new(policy);
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         apps.insert("reader".to_string(), app);
 
