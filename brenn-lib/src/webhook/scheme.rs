@@ -41,16 +41,23 @@ pub enum HexFormat {
 /// Populated at config-resolve time from `WebhookSignatureConfigRaw`.
 /// The hot path reads this directly — no re-parsing of header names or
 /// secret files on the request path.
-#[derive(Debug)]
-pub enum SignatureScheme {
+///
+/// `S` is what a key or token entry maps to. The hot-path form is the default,
+/// `SignatureScheme<Vec<u8>>`: the secret's bytes. The document-only form is
+/// [`UnloadedSignatureScheme`] — `SignatureScheme<PathBuf>`, the *path* each
+/// secret is read from — which every gate except signature verification is
+/// answerable against, and which is therefore what a resolver that reads no
+/// files produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureScheme<S = Vec<u8>> {
     /// HMAC-SHA256 over raw body. Phonebuddy, GitHub/Forgejo, generic.
     HmacRawBody {
         algorithm: SignatureAlgorithm,
         header: HeaderName,
         format: HexFormat,
         key_id_header: Option<HeaderName>,
-        /// key_id → secret bytes
-        keys: HashMap<String, Vec<u8>>,
+        /// key_id → secret
+        keys: HashMap<String, S>,
     },
     /// HMAC-SHA256 over `<template>` filled with `{t}` from a separate
     /// timestamp header and `{body}` from raw body. Covers Slack.
@@ -68,8 +75,8 @@ pub enum SignatureScheme {
         t_before_body: bool,
         max_skew_secs: u64,
         key_id_header: Option<HeaderName>,
-        /// key_id → secret bytes
-        keys: HashMap<String, Vec<u8>>,
+        /// key_id → secret
+        keys: HashMap<String, S>,
     },
     /// Stripe's combined `t=...,v1=...` header. HMAC over `<t>.<body>`.
     HmacStripe {
@@ -77,20 +84,25 @@ pub enum SignatureScheme {
         header: HeaderName,
         max_skew_secs: u64,
         key_id_header: Option<HeaderName>,
-        /// key_id → secret bytes
-        keys: HashMap<String, Vec<u8>>,
+        /// key_id → secret
+        keys: HashMap<String, S>,
     },
     /// No HMAC; constant-time compare of a header value against a configured
     /// secret. Google push, Mailgun bearer.
     BearerToken {
         header: HeaderName,
         token_id_header: Option<HeaderName>,
-        /// token_id → expected bearer bytes
-        tokens: HashMap<String, Vec<u8>>,
+        /// token_id → expected bearer credential
+        tokens: HashMap<String, S>,
     },
 }
 
-impl SignatureScheme {
+/// The document-only form of a signature scheme: every field of the hot-path
+/// form, with each key or token entry naming the file its secret is read from
+/// instead of carrying the bytes.
+pub type UnloadedSignatureScheme = SignatureScheme<std::path::PathBuf>;
+
+impl<S> SignatureScheme<S> {
     /// Return the header name(s) whose values are credential secrets for this
     /// scheme. These are the headers whose values must be masked when building
     /// the `WebhookEnvelope`.

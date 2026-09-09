@@ -164,29 +164,28 @@ pub fn validate_and_resolve(
         }
     }
 
-    // The frozen-input subsystems resolve first: `resolve_apps` is the single
-    // body boot and reload share, and it takes the MQTT client identities and
-    // the webhook subscription stamps as inputs rather than deriving them.
+    // The two subsystems `resolve_apps` reads rather than derives resolve
+    // first: it is the single body boot and reload share, and it takes the MQTT
+    // client identities and the webhook subscription stamps as inputs.
     let resolved_clients = crate::mqtt::config::resolve_clients(&config.mqtt_clients);
     let client_identities = crate::mqtt::config::client_identities(&resolved_clients);
 
-    let (webhook_endpoints, webhook_subscriptions) =
-        crate::webhook::config::resolve_webhook_endpoints(
+    let (webhook_identities, webhook_subscriptions) =
+        crate::webhook::config::resolve_webhook_identities(
             &config.webhook_endpoints,
             &config.apps,
             &config.wasm_consumers,
             &config.wasm,
             &config.messaging,
         );
+    let webhook_endpoints = crate::webhook::config::resolve_webhook_endpoints(&webhook_identities);
 
     let apps = resolve_apps(
         config,
         integration_registry,
         runtime_dir,
-        &FrozenInputs {
-            mqtt_clients: &client_identities,
-            webhook_subscriptions: &webhook_subscriptions,
-        },
+        &client_identities,
+        &webhook_subscriptions,
     );
 
     let pwa_push = crate::pwa_push::config::resolve_pwa_push_layer(&config.pwa_push);
@@ -205,16 +204,6 @@ pub fn validate_and_resolve(
     }
 }
 
-/// The inputs to `resolve_apps` that are resolved outside it and held fixed
-/// across a reload: everything reload's level-1 comparison freezes.
-pub struct FrozenInputs<'a> {
-    /// Client identities, keyed by client slug.
-    pub mqtt_clients: &'a IndexMap<String, crate::mqtt::config::MqttClientIdentity>,
-    /// Per-app webhook subscriptions, keyed by app slug.
-    pub webhook_subscriptions:
-        &'a BTreeMap<String, Vec<crate::webhook::config::ResolvedWebhookSubscription>>,
-}
-
 /// Resolve the app map from `config`. Boot and reload both call this, so a
 /// document reload accepts is a document boot would have accepted, resolved to
 /// the same map.
@@ -231,7 +220,11 @@ pub fn resolve_apps(
     config: &BrennConfig,
     integration_registry: &IntegrationRegistry,
     runtime_dir: Option<&std::path::Path>,
-    frozen: &FrozenInputs,
+    mqtt_clients: &IndexMap<String, crate::mqtt::config::MqttClientIdentity>,
+    webhook_subscriptions: &BTreeMap<
+        String,
+        Vec<crate::webhook::config::ResolvedWebhookSubscription>,
+    >,
 ) -> IndexMap<String, AppConfig> {
     let slug_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*$").unwrap();
 
@@ -976,7 +969,7 @@ pub fn resolve_apps(
         }
         let subs = crate::mqtt::config::resolve_app_mqtt_subscriptions(
             raw,
-            frozen.mqtt_clients,
+            mqtt_clients,
             &system_channel_tuning,
             &config.messaging,
         );
@@ -985,7 +978,7 @@ pub fn resolve_apps(
         }
     }
 
-    for (app_slug, subs) in frozen.webhook_subscriptions {
+    for (app_slug, subs) in webhook_subscriptions {
         if let Some(app) = apps.get_mut(app_slug) {
             app.webhook_subscriptions = subs.clone();
         }
@@ -993,12 +986,7 @@ pub fn resolve_apps(
 
     // Runs after the other phases so MQTT client slugs in ACL matchers can be
     // cross-checked against the resolved client set.
-    resolve_access_policies(
-        &config.apps,
-        &mut apps,
-        frozen.mqtt_clients,
-        &config.llm_chat,
-    );
+    resolve_access_policies(&config.apps, &mut apps, mqtt_clients, &config.llm_chat);
 
     if let Some(refusal) = pwa_push_grant_without_section(config) {
         panic!("{refusal}");
@@ -1085,7 +1073,7 @@ fn resolve_messaging_layer(
 /// `build_app_policy` panics on a duplicate grant or an invalid matcher
 /// (operator-authored config, fail-fast), including an
 /// `mqtt_subscribe`/`mqtt_publish` matcher naming a client absent from
-/// the frozen MQTT client identity map.
+/// the MQTT client identity map.
 ///
 /// The app's derived chat-harness policy is stamped beside the authored one, on
 /// its own field: the harness's chat-tree authority never enters `policy`, so

@@ -4,8 +4,9 @@
 //! the process reports afterwards:
 //!
 //! - [`compare`] is level 1, over the raw documents. Everything outside the
-//!   three convergible blocks — `channels`, `links`, `wasm_consumers` — must be
-//!   equal, and a difference anywhere else is a refusal naming the section.
+//!   six convergible blocks — `channels`, `links`, `wasm_consumers`,
+//!   `surfaces`, `webhook_endpoints` and `mqtt_clients` — must be equal, and a
+//!   difference anywhere else is a refusal naming the section.
 //! - [`delta`] is level 2, over the two lowered plans. It says which channel
 //!   entries and which consumers moved, and refuses the moves that cannot be
 //!   made without restarting. [`agents`] is its agent half: which agents moved,
@@ -51,6 +52,7 @@ pub(crate) mod mqtt;
 pub(crate) mod status;
 pub(crate) mod subscribers;
 pub(crate) mod surfaces;
+pub(crate) mod webhook;
 
 /// The correctness rule above, checked against a running process, and the
 /// cases that need one: they live beside the driver's own tests rather than

@@ -116,10 +116,28 @@ pub async fn direct_publisher_acked(
     broker_port: u16,
     ca_pem: Vec<u8>,
 ) -> (AsyncClient, mpsc::UnboundedReceiver<()>) {
+    direct_publisher_acked_as(broker_port, ca_pem, None).await
+}
+
+/// [`direct_publisher_acked`] logging in as `credentials`, for a broker that
+/// rejects anonymous clients.
+///
+/// The publisher is the case's stand-in for whatever is really on the topic, so
+/// it needs an account of its own on a password-authenticating broker;
+/// `brenn_mqtt::test_support::broker`'s two are both admitted by the shipped
+/// ACL.
+pub async fn direct_publisher_acked_as(
+    broker_port: u16,
+    ca_pem: Vec<u8>,
+    credentials: Option<(&str, &str)>,
+) -> (AsyncClient, mpsc::UnboundedReceiver<()>) {
     let client_id = format!("brenn-direct-acked-{}", unique_suffix());
     let mut opts = MqttOptions::new(client_id, ("127.0.0.1", broker_port));
     opts.set_clean_start(true);
     opts.set_transport(Transport::tls(ca_pem, None, None));
+    if let Some((username, password)) = credentials {
+        opts.set_credentials(username.to_string(), password.to_string());
+    }
     let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
 
     drain_until_incoming(

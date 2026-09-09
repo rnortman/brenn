@@ -14,11 +14,12 @@
 //!    to channel subscribers via the standard bus publish path.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::http::HeaderMap;
-use brenn_lib::messaging::{SubscriberEntryKind, Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope};
-use brenn_lib::webhook::config::WebhookOwner;
+use brenn_lib::messaging::{SubscriberEntryKind, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope};
+use brenn_lib::webhook::config::{ResolvedWebhookEndpoint, WebhookOwner};
 use brenn_lib::webhook::scheme::SignatureScheme;
 use brenn_webhook::service::WebhookEventRouter;
 use tokio::sync::OnceCell;
@@ -145,15 +146,15 @@ fn build_webhook_envelope(
 impl WebhookEventRouter for WebhookEventRouterImpl {
     async fn deliver_inbound(
         &self,
-        endpoint_slug: &str,
-        owner: &WebhookOwner,
+        endpoint: &Arc<ResolvedWebhookEndpoint>,
         key_id: &str,
         headers: HeaderMap,
         client_ip: IpAddr,
         received_at: SystemTime,
         raw_body: String,
-        urgency: Urgency,
     ) -> Result<(), String> {
+        let endpoint_slug = endpoint.slug.as_str();
+        let owner = &endpoint.owner;
         // Returns Err only for invariant-violation cases (startup race, unknown owner,
         // missing messenger/channel) that require the HTTP layer to emit 5xx so the
         // sender can retry rather than treating the drop as success.
@@ -189,27 +190,11 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
             return Err(msg);
         }
 
-        // Resolve the endpoint to get its SignatureScheme for credential masking.
-        // The endpoint must exist in the webhook service since the HTTP handler already
-        // looked it up — panic if it's missing now (startup invariant violation).
-        let endpoint_arc = state
-            .webhook
-            .as_ref()
-            .unwrap_or_else(|| {
-                panic!(
-                    "webhook_router: WebhookService not present in AppState for endpoint \
-                     '{endpoint_slug}' — startup invariant violated"
-                )
-            })
-            .endpoint_by_slug(endpoint_slug)
-            .unwrap_or_else(|| {
-                panic!(
-                    "webhook_router: endpoint '{endpoint_slug}' missing from WebhookService index \
-                     at deliver_inbound time — routing invariant violated"
-                )
-            });
-
-        // Build the WebhookEnvelope with credential-header masking (design §2.2).
+        // Build the WebhookEnvelope with credential-header masking. The scheme
+        // is the one on the handed-over endpoint, which is the one the request
+        // was verified against — a reload may have replaced the table entry
+        // since, and masking under the new scheme's header set would mask the
+        // wrong headers.
         let envelope = build_webhook_envelope(
             endpoint_slug,
             key_id,
@@ -217,7 +202,7 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
             client_ip,
             received_at,
             raw_body,
-            &endpoint_arc.scheme,
+            &endpoint.scheme,
         );
         let envelope_json =
             serde_json::to_string(&envelope).expect("WebhookEnvelope serialization is infallible");
@@ -233,15 +218,21 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
                      webhook endpoints exist)"
             )
         });
-        let channel = messenger
-            .directory()
-            .resolve(&channel_address)
-            .unwrap_or_else(|| {
-                panic!(
-                    "webhook_router: webhook channel '{channel_address}' not found in directory \
-                     for endpoint '{endpoint_slug}' — channel must be derived at startup"
-                )
-            });
+        // The channel is minted from the endpoint and upserted with it, so a
+        // miss means this endpoint left the document while the request was in
+        // flight and a reload's commit removed its channel. That is a runtime
+        // outcome for a request that arrived before the swap, not an invariant
+        // violation: 500 and let the sender retry into the 404 the retired
+        // mount now answers.
+        let Some(channel) = messenger.directory().resolve(&channel_address) else {
+            let msg = format!(
+                "webhook_router: webhook channel '{channel_address}' is no longer in the \
+                 directory — endpoint '{endpoint_slug}' was retired mid-request; returning 500 \
+                 to caller"
+            );
+            tracing::warn!(endpoint = endpoint_slug, owner = %owner, "{msg}");
+            return Err(msg);
+        };
 
         // Guard (WASM owners): the resolved channel must carry a matching
         // `Wasm(<owner slug>)` subscriber. `AppState` holds no wasm-consumer map,
@@ -272,7 +263,7 @@ impl WebhookEventRouter for WebhookEventRouterImpl {
         // `204` is returned by the HTTP handler only after this returns (durable enqueue
         // has completed). Never 204 if enqueue failed — the handler maps Err→500.
         messenger
-            .publish_transport_ingress(channel, &source, sender, &envelope_json, urgency)
+            .publish_transport_ingress(channel, &source, sender, &envelope_json, endpoint.urgency)
             .await;
         Ok(())
     }
@@ -287,8 +278,8 @@ mod tests {
     use axum::http::HeaderMap;
     use brenn_lib::messaging::{
         ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, NoiseLevel,
-        ResolvedChannel, SubscriberEntry, SubscriberEntryKind, Urgency, WEBHOOK_ADDRESS_PREFIX,
-        WakeMin, webhook_channel_uuid_from_slug,
+        ResolvedChannel, SubscriberEntry, SubscriberEntryKind, WEBHOOK_ADDRESS_PREFIX, WakeMin,
+        webhook_channel_uuid_from_slug,
     };
     use brenn_lib::webhook::config::ResolvedWebhookEndpoint;
     use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
@@ -318,7 +309,31 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        WebhookService::new(vec![(endpoint_slug.to_string(), endpoint)])
+        WebhookService::for_test(vec![endpoint])
+    }
+
+    /// The endpoint a delivery is handed: the entity the handler looked up and
+    /// held.
+    fn test_endpoint(endpoint_slug: &str, owner: WebhookOwner) -> Arc<ResolvedWebhookEndpoint> {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("k1".to_string(), b"secret".to_vec());
+        Arc::new(ResolvedWebhookEndpoint {
+            slug: endpoint_slug.to_string(),
+            mount: format!("/webhooks/{endpoint_slug}"),
+            description: None,
+            transport_ceiling_bytes: 1024 * 1024,
+            content_type: "application/json".to_string(),
+            scheme: SignatureScheme::HmacRawBody {
+                algorithm: SignatureAlgorithm::HmacSha256,
+                header: "x-sig".parse().unwrap(),
+                format: HexFormat::V1Hex,
+                key_id_header: None,
+                keys,
+            },
+            owner,
+            urgency: brenn_lib::messaging::Urgency::Normal,
+            replay_protection: None,
+        })
     }
 
     /// Build a minimal `WebhookService` with a no-credential `HmacRawBody`
@@ -513,20 +528,18 @@ mod tests {
             "consume-demo",
             true,
         ));
-        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
+        state.webhook = test_webhook_svc("push-alice", "myapp");
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
         router
             .deliver_inbound(
-                "push-alice",
-                &WebhookOwner::App(Arc::from("myapp")),
+                &test_endpoint("push-alice", WebhookOwner::App(Arc::from("myapp"))),
                 "primary",
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
                 "hello".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery should succeed");
@@ -570,20 +583,18 @@ mod tests {
             .expect("the webhook channel must be in the directory");
         crate::test_support::wasm::attach_wasm_consumer(&messenger, &entry, "consume-demo").await;
         state.messenger = Some(Arc::clone(&messenger));
-        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
+        state.webhook = test_webhook_svc("push-alice", "myapp");
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
         router
             .deliver_inbound(
-                "push-alice",
-                &WebhookOwner::App(Arc::from("myapp")),
+                &test_endpoint("push-alice", WebhookOwner::App(Arc::from("myapp"))),
                 "primary",
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
                 "hello".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery itself succeeds; the subscriber is denied, not the ingress");
@@ -620,21 +631,19 @@ mod tests {
             .expect("the webhook channel must be in the directory");
         crate::test_support::wasm::attach_wasm_consumer(&denied, &entry, "consume-demo").await;
         state.messenger = Some(Arc::clone(&denied));
-        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
+        state.webhook = test_webhook_svc("push-alice", "myapp");
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
         for body in ["first", "second"] {
             router
                 .deliver_inbound(
-                    "push-alice",
-                    &WebhookOwner::App(Arc::from("myapp")),
+                    &test_endpoint("push-alice", WebhookOwner::App(Arc::from("myapp"))),
                     "primary",
                     test_headers(),
                     test_ip(),
                     SystemTime::now(),
                     body.to_string(),
-                    Urgency::Normal,
                 )
                 .await
                 .expect("delivery itself succeeds while the subscriber is denied");
@@ -686,14 +695,12 @@ mod tests {
 
         let result = router
             .deliver_inbound(
-                "ep",
-                &WebhookOwner::App(Arc::from("no_such_app")),
+                &test_endpoint("ep", WebhookOwner::App(Arc::from("no_such_app"))),
                 "k",
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
                 "x".to_string(),
-                Urgency::Normal,
             )
             .await;
 
@@ -715,20 +722,18 @@ mod tests {
             "consume-demo",
             true,
         ));
-        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
+        state.webhook = test_webhook_svc("push-alice", "myapp");
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
         router
             .deliver_inbound(
-                "push-alice",
-                &WebhookOwner::Wasm(Arc::from("consume-demo")),
+                &test_endpoint("push-alice", WebhookOwner::Wasm(Arc::from("consume-demo"))),
                 "primary",
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
                 "hello".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery should succeed for a present wasm owner");
@@ -753,20 +758,18 @@ mod tests {
             "consume-demo",
             true,
         ));
-        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
+        state.webhook = test_webhook_svc("push-alice", "myapp");
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
         let result = router
             .deliver_inbound(
-                "push-alice",
-                &WebhookOwner::Wasm(Arc::from("ghost")),
+                &test_endpoint("push-alice", WebhookOwner::Wasm(Arc::from("ghost"))),
                 "primary",
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
                 "hello".to_string(),
-                Urgency::Normal,
             )
             .await;
 
@@ -786,7 +789,7 @@ mod tests {
     async fn deliver_inbound_stores_webhook_envelope_json() {
         let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
         state.messenger = Some(messenger_with_webhook_channel(db.clone(), "ep-test"));
-        state.webhook = Some(test_webhook_svc("ep-test", "myapp"));
+        state.webhook = test_webhook_svc("ep-test", "myapp");
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
@@ -796,14 +799,12 @@ mod tests {
 
         router
             .deliver_inbound(
-                "ep-test",
-                &WebhookOwner::App(Arc::from("myapp")),
+                &test_endpoint("ep-test", WebhookOwner::App(Arc::from("myapp"))),
                 "primary",
                 headers,
                 "192.168.1.1".parse().unwrap(),
                 SystemTime::now(),
                 "raw-body-content".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery should succeed");
@@ -859,20 +860,18 @@ mod tests {
             "myapp",
             vec!["alice".to_string()],
         ));
-        state.webhook = Some(test_webhook_svc("ep-test", "myapp"));
+        state.webhook = test_webhook_svc("ep-test", "myapp");
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
         router
             .deliver_inbound(
-                "ep-test",
-                &WebhookOwner::App(Arc::from("myapp")),
+                &test_endpoint("ep-test", WebhookOwner::App(Arc::from("myapp"))),
                 "primary",
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
                 "hello".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery should succeed");
@@ -919,10 +918,8 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        state.webhook = Some(brenn_webhook::service::WebhookService::new(vec![(
-            "ep-test".to_string(),
-            endpoint,
-        )]));
+        state.webhook =
+            brenn_webhook::service::WebhookService::for_test(vec![Arc::clone(&endpoint)]);
 
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
@@ -934,14 +931,12 @@ mod tests {
 
         router
             .deliver_inbound(
-                "ep-test",
-                &WebhookOwner::App(Arc::from("myapp")),
+                &endpoint,
                 "k1",
                 headers,
                 "127.0.0.1".parse().unwrap(),
                 SystemTime::now(),
                 "{}".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery should succeed");
@@ -1056,21 +1051,19 @@ mod tests {
             MessagingGlobalConfig::default(),
         );
         state.messenger = Some(messenger);
-        state.webhook = Some(test_webhook_svc("ep-budget", "myapp"));
+        state.webhook = test_webhook_svc("ep-budget", "myapp");
 
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
 
         router
             .deliver_inbound(
-                "ep-budget",
-                &WebhookOwner::App(Arc::from("myapp")),
+                &test_endpoint("ep-budget", WebhookOwner::App(Arc::from("myapp"))),
                 "k1",
                 test_headers(),
                 test_ip(),
                 SystemTime::now(),
                 "body".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery must succeed even with send_budget=0");
@@ -1113,10 +1106,8 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        state.webhook = Some(brenn_webhook::service::WebhookService::new(vec![(
-            "ep-bearer".to_string(),
-            endpoint,
-        )]));
+        state.webhook =
+            brenn_webhook::service::WebhookService::for_test(vec![Arc::clone(&endpoint)]);
 
         let router = WebhookEventRouterImpl::new();
         router.set_state(state);
@@ -1128,14 +1119,12 @@ mod tests {
 
         router
             .deliver_inbound(
-                "ep-bearer",
-                &WebhookOwner::App(Arc::from("myapp")),
+                &endpoint,
                 "t1",
                 headers,
                 "127.0.0.1".parse().unwrap(),
                 SystemTime::now(),
                 "{}".to_string(),
-                Urgency::Normal,
             )
             .await
             .expect("delivery should succeed");

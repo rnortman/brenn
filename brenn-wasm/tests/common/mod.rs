@@ -186,6 +186,7 @@ pub fn open_component(artifact: &Path) -> (NamedTempFile, ReplayComponent) {
         DEFAULT_MAX_PAGE_COUNT,
         HashMap::new(),
     );
+    component.open_store();
     (db, component)
 }
 

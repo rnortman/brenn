@@ -217,14 +217,13 @@ pub struct ActiveBridge {
     pub(in crate::active_bridge) chat_shutdown: Arc<tokio::sync::Notify>,
     /// PWA push service. `None` when no app has `pwa_push.enabled = true`.
     pub(super) pwa_push_service: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
-    /// MQTT service. `None` when no `[[mqtt_client]]` is configured.
-    pub(super) mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
-    /// MQTT inbound event router (concrete type). `None` when MQTT is not
-    /// configured. Held so a runtime `mqtt:` dynamic subscribe can add an
-    /// `IngressRoute` via `add_route`; the `Arc<dyn MqttEventRouter>` clones
-    /// the supervisors hold expose only `deliver_inbound`, so the concrete
-    /// handle must be threaded here to reach `add_route`.
-    pub(super) mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
+    /// MQTT service. Always present; its client registry is empty when no
+    /// `[[mqtt_client]]` is declared.
+    pub(super) mqtt_service: Arc<brenn_mqtt::MqttService>,
+    /// Concrete MQTT inbound event router. Held so a runtime `mqtt:` dynamic
+    /// subscribe can call `add_route`; the `Arc<dyn MqttEventRouter>` the
+    /// supervisors hold exposes only `deliver_inbound`.
+    pub(super) mqtt_event_router: Arc<crate::mqtt_router::MqttEventRouterImpl>,
     /// Automation engine. `None` when the automation subsystem is not configured
     /// (no messenger, or no apps with allowed_users).
     pub(super) automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
@@ -356,9 +355,9 @@ pub struct SpawnContext<'a> {
     pub repo_sync_sender: Option<brenn_git::sync::SyncTriggerSender>,
     pub messenger: Option<Arc<brenn_messaging::Messenger>>,
     pub pwa_push_service: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
-    pub mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
+    pub mqtt_service: Arc<brenn_mqtt::MqttService>,
     /// Concrete MQTT event router handle, for runtime `add_route`.
-    pub mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
+    pub mqtt_event_router: Arc<crate::mqtt_router::MqttEventRouterImpl>,
     pub automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
     pub usage_session_gap_secs: u32,
     /// Which profile each profiled app should run under. The account this
@@ -791,16 +790,16 @@ impl ActiveBridge {
         self.automation_engine.as_ref()
     }
 
-    /// MQTT service handle. `None` when no `[[mqtt_client]]` is configured.
-    pub fn mqtt_service(&self) -> Option<&Arc<brenn_mqtt::MqttService>> {
-        self.mqtt_service.as_ref()
+    /// MQTT service handle. Always present; its client registry is empty when
+    /// no `[[mqtt_client]]` is declared.
+    pub fn mqtt_service(&self) -> &Arc<brenn_mqtt::MqttService> {
+        &self.mqtt_service
     }
 
-    /// Concrete MQTT event router handle. `None` when MQTT is not configured.
-    /// Used by the runtime `mqtt:` dynamic-subscribe path to add an
-    /// `IngressRoute` (design §2.3 step 6).
-    pub fn mqtt_event_router(&self) -> Option<&Arc<crate::mqtt_router::MqttEventRouterImpl>> {
-        self.mqtt_event_router.as_ref()
+    /// Concrete MQTT event router handle. Used by the runtime `mqtt:`
+    /// dynamic-subscribe path to add an `IngressRoute`.
+    pub fn mqtt_event_router(&self) -> &Arc<crate::mqtt_router::MqttEventRouterImpl> {
+        &self.mqtt_event_router
     }
 
     /// The shared DB handle. Used by callers that need to pass the `Db` to a
@@ -1122,9 +1121,9 @@ mod tests {
     }
 
     /// The concrete `MqttEventRouterImpl` threads through the test fixture onto
-    /// the bridge and is reachable via `mqtt_event_router()` (the handle the
-    /// runtime `mqtt:` subscribe-activation path needs for `add_route`, design
-    /// §2.3 step 6). Default fixtures leave it `None`.
+    /// the bridge and is reachable via `mqtt_event_router()` — the handle the
+    /// runtime `mqtt:` subscribe-activation path needs for `add_route`. A
+    /// default fixture gets one of its own instead.
     #[tokio::test]
     async fn mqtt_event_router_threads_through_fixture() {
         use crate::active_bridge::test_fixtures::TestBridgeConfig;
@@ -1147,10 +1146,7 @@ mod tests {
             brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig::default(),
         );
-        assert!(
-            plain.mqtt_event_router().is_none(),
-            "default fixture must leave mqtt_event_router None"
-        );
+        let default_router = plain.mqtt_event_router().clone();
 
         // Injected router resolves through the accessor (same Arc).
         let router = std::sync::Arc::new(crate::mqtt_router::MqttEventRouterImpl::new());
@@ -1166,12 +1162,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        let got = bridge
-            .mqtt_event_router()
-            .expect("injected router must be reachable");
+        let got = bridge.mqtt_event_router();
         assert!(
             std::sync::Arc::ptr_eq(got, &router),
             "mqtt_event_router() must return the exact injected Arc"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&default_router, &router),
+            "a default fixture must get a router of its own, not the injected one"
         );
     }
 

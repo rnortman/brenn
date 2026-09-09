@@ -595,20 +595,21 @@ Code sites (`TODO(surface-counters-host-testable)`):
 the directory it validates against holds every entry boot's holds and consumer
 resolution decides its verdict. What is left is what the planner is not handed:
 
-- **Webhook endpoint resolution.** The planner mints an endpoint's channel entry
-  and mount from the raw block, but `resolve_webhook_endpoints` — slug charset,
-  duplicate slug and mount, ownership, signature scheme, secrets, replay
-  protection — runs only at boot, because it reads this host's secret files and
-  mutates the resolved-app registry. Splitting it the way `[[mqtt_client]]`
-  resolution was split (document facts, then the secret reads) is this entry.
-  Per-app webhook and mqtt subscription stamping rides along with it.
+- **The host reads.** The document half of webhook resolution runs offline
+  now; what does not is `resolve_webhook_endpoints`, which reads this host's
+  key and token files and stats the directory each replay `store_path` lives
+  in. The same holds for `[[mqtt_client]]`'s `password_file`
+  and `ca_file`. A workstation holds none of them, so an unreadable or
+  wrongly-permissioned secret, or a data directory only the deployment host
+  has, is still boot's verdict alone.
+- **Per-app mqtt subscription stamping.** The webhook stamps are resolved
+  offline with the document half; the mqtt ones ride on `resolve_clients`,
+  which is a secret read.
 - **The tool substrate.** With no `ToolRegistry`, no request channels or result
   inboxes are minted, the `brenn:tools/` and `brenn:tool-results/` arms of the
   exact-tuning cross-check have no population to check against, and per-consumer
   `validate_grants` does not run. A config check would need the registry, which
   is built over live repo-sync state.
-- **Replay store aliasing.** `assert_unique_store_paths` runs, but with an empty
-  replay-path list: the endpoints it would come from are the first bullet's.
 - **The per-instance import⊆grants assert** (`validate_surface_assets`) reads
   the built `.wasm` component trees. A config checker does not have them and
   should not grow a build. It is boot-and-CI-with-artifacts territory, listed
@@ -616,8 +617,9 @@ resolution decides its verdict. What is left is what the planner is not handed:
 
 Every one is a *missed* refusal with boot authoritative, never a false one.
 
-Done = on a machine holding no secrets, `brenn config-check` fails a
-`[[webhook_endpoint]]` whose slug, mount or ownership is wrong.
+Done = on a machine holding no secrets, `brenn config-check` reaches every
+verdict boot reaches that does not require reading a secret file or building a
+component.
 
 Code site (`TODO(config-check-offline-residue)`):
 `brenn-messaging-boot/src/offline.rs`, on `resolve_messaging_offline`.
@@ -2795,61 +2797,32 @@ Code site (`TODO(system-participant-noise-inert)`):
 Done = a tuning block's `noise` is either enacted by the system participant
 subscribed to that channel or refused at load, with no family in between.
 
-## `reload-webhooks`
+## `webhook-crate-wasm-dep`
 
-A reload converges `brenn:`, `ephemeral:`, `local:` and `mqtt:` channels;
-`webhook:` is the one scheme left refusing. The reason is structural rather than
-residual: each endpoint is a literal axum path built once into the router, with
-its own `DefaultBodyLimit` and an `Extension(EndpointSlug(..))`, and the
-`WebhookService` behind them is immutable after boot. So an endpoint added,
-removed or retuned in the document has nowhere to go, and the delta refuses the
-channel rather than applying half of it.
+`brenn-webhook` is the request-path crate: address parsing, signature and
+bearer verification, the endpoint service. It now depends on `brenn-wasm`, and
+therefore links wasmtime and the whole component runtime, for exactly one
+reason: `ReplayGuard.slot` is typed `Option<Arc<ReplayComponent>>`. Nothing
+gains reach from the edge — both in-tree consumers already depend on
+`brenn-wasm` — so what it buys is that the endpoint runtime type sits beside the
+service that holds it, and what it costs is that every edit to the signature
+suite pays a wasmtime link, and that a consumer wanting webhook verification
+without a WASM host no longer has one.
 
-Converging it is one wildcard `/webhooks/{*tail}` route over a swappable
-endpoint table, with the per-endpoint body ceiling applied in-handler instead of
-per-route, plus a swappable `WebhookService`. That is a self-contained slice —
-the routing change and the ceiling change are both load-bearing on their own,
-and the in-handler ceiling has to refuse a body the route-level limit used to
-reject before it was read.
+Two ways out, both design questions rather than edits. Move `EndpointRuntime`,
+`ReplayGuard` and the table to `brenn-server`, which already has both
+dependencies and is where boot and commit both reach — that decides where the
+serving table lives, which the endpoint-reload design placed here deliberately.
+Or type the slot behind a trait declared in `brenn-webhook` — which needs
+`CheckInput`/`ReplayError` to be nameable without `brenn-wasm`, and they are
+WIT-bindgen output in that crate, so it needs a home for the replay check's
+vocabulary first.
 
-It also unlocks the second half: an agent's `webhook_subscriptions` block.
-The subscriber entry on a `webhook:` channel is an ordinary in-place edit, but
-`resolve_webhook_endpoints` computes endpoint *ownership* from the subscribing
-agent and stamps it into the endpoint table the HTTP layer holds frozen, so
-moving the subscription without moving the ownership leaves the router's view
-and the document's apart. Once that table is swappable, the field leaves the
-level-1 refusal list with the endpoints.
+Code site (`TODO(webhook-crate-wasm-dep)`): `brenn-webhook/src/service.rs`, on
+`ReplayGuard`.
 
-Code sites (`TODO(reload-webhooks)`): `brenn-bootstrap/src/reload/delta.rs`, at
-rule 3; `brenn-server/src/router.rs`, at the per-endpoint route registration;
-`brenn-bootstrap/src/reload/compare.rs`, at the `webhook_subscriptions` arm of
-`compare_app`.
-
-Done = a `webhook:` channel that moved is applied rather than refused, rule 3 is
-gone, the per-endpoint body ceiling is enforced on a wildcard route, and an
-agent's `webhook_subscriptions` converge.
-
-## `reload-mqtt-sessions`
-
-Every declared `mqtt_client` has a broker session for the life of the process, so
-an `mqtt:` channel converges in both directions. What does not converge is the
-`mqtt_clients` block itself: it is level-1 frozen (`compare.rs`, the
-`mqtt_clients` `keyed_vec` arm), so adding, removing or editing a client is a
-refusal asking for a restart.
-
-Converging it means starting a supervisor for an added client, stopping one for a
-removed client — a mutable `MqttService` registry with a `remove_client`, and a
-mutable `ShutdownHandle::mqtt_stop_txs` (`brenn-bootstrap/src/shutdown.rs`) —
-restarting one whose config changed, and building the service, the event router
-and the `AppState` injection lazily, because a boot document declaring no client
-builds none of it today.
-
-Code sites (`TODO(reload-mqtt-sessions)`): `brenn-bootstrap/src/mqtt.rs`, at
-`start_mqtt`; `brenn-bootstrap/src/reload/compare.rs`, at the `mqtt_clients`
-`keyed_vec` arm.
-
-Done = a document that adds, removes or edits an `mqtt_client` applies at
-reload.
+Done = `brenn-webhook` builds and tests without wasmtime in its dependency
+graph, or the edge is recorded as deliberate with the link cost accepted.
 
 ## `mqtt-idle-client-visibility`
 
@@ -2875,6 +2848,15 @@ boot, a broker that will never work is a routine boot condition with the
 weakest reporting in the subsystem. Needs the same decision as the read
 surface: whether the terminal `Failed` write dispatches an alert directly, or
 whether it is the health surface above that alerts on what it finds.
+
+A reload widened it. A client a reload added or restarted reports its filters as
+`mqtt_deferred` at commit — its supervisor was spawned microseconds earlier and
+has not connected yet — so a supervisor that then fails authoritatively has no
+status surface at all: the reload said `applied`, the status body says
+`mqtt_deferred`, and the only account of the rejection is that same `error!`.
+The operator's edit and the operator's answer are minutes and a journal apart.
+That is the same gap as a declared-and-idle failed client's at boot, and it
+closes the same way.
 
 Code sites (`TODO(mqtt-idle-client-visibility)`):
 `brenn-server/src/messaging_intercept.rs`, at `enrich_mqtt_listing`;

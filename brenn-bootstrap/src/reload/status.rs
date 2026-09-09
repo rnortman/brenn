@@ -90,6 +90,22 @@ impl From<&PlanDelta> for StatusDelta {
                 .map(|change| change.new.slug.clone())
                 .collect(),
             kinds_changed: delta.kinds_changed.iter().cloned().collect(),
+            webhook_endpoints_added: delta
+                .webhook
+                .added
+                .iter()
+                .map(|endpoint| endpoint.slug.clone())
+                .collect(),
+            webhook_endpoints_removed: delta.webhook.removed_slugs(),
+            webhook_endpoints_changed: delta
+                .webhook
+                .changed
+                .iter()
+                .map(|change| change.new.slug.clone())
+                .collect(),
+            mqtt_clients_added: super::mqtt::slugs(&delta.mqtt_clients.added),
+            mqtt_clients_removed: delta.mqtt_clients.removed.iter().cloned().collect(),
+            mqtt_clients_changed: super::mqtt::slugs(&delta.mqtt_clients.changed),
             agents_changed: delta
                 .agents_changed
                 .iter()
@@ -187,6 +203,24 @@ mod tests {
             brenn_surface_server::fixtures_config::SurfaceFixture::new(slug, "chart").build()
         }
 
+        fn endpoint(slug: &str) -> Arc<brenn_lib::webhook::config::ResolvedWebhookEndpoint> {
+            Arc::new(brenn_lib::webhook::config::ResolvedWebhookEndpoint {
+                slug: slug.to_string(),
+                mount: format!("/webhooks/{slug}"),
+                description: None,
+                transport_ceiling_bytes: 1024,
+                content_type: "application/json".to_string(),
+                scheme: brenn_lib::webhook::scheme::SignatureScheme::BearerToken {
+                    header: "authorization".parse().expect("a header name"),
+                    token_id_header: None,
+                    tokens: std::collections::HashMap::new(),
+                },
+                owner: brenn_lib::webhook::config::WebhookOwner::App("reader".into()),
+                urgency: brenn_lib::messaging::Urgency::Normal,
+                replay_protection: None,
+            })
+        }
+
         let changed = entry("brenn:moved");
         let plan_delta = PlanDelta {
             agents_changed: Vec::new(),
@@ -220,6 +254,27 @@ mod tests {
                 }],
             },
             kinds_changed: ["chart".to_string()].into_iter().collect(),
+            webhook: super::super::webhook::WebhookDelta {
+                added: vec![endpoint("inbox")],
+                removed: vec![brenn_webhook::EndpointRuntime::new(
+                    endpoint("retired"),
+                    None,
+                )],
+                changed: vec![super::super::webhook::WebhookChange {
+                    old: brenn_webhook::EndpointRuntime::new(endpoint("rotated"), None),
+                    new: endpoint("rotated"),
+                }],
+                releases: Default::default(),
+            },
+            mqtt_clients: super::super::mqtt::MqttClientsDelta {
+                added: vec![std::sync::Arc::new(
+                    brenn_lib::mqtt::test_support::test_client_config("spare"),
+                )],
+                removed: ["retired".to_string()].into_iter().collect(),
+                changed: vec![std::sync::Arc::new(
+                    brenn_lib::mqtt::test_support::test_client_config("rotated"),
+                )],
+            },
             dynamic_observed: Default::default(),
         };
         let status: StatusDelta = (&plan_delta).into();
@@ -239,12 +294,25 @@ mod tests {
         // commit narrows each list to the filters that landed there.
         assert_eq!(status.mqtt_deferred, vec!["mqtt:chef:a/b".to_string()]);
         assert_eq!(status.mqtt_failed, vec!["mqtt:chef:a/b".to_string()]);
+        assert_eq!(status.mqtt_clients_added, vec!["spare".to_string()]);
+        assert_eq!(status.mqtt_clients_removed, vec!["retired".to_string()]);
+        assert_eq!(status.mqtt_clients_changed, vec!["rotated".to_string()]);
         // A changed surface is named by the slug the candidate runs it under,
         // which is the slug an operator reads in the document.
         assert_eq!(status.surfaces_added, vec!["wall".to_string()]);
         assert_eq!(status.surfaces_removed, vec!["kiosk".to_string()]);
         assert_eq!(status.surfaces_changed, vec!["deskbar".to_string()]);
         assert_eq!(status.kinds_changed, vec!["chart".to_string()]);
+        // Endpoints are reported by slug, a changed one at the slug it keeps.
+        assert_eq!(status.webhook_endpoints_added, vec!["inbox".to_string()]);
+        assert_eq!(
+            status.webhook_endpoints_removed,
+            vec!["retired".to_string()]
+        );
+        assert_eq!(
+            status.webhook_endpoints_changed,
+            vec!["rotated".to_string()]
+        );
     }
 
     /// The facility's own identity publishes onto the operator's status

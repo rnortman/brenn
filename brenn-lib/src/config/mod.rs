@@ -64,8 +64,7 @@ pub use repo::*;
 #[cfg(test)]
 pub(crate) use resolve::shallow_merge_toml;
 pub use resolve::{
-    FrozenInputs, ResolvedConfig, pwa_push_grant_without_section, resolve_apps,
-    validate_and_resolve,
+    ResolvedConfig, pwa_push_grant_without_section, resolve_apps, validate_and_resolve,
 };
 pub use secret::SecretString;
 pub(crate) use secret::{load_secret_file, load_secret_file_private};

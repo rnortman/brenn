@@ -13,9 +13,15 @@ description = "Webhook transport runtime: address parsing, signature/bearer veri
 [dependencies]
 async-trait = "0.1.89"
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+# The replay component an endpoint's guard holds. brenn-wasm depends on neither
+# brenn-webhook nor brenn-lib, so naming it here closes no cycle.
+brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }
 bytes = "1.11.1"
 hex = "0.4.3"
 http = "1.4.0"
+# `tokio::sync::Mutex` for the replay guard's component slot: an inbound request
+# holds it across the blocking replay check.
+tokio = { version = "1.50.0", features = ["sync"] }
 
 [dev-dependencies]
 # The seam test resolves a whole config, which needs brenn-lib's runtime-dir

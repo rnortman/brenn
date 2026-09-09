@@ -26,13 +26,14 @@ use brenn_server::test_support::init_db_file;
 
 use super::driver::TriggerSource;
 use super::driver::tests::{
-    BootFixture, Booted, READER, SPILL_ACL_BY_ADDRESS, Tree, async_tool_registry, boot, boot_with,
-    conversation_of, document, document_covering_work, document_push_subscribing,
+    BootFixture, Booted, READER, SPILL_ACL_BY_ADDRESS, Tree, async_tool_registry, bearer_endpoint,
+    boot, boot_with, conversation_of, document, document_covering_work, document_push_subscribing,
     document_push_subscribing_acl, document_subscribing, document_with_a_broker_only,
-    document_with_a_consumer, document_with_an_mqtt_consumer, insert_dynamic_row,
-    insert_push_dynamic_row, install_package, install_package_from, push_owner_covering_work,
-    seat_a_conversation, seat_position, seat_user, spill_channel, staged_module,
-    subscriber_debug_lines, surface_document, surfaces_document, write_surface_kind,
+    document_with_a_consumer, document_with_an_mqtt_consumer, document_with_clients,
+    document_with_webhooks, insert_dynamic_row, insert_push_dynamic_row, install_package,
+    install_package_from, push_owner_covering_work, seat_a_conversation, seat_position, seat_user,
+    spill_channel, staged_module, subscriber_debug_lines, surface_document, surfaces_document,
+    write_surface_kind,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -93,14 +94,31 @@ pub(crate) struct Snapshot {
     mqtt_routes: Vec<String>,
     /// The clients holding a broker session, sorted.
     ///
-    /// Forward-looking, and cannot fail today: nothing writes the service's
-    /// registry after boot, so both sides of the comparison are the same
-    /// function of the same declaration set. It is here so that the change
-    /// which makes the registry mutable cannot land without the oracle
-    /// noticing. The claim that a session survives its last binding leaving is
-    /// pinned meanwhile by the direct read in
-    /// `a_last_mqtt_binding_leaving_matches_a_fresh_boot`.
+    /// Read off the service rather than off the document: a reload that
+    /// registered, restarted or stopped a client and left the registry in a
+    /// different state than a fresh boot would build is exactly the drift
+    /// this field exists to see.
     mqtt_sessions: Vec<String>,
+    /// The resolved config every registered session is connected as: one line
+    /// per slug, sorted.
+    ///
+    /// The session set beside it says which clients exist; this says what they
+    /// are. A reload that registered a client on the predecessor's credential,
+    /// or restarted one and carried the wrong identity into the successor,
+    /// holds the same slug as a fresh boot and differs here. Secrets are
+    /// rendered as digests, for the reason the endpoint field's scheme is: a
+    /// snapshot is a panic message.
+    mqtt_client_configs: Vec<String>,
+    /// The webhook endpoint table the inbound handler resolves against: one
+    /// line per served slug, sorted.
+    ///
+    /// Read off the running `WebhookService`, not off the resolved document:
+    /// a reload that installed a subtly different entry than boot builds — an
+    /// owner stamped one way on one path and another on the other, a default
+    /// applied on one only — agrees with a fresh boot on the channel the
+    /// endpoint mints and differs here. Secrets are rendered as digests: what
+    /// must match is the bytes, and a snapshot is a panic message.
+    webhook_endpoints: Vec<String>,
     /// The authority view of every agent, one line per slug, sorted.
     ///
     /// Read off the table the gates read, not off the plan: a reload that
@@ -156,6 +174,8 @@ impl Snapshot {
             mqtt_filters,
             mqtt_routes,
             mqtt_sessions,
+            mqtt_client_configs,
+            webhook_endpoints,
             agent_authority,
             agent_spawn,
             agent_per_call,
@@ -175,6 +195,16 @@ impl Snapshot {
         assert_lines("mqtt_filters", mqtt_filters, &fresh.mqtt_filters);
         assert_lines("mqtt_routes", mqtt_routes, &fresh.mqtt_routes);
         assert_lines("mqtt_sessions", mqtt_sessions, &fresh.mqtt_sessions);
+        assert_lines(
+            "mqtt_client_configs",
+            mqtt_client_configs,
+            &fresh.mqtt_client_configs,
+        );
+        assert_lines(
+            "webhook_endpoints",
+            webhook_endpoints,
+            &fresh.webhook_endpoints,
+        );
         assert_lines("agent_authority", agent_authority, &fresh.agent_authority);
         assert_lines("agent_spawn", agent_spawn, &fresh.agent_spawn);
         assert_lines("agent_per_call", agent_per_call, &fresh.agent_per_call);
@@ -217,6 +247,18 @@ impl Snapshot {
     /// The session set, for a transition whose point is that it did *not* move.
     pub(crate) fn mqtt_sessions(&self) -> &[String] {
         &self.mqtt_sessions
+    }
+
+    /// What those sessions are connected as, for a transition whose point is
+    /// that a credential or an identity field moved under an unmoved slug.
+    pub(crate) fn mqtt_client_configs(&self) -> &[String] {
+        &self.mqtt_client_configs
+    }
+
+    /// The served endpoint table, for a transition asserting it moved at all:
+    /// a field compared while empty on both sides tests nothing.
+    pub(crate) fn webhook_endpoints(&self) -> &[String] {
+        &self.webhook_endpoints
     }
 }
 
@@ -269,6 +311,75 @@ fn entry_line(entry: &brenn_lib::messaging::ChannelEntry) -> String {
         entry.description,
         entry.resolved_channel,
         subscribers.join(" | "),
+    )
+}
+
+/// One served endpoint as a line: what it is, what it verifies against, and
+/// what its replay protection is bound to.
+///
+/// The scheme goes in as a digest of its `Debug` rendering rather than
+/// verbatim, because that rendering carries the secret bytes and a snapshot is
+/// printed by a failing assertion. A rotated secret changes the digest, which
+/// is the whole of what this field has to see.
+fn endpoint_line(entry: &brenn_webhook::EndpointRuntime) -> String {
+    let endpoint = &entry.endpoint;
+    let replay = match (endpoint.replay_protection.as_ref(), entry.replay.as_ref()) {
+        (Some(rp), Some(guard)) => format!(
+            "component={:?} store_path={:?} max_page_count={} config={:?} release={}",
+            rp.component,
+            rp.store_path,
+            rp.max_page_count,
+            {
+                let mut config: Vec<(&String, &String)> = rp.config.iter().collect();
+                config.sort();
+                config
+            },
+            guard.verified.artifact_sha256,
+        ),
+        (None, None) => "none".to_string(),
+        // A guard without a block, or a block without a guard, is drift in
+        // itself: rendered rather than unwrapped so the comparison reports it.
+        (rp, guard) => format!(
+            "inconsistent block={:?} guard={:?}",
+            rp.is_some(),
+            guard.is_some()
+        ),
+    };
+    format!(
+        "{} mount={:?} owner={:?} ceiling={} content_type={:?} urgency={:?} scheme={} replay=[{}]",
+        endpoint.slug,
+        endpoint.mount,
+        endpoint.owner,
+        endpoint.transport_ceiling_bytes,
+        endpoint.content_type,
+        endpoint.urgency,
+        brenn_lib::util::sha256_hex(format!("{:?}", endpoint.scheme).as_bytes()),
+        replay,
+    )
+}
+
+/// One registered session's resolved config as a line: the whole identity, and
+/// a digest of each credential.
+///
+/// The identity goes in through `Debug`, so a field added to it joins the
+/// comparison by existing. The two secrets do not: `MqttClientConfig`'s own
+/// `Debug` renders the password as `<redacted>` and the CA as a byte count, and
+/// neither says whether the bytes moved — which is the whole of what a rotation
+/// transition has to see. Digested rather than rendered, because a snapshot is
+/// printed by a failing assertion.
+fn client_config_line(slug: &str, config: &brenn_lib::mqtt::config::MqttClientConfig) -> String {
+    let digest = |bytes: &[u8]| brenn_lib::util::sha256_hex(bytes);
+    format!(
+        "{slug} identity={:?} password={} ca={}",
+        config.identity,
+        config
+            .password
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |p| digest(p.as_bytes())),
+        config
+            .ca_cert_pem
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |pem| digest(pem)),
     )
 }
 
@@ -414,11 +525,22 @@ async fn snapshot(booted: &Booted) -> Snapshot {
     virtual_tools.sort();
 
     let (mqtt_filters, mqtt_routes) = mqtt_ingress(booted, &entries).await;
-    let mqtt_sessions: Vec<String> = booted
+    let mqtt_sessions: Vec<String> = booted.mqtt.0.client_slugs();
+    let mut mqtt_client_configs: Vec<String> = booted
         .mqtt
-        .as_ref()
-        .map(|(service, _)| service.client_slugs())
-        .unwrap_or_default();
+        .0
+        .baseline()
+        .iter()
+        .map(|(slug, config)| client_config_line(slug, config))
+        .collect();
+    mqtt_client_configs.sort();
+    let mut webhook_endpoints: Vec<String> = booted
+        .webhook
+        .baseline()
+        .values()
+        .map(|entry| endpoint_line(entry))
+        .collect();
+    webhook_endpoints.sort();
 
     Snapshot {
         channels,
@@ -434,6 +556,8 @@ async fn snapshot(booted: &Booted) -> Snapshot {
         mqtt_filters,
         mqtt_routes,
         mqtt_sessions,
+        mqtt_client_configs,
+        webhook_endpoints,
         agent_authority,
         agent_spawn,
         agent_per_call,
@@ -489,9 +613,7 @@ async fn mqtt_ingress(
     booted: &Booted,
     entries: &[Arc<brenn_lib::messaging::ChannelEntry>],
 ) -> (Vec<String>, Vec<String>) {
-    let Some((service, router)) = &booted.mqtt else {
-        return (Vec::new(), Vec::new());
-    };
+    let (service, router) = &booted.mqtt;
 
     let mut filters = Vec::new();
     for slug in service.client_slugs() {
@@ -1541,15 +1663,17 @@ async fn an_artifact_that_moved_under_an_unmoved_document_is_a_changed_consumer(
 
 // ── The oracle over the MQTT ingress transitions ──────────────────────────
 
-/// The rig both directions boot on: the plan-only MQTT runtime, which registers
-/// a handle per declared client and spawns no supervisor, so every SUBSCRIBE
-/// defers and no packet moves. The wire version is
-/// `mqtt_broker_tests::compare_over_the_broker`'s.
-fn mqtt_fixture(components: &std::path::Path) -> impl Fn(brenn_db::Db) -> BootFixture + use<'_> {
+/// The rig every MQTT transition here boots on, ingress and client alike: a
+/// components root for the consumer the bindings feed, and the plan-only MQTT
+/// runtime, which registers a session per *declared* client and spawns no
+/// connection — so both sides hold the whole registry, every SUBSCRIBE defers
+/// and no packet moves. The wire versions are `mqtt_broker_tests`'.
+fn components_fixture(
+    components: &std::path::Path,
+) -> impl Fn(brenn_db::Db) -> BootFixture + use<'_> {
     move |db| BootFixture {
         db: Some(db),
         components_roots: vec![components.to_path_buf()],
-        mqtt: true,
         ..BootFixture::default()
     }
 }
@@ -1566,7 +1690,7 @@ async fn a_first_mqtt_binding_matches_a_fresh_boot() {
 
     a_reload_matches_a_fresh_boot(
         &tree,
-        mqtt_fixture(components.path()),
+        components_fixture(components.path()),
         async |booted| {
             tree.write(&document_with_an_mqtt_consumer(&[TOPIC]));
             install_package(components.path(), &staged_module(&tree));
@@ -1607,7 +1731,7 @@ async fn a_last_mqtt_binding_leaving_matches_a_fresh_boot() {
 
     a_reload_matches_a_fresh_boot(
         &tree,
-        mqtt_fixture(components.path()),
+        components_fixture(components.path()),
         async |booted| {
             tree.write(&document_with_a_broker_only());
             booted.driver.reload(TriggerSource::Signal).await;
@@ -1633,6 +1757,302 @@ async fn a_last_mqtt_binding_leaving_matches_a_fresh_boot() {
                 "the session outlives its last binding on both sides, or this transition \
                  compares nothing",
             );
+        },
+    )
+    .await;
+}
+
+// ── The oracle over the `[[mqtt_client]]` transitions ─────────────────────
+
+/// The two client sets every transition here moves between, and the bindings
+/// that go with them: one broker, or two.
+fn one_client() -> [(&'static str, u16, Option<&'static std::path::Path>); 1] {
+    [("ha", 8883, None)]
+}
+
+fn two_clients() -> [(&'static str, u16, Option<&'static std::path::Path>); 2] {
+    [("ha", 8883, None), ("spare", 8884, None)]
+}
+
+const ONE_BINDING: [(&str, &str); 1] = [("ha", "home/state")];
+const TWO_BINDINGS: [(&str, &str); 2] = [("ha", "home/state"), ("spare", "home/other")];
+
+/// **The deploy story on the MQTT side.** A `[[mqtt_client]]` the process does
+/// not hold arrives: the session, its filters, the ingress route and the
+/// channel all have to be what a fresh boot of the same document builds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_mqtt_client_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with_clients(&one_client(), &ONE_BINDING));
+    install_package(components.path(), &staged_module(&tree));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        components_fixture(components.path()),
+        async |booted| {
+            tree.write(&document_with_clients(&two_clients(), &TWO_BINDINGS));
+            install_package(components.path(), &staged_module(&tree));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.mqtt_clients_added,
+                vec!["spare".to_string()],
+            );
+            booted.stop_mqtt();
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.mqtt_sessions(),
+                ["ha".to_string(), "spare".to_string()],
+                "the arriving client is registered on both sides, or this transition compares \
+                 nothing",
+            );
+            assert_eq!(
+                reloaded.mqtt_filters().len(),
+                2,
+                "{:?}",
+                reloaded.mqtt_filters(),
+            );
+        },
+    )
+    .await;
+}
+
+/// **A client leaving.** Its session, its filters and its route go, and what a
+/// fresh boot of the shorter document holds is none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_mqtt_client_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with_clients(&two_clients(), &TWO_BINDINGS));
+    install_package(components.path(), &staged_module(&tree));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        components_fixture(components.path()),
+        async |booted| {
+            tree.write(&document_with_clients(&one_client(), &ONE_BINDING));
+            install_package(components.path(), &staged_module(&tree));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.mqtt_clients_removed,
+                vec!["spare".to_string()],
+            );
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.mqtt_sessions(),
+                ["ha".to_string()],
+                "the departing client is gone on both sides, or this transition compares nothing",
+            );
+        },
+    )
+    .await;
+}
+
+/// **An identity field moving under an unmoved slug.** The client dials a
+/// different broker port, so its supervisor is restarted; the registry holds
+/// the same slug it always did, and what it is connected as has to be the
+/// successor's — which only the config field of the snapshot can see.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_mqtt_client_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with_clients(&one_client(), &ONE_BINDING));
+    install_package(components.path(), &staged_module(&tree));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        components_fixture(components.path()),
+        async |booted| {
+            let before = snapshot(booted).await.mqtt_client_configs().to_vec();
+            tree.write(&document_with_clients(&[("ha", 8885, None)], &ONE_BINDING));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.mqtt_clients_changed,
+                vec!["ha".to_string()],
+            );
+            assert_ne!(
+                snapshot(booted).await.mqtt_client_configs(),
+                before.as_slice(),
+                "the edit moved the registered config, or this transition compares nothing",
+            );
+            booted.stop_mqtt();
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.mqtt_sessions(),
+                ["ha".to_string()],
+                "a restarted client is never absent from the registry",
+            );
+            assert_eq!(
+                reloaded.mqtt_filters().len(),
+                1,
+                "the successor carries the predecessor's filters: {:?}",
+                reloaded.mqtt_filters(),
+            );
+        },
+    )
+    .await;
+}
+
+/// **A rotated broker password under an unmoved document.** The bytes on disk
+/// are part of the resolved client, so the reload has to be connected as the
+/// new ones — which is only a convergence if a fresh boot of the same unmoved
+/// document is too, and is what the config field's password digest is in the
+/// comparison for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_broker_password_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    // The secret is written before the document that names it: it has to be
+    // readable at both boots as well as at the reload.
+    let tree = Tree::new();
+    let password = tree.secret("broker.pw", "before");
+    let clients = [("ha", 8883u16, Some(password.as_path()))];
+    let document = document_with_clients(&clients, &ONE_BINDING);
+    tree.write(&document);
+    install_package(components.path(), &staged_module(&tree));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        components_fixture(components.path()),
+        async |booted| {
+            let before = snapshot(booted).await.mqtt_client_configs().to_vec();
+            std::fs::write(&password, "after").expect("rotate the secret");
+            tree.write(&document);
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.mqtt_clients_changed,
+                vec!["ha".to_string()],
+            );
+            assert_ne!(
+                snapshot(booted).await.mqtt_client_configs(),
+                before.as_slice(),
+                "the rotation moved the registered config, or this transition compares nothing",
+            );
+            booted.stop_mqtt();
+        },
+        |reloaded| {
+            assert_eq!(reloaded.mqtt_sessions(), ["ha".to_string()]);
+        },
+    )
+    .await;
+}
+
+// ── The oracle over the webhook transitions ───────────────────────────────
+
+/// The rig every webhook transition boots on: a database per process. A bearer
+/// endpoint needs no mount and no components root; its secret files live under
+/// the document tree, which both sides read.
+fn webhook_fixture(db: brenn_db::Db) -> BootFixture {
+    BootFixture {
+        db: Some(db),
+        ..BootFixture::default()
+    }
+}
+
+/// **The deploy story.** A first endpoint arrives: the table entry, the channel
+/// it mints and the owner folded onto it all have to be what a fresh boot of
+/// the same document builds — including the stamped owner, which boot derives
+/// from the agent's `subscribe` line and the reload derives from the
+/// candidate's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_webhook_endpoint_matches_a_fresh_boot() {
+    let tree = Tree::holding(&document_with_webhooks("", &[]));
+    let secret = tree.secret("inbox.token", "s3cret");
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        webhook_fixture,
+        async |booted| {
+            tree.write(&document_with_webhooks(
+                &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+                &["inbox"],
+            ));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.webhook_endpoints_added,
+                vec!["inbox".to_string()],
+            );
+        },
+        |reloaded| {
+            assert_eq!(
+                reloaded.webhook_endpoints().len(),
+                1,
+                "the endpoint is served on both sides, or this transition compares nothing: \
+                 {:?}",
+                reloaded.webhook_endpoints(),
+            );
+        },
+    )
+    .await;
+}
+
+/// **An endpoint leaving.** The entry goes out of the table and its channel out
+/// of the directory, and what a fresh boot of the shorter document holds is
+/// neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_webhook_endpoint_matches_a_fresh_boot() {
+    let tree = Tree::new();
+    let secret = tree.secret("inbox.token", "s3cret");
+    tree.write(&document_with_webhooks(
+        &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+        &["inbox"],
+    ));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        webhook_fixture,
+        async |booted| {
+            tree.write(&document_with_webhooks("", &[]));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.webhook_endpoints_removed,
+                vec!["inbox".to_string()],
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded.webhook_endpoints().is_empty(),
+                "{:?}",
+                reloaded.webhook_endpoints(),
+            );
+        },
+    )
+    .await;
+}
+
+/// **A rotated secret under an unmoved document.** The bytes on disk are the
+/// entity, so the reload has to be serving the new ones — which is only a
+/// convergence if a fresh boot of the same unmoved document serves them too,
+/// and is what the endpoint field's scheme digest is in the comparison for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_webhook_secret_matches_a_fresh_boot() {
+    let tree = Tree::new();
+    let secret = tree.secret("inbox.token", "before");
+    let document = document_with_webhooks(
+        &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+        &["inbox"],
+    );
+    tree.write(&document);
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        webhook_fixture,
+        async |booted| {
+            let before = snapshot(booted).await.webhook_endpoints().to_vec();
+            std::fs::write(&secret, "after").expect("rotate the secret");
+            tree.write(&document);
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.webhook_endpoints_changed,
+                vec!["inbox".to_string()],
+            );
+            assert_ne!(
+                snapshot(booted).await.webhook_endpoints(),
+                before.as_slice(),
+                "the rotation moved the served entry, or this transition compares nothing",
+            );
+        },
+        |reloaded| {
+            assert_eq!(reloaded.webhook_endpoints().len(), 1);
         },
     )
     .await;

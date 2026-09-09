@@ -16,11 +16,14 @@
 //! one of its own. The gate that decides between running and skipping is
 //! `brenn_mqtt::broker_gate!`, beside the harness it gates.
 
+use std::sync::Arc;
+
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::test_support::{
-    BrokerHarness, await_puback, certs, direct_publisher_acked, log_records_publish_to_subscriber,
-    log_records_unsubscribe, session_client_id,
+    AUTH_CREDENTIALS, BrokerHarness, ROTATED_CREDENTIALS, await_puback, certs,
+    direct_publisher_acked, direct_publisher_acked_as, log_records_disconnect,
+    log_records_publish_to_subscriber, log_records_unsubscribe, session_client_id,
 };
 use rumqttc::mqttbytes::QoS;
 
@@ -39,9 +42,8 @@ const TOPIC_PREFIX: &str = "brenn/itest/reload";
 ///
 /// One copy for every shape: the idle-broker test boots a document with no
 /// binding and reloads onto a bound one, and a second copy that drifted in
-/// `url` or `qos` would make it converge onto a different client declaration
-/// than it booted — which the `mqtt_clients` level-1 refusal would answer, in a
-/// test whose whole point is the applied path.
+/// `url` or `qos` would restart the client's supervisor mid-case — a change
+/// these tests are not about, in the middle of the applied path they are.
 fn client_block(port: u16, ca_file: &std::path::Path) -> String {
     format!(
         r#"mqtt_client ha {{
@@ -66,7 +68,17 @@ fn client_block(port: u16, ca_file: &std::path::Path) -> String {
 /// so a reload from it adds the component, the consumer and its `mqtt:` binding
 /// together.
 fn document_over_the_broker(port: u16, ca_file: &std::path::Path, topics: &[&str]) -> String {
-    let mut body = client_block(port, ca_file);
+    document_over_a_declared_client(&client_block(port, ca_file), topics)
+}
+
+/// [`document_over_the_broker`] over an arbitrary `mqtt_client` block, for the
+/// cases that vary the declaration itself rather than what is bound through it.
+///
+/// With `block` empty it is the document with no broker at all — no client, no
+/// component and no consumer — which is what a reload that brings the first
+/// client starts from.
+fn document_over_a_declared_client(block: &str, topics: &[&str]) -> String {
+    let mut body = block.to_string();
     if topics.is_empty() {
         return document(&body);
     }
@@ -125,24 +137,16 @@ async fn boot_connected(
     topics: &[&str],
 ) -> (Tree, Booted) {
     let tree = Tree::holding(&document_over_the_broker(harness.port, ca_file, topics));
-    // A broker-only document declares no component and so stages no module,
-    // and there is then no package to install; the reload that brings the first
-    // component installs it. Read off the tree rather than off `topics`, so the
-    // builder stays the only thing that knows which documents stage one.
-    if let Some(module) = staged_module_opt(&tree) {
-        install_package(components, &module);
-    }
-    let booted = boot_with(
-        &tree,
-        BootFixture {
-            components_roots: vec![components.to_path_buf()],
-            mqtt_live: true,
-            dispatcher: true,
-            ..BootFixture::default()
-        },
-    )
-    .await;
-    let (service, _) = booted.mqtt.clone().expect("the fixture stood one up");
+    let booted = boot_connected_on(&tree, components).await;
+    (tree, booted)
+}
+
+/// [`boot_connected`] over a tree a case built itself — one whose client block
+/// carries credentials, or whose secret files had to exist before the document
+/// naming them.
+async fn boot_connected_on(tree: &Tree, components: &std::path::Path) -> Booted {
+    let booted = boot_declared(tree, components).await;
+    let (service, _) = booted.mqtt.clone();
     brenn_mqtt::test_support::wait_for_health(
         &service,
         CLIENT,
@@ -151,7 +155,29 @@ async fn boot_connected(
         "the booted session never reached the broker",
     )
     .await;
-    (tree, booted)
+    booted
+}
+
+/// Boot `tree` over the live subsystem without waiting on any session: the
+/// shape for a document that declares no client at all.
+async fn boot_declared(tree: &Tree, components: &std::path::Path) -> Booted {
+    // A broker-only document declares no component and so stages no module,
+    // and there is then no package to install; the reload that brings the first
+    // component installs it. Read off the tree rather than off `topics`, so the
+    // builder stays the only thing that knows which documents stage one.
+    if let Some(module) = staged_module_opt(tree) {
+        install_package(components, &module);
+    }
+    boot_with(
+        tree,
+        BootFixture {
+            components_roots: vec![components.to_path_buf()],
+            mqtt_live: true,
+            dispatcher: true,
+            ..BootFixture::default()
+        },
+    )
+    .await
 }
 
 /// The half of holding the reload's ingress answer to account that both
@@ -333,7 +359,7 @@ async fn a_binding_added_by_reload_receives_from_the_broker() {
     let components = tempfile::tempdir().expect("a components root");
 
     let (tree, mut booted) = boot_connected(&harness, &ca_file, components.path(), &[&kept]).await;
-    let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+    let (service, router) = booted.mqtt.clone();
     assert_eq!(service.ingress_filter_qos(CLIENT, &arrived).await, None);
 
     // The reload: one more binding on the same client's existing session.
@@ -466,7 +492,7 @@ async fn a_binding_removed_by_reload_stops_receiving_from_the_broker() {
 
     let (tree, mut booted) =
         boot_connected(&harness, &ca_file, components.path(), &[&kept, &dropped]).await;
-    let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+    let (service, router) = booted.mqtt.clone();
     assert!(service.ingress_filter_qos(CLIENT, &dropped).await.is_some());
     let dropped_uuid = booted
         .messenger
@@ -657,7 +683,7 @@ async fn compare_over_the_broker(
         &tree,
         fixture,
         async |booted| {
-            let (service, _) = booted.mqtt.clone().expect("the fixture stood one up");
+            let (service, _) = booted.mqtt.clone();
             brenn_mqtt::test_support::wait_for_health(
                 &service,
                 CLIENT,
@@ -734,7 +760,7 @@ async fn the_first_binding_on_an_idle_broker_receives_from_the_broker() {
     let components = tempfile::tempdir().expect("a components root");
 
     let (tree, mut booted) = boot_connected(&harness, &ca_file, components.path(), &[]).await;
-    let (service, router) = booted.mqtt.clone().expect("a declared client gets one");
+    let (service, router) = booted.mqtt.clone();
     assert_eq!(service.client_slugs(), vec![CLIENT.to_string()]);
     assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, None);
     assert!(router.route_uuids().is_empty());
@@ -826,7 +852,7 @@ async fn boot_live(tree: &Tree, db: Option<brenn_db::Db>) -> Booted {
         },
     )
     .await;
-    let (service, _) = booted.mqtt.clone().expect("the fixture stood one up");
+    let (service, _) = booted.mqtt.clone();
     brenn_mqtt::test_support::wait_for_health(
         &service,
         CLIENT,
@@ -862,7 +888,7 @@ async fn an_agent_binding_added_by_reload_receives_from_the_broker() {
     let tree = Tree::holding(&document_agent_over_the_broker(harness.port, &ca_file, &[]));
     let mut booted = boot_live(&tree, None).await;
     seat_user(&booted.db, "alice").await;
-    let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+    let (service, router) = booted.mqtt.clone();
     assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, None);
 
     tree.write(&document_agent_over_the_broker(
@@ -954,7 +980,6 @@ async fn boot_over_a_dynamic_row(
         BootFixture {
             db: Some(db.clone()),
             components_roots: vec![components.path().to_path_buf()],
-            mqtt: true,
             ..BootFixture::default()
         },
     )
@@ -992,7 +1017,7 @@ async fn a_revived_dynamic_binding_receives_from_the_broker() {
     // this process has never asserted.
     let narrow = document_over_the_broker(harness.port, &ca_file, &[]);
     let (tree, mut booted) = boot_over_a_dynamic_row(harness.port, &ca_file, &topic, &narrow).await;
-    let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+    let (service, router) = booted.mqtt.clone();
     assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, None);
     assert!(live_entry_of_reader(&booted, &address).is_none());
 
@@ -1078,7 +1103,7 @@ async fn a_revoked_dynamic_binding_leaves_the_brokers_filter_set() {
         &covering_over_the_broker(harness.port, &ca_file, &[&address]),
     )
     .await;
-    let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+    let (service, router) = booted.mqtt.clone();
     assert!(
         service.ingress_filter_qos(CLIENT, &topic).await.is_some(),
         "the kept row's filter is asserted at boot",
@@ -1178,7 +1203,7 @@ async fn compare_agent_over_the_broker(
             seat_user(&booted.db, "alice").await;
         },
         async |booted| {
-            let (service, _) = booted.mqtt.clone().expect("the fixture stood one up");
+            let (service, _) = booted.mqtt.clone();
             brenn_mqtt::test_support::wait_for_health(
                 &service,
                 CLIENT,
@@ -1213,4 +1238,432 @@ async fn compare_agent_over_the_broker(
         },
     )
     .await;
+}
+
+// ===========================================================================
+// The `[[mqtt_client]]` block itself, against a broker that is really running.
+//
+// Every other client case in this crate proves the *registry*: which handle the
+// commit built, which subscriptions it carried, in what order relative to the
+// agent swap. None can prove the packets — the handles those fixtures register
+// hold no connection, so a client the reload added never dials and one it
+// stopped never says goodbye. These four cases are the packet half: the first
+// binding on a client this reload declared receives, a stopped client's
+// DISCONNECT reaches the broker, an edited credential re-authenticates and
+// keeps receiving, and a wrong one applies and then fails.
+// ===========================================================================
+
+/// [`client_block`] with the credentials a password-authenticating broker
+/// requires: the account name in the document, its password in a file the
+/// document points at.
+fn credentialed_client_block(
+    port: u16,
+    ca_file: &std::path::Path,
+    username: &str,
+    password_file: &std::path::Path,
+) -> String {
+    format!(
+        r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:{port}";
+    ca_file = "{ca}";
+    username = "{username}";
+    password_file = "{password}";
+    qos = 1;
+}}
+"#,
+        ca = ca_file.display(),
+        password = password_file.display(),
+    )
+}
+
+/// Write `ca_file` under a fresh directory and hand back both, so a case's
+/// document can name the CA the harness's broker presents.
+fn trusted_ca() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("a directory for the CA");
+    let path = dir.path().join("ca.pem");
+    std::fs::write(&path, certs::ca_pem()).expect("the CA is writable");
+    (dir, path)
+}
+
+/// **The deploy story the facility exists for.** A site with no broker at all
+/// declares one, and the first binding through it receives, with no restart.
+///
+/// The plan-level version is
+/// `driver::tests::an_added_client_is_registered_and_its_first_binding_defers`,
+/// which is where the deferral is pinned; against a fixture handle that is all
+/// it can say. Here the supervisor the commit spawned dials a broker that is
+/// listening, so the case follows the same filter to the end: the broker grants
+/// it, an outside publisher publishes on the topic, and the message reaches the
+/// channel the reload minted.
+///
+/// The filters of a client this reload added are normally `mqtt_deferred` — the
+/// supervisor was spawned a few commit steps before the incoming step ran and
+/// its client cell is usually still empty — but not deterministically: the
+/// steps between the two write channels to the database, swap the agents and
+/// join every other restarting session, and a localhost broker can answer the
+/// CONNECT inside that span. So the filter is held to being a *move* that the
+/// broker has not refused, either reported live or deferred, and the walk below
+/// follows it to the broker's own grant, which is the claim that matters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_added_by_reload_connects_and_its_first_binding_receives() {
+    broker_gate!();
+
+    let arrived = format!("{TOPIC_PREFIX}/client-added");
+    let address = format!("mqtt:ha:{arrived}");
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let components = tempfile::tempdir().expect("a components root");
+
+    // No broker in the document at all: the registry is empty and nothing has
+    // ever dialed.
+    let tree = Tree::holding(&document_over_a_declared_client("", &[]));
+    let mut booted = boot_declared(&tree, components.path()).await;
+    let (service, router) = booted.mqtt.clone();
+    assert!(
+        service.client_slugs().is_empty(),
+        "{:?}",
+        service.client_slugs(),
+    );
+
+    tree.write(&document_over_the_broker(
+        harness.port,
+        &ca_file,
+        &[&arrived],
+    ));
+    install_package(components.path(), &staged_module(&tree));
+    booted.driver.reload(TriggerSource::Signal).await;
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_added, vec![CLIENT.to_string()]);
+    assert!(status.delta.mqtt_clients_removed.is_empty());
+    assert!(status.delta.mqtt_clients_changed.is_empty());
+    assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+    assert!(
+        status.delta.mqtt_deferred == vec![address.clone()]
+            || status.delta.mqtt_deferred.is_empty(),
+        "the filter is either registered for the supervisor's first connect or was sent live on \
+         a connection it had already made, and nothing else may have deferred: {:?}",
+        status.delta.mqtt_deferred,
+    );
+    assert_no_failed_filters(&status);
+
+    // The supervisor the commit spawned dials on its own; from here the case is
+    // the same walk as an added binding on a client that was already up.
+    brenn_mqtt::test_support::wait_for_health(
+        &service,
+        CLIENT,
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the session the reload registered never reached the broker",
+    )
+    .await;
+    brenn_mqtt::test_support::wait_for_filter_acked(
+        &service,
+        CLIENT,
+        &arrived,
+        BROKER_WAIT_SECS,
+        &format!("the broker never granted a subscription for {arrived}"),
+    )
+    .await;
+    let arrived_uuid = booted
+        .messenger
+        .directory()
+        .resolve(&address)
+        .expect("the reload minted the entry")
+        .uuid;
+    assert!(router.route_uuids().contains(&arrived_uuid));
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    publisher
+        .publish(arrived.clone(), QoS::AtLeastOnce, false, b"first".to_vec())
+        .await
+        .expect("the broker took the publish");
+    await_puback(&mut acks, "the arriving topic's publish").await;
+    note_if_filter_lost(&service, CLIENT, &arrived).await;
+
+    let bodies = booted.bodies_until(&address, 1).await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&bodies[0]).expect("the ingress envelope is JSON");
+    assert_eq!(envelope["client_slug"], CLIENT);
+    assert_eq!(envelope["topic"], arrived.as_str());
+    assert_eq!(envelope["payload"]["text"], "first", "{bodies:?}");
+
+    booted.stop_mqtt();
+}
+
+/// A client the candidate no longer declares says goodbye to the broker.
+///
+/// The registry half is pinned over a fixture handle by
+/// `driver::tests::a_removed_client_is_stopped_and_contributes_no_filter_moves`.
+/// What only a broker can answer is whether the stop was *orderly*: the commit
+/// signals the supervisor and joins it, and the supervisor's stop arm drains a
+/// DISCONNECT under its own timeout before the task exits. A join that returned
+/// on a supervisor which dropped its connection instead is invisible in
+/// process — brenn discards the session's state as it goes — and is what
+/// [`log_records_disconnect`] reads off the broker's own account.
+///
+/// The filter lists are held empty on the way past: a stopped client's filters
+/// leave with its session, and reporting them as withdrawn — or as deferred,
+/// which a session about to be stopped can never make good — would misdescribe
+/// what happened. Its channel is gone from the directory, which is the half an
+/// operator reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_removed_by_reload_disconnects() {
+    broker_gate!();
+
+    let topic = format!("{TOPIC_PREFIX}/client-removed");
+    let address = format!("mqtt:ha:{topic}");
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let components = tempfile::tempdir().expect("a components root");
+
+    let (tree, mut booted) = boot_connected(&harness, &ca_file, components.path(), &[&topic]).await;
+    let (service, _router) = booted.mqtt.clone();
+    let session = session_client_id(CLIENT);
+
+    // What the broker records from here is this reload's own account.
+    let before = harness.log_len();
+    tree.write(&document_over_a_declared_client("", &[]));
+    booted.driver.reload(TriggerSource::Signal).await;
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_removed, vec![CLIENT.to_string()]);
+    assert!(status.delta.mqtt_clients_added.is_empty());
+    assert!(status.delta.mqtt_clients_changed.is_empty());
+    assert!(
+        status.delta.mqtt_unsubscribed.is_empty() && status.delta.mqtt_deferred.is_empty(),
+        "a stopped client's filters left with its session and are no reload's moves: {:?} {:?}",
+        status.delta.mqtt_unsubscribed,
+        status.delta.mqtt_deferred,
+    );
+    assert_no_failed_filters(&status);
+    assert!(status.delta.channels_removed.contains(&address));
+    assert!(
+        service.client_slugs().is_empty(),
+        "{:?}",
+        service.client_slugs(),
+    );
+
+    harness
+        .wait_for_log(
+            before,
+            BROKER_WAIT_SECS,
+            &format!(
+                "the broker never recorded a DISCONNECT from {session}; a supervisor that dropped \
+                 its socket instead of draining one is the regression this reads for, and a \
+                 broker whose wording log_records_disconnect no longer parses is the other \
+                 explanation — the_disconnect_matcher_reads_a_live_brokers_wording in brenn-mqtt's \
+                 integration suite is the case that tells them apart"
+            ),
+            |log| log_records_disconnect(log, &session),
+        )
+        .await;
+
+    booted.stop_mqtt();
+}
+
+/// An edited credential is a supervisor restart that re-authenticates and keeps
+/// receiving, with no restart of the process.
+///
+/// Against a broker with `allow_anonymous false`, so reaching `Connected` at
+/// all is the broker's own answer that the account and the password the
+/// document now names were accepted. The filter is not a move — the successor
+/// carries the predecessor's list — so what proves the re-assert is the
+/// broker's grant on the *new* session: the successor starts with the filter
+/// registered and ungranted, and the supervisor re-asserts it on its first
+/// connect.
+///
+/// Deviation from a pure password rotation: the account name moves with the
+/// password, because a mosquitto password file holds one entry per user and
+/// both sides of the change have to be a login the broker really accepts. That
+/// a rotation of the password *bytes alone* — no document edit — restarts the
+/// client is pinned where it needs no broker,
+/// `driver::tests::a_rotated_broker_password_restarts_the_client_without_a_document_edit`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_whose_credentials_changed_reconnects_and_keeps_receiving() {
+    broker_gate!();
+
+    let topic = format!("{TOPIC_PREFIX}/credentials-changed");
+    let address = format!("mqtt:ha:{topic}");
+
+    let harness = BrokerHarness::start_auth();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let components = tempfile::tempdir().expect("a components root");
+
+    // The secret is written before the document that names it: it has to be
+    // readable at boot as well as at the reload.
+    let tree = Tree::new();
+    let first = tree.secret("broker.pw", AUTH_CREDENTIALS.1);
+    tree.write(&document_over_a_declared_client(
+        &credentialed_client_block(harness.port, &ca_file, AUTH_CREDENTIALS.0, &first),
+        &[&topic],
+    ));
+    let mut booted = boot_connected_on(&tree, components.path()).await;
+    let (service, _router) = booted.mqtt.clone();
+    let before = service.get_client(CLIENT).expect("a declared client");
+
+    // Opened before the reload, so the first line in it naming this session's
+    // client id is the restart's, not the boot's.
+    let log_from = harness.log_len();
+    let rotated = tree.secret("broker.rotated.pw", ROTATED_CREDENTIALS.1);
+    tree.write(&document_over_a_declared_client(
+        &credentialed_client_block(harness.port, &ca_file, ROTATED_CREDENTIALS.0, &rotated),
+        &[&topic],
+    ));
+    booted.driver.reload(TriggerSource::Signal).await;
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_changed, vec![CLIENT.to_string()]);
+    assert!(status.delta.mqtt_clients_added.is_empty());
+    assert!(status.delta.mqtt_clients_removed.is_empty());
+    assert!(
+        status.delta.mqtt_subscribed.is_empty() && status.delta.mqtt_unsubscribed.is_empty(),
+        "a carried filter is not a move: {:?} {:?}",
+        status.delta.mqtt_subscribed,
+        status.delta.mqtt_unsubscribed,
+    );
+    assert_no_failed_filters(&status);
+
+    let after = service
+        .get_client(CLIENT)
+        .expect("the slug is never absent");
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "the changed client kept its predecessor's handle",
+    );
+    assert_eq!(
+        after.config.identity.username.as_deref(),
+        Some(ROTATED_CREDENTIALS.0),
+    );
+    assert_eq!(
+        after.config.password.as_deref(),
+        Some(ROTATED_CREDENTIALS.1)
+    );
+
+    brenn_mqtt::test_support::wait_for_health(
+        &service,
+        CLIENT,
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the restarted session never re-authenticated against the broker",
+    )
+    .await;
+    brenn_mqtt::test_support::wait_for_filter_acked(
+        &service,
+        CLIENT,
+        &topic,
+        BROKER_WAIT_SECS,
+        &format!("the restarted session never re-asserted {topic} at the broker"),
+    )
+    .await;
+
+    // The handover's own claim, which no in-process state can make: the
+    // predecessor's DISCONNECT reached the broker before the successor's
+    // CONNECT.
+    let session_id = brenn_mqtt::test_support::session_client_id(CLIENT);
+    let window = harness
+        .wait_for_log(
+            log_from,
+            BROKER_WAIT_SECS,
+            &format!("the broker never recorded a DISCONNECT from {session_id}"),
+            |log| brenn_mqtt::test_support::log_records_disconnect(log, &session_id),
+        )
+        .await;
+    assert!(
+        brenn_mqtt::test_support::log_records_disconnect_before_reconnect(&window, &session_id),
+        "the successor connected under {session_id} before the predecessor's DISCONNECT was \
+         drained, which is a client-id takeover: {window}",
+    );
+
+    // The auth broker admits nobody anonymously, so the case's own publisher
+    // logs in as the account brenn just left.
+    let (publisher, mut acks) =
+        direct_publisher_acked_as(harness.port, certs::ca_pem_bytes(), Some(AUTH_CREDENTIALS))
+            .await;
+    publisher
+        .publish(topic.clone(), QoS::AtLeastOnce, false, b"after".to_vec())
+        .await
+        .expect("the broker took the publish");
+    await_puback(&mut acks, "the publish after the credential change").await;
+    note_if_filter_lost(&service, CLIENT, &topic).await;
+
+    let bodies = booted.bodies_until(&address, 1).await;
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&bodies[0]).expect("the ingress envelope is JSON");
+    assert_eq!(envelope["payload"]["text"], "after", "{bodies:?}");
+
+    booted.stop_mqtt();
+}
+
+/// A credential the broker rejects is an `applied` reload and then a `Failed`
+/// supervisor — not a refusal.
+///
+/// Prepare cannot dial the broker: that would make every reload wait on a
+/// network round trip and turn a slow broker into a refused deploy. So the
+/// document is accepted, the client is restarted with it, and the answer
+/// arrives from the broker afterwards, exactly as it would for a fresh boot of
+/// the same document. The rejection is authoritative — mosquitto answers the
+/// CONNACK with a bad-credentials reason code — so the supervisor stops
+/// retrying and the session's health is `Failed`, which is the only surface
+/// this state has (`TODO(mqtt-idle-client-visibility)`).
+///
+/// No document edit: the rotation is the password file's bytes alone, which is
+/// the shape an operator's own rotation takes and the one the status body reads
+/// as a changed client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_whose_new_credentials_are_wrong_reaches_failed_after_an_applied_reload() {
+    broker_gate!();
+
+    let topic = format!("{TOPIC_PREFIX}/credentials-wrong");
+    let address = format!("mqtt:ha:{topic}");
+
+    let harness = BrokerHarness::start_auth();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let components = tempfile::tempdir().expect("a components root");
+
+    let tree = Tree::new();
+    let password = tree.secret("broker.pw", AUTH_CREDENTIALS.1);
+    tree.write(&document_over_a_declared_client(
+        &credentialed_client_block(harness.port, &ca_file, AUTH_CREDENTIALS.0, &password),
+        &[&topic],
+    ));
+    let mut booted = boot_connected_on(&tree, components.path()).await;
+    let (service, _router) = booted.mqtt.clone();
+
+    std::fs::write(&password, "not-this-accounts-password").expect("the secret file is writable");
+    booted.driver.reload(TriggerSource::Signal).await;
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_changed, vec![CLIENT.to_string()]);
+    assert!(
+        status.delta.mqtt_failed.is_empty(),
+        "the supervisor has not had time to fail when the incoming step runs: {:?}",
+        status.delta.mqtt_failed,
+    );
+
+    brenn_mqtt::test_support::wait_for_health(
+        &service,
+        CLIENT,
+        &[ConnectorHealthLabel::Failed],
+        BROKER_WAIT_SECS,
+        "the restarted session never reached Failed against the broker that rejected it",
+    )
+    .await;
+    // The filter is registered on the handle and would be asserted by a process
+    // whose credentials work, which is why the reload applied.
+    assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, Some(1));
+    assert!(
+        booted.messenger.directory().resolve(&address).is_some(),
+        "the ingress channel is the document's whatever the broker thinks of the credentials",
+    );
+
+    booted.stop_mqtt();
 }

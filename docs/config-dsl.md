@@ -1173,6 +1173,28 @@ What converges is components, surfaces and their wiring:
 - `wasm_consumer` instances — added, removed, and changed, where changed
   includes a package whose artifact moved under an unmoved document, since the
   process must not keep executing bytes the module roots no longer hold.
+- `webhook` endpoints — added, removed, and changed, where changed includes a
+  rotated signing secret or bearer token under an unmoved document and a replay
+  component whose package now holds different bytes. The whole prefix is one
+  route, so a mount arrives and leaves without touching the HTTP router: from
+  the instant a reload retires an endpoint, its mount is an unrecognized URL.
+  Which agent or consumer *owns* an endpoint — the `subscribe "webhook:…"` line
+  or the `in` port bound to it — converges with it. The status body's
+  `webhook_endpoints_added`, `webhook_endpoints_removed` and
+  `webhook_endpoints_changed` say what moved.
+- `mqtt_client` declarations — added, removed, and changed, where changed
+  includes a rotated broker password or CA bundle under an unmoved document. An
+  added client's supervisor is registered and dialing before any authority that
+  names it goes live; a changed one's successor is swapped into the registry
+  before its predecessor is stopped, carries the predecessor's filters, and
+  resumes the same persistent session at the broker; a removed one is stopped,
+  with an orderly DISCONNECT, only after the last authority that could name it
+  is gone. The status body's `mqtt_clients_added`, `mqtt_clients_removed` and
+  `mqtt_clients_changed` say what moved. An agent's `mqtt_publish` or
+  `mqtt_subscribe` call that was already in flight when the reload removed the
+  client it names is answered as a tool error naming that client — the agent
+  asked for something the document said was there when it asked — and, for a
+  subscribe, the durable row it had already written is left dormant.
 - `surface` instances — added, removed, and changed. A surface is *changed* when
   its own block moved, when a channel it binds moved, or when the installed
   bytes of a kind it instantiates moved, which is what a bundle upgrade under a
@@ -1192,7 +1214,8 @@ What converges is components, surfaces and their wiring:
   swapped the tree in has the retained evidence that the new bytes are the ones
   being served.
 - `agent` blocks — compared **field by field**, not whole. An agent's grants,
-  ACLs, tool grants, `subscribe` lines, `mqtt_subscription`s, `send_budget`, and
+  ACLs, tool grants, `subscribe` lines, `mqtt_subscription`s,
+  `webhook_subscription`s, `send_budget`, and
   its display and door settings (`name`, `icon`, `models`, `multiuser`,
   `allowed_users`, the `prefix_*` flags, `attachment_targets`,
   `history_replay_limit`, `start_hooks`, `post_pull_hooks`, …) converge at once:
@@ -1221,7 +1244,7 @@ What converges is components, surfaces and their wiring:
   affected.
   Refused, each naming the field (`apps[assistant].mounts`): `mounts`,
   `container`, `integrations`, `integration_config`, `startup_hooks`,
-  `claude_profiles`, `webhook_subscriptions` — boot folds each of those into
+  `claude_profiles` — boot folds each of those into
   another subsystem's tables or runs an operator script for it — and adding,
   removing, renaming or reordering an agent, which is its existence rather than
   its configuration.
@@ -1260,6 +1283,24 @@ What converges is components, surfaces and their wiring:
   keeps its dynamic subscription in memory, so it is always folded, and removing
   such a channel under one is the folded refusal above.
 
+**What a fresh boot reads off the host, a reload reads off the host.** Every
+declared endpoint's `secret_file`s and every declared `mqtt_client`'s
+`password_file` and `ca_file` are read at every reload, whether or not the block
+that names them moved, and the *bytes* are what the comparison is over — so
+rotating a signing secret or a broker password in place and reloading is enough
+to serve the new one, with the entity named in `webhook_endpoints_changed` or
+`mqtt_clients_changed`. The other side of that: a secret file that is missing,
+unreadable or readable by another local account refuses the whole reload, even
+when the edit that triggered it was somewhere else, because a fresh boot could
+not have produced that state either. The same holds for a replay component's
+package and for the directory its `store_path` lives in.
+
+A credential the *broker* rejects is not a refusal: prepare never dials, because
+that would make every reload wait on a network round trip and turn a slow broker
+into a refused deploy. The reload applies, the restarted supervisor is told
+`NotAuthorized` on its first connect, and the session's health is `Failed` —
+which a fresh boot of the same document reaches the same way.
+
 The **mounts document is re-read first**, before the deployment document is
 compiled, so the roots every step below reads are the ones declared right now: a
 bundle installed and declared since boot is in reach without a restart, and a
@@ -1269,8 +1310,8 @@ refusal on its own — nothing about the deployment document is read. The outcom
 body's `mounts` array names what the process is reading: the candidate's on
 `applied` and `unchanged`, the running one's on `refused`.
 
-Everything else needs a restart, and says so. Remotes, webhook
-endpoints, MQTT clients, PWA push, tool declarations, Claude profiles, and the
+Everything else needs a restart, and says so. Remotes,
+PWA push, tool declarations, Claude profiles, and the
 `server` / `database` / `logging` / `messaging` / `observability` /
 `surface_description` sections are all compared whole: any difference is a
 refusal naming the section, and for a block array the key that differs
@@ -1296,10 +1337,10 @@ Three further refusals come from the wiring rather than from a section:
   deciding, so it is the one refusal that may appear seconds after the request.
   The mirror of it refuses too: a channel the document *starts* declaring at an
   address a dynamic subscription already minted.
-- `brenn:`, `ephemeral:`, `local:` and `mqtt:` channels converge; `webhook:`
-  does not. A `webhook:` channel that changed — including one whose only edit
-  was a tuning block — is a refusal naming the address, because its route is a
-  literal path built once into the HTTP router.
+- `brenn:`, `ephemeral:`, `local:`, `mqtt:` and `webhook:` channels all
+  converge. A `webhook:` channel is minted from its endpoint rather than
+  declared, so it moves when the endpoint does — including a retune, which used
+  to be a refusal naming the address.
 - An `mqtt:` channel converges its broker subscription and its ingress route
   with it: the filter is subscribed or unsubscribed on the live session and the
   route is added or removed, and the status body's `mqtt_subscribed`,
@@ -1311,15 +1352,26 @@ Three further refusals come from the wiring rather than from a section:
   failure such as bad credentials or a rejected TLS chain — is in `mqtt_failed`
   instead: the reload applied and the filter is registered, but no reconnect is
   coming, so nothing arrives on that channel until the `mqtt_client`
-  declaration is fixed and the process restarted. Waiting is the right response
-  to `mqtt_deferred` and the wrong response to `mqtt_failed`.
-  Every declared `mqtt_client` has a broker session from boot, so a
-  `wasm_consumer`'s `mqtt:` binding on any declared client converges, including
-  the first binding a document ever puts on a broker and the removal of the
-  last. What does *not* converge is the `mqtt_client` declaration itself —
-  adding, removing or editing a client is a refusal asking for a restart
-  (level 1) — nor an `[[app.mqtt_subscription]]`, because `apps` is frozen at
-  level 1 and app subscriptions are lowered to ingress channels at boot.
+  declaration is fixed and reloaded — editing the block restarts the supervisor,
+  so no restart of the process is needed. Waiting is the right response to
+  `mqtt_deferred` and the wrong response to `mqtt_failed`.
+  A filter bound through a client this reload *added or restarted* is normally
+  in `mqtt_deferred`: its supervisor was spawned a few commit steps earlier and
+  is usually still connecting, so the filter is registered on the handle and
+  asserted on the first connect rather than sent live. A fast broker can beat
+  those steps, in which case the same filter is in `mqtt_subscribed` alone —
+  both reports are true, and neither is an anomaly. Filters a
+  restarted client *carried* — everything bound through it that the document did
+  not move — are in neither list; the client itself is named in
+  `mqtt_clients_changed`. A removed client's filters are in neither list either:
+  they left with the session, and a session about to be stopped can make no
+  UNSUBSCRIBE good.
+  Every declared `mqtt_client` has a broker session from boot, and one a reload
+  declares has one from the instant it applied, so a `wasm_consumer`'s `mqtt:`
+  binding on any declared client converges — including the first binding a
+  document ever puts on a broker, on a broker the same reload declared, and the
+  removal of the last. An `[[app.mqtt_subscription]]` converges too, with the
+  rest of the agent's fields.
 
 The outcome vocabulary, on `brenn:config.status` and in the journal:
 

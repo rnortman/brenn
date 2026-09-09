@@ -25,5 +25,7 @@ pub mod signature;
 
 pub use address::{WEBHOOK_PREFIX, WebhookAddress, parse_webhook_address};
 pub use error::WebhookError;
-pub use service::{EndpointView, WebhookEventRouter, WebhookService};
+pub use service::{
+    EndpointRuntime, EndpointView, ReplayGuard, WebhookEventRouter, WebhookService, WebhookTable,
+};
 pub use signature::{VerifiedRequest, WebhookRejection, verify_request};

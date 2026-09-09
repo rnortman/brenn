@@ -1,84 +1,97 @@
-//! Inbound webhook handler — serves `POST <endpoint.mount>` for each configured
-//! endpoint.
+//! Inbound webhook handler — serves every path under `/webhooks/`.
 //!
-//! One handler function is shared across all configured endpoints. Each route is
-//! registered at the literal mount path (e.g. `/webhooks/phonebuddy`); the endpoint
-//! slug is injected per-route via an axum `Extension` layer so the handler can
-//! look up the resolved `ResolvedWebhookEndpoint` from the `WebhookService`.
-//!
-//! Mounted on the pre-auth utility-routes layer. Body size limiting is
-//! applied per-endpoint via `DefaultBodyLimit`.
+//! Mounted on the pre-auth utility-routes layer.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use axum::body::Bytes;
-use axum::extract::{Extension, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{Extension, OriginalUri, State};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_wasm::{CheckInput, Header, ReplayComponent, ReplayError};
+use brenn_wasm::{CheckInput, Header, ReplayError};
 use brenn_webhook::signature::{VerifiedRequest, WebhookRejection, verify_request};
+use futures::StreamExt;
 
 use crate::client_ip::ClientIp;
 use crate::state::AppState;
 
-/// Newtype wrapper for the per-route endpoint slug injected via `Extension`.
-#[derive(Clone)]
-pub struct EndpointSlug(pub String);
-
-/// Inbound webhook handler. Validates auth per the endpoint's configured
-/// `SignatureScheme`, then delivers the raw body to the owning app's
-/// singleton conversation via the `WebhookEventRouter`.
-///
-/// Registered as `POST <endpoint.mount>` for each configured endpoint.
-/// The endpoint slug is injected per-route via `Extension(EndpointSlug(...))`.
+/// Inbound webhook handler. Validates auth and delivers the payload to the
+/// owning app via `WebhookEventRouter`.
 pub async fn receive(
     State(state): State<AppState>,
-    Extension(EndpointSlug(endpoint_slug)): Extension<EndpointSlug>,
+    OriginalUri(original): OriginalUri,
     Extension(ClientIp(ip)): Extension<ClientIp>,
+    method: Method,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let dispatcher = &state.alert_dispatcher;
+    let webhook_svc = &state.webhook;
 
-    // Routes are registered only when the service exists; None here is an
-    // invariant violation — panic rather than silently returning 500.
-    let webhook_svc = state.webhook.as_ref().unwrap_or_else(|| {
-        panic!(
-            "inbound webhook handler reached but WebhookService is None; routing invariant violated"
-        )
-    });
-
-    let endpoint = match webhook_svc.endpoint_by_slug(&endpoint_slug) {
-        Some(ep) => ep,
-        None => {
-            // A registered route's endpoint slug is missing from the service
-            // index — startup sequencing bug, not an attacker scan. Log as a
-            // structured error (not fail2ban) so the operator sees the config
-            // mismatch, and return 404 so the sender does not assume success.
-            tracing::error!(
-                endpoint = %endpoint_slug,
-                "webhook handler reached for slug not in WebhookService index; \
-                 routing invariant violated — route registered but endpoint missing from service"
-            );
-            return StatusCode::NOT_FOUND.into_response();
-        }
+    // The requested path, undecoded: a mount is matched against the bytes the
+    // client sent, so no endpoint answers at an alternate percent-encoding of
+    // its path, and the security log names a URL that was actually requested —
+    // which is what a fail2ban rule and an upstream proxy rule are written
+    // against.
+    let mount = original.path();
+    let Some(entry) = webhook_svc.endpoint_by_mount(mount) else {
+        // No endpoint mounts here. Same lane as the router's global fallback:
+        // fail2ban signal, no phone alert, for every method.
+        brenn_obs::security::log_security_event(SecurityEventType::UnrecognizedUrl, ip, mount);
+        return StatusCode::NOT_FOUND.into_response();
     };
+    if method != Method::POST {
+        // A declared mount addressed with the wrong method is an integration
+        // mistake, not a scan: no security event.
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let endpoint = Arc::clone(&entry.endpoint);
+    let endpoint_slug = endpoint.slug.clone();
 
-    // Capture received_at once — shared by verify_request (skew check) and
-    // the replay component (replay skew check and nonce ordering key).
-    // Requirements §4.2.1: the two timestamps must be the same instant.
+    // The ceiling is enforced on the running total, so a body that lies about
+    // its `Content-Length` is cut at the ceiling rather than buffered whole.
+    // Read chunk by chunk rather than through `axum::body::to_bytes` because a
+    // ceiling breach and a broken request stream are different faults and a
+    // single error value cannot be told apart without naming
+    // `http_body_util`'s error type: an operator raising the ceiling in
+    // response to a truncated upload from a flaky sender changes nothing.
+    let mut stream = body.into_data_stream();
+    let mut buffered: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                tracing::warn!(
+                    endpoint = %endpoint_slug,
+                    read = buffered.len(),
+                    error = %err,
+                    "inbound webhook request stream failed before the body was whole; \
+                     returning 400"
+                );
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+        if buffered.len() + chunk.len() > endpoint.transport_ceiling_bytes {
+            tracing::warn!(
+                endpoint = %endpoint_slug,
+                ceiling = endpoint.transport_ceiling_bytes,
+                "inbound webhook body exceeds the endpoint's transport ceiling; returning 413"
+            );
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+    let body = Bytes::from(buffered);
+
+    // Shared by verify_request (skew check) and the replay component (replay
+    // skew check and nonce ordering key): the two timestamps must be the same
+    // instant.
     let received_at = SystemTime::now();
 
-    // Replay-component lookup: one map access, result used twice below
-    // (gates the UTF-8 guard and the replay seam).
-    let replay_component: Option<Arc<ReplayComponent>> =
-        state.replay_components.get(&endpoint_slug).map(Arc::clone);
-
-    // Header UTF-8 guard — gated on replay_component being present.
     // Non-UTF-8 header values cannot be marshaled across the WIT boundary
     // (which requires valid UTF-8 strings). Reject early rather than panic
     // inside the component. Unbound endpoints skip the guard entirely.
@@ -88,7 +101,7 @@ pub async fn receive(
     // log_and_alert_security_event to avoid burning the phone-alert rate-limit
     // budget on pre-auth noise. Post-auth paths that reach the replay component
     // use log_and_alert_security_event as appropriate.
-    if replay_component.is_some() {
+    if entry.replay.is_some() {
         for (name, value) in headers.iter() {
             if value.to_str().is_err() {
                 let detail = format!(
@@ -116,11 +129,32 @@ pub async fn receive(
             (status, body_str).into_response()
         }
         Ok(VerifiedRequest { key_id, body }) => {
-            // Replay-protection seam. Only runs when a component is bound for
-            // this endpoint.
-            if let Some(component) = replay_component {
-                // Build CheckInput. UTF-8 validity of header values guaranteed
-                // above (the guard returned early for any non-UTF-8 value).
+            if let Some(replay) = entry.replay.as_ref() {
+                // The slot lock does two jobs. It serializes checks against
+                // this store — `ReplayComponent::check` holds an AtomicBool CAS
+                // guard that panics on a concurrent call, so at most one check
+                // may be in flight — and it guards the component slot, so a
+                // request either checks against a component that holds the
+                // store or finds the slot empty.
+                let slot = replay.slot.lock().await;
+                let Some(component) = slot.as_ref().map(Arc::clone) else {
+                    // The component that held this store has been dropped and
+                    // its replacement is not installed yet. A message that
+                    // cannot be replay-checked is not delivered.
+                    tracing::warn!(
+                        endpoint = %endpoint_slug,
+                        store_path = %replay.store_path.display(),
+                        "replay store has no component installed; returning 503 and \
+                         publishing nothing"
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("content-type", "application/json")],
+                        r#"{"error":"unavailable"}"#,
+                    )
+                        .into_response();
+                };
+                // UTF-8 validity of header values guaranteed by the guard above.
                 let received_at_ms: u64 = received_at
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_else(|_| {
@@ -152,29 +186,8 @@ pub async fn receive(
                     endpoint_slug: endpoint_slug.clone(),
                 };
 
-                // Serialize replay checks for this endpoint behind a per-endpoint
-                // tokio Mutex. The underlying ReplayComponent uses an AtomicBool CAS
-                // guard that fails-immediately (→ panic → 500) on concurrent calls.
-                // Holding this lock across spawn_blocking ensures at most one
-                // in-flight check per endpoint at any time. Lock is acquired async
-                // (no executor blocking); the blocking work runs inside the guard.
-                let _replay_lock = state
-                    .replay_locks
-                    .get(&endpoint_slug)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "replay_lock missing for endpoint={} — replay_components and \
-                             replay_locks must be populated together at startup",
-                            endpoint_slug
-                        )
-                    })
-                    .lock_owned()
-                    .await;
-
-                // Spawn-blocking: `ReplayComponent::check` drives wasmtime +
-                // SQLite synchronously. Must not block the async executor.
-                // Closes `wasm-drop-wasi` tokio sub-item.
+                // `ReplayComponent::check` drives wasmtime + SQLite
+                // synchronously; must not block the async executor.
                 let join = tokio::task::spawn_blocking(move || component.check(&check_input));
                 let (verdict, quota_hit) = join.await.unwrap_or_else(|je| {
                     // JoinError::is_panic() → re-propagate the panic so the
@@ -182,11 +195,11 @@ pub async fn receive(
                     // Cancellation cannot occur here: no select! races the join.
                     if je.is_panic() {
                         // Log endpoint identity before re-propagating: the panic
-                        // payload is a generic trap string (no slug). This is the
-                        // design §3.5(a) diagnosability point — on a first-request
-                        // anonymous trap it tells the operator which endpoint to
-                        // inspect (likely: replay-generic paired with a skew-less
-                        // scheme → brenn.max-skew-secs not injected).
+                        // payload is a generic trap string (no slug). On a
+                        // first-request trap this tells the operator which
+                        // endpoint to inspect (likely: replay-generic paired
+                        // with a skew-less scheme, brenn.max-skew-secs not
+                        // injected).
                         tracing::error!(
                             endpoint = %endpoint_slug,
                             key_id = %key_id,
@@ -204,11 +217,10 @@ pub async fn receive(
                 });
 
                 // Host-quota hit: fire a Warning phone alert (distinct from the
-                // guest-abuse 429 path in route_replay_error). This is operator
-                // signal — the store has reached its configured size cap — not a
-                // fail2ban signal. The log was already emitted host-side at the
-                // SQLite layer (§2.E layer 1). Alert fires regardless of verdict
-                // so the two signals remain separable.
+                // guest-abuse 429 path in route_replay_error). Operator signal
+                // — the store has reached its configured size cap — not a
+                // fail2ban signal. Alert fires regardless of verdict so the two
+                // signals remain separable.
                 if quota_hit {
                     let body = format!(
                         "endpoint={endpoint_slug} key_id={key_id} \
@@ -255,17 +267,12 @@ pub async fn receive(
 
             let owner = &endpoint.owner;
 
+            // The endpoint itself, not its slug: the entity this request
+            // arrived under is the one it must be delivered under, and a reload
+            // may have retired or replaced the table entry while the body was
+            // being read.
             match router
-                .deliver_inbound(
-                    &endpoint_slug,
-                    owner,
-                    &key_id,
-                    headers,
-                    ip,
-                    received_at,
-                    body,
-                    endpoint.urgency,
-                )
+                .deliver_inbound(&endpoint, &key_id, headers, ip, received_at, body)
                 .await
             {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -278,7 +285,6 @@ pub async fn receive(
                     );
                     // Return a JSON body consistent with all other rejection paths so
                     // the CLI's stderr diagnostic includes detail rather than a bare status.
-                    // (errhandling-5)
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         [("content-type", "application/json")],
@@ -293,18 +299,10 @@ pub async fn receive(
 
 /// Route a `ReplayError` to the appropriate HTTP response.
 ///
-/// Extracted from the `match verdict` block in `receive` so the typed arms can
-/// be unit-tested directly with synthetic `&ReplayError` values (tests 3 and 4)
-/// without WASM execution.
-///
-/// The `Ok(())` fall-through to `deliver_inbound` stays in the caller;
-/// this function handles only the `Err(_)` cases.
-///
-/// `quota_hit`: set when the 429 was caused by the host-enforced store size cap
-/// (not guest logic). When true, the `TooManyRequests` arm skips the fail2ban
-/// `ReplayCapHit` security event — the operator has already been alerted via the
-/// quota Warning path, and banning a legitimate sender's IP for a storage-cap
-/// condition would be incorrect.
+/// `quota_hit`: when true the `TooManyRequests` arm skips the fail2ban
+/// `ReplayCapHit` security event — the operator has already been alerted via
+/// the quota Warning path, and banning a legitimate sender's IP for a
+/// storage-cap condition would be incorrect.
 fn route_replay_error(
     err: &ReplayError,
     endpoint_slug: &str,
@@ -458,12 +456,14 @@ mod tests {
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{HeaderMap, Request, StatusCode};
     use axum::middleware as axum_mw;
-    use axum::routing::post;
     use brenn_lib::messaging::Urgency;
     use brenn_lib::webhook::config::ResolvedWebhookEndpoint;
     use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
     use brenn_obs::alerting::{AlertDispatcher, make_capturing_alerter};
-    use brenn_webhook::service::{WebhookEventRouter, WebhookService};
+    use brenn_wasm::ReplayComponent;
+    use brenn_webhook::service::{
+        EndpointRuntime, ReplayGuard, WebhookEventRouter, WebhookService,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -505,15 +505,16 @@ mod tests {
     impl WebhookEventRouter for CapturingRouter {
         async fn deliver_inbound(
             &self,
-            endpoint_slug: &str,
-            owner: &brenn_lib::webhook::config::WebhookOwner,
+            endpoint: &Arc<brenn_lib::webhook::config::ResolvedWebhookEndpoint>,
             key_id: &str,
             headers: HeaderMap,
             client_ip: IpAddr,
             _received_at: std::time::SystemTime,
             raw_body: String,
-            urgency: Urgency,
         ) -> Result<(), String> {
+            let endpoint_slug = endpoint.slug.as_str();
+            let owner = &endpoint.owner;
+            let urgency = endpoint.urgency;
             let headers_vec: Vec<(String, String)> = headers
                 .iter()
                 .filter_map(|(n, v)| {
@@ -573,39 +574,93 @@ mod tests {
         format!("v1={}", brenn_lib::util::hmac_sha256_hex(TEST_SECRET, body))
     }
 
-    /// Build a minimal test axum router for the inbound webhook handler.
-    /// The `AppState` is constructed with `webhook` populated from `svc`.
-    fn test_router(svc: Arc<WebhookService>, capture: Arc<CapturingRouter>) -> Router {
-        let router_trait: Arc<dyn WebhookEventRouter> = capture;
-        svc.set_router(router_trait);
-
-        let db = crate::test_support::init_db_memory();
-        let (alert_dispatcher, _handle) = AlertDispatcher::noop();
-        let mut state = crate::state::AppState::for_test(db, None);
-        state.alert_dispatcher = alert_dispatcher;
-        state.webhook = Some(svc.clone());
-
-        let slug = TEST_SLUG.to_string();
-        let ceiling = 1024 * 1024usize;
-
-        Router::new()
+    /// The router shape every case in this module posts through: the one
+    /// wildcard route the server registers, the global body limit off because
+    /// the addressed endpoint's ceiling is the only one, and the pre-auth
+    /// layers that hand the handler a client IP.
+    ///
+    /// One transcription, so a change to the route string, the limit posture or
+    /// the layer stack cannot leave a case exercising a router the server does
+    /// not build. `catch_panic` wraps the handler so a panic becomes a 500
+    /// rather than a dropped connection; it must sit outside the route to catch
+    /// the ones `resume_unwind` carries out of a `spawn_blocking` join.
+    fn wire(state: crate::state::AppState, catch_panic: bool) -> Router {
+        let mut router = Router::new()
             .route(
-                TEST_MOUNT,
-                post(receive).layer(
-                    tower::ServiceBuilder::new()
-                        .layer(axum::Extension(EndpointSlug(slug)))
-                        .layer(DefaultBodyLimit::max(ceiling)),
-                ),
+                "/webhooks/{*tail}",
+                axum::routing::any(receive).layer(DefaultBodyLimit::disable()),
             )
-            .with_state(state)
+            .with_state(state);
+        if catch_panic {
+            router = router.layer(tower_http::catch_panic::CatchPanicLayer::new());
+        }
+        router
             .layer(axum_mw::from_fn(resolve_client_ip))
             .layer(axum::Extension(TrustedProxyHops(0)))
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))))
     }
 
+    /// Build a minimal test axum router for the inbound webhook handler.
+    /// The `AppState` is constructed with `webhook` populated from `svc`.
+    fn test_router(svc: Arc<WebhookService>, capture: Arc<CapturingRouter>) -> Router {
+        let (alert_dispatcher, _handle) = AlertDispatcher::noop();
+        test_router_with_alerter(svc, capture, alert_dispatcher)
+    }
+
+    /// [`test_router`] over a caller-supplied dispatcher, for the cases whose
+    /// subject is whether a request burns phone-alert budget. The dispatcher
+    /// has to reach the `AppState` the handler reads, so a case that builds a
+    /// capturing one beside a noop-wired router asserts nothing.
+    fn test_router_with_alerter(
+        svc: Arc<WebhookService>,
+        capture: Arc<CapturingRouter>,
+        alert_dispatcher: AlertDispatcher,
+    ) -> Router {
+        let router_trait: Arc<dyn WebhookEventRouter> = capture;
+        svc.set_router(router_trait);
+
+        let db = crate::test_support::init_db_memory();
+        let mut state = crate::state::AppState::for_test(db, None);
+        state.alert_dispatcher = alert_dispatcher;
+        state.webhook = Arc::clone(&svc);
+
+        wire(state, false)
+    }
+
+    /// The release identity a test guard carries. Only a reload compares it —
+    /// the handler never reads it — so any well-formed record will do.
+    fn test_verified() -> brenn_lib::wasm_package::Verified {
+        brenn_lib::wasm_package::Verified {
+            artifact: std::path::PathBuf::from("/components/replay-generic/replay.wasm"),
+            root: std::path::PathBuf::from("/components"),
+            world: "brenn:replay".to_string(),
+            artifact_sha256: "0".repeat(64),
+            spec_sha256: None,
+        }
+    }
+
+    /// Build a `WebhookService` serving `endpoint` with `component` holding the
+    /// replay store at `store_path`.
+    fn replay_protected_service(
+        endpoint: Arc<ResolvedWebhookEndpoint>,
+        store_path: &std::path::Path,
+        component: Arc<ReplayComponent>,
+    ) -> Arc<WebhookService> {
+        let svc = WebhookService::new();
+        svc.install(vec![EndpointRuntime::new(
+            endpoint,
+            Some(ReplayGuard::new(
+                store_path.to_path_buf(),
+                test_verified(),
+                component,
+            )),
+        )]);
+        svc
+    }
+
     /// Build a `WebhookService` containing only the phonebuddy endpoint.
     fn phonebuddy_service() -> Arc<WebhookService> {
-        WebhookService::new(vec![(TEST_SLUG.to_string(), phonebuddy_endpoint())])
+        WebhookService::for_test(vec![phonebuddy_endpoint()])
     }
 
     /// POST to `TEST_MOUNT` with the given body, content-type, signature, and
@@ -945,7 +1000,7 @@ mod tests {
             replay_protection: None,
         });
 
-        let svc = WebhookService::new(vec![("slack-ep".to_string(), endpoint)]);
+        let svc = WebhookService::for_test(vec![endpoint]);
         let capture = CapturingRouter::new();
         svc.set_router(Arc::clone(&capture) as Arc<dyn WebhookEventRouter>);
 
@@ -953,22 +1008,9 @@ mod tests {
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         let mut state = crate::state::AppState::for_test(db, None);
         state.alert_dispatcher = alert_dispatcher;
-        state.webhook = Some(svc.clone());
+        state.webhook = Arc::clone(&svc);
 
-        let slug = "slack-ep".to_string();
-        let router = Router::new()
-            .route(
-                "/webhooks/slack",
-                post(receive).layer(
-                    tower::ServiceBuilder::new()
-                        .layer(axum::Extension(EndpointSlug(slug)))
-                        .layer(DefaultBodyLimit::max(1024 * 1024)),
-                ),
-            )
-            .with_state(state)
-            .layer(axum_mw::from_fn(resolve_client_ip))
-            .layer(axum::Extension(TrustedProxyHops(0)))
-            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+        let router = wire(state, false);
 
         // Build a stale timestamp (600 seconds ago — outside max_skew_secs=300).
         let stale_t = SystemTime::now()
@@ -1016,14 +1058,12 @@ mod tests {
     impl WebhookEventRouter for FailingRouter {
         async fn deliver_inbound(
             &self,
-            _endpoint_slug: &str,
-            _owner: &brenn_lib::webhook::config::WebhookOwner,
+            _endpoint: &Arc<brenn_lib::webhook::config::ResolvedWebhookEndpoint>,
             _key_id: &str,
             _headers: HeaderMap,
             _client_ip: IpAddr,
             _received_at: std::time::SystemTime,
             _raw_body: String,
-            _urgency: Urgency,
         ) -> Result<(), String> {
             Err("injected delivery failure".to_string())
         }
@@ -1041,21 +1081,9 @@ mod tests {
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         let mut state = crate::state::AppState::for_test(db, None);
         state.alert_dispatcher = alert_dispatcher;
-        state.webhook = Some(svc.clone());
+        state.webhook = Arc::clone(&svc);
 
-        let router = Router::new()
-            .route(
-                TEST_MOUNT,
-                post(receive).layer(
-                    tower::ServiceBuilder::new()
-                        .layer(axum::Extension(EndpointSlug(TEST_SLUG.to_string())))
-                        .layer(DefaultBodyLimit::max(1024 * 1024)),
-                ),
-            )
-            .with_state(state)
-            .layer(axum_mw::from_fn(resolve_client_ip))
-            .layer(axum::Extension(TrustedProxyHops(0)))
-            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+        let router = wire(state, false);
 
         let body = br#"{"kind":"ping"}"#;
         let sig = sign_v1hex(body);
@@ -1076,36 +1104,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Body size limit (DefaultBodyLimit)
+    // Body size limit (the endpoint's transport ceiling, enforced in-handler)
     // -----------------------------------------------------------------------
 
-    /// Build a test router with a tiny body-size ceiling to exercise the
-    /// `DefaultBodyLimit` layer. Bodies exceeding the ceiling return 413
-    /// before the handler is called.
+    /// Build a test router whose phonebuddy endpoint declares a tiny transport
+    /// ceiling. Bodies exceeding it are cut while being read and answered 413,
+    /// so the handler never sees a whole body.
     fn test_router_with_ceiling(ceiling: usize, capture: Arc<CapturingRouter>) -> Router {
         let router_trait: Arc<dyn WebhookEventRouter> = capture;
-        let svc = phonebuddy_service();
+        let mut endpoint = phonebuddy_endpoint();
+        Arc::get_mut(&mut endpoint)
+            .expect("sole reference")
+            .transport_ceiling_bytes = ceiling;
+        let svc = WebhookService::for_test(vec![endpoint]);
         svc.set_router(router_trait);
 
         let db = crate::test_support::init_db_memory();
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         let mut state = crate::state::AppState::for_test(db, None);
         state.alert_dispatcher = alert_dispatcher;
-        state.webhook = Some(svc.clone());
+        state.webhook = Arc::clone(&svc);
 
-        Router::new()
-            .route(
-                TEST_MOUNT,
-                post(receive).layer(
-                    tower::ServiceBuilder::new()
-                        .layer(axum::Extension(EndpointSlug(TEST_SLUG.to_string())))
-                        .layer(DefaultBodyLimit::max(ceiling)),
-                ),
-            )
-            .with_state(state)
-            .layer(axum_mw::from_fn(resolve_client_ip))
-            .layer(axum::Extension(TrustedProxyHops(0)))
-            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))))
+        wire(state, false)
     }
 
     /// A body one byte over the configured ceiling returns 413; handler is not called.
@@ -1136,6 +1156,227 @@ mod tests {
             capture.drain().is_empty(),
             "oversized body must not reach deliver_inbound"
         );
+    }
+
+    /// A body whose length is not known up front is cut at the ceiling while it
+    /// is read, so nothing past the ceiling is ever buffered.
+    #[tokio::test]
+    async fn a_streamed_body_over_the_ceiling_is_cut_and_answered_413() {
+        const CEILING: usize = 16;
+        let capture = CapturingRouter::new();
+        let router = test_router_with_ceiling(CEILING, Arc::clone(&capture));
+
+        // A stream has no exact size hint, so the limit can only be enforced on
+        // the running total.
+        let chunks = futures::stream::iter(
+            (0..8).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"xxxxxxxx"))),
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri(TEST_MOUNT)
+            .header("content-type", "application/json")
+            .header("x-phonebuddy-signature", "v1=deadbeef")
+            .header("x-phonebuddy-key-id", TEST_KEY_ID)
+            .body(Body::from_stream(chunks))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a streamed body over the ceiling is 413"
+        );
+        assert!(
+            capture.drain().is_empty(),
+            "an over-ceiling body must not reach deliver_inbound"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mount resolution over the wildcard route
+    // -----------------------------------------------------------------------
+
+    /// No endpoint mounts at the arrival path: 404, the `UnrecognizedUrl`
+    /// security event that feeds fail2ban, and no phone alert — this prefix is
+    /// pre-auth, so the lane is log-only by design.
+    ///
+    /// The dispatcher is wired into the state the handler reads, and its
+    /// drainer is awaited before the captured vec is read, so "empty" is a
+    /// verdict rather than a foregone conclusion. The positive control for the
+    /// same harness is `replay_duplicate_emits_security_event_and_alert`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn unknown_mount_is_404_with_a_security_event_and_no_phone_alert() {
+        let capture = CapturingRouter::new();
+        let (dispatcher, alerts, handle) = make_capturing_alerter();
+        let router = test_router_with_alerter(
+            phonebuddy_service(),
+            Arc::clone(&capture),
+            dispatcher.clone(),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/no-such-endpoint")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            logs_contain("security_event=true"),
+            "an unrecognized URL under /webhooks/ must produce fail2ban signal"
+        );
+        assert!(
+            logs_contain("event_type=unrecognized_url"),
+            "and it must be the unrecognized-URL event"
+        );
+        assert!(
+            capture.drain().is_empty(),
+            "an unrecognized URL delivers nothing"
+        );
+        drop(dispatcher);
+        handle.await.expect("the alert drainer");
+        assert!(
+            alerts.lock().unwrap().is_empty(),
+            "an unrecognized URL must not burn phone-alert budget"
+        );
+    }
+
+    /// A percent-encoding of a declared mount is not that mount.
+    ///
+    /// The wildcard route matches the raw path, so an endpoint must be matched
+    /// against the bytes the client sent rather than a decoded capture:
+    /// otherwise every endpoint answers at every alternate spelling of its
+    /// path, which is what a proxy rule or a fail2ban rule keyed on the literal
+    /// path is written against.
+    #[tokio::test]
+    async fn a_percent_encoded_mount_is_not_the_declared_mount() {
+        let capture = CapturingRouter::new();
+        let router = test_router(phonebuddy_service(), Arc::clone(&capture));
+
+        let body = br#"{"kind":"ping"}"#;
+        let sig = sign_v1hex(body);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/phonebudd%79")
+            .header("content-type", "application/json")
+            .header("x-phonebuddy-signature", &sig)
+            .header("x-phonebuddy-key-id", TEST_KEY_ID)
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "an encoded spelling of a declared mount is an unrecognized URL"
+        );
+        assert!(
+            capture.drain().is_empty(),
+            "and delivers nothing on the endpoint's behalf"
+        );
+    }
+
+    /// A `GET` walking the prefix is an unrecognized URL too — the route is
+    /// matched for every method so the scan still produces fail2ban signal.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn get_to_an_unknown_mount_is_404_with_a_security_event() {
+        let router = test_router(phonebuddy_service(), CapturingRouter::new());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/webhooks/scanning-for-secrets")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            logs_contain("security_event=true") && logs_contain("event_type=unrecognized_url"),
+            "a GET scan of the prefix produces the same fail2ban signal as a POST"
+        );
+    }
+
+    /// A declared mount addressed with the wrong method is a 405 and no
+    /// security event — an integration mistake, not a scan. The absence is
+    /// asserted, so a misclassification cannot ban a sender's IP for using the
+    /// wrong verb.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_non_post_to_a_known_mount_is_405_without_a_security_event() {
+        let capture = CapturingRouter::new();
+        let router = test_router(phonebuddy_service(), Arc::clone(&capture));
+        for method in ["GET", "PUT", "DELETE"] {
+            let req = Request::builder()
+                .method(method)
+                .uri(TEST_MOUNT)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                router.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} on a declared mount is 405"
+            );
+        }
+        assert!(capture.drain().is_empty(), "no method but POST delivers");
+        assert!(
+            !logs_contain("security_event=true"),
+            "a wrong-verb request to a declared mount is not fail2ban signal"
+        );
+    }
+
+    /// The table a request resolves against is the one installed when it
+    /// arrived: a swap between two requests is seen by the second and only the
+    /// second.
+    #[tokio::test]
+    async fn a_table_swap_between_two_requests_is_observed_by_the_second() {
+        let capture = CapturingRouter::new();
+        let svc = phonebuddy_service();
+        let router = test_router(Arc::clone(&svc), Arc::clone(&capture));
+
+        let body = br#"{"kind":"ping"}"#;
+        let sig = sign_v1hex(body);
+        let first = post_to_endpoint(
+            router.clone(),
+            body.to_vec(),
+            Some("application/json"),
+            Some(&sig),
+            Some(TEST_KEY_ID),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+        svc.retire(&[TEST_SLUG.to_string()]);
+
+        let second = post_to_endpoint(
+            router,
+            body.to_vec(),
+            Some("application/json"),
+            Some(&sig),
+            Some(TEST_KEY_ID),
+        )
+        .await;
+        assert_eq!(
+            second.status(),
+            StatusCode::NOT_FOUND,
+            "a retired mount is an unrecognized URL from the swap onward"
+        );
+        assert_eq!(
+            capture.drain().len(),
+            1,
+            "only the request that arrived before the swap was delivered"
+        );
+    }
+
+    /// `list_endpoints_for_app` reads the current table, not the booted one.
+    #[test]
+    fn list_endpoints_for_app_reads_the_current_table() {
+        let svc = phonebuddy_service();
+        assert_eq!(svc.list_endpoints_for_app(TEST_APP_SLUG).len(), 1);
+        svc.retire(&[TEST_SLUG.to_string()]);
+        assert!(svc.list_endpoints_for_app(TEST_APP_SLUG).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1256,7 +1497,7 @@ mod tests {
         // They share the same underlying Db; clone state for the axum layer.
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         state.alert_dispatcher = alert_dispatcher;
-        state.webhook = Some(svc.clone());
+        state.webhook = Arc::clone(&svc);
 
         // Clone for the axum router (the handler reads state.webhook to find the router).
         let axum_state = state.clone();
@@ -1270,19 +1511,7 @@ mod tests {
         real_impl.set_state(state);
 
         // Build the axum router exactly like the seam tests do.
-        let axum_router = Router::new()
-            .route(
-                TEST_MOUNT,
-                axum::routing::post(receive).layer(
-                    tower::ServiceBuilder::new()
-                        .layer(axum::Extension(EndpointSlug(TEST_SLUG.to_string())))
-                        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
-                ),
-            )
-            .with_state(axum_state)
-            .layer(axum_mw::from_fn(resolve_client_ip))
-            .layer(axum::Extension(TrustedProxyHops(0)))
-            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+        let axum_router = wire(axum_state, false);
 
         // Build a properly HMAC-signed POST body.
         let body = br#"{"kind":"ping","client_id":"c1"}"#;
@@ -1404,7 +1633,6 @@ mod tests {
         use brenn_cal::ms_to_sent_at;
         use brenn_wasm::ReplayComponent;
         use tempfile::NamedTempFile;
-        use tower_http::catch_panic::CatchPanicLayer;
 
         const REPLAY_ARTIFACT_PATH: &str = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1446,6 +1674,15 @@ mod tests {
         /// endpoint. Returns (Router, Arc<CapturingRouter>).
         /// The NamedTempFile passed in must be kept alive for the duration of the test.
         fn replay_test_router(db: &NamedTempFile) -> (Router, Arc<CapturingRouter>) {
+            let (router, capture, _guard) = replay_test_router_with_guard(db);
+            (router, capture)
+        }
+
+        /// Like `replay_test_router`, but also hands back the endpoint's replay
+        /// guard so a test can drive the handover the reload's commit performs.
+        fn replay_test_router_with_guard(
+            db: &NamedTempFile,
+        ) -> (Router, Arc<CapturingRouter>, Arc<ReplayGuard>) {
             let component = Arc::new(ReplayComponent::load(
                 "phonebuddy",
                 &replay_artifact(),
@@ -1453,9 +1690,15 @@ mod tests {
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
                 std::collections::HashMap::new(),
             ));
+            component.open_store();
 
             let capture = CapturingRouter::new();
-            let svc = phonebuddy_service();
+            let guard = ReplayGuard::new(db.path().to_path_buf(), test_verified(), component);
+            let svc = WebhookService::new();
+            svc.install(vec![EndpointRuntime::new(
+                phonebuddy_endpoint(),
+                Some(Arc::clone(&guard)),
+            )]);
             let router_trait: Arc<dyn WebhookEventRouter> = Arc::clone(&capture) as _;
             svc.set_router(router_trait);
 
@@ -1463,43 +1706,22 @@ mod tests {
             let (alert_dispatcher, _handle) = AlertDispatcher::noop();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = alert_dispatcher;
-            state.webhook = Some(svc.clone());
-            state.replay_components = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(TEST_SLUG.to_string(), component);
-                map
-            });
-            state.replay_locks = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(TEST_SLUG.to_string(), Arc::new(tokio::sync::Mutex::new(())));
-                map
-            });
+            state.webhook = Arc::clone(&svc);
 
-            let router = Router::new()
-                .route(
-                    TEST_MOUNT,
-                    post(receive).layer(
-                        tower::ServiceBuilder::new()
-                            .layer(axum::Extension(EndpointSlug(TEST_SLUG.to_string())))
-                            .layer(DefaultBodyLimit::max(1024 * 1024)),
-                    ),
-                )
-                .with_state(state)
-                .layer(axum_mw::from_fn(resolve_client_ip))
-                .layer(axum::Extension(TrustedProxyHops(0)))
-                .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+            let router = wire(state, false);
 
-            (router, capture)
+            (router, capture, guard)
         }
 
         /// Like replay_test_router but also wraps with CatchPanicLayer so
         /// handler panics produce 500 rather than a connection drop.
         /// Takes a pre-built component (caller owns the NamedTempFile).
         fn replay_test_router_with_catch_panic(
+            store_path: &std::path::Path,
             component: Arc<ReplayComponent>,
         ) -> (Router, Arc<CapturingRouter>) {
             let capture = CapturingRouter::new();
-            let svc = phonebuddy_service();
+            let svc = replay_protected_service(phonebuddy_endpoint(), store_path, component);
             let router_trait: Arc<dyn WebhookEventRouter> = Arc::clone(&capture) as _;
             svc.set_router(router_trait);
 
@@ -1507,34 +1729,9 @@ mod tests {
             let (alert_dispatcher, _handle) = AlertDispatcher::noop();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = alert_dispatcher;
-            state.webhook = Some(svc.clone());
-            state.replay_components = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(TEST_SLUG.to_string(), component);
-                map
-            });
-            state.replay_locks = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(TEST_SLUG.to_string(), Arc::new(tokio::sync::Mutex::new(())));
-                map
-            });
+            state.webhook = Arc::clone(&svc);
 
-            let router = Router::new()
-                .route(
-                    TEST_MOUNT,
-                    post(receive).layer(
-                        tower::ServiceBuilder::new()
-                            .layer(axum::Extension(EndpointSlug(TEST_SLUG.to_string())))
-                            .layer(DefaultBodyLimit::max(1024 * 1024)),
-                    ),
-                )
-                .with_state(state)
-                // CatchPanicLayer must be outside the route handler to catch panics
-                // propagated via resume_unwind from spawn_blocking join errors.
-                .layer(CatchPanicLayer::new())
-                .layer(axum_mw::from_fn(resolve_client_ip))
-                .layer(axum::Extension(TrustedProxyHops(0)))
-                .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+            let router = wire(state, true);
 
             (router, capture)
         }
@@ -1585,6 +1782,30 @@ mod tests {
             let deliveries = capture.drain();
             assert_eq!(deliveries.len(), 1, "expected one delivery");
             assert_eq!(deliveries[0].raw_body, std::str::from_utf8(&body).unwrap());
+        }
+
+        /// A request that finds its endpoint's replay store with no component
+        /// installed answers 503 and publishes nothing: a message that cannot be
+        /// replay-checked is not delivered.
+        #[tokio::test]
+        async fn a_request_whose_guard_was_emptied_answers_503_and_publishes_nothing() {
+            let db = NamedTempFile::new().unwrap();
+            let (router, capture, guard) = replay_test_router_with_guard(&db);
+
+            drop(guard.slot.lock().await.take());
+
+            let body = envelope("client1", &ms_to_sent_at(now_ms()), &nonce(1));
+            let resp = post_envelope(router, body, None).await;
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an emptied replay slot answers 503"
+            );
+            assert!(
+                capture.drain().is_empty(),
+                "a message that cannot be replay-checked is not delivered"
+            );
         }
 
         // ── AC-duplicate ──────────────────────────────────────────────────────
@@ -2209,27 +2430,29 @@ mod tests {
             );
         }
 
-        /// Two `ReplayComponent` instances sharing one store path panic at startup.
+        /// Two `ReplayComponent` instances may be loaded over one store path,
+        /// but only one may open it — the process-global dedup guard fires on
+        /// the second open.
         #[test]
         #[should_panic(expected = "already open")]
         fn startup_panics_on_duplicate_store_path() {
             let db = NamedTempFile::new().unwrap();
-            let _c1 = ReplayComponent::load(
+            let c1 = ReplayComponent::load(
                 "phonebuddy",
                 &replay_artifact(),
                 db.path(),
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
                 std::collections::HashMap::new(),
             );
-            // Second load with same store path must panic — KvStore::open's
-            // process-global dedup guard fires.
-            let _c2 = ReplayComponent::load(
+            c1.open_store();
+            let c2 = ReplayComponent::load(
                 "phonebuddy",
                 &replay_artifact(),
                 db.path(),
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
                 std::collections::HashMap::new(),
             );
+            c2.open_store();
         }
 
         // ── AC-restart-durability (HTTP path) ─────────────────────────────────
@@ -2293,7 +2516,8 @@ mod tests {
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
                 std::collections::HashMap::new(),
             ));
-            let (router, _capture) = replay_test_router_with_catch_panic(component);
+            component.open_store();
+            let (router, _capture) = replay_test_router_with_catch_panic(db.path(), component);
 
             // The TRAP sentinel is keyed on the `x-brenn-fault-test: TRAP` header.
             // The body is arbitrary but must be valid UTF-8 (UTF-8 guard passes
@@ -2348,6 +2572,7 @@ mod tests {
                 TINY_CAP_PAGES,
                 std::collections::HashMap::new(),
             ));
+            component.open_store();
 
             let (dispatcher, captured, handle) = make_capturing_alerter_with_severity();
             // Clone the dispatcher so we can drop our copy to drain the channel later.
@@ -2355,37 +2580,15 @@ mod tests {
             let dispatcher_for_drain = dispatcher.clone();
 
             let capture = CapturingRouter::new();
-            let svc = phonebuddy_service();
+            let svc = replay_protected_service(phonebuddy_endpoint(), db.path(), component);
             svc.set_router(Arc::clone(&capture) as Arc<dyn WebhookEventRouter>);
 
             let db2 = crate::test_support::init_db_memory();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = dispatcher;
-            state.webhook = Some(svc.clone());
-            state.replay_components = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(TEST_SLUG.to_string(), component);
-                map
-            });
-            state.replay_locks = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(TEST_SLUG.to_string(), Arc::new(tokio::sync::Mutex::new(())));
-                map
-            });
+            state.webhook = Arc::clone(&svc);
 
-            let base_router = Router::new()
-                .route(
-                    TEST_MOUNT,
-                    post(receive).layer(
-                        tower::ServiceBuilder::new()
-                            .layer(axum::Extension(EndpointSlug(TEST_SLUG.to_string())))
-                            .layer(DefaultBodyLimit::max(1024 * 1024)),
-                    ),
-                )
-                .with_state(state)
-                .layer(axum_mw::from_fn(resolve_client_ip))
-                .layer(axum::Extension(TrustedProxyHops(0)))
-                .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+            let base_router = wire(state, false);
 
             // Send requests with unique nonces until the store reaches its cap (429).
             // Each accepted request inserts 2 rows (last_ns + nonce namespace), so with
@@ -2505,7 +2708,9 @@ mod tests {
                 },
                 owner: brenn_lib::webhook::config::WebhookOwner::App(Arc::from(PUSH_APP_SLUG)),
                 urgency: brenn_lib::messaging::Urgency::Normal,
-                replay_protection: None, // set via replay_components map in state
+                // The guard the service is built with is what makes this
+                // endpoint replay-protected at runtime.
+                replay_protection: None,
             })
         }
 
@@ -2545,39 +2750,18 @@ mod tests {
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
                 push_replay_config(),
             ));
+            component.open_store();
             let capture = CapturingRouter::new();
-            let svc = WebhookService::new(vec![(PUSH_SLUG.to_string(), push_endpoint())]);
+            let svc = replay_protected_service(push_endpoint(), db.path(), component);
             svc.set_router(Arc::clone(&capture) as Arc<dyn WebhookEventRouter>);
 
             let db2 = crate::test_support::init_db_memory();
             let (alert_dispatcher, _handle) = AlertDispatcher::noop();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = alert_dispatcher;
-            state.webhook = Some(svc.clone());
-            state.replay_components = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(PUSH_SLUG.to_string(), component);
-                map
-            });
-            state.replay_locks = Arc::new({
-                let mut map = HashMap::new();
-                map.insert(PUSH_SLUG.to_string(), Arc::new(tokio::sync::Mutex::new(())));
-                map
-            });
+            state.webhook = Arc::clone(&svc);
 
-            let router = Router::new()
-                .route(
-                    PUSH_MOUNT,
-                    post(receive).layer(
-                        tower::ServiceBuilder::new()
-                            .layer(axum::Extension(EndpointSlug(PUSH_SLUG.to_string())))
-                            .layer(DefaultBodyLimit::max(1024 * 1024)),
-                    ),
-                )
-                .with_state(state)
-                .layer(axum_mw::from_fn(resolve_client_ip))
-                .layer(axum::Extension(TrustedProxyHops(0)))
-                .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+            let router = wire(state, false);
 
             (router, capture)
         }
@@ -2731,6 +2915,7 @@ mod tests {
                 brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
                 push_replay_config(),
             );
+            component.open_store();
             let input = CheckInput {
                 headers: vec![
                     // Signature header intentionally absent; only timestamp present.

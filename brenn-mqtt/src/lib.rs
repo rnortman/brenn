@@ -32,7 +32,9 @@ pub mod state;
 #[cfg(feature = "testutils")]
 pub mod test_support;
 
-pub use connection::{spawn_client_supervisor, union_subscriptions};
+pub use connection::{
+    ArrivingFilters, register_and_spawn, spawn_client_supervisor, union_subscriptions,
+};
 pub use egress::{MqttEgressError, SendBudget, enforce_and_publish};
 pub use payload::{InboundPayload, OutboundPayload, classify_inbound, decode_outbound_body};
 pub use service::{

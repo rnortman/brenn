@@ -29,7 +29,7 @@
 //! boot leaves dormant — is excluded from the classification instead, so no arm
 //! reads the entry the channel walk is deleting.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::{
@@ -445,13 +445,24 @@ pub(crate) fn dormant_rows_the_reload_cannot_follow(
 /// row joins that list (parallel to boot's `DynamicMqttIngress` conversion;
 /// both must produce the same shape).
 ///
-/// A pair whose channel is not `mqtt:`, or whose client the document does not
+/// A pair whose channel is not `mqtt:`, or whose client the candidate does not
 /// declare, is not one: the first is another transport and the second cannot be
 /// subscribed at any broker this process holds.
+///
+/// The second of those has two meanings and they are told apart, because only
+/// one of them is expected. A row on a client in `stopping` is the ordinary
+/// shape of a removal — the agent's ACL lost the client, the re-merge revokes
+/// the row, and the session it named is going — and is skipped quietly. A row
+/// on a client that is in neither the candidate nor `stopping` is host state no
+/// document accounts for: a durable subscription naming a broker session this
+/// process does not have and will not get, invisible to every status field and
+/// to the oracle, which compares registries and not stored rows. It is named in
+/// the journal so it is visible at all.
 pub(crate) fn dynamic_ingress(
     rows: &[DynamicSubscriptionRow],
     live: &MessagingDirectory,
     clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
+    stopping: &BTreeSet<String>,
     exclude: &HashSet<Uuid>,
 ) -> Vec<brenn_lib::mqtt::config::ResolvedMqttIngressChannel> {
     let mut seen: HashSet<Uuid> = HashSet::new();
@@ -478,6 +489,22 @@ pub(crate) fn dynamic_ingress(
                 )
             });
         let Some(client) = clients.get(&parsed.client) else {
+            if stopping.contains(&parsed.client) {
+                tracing::debug!(
+                    app = %row.app_slug,
+                    address = %entry.address,
+                    client = %parsed.client,
+                    "reload: dynamic mqtt row on a client this reload stops",
+                );
+            } else {
+                tracing::warn!(
+                    app = %row.app_slug,
+                    address = %entry.address,
+                    client = %parsed.client,
+                    "reload: dynamic mqtt row on a client no document declares — the row \
+                     names a broker session this process does not hold",
+                );
+            }
             continue;
         };
         let qos = row.qos.unwrap_or_else(|| {
@@ -510,6 +537,7 @@ mod tests {
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
     use brenn_lib::messaging::test_support::test_channel_entry;
     use brenn_lib::messaging::{SubscriberEntry, WakeMin};
+    use tracing_test::traced_test;
 
     /// A channel delta that removes these uuids and moves nothing else.
     fn removing(uuids: &[Uuid]) -> ChannelSides {
@@ -1115,7 +1143,14 @@ mod tests {
         let (live, uuids) = mqtt_directory(&["mqtt:ha:home/state"]);
         let rows = vec![mqtt_row(uuids[0], "reader")];
         assert!(
-            dynamic_ingress(&rows, &live, &clients(&["ha"]), &HashSet::from([uuids[0]])).is_empty(),
+            dynamic_ingress(
+                &rows,
+                &live,
+                &clients(&["ha"]),
+                &BTreeSet::new(),
+                &HashSet::from([uuids[0]])
+            )
+            .is_empty(),
         );
     }
 
@@ -1126,7 +1161,13 @@ mod tests {
     fn two_agents_on_one_channel_project_one_filter() {
         let (live, uuids) = mqtt_directory(&["mqtt:ha:home/state"]);
         let rows = vec![mqtt_row(uuids[0], "reader"), mqtt_row(uuids[0], "writer")];
-        let projected = dynamic_ingress(&rows, &live, &clients(&["ha"]), &HashSet::new());
+        let projected = dynamic_ingress(
+            &rows,
+            &live,
+            &clients(&["ha"]),
+            &BTreeSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].channel_address, "mqtt:ha:home/state");
         assert_eq!(projected[0].topic, "home/state");
@@ -1144,6 +1185,7 @@ mod tests {
                 &[row(brenn_uuid, "reader", Depth::Bounded(1))],
                 &brenn_live,
                 &clients(&["ha"]),
+                &BTreeSet::new(),
                 &HashSet::new(),
             )
             .is_empty(),
@@ -1156,10 +1198,51 @@ mod tests {
                 &[mqtt_row(uuids[0], "reader")],
                 &live,
                 &clients(&["ha"]),
+                &BTreeSet::new(),
                 &HashSet::new(),
             )
             .is_empty(),
             "the row's client is not declared",
+        );
+    }
+
+    /// The two meanings of an undeclared client are told apart in the journal:
+    /// a client this reload stops is the ordinary shape of a removal, and one
+    /// no document accounts for is host state nothing else surfaces.
+    #[tokio::test]
+    #[traced_test]
+    async fn an_undeclared_clients_row_is_journalled_by_which_kind_it_is() {
+        let (live, uuids) = mqtt_directory(&["mqtt:gone:home/state"]);
+        let rows = [mqtt_row(uuids[0], "reader")];
+
+        assert!(
+            dynamic_ingress(
+                &rows,
+                &live,
+                &clients(&["ha"]),
+                &BTreeSet::from(["gone".to_string()]),
+                &HashSet::new(),
+            )
+            .is_empty(),
+        );
+        assert!(
+            !logs_contain("no document declares"),
+            "a row on a client this reload stops is expected and is not warned about",
+        );
+
+        assert!(
+            dynamic_ingress(
+                &rows,
+                &live,
+                &clients(&["ha"]),
+                &BTreeSet::new(),
+                &HashSet::new(),
+            )
+            .is_empty(),
+        );
+        assert!(
+            logs_contain("no document declares") && logs_contain("mqtt:gone:home/state"),
+            "and one nothing declares is named",
         );
     }
 }

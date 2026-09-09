@@ -58,10 +58,12 @@ use crate::reload::agents::AgentInputs;
 use crate::reload::compare::non_convergible_differences;
 use crate::reload::delta::{LiveFacts, PlanDelta, PlanFacts, convergibility_refusals, plan_delta};
 use crate::reload::dynamic::DynamicSnapshot;
+use crate::reload::mqtt::mqtt_clients_delta;
 use crate::reload::surfaces::{
     SurfaceDocInputs, SurfaceDocParams, SurfaceDocs, arriving, build_surface_docs,
     system_participant_refusals,
 };
+use crate::reload::webhook::{WebhookArrivals, replay_releases, webhook_delta};
 use brenn_messaging::config_reload::{
     Outcome, ReloadStatus, STATUS_VERSION, StatusDelta, StatusMount, Trigger, now, publish_status,
     refusal_alert_body,
@@ -93,9 +95,9 @@ impl From<TriggerSource> for Trigger {
 /// to, and the two channels an outcome is reported through.
 ///
 /// Every plan input here is a *booted* value, which is legitimate exactly
-/// because level 1 refuses any candidate that would have moved one: an app map,
-/// a client identity, a tool registry and a replay store path are all
-/// projections of blocks a reload cannot converge. The roots are not among
+/// because level 1 refuses any candidate that would have moved one: an app
+/// map, a tool registry and an integration registry are all projections of
+/// blocks a reload cannot converge. The roots are not among
 /// them: they are the mounts document's answer, re-read on every reload, so a
 /// bundle installed since boot is a tree this process may read the moment the
 /// operator declared it.
@@ -124,9 +126,13 @@ pub(crate) struct ReloadEnv {
     /// agent is bare. A candidate cannot change that: `container` is refused at
     /// level 1, so the same answer serves every reload.
     pub runtime_dir: Option<PathBuf>,
-    pub mqtt_clients: IndexMap<String, MqttClientIdentity>,
     pub tool_registry: Arc<brenn_tool_registry::ToolRegistry>,
-    pub replay_store_paths: Vec<PathBuf>,
+    /// The endpoint table every inbound webhook request is matched against.
+    ///
+    /// Held rather than snapshotted, for the reason the surface cell is: a
+    /// reload's baseline for endpoints is what the HTTP layer is serving right
+    /// now, and commit swaps this same table.
+    pub webhook: Arc<brenn_webhook::WebhookService>,
     /// The cell holding the surface asset roots this process is serving from —
     /// the same cell `/surface-static` resolves against, not a copy of it.
     ///
@@ -143,11 +149,11 @@ pub(crate) struct ReloadEnv {
     /// pages are closed through it, with the reason that tells each page
     /// whether to reload or to stop.
     pub attach_registry: brenn_attach_server::registry::AttachRegistry,
-    pub mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
-    /// The concrete ingress router, whose route table the commit adds to and
-    /// removes from. Present on exactly the terms `mqtt_service` is: both come
-    /// off the one `MqttResult`.
-    pub mqtt_event_router: Option<Arc<brenn_server::mqtt_router::MqttEventRouterImpl>>,
+    /// The broker client registry. Always present; empty when the document
+    /// declares no `[[mqtt_client]]`.
+    pub mqtt_service: Arc<brenn_mqtt::MqttService>,
+    /// The concrete ingress router. Always present.
+    pub mqtt_event_router: Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
     pub max_payload_bytes: usize,
     /// The live Claude Code sessions. A reload condemns the ones whose agent's
     /// per-process view moved, or whose conversation belongs to a user the
@@ -300,6 +306,10 @@ pub(crate) struct ReadyReload {
     /// surface-description registrations it swaps first. Built and size-checked
     /// in prepare, so commit publishes bodies already proved publishable.
     pub surface_docs: SurfaceDocs,
+    /// The endpoint runtimes commit installs, the arriving replay stores it
+    /// opens, and the retiring holders it drops first. A store file admits one
+    /// holder, so a handover is "drop, then open" and never the reverse.
+    pub webhook: WebhookArrivals,
     /// The `applied` outcome this reload will publish, built and measured in
     /// prepare.
     ///
@@ -437,10 +447,48 @@ impl ReloadDriver {
         }
         let app_diffs = level_one.app_diffs;
 
+        // 2w. The webhook document half, on the candidate: slug and mount
+        //     uniqueness, ownership, scheme shape, replay configuration, and
+        //     the per-agent subscription stamps every later step reads. No
+        //     secret is touched here — that is step 4w, and this half is the
+        //     one `brenn config-check` runs offline.
+        let (webhook_identities, webhook_subscriptions) =
+            match catch_quietly(AssertUnwindSafe(|| {
+                brenn_lib::webhook::config::resolve_webhook_identities(
+                    &candidate.config.webhook_endpoints,
+                    &candidate.config.apps,
+                    &candidate.config.wasm_consumers,
+                    &candidate.config.wasm,
+                    &candidate.config.messaging,
+                )
+            })) {
+                Ok(resolved) => resolved,
+                Err(payload) => return refused(Some(sha), vec![app_resolver_refusal(payload)]),
+            };
+        let replay_store_paths =
+            brenn_lib::webhook::config::webhook_store_paths(webhook_identities.values());
+
+        //     The `[[mqtt_client]]` document half, on the candidate for the
+        //     same reason: the clients are what an agent's MQTT authority, the
+        //     ingress channels and a dynamic row's injection urgency are all
+        //     resolved against, and the block converges, so every one of those
+        //     reads the candidate's answer rather than the booted one. The
+        //     credentials are step 4w's.
+        let client_identities = match catch_quietly(AssertUnwindSafe(|| {
+            brenn_lib::mqtt::config::resolve_client_identities(&candidate.config.mqtt_clients)
+        })) {
+            Ok(identities) => identities,
+            Err(payload) => return refused(Some(sha), vec![app_resolver_refusal(payload)]),
+        };
+
         // 2a. The candidate's agent map — must be the candidate's, not the
         //     booted one, because the plan derives static subscriptions from it
         //     and the gates read authority per call through the swapped table.
-        let candidate_apps = match self.resolve_candidate_apps(&candidate.config) {
+        let candidate_apps = match self.resolve_candidate_apps(
+            &candidate.config,
+            &client_identities,
+            &webhook_subscriptions,
+        ) {
             Ok(apps) => apps,
             Err(refusals) => return refused(Some(sha), refusals),
         };
@@ -456,7 +504,12 @@ impl ReloadDriver {
         }
 
         // 4. The candidate's plan, and level 2 over it.
-        let plan = match self.plan_of(&candidate, &candidate_apps) {
+        let plan = match self.plan_of(
+            &candidate,
+            &candidate_apps,
+            &client_identities,
+            &replay_store_paths,
+        ) {
             Ok(plan) => plan,
             Err(refusals) => return refused(Some(sha), refusals),
         };
@@ -496,6 +549,47 @@ impl ReloadDriver {
             Ok(records) => records,
             Err(refusals) => return refused(Some(sha), refusals),
         };
+        // 4w. The webhook environment half: every declared endpoint's signing
+        //     secrets, read off the host on every reload because a fresh boot
+        //     reads them. A missing or unreadable file refuses the whole
+        //     reload — a fresh boot could not have produced that state either.
+        let candidate_endpoints = match catch_quietly(AssertUnwindSafe(|| {
+            brenn_lib::webhook::config::resolve_webhook_endpoints(&webhook_identities)
+        })) {
+            Ok(endpoints) => endpoints,
+            Err(payload) => return refused(Some(sha), vec![environment_refusal(payload)]),
+        };
+        //     The same step re-verifies every replay-protected endpoint's
+        //     package against the candidate roots: a bundle can ship new bytes
+        //     under a package name the document never mentions moving, and a
+        //     fresh boot would compile those bytes.
+        let releases = match catch_quietly(AssertUnwindSafe(|| {
+            replay_releases(&candidate_endpoints, &mounts.roots)
+        })) {
+            Ok(releases) => releases,
+            Err(payload) => return refused(Some(sha), vec![environment_refusal(payload)]),
+        };
+        let webhook = webhook_delta(&self.env.webhook.baseline(), &candidate_endpoints, releases);
+
+        // 4m. The `[[mqtt_client]]` environment half, beside the webhook one
+        //     and for the same reason: `password_file` and `ca_file` are read
+        //     off the host on every reload, so a rotated credential under an
+        //     unmoved document is a change and an unreadable one refuses the
+        //     whole reload. It runs against step 2w's identity map rather than
+        //     re-resolving the blocks, so the document grammar is asserted
+        //     once per reload and every panic here is a host fact.
+        let candidate_clients = match catch_quietly(AssertUnwindSafe(|| {
+            brenn_lib::mqtt::config::resolve_client_secrets(
+                &client_identities,
+                &candidate.config.mqtt_clients,
+            )
+        })) {
+            Ok(clients) => clients,
+            Err(payload) => return refused(Some(sha), vec![environment_refusal(payload)]),
+        };
+        let mqtt_clients =
+            mqtt_clients_delta(&self.env.mqtt_service.baseline(), &candidate_clients);
+
         let baseline_records = self.baseline_records();
         let baseline_apps = self.env.apps.load();
         let baseline_facts = PlanFacts {
@@ -514,7 +608,7 @@ impl ReloadDriver {
             mqtt_ingress: &plan.mqtt_ingress_channels,
             surfaces: &plan.surfaces,
         };
-        let delta = plan_delta(
+        let mut delta = plan_delta(
             &baseline_facts,
             &candidate_facts,
             kind_differences.into_keys().collect(),
@@ -525,9 +619,12 @@ impl ReloadDriver {
             &LiveFacts {
                 directory: self.env.messenger.directory(),
                 dynamic,
-                mqtt_clients: &self.env.mqtt_clients,
+                mqtt_clients: &client_identities,
+                clients_stopping: &mqtt_clients.removed,
             },
         );
+        delta.webhook = webhook;
+        delta.mqtt_clients = mqtt_clients;
         let refusals = convergibility_refusals(
             &baseline_facts,
             &candidate_facts,
@@ -590,6 +687,16 @@ impl ReloadDriver {
             Err(refusals) => return refused(Some(sha), refusals),
         };
 
+        // 7w. Every arriving endpoint's replay component, verified and
+        //     compiled but *not* opened: the store file is still held by the
+        //     entry this reload replaces, and commit is where it is handed
+        //     over. An endpoint whose replay configuration did not move keeps
+        //     the guard it is being served through, component and lock and all.
+        let webhook = match self.webhook_arrivals(&delta, &mounts.roots) {
+            Ok(arrivals) => arrivals,
+            Err(refusals) => return refused(Some(sha), refusals),
+        };
+
         // 8. What the reload republishes about surfaces, and the runtimes it
         //    installs. Both are built here for the reason step 7 is: a
         //    malformed sidecar or an oversize body is a refusal that leaves the
@@ -621,6 +728,7 @@ impl ReloadDriver {
             surface_roots: candidate_surface_roots,
             surface_runtimes,
             surface_docs,
+            webhook,
             applied,
         }))
     }
@@ -726,26 +834,31 @@ impl ReloadDriver {
 
     /// The candidate's agent map, resolved as boot resolves it.
     ///
-    /// Frozen inputs are the booted process's (MQTT client identities and
-    /// webhook subscription stamps), which level 1 has proved equal. A panic
-    /// out of the resolver is classified as a refusal.
+    /// Both of the resolver's other inputs are the *candidate's*, resolved by
+    /// step 2w: an agent's MQTT authority is validated against the declared
+    /// clients and its webhook subscriptions are stamped off the declared
+    /// endpoints, and both blocks converge, so the booted answer would be the
+    /// wrong one to gate the new document with. A panic out of the resolver is
+    /// classified as a refusal.
     fn resolve_candidate_apps(
         &self,
         candidate: &brenn_lib::config::BrennConfig,
+        clients: &IndexMap<String, MqttClientIdentity>,
+        webhook_subscriptions: &std::collections::BTreeMap<
+            String,
+            Vec<brenn_lib::webhook::config::ResolvedWebhookSubscription>,
+        >,
     ) -> Result<Arc<IndexMap<String, AppConfig>>, Vec<String>> {
-        let booted = self.env.apps.load();
-        let webhook_subscriptions: std::collections::BTreeMap<String, Vec<_>> = booted
-            .iter()
-            .map(|(slug, app)| (slug.clone(), app.webhook_subscriptions.clone()))
-            .collect();
-        let frozen = brenn_lib::config::FrozenInputs {
-            mqtt_clients: &self.env.mqtt_clients,
-            webhook_subscriptions: &webhook_subscriptions,
-        };
         let registry = &self.env.integration_registry;
         let runtime_dir = self.env.runtime_dir.as_deref();
         let resolved = catch_quietly(AssertUnwindSafe(|| {
-            let apps = brenn_lib::config::resolve_apps(candidate, registry, runtime_dir, &frozen);
+            let apps = brenn_lib::config::resolve_apps(
+                candidate,
+                registry,
+                runtime_dir,
+                clients,
+                webhook_subscriptions,
+            );
             self.env.tool_registry.validate_config(&apps);
             apps
         }))
@@ -753,20 +866,23 @@ impl ReloadDriver {
         Ok(Arc::new(resolved))
     }
 
-    /// Lower a candidate document with the candidate's agents and the booted
-    /// plan inputs level 1 froze.
+    /// Lower a candidate document with the candidate's agents, the candidate's
+    /// clients, the candidate's replay store paths and the booted plan inputs
+    /// level 1 froze.
     fn plan_of(
         &self,
         candidate: &LoadedDocument,
         apps: &Arc<IndexMap<String, AppConfig>>,
+        clients: &IndexMap<String, MqttClientIdentity>,
+        replay_store_paths: &[PathBuf],
     ) -> Result<MessagingPlan, Vec<String>> {
         let planned = catch_quietly(AssertUnwindSafe(|| {
             plan_messaging(&PlanInputs {
                 config: &candidate.config,
                 apps: Some(apps),
-                mqtt_clients: &self.env.mqtt_clients,
+                mqtt_clients: clients,
                 tool_registry: Some(&self.env.tool_registry),
-                replay_store_paths: &self.env.replay_store_paths,
+                replay_store_paths,
             })
         }))
         .map_err(|payload| vec![planner_refusal(payload)])?;
@@ -871,6 +987,108 @@ impl ReloadDriver {
         }
         if refusals.is_empty() {
             Ok(loaded)
+        } else {
+            Err(refusals)
+        }
+    }
+
+    /// What commit's webhook steps need: the runtimes to install, the stores to
+    /// open, and the holders to drop first.
+    ///
+    /// A replay-protected endpoint that is arriving fresh, or whose replay
+    /// configuration moved, gets its component verified and compiled here — the
+    /// fallible, root-dependent half — and a guard whose store file is not open
+    /// yet, because the entry this reload replaces is still holding it. A
+    /// changed endpoint whose replay configuration is *equal* carries the
+    /// running guard forward — same slot, same component, same lock — so an
+    /// in-flight request checks against the component it always did.
+    fn webhook_arrivals(
+        &self,
+        delta: &PlanDelta,
+        roots: &Roots,
+    ) -> Result<WebhookArrivals, Vec<String>> {
+        let mut arrivals = WebhookArrivals {
+            runtimes: Vec::new(),
+            opening: Vec::new(),
+            retiring: Vec::new(),
+        };
+        let mut refusals = Vec::new();
+        for entry in &delta.webhook.removed {
+            arrivals.retiring.extend(entry.replay.clone());
+        }
+        let arriving = delta
+            .webhook
+            .added
+            .iter()
+            .map(|endpoint| (None, endpoint))
+            .chain(
+                delta
+                    .webhook
+                    .changed
+                    .iter()
+                    .map(|change| (Some(&change.old), &change.new)),
+            );
+        for (old, endpoint) in arriving {
+            // A running guard is carried forward only when the endpoint's
+            // replay configuration *and* the bytes behind its package are the
+            // ones it was compiled from: a bumped package is a different
+            // component over the same store, which is a fresh guard and a
+            // handover.
+            let carried = old.and_then(|old| {
+                let same_config = old.endpoint.replay_protection == endpoint.replay_protection;
+                let same_release = old.replay.as_ref().is_none_or(|guard| {
+                    delta
+                        .webhook
+                        .releases
+                        .get(endpoint.slug.as_str())
+                        .is_some_and(|release| guard.verified.same_release(release))
+                });
+                (same_config && same_release)
+                    .then(|| old.replay.clone())
+                    .flatten()
+            });
+            if carried.is_none()
+                && let Some(old) = old
+            {
+                arrivals.retiring.extend(old.replay.clone());
+            }
+            let replay = match (carried, endpoint.replay_protection.as_ref()) {
+                (Some(guard), _) => Some(guard),
+                (None, None) => None,
+                (None, Some(rp)) => {
+                    match catch_quietly(AssertUnwindSafe(|| {
+                        crate::load_verified_replay(
+                            &endpoint.slug,
+                            &roots.components_roots,
+                            &rp.component,
+                            &rp.store_path,
+                            rp.max_page_count,
+                            rp.config.clone(),
+                        )
+                    })) {
+                        Ok((component, verified)) => {
+                            let guard = brenn_webhook::ReplayGuard::new(
+                                rp.store_path.clone(),
+                                verified,
+                                Arc::new(component),
+                            );
+                            arrivals.opening.push(Arc::clone(&guard));
+                            Some(guard)
+                        }
+                        Err(payload) => {
+                            refusals.push(environment_refusal(payload));
+                            continue;
+                        }
+                    }
+                }
+            };
+            arrivals.runtimes.push(brenn_webhook::EndpointRuntime::new(
+                Arc::clone(endpoint),
+                replay,
+            ));
+        }
+        if refusals.is_empty() {
+            Ok(arrivals)
         } else {
             Err(refusals)
         }
@@ -1173,6 +1391,7 @@ impl ReloadDriver {
             surface_roots,
             surface_runtimes,
             surface_docs,
+            webhook,
             mut applied,
         } = ready;
         let sha = document.document_sha256.clone();
@@ -1184,13 +1403,16 @@ impl ReloadDriver {
             &mut self.registry,
             &plan,
             &delta,
-            loaded,
-            &records,
-            &super::commit::SurfaceCommit {
-                roots: &surface_roots,
-                runtimes: &surface_runtimes,
-                docs: &surface_docs,
-                prefix: &document.config.surface_description.prefix,
+            super::commit::CommitArtifacts {
+                loaded,
+                records: &records,
+                surfaces: super::commit::SurfaceCommit {
+                    roots: &surface_roots,
+                    runtimes: &surface_runtimes,
+                    docs: &surface_docs,
+                    prefix: &document.config.surface_description.prefix,
+                },
+                webhook: &webhook,
             },
         )
         .await
@@ -1691,6 +1913,22 @@ channel scratch at "ephemeral:scratch" {{
             self.dir.path().join("main.brenn")
         }
 
+        /// Write a secret file under this tree and hand back its path, so a
+        /// document can name a `secret_file` a resolution will really read.
+        /// Rewriting one with different bytes is a rotation.
+        pub(crate) fn secret(&self, name: &str, bytes: &str) -> PathBuf {
+            let path = self.secret_path(name);
+            std::fs::create_dir_all(path.parent().expect("a secrets directory"))
+                .expect("a secrets directory");
+            std::fs::write(&path, bytes).expect("the secret file is writable");
+            path
+        }
+
+        /// Where [`Tree::secret`] puts a named secret, written or not.
+        pub(crate) fn secret_path(&self, name: &str) -> PathBuf {
+            self.dir.path().join("secrets").join(name)
+        }
+
         pub(crate) fn modules(&self) -> PathBuf {
             self.dir.path().join("modules")
         }
@@ -1864,21 +2102,19 @@ channel scratch at "ephemeral:scratch" {{
         /// directories it declares. Held because dropping it would take the
         /// mount trees with it.
         pub(crate) mounts: Mounts,
-        /// The MQTT runtime the reload walks, when the fixture asked for one.
-        pub(crate) mqtt: Option<(
+        /// The MQTT runtime the reload walks. Always present, as it is on a
+        /// booted process; a fixture that asked for neither a registered nor a
+        /// live client gets an empty registry.
+        pub(crate) mqtt: (
             Arc<brenn_mqtt::MqttService>,
             Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
-        )>,
-        /// The stop signals of the live supervisors, when the fixture booted
-        /// against a real broker.
-        ///
-        /// Held so a fixture can fire them. Dropping them stops nothing: each
-        /// supervisor holds a sender of its own inside its
-        /// `MqttClientHandle`, so the channel never closes while the
-        /// supervisor runs. A fixture that does not call `stop_mqtt()` leaves
-        /// a connected supervisor under the document's client id for the rest
-        /// of the test binary.
-        pub(crate) mqtt_stop_txs: Vec<tokio::sync::watch::Sender<bool>>,
+        ),
+        /// The endpoint table the reload's webhook steps walk — the same one
+        /// the HTTP layer would be matching requests against. Built over the
+        /// booted document's endpoints, with a real replay component per
+        /// replay-protected one, so a candidate is compared against what is
+        /// actually being served.
+        pub(crate) webhook: Arc<brenn_webhook::WebhookService>,
         /// The dispatcher task, when the fixture asked for one.
         ///
         /// Held rather than detached so that a wait for something the
@@ -1905,9 +2141,52 @@ channel scratch at "ephemeral:scratch" {{
             // booted identities for the same reason.
             mqtt_clients: &client_identities(config),
             tool_registry: Some(tool_registry),
-            replay_store_paths: &[],
+            replay_store_paths: &brenn_lib::webhook::config::webhook_store_paths(
+                webhook_identities(config).values(),
+            ),
         })
         .expect("the fixture document configures messaging")
+    }
+
+    /// The per-agent webhook subscription stamps a fixture document resolves,
+    /// which is what boot hands `resolve_apps`. Read off the document rather
+    /// than defaulted to empty: a fixture declaring an endpoint an agent
+    /// subscribes to has to resolve the same map on both paths, or the
+    /// baseline's agents would hold no webhook subscription and every candidate
+    /// would report one added.
+    fn webhook_stamps(
+        config: &BrennConfig,
+    ) -> std::collections::BTreeMap<
+        String,
+        Vec<brenn_lib::webhook::config::ResolvedWebhookSubscription>,
+    > {
+        webhook_halves(config).1
+    }
+
+    /// The endpoint identities a fixture document declares.
+    fn webhook_identities(
+        config: &BrennConfig,
+    ) -> IndexMap<String, brenn_lib::webhook::config::WebhookEndpointIdentity> {
+        webhook_halves(config).0
+    }
+
+    /// The webhook document half, run the way boot and prepare both run it.
+    fn webhook_halves(
+        config: &BrennConfig,
+    ) -> (
+        IndexMap<String, brenn_lib::webhook::config::WebhookEndpointIdentity>,
+        std::collections::BTreeMap<
+            String,
+            Vec<brenn_lib::webhook::config::ResolvedWebhookSubscription>,
+        >,
+    ) {
+        brenn_lib::webhook::config::resolve_webhook_identities(
+            &config.webhook_endpoints,
+            &config.apps,
+            &config.wasm_consumers,
+            &config.wasm,
+            &config.messaging,
+        )
     }
 
     /// The `[[mqtt_client]]` identities a fixture document declares.
@@ -1921,14 +2200,20 @@ channel scratch at "ephemeral:scratch" {{
     /// Declared and not referenced, because that is the set boot spawns a
     /// session for.
     ///
-    /// The handles are registered and no supervisor is spawned, so every session
-    /// exists and none has a connection: a SUBSCRIBE at commit comes back
+    /// The handles carry the document's own resolved config — secrets and all,
+    /// which is what a reload's client delta compares against, so an unmoved
+    /// `[[mqtt_client]]` block produces no change.
+    ///
+    /// No *connection* supervisor is spawned, so every session exists and none
+    /// has a connection: a SUBSCRIBE at commit comes back
     /// `DeferredDisconnected`, which is the outcome a broker-down reload has and
     /// the one that leaves the filter in the reconnect-survival set for a test to
-    /// read.
+    /// read. What is spawned is a stand-in task that watches the same stop
+    /// signal and exits when it is set, so a reload that stops or restarts one
+    /// of these clients has a supervisor to join — which is what commit does.
     async fn mqtt_runtime(
         plan: &MessagingPlan,
-        clients: &IndexMap<String, MqttClientIdentity>,
+        clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientConfig>,
         db: &brenn_db::Db,
     ) -> (
         Arc<brenn_mqtt::MqttService>,
@@ -1937,14 +2222,22 @@ channel scratch at "ephemeral:scratch" {{
         use brenn_server::mqtt_router::IngressRoute;
 
         let service = brenn_mqtt::MqttService::new();
-        for slug in clients.keys() {
-            let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
-            service
-                .add_client(brenn_mqtt::MqttClientHandle::new(
-                    Arc::new(brenn_server::test_support::mqtt::test_client_config(slug)),
-                    brenn_mqtt::union_subscriptions(slug, &plan.mqtt_ingress_channels),
-                    stop_tx,
-                ))
+        for (slug, config) in clients {
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let handle = brenn_mqtt::MqttClientHandle::new(
+                Arc::new(config.clone()),
+                brenn_mqtt::union_subscriptions(slug, &plan.mqtt_ingress_channels),
+                stop_tx,
+            );
+            service.add_client(handle.clone());
+            handle
+                .set_supervisor(tokio::spawn(async move {
+                    while !*stop_rx.borrow_and_update() {
+                        if stop_rx.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                }))
                 .await;
         }
         let router = Arc::new(brenn_server::mqtt_router::MqttEventRouterImpl::new());
@@ -1972,11 +2265,8 @@ channel scratch at "ephemeral:scratch" {{
         db: &brenn_db::Db,
         messenger: &Arc<Messenger>,
     ) -> (
-        (
-            Arc<brenn_mqtt::MqttService>,
-            Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
-        ),
-        Vec<tokio::sync::watch::Sender<bool>>,
+        Arc<brenn_mqtt::MqttService>,
+        Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
     ) {
         let clients = brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients);
         // The supervisor's SUBSCRIBE union and the router's route table are
@@ -2004,19 +2294,14 @@ channel scratch at "ephemeral:scratch" {{
             });
         }
         let result = crate::mqtt::start_mqtt(&ingress, &clients).await;
-        let service = result.service.expect("a live fixture declares a client");
-        let router = result
-            .event_router
-            .expect("a live fixture declares a client");
         // The state the router delivers through must carry the messenger this
         // process publishes with: an inbound packet reaches the bus through it,
         // and a state without one panics the delivery path on the first
         // message.
         let mut state = brenn_server::test_support::state::test_state(db);
         state.messenger = Some(messenger.clone());
-        let stop_txs =
-            crate::mqtt::wire_mqtt_state(&service, &router, state, &ingress, result.stop_txs).await;
-        ((service, router), stop_txs)
+        crate::mqtt::wire_mqtt_state(&result.service, &result.event_router, state, &ingress).await;
+        (result.service, result.event_router)
     }
 
     /// A fixture document's agent map, resolved as boot resolves it.
@@ -2034,10 +2319,8 @@ channel scratch at "ephemeral:scratch" {{
             config,
             &brenn_lib::integration::IntegrationRegistry::new(vec![]),
             Some(runtime_dir),
-            &brenn_lib::config::FrozenInputs {
-                mqtt_clients: &client_identities(config),
-                webhook_subscriptions: &std::collections::BTreeMap::new(),
-            },
+            &client_identities(config),
+            &webhook_stamps(config),
         )
     }
 
@@ -2059,18 +2342,15 @@ channel scratch at "ephemeral:scratch" {{
         /// shape a release installs: the kernel pair at its root and one
         /// `processor/<kind>/` directory per kind it serves.
         pub(crate) surface_assets: Option<PathBuf>,
-        /// Stand up a live `MqttService` and ingress router over the document's
-        /// `mqtt_client` declarations. Off by default: a document declaring no
-        /// client has neither.
-        pub(crate) mqtt: bool,
         /// Stand up the MQTT subsystem the way boot does, against whatever
         /// broker the document's `mqtt_client` names — one real supervisor per
-        /// declared client, dialing and staying connected.
+        /// declared client, dialing and staying connected. Needs a broker to be
+        /// listening.
         ///
-        /// Distinct from `mqtt`, which registers handles and spawns nothing:
-        /// that fixture is for the cases about the *plan*, where every
-        /// SUBSCRIBE defers and no packet moves. This one is for the cases
-        /// about the wire, and it needs a broker to be listening.
+        /// Off by default, which is not "no MQTT": every fixture registers a
+        /// session per declared client, with a stand-in supervisor that holds
+        /// no connection, so every SUBSCRIBE defers and no packet moves. That
+        /// is the shape the cases about the *plan* want.
         pub(crate) mqtt_live: bool,
         /// Run a dispatcher over this process. Off by default: a published row
         /// is then stored and nobody is woken, so nothing advances a cursor
@@ -2100,14 +2380,9 @@ channel scratch at "ephemeral:scratch" {{
             components_roots,
             tool_registry,
             surface_assets,
-            mqtt,
             mqtt_live,
             dispatcher,
         } = fixture;
-        assert!(
-            !(mqtt && mqtt_live),
-            "a fixture asks for one MQTT runtime or the other, not both",
-        );
         // The roots every load below reads are the mounts document's, exactly
         // as `run_server` derives them: a record read out of a path the reload
         // would not name is a baseline that disagrees with every candidate.
@@ -2195,23 +2470,27 @@ channel scratch at "ephemeral:scratch" {{
             handle
         });
         let plan = plan_like_the_driver(&document.config, &apps, &tool_registry);
-        let (mqtt, mqtt_stop_txs) = match (mqtt, mqtt_live) {
-            (true, _) => (
-                Some(mqtt_runtime(&plan, &client_identities(&document.config), &db).await),
-                Vec::new(),
-            ),
-            (_, true) => {
-                let (runtime, stop_txs) = live_mqtt_runtime(
-                    &document.config,
-                    &plan,
-                    &result.dynamic_mqtt_ingress,
-                    &db,
-                    &messenger,
-                )
-                .await;
-                (Some(runtime), stop_txs)
-            }
-            _ => (None, Vec::new()),
+        // Registered from the document's own declarations whether or not a
+        // fixture asked for the live variant: boot spawns a session per
+        // *declared* client, so a rig that left one unregistered would be a
+        // process a fresh boot of its own document does not match — and the
+        // reload would read the gap as a client to add.
+        let mqtt = if mqtt_live {
+            live_mqtt_runtime(
+                &document.config,
+                &plan,
+                &result.dynamic_mqtt_ingress,
+                &db,
+                &messenger,
+            )
+            .await
+        } else {
+            mqtt_runtime(
+                &plan,
+                &brenn_lib::mqtt::config::resolve_clients(&document.config.mqtt_clients),
+                &db,
+            )
+            .await
         };
 
         // The async tool executor's grant table: the plan's own value, installed
@@ -2236,7 +2515,7 @@ channel scratch at "ephemeral:scratch" {{
                 &ConsumerLoadContext {
                     components_roots: &components_roots,
                     alert_dispatcher: &alert_dispatcher,
-                    mqtt_service: None,
+                    mqtt_service: mqtt.0.clone(),
                     tool_registry: &tool_registry,
                     max_payload_bytes: document.config.messaging.max_body_bytes,
                 },
@@ -2272,6 +2551,18 @@ channel scratch at "ephemeral:scratch" {{
         for surface in &plan.surfaces {
             router.register_surface_delivery_routes(surface);
         }
+        // The endpoint table boot installs: the document half, then the host
+        // half over whatever secret files the fixture wrote, then the same
+        // builder `run_server` calls — so a replay-protected endpoint's
+        // component and store are the real ones.
+        let webhook_service = crate::webhook::build_webhook(
+            brenn_lib::webhook::config::resolve_webhook_endpoints(&webhook_identities(
+                &document.config,
+            )),
+            &components_roots,
+        )
+        .service;
+
         let attach_registry = brenn_attach_server::registry::AttachRegistry::default();
 
         let surface_roots = brenn_surface_server::validate_surface_assets(
@@ -2305,14 +2596,13 @@ channel scratch at "ephemeral:scratch" {{
                     vec![],
                 )),
                 runtime_dir: Some(runtime_dir),
-                mqtt_clients: client_identities(&document.config),
                 tool_registry,
-                replay_store_paths: Vec::new(),
+                webhook: webhook_service.clone(),
                 surface_roots: Arc::new(std::sync::RwLock::new(Arc::new(surface_roots))),
                 surfaces: surfaces_cell,
                 attach_registry,
-                mqtt_service: mqtt.as_ref().map(|(service, _)| service.clone()),
-                mqtt_event_router: mqtt.as_ref().map(|(_, router)| router.clone()),
+                mqtt_service: mqtt.0.clone(),
+                mqtt_event_router: mqtt.1.clone(),
                 max_payload_bytes: document.config.messaging.max_body_bytes,
                 active_bridges,
                 apps_swapped_tx: apps_swapped_tx.clone(),
@@ -2326,11 +2616,11 @@ channel scratch at "ephemeral:scratch" {{
         );
         Booted {
             driver,
+            webhook: webhook_service,
             apps_swapped_tx,
             active_bridges: bridges_for_fixture,
             mounts,
             mqtt,
-            mqtt_stop_txs,
             messenger,
             router,
             captured,
@@ -2830,89 +3120,15 @@ new sifter: Demo {{
     /// topic per entry in `topics`. The channels are literal addresses: an
     /// `mqtt:` entry is minted by the binding, never declared.
     pub(crate) fn document_with_an_mqtt_consumer(topics: &[&str]) -> String {
-        let ports: String = (0..topics.len())
-            .map(|index| format!("    in inbound{index};\n"))
-            .collect();
-        let bindings: String = topics
-            .iter()
-            .enumerate()
-            .map(|(index, topic)| {
-                format!(
-                    "    in inbound{index} <- \"mqtt:ha:{topic}\" {{ push_depth = 4; \
-                     retain_depth = 4; }}\n"
-                )
-            })
-            .collect();
-        document(&format!(
-            r#"mqtt_client ha {{
-    url = "mqtts://127.0.0.1:8883";
-    qos = 1;
-}}
-
-channel sink at "brenn:sink" {{
-    push_depth = 1;
-    retain_depth = 4;
-    standing_retain_depth = 4;
-}}
-{PACKAGED}component Demo {{
-    abi = processor;
-    requires = [ports];
-{ports}    out digest;
-}}
-{PACKAGED}
-new sifter: Demo {{
-    grants = [ports];
-{bindings}    out digest -> sink;
-}}
-"#
-        ))
+        let bindings: Vec<(&str, &str)> = topics.iter().map(|topic| ("ha", *topic)).collect();
+        document_with_clients(&[("ha", 8883, None)], &bindings)
     }
 
     /// Two declared brokers and a consumer bound to one `mqtt:` topic per
     /// `(client, topic)` pair. A client no pair names is declared and
     /// referenced by nothing, and has a session all the same.
     pub(crate) fn document_with_two_brokers(bindings: &[(&str, &str)]) -> String {
-        let ports: String = (0..bindings.len())
-            .map(|index| format!("    in inbound{index};\n"))
-            .collect();
-        let wiring: String = bindings
-            .iter()
-            .enumerate()
-            .map(|(index, (client, topic))| {
-                format!(
-                    "    in inbound{index} <- \"mqtt:{client}:{topic}\" {{ push_depth = 4; \
-                     retain_depth = 4; }}\n"
-                )
-            })
-            .collect();
-        document(&format!(
-            r#"mqtt_client ha {{
-    url = "mqtts://127.0.0.1:8883";
-    qos = 1;
-}}
-
-mqtt_client spare {{
-    url = "mqtts://127.0.0.1:8884";
-    qos = 1;
-}}
-
-channel sink at "brenn:sink" {{
-    push_depth = 1;
-    retain_depth = 4;
-    standing_retain_depth = 4;
-}}
-{PACKAGED}component Demo {{
-    abi = processor;
-    requires = [ports];
-{ports}    out digest;
-}}
-{PACKAGED}
-new sifter: Demo {{
-    grants = [ports];
-{wiring}    out digest -> sink;
-}}
-"#
-        ))
+        document_with_clients(&[("ha", 8883, None), ("spare", 8884, None)], bindings)
     }
 
     /// A client the document declares and nothing binds still has a session, so
@@ -2927,12 +3143,11 @@ new sifter: Demo {{
             &tree,
             BootFixture {
                 components_roots: vec![components.path().to_path_buf()],
-                mqtt: true,
                 ..BootFixture::default()
             },
         )
         .await;
-        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+        let (service, router) = booted.mqtt.clone();
         assert_eq!(
             service.ingress_filter_qos("spare", "home/other").await,
             None
@@ -2988,12 +3203,11 @@ new sifter: Demo {{
             &tree,
             BootFixture {
                 components_roots: vec![components.path().to_path_buf()],
-                mqtt: true,
                 ..BootFixture::default()
             },
         )
         .await;
-        let (service, _router) = booted.mqtt.clone().expect("the fixture stood one up");
+        let (service, _router) = booted.mqtt.clone();
         // A placeholder broker whose credentials are wrong: declared, dialled
         // at boot, rejected authoritatively, not retrying.
         let handle = service.get_client("spare").expect("a declared client");
@@ -3053,12 +3267,11 @@ new sifter: Demo {{
             &tree,
             BootFixture {
                 components_roots: vec![components.path().to_path_buf()],
-                mqtt: true,
                 ..BootFixture::default()
             },
         )
         .await;
-        let (service, router) = booted.mqtt.clone().expect("a declared client gets one");
+        let (service, router) = booted.mqtt.clone();
         assert_eq!(service.client_slugs(), vec!["ha".to_string()]);
         assert!(router.route_uuids().is_empty());
 
@@ -3097,12 +3310,11 @@ new sifter: Demo {{
             &tree,
             BootFixture {
                 components_roots: vec![components.path().to_path_buf()],
-                mqtt: true,
                 ..BootFixture::default()
             },
         )
         .await;
-        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+        let (service, router) = booted.mqtt.clone();
         assert_eq!(service.ingress_filter_qos("ha", TOPIC).await, Some(1));
 
         tree.write(&document_with_a_broker_only());
@@ -3118,6 +3330,951 @@ new sifter: Demo {{
             vec!["ha".to_string()],
             "the session outlives its last binding",
         );
+    }
+
+    /// A document declaring one `mqtt_client` per entry — slug, broker port and
+    /// an optional `password_file` — with a consumer bound to one `mqtt:` topic
+    /// per binding.
+    pub(crate) fn document_with_clients(
+        clients: &[(&str, u16, Option<&std::path::Path>)],
+        bindings: &[(&str, &str)],
+    ) -> String {
+        let blocks: String = clients
+            .iter()
+            .map(|(slug, port, password)| {
+                let credential = password.map_or_else(String::new, |path| {
+                    format!("    password_file = \"{}\";\n", path.display())
+                });
+                format!(
+                    "mqtt_client {slug} {{\n    url = \"mqtts://127.0.0.1:{port}\";\n\
+                     {credential}    qos = 1;\n}}\n\n"
+                )
+            })
+            .collect();
+        let ports: String = (0..bindings.len())
+            .map(|index| format!("    in inbound{index};\n"))
+            .collect();
+        let wiring: String = bindings
+            .iter()
+            .enumerate()
+            .map(|(index, (client, topic))| {
+                format!(
+                    "    in inbound{index} <- \"mqtt:{client}:{topic}\" {{ push_depth = 4; \
+                     retain_depth = 4; }}\n"
+                )
+            })
+            .collect();
+        document(&format!(
+            r#"{blocks}channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [ports];
+{ports}    out digest;
+}}
+{PACKAGED}
+new sifter: Demo {{
+    grants = [ports];
+{wiring}    out digest -> sink;
+}}
+"#
+        ))
+    }
+
+    /// A `[[mqtt_client]]` the candidate declares and the process does not hold
+    /// is registered by the commit, with a supervisor of its own — the deploy
+    /// story the facility exists for, and a level-1 refusal until this slice.
+    ///
+    /// Its filters are reported `mqtt_deferred`: the supervisor was spawned
+    /// microseconds earlier and asserts them on its first connect, which is
+    /// what that list has always promised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_added_client_is_registered_and_its_first_binding_defers() {
+        const ADDRESS: &str = "mqtt:spare:home/other";
+        let one = [("ha", 8883u16, None)];
+        let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
+        let tree = Tree::holding(&document_with_clients(&one, &[("ha", "home/state")]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone();
+        assert_eq!(service.client_slugs(), vec!["ha".to_string()]);
+
+        tree.write(&document_with_clients(
+            &two,
+            &[("ha", "home/state"), ("spare", "home/other")],
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_added, vec!["spare".to_string()]);
+        assert!(status.delta.mqtt_clients_removed.is_empty());
+        assert!(status.delta.mqtt_clients_changed.is_empty());
+        assert_eq!(
+            service.client_slugs(),
+            vec!["ha".to_string(), "spare".to_string()],
+        );
+        assert_eq!(status.delta.mqtt_subscribed, vec![ADDRESS.to_string()]);
+        assert_eq!(
+            status.delta.mqtt_deferred,
+            vec![ADDRESS.to_string()],
+            "a supervisor spawned in this walk asserts its filters on its first connect",
+        );
+        assert!(status.delta.mqtt_failed.is_empty());
+        assert_eq!(
+            service.ingress_filter_qos("spare", "home/other").await,
+            Some(1),
+            "the arriving filter is not on the arriving client's handle",
+        );
+        let uuid = booted
+            .messenger
+            .directory()
+            .resolve(ADDRESS)
+            .expect("the entry is in the directory")
+            .uuid;
+        assert!(
+            router.route_uuids().contains(&uuid),
+            "{ADDRESS} has no route"
+        );
+        booted.stop_mqtt();
+    }
+
+    /// A client the candidate no longer declares loses its session, and its
+    /// filters are reported as no move at all: they leave with the session, and
+    /// an UNSUBSCRIBE named in the status body would be a packet nothing sent.
+    /// Its route still goes — the ingress table has to lose it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_client_is_stopped_and_contributes_no_filter_moves() {
+        const ADDRESS: &str = "mqtt:spare:home/other";
+        let one = [("ha", 8883u16, None)];
+        let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
+        let tree = Tree::holding(&document_with_clients(
+            &two,
+            &[("ha", "home/state"), ("spare", "home/other")],
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone();
+        let uuid = booted
+            .messenger
+            .directory()
+            .resolve(ADDRESS)
+            .expect("the entry is in the directory")
+            .uuid;
+        assert!(router.route_uuids().contains(&uuid));
+
+        tree.write(&document_with_clients(&one, &[("ha", "home/state")]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_removed, vec!["spare".to_string()]);
+        assert_eq!(service.client_slugs(), vec!["ha".to_string()]);
+        assert!(
+            status.delta.mqtt_unsubscribed.is_empty(),
+            "a stopped client's filters are not moves: {:?}",
+            status.delta.mqtt_unsubscribed,
+        );
+        assert!(
+            status.delta.mqtt_deferred.is_empty(),
+            "{:?}",
+            status.delta.mqtt_deferred,
+        );
+        assert!(
+            !router.route_uuids().contains(&uuid),
+            "{ADDRESS} still has a route",
+        );
+        assert!(service.get_client("spare").is_none());
+    }
+
+    /// A rotated broker password with no document edit at all: the file's bytes
+    /// are part of the resolved client, so the reload applies and the client's
+    /// supervisor is restarted with the new credential — carrying the filters
+    /// the predecessor held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rotated_broker_password_restarts_the_client_without_a_document_edit() {
+        const TOPIC: &str = "home/state";
+        // The secret is written before the document that names it, because it
+        // has to be readable at boot as well as at the reload.
+        let tree = Tree::new();
+        let password = tree.secret("broker.pw", "first");
+        let clients = [("ha", 8883u16, Some(password.as_path()))];
+        tree.write(&document_with_clients(&clients, &[("ha", TOPIC)]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, _router) = booted.mqtt.clone();
+        let before = service.get_client("ha").expect("a declared client");
+        assert_eq!(before.config.password.as_deref(), Some("first"));
+
+        std::fs::write(&password, "second").expect("the secret file is writable");
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
+        assert!(status.delta.mqtt_clients_added.is_empty());
+        assert!(status.delta.mqtt_clients_removed.is_empty());
+        let after = service.get_client("ha").expect("the slug is never absent");
+        assert_eq!(after.config.password.as_deref(), Some("second"));
+        assert_eq!(
+            service.ingress_filter_qos("ha", TOPIC).await,
+            Some(1),
+            "the successor did not carry the predecessor's filters",
+        );
+        assert!(
+            status.delta.mqtt_subscribed.is_empty(),
+            "a carried filter is not a move: {:?}",
+            status.delta.mqtt_subscribed,
+        );
+        booted.stop_mqtt();
+    }
+
+    /// The other side of reading secrets at every prepare: a `password_file`
+    /// that is missing refuses the whole reload in the environment grammar,
+    /// whatever the edit was — a fresh boot could not have produced that state
+    /// either — and the running client keeps serving on the credential it has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_password_file_refuses_the_reload_in_the_environment_grammar() {
+        const TOPIC: &str = "home/state";
+        // The secret is written before the document that names it, because it
+        // has to be readable at boot as well as at the reload.
+        let tree = Tree::new();
+        let password = tree.secret("broker.pw", "first");
+        let clients = [("ha", 8883u16, Some(password.as_path()))];
+        tree.write(&document_with_clients(&clients, &[("ha", TOPIC)]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, _router) = booted.mqtt.clone();
+
+        std::fs::remove_file(&password).expect("the secret file is removable");
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert_eq!(status.refusals.len(), 1, "{:?}", status.refusals);
+        assert!(
+            status.refusals[0].contains(&password.display().to_string()),
+            "the refusal must name the file: {:?}",
+            status.refusals,
+        );
+        assert_eq!(
+            service
+                .get_client("ha")
+                .expect("the running client is untouched")
+                .config
+                .password
+                .as_deref(),
+            Some("first"),
+        );
+    }
+
+    /// One sample of a concurrent observation: whether the process was in the
+    /// forbidden state, and which side of the transition the sample landed on.
+    struct Sample {
+        /// What was wrong, if the sample caught the process in the state
+        /// commit's step order forbids.
+        violation: Option<String>,
+        /// A tag naming the state this sample observed, so [`Probe::stop`] can
+        /// hold the run to having straddled the transition it is about.
+        witness: &'static str,
+    }
+
+    /// What one probe run saw, shared between the sampler and its controller.
+    #[derive(Default)]
+    struct Observed {
+        samples: usize,
+        violations: Vec<String>,
+        witnesses: std::collections::HashSet<&'static str>,
+    }
+
+    /// A concurrent observer of a fact about the running process, sampled as
+    /// tightly as the runtime allows while a reload commits.
+    ///
+    /// What it is for: commit's client steps — `start_added_clients` before the
+    /// agent swap, `restart_changed_and_stop_removed_clients` after it — are
+    /// statements about instants *inside* one `apply` call, and nothing is
+    /// published between them. A sampler on another worker thread is the only
+    /// thing outside commit that can see those instants at all.
+    ///
+    /// A probe cannot invent a violation: every predicate below reads the same
+    /// tables the publish path reads. What it must not be allowed to do is pass
+    /// while saying nothing, which is what a sampler that was never scheduled
+    /// across the transition does. Two gates keep that from reading as a green
+    /// run:
+    ///
+    /// - [`Self::spawn`] does not return until the sampler has taken its first
+    ///   sample, so every run is sampling *before* the reload under test
+    ///   starts.
+    /// - [`Self::stop`] waits, bounded, for the sampler to observe the state
+    ///   the transition leaves behind, and fails the run as inconclusive if it
+    ///   never does.
+    ///
+    /// So a green run is one in which the sampler was live on both sides of the
+    /// step under test and never saw the forbidden state. It is still no proof
+    /// that a sample landed in the interior of the window — nothing outside
+    /// commit can prove that — which is why a mutation of the commit order is
+    /// caught in a fraction of samples rather than all of them.
+    struct Probe {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        observed: Arc<std::sync::Mutex<Observed>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    /// How long [`Probe::stop`] waits for the post-transition witness before
+    /// calling the run inconclusive. Generous: the transition has already
+    /// happened when `stop` is called, so this bounds only how long the sampler
+    /// may stay descheduled.
+    const PROBE_WITNESS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    impl Probe {
+        /// Start sampling, returning once the first sample is in.
+        async fn spawn(mut sample: impl FnMut() -> Sample + Send + 'static) -> Self {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = Arc::new(std::sync::Mutex::new(Observed::default()));
+            let flag = Arc::clone(&stop);
+            let shared = Arc::clone(&observed);
+            let task = tokio::spawn(async move {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    let taken = sample();
+                    {
+                        let mut observed =
+                            shared.lock().expect("the probe's state is not poisoned");
+                        observed.samples += 1;
+                        if let Some(violation) = taken.violation {
+                            observed.violations.push(violation);
+                        }
+                        observed.witnesses.insert(taken.witness);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+            let probe = Self {
+                stop,
+                observed,
+                task,
+            };
+            probe
+                .wait_for(PROBE_WITNESS_WAIT, |observed| observed.samples > 0)
+                .await
+                .expect("the probe never took its first sample, so it observed nothing at all");
+            probe
+        }
+
+        /// Poll the shared state until `ready`, or give up after `budget`.
+        async fn wait_for(
+            &self,
+            budget: std::time::Duration,
+            ready: impl Fn(&Observed) -> bool,
+        ) -> Result<(), ()> {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                if ready(
+                    &self
+                        .observed
+                        .lock()
+                        .expect("the probe's state is not poisoned"),
+                ) {
+                    return Ok(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        /// Stop sampling and hold the run to account: the sampler must have
+        /// observed every state in `straddled` — the last of them is the one
+        /// the transition leaves behind, which it may still be about to see —
+        /// and none of the forbidden ones.
+        async fn stop(self, straddled: &[&'static str]) {
+            for state in straddled {
+                if self
+                    .wait_for(PROBE_WITNESS_WAIT, |observed| {
+                        observed.witnesses.contains(state)
+                    })
+                    .await
+                    .is_err()
+                {
+                    let observed = self
+                        .observed
+                        .lock()
+                        .expect("the probe's state is not poisoned");
+                    panic!(
+                        "inconclusive: the probe never observed {state:?} in {} samples, so it \
+                         was not sampling across the transition it is about and its silence \
+                         about the ordering says nothing",
+                        observed.samples,
+                    );
+                }
+            }
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.task.await.expect("the probe task ran to completion");
+            let observed = self
+                .observed
+                .lock()
+                .expect("the probe's state is not poisoned");
+            assert!(
+                observed.violations.is_empty(),
+                "the process was observed in a state commit's step order forbids, {} of {} \
+                 samples: {:?}",
+                observed.violations.len(),
+                observed.samples,
+                &observed.violations[..observed.violations.len().min(3)],
+            );
+        }
+    }
+
+    /// The invariant both client steps are placed by: a client is registered
+    /// whenever anything authorized to name it is live.
+    ///
+    /// One predicate for both directions, because it is one invariant. An
+    /// arriving client is registered at `10m` and its agent's authority goes
+    /// live at the swap that follows, so the forbidden state is never entered;
+    /// a departing client's authority stops naming it at that same swap and its
+    /// session is taken out afterwards, so it is never entered on the way out
+    /// either. A single step on the wrong side of the swap enters it for the
+    /// width of everything between.
+    async fn authority_probe(booted: &Booted, client: &'static str) -> Probe {
+        let apps = booted.messenger.app_table();
+        let service = booted.mqtt.0.clone();
+        Probe::spawn(move || {
+            let authorized = apps
+                .load()
+                .values()
+                .any(|app| app.policy.allows_mqtt_publish(client));
+            Sample {
+                violation: (authorized && service.get_client(client).is_none()).then(|| {
+                    format!("an agent may publish through {client}, which has no session")
+                }),
+                // The agent swap is the transition: the authority naming the
+                // client is live on exactly one side of it, whichever direction
+                // this reload moves.
+                witness: if authorized {
+                    AUTHORITY_LIVE
+                } else {
+                    AUTHORITY_ABSENT
+                },
+            }
+        })
+        .await
+    }
+
+    /// The two states `authority_probe` has to see for its silence to mean
+    /// anything: the agent table before the swap and after it.
+    const AUTHORITY_ABSENT: &str = "no agent may publish through the client";
+    const AUTHORITY_LIVE: &str = "an agent may publish through the client";
+
+    /// The two states `presence_probe` has to see: the registry holding the
+    /// predecessor's handle, and holding the successor's.
+    const PREDECESSOR: &str = "the predecessor's session";
+    const SUCCESSOR: &str = "the successor's session";
+
+    /// The other half of the same invariant, for a client the reload restarts: the
+    /// successor is swapped into the registry before the predecessor is joined,
+    /// so the slug is never absent.
+    async fn presence_probe(
+        booted: &Booted,
+        client: &'static str,
+        predecessor: &Arc<brenn_mqtt::state::MqttClientHandle>,
+    ) -> Probe {
+        let service = booted.mqtt.0.clone();
+        let predecessor = Arc::clone(predecessor);
+        Probe::spawn(move || match service.get_client(client) {
+            None => Sample {
+                violation: Some(format!("{client} was absent from the registry")),
+                // The registry answered neither handle, which is the forbidden
+                // state itself; it witnesses no side of the swap.
+                witness: "",
+            },
+            Some(held) => Sample {
+                violation: None,
+                witness: if Arc::ptr_eq(&held, &predecessor) {
+                    PREDECESSOR
+                } else {
+                    SUCCESSOR
+                },
+            },
+        })
+        .await
+    }
+
+    /// The `client "mqtt:<slug>"` clause on the reader's publish ACL — the
+    /// authority whose going-live the arriving client's registration is ordered
+    /// before.
+    fn publishing_through(document: &str, client: &str) -> String {
+        document.replace(
+            "acl publish [exact reload_requests, exact work];",
+            &format!("acl publish [exact reload_requests, exact work, client \"mqtt:{client}\"];"),
+        )
+    }
+
+    /// Commit registers an arriving client before the swap that makes an
+    /// agent's new authority live: an agent that may publish through a client
+    /// the registry does not hold reaches `enforce_and_publish`'s per-client
+    /// panic, and the window would be every step between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_added_client_is_registered_before_agents_swap() {
+        let one = [("ha", 8883u16, None)];
+        let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
+        let tree = Tree::holding(&document_with_clients(&one, &[("ha", "home/state")]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+
+        let probe = authority_probe(&booted, "spare").await;
+        tree.write(&publishing_through(
+            &document_with_clients(&two, &[("ha", "home/state"), ("spare", "home/other")]),
+            "spare",
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+        probe.stop(&[AUTHORITY_ABSENT, AUTHORITY_LIVE]).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_added, vec!["spare".to_string()]);
+        assert!(
+            booted.messenger.app_table().load()[READER]
+                .policy
+                .allows_mqtt_publish("spare"),
+            "the authority the ordering is about never went live",
+        );
+        booted.stop_mqtt();
+    }
+
+    /// The other direction, one invariant: commit stops a departing client
+    /// after that swap, so the authority naming it is gone before its session
+    /// is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_removed_client_is_stopped_after_agents_swap() {
+        let one = [("ha", 8883u16, None)];
+        let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
+        let tree = Tree::holding(&publishing_through(
+            &document_with_clients(&two, &[("ha", "home/state"), ("spare", "home/other")]),
+            "spare",
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        assert!(
+            booted.messenger.app_table().load()[READER]
+                .policy
+                .allows_mqtt_publish("spare"),
+            "the authority the ordering is about was never live",
+        );
+
+        let probe = authority_probe(&booted, "spare").await;
+        tree.write(&document_with_clients(&one, &[("ha", "home/state")]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+        probe.stop(&[AUTHORITY_LIVE, AUTHORITY_ABSENT]).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_removed, vec!["spare".to_string()]);
+        assert!(booted.mqtt.0.get_client("spare").is_none());
+    }
+
+    /// A restarted client keeps its slug in the registry throughout: the
+    /// successor handle is swapped in before the predecessor's supervisor is
+    /// joined, and it carries the filters the predecessor held so no `mqtt:`
+    /// binding has to be re-planned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_changed_client_is_restarted_with_its_filters_carried() {
+        const TOPIC: &str = "home/state";
+        let tree = Tree::holding(&document_with_clients(
+            &[("ha", 8883u16, None)],
+            &[("ha", TOPIC)],
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, _router) = booted.mqtt.clone();
+        let before = service.get_client("ha").expect("a declared client");
+
+        let probe = presence_probe(&booted, "ha", &before).await;
+        tree.write(&document_with_clients(
+            &[("ha", 8885u16, None)],
+            &[("ha", TOPIC)],
+        ));
+        booted.driver.reload(TriggerSource::Signal).await;
+        probe.stop(&[PREDECESSOR, SUCCESSOR]).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
+        let after = service.get_client("ha").expect("the slug is never absent");
+        assert_eq!(after.config.identity.port, 8885);
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a changed client is a new handle, not an edited one",
+        );
+        assert_eq!(
+            service.ingress_filter_qos("ha", TOPIC).await,
+            Some(1),
+            "the successor did not carry the predecessor's filters",
+        );
+        assert!(
+            status.delta.mqtt_subscribed.is_empty(),
+            "a carried filter is not a move: {:?}",
+            status.delta.mqtt_subscribed,
+        );
+        booted.stop_mqtt();
+    }
+
+    /// A filter arriving on a client this same reload restarted is reported
+    /// `mqtt_deferred`: the successor's supervisor was spawned in this walk and
+    /// is still connecting when the move is asserted, so the SUBSCRIBE goes out
+    /// on its first connect.
+    ///
+    /// `mqtt_subscribed` is every move this reload made; `mqtt_deferred` is
+    /// the subset the broker has not taken yet. The claim the case can make is
+    /// that the move is on the deferred list and on neither the failed nor the
+    /// withdrawn one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_added_or_changed_clients_filter_moves_are_reported_deferred() {
+        const KEPT: &str = "home/state";
+        const ARRIVED: &str = "home/other";
+        let address = format!("mqtt:spare:{ARRIVED}");
+        let clients = |port: u16| [("ha", 8883u16, None), ("spare", port, None)];
+        let tree = Tree::holding(&document_with_clients(&clients(8884), &[("ha", KEPT)]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+
+        // One reload, two moves on one client: its broker coordinates change,
+        // and the first binding through it arrives.
+        tree.write(&document_with_clients(
+            &clients(8886),
+            &[("ha", KEPT), ("spare", ARRIVED)],
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_changed, vec!["spare".to_string()]);
+        assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+        assert_eq!(
+            status.delta.mqtt_deferred,
+            vec![address.clone()],
+            "the move on a client restarted in this walk is deferred to its first connect",
+        );
+        assert!(status.delta.mqtt_failed.is_empty());
+        assert!(status.delta.mqtt_unsubscribed.is_empty());
+        assert_eq!(
+            booted.mqtt.0.ingress_filter_qos("spare", ARRIVED).await,
+            Some(1),
+            "the deferred filter is registered on the successor all the same",
+        );
+        booted.stop_mqtt();
+    }
+
+    /// A restart and a withdrawal in one reload: the successor inherits the
+    /// filter the document still binds and not the one it dropped.
+    ///
+    /// This is what the step order is for. The outgoing step runs before the
+    /// restart, so the predecessor's set is pruned before the successor
+    /// inherits it; inherit first, or restart before the prune, and the
+    /// successor holds a filter the document no longer binds and re-asserts it
+    /// at the broker on every connect, on a route this same reload removed —
+    /// every delivery a zero-match drop, with no status field and no log line
+    /// to say so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_client_does_not_inherit_a_withdrawn_filter() {
+        const KEPT: &str = "home/state";
+        const DROPPED: &str = "home/other";
+        let dropped_address = format!("mqtt:ha:{DROPPED}");
+        let tree = Tree::new();
+        let password = tree.secret("broker.pw", "first");
+        let before = [("ha", 8883u16, Some(password.as_path()))];
+        let after = [("ha", 8886u16, Some(password.as_path()))];
+        tree.write(&document_with_clients(
+            &before,
+            &[("ha", KEPT), ("ha", DROPPED)],
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone();
+        assert_eq!(service.ingress_filter_qos("ha", DROPPED).await, Some(1));
+        let dropped_uuid = booted
+            .messenger
+            .directory()
+            .resolve(&dropped_address)
+            .expect("the entry is in the directory")
+            .uuid;
+
+        // One reload, every move at once: the broker coordinates move, the
+        // credential rotates, and one of the two bindings goes.
+        std::fs::write(&password, "second").expect("the secret file is writable");
+        tree.write(&document_with_clients(&after, &[("ha", KEPT)]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
+        assert_eq!(
+            status.delta.mqtt_unsubscribed,
+            vec![dropped_address.clone()]
+        );
+        let after_handle = service.get_client("ha").expect("the slug is never absent");
+        assert_eq!(after_handle.config.password.as_deref(), Some("second"));
+        assert_eq!(
+            service.ingress_filter_qos("ha", KEPT).await,
+            Some(1),
+            "the surviving binding's filter is inherited",
+        );
+        assert_eq!(
+            service.ingress_filter_qos("ha", DROPPED).await,
+            None,
+            "and the withdrawn one is not: the successor would re-assert it at the broker \
+             forever, on a route this reload removed",
+        );
+        assert!(
+            !router.route_uuids().contains(&dropped_uuid),
+            "{dropped_address} still has a route",
+        );
+        assert_eq!(after_handle.config.identity.port, 8886);
+        booted.stop_mqtt();
+    }
+
+    /// A dormant durable row on a channel a removed client's binding took with
+    /// it is refused.
+    ///
+    /// The rule is what keeps the removal honest. A stopping client contributes
+    /// no filter move at all — its filters leave with its session — so nothing
+    /// else in the walk would notice that a durable subscription is left
+    /// naming a broker session this process will not have. A fresh boot of the
+    /// candidate reconstructs the channel from the store and holds the row
+    /// dormant against it; the reload cannot reproduce that reconstruction, so
+    /// it refuses and says which pair it could not follow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dormant_row_on_a_removed_clients_channel_is_refused() {
+        const ADDRESS: &str = "mqtt:spare:home/other";
+        let one = [("ha", 8883u16, None)];
+        let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
+        let tree = Tree::holding(&document_with_clients(
+            &two,
+            &[("ha", "home/state"), ("spare", "home/other")],
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        // Dormant: the row is stored and is not folded onto the entry, which is
+        // where an ACL narrowed under a runtime `MessageSubscribe` leaves it.
+        insert_dynamic_mqtt_row(&booted, ADDRESS, false, 1).await;
+
+        tree.write(&document_with_clients(&one, &[("ha", "home/state")]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.delta);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains(ADDRESS) && refusal.contains(READER)),
+            "the refusal names the pair it cannot follow: {:?}",
+            status.refusals,
+        );
+        assert_eq!(
+            booted.mqtt.0.client_slugs(),
+            vec!["ha".to_string(), "spare".to_string()],
+            "a refusal changes nothing: the session the candidate would have stopped is up",
+        );
+    }
+
+    /// Three clients moving in one reload, one per list: the commit walk runs a
+    /// task per client against one registry, and every existing case moves
+    /// exactly one, where the walk is indistinguishable from a serial call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn several_clients_move_in_one_reload() {
+        const SURVIVOR_TOPIC: &str = "home/state";
+        let tree = Tree::new();
+        let password = tree.secret("broker.pw", "first");
+        let before = [
+            ("ha", 8883u16, None),
+            ("attic", 8884u16, Some(password.as_path())),
+            ("shed", 8885u16, None),
+        ];
+        // `ha` survives untouched, `attic`'s credential rotates, `shed` goes
+        // and `spare` arrives.
+        let after = [
+            ("ha", 8883u16, None),
+            ("attic", 8884u16, Some(password.as_path())),
+            ("spare", 8886u16, None),
+        ];
+        tree.write(&document_with_clients(&before, &[("ha", SURVIVOR_TOPIC)]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, _router) = booted.mqtt.clone();
+        assert_eq!(
+            service.client_slugs(),
+            vec!["attic".to_string(), "ha".to_string(), "shed".to_string()],
+        );
+
+        std::fs::write(&password, "second").expect("the secret file is writable");
+        tree.write(&document_with_clients(&after, &[("ha", SURVIVOR_TOPIC)]));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_added, vec!["spare".to_string()]);
+        assert_eq!(status.delta.mqtt_clients_removed, vec!["shed".to_string()]);
+        assert_eq!(status.delta.mqtt_clients_changed, vec!["attic".to_string()]);
+        assert_eq!(
+            service.client_slugs(),
+            vec!["attic".to_string(), "ha".to_string(), "spare".to_string()],
+            "the registry is exactly the candidate's set",
+        );
+        assert_eq!(
+            service
+                .get_client("attic")
+                .expect("the restarted slug is never absent")
+                .config
+                .password
+                .as_deref(),
+            Some("second"),
+        );
+        assert_eq!(
+            service.ingress_filter_qos("ha", SURVIVOR_TOPIC).await,
+            Some(1),
+            "the untouched client's filter is where it was",
+        );
+        booted.stop_mqtt();
+    }
+
+    /// Shutdown reads the live registry, so a client a reload added is
+    /// disconnected cleanly on SIGTERM: `stop_all` signals its supervisor and
+    /// the join returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_all_disconnects_a_client_added_at_reload() {
+        let one = [("ha", 8883u16, None)];
+        let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
+        let tree = Tree::holding(&document_with_clients(&one, &[("ha", "home/state")]));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+
+        tree.write(&document_with_clients(
+            &two,
+            &[("ha", "home/state"), ("spare", "home/other")],
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+
+        let service = booted.mqtt.0.clone();
+        let added = service.get_client("spare").expect("the reload added it");
+        assert_eq!(
+            service.stop_all(),
+            2,
+            "the shutdown path signals every registered supervisor, the arriving one included",
+        );
+        // The supervisor the commit spawned exits on the signal shutdown just
+        // sent: an added client whose task outlived `stop_all` would hold its
+        // broker session open past the process's last word.
+        added.stop_and_join().await;
     }
 
     /// Ingress convergence against a live service and router: a second `mqtt:`
@@ -3139,12 +4296,11 @@ new sifter: Demo {{
             &tree,
             BootFixture {
                 components_roots: vec![components.path().to_path_buf()],
-                mqtt: true,
                 ..BootFixture::default()
             },
         )
         .await;
-        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+        let (service, router) = booted.mqtt.clone();
         let kept_uuid = booted
             .messenger
             .directory()
@@ -3227,12 +4383,11 @@ new sifter: Demo {{
             &tree,
             BootFixture {
                 components_roots: vec![components.path().to_path_buf()],
-                mqtt: true,
                 ..BootFixture::default()
             },
         )
         .await;
-        let (service, router) = booted.mqtt.clone().expect("the fixture stood one up");
+        let (service, router) = booted.mqtt.clone();
 
         let address = format!("mqtt:ha:{DYNAMIC}");
         booted
@@ -3493,13 +4648,10 @@ new sifter: Demo {{
         /// Teardown rather than assertion: the broker is killed a moment later
         /// either way, and a session that leaves with a DISCONNECT keeps the
         /// broker's log free of the abnormal-close lines a failing case has to
-        /// read past.
+        /// read past. Reads the live registry, so a client a reload under test
+        /// added is signalled too.
         pub(crate) fn stop_mqtt(&self) {
-            for stop in &self.mqtt_stop_txs {
-                // A supervisor that already exited is a closed channel, which
-                // is the state this asks for.
-                let _ = stop.send(true);
-            }
+            self.mqtt.0.stop_all();
         }
 
         /// Poll until `address` holds at least `wanted` messages, and answer
@@ -7959,5 +9111,1128 @@ channel spill at "ephemeral:spill" {
             status.refusals,
         );
         assert!(serves_surface(&booted, "deskbar"), "nothing was touched");
+    }
+
+    // ---------------------------------------------------------------------
+    // Webhook endpoints: the ingress edge converges.
+    // ---------------------------------------------------------------------
+
+    /// A document whose singleton agent owns one endpoint per entry in `slugs`.
+    ///
+    /// `blocks` is the `webhook` declarations themselves, so a case writes the
+    /// scheme, the mount and the secret paths it is about; the agent side is
+    /// the ownership rule's minimum — singleton, one user, a `subscribe` on
+    /// each `webhook:` address and the `endpoint` ACL clause that admits it.
+    pub(crate) fn document_with_webhooks(blocks: &str, slugs: &[&str]) -> String {
+        let subscriptions: String = slugs
+            .iter()
+            .map(|slug| {
+                format!(
+                    "    subscribe \"webhook:{slug}\" {{ push_depth = 1; retain_depth = 4; }}\n"
+                )
+            })
+            .collect();
+        let subscribe_acl: String = slugs
+            .iter()
+            .map(|slug| format!(", endpoint \"webhook:{slug}\""))
+            .collect();
+        document_with_agent(
+            blocks,
+            &format!(
+                r#"
+agent Reader() {{
+    working_dir = ".";
+    singleton = true;
+    compact_soft_pct = 70;
+    allowed_users = ["alice"];
+    grants = [subscribe, publish];
+    send_budget = 1000000;
+    acl subscribe [exact reload_outcomes, prefix "brenn:surface.", prefix "ephemeral:surface."{subscribe_acl}];
+    acl publish [exact reload_requests, exact work];
+{subscriptions}}}
+
+new some-reader: Reader();
+"#
+            ),
+        )
+    }
+
+    /// One `webhook` block over a bearer token read from `secret`.
+    pub(crate) fn bearer_endpoint(slug: &str, mount: &str, secret: &std::path::Path) -> String {
+        format!(
+            r#"
+webhook {slug} {{
+    mount = "{mount}";
+    signature {{
+        scheme = bearer-token;
+        header = "authorization";
+    }}
+    token phone {{ secret_file = "{}"; }}
+}}
+"#,
+            secret.display(),
+        )
+    }
+
+    /// The endpoint the service is serving under `slug`, or `None`.
+    fn served(booted: &Booted, slug: &str) -> Option<Arc<brenn_webhook::EndpointRuntime>> {
+        booted.webhook.endpoint_by_slug(slug)
+    }
+
+    /// The bearer tokens an endpoint verifies against, by token id.
+    fn tokens(entry: &brenn_webhook::EndpointRuntime) -> HashMap<String, Vec<u8>> {
+        match &entry.endpoint.scheme {
+            brenn_lib::webhook::scheme::SignatureScheme::BearerToken { tokens, .. } => {
+                tokens.clone()
+            }
+            other => panic!("the fixture endpoint is a bearer-token one, not {other:?}"),
+        }
+    }
+
+    /// A first endpoint: installed in the table, its channel minted, its owner
+    /// folded onto it, and named in the outcome. This is the deploy story the
+    /// facility exists for — the endpoint block and the agent's subscription
+    /// both arrive in one reload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_added_endpoint_is_installed_with_its_owner_folded_on() {
+        let tree = Tree::holding(&document_with_webhooks("", &[]));
+        let mut booted = boot(&tree, vec![]).await;
+        assert!(served(&booted, "inbox").is_none(), "nothing serves it yet");
+
+        let secret = tree.secret("inbox.token", "s3cret");
+        tree.write(&document_with_webhooks(
+            &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+            &["inbox"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_added,
+            vec!["inbox".to_string()],
+        );
+        assert!(status.delta.webhook_endpoints_changed.is_empty());
+        assert!(
+            status
+                .delta
+                .subscriptions_added
+                .iter()
+                .any(|line| line == &format!("{READER} webhook:inbox")),
+            "{:?}",
+            status.delta.subscriptions_added,
+        );
+
+        let entry = served(&booted, "inbox").expect("the endpoint is serving");
+        assert_eq!(entry.endpoint.mount, "/webhooks/inbox");
+        assert_eq!(tokens(&entry)["phone"], b"s3cret".to_vec());
+        // The mount index answers too: that is the lookup a request makes.
+        assert_eq!(
+            booted
+                .webhook
+                .endpoint_by_mount("/webhooks/inbox")
+                .expect("the mount resolves")
+                .slug(),
+            "inbox",
+        );
+        assert!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::App(READER.to_string())
+            )
+            .contains(&"webhook:inbox".to_string()),
+            "the owning agent reads the endpoint's channel",
+        );
+    }
+
+    /// The reverse: the block and the subscription leave together, and the
+    /// endpoint is out of the table before the reload reports. From that
+    /// instant its mount is an unrecognized URL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_endpoint_leaves_the_table() {
+        let secret = tree_with_endpoint().await;
+        let (tree, mut booted) = secret;
+        tree.write(&document_with_webhooks("", &[]));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_removed,
+            vec!["inbox".to_string()],
+        );
+        assert!(served(&booted, "inbox").is_none());
+        assert!(
+            booted
+                .webhook
+                .endpoint_by_mount("/webhooks/inbox")
+                .is_none()
+        );
+    }
+
+    /// A rotated secret with no document edit at all: the resolved endpoint
+    /// moved because its bytes did, so the reload is `applied` and names the
+    /// endpoint. The comparison is over the resolved form, never the text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rotated_signing_secret_is_applied_without_a_document_edit() {
+        let (tree, mut booted) = tree_with_endpoint().await;
+        tree.secret("inbox.token", "rotated");
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["inbox".to_string()],
+        );
+        let entry = served(&booted, "inbox").expect("the endpoint is serving");
+        assert_eq!(tokens(&entry)["phone"], b"rotated".to_vec());
+        // Nothing else moved: an endpoint's secret is not a channel edit.
+        assert!(status.delta.channels_changed.is_empty());
+        drop(tree);
+    }
+
+    /// An unreadable secret file refuses the whole reload in the environment
+    /// grammar, and the running endpoint keeps verifying against the bytes it
+    /// was serving. A fresh boot could not have produced that state either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_secret_file_refuses_the_reload_in_the_environment_grammar() {
+        let (tree, mut booted) = tree_with_endpoint().await;
+        std::fs::remove_file(tree.secret_path("inbox.token")).expect("the secret is removable");
+
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|line| line.contains("inbox.token")),
+            "the refusal names the file: {:?}",
+            status.refusals,
+        );
+        let entry = served(&booted, "inbox").expect("nothing was touched");
+        assert_eq!(tokens(&entry)["phone"], b"s3cret".to_vec());
+    }
+
+    /// Two endpoints swapping mounts: both are changed, and the table is
+    /// derived in one swap, so no request can see the intermediate in which two
+    /// entries claim one mount.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mount_swap_between_two_endpoints_converges() {
+        let tree = Tree::new();
+        let first = tree.secret("first.token", "one");
+        let second = tree.secret("second.token", "two");
+        let document = |a: &str, b: &str| {
+            format!(
+                "{}{}",
+                bearer_endpoint("first", a, &first),
+                bearer_endpoint("second", b, &second),
+            )
+        };
+        tree.write(&document_with_webhooks(
+            &document("/webhooks/a", "/webhooks/b"),
+            &["first", "second"],
+        ));
+        let mut booted = boot(&tree, vec![]).await;
+
+        tree.write(&document_with_webhooks(
+            &document("/webhooks/b", "/webhooks/a"),
+            &["first", "second"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["first".to_string(), "second".to_string()],
+            "changed follows candidate document order",
+        );
+        assert_eq!(
+            booted
+                .webhook
+                .endpoint_by_mount("/webhooks/a")
+                .expect("the mount resolves")
+                .slug(),
+            "second",
+        );
+        assert_eq!(
+            booted
+                .webhook
+                .endpoint_by_mount("/webhooks/b")
+                .expect("the mount resolves")
+                .slug(),
+            "first",
+        );
+    }
+
+    /// A components root holding one `brenn:replay` package, in the layout the
+    /// resolver reads: the artifact, and a record binding it.
+    fn install_replay_package(root: &std::path::Path, name: &str) {
+        install_replay_package_from(root, name, "brenn_replay.wasm");
+    }
+
+    /// [`install_replay_package`] over a named artifact, for the case whose
+    /// subject is the bytes under the package rather than the document over it.
+    fn install_replay_package_from(root: &std::path::Path, name: &str, artifact: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("a package directory");
+        let bytes = crate::consumers::fixture_artifact(artifact);
+        std::fs::write(dir.join(format!("{name}.wasm")), &bytes).expect("write the artifact");
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                "{{\n  \"v\": 2,\n  \"name\": \"{name}\",\n  \"world\": \"brenn:replay\",\n  \
+                 \"artifact\": \"{name}.wasm\",\n  \"artifact_sha256\": \"{}\"\n}}\n",
+                brenn_lib::util::sha256_hex(&bytes),
+            ),
+        )
+        .expect("write the record");
+    }
+
+    /// A replay-protected endpoint arriving at reload: the component is
+    /// compiled at prepare, and its store — held by nobody, since this endpoint
+    /// is new — is opened at commit, in that order. The proof that the store
+    /// was really opened is that a request path can take the guard's lock and
+    /// find a component whose `check` runs; an unopened one panics on the first
+    /// read.
+    ///
+    /// A second reload that moves nothing about the replay block then carries
+    /// the same guard forward, which is what keeps a store from being opened
+    /// twice over one file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_added_replay_protected_endpoint_opens_its_store_at_commit() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        let endpoint = |ceiling: usize| {
+            format!(
+                r#"
+webhook inbox {{
+    mount = "/webhooks/inbox";
+    transport_ceiling_bytes = {ceiling};
+    signature {{
+        scheme = bearer-token;
+        header = "authorization";
+    }}
+    token phone {{ secret_file = "{}"; }}
+    replay_protection {{
+        component = "replay-generic";
+        store_path = "{}";
+    }}
+}}
+"#,
+                secret.display(),
+                store.display(),
+            )
+        };
+        tree.write(&document_with_webhooks("", &[]));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&document_with_webhooks(&endpoint(1024), &["inbox"]));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        let entry = served(&booted, "inbox").expect("the endpoint is serving");
+        let guard = entry
+            .replay
+            .clone()
+            .expect("the endpoint is replay-protected");
+        {
+            let slot = guard.slot.lock().await;
+            let component = slot.as_ref().expect("the component is installed");
+            // A `check` reads the store; it would panic if commit had not
+            // opened it. The verdict itself is the component's business.
+            let (verdict, _quota_hit) = component.check(&brenn_wasm::CheckInput {
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+                received_at: 0,
+                key_id: "phone".to_string(),
+                endpoint_slug: "inbox".to_string(),
+            });
+            let _ = verdict;
+        }
+
+        // A ceiling edit is a changed endpoint whose replay block did not
+        // move: the guard travels, component, store and lock together.
+        tree.write(&document_with_webhooks(&endpoint(2048), &["inbox"]));
+        booted.driver.reload(TriggerSource::Bus).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["inbox".to_string()],
+        );
+        let after = served(&booted, "inbox").expect("the endpoint is serving");
+        assert_eq!(after.endpoint.transport_ceiling_bytes, 2048);
+        assert!(
+            Arc::ptr_eq(
+                &guard,
+                &after.replay.clone().expect("still replay-protected")
+            ),
+            "an unmoved replay block keeps the guard it is being served through",
+        );
+    }
+
+    /// One replay-protected bearer endpoint over `store`, with an explicit
+    /// store cap so a case can move the replay block without moving the path.
+    fn replay_endpoint(
+        slug: &str,
+        mount: &str,
+        secret: &std::path::Path,
+        store: &std::path::Path,
+        size_limit: &str,
+    ) -> String {
+        format!(
+            r#"
+webhook {slug} {{
+    mount = "{mount}";
+    signature {{
+        scheme = bearer-token;
+        header = "authorization";
+    }}
+    token phone {{ secret_file = "{}"; }}
+    replay_protection {{
+        component = "replay-generic";
+        store_path = "{}";
+        store_size_limit = "{size_limit}";
+    }}
+}}
+"#,
+            secret.display(),
+            store.display(),
+        )
+    }
+
+    /// One instant every replay case checks at, and its envelope spelling. The
+    /// component's skew window is five minutes wide, so a nonce written before
+    /// a reload is still live after it.
+    const REPLAY_NOW_MS: u64 = 1_748_000_000_000;
+    const REPLAY_NOW_RFC3339: &str = "2025-05-23T11:33:20.000Z";
+
+    /// Run one `check` through the component in this entry's guard, and hand
+    /// back the verdict.
+    ///
+    /// Two things are proven by calling this at all. A component whose store
+    /// was never opened panics on the first read, so reaching past the call is
+    /// the proof that commit opened one. And the verdict says *which* file: the
+    /// component records the last `sent_at` it accepted per client, so a second
+    /// envelope at the same instant is a `MonotonicityViolation` against a
+    /// store that already holds the first one and an accept against a store
+    /// that does not. That is how a case tells "the file at that path" from
+    /// "some empty file".
+    async fn replay_check_at(
+        entry: &brenn_webhook::EndpointRuntime,
+        nonce: &str,
+    ) -> Result<(), brenn_wasm::ReplayError> {
+        let guard = entry
+            .replay
+            .clone()
+            .expect("the endpoint is replay-protected");
+        let slot = guard.slot.lock().await;
+        let component = slot.as_ref().expect("the component is installed");
+        let (verdict, _quota_hit) = component.check(&replay_input(entry.slug(), nonce));
+        verdict
+    }
+
+    /// One phonebuddy envelope at [`REPLAY_NOW_MS`], the shape the fixture's
+    /// replay component parses.
+    fn replay_input(endpoint_slug: &str, nonce: &str) -> brenn_wasm::CheckInput {
+        let body = format!(
+            r#"{{"client_id":"phone","sent_at":"{REPLAY_NOW_RFC3339}","nonce":"{nonce}"}}"#
+        );
+        brenn_wasm::CheckInput {
+            headers: Vec::new(),
+            body: body.into_bytes(),
+            received_at: REPLAY_NOW_MS,
+            key_id: "phone".to_string(),
+            endpoint_slug: endpoint_slug.to_string(),
+        }
+    }
+
+    /// One envelope no store has seen, asserted accepted — which also leaves
+    /// the accepting store holding this instant for `phone`.
+    async fn replay_check(entry: &brenn_webhook::EndpointRuntime) {
+        let nonce = format!("first-sight-{}", entry.slug());
+        let verdict = replay_check_at(entry, &nonce).await;
+        assert!(
+            verdict.is_ok(),
+            "a first-sight envelope against a freshly opened store must be accepted: {verdict:?}",
+        );
+    }
+
+    /// Whether the store this entry checks against already accepted an envelope
+    /// at [`REPLAY_NOW_MS`] — the discriminator for "this component reads the
+    /// bytes at that path".
+    async fn replay_store_carries_history(entry: &brenn_webhook::EndpointRuntime) -> bool {
+        let nonce = format!("probe-{}", entry.slug());
+        match replay_check_at(entry, &nonce).await {
+            Ok(()) => false,
+            Err(brenn_wasm::ReplayError::MonotonicityViolation) => true,
+            other => panic!("unexpected verdict from the history probe: {other:?}"),
+        }
+    }
+
+    /// This entry's replay guard, by identity.
+    fn guard_of(entry: &brenn_webhook::EndpointRuntime) -> Arc<brenn_webhook::ReplayGuard> {
+        entry
+            .replay
+            .clone()
+            .expect("the endpoint is replay-protected")
+    }
+
+    /// A replay block that moved over an unmoved store path: the arriving
+    /// component is compiled at prepare, the retiring one is dropped at 21w,
+    /// and only then is the same file opened again. Nothing in the planner
+    /// forbids the pair — the path is used once in the candidate — so the
+    /// commit order is the whole of what keeps two holders off one file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changed_replay_component_over_the_same_store_path_converges() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        tree.write(&document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "64MiB"),
+            &["inbox"],
+        ));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        let serving = served(&booted, "inbox").expect("serving");
+        let before = guard_of(&serving);
+        // Leaves this instant in the store, so the component installed by the
+        // reload can be held to reading the same file rather than a new one.
+        replay_check(&serving).await;
+
+        tree.write(&document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "32MiB"),
+            &["inbox"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["inbox".to_string()],
+        );
+        let after = served(&booted, "inbox").expect("serving");
+        assert!(
+            !Arc::ptr_eq(&before, &guard_of(&after)),
+            "a moved replay block is a fresh guard, not the running one"
+        );
+        assert!(
+            replay_store_carries_history(&after).await,
+            "the arriving component reads the store the retired one wrote to",
+        );
+    }
+
+    /// An added endpoint taking a removed endpoint's store path. The planner's
+    /// uniqueness check passes — one use in the candidate — and the retiring
+    /// holder is dropped before the arriving one opens the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_added_endpoint_reusing_a_removed_endpoints_store_path_converges() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        tree.write(&document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "64MiB"),
+            &["inbox"],
+        ));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        replay_check(&served(&booted, "inbox").expect("serving")).await;
+
+        tree.write(&document_with_webhooks(
+            &replay_endpoint("mailbox", "/webhooks/mailbox", &secret, &store, "64MiB"),
+            &["mailbox"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_removed,
+            vec!["inbox".to_string()],
+        );
+        assert!(
+            served(&booted, "inbox").is_none(),
+            "the removed one is gone"
+        );
+        assert!(
+            replay_store_carries_history(&served(&booted, "mailbox").expect("serving")).await,
+            "the arriving endpoint inherited the file, not merely the path",
+        );
+    }
+
+    /// Two endpoints swapping store paths in one reload: both guards are fresh,
+    /// both old holders are dropped at 21w, and both files are opened at 22w.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_path_swap_between_two_endpoints_converges() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let first = tree.secret_path("first.sqlite");
+        let second = tree.secret_path("second.sqlite");
+        let pair = |a: &std::path::Path, b: &std::path::Path| {
+            format!(
+                "{}{}",
+                replay_endpoint("inbox", "/webhooks/inbox", &secret, a, "64MiB"),
+                replay_endpoint("mailbox", "/webhooks/mailbox", &secret, b, "64MiB"),
+            )
+        };
+        tree.write(&document_with_webhooks(
+            &pair(&first, &second),
+            &["inbox", "mailbox"],
+        ));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        // Only `first` is written to, so after the swap the endpoint holding
+        // `first` must see the history and the one holding `second` must not.
+        replay_check(&served(&booted, "inbox").expect("serving")).await;
+
+        tree.write(&document_with_webhooks(
+            &pair(&second, &first),
+            &["inbox", "mailbox"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["inbox".to_string(), "mailbox".to_string()],
+        );
+        let inbox = served(&booted, "inbox").expect("serving");
+        let mailbox = served(&booted, "mailbox").expect("serving");
+        assert_eq!(guard_of(&inbox).store_path, second);
+        assert_eq!(guard_of(&mailbox).store_path, first);
+        assert!(
+            replay_store_carries_history(&mailbox).await,
+            "mailbox inherited the file inbox had written to",
+        );
+        assert!(
+            !replay_store_carries_history(&inbox).await,
+            "inbox took the other file, which nothing had written to",
+        );
+    }
+
+    /// The cross-subsystem handover, and the whole reason 21w sits before
+    /// `start_consumers` rather than inside 22w: the store-path namespace is
+    /// one namespace, the planner holds it unique over the candidate alone, and
+    /// so a candidate may hand a retiring endpoint's store to an arriving
+    /// consumer. Only the commit order keeps the two holders apart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_consumer_taking_a_removed_endpoints_store_path_converges() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        tree.write(&document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "64MiB"),
+            &["inbox"],
+        ));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        replay_check(&served(&booted, "inbox").expect("serving")).await;
+
+        tree.write(&document_with_webhooks(
+            &format!(
+                r#"{PACKAGED}component Sifter {{
+    abi = processor;
+    requires = [ports, store];
+    in inbound;
+    out digest;
+}}
+{PACKAGED}
+
+new sifter: Sifter {{
+    grants = [ports, store];
+    store_path = "{}";
+    in inbound <- work {{ push_depth = 4; }}
+    out digest -> scratch;
+}}
+"#,
+                store.display(),
+            ),
+            &[],
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_removed,
+            vec!["inbox".to_string()],
+        );
+        assert_eq!(status.delta.consumers_added, vec!["sifter".to_string()]);
+        assert!(
+            served(&booted, "inbox").is_none(),
+            "the endpoint that held the store is gone"
+        );
+    }
+
+    /// A bundle release that ships new bytes under the package an unmoved
+    /// `replay_protection` block names. A fresh boot would compile the new
+    /// artifact, so the reload must install it: the endpoint is `changed` with
+    /// a fresh guard, and the store is handed from the old component to the new
+    /// one. Nothing in the document moved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bumped_replay_package_is_applied_under_an_unmoved_document() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        let document = document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "64MiB"),
+            &["inbox"],
+        );
+        tree.write(&document);
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        let before = guard_of(&served(&booted, "inbox").expect("serving"));
+
+        // Same package name, same document, different artifact bytes.
+        install_replay_package_from(
+            components.path(),
+            "replay-generic",
+            "brenn_replay_generic.wasm",
+        );
+        tree.write(&document);
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["inbox".to_string()],
+            "a bumped package is a changed endpoint, not an unchanged reload",
+        );
+        let after = guard_of(&served(&booted, "inbox").expect("serving"));
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the endpoint serves the component compiled from the new bytes",
+        );
+        assert_eq!(
+            after.verified.artifact_sha256,
+            brenn_lib::util::sha256_hex(&crate::consumers::fixture_artifact(
+                "brenn_replay_generic.wasm"
+            )),
+            "the installed guard carries the release it was compiled from",
+        );
+    }
+
+    /// The same bytes under the same document are not a handover: nothing is
+    /// reported and the running guard keeps serving, so a re-deploy or a
+    /// rollback whose artifact is identical costs the endpoint nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reinstalled_replay_package_with_the_same_bytes_is_unchanged() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        let document = document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "64MiB"),
+            &["inbox"],
+        );
+        tree.write(&document);
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        let before = guard_of(&served(&booted, "inbox").expect("serving"));
+
+        install_replay_package(components.path(), "replay-generic");
+        tree.write(&document);
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert!(
+            status.delta.webhook_endpoints_changed.is_empty(),
+            "{status:?}"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &before,
+                &guard_of(&served(&booted, "inbox").expect("serving"))
+            ),
+            "identical bytes leave the running component in place",
+        );
+    }
+
+    /// A replay store whose directory is not on this host: refused at prepare,
+    /// in the environment grammar, naming the path. The alternative is a commit
+    /// that reaches `open_store` and aborts the process — every live session
+    /// with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replay_store_under_a_missing_directory_refuses_the_reload() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        tree.write(&document_with_webhooks("", &[]));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        let missing = std::path::Path::new("/nonexistent-brenn-store-dir/replay.sqlite");
+        tree.write(&document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, missing, "64MiB"),
+            &["inbox"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|line| line.contains("parent directory does not exist")
+                    && line.contains("nonexistent-brenn-store-dir")),
+            "the refusal names the directory: {:?}",
+            status.refusals,
+        );
+        assert!(served(&booted, "inbox").is_none(), "nothing was installed");
+    }
+
+    /// A replay component whose package no declared mount holds: refused at
+    /// prepare in the environment grammar, naming the package. The refusal is
+    /// the whole point of compiling at 7w — past it, commit's `open_store` and
+    /// its `expect` take the process down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_replay_package_refuses_the_reload() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        tree.write(&document_with_webhooks("", &[]));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+
+        tree.write(&document_with_webhooks(
+            &format!(
+                r#"
+webhook inbox {{
+    mount = "/webhooks/inbox";
+    signature {{
+        scheme = bearer-token;
+        header = "authorization";
+    }}
+    token phone {{ secret_file = "{}"; }}
+    replay_protection {{
+        component = "replay-nowhere";
+        store_path = "{}";
+    }}
+}}
+"#,
+                secret.display(),
+                store.display(),
+            ),
+            &["inbox"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|line| line.contains("replay-nowhere")),
+            "the refusal names the package: {:?}",
+            status.refusals,
+        );
+        assert!(served(&booted, "inbox").is_none(), "nothing was installed");
+    }
+
+    /// A candidate the webhook *document* half refuses — two endpoints on one
+    /// mount — is reported in the resolver's own words. Not through the planner
+    /// classifier, which would frame an operator's duplicate mount as a
+    /// possible host defect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_duplicate_mount_is_refused_in_the_resolvers_own_words() {
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        tree.write(&document_with_webhooks(
+            &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+            &["inbox"],
+        ));
+        let mut booted = boot(&tree, vec![]).await;
+
+        tree.write(&document_with_webhooks(
+            &format!(
+                "{}{}",
+                bearer_endpoint("inbox", "/webhooks/shared", &secret),
+                bearer_endpoint("mailbox", "/webhooks/shared", &secret),
+            ),
+            &["inbox", "mailbox"],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|line| line.starts_with("[[webhook_endpoint]]")
+                    && line.contains("/webhooks/shared")),
+            "the refusal is the resolver's: {:?}",
+            status.refusals,
+        );
+        assert!(
+            !status
+                .refusals
+                .iter()
+                .any(|line| line.contains("host defect")),
+            "an operator's duplicate mount is not framed as a host defect: {:?}",
+            status.refusals,
+        );
+        assert_eq!(
+            served(&booted, "inbox")
+                .expect("still serving")
+                .endpoint
+                .mount,
+            "/webhooks/inbox",
+            "nothing was touched",
+        );
+    }
+
+    /// Replay protection gained by an endpoint that keeps its slug, then lost
+    /// again. The losing transition is the only one where a live guard is
+    /// emptied with no arriving store to open, and the proof that its holder
+    /// was really released is that a third reload can protect the same path
+    /// again — a file still held would panic on the second open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_protection_gained_and_lost_on_a_surviving_endpoint_converges() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        let bare = document_with_webhooks(
+            &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+            &["inbox"],
+        );
+        let protected = document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "64MiB"),
+            &["inbox"],
+        );
+        tree.write(&bare);
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        assert!(
+            served(&booted, "inbox").expect("serving").replay.is_none(),
+            "the endpoint boots unprotected",
+        );
+
+        // Gained.
+        tree.write(&protected);
+        booted.driver.reload(TriggerSource::Bus).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["inbox".to_string()],
+        );
+        replay_check(&served(&booted, "inbox").expect("serving")).await;
+
+        // Lost: the guard goes, and with it the holder of the file.
+        tree.write(&bare);
+        booted.driver.reload(TriggerSource::Bus).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        let entry = served(&booted, "inbox").expect("serving");
+        assert!(
+            entry.replay.is_none(),
+            "an endpoint that lost its replay block serves without a guard",
+        );
+
+        // Gained again over the same path. This is what proves the release:
+        // a component still holding that file makes commit's open panic.
+        tree.write(&protected);
+        booted.driver.reload(TriggerSource::Bus).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(
+            replay_store_carries_history(&served(&booted, "inbox").expect("serving")).await,
+            "the re-added protection opened the same file, which nothing was holding",
+        );
+    }
+
+    /// An endpoint's owner moving from the agent that subscribes to it to a
+    /// WASM consumer's `in` port. The endpoint block itself does not move: what
+    /// moves is who reads the channel it mints, which the resolver stamps onto
+    /// the endpoint — so this reaches the delta twice, as a changed endpoint and
+    /// as a withdrawn agent subscription.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owner_change_from_agent_to_consumer_converges() {
+        let components = tempfile::tempdir().expect("a components root");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let endpoint = bearer_endpoint("inbox", "/webhooks/inbox", &secret);
+        tree.write(&document_with_webhooks(&endpoint, &["inbox"]));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        assert!(
+            matches!(
+                served(&booted, "inbox").expect("serving").endpoint.owner,
+                brenn_lib::webhook::config::WebhookOwner::App(_),
+            ),
+            "the agent owns it at boot",
+        );
+
+        tree.write(&document_with_webhooks(
+            &format!(
+                r#"{endpoint}{PACKAGED}component Sifter {{
+    abi = processor;
+    requires = [ports];
+    in hooked;
+    out digest;
+}}
+{PACKAGED}
+
+new sifter: Sifter {{
+    grants = [ports];
+    in hooked <- "webhook:inbox" {{ push_depth = 4; retain_depth = 8; }}
+    out digest -> scratch;
+}}
+"#
+            ),
+            &[],
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.webhook_endpoints_changed,
+            vec!["inbox".to_string()],
+            "the stamped owner moved",
+        );
+        assert!(
+            status
+                .delta
+                .subscriptions_removed
+                .iter()
+                .any(|line| line == &format!("{READER} webhook:inbox")),
+            "the agent's subscription is withdrawn: {:?}",
+            status.delta.subscriptions_removed,
+        );
+        assert_eq!(status.delta.consumers_added, vec!["sifter".to_string()]);
+        let entry = served(&booted, "inbox").expect("serving");
+        assert_eq!(
+            entry.endpoint.owner,
+            brenn_lib::webhook::config::WebhookOwner::Wasm(Arc::from("sifter")),
+        );
+        let channel = booted
+            .messenger
+            .directory()
+            .resolve("webhook:inbox")
+            .expect("the channel stays at its address through the owner change");
+        assert!(
+            channel.subscribers.iter().any(|s| matches!(
+                &s.kind,
+                brenn_lib::messaging::SubscriberEntryKind::Wasm(slug) if &**slug == "sifter"
+            )),
+            "the new owner is folded onto the channel it now reads",
+        );
+    }
+
+    /// The reverse edit, which is not an owner change but an orphan: the
+    /// endpoint block stays and its only subscriber leaves. Refused offline and
+    /// here, in rule 9's own words.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_left_without_a_subscriber_refuses_the_reload() {
+        let (tree, mut booted) = tree_with_endpoint().await;
+        let secret = tree.secret_path("inbox.token");
+
+        tree.write(&document_with_webhooks(
+            &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+            &[],
+        ));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert!(
+            status
+                .refusals
+                .iter()
+                .any(|line| line.contains("orphan endpoints are not permitted")),
+            "{:?}",
+            status.refusals,
+        );
+        assert!(
+            served(&booted, "inbox").is_some(),
+            "the running endpoint keeps serving"
+        );
+    }
+
+    /// A request that took the guard's lock before commit reaches 21w checks
+    /// against the component it holds, and commit waits behind it. The other
+    /// half of the invariant — a request that arrives after 21w finds an empty
+    /// slot and answers 503 — is
+    /// `inbound.rs`'s `a_request_whose_guard_was_emptied_answers_503_and_publishes_nothing`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_endpoints_component_serves_a_request_holding_its_guard() {
+        let components = tempfile::tempdir().expect("a components root");
+        install_replay_package(components.path(), "replay-generic");
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        let store = tree.secret_path("replay.sqlite");
+        tree.write(&document_with_webhooks(
+            &replay_endpoint("inbox", "/webhooks/inbox", &secret, &store, "64MiB"),
+            &["inbox"],
+        ));
+        let mut booted = boot(&tree, vec![components.path().to_path_buf()]).await;
+        let guard = guard_of(&served(&booted, "inbox").expect("serving"));
+
+        // Stand in for a request that has verified its signature and is now in
+        // the replay step: it holds the slot lock across the whole reload.
+        let held = Arc::clone(&guard);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let slot = held.slot.lock().await;
+            let component = Arc::clone(slot.as_ref().expect("the running component"));
+            locked_tx.send(()).expect("the test is waiting");
+            // Long enough that commit's 21w is certainly waiting on this lock.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let (verdict, _quota_hit) = component.check(&replay_input("inbox", "in-flight"));
+            verdict
+        });
+        locked_rx.await.expect("the holder took the lock");
+
+        tree.write(&document_with_webhooks("", &[]));
+        booted.driver.reload(TriggerSource::Bus).await;
+
+        let verdict = holder.await.expect("the holder task");
+        assert!(
+            verdict.is_ok(),
+            "the in-flight request checked against the component it held: {verdict:?}",
+        );
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(served(&booted, "inbox").is_none(), "the endpoint is gone");
+        assert!(
+            guard.slot.lock().await.is_none(),
+            "commit emptied the guard once the request let go of it",
+        );
+    }
+
+    /// A booted process serving one bearer endpoint whose token is `s3cret`.
+    async fn tree_with_endpoint() -> (Tree, Booted) {
+        let tree = Tree::new();
+        let secret = tree.secret("inbox.token", "s3cret");
+        tree.write(&document_with_webhooks(
+            &bearer_endpoint("inbox", "/webhooks/inbox", &secret),
+            &["inbox"],
+        ));
+        let booted = boot(&tree, vec![]).await;
+        (tree, booted)
     }
 }

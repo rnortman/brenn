@@ -189,34 +189,22 @@ pub async fn try_handle_mqtt_tool(
                 )
             });
 
-            // Require MQTT service. Server-global readiness, distinct from a
-            // per-app grant/ACL denial (handled inside `enforce_and_publish`). A
-            // per-client session miss after an ACL pass is a boot-prevented panic
-            // invariant, not a runtime outcome (design §3.5).
-            let svc = match bridge.mqtt_service() {
-                Some(s) => s,
-                None => {
-                    return Some(
-                        tool_error_response(
-                            bridge,
-                            tool_name,
-                            tool_input,
-                            "MQTT is not configured on this server",
-                        )
-                        .await,
-                    );
-                }
-            };
+            // The service always exists; a per-app grant/ACL denial is handled
+            // inside `enforce_and_publish`, and a per-client session miss after
+            // an ACL pass is a tool error: the policy read above is a snapshot,
+            // and a reload that stops a client swaps the authority naming it
+            // before it stops the session, so an in-flight tool call can hold an
+            // authority the registry has already moved past.
+            let svc = bridge.mqtt_service();
 
-            // Shared enforcement (design §2.3): the grant + per-client ACL,
-            // session lookup, and send-budget decrement collapse into one call,
-            // preserving the "validate before budget" ordering inside
-            // `enforce_and_publish`. JSON extraction, address parsing, body
-            // decoding, and all response mapping stay here (design §2.2). The
-            // shared function locks the DB only for the budget decrement and drops
-            // it before the broker await, so this future stays `Send` (it runs in a
-            // `tokio::spawn`ed CC event loop) — we pass the `Db` handle, not a held
-            // connection guard.
+            // The grant + per-client ACL, session lookup, and send-budget
+            // decrement collapse into one call, preserving the "validate before
+            // budget" ordering inside `enforce_and_publish`. JSON extraction,
+            // address parsing, body decoding, and all response mapping stay here.
+            // The shared function locks the DB only for the budget decrement and
+            // drops it before the broker await, so this future stays `Send` (it
+            // runs in a `tokio::spawn`ed CC event loop) — we pass the `Db` handle,
+            // not a held connection guard.
             let outcome = enforce_and_publish(
                 svc,
                 &policy,
@@ -283,6 +271,29 @@ pub async fn try_handle_mqtt_tool(
                         )
                     };
                     let err = ToolErr { ok: false, error };
+                    (
+                        serde_json::to_value(&err).expect("ToolErr serialization is infallible"),
+                        true,
+                    )
+                }
+                Err(MqttEgressError::ClientNotRegistered { client }) => {
+                    // The operator removed the client from the document while
+                    // this call was in flight. Not a security event and not a
+                    // host bug: the agent asked for something that was true when
+                    // it asked. `client` is CC-supplied, so the log line
+                    // sanitizes it; the LLM-facing text repeats what it sent.
+                    tracing::warn!(
+                        app_slug = %bridge.app_slug,
+                        conversation_id = bridge.conversation_id,
+                        client = %sanitize_untrusted_str(&client, MAX_LOGGED_UNTRUSTED_BYTES),
+                        "MqttSend: the client's session is no longer registered (removed by a reload)"
+                    );
+                    let err = ToolErr {
+                        ok: false,
+                        error: Cow::Owned(format!(
+                            "MQTT client `{client}` is no longer configured on this server"
+                        )),
+                    };
                     (
                         serde_json::to_value(&err).expect("ToolErr serialization is infallible"),
                         true,
@@ -488,23 +499,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mqtt_send_no_service_returns_error() {
-        // Use a bridge with an mqtt_publish ACL so the per-app gate passes, allowing
-        // the server-global "MQTT not configured on this server" gate to fire.
+    async fn mqtt_send_on_a_client_with_no_session_is_a_tool_error() {
+        // An ACL naming a client the registry holds no session for is what an
+        // in-flight tool call sees when a reload removes that client: the
+        // policy this call is deciding against was resolved before the agent
+        // swap, and the session is stopped after it. The agent asked for
+        // something that was true when it asked, so it is told, not panicked
+        // at.
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_mqtt_publish_acl().await;
         let req = post_tool_use_req(
             MCP_MQTT_SEND_TOOL,
             json!({ "to": "mqtt:ha:home/sensor/temp", "body": "42" }),
         );
-        let result = try_handle_mqtt_tool(&bridge, &req).await;
-        match result {
+        match try_handle_mqtt_tool(&bridge, &req).await {
             Some(MqttHandled::Respond(CcApprovalDecision::Continue {
                 updated_output: Some(out),
             })) => {
                 let v: serde_json::Value = serde_json::from_str(&out).unwrap();
                 assert_eq!(v["ok"], json!(false));
                 let err = v["error"].as_str().unwrap();
-                assert!(err.contains("not configured"), "error: {err}");
+                assert!(
+                    err.contains("no longer configured") && err.contains("ha"),
+                    "the error names the client and why: {err}"
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }

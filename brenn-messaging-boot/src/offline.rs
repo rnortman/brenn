@@ -25,11 +25,10 @@ use crate::{PlanInputs, plan_messaging};
 /// replay store paths, and no environment anywhere.
 ///
 /// - `validate_and_resolve` and everything downstream of it: container and
-///   working-dir stats, the XDG runtime dir, the integration registry, webhook
-///   endpoint resolution beyond the channel entry the planner mints from the raw
-///   block (slug charset, duplicate slug and mount, ownership, signature
-///   scheme, secrets, replay protection), per-app webhook and mqtt subscription
-///   stamping, and mqtt client secrets (`password_file` / `ca_file`).
+///   working-dir stats, the XDG runtime dir, the integration registry, the
+///   webhook endpoints' and mqtt clients' secret files (a key's or token's
+///   `secret_file`, a client's `password_file` / `ca_file`), the directory a
+///   replay `store_path` lives in, and per-app mqtt subscription stamping.
 /// - The async tool substrate: with no registry there are no request channels,
 ///   no result inboxes, no executor participant and no derived async grants, so
 ///   the `brenn:tools/` and `brenn:tool-results/` arms of the exact-tuning
@@ -37,9 +36,6 @@ use crate::{PlanInputs, plan_messaging};
 ///   `validate_grants` does not run.
 /// - The description single-writer sweep, which reads the resolved app
 ///   policies.
-/// - `assert_unique_store_paths` against the replay endpoints' stores, of which
-///   this pass is handed none. Consumer stores are still held unique against
-///   each other.
 /// - The per-instance import⊆grants assert and the per-instance specification
 ///   binding (`brenn_surface_server`'s `validate_surface_assets`): both read the
 ///   built surface asset tree — the component trees and the binding records that
@@ -58,21 +54,25 @@ use crate::{PlanInputs, plan_messaging};
 /// the words boot would have logged. A caller with no `tracing` subscriber —
 /// the config-check tool — prints it beside its verdict.
 ///
+/// `replay_store_paths` are the webhook endpoints' replay stores, which the
+/// planner holds the consumers' stores unique against. Callers must derive them
+/// with [`brenn_lib::webhook::webhook_store_paths`].
+///
 /// # Panics
 ///
 /// On any refusal the planner makes.
 // TODO(config-check-offline-residue): the residue above is what a config check
-// still cannot answer. Closing the webhook-endpoint half wants endpoint
-// resolution split the way the mqtt client resolution was.
+// still cannot answer.
 pub fn resolve_messaging_offline(
     config: &BrennConfig,
+    replay_store_paths: &[std::path::PathBuf],
 ) -> Option<brenn_surface_server::SurfaceErrorAdvisory> {
     let plan = plan_messaging(&PlanInputs {
         config,
         apps: None,
         mqtt_clients: &brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients),
         tool_registry: None,
-        replay_store_paths: &[],
+        replay_store_paths,
     });
     plan.and_then(|plan| plan.surface_error_advisory)
 }
@@ -98,7 +98,7 @@ mod tests {
         config
             .channels
             .push(durable_channel("brenn:alerts", Depth::Bounded(1)));
-        resolve_messaging_offline(&config);
+        resolve_messaging_offline(&config, &[]);
     }
 
     /// The same document with the index declared passes, so the refusal above is
@@ -112,14 +112,14 @@ mod tests {
         config
             .channels
             .push(durable_channel("brenn:surface.index", Depth::Bounded(1)));
-        resolve_messaging_offline(&config);
+        resolve_messaging_offline(&config, &[]);
     }
 
     /// The `None` arm: a document that activates no messaging is handed no
     /// directory, so the validator has no derived channel to require.
     #[test]
     fn a_document_with_no_messaging_is_handed_no_directory() {
-        resolve_messaging_offline(&BrennConfig::default());
+        resolve_messaging_offline(&BrennConfig::default(), &[]);
     }
 
     /// A remote is a disjunct of its own: it attaches to the bus, so the
@@ -130,7 +130,7 @@ mod tests {
     fn a_remote_only_document_owes_the_index_too() {
         let mut config = BrennConfig::default();
         config.remotes.push(remote("pod"));
-        resolve_messaging_offline(&config);
+        resolve_messaging_offline(&config, &[]);
     }
 
     /// And a consumer is another: the document has activated messaging, so the
@@ -142,7 +142,7 @@ mod tests {
         config
             .wasm_consumers
             .push(crate::test_fixtures::minimal_wasm_consumer());
-        resolve_messaging_offline(&config);
+        resolve_messaging_offline(&config, &[]);
     }
 
     /// A remote that names a token file it never reads here: the file is an

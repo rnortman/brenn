@@ -20,6 +20,7 @@ use crate::state::{
     SupervisorState,
 };
 use brenn_lib::messaging::Urgency;
+use brenn_lib::mqtt::config::MqttClientConfig;
 use brenn_lib::mqtt::error::MqttError;
 
 // ---------------------------------------------------------------------------
@@ -99,19 +100,57 @@ pub enum IngressUnsubscribeOutcome {
 // MqttService
 // ---------------------------------------------------------------------------
 
-/// The MQTT service. Owned once at startup and held on `AppState` as
-/// `Option<Arc<MqttService>>`.
+/// The MQTT service: per-client session registry, event router, and the
+/// publish + ingress paths. Always present whether or not any
+/// `[[mqtt_client]]` is declared.
 pub struct MqttService {
     pub(crate) router: Arc<RwLock<Option<Arc<dyn MqttEventRouter>>>>,
     /// Per-client session handles, keyed by `client_slug`. One session per client
-    /// carries both the publish path and the ingress delivery path. Populated once
-    /// at startup; read-only thereafter.
-    pub(crate) clients: Arc<RwLock<HashMap<String, Arc<MqttClientHandle>>>>,
+    /// carries both the publish path and the ingress delivery path.
+    ///
+    /// A reload's commit adds, replaces and removes entries. The lock is held
+    /// only for a lookup or a mutation, never across an await, so a caller that
+    /// obtained a handle keeps serving through a commit that replaces it.
+    pub(crate) clients: std::sync::RwLock<HashMap<String, Arc<MqttClientHandle>>>,
 }
 
 /// `last_error` reported for a client with no registered session — the honest
 /// "MQTT runtime not present for this client" state.
 const NO_CLIENT_SESSION: &str = "no session for client";
+
+/// Poisoning message for the client registry lock. A panic while the registry
+/// was being mutated means a commit step died mid-swap; there is no honest way
+/// to keep serving from a half-written registry.
+const CLIENTS_LOCK: &str = "MqttService client registry lock poisoned";
+
+/// How many times a filter edit may be re-aimed at a freshly registered
+/// successor before the churn is read as a defect rather than a reload.
+const MAX_RETARGETS: u32 = 8;
+
+/// Count one re-aim of a filter edit that landed on a handle the registry had
+/// already replaced, and return the new count.
+///
+/// # Panics
+///
+/// Panics once the count passes [`MAX_RETARGETS`]. Each swap is one reload
+/// commit restarting this client, and a reload is an operator's deliberate act,
+/// so eight of them inside one filter edit is not a busy system — it is a
+/// registry being rewritten by something that is not a commit.
+fn retarget_on_swap(client_slug: &str, attempts: u32) -> u32 {
+    let attempts = attempts + 1;
+    assert!(
+        attempts <= MAX_RETARGETS,
+        "MqttService: a filter edit on client {client_slug:?} was re-aimed {MAX_RETARGETS} times \
+         and the registry moved under every one of them — the session for a slug is replaced \
+         only by a reload commit, so this is a host bug",
+    );
+    tracing::debug!(
+        client = client_slug,
+        attempts,
+        "filter edit re-aimed: the client's session was replaced while the edit was in flight",
+    );
+    attempts
+}
 
 impl MqttService {
     /// Construct an empty service. Populate with `add_client` then `set_router`
@@ -119,7 +158,7 @@ impl MqttService {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             router: Arc::new(RwLock::new(None)),
-            clients: Arc::new(RwLock::new(HashMap::new())),
+            clients: std::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -135,26 +174,79 @@ impl MqttService {
         self.router.read().await.clone()
     }
 
-    /// Register a per-client session handle, keyed by `client_slug`. Called once
-    /// per client at startup (bootstrap spawn loop).
-    pub async fn add_client(&self, handle: Arc<MqttClientHandle>) {
+    /// Register a per-client session handle, keyed by `client_slug`, replacing
+    /// any entry the slug already had.
+    pub fn add_client(&self, handle: Arc<MqttClientHandle>) {
         self.clients
             .write()
-            .await
+            .expect(CLIENTS_LOCK)
             .insert(handle.config.identity.slug.clone(), handle);
     }
 
-    /// Look up the session handle for `client_slug`.
+    /// Take the session handle for `client_slug` out of the registry.
     ///
-    /// The registry is written only at startup; after that it is read-only. A
-    /// write-lock held at this point is a bug (unexpected state), so we panic
-    /// (fail-loud posture on the lookup path).
+    /// The caller owns the returned handle and is responsible for stopping its
+    /// supervisor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no entry is registered for the slug — an absent entry is a
+    /// host bug.
+    pub fn remove_client(&self, client_slug: &str) -> Arc<MqttClientHandle> {
+        self.clients
+            .write()
+            .expect(CLIENTS_LOCK)
+            .remove(client_slug)
+            .unwrap_or_else(|| {
+                panic!(
+                    "MqttService::remove_client: no session registered for client \
+                     {client_slug:?}"
+                )
+            })
+    }
+
+    /// Signal every registered supervisor to stop, without waiting for any of
+    /// them to exit. Returns the number of supervisors signalled.
+    pub fn stop_all(&self) -> usize {
+        let clients = self.clients.read().expect(CLIENTS_LOCK);
+        for handle in clients.values() {
+            handle.stop();
+        }
+        clients.len()
+    }
+
+    /// Look up the session handle for `client_slug`.
     pub fn get_client(&self, client_slug: &str) -> Option<Arc<MqttClientHandle>> {
-        let clients = self.clients.try_read().expect(
-            "MqttService clients map write lock held unexpectedly — the registry is read-only \
-             after startup",
-        );
-        clients.get(client_slug).cloned()
+        self.clients
+            .read()
+            .expect(CLIENTS_LOCK)
+            .get(client_slug)
+            .cloned()
+    }
+
+    /// Whether `handle` is still the session the registry holds for
+    /// `client_slug` — the same allocation, not an equal value.
+    fn still_registered(&self, client_slug: &str, handle: &Arc<MqttClientHandle>) -> bool {
+        self.clients
+            .read()
+            .expect(CLIENTS_LOCK)
+            .get(client_slug)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+    }
+
+    /// The resolved config of every registered session, by slug.
+    ///
+    /// A reload's baseline for `[[mqtt_client]]`: what this process is
+    /// connected as right now, which is the only side that answers "would a
+    /// fresh boot of the candidate dial something else". Secrets included —
+    /// they are what the config is compared on.
+    pub fn baseline(&self) -> HashMap<String, Arc<MqttClientConfig>> {
+        self.clients
+            .read()
+            .expect(CLIENTS_LOCK)
+            .iter()
+            .map(|(slug, handle)| (slug.clone(), handle.config.clone()))
+            .collect()
     }
 
     /// Every client that has a registered session, sorted by slug.
@@ -162,16 +254,14 @@ impl MqttService {
     /// Sorted here rather than by each caller: the registry is a `HashMap`, so
     /// an unsorted return is a different order on every run, and the callers
     /// are assertions comparing the set element for element.
-    ///
-    /// Read under the same non-blocking lock `get_client` takes, and for the
-    /// same reason: the registry is written only at startup, so a write lock
-    /// held here is a host bug rather than contention to wait out.
     pub fn client_slugs(&self) -> Vec<String> {
-        let clients = self.clients.try_read().expect(
-            "MqttService clients map write lock held unexpectedly — the registry is read-only \
-             after startup",
-        );
-        let mut slugs: Vec<String> = clients.keys().cloned().collect();
+        let mut slugs: Vec<String> = self
+            .clients
+            .read()
+            .expect(CLIENTS_LOCK)
+            .keys()
+            .cloned()
+            .collect();
         slugs.sort();
         slugs
     }
@@ -293,14 +383,30 @@ impl MqttService {
     /// ([`IngressSubscribeOutcome::ClientFailed`]). The supervisor state is the
     /// only thing that distinguishes them, so it is read here rather than left
     /// for a caller to guess from the empty client cell.
+    ///
+    /// The filter is added to whichever handle the registry holds when the add
+    /// completes: a reload restarting this client swaps a successor in
+    /// underneath, and a filter left on the predecessor is lost outright —
+    /// its durable row is on both sides of every later reload's comparison, so
+    /// no move ever re-asserts it. See [`retarget_on_swap`]. The successor's
+    /// set is claimed by the handover until its inherit has been written, so an
+    /// edit that reaches the successor mid-handover applies on top of the
+    /// inherited set and cannot be discarded by it.
     pub async fn subscribe_filter(
         &self,
         client_slug: &str,
         topic_filter: String,
         qos: u8,
     ) -> Option<IngressSubscribeOutcome> {
-        let handle = self.get_client(client_slug)?;
-        let sub = handle.add_subscription(topic_filter, qos).await;
+        let mut attempts = 0;
+        let (handle, sub) = loop {
+            let handle = self.get_client(client_slug)?;
+            let sub = handle.add_subscription(topic_filter.clone(), qos).await;
+            if self.still_registered(client_slug, &handle) {
+                break (handle, sub);
+            }
+            attempts = retarget_on_swap(client_slug, attempts);
+        };
         let client = handle.client.lock().await.clone();
         let outcome = match client {
             None => match &*handle.supervisor_state.read().await {
@@ -325,13 +431,26 @@ impl MqttService {
     /// subscriber on the filter.**
     ///
     /// Returns `None` if `client_slug` has no registered session.
+    ///
+    /// Retargets across a restart for the reason
+    /// [`Self::subscribe_filter`] does, in the other direction: a removal left
+    /// on the predecessor would let the successor inherit a filter the document
+    /// no longer binds and re-assert it at the broker forever.
     pub async fn unsubscribe_filter(
         &self,
         client_slug: &str,
         topic_filter: &str,
     ) -> Option<IngressUnsubscribeOutcome> {
-        let handle = self.get_client(client_slug)?;
-        if !handle.remove_subscription(topic_filter).await {
+        let mut attempts = 0;
+        let (handle, removed) = loop {
+            let handle = self.get_client(client_slug)?;
+            let removed = handle.remove_subscription(topic_filter).await;
+            if self.still_registered(client_slug, &handle) {
+                break (handle, removed);
+            }
+            attempts = retarget_on_swap(client_slug, attempts);
+        };
+        if !removed {
             tracing::warn!(
                 client = client_slug,
                 topic_filter,
@@ -478,7 +597,7 @@ impl Default for MqttService {
     fn default() -> Self {
         Self {
             router: Arc::new(RwLock::new(None)),
-            clients: Arc::new(RwLock::new(HashMap::new())),
+            clients: std::sync::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -525,7 +644,7 @@ mod tests {
         let handle = make_handle("home");
         let (client, _eventloop) = live_client();
         *handle.client.lock().await = Some(client);
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
 
         let outcome = svc
             .subscribe_filter("home", "sensors/+/temp".to_string(), 1)
@@ -548,7 +667,7 @@ mod tests {
         let handle = make_handle("home");
         let (client, _eventloop) = live_client();
         *handle.client.lock().await = Some(client);
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
         svc.subscribe_filter("home", "sensors/#".to_string(), 1)
             .await;
         assert_eq!(
@@ -569,7 +688,7 @@ mod tests {
         let handle = make_handle("home");
         let (client, _eventloop) = live_client();
         *handle.client.lock().await = Some(client);
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
         svc.subscribe_filter("home", "sensors/#".to_string(), 1)
             .await;
         assert_eq!(
@@ -608,7 +727,7 @@ mod tests {
         let handle = make_handle("home");
         let (client, _eventloop) = live_client();
         *handle.client.lock().await = Some(client);
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
         svc.subscribe_filter("home", "sensors/#".to_string(), 1)
             .await;
         handle.record_grant("sensors/#").await;
@@ -630,7 +749,7 @@ mod tests {
         let svc = MqttService::new();
         let handle = make_handle("home");
         *handle.client.lock().await = Some(dead_live_client());
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
 
         let outcome = svc
             .subscribe_filter("home", "sensors/+/temp".to_string(), 1)
@@ -652,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn add_get_client_round_trip() {
         let svc = MqttService::new();
-        svc.add_client(make_handle("home")).await;
+        svc.add_client(make_handle("home"));
 
         let got = svc.get_client("home");
         assert!(got.is_some());
@@ -671,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn ingress_health_registered_but_disconnected() {
         let svc = MqttService::new();
-        svc.add_client(make_handle("home")).await;
+        svc.add_client(make_handle("home"));
         let (label, err) = svc.ingress_health("home").await;
         // A fresh handle starts in Disconnected with no prior error.
         assert_eq!(label, ConnectorHealthLabel::Disconnected);
@@ -685,7 +804,7 @@ mod tests {
         handle
             .add_subscription("sensors/+/temp".to_string(), 2)
             .await;
-        svc.add_client(handle).await;
+        svc.add_client(handle);
 
         assert_eq!(
             svc.ingress_filter_qos("home", "sensors/+/temp").await,
@@ -706,7 +825,7 @@ mod tests {
         config.identity.urgency = Urgency::High;
         config.identity.qos = 2;
         let handle = MqttClientHandle::new(Arc::new(config), vec![], tx);
-        svc.add_client(handle).await;
+        svc.add_client(handle);
 
         assert_eq!(svc.ingress_urgency("home").await, Some(Urgency::High));
         assert_eq!(svc.ingress_qos("home").await, Some(2));
@@ -727,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_filter_disconnected_defers_but_registers() {
         let svc = MqttService::new();
-        svc.add_client(make_handle("home")).await;
+        svc.add_client(make_handle("home"));
 
         let outcome = svc
             .subscribe_filter("home", "sensors/+/temp".to_string(), 2)
@@ -743,7 +862,7 @@ mod tests {
     async fn unsubscribe_filter_disconnected_removes_from_set() {
         let svc = MqttService::new();
         let handle = make_handle("home");
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
 
         svc.subscribe_filter("home", "sensors/+/temp".to_string(), 2)
             .await;
@@ -770,7 +889,7 @@ mod tests {
     async fn publish_returns_not_connected_when_disconnected() {
         let svc = MqttService::new();
         let handle = make_handle("broker");
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
         let result = svc
             .publish_on_handle(
                 &handle,
@@ -792,7 +911,7 @@ mod tests {
             .add_subscription("sensors/+/temp".to_string(), 1)
             .await;
         *handle.client.lock().await = Some(dead_live_client());
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
 
         let outcome = svc.unsubscribe_filter("home", "sensors/+/temp").await;
         match outcome {
@@ -823,7 +942,7 @@ mod tests {
         *handle.supervisor_state.write().await = crate::state::SupervisorState::Failed {
             reason: "authoritative connect failure: boom".to_string(),
         };
-        svc.add_client(handle).await;
+        svc.add_client(handle);
 
         let (label, err) = svc.ingress_health("home").await;
         assert_eq!(label, ConnectorHealthLabel::Failed);
@@ -834,7 +953,7 @@ mod tests {
     async fn ingress_filter_status_failed_state_reports_failed_with_qos() {
         let svc = MqttService::new();
         let handle = make_handle("home");
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
         // Register a filter so qos is a fact, then drive the session to Failed.
         svc.subscribe_filter("home", "sensors/+/temp".to_string(), 2)
             .await;
@@ -857,7 +976,7 @@ mod tests {
     async fn subscribe_on_a_disconnected_client_defers_and_on_a_failed_one_does_not() {
         let svc = MqttService::new();
         let handle = make_handle("home");
-        svc.add_client(handle.clone()).await;
+        svc.add_client(handle.clone());
 
         // Fresh handle: no client installed, supervisor still retrying.
         assert_eq!(
@@ -887,12 +1006,169 @@ mod tests {
     async fn client_slugs_is_sorted() {
         let svc = MqttService::new();
         for slug in ["spare", "ha", "attic"] {
-            svc.add_client(make_handle(slug)).await;
+            svc.add_client(make_handle(slug));
         }
 
         assert_eq!(
             svc.client_slugs(),
             vec!["attic".to_string(), "ha".to_string(), "spare".to_string()]
         );
+    }
+
+    /// `remove_client` hands the caller the exact handle the registry held, and
+    /// the slug stops resolving. The caller owns stopping the supervisor, which
+    /// is why it gets the handle rather than a bool.
+    #[tokio::test]
+    async fn remove_client_takes_the_handle() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        svc.add_client(handle.clone());
+        svc.add_client(make_handle("attic"));
+
+        let taken = svc.remove_client("home");
+        assert!(
+            Arc::ptr_eq(&taken, &handle),
+            "remove_client must return the registered handle, not a copy of it"
+        );
+        assert!(svc.get_client("home").is_none());
+        assert_eq!(svc.client_slugs(), vec!["attic".to_string()]);
+    }
+
+    /// Removing a slug the registry does not hold is a host bug.
+    #[test]
+    #[should_panic(expected = "no session registered for client")]
+    fn remove_client_panics_on_an_absent_slug() {
+        MqttService::new().remove_client("ghost");
+    }
+
+    /// A second `add_client` on one slug replaces the entry.
+    #[tokio::test]
+    async fn add_client_replaces_by_slug() {
+        let svc = MqttService::new();
+        svc.add_client(make_handle("home"));
+        let replacement = make_handle("home");
+        svc.add_client(replacement.clone());
+
+        assert_eq!(svc.client_slugs(), vec!["home".to_string()]);
+        assert!(Arc::ptr_eq(
+            &svc.get_client("home").expect("the slug still resolves"),
+            &replacement
+        ));
+    }
+
+    /// `stop_all` signals every registered handle and nothing else.
+    #[tokio::test]
+    async fn stop_all_signals_every_registered_handle() {
+        let svc = MqttService::new();
+        let mut receivers = Vec::new();
+        for slug in ["home", "attic"] {
+            let handle = make_handle(slug);
+            receivers.push(handle.stop_tx.subscribe());
+            svc.add_client(handle);
+        }
+        let unregistered = make_handle("spare");
+        let mut spare_rx = unregistered.stop_tx.subscribe();
+
+        assert_eq!(svc.stop_all(), 2);
+        for rx in &receivers {
+            assert!(*rx.borrow(), "every registered handle is signalled");
+        }
+        assert!(
+            !*spare_rx.borrow_and_update(),
+            "a handle the registry does not hold is untouched"
+        );
+    }
+
+    /// `stop_and_join` signals the supervisor and returns only once the task
+    /// has exited.
+    #[tokio::test]
+    async fn stop_and_join_returns_after_the_supervisor_exits() {
+        let handle = make_handle("home");
+        let mut stop_rx = handle.stop_tx.subscribe();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let join = tokio::spawn(async move {
+            stop_rx
+                .changed()
+                .await
+                .expect("the stop sender outlives us");
+            flag2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        handle.set_supervisor(join).await;
+
+        handle.stop_and_join().await;
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_join must not return before the task ran to completion"
+        );
+    }
+
+    /// A filter edit that resolved a handle the registry then replaced is
+    /// re-aimed at the successor rather than left on the predecessor.
+    ///
+    /// The predecessor is dropped from the registry by a reload restarting the
+    /// client, and a filter left on it is lost for the life of the process: the
+    /// durable row behind it is on both sides of every later reload's
+    /// comparison, so no move re-asserts it, and the broker is never told.
+    ///
+    /// Staged rather than raced: holding the predecessor's subscription set
+    /// parks the edit inside `add_subscription`, and the swap lands while it is
+    /// parked, which is the interleaving the re-aim exists for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_filter_edit_is_re_aimed_at_the_successor_the_registry_swapped_in() {
+        let svc = MqttService::new();
+        let old = make_handle("home");
+        svc.add_client(old.clone());
+
+        let held = old.subscriptions.write().await;
+        let editing = svc.clone();
+        let edit = tokio::spawn(async move {
+            editing
+                .subscribe_filter("home", "home/state".to_string(), 1)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let new = make_handle("home");
+        svc.add_client(new.clone());
+        drop(held);
+
+        assert!(
+            edit.await.expect("the subscribe task").is_some(),
+            "the slug resolves throughout",
+        );
+        assert_eq!(
+            old.subscriptions.read().await.len(),
+            1,
+            "the edit landed on the predecessor first, which is the interleaving under test: \
+             an edit that started after the swap would leave this set empty",
+        );
+        assert_eq!(
+            new.subscriptions
+                .read()
+                .await
+                .iter()
+                .map(|sub| sub.topic_filter.clone())
+                .collect::<Vec<_>>(),
+            vec!["home/state".to_string()],
+            "the filter is on the session the registry holds",
+        );
+    }
+
+    /// A second `set_supervisor` would leave two supervisors sharing one broker
+    /// client id, so it is a panic rather than a replace.
+    #[tokio::test]
+    #[should_panic(expected = "set_supervisor called twice")]
+    async fn set_supervisor_twice_panics() {
+        let handle = make_handle("home");
+        handle.set_supervisor(tokio::spawn(async {})).await;
+        handle.set_supervisor(tokio::spawn(async {})).await;
+    }
+
+    /// Joining a client that never had a supervisor recorded is a host bug.
+    #[tokio::test]
+    #[should_panic(expected = "no supervisor recorded")]
+    async fn stop_and_join_without_a_supervisor_panics() {
+        make_handle("home").stop_and_join().await;
     }
 }

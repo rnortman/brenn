@@ -105,17 +105,15 @@ impl SubscribeActivation {
 
 /// Error from the runtime subscribe-activation wrapper.
 ///
-/// All variants are returned, never panicked (tool/LLM input, design §4).
+/// All variants are returned, never panicked (tool/LLM input).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscribeActivateError {
-    /// MQTT is not configured at all (no `[[mqtt_client]]`), so this server has no
-    /// `MqttService`. An `mqtt:` subscribe is impossible.
-    MqttNotConfigured,
     /// The `mqtt:` address names a client that has no running ingress supervisor
-    /// (no `[[mqtt_client]]` with that slug). We never spawn supervisors at
-    /// runtime (design §2.3 step 1), so this is terminal — and it is checked
-    /// **before** the lib core persists anything, so no durable channel/row is
-    /// created for an unconfigured client.
+    /// (no `[[mqtt_client]]` with that slug). Supervisors are never spawned on a
+    /// tool call's behalf, so this is terminal for the caller — and it is
+    /// checked **before** the lib core persists anything, so no durable
+    /// channel/row is created for an undeclared client. Declaring the client and
+    /// reloading is the remedy.
     UnconfiguredMqttClient { client: String },
     /// The lib core (`Messenger::subscribe_dynamic`) rejected the subscribe —
     /// unknown `brenn:`/`webhook:` channel, invalid mqtt filter, a duplicate
@@ -134,11 +132,6 @@ pub enum SubscribeActivateError {
 impl std::fmt::Display for SubscribeActivateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SubscribeActivateError::MqttNotConfigured => write!(
-                f,
-                "MQTT is not configured on this server (no [[mqtt_client]]); \
-                 mqtt: subscriptions are unavailable"
-            ),
             SubscribeActivateError::UnconfiguredMqttClient { client } => write!(
                 f,
                 "mqtt client {client:?} is not a declared `mqtt_client`; cannot subscribe \
@@ -257,10 +250,9 @@ pub async fn subscribe_dynamic_activated(
 
     // --- mqtt: activation ---
 
-    // MQTT must be configured to subscribe to any mqtt: address.
-    let mqtt_svc = bridge
-        .mqtt_service()
-        .ok_or(SubscribeActivateError::MqttNotConfigured)?;
+    // The service always exists; the per-client guard below is what refuses an
+    // address on a client no `[[mqtt_client]]` declares.
+    let mqtt_svc = bridge.mqtt_service();
 
     // Parse the mqtt: address once. Both the configured-client guard and the
     // Phase-1 ACL gate need fields off the same parse (`client` and `topic`),
@@ -359,24 +351,26 @@ pub async fn subscribe_dynamic_activated(
     // client's ingress urgency (the same the client's static routes carry) so
     // deliver_inbound routes broker deliveries on this filter to the new channel.
     // The client is configured (guard above), so ingress_urgency is Some.
-    let urgency = mqtt_svc
-        .ingress_urgency(&parsed.client)
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "subscribe_dynamic_activated: client {:?} passed the configured-client guard but \
-                 has no ingress urgency — registry inconsistency (host bug)",
-                parsed.client
-            )
+    //
+    // The client is re-resolved here rather than read off the guard above: a
+    // reload's commit stops a removed client's session after it swaps the
+    // authority that named it, and the durable write between the two is an
+    // await, so the session can be gone by now. The row stays where the write
+    // left it — nothing rolls a durable subscription back — and it is dormant
+    // by construction, since no session can fold it onto a broker filter.
+    let Some(urgency) = mqtt_svc.ingress_urgency(&parsed.client).await else {
+        tracing::warn!(
+            app_slug,
+            address,
+            client = %parsed.client,
+            "subscribe_dynamic_activated: the client's session was stopped mid-call (a reload \
+             removed it); the durable row remains and is dormant",
+        );
+        return Err(SubscribeActivateError::UnconfiguredMqttClient {
+            client: parsed.client.clone(),
         });
-    let router = bridge.mqtt_event_router().unwrap_or_else(|| {
-        // mqtt_service() is Some (guarded above) but the concrete router is absent:
-        // a startup wiring bug (both are populated together when MQTT is configured).
-        panic!(
-            "subscribe_dynamic_activated: mqtt_service present but mqtt_event_router absent — \
-             startup wiring bug"
-        )
-    });
+    };
+    let router = bridge.mqtt_event_router();
     router.add_route(IngressRoute {
         client_slug: parsed.client.clone(),
         topic_filter: parsed.topic.clone(),
@@ -394,19 +388,26 @@ pub async fn subscribe_dynamic_activated(
             parsed.client
         )
     });
-    let outcome = mqtt_svc
+    // Same window as the urgency read above, one await later: a `None` is the
+    // client's session having been stopped, not an inconsistency. The route
+    // installed a moment ago comes back out — it maps to a filter no session
+    // will ever assert — and the durable row is left dormant.
+    let Some(outcome) = mqtt_svc
         .subscribe_filter(&parsed.client, parsed.topic.clone(), qos)
         .await
-        .unwrap_or_else(|| {
-            // get_client returned Some at the guard; a None here means the client
-            // vanished from the registry mid-call, which is a host bug (the registry
-            // is populated once at startup and read-only thereafter).
-            panic!(
-                "subscribe_dynamic_activated: client {:?} passed the configured-client guard but \
-                 subscribe_filter found no session — registry inconsistency (host bug)",
-                parsed.client
-            )
+    else {
+        router.remove_route(channel_uuid);
+        tracing::warn!(
+            app_slug,
+            address,
+            client = %parsed.client,
+            "subscribe_dynamic_activated: the client's session was stopped mid-call (a reload \
+             removed it); the route is withdrawn and the durable row remains dormant",
+        );
+        return Err(SubscribeActivateError::UnconfiguredMqttClient {
+            client: parsed.client.clone(),
         });
+    };
 
     Ok(match outcome {
         IngressSubscribeOutcome::SubscribedLive => SubscribeActivation::MqttLive,
@@ -472,7 +473,7 @@ impl UnsubscribeActivation {
 
 /// Error from the runtime unsubscribe-activation wrapper.
 ///
-/// All variants are returned, never panicked (tool/LLM input, design §4).
+/// All variants are returned, never panicked (tool/LLM input).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsubscribeActivateError {
     /// The lib core (`Messenger::unsubscribe_dynamic`) found no dynamic
@@ -561,28 +562,12 @@ pub async fn unsubscribe_dynamic_activated(
     }
 
     // Last subscriber removed: drop the route and issue the broker UNSUBSCRIBE.
-    // A dynamic `mqtt:` sub can only have been created for a configured client
-    // (subscribe_dynamic_activated's guard), so the MqttService + ingress
-    // supervisor must be present here — their absence is a host bug, not bad input.
-    let mqtt_svc = bridge.mqtt_service().unwrap_or_else(|| {
-        panic!(
-            "unsubscribe_dynamic_activated: removed a dynamic mqtt: sub on {address:?} but \
-             mqtt_service is absent — a dynamic mqtt: sub cannot exist without a configured \
-             client (host bug)"
-        )
-    });
+    let mqtt_svc = bridge.mqtt_service();
 
     // Drop the router IngressRoute for this channel so any in-flight broker
     // delivery on the filter (before the UNSUBSCRIBE takes effect) no longer
     // routes to the now-unsubscribed channel.
-    let router = bridge.mqtt_event_router().unwrap_or_else(|| {
-        // mqtt_service() is Some but the concrete router is absent: a startup
-        // wiring bug (both are populated together when MQTT is configured).
-        panic!(
-            "unsubscribe_dynamic_activated: mqtt_service present but mqtt_event_router absent — \
-             startup wiring bug"
-        )
-    });
+    let router = bridge.mqtt_event_router();
     router.remove_route(channel_uuid);
 
     // Parse the client + filter to issue the broker UNSUBSCRIBE. The address
@@ -596,20 +581,23 @@ pub async fn unsubscribe_dynamic_activated(
              does not parse — stored channel-address corruption (host bug)"
         )
     });
-    let outcome = mqtt_svc
+    // A `None` is the client's session having been stopped by a reload while
+    // this call was in flight: the durable row is already gone and the route is
+    // already out, and the filter went with the session, so the removal is
+    // complete with nothing left to tell the broker.
+    let Some(outcome) = mqtt_svc
         .unsubscribe_filter(&parsed.client, &parsed.topic)
         .await
-        .unwrap_or_else(|| {
-            // The dynamic sub existed (core removed it), so the client was
-            // configured at creation and its ingress supervisor is registered
-            // (registry is populated once at startup, read-only thereafter). A
-            // None here means the client vanished from the registry — a host bug.
-            panic!(
-                "unsubscribe_dynamic_activated: removed a dynamic mqtt: sub for client {:?} but \
-                 unsubscribe_filter found no ingress supervisor — registry inconsistency (host bug)",
-                parsed.client
-            )
-        });
+    else {
+        tracing::warn!(
+            app_slug,
+            address,
+            client = %parsed.client,
+            "unsubscribe_dynamic_activated: the client's session was stopped mid-call (a reload \
+             removed it); the row and the route are gone and the filter left with the session",
+        );
+        return Ok(UnsubscribeActivation::LocalOnly);
+    };
 
     Ok(match outcome {
         IngressUnsubscribeOutcome::UnsubscribedLive => UnsubscribeActivation::MqttUnsubscribedLive,
@@ -683,17 +671,31 @@ mod tests {
         assert!(has_app_subscriber(&bridge, addr, "testapp"));
     }
 
-    /// An `mqtt:` subscribe on a bridge with no `MqttService` (MQTT not configured
-    /// on this server) → `MqttNotConfigured`, nothing persisted.
+    /// An `mqtt:` subscribe on a client the registry holds no session for →
+    /// `UnconfiguredMqttClient`, nothing persisted. The service itself always
+    /// exists, so an empty registry is what a document declaring no
+    /// `[[mqtt_client]]` looks like, and the per-client guard is the whole of
+    /// the refusal.
     #[tokio::test]
-    async fn subscribe_mqtt_not_configured_when_no_service() {
-        // `test_new_with_combined_services` wires a Messenger but no MqttService.
-        let bridge = ActiveBridge::test_new_with_combined_services().await;
-        let err =
-            subscribe_dynamic_activated(&bridge, "testapp", "mqtt:home:sensors/x", pull_only(None))
-                .await
-                .unwrap_err();
-        assert_eq!(err, SubscribeActivateError::MqttNotConfigured);
+    async fn subscribe_on_a_client_with_no_session_is_unconfigured() {
+        // The fixture's ACL permits `home`; taking its session out leaves the
+        // registry as a document declaring no client would.
+        let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
+        bridge.mqtt_service().remove_client("home");
+        let err = subscribe_dynamic_activated(
+            &bridge,
+            "testapp",
+            "mqtt:home:sensors/+/temp",
+            pull_only(None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SubscribeActivateError::UnconfiguredMqttClient {
+                client: "home".to_string()
+            }
+        );
         assert!(dynamic_rows(&bridge).await.is_empty());
     }
 
@@ -777,7 +779,7 @@ mod tests {
         // Route was added: a matching inbound delivery now routes to the channel
         // and stores a message row. Before the subscribe there was no route, so a
         // stored row proves the runtime-added IngressRoute is live.
-        let router = bridge.mqtt_event_router().unwrap().clone();
+        let router = bridge.mqtt_event_router().clone();
         router
             .deliver_inbound(
                 "home",
@@ -811,7 +813,6 @@ mod tests {
         let addr = "mqtt:home:sensors/+/temp";
         let handle = bridge
             .mqtt_service()
-            .expect("the fixture stands one up")
             .get_client("home")
             .expect("the configured client");
         *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
@@ -834,7 +835,7 @@ mod tests {
 
         // And the route: a process with working credentials asserts the filter
         // without the app re-subscribing, which needs the route to be there.
-        let router = bridge.mqtt_event_router().unwrap().clone();
+        let router = bridge.mqtt_event_router().clone();
         router
             .deliver_inbound(
                 "home",
@@ -1396,7 +1397,7 @@ mod tests {
     /// Count `mqtt:` rows stored via `deliver_inbound` on a topic, after the
     /// bridge's router. Used to prove a route is (or is no longer) live.
     async fn deliver_and_count(bridge: &ActiveBridge, client: &str, topic: &str) -> i64 {
-        let router = bridge.mqtt_event_router().unwrap().clone();
+        let router = bridge.mqtt_event_router().clone();
         router
             .deliver_inbound(client, topic, InboundPayload::Text("v".to_string()), 0)
             .await;
@@ -1664,7 +1665,6 @@ mod tests {
         assert_eq!(
             bridge
                 .mqtt_service()
-                .unwrap()
                 .ingress_filter_qos("home", "sensors/+/temp")
                 .await,
             Some(2),

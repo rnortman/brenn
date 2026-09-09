@@ -344,6 +344,7 @@ fn production_limits_accept_an_honest_replay_check() {
         brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
         HashMap::new(),
     );
+    component.open_store();
     let result = component
         .check_raw_for_testing(&simple_input(
             "budget_client",
@@ -385,6 +386,7 @@ fn honest_replay_check_near_full_window_within_fuel() {
         brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
         HashMap::new(),
     );
+    component.open_store();
 
     // Fill the nonce window for one client with strictly-increasing timestamps (the
     // production component enforces per-client `sent_at` monotonicity) spaced 1 ms apart, so

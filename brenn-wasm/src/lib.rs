@@ -185,7 +185,9 @@ impl brenn::replay::config::Host for StoreData {
 pub struct ReplayComponent {
     engine: Engine,
     replay_pre: ReplayPre<StoreData>,
-    kv_store: Arc<KvStore>,
+    /// Present but unopened between [`load`](ReplayComponent::load) and
+    /// [`open_store`](ReplayComponent::open_store).
+    store: DeferredStore,
     config: Arc<HashMap<String, String>>,
     /// Endpoint slug, used for the epoch-ticker thread name and the leaked-tx
     /// cleanup `warn` (H1046, design §2.3).
@@ -294,8 +296,9 @@ pub fn pin_guest_feature_envelope(cfg: &mut Config) {
 }
 
 impl ReplayComponent {
-    /// Load from a .wasm component artifact at the given path, with a SQLite
-    /// KV store at `store_path`.
+    /// Load from a .wasm component artifact at the given path, naming the SQLite
+    /// KV store at `store_path` without opening it — see
+    /// [`open_store`](Self::open_store).
     ///
     /// `max_page_count` is the host-enforced `PRAGMA max_page_count` value
     /// derived from the configured byte limit for this store (from
@@ -349,8 +352,6 @@ impl ReplayComponent {
                  (stale .wasm or WIT signature changed): {e}"
             )
         });
-        let kv_store = KvStore::open(store_path, max_page_count);
-
         // Spawn an epoch ticker thread for this engine, mirroring the processor world.
         // Uses an EngineWeak so the thread exits naturally when the
         // ReplayComponent is dropped (engine is the only strong ref). N replay-protected
@@ -376,10 +377,45 @@ impl ReplayComponent {
         Self {
             engine,
             replay_pre,
-            kv_store,
+            store: DeferredStore {
+                path: store_path.to_path_buf(),
+                max_page_count,
+                opened: OnceLock::new(),
+            },
             config: Arc::new(config),
             slug: Arc::from(slug),
         }
+    }
+
+    /// Open this component's KV store.
+    ///
+    /// Separate from [`load`](Self::load) because a store file admits at most
+    /// one `KvStore` in the process, so a host that compiles a replacement for a
+    /// running endpoint must be able to verify and link it while the entry it
+    /// replaces still holds the file. The open happens once the old component is
+    /// gone.
+    ///
+    /// # Panics
+    ///
+    /// If called twice, or if the path is already open elsewhere in the process.
+    pub fn open_store(&self) {
+        self.store.open(&self.holder());
+    }
+
+    /// The opened store.
+    ///
+    /// # Panics
+    ///
+    /// If [`open_store`](Self::open_store) was never called: a check against a
+    /// store that silently went missing would read an empty nonce namespace and
+    /// accept every replay.
+    fn kv_store(&self) -> &Arc<KvStore> {
+        self.store.handle(&self.holder())
+    }
+
+    /// How this component names itself in a store panic.
+    fn holder(&self) -> String {
+        format!("replay component {}", self.slug)
     }
 
     fn make_store(&self) -> Store<StoreData> {
@@ -389,7 +425,7 @@ impl ReplayComponent {
             &self.engine,
             StoreData {
                 resource_table: ResourceTable::new(),
-                kv_store: Arc::clone(&self.kv_store),
+                kv_store: Arc::clone(self.kv_store()),
                 config: Arc::clone(&self.config),
                 limits,
             },
@@ -420,7 +456,7 @@ impl ReplayComponent {
         // that happened inside tx_put (same thread in spawn_blocking, but use
         // SeqCst for clarity and cross-thread-safe-at-Arc-boundary).
         let quota_hit = self
-            .kv_store
+            .kv_store()
             .quota_hit
             .swap(false, std::sync::atomic::Ordering::SeqCst);
         (verdict, quota_hit)
@@ -517,13 +553,14 @@ impl ReplayComponent {
     /// processor world's `cleanup_leaked_tx`. Rollback failure
     /// escalates to panic (an unrollback-able store is corruption, not a tolerable state).
     fn cleanup_leaked_tx(&self) {
-        if self.kv_store.is_tx_active() {
+        let kv = self.kv_store();
+        if kv.is_tx_active() {
             warn!(
                 slug = %self.slug,
                 "wasm replay: store transaction leaked (guest trapped mid-transaction); \
                  rolling back to release write lock"
             );
-            let conn = self.kv_store.lock_conn();
+            let conn = kv.lock_conn();
             store::rollback_tx(&conn).unwrap_or_else(|e| {
                 panic!(
                     "cleanup_leaked_tx: ROLLBACK failed ({e}) — store may be corrupted \
@@ -532,7 +569,7 @@ impl ReplayComponent {
                 )
             });
             drop(conn);
-            self.kv_store.clear_tx();
+            kv.clear_tx();
         }
     }
 
@@ -600,7 +637,7 @@ impl ReplayComponent {
     /// `pub` because integration tests are external crates; `pub(crate)` would not reach them.
     #[doc(hidden)]
     pub fn kv_store_for_testing(&self) -> &Arc<KvStore> {
-        &self.kv_store
+        self.kv_store()
     }
 
     /// The engine replay guest code is compiled by — test use only.
@@ -2509,11 +2546,46 @@ pub struct ProcessorLoadSpec<'a> {
 ///
 /// The two are apart because a store file admits exactly one `KvStore` in the
 /// process, so opening cannot be part of loading — see
-/// [`ProcessorComponent::open_store`].
+/// [`ProcessorComponent::open_store`] and [`ReplayComponent::open_store`].
 struct DeferredStore {
     path: std::path::PathBuf,
     max_page_count: u32,
     opened: OnceLock<Arc<KvStore>>,
+}
+
+impl DeferredStore {
+    /// Open the file, once. `holder` names the component in either panic, which
+    /// is the only thing the two callers differ in.
+    ///
+    /// # Panics
+    ///
+    /// If called twice, or if the path is already open elsewhere in the
+    /// process.
+    fn open(&self, holder: &str) {
+        let opened = KvStore::open(&self.path, self.max_page_count);
+        assert!(
+            self.opened.set(opened).is_ok(),
+            "{holder}: open_store called twice for {}",
+            self.path.display(),
+        );
+    }
+
+    /// The open handle.
+    ///
+    /// # Panics
+    ///
+    /// If [`open`](Self::open) was never called: reading a store that silently
+    /// went missing would answer out of an empty namespace and write into
+    /// nothing.
+    fn handle(&self, holder: &str) -> &Arc<KvStore> {
+        self.opened.get().unwrap_or_else(|| {
+            panic!(
+                "{holder}: its store at {} was never opened — call open_store before \
+                 using it",
+                self.path.display(),
+            )
+        })
+    }
 }
 
 /// Loaded, pre-linked processor component for bus consumption and publication.
@@ -3216,16 +3288,14 @@ impl ProcessorComponent {
     /// If the store is already open, and on anything that makes the file
     /// unusable — a store nobody can open is a consumer that cannot run.
     pub fn open_store(&self) {
-        let Some(store) = self.store.as_ref() else {
-            return;
-        };
-        let opened = KvStore::open(&store.path, store.max_page_count);
-        assert!(
-            store.opened.set(opened).is_ok(),
-            "component {}: open_store called twice for {}",
-            self.slug,
-            store.path.display(),
-        );
+        if let Some(store) = self.store.as_ref() {
+            store.open(&self.store_holder());
+        }
+    }
+
+    /// How this component names itself in a store panic.
+    fn store_holder(&self) -> String {
+        format!("component {}", self.slug)
     }
 
     /// The opened store, or `None` for a component without the `Store` grant.
@@ -3236,20 +3306,9 @@ impl ProcessorComponent {
     /// never called: a granted guest whose store silently went missing would
     /// read an empty namespace and write into nothing.
     fn kv_store(&self) -> Option<Arc<KvStore>> {
-        self.store.as_ref().map(|store| {
-            store
-                .opened
-                .get()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "component {}: its store at {} was never opened — call open_store \
-                         before dispatching to it",
-                        self.slug,
-                        store.path.display(),
-                    )
-                })
-                .clone()
-        })
+        self.store
+            .as_ref()
+            .map(|store| Arc::clone(store.handle(&self.store_holder())))
     }
 
     /// Expose the underlying KvStore for test assertions.

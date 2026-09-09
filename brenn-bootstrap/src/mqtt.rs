@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel};
 use brenn_mqtt::MqttService;
-use brenn_mqtt::{MqttClientHandle, spawn_client_supervisor, union_subscriptions};
+use brenn_mqtt::{ArrivingFilters, register_and_spawn, union_subscriptions};
 use indexmap::IndexMap;
 use tracing::info;
 
@@ -12,38 +12,30 @@ use brenn_server::mqtt_router::{IngressRoute, MqttEventRouterImpl};
 
 /// Outcome of starting the MQTT service.
 pub(crate) struct MqttResult {
-    pub(crate) service: Option<Arc<MqttService>>,
-    pub(crate) event_router: Option<Arc<MqttEventRouterImpl>>,
-    /// Stop-signal senders — one per client supervisor. Passed to
-    /// `ShutdownHandle::mqtt_stop_txs`; each sender is fired on SIGTERM/SIGINT
-    /// to send MQTT DISCONNECT before process exit.
-    pub(crate) stop_txs: Vec<tokio::sync::watch::Sender<bool>>,
+    pub(crate) service: Arc<MqttService>,
+    pub(crate) event_router: Arc<MqttEventRouterImpl>,
 }
 
 /// Build the MQTT service and spawn one unified supervisor per **declared**
 /// `[[mqtt_client]]`. Each session carries both the publish path and the
 /// ingress delivery + reconnect re-assert path.
 ///
-/// Returns `None` values iff no `[[mqtt_client]]` is declared.
+/// The service and its router are built whether or not any client is declared;
+/// a document with none gets an empty registry.
 ///
-/// A declared client has a broker session for the life of the process, whether
-/// or not anything is bound through it: the operator wrote the declaration, and
-/// an idle session costs a keepalive. That is what lets a reload converge the
-/// first `mqtt:` binding a document ever puts on a broker.
+/// A declared client has a broker session for as long as the document declares
+/// it, whether or not anything is bound through it: the operator wrote the
+/// declaration, and an idle session costs a keepalive. That is what lets a
+/// reload converge the first `mqtt:` binding a document ever puts on a broker.
 ///
 /// `AppState` injection (`set_state` + `set_router`) must happen after
 /// `AppState` construction — same deferred-state pattern as `WakeRouterImpl`.
-///
-/// The declaration set itself is boot-only.
 ///
 /// # Panics
 ///
 /// Panics if an ingress channel names a client this map does not declare. Such
 /// a channel would get a router route and no subscription — a channel that
 /// exists and can never receive.
-// TODO(reload-mqtt-sessions): start, stop and restart supervisors at reload,
-// and build the service, router and `AppState` injection lazily so a boot
-// document declaring no client can gain one.
 pub(crate) async fn start_mqtt(
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
     clients: &IndexMap<String, MqttClientConfig>,
@@ -62,18 +54,9 @@ pub(crate) async fn start_mqtt(
         );
     }
 
-    if clients.is_empty() {
-        return MqttResult {
-            service: None,
-            event_router: None,
-            stop_txs: vec![],
-        };
-    }
-
     let svc = MqttService::new();
     let router = Arc::new(MqttEventRouterImpl::new());
     let router_trait: Arc<dyn brenn_mqtt::MqttEventRouter> = router.clone();
-    let mut stop_txs: Vec<tokio::sync::watch::Sender<bool>> = Vec::new();
 
     // One unified supervisor per declared client, in the map's order — which
     // nothing observes: `client_slugs` sorts, and the handles are reached by
@@ -84,17 +67,13 @@ pub(crate) async fn start_mqtt(
     for (client_slug, broker_cfg) in clients {
         let subscriptions = union_subscriptions(client_slug, mqtt_ingress_channels);
         let subscription_count = subscriptions.len();
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let config = Arc::new(broker_cfg.clone());
-        let handle = MqttClientHandle::new(config, subscriptions, stop_tx.clone());
-        stop_txs.push(stop_tx);
-
-        // Register the handle on the service before spawning: dynamic `mqtt:`
-        // subscribe needs the live `AsyncClient` via `get_client`, egress publishes
-        // resolve the handle by client slug, and the listing health enrichment reads
-        // per-client session state. The supervisor consumes the handle, so register
-        // the clone first.
-        svc.add_client(handle.clone()).await;
+        register_and_spawn(
+            &svc,
+            Arc::new(broker_cfg.clone()),
+            ArrivingFilters::Declared(subscriptions),
+            router_trait.clone(),
+        )
+        .await;
 
         // Per client, because a declared client with no binding is otherwise
         // invisible: the channel listing decorates `mqtt:` channel entries and
@@ -107,21 +86,15 @@ pub(crate) async fn start_mqtt(
             subscriptions = subscription_count,
             "MQTT client supervisor spawned"
         );
-
-        spawn_client_supervisor(handle, router_trait.clone(), stop_rx);
     }
 
     MqttResult {
-        service: Some(svc),
-        event_router: Some(router),
-        stop_txs,
+        service: svc,
+        event_router: router,
     }
 }
 
-/// Inject AppState into the MQTT event router and service. Returns the
-/// `stop_txs` senders so the caller can pass them to the shutdown handler
-/// (which sends `true` on each, causing every supervisor to send MQTT
-/// DISCONNECT before process exit).
+/// Inject AppState into the MQTT event router and service.
 ///
 /// # Panics
 ///
@@ -132,8 +105,7 @@ pub(crate) async fn wire_mqtt_state(
     router: &Arc<MqttEventRouterImpl>,
     state: brenn_server::state::AppState,
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
-    stop_txs: Vec<tokio::sync::watch::Sender<bool>>,
-) -> Vec<tokio::sync::watch::Sender<bool>> {
+) {
     // Build the router's routing table from the distinct ingress channels, one
     // route per channel. The router fans inbound deliveries out to every
     // matching route.
@@ -151,7 +123,6 @@ pub(crate) async fn wire_mqtt_state(
         routes = route_count,
         "MQTT service started; supervisors running"
     );
-    stop_txs
 }
 
 #[cfg(test)]
@@ -193,20 +164,16 @@ mod tests {
         )
         .await;
 
-        assert!(result.service.is_some());
-        assert!(result.event_router.is_some());
-        assert_eq!(result.stop_txs.len(), 1);
-        assert!(result.stop_txs[0].send(true).is_ok());
+        assert_eq!(result.service.client_slugs(), vec!["cl".to_string()]);
+        assert_eq!(result.service.stop_all(), 1);
     }
 
     #[tokio::test]
     async fn activates_for_a_declared_client_nothing_references() {
         let result = start_mqtt(&[], &client_map(&["cl"])).await;
 
-        let service = result.service.expect("a declared client gets a service");
-        assert!(result.event_router.is_some());
-        assert_eq!(result.stop_txs.len(), 1);
-        assert_eq!(service.client_slugs(), vec!["cl".to_string()]);
+        assert_eq!(result.service.client_slugs(), vec!["cl".to_string()]);
+        assert_eq!(result.service.stop_all(), 1);
     }
 
     #[tokio::test]
@@ -219,12 +186,11 @@ mod tests {
         )
         .await;
 
-        let service = result.service.expect("declared clients get a service");
-        assert_eq!(result.stop_txs.len(), 2);
         assert_eq!(
-            service.client_slugs(),
+            result.service.client_slugs(),
             vec!["ha".to_string(), "spare".to_string()]
         );
+        assert_eq!(result.service.stop_all(), 2);
     }
 
     /// A route with no subscription behind it is a channel that exists and can
@@ -240,12 +206,14 @@ mod tests {
         .await;
     }
 
+    /// A document declaring no client still gets a service and a router, both
+    /// with an empty registry.
     #[tokio::test]
-    async fn inactive_when_no_client_is_declared() {
+    async fn an_empty_declaration_set_builds_an_empty_registry() {
         let result = start_mqtt(&[], &IndexMap::new()).await;
 
-        assert!(result.service.is_none());
-        assert!(result.event_router.is_none());
-        assert!(result.stop_txs.is_empty());
+        assert!(result.service.client_slugs().is_empty());
+        assert_eq!(result.service.stop_all(), 0);
+        assert!(result.event_router.route_uuids().is_empty());
     }
 }

@@ -21,8 +21,9 @@ use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
 use common::{
-    BrokerHarness, SpawnedClient, TcpRelay, await_puback, broker_auth, broker_tls13, certs,
-    direct_publisher_acked, direct_subscriber, log_records_publish_to_subscriber,
+    AUTH_CREDENTIALS, BrokerHarness, SpawnedClient, TcpRelay, await_puback, broker_auth,
+    broker_tls13, certs, direct_publisher_acked, direct_subscriber, log_records_disconnect,
+    log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
     log_records_unsubscribe, recv_delivery, session_client_id, spawn_client, spawn_client_tls13,
     spawn_client_with_config, subscribe_live_confirmed, test_client_config, wait_for_health,
 };
@@ -757,6 +758,81 @@ async fn the_matchers_read_a_live_brokers_wording() {
     );
 }
 
+/// The wording pin for `log_records_disconnect`, the other broker-log matcher
+/// a reload case reads its claim off.
+///
+/// Held the same way as the two above: against a broker that is really running,
+/// so a `mosquitto` release that re-spells the line fails here rather than
+/// turning a reload case's ten-second wait into a report of a regression that
+/// did not happen.
+///
+/// The negative half is what makes it a matcher and not a substring: a live
+/// session's id must not read as disconnected while it is still connected, and
+/// a strict prefix of the stopped session's id must not read as it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_disconnect_matcher_reads_a_live_brokers_wording() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+
+    // Opened before anything connects, for the ordering matcher's negative
+    // side below.
+    let start = harness.log_len();
+    let stopped = spawn_client("logfmt-stop", &harness, ca.clone(), vec![]).await;
+    let staying = spawn_client("logfmt-stay", &harness, ca, vec![]).await;
+    let stopped_id = session_client_id(&stopped.client_slug);
+    let staying_id = session_client_id(&staying.client_slug);
+
+    let before = harness.log_len();
+    stopped.handle.stop_and_join().await;
+
+    let log = harness
+        .wait_for_log(
+            before,
+            5,
+            &format!("the broker never recorded a DISCONNECT from {stopped_id}"),
+            |log| log_records_disconnect(log, &stopped_id),
+        )
+        .await;
+    assert!(
+        !log_records_disconnect(&log, &staying_id),
+        "the session still connected read as disconnected: {log}",
+    );
+    let prefix = &stopped_id[..stopped_id.len() - 1];
+    assert!(
+        !log_records_disconnect(&log, prefix),
+        "a DISCONNECT from {stopped_id} read as one from {prefix}: {log}",
+    );
+
+    // The ordering matcher a restart case reads its claim off carries a second
+    // wording — the line naming the id a session connected under — so it is
+    // pinned here too, on both sides. Over a window opened after both sessions
+    // connected, the stopped session's DISCONNECT is the first thing in it
+    // under that id.
+    assert!(
+        log_records_disconnect_before_reconnect(&log, &stopped_id),
+        "the DISCONNECT is in the window and no connect under {stopped_id} follows it: {log}",
+    );
+    // Over a window opened before it connected, it is not: the connect line
+    // comes first, which is the shape a client-id takeover would leave in a
+    // restart case's window and the reason that window is opened where it is.
+    let wide = harness
+        .wait_for_log(
+            start,
+            5,
+            &format!("the broker never recorded a DISCONNECT from {stopped_id}"),
+            |log| log_records_disconnect(log, &stopped_id),
+        )
+        .await;
+    assert!(
+        !log_records_disconnect_before_reconnect(&wide, &stopped_id),
+        "a session's own connect line read as a successor's: {wide}",
+    );
+
+    staying.handle.stop();
+}
+
 // ===========================================================================
 // Reconnect / auth (mqtt-unify-reconnect-test) — the two design-mandated pins
 // for the unify-sessions refactor's core behaviors, exercised through a real
@@ -913,8 +989,8 @@ async fn auth_good_credentials_connects() {
 
     let mut config =
         test_client_config("testbroker-authgood", broker.port, ca, TlsVersionMin::Tls12);
-    config.identity.username = Some("brenn-itest".to_string());
-    config.password = Some("brenn-itest-password".to_string());
+    config.identity.username = Some(AUTH_CREDENTIALS.0.to_string());
+    config.password = Some(AUTH_CREDENTIALS.1.to_string());
     let SpawnedClient {
         svc,
         client_slug,
@@ -950,7 +1026,7 @@ async fn auth_bad_credentials_drives_failed_with_reason() {
     let auth_filter = "brenn/itest/auth/#";
     let mut config =
         test_client_config("testbroker-authbad", broker.port, ca, TlsVersionMin::Tls12);
-    config.identity.username = Some("brenn-itest".to_string());
+    config.identity.username = Some(AUTH_CREDENTIALS.0.to_string());
     config.password = Some("wrong-password".to_string());
     let SpawnedClient {
         svc,

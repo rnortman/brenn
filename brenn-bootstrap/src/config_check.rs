@@ -8,6 +8,13 @@
 //! per-instance surface gates — grant/binding coherence, chrome placement —
 //! decide the verdict here rather than only at a service start.
 //!
+//! Between the two runs the document half of webhook resolution
+//! ([`brenn_lib::webhook::resolve_webhook_identities`]), which answers every
+//! endpoint gate a document determines — slug charset and uniqueness, mount
+//! uniqueness, ownership, signature-scheme shape, replay-protection config —
+//! and whose replay store paths the messaging pass is then handed for the
+//! store-aliasing check.
+//!
 //! Environment facts remain out of scope: the passes that stat a path, read a
 //! secret, or touch the DB are excluded by name on
 //! [`resolve_messaging_offline`]. A workstation must be able to check a config
@@ -65,7 +72,14 @@ pub fn run_config_check(file: &Path, module_roots: &RootList) -> bool {
         eprintln!("{}: refused:\n{refusal}", file.display());
         return false;
     }
-    match offline_messaging_outcome(&document.config) {
+    let replay_store_paths = match webhook_document_outcome(&document.config) {
+        Ok(paths) => paths,
+        Err(message) => {
+            eprintln!("{}: refused:\n{message}", file.display());
+            return false;
+        }
+    };
+    match offline_messaging_outcome(&document.config, &replay_store_paths) {
         Ok(advisories) => {
             // Advice, not a verdict: the document is a config either way, and
             // this tool is the last place before a deploy where an operator
@@ -94,6 +108,34 @@ pub fn run_config_check(file: &Path, module_roots: &RootList) -> bool {
     }
 }
 
+/// Run the document half of webhook resolution, returning the replay store
+/// paths its endpoints declare, or the refusal text if it refused.
+///
+/// The gates here decide the verdict on a workstation, the same way the
+/// messaging planner's do: every one of them is a fact about the document. The
+/// host half — reading each key's and token's `secret_file` — is what stays out,
+/// so a config destined for another host still checks clean here.
+///
+/// The catch is the same narrow one [`offline_messaging_outcome`] makes, for the
+/// same reason: the asserts are the single source of the refusal text.
+///
+/// # Panics
+///
+/// On a payload [`refusal_text`] does not read as a refusal.
+fn webhook_document_outcome(config: &BrennConfig) -> Result<Vec<std::path::PathBuf>, String> {
+    catch_quietly(AssertUnwindSafe(|| {
+        let (identities, _app_stamps) = brenn_lib::webhook::resolve_webhook_identities(
+            &config.webhook_endpoints,
+            &config.apps,
+            &config.wasm_consumers,
+            &config.wasm,
+            &config.messaging,
+        );
+        brenn_lib::webhook::webhook_store_paths(identities.values())
+    }))
+    .map_err(refusal_text)
+}
+
 /// Run the offline messaging resolution, returning its advisories, or the
 /// refusal text if it refused.
 ///
@@ -113,9 +155,12 @@ pub fn run_config_check(file: &Path, module_roots: &RootList) -> bool {
 ///
 /// On a payload [`refusal_text`] does not read as a refusal — a host bug rather
 /// than a config verdict.
-fn offline_messaging_outcome(config: &BrennConfig) -> Result<Vec<String>, String> {
+fn offline_messaging_outcome(
+    config: &BrennConfig,
+    replay_store_paths: &[std::path::PathBuf],
+) -> Result<Vec<String>, String> {
     catch_quietly(AssertUnwindSafe(|| {
-        resolve_messaging_offline(config)
+        resolve_messaging_offline(config, replay_store_paths)
             .map(|advisory| advisory.to_string())
             .into_iter()
             .collect::<Vec<String>>()
@@ -132,7 +177,8 @@ fn offline_messaging_outcome(config: &BrennConfig) -> Result<Vec<String>, String
 /// is refusing, and it does so in one of these spellings — `config: …` for the
 /// resolvers, and one per `AttachOwner` `Display` arm for the attach-policy
 /// lowering, which prefixes its asserts with the principal it is lowering for.
-/// A new owner arm is spelled here too, or its refusals read as host bugs.
+/// A new owner arm is spelled here too, or its refusals read as host bugs. The
+/// webhook resolver's own spellings are listed for the same reason.
 ///
 /// The resolvers' spelling is [`CONFIG_REFUSAL`], shared with the validators
 /// that build their messages from it, so the classifier and its producers
@@ -140,11 +186,20 @@ fn offline_messaging_outcome(config: &BrennConfig) -> Result<Vec<String>, String
 /// names the block it is refusing instead — `[[wasm_consumer]] "slug": …`, some
 /// forty asserts of it — and a document can reach every one of them, so that
 /// spelling is listed too.
-const REFUSAL_PREFIXES: [&str; 4] = [
+const REFUSAL_PREFIXES: [&str; 7] = [
     CONFIG_REFUSAL,
     "[[wasm_consumer]] ",
     "surface \"",
     "remote \"",
+    // The document half of webhook resolution, whose asserts name the block
+    // they refuse rather than opening with `config: `. Every prefix here is
+    // anchored on a block name: the classifier decides whether a caught panic
+    // is a verdict about the document or a host defect, and a prefix that is an
+    // ordinary English opening would reclassify any assert that happens to
+    // start that way.
+    "[[webhook_endpoint]] ",
+    "[[webhook_endpoint]]: ",
+    "[[app.webhook_subscription]] ",
 ];
 
 /// Whether a caught planner payload's text reads as a refusal of the document.
@@ -707,14 +762,21 @@ new relay: Relay {
     }
 
     /// Check `inputs`, holding both layers: the front end accepts the document
-    /// (so the refusal is the offline pass's own) and the verdict refuses it
+    /// (so the refusal is an offline pass's own) and the verdict refuses it
     /// (so the pass decides the verdict).
+    ///
+    /// The two offline passes run in the order `run_config_check` runs them, so
+    /// a webhook document refusal is returned as itself rather than shadowed by
+    /// whatever the messaging planner would then say about the same document.
     fn refusal_of(inputs: &DocumentInputs) -> String {
         let config = check_config(inputs)
             .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"))
             .config;
-        let message = offline_messaging_outcome(&config)
-            .expect_err("a messaging gate must refuse this configuration");
+        let message = match webhook_document_outcome(&config) {
+            Err(message) => message,
+            Ok(replay_store_paths) => offline_messaging_outcome(&config, &replay_store_paths)
+                .expect_err("an offline gate must refuse this configuration"),
+        };
         assert!(
             !run_config_check(&inputs.root, &inputs.module_roots),
             "the offline pass refused it but the verdict passed it",
@@ -871,9 +933,15 @@ channel feed at "brenn:alice.feed" {
     /// families rather than one block: a webhook secret, an mqtt client's
     /// password and CA, and a consumer's component artifact are all environment
     /// facts this machine does not hold, and none of them may decide the
-    /// verdict. What this pass still cannot answer is the endpoint resolution
-    /// and tool substrate the planner is handed no inputs for, which can only
-    /// make it more permissive, never stricter.
+    /// verdict. So is the directory a replay store lives in — the block resolves
+    /// here and the parent is checked on the host that opens the file. What this pass still cannot answer is the tool substrate the
+    /// planner is handed no inputs for, which can only make it more permissive,
+    /// never stricter.
+    ///
+    /// The endpoint is owned by the consumer's second `in` port: ownership is a
+    /// document fact answered here, so an endpoint nobody subscribes to would be
+    /// refused for orphanhood rather than passing on its unreadable token file,
+    /// which is not what this case is about.
     #[test]
     fn a_config_full_of_environment_coupled_blocks_still_passes() {
         let (ok, report) = check(
@@ -894,6 +962,11 @@ webhook push_alice {
         header = "authorization";
     }
     token phone { secret_file = "/nonexistent/alice/push-alice.token"; }
+
+    replay_protection {
+        component = "replay-generic";
+        store_path = "/nonexistent/alice/state/push-alice-replay.db";
+    }
 }
 
 mqtt_client broker {
@@ -909,6 +982,7 @@ component Sink {
                 processor_needs!(""),
                 r#"
     in inbound;
+    in hooked;
 }
 // ── packaged ──
 
@@ -917,12 +991,122 @@ new sink: Sink {
     grants = [];
 
     in inbound <- feed { push_depth = 4; }
+    in hooked <- "webhook:push_alice" { push_depth = 4; retain_depth = 8; }
 }
 "#,
             ]
             .concat(),
         );
         assert!(ok, "{report}");
+    }
+
+    /// An endpoint nobody subscribes to is refused offline, in rule 9's own
+    /// words.
+    #[test]
+    fn an_orphan_endpoint_is_refused_offline() {
+        let message = boot_gate_refusal(
+            r#"
+webhook push_alice {
+    mount = "/webhooks/push-alice";
+
+    signature {
+        scheme = bearer-token;
+        header = "authorization";
+    }
+
+    token phone { secret_file = "/nonexistent/alice/push-alice.token"; }
+}
+"#,
+        );
+        assert_eq!(
+            message,
+            "[[webhook_endpoint]] \"push_alice\": no app has a \
+             [[app.webhook_subscription]] and no [[wasm_consumer]] has a \
+             webhook:push_alice subscription referencing this endpoint; orphan \
+             endpoints are not permitted",
+        );
+    }
+
+    /// The other half of rule 9: an endpoint two agents both subscribe to has
+    /// no single owner, and the refusal names both claimants.
+    #[test]
+    fn a_two_owner_endpoint_is_refused_offline() {
+        let message = boot_gate_refusal(
+            r#"
+webhook push_alice {
+    mount = "/webhooks/push-alice";
+
+    signature {
+        scheme = bearer-token;
+        header = "authorization";
+    }
+
+    token phone { secret_file = "/nonexistent/alice/push-alice.token"; }
+}
+
+agent Assistant(user: String) {
+    singleton = true;
+    allowed_users = [user];
+    grants = [subscribe];
+    subscribe "webhook:push_alice" { push_depth = 4; retain_depth = 8; }
+}
+
+new alice: Assistant(user = "alice");
+new bob: Assistant(user = "bob");
+"#,
+        );
+        assert_eq!(
+            message,
+            "[[webhook_endpoint]] \"push_alice\": subscribed to by both app \"alice\" \
+             and app \"bob\"; each endpoint must have exactly one owning app",
+        );
+    }
+
+    /// Cross-subsystem store aliasing is caught offline: an endpoint's replay
+    /// store and a consumer's store on one file is refused here rather than at
+    /// the process-global one-holder guard.
+    #[test]
+    fn a_replay_store_aliasing_a_consumer_store_is_refused_offline() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = dir.path().join("shared.sqlite");
+        let message = staged_gate_refusal(&format!(
+            r#"
+webhook push_alice {{
+    mount = "/webhooks/push-alice";
+
+    signature {{
+        scheme = bearer-token;
+        header = "authorization";
+    }}
+
+    token phone {{ secret_file = "/nonexistent/alice/push-alice.token"; }}
+
+    replay_protection {{
+        component = "replay-generic";
+        store_path = "{store}";
+    }}
+}}
+
+// ── packaged ──
+component Sink {{
+    {needs}
+    in hooked;
+}}
+// ── packaged ──
+
+new sink: Sink {{
+    slug = "sink";
+    grants = [store];
+    store_path = "{store}";
+
+    in hooked <- "webhook:push_alice" {{ push_depth = 4; retain_depth = 8; }}
+}}
+"#,
+            store = store.display(),
+            needs = processor_needs!("store"),
+        ));
+        assert!(message.contains("is shared between"), "{message}");
+        assert!(message.contains("shared.sqlite"), "{message}");
     }
 
     /// A `[[remote]]` names a token file this machine does not have, and the
@@ -1208,7 +1392,7 @@ new alice: Assistant();
         let config = check_config(&DocumentInputs::with_modules(root.join(filename), specs))
             .unwrap_or_else(|report| panic!("{filename} must compile: {report}"))
             .config;
-        let advisories = offline_messaging_outcome(&config)
+        let advisories = offline_messaging_outcome(&config, &[])
             .unwrap_or_else(|message| panic!("{filename} must pass the offline pass: {message}"));
         assert!(
             advisories.is_empty(),
@@ -1626,7 +1810,7 @@ channel surface_errors at "brenn:surface-errors" {
         let config = check_config(&DocumentInputs::bare(&file))
             .unwrap_or_else(|report| panic!("the front end must accept this document: {report}"))
             .config;
-        let advisories = offline_messaging_outcome(&config).expect("the document must pass");
+        let advisories = offline_messaging_outcome(&config, &[]).expect("the document must pass");
         assert_eq!(advisories.len(), 1, "{advisories:?}");
         assert!(
             advisories[0].contains("eviction frontier"),

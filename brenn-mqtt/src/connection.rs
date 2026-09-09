@@ -19,7 +19,7 @@ use rumqttc::{
 use rustls_pki_types::pem::PemObject as _;
 
 use crate::payload::classify_inbound;
-use crate::service::MqttEventRouter;
+use crate::service::{MqttEventRouter, MqttService};
 use crate::state::{IngressSubscription, MqttClientHandle, PubackOutcome, SupervisorState};
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsVersionMin};
 
@@ -28,6 +28,11 @@ use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsV
 // prevents a non-conforming or slow-to-close broker from hanging the supervisor
 // task indefinitely after the terminal state is already written.
 const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The `last_error` a publish waiting for its PUBACK is failed with when the
+/// session it was submitted on is stopped — by a reload restarting or removing
+/// the client, or by shutdown.
+const STOPPED_BY_OWNER: &str = "client session stopped";
 
 // What the SubAck arm logs as the filter when no pending SUBSCRIBE was bound to
 // the acked pkid — a broker resending a SubAck from a session brenn did not
@@ -328,11 +333,16 @@ pub(crate) fn backoff_duration(
 ///
 /// The body is wrapped by a watchdog that catches panics, logs at error, and
 /// respawns after a brief pause.
+///
+/// The returned join handle resolves when the supervisor has exited — on the
+/// stop signal or on an authoritative give-up. Callers must hand it to
+/// `MqttClientHandle::set_supervisor`.
+#[must_use]
 pub fn spawn_client_supervisor(
     handle: Arc<MqttClientHandle>,
     router: Arc<dyn MqttEventRouter>,
     stop_rx: tokio::sync::watch::Receiver<bool>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let handle2 = handle.clone();
@@ -359,7 +369,84 @@ pub fn spawn_client_supervisor(
                 }
             }
         }
-    });
+    })
+}
+
+/// Where an arriving session's filter set comes from.
+pub enum ArrivingFilters<'a> {
+    /// The set the caller derived: a boot's static union, or the empty list an
+    /// arriving client is registered with so the incoming step can report every
+    /// one of its filters as a move.
+    Declared(Vec<IngressSubscription>),
+    /// The predecessor this session replaces. Its filter set is inherited, and
+    /// its supervisor is stopped and joined as part of the handover.
+    Successor(&'a MqttClientHandle),
+}
+
+/// Bring one client session up on `service`: build the handle, register it,
+/// hand the broker client id and the filter set over from a predecessor if
+/// there is one, spawn the supervisor, and record its join handle. Returns the
+/// registered handle.
+///
+/// The order is the protocol, and it lives here rather than at each caller
+/// because every part of it is load-bearing:
+///
+/// - **Register before spawning.** A dynamic `mqtt:` subscribe reaches the live
+///   `AsyncClient` through `get_client`, and egress resolves the handle by
+///   slug. The supervisor must not be able to run before the slug resolves.
+/// - **Register the successor before joining the predecessor.** A restart must
+///   never leave the slug absent from the registry for a caller that is
+///   authorised to name it.
+/// - **Join the predecessor before spawning the successor.** Both sessions
+///   carry one MQTT client id, so the broker must see the predecessor's
+///   DISCONNECT before the successor's CONNECT.
+/// - **Inherit the filter set after that join, not before, and atomically.** A
+///   concurrent `subscribe_filter` can add a filter to the predecessor at any
+///   instant up to the join; a set copied before it would drop that filter, and
+///   nothing downstream would ever re-assert it — the durable row is on both
+///   sides of the next reload's comparison, so it produces no move. After the
+///   join no supervisor touches the predecessor, and a subscribe that resolved
+///   it before the swap re-targets the successor
+///   ([`MqttService::subscribe_filter`]). The inherit is an assignment onto a
+///   handle the registry has been handing out since `add_client`, so the
+///   successor's write guard is taken before the join and held across it: every
+///   filter edit that reaches this slug during the handover — whether it
+///   resolved the successor directly or was re-aimed at it — therefore applies
+///   on top of the inherited set rather than being discarded by it, and
+///   `add_subscription`'s id numbering stays monotone because no edit can
+///   precede the inherit. A read of the successor's set blocks for the duration
+///   of the drain, which `MqttClientHandle::stop_and_join`'s own timeout bounds.
+/// - **Record the join handle.** `MqttClientHandle::stop_and_join` panics
+///   without one, so a session that is brought up any other way cannot be
+///   stopped.
+///
+/// Callers log; nothing is logged here, because what an operator needs to read
+/// off a boot, an arrival and a restart differs.
+pub async fn register_and_spawn(
+    service: &MqttService,
+    config: Arc<MqttClientConfig>,
+    filters: ArrivingFilters<'_>,
+    router: Arc<dyn MqttEventRouter>,
+) -> Arc<MqttClientHandle> {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let declared = match &filters {
+        ArrivingFilters::Declared(subs) => subs.clone(),
+        ArrivingFilters::Successor(_) => Vec::new(),
+    };
+    let handle = MqttClientHandle::new(config, declared, stop_tx);
+    service.add_client(handle.clone());
+    if let ArrivingFilters::Successor(old) = filters {
+        // The successor's set is claimed before the predecessor is stopped and
+        // held until the inherit has been written, so a filter edit on this
+        // slug queues behind the inherit instead of being overwritten by it.
+        let mut arriving = handle.subscriptions.write().await;
+        old.stop_and_join().await;
+        *arriving = old.subscriptions.read().await.clone();
+        drop(arriving);
+    }
+    let join = spawn_client_supervisor(handle.clone(), router, stop_rx);
+    handle.set_supervisor(join).await;
+    handle
 }
 
 /// Whether the supervisor has been asked to stop, right now.
@@ -421,6 +508,12 @@ async fn supervisor_body(
             if let Some(client) = client_opt {
                 let _ = client.disconnect().await;
             }
+            // A publish waiting for its PUBACK is waiting on a session that is
+            // over: nothing polls this eventloop again, so the ack can never be
+            // attributed and the waiter would hang on its oneshot forever.
+            handle
+                .fail_all_publishes(Some(STOPPED_BY_OWNER.to_string()))
+                .await;
             if terminal_reason.is_none() {
                 terminal_reason = Some(SupervisorState::Disconnected {
                     last_error: None,
@@ -616,7 +709,14 @@ async fn supervisor_body(
                     }
                     // A stop is terminal for this session, so the broker's
                     // answers go with the client here as they do on every other
-                    // path out of a connection.
+                    // path out of a connection. The drain above discards events
+                    // without attributing them, so a PUBACK that arrives in it
+                    // reaches nobody: every waiter is failed here, as the
+                    // connection-lost path does, rather than left on a oneshot
+                    // whose sender lives in this handle's queue.
+                    handle
+                        .fail_all_publishes(Some(STOPPED_BY_OWNER.to_string()))
+                        .await;
                     clear_subscribe_tracking(&handle).await;
                     break 'supervisor;
                 }
@@ -1157,6 +1257,209 @@ mod tests {
             _qos: u8,
         ) {
         }
+    }
+
+    /// A stand-in supervisor for a predecessor a handover is about to stop: it
+    /// holds no connection and exits on the stop signal, which is all
+    /// `stop_and_join` needs of it.
+    fn stand_in_supervisor(handle: &Arc<MqttClientHandle>) -> tokio::task::JoinHandle<()> {
+        let mut stop_rx = handle.stop_tx.subscribe();
+        tokio::spawn(async move {
+            while !*stop_rx.borrow_and_update() {
+                if stop_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// A stand-in supervisor that lingers for `delay` after the stop signal, so
+    /// a test can act inside the handover's drain window.
+    fn lingering_stand_in_supervisor(
+        handle: &Arc<MqttClientHandle>,
+        delay: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut stop_rx = handle.stop_tx.subscribe();
+        tokio::spawn(async move {
+            while !*stop_rx.borrow_and_update() {
+                if stop_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(delay).await;
+        })
+    }
+
+    /// A filter edit that resolves the *successor* while the handover is still
+    /// draining the predecessor survives the inherit.
+    ///
+    /// This is the other interleaving. The registry hands the successor out from
+    /// `add_client`, which is before the join, so an edit arriving in that
+    /// window writes into the successor's own set — and the inherit that follows
+    /// is an assignment. Were the successor's set not claimed before the join,
+    /// that assignment would discard the edit: a lost `add` is a subscription
+    /// the broker never hears about and no later move re-asserts, and a lost
+    /// `remove` is a filter the document no longer binds re-asserted at the
+    /// broker forever.
+    ///
+    /// Staged rather than raced: the predecessor's supervisor lingers after the
+    /// stop signal, so the edit runs inside the drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_edit_reaching_the_successor_mid_handover_survives_the_inherit() {
+        let service = MqttService::new();
+        let old = test_handle();
+        old.add_subscription("home/state".to_string(), 1).await;
+        old.set_supervisor(lingering_stand_in_supervisor(
+            &old,
+            Duration::from_millis(400),
+        ))
+        .await;
+        service.add_client(old.clone());
+
+        let config = Arc::new(brenn_lib::mqtt::test_support::test_client_config("broker"));
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        let handover_service = service.clone();
+        let predecessor = old.clone();
+        let handover = tokio::spawn(async move {
+            register_and_spawn(
+                &handover_service,
+                config,
+                ArrivingFilters::Successor(&predecessor),
+                router.clone(),
+            )
+            .await
+        });
+
+        // The successor is registered by now and the drain is still running.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !Arc::ptr_eq(
+                &service
+                    .get_client("broker")
+                    .expect("a session for the slug"),
+                &old,
+            ),
+            "the registry answers with the successor before the drain finishes, which is what              makes this window reachable",
+        );
+        let edit = service
+            .subscribe_filter("broker", "attic/+".to_string(), 1)
+            .await;
+        assert!(edit.is_some(), "the slug is registered throughout");
+
+        let successor = handover.await.expect("the handover task");
+        let filters: Vec<String> = successor
+            .subscriptions
+            .read()
+            .await
+            .iter()
+            .map(|sub| sub.topic_filter.clone())
+            .collect();
+        assert!(
+            filters.contains(&"home/state".to_string()),
+            "the predecessor's own filter is inherited: {filters:?}",
+        );
+        assert!(
+            filters.contains(&"attic/+".to_string()),
+            "and the edit that landed on the successor mid-handover is still there: {filters:?}",
+        );
+        assert!(
+            !old.subscriptions
+                .read()
+                .await
+                .iter()
+                .any(|sub| sub.topic_filter == "attic/+"),
+            "the edit resolved the successor, not the predecessor — the interleaving under test",
+        );
+        let ids: Vec<u32> = successor
+            .subscriptions
+            .read()
+            .await
+            .iter()
+            .map(|sub| sub.sub_id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            "no edit precedes the inherit, so the ids stay distinct: {ids:?}",
+        );
+        successor.stop_and_join().await;
+    }
+
+    /// A successor inherits the predecessor's filter set, and it inherits a
+    /// filter a concurrent subscribe adds while the handover is in flight.
+    ///
+    /// The window is the reason the inheritance is copied after the join rather
+    /// than before it: a set copied at the top of the handover is missing that
+    /// filter, and nothing ever re-asserts it — the durable row behind it is on
+    /// both sides of every later reload's comparison, so it produces no move,
+    /// and the process holds a subscription the broker never hears about.
+    ///
+    /// The concurrency is staged rather than raced: the test holds the
+    /// predecessor's subscription set, which parks the subscribe inside
+    /// `add_subscription`, and releases it once the handover has begun.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_successor_inherits_a_filter_added_during_the_handover() {
+        let service = MqttService::new();
+        let old = test_handle();
+        old.add_subscription("home/state".to_string(), 1).await;
+        old.set_supervisor(stand_in_supervisor(&old)).await;
+        service.add_client(old.clone());
+
+        // Park a subscribe inside the predecessor's set.
+        let held = old.subscriptions.write().await;
+        let edit_service = service.clone();
+        let edit = tokio::spawn(async move {
+            edit_service
+                .subscribe_filter("broker", "attic/+".to_string(), 1)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = Arc::new(brenn_lib::mqtt::test_support::test_client_config("broker"));
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        let predecessor = old.clone();
+        let handover = tokio::spawn(async move {
+            register_and_spawn(
+                &service,
+                config,
+                ArrivingFilters::Successor(&predecessor),
+                router.clone(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+
+        assert!(
+            edit.await.expect("the subscribe task").is_some(),
+            "the slug is registered throughout, so the edit resolves a session",
+        );
+        let successor = handover.await.expect("the handover task");
+        let filters: Vec<String> = successor
+            .subscriptions
+            .read()
+            .await
+            .iter()
+            .map(|sub| sub.topic_filter.clone())
+            .collect();
+        assert!(
+            filters.contains(&"home/state".to_string()),
+            "the predecessor's own filter is inherited: {filters:?}",
+        );
+        assert!(
+            filters.contains(&"attic/+".to_string()),
+            "and so is the one added while the handover ran: {filters:?}",
+        );
+        assert!(
+            old.subscriptions
+                .read()
+                .await
+                .iter()
+                .any(|sub| sub.topic_filter == "attic/+"),
+            "the late edit landed on the predecessor, which is the interleaving under test: an \
+             edit that started after the swap would not be on this set at all",
+        );
+        successor.stop_and_join().await;
     }
 
     /// Two SUBSCRIBEs bound to distinct pkids resolve to their own filters at

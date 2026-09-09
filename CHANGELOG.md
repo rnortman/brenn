@@ -4,6 +4,57 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Webhook endpoints converge at reload.** Adding, removing, or editing a
+  `[[webhook_endpoint]]` block -- or moving an agent's `subscribe "webhook:…"`
+  line between agents -- is applied by a reload instead of requiring a restart.
+  A rotated signing secret or bearer token is picked up automatically: every
+  declared endpoint's `secret_file` is re-read on every reload, so rotating the
+  file and reloading is enough. A missing or unreadable secret file refuses the
+  whole reload, even when the triggering edit was elsewhere.
+- **MQTT client blocks converge at reload.** Declaring a new broker registers
+  its session and dials it; removing one stops its supervisor with an orderly
+  DISCONNECT; editing one restarts the supervisor, resuming the same persistent
+  session at the broker. A rotated broker password or CA bundle needs no
+  document edit -- `password_file` and `ca_file` are re-read on every reload on
+  the same terms as webhook secrets. A credential the broker rejects is an
+  `applied` reload whose client then reaches `Failed` on connect, not a refusal
+  (prepare never dials).
+- **Offline config-check covers webhook resolution.** `brenn config-check` now
+  runs the document half of webhook endpoint resolution: orphan endpoints,
+  duplicate slugs and mounts, ownership violations, and replay-store aliasing
+  are caught without the deployment host's secrets.
+
+### Changed
+
+- **One wildcard webhook route.** The per-endpoint route fold is replaced by a
+  single `/webhooks/{*tail}` route matched for every HTTP method, with the
+  endpoint ceiling enforced in-handler before the body is buffered past it. An
+  unknown mount is a 404 with an unrecognized-URL security event for any method;
+  a non-POST to a known mount is a 405 with no security event.
+- **MQTT service is always present.** The MQTT service and event router are
+  built unconditionally, even when no client is declared. The "MQTT is not
+  configured on this server" error paths are removed; per-client checks handle
+  undeclared clients instead.
+- **Replay components defer their store open.** `ReplayComponent::load` now
+  verifies and compiles the WASM module without opening the KV store; a separate
+  `open_store` call claims the file. This lets a reload compile a replacement
+  while the predecessor still holds the store.
+
+### Fixed
+
+- **Webhook event delivery no longer panics on a reload race.** A request
+  holding an endpoint entry whose mount was removed mid-flight gets a channel-
+  miss warning instead of a false host-bug panic and a Critical alert.
+- **MQTT session miss after a reload is a tool error, not a panic.** An agent
+  tool call whose ACL snapshot predates the reload that removed its client now
+  returns a tool error naming the client, instead of panicking on the registry
+  miss.
+- **Dynamic MQTT filter edits survive a client restart.** A `subscribe_filter`
+  that lands on a successor handle during the predecessor's drain is no longer
+  discarded by the inherit step.
+
 ## [0.20.3]
 
 ### Added

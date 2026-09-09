@@ -2,7 +2,7 @@
 //!
 //! This is the brenn-lib-free seam the WASM host calls for `mqtt:publish`. It
 //! closes over the consumer's `AppPolicy`, the consumer slug (the
-//! connector-namespace key), and the (optional) `MqttService`, owns the
+//! connector-namespace key), and the `MqttService`, owns the
 //! `mqtt:<client>:<topic>` parse, and bridges the async `enforce_and_publish`
 //! into the synchronous `MqttPublishFn`. `brenn-wasm` never sees a `brenn-lib`
 //! type — the closure maps `MqttEgressError` into the `brenn-wasm`-local
@@ -18,10 +18,9 @@ use brenn_obs::security::{DenialKind, DenialOrigin, SecurityEventType, signal_pu
 /// Build the synchronous MQTT-egress callback for a WASM consumer holding the
 /// `Mqtt` grant.
 ///
-/// `svc` is `Some` whenever at least one `[[mqtt_client]]` is declared; otherwise
-/// it is `None`, in which case the closure returns `NoConnector` — fail-closed. A
-/// matcher's client is boot-validated as declared, and a declared client has a
-/// broker session, so a consumer with a publish matcher always finds one.
+/// A matcher's client is validated as declared and a declared client has a
+/// broker session registered before anything holding that matcher runs, so a
+/// consumer with a publish matcher always finds one.
 ///
 /// The returned closure bridges async → sync via `block_on`, which is correct
 /// **only** because the WASM guest invocation runs on a `spawn_blocking`
@@ -34,7 +33,7 @@ use brenn_obs::security::{DenialKind, DenialOrigin, SecurityEventType, signal_pu
 pub(crate) fn make_wasm_mqtt_publish_fn(
     policy: brenn_lib::access::AppPolicy,
     slug: String,
-    svc: Option<Arc<MqttService>>,
+    svc: Arc<MqttService>,
     alerts: AlertDispatcher,
 ) -> brenn_wasm::MqttPublishFn {
     Arc::new(
@@ -56,19 +55,6 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
                     return brenn_wasm::MqttPublishOutcome::InvalidPayload(e.to_string());
                 }
             };
-            // No MQTT service configured on this server ⇒ fail-closed. This arm is
-            // reachable only when no `[[mqtt_client]]` is declared at all: a
-            // matcher's client is boot-validated as declared, and declared means a
-            // session. So a consumer reaching here holds the `mqtt` grant with no
-            // publish matcher, or the server runs no MQTT at all. Same guest variant
-            // as `do_mqtt_publish`'s service-absent arm.
-            let Some(ref svc) = svc else {
-                tracing::warn!(
-                    slug = %slug,
-                    "wasm mqtt-publish: no-connector — MQTT service not configured on this server (no [[mqtt_client]] declared)"
-                );
-                return brenn_wasm::MqttPublishOutcome::NoConnector;
-            };
             // Bridge async → sync via `block_on` — safe only on a
             // blocking-pool thread; see this fn's doc for the full
             // constraint.
@@ -82,7 +68,7 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
             // egress path this component has (MQTT, bus, webhooks), so the host fn
             // itself intentionally stays limiter-free.
             let result = tokio::runtime::Handle::current().block_on(enforce_and_publish(
-                svc,
+                &svc,
                 &policy,
                 &addr,
                 payload,
@@ -155,6 +141,19 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
                 Err(MqttEgressError::BrokerRejected { reason }) => {
                     brenn_wasm::MqttPublishOutcome::BrokerRejected(reason)
                 }
+                // Structurally impossible on this path, unlike the LLM one: a
+                // consumer whose ACL names a client is retired — task joined —
+                // before a reload's commit stops any session, and the planner
+                // refuses a matcher on an undeclared client, so no live
+                // consumer can hold an authority the registry has moved past.
+                // A miss here means a consumer outlived its retirement.
+                Err(MqttEgressError::ClientNotRegistered { client }) => {
+                    unreachable!(
+                        "wasm mqtt-publish: no session registered for client {client:?} while \
+                         consumer {slug:?} is live — a consumer naming a client is retired \
+                         before any session is stopped (host bug)"
+                    )
+                }
             }
         },
     )
@@ -205,7 +204,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let config = Arc::new(brenn_server::test_support::mqtt::test_client_config(client));
         let handle = MqttClientHandle::new(config, vec![], tx);
-        svc.add_client(handle).await;
+        svc.add_client(handle);
         svc
     }
 
@@ -221,37 +220,19 @@ mod tests {
     }
 
     /// A wildcard in a publish topic is rejected by `parse_topic_name` before the
-    /// service is consulted (service is `None` here, which would also surface as
-    /// `NoConnector` if the parse arm were skipped).
+    /// service is consulted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalid_address_maps_to_invalid_payload() {
         let f = make_wasm_mqtt_publish_fn(
             policy_allowing(&["home"]),
             "slug".to_string(),
-            None,
+            MqttService::new(),
             noop_dispatcher(),
         );
         let out = call(&f, "home", "cmd/#").await;
         assert!(
             matches!(out, MqttPublishOutcome::InvalidPayload(_)),
             "expected InvalidPayload, got {out:?}"
-        );
-    }
-
-    /// `svc: None` (no MQTT service configured on the server) ⇒ the fail-closed
-    /// infrastructure arm returns `NoConnector`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn no_service_maps_to_no_connector() {
-        let f = make_wasm_mqtt_publish_fn(
-            policy_allowing(&["home"]),
-            "slug".to_string(),
-            None,
-            noop_dispatcher(),
-        );
-        let out = call(&f, "home", "cmd/light").await;
-        assert!(
-            matches!(out, MqttPublishOutcome::NoConnector),
-            "expected NoConnector, got {out:?}"
         );
     }
 
@@ -263,7 +244,7 @@ mod tests {
         let f = make_wasm_mqtt_publish_fn(
             policy_allowing(&["home"]),
             "slug".to_string(),
-            Some(svc),
+            svc,
             noop_dispatcher(),
         );
         let out = call(&f, "office", "cmd/light").await;
@@ -281,7 +262,7 @@ mod tests {
         let f = make_wasm_mqtt_publish_fn(
             policy_allowing(&["home"]),
             "slug".to_string(),
-            Some(svc),
+            svc,
             noop_dispatcher(),
         );
         let out = call(&f, "home", "cmd/light").await;
@@ -315,7 +296,7 @@ mod tests {
         let f = make_wasm_mqtt_publish_fn(
             policy_allowing(&["home"]),
             "slug".to_string(),
-            Some(svc.clone()),
+            svc.clone(),
             dispatcher.clone(),
         );
         // Two denials to the same client: the security log fires per occurrence,

@@ -60,6 +60,7 @@ fn open_component() -> (NamedTempFile, ReplayComponent) {
         brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
         default_config(),
     );
+    component.open_store();
     (db, component)
 }
 
@@ -239,6 +240,7 @@ fn restart_persists_dedup() {
             brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
             default_config(),
         );
+        component.open_store();
         let (r, _) = component.check(&sig_input(sig, t));
         assert!(r.is_ok(), "initial accept must succeed: {r:?}");
         // component dropped here; store flushed to disk
@@ -253,6 +255,7 @@ fn restart_persists_dedup() {
             brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
             default_config(),
         );
+        component.open_store();
         // t+1 so received_at differs (key = received_at_be || sig_bytes, same sig → duplicate).
         let (r2, _) = component.check(&sig_input(sig, t + 1));
         assert!(
@@ -293,6 +296,7 @@ fn host_quota_returns_too_many_requests_and_sets_quota_hit_flag() {
         TINY_CAP_PAGES,
         default_config(),
     );
+    component.open_store();
 
     let base: u64 = 1_748_000_000_000;
 
@@ -358,6 +362,7 @@ fn quota_hit_flag_is_per_call_not_sticky() {
         large_cap,
         default_config(),
     );
+    fresh.open_store();
     let (_, flag_fresh) = fresh.check(&sig_input("v1=aabbccdd", 1_748_000_000_000));
     assert!(
         !flag_fresh,
@@ -374,6 +379,7 @@ fn quota_hit_flag_is_per_call_not_sticky() {
         TINY_CAP_PAGES,
         default_config(),
     );
+    full_component.open_store();
     let base: u64 = 1_748_000_000_000;
     let mut first_hit_sig_idx: Option<u64> = None;
     for i in 0u64..2000 {
@@ -419,6 +425,7 @@ fn quota_hit_flag_is_per_call_not_sticky() {
         large_cap,
         default_config(),
     );
+    second.open_store();
     let (_, flag_second) = second.check(&sig_input("v1=notfull", base));
     assert!(
         !flag_second,
@@ -442,6 +449,7 @@ fn missing_max_skew_secs_traps() {
         DEFAULT_MAX_PAGE_COUNT,
         std::collections::HashMap::new(),
     );
+    component.open_store();
     let result = component.check_raw_for_testing(&sig_input("v1=aabbccdd", 1_748_000_000_000));
     assert!(
         result.is_err(),
@@ -470,6 +478,7 @@ fn unparseable_max_skew_secs_traps() {
         DEFAULT_MAX_PAGE_COUNT,
         bad_config,
     );
+    component.open_store();
     let result = component.check_raw_for_testing(&sig_input("v1=aabbccdd", 1_748_000_000_000));
     assert!(
         result.is_err(),
@@ -499,6 +508,7 @@ fn non_default_skew_window_tracks_config() {
         DEFAULT_MAX_PAGE_COUNT,
         cfg,
     );
+    component.open_store();
 
     let sig = "v1=non_default_skew_test";
     let t0: u64 = 1_748_000_000_000;
@@ -521,4 +531,72 @@ fn non_default_skew_window_tracks_config() {
         "re-check at window_ms+1={} must be accepted (entry expired): {r3:?}",
         window_ms + 1
     );
+}
+
+// ── load / open_store split ──────────────────────────────────────────────────
+
+/// A store file admits one `KvStore` per process, so two components may be
+/// loaded over one path as long as neither has opened it. This is what lets a
+/// reload compile a replacement while the entry it replaces is still serving.
+#[test]
+fn replay_load_does_not_open_the_store() {
+    let db = NamedTempFile::new().unwrap();
+    let running = ReplayComponent::load(
+        "push-test",
+        &generic_artifact(),
+        db.path(),
+        DEFAULT_MAX_PAGE_COUNT,
+        default_config(),
+    );
+    running.open_store();
+
+    let arriving = ReplayComponent::load(
+        "push-test",
+        &generic_artifact(),
+        db.path(),
+        DEFAULT_MAX_PAGE_COUNT,
+        default_config(),
+    );
+
+    let (verdict, _) = running.check(&sig_input("v1=handover", 1_748_000_000_000));
+    assert!(verdict.is_ok(), "the running component still serves");
+
+    drop(running);
+    arriving.open_store();
+    let (verdict, _) = arriving.check(&sig_input("v1=handover", 1_748_000_000_000));
+    assert!(
+        matches!(verdict, Err(ReplayError::Duplicate)),
+        "the arriving component reads the same store: {verdict:?}"
+    );
+}
+
+/// The process-global one-holder guard fires on the second open, before the
+/// component's own twice-called assertion can.
+#[test]
+#[should_panic(expected = "path already open")]
+fn replay_open_store_twice_panics() {
+    let db = NamedTempFile::new().unwrap();
+    let component = ReplayComponent::load(
+        "push-test",
+        &generic_artifact(),
+        db.path(),
+        DEFAULT_MAX_PAGE_COUNT,
+        default_config(),
+    );
+    component.open_store();
+    component.open_store();
+}
+
+#[test]
+#[should_panic(expected = "was never opened")]
+fn replay_check_before_open_store_panics() {
+    let db = NamedTempFile::new().unwrap();
+    let component = ReplayComponent::load(
+        "push-test",
+        &generic_artifact(),
+        db.path(),
+        DEFAULT_MAX_PAGE_COUNT,
+        default_config(),
+    );
+    let (_verdict, _quota_hit) = component.check(&sig_input("v1=unopened", 1_748_000_000_000));
 }

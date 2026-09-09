@@ -7,7 +7,8 @@
 //!
 //! # Module layout
 //!
-//! - `config` — raw + resolved config types; `resolve_webhook_endpoints`.
+//! - `config` — raw, identity and resolved config types;
+//!   `resolve_webhook_identities` and `resolve_webhook_endpoints`.
 //! - `scheme` — `SignatureScheme` and its supporting enums, resolved from
 //!   config.
 
@@ -32,8 +33,9 @@ pub mod config;
 pub mod scheme;
 
 pub use config::{
-    AppWebhookSubscriptionRaw, ResolvedWebhookEndpoint, ResolvedWebhookSubscription,
-    WebhookEndpointConfigRaw, WebhookKeyConfigRaw, WebhookOwner, WebhookTokenConfigRaw,
-    resolve_webhook_endpoints, webhook_mount,
+    AppWebhookSubscriptionRaw, ReplayProtectedEndpoint, ResolvedWebhookEndpoint,
+    ResolvedWebhookSubscription, WEBHOOK_MOUNT_PREFIX, WebhookEndpointConfigRaw,
+    WebhookEndpointIdentity, WebhookKeyConfigRaw, WebhookOwner, WebhookTokenConfigRaw,
+    resolve_webhook_endpoints, resolve_webhook_identities, webhook_mount, webhook_store_paths,
 };
-pub use scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
+pub use scheme::{HexFormat, SignatureAlgorithm, SignatureScheme, UnloadedSignatureScheme};

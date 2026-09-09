@@ -734,6 +734,7 @@ fn restart_persists_state() {
             brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
             std::collections::HashMap::new(),
         );
+        component.open_store();
         let r = component
             .check_raw_for_testing(&simple_input("persist_client", t, "nonce00001"))
             .expect("no wasmtime error");
@@ -750,6 +751,7 @@ fn restart_persists_state() {
             brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
             std::collections::HashMap::new(),
         );
+        component.open_store();
         // Try to replay the same nonce at a slightly later time (monotonicity passes).
         let replay_input = CheckInput {
             headers: vec![],

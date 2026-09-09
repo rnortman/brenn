@@ -206,6 +206,33 @@ pub struct StatusDelta {
     /// `surfaces_changed`; one that no surface instantiates is reported and
     /// nothing else.
     pub kinds_changed: Vec<String>,
+    /// Slugs of the webhook endpoints this reload installed, retired, and
+    /// replaced. An endpoint is here when its resolved form moved — its mount,
+    /// its owner, its ceiling, its content type, its replay configuration, or
+    /// the bytes of a signing secret — so a rotated secret under an unmoved
+    /// document reports the endpoint as changed.
+    ///
+    /// From the moment the reload applied, a retired endpoint's mount is an
+    /// unrecognized URL and an installed one's is answering.
+    pub webhook_endpoints_added: Vec<String>,
+    pub webhook_endpoints_removed: Vec<String>,
+    pub webhook_endpoints_changed: Vec<String>,
+    /// Slugs of the broker clients this reload registered, stopped, and
+    /// restarted. A client is here when its resolved form moved — its broker
+    /// coordinates, its tuning, or the bytes of its password or CA — so a
+    /// rotated credential under an unmoved document reports the client as
+    /// changed.
+    ///
+    /// A client here has a session in this process from the moment the reload
+    /// applied; the filters bound through an added or a restarted one are
+    /// normally in `mqtt_deferred`, because its supervisor was spawned a few
+    /// commit steps earlier and is usually still connecting — a broker that
+    /// answers faster than those steps run puts the same filter in
+    /// `mqtt_subscribed` alone instead. A removed client's filters are in
+    /// neither move list: they left with the session.
+    pub mqtt_clients_added: Vec<String>,
+    pub mqtt_clients_removed: Vec<String>,
+    pub mqtt_clients_changed: Vec<String>,
     /// Slugs of the agents whose authority, per-call settings, per-process view
     /// or static subscriptions moved. An agent here decides every gate on the
     /// new document's terms from the moment the reload applied.

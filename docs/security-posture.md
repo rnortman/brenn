@@ -651,7 +651,36 @@ unpaced consumer path exists); output volume and guest strings are bounded and
 sanitized; per-component storage is isolated and injection-safe; no downstream
 authorization trusts forgeable provenance.
 
-### 8.1 MQTT echo and republish loops
+### 8.1 The webhook ingress edge
+
+Everything under `/webhooks/` is one wildcard route, registered pre-auth and
+matched for **every** method; which endpoint a request reaches is decided in the
+handler, on the raw requested path. Three consequences the reviewer should hold
+the code to:
+
+- **An unknown mount is an unrecognized URL, whatever the method.** It answers
+  `404` and records the `UnrecognizedUrl` security event — the fail2ban lane,
+  log-only, no phone alert, since this prefix is reachable pre-auth and paging
+  on scans would burn the alert budget. A method router would have answered a
+  scanner's `GET` with axum's own `405` before the handler ran, and the signal
+  for the one internet-facing pre-auth prefix would be gone.
+- **A declared mount addressed with the wrong method is `405` and no security
+  event.** That is an integration mistake, not reconnaissance, and banning a
+  legitimate sender's address for it would be wrong.
+- **The endpoint's `transport_ceiling_bytes` is the only body limit, and it is
+  enforced while the body is read** — on the running total, so a request that
+  lies about its `Content-Length` is cut at the ceiling rather than buffered
+  whole. The route disables the router's global limit deliberately: an endpoint
+  whose ceiling is above it must serve, and a per-endpoint ceiling that some
+  outer layer silently overrode would be a limit nobody could reason about.
+
+The endpoint table is swapped by a reload rather than rebuilt, so a request
+holds the endpoint it resolved at arrival for its whole life: the scheme it was
+verified against, the ceiling it was read under and the owner it is delivered to
+are the entity's as of arrival. A retired mount is a `404` from the instant the
+swap lands.
+
+### 8.2 MQTT echo and republish loops
 
 Brenn runs one MQTT session per `[[mqtt_client]]`, shared by both the publish
 (egress) path and the ingress-delivery path. Because publisher and subscriber are
@@ -955,7 +984,10 @@ plainly: such a principal can now widen any agent's authority, its own included
 — grants, ACLs, tool grants, subscriptions, send budget — and change what that
 agent's sessions *run with*, meaning its model, its MCP servers, its disabled
 tools and its working directory, and have the running process pick all of it up
-without a restart. Nothing here is new in kind: the same principal could already
+without a restart. It reaches the ingress edge too: such a principal can declare
+a webhook endpoint or a broker client, point either at a `secret_file` or
+`password_file` of its choosing, and have the process read those bytes and dial
+that broker at the next reload. Nothing here is new in kind: the same principal could already
 confer authority on itself by adding a consumer and a channel, and a restart
 would have applied every one of these edits anyway. What changed is the latency
 — the edit lands at the next reload and, for the spawn-shaped half, at each

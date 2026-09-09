@@ -203,10 +203,10 @@ pub(crate) fn assert_store_parent_exists(slug: &str, store_path: &std::path::Pat
 pub(crate) struct ConsumerLoadContext<'a> {
     pub components_roots: &'a [PathBuf],
     pub alert_dispatcher: &'a AlertDispatcher,
-    /// The MQTT service, when one was started. A consumer holding the `mqtt`
-    /// grant gets an egress callback over it; one that does not gets no callback
-    /// and no linked interface.
-    pub mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
+    /// The MQTT service. A consumer holding the `mqtt` grant gets an egress
+    /// callback over it; one that does not gets no callback and no linked
+    /// interface.
+    pub mqtt_service: Arc<brenn_mqtt::MqttService>,
     pub tool_registry: &'a Arc<brenn_tool_registry::ToolRegistry>,
     /// `[messaging].max_body_bytes`, the ceiling on one published payload.
     pub max_payload_bytes: usize,
@@ -774,7 +774,7 @@ mod tests {
         let ctx = ConsumerLoadContext {
             components_roots: &[],
             alert_dispatcher: &alert_dispatcher,
-            mqtt_service: None,
+            mqtt_service: brenn_mqtt::MqttService::new(),
             tool_registry: &tool_registry,
             max_payload_bytes: 1024,
         };

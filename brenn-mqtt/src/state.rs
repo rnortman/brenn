@@ -4,17 +4,24 @@
 //! (pending/inflight ack tracking) and the ingress delivery + reconnect
 //! re-assert path. One is built per declared `[[mqtt_client]]`, whether or not
 //! anything is bound through it, and held on `MqttService` in a
-//! `client_slug`-keyed registry, built once at startup and read-only
-//! thereafter.
+//! `client_slug`-keyed registry.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
 
 use brenn_lib::mqtt::config::MqttClientConfig;
 use brenn_lib::mqtt::error::MqttError;
+
+/// How long [`MqttClientHandle::stop_and_join`] waits for a supervisor it has
+/// asked to stop.
+///
+/// Wide enough for every path the supervisor can be on when the signal lands —
+/// a DISCONNECT drain, a panic-respawn pause, then another drain — and narrow
+/// enough that a reload's commit cannot sit here unnoticed.
+const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
 // Supervisor state (visible to the registry for health reporting)
@@ -195,6 +202,11 @@ pub struct MqttClientHandle {
 
     /// The wake channel used to send a "stop" signal to the supervisor task.
     pub stop_tx: tokio::sync::watch::Sender<bool>,
+
+    /// The outer supervisor task's join handle, set by
+    /// [`Self::set_supervisor`] right after the spawn. `None` before the spawn
+    /// and after [`Self::stop_and_join`] has taken it.
+    supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MqttClientHandle {
@@ -217,6 +229,7 @@ impl MqttClientHandle {
             inflight_subscribes: Mutex::new(HashMap::new()),
             subscribe_outcomes: Mutex::new(HashMap::new()),
             stop_tx,
+            supervisor: Mutex::new(None),
         })
     }
 
@@ -363,6 +376,67 @@ impl MqttClientHandle {
     /// Idempotent: repeated calls are safe.
     pub fn stop(&self) {
         let _ = self.stop_tx.send(true);
+    }
+
+    /// Record the supervisor task's join handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handle is already recorded. One handle serves one client for
+    /// as long as that client is registered; a second spawn against the same
+    /// handle would leave two supervisors sharing one broker client id.
+    pub async fn set_supervisor(&self, join: tokio::task::JoinHandle<()>) {
+        let mut slot = self.supervisor.lock().await;
+        assert!(
+            slot.is_none(),
+            "MqttClientHandle::set_supervisor called twice for client {:?}",
+            self.config.identity.slug,
+        );
+        *slot = Some(join);
+    }
+
+    /// Signal the supervisor to stop, then wait for it to exit.
+    ///
+    /// Bounded twice over. The supervisor's stop arm drains the DISCONNECT
+    /// under its own timeout and its connect and backoff sleeps race the stop
+    /// signal, so every path out of it is short; and the wait itself is under
+    /// [`STOP_JOIN_TIMEOUT`], because a commit step that stalls here stalls the
+    /// whole reload with no `mqtt:` route installed and no status published,
+    /// which is a worse failure than a loud death. Returning means the broker
+    /// connection is gone and the client id is free for a successor to take.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no handle was recorded; if the wait outlives
+    /// [`STOP_JOIN_TIMEOUT`], which means the supervisor has a path out that
+    /// does not race the stop signal; or if the supervisor task ended in a way
+    /// `tokio` reports as an error — the outer task catches its body's panics
+    /// itself, so a join error here means the runtime tore the task down.
+    pub async fn stop_and_join(&self) {
+        self.stop();
+        let join = self.supervisor.lock().await.take().unwrap_or_else(|| {
+            panic!(
+                "MqttClientHandle::stop_and_join with no supervisor recorded for client {:?}",
+                self.config.identity.slug,
+            )
+        });
+        let joined = tokio::time::timeout(STOP_JOIN_TIMEOUT, join)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "MQTT supervisor for client {:?} did not exit within {}s of being asked to \
+                     stop — every path out of it is supposed to race the stop signal, so this is \
+                     a host bug",
+                    self.config.identity.slug,
+                    STOP_JOIN_TIMEOUT.as_secs(),
+                )
+            });
+        if let Err(e) = joined {
+            panic!(
+                "MQTT supervisor for client {:?} could not be joined: {e}",
+                self.config.identity.slug,
+            );
+        }
     }
 }
 

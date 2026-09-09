@@ -56,13 +56,14 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     pub path_mapper: PathMapper,
     pub messenger: Option<Arc<brenn_messaging::Messenger>>,
     pub pwa_push_service: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
-    /// Optional MQTT service (ingress registry + health). `None` (default) leaves
-    /// `bridge.mqtt_service()` empty; `Some` injects it so `MessageChannelList`
-    /// mqtt: health enrichment can be exercised.
+    /// MQTT service (ingress registry + health). `None` (default) gives the
+    /// bridge a fresh service with an empty client registry; `Some` injects one
+    /// holding sessions so `MessageChannelList` mqtt: health enrichment can be
+    /// exercised.
     pub mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
-    /// Optional concrete MQTT event router. `None` (default) leaves
-    /// `bridge.mqtt_event_router()` empty; only the runtime `mqtt:`
-    /// subscribe-activation path needs it.
+    /// Concrete MQTT event router. `None` (default) gives the bridge a fresh
+    /// one with an empty route table; only the runtime `mqtt:`
+    /// subscribe-activation path needs a shared instance.
     pub mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
     /// App-level user allowlist. Empty = open app (all users visible). Non-empty = restricted.
     /// Written into the agent this fixture's `AppTable` holds, where the device
@@ -618,8 +619,9 @@ impl ActiveBridge {
             chat_commands: Arc::new(tokio::sync::Notify::new()),
             chat_shutdown: Arc::new(tokio::sync::Notify::new()),
             pwa_push_service,
-            mqtt_service,
-            mqtt_event_router,
+            mqtt_service: mqtt_service.unwrap_or_else(brenn_mqtt::MqttService::new),
+            mqtt_event_router: mqtt_event_router
+                .unwrap_or_else(|| Arc::new(crate::mqtt_router::MqttEventRouterImpl::new())),
             automation_engine,
             usage_session_gap_secs: 1800,
             last_cost_prune_at: AtomicI64::new(0),
@@ -914,7 +916,7 @@ impl ActiveBridge {
         handle
             .add_subscription("sensors/+/temp".to_string(), 2)
             .await;
-        mqtt_service.add_client(handle).await;
+        mqtt_service.add_client(handle);
 
         Self::inject_for_test_full(
             user_id,
@@ -1109,7 +1111,7 @@ impl ActiveBridge {
         config.identity.urgency = brenn_lib::messaging::Urgency::High;
         config.identity.qos = 2;
         let handle = brenn_mqtt::MqttClientHandle::new(Arc::new(config), vec![], stop_tx);
-        mqtt_service.add_client(handle).await;
+        mqtt_service.add_client(handle);
 
         // Concrete router wired with an AppState holding the same Messenger, so a
         // post-subscribe deliver_inbound routes through the runtime-added route.
@@ -1451,7 +1453,7 @@ impl ActiveBridge {
             let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
             let config = Arc::new(crate::test_support::mqtt::test_client_config(client));
             let handle = brenn_mqtt::MqttClientHandle::new(config, vec![], stop_tx);
-            mqtt_service.add_client(handle).await;
+            mqtt_service.add_client(handle);
         }
 
         Self::inject_for_test_full(

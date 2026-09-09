@@ -219,7 +219,11 @@ pub struct MqttClientIdentity {
 /// The non-secret half is [`MqttClientIdentity`]; the two credential fields here
 /// are the only part of a `[[mqtt_client]]` that a machine other than the
 /// deployment target cannot answer.
-#[derive(Clone)]
+///
+/// `PartialEq` is what a reload's client delta is taken over: two resolved
+/// clients are the same client when their identity and both credentials are,
+/// so a rotated `password_file` under an unmoved block is a change to converge.
+#[derive(Clone, PartialEq)]
 pub struct MqttClientConfig {
     pub identity: MqttClientIdentity,
     /// Password loaded from `password_file`, trimmed.
@@ -534,22 +538,45 @@ pub fn resolve_client_identities(
 /// Resolve `[[mqtt_client]]` raw entries into a validated, indexed map, secrets
 /// loaded.
 ///
-/// [`resolve_client_identities`] is the document half; this adds the host reads.
+/// [`resolve_client_identities`] is the document half and
+/// [`resolve_client_secrets`] the host half; this is the two in sequence, which
+/// is what boot wants.
+///
+/// # Panics
+///
+/// Panics on anything either half panics on.
+pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, MqttClientConfig> {
+    resolve_client_secrets(&resolve_client_identities(raw_clients), raw_clients)
+}
+
+/// The host half: load every declared client's credentials off disk, against an
+/// identity map the document half has already produced.
+///
+/// Split out so a caller that needs the document's view of the clients *before*
+/// it may touch the host — a reload's prepare, which classifies a document
+/// refusal and an environment refusal in different grammars — resolves the
+/// blocks once and hands that one answer here, rather than re-running the whole
+/// identity grammar inside a second call.
+///
 /// Raw entry order is the identity map's order — duplicate slugs are refused
 /// there — so the zip below pairs each identity with the block it came from.
 ///
 /// # Panics
 ///
-/// Panics on anything [`resolve_client_identities`] panics on, plus:
+/// Panics on:
 /// - `password_file` missing or empty when present.
 /// - `ca_file` missing, unreadable, or empty when present.
-pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, MqttClientConfig> {
-    resolve_client_identities(raw_clients)
-        .into_iter()
+/// - An identity map whose order does not follow the raw blocks (host bug).
+pub fn resolve_client_secrets(
+    identities: &IndexMap<String, MqttClientIdentity>,
+    raw_clients: &[MqttClientConfigRaw],
+) -> IndexMap<String, MqttClientConfig> {
+    identities
+        .iter()
         .zip(raw_clients)
         .map(|((slug, identity), raw)| {
             assert_eq!(
-                slug, raw.slug,
+                *slug, raw.slug,
                 "mqtt: identity map order does not follow the raw [[mqtt_client]] order (host bug)",
             );
             let password = raw.password_file.as_ref().map(|path| {
@@ -580,9 +607,9 @@ pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, 
             };
 
             (
-                slug,
+                slug.clone(),
                 MqttClientConfig {
-                    identity,
+                    identity: identity.clone(),
                     password,
                     ca_cert_pem,
                 },

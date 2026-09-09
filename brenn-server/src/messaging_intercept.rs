@@ -219,16 +219,15 @@ pub async fn try_handle_messaging_tool(
             // webhook: channels are now persisted in the directory and emitted
             // by list_channels() above — no runtime synthesis needed here.
 
-            // Enrich mqtt: entries with runtime ingress health (design §2.5).
+            // Enrich mqtt: entries with runtime ingress health.
             // `list_channels()` emits MqttDetails with client/topic and the
             // health fields left `None` (Messenger has no MQTT dependency); fill
             // qos/health/last_error from MqttService here, exactly as the
-            // pwa_push: targets are appended above. When mqtt_service() is None
-            // (no MQTT runtime), the fields stay absent — an honest "MQTT runtime
-            // not present" state; the channel still lists with client/topic.
-            if let Some(mqtt_svc) = bridge.mqtt_service() {
-                enrich_mqtt_listing(&mut listing, mqtt_svc).await;
-            }
+            // pwa_push: targets are appended above. An entry whose client has no
+            // session keeps the fields absent — an honest "MQTT runtime not
+            // present for this client" state; the channel still lists with
+            // client/topic.
+            enrich_mqtt_listing(&mut listing, bridge.mqtt_service()).await;
 
             let resp = MessageChannelListResponse { channels: &listing };
             let output_str = serde_json::to_string(&resp)
@@ -305,13 +304,11 @@ pub async fn try_handle_messaging_tool(
             // Enrich mqtt: entries with runtime ingress health, exactly as the
             // MessageChannelList arm does. `list_subscriptions` leaves the health
             // fields `None`; fill qos/health/last_error from MqttService here.
-            if let Some(mqtt_svc) = bridge.mqtt_service() {
-                // Reuse the shared per-entry primitive directly (reuse-1): the
-                // SubscriptionListing rows carry the same `Option<ChannelDetails>`
-                // as ChannelListing, so no per-type wrapper is needed.
-                for entry in listing.iter_mut() {
-                    enrich_mqtt_details(&mut entry.details, mqtt_svc).await;
-                }
+            // Reuse the shared per-entry primitive directly: the
+            // SubscriptionListing rows carry the same `Option<ChannelDetails>`
+            // as ChannelListing, so no per-type wrapper is needed.
+            for entry in listing.iter_mut() {
+                enrich_mqtt_details(&mut entry.details, bridge.mqtt_service()).await;
             }
 
             let resp = MessageSubscriptionListResponse {
@@ -2223,11 +2220,13 @@ mod tests {
         );
     }
 
-    /// `MessageChannelList` with no MqttService still lists the `mqtt:` channel
-    /// with `client`/`topic`, but the runtime health fields stay absent (honest
-    /// "MQTT runtime not present" — no qos/health/urgency/last_error keys).
+    /// `MessageChannelList` on a client the registry holds no session for still
+    /// lists the `mqtt:` channel with `client`/`topic`, and reports the honest
+    /// "no session for client" health rather than a plausible-looking one. `qos`
+    /// and `urgency` stay absent — they are the session's own numbers and there
+    /// is no session to read them off.
     #[tokio::test]
-    async fn message_channel_list_mqtt_entry_without_service_omits_runtime_fields() {
+    async fn message_channel_list_mqtt_entry_without_a_session_reports_no_session() {
         use std::sync::Arc;
         let mqtt_address =
             brenn_lib::mqtt::config::parsed_address_canonical("home", "sensors/+/temp");
@@ -2296,11 +2295,17 @@ mod tests {
         assert_eq!(mqtt["access"], json!("pattern"));
         assert_eq!(mqtt["details"]["client"], json!("home"));
         assert_eq!(mqtt["details"]["topic"], json!("sensors/+/temp"));
-        // No service → no runtime fields enriched; they serialize away.
-        for field in ["qos", "health", "urgency", "last_error"] {
+        assert_eq!(mqtt["details"]["health"], json!("disconnected"));
+        assert_eq!(
+            mqtt["details"]["last_error"],
+            json!("no session for client"),
+            "the honest per-client answer, not a plausible-looking one: {mqtt}"
+        );
+        // The session's own numbers, and there is no session.
+        for field in ["qos", "urgency"] {
             assert!(
                 mqtt["details"].get(field).is_none(),
-                "{field} should be absent with no MqttService: {mqtt}"
+                "{field} should be absent with no session: {mqtt}"
             );
         }
     }
@@ -2958,7 +2963,7 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        brenn_webhook::WebhookService::new(vec![("test-ep".to_string(), ep)])
+        brenn_webhook::WebhookService::for_test(vec![ep])
     }
 
     /// `MessageChannelList` on a bridge whose Messenger directory contains a
@@ -4188,7 +4193,6 @@ mod tests {
         let addr = "mqtt:home:sensors/+/temp";
         let handle = bridge
             .mqtt_service()
-            .expect("the fixture stands one up")
             .get_client("home")
             .expect("the configured client");
         *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {

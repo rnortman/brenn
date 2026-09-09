@@ -1,7 +1,8 @@
 //! `resolve_apps` — the one resolver boot and reload share.
 //!
 //! Boot reaches it through `validate_and_resolve`; reload reaches it directly,
-//! over a candidate document, with the frozen inputs the booted process holds.
+//! over a candidate document, with the caller-supplied client identities and
+//! webhook subscription stamps.
 //! What these tests hold is that the two paths are the same function: a
 //! candidate resolves to the map a fresh boot of that same document would have
 //! produced, and every refusal boot makes over an agent is a refusal here.
@@ -12,7 +13,7 @@ use indexmap::IndexMap;
 
 use super::*;
 use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
-use crate::config::{FrozenInputs, ResolvedConfig, resolve_apps, validate_and_resolve};
+use crate::config::{ResolvedConfig, resolve_apps, validate_and_resolve};
 use crate::integration::IntegrationRegistry;
 use crate::messaging::config::{
     ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingSubscriptionRaw,
@@ -21,26 +22,24 @@ use crate::mqtt::config::MqttClientIdentity;
 use crate::webhook::config::ResolvedWebhookSubscription;
 use brenn_envelope::grants::AppCapability;
 
-/// Empty frozen inputs: no MQTT clients, no webhook subscriptions.
-fn empty_frozen() -> (
+/// Empty caller-supplied inputs: no MQTT clients, no webhook subscriptions.
+fn empty_inputs() -> (
     IndexMap<String, MqttClientIdentity>,
     BTreeMap<String, Vec<ResolvedWebhookSubscription>>,
 ) {
     (IndexMap::new(), BTreeMap::new())
 }
 
-/// Resolve a document the way reload does: `resolve_apps` alone, over frozen
-/// inputs, with no `ResolvedConfig` around it.
+/// Resolve a document the way reload does: `resolve_apps` alone, over the two
+/// inputs it reads rather than derives, with no `ResolvedConfig` around it.
 fn candidate_apps(config: &BrennConfig) -> IndexMap<String, AppConfig> {
-    let (clients, webhooks) = empty_frozen();
+    let (clients, webhooks) = empty_inputs();
     resolve_apps(
         config,
         &IntegrationRegistry::new(vec![]),
         Some(super::test_runtime_dir()),
-        &FrozenInputs {
-            mqtt_clients: &clients,
-            webhook_subscriptions: &webhooks,
-        },
+        &clients,
+        &webhooks,
     )
 }
 
@@ -182,11 +181,11 @@ fn spawn_field_edit_moves_only_that_field() {
     );
 }
 
-/// The webhook stamps come from the frozen inputs, not from the document: the
+/// The webhook stamps come from the caller, not from the document: the
 /// agent map is stamped in one place, which is what lets boot and reload stamp
 /// through one line.
 #[test]
-fn webhook_stamps_come_from_the_frozen_inputs() {
+fn webhook_stamps_come_from_the_caller() {
     let dir = tempfile::tempdir().unwrap();
     let config = document(dir.path(), "ch");
     let clients: IndexMap<String, MqttClientIdentity> = IndexMap::new();
@@ -204,10 +203,8 @@ fn webhook_stamps_come_from_the_frozen_inputs() {
         &config,
         &IntegrationRegistry::new(vec![]),
         Some(super::test_runtime_dir()),
-        &FrozenInputs {
-            mqtt_clients: &clients,
-            webhook_subscriptions: &webhooks,
-        },
+        &clients,
+        &webhooks,
     );
     let stamped = &apps["assistant"].webhook_subscriptions;
     assert_eq!(stamped.len(), 1);
@@ -326,6 +323,6 @@ fn acl_naming_an_unknown_mqtt_client_panics() {
         .push(crate::access::raw::MqttClientMatcherRaw {
             client: "ha".to_string(),
         });
-    // The frozen identity map is empty: no `[[mqtt_client]]` named `ha`.
+    // The supplied identity map is empty: no `[[mqtt_client]]` named `ha`.
     let _ = candidate_apps(&config);
 }

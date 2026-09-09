@@ -41,15 +41,61 @@ persistence false
 
 /// The ACL every template references as `__ACL__`.
 ///
-/// The general section applies to anonymous clients only, so the authenticated
-/// user of the password-authentication template needs its own section; that
-/// section is a no-op for the anonymous templates, which never log anyone in.
+/// The general section applies to anonymous clients only, so each authenticated
+/// user of the password-authentication template needs its own section; those
+/// sections are a no-op for the anonymous templates, which never log anyone in.
 pub const DEFAULT_ACL: &str = "\
 topic readwrite brenn/itest/#
 
 user brenn-itest
 topic readwrite brenn/itest/#
+
+user brenn-itest-rotated
+topic readwrite brenn/itest/#
 ";
+
+/// The password-authentication listener: anonymous clients are rejected and
+/// credentials come from `__PASSWD__`.
+///
+/// A constant beside the default one, for the same reason: a crate above this
+/// one drives a credential change through a real broker and cannot reach a data
+/// file in another package's runfiles.
+pub const AUTH_CONF_TEMPLATE: &str = "\
+listener __PORT__ 127.0.0.1
+protocol mqtt
+cafile   __CA_PEM__
+certfile __SERVER_CRT__
+keyfile  __SERVER_KEY__
+require_certificate false
+allow_anonymous false
+password_file __PASSWD__
+acl_file __ACL__
+log_dest file __LOG__
+log_type all
+persistence false
+";
+
+/// The password file [`AUTH_CONF_TEMPLATE`] reads, holding the two accounts
+/// [`AUTH_CREDENTIALS`] and [`ROTATED_CREDENTIALS`] name.
+///
+/// Two accounts because a mosquitto password file holds one entry per user, so
+/// a credential *rotation* a live broker authenticates on both sides of needs a
+/// second account: the username moves with the password. Checked in as the
+/// `$7$` sha512-pbkdf2 hash `mosquitto_passwd` writes, so no test needs that
+/// binary at runtime. A mosquitto too old to read the format fails the auth
+/// control case at connect; regenerate with
+/// `mosquitto_passwd -c -b <file> <user> <password>` per account.
+pub const AUTH_PASSWD: &str = "\
+brenn-itest:$7$101$iebdWDoklc/lomy/$D6Z40ukuECDWm6zM+OL3bbBA0PnwVcJdi4kQinefi6q87obwcb2/Hv2kfU9x6LphTSUcYVH2umdgMvV2/H0/Qw==
+brenn-itest-rotated:$7$101$/VrRzaON6/KYjAhm$9X3+QV4Z4u+LT5jt71wL0B3dZy8PwZqJiXqVBQGIj2HeD5n5/Ags+9YUsTa3y8MGjWL3F1JM3dAQOVsbkr7e2Q==
+";
+
+/// The account a credentialed session starts on: username, then password.
+pub const AUTH_CREDENTIALS: (&str, &str) = ("brenn-itest", "brenn-itest-password");
+
+/// The account a credential rotation moves to.
+pub const ROTATED_CREDENTIALS: (&str, &str) =
+    ("brenn-itest-rotated", "brenn-itest-rotated-password");
 
 /// How many ephemeral ports to try before giving up.
 ///
@@ -84,6 +130,22 @@ impl BrokerHarness {
     /// - TCP-connect readiness poll exceeds 2 seconds on every attempt.
     pub fn start() -> Self {
         Self::start_with(DEFAULT_CONF_TEMPLATE, &[("acl", DEFAULT_ACL.as_bytes())])
+    }
+
+    /// Spawn `mosquitto` on [`AUTH_CONF_TEMPLATE`] with [`AUTH_PASSWD`],
+    /// rejecting anonymous clients.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`BrokerHarness::start`].
+    pub fn start_auth() -> Self {
+        Self::start_with(
+            AUTH_CONF_TEMPLATE,
+            &[
+                ("acl", DEFAULT_ACL.as_bytes()),
+                ("passwd", AUTH_PASSWD.as_bytes()),
+            ],
+        )
     }
 
     /// Spawn `mosquitto` on `template`, with `extras` written beside it.
@@ -391,6 +453,56 @@ pub fn log_records_unsubscribe(log: &str, client_id: &str, topic_filter: &str) -
     false
 }
 
+/// Whether `log` records the broker receiving an orderly DISCONNECT from
+/// `client_id` — [`session_client_id`](super::client::session_client_id) for a
+/// brenn session.
+///
+/// The sibling of [`log_records_unsubscribe`] for the other packet a stopping
+/// supervisor sends, and the only account available of the fact: brenn drops
+/// the session's state as it stops, so nothing in-process afterwards says
+/// whether the DISCONNECT reached the broker. A session the broker lost instead
+/// — killed, or timed out — is logged as a socket error rather than as this
+/// line, so a supervisor that never drained its DISCONNECT does not read as one
+/// that did.
+///
+/// The id is matched to the end of the line, so one client id that is a prefix
+/// of another is not it. The wording is pinned against a real broker by
+/// `the_disconnect_matcher_reads_a_live_brokers_wording` in `brenn-mqtt`'s
+/// integration suite.
+pub fn log_records_disconnect(log: &str, client_id: &str) -> bool {
+    let received = format!("Received DISCONNECT from {client_id}");
+    log.lines().any(|line| line.ends_with(&received))
+}
+
+/// Whether `log` records an orderly DISCONNECT from `client_id` and records it
+/// *before* any session connects under that same id.
+///
+/// The claim a restart makes at the broker: the predecessor's DISCONNECT is
+/// drained before the successor's CONNECT, because both carry one MQTT client
+/// id and a broker that sees the CONNECT first performs a takeover — it kicks
+/// one of the two sessions and the persistent session's queued QoS-1 messages
+/// go with it. The supervisor's own reconnect loop then heals the connection,
+/// so every in-process health check still passes: the order is the only place
+/// the difference shows.
+///
+/// Read over a window opened before the restart, so the first connect line in
+/// it is the successor's. Both wordings are pinned against a real broker by
+/// `the_disconnect_matcher_reads_a_live_brokers_wording` in `brenn-mqtt`'s
+/// integration suite.
+pub fn log_records_disconnect_before_reconnect(log: &str, client_id: &str) -> bool {
+    let disconnected = format!("Received DISCONNECT from {client_id}");
+    let connected = format!(" as {client_id} (");
+    for line in log.lines() {
+        if line.contains(&connected) {
+            return false;
+        }
+        if line.ends_with(&disconnected) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `log` records the broker sending a PUBLISH on `topic` to
 /// `subscriber` — the MQTT client id of the session that should have received
 /// it, [`session_client_id`](super::client::session_client_id) for a brenn one.
@@ -463,7 +575,10 @@ fn read_tail_4k(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_lines, log_records_publish_to_subscriber, log_records_unsubscribe};
+    use super::{
+        complete_lines, log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
+        log_records_unsubscribe,
+    };
 
     /// One `log_type all` transcript in mosquitto's own shape: a SUBSCRIBE for
     /// three filters, an UNSUBSCRIBE for one of them, a publish delivered on one
@@ -507,6 +622,39 @@ mod tests {
 1700000005: carol brenn/itest/other
 1700000005: Sending UNSUBACK to carol
 ";
+
+    /// The restart shape: one session under `brenn:ha` disconnects and another
+    /// connects under the same id, in that order, with an unrelated session's
+    /// traffic interleaved.
+    const RESTART: &str = "\
+1700000000: Received DISCONNECT from brenn:ha
+1700000000: Client brenn:ha disconnected.
+1700000001: New client connected from 10.0.0.1:36992 as brenn:ha (p2, c0, k30).
+1700000001: Received SUBSCRIBE from brenn:ha
+";
+
+    #[test]
+    fn a_disconnect_before_the_successors_connect_is_the_restart_order() {
+        assert!(log_records_disconnect_before_reconnect(RESTART, "brenn:ha"));
+    }
+
+    #[test]
+    fn a_connect_before_the_disconnect_is_not() {
+        let takeover = "\
+1700000000: New client connected from 10.0.0.1:36992 as brenn:ha (p2, c0, k30).
+1700000000: Received DISCONNECT from brenn:ha
+";
+        assert!(!log_records_disconnect_before_reconnect(
+            takeover, "brenn:ha"
+        ));
+    }
+
+    #[test]
+    fn a_window_with_neither_packet_makes_no_claim() {
+        assert!(!log_records_disconnect_before_reconnect(
+            TRANSCRIPT, "brenn:ha"
+        ));
+    }
 
     #[test]
     fn an_unsubscribed_filter_is_found() {

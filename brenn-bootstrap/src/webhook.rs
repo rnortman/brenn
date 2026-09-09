@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use brenn_lib::webhook::ResolvedWebhookEndpoint;
-use brenn_webhook::{WebhookEventRouter, WebhookService};
+use brenn_webhook::{EndpointRuntime, ReplayGuard, WebhookEventRouter, WebhookService};
 use indexmap::IndexMap;
 use tracing::info;
 
@@ -11,36 +11,64 @@ use brenn_server::webhook_router::WebhookEventRouterImpl;
 
 /// Outcome of building the webhook service.
 pub(crate) struct WebhookResult {
-    pub(crate) service: Option<Arc<WebhookService>>,
-    pub(crate) event_router: Option<Arc<WebhookEventRouterImpl>>,
+    pub(crate) service: Arc<WebhookService>,
+    pub(crate) event_router: Arc<WebhookEventRouterImpl>,
 }
 
-/// Build the webhook service from the pre-resolved endpoint table produced by
-/// `validate_and_resolve`.
+/// Build the webhook service from the resolved endpoint table, loading each
+/// replay-protected endpoint's component.
 ///
-/// Returns `None` values when `endpoints` is empty (i.e. no `[[webhook_endpoint]]`
-/// blocks declared, or no app subscribes — `resolve_webhook_endpoints` panics on
-/// orphan endpoints so a non-empty table implies at least one subscriber).
+/// Always returns a service. An empty endpoint table leaves every path under
+/// `/webhooks/` unrecognized.
+///
+/// Each replay component is loaded then opened, in that order (see
+/// [`brenn_wasm::ReplayComponent::open_store`]). Panics on a component that
+/// cannot be loaded or a store that cannot be opened — a boot that cannot serve
+/// a declared endpoint must not serve.
 ///
 /// `AppState` injection (`set_state` + `set_router`) must happen after
 /// `AppState` construction — same deferred-state pattern as `MqttEventRouterImpl`.
 pub(crate) fn build_webhook(
     endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
+    components_roots: &[std::path::PathBuf],
 ) -> WebhookResult {
-    if endpoints.is_empty() {
-        return WebhookResult {
-            service: None,
-            event_router: None,
-        };
-    }
-
     info!("wiring webhook service ({} endpoints)", endpoints.len());
-    let svc = WebhookService::new(endpoints);
+    let runtimes: Vec<Arc<EndpointRuntime>> = endpoints
+        .into_values()
+        .map(|endpoint| {
+            let replay = endpoint.replay_protection.as_ref().map(|rp| {
+                let (component, verified) = crate::load_verified_replay(
+                    &endpoint.slug,
+                    components_roots,
+                    &rp.component,
+                    &rp.store_path,
+                    rp.max_page_count,
+                    rp.config.clone(),
+                );
+                component.open_store();
+                info!(
+                    endpoint = %endpoint.slug,
+                    component = %rp.component,
+                    store_path = %rp.store_path.display(),
+                    component_path = %verified.artifact.display(),
+                    root = %verified.root.display(),
+                    world = %verified.world,
+                    artifact_sha256 = %verified.artifact_sha256,
+                    "replay protection loaded"
+                );
+                ReplayGuard::new(rp.store_path.clone(), verified, Arc::new(component))
+            });
+            EndpointRuntime::new(endpoint, replay)
+        })
+        .collect();
+
+    let svc = WebhookService::new();
+    svc.install(runtimes);
     let router = Arc::new(WebhookEventRouterImpl::new());
 
     WebhookResult {
-        service: Some(svc),
-        event_router: Some(router),
+        service: svc,
+        event_router: router,
     }
 }
 
@@ -59,7 +87,7 @@ pub(crate) async fn wire_webhook_state(
     state: brenn_server::state::AppState,
 ) {
     assert!(
-        state.messenger.is_some(),
+        state.messenger.is_some() || service.baseline().is_empty(),
         "webhook endpoint(s) configured but no messenger — \
          add at least one [[app.channel]] block or remove [[webhook_endpoint]] blocks"
     );

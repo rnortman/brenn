@@ -414,22 +414,12 @@ pub async fn run_server(
     // below so a server-restart-recovery scan that finds a past-deadline /
     // past-release row already has a fully initialized router for
     // `spawn_eager_wake`. Without that ordering, those rows could be
-    // released-and-orphaned during the startup race (review F1).
+    // released-and-orphaned during the startup race.
     // The replay endpoints' KV stores, which the planner holds the consumers'
-    // stores unique against. Read off the resolved endpoints rather than off the
-    // `WebhookService` built further down: the paths are canonical either way,
-    // and the check belongs to the derivation.
-    let replay_store_paths: Vec<std::path::PathBuf> = webhook_endpoints
-        .values()
-        .filter_map(|ep| {
-            ep.replay_protection
-                .as_ref()
-                .map(|rp| rp.store_path.clone())
-        })
-        .collect();
+    // stores unique against.
+    let replay_store_paths =
+        brenn_lib::webhook::webhook_store_paths(webhook_endpoints.values().map(|ep| &**ep));
 
-    // Held so the reload facility plans every candidate against the same
-    // booted identities.
     let mqtt_client_identities = brenn_lib::mqtt::config::client_identities(&mqtt_clients);
 
     let (mut messaging_result, plan_carried) = brenn_messaging_boot::build_messaging(
@@ -617,52 +607,9 @@ pub async fn run_server(
     // `[[mqtt_client]]`. Each session carries both the publish and the
     // ingress-delivery paths.
     //
-    // `None` when no `[[mqtt_client]]` is declared.
     let mqtt_result = mqtt::start_mqtt(&mqtt_ingress_channels, &mqtt_clients).await;
 
-    // Webhook service: build from pre-resolved endpoint table.
-    //
-    // `None` when no `[[webhook_endpoint]]` is declared OR no app declares any
-    // `[[app.webhook_subscription]]`.
-    let webhook_result = webhook::build_webhook(webhook_endpoints);
-
-    // Replay-protection components: load each endpoint's WASM component at
-    // startup, using the already-resolved (canonical) paths from the
-    // WebhookService. Panics on failure — a boot that cannot load a declared
-    // component must not serve.
-    let (replay_components, replay_locks) = {
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        let mut components = HashMap::new();
-        let mut locks = HashMap::new();
-        if let Some(ref svc) = webhook_result.service {
-            for ep in svc.all_endpoints() {
-                if let Some(ref rp) = ep.replay_protection {
-                    let (component, verified) = load_verified_replay(
-                        &ep.slug,
-                        &components_roots,
-                        &rp.component,
-                        &rp.store_path,
-                        rp.max_page_count,
-                        rp.config.clone(),
-                    );
-                    components.insert(ep.slug.clone(), Arc::new(component));
-                    locks.insert(ep.slug.clone(), Arc::new(tokio::sync::Mutex::new(())));
-                    info!(
-                        endpoint = %ep.slug,
-                        component = %rp.component,
-                        store_path = %rp.store_path.display(),
-                        component_path = %verified.artifact.display(),
-                        root = %verified.root.display(),
-                        world = %verified.world,
-                        artifact_sha256 = %verified.artifact_sha256,
-                        "replay protection loaded"
-                    );
-                }
-            }
-        }
-        (Arc::new(components), Arc::new(locks))
-    };
+    let webhook_result = webhook::build_webhook(webhook_endpoints, &components_roots);
 
     // WASM processor components: load each [[wasm_consumer]]'s component at
     // startup. Panics on failure — a boot that cannot load a declared component
@@ -882,8 +829,6 @@ pub async fn run_server(
         remotes: std::sync::Arc::new(remote_runtimes),
         attach_registry: brenn_attach_server::registry::AttachRegistry::default(),
         attach_heartbeat_secs: brenn_surface_server::HEARTBEAT_SECS,
-        replay_components,
-        replay_locks,
         cc_profiles: cc_profiles.clone(),
     };
 
@@ -1024,9 +969,8 @@ pub async fn run_server(
                 apps: app_table.clone(),
                 integration_registry: integration_registry.clone(),
                 runtime_dir: runtime_dir.clone(),
-                mqtt_clients: mqtt_client_identities,
                 tool_registry: state.tools.clone(),
-                replay_store_paths: replay_store_paths.clone(),
+                webhook: state.webhook.clone(),
                 surface_roots: state.surface_roots.clone(),
                 surfaces: state.surfaces.clone(),
                 attach_registry: state.attach_registry.clone(),
@@ -1067,30 +1011,21 @@ pub async fn run_server(
     // call `submit_ingress`. The supervisors are already running; they won't
     // call `deliver_inbound` until they have an active connection and receive
     // a publish from the broker, which is after this point.
-    let mqtt_stop_txs = if let (Some(svc), Some(router)) = (
-        mqtt_result.service.as_ref(),
-        mqtt_result.event_router.as_ref(),
-    ) {
-        mqtt::wire_mqtt_state(
-            svc,
-            router,
-            state.clone(),
-            &mqtt_ingress_channels,
-            mqtt_result.stop_txs,
-        )
-        .await
-    } else {
-        // No MQTT configured — return empty vec.
-        mqtt_result.stop_txs
-    };
+    mqtt::wire_mqtt_state(
+        &mqtt_result.service,
+        &mqtt_result.event_router,
+        state.clone(),
+        &mqtt_ingress_channels,
+    )
+    .await;
 
     // Webhook: inject AppState into the event router.
-    if let (Some(svc), Some(router)) = (
-        webhook_result.service.as_ref(),
-        webhook_result.event_router.as_ref(),
-    ) {
-        webhook::wire_webhook_state(svc, router, state.clone()).await;
-    }
+    webhook::wire_webhook_state(
+        &webhook_result.service,
+        &webhook_result.event_router,
+        state.clone(),
+    )
+    .await;
 
     // Automation engine: inject state into the IngressRouter, run startup
     // catch-up pass, then spawn the background scheduler loop.
@@ -1166,12 +1101,12 @@ pub async fn run_server(
 
     // Capture the handles `shutdown_signal` needs before `state` is consumed
     // by `build_router`. `active_bridges` and `server_shutting_down` are
-    // cheap `Clone` (Arc-backed); `mqtt_stop_txs` is moved here so the
-    // senders fire MQTT DISCONNECT on SIGTERM/SIGINT.
+    // cheap `Clone` (Arc-backed); the MQTT service is the live registry, whose
+    // supervisors are signalled to send DISCONNECT on SIGTERM/SIGINT.
     let shutdown_handle = shutdown::ShutdownHandle {
         active_bridges: state.active_bridges.clone(),
         server_shutting_down: state.server_shutting_down.clone(),
-        mqtt_stop_txs,
+        mqtt: mqtt_result.service.clone(),
     };
 
     // Warn if resized images will exceed the upload limit. Rough JPEG upper bound: long_edge² / 4 bytes.

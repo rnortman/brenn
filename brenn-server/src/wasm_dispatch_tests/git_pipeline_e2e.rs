@@ -35,7 +35,6 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::middleware as axum_mw;
-use axum::routing::post;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{NoiseLevel, ResolvedChannel, Sink, SystemChannelTuning};
 use brenn_lib::tools::ResolvedToolGrant;
@@ -48,7 +47,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use crate::client_ip::{TrustedProxyHops, resolve_client_ip};
-use crate::routes::webhooks::inbound::{EndpointSlug, receive};
+use crate::routes::webhooks::inbound::receive;
 use crate::webhook_router::WebhookEventRouterImpl;
 use brenn_git::sync::CloneInfo;
 use brenn_tool_registry::bus_wiring::{
@@ -457,13 +456,10 @@ async fn build_pipeline() -> Pipeline {
     );
 
     // --- AppState + real WebhookEventRouterImpl for the HTTP ingress. ---
-    let svc = WebhookService::new(vec![
-        (FORGEJO.endpoint_slug.to_string(), forge_endpoint(FORGEJO)),
-        (GITHUB.endpoint_slug.to_string(), forge_endpoint(GITHUB)),
-    ]);
+    let svc = WebhookService::for_test(vec![forge_endpoint(FORGEJO), forge_endpoint(GITHUB)]);
     let mut state = crate::state::AppState::for_test(messenger.db().clone(), None);
     state.messenger = Some(Arc::clone(&messenger));
-    state.webhook = Some(svc.clone());
+    state.webhook = Arc::clone(&svc);
     let axum_state = state.clone();
 
     let real_router = Arc::new(WebhookEventRouterImpl::new());
@@ -486,19 +482,12 @@ async fn build_pipeline() -> Pipeline {
     }
 }
 
-/// Build the axum router serving `forge`'s mount, backed by the pipeline's
-/// shared `AppState`. A fresh router per request (oneshot consumes it).
-fn axum_router(pipeline: &Pipeline, forge: Forge) -> Router {
+/// A fresh router per request (oneshot consumes it).
+fn axum_router(pipeline: &Pipeline) -> Router {
     Router::new()
         .route(
-            &format!("/webhooks/{}", forge.endpoint_slug),
-            post(receive).layer(
-                tower::ServiceBuilder::new()
-                    .layer(axum::Extension(EndpointSlug(
-                        forge.endpoint_slug.to_string(),
-                    )))
-                    .layer(DefaultBodyLimit::max(65536)),
-            ),
+            "/webhooks/{*tail}",
+            axum::routing::any(receive).layer(DefaultBodyLimit::disable()),
         )
         .with_state(pipeline.axum_state.clone())
         .layer(axum_mw::from_fn(resolve_client_ip))
@@ -522,7 +511,7 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
         .header(forge.event_header, "push")
         .body(Body::from(body))
         .unwrap();
-    let resp = axum_router(&pipeline, forge).oneshot(req).await.unwrap();
+    let resp = axum_router(&pipeline).oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::NO_CONTENT,

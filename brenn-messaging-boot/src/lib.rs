@@ -191,7 +191,7 @@ pub(crate) fn assert_unique_store_paths(
     for path in replay_paths {
         if let Some(prior_owner) = seen.insert(path.as_path(), "replay endpoint".to_string()) {
             panic!(
-                "bootstrap: store_path {:?} is shared between two replay endpoints \
+                "config: store_path {:?} is shared between two replay endpoints \
                  (also owned by {prior_owner}) — each store_path must be unique \
                  across all replay and consumer stores",
                 path
@@ -202,7 +202,7 @@ pub(crate) fn assert_unique_store_paths(
         let owner_label = format!("[[wasm_consumer]] {slug:?}");
         if let Some(prior_owner) = seen.insert(path.as_path(), owner_label) {
             panic!(
-                "bootstrap: store_path {:?} is shared between [[wasm_consumer]] {slug:?} \
+                "config: store_path {:?} is shared between [[wasm_consumer]] {slug:?} \
                  and {prior_owner} — each store_path must be unique across all \
                  replay and consumer stores",
                 path

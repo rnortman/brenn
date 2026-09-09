@@ -18,7 +18,9 @@ pub mod relay;
 pub mod router;
 
 pub use brenn_mqtt::test_support::broker::{
-    BrokerHarness, DEFAULT_ACL, log_records_publish_to_subscriber, log_records_unsubscribe,
+    AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, log_records_disconnect,
+    log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
+    log_records_unsubscribe,
 };
 pub use brenn_mqtt::test_support::certs;
 pub use brenn_mqtt::test_support::client::{
@@ -34,7 +36,9 @@ use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::config::{MqttClientConfig, MqttClientIdentity, TlsVersionMin};
 use brenn_mqtt::service::IngressSubscribeOutcome;
 use brenn_mqtt::state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle};
-use brenn_mqtt::{InboundPayload, MqttEventRouter, MqttService, spawn_client_supervisor};
+use brenn_mqtt::{
+    ArrivingFilters, InboundPayload, MqttEventRouter, MqttService, register_and_spawn,
+};
 use rumqttc::{AsyncClient, MqttOptions, Transport};
 use tokio::sync::mpsc;
 
@@ -61,14 +65,10 @@ pub fn broker_tls13() -> BrokerHarness {
 }
 
 /// Spawn a broker that requires username/password authentication
-/// (`allow_anonymous false` + a `password_file`). The checked-in `passwd` asset
-/// holds one user (`brenn-itest` / `brenn-itest-password`).
+/// (`allow_anonymous false` + a `password_file`), whose accounts are
+/// `brenn_mqtt::test_support::broker`'s two.
 pub fn broker_auth() -> BrokerHarness {
-    let passwd = std::fs::read(mqtt_assets_dir().join("passwd")).expect("failed to read passwd");
-    BrokerHarness::start_with(
-        &conf_template("mosquitto.conf.auth.tmpl"),
-        &[("acl", DEFAULT_ACL.as_bytes()), ("passwd", &passwd)],
-    )
+    BrokerHarness::start_auth()
 }
 
 // ---------------------------------------------------------------------------
@@ -222,17 +222,13 @@ pub async fn spawn_client_with_config(
         })
         .collect();
 
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let handle = MqttClientHandle::new(config, subs, stop_tx);
-
     let svc = MqttService::new();
-    svc.add_client(handle.clone()).await;
-
     let (router, rx) = CapturingRouter::new();
     let router_arc: Arc<dyn MqttEventRouter> = Arc::new(router);
     svc.set_router(router_arc.clone()).await;
 
-    spawn_client_supervisor(handle.clone(), router_arc, stop_rx);
+    let handle =
+        register_and_spawn(&svc, config, ArrivingFilters::Declared(subs), router_arc).await;
 
     SpawnedClient {
         svc,

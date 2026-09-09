@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use brenn_lib::messaging::config::{Depth, DormantSubscription};
 use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntryKind};
+use brenn_lib::mqtt::config::MqttClientConfig;
 use brenn_lib::wasm_package::Verified;
 use brenn_messaging::{Messenger, WASM_WINDOW_MAX_NEW};
 use brenn_messaging_boot::MessagingPlan;
@@ -37,7 +38,11 @@ use brenn_server::messaging_router::DeliveryBinding;
 
 use brenn_wasm_dispatch::ConsumerHandle;
 
-use brenn_mqtt::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
+use super::webhook::WebhookArrivals;
+
+use brenn_mqtt::{
+    ArrivingFilters, IngressSubscribeOutcome, IngressUnsubscribeOutcome, register_and_spawn,
+};
 
 use brenn_lib::messaging::identity::AttachScope;
 use brenn_server::routes::surface::SurfaceCloseReason;
@@ -104,10 +109,15 @@ pub(crate) async fn apply(
     registry: &mut ConsumerRegistry,
     plan: &MessagingPlan,
     delta: &PlanDelta,
-    loaded: Vec<(String, LoadedConsumer)>,
-    records: &HashMap<String, Verified>,
-    surfaces: &SurfaceCommit<'_>,
+    artifacts: CommitArtifacts<'_>,
 ) -> Result<CommitReport, Vec<String>> {
+    let CommitArtifacts {
+        loaded,
+        records,
+        surfaces,
+        webhook,
+    } = artifacts;
+    let surfaces = &surfaces;
     let arrived = live_subscriber_refusals(delta, env.messenger.directory());
     if !arrived.is_empty() {
         return Err(arrived);
@@ -124,6 +134,7 @@ pub(crate) async fn apply(
     let channels = plan.directory.list();
     let planned = PlannedSubscribers::of(&channels);
 
+    retire_webhook_endpoints(env, delta);
     retire_consumers(env, registry, plan, delta).await;
     retire_surfaces(env, delta).await;
     // Asked again, because the two retirements' waits — for a stopping consumer
@@ -149,6 +160,7 @@ pub(crate) async fn apply(
     );
     retire_agent_subscriptions(env, delta).await;
     describe_channels(env, delta).await;
+    start_added_clients(env, delta).await;
     let mut report = MqttCommitReport {
         deferred: mqtt_outgoing(env, delta).await,
         failed: Vec::new(),
@@ -158,6 +170,7 @@ pub(crate) async fn apply(
     swap_agents(env, plan, delta);
     let sessions = retire_stale_sessions(env, delta).await;
     start_agent_subscriptions(env, delta, &planned).await;
+    restart_changed_and_stop_removed_clients(env, delta).await;
     let incoming = mqtt_incoming(env, delta).await;
     report.deferred.extend(incoming.deferred);
     report.failed = incoming.failed;
@@ -165,7 +178,9 @@ pub(crate) async fn apply(
     swap_surface_registrations(env, surfaces.docs);
     publish_surface_docs(env, surfaces.docs).await;
     start_surfaces(env, plan, delta, surfaces, &planned).await;
+    release_retiring_replay_stores(webhook).await;
     start_consumers(env, registry, plan, delta, loaded, &planned).await;
+    install_webhook_endpoints(env, webhook);
     refresh_records(registry, records);
 
     // The same cross-check boot runs over its own wiring, asked of the wiring
@@ -664,6 +679,147 @@ async fn start_agent_subscriptions(
     }
 }
 
+/// Register and spawn a supervisor for every client the candidate adds.
+///
+/// Before the outgoing step and before the agent swap, so an agent whose new
+/// authority names the client finds it registered from the first instant that
+/// authority is live, and so the incoming step has a session to subscribe its
+/// filters on.
+///
+/// The handle is built with an **empty** subscription list: the incoming step
+/// is about to `subscribe_filter` every one of the client's filters and record
+/// each outcome, and a handle pre-loaded with the union would leave those
+/// moves unreported. The end state is a fresh boot's — the same filter set on
+/// the handle and at the broker.
+///
+/// Between here and the incoming step the handle is registered and connecting,
+/// so a publish through it is a normal not-connected outcome.
+async fn start_added_clients(env: &ReloadEnv, delta: &PlanDelta) {
+    let router: Arc<dyn brenn_mqtt::MqttEventRouter> = env.mqtt_event_router.clone();
+    for client in &delta.mqtt_clients.added {
+        register_and_spawn(
+            &env.mqtt_service,
+            Arc::clone(client),
+            ArrivingFilters::Declared(Vec::new()),
+            router.clone(),
+        )
+        .await;
+        info!(
+            client = %client.identity.slug,
+            host = %client.identity.host,
+            port = client.identity.port,
+            subscriptions = 0,
+            "reload: mqtt client supervisor spawned"
+        );
+    }
+}
+
+/// Which half of a restarted client's resolved value moved, for the journal.
+///
+/// The headline case this facility adds is a rotated `password_file` or
+/// `ca_file` under an unmoved document, where the successor's broker
+/// coordinates are the predecessor's: without this field the line says a
+/// session was torn down and rebuilt and gives no reason, and the `Failed`
+/// health a rejected credential produces afterwards has no antecedent in the
+/// journal.
+fn what_moved(old: &MqttClientConfig, new: &MqttClientConfig) -> &'static str {
+    let identity = old.identity != new.identity;
+    let credential = old.password != new.password || old.ca_cert_pem != new.ca_cert_pem;
+    match (identity, credential) {
+        (true, true) => "identity+credential",
+        (true, false) => "identity",
+        (false, true) => "credential",
+        (false, false) => panic!(
+            "reload commit: client {:?} is being restarted with nothing moved — the delta and \
+             this comparison disagreeing is a host bug",
+            old.identity.slug,
+        ),
+    }
+}
+
+/// Restart every client whose resolved value moved, then stop every one the
+/// candidate no longer declares.
+///
+/// After the agent swap, which is the last step at which anything authorized to
+/// name a removed client could have been live: its consumers were retired
+/// before the channel walk, its ingress channels all left with it — the planner
+/// refuses a binding on an undeclared client — and its ACL-holding agents were
+/// swapped. Before the incoming step, so the filter moves land on the handle
+/// that will assert them.
+///
+/// A changed client is swapped into the registry **first** and stopped second,
+/// so `get_client` never answers `None` for a slug the document still declares.
+/// The successor inherits the predecessor's subscription list — the live union
+/// of static and dynamic filters as the outgoing step left it, copied after the
+/// predecessor's supervisor has joined so a filter a concurrent subscribe added
+/// late is not dropped — and the
+/// broker sees an orderly DISCONNECT followed by a CONNECT with the same client
+/// id and `clean_start(false)`, so the persistent session resumes and the new
+/// supervisor re-asserts every filter on its first connect.
+///
+/// A removed client's session lingers at the broker until its session expiry
+/// elapses, exactly as it would after a fresh boot of the new document.
+///
+/// One task per client, all in flight together: every join here is bounded by
+/// the supervisor's own DISCONNECT drain timeout but not fast, and only the
+/// stop-then-spawn pair *within* one client is ordered — distinct clients share
+/// nothing. Serially, a document retiring or re-credentialling K clients
+/// against a broker slow to close would stretch this step, and the whole commit
+/// with it, to K drains, with no `mqtt:` route installed and no status
+/// published until it finished. Concurrently the step is bounded by one drain
+/// whatever K is. A panic in any of them is carried back out of the join, so a
+/// commit-step assertion still takes the process down with its own payload.
+async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanDelta) {
+    let router: Arc<dyn brenn_mqtt::MqttEventRouter> = env.mqtt_event_router.clone();
+    let mut sessions = tokio::task::JoinSet::new();
+    for new in &delta.mqtt_clients.changed {
+        let service = env.mqtt_service.clone();
+        let router = router.clone();
+        let new = Arc::clone(new);
+        sessions.spawn(async move {
+            let slug = new.identity.slug.clone();
+            let old = service.get_client(&slug).unwrap_or_else(|| {
+                panic!(
+                    "reload commit: client {slug:?} is being restarted but the registry holds \
+                     no session for it — {SESSION_INVARIANT}, so it is a host bug",
+                )
+            });
+            let moved = what_moved(&old.config, &new);
+            let (host, port) = (new.identity.host.clone(), new.identity.port);
+            let successor =
+                register_and_spawn(&service, new, ArrivingFilters::Successor(&old), router).await;
+            // The inherited set lands on the successor after the predecessor's
+            // join, so a filter a concurrent subscribe added late is in this
+            // count.
+            let count = successor.subscriptions.read().await.len();
+            info!(
+                client = %slug,
+                host = %host,
+                port = port,
+                subscriptions = count,
+                moved = moved,
+                "reload: mqtt client supervisor restarted"
+            );
+        });
+    }
+    for slug in &delta.mqtt_clients.removed {
+        let service = env.mqtt_service.clone();
+        let slug = slug.clone();
+        sessions.spawn(async move {
+            service.remove_client(&slug).stop_and_join().await;
+            info!(client = %slug, "reload: mqtt client supervisor stopped");
+        });
+    }
+    while let Some(joined) = sessions.join_next().await {
+        if let Err(e) = joined {
+            if e.is_panic() {
+                std::panic::resume_unwind(e.into_panic());
+            }
+            panic!("reload commit: an mqtt client session task ended unexpectedly: {e}");
+        }
+    }
+}
+
 /// The outgoing MQTT step, between the descriptions and the channel removals.
 ///
 /// UNSUBSCRIBE before the route goes, so a publish already in flight finds its
@@ -675,7 +831,7 @@ async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
     for client in &delta.mqtt.clients {
         for filter in client.leaving() {
             let address = address_of(&client.client, &filter.topic_filter);
-            let service = mqtt_service(env, &address);
+            let service = &env.mqtt_service;
             let outcome = session_or_bug(
                 service
                     .unsubscribe_filter(&client.client, &filter.topic_filter)
@@ -690,7 +846,7 @@ async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
         }
     }
     for route in &delta.mqtt.routes_removed {
-        let removed = mqtt_router(env, &route.channel_address).remove_route(route.channel_uuid);
+        let removed = env.mqtt_event_router.remove_route(route.channel_uuid);
         assert!(
             removed,
             "reload commit: mqtt channel {:?} is in the delta but the router holds no route for \
@@ -712,7 +868,7 @@ async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
         // Idempotent on the channel uuid, and the uuid is the plan's, so a
         // `false` here means the table already held a route the plan also
         // wants — which rule 2's added arm refused before the walk.
-        let added = mqtt_router(env, &address).add_route(route.clone());
+        let added = env.mqtt_event_router.add_route(route.clone());
         assert!(
             added,
             "reload commit: the router already holds a route for mqtt channel {address:?}, which \
@@ -724,7 +880,7 @@ async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
     for client in &delta.mqtt.clients {
         for filter in client.joining() {
             let address = address_of(&client.client, &filter.topic_filter);
-            let service = mqtt_service(env, &address);
+            let service = &env.mqtt_service;
             let outcome = session_or_bug(
                 service
                     .subscribe_filter(&client.client, filter.topic_filter.clone(), filter.qos)
@@ -741,6 +897,106 @@ async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
         }
     }
     report
+}
+
+/// Take every removed endpoint out of the table.
+///
+/// From this instant a request to one of their mounts is an unrecognized URL.
+/// Ordered before the consumers leave so no request can reach the event
+/// router's WASM-owner guard for an endpoint whose owner is gone. A removed
+/// endpoint's replay guard keeps its component until
+/// [`release_retiring_replay_stores`], so an in-flight request that already
+/// holds the entry still gets a real replay check.
+fn retire_webhook_endpoints(env: &ReloadEnv, delta: &PlanDelta) {
+    if delta.webhook.removed.is_empty() {
+        return;
+    }
+    env.webhook.retire(&delta.webhook.removed_slugs());
+    for entry in &delta.webhook.removed {
+        info!(
+            endpoint = %entry.slug(),
+            mount = %entry.endpoint.mount,
+            "reload: webhook endpoint retired"
+        );
+    }
+}
+
+/// Drop every replay component this reload is taking out of service.
+///
+/// The store-path namespace is one namespace across the webhook and consumer
+/// subsystems, and the planner's uniqueness check is over the candidate alone —
+/// so a candidate may hand a retiring endpoint's store path to an arriving
+/// consumer, and only this order keeps the two holders from overlapping. Every
+/// retiring holder is dropped here, before the first arriving store of either
+/// subsystem is opened.
+///
+/// The lock wait is bounded by one replay `check`, which the replay wall budget
+/// bounds. A request that takes the lock afterwards finds an empty slot and
+/// answers `503` rather than publishing a message nothing replay-checked.
+///
+/// # Panics
+///
+/// On a retiring guard that is already empty. Every guard here is either a
+/// removed endpoint's — still holding, since retiring the table entry does not
+/// touch the slot — or the old guard of a changed endpoint whose component this
+/// reload replaced. An empty one means requests have been answering `503`
+/// against an entry nothing replaced, which is a host bug and not a state to
+/// walk past.
+async fn release_retiring_replay_stores(webhook: &WebhookArrivals) {
+    for guard in &webhook.retiring {
+        let mut slot = guard.slot.lock().await;
+        assert!(
+            slot.take().is_some(),
+            "reload commit: the retiring replay guard over {} was already empty — host bug",
+            guard.store_path.display(),
+        );
+        info!(
+            store_path = %guard.store_path.display(),
+            "reload: replay store released"
+        );
+    }
+}
+
+/// Open every arriving replay store, then swap the endpoint table.
+///
+/// In that order, and after the arriving consumers' stores: `open_store` panics
+/// on a path some other component still holds, which past
+/// [`release_retiring_replay_stores`] and `retire_consumers` would be a host
+/// bug — a component holding a file the planner proved unique.
+///
+/// The swap is last so that the first request to an added mount finds the
+/// channel it publishes to already in the directory and the subscriber that
+/// reads it already folded on. For a changed endpoint the old entry serves
+/// until the swap.
+fn install_webhook_endpoints(env: &ReloadEnv, webhook: &WebhookArrivals) {
+    for guard in &webhook.opening {
+        let slot = guard
+            .slot
+            .try_lock()
+            .expect("an arriving replay guard is not installed yet, so nothing else holds it");
+        let component = slot.as_ref().unwrap_or_else(|| {
+            panic!(
+                "reload commit: the arriving replay guard over {} carries no component — host bug",
+                guard.store_path.display(),
+            )
+        });
+        component.open_store();
+        info!(
+            store_path = %guard.store_path.display(),
+            "reload: replay store opened"
+        );
+    }
+    if webhook.runtimes.is_empty() {
+        return;
+    }
+    for runtime in &webhook.runtimes {
+        info!(
+            endpoint = %runtime.slug(),
+            mount = %runtime.endpoint.mount,
+            "reload: webhook endpoint installed"
+        );
+    }
+    env.webhook.install(webhook.runtimes.clone());
 }
 
 /// Point every running consumer's record at the tree this reload resolved it
@@ -843,17 +1099,17 @@ fn record_subscribe(outcome: &IngressSubscribeOutcome, address: &str) -> Subscri
         }
         IngressSubscribeOutcome::ClientFailed(reason) => {
             // The supervisor has stopped retrying, so there is no reconnect to
-            // defer to: this filter will not reach the broker in this process at
-            // all. The filter is registered and a fixed process asserts it, so
-            // the reload applied — but an operator reading `mqtt_deferred` would
-            // wait for a convergence that is not coming, which is why this one
-            // is reported in a list of its own.
+            // defer to: this filter will not reach the broker until the
+            // client's block is edited, which restarts its supervisor. The
+            // filter is registered, so the reload applied — but an operator
+            // reading `mqtt_deferred` would wait for a convergence that is not
+            // coming, which is why this one is reported in a list of its own.
             warn!(
                 address = %address,
                 %reason,
                 "reload: mqtt filter registered but its client's session has failed \
-                 authoritatively; nothing will be subscribed until the client is fixed and the \
-                 process restarted"
+                 authoritatively; nothing will be subscribed until the client is fixed and \
+                 reloaded"
             );
             SubscribeReport::Failed
         }
@@ -864,11 +1120,10 @@ fn record_subscribe(outcome: &IngressSubscribeOutcome, address: &str) -> Subscri
     }
 }
 
-/// Why a missing broker session or a missing service is a host bug in this walk
-/// and not a state the document could have asked for.
+/// Why a missing broker session is a host bug in this walk and not a state the
+/// document could have asked for.
 const SESSION_INVARIANT: &str = "every `mqtt:` address a plan can carry names a declared client, \
-                                 and a declared client has a session on a service that exists \
-                                 whenever one is declared";
+                                 and a declared client has a session";
 
 /// One broker-subscription move's outcome, or the host bug of the named client
 /// having no session. `verb` is the past participle for the direction —
@@ -882,27 +1137,19 @@ fn session_or_bug<T>(outcome: Option<T>, client: &str, address: &str, verb: &str
     })
 }
 
-/// The broker service this walk needs, or the host bug of not having one.
-fn mqtt_service<'a>(env: &'a ReloadEnv, address: &str) -> &'a Arc<brenn_mqtt::MqttService> {
-    env.mqtt_service.as_ref().unwrap_or_else(|| {
-        panic!(
-            "reload commit: {address} moves a broker subscription but this process has no MQTT \
-             service — {SESSION_INVARIANT}, so it is a host bug"
-        )
-    })
-}
-
-/// The ingress router this walk needs, or the host bug of not having one.
-fn mqtt_router<'a>(
-    env: &'a ReloadEnv,
-    address: &str,
-) -> &'a Arc<brenn_server::mqtt_router::MqttEventRouterImpl> {
-    env.mqtt_event_router.as_ref().unwrap_or_else(|| {
-        panic!(
-            "reload commit: {address} moves an ingress route but this process has no MQTT event \
-             router — it exists on exactly the terms the service does, so it is a host bug"
-        )
-    })
+/// Everything prepare built for the walk to install: the consumers it loaded,
+/// what each candidate consumer's package binds to, the surface half, and the
+/// webhook half. All of it built before anything could be refused, so none of
+/// it can fail here — which is why it travels as one value rather than as four
+/// more parameters.
+pub(crate) struct CommitArtifacts<'a> {
+    /// One loaded component per consumer the delta adds or changes, by slug.
+    pub loaded: Vec<(String, LoadedConsumer)>,
+    /// What every candidate consumer resolved to, by slug; the registry adopts
+    /// these at the end of the walk.
+    pub records: &'a HashMap<String, Verified>,
+    pub surfaces: SurfaceCommit<'a>,
+    pub webhook: &'a WebhookArrivals,
 }
 
 /// Everything the walk's surface steps install: the scanned asset roots, the
@@ -1640,6 +1887,40 @@ mod tests {
             ),
             SubscribeReport::Deferred
         );
+    }
+
+    /// The restart reason the journal carries, one assertion per arm.
+    ///
+    /// The field is the only operator-facing account of *why* a session was
+    /// torn down and rebuilt mid-flight, and the credential arm is the headline
+    /// case: nothing in the document moved, so a line without it is a restart
+    /// with no antecedent and the `Failed` health a rejected credential
+    /// produces afterwards has none either. Swap two arms and every reload case
+    /// stays green while the explanation is inverted, which is what this holds.
+    #[test]
+    fn every_restart_reason_names_the_half_that_moved() {
+        let base = brenn_lib::mqtt::test_support::test_client_config("ha");
+
+        let mut elsewhere = base.clone();
+        elsewhere.identity.port += 1;
+        assert_eq!(what_moved(&base, &elsewhere), "identity");
+
+        let mut rotated = base.clone();
+        rotated.password = Some("second".to_string());
+        assert_eq!(what_moved(&base, &rotated), "credential");
+
+        let mut both = elsewhere.clone();
+        both.ca_cert_pem = Some(b"-----BEGIN CERTIFICATE-----".to_vec());
+        assert_eq!(what_moved(&base, &both), "identity+credential");
+    }
+
+    /// A restart with nothing moved means the delta and this comparison
+    /// disagree, which no document can produce.
+    #[test]
+    #[should_panic(expected = "nothing moved")]
+    fn a_restart_with_nothing_moved_is_a_host_bug() {
+        let config = brenn_lib::mqtt::test_support::test_client_config("ha");
+        let _ = what_moved(&config, &config.clone());
     }
 
     /// The same for the outgoing direction. `SendFailed` in particular must be

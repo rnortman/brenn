@@ -74,6 +74,17 @@ pub enum MqttEgressError {
         /// The broker-supplied rejection reason.
         reason: String,
     },
+    /// The ACL passed but the registry holds no session for the client.
+    ///
+    /// Reachable for a caller whose authority snapshot predates a reload that
+    /// stopped the client: the snapshot still lists the client and the registry
+    /// no longer holds it. A runtime outcome for such a caller, and a broken
+    /// invariant for one whose policy and registry reads are under one table
+    /// snapshot — the caller decides which it is.
+    ClientNotRegistered {
+        /// The slug with no registered session.
+        client: String,
+    },
 }
 
 /// Run the shared MQTT-egress enforcement chain and, if every gate passes,
@@ -85,10 +96,12 @@ pub enum MqttEgressError {
 ///    `MqttPublish` grant check and the layer-2 per-client matcher, so no separate
 ///    grant gate is needed here. A deny returns [`MqttEgressError::AclDenied`]
 ///    *before* any session lookup or budget decrement.
-/// 2. **Session lookup** — `svc.get_client(client)`. A miss after an ACL pass is
-///    a broken boot invariant (every matcher client is validated and a session
-///    registered for it at boot; the registry is immutable after startup), so it
-///    **panics** rather than returning an error, per project posture.
+/// 2. **Session lookup** — `svc.get_client(client)`. A miss after an ACL pass
+///    returns [`MqttEgressError::ClientNotRegistered`]: the registry shrinks at
+///    a reload that stops a client, and a caller holding an older authority
+///    snapshot can still name it. Whether that is a runtime outcome or a broken
+///    invariant depends on how the caller obtained its policy, so the decision
+///    is the caller's.
 /// 3. **Budget** — for [`SendBudget::Conversation`], decrement under the supplied
 ///    connection; exhausted → [`MqttEgressError::BudgetExhausted`]. For
 ///    [`SendBudget::None`] this step is skipped entirely (WASM's quota is enforced
@@ -121,17 +134,17 @@ pub async fn enforce_and_publish(
     }
 
     // 2. Session lookup — replaces connector resolution. The client slug selects
-    //    the session; a miss after an ACL pass is a broken boot invariant (every
-    //    matcher client is validated and registered at boot, registry immutable
-    //    after startup), so panic per project posture.
-    let handle = svc.get_client(&addr.client).unwrap_or_else(|| {
-        panic!(
-            "mqtt egress: ACL authorized a publish to client {:?} but no session is registered \
-             — every matcher client is validated and a session registered at boot; the client \
-             registry is immutable after startup (broken invariant)",
-            addr.client
-        )
-    });
+    //    the session. A reload's commit stops a client's session after it swaps
+    //    the authority that named it, so a caller whose ACL snapshot was taken
+    //    before that swap can pass the gate above and find no session here. That
+    //    is a runtime outcome for such a caller and an invariant break for one
+    //    reading its policy and the registry under one snapshot; the error
+    //    carries the fact and the caller decides.
+    let Some(handle) = svc.get_client(&addr.client) else {
+        return Err(MqttEgressError::ClientNotRegistered {
+            client: addr.client.clone(),
+        });
+    };
 
     // 3. Budget — last gate before the publish. Skipped entirely for the WASM
     //    caller (its per-activation quota is enforced upstream). The
@@ -208,7 +221,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let config = std::sync::Arc::new(brenn_lib::mqtt::test_support::test_client_config(client));
         let handle = MqttClientHandle::new(config, vec![], tx);
-        svc.add_client(handle).await;
+        svc.add_client(handle);
         svc
     }
 
@@ -290,18 +303,19 @@ mod tests {
         );
     }
 
-    /// Grant + ACL pass but no registered session for the client is a broken boot
-    /// invariant (boot validates + registers a session for every matcher client;
-    /// the registry is immutable after startup), so it panics rather than errors.
+    /// Grant + ACL pass but no registered session for the client is reported,
+    /// not panicked: the registry shrinks at a reload that stops a client, and
+    /// an authority snapshot taken before that commit still names it. The
+    /// caller decides whether that is a runtime outcome — it is, for an
+    /// in-flight tool call — or an invariant break.
     #[tokio::test]
-    #[should_panic(expected = "no session is registered")]
-    async fn session_miss_after_acl_pass_panics() {
+    async fn session_miss_after_acl_pass_is_reported() {
         // ACL allows `home`, but the service has a session only for `other`.
         let svc = service_with_client("other").await;
         let policy = policy_allowing(&["home"]);
         let db = init_db_memory();
 
-        let _ = enforce_and_publish(
+        let result = enforce_and_publish(
             &svc,
             &policy,
             &addr("home", "cmd/light"),
@@ -316,6 +330,14 @@ mod tests {
             },
         )
         .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MqttEgressError::ClientNotRegistered { ref client }) if client == "home"
+            ),
+            "got {result:?}",
+        );
     }
 
     /// Budget exhausted ⇒ `BudgetExhausted`, and the broker is never reached. (If

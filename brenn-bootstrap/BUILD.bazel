@@ -88,6 +88,10 @@ rust_test(
         # thing that can see the change.
         "//brenn-wasm:fixture_processor_dual",
         "//brenn-wasm:fixture_replay",
+        # The bumped-replay-package case installs a second replay artifact
+        # under one package name, which is what makes the release comparison
+        # the only thing that can see the change.
+        "//brenn-wasm:fixture_replay_generic",
     ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-bootstrap"},

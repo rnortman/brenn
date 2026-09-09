@@ -1315,10 +1315,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "brenn-lib",
+ "brenn-wasm",
  "bytes",
  "hex",
  "http",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

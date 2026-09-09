@@ -15,11 +15,13 @@ pub mod client;
 pub mod poll;
 
 pub use broker::{
-    BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, log_records_publish_to_subscriber,
-    log_records_unsubscribe,
+    AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, ROTATED_CREDENTIALS,
+    log_records_disconnect, log_records_disconnect_before_reconnect,
+    log_records_publish_to_subscriber, log_records_unsubscribe,
 };
 pub use client::{
-    await_puback, direct_publisher_acked, session_client_id, wait_for_filter_acked, wait_for_health,
+    await_puback, direct_publisher_acked, direct_publisher_acked_as, session_client_id,
+    wait_for_filter_acked, wait_for_health,
 };
 pub use poll::{POLL_INTERVAL, poll_until};
 

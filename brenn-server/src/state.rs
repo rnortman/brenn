@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use brenn_wasm::ReplayComponent;
-
 use brenn_db::Db;
 use brenn_lib::app::AppTool;
 use brenn_lib::config::AppTable;
@@ -146,40 +144,31 @@ pub struct AppState {
     /// PWA push service (VAPID keypair, subscription DB, HTTP client). `None` when
     /// no app has `pwa_push.enabled = true` (push effectively disabled).
     pub pwa_push: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
-    /// MQTT service (per-client session supervisors, event router). `None` when no
-    /// `[[mqtt_client]]` is declared; every declared client has a session.
+    /// MQTT service (per-client session supervisors, event router).
+    ///
+    /// Always present. A document with no `[[mqtt_client]]` leaves the client
+    /// registry empty; every declared client has a session.
     #[cfg_attr(test, allow(dead_code))]
-    pub mqtt: Option<Arc<brenn_mqtt::MqttService>>,
-    /// Concrete MQTT inbound event router. `None` when MQTT is not configured.
-    /// Threaded onto each spawned `ActiveBridge` so a runtime `mqtt:` dynamic
-    /// subscribe can call `add_route`. The `Arc<dyn
-    /// MqttEventRouter>` the supervisors hold exposes only `deliver_inbound`, so
-    /// the concrete handle is retained here separately from `mqtt`.
+    pub mqtt: Arc<brenn_mqtt::MqttService>,
+    /// Concrete MQTT inbound event router. Always present. Threaded onto each
+    /// spawned `ActiveBridge` so a runtime `mqtt:` dynamic subscribe can call
+    /// `add_route`. The `Arc<dyn MqttEventRouter>` the supervisors hold
+    /// exposes only `deliver_inbound`, so the concrete handle is retained here
+    /// separately from `mqtt`.
     #[cfg_attr(test, allow(dead_code))]
-    pub mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
-    /// Webhook service (endpoint registry, event router). `None` when no
-    /// `[[webhook_endpoint]]` is configured or no app declares any
-    /// `[[app.webhook_subscription]]`.
+    pub mqtt_event_router: Arc<crate::mqtt_router::MqttEventRouterImpl>,
+    /// Webhook service: the endpoints this process serves, and the event router.
+    ///
+    /// Always present. A document with no `[[webhook_endpoint]]` leaves the
+    /// table empty, and every path under `/webhooks/` is then an unrecognized
+    /// URL. The table is swapped by a reload's commit; see
+    /// [`brenn_webhook::WebhookService`].
     #[cfg_attr(test, allow(dead_code))]
-    pub webhook: Option<Arc<brenn_webhook::WebhookService>>,
+    pub webhook: Arc<brenn_webhook::WebhookService>,
     /// Automation engine. `None` when automation is not configured (no messenger
     /// or no apps with allowed_users).
     #[cfg_attr(test, allow(dead_code))]
     pub automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
-    /// Replay-protection components, keyed by webhook endpoint slug.
-    /// Empty map = no endpoint is replay-protected.
-    /// Populated at startup from `ResolvedWebhookEndpoint.replay_protection`.
-    pub replay_components: Arc<HashMap<String, Arc<ReplayComponent>>>,
-    /// Per-endpoint serialization locks for replay component calls.
-    ///
-    /// `ReplayComponent::check` runs in `spawn_blocking` and internally holds
-    /// the SQLite `tx_active` CAS guard. Concurrent requests for the same
-    /// endpoint that both call `spawn_blocking` simultaneously race on that CAS
-    /// and the loser panics (→ 500). This per-endpoint `tokio::sync::Mutex`
-    /// serializes the `spawn_blocking` calls so concurrent inbound requests wait
-    /// rather than fail. One entry per replay-protected endpoint; empty for
-    /// unbound endpoints (fast path). Keyed by endpoint slug.
-    pub replay_locks: Arc<HashMap<String, Arc<Mutex<()>>>>,
     /// Which Claude account each profiled app should run under, and the token
     /// that says so. `None` when no agent declares `claude_profiles`. Built
     /// once at boot, moved thereafter only by the goal channel.
@@ -954,17 +943,15 @@ impl AppState {
             repo_sync_sender: None,
             messenger: None,
             pwa_push: None,
-            mqtt: None,
-            mqtt_event_router: None,
-            webhook: None,
+            mqtt: brenn_mqtt::MqttService::new(),
+            mqtt_event_router: Arc::new(crate::mqtt_router::MqttEventRouterImpl::new()),
+            webhook: brenn_webhook::WebhookService::new(),
             automation_engine: None,
             usage_session_gap_secs: 1800,
             surfaces: Default::default(),
             remotes: Arc::new(HashMap::new()),
             attach_registry: Default::default(),
             attach_heartbeat_secs: 1,
-            replay_components: Arc::new(HashMap::new()),
-            replay_locks: Arc::new(HashMap::new()),
             cc_profiles: None,
             // These two fields, and the wake stubs that read them, exist only
             // in this crate's own test build.

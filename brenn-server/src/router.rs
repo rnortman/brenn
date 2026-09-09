@@ -7,7 +7,7 @@ use axum::http::{HeaderValue, Request, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::{Router, middleware as axum_mw, routing::get, routing::post};
+use axum::{Router, middleware as axum_mw, routing::any, routing::get, routing::post};
 use axum_helmet::Helmet;
 use brenn_lib::config::SecurityConfig;
 use brenn_obs::security::{SecurityEventType, log_security_event};
@@ -390,33 +390,19 @@ pub fn build_router(
         // IP-attributed fail2ban signal like every other pre-auth route's.
         .route("/remote/{slug}/ws", get(remote::remote_ws_handler));
 
-    // Per-endpoint inbound webhook routes. Registered only when a WebhookService
-    // is configured. Each endpoint gets its own literal mount path, built once
-    // here, which is why a reload refuses a `webhook:` channel that moved.
-    // TODO(reload-webhooks): one wildcard `/webhooks/{*tail}` route over a
-    // swappable endpoint table, with the per-endpoint body ceiling applied
-    // in-handler, so the endpoint set converges.
+    // `any`, not `post`: a method router answers every non-POST under the
+    // prefix with a 405 before any handler runs, and a `GET /webhooks/<junk>`
+    // would stop producing the unrecognized-URL fail2ban signal the global
+    // fallback gives it. The method is decided in the handler, after the mount
+    // lookup, so an unknown mount is an unrecognized URL whatever the method.
     //
-    // Each endpoint's path (e.g. `/webhooks/phonebuddy`) carries a
-    // per-endpoint `DefaultBodyLimit` and an `Extension(EndpointSlug(..))`
-    // so the shared handler knows which endpoint is being addressed.
-    let utility_routes = if let Some(ref webhook_svc) = state.webhook {
-        let endpoints: Vec<_> = webhook_svc.all_endpoints().cloned().collect();
-        endpoints.iter().fold(utility_routes, |router, ep| {
-            let slug = ep.slug.clone();
-            let ceiling = ep.transport_ceiling_bytes;
-            router.route(
-                &ep.mount,
-                post(webhooks::inbound::receive).layer(
-                    tower::ServiceBuilder::new()
-                        .layer(axum::Extension(webhooks::inbound::EndpointSlug(slug)))
-                        .layer(DefaultBodyLimit::max(ceiling)),
-                ),
-            )
-        })
-    } else {
-        utility_routes
-    };
+    // The global body limit is disabled on this route: the addressed endpoint's
+    // `transport_ceiling_bytes` is the only ceiling, and the handler enforces it
+    // while reading the body, so nothing is buffered past it.
+    let utility_routes = utility_routes.route(
+        &format!("{}{{*tail}}", brenn_lib::webhook::WEBHOOK_MOUNT_PREFIX),
+        any(webhooks::inbound::receive).layer(DefaultBodyLimit::disable()),
+    );
 
     // --- Protected routes (auth required) ---
     // Everything behind auth, including app static assets (JS/CSS).
@@ -735,14 +721,12 @@ mod tests {
     impl brenn_webhook::service::WebhookEventRouter for AlwaysOkRouter {
         async fn deliver_inbound(
             &self,
-            _endpoint_slug: &str,
-            _owner: &brenn_lib::webhook::config::WebhookOwner,
+            _endpoint: &std::sync::Arc<brenn_lib::webhook::config::ResolvedWebhookEndpoint>,
             _key_id: &str,
             _headers: axum::http::HeaderMap,
             _client_ip: std::net::IpAddr,
             _received_at: std::time::SystemTime,
             _raw_body: String,
-            _urgency: brenn_lib::messaging::Urgency,
         ) -> Result<(), String> {
             Ok(())
         }
@@ -780,15 +764,14 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        let svc = WebhookService::new(vec![("git-forgejo".to_string(), endpoint)]);
+        let svc = WebhookService::for_test(vec![endpoint]);
         svc.set_router(Arc::new(AlwaysOkRouter));
 
         let db = crate::test_support::init_db_memory();
         let mut state = test_state(&db);
-        state.webhook = Some(svc);
-        // build_router registers the endpoint's mount in the dynamic per-endpoint
-        // loop; a surviving fixed `/webhooks/git` route would panic here on the
-        // duplicate path. Reaching past this call is itself part of the proof.
+        state.webhook = svc;
+        // The whole prefix is one wildcard route, so what is under test is that
+        // a user endpoint mounted at `/webhooks/git` resolves through it.
         let app = build_router(state, None, 0, 2576)
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
 
@@ -808,6 +791,84 @@ mod tests {
             response.status(),
             StatusCode::NO_CONTENT,
             "user endpoint at /webhooks/git must resolve and serve (collision retired)"
+        );
+    }
+
+    /// The wildcard webhook route carries `DefaultBodyLimit::disable()`, so the
+    /// endpoint's own `transport_ceiling_bytes` is the only limit — including
+    /// when it is *above* the router's global body limit, which for a
+    /// security-less test router is 1 MiB.
+    ///
+    /// This is the one layer `inbound.rs`'s `wire()` transcription does not
+    /// reproduce, so it is asserted through the real `build_router`. Dropping
+    /// the `disable()` would put every endpoint back under a 1 MiB hard cap
+    /// with no other case noticing.
+    #[tokio::test]
+    async fn an_endpoint_ceiling_above_the_global_body_limit_is_the_only_limit() {
+        use brenn_lib::util::hmac_sha256_hex;
+        use brenn_lib::webhook::config::{ResolvedWebhookEndpoint, WebhookOwner};
+        use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
+        use brenn_webhook::service::WebhookService;
+
+        const SECRET: &[u8] = b"big-body-secret";
+        const MOUNT: &str = "/webhooks/bulk";
+        const GLOBAL_LIMIT: usize = 1024 * 1024;
+        const CEILING: usize = 2 * 1024 * 1024;
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("bulk".to_string(), SECRET.to_vec());
+        let endpoint = Arc::new(ResolvedWebhookEndpoint {
+            slug: "bulk".to_string(),
+            mount: MOUNT.to_string(),
+            description: None,
+            transport_ceiling_bytes: CEILING,
+            content_type: "application/octet-stream".to_string(),
+            scheme: SignatureScheme::HmacRawBody {
+                algorithm: SignatureAlgorithm::HmacSha256,
+                header: "x-sig".parse().unwrap(),
+                format: HexFormat::Hex,
+                key_id_header: None,
+                keys,
+            },
+            owner: WebhookOwner::Wasm(Arc::from("git-forge-parser")),
+            urgency: brenn_lib::messaging::Urgency::Normal,
+            replay_protection: None,
+        });
+        let svc = WebhookService::for_test(vec![endpoint]);
+        svc.set_router(Arc::new(AlwaysOkRouter));
+
+        let db = crate::test_support::init_db_memory();
+        let mut state = test_state(&db);
+        state.webhook = svc;
+        let app = build_router(state, None, 0, 2576)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+
+        let post = |body: Vec<u8>| {
+            let signature = hmac_sha256_hex(SECRET, &body);
+            Request::post(MOUNT)
+                .header("content-type", "application/octet-stream")
+                .header("x-sig", signature)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Between the global limit and the endpoint's ceiling: served.
+        let response = app
+            .clone()
+            .oneshot(post(vec![b'x'; GLOBAL_LIMIT + 4096]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "a body over the global limit but under the endpoint ceiling must be served"
+        );
+
+        // Over the endpoint's ceiling: refused by the handler, not the layer.
+        let response = app.oneshot(post(vec![b'x'; CEILING + 4096])).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the endpoint ceiling is still enforced"
         );
     }
 

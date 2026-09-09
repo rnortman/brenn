@@ -14,14 +14,15 @@ use brenn_server::active_bridge::ActiveBridges;
 
 /// Handles passed into `shutdown_signal` so it can mark live CC sessions
 /// shutting-down before yielding control back to `axum::serve`'s graceful
-/// shutdown. Both `active_bridges` and `server_shutting_down` are cheap
-/// `Clone` (Arc-backed). `mqtt_stop_txs` is `Vec<watch::Sender<bool>>`
-/// moved here so the senders are signalled on SIGTERM/SIGINT before process
-/// exit, causing each supervisor to send MQTT DISCONNECT.
+/// shutdown. All three are cheap `Clone` (Arc-backed). `mqtt` is the live
+/// client registry, signalled on SIGTERM/SIGINT so each supervisor sends MQTT
+/// DISCONNECT before process exit — read at signal time rather than captured at
+/// boot, so a client a reload added is disconnected as cleanly as a declared
+/// one.
 pub(crate) struct ShutdownHandle {
     pub(crate) active_bridges: ActiveBridges,
     pub(crate) server_shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) mqtt_stop_txs: Vec<tokio::sync::watch::Sender<bool>>,
+    pub(crate) mqtt: std::sync::Arc<brenn_mqtt::MqttService>,
 }
 
 pub(crate) async fn shutdown_signal(handle: ShutdownHandle) {
@@ -57,12 +58,10 @@ pub(crate) async fn shutdown_signal(handle: ShutdownHandle) {
 
     // Signal all MQTT supervisors to disconnect cleanly. Each supervisor will
     // send MQTT DISCONNECT and exit its event loop on the next poll cycle.
-    for tx in &handle.mqtt_stop_txs {
-        let _ = tx.send(true);
-    }
-    if !handle.mqtt_stop_txs.is_empty() {
+    let signalled = handle.mqtt.stop_all();
+    if signalled > 0 {
         info!(
-            count = handle.mqtt_stop_txs.len(),
+            count = signalled,
             "signalled MQTT supervisors to disconnect"
         );
     }

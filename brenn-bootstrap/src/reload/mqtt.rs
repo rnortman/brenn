@@ -17,14 +17,83 @@
 //! is the pair of convergibility rules in [`super::delta`]: a live subscriber
 //! the plan does not hold refuses the reload before any UNSUBSCRIBE is issued.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use brenn_envelope::ChannelScheme;
 use brenn_lib::messaging::ChannelEntry;
-use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
+use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel};
 use brenn_mqtt::union_subscriptions;
 use brenn_server::mqtt_router::IngressRoute;
+use indexmap::IndexMap;
 use uuid::Uuid;
+
+/// Which broker clients a reload registers, restarts, or stops.
+///
+/// The baseline is the live registry, not a plan field: a client is resolved
+/// off the document and registered as a session, and what this process is
+/// connected as right now is the only baseline that answers "would a fresh
+/// boot of the candidate dial something else". Both sides are compared in
+/// resolved form — broker coordinates, tuning, and the bytes of the password
+/// and the CA — so a rotated credential under an unmoved document is a change
+/// and a re-spelled block that resolves to the same client is not.
+///
+/// The arriving sides carry the candidate's resolved client behind an `Arc`:
+/// commit hands the same value to `MqttClientHandle`, so the CA bundle is
+/// copied once at prepare and never again. The old side of a change is not
+/// carried — commit reaches the predecessor through the registry, which is
+/// where the subscription set it hands the successor lives.
+#[derive(Default)]
+pub(crate) struct MqttClientsDelta {
+    /// Clients the candidate declares and the registry does not hold, in
+    /// candidate document order.
+    pub added: Vec<Arc<MqttClientConfig>>,
+    /// Slugs the registry holds and the candidate does not declare. A set, so
+    /// the status body that reads it verbatim and the filter suppression that
+    /// tests membership both get what they need without a sort.
+    pub removed: BTreeSet<String>,
+    /// Clients on both sides whose resolved value moved, in candidate document
+    /// order.
+    pub changed: Vec<Arc<MqttClientConfig>>,
+}
+
+/// The slugs of a list of clients, as the status body names them.
+pub(crate) fn slugs(clients: &[Arc<MqttClientConfig>]) -> Vec<String> {
+    clients
+        .iter()
+        .map(|client| client.identity.slug.clone())
+        .collect()
+}
+
+impl MqttClientsDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Which clients moved, comparing the live registry against the candidate's
+/// resolved clients.
+pub(crate) fn mqtt_clients_delta(
+    live: &HashMap<String, Arc<MqttClientConfig>>,
+    candidate: &IndexMap<String, MqttClientConfig>,
+) -> MqttClientsDelta {
+    let mut delta = MqttClientsDelta::default();
+    for (slug, client) in candidate {
+        match live.get(slug) {
+            None => delta.added.push(Arc::new(client.clone())),
+            Some(running) if running.as_ref() != client => {
+                delta.changed.push(Arc::new(client.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    delta.removed = live
+        .keys()
+        .filter(|slug| !candidate.contains_key(*slug))
+        .cloned()
+        .collect();
+    delta
+}
 
 /// One filter's place in a client's broker set after this reload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,11 +248,19 @@ impl<'a> MqttIngressSet<'a> {
 /// route moves when the channel delta moves the channel, and a dynamic
 /// subscription's route moves when the re-merge revoked or revived it, which no
 /// channel delta can see.
+///
+/// `clients_removed` are the slugs whose session this reload stops. They
+/// contribute no filter move at all: their filters leave with the session, and
+/// an UNSUBSCRIBE reported against a client that is about to be disconnected
+/// would name a packet nothing sent — a disconnected supervisor defers the
+/// packet, and a stopped one never reconnects to send it. Their routes still
+/// go: the ingress router's table has to lose them.
 pub(crate) fn mqtt_delta(
     baseline: &MqttIngressSet<'_>,
     candidate: &MqttIngressSet<'_>,
     channels_leaving: &[&ChannelEntry],
     channels_joining: &[&ChannelEntry],
+    clients_removed: &BTreeSet<String>,
 ) -> MqttDelta {
     let baseline_all = baseline.all();
     let candidate_all = candidate.all();
@@ -196,6 +273,9 @@ pub(crate) fn mqtt_delta(
 
     let mut delta = MqttDelta::default();
     for client in clients {
+        if clients_removed.contains(client) {
+            continue;
+        }
         let before = union_subscriptions(client, &baseline_all);
         let after = union_subscriptions(client, &candidate_all);
         let mut moved = MqttClientDelta {
@@ -330,6 +410,7 @@ mod tests {
             &MqttIngressSet::only_static(std::slice::from_ref(&arriving)),
             &[],
             &[&entry],
+            &BTreeSet::new(),
         );
 
         assert_eq!(delta.clients.len(), 1);
@@ -351,6 +432,7 @@ mod tests {
             &MqttIngressSet::only_static(&[]),
             &[&entry],
             &[],
+            &BTreeSet::new(),
         );
 
         assert_eq!(filters(&delta.clients[0].unsubscribe), vec![("a/b", 1)]);
@@ -379,6 +461,7 @@ mod tests {
             &MqttIngressSet::only_static(std::slice::from_ref(&stays)),
             &[&goes_entry],
             &[],
+            &BTreeSet::new(),
         );
 
         assert_eq!(filters(&delta.clients[0].unsubscribe), vec![("c/d", 1)]);
@@ -404,6 +487,7 @@ mod tests {
             &MqttIngressSet::only_static(&[after]),
             &[],
             &[],
+            &BTreeSet::new(),
         );
 
         assert!(delta.clients[0].subscribe.is_empty());
@@ -441,6 +525,7 @@ mod tests {
             &MqttIngressSet::only_static(&candidate),
             &[],
             &[&arriving_entry],
+            &BTreeSet::new(),
         );
 
         assert_eq!(delta.clients.len(), 1);
@@ -466,6 +551,7 @@ mod tests {
             &MqttIngressSet::only_static(&[]),
             &[],
             &[],
+            &BTreeSet::new(),
         );
 
         assert_eq!(filters(&delta.clients[0].unsubscribe), vec![("a/b", 1)]);
@@ -488,6 +574,7 @@ mod tests {
             },
             &[],
             &[],
+            &BTreeSet::new(),
         );
 
         assert_eq!(filters(&delta.clients[0].subscribe), vec![("a/b", 1)]);
@@ -527,6 +614,7 @@ mod tests {
             },
             &[&entry],
             &[],
+            &BTreeSet::new(),
         );
 
         assert!(
@@ -559,6 +647,7 @@ mod tests {
             },
             &[&entry],
             &[],
+            &BTreeSet::new(),
         );
 
         assert_eq!(filters(&delta.clients[0].unsubscribe), vec![("a/b", 1)]);
@@ -591,8 +680,106 @@ mod tests {
             },
             &[],
             &[],
+            &BTreeSet::new(),
         );
 
         assert!(delta.is_empty());
+    }
+
+    /// A resolved client, with the password as the only thing a case varies:
+    /// the delta is over the whole value, so one field standing in for the
+    /// credentials proves the comparison reaches them.
+    fn client(slug: &str, password: Option<&str>) -> MqttClientConfig {
+        let mut config = brenn_lib::mqtt::test_support::test_client_config(slug);
+        config.password = password.map(ToString::to_string);
+        config
+    }
+
+    fn live(clients: &[MqttClientConfig]) -> HashMap<String, Arc<MqttClientConfig>> {
+        clients
+            .iter()
+            .map(|client| (client.identity.slug.clone(), Arc::new(client.clone())))
+            .collect()
+    }
+
+    fn candidate(clients: &[MqttClientConfig]) -> IndexMap<String, MqttClientConfig> {
+        clients
+            .iter()
+            .map(|client| (client.identity.slug.clone(), client.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn an_unmoved_declaration_set_moves_no_client() {
+        let clients = [client("ha", None), client("spare", Some("s3cret"))];
+        let delta = mqtt_clients_delta(&live(&clients), &candidate(&clients));
+
+        assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn a_rotated_password_is_a_changed_client() {
+        let delta = mqtt_clients_delta(
+            &live(&[client("ha", Some("old"))]),
+            &candidate(&[client("ha", Some("new"))]),
+        );
+
+        assert_eq!(slugs(&delta.changed), vec!["ha".to_string()]);
+        assert_eq!(delta.changed[0].password.as_deref(), Some("new"));
+        assert!(delta.added.is_empty() && delta.removed.is_empty());
+    }
+
+    /// `added` and `changed` follow the candidate's declaration order, which is
+    /// the order commit registers them in and the order the status body reads.
+    /// `removed`'s side is the registry's hash map, so it is a set, read out
+    /// in slug order.
+    #[test]
+    fn the_three_lists_are_ordered_as_the_status_body_reads_them() {
+        let delta = mqtt_clients_delta(
+            &live(&[
+                client("zeta", None),
+                client("alpha", None),
+                client("moved", Some("old")),
+            ]),
+            &candidate(&[
+                client("second", None),
+                client("moved", Some("new")),
+                client("first", None),
+            ]),
+        );
+
+        assert_eq!(
+            slugs(&delta.added),
+            vec!["second".to_string(), "first".to_string()]
+        );
+        assert_eq!(
+            delta.removed.iter().cloned().collect::<Vec<_>>(),
+            vec!["alpha".to_string(), "zeta".to_string()],
+        );
+        assert_eq!(slugs(&delta.changed), vec!["moved".to_string()]);
+    }
+
+    /// A client the candidate stops contributes no filter move: its filters
+    /// leave with its session, and an UNSUBSCRIBE reported against it would
+    /// name a packet nothing sent. Its routes still go.
+    #[test]
+    fn a_removed_clients_filters_are_not_moves_but_its_routes_are() {
+        let leaving = ingress("chef", "a/b", 1);
+        let entry = entry(&leaving);
+        let delta = mqtt_delta(
+            &MqttIngressSet::only_static(std::slice::from_ref(&leaving)),
+            &MqttIngressSet::only_static(&[]),
+            &[&entry],
+            &[],
+            &["chef".to_string()].into_iter().collect(),
+        );
+
+        assert!(
+            delta.clients.is_empty(),
+            "{:?}",
+            delta.clients.first().map(|c| c.client.clone())
+        );
+        assert!(delta.unsubscribed().is_empty());
+        assert_eq!(delta.routes_removed.len(), 1);
     }
 }

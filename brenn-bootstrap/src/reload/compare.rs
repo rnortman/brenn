@@ -1,18 +1,18 @@
 //! Level 1: everything a reload cannot converge must be equal.
 //!
-//! Four blocks of a document are convergible — `channels`, `links`,
-//! `wasm_consumers` and `surfaces` — and this pass ignores exactly those. Every
-//! other section describes an entity whose runtime tables are boot snapshots:
-//! a remote's token is loaded once, an MQTT client's broker session is opened
-//! once for every declared client, a webhook endpoint's route is an axum path
-//! built once. Converging any of them is a later slice's work; a difference in
-//! one of them here is a refusal.
+//! Six blocks of a document are convergible — `channels`, `links`,
+//! `wasm_consumers`, `surfaces`, `webhook_endpoints` and `mqtt_clients` — and
+//! this pass ignores exactly those. Every other section describes an entity
+//! whose runtime tables are boot snapshots: a remote's token is loaded once,
+//! a repo's mount is bound once. Converging any of them is a later slice's
+//! work; a difference in one of them here is a refusal.
 //!
 //! An `agent` block is compared field by field rather than whole, because its
 //! fields converge in three different ways:
 //!
 //! - **authority** (`grants`, `acl`, `tool_grants`, `messaging`,
-//!   `mqtt_subscriptions`) — every gate reads it per call, so it converges the
+//!   `mqtt_subscriptions`, `webhook_subscriptions`) — every gate reads it per
+//!   call, so it converges the
 //!   instant the resolved map is swapped. This pass ignores these fields
 //!   entirely: what decides whether the agent's authority moved is the
 //!   comparison of the *resolved* `AppAuthority`, which is why a re-spelled
@@ -114,8 +114,8 @@ pub(crate) fn non_convergible_differences(
         llm_chat,
         pwa_push,
         automation,
-        mqtt_clients,
-        webhook_endpoints,
+        mqtt_clients: _,
+        webhook_endpoints: _,
         events,
         wasm_consumers: _,
         surfaces: _,
@@ -144,8 +144,8 @@ pub(crate) fn non_convergible_differences(
         llm_chat: b_llm_chat,
         pwa_push: b_pwa_push,
         automation: b_automation,
-        mqtt_clients: b_mqtt_clients,
-        webhook_endpoints: b_webhook_endpoints,
+        mqtt_clients: _,
+        webhook_endpoints: _,
         events: b_events,
         wasm_consumers: _,
         surfaces: _,
@@ -199,23 +199,6 @@ pub(crate) fn non_convergible_differences(
     plain("llm_chat", llm_chat, b_llm_chat, &mut out);
     plain("pwa_push", pwa_push, b_pwa_push, &mut out);
     plain("automation", automation, b_automation, &mut out);
-    // TODO(reload-mqtt-sessions): converge this block — start a supervisor for an
-    // added client, stop one for a removed client, restart one whose config
-    // changed.
-    keyed_vec(
-        "mqtt_clients",
-        mqtt_clients,
-        b_mqtt_clients,
-        |c| &c.slug,
-        &mut out,
-    );
-    keyed_vec(
-        "webhook_endpoints",
-        webhook_endpoints,
-        b_webhook_endpoints,
-        |e| &e.slug,
-        &mut out,
-    );
     plain("events", events, b_events, &mut out);
     keyed_vec("remotes", remotes, b_remotes, |r| &r.slug, &mut out);
     plain("wasm", wasm, b_wasm, &mut out);
@@ -392,7 +375,7 @@ fn compare_app(
         frontmatter,
         messaging: _,
         pwa_push,
-        webhook_subscriptions,
+        webhook_subscriptions: _,
         mqtt_subscriptions: _,
         grants: _,
         acl: _,
@@ -444,7 +427,7 @@ fn compare_app(
         frontmatter: b_frontmatter,
         messaging: _,
         pwa_push: b_pwa_push,
-        webhook_subscriptions: b_webhook_subscriptions,
+        webhook_subscriptions: _,
         mqtt_subscriptions: _,
         grants: _,
         acl: _,
@@ -452,9 +435,12 @@ fn compare_app(
     } = b;
 
     // Authority — `grants`, `acl`, `tool_grants`, `messaging`,
-    // `mqtt_subscriptions` — is bound to `_` above and compared nowhere here:
-    // the delta compares its resolved form, so two spellings that resolve to
-    // the same policy are not a change.
+    // `mqtt_subscriptions`, `webhook_subscriptions` — is bound to `_` above and
+    // compared nowhere here: the delta compares its resolved form, so two
+    // spellings that resolve to the same policy are not a change. A
+    // `webhook_subscriptions` edit reaches the delta twice over: as the
+    // agent's resolved subscription on the `webhook:` channel, and as the
+    // endpoint whose stamped owner moved.
 
     // Class A: read off the map on each request. The swap converges them.
     // `allowed_users` additionally closes a removed user's connections and
@@ -549,17 +535,6 @@ fn compare_app(
         b_claude_profiles,
         out,
     );
-    // TODO(reload-webhooks): the subscriber entry is an ordinary in-place
-    // edit, but endpoint *ownership* is computed from the subscribing agent
-    // and stamped into the endpoint table the HTTP layer holds frozen. Moving
-    // one without the other leaves the router's view and the document's apart.
-    plain(
-        &field("webhook_subscriptions"),
-        webhook_subscriptions,
-        b_webhook_subscriptions,
-        out,
-    );
-
     AppFieldDiff {
         per_call_changed,
         spawn_changed,
@@ -652,7 +627,7 @@ mod tests {
         assert!(refusals(&base(), &base()).is_empty());
     }
 
-    /// The three blocks a reload converges are not this pass's business, and it
+    /// The blocks a reload converges are not this pass's business, and it
     /// says nothing about them however far apart they are.
     #[test]
     fn the_convergible_blocks_are_ignored() {
@@ -676,6 +651,49 @@ mod tests {
             &["brenn:work"],
         )];
         assert!(refusals(&base(), &candidate).is_empty());
+    }
+
+    /// A `[[webhook_endpoint]]` block converges: the endpoint table is swapped
+    /// and its route is one wildcard, so an added, removed or retuned block is
+    /// not a refusal here. Level 2 compares the *resolved* endpoints, secrets
+    /// included, which is what a rotated secret file moves.
+    #[test]
+    fn a_webhook_endpoint_block_is_ignored() {
+        let mut candidate = base();
+        candidate.webhook_endpoints = vec![brenn_lib::webhook::config::WebhookEndpointConfigRaw {
+            slug: "inbox".to_string(),
+            mount: None,
+            description: None,
+            transport_ceiling_bytes: 1024,
+            content_type: "application/json".to_string(),
+            signature: brenn_lib::webhook::config::WebhookSignatureConfigRaw::BearerToken {
+                header: "authorization".to_string(),
+                token_id_header: None,
+            },
+            keys: Vec::new(),
+            tokens: Vec::new(),
+            replay_protection: None,
+            urgency: None,
+        }];
+        assert!(refusals(&base(), &candidate).is_empty());
+    }
+
+    /// An agent's `webhook_subscriptions` is authority: it converges through
+    /// the resolved subscription the delta folds, and the endpoint's stamped
+    /// owner moves with it. So it sets neither field class and refuses nothing.
+    #[test]
+    fn an_agents_webhook_subscriptions_are_not_a_field_class() {
+        let candidate = edited(|app| {
+            app.webhook_subscriptions =
+                vec![brenn_lib::webhook::config::AppWebhookSubscriptionRaw {
+                    endpoint: "inbox".to_string(),
+                    push_depth: None,
+                    retain_depth: None,
+                    wake_min: None,
+                }];
+        });
+        assert!(refusals(&base(), &candidate).is_empty());
+        assert_eq!(diff_of(&candidate, "assistant"), None);
     }
 
     /// An agent's authority is compared in its resolved form, not here: a
@@ -886,18 +904,6 @@ mod tests {
                     });
                 }),
             ),
-            (
-                "webhook_subscriptions",
-                edited(|app| {
-                    app.webhook_subscriptions =
-                        vec![brenn_lib::webhook::config::AppWebhookSubscriptionRaw {
-                            endpoint: "inbox".to_string(),
-                            push_depth: None,
-                            retain_depth: None,
-                            wake_min: None,
-                        }];
-                }),
-            ),
         ];
         for (field, candidate) in cases {
             assert_eq!(
@@ -980,20 +986,17 @@ mod tests {
         );
     }
 
-    /// The boundary the `mqtt:` convergence rests on: a declared client has a
-    /// broker session for the life of the process, so adding one is a change
-    /// only a restart can make.
+    /// The block is convergible: level 2 takes the client delta over the live
+    /// registry, and commit registers a supervisor for an added client. So a
+    /// declaration this pass once named is nothing it may say anything about.
     #[test]
-    fn an_added_mqtt_client_is_a_restart() {
+    fn an_added_mqtt_client_converges() {
         let mut candidate = base();
         candidate.mqtt_clients = vec![MqttClientConfigRaw::minimal(
             "spare",
             "mqtts://127.0.0.1:8884",
         )];
-        assert_eq!(
-            refusals(&base(), &candidate),
-            vec!["mqtt_clients[spare] added: this change needs a restart".to_string()],
-        );
+        assert_eq!(refusals(&base(), &candidate), Vec::<String>::new());
     }
 
     /// Block arrays are read in order by the runtime — which is why

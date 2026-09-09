@@ -1,5 +1,5 @@
 {
-  "checksum": "b38953dd1bf79338292f68d5ec2d27360c79ca7d53900711648c39948d13fe6f",
+  "checksum": "afb92e616b0abec16cbdce34a1891f5ac86cdc25fa725d66dd85657e59afe62c",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -5812,6 +5812,10 @@
             {
               "id": "http 1.4.2",
               "target": "http"
+            },
+            {
+              "id": "tokio 1.52.3",
+              "target": "tokio"
             }
           ],
           "selects": {}

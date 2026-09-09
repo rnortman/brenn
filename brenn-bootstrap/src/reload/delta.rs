@@ -1,7 +1,9 @@
 //! Level 2: what moved in the lowered plan, and whether it may move live.
 //!
 //! Level 1 has already established that the two documents agree everywhere
-//! outside `channels`, `links` and `wasm_consumers`. What is left is a plan
+//! outside the six convergible blocks — `channels`, `links`,
+//! `wasm_consumers`, `surfaces`, `webhook_endpoints` and `mqtt_clients`. What
+//! is left is a plan
 //! computed from each, and two questions about the pair: which directory
 //! entries and which consumers differ, and whether every one of those
 //! differences is one the running process can be walked to without a restart.
@@ -20,7 +22,7 @@ use indexmap::IndexMap;
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
 use brenn_lib::messaging::{
-    ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
+    ChannelEntry, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
 };
 use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
 use brenn_lib::wasm_package::Verified;
@@ -31,8 +33,9 @@ use super::agents::{AgentChange, AgentClosure, AgentInputs, agent_delta};
 use super::dynamic::{
     DynamicSnapshot, dormant_rows_the_reload_cannot_follow, dynamic_ingress, folded_now,
 };
-use super::mqtt::{MqttDelta, MqttIngressSet, mqtt_delta};
+use super::mqtt::{MqttClientsDelta, MqttDelta, MqttIngressSet, mqtt_delta};
 use super::surfaces::{SurfaceClosure, SurfaceDelta, surface_delta};
+use super::webhook::WebhookDelta;
 
 /// One side of the comparison: everything a reload reads off a plan.
 ///
@@ -70,10 +73,18 @@ pub(crate) struct PlanFacts<'a> {
 pub(crate) struct LiveFacts<'a> {
     pub directory: &'a MessagingDirectory,
     pub dynamic: &'a DynamicSnapshot,
-    /// The declared MQTT clients, which is where a dynamic `mqtt:`
-    /// subscription's injection urgency comes from — the row carries the qos
-    /// and the address carries the filter, and neither carries that.
+    /// The **candidate's** declared MQTT clients — not the booted ones, which
+    /// is where a dynamic `mqtt:` subscription's injection urgency comes from
+    /// (the row carries the qos and the address carries the filter, and neither
+    /// carries that). Reading the candidate's is what gives a carried-over row
+    /// the urgency a fresh boot of the candidate would give it, and it is why a
+    /// row can name a client this map does not hold.
     pub mqtt_clients: &'a IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
+    /// The slugs whose broker session this reload stops, from the client delta
+    /// the caller took off the live registry. A live fact by derivation: the
+    /// registry is this process's, not either plan's. The MQTT half reads it to
+    /// suppress filter moves on a client that is about to be disconnected.
+    pub clients_stopping: &'a BTreeSet<String>,
 }
 
 /// A channel entry that is in both plans under one uuid but is not the same
@@ -107,10 +118,20 @@ pub(crate) struct PlanDelta {
     /// become. Derived from the two plans' ingress channel lists and from the
     /// channel delta above, not declared alongside them.
     pub mqtt: MqttDelta,
+    /// Which broker clients the commit registers, restarts or stops. Derived
+    /// from the live client registry against the candidate's resolved clients,
+    /// not from either plan: a `[[mqtt_client]]` is a document block and a
+    /// runtime session, and the plan sees only the channels bound through it.
+    pub mqtt_clients: MqttClientsDelta,
     /// Which surfaces the commit retires, starts or replaces. Derived from the
     /// two plans' surface lists, from the channel delta above and from the two
     /// sides' kind fingerprints.
     pub surfaces: SurfaceDelta,
+    /// Which webhook endpoints the commit retires, installs or replaces.
+    /// Derived from the live endpoint table against the candidate's resolved
+    /// endpoints, not from either plan: an endpoint is a document block and a
+    /// runtime table entry, and the plan sees only the channel it mints.
+    pub webhook: WebhookDelta,
     /// Kinds the two sides' scans of the declared mounts disagree about. The
     /// kind half of the surface delta's closure, kept because the status body
     /// reports it: "this reload's surfaces moved because that bundle upgraded"
@@ -194,7 +215,9 @@ impl PlanDelta {
             && self.consumers_removed.is_empty()
             && self.consumers_changed.is_empty()
             && self.mqtt.is_empty()
+            && self.mqtt_clients.is_empty()
             && self.surfaces.is_empty()
+            && self.webhook.is_empty()
             && self.agents_changed.is_empty()
     }
 
@@ -367,7 +390,10 @@ pub(crate) fn plan_delta(
 
     // The MQTT half, last: it reads the channel delta for its static routes,
     // the two plans' ingress lists and the two sides' dynamic subscriptions for
-    // the broker set, which are three grains of the same move.
+    // the broker set, which are three grains of the same move. A client the
+    // candidate stops contributes no filter move at all, because its filters
+    // leave with its session — which is why the stopping set is a live fact
+    // this pass reads rather than a peer half it assembles.
     let leaving: Vec<&ChannelEntry> = delta.leaving().map(Arc::as_ref).collect();
     let joining: Vec<&ChannelEntry> = delta.joining().map(Arc::as_ref).collect();
     let (baseline_dynamic, candidate_dynamic) =
@@ -383,6 +409,7 @@ pub(crate) fn plan_delta(
         },
         &leaving,
         &joining,
+        live.clients_stopping,
     );
     delta
 }
@@ -454,8 +481,20 @@ fn dynamic_ingress_sides(
         .map(|channel| channel.channel_uuid)
         .collect();
     (
-        dynamic_ingress(&before, live.directory, live.mqtt_clients, &baseline_static),
-        dynamic_ingress(&after, live.directory, live.mqtt_clients, &candidate_static),
+        dynamic_ingress(
+            &before,
+            live.directory,
+            live.mqtt_clients,
+            live.clients_stopping,
+            &baseline_static,
+        ),
+        dynamic_ingress(
+            &after,
+            live.directory,
+            live.mqtt_clients,
+            live.clients_stopping,
+            &candidate_static,
+        ),
     )
 }
 
@@ -534,19 +573,6 @@ pub(crate) fn convergibility_refusals(
         .chain(&delta.consumers_changed)
         .map(String::as_str)
         .collect();
-
-    // Rule 3 first: the scheme is a property of the entry alone, and reporting
-    // it before the subscriber rules gives the operator the address rather than
-    // a list of who happens to sit on it.
-    for entry in &delta.channels_added {
-        rule_3(entry, "is newly minted", &mut out);
-    }
-    for entry in &delta.channels_removed {
-        rule_3(entry, "is no longer minted", &mut out);
-    }
-    for change in &delta.channels_changed {
-        rule_3(&change.new, "retuned", &mut out);
-    }
 
     // Rule 1, over both plans: every subscriber on an entry in the channel
     // delta must belong to a consumer or a surface that is itself moving,
@@ -702,28 +728,6 @@ pub(crate) fn live_subscriber_refusals(
     out
 }
 
-/// Rule 3: a `webhook:` entry cannot move.
-///
-/// A `webhook:` entry reaches the channel delta whenever a convergible block
-/// moves what mints it — a tuning block retuning the entry, or the consumer
-/// subscription that was its sole minter appearing or leaving. Its route is a
-/// literal axum path built once into the router and the `WebhookService` behind
-/// it is immutable, so the entry cannot follow. `mqtt:` is not here: the
-/// broker's SUBSCRIBE set and the ingress route table are both runtime-mutable,
-/// and [`super::mqtt`] walks them.
-// TODO(reload-webhooks): converge webhook endpoints — one wildcard route over a
-// swappable endpoint table with the per-endpoint body ceiling applied
-// in-handler, plus a swappable `WebhookService` — and retire this rule.
-fn rule_3(entry: &ChannelEntry, what: &str, out: &mut Vec<String>) {
-    match entry.transport_type {
-        ChannelScheme::Brenn
-        | ChannelScheme::Ephemeral
-        | ChannelScheme::Local
-        | ChannelScheme::Mqtt => {}
-        _ => out.push(format!("{} {what}: {NEEDS_RESTART}", entry.address)),
-    }
-}
-
 /// The surfaces leaving service on this reload: removed outright, or the old
 /// half of a replacement.
 fn departing_surfaces(delta: &PlanDelta) -> HashSet<&str> {
@@ -869,6 +873,8 @@ fn named(kinds: &HashSet<&SubscriberEntryKind>) -> String {
 mod tests {
     use super::*;
 
+    use brenn_lib::messaging::ChannelScheme;
+
     /// No agents on either side: these cases are about channels, consumers and
     /// surfaces, and an empty map on both sides keeps the agent half of the
     /// delta out of them.
@@ -896,15 +902,17 @@ mod tests {
     static NO_CLIENTS: std::sync::LazyLock<
         IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
     > = std::sync::LazyLock::new(IndexMap::new);
+    static NO_CLIENTS_STOPPING: BTreeSet<String> = BTreeSet::new();
 
-    /// A process holding no dynamic subscription at all, which is every case in
-    /// this module: they are about two plans, and a dynamic subscription is in
-    /// neither.
+    /// A process holding no dynamic subscription at all and stopping no broker
+    /// client, which is every case in this module: they are about two plans,
+    /// and neither a dynamic subscription nor a client delta is in either.
     fn no_live() -> LiveFacts<'static> {
         LiveFacts {
             directory: &EMPTY_DIRECTORY,
             dynamic: &NO_DYNAMIC,
             mqtt_clients: &NO_CLIENTS,
+            clients_stopping: &NO_CLIENTS_STOPPING,
         }
     }
 
@@ -1352,10 +1360,10 @@ mod tests {
         }
     }
 
-    /// A `link` is one of the three blocks a reload converges, and the entry it
-    /// mints is nobody's declaration — so the delta has to see it like any
-    /// other entry, and rule 3 has to admit it. A link edit that minted nothing
-    /// visible would land as `unchanged` with the wiring not there.
+    /// A `link` is one of the convergible blocks, and the entry it mints is
+    /// nobody's declaration — so the delta has to see it like any other entry.
+    /// A link edit that minted nothing visible would land as `unchanged` with
+    /// the wiring not there.
     #[test]
     fn a_link_derived_entry_participates_and_converges() {
         use brenn_lib::messaging::config::{
@@ -1443,9 +1451,8 @@ mod tests {
     /// The `mqtt:` ingress population is derived from the candidate document,
     /// so a consumer subscription that is the sole minter of one appearing or
     /// disappearing moves that entry — and that move converges: the broker's
-    /// SUBSCRIBE set and the ingress route table are both runtime-mutable, so
-    /// rule 3 lets the entry through and the MQTT half of the delta carries the
-    /// filter and the route it needs.
+    /// SUBSCRIBE set and the ingress route table are both runtime-mutable, and
+    /// the MQTT half of the delta carries the filter and the route it needs.
     #[test]
     fn a_consumer_that_is_the_sole_minter_of_an_mqtt_entry_converges() {
         const TOPIC: &str = "mqtt:ha:home/+/state";
@@ -1494,7 +1501,7 @@ mod tests {
             let refusals = convergibility_refusals(&old, &new, &delta, &plan_a.directory);
             assert!(
                 refusals.is_empty(),
-                "{direction}: rule 3 no longer holds mqtt back: {refusals:?}",
+                "{direction}: an mqtt entry must converge: {refusals:?}",
             );
             // The filter and the route follow the entry, in the direction it
             // moved. The client has a session either way: it is declared.
@@ -1640,9 +1647,11 @@ mod tests {
     /// A `channel` block addressed at a system-minted channel does not declare
     /// it, it tunes it — and the planner resolves the entry's depths from the
     /// candidate document, so a retune reaches level 2 as an identity change on
-    /// an entry of a scheme reload cannot converge.
+    /// the entry. A `webhook:` entry converges like every other scheme: the
+    /// route is one wildcard and the endpoint table is swapped, so nothing
+    /// about the entry's identity holds it back.
     #[test]
-    fn a_retuned_webhook_entry_is_refused_by_rule_3() {
+    fn a_retuned_webhook_entry_converges() {
         let with_tuning = |standing: u64| {
             let mut config = BrennConfig::default();
             config.channels.push(surface_index_channel());
@@ -1679,10 +1688,7 @@ mod tests {
             &delta,
             &plan_a.directory,
         );
-        assert_eq!(
-            refusals,
-            vec!["webhook:gh-events retuned: this change needs a restart".to_string()],
-        );
+        assert!(refusals.is_empty(), "{refusals:?}");
     }
 
     // ---------------------------------------------------------------------
@@ -2339,6 +2345,7 @@ mod tests {
             directory: &directory,
             dynamic: &dynamic,
             mqtt_clients: &clients,
+            clients_stopping: &NO_CLIENTS_STOPPING,
         };
         // Two plans that declare nothing: the filter under test is purely
         // dynamic, so it is in neither side's static ingress list.

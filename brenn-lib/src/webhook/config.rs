@@ -4,8 +4,10 @@
 //! - top-level `[[webhook_endpoint]]` arrays → `Vec<WebhookEndpointConfigRaw>`
 //! - per-app `[[app.webhook_subscription]]` → `Vec<AppWebhookSubscriptionRaw>`
 //!
-//! Validation and resolution in `resolve_webhook_endpoints` and
-//! `resolve_app_webhook_subscriptions`.
+//! Resolution is two halves. `resolve_webhook_identities` answers every gate a
+//! document determines and produces `WebhookEndpointIdentity`, whose scheme
+//! names the file each secret is read from; `resolve_webhook_endpoints` reads
+//! those files and produces `ResolvedWebhookEndpoint`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -19,7 +21,9 @@ use crate::config::{AppConfigRaw, load_secret_file};
 use crate::messaging::config::Depth;
 use crate::messaging::{Urgency, WakeMin};
 use crate::webhook::is_valid_key_id;
-use crate::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
+use crate::webhook::scheme::{
+    HexFormat, SignatureAlgorithm, SignatureScheme, UnloadedSignatureScheme,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -184,7 +188,7 @@ pub struct AppWebhookSubscriptionRaw {
 /// triggers a startup panic. `component` is carried through untouched: where a
 /// package is installed is a boot fact, and config resolution never sees the
 /// components root.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedReplayProtection {
     /// The installed component package's name.
     pub component: String,
@@ -209,7 +213,7 @@ pub struct ResolvedReplayProtection {
 /// violation). An `App` owner is a singleton `[[app]]` with a matching
 /// `[[app.webhook_subscription]]`; a `Wasm` owner is a `[[wasm_consumer]]`
 /// whose sole `webhook:<slug>` subscription designates it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebhookOwner {
     /// App slug of the singleton app subscribing to this endpoint.
     App(Arc<str>),
@@ -246,9 +250,38 @@ impl std::fmt::Display for WebhookOwner {
     }
 }
 
+/// One endpoint as the document determines it: every field of
+/// [`ResolvedWebhookEndpoint`] with the scheme in unloaded form, naming the
+/// file each secret is read from rather than carrying its bytes.
+///
+/// Produced by [`resolve_webhook_identities`]; [`resolve_webhook_endpoints`]
+/// loads the secrets and produces the hot-path form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookEndpointIdentity {
+    pub slug: String,
+    pub mount: String,
+    pub description: Option<String>,
+    pub transport_ceiling_bytes: usize,
+    /// Lowercased, params-stripped content-type (e.g. `"application/json"`).
+    pub content_type: String,
+    pub scheme: UnloadedSignatureScheme,
+    /// The participant (app or WASM consumer) that owns this endpoint.
+    pub owner: WebhookOwner,
+    /// Ingress urgency intent assigned to this endpoint (sender side). Default `Normal`.
+    pub urgency: Urgency,
+    /// Replay-protection binding. `None` means replay protection is disabled
+    /// for this endpoint; requests bypass the component check entirely.
+    pub replay_protection: Option<ResolvedReplayProtection>,
+}
+
 /// Resolved per-endpoint config, ready for the hot path. All headers are
 /// pre-parsed to `HeaderName`; all secrets are pre-loaded from disk.
-#[derive(Debug)]
+///
+/// Equality is over the whole entity, secret bytes included: two endpoints are
+/// the same endpoint when a request would be answered identically by either.
+/// The byte comparison runs on the host that owns the secret files, never on a
+/// request path, so there is no attacker-observable timing in it.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ResolvedWebhookEndpoint {
     pub slug: String,
     pub mount: String,
@@ -286,23 +319,20 @@ pub struct ResolvedWebhookSubscription {
 
 /// Validate and canonicalize a `[webhook_endpoint.replay_protection]` sub-table.
 ///
-/// - `store_path` parent directory must exist; the file itself is created if
-///   absent (KvStore::open calls `Connection::open` which creates it).
-///   The file is touched (created if needed) then canonicalized so the
-///   process-global guard in `brenn_wasm::KvStore` sees uniform paths
-///   regardless of symlinks or `./foo.sqlite` vs `foo.sqlite` spelling.
-///
 /// Returns `None` when `raw` is `None`.
+///
+/// Reads nothing off the host: `store_path` is normalised with
+/// `std::path::absolute`, and whether its parent directory exists is the host
+/// half's question (`assert_store_parent_exists`), so an offline
+/// `brenn config-check` on a workstation does not refuse a document for a
+/// directory only the deployment host has.
 ///
 /// # Panics
 ///
-/// Panics when `store_path`'s parent directory does not exist, or when the
-/// effective size limit string is unparseable or below the floor. The component
-/// package's existence is not checked here: it is resolved and verified at boot
-/// against the components root, which resolution has no access to.
-///
-/// Pure validator: no write side-effects. The store file is created (touched)
-/// lazily by `KvStore::open` at first use.
+/// Panics when the effective size limit string is unparseable or below the
+/// floor. The component package's existence is not checked here: it is resolved
+/// and verified at boot against the components root, which resolution has no
+/// access to.
 fn resolve_replay_protection(
     raw: Option<&ReplayProtectionConfigRaw>,
     endpoint_slug: &str,
@@ -310,15 +340,6 @@ fn resolve_replay_protection(
 ) -> Option<ResolvedReplayProtection> {
     let raw = raw?;
 
-    // store_path parent dir must exist; file itself is auto-created by KvStore::open.
-    let store_parent = raw.store_path.parent().unwrap_or_else(|| Path::new("."));
-    assert!(
-        store_parent.exists(),
-        "[[webhook_endpoint]] {:?}: replay_protection.store_path {:?} — \
-         parent directory does not exist",
-        endpoint_slug,
-        raw.store_path,
-    );
     // `std::path::absolute` joins relative paths against cwd and normalises lone
     // `.` components, covering the common relative-vs-absolute alias case.
     // It does NOT resolve symlinks. Operators must not alias store_path values
@@ -393,9 +414,12 @@ fn resolve_opt_header(name: Option<&str>, endpoint_slug: &str, field: &str) -> O
     name.map(|n| resolve_header(n, endpoint_slug, field))
 }
 
-/// Load all HMAC key entries for an endpoint. Validates key_id charset and
-/// uniqueness, and loads secrets via `load_secret_file`.
-fn resolve_keys(raw_keys: &[WebhookKeyConfigRaw], endpoint_slug: &str) -> HashMap<String, Vec<u8>> {
+/// Collect all HMAC key entries for an endpoint. Validates key_id charset and
+/// uniqueness, and carries each entry's `secret_file` path. Reads no files.
+fn resolve_key_refs(
+    raw_keys: &[WebhookKeyConfigRaw],
+    endpoint_slug: &str,
+) -> HashMap<String, PathBuf> {
     let mut keys = HashMap::new();
     for raw_key in raw_keys {
         assert!(
@@ -404,12 +428,7 @@ fn resolve_keys(raw_keys: &[WebhookKeyConfigRaw], endpoint_slug: &str) -> HashMa
             endpoint_slug,
             raw_key.key_id,
         );
-        let label = format!(
-            "[[webhook_endpoint]] {:?} key {:?} secret_file",
-            endpoint_slug, raw_key.key_id,
-        );
-        let secret = load_secret_file(&label, &raw_key.secret_file);
-        let prev = keys.insert(raw_key.key_id.clone(), secret.into_bytes());
+        let prev = keys.insert(raw_key.key_id.clone(), raw_key.secret_file.clone());
         assert!(
             prev.is_none(),
             "[[webhook_endpoint]] {:?}: duplicate key_id {:?}",
@@ -425,12 +444,13 @@ fn resolve_keys(raw_keys: &[WebhookKeyConfigRaw], endpoint_slug: &str) -> HashMa
     keys
 }
 
-/// Load all bearer token entries for an endpoint. Validates token_id charset,
-/// uniqueness, and loads token bytes via `load_secret_file`.
-fn resolve_tokens(
+/// Collect all bearer token entries for an endpoint. Validates token_id
+/// charset and uniqueness, and carries each entry's `secret_file` path. Reads
+/// no files.
+fn resolve_token_refs(
     raw_tokens: &[WebhookTokenConfigRaw],
     endpoint_slug: &str,
-) -> HashMap<String, Vec<u8>> {
+) -> HashMap<String, PathBuf> {
     let mut tokens = HashMap::new();
     for raw_token in raw_tokens {
         assert!(
@@ -439,12 +459,7 @@ fn resolve_tokens(
             endpoint_slug,
             raw_token.token_id,
         );
-        let label = format!(
-            "[[webhook_endpoint]] {:?} token {:?} secret_file",
-            endpoint_slug, raw_token.token_id,
-        );
-        let secret = load_secret_file(&label, &raw_token.secret_file);
-        let prev = tokens.insert(raw_token.token_id.clone(), secret.into_bytes());
+        let prev = tokens.insert(raw_token.token_id.clone(), raw_token.secret_file.clone());
         assert!(
             prev.is_none(),
             "[[webhook_endpoint]] {:?}: duplicate token_id {:?}",
@@ -541,9 +556,10 @@ fn resolve_template(template: &str, endpoint_slug: &str) -> (String, String, Str
     }
 }
 
-/// Resolve one `WebhookEndpointConfigRaw` into a `SignatureScheme`, validating
-/// all per-scheme invariants and loading secrets.
-fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> SignatureScheme {
+/// Resolve one `WebhookEndpointConfigRaw` into an `UnloadedSignatureScheme`,
+/// validating all per-scheme invariants. Reads no files: each key or token
+/// entry carries the path its secret is read from.
+fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> UnloadedSignatureScheme {
     let slug = &raw.slug;
     match &raw.signature {
         WebhookSignatureConfigRaw::HmacRawBody {
@@ -563,7 +579,7 @@ fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> SignatureScheme {
             let format = resolve_hex_format(format, slug, "signature.format");
             let key_id_header =
                 resolve_opt_header(key_id_header.as_deref(), slug, "signature.key_id_header");
-            let keys = resolve_keys(&raw.keys, slug);
+            let keys = resolve_key_refs(&raw.keys, slug);
             if keys.len() > 1 {
                 assert!(
                     key_id_header.is_some(),
@@ -608,7 +624,7 @@ fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> SignatureScheme {
                 resolve_opt_header(key_id_header.as_deref(), slug, "signature.key_id_header");
             let (template_prefix, template_mid, template_suffix, t_before_body) =
                 resolve_template(template, slug);
-            let keys = resolve_keys(&raw.keys, slug);
+            let keys = resolve_key_refs(&raw.keys, slug);
             if keys.len() > 1 {
                 assert!(
                     key_id_header.is_some(),
@@ -651,7 +667,7 @@ fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> SignatureScheme {
             let header = resolve_header(header, slug, "signature.header");
             let key_id_header =
                 resolve_opt_header(key_id_header.as_deref(), slug, "signature.key_id_header");
-            let keys = resolve_keys(&raw.keys, slug);
+            let keys = resolve_key_refs(&raw.keys, slug);
             if keys.len() > 1 {
                 assert!(
                     key_id_header.is_some(),
@@ -684,7 +700,7 @@ fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> SignatureScheme {
                 slug,
                 "signature.token_id_header",
             );
-            let tokens = resolve_tokens(&raw.tokens, slug);
+            let tokens = resolve_token_refs(&raw.tokens, slug);
             if tokens.len() > 1 {
                 assert!(
                     token_id_header.is_some(),
@@ -711,12 +727,12 @@ fn resolve_signature_scheme(raw: &WebhookEndpointConfigRaw) -> SignatureScheme {
 /// Webhook mounts must start with this prefix and include a non-empty path
 /// segment after it (e.g. `/webhooks/myendpoint`). Bare `/webhooks` and
 /// `/webhooks/` are rejected.
-const WEBHOOK_MOUNT_PREFIX: &str = "/webhooks/";
+pub const WEBHOOK_MOUNT_PREFIX: &str = "/webhooks/";
 
 /// The HTTP mount path a `[[webhook_endpoint]]` block serves at: the declared
 /// one, or `/webhooks/<slug>`.
 ///
-/// Shared by [`resolve_webhook_endpoints`], which hands it to the HTTP layer,
+/// Shared by [`resolve_webhook_identities`], which hands it to the HTTP layer,
 /// and by the boot-plan derivation, which carries it on the endpoint's
 /// `webhook:` channel entry. One function so the mount a request arrives on and
 /// the mount `list_channels` reports cannot disagree.
@@ -770,25 +786,31 @@ fn resolve_and_check_replay_protection(
     Some(rp)
 }
 
-/// Validate and resolve all `[[webhook_endpoint]]` raw entries, producing a map
-/// of endpoint slug → `Arc<ResolvedWebhookEndpoint>` and the resolved per-app
-/// subscription lists keyed by app slug.
+/// Validate all `[[webhook_endpoint]]` raw entries against the facts a document
+/// determines, producing a map of endpoint slug → [`WebhookEndpointIdentity`]
+/// and the resolved per-app subscription lists keyed by app slug.
+///
+/// The document half of webhook resolution: slug charset and uniqueness, mount
+/// uniqueness, ownership, subscription depth stamping, content type,
+/// replay-protection config and store-path uniqueness, and signature-scheme
+/// shape. Reads nothing off the host — the scheme names each secret's file
+/// rather than carrying its bytes.
 ///
 /// Also validates cross-app binding constraints (one endpoint → one owning
 /// app; every endpoint must be bound; singleton invariant).
 ///
 /// # Panics
 ///
-/// On any config error (invalid slug, missing secret, duplicate endpoint,
+/// On any document-level config error (invalid slug, duplicate endpoint,
 /// binding violations).
-pub fn resolve_webhook_endpoints(
+pub fn resolve_webhook_identities(
     raw_endpoints: &[WebhookEndpointConfigRaw],
     raw_apps: &[AppConfigRaw],
     raw_wasm_consumers: &[crate::messaging::config::WasmConsumerConfigRaw],
     wasm_config: &WasmConfig,
     global_messaging: &crate::messaging::config::MessagingGlobalConfig,
 ) -> (
-    IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
+    IndexMap<String, WebhookEndpointIdentity>,
     BTreeMap<String, Vec<ResolvedWebhookSubscription>>,
 ) {
     use crate::messaging::WEBHOOK_ADDRESS_PREFIX;
@@ -811,15 +833,15 @@ pub fn resolve_webhook_endpoints(
         // Singleton invariant.
         assert!(
             raw_app.singleton && raw_app.allowed_users.len() == 1,
-            "app {:?}: webhook_subscription requires singleton = true and exactly one \
-             allowed_users entry (MVP restriction matching messaging and MQTT)",
+            "[[app.webhook_subscription]] on app {:?}: requires singleton = true and \
+             exactly one allowed_users entry (MVP restriction matching messaging and MQTT)",
             raw_app.slug,
         );
         for sub in &raw_app.webhook_subscriptions {
             let prev = endpoint_to_app.insert(sub.endpoint.clone(), (&raw_app.slug, sub));
             assert!(
                 prev.is_none(),
-                "endpoint {:?} is subscribed to by both app {:?} and app {:?}; \
+                "[[webhook_endpoint]] {:?}: subscribed to by both app {:?} and app {:?}; \
                  each endpoint must have exactly one owning app",
                 sub.endpoint,
                 prev.unwrap().0,
@@ -850,7 +872,7 @@ pub fn resolve_webhook_endpoints(
     }
 
     // Resolve each endpoint.
-    let mut result: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
+    let mut result: IndexMap<String, WebhookEndpointIdentity> = IndexMap::new();
     let mut app_subs: BTreeMap<String, Vec<ResolvedWebhookSubscription>> = BTreeMap::new();
     let mut mount_set: HashSet<String> = HashSet::new();
     // Duplicate-store-path guard: canonical store_path must be unique across endpoints.
@@ -926,16 +948,17 @@ pub fn resolve_webhook_endpoints(
             // decision the operator ought to be making.
             let push_depth = raw_sub.push_depth.unwrap_or_else(|| {
                 panic!(
-                    "app {app_slug:?}: [[app.webhook_subscription]] for endpoint {slug:?} \
-                     requires push_depth — how many unseen requests one activation hands \
-                     over is a sizing decision, not a default"
+                    "[[app.webhook_subscription]] on app {app_slug:?} for endpoint \
+                     {slug:?}: requires push_depth — how many unseen requests one \
+                     activation hands over is a sizing decision, not a default"
                 )
             });
             let retain_depth = raw_sub.retain_depth.unwrap_or_else(|| {
                 panic!(
-                    "app {app_slug:?}: [[app.webhook_subscription]] for endpoint {slug:?} \
-                     requires retain_depth — the app's window onto the endpoint's channel \
-                     is sized for the outage it must survive, not defaulted"
+                    "[[app.webhook_subscription]] on app {app_slug:?} for endpoint \
+                     {slug:?}: requires retain_depth — the app's window onto the \
+                     endpoint's channel is sized for the outage it must survive, not \
+                     defaulted"
                 )
             });
             // wake_min absent ⇒ inherit from the global default_wake_min, the same
@@ -977,7 +1000,7 @@ pub fn resolve_webhook_endpoints(
             max_skew_secs,
         );
 
-        let endpoint = Arc::new(ResolvedWebhookEndpoint {
+        let identity = WebhookEndpointIdentity {
             slug: slug.clone(),
             mount,
             description: raw.description.clone(),
@@ -987,9 +1010,9 @@ pub fn resolve_webhook_endpoints(
             owner,
             urgency,
             replay_protection,
-        });
+        };
 
-        result.insert(slug.clone(), endpoint.clone());
+        result.insert(slug.clone(), identity);
 
         // Record the resolved subscription under its owning app (app-owned only).
         if let Some((app_slug, push_depth, retain_depth, wake_min)) = app_stamp {
@@ -1010,7 +1033,7 @@ pub fn resolve_webhook_endpoints(
         for sub in &raw_app.webhook_subscriptions {
             assert!(
                 result.contains_key(&sub.endpoint),
-                "app {:?}: [[app.webhook_subscription]] references endpoint {:?} \
+                "[[app.webhook_subscription]] on app {:?}: references endpoint {:?} \
                  which is not declared in any [[webhook_endpoint]] block",
                 raw_app.slug,
                 sub.endpoint,
@@ -1021,14 +1044,195 @@ pub fn resolve_webhook_endpoints(
     (result, app_subs)
 }
 
+/// Load every secret an identity map references, producing the hot-path
+/// endpoint table keyed by slug.
+///
+/// Entries are loaded in key-id order within an endpoint, so the first
+/// unreadable file an endpoint has is the one named.
+///
+/// A replay-protected endpoint's `store_path` parent is checked here too: the
+/// store file is opened later, by the component, and an open over a missing
+/// directory is a panic in `KvStore::open`. Checking it in this half is what
+/// makes it a boot refusal and a reload's environment refusal rather than a
+/// commit-time process abort.
+///
+/// # Panics
+///
+/// On a `secret_file` that is missing, unreadable, empty, or readable by
+/// another local account (see `load_secret_file`), or on a `store_path` whose
+/// parent directory does not exist.
+pub fn resolve_webhook_endpoints(
+    identities: &IndexMap<String, WebhookEndpointIdentity>,
+) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
+    identities
+        .iter()
+        .map(|(slug, identity)| {
+            if let Some(rp) = identity.replay_protection.as_ref() {
+                assert_store_parent_exists(&identity.slug, &rp.store_path);
+            }
+            let endpoint = ResolvedWebhookEndpoint {
+                slug: identity.slug.clone(),
+                mount: identity.mount.clone(),
+                description: identity.description.clone(),
+                transport_ceiling_bytes: identity.transport_ceiling_bytes,
+                content_type: identity.content_type.clone(),
+                scheme: load_scheme_secrets(&identity.scheme, &identity.slug),
+                owner: identity.owner.clone(),
+                urgency: identity.urgency,
+                replay_protection: identity.replay_protection.clone(),
+            };
+            (slug.clone(), Arc::new(endpoint))
+        })
+        .collect()
+}
+
+/// Refuse a replay store whose directory is not there.
+///
+/// The store file itself is created by `KvStore::open`; its parent is not, and
+/// an open under a missing directory panics inside the component. Named here so
+/// an operator reads the block and the path instead of a SQLite error.
+///
+/// # Panics
+///
+/// When `store_path`'s parent directory does not exist.
+pub fn assert_store_parent_exists(endpoint_slug: &str, store_path: &Path) {
+    let parent = store_path.parent().unwrap_or_else(|| Path::new("."));
+    assert!(
+        parent.exists(),
+        "[[webhook_endpoint]] {endpoint_slug:?}: replay_protection.store_path {:?} — \
+         parent directory does not exist",
+        store_path,
+    );
+}
+
+/// Read the secret behind every entry of one endpoint's unloaded scheme.
+fn load_scheme_secrets(
+    scheme: &UnloadedSignatureScheme,
+    endpoint_slug: &str,
+) -> SignatureScheme<Vec<u8>> {
+    match scheme {
+        SignatureScheme::HmacRawBody {
+            algorithm,
+            header,
+            format,
+            key_id_header,
+            keys,
+        } => SignatureScheme::HmacRawBody {
+            algorithm: *algorithm,
+            header: header.clone(),
+            format: *format,
+            key_id_header: key_id_header.clone(),
+            keys: load_secret_refs(keys, endpoint_slug, "key"),
+        },
+        SignatureScheme::HmacTimestampedBody {
+            algorithm,
+            sig_header,
+            sig_format,
+            timestamp_header,
+            template_prefix,
+            template_mid,
+            template_suffix,
+            t_before_body,
+            max_skew_secs,
+            key_id_header,
+            keys,
+        } => SignatureScheme::HmacTimestampedBody {
+            algorithm: *algorithm,
+            sig_header: sig_header.clone(),
+            sig_format: *sig_format,
+            timestamp_header: timestamp_header.clone(),
+            template_prefix: template_prefix.clone(),
+            template_mid: template_mid.clone(),
+            template_suffix: template_suffix.clone(),
+            t_before_body: *t_before_body,
+            max_skew_secs: *max_skew_secs,
+            key_id_header: key_id_header.clone(),
+            keys: load_secret_refs(keys, endpoint_slug, "key"),
+        },
+        SignatureScheme::HmacStripe {
+            algorithm,
+            header,
+            max_skew_secs,
+            key_id_header,
+            keys,
+        } => SignatureScheme::HmacStripe {
+            algorithm: *algorithm,
+            header: header.clone(),
+            max_skew_secs: *max_skew_secs,
+            key_id_header: key_id_header.clone(),
+            keys: load_secret_refs(keys, endpoint_slug, "key"),
+        },
+        SignatureScheme::BearerToken {
+            header,
+            token_id_header,
+            tokens,
+        } => SignatureScheme::BearerToken {
+            header: header.clone(),
+            token_id_header: token_id_header.clone(),
+            tokens: load_secret_refs(tokens, endpoint_slug, "token"),
+        },
+    }
+}
+
+/// Read every `id → path` entry into `id → secret bytes`, in id order.
+///
+/// `kind` is the block word the label names — `"key"` or `"token"` — so the
+/// refusal an unreadable file raises points at the block the operator wrote.
+fn load_secret_refs(
+    refs: &HashMap<String, PathBuf>,
+    endpoint_slug: &str,
+    kind: &str,
+) -> HashMap<String, Vec<u8>> {
+    let mut ids: Vec<&String> = refs.keys().collect();
+    ids.sort();
+    ids.into_iter()
+        .map(|id| {
+            let label = format!("[[webhook_endpoint]] {endpoint_slug:?} {kind} {id:?} secret_file");
+            let secret = load_secret_file(&label, &refs[id]);
+            (id.clone(), secret.into_bytes())
+        })
+        .collect()
+}
+
+/// An endpoint in either resolved form: the document half (before a secret has
+/// been read) and the hot-path form (after).
+pub trait ReplayProtectedEndpoint {
+    fn replay_protection(&self) -> Option<&ResolvedReplayProtection>;
+}
+
+impl ReplayProtectedEndpoint for WebhookEndpointIdentity {
+    fn replay_protection(&self) -> Option<&ResolvedReplayProtection> {
+        self.replay_protection.as_ref()
+    }
+}
+
+impl ReplayProtectedEndpoint for ResolvedWebhookEndpoint {
+    fn replay_protection(&self) -> Option<&ResolvedReplayProtection> {
+        self.replay_protection.as_ref()
+    }
+}
+
+/// The replay store paths a resolved endpoint set declares, in endpoint order.
+///
+/// Every caller that feeds replay store paths to the planner must use this
+/// derivation: the planner holds the consumers' stores unique against these,
+/// and the uniqueness must agree with the process-global one-holder guard.
+pub fn webhook_store_paths<'a, E>(endpoints: impl IntoIterator<Item = &'a E>) -> Vec<PathBuf>
+where
+    E: ReplayProtectedEndpoint + 'a,
+{
+    endpoints
+        .into_iter()
+        .filter_map(|endpoint| endpoint.replay_protection().map(|rp| rp.store_path.clone()))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use super::*;
 
     /// The replay package name these endpoints name. Resolution never looks it
@@ -1036,24 +1240,24 @@ mod tests {
     /// could ship serves.
     const REPLAY_PACKAGE: &str = "replay-generic";
 
-    // Helper: create a temp file with given contents, return path.
-    fn secret_file(contents: &[u8]) -> tempfile::NamedTempFile {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(contents).unwrap();
-        f
+    // A `secret_file` path for a key or token block. The document half never
+    // opens it, so these tests name files that do not exist: a resolution that
+    // reached for one would fail here rather than pass on a temp file.
+    fn secret_path(name: &str) -> PathBuf {
+        PathBuf::from(format!("/nonexistent/alice/{name}"))
     }
 
-    fn raw_key(key_id: &str, secret_file: &tempfile::NamedTempFile) -> WebhookKeyConfigRaw {
+    fn raw_key(key_id: &str, secret_file: &Path) -> WebhookKeyConfigRaw {
         WebhookKeyConfigRaw {
             key_id: key_id.to_string(),
-            secret_file: secret_file.path().to_owned(),
+            secret_file: secret_file.to_owned(),
         }
     }
 
-    fn raw_token(token_id: &str, secret_file: &tempfile::NamedTempFile) -> WebhookTokenConfigRaw {
+    fn raw_token(token_id: &str, secret_file: &Path) -> WebhookTokenConfigRaw {
         WebhookTokenConfigRaw {
             token_id: token_id.to_string(),
-            secret_file: secret_file.path().to_owned(),
+            secret_file: secret_file.to_owned(),
         }
     }
 
@@ -1101,11 +1305,12 @@ mod tests {
         }
     }
 
-    // Helper to call resolve with default WasmConfig, keeping the endpoint map.
+    // Helper to call the document half with default WasmConfig, keeping the
+    // endpoint map.
     fn resolve(
         endpoints: &[WebhookEndpointConfigRaw],
         app_raws: &[AppConfigRaw],
-    ) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
+    ) -> IndexMap<String, WebhookEndpointIdentity> {
         resolve_with_wasm(endpoints, app_raws, &[])
     }
 
@@ -1114,7 +1319,7 @@ mod tests {
         endpoints: &[WebhookEndpointConfigRaw],
         app_raws: &[AppConfigRaw],
         wasm_consumers: &[crate::messaging::config::WasmConsumerConfigRaw],
-    ) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
+    ) -> IndexMap<String, WebhookEndpointIdentity> {
         resolve_full(endpoints, app_raws, wasm_consumers).0
     }
 
@@ -1124,10 +1329,10 @@ mod tests {
         app_raws: &[AppConfigRaw],
         wasm_consumers: &[crate::messaging::config::WasmConsumerConfigRaw],
     ) -> (
-        IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
+        IndexMap<String, WebhookEndpointIdentity>,
         BTreeMap<String, Vec<ResolvedWebhookSubscription>>,
     ) {
-        resolve_webhook_endpoints(
+        resolve_webhook_identities(
             endpoints,
             app_raws,
             wasm_consumers,
@@ -1140,7 +1345,7 @@ mod tests {
     /// them: `resolve_apps` is the one place an `AppConfig` field is written.
     #[test]
     fn per_app_subscriptions_are_returned_keyed_by_app_slug() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep1 = raw_hmac_endpoint("ep1", vec![raw_key("k1", &secret)]);
         let ep2 = raw_hmac_endpoint("ep2", vec![raw_key("k1", &secret)]);
         let mut app = minimal_app_raw("myapp", true, vec!["dev".to_string()]);
@@ -1170,7 +1375,7 @@ mod tests {
     /// A WASM-owned endpoint stamps nothing on any app.
     #[test]
     fn wasm_owned_endpoint_produces_no_app_stamp() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let consumer = wasm_consumer_with_webhook_subs("myconsumer", &["ep"]);
         let (_endpoints, subs) = resolve_full(&[ep], &[], &[consumer]);
@@ -1196,7 +1401,7 @@ mod tests {
 
     #[test]
     fn default_mount_is_applied() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("myendpoint", vec![raw_key("k1", &secret)]);
         let app = app_raw_with_sub("myapp", "myendpoint");
         let result = resolve(&[ep], &[app]);
@@ -1205,7 +1410,7 @@ mod tests {
 
     #[test]
     fn explicit_mount_is_used() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("myendpoint", vec![raw_key("k1", &secret)]);
         ep.mount = Some("/webhooks/custom".to_string());
         let app = app_raw_with_sub("myapp", "myendpoint");
@@ -1215,7 +1420,7 @@ mod tests {
 
     #[test]
     fn owning_app_slug_stamped() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let app = app_raw_with_sub("myapp", "ep");
         let result = resolve(&[ep], &[app]);
@@ -1225,7 +1430,7 @@ mod tests {
 
     #[test]
     fn content_type_lowercased_and_params_stripped() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         ep.content_type = "Application/JSON; charset=utf-8".to_string();
         let app = app_raw_with_sub("myapp", "ep");
@@ -1238,7 +1443,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "singleton")]
     fn non_singleton_app_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let mut app = app_raw_with_sub("myapp", "ep");
         app.singleton = false;
@@ -1249,7 +1454,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "singleton")]
     fn multi_user_app_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let mut app = app_raw_with_sub("myapp", "ep");
         app.singleton = true;
@@ -1262,11 +1467,11 @@ mod tests {
     /// app and endpoint.
     #[test]
     #[should_panic(
-        expected = "app \"myapp\": [[app.webhook_subscription]] for endpoint \"ep\" \
+        expected = "[[app.webhook_subscription]] on app \"myapp\" for endpoint \"ep\": \
                                requires push_depth"
     )]
     fn webhook_subscription_without_push_depth_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let mut app = app_raw_with_sub("myapp", "ep");
         app.webhook_subscriptions[0].push_depth = None;
@@ -1275,11 +1480,11 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "app \"myapp\": [[app.webhook_subscription]] for endpoint \"ep\" \
+        expected = "[[app.webhook_subscription]] on app \"myapp\" for endpoint \"ep\": \
                                requires retain_depth"
     )]
     fn webhook_subscription_without_retain_depth_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let mut app = app_raw_with_sub("myapp", "ep");
         app.webhook_subscriptions[0].retain_depth = None;
@@ -1289,7 +1494,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "orphan endpoints are not permitted")]
     fn orphan_endpoint_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         // No app subscribes to "ep".
         let app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
@@ -1300,7 +1505,7 @@ mod tests {
 
     #[test]
     fn wasm_consumer_owns_endpoint_when_no_app_subscribes() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         // No app subscribes; a sole WASM consumer subscribes to webhook:ep.
         let consumer = wasm_consumer_with_webhook_subs("myconsumer", &["ep"]);
@@ -1316,7 +1521,7 @@ mod tests {
     fn app_owns_endpoint_even_when_wasm_also_subscribes() {
         // An app subscription wins over a WASM subscriber (fan-out is allowed;
         // ownership stays with the app).
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let app = app_raw_with_sub("myapp", "ep");
         let consumer = wasm_consumer_with_webhook_subs("myconsumer", &["ep"]);
@@ -1327,7 +1532,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "ambiguous ownership")]
     fn two_wasm_subscribers_no_app_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let c1 = wasm_consumer_with_webhook_subs("consumer-a", &["ep"]);
         let c2 = wasm_consumer_with_webhook_subs("consumer-b", &["ep"]);
@@ -1337,7 +1542,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "orphan endpoints are not permitted")]
     fn endpoint_with_no_app_or_wasm_subscriber_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         // A WASM consumer exists but subscribes to a different endpoint.
         let consumer = wasm_consumer_with_webhook_subs("myconsumer", &["other"]);
@@ -1348,7 +1553,7 @@ mod tests {
     fn wasm_owner_dedupes_repeated_subscriptions() {
         // A consumer subscribing to webhook:ep twice counts once, so it is a
         // sole owner (not ambiguous).
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let consumer = wasm_consumer_with_webhook_subs("myconsumer", &["ep", "ep"]);
         let result = resolve_with_wasm(&[ep], &[], &[consumer]);
@@ -1358,7 +1563,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplicate slug")]
     fn duplicate_slug_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep1 = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let ep2 = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         let app = app_raw_with_sub("myapp", "ep");
@@ -1368,8 +1573,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "already used by another endpoint")]
     fn duplicate_mount_panics() {
-        let s1 = secret_file(b"secret1");
-        let s2 = secret_file(b"secret2");
+        let s1 = secret_path("secret1");
+        let s2 = secret_path("secret2");
         let mut ep1 = raw_hmac_endpoint("ep1", vec![raw_key("k1", &s1)]);
         ep1.mount = Some("/webhooks/shared".to_string());
         let mut ep2 = raw_hmac_endpoint("ep2", vec![raw_key("k1", &s2)]);
@@ -1384,8 +1589,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with")]
     fn namespace_check_precedes_uniqueness_check() {
-        let s1 = secret_file(b"secret1");
-        let s2 = secret_file(b"secret2");
+        let s1 = secret_path("secret1");
+        let s2 = secret_path("secret2");
         let mut ep1 = raw_hmac_endpoint("ep1", vec![raw_key("k1", &s1)]);
         ep1.mount = Some("/foo".to_string()); // invalid prefix, shared mount
         let mut ep2 = raw_hmac_endpoint("ep2", vec![raw_key("k1", &s2)]);
@@ -1398,7 +1603,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with")]
     fn mount_not_under_webhooks_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         ep.mount = Some("/foo".to_string());
         let app = app_raw_with_sub("myapp", "ep");
@@ -1408,7 +1613,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with")]
     fn mount_under_hooks_legacy_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         ep.mount = Some("/hooks/ep".to_string());
         let app = app_raw_with_sub("myapp", "ep");
@@ -1418,7 +1623,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with")]
     fn mount_webhook_singular_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         ep.mount = Some("/webhook/x".to_string());
         let app = app_raw_with_sub("myapp", "ep");
@@ -1428,7 +1633,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with")]
     fn mount_bare_webhooks_namespace_panics_no_slash() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         ep.mount = Some("/webhooks".to_string());
         let app = app_raw_with_sub("myapp", "ep");
@@ -1438,7 +1643,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with")]
     fn mount_bare_webhooks_namespace_panics_trailing_slash() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         ep.mount = Some("/webhooks/".to_string());
         let app = app_raw_with_sub("myapp", "ep");
@@ -1447,7 +1652,7 @@ mod tests {
 
     #[test]
     fn mount_under_webhooks_accepted() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let mut ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
         ep.mount = Some("/webhooks/anything".to_string());
         let app = app_raw_with_sub("myapp", "ep");
@@ -1458,7 +1663,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "exactly one owning app")]
     fn two_apps_same_endpoint_panics() {
-        let s1 = secret_file(b"secret1");
+        let s1 = secret_path("secret1");
         let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &s1)]);
         let app1 = app_raw_with_sub("app1", "ep");
         let app2 = app_raw_with_sub("app2", "ep");
@@ -1474,8 +1679,8 @@ mod tests {
 
     #[test]
     fn one_app_multiple_subscriptions_ok() {
-        let s1 = secret_file(b"secret1");
-        let s2 = secret_file(b"secret2");
+        let s1 = secret_path("secret1");
+        let s2 = secret_path("secret2");
         let ep1 = raw_hmac_endpoint("ep1", vec![raw_key("k1", &s1)]);
         let ep2 = raw_hmac_endpoint("ep2", vec![raw_key("k1", &s2)]);
         let app = AppConfigRaw {
@@ -1508,7 +1713,7 @@ mod tests {
 
     #[test]
     fn hmac_raw_body_phonebuddy_shape_resolves() {
-        let secret = secret_file(b"supersecret");
+        let secret = secret_path("supersecret");
         let ep = WebhookEndpointConfigRaw {
             slug: "phonebuddy".to_string(),
             mount: Some("/webhooks/phonebuddy/v1/ingest".to_string()),
@@ -1544,8 +1749,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "[[webhook_endpoint.token]]")]
     fn hmac_with_tokens_panics() {
-        let secret = secret_file(b"mysecret");
-        let token_secret = secret_file(b"tokenvalue");
+        let secret = secret_path("mysecret");
+        let token_secret = secret_path("tokenvalue");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1570,8 +1775,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "key_id_header")]
     fn hmac_multi_key_without_key_id_header_panics() {
-        let s1 = secret_file(b"secret1");
-        let s2 = secret_file(b"secret2");
+        let s1 = secret_path("secret1");
+        let s2 = secret_path("secret2");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1596,7 +1801,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unsupported algorithm")]
     fn unknown_algorithm_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1621,7 +1826,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unrecognised")]
     fn unknown_format_panics() {
-        let secret = secret_file(b"mysecret");
+        let secret = secret_path("mysecret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1647,7 +1852,7 @@ mod tests {
 
     #[test]
     fn hmac_timestamped_body_slack_shape_resolves() {
-        let secret = secret_file(b"slack-secret");
+        let secret = secret_path("slack-secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "slack".to_string(),
             mount: None,
@@ -1695,7 +1900,7 @@ mod tests {
 
     #[test]
     fn hmac_timestamped_body_before_t_resolves() {
-        let secret = secret_file(b"secret");
+        let secret = secret_path("secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1738,7 +1943,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "max_skew_secs must be > 0")]
     fn hmac_timestamped_zero_skew_panics() {
-        let secret = secret_file(b"secret");
+        let secret = secret_path("secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1766,7 +1971,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must contain {t} exactly once")]
     fn template_missing_t_panics() {
-        let secret = secret_file(b"secret");
+        let secret = secret_path("secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1794,7 +1999,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must contain {body} exactly once")]
     fn template_missing_body_panics() {
-        let secret = secret_file(b"secret");
+        let secret = secret_path("secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1822,7 +2027,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unrecognised placeholder")]
     fn template_unknown_placeholder_panics() {
-        let secret = secret_file(b"secret");
+        let secret = secret_path("secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1850,8 +2055,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "[[webhook_endpoint.token]]")]
     fn hmac_timestamped_with_tokens_panics() {
-        let secret = secret_file(b"secret");
-        let token_secret = secret_file(b"tokenvalue");
+        let secret = secret_path("secret");
+        let token_secret = secret_path("tokenvalue");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1880,7 +2085,7 @@ mod tests {
 
     #[test]
     fn hmac_stripe_resolves() {
-        let secret = secret_file(b"stripe-secret");
+        let secret = secret_path("stripe-secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "stripe".to_string(),
             mount: None,
@@ -1912,7 +2117,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "max_skew_secs must be > 0")]
     fn hmac_stripe_zero_skew_panics() {
-        let secret = secret_file(b"secret");
+        let secret = secret_path("secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1937,8 +2142,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "[[webhook_endpoint.token]]")]
     fn hmac_stripe_with_tokens_panics() {
-        let secret = secret_file(b"secret");
-        let token_secret = secret_file(b"tokenvalue");
+        let secret = secret_path("secret");
+        let token_secret = secret_path("tokenvalue");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -1964,7 +2169,7 @@ mod tests {
 
     #[test]
     fn bearer_token_google_push_shape_resolves() {
-        let token_secret = secret_file(b"my-google-token");
+        let token_secret = secret_path("my-google-token");
         let ep = WebhookEndpointConfigRaw {
             slug: "google".to_string(),
             mount: None,
@@ -1994,8 +2199,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "[[webhook_endpoint.key]]")]
     fn bearer_with_keys_panics() {
-        let secret = secret_file(b"hmac-secret");
-        let token_secret = secret_file(b"bearer-token");
+        let secret = secret_path("hmac-secret");
+        let token_secret = secret_path("bearer-token");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -2018,8 +2223,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "token_id_header")]
     fn bearer_multi_token_without_token_id_header_panics() {
-        let t1 = secret_file(b"token1");
-        let t2 = secret_file(b"token2");
+        let t1 = secret_path("token1");
+        let t2 = secret_path("token2");
         let ep = WebhookEndpointConfigRaw {
             slug: "ep".to_string(),
             mount: None,
@@ -2044,7 +2249,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "slug")]
     fn invalid_endpoint_slug_panics() {
-        let secret = secret_file(b"secret");
+        let secret = secret_path("secret");
         let ep = WebhookEndpointConfigRaw {
             slug: "bad slug!".to_string(),
             mount: None,
@@ -2113,7 +2318,7 @@ mod tests {
             "precondition: store file must not exist before resolve"
         );
 
-        let s = secret_file(b"secret");
+        let s = secret_path("secret");
         let ep = raw_hmac_endpoint_with_replay(
             "ep",
             vec![raw_key("k1", &s)],
@@ -2133,8 +2338,8 @@ mod tests {
     #[should_panic(expected = "already used by another endpoint")]
     fn resolve_webhook_endpoints_dup_store_path_panics() {
         // Two endpoints sharing the same canonical store_path must panic.
-        let s1 = secret_file(b"secret1");
-        let s2 = secret_file(b"secret2");
+        let s1 = secret_path("secret1");
+        let s2 = secret_path("secret2");
         // Use a single NamedTempFile as both the component artifact (real file) and store.
         let store_file = tempfile::NamedTempFile::new().unwrap();
         let ep1 = raw_hmac_endpoint_with_replay(
@@ -2161,8 +2366,8 @@ mod tests {
         endpoints: &[WebhookEndpointConfigRaw],
         app_raws: &[AppConfigRaw],
         wasm_config: &WasmConfig,
-    ) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
-        resolve_webhook_endpoints(
+    ) -> IndexMap<String, WebhookEndpointIdentity> {
+        resolve_webhook_identities(
             endpoints,
             app_raws,
             &[],
@@ -2177,7 +2382,7 @@ mod tests {
         // AC-5: when per-store store_size_limit is set, it overrides the global default.
         // 128 MiB override vs 64 MiB global → resolved max_page_count must come from 128 MiB.
         use crate::config::wasm::byte_size_to_max_page_count;
-        let s = secret_file(b"secret");
+        let s = secret_path("secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
         let mut ep =
@@ -2203,7 +2408,7 @@ mod tests {
     fn store_size_limit_global_default_applies_when_no_override() {
         // AC-5: when no per-store override, global default is used.
         use crate::config::wasm::byte_size_to_max_page_count;
-        let s = secret_file(b"secret");
+        let s = secret_path("secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
         // No per-store override (store_size_limit: None).
@@ -2228,7 +2433,7 @@ mod tests {
     #[should_panic(expected = "ep")]
     fn store_size_limit_bad_per_store_value_panics_with_slug() {
         // AC-6: unparseable per-store value → fatal panic; message must contain slug.
-        let s = secret_file(b"secret");
+        let s = secret_path("secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
         let mut ep =
@@ -2246,7 +2451,7 @@ mod tests {
         // AC-6: unparseable global default → fatal panic; message must contain field identifier.
         // "99KB" uses decimal-SI (rejected); "99MiB" would pass. Expect panic containing the
         // string "store_size_limit" (the config key name embedded in the field_name argument).
-        let s = secret_file(b"secret");
+        let s = secret_path("secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
         let ep =
@@ -2260,15 +2465,15 @@ mod tests {
 
     // --- Host injection: brenn.max-skew-secs ---
 
-    /// Helper: build a `WebhookEndpointConfigRaw` with `HmacTimestampedBody` scheme
-    /// and replay protection. `secret` must outlive this function's result.
+    /// Helper: build a `WebhookEndpointConfigRaw` with `HmacTimestampedBody`
+    /// scheme and replay protection.
     fn timestamped_endpoint_with_replay(
         slug: &str,
         max_skew_secs: u64,
         component: &str,
         store_path: std::path::PathBuf,
         replay_config: Option<toml::Table>,
-        secret: &tempfile::NamedTempFile,
+        secret: &Path,
     ) -> WebhookEndpointConfigRaw {
         WebhookEndpointConfigRaw {
             slug: slug.to_string(),
@@ -2287,7 +2492,7 @@ mod tests {
             },
             keys: vec![WebhookKeyConfigRaw {
                 key_id: "k1".to_string(),
-                secret_file: secret.path().to_owned(),
+                secret_file: secret.to_owned(),
             }],
             tokens: vec![],
             replay_protection: Some(ReplayProtectionConfigRaw {
@@ -2303,7 +2508,7 @@ mod tests {
     /// `HmacTimestampedBody` endpoint → `brenn.max-skew-secs` injected into replay config.
     #[test]
     fn hmac_timestamped_injects_max_skew_secs() {
-        let secret = secret_file(b"test-secret");
+        let secret = secret_path("test-secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2328,7 +2533,7 @@ mod tests {
     /// `HmacRawBody` endpoint → no `brenn.max-skew-secs` injected.
     #[test]
     fn hmac_raw_body_does_not_inject_max_skew_secs() {
-        let s = secret_file(b"secret");
+        let s = secret_path("secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2347,7 +2552,7 @@ mod tests {
     /// Operator-supplied keys coexist with the injected `brenn.max-skew-secs`.
     #[test]
     fn operator_keys_coexist_with_injected_skew() {
-        let secret = secret_file(b"test-secret");
+        let secret = secret_path("test-secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2380,7 +2585,7 @@ mod tests {
     /// `HmacStripe` endpoint → `brenn.max-skew-secs` injected into replay config.
     #[test]
     fn hmac_stripe_injects_max_skew_secs() {
-        let secret = secret_file(b"stripe-secret");
+        let secret = secret_path("stripe-secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2420,7 +2625,7 @@ mod tests {
     /// `BearerToken` endpoint → no `brenn.max-skew-secs` injected.
     #[test]
     fn bearer_token_does_not_inject_max_skew_secs() {
-        let token_secret = secret_file(b"bearer-token");
+        let token_secret = secret_path("bearer-token");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2458,7 +2663,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "reserved prefix")]
     fn operator_brenn_prefix_in_replay_config_panics() {
-        let secret = secret_file(b"test-secret");
+        let secret = secret_path("test-secret");
         let store_dir = tempfile::TempDir::new().unwrap();
         let store_path = store_dir.path().join("store.sqlite");
 
@@ -2510,6 +2715,210 @@ new alice: Assistant();
         assert!(
             rendered.contains("wake_kind"),
             "the refusal must name the key it rejected: {rendered}"
+        );
+    }
+    // --- The host half: reading the secrets the identities name ---
+
+    /// A file holding a secret, mode-unrestricted: the webhook reader is the
+    /// plain one, not the private-mode one.
+    fn written_secret(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// The host half loads every key an HMAC endpoint declares and every token
+    /// a bearer endpoint declares, keyed by the same ids the document used.
+    #[test]
+    fn the_host_half_loads_every_key_and_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = written_secret(dir.path(), "k1", "first-secret\n");
+        let k2 = written_secret(dir.path(), "k2", "second-secret");
+        let t1 = written_secret(dir.path(), "t1", "bearer-value");
+
+        let mut hmac = raw_hmac_endpoint("hooked", vec![raw_key("k1", &k1), raw_key("k2", &k2)]);
+        let WebhookSignatureConfigRaw::HmacRawBody { key_id_header, .. } = &mut hmac.signature
+        else {
+            panic!("raw_hmac_endpoint builds an HmacRawBody block");
+        };
+        *key_id_header = Some("x-key-id".to_string());
+
+        let mut bearer = raw_hmac_endpoint("bearer", vec![]);
+        bearer.signature = WebhookSignatureConfigRaw::BearerToken {
+            header: "authorization".to_string(),
+            token_id_header: None,
+        };
+        bearer.tokens = vec![raw_token("t1", &t1)];
+
+        let identities = resolve(
+            &[hmac, bearer],
+            &[
+                app_raw_with_sub("hookapp", "hooked"),
+                app_raw_with_sub("bearerapp", "bearer"),
+            ],
+        );
+        let endpoints = resolve_webhook_endpoints(&identities);
+
+        let SignatureScheme::HmacRawBody { keys, .. } = &endpoints["hooked"].scheme else {
+            panic!("expected HmacRawBody");
+        };
+        // Trailing whitespace is trimmed by the reader, so the first key's
+        // newline is not part of the secret.
+        assert_eq!(keys["k1"], b"first-secret".to_vec());
+        assert_eq!(keys["k2"], b"second-secret".to_vec());
+
+        let SignatureScheme::BearerToken { tokens, .. } = &endpoints["bearer"].scheme else {
+            panic!("expected BearerToken");
+        };
+        assert_eq!(tokens["t1"], b"bearer-value".to_vec());
+    }
+
+    /// Everything else about the endpoint survives the load unchanged: the
+    /// identity is the whole of the entity except the bytes.
+    #[test]
+    fn the_host_half_carries_every_document_field_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = written_secret(dir.path(), "k1", "secret");
+        let mut raw = raw_hmac_endpoint("hooked", vec![raw_key("k1", &k1)]);
+        raw.mount = Some("/webhooks/hooked/v2".to_string());
+        raw.description = Some("a hook".to_string());
+        raw.transport_ceiling_bytes = 4096;
+        raw.urgency = Some(Urgency::Low);
+
+        let identities = resolve(&[raw], &[app_raw_with_sub("hookapp", "hooked")]);
+        let endpoints = resolve_webhook_endpoints(&identities);
+        let (identity, endpoint) = (&identities["hooked"], &endpoints["hooked"]);
+
+        assert_eq!(endpoint.slug, identity.slug);
+        assert_eq!(endpoint.mount, "/webhooks/hooked/v2");
+        assert_eq!(endpoint.description, identity.description);
+        assert_eq!(endpoint.transport_ceiling_bytes, 4096);
+        assert_eq!(endpoint.content_type, identity.content_type);
+        assert_eq!(endpoint.owner, identity.owner);
+        assert_eq!(endpoint.urgency, Urgency::Low);
+        assert_eq!(endpoint.replay_protection, identity.replay_protection);
+    }
+
+    /// The document half opens nothing: an endpoint naming a file that is not
+    /// there resolves to an identity, and only the host half refuses it.
+    #[test]
+    #[should_panic(expected = "key \"k1\" secret_file")]
+    fn an_unreadable_key_secret_file_is_refused_by_the_host_half_only() {
+        let raw = raw_hmac_endpoint("hooked", vec![raw_key("k1", &secret_path("missing"))]);
+        let identities = resolve(&[raw], &[app_raw_with_sub("hookapp", "hooked")]);
+        assert_eq!(identities.len(), 1, "the document half accepted the block");
+        resolve_webhook_endpoints(&identities);
+    }
+
+    /// The bearer arm carries its own label, so an operator reading the refusal
+    /// is sent to the `[[webhook_endpoint.token]]` block that names the file and
+    /// not to a `key` block the document does not have.
+    #[test]
+    #[should_panic(expected = "token \"main\" secret_file")]
+    fn an_unreadable_token_secret_file_names_the_token_block() {
+        let ep = WebhookEndpointConfigRaw {
+            slug: "google".to_string(),
+            mount: None,
+            description: None,
+            transport_ceiling_bytes: DEFAULT_TRANSPORT_CEILING,
+            content_type: DEFAULT_CONTENT_TYPE.to_string(),
+            signature: WebhookSignatureConfigRaw::BearerToken {
+                header: "x-goog-channel-token".to_string(),
+                token_id_header: None,
+            },
+            keys: vec![],
+            tokens: vec![raw_token("main", &secret_path("missing"))],
+            replay_protection: None,
+            urgency: None,
+        };
+        let identities = resolve(&[ep], &[app_raw_with_sub("myapp", "google")]);
+        assert_eq!(identities.len(), 1, "the document half accepted the block");
+        resolve_webhook_endpoints(&identities);
+    }
+
+    /// A replay store whose directory is not there is a host fact: the document
+    /// half resolves the block, and the half that runs on the deployment host
+    /// refuses it. This is what keeps an offline `brenn config-check` on a
+    /// workstation from refusing a document for a directory only the host has.
+    #[test]
+    #[should_panic(expected = "parent directory does not exist")]
+    fn a_replay_store_under_a_missing_directory_is_refused_by_the_host_half_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = written_secret(dir.path(), "k1", "shhh");
+        let raw = raw_hmac_endpoint_with_replay(
+            "hooked",
+            vec![raw_key("k1", &k1)],
+            "replay-generic",
+            std::path::PathBuf::from("/nonexistent-brenn-store-dir/replay.sqlite"),
+        );
+        let identities = resolve(&[raw], &[app_raw_with_sub("hookapp", "hooked")]);
+        assert_eq!(identities.len(), 1, "the document half accepted the block");
+        resolve_webhook_endpoints(&identities);
+    }
+
+    /// Two endpoints resolved from the same identity map with the same bytes on
+    /// disk are equal; a rotated secret makes them unequal, which is the whole
+    /// of what a reload compares.
+    #[test]
+    fn endpoint_equality_follows_the_secret_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = written_secret(dir.path(), "k1", "before");
+        let raw = raw_hmac_endpoint("hooked", vec![raw_key("k1", &k1)]);
+        let identities = resolve(
+            std::slice::from_ref(&raw),
+            &[app_raw_with_sub("hookapp", "hooked")],
+        );
+
+        let first = resolve_webhook_endpoints(&identities);
+        let again = resolve_webhook_endpoints(&identities);
+        assert_eq!(first["hooked"], again["hooked"]);
+
+        std::fs::write(&k1, "after").unwrap();
+        let rotated = resolve_webhook_endpoints(&identities);
+        assert_ne!(
+            first["hooked"], rotated["hooked"],
+            "the same document over rotated bytes is a different endpoint",
+        );
+    }
+
+    /// The store-path derivation reports one path per replay-protected
+    /// endpoint, in endpoint order, and nothing for the rest.
+    #[test]
+    fn store_paths_are_one_per_replay_protected_endpoint_in_order() {
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let first = store_dir.path().join("first.sqlite");
+        let second = store_dir.path().join("second.sqlite");
+        let secret = secret_path("k");
+
+        let guarded_first = timestamped_endpoint_with_replay(
+            "first",
+            300,
+            REPLAY_PACKAGE,
+            first.clone(),
+            None,
+            &secret,
+        );
+        let plain = raw_hmac_endpoint("plain", vec![raw_key("k1", &secret)]);
+        let guarded_second = timestamped_endpoint_with_replay(
+            "second",
+            300,
+            REPLAY_PACKAGE,
+            second.clone(),
+            None,
+            &secret,
+        );
+
+        let identities = resolve(
+            &[guarded_first, plain, guarded_second],
+            &[
+                app_raw_with_sub("a", "first"),
+                app_raw_with_sub("b", "plain"),
+                app_raw_with_sub("c", "second"),
+            ],
+        );
+        assert_eq!(
+            webhook_store_paths(identities.values()),
+            vec![first, second]
         );
     }
 }
