@@ -1128,7 +1128,7 @@ async fn a_bare_identity_flush_parks_under_the_attacher() {
     assert_eq!(view.entries.len(), 1);
     let parked = ctx
         .messenger
-        .deferred_view_for_sender(ERRORS, sender_of(None).as_str(), Utc::now())
+        .deferred_view_for_sender(ERRORS, sender_of(None).as_str())
         .await;
     assert_eq!(parked.len(), 1, "the set is the bare identity's");
 }
@@ -1183,7 +1183,6 @@ async fn an_edit_op_rewrites_the_parked_body() {
         .deferred_view_for_sender(
             OUT,
             ParticipantId::for_surface_component(ATTACHER, SUB).as_str(),
-            Utc::now(),
         )
         .await;
     assert_eq!(parked.len(), 1);
@@ -1219,7 +1218,6 @@ async fn an_oversized_edit_body_kills_the_batch() {
         .deferred_view_for_sender(
             OUT,
             ParticipantId::for_surface_component(ATTACHER, SUB).as_str(),
-            Utc::now(),
         )
         .await;
     assert_eq!(parked[0].envelope.body, r#"{"v":1}"#, "nothing applied");
@@ -1311,7 +1309,7 @@ async fn a_broken_control_op_kills_the_batch_and_applies_nothing() {
         assert!(rx.try_recv().is_err(), "no frame answers a violation");
         let parked = ctx
             .messenger
-            .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str(), Utc::now())
+            .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
             .await;
         assert!(
             parked.iter().any(|m| m.message_uuid() == parked_id),
@@ -1384,7 +1382,7 @@ async fn an_edit_op_moves_the_release_time() {
     assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
     let parked = ctx
         .messenger
-        .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str(), Utc::now())
+        .deferred_view_for_sender(OUT, sender_of(Some(SUB)).as_str())
         .await;
     assert_eq!(parked.len(), 1);
     assert_eq!(
@@ -1526,7 +1524,7 @@ async fn park_under(
         .await;
     let parked = ctx
         .messenger
-        .deferred_view_for_sender(channel, sender_of(attribution).as_str(), Utc::now())
+        .deferred_view_for_sender(channel, sender_of(attribution).as_str())
         .await;
     parked.last().expect("one parked message").message_uuid()
 }
@@ -1542,10 +1540,13 @@ fn sibling_view_queue(
     let (push_tx, push_rx) = mpsc::channel(PUSH_QUEUE_FRAMES);
     let mut handle = AttachSessionHandle::for_test("dev");
     handle.push_tx = push_tx;
+    // Under the registry key, which is what the routes register under — a
+    // surface's bare slug, not the participant id. Registering under the id
+    // would make the broadcast find a session no production lookup can.
     let guard = ctx
         .registry
         .try_register(
-            ctx.profile.attacher().as_str(),
+            &ctx.profile.attach_scope().registry_key(),
             handle,
             SessionCaps::UNCAPPED,
         )
@@ -1631,7 +1632,7 @@ async fn a_broadcast_reaches_every_attachment_of_the_attacher() {
         guards.push(
             ctx.registry
                 .try_register(
-                    ctx.profile.attacher().as_str(),
+                    &ctx.profile.attach_scope().registry_key(),
                     handle,
                     SessionCaps::UNCAPPED,
                 )
@@ -1640,7 +1641,7 @@ async fn a_broadcast_reaches_every_attachment_of_the_attacher() {
         queues.push(push_rx);
     }
 
-    broadcast_deferred_view(&ctx, Some(SUB), OUT, Utc::now()).await;
+    broadcast_deferred_view(&ctx, Some(SUB), OUT).await;
 
     for queue in &mut queues {
         let SessionPush::DeferredView(view) = queue.try_recv().expect("a view push") else {

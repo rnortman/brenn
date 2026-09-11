@@ -25,7 +25,7 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 const MAX_DEPTH: usize = 32;
 
 /// A block-level node. Maps one-to-one to the DOM element the glue creates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Block {
     /// `<p>`.
     Paragraph(Vec<Inline>),
@@ -48,7 +48,7 @@ pub enum Block {
 }
 
 /// An inline-level node.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Inline {
     /// A literal text run (`createTextNode`).
     Text(String),
@@ -61,7 +61,7 @@ pub enum Inline {
 }
 
 /// Inline emphasis style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Style {
     Emphasis,
     Strong,

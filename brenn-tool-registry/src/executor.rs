@@ -627,7 +627,7 @@ mod tests {
     use brenn_lib::tools::AclClause;
     use brenn_messaging::query::NoopWakeRouter;
     use brenn_messaging::testutils::test_channel_entry;
-    use brenn_messaging::{WakeRouter, config::Depth, config::NoiseLevel};
+    use brenn_messaging::{MountDebt, WakeRouter, config::Depth, config::NoiseLevel};
     use brenn_messaging_store::db::{insert_message, upsert_channels, utc_to_ns};
     use brenn_obs::alerting::{make_capturing_alerter, noop_alert_dispatcher};
     use chrono::Utc;
@@ -1341,9 +1341,13 @@ mod tests {
             wake_min: WakeMin::Normal,
             send_rate: SendRate::default(),
         };
-        let snapshot = h
+        let (_wake, snapshot) = h
             .messenger
-            .load_activation_snapshot(&caller, &[inbox_input_port(CALLER_SLUG, &unbounded_inbox)])
+            .load_activation_snapshot(
+                &caller,
+                &[inbox_input_port(CALLER_SLUG, &unbounded_inbox)],
+                MountDebt::Settled,
+            )
             .await
             .expect("a pending inbox row on a triggering input port yields an activation");
         let port = snapshot

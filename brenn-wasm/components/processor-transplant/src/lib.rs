@@ -8,11 +8,12 @@
 // Per activation, in order:
 //   1. Read config keys "greeting" (present) and "absent" (missing).
 //   2. Log one info line.
-//   3. Publish a summary of every port window, every output-port deferred
-//      window, and the activation's `now` to "out".
+//   3. Publish a report of every port window, every output-port deferred
+//      window, the activation's `now` and the instance counter to "report".
 //   4. Publish one marker per new envelope body to "out".
-//   5. Run the deferral markers below, in window order.
-//   6. Honour the err/trap sentinels below.
+//   5. Re-arm the self-tick chain if config names one and nothing is parked.
+//   6. Run the deferral markers below, in window order.
+//   7. Honour the err/trap sentinels below.
 //
 // Markers, matched against a new envelope's body. A body starting with "__" is
 // always a marker; an unrecognized or unparseable one is an error, never a
@@ -46,16 +47,24 @@
 // portability claim under test: a guest computes absolute release instants from
 // what the host hands it, identically on either host.
 //
-// Deliberately stateless across activations. The two hostings genuinely differ
-// here — the wasmtime host builds a fresh store per invocation, a browser
-// instance's linear memory lives as long as the instance — and neither the
-// contract nor `processor.wit` promises either behaviour. A fixture that
-// carried a counter would pin that divergence into the transcript and fail for
-// a reason the contract never claimed.
+// The report's `counter` lives in linear memory and is incremented on entry, so
+// it reads `1` on a host that gives an instance one activation and climbs on one
+// that does not. Linear memory is activation-scoped on every host, so `1` is the
+// only conforming answer and the counter is the probe for it.
+//
+// The self-tick chain re-arms from what the host shows: if `tick`'s deferred
+// window is empty and config names `tick_ms`, park one tick at `now + tick_ms`.
+// A parked tick the host still holds is left alone, so an activation that sees
+// a standing tick never doubles it — which is the whole of the re-arm rule an
+// author is owed. A host that presents no `tick` window at all is a failed
+// activation, not an empty one.
 
 mod spec;
 
-use crate::spec::{config, log, port::OUT};
+use crate::spec::{
+    config, log,
+    port::{OUT, REPORT, TICK},
+};
 use brenn_guest::{
     Activation, Error, Processor, defer_cancel, defer_edit, publish, publish_deferred,
 };
@@ -85,6 +94,12 @@ struct DeferredSummary<'a> {
     entries: Vec<DeferredEntrySummary<'a>>,
 }
 
+// How many activations this linear memory has seen, including the one running.
+// A `thread_local!` rather than a `static mut`: the guest is single-threaded.
+thread_local! {
+    static COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(serde::Serialize)]
 struct ActivationSummary<'a> {
     ports: Vec<PortSummary<'a>>,
@@ -94,6 +109,10 @@ struct ActivationSummary<'a> {
     /// The host's wall clock at drain, epoch milliseconds UTC; `null` on a host
     /// that exposes none.
     now: Option<u64>,
+    /// Activations this instance's linear memory has seen. `1` on every
+    /// conforming host; anything higher is a memory that outlived its
+    /// activation.
+    counter: u32,
     /// Present key, then a deliberately absent one — `null` distinguishes
     /// "no such key" from "empty value" in the transcript.
     greeting: Option<String>,
@@ -151,6 +170,10 @@ struct ProcessorTransplant;
 
 impl Processor for ProcessorTransplant {
     fn receive(activation: Activation) -> Result<Option<String>, Error> {
+        let counter = COUNTER.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
         let windows: Vec<_> = activation.port_windows().collect();
 
         let mut ports = Vec::with_capacity(windows.len());
@@ -201,6 +224,7 @@ impl Processor for ProcessorTransplant {
             ports,
             deferred,
             now: activation.now(),
+            counter,
             greeting: config::get("greeting"),
             absent: config::get("absent"),
         };
@@ -208,9 +232,9 @@ impl Processor for ProcessorTransplant {
         log::info("transplant activation");
 
         publish(
-            OUT,
+            REPORT,
             &serde_json::to_string(&summary)
-                .map_err(|e| Error::failed(format!("serialize summary: {e}")))?,
+                .map_err(|e| Error::failed(format!("serialize report: {e}")))?,
         )?;
         for marker in &markers {
             publish(OUT, marker)?;
@@ -224,6 +248,27 @@ impl Processor for ProcessorTransplant {
                 .map(|now| now + delay_ms)
                 .ok_or_else(|| Error::failed("timing marker on an activation with no `now`"))
         };
+        // Re-arm before the markers run, so a script that parks on `out` in the
+        // same activation still sees an untouched `tick` window here.
+        if let Some(tick_ms) = config::get("tick_ms") {
+            let tick_ms: u64 = tick_ms
+                .parse()
+                .map_err(|e| Error::failed(format!("config tick_ms: {e}")))?;
+            // An absent `tick` window is not an empty one. Folding the two
+            // together would answer a host that omits a bound output's deferred
+            // window by double-arming the chain — an accelerating tick loop
+            // instead of a clean failure — and this fixture exists to catch
+            // exactly that class of host bug.
+            let window = summary
+                .deferred
+                .iter()
+                .find(|window| window.port == TICK)
+                .ok_or_else(|| Error::failed("no deferred window for `tick`"))?;
+            if window.entries.is_empty() {
+                publish_deferred(TICK, "tick", release_at(tick_ms)?)?;
+            }
+        }
+
         for action in &actions {
             match action {
                 Marker::Park { delay_ms } => {

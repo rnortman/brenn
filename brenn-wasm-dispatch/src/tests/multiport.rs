@@ -56,7 +56,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
         activation_pacing: unthrottled_pacing(),
     };
 
-    drain_step(&cfg2, &wasm_sub).await;
+    drain_step(&cfg2, &wasm_sub, MountDebt::Settled).await;
 
     // Ack-at-start: both ports' positions moved past their message before the guest
     // ran, whatever the outcome. A regression that moved the advance inside
@@ -138,7 +138,7 @@ async fn multiport_combined_activation_two_triggering_channels() {
     testutils::insert_bus_message(&messenger, &in_entries[1], "body-b", ChannelScheme::Brenn).await;
 
     // Drain — must invoke the guest exactly once.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Input push rows must be acked.
     let remaining = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -258,7 +258,7 @@ async fn multiport_sampled_port_included_as_pure_context() {
     .await;
 
     // Drain — must invoke the guest exactly once.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // in0 push row must be acked; no push rows existed for in1.
     let remaining = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -377,8 +377,8 @@ async fn a_denied_port_is_empty_and_unadvanced_beside_a_served_sibling() {
     testutils::insert_bus_message(&denied, &channels[0], "served", ChannelScheme::Brenn).await;
     testutils::insert_bus_message(&denied, &channels[1], "withheld", ChannelScheme::Brenn).await;
 
-    let snapshots = denied
-        .load_activation_snapshot(&wasm_sub, &cfg.inputs)
+    let (_wake, snapshots) = denied
+        .load_activation_snapshot(&wasm_sub, &cfg.inputs, MountDebt::Settled)
         .await
         .expect("the allowed port is owed a message, so the component activates");
     assert_eq!(snapshots.len(), 2);
@@ -409,7 +409,7 @@ async fn a_denied_port_is_empty_and_unadvanced_beside_a_served_sibling() {
         outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
-    drain_step(&denied_cfg, &wasm_sub).await;
+    drain_step(&denied_cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Read the positions off the store directly: what the gate withheld is still
     // owed, and only the covered channel's position moved.
@@ -461,7 +461,7 @@ async fn multiport_sampled_only_no_push_rows_no_activation() {
     );
 
     // Drain: no triggering port has pending rows → no activation → no output.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Still no push rows (nothing acked, nothing created).
     let push_rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -508,7 +508,7 @@ async fn multiport_triggering_port_without_rows_appears_as_context_window() {
         )
         .await;
     }
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     // First drain consumed in1's messages as a triggering activation (in1 had them,
     // in0 did not). They are retained context now. Move the output reader's
     // position past this drain's summary so the assertion below sees only the next
@@ -525,7 +525,7 @@ async fn multiport_triggering_port_without_rows_appears_as_context_window() {
     .await;
 
     // Drain again: in0 has a push row (triggering), in1 has retained context only.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Exactly one summary in the output channel for this drain.
     let out_rows = brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
@@ -613,7 +613,7 @@ async fn multiport_all_or_nothing_trap_discards_output_from_all_ports() {
     testutils::insert_bus_message(&messenger, &in_entries[1], "__trap__", ChannelScheme::Brenn)
         .await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Both push rows must be acked (ack-at-start, at-most-once).
     let remaining = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -694,7 +694,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
         testutils::insert_bus_message(&messenger, &in_entries[1], "__err__", ChannelScheme::Brenn)
             .await;
 
-    drain_step(&cfg2, &wasm_sub).await;
+    drain_step(&cfg2, &wasm_sub, MountDebt::Settled).await;
 
     // Both push rows must be acked (ack-at-start).
     let remaining = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -775,7 +775,7 @@ async fn multiport_drop_reporting_exactly_once() {
     testutils::insert_bus_message(&messenger, &in_entries[1], "body-b", ChannelScheme::Brenn).await;
 
     // Drain: one activation with both ports; in0 reports dropped=2, in1 reports 0.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Parse the first summary.
     let summary1_body = {
@@ -829,7 +829,7 @@ async fn multiport_drop_reporting_exactly_once() {
     testutils::insert_bus_message(&messenger, &in_entries[1], "body-b2", ChannelScheme::Brenn)
         .await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Parse the second summary (most recently published).
     let summary2_body = {
@@ -896,7 +896,7 @@ async fn multiport_retain_depth_zero_triggering_port_back_fills_seen_context() {
     )
     .await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // One summary in output.
     let out_rows = brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
@@ -960,7 +960,7 @@ async fn multiport_retain_depth_zero_triggering_port_back_fills_seen_context() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let summary2_body = {
         let conn = messenger.db().lock().await;
@@ -1200,7 +1200,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
     testutils::insert_bus_message(&messenger, &in1_arc, "msg-b", ChannelScheme::Brenn).await;
 
     // Drain: one activation with 2 input windows.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Both input push rows must be acked.
     let remaining = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;

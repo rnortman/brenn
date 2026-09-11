@@ -1012,13 +1012,22 @@ fn a_confined_output_reads_the_pages_own_deferred_set() {
 }
 
 #[test]
-fn a_confined_entry_already_due_is_out_of_the_window() {
+fn a_confined_entry_already_due_is_still_in_the_window() {
     let mut page = Page::standard();
     page.park("p1", "due", 500);
-    // Assembled at 1_000: the release time has arrived, so the schedule no longer
-    // shows it even though the sweep has not taken it yet.
+    // Assembled at 1_000: the release time has arrived and the sweep has not
+    // taken it, so the component is shown it with the instant that has passed.
+    // An empty window means nothing is standing, at every instant, which is
+    // what the re-arm rule reads.
     let ready = page.assemble("p1");
-    assert!(ready.activation.deferred[1].entries.is_empty());
+    assert_eq!(
+        ready.activation.deferred[1].entries,
+        vec![DeferredEntry {
+            index: 0,
+            payload: "due".into(),
+            deliver_after: 500,
+        }]
+    );
 }
 
 #[test]

@@ -227,7 +227,7 @@ impl Page {
 
     fn parked_bodies(&self, instance: &str) -> Vec<String> {
         self.router
-            .parked_for(&self.stores, NOTES, Origin::Sub(instance), NOW_MS)
+            .parked_for(&self.stores, NOTES, Origin::Sub(instance))
             .into_iter()
             .map(|entry| entry.body)
             .collect()
@@ -568,6 +568,33 @@ fn a_control_op_applies_ahead_of_the_same_activations_publishes() {
     assert_eq!(page.schedules.deferred_races("p1"), 0);
 }
 
+/// The doctrine violation, told apart from the race by the log line and by
+/// nothing else: the component's own deferred window showed this entry with a
+/// `deliver_after` that had already passed, and it named it anyway. One counter
+/// answers for both causes, so the two fields the line carries — the target's
+/// instant and the flush's `now` — are the whole of the instrument.
+#[test]
+#[tracing_test::traced_test]
+fn a_confined_op_naming_a_due_entry_names_both_instants() {
+    let mut page = Page::standard();
+    let parked = page.park("p1", "due", NOW_MS - 500);
+    let mut buffer = page.buffer("p1", HashMap::from([("notes".to_string(), vec![parked])]));
+    buffer.defer_cancel("notes", 0).expect("in the window");
+
+    let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(0));
+
+    assert!(report.refusals.is_empty(), "the no-op is not a refusal");
+    assert_eq!(
+        page.parked_bodies("p1"),
+        vec!["due".to_string()],
+        "a due entry is past cancelling and still owed",
+    );
+    assert_eq!(page.schedules.deferred_races("p1"), 1);
+    assert!(logs_contain("past its release time at flush"));
+    assert!(logs_contain(&format!("deliver_after={}", NOW_MS - 500)));
+    assert!(logs_contain(&format!("now={NOW_MS}")));
+}
+
 #[test]
 fn a_confined_op_naming_a_released_message_is_counted_as_a_race() {
     let mut page = Page::standard();
@@ -661,8 +688,7 @@ fn a_refused_confined_edit_changes_nothing_and_reports_its_reason() {
             .parked_for(
                 &page.stores,
                 LOCAL_OVERLAY_STATE_CHANNEL,
-                Origin::Sub("chrome"),
-                NOW_MS
+                Origin::Sub("chrome")
             )
             .into_iter()
             .map(|entry| entry.body)

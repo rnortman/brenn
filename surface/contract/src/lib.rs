@@ -13,84 +13,38 @@
 //! boundary stays serialization-clean across independently-built components. All
 //! rendered text reaches the DOM as `textContent`, never `innerHTML`.
 //!
-//! # The invariant
+//! # The doctrine lives in `brenn-activation`
 //!
-//! > **There is one component model. Any component runs on any host that can
-//! > satisfy its imports. Hosting eligibility is an import profile, not a
-//! > component kind.**
+//! The invariant ("there is one component model; hosting eligibility is an
+//! import profile"), the delivery doctrine (the port is a view not a pipe,
+//! attach is a delivery point, `dropped` is a counter, err consumes, attaches
+//! are legitimately everything-is-new, coalescing, one instant per activation),
+//! the mount guarantee, the deferred-chain re-arm rule, the activation-scoped
+//! linear memory rule and the exhaustive list of host-specific behaviours are
+//! all `brenn-activation`'s crate docs. They are written there because both
+//! hosts compile against that crate and neither this file nor the wasmtime
+//! host's is read by the other host's author as an obligation. What is written
+//! *here* is the surface seam: the sync port class, the mount port, the DOM
+//! vocabulary, and the `window`-event seam between the kernel and the TS
+//! bootstrap.
 //!
-//! Every rule in this crate is subordinate to that sentence, and it is the test
-//! a change to this seam has to pass. A component importing `store`/`mqtt`/
-//! `tools` is backend-only; a component importing DOM capability — everything
-//! this seam serves — is surface-only. Both are the *same* rule reading a
-//! different import profile, not two kinds of thing. Components see exactly one
-//! mechanism: **messages on named ports**.
+//! Two of those rules bear directly on what a component may assume on this host,
+//! and are named again here for the author reading only this file:
 //!
-//! # Delivery: the activation is the only shape
+//! - **Every mount gets exactly one activation.** On this host a `dom`-granted
+//!   instance gets it as a sync-call activation on [`MOUNT_SYNC_PORT`] (below);
+//!   a headless one gets the ordinary async shape. Both settle the same debt,
+//!   both happen once per mount, and a re-registration is a new mount.
+//! - **Linear memory is activation-scoped.** A component must not carry state in
+//!   a `thread_local!` or a static from one activation to the next; state is
+//!   published on a retained `io` port and read back from its context window.
+//!   The page's loader mints an instance inside the activation entry and drops
+//!   it when the entry returns, and `brenn-page-harness` instantiates per
+//!   activation, so a kind that relies on memory surviving fails its own suite.
 //!
-//! A component on any hosting and any ABI sees exactly one delivery shape, the
-//! **activation**: every bound input port windowed — retained context first, new
-//! messages after, split by `new_from`, with a `dropped` delta — the whole thing
-//! delivered by one call through the registration seam below, publishes buffered
-//! during the call and flushed atomically iff it returns ok. There is no
-//! per-envelope event, no drop marker, and no component-visible gap.
-//!
-//! The doctrine that shape encodes, because a port author must be able to read it
-//! somewhere:
-//!
-//! - **The port is a view, not a pipe.** An input port views a sliding window of
-//!   its channel's stream. Messages before `new_from` are **seen** — still in the
-//!   view because retention has not displaced them yet. Seeing a message again is
-//!   not an error and not "duplicate delivery"; it is what "seen" means. A
-//!   component needing exactly-once-seen tracks its own high-water by
-//!   `message_id`.
-//! - **Attach is a delivery point.** When a port's queue comes into existence —
-//!   the instance's first registration, a re-registration, a binding added or a
-//!   port rebound by a later bindings document — the channel's retained tail,
-//!   capped at
-//!   the binding's `push_depth`, arrives as **new**, not as context. So a message
-//!   published on a `local:` channel before its consumer existed still reaches
-//!   that consumer and still wakes it; a component may rely on `new` alone to
-//!   catch up on attach. Wire channels get the same thing from the server's
-//!   fresh-attach replay. The symmetric cost is that a re-attach re-delivers what
-//!   the component already folded, so a side-effecting fold owes itself
-//!   at-most-once handling by `message_id`.
-//! - **`dropped` is a counter, not a marker in the stream.** It is the delivery
-//!   loss on that binding since the port's previous activation. The lost message
-//!   itself is not gone: it remains visible as retained context in this or any
-//!   later activation whose `retain_depth` still covers it. Recovery *is*
-//!   retention — there is no gap-and-replay choreography and no terminal port
-//!   failure.
-//! - **Err consumes.** The messages an activation was assembled for are acked
-//!   when it is assembled, so returning err (or trapping) does not redeliver
-//!   them; they reappear only as retained context. That is backend parity.
-//! - **Attach events are legitimately everything-is-new.** A page reload is the
-//!   widest of them: cursors, rings and registrations die with the page, so
-//!   everything in the first windows after a reload is new. A fresh attach that
-//!   finds a ring already populated — the priming rule above — is the narrower
-//!   one. Neither is a bug.
-//! - **Every mount gets one activation, guaranteed.** An activation with nothing
-//!   to deliver is otherwise never assembled; the **mount activation** is the
-//!   deliberate, once-per-mount exception. It arrives as soon as the instance is
-//!   both registered and wired (a registration made before the page's first
-//!   bindings document waits for that document), it is an ordinary async
-//!   activation in every respect, and its windows carry whatever retained context
-//!   and new messages exist — possibly nothing at all. It carries no marker: a
-//!   component that needs to know whether this is its first activation tracks that
-//!   itself, and most simply recompute from their windows.
-//!
-//!   It exists so that a component's first output — its first state report, the
-//!   first tick of a deferred self-publish chain — has somewhere to come from
-//!   that is inside an activation, where the buffered publish seam and the
-//!   deferred-message ops live. An activation that only happens when a bound
-//!   channel happens to hold history is not something a component can build on.
-//!   Exactly one is delivered per mount: an instance that deregisters and
-//!   registers again is a new mount and is owed a new one; a second bindings
-//!   document mid-attachment is not.
-//!
-//! Typed gaps (`EpochChanged`, `BeyondRetained`) survive only
-//! at the websocket/resume layer, where the kernel handles them by re-resuming;
-//! the component observes at most a first-window-after-resubscription. `GapReason`
+//! Typed gaps (`EpochChanged`, `BeyondRetained`) survive only at the
+//! websocket/resume layer, where the kernel handles them by re-resuming; the
+//! component observes at most a first-window-after-resubscription. `GapReason`
 //! is not part of the component seam.
 //!
 //! **Nothing a component sends stands outside the activation boundary.** A
@@ -141,21 +95,14 @@
 //!
 //! # The timer idiom
 //!
-//! There is no timer concept on this seam, and no arming API. **A timer is a
-//! deferred self-publish**: a component declares an in/out port
-//! (`[[surface.io_port]]`, whose two halves resolve to one channel by
-//! construction), publishes its next tick to itself with a `deliver_after`
-//! computed from the activation's own `now`, and the tick arrives as an ordinary
-//! message on an ordinary input port. Rescheduling and cancelling are the
-//! cancel/edit ops against the [`DeferredWindow`] the activation is handed, so they
-//! ride the same flush rule: an entry that errs schedules nothing.
-//!
-//! The behavioral delta worth naming: a tick dispatches as a **normal async
-//! activation** — a later task, subject to the kernel's ordinary pacing — not
-//! synchronously inside a `setTimeout` callback. At the cadences components
-//! actually tick on (a minute boundary, a toast lifetime) that is immaterial, but
-//! it is a difference, and a component that assumed same-task fire would be assuming
-//! something this seam never promised.
+//! There is no timer concept on this seam and no arming API: a timer is a
+//! deferred self-publish on an `io` port, and the re-arm rule is
+//! `brenn-activation`'s. One thing about it is this host's: a tick dispatches as
+//! a **normal async activation** — a later task, subject to the kernel's
+//! ordinary pacing — not synchronously inside a `setTimeout` callback. At the
+//! cadences components actually tick on (a minute boundary, a toast lifetime)
+//! that is immaterial, but a component that assumed same-task fire would be
+//! assuming something this seam never promised.
 //!
 //! # The context rule
 //!
@@ -179,11 +126,15 @@
 //! # The activation seam
 //!
 //! A component joins activation delivery through its host, not through this
-//! crate: the page's loader instantiates the component once per instance and
-//! registers its `receive` export with the kernel, which then calls it once per
-//! activation with the [`Activation`] as JSON and reads its return for the flush
-//! rule. [`ENTRY_REPLY_FIELD`] is the one name that convention needs here — the
-//! key a sync reply rides back on.
+//! crate: the page's loader registers an entry for each instance with the
+//! kernel, which calls it once per activation with the [`Activation`] as JSON
+//! and reads its return for the flush rule. The entry is to instantiate the
+//! kind's compiled module per call and drop the instance when it returns, which
+//! is what makes linear memory activation-scoped here as `brenn-activation`
+//! states it everywhere. The kind's glue and its core modules are compiled once
+//! per kind at bring-up: only instantiation is per activation.
+//! [`ENTRY_REPLY_FIELD`] is the one name that convention needs here — the key a
+//! sync reply rides back on.
 //!
 //! The kernel mints a sync-call activation for two things: a gesture the
 //! component asked for with `dom.listen`, and the mount call
@@ -238,6 +189,12 @@
 //! - [`PROCESSOR_START`] — `detail = { instances }` (an array of instance-id
 //!   strings). The kernel names this page's component instances once its first
 //!   bindings land, and the loader instantiates and registers each one.
+//! - [`SURFACE_FAILURE`] — `detail = { message }` (a string). The page cannot be
+//!   made to work by reloading it; the bootstrap renders the message and latches
+//!   its terminal state instead of reloading. Distinct from [`SURFACE_RELOAD`]
+//!   precisely because the reload cap is the wrong instrument for a condition
+//!   only an operator can clear: reloading would spend the cap and end on a
+//!   message naming neither the cause nor the cure.
 //!
 //! # Why the seam is imports and one entry call
 //!
@@ -384,9 +341,11 @@
 //! instance is confined by construction: its handles all descend from its own
 //! `dom.root`, and handle tables are per instance, so a foreign handle traps.
 //!
-//! Per-instance state is ordinary state in the component's own linear memory:
-//! one instantiation per instance, page-lifetime, so a module-level static is
-//! per instance too and cannot bleed across siblings.
+//! Per-instance state is per instance: a module-level static cannot bleed across
+//! siblings, because each instance is instantiated separately and its import
+//! table carries its own instance id. It is not per *page* — linear memory is
+//! activation-scoped (above), so state belongs on a retained `io` port and not
+//! in a static.
 
 // ── Activation delivery (kernel → component) ───────────────────────────────
 
@@ -697,6 +656,11 @@ pub const SURFACE_RELOAD: &str = "brenn-surface-reload";
 /// load; resets the bootstrap's reload-loop counter.
 pub const SURFACE_READY: &str = "brenn-surface-ready";
 
+/// Kernel → bootstrap, on `window`. `detail = { message }` (a string). The
+/// bootstrap renders the message as the page's terminal state and latches it;
+/// no reload is attempted and the reload counter is untouched.
+pub const SURFACE_FAILURE: &str = "brenn-surface-failure";
+
 /// Kernel → bootstrap, on `window`. `detail = { instances }` (an array of
 /// instance-id strings). Asks the bootstrap to load and instantiate the
 /// transpiled module of every named headless processor instance.
@@ -734,7 +698,18 @@ pub const HELP_SIDECAR_HEADER: &str =
 /// is the unit and this names only its entry point. The single home for the
 /// layout the transpile rule writes and the page manifest reads.
 pub fn processor_module_path(kind: &str) -> String {
-    format!("{PROCESSOR_DIR}/{kind}/{kind}.js")
+    processor_asset_path(kind, &format!("{kind}.js"))
+}
+
+/// The path of one file `file` inside a component `kind`'s transpile
+/// directory, relative to the surface asset root: `processor/<kind>/<file>`.
+///
+/// The entry JS and the core wasm files jco emits beside it are both served out
+/// of that directory, so the layout is spelled here and nowhere else — a page
+/// minting a core URL and a page minting the glue's URL are asking the same
+/// question.
+pub fn processor_asset_path(kind: &str, file: &str) -> String {
+    format!("{PROCESSOR_DIR}/{kind}/{file}")
 }
 
 /// The one directory every transpiled kind is staged under, in the served tree
@@ -810,6 +785,7 @@ mod tests {
     fn event_names_frozen() {
         assert_eq!(SURFACE_RELOAD, "brenn-surface-reload");
         assert_eq!(SURFACE_READY, "brenn-surface-ready");
+        assert_eq!(SURFACE_FAILURE, "brenn-surface-failure");
         assert_eq!(PROCESSOR_START, "brenn-processor-start");
         assert_eq!(ENTRY_REPLY_FIELD, "reply");
     }

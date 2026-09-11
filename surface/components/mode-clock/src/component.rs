@@ -21,9 +21,7 @@
 //! dispatches — which is what converges the shell off the page's initial dark
 //! stamp.
 
-use std::cell::RefCell;
-
-use brenn_guest::{Activation, Error, Processor, dom, log, repark};
+use brenn_guest::{Activation, Error, Processor, RetainedState, StateLoss, dom, log, repark};
 
 use crate::logic::{ConfigNote, ConfigWindow, ModeClock, ThemeBody};
 use crate::spec::{InPort, port::TICK};
@@ -36,22 +34,27 @@ const MINUTES_PER_DAY: i64 = 24 * 60;
 const MS_PER_MINUTE: i64 = 60_000;
 
 impl crate::spec::ThemePayload for ThemeBody {}
-
-// One instantiation backs one instance for the page's lifetime, so the state
-// machine is ordinary interior-mutable module state rather than anything handed
-// across a seam.
-thread_local! {
-    static CLOCK: RefCell<ModeClock> = RefCell::new(ModeClock::new());
-}
+impl crate::spec::StatePayload for ModeClock {}
 
 struct ModeClockComponent;
 
 impl Processor for ModeClockComponent {
     fn receive(activation: Activation) -> Result<Option<String>, Error> {
-        CLOCK.with(|clock| on_activation(&activation, &mut clock.borrow_mut()))?;
-        // Mount is a sync-call activation, and the mount call is answered with
-        // nothing; no other activation this component sees is one at all.
-        Ok(None)
+        // The theme is a pure function of the clock and the config, so an
+        // unreadable body costs only the fault count and one redundant
+        // dispatch: start from the default and let the store overwrite it.
+        RetainedState::around(
+            activation,
+            crate::spec::state::<ModeClock>(),
+            StateLoss::Recover,
+            |activation, clock| {
+                on_activation(activation, clock)?;
+                // Mount is a sync-call activation, and the mount call is
+                // answered with nothing; no other activation this component
+                // sees is one at all.
+                Ok(None)
+            },
+        )
     }
 }
 
@@ -78,7 +81,7 @@ fn local_minutes(now_ms: u64) -> u16 {
 fn on_activation(activation: &Activation, clock: &mut ModeClock) -> Result<(), Error> {
     for window in activation.delivered_windows() {
         // The tick's payload is irrelevant — the wake is the message.
-        if InPort::of(window)? == InPort::Tick {
+        if matches!(InPort::of(window)?, InPort::Tick) {
             continue;
         }
         let notes = clock

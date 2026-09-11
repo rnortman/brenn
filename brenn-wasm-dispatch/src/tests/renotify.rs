@@ -43,7 +43,7 @@ async fn a_clamped_activation_clears_the_whole_backlog() {
         Depth::Bounded(1),
         Depth::Bounded(0),
     );
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert!(
         brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
@@ -91,7 +91,7 @@ async fn a_trapping_clamped_activation_leaves_nothing_owed() {
         Depth::Bounded(2),
         Depth::Bounded(0),
     );
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert!(
         brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub)

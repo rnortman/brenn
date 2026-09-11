@@ -4816,3 +4816,39 @@ fn rendered(directory: &brenn_lib::messaging::MessagingDirectory) -> Vec<String>
     lines.sort();
     lines
 }
+
+// ── the never-activates observation ───────────────────────────────────────────
+
+/// A component with no authored input bindings is presentational, not broken:
+/// it mounts, answers gestures and publishes, and there is nothing to say.
+#[test]
+fn no_authored_input_bindings_says_nothing() {
+    assert_eq!(ports_that_never_activate(&[]), None);
+}
+
+/// One push-enabled binding is enough — a sibling sampled port is context, and
+/// context is what sampled ports are for.
+#[test]
+fn one_push_enabled_binding_says_nothing() {
+    let bindings = [
+        ("sampled".to_string(), false),
+        ("commands".to_string(), true),
+    ];
+    assert_eq!(ports_that_never_activate(&bindings), None);
+}
+
+/// Every authored binding sampled: the component mounts once and then goes
+/// quiet, which is legitimate config and also what an operator's `push_depth`
+/// typo looks like. The observation names every port so the binding to fix is
+/// in the line.
+#[test]
+fn every_authored_binding_sampled_names_them_all() {
+    let bindings = [
+        ("commands".to_string(), false),
+        ("status".to_string(), false),
+    ];
+    assert_eq!(
+        ports_that_never_activate(&bindings),
+        Some(vec!["commands", "status"])
+    );
+}

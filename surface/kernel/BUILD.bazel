@@ -15,6 +15,7 @@ surface_wasm_crate(
     deps = [
         "//attach/client",
         "//attach/proto",
+        "//brenn-activation",
         "//brenn-budget",
         "//brenn-envelope",
         "//brenn-queue",

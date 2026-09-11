@@ -47,6 +47,7 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 
+use brenn_activation::schedule::{MountDebt, readiness};
 use brenn_attach_client::publish::DeferredViews;
 use brenn_attach_client::router::{LocalRouter, Origin, PlanePolicy};
 use brenn_attach_client::subs::SubscriptionDepths;
@@ -61,26 +62,6 @@ use uuid::Uuid;
 use crate::bindings::{AppliedBindings, channel_is_transportable};
 use crate::publish_buffer::{OutputSpec, PublishBuffer};
 use crate::registry::{BindingKey, Registrations, SurfaceStores};
-
-/// Where one mount stands with the activation every mount is guaranteed.
-///
-/// A component may not publish from its connect-time code, so the first thing it
-/// ever schedules — the first tick of a deferred self-publish chain, the first
-/// state report — has to come from the tail of an activation. An activation that
-/// only happens when a bound channel happens to hold history is not something a
-/// component can build on, so one is owed unconditionally.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum MountDebt {
-    /// Registered before the page's first bindings document. There is nothing to
-    /// window against yet, so the debt is not incurred until a document lands.
-    #[default]
-    Unwired,
-    /// Owed, and not yet assembled.
-    Owed,
-    /// Settled: this mount has had its activation. A later document does not
-    /// revive it — the debt is per mount, and a re-registration is a new mount.
-    Settled,
-}
 
 /// One instance's scheduler state: what it is doing, what it has spent, and what
 /// it has lost.
@@ -354,9 +335,16 @@ impl Schedules {
     /// Whether `instance` is still owed its mount activation. `false` for an
     /// instance this table does not hold.
     pub fn owes_mount_activation(&self, instance: &str) -> bool {
+        self.mount_debt(instance) == MountDebt::Owed
+    }
+
+    /// Where `instance` stands with its mount activation — the half of the
+    /// activation gate this table owns. An instance this table does not hold is
+    /// `Settled`: it is owed nothing, because it is not mounted here.
+    fn mount_debt(&self, instance: &str) -> MountDebt {
         self.instances
             .get(instance)
-            .is_some_and(|schedule| schedule.mount == MountDebt::Owed)
+            .map_or(MountDebt::Settled, |schedule| schedule.mount)
     }
 
     /// Settle every outstanding mount debt without assembling anything.
@@ -474,10 +462,10 @@ impl Schedules {
     /// no position, so an instance woken three times is run once and the window it
     /// is assembled from serves the newest.
     ///
-    /// The mount debt is the one thing here that makes an instance with nothing to
-    /// deliver ready. Empty activations are elided everywhere else; this is the
-    /// deliberate, once-per-mount exception, and [`Self::assemble`] settles it so
-    /// no second empty activation follows.
+    /// The gate itself is `brenn_activation::schedule::readiness`, which the
+    /// backend asks too: a mount is owed, or a port is ready. The mount debt is
+    /// the one thing that makes an instance with nothing to deliver ready, and
+    /// [`Self::assemble`] settles it so no second empty activation follows.
     ///
     /// The pick resumes after the last instance [`Self::assemble`] handed out and
     /// wraps, so each ready instance gets one activation per pass over the set and
@@ -511,8 +499,14 @@ impl Schedules {
             .chain(runnable[..start].iter())
             .copied()
             .find(|instance| {
-                self.owes_mount_activation(instance)
-                    || stores.any_deliverable(|key: &BindingKey| key.instance == *instance)
+                // `any_deliverable` is this host's fold of the gate's per-port
+                // conjunction: only an allowed, push-enabled binding holds a
+                // position at all — a sampled port has none and a port this page
+                // did not bind has no store entry — so a position that is behind
+                // is a ready port by the gate's own definition.
+                let any_port_ready =
+                    stores.any_deliverable(|key: &BindingKey| key.instance == *instance);
+                readiness(self.mount_debt(instance), any_port_ready).is_some()
             })
     }
 
@@ -957,12 +951,8 @@ fn deferred_windows<P: PlanePolicy>(
             // sender-scoped, and empty where it has said nothing.
             ctx.views.get(&binding.channel, Some(instance)).to_vec()
         } else {
-            ctx.router.parked_for(
-                &*ctx.stores,
-                &binding.channel,
-                Origin::Sub(instance),
-                ctx.now_ms,
-            )
+            ctx.router
+                .parked_for(&*ctx.stores, &binding.channel, Origin::Sub(instance))
         };
         let (entries, port_ids): (Vec<DeferredEntry>, Vec<Uuid>) = parked
             .into_iter()

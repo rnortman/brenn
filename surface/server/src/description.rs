@@ -33,6 +33,8 @@ use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, is_unreserved_name
 use brenn_lib::panic_util::{CONFIG_REFUSAL, HOST_DEFECT};
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_messaging::{Messenger, PublishResult};
+
+use crate::KindPlacement;
 use brenn_surface_contract::processor_module_path;
 use brenn_surface_schema::bindings::{STATUS_INTERVAL_SECS_MAX, STATUS_INTERVAL_SECS_MIN};
 use serde::Deserialize;
@@ -352,14 +354,14 @@ pub fn build_description_docs_selected(
         if !want.kinds.contains(&kind) {
             continue;
         }
-        let root = roots.kind_root(&kind);
+        let placement = roots.placement(&kind);
         docs.push((
             kind_help_channel(prefix, &kind),
-            build_kind_help(&kind, surfaces, root, &ts),
+            build_kind_help(&kind, surfaces, placement, &ts),
         ));
         docs.push((
             kind_schema_channel(prefix, &kind),
-            build_kind_schema(&kind, root, &ts),
+            build_kind_schema(&kind, placement, &ts),
         ));
     }
 
@@ -475,15 +477,31 @@ fn build_surface_help(prefix: &str, build_id: &str, surface: &ResolvedSurface, t
     md
 }
 
+/// The sidecar root to read for a kind, where there is one: a withheld kind
+/// ships no readable record and therefore no sidecars this host will read.
+fn served_root(placement: KindPlacement<'_>) -> Option<&Path> {
+    match placement {
+        KindPlacement::Served(root) => root,
+        KindPlacement::Withheld(_) => None,
+    }
+}
+
 /// One kind's help doc (markdown): a generated header (kind, module filename,
 /// which surfaces mount it and on which content channels) followed by the kind's
 /// sidecar markdown verbatim, or a stub when no `.help.md` ships.
+///
+/// A withheld kind ships no readable record, so it has no sidecars to read and
+/// would otherwise produce exactly the stub a served kind with none produces.
+/// The header states the withholding first, so a reader asking why the
+/// instance is dead is told here rather than left to compare two identical
+/// stubs.
 fn build_kind_help(
     kind: &str,
     surfaces: &[ResolvedSurface],
-    root: Option<&Path>,
+    placement: KindPlacement<'_>,
     ts: &str,
 ) -> String {
+    let root = served_root(placement);
     let module = processor_module_path(kind);
     let mut md = String::new();
     let _ = writeln!(md, "# Component kind `{kind}`");
@@ -491,6 +509,26 @@ fn build_kind_help(
     let _ = writeln!(md, "- module: `{module}`");
     let _ = writeln!(md, "- generated: {ts}");
     let _ = writeln!(md);
+    if let KindPlacement::Withheld(withheld) = placement {
+        let _ = writeln!(md, "## Withheld");
+        let _ = writeln!(md);
+        let _ = writeln!(md, "{}", withheld.reason);
+        let _ = writeln!(md);
+        let _ = writeln!(
+            md,
+            "- mount: `{}`\n- tree: `{}`",
+            withheld.mount,
+            withheld.root.display(),
+        );
+        let _ = writeln!(md);
+        let _ = writeln!(
+            md,
+            "This host is not serving this kind: its assets are not reachable, every configured \
+             instance of it is marked failed on its page, and it ships no documentation here \
+             until the bundle offering it is re-released against this brenn."
+        );
+        let _ = writeln!(md);
+    }
     let _ = writeln!(md, "## Mounted by");
     let _ = writeln!(md);
     let mut any = false;
@@ -565,21 +603,31 @@ struct Dimensions {
     max_height: Option<u32>,
 }
 
-/// One kind's schema doc (JSON): `{v, kind, schema, dimensions, ts}`, where
+/// One kind's schema doc (JSON): `{v, kind, schema, dimensions, ts}` — plus a
+/// `withheld` member carrying the reason, for a kind this host declines to
+/// serve — where
 /// `schema` is the verbatim `.schema.json` sidecar (or `null` when the kind ships
 /// none) and `dimensions` is the validated `.dimensions.json` sidecar (or `null`
 /// when absent). The channel always exists so the topology is uniform; `null` is
 /// the machine-readable "not shipped".
-fn build_kind_schema(kind: &str, root: Option<&Path>, ts: &str) -> String {
+fn build_kind_schema(kind: &str, placement: KindPlacement<'_>, ts: &str) -> String {
+    let root = served_root(placement);
     let schema = read_schema_sidecar(kind, root);
     let dimensions = read_dimensions_sidecar(kind, root);
-    let body = json!({
+    let mut body = json!({
         "v": SCHEMA_VERSION,
         "kind": kind,
         "schema": schema,
         "dimensions": dimensions,
         "ts": ts,
     });
+    // Additive, and `SCHEMA_VERSION` deliberately does not move for it: the
+    // same number is the `v` every `.dimensions.json` sidecar is checked
+    // against, so bumping it would refuse every installed bundle's sidecars.
+    // The readers of this document are agents, which read members by name.
+    if let KindPlacement::Withheld(withheld) = placement {
+        body["withheld"] = json!(withheld.reason);
+    }
     serde_json::to_string(&body).expect("kind schema document serializes to JSON")
 }
 

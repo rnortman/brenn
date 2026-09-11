@@ -254,6 +254,12 @@ pub(crate) fn resolve_wasm_consumers(
         // is silently dead.
         let mut ephemeral_inputs: Vec<String> = Vec::new();
         let mut local_inputs: Vec<String> = Vec::new();
+        // The authored input bindings: `(port, push-enabled)`. A free `io`
+        // port's input half is the consumer's own writing to itself over its own
+        // ring and is left out; an `io` port bound to a declared channel arrives
+        // here as an ordinary subscription and is counted, because another
+        // publisher can wake it.
+        let mut authored_inputs: Vec<(String, bool)> = Vec::new();
 
         for (sub, kind, is_io_port) in consumer
             .subscriptions
@@ -407,6 +413,9 @@ pub(crate) fn resolve_wasm_consumers(
                 ),
             );
 
+            if !is_io_port {
+                authored_inputs.push((sub.port.clone(), push_depth.is_push_enabled()));
+            }
             inputs.push(WasmInputPort {
                 port: sub.port.clone(),
                 sub: ResolvedSubscription {
@@ -421,20 +430,11 @@ pub(crate) fn resolve_wasm_consumers(
             });
         }
 
-        // Dead-consumer validation: all inputs are sampled-only (push_depth=0),
-        // so the consumer can never activate. Fail-fast.
-        if !inputs.is_empty()
-            && inputs
-                .iter()
-                .all(|inp| inp.sub.push_depth == Depth::Bounded(0))
-        {
-            panic!(
-                "[[wasm_consumer]] {slug:?}: all {} input subscription(s) have push_depth = 0 \
-                 (sampled/context-only) — this consumer can never activate; \
-                 at least one subscription must have push_depth > 0 to trigger activations",
-                inputs.len(),
-            );
-        }
+        super::warn_when_nothing_can_activate(
+            &format!("[[wasm_consumer]] {slug:?}"),
+            "consumer",
+            &authored_inputs,
+        );
 
         // Resolve output ports. The addresses of the *address-bound* ones are
         // collected separately: the per-scheme empty-publish-ACL checks below

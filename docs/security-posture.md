@@ -695,7 +695,7 @@ deliberate and does not create an unbounded loop:
   MQTT mode is `push_depth == 0` (pull), which never wakes and so costs nothing.
 - **WASM republish loop.** Bounded in code by the per-component activation pacer
   (`ActivationPacer`, `brenn-wasm-dispatch`). Every consumer activation —
-  external wake, deadline wake, clamp self-renotify, and the startup sweep — is
+  external wake, deadline wake, clamp self-renotify, and the mount activation — is
   admitted through a per-component token bucket over *activations* before its drain
   step: sustained rate is capped at one activation per `activation_min_period_ms`
   (default 1 s) after an `activation_burst` (default 60) burst. The gate **delays**

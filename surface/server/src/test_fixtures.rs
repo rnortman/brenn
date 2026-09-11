@@ -435,7 +435,7 @@ pub fn write_processor_tree_from_bytes(
 
     use sha2::Digest as _;
     let mut manifest = serde_json::json!({
-        "v": 2,
+        "v": 3,
         "kind": kind,
         "source_sha256": hex::encode(sha2::Sha256::digest(component_bytes)),
         "jco_version": PINNED_JCO_VERSION_FOR_TESTS,

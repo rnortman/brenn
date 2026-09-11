@@ -24,6 +24,7 @@ import {
     readSurfaceManifest,
     renderStaticFailure,
     resetReloadCount,
+    seamFailureMessage,
     seamReloadReason,
     setKernelHandle,
     SURFACE_CHROME_DEATH_COUNT_KEY,
@@ -371,8 +372,10 @@ describe("surface bootstrap page-input reads", () => {
                                 instance: "echo-stub",
                                 kind: "echo-stub",
                                 module: "/surface-static/brenn_echo_stub.js?v=build-xyz&instance=echo-stub",
+                                cores: ["/surface-static/echo-stub.core.wasm?v=build-xyz"],
                             },
                         ],
+                        withheld: [],
                     }),
                 ),
         );
@@ -386,6 +389,7 @@ describe("surface bootstrap page-input reads", () => {
                 instance: "echo-stub",
                 kind: "echo-stub",
                 module: "/surface-static/brenn_echo_stub.js?v=build-xyz&instance=echo-stub",
+                cores: ["/surface-static/echo-stub.core.wasm?v=build-xyz"],
             },
         ]);
     });
@@ -416,6 +420,58 @@ describe("surface bootstrap page-input reads", () => {
         expect(readSurfaceManifest()).toBeNull();
     });
 
+    it("manifest whose component entry carries no cores → static failure", () => {
+        // A page built before the core list is one the loader cannot bring up:
+        // the sync glue asks for cores it would have no way to answer for. A
+        // rejected manifest is the reload path, not a silent empty list.
+        expectConsoleError(/surface bootstrap failure/);
+        setPage(
+            METAS +
+                manifestScript(
+                    JSON.stringify({
+                        kernel: "/surface-static/brenn_surface_kernel.js?v=b",
+                        components: [
+                            { instance: "i", kind: "k", module: "/k.js" },
+                        ],
+                        withheld: [],
+                    }),
+                ),
+        );
+        expect(readSurfaceManifest()).toBeNull();
+    });
+
+    it("manifest carrying no withheld list → static failure, returns null", () => {
+        // A page built before the withheld list is one whose kernel would never
+        // hear about a withheld instance: the row would sit `pending` with no
+        // reason anywhere. A rejected manifest is the reload path.
+        expectConsoleError(/surface bootstrap failure/);
+        setPage(
+            METAS +
+                manifestScript(
+                    JSON.stringify({
+                        kernel: "/surface-static/brenn_surface_kernel.js?v=b",
+                        components: [],
+                    }),
+                ),
+        );
+        expect(readSurfaceManifest()).toBeNull();
+    });
+
+    it("manifest with a malformed withheld entry → static failure, returns null", () => {
+        expectConsoleError(/surface bootstrap failure/);
+        setPage(
+            METAS +
+                manifestScript(
+                    JSON.stringify({
+                        kernel: "/surface-static/brenn_surface_kernel.js?v=b",
+                        components: [],
+                        withheld: [{ instance: "i", kind: "k" }],
+                    }),
+                ),
+        );
+        expect(readSurfaceManifest()).toBeNull();
+    });
+
     it("manifest with a malformed component entry → static failure, returns null", () => {
         expectConsoleError(/surface bootstrap failure/);
         setPage(
@@ -423,7 +479,10 @@ describe("surface bootstrap page-input reads", () => {
                 manifestScript(
                     JSON.stringify({
                         kernel: "/surface-static/brenn_surface_kernel.js?v=b",
-                        components: [{ instance: "i", kind: 1, module: "x" }],
+                        components: [
+                            { instance: "i", kind: 1, module: "x", cores: [] },
+                        ],
+                        withheld: [],
                     }),
                 ),
         );
@@ -451,7 +510,7 @@ describe("surface bootstrap module loading", () => {
     const KERNEL_URL = "/surface-static/brenn_surface_kernel.js?v=b";
 
     function manifest(components: ManifestComponent[]): SurfaceManifest {
-        return { kernel: KERNEL_URL, components };
+        return { kernel: KERNEL_URL, components, withheld: [] };
     }
 
     it("kernel import failure → cappedReload, returns null, components not loaded", async () => {
@@ -465,6 +524,7 @@ describe("surface bootstrap module loading", () => {
                     instance: "echo-stub",
                     kind: "echo-stub",
                     module: "/x.js",
+                    cores: [],
                 },
             ]).kernel,
             importModule,
@@ -507,7 +567,7 @@ describe("surface bootstrap orchestration", () => {
     beforeEach(() => {
         sessionStorage.clear();
         document.head.innerHTML = `<script type="application/json" id="brenn-surface-manifest">${JSON.stringify(
-            { kernel: KERNEL_URL, components: [] },
+            { kernel: KERNEL_URL, components: [], withheld: [] },
         )}</script>`;
         document.body.innerHTML = '<div id="surface-root"></div>';
         reloadSpy = vi
@@ -605,6 +665,73 @@ describe("surface bootstrap orchestration", () => {
         // loadKernel routed the kernel failure through cappedReload.
         expect(reloadSpy).toHaveBeenCalledTimes(1);
     });
+
+    it("brenn-surface-failure renders its message and reloads nothing", async () => {
+        // `bootstrap` installs its seam listeners on `window` and they persist
+        // for the module lifetime, so every bootstrap this file has already run
+        // renders this message too. Silencing the console here keeps the
+        // assertion about the behaviour rather than about test order.
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        await bootstrap(
+            kernelImporter(() => {
+                window.dispatchEvent(
+                    new CustomEvent("brenn-surface-failure", {
+                        detail: {
+                            message: "fleet is withheld: record v = 2",
+                        },
+                    }),
+                );
+            }),
+        );
+        expect(document.getElementById("surface-root")?.textContent).toBe(
+            "fleet is withheld: record v = 2",
+        );
+        // Terminal, not capped: reloading cannot clear it, so the cap is not
+        // spent and no navigation is asked for.
+        expect(reloadSpy).not.toHaveBeenCalled();
+        expect(sessionStorage.getItem(SURFACE_RELOAD_COUNT_KEY)).toBeNull();
+    });
+
+    it("a rendered terminal failure is not overwritten by a later uncaught error", async () => {
+        // The latch the failure listener sets is read by the pre-kernel arm of
+        // the global error handler, which is the arm a page reaches while
+        // `start()` is still running — exactly when the kernel can already have
+        // dispatched this seam event. Without it the actionable message is
+        // replaced by whatever died next.
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        // The state a page is in before `start()` returns, which an earlier
+        // bootstrap in this block leaves behind it.
+        setKernelHandle(null);
+        await bootstrap(
+            kernelImporter(() => {
+                window.dispatchEvent(
+                    new CustomEvent("brenn-surface-failure", {
+                        detail: { message: "fleet is withheld: record v = 2" },
+                    }),
+                );
+                // Still inside `start()`, so the kernel handle is not recorded
+                // yet and this lands on the pre-kernel arm — the window the
+                // latch exists for.
+                const rejection = new Event(
+                    "unhandledrejection",
+                ) as unknown as PromiseRejectionEvent;
+                Object.defineProperty(rejection, "reason", {
+                    value: new Error("something-else-died"),
+                });
+                window.dispatchEvent(rejection);
+            }),
+        );
+
+        expect(document.getElementById("surface-root")?.textContent).toBe(
+            "fleet is withheld: record v = 2",
+        );
+    });
+
+    it("seamFailureMessage falls back for a missing or non-string message", () => {
+        expect(seamFailureMessage({ message: "withheld" })).toBe("withheld");
+        expect(seamFailureMessage({})).toContain("cannot start");
+        expect(seamFailureMessage(null)).toContain("cannot start");
+    });
 });
 
 describe("surface seam reload reason", () => {
@@ -694,6 +821,7 @@ describe("surface processor bring-up", () => {
                 (_i: string, _e: (a: string) => unknown) => true,
             ),
             brenn_processor_load_failed: vi.fn((_i: string, _d: string) => {}),
+            brenn_processor_withheld: vi.fn((_i: string, _r: string) => {}),
             brenn_dom_root: vi.fn((_i: string) => 1n),
             brenn_dom_create_element: vi.fn((_i: string, _t: string) => 1n),
             brenn_dom_set_attribute: vi.fn(
@@ -737,10 +865,101 @@ describe("surface processor bring-up", () => {
 
     const PROC_MODULE = "/surface-static/processor/counter/counter.js?v=b";
 
+    it("a withheld instance is reported to the kernel and never loaded", async () => {
+        expectConsoleError(/is withheld/);
+        expectConsoleError(/is withheld/);
+        const kernel = fakeKernel();
+        const importModule = vi.fn(async () => ({
+            instantiate: vi.fn(() => ({ receive: vi.fn() })),
+        }));
+        const withheldManifest: SurfaceManifest = {
+            kernel: "/surface-static/brenn_surface_kernel.js?v=b",
+            components: [processorEntry("p1"), processorEntry("p2")],
+            withheld: [
+                {
+                    instance: "fleet-1",
+                    kind: "fleet",
+                    reason: "manifest declares v = 2, but this server reads v = 3",
+                },
+                {
+                    instance: "fleet-2",
+                    kind: "fleet",
+                    reason: "manifest declares v = 2, but this server reads v = 3",
+                },
+            ],
+        };
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            withheldManifest,
+            ["fleet-1", "p1", "fleet-2", "p2"],
+            importModule as unknown as ModuleImporter,
+        );
+
+        expect(kernel.brenn_processor_withheld).toHaveBeenCalledWith(
+            "fleet-1",
+            "manifest declares v = 2, but this server reads v = 3",
+        );
+        // Not also a load failure: the instance has a verdict already, and a
+        // second one would overwrite the reason with "no module in the manifest".
+        expect(kernel.brenn_processor_load_failed).not.toHaveBeenCalled();
+        expect(
+            kernel.brenn_processor_register.mock.calls.map((c) => c[0]).sort(),
+        ).toEqual(["p1", "p2"]);
+        // Every verdict before any bring-up, not merely both eventually: a
+        // withheld chrome's terminal message must not be raced by a sibling's
+        // bring-up error card, which is the whole reason the reports are not in
+        // the same `Promise.all` the loads are.
+        expect(
+            Math.max(
+                ...kernel.brenn_processor_withheld.mock.invocationCallOrder,
+            ),
+        ).toBeLessThan(
+            Math.min(
+                ...kernel.brenn_processor_register.mock.invocationCallOrder,
+            ),
+        );
+    });
+
+    it("a withheld entry for an instance the kernel did not name is logged", async () => {
+        // A manifest/bindings skew: the field exists so every declared instance
+        // gets a verdict, so an entry belonging to no declaration is a broken
+        // deploy and has to be said out loud rather than skipped in silence.
+        expectConsoleError(/the kernel did not ask to start/);
+        const kernel = fakeKernel();
+        const importModule = vi.fn(async () => ({
+            instantiate: vi.fn(() => ({ receive: vi.fn() })),
+        }));
+        const skewed: SurfaceManifest = {
+            kernel: "/surface-static/brenn_surface_kernel.js?v=b",
+            components: [processorEntry("p1")],
+            withheld: [
+                {
+                    instance: "ghost-1",
+                    kind: "fleet",
+                    reason: "manifest declares v = 2, but this server reads v = 3",
+                },
+            ],
+        };
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            skewed,
+            ["p1"],
+            importModule as unknown as ModuleImporter,
+        );
+
+        expect(kernel.brenn_processor_withheld).not.toHaveBeenCalled();
+        expect(
+            kernel.brenn_processor_register.mock.calls.map((c) => c[0]),
+        ).toEqual(["p1"]);
+    });
+
     function manifest(components: ManifestComponent[]): SurfaceManifest {
         return {
             kernel: "/surface-static/brenn_surface_kernel.js?v=b",
             components,
+            withheld: [],
         };
     }
 
@@ -748,14 +967,38 @@ describe("surface processor bring-up", () => {
         return {
             instance,
             kind: "counter",
+            // The core-URL path is pinned by its own cases below.
             module: PROC_MODULE,
+            cores: [],
         };
     }
 
-    it("evaluates the kind's module once and instantiates once per instance", async () => {
+    /** The smallest well-formed activation: the shape, not the content. */
+    const EMPTY_ACTIVATION = JSON.stringify({
+        ports: [],
+        deferred: [],
+        now: null,
+        sync: null,
+    });
+
+    /** The activation entry the loader registered for one instance. */
+    function registeredEntry(
+        kernel: ReturnType<typeof fakeKernel>,
+        instance: string,
+    ): (activation: string) => unknown {
+        const call = kernel.brenn_processor_register.mock.calls.find(
+            (c) => c[0] === instance,
+        );
+        if (call === undefined) {
+            throw new Error(`no activation entry registered for ${instance}`);
+        }
+        return call[1] as (activation: string) => unknown;
+    }
+
+    it("evaluates the kind's module once and instantiates once per activation", async () => {
         const kernel = fakeKernel();
         const receive = vi.fn();
-        const instantiate = vi.fn(async () => ({ receive }));
+        const instantiate = vi.fn(() => ({ receive }));
         const importModule = vi.fn(async () => ({ instantiate }));
 
         await startProcessors(
@@ -765,21 +1008,101 @@ describe("surface processor bring-up", () => {
             importModule as unknown as ModuleImporter,
         );
 
-        // One evaluation per kind (siblings share the URL), one instantiation
-        // per instance — its own linear memory.
         expect(importModule).toHaveBeenCalledTimes(1);
-        expect(instantiate).toHaveBeenCalledTimes(2);
+        expect(instantiate).not.toHaveBeenCalled();
         expect(
             kernel.brenn_processor_register.mock.calls.map((c) => c[0]),
         ).toEqual(["p1", "p2"]);
         expect(kernel.brenn_processor_load_failed).not.toHaveBeenCalled();
+
+        registeredEntry(kernel, "p1")(EMPTY_ACTIVATION);
+        registeredEntry(kernel, "p1")(EMPTY_ACTIVATION);
+        registeredEntry(kernel, "p2")(EMPTY_ACTIVATION);
+        registeredEntry(kernel, "p2")(EMPTY_ACTIVATION);
+        expect(instantiate).toHaveBeenCalledTimes(4);
+        expect(receive).toHaveBeenCalledTimes(4);
+        expect(importModule).toHaveBeenCalledTimes(1);
+    });
+
+    it("compiles each kind's cores once and answers the glue by basename", async () => {
+        const kernel = fakeKernel();
+        const compiled: string[] = [];
+        const fetched: string[] = [];
+        vi.spyOn(globalThis, "fetch").mockImplementation(((url: string) => {
+            fetched.push(url);
+            return Promise.resolve(new Response(null));
+        }) as unknown as typeof fetch);
+        vi.spyOn(WebAssembly, "compileStreaming").mockImplementation(
+            (async (source: Promise<Response>) => {
+                await source;
+                return { core: fetched[fetched.length - 1] };
+            }) as unknown as typeof WebAssembly.compileStreaming,
+        );
+
+        let lookup: ((name: string) => unknown) | undefined;
+        const instantiate = vi.fn((getCoreModule: (n: string) => unknown) => {
+            lookup = getCoreModule;
+            compiled.push("instantiated");
+            return { receive: vi.fn() };
+        });
+        const importModule = vi.fn(async () => ({ instantiate }));
+
+        const withCores = (instance: string): ManifestComponent => ({
+            ...processorEntry(instance),
+            cores: [
+                "/surface-static/processor/counter/counter.core.wasm?v=b",
+                "/surface-static/processor/counter/counter.core2.wasm?v=b",
+            ],
+        });
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([withCores("p1"), withCores("p2")]),
+            ["p1", "p2"],
+            importModule as unknown as ModuleImporter,
+        );
+
+        // Cache is keyed by URL: the sibling pays for neither fetch nor compile.
+        expect(fetched).toHaveLength(2);
+
+        registeredEntry(kernel, "p1")(EMPTY_ACTIVATION);
+        // The glue asks by the emitted file name; the URL's directory and its
+        // `?v=` build stamp are the page's business, not the glue's.
+        expect(lookup?.("counter.core2.wasm")).toEqual({
+            core: "/surface-static/processor/counter/counter.core2.wasm?v=b",
+        });
+        // A name the manifest does not carry is build/server skew, and saying
+        // so beats handing the glue an undefined it would fail on obscurely.
+        expect(() => lookup?.("counter.core9.wasm")).toThrowError(
+            /different builds/,
+        );
+    });
+
+    it("an instantiation that throws is that activation's trap, not a bring-up failure", async () => {
+        const kernel = fakeKernel();
+        const instantiate = vi.fn(() => {
+            throw new Error("core wasm rejected");
+        });
+        const importModule = vi.fn(async () => ({ instantiate }));
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([processorEntry("p1")]),
+            ["p1"],
+            importModule as unknown as ModuleImporter,
+        );
+
+        expect(kernel.brenn_processor_load_failed).not.toHaveBeenCalled();
+        expect(() => registeredEntry(kernel, "p1")(EMPTY_ACTIVATION)).toThrowError(
+            "core wasm rejected",
+        );
     });
 
     it("closes each instance's imports over its own instance id", async () => {
         const kernel = fakeKernel();
         let captured: Record<string, Record<string, unknown>> | undefined;
         const importModule = vi.fn(async () => ({
-            instantiate: async (
+            instantiate: (
                 _core: unknown,
                 imports: Record<string, Record<string, unknown>>,
             ) => {
@@ -794,6 +1117,10 @@ describe("surface processor bring-up", () => {
             ["p1"],
             importModule as unknown as ModuleImporter,
         );
+        // The import table is built at bring-up and handed to every
+        // instantiation; the guest that reads it exists only inside an
+        // activation, so one is driven to get at it.
+        registeredEntry(kernel, "p1")(EMPTY_ACTIVATION);
 
         const ports = captured?.["brenn:processor/ports"] as {
             publish: (port: string, payload: string) => void;
@@ -900,7 +1227,7 @@ describe("surface processor bring-up", () => {
     ): Promise<Record<string, Record<string, unknown>>> {
         let captured: Record<string, Record<string, unknown>> | undefined;
         const importModule = vi.fn(async () => ({
-            instantiate: async (
+            instantiate: (
                 _core: unknown,
                 imports: Record<string, Record<string, unknown>>,
             ) => {
@@ -914,6 +1241,7 @@ describe("surface processor bring-up", () => {
             [instance],
             importModule as unknown as ModuleImporter,
         );
+        registeredEntry(kernel, instance)(EMPTY_ACTIVATION);
         if (captured === undefined) {
             throw new Error("the instance was never instantiated");
         }
@@ -969,7 +1297,7 @@ describe("surface processor bring-up", () => {
         );
         let captured: Record<string, Record<string, unknown>> | undefined;
         const importModule = vi.fn(async () => ({
-            instantiate: async (
+            instantiate: (
                 _core: unknown,
                 imports: Record<string, Record<string, unknown>>,
             ) => {
@@ -984,6 +1312,7 @@ describe("surface processor bring-up", () => {
             ["p1"],
             importModule as unknown as ModuleImporter,
         );
+        registeredEntry(kernel, "p1")(EMPTY_ACTIVATION);
 
         const ports = captured?.["brenn:processor/ports"] as {
             publishDeferred: (
@@ -1045,7 +1374,7 @@ describe("surface processor bring-up", () => {
         );
         let captured: Record<string, Record<string, unknown>> | undefined;
         const importModule = vi.fn(async () => ({
-            instantiate: async (
+            instantiate: (
                 _core: unknown,
                 imports: Record<string, Record<string, unknown>>,
             ) => {
@@ -1060,6 +1389,7 @@ describe("surface processor bring-up", () => {
             ["p1"],
             importModule as unknown as ModuleImporter,
         );
+        registeredEntry(kernel, "p1")(EMPTY_ACTIVATION);
 
         const ports = captured?.["brenn:processor/ports"] as {
             publish: (port: string, payload: string) => void;
@@ -1104,7 +1434,7 @@ describe("surface processor bring-up", () => {
             return undefined;
         };
         const importModule = vi.fn(async () => ({
-            instantiate: async () => ({ receive }),
+            instantiate: () => ({ receive }),
         }));
 
         await startProcessors(
@@ -1225,7 +1555,7 @@ describe("surface processor bring-up", () => {
         expect(() => entry?.(activation)).toThrowError("unreachable");
     });
 
-    it("reports import, instantiate, and registration failures to the kernel", async () => {
+    it("reports import, core-compilation, and registration failures to the kernel", async () => {
         const kernel = fakeKernel();
         kernel.brenn_processor_register = vi.fn(
             (instance: string) => instance !== "refused",
@@ -1234,25 +1564,25 @@ describe("surface processor bring-up", () => {
             if (url.includes("missing")) {
                 throw new Error("404");
             }
-            return {
-                instantiate: async (
-                    _core: unknown,
-                    imports: Record<string, Record<string, unknown>>,
-                ) => {
-                    const config = imports["brenn:processor/config"] as {
-                        get: (key: string) => unknown;
-                    };
-                    if (
-                        config.get("__boom") === undefined &&
-                        url.includes("bad")
-                    ) {
-                        throw new Error("bad core wasm");
-                    }
-                    return { receive: vi.fn() };
-                },
-            };
+            return { instantiate: () => ({ receive: vi.fn() }) };
         });
+        vi.spyOn(globalThis, "fetch").mockImplementation(((url: string) =>
+            Promise.resolve(
+                new Response(null, { status: url.includes("bad") ? 404 : 200 }),
+            )) as unknown as typeof fetch);
+        vi.spyOn(WebAssembly, "compileStreaming").mockImplementation((async (
+            source: Promise<Response>,
+        ) => {
+            const response = await source;
+            if (!response.ok) {
+                throw new Error("core wasm is not there");
+            }
+            return {};
+        }) as unknown as typeof WebAssembly.compileStreaming);
 
+        // Three bring-up failure modes: the glue does not import, a core does
+        // not compile, or the kernel refuses the registration. An instantiation
+        // that throws is an activation's trap, pinned above.
         expectConsoleError(/instance 'gone'.*failed to start/);
         expectConsoleError(/instance 'bad'.*failed to start/);
         {
@@ -1263,11 +1593,13 @@ describe("surface processor bring-up", () => {
                         instance: "gone",
                         kind: "counter",
                         module: "/missing.js",
+                        cores: [],
                     },
                     {
                         instance: "bad",
                         kind: "counter",
-                        module: "/bad.js",
+                        module: PROC_MODULE,
+                        cores: ["/bad.core.wasm?v=b"],
                     },
                     processorEntry("refused"),
                 ]),
@@ -1286,4 +1618,5 @@ describe("surface processor bring-up", () => {
             "undeclared",
         ]);
     });
+
 });

@@ -15,12 +15,19 @@
     "non-identifying fields in `envelope_template`.",
     "",
     "`transcript` is the reduced observable of each activation: the flush",
-    "outcome and, in call order, the immediate publishes, the deferred publishes",
-    "(body + release instant), and the deferred-message control ops that",
-    "actually reached the host. An err or trap activation flushes nothing —",
-    "that is what discard-on-err looks like reduced to observables, and it",
-    "covers deferral: a parked schedule and a buffered cancel/edit are discarded",
-    "with the publishes.",
+    "outcome and, in call order, the immediate publishes (port + body), the",
+    "deferred publishes (port + body + release instant), and the",
+    "deferred-message control ops that actually reached the host. An err or",
+    "trap activation flushes nothing — that is what discard-on-err looks like",
+    "reduced to observables, and it covers deferral: a parked schedule and a",
+    "buffered cancel/edit are discarded with the publishes.",
+    "",
+    "Every activation opens with one publish on `report` carrying the guest's",
+    "own view of what it was handed, including `counter` — the activations this",
+    "instance's linear memory has seen. It reads `1` throughout: linear memory",
+    "is activation-scoped on every host, so both harnesses instantiate per",
+    "activation and a transcript with a climbing counter is a host that kept a",
+    "memory it was not entitled to.",
     "",
     "Wire class: every channel here is `brenn:`. That is an owner scoping",
     "decision, not doctrine — backend WASM consumers cannot bind `ephemeral:`",
@@ -276,8 +283,8 @@
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"greeting\":\"hello, transplant\",\"absent\":null}",
-        "in:alpha"
+        { "port": "report", "body": "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"counter\":1,\"greeting\":\"hello, transplant\",\"absent\":null}" },
+        { "port": "out", "body": "in:alpha" }
       ],
       "deferred_publishes": [],
       "ops": []
@@ -285,8 +292,8 @@
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\",\"00000000-0000-0000-0000-000000000002\"],\"new_from\":1,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[\"00000000-0000-0000-0000-000000000010\"],\"new_from\":1,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"greeting\":\"hello, transplant\",\"absent\":null}",
-        "in:beta"
+        { "port": "report", "body": "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\",\"00000000-0000-0000-0000-000000000002\"],\"new_from\":1,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[\"00000000-0000-0000-0000-000000000010\"],\"new_from\":1,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"counter\":1,\"greeting\":\"hello, transplant\",\"absent\":null}" },
+        { "port": "out", "body": "in:beta" }
       ],
       "deferred_publishes": [],
       "ops": []
@@ -294,17 +301,17 @@
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000006\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":1767225600000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+        { "port": "report", "body": "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000006\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":1767225600000,\"counter\":1,\"greeting\":\"hello, transplant\",\"absent\":null}" }
       ],
       "deferred_publishes": [
-        { "body": "parked:60000", "deliver_after": 1767225660000 }
+        { "port": "out", "body": "parked:60000", "deliver_after": 1767225660000 }
       ],
       "ops": []
     },
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000007\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"parked:60000\",\"deliver_after\":1767225660000},{\"index\":1,\"payload\":\"parked:900000\",\"deliver_after\":1767226500000}]}],\"now\":1767225660000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+        { "port": "report", "body": "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000007\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"parked:60000\",\"deliver_after\":1767225660000},{\"index\":1,\"payload\":\"parked:900000\",\"deliver_after\":1767226500000}]}],\"now\":1767225660000,\"counter\":1,\"greeting\":\"hello, transplant\",\"absent\":null}" }
       ],
       "deferred_publishes": [],
       "ops": [
@@ -320,7 +327,7 @@
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000008\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"edited@0\",\"deliver_after\":1767225780000},{\"index\":1,\"payload\":\"parked:900000\",\"deliver_after\":1767226500000}]}],\"now\":1767225700000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+        { "port": "report", "body": "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000008\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"edited@0\",\"deliver_after\":1767225780000},{\"index\":1,\"payload\":\"parked:900000\",\"deliver_after\":1767226500000}]}],\"now\":1767225700000,\"counter\":1,\"greeting\":\"hello, transplant\",\"absent\":null}" }
       ],
       "deferred_publishes": [],
       "ops": [{ "op": "cancel", "port": "out", "index": 1 }]
@@ -328,7 +335,7 @@
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000009\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"edited@0\",\"deliver_after\":1767225780000}]}],\"now\":1767225750000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+        { "port": "report", "body": "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000009\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"edited@0\",\"deliver_after\":1767225780000}]}],\"now\":1767225750000,\"counter\":1,\"greeting\":\"hello, transplant\",\"absent\":null}" }
       ],
       "deferred_publishes": [],
       "ops": [
@@ -356,8 +363,8 @@
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000004\"],\"new_from\":0,\"dropped\":2},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"greeting\":\"hello, transplant\",\"absent\":null}",
-        "in:delta"
+        { "port": "report", "body": "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000004\"],\"new_from\":0,\"dropped\":2},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"counter\":1,\"greeting\":\"hello, transplant\",\"absent\":null}" },
+        { "port": "out", "body": "in:delta" }
       ],
       "deferred_publishes": [],
       "ops": []

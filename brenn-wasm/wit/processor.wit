@@ -737,5 +737,39 @@ world processor {
     /// ordinary activation must answer `ok(none)`; a `some` on one is a host
     /// trap, because a component replying to a cause that asked nothing has
     /// lost track of why it was called.
+    ///
+    /// LINEAR MEMORY LIVES FOR ONE ACTIVATION. A component must not carry
+    /// state in statics, thread-locals or the heap from one call to the next:
+    /// a host instantiates the component for this call and drops the instance
+    /// when it returns. A component that breaks this rule fails its own tests.
+    /// A component keeps state by publishing it: an in/out port bound
+    /// `push_depth = 0, retain_depth = 1` — sampled, so it never wakes its
+    /// owner; retained, so the newest state is always in that port's context
+    /// window. Read it back from the window at the top of the call and publish
+    /// the new one before returning. Host resources reached by handle are
+    /// owned by the mount, not by the memory: a `node` minted in one activation
+    /// names the same element in the next, and the handle travels in the
+    /// published state like any other field.
+    ///
+    /// EVERY MOUNT GETS EXACTLY ONE ACTIVATION. A mount is a host putting an
+    /// instance into service: a registration wired by a bindings document on
+    /// the surface, a consumer task starting on the backend — so a page reload,
+    /// a consumer restart and a process restart are each a new mount. That
+    /// activation arrives whether or not anything is deliverable: its windows
+    /// carry whatever context and new messages exist, possibly nothing at all,
+    /// and its deferred windows carry whatever the component has parked. It
+    /// carries no marker; a component that needs to know it is first tracks
+    /// that itself. It exists so a component's first output has somewhere to
+    /// come from that is inside an activation — nothing may be published from
+    /// connect-time code. The corollary for a self-tick chain: park a tick at
+    /// mount IFF the deferred window holds none, so a tick that survived on a
+    /// durable channel is not double-armed and one that did not survive is
+    /// restored. The window holds every entry the component parked on that port
+    /// that no release pass has taken, including one whose `deliver-after` has
+    /// already passed while the instance was out of service — carried with that
+    /// past instant. So an empty window means nothing is standing, at every
+    /// instant. A due entry may be read but not cancelled or edited: the
+    /// authority cutoff is still the release instant, and a component that
+    /// wants it gone waits for it to arrive.
     export receive: func(a: activation) -> result<option<string>, receive-error>;
 }

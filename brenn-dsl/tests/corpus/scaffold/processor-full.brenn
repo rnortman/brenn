@@ -1,7 +1,8 @@
 /// A specification exercising the whole generated processor surface: both port
-/// directions, an `io` port, an optional port, the substrate-wired tool-result
-/// inbox its `tools` requirement obliges, doctypes, and every capability word
-/// that names an SDK module.
+/// directions, an `io` port, the `io state` port a component's retained state
+/// lives on, an optional port, the substrate-wired tool-result inbox its
+/// `tools` requirement obliges, doctypes, and every capability word that names
+/// an SDK module.
 ///
 /// The prose is carried into the generated module, so this paragraph is part of
 /// what the golden pins.
@@ -13,4 +14,5 @@ component ScaffoldFull {
   in tool-results;
   out results: "brenn.scaffold.results@1";
   io tick;
+  io state;
 }

@@ -236,8 +236,9 @@ pub struct DeferOpRequest<'a> {
     pub message_id: Uuid,
     pub op: DeferOp,
     /// The wall-clock instant the op is judged at, in the currency a release time
-    /// is stated in. The same cutoff [`LocalRouter::parked_for`] answers against,
-    /// so an op reaches exactly what the schedule showed.
+    /// is stated in. The authority cutoff, which [`LocalRouter::parked_for`]
+    /// does not share: a due entry is in the schedule the origin read and is
+    /// still out of reach here.
     pub now: ReleaseTime,
 }
 
@@ -245,10 +246,16 @@ pub struct DeferOpRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeferOpAnswer {
     Applied,
-    /// The message is no longer parked — released or already cancelled. The
-    /// benign race any publisher can lose between reading its schedule and
-    /// acting on it.
-    NotParked,
+    /// The op reached nothing: the target is past the authority cutoff.
+    ///
+    /// Two causes, one answer. `deliver_after` is `Some` while the entry is
+    /// still held — it came due, either between the view the component read and
+    /// this flush, or before that view was ever assembled, which is the
+    /// doctrine violation the embedder logs — and `None` once nothing of that
+    /// identity is held, which is the benign race any publisher can lose.
+    NotParked {
+        deliver_after: Option<ReleaseTime>,
+    },
     /// A plane guard refused an edit's replacement body. The parked message is
     /// unchanged, schedule included.
     Refused {
@@ -483,7 +490,6 @@ impl<P: PlanePolicy> LocalRouter<P> {
         stores: &ChannelStores<K>,
         channel: &str,
         origin: Origin<'_>,
-        now: ReleaseTime,
     ) -> Vec<DeferredViewEntry> {
         assert!(
             is_local_channel(channel),
@@ -495,7 +501,7 @@ impl<P: PlanePolicy> LocalRouter<P> {
         };
         let sender = self.sender(principal, origin);
         store_ref(stores, channel)
-            .deferred_for_sender(&sender, now)
+            .deferred_for_sender(&sender)
             .map(|parked| DeferredViewEntry {
                 message_id: parked.message.message_id,
                 // The body, not the envelope: what a publisher gets back is what
@@ -515,11 +521,12 @@ impl<P: PlanePolicy> LocalRouter<P> {
     ///
     /// Nothing is woken: a schedule changing is invisible until it releases.
     ///
-    /// Reaches only what is still parked at `req.now` — the cutoff
-    /// [`Self::parked_for`] answers against. A message whose release time has
-    /// arrived is [`DeferOpAnswer::NotParked`] even before the sweep takes it,
-    /// which is both what the schedule showed and what the peer answers for the
-    /// same op on a channel that crosses the wire.
+    /// Reaches only what is still parked at `req.now` — a boundary
+    /// [`Self::parked_for`] deliberately does not share. A message whose
+    /// release time has arrived is shown by the view, carrying its past
+    /// instant, and is [`DeferOpAnswer::NotParked`] here even before the sweep
+    /// takes it, which is what the peer answers for the same op on a channel
+    /// that crosses the wire.
     ///
     /// # Panics
     ///
@@ -551,7 +558,9 @@ impl<P: PlanePolicy> LocalRouter<P> {
         let Some(principal) = self.principal.clone() else {
             // Nothing is parked under an identity that does not exist yet, so
             // the op names nothing — the same answer the release race gets.
-            return DeferOpAnswer::NotParked;
+            return DeferOpAnswer::NotParked {
+                deliver_after: None,
+            };
         };
         let op = match op {
             DeferOp::Edit {
@@ -569,7 +578,9 @@ impl<P: PlanePolicy> LocalRouter<P> {
         let sender = self.sender(&principal, origin);
         match store_for(stores, channel).apply_defer_op(&sender, message_id, op, now) {
             DeferOpOutcome::Applied => DeferOpAnswer::Applied,
-            DeferOpOutcome::NotParked => DeferOpAnswer::NotParked,
+            DeferOpOutcome::NotParked { deliver_after } => {
+                DeferOpAnswer::NotParked { deliver_after }
+            }
             DeferOpOutcome::WrongSender { owner } => panic!(
                 "attach client: {sender} named message {message_id} on {channel}, parked by \
                  {owner} — the schedule this router showed {sender} carried an id it does not own"

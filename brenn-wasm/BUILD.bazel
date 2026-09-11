@@ -152,6 +152,8 @@ _SURFACE_FIXTURES = {
     "echo-stub": "//surface/components/echo-stub:echo-stub_component",
     "meeting": "//surface/components/meeting:meeting_component",
     "chrome": "//surface/chrome:chrome_component",
+    "mode-clock": "//surface/components/mode-clock:mode-clock_component",
+    "protobar": "//surface/components/protobar:protobar_component",
 }
 
 [
@@ -297,8 +299,10 @@ WASM_TEST_SUITES = [
             "chrome",
             "echo-stub",
             "meeting",
+            "mode-clock",
             "processor-config",
             "processor-log",
+            "protobar",
         ],
         [],
         [

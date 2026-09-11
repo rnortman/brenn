@@ -10,10 +10,10 @@
 //! third button traps, which is how the error-card path is exercised from a
 //! real component.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 
-use brenn_guest::{Activation, Error, Processor, dom, log, publish};
+use brenn_guest::{Activation, Error, Processor, RetainedState, StateLoss, dom, log, publish};
+use serde::{Deserialize, Serialize};
 
 use crate::spec::{InPort, port::OUT};
 
@@ -35,14 +35,23 @@ const MAX_SCROLLBACK_ENTRIES: usize = 100;
 
 const AWAITING: &str = "awaiting data";
 
-// One instantiation backs one instance for the page's lifetime, so the view
-// handles and the counters are ordinary interior-mutable module state. Handles
-// are page-lifetime too: the element a handle names on the mount activation is
-// the same element on every activation after it.
-thread_local! {
-    static ECHO: RefCell<EchoStub> = const { RefCell::new(EchoStub::new()) };
-}
+/// A delivered body that makes the activation fail *after* its state has been
+/// stored.
+///
+/// The one shape a host's discard rule cannot be observed without: everything
+/// else this component refuses, it refuses before the state cell writes
+/// anything, so nothing distinguishes a host that drops a failed activation's
+/// publishes from one that keeps them. The entry is rendered and the counters
+/// move first, so the state this activation would have left is visibly
+/// different from the one before it.
+const FAIL_AFTER_STORE: &str = "__fail-after-store__";
 
+/// Everything this instance carries between activations, which rides its
+/// retained `state` port because linear memory does not survive one.
+///
+/// The handles in it do survive: a handle is owned by the mount, so the element
+/// one named when it was stored is the element it names when it is read back.
+#[derive(Default, Serialize, Deserialize)]
 struct EchoStub {
     /// The elements an activation writes to, built by the mount activation.
     view: Option<View>,
@@ -56,6 +65,7 @@ struct EchoStub {
     sent: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 struct View {
     status: dom::Node,
     scrollback: dom::Node,
@@ -64,15 +74,6 @@ struct View {
 }
 
 impl EchoStub {
-    const fn new() -> EchoStub {
-        EchoStub {
-            view: None,
-            entries: VecDeque::new(),
-            drops: 0,
-            sent: 0,
-        }
-    }
-
     /// The view, which every activation after the mount one has.
     fn view(&self) -> &View {
         self.view
@@ -83,12 +84,27 @@ impl EchoStub {
 
 struct EchoStubComponent;
 
+impl crate::spec::StatePayload for EchoStub {}
+
 impl Processor for EchoStubComponent {
     fn receive(activation: Activation) -> Result<Option<String>, Error> {
-        ECHO.with(|echo| on_activation(&activation, &mut echo.borrow_mut()))?;
-        // Mount and both send gestures are answered with nothing: the mount
-        // call has no reply dialect, and neither button's default action is
-        // one this component cancels.
+        // Starting from a default state would lose the view and trap on the
+        // first `view()`, so an unreadable body fails the activation and the
+        // instance takes its error card.
+        let fail = RetainedState::around(
+            activation,
+            crate::spec::state::<EchoStub>(),
+            StateLoss::FailActivation,
+            on_activation,
+        )?;
+        if fail {
+            return Err(Error::failed(format!(
+                "echo-stub: {FAIL_AFTER_STORE} was delivered"
+            )));
+        }
+        // Mount and both send gestures are answered with nothing: the mount call
+        // has no reply dialect, and neither button's default action is one this
+        // component cancels.
         Ok(None)
     }
 }
@@ -101,17 +117,35 @@ brenn_guest::export_processor!(EchoStubComponent);
 ///
 /// A mount activation windows whatever input was already pending, so the build
 /// and the fold both run on it — a component is never told why it woke.
-fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<(), Error> {
+///
+/// Answers whether a [`FAIL_AFTER_STORE`] body was among the new envelopes,
+/// which the caller turns into a failure once the state has been written.
+fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<bool, Error> {
     if activation.sync_is(dom::MOUNT) {
         echo.view = Some(build_view());
     } else if let Some(port) = activation.sync() {
         on_gesture(port, echo)?;
     }
     let mut new_entries = 0usize;
+    let mut fail_after_store = false;
     for window in activation.delivered_windows() {
         // Matched through the specification enum so a rename fails at build
         // time rather than at runtime on the page.
-        let InPort::Messages = InPort::of(window)?;
+        match InPort::of(window)? {
+            InPort::Messages => {}
+            // The retained-state port is read and taken away by the cell this
+            // activation runs inside, so no window here is ever on it. Saying so
+            // as a refusal rather than a skip makes the guarantee executable:
+            // every activation of this kind carries the port, so a cell that
+            // stopped taking the window away fails the whole fixture suite
+            // instead of quietly handing a component its own state as traffic.
+            InPort::State => {
+                return Err(Error::failed(
+                    "the retained-state window reached the component's fold; the state cell takes \
+                     it off the activation it hands the body",
+                ));
+            }
+        }
         echo.drops += u64::from(window.dropped());
         for envelope in window.new_raw() {
             // Only new envelopes are rendered: the context is what this
@@ -123,13 +157,16 @@ fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<(), Err
             dom::append(echo.view().scrollback, entry);
             echo.entries.push_back(entry);
             new_entries += 1;
+            if envelope.contains(FAIL_AFTER_STORE) {
+                fail_after_store = true;
+            }
         }
     }
     if new_entries > 0 {
         trim_scrollback(echo);
     }
     update_status(echo);
-    Ok(())
+    Ok(fail_after_store)
 }
 
 /// Destroy the oldest entries past the cap, dropping this component's handles

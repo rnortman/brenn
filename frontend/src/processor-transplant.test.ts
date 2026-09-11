@@ -68,8 +68,15 @@ interface ScriptActivation {
     now: number | null;
 }
 
+/** One immediate publish as the transcript reduces it. */
+interface Publish {
+    port: string;
+    body: string;
+}
+
 /** One deferred publish as the transcript reduces it. */
 interface DeferredPublish {
+    port: string;
     body: string;
     deliver_after: number;
 }
@@ -85,7 +92,7 @@ interface TranscriptOp {
 
 interface TranscriptEntry {
     outcome: "ok" | "err" | "trap";
-    publishes: string[];
+    publishes: Publish[];
     deferred_publishes: DeferredPublish[];
     ops: TranscriptOp[];
 }
@@ -131,7 +138,7 @@ function envelope(pair: { id: string; body: string }): string {
  * the publishes.
  */
 interface Buffer {
-    publishes: string[];
+    publishes: Publish[];
     deferredPublishes: DeferredPublish[];
     ops: TranscriptOp[];
 }
@@ -174,15 +181,16 @@ async function harness(): Promise<Harness> {
         // an unsatisfiable `log` would fail instantiation outright.
         "brenn:processor/log": { log: () => {} },
         "brenn:processor/ports": {
-            publish: (_port: string, payload: string) => {
-                buffer.publishes.push(payload);
+            publish: (port: string, payload: string) => {
+                buffer.publishes.push({ port, body: payload });
             },
             publishDeferred: (
-                _port: string,
+                port: string,
                 payload: string,
                 deliverAfter: bigint,
             ) => {
                 buffer.deferredPublishes.push({
+                    port,
                     body: payload,
                     deliver_after: Number(deliverAfter),
                 });
@@ -220,11 +228,19 @@ async function harness(): Promise<Harness> {
     };
 }
 
-/** Drive the whole script against one instance and return the transcript. */
+/**
+ * Drive the whole script and return the transcript.
+ *
+ * One instance per activation: linear memory is activation-scoped on every
+ * host, and the report's `counter` reads that rule off the guest. Reusing one
+ * instance across the script would make this half disagree with the wasmtime
+ * half on the counter alone, which is the divergence the rule closes rather
+ * than a property of the transpiled seam.
+ */
 async function runScript(): Promise<TranscriptEntry[]> {
-    const { entry, reset, buffer } = await harness();
-
-    return script.activations.map((activation) => {
+    const transcript: TranscriptEntry[] = [];
+    for (const activation of script.activations) {
+        const { entry, reset, buffer } = await harness();
         reset();
         const record: KernelActivation = {
             ports: activation.ports.map((p) => ({
@@ -264,20 +280,22 @@ async function runScript(): Promise<TranscriptEntry[]> {
             );
         }
         if (outcome !== "ok") {
-            return {
+            transcript.push({
                 outcome,
                 publishes: [],
                 deferred_publishes: [],
                 ops: [],
-            };
+            });
+            continue;
         }
-        return {
+        transcript.push({
             outcome,
             publishes: buffer().publishes,
             deferred_publishes: buffer().deferredPublishes,
             ops: buffer().ops,
-        };
-    });
+        });
+    }
+    return transcript;
 }
 
 describe("processor transplant — surface hosting", () => {
@@ -403,7 +421,7 @@ describe("processor transplant — surface hosting", () => {
             if (entry.outcome !== "ok") {
                 return scripted[i];
             }
-            const summary = JSON.parse(entry.publishes[0]) as {
+            const summary = JSON.parse(entry.publishes[0].body) as {
                 deferred: KernelActivation["deferred"];
                 now: number | null;
             };

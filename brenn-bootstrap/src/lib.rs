@@ -107,6 +107,30 @@ fn log_mounts(mounts: &LoadedMounts) {
     }
 }
 
+/// Raise one warning per kind this boot withholds.
+///
+/// A kind a bundle offers under a record this binary cannot read is withheld
+/// rather than fatal, so the process is up and nothing else says so: the alert
+/// is the operator's only unprompted notice that a configured instance is dead
+/// until the bundle is re-released.
+///
+/// One function rather than a block inside `run_server` because the reload
+/// suite's boot fixture has to raise exactly what boot raises — a fixture that
+/// skipped it would leave this loop reachable from no test at all, and one that
+/// transcribed it would be asserting the transcription.
+pub(crate) fn alert_withheld_kinds(
+    alert_dispatcher: &brenn_obs::alerting::AlertDispatcher,
+    roots: &brenn_surface_server::SurfaceRoots,
+) {
+    for held in roots.withheld.values() {
+        alert_dispatcher.alert(
+            brenn_obs::alerting::AlertSeverity::Warning,
+            brenn_surface_server::WITHHELD_ALERT_TITLE.to_string(),
+            held.alert_body(),
+        );
+    }
+}
+
 /// Publish the surface self-description family a boot publishes: the topology
 /// index, every surface's and every kind's help, each kind's schema, one
 /// bindings document per surface, and a boot `disconnected` stamp per surface.
@@ -533,6 +557,7 @@ pub async fn run_server(
         &surface_asset_roots,
         &messaging_result.surfaces,
     );
+    alert_withheld_kinds(&guard.alert_dispatcher, &surface_roots);
 
     if let Some(messenger) = messenger {
         publish_boot_surface_documents(

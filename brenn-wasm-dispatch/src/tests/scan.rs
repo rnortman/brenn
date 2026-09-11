@@ -21,7 +21,7 @@ async fn single_scan_per_drain_step_regardless_of_k() {
 
     // Snapshot the counter immediately before the drain step.
     let before = messenger.pending_bus_pushes_scan_count();
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     let after = messenger.pending_bus_pushes_scan_count();
 
     assert_eq!(
@@ -71,8 +71,8 @@ async fn order_preserving_partition_delivers_all_rows() {
     // portion in ascending retention order (= publish_ts_ns ASC, id ASC).
     // This directly pins AC 3 "within a channel" without relying on the demo guest.
     let pre_scan_before = messenger.pending_bus_pushes_scan_count();
-    let pre_snapshots = messenger
-        .load_activation_snapshot(&wasm_sub, &cfg.inputs)
+    let (_wake, pre_snapshots) = messenger
+        .load_activation_snapshot(&wasm_sub, &cfg.inputs, MountDebt::Settled)
         .await
         .expect("expected Some — all channels have pending rows");
     let pre_scan_after = messenger.pending_bus_pushes_scan_count();
@@ -99,7 +99,7 @@ async fn order_preserving_partition_delivers_all_rows() {
     }
 
     let before = messenger.pending_bus_pushes_scan_count();
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     let after = messenger.pending_bus_pushes_scan_count();
 
     // +1 from the pre-drain load_activation_snapshot call above + 1 from drain = 2 total.
@@ -131,7 +131,7 @@ async fn all_channels_with_pending_rows_are_visited() {
         testutils::insert_bus_message(&messenger, channel, "body", ChannelScheme::Brenn).await;
     }
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let rows = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(rows.is_empty(), "all channels visited and rows delivered");
@@ -153,7 +153,7 @@ async fn empty_channels_skipped_no_scan_per_empty_channel() {
     testutils::insert_bus_message(&messenger, &channels[0], "only-row", ChannelScheme::Brenn).await;
 
     let before = messenger.pending_bus_pushes_scan_count();
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     let after = messenger.pending_bus_pushes_scan_count();
 
     // Exactly one scan, regardless of empty channels.

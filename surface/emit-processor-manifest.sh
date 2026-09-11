@@ -15,6 +15,13 @@
 # read out of the artifact itself (never hand-written) and is the import profile
 # boot validation checks against the transpilable set.
 #
+# The record version is the hosting contract the artifact was built against, not
+# just this file's shape: v3 is the transpile that instantiates per activation
+# (`--instantiation sync`, core modules named by the record's `files` rather than
+# discovered by the glue). A v2 tree is refused at boot because a kind built
+# against it may keep state in linear memory across activations, which the host
+# no longer gives it.
+#
 # `spec_sha256` binds the tree to the specification the component was authored
 # against, the same way the backend package record binds a component to its
 # spec: the deployment's configuration compiled against exactly those bytes, so
@@ -72,7 +79,7 @@ json_array() {
 
 {
     printf '{\n'
-    printf '  "v": 2,\n'
+    printf '  "v": 3,\n'
     printf '  "kind": "%s",\n' "$(json_escape "$kind")"
     printf '  "source_sha256": "%s",\n' "$(json_escape "$sha")"
     printf '  "jco_version": "%s",\n' "$(json_escape "$jco_version")"

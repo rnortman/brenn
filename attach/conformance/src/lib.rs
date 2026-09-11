@@ -2,8 +2,10 @@
 //!
 //! [`AttachClient`] embeds `brenn-attach-client` the way a native daemon would:
 //! it opens a native websocket, negotiates a version, subscribes channels,
-//! publishes onto them, reads what comes back, and survives a severed transport
-//! by resuming each subscription from the cursor it held. It knows nothing of
+//! publishes onto them one at a time or as one activation's atomic flush, parks
+//! messages for later and acts on the parked set the peer mirrors back, reads
+//! what comes back, and survives a severed transport by resuming each
+//! subscription from the cursor it held. It knows nothing of
 //! components, ports, mounts, or pixels — it has no surface crate to know them
 //! from — so whatever it can drive is, by construction, drivable by an attacher
 //! with no page behind it.
@@ -30,20 +32,22 @@ use std::time::Duration;
 
 use brenn_attach_client::conn::{ConnConfig, ConnEvent};
 use brenn_attach_client::driver::{AttachDriver, DriverStep, IoEvent};
-use brenn_attach_client::publish::PendingPublishes;
+use brenn_attach_client::publish::{DeferredViews, OutboxSteps, Outboxes, PendingPublishes};
 use brenn_attach_client::subs::{DeliverDisposition, Subscriptions};
 use brenn_attach_client::transport::native::NativeConnector;
 use brenn_attach_proto::{
-    AlertSeverity, ClientFrame, DeferredViewEntry, PublishBatchOutcome, PublishOutcome,
-    ServerFrame, VersionRange,
+    AlertSeverity, ClientFrame, PublishOutcome, ServerFrame, Urgency, VersionRange,
 };
 
 // The vocabulary this client's own API is stated in, re-exported so a caller
 // names it through the crate it is calling rather than reaching past it.
 pub use brenn_attach_client::conn::{AttachmentFacts, DetachReason};
-pub use brenn_attach_client::publish::PublishRequest;
+pub use brenn_attach_client::publish::{FlushBatch, PublishRequest};
 pub use brenn_attach_client::subs::{
     ResumePolicy, SubscribeAck, SubscribeSettlement, SubscriptionDepths,
+};
+pub use brenn_attach_proto::{
+    BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, PublishBatchOutcome,
 };
 
 /// How long any awaited helper will pump before it gives up and panics.
@@ -113,12 +117,20 @@ pub enum Observation {
         correlation: u64,
         outcome: PublishOutcome,
     },
-    /// A batch flush was answered. This client sends no batches itself; the
-    /// variant exists so an unexpected one is a visible observation rather than
-    /// a silent drop.
+    /// A batch flush was answered, and the outbox plane has settled it.
     BatchPublished {
         correlation: u64,
         outcome: PublishBatchOutcome,
+    },
+    /// A whole flush the outbox plane dropped — at a registrant's depth cap, or
+    /// with the registration that owned it. Named rather than counted, because a
+    /// drop is never silent.
+    FlushDropped { registrant: String },
+    /// A flush the peer refused after nobody was left to own it: ok'd entries
+    /// that will never be applied anywhere.
+    FlushLost {
+        registrant: String,
+        batch: Box<FlushBatch>,
     },
     /// The peer's snapshot of what one sub-identity has parked on one channel.
     Deferred {
@@ -163,6 +175,13 @@ pub struct AttachClient {
     /// the observation queue rather than from a routing table, so the tag exists
     /// only to name what was lost when a transport dies mid-publish.
     pending: PendingPublishes<u64>,
+    /// The atomic-flush plane, keyed by a registrant name this crate's caller
+    /// chooses. A daemon's registrant is whatever unit of its own produces one
+    /// activation's flush; nothing about the key reaches the wire.
+    outboxes: Outboxes<String>,
+    /// The peer's parked-set mirrors. Read-only here — the server is the parked
+    /// set's authority, and this is the client's copy of what it last said.
+    views: DeferredViews,
     next_correlation: u64,
     observed: VecDeque<Observation>,
     started: bool,
@@ -205,6 +224,8 @@ impl AttachClient {
             driver,
             subs: Subscriptions::new(),
             pending: PendingPublishes::new(),
+            outboxes: Outboxes::new(),
+            views: DeferredViews::new(),
             next_correlation: 1,
             observed: VecDeque::new(),
             started: false,
@@ -355,6 +376,110 @@ impl AttachClient {
         correlation
     }
 
+    /// Open an outbox for `registrant`, flushing under `attribution` and holding
+    /// at most `depth` whole flushes while there is no wire.
+    ///
+    /// The atomic-flush plane is where deferral lives: parking a message, and
+    /// the control ops against one already parked, ride
+    /// [`ClientFrame::PublishBatch`] and nothing else.
+    pub fn register_outbox(&mut self, registrant: &str, attribution: Option<&str>, depth: u64) {
+        self.outboxes.register(
+            registrant.to_string(),
+            attribution.map(str::to_string),
+            depth,
+        );
+    }
+
+    /// Offer one activation's whole flush to `registrant`'s outbox and send
+    /// whatever that produced.
+    ///
+    /// Returns without waiting: a flush is answered by a
+    /// [`Observation::BatchPublished`], which the caller awaits with
+    /// [`AttachClient::next_batch_outcome`], and a flush offered while the outbox
+    /// is blocked is not on the wire at all yet.
+    pub async fn flush(&mut self, registrant: &str, batch: FlushBatch) {
+        let now = self.driver.now();
+        let steps = self.outboxes.flush(registrant, batch, now);
+        let frames = self.take_outbox_steps(steps);
+        self.write(frames).await;
+    }
+
+    /// One flush carrying one buffered publish, parked at `deliver_after` when
+    /// that is `Some`.
+    pub fn parking(channel: &str, body: &str, deliver_after: Option<u64>) -> FlushBatch {
+        FlushBatch {
+            entries: vec![BatchEntry {
+                channel: channel.to_string(),
+                body: body.to_string(),
+                urgency: Urgency::Normal,
+                deliver_after,
+            }],
+            ops: Vec::new(),
+        }
+    }
+
+    /// One flush carrying one control op against a message this sender parked.
+    ///
+    /// The target is named by the view entry rather than by a bare id, which is
+    /// the only way a conforming attacher can name one: the ids it may act on
+    /// are exactly those a sender-scoped [`ServerFrame::DeferredView`] showed it.
+    pub fn controlling(
+        channel: &str,
+        target: &DeferredViewEntry,
+        op: DeferredOpKind,
+    ) -> FlushBatch {
+        FlushBatch {
+            entries: Vec::new(),
+            ops: vec![BatchDeferredOp {
+                channel: channel.to_string(),
+                message_id: target.message_id,
+                op,
+            }],
+        }
+    }
+
+    /// The next batch answer, pumping until one arrives.
+    pub async fn next_batch_outcome(&mut self) -> PublishBatchOutcome {
+        match self
+            .take_first("a batch answer", true, |o| {
+                matches!(o, Observation::BatchPublished { .. })
+            })
+            .await
+        {
+            Observation::BatchPublished { outcome, .. } => outcome,
+            other => unreachable!("the predicate admits only BatchPublished, got {other:?}"),
+        }
+    }
+
+    /// The next parked-set snapshot for `channel`, pumping until one arrives.
+    ///
+    /// A snapshot, not a delta: what it carries is the whole of what the peer
+    /// says that sender holds on that channel at that instant.
+    pub async fn next_deferred_view(
+        &mut self,
+        channel: &str,
+        attribution: Option<&str>,
+    ) -> Vec<DeferredViewEntry> {
+        let channel = channel.to_string();
+        let attribution = attribution.map(str::to_string);
+        match self
+            .take_first("a deferred view", true, |o| {
+                matches!(o, Observation::Deferred { channel: c, attribution: a, .. }
+                    if *c == channel && *a == attribution)
+            })
+            .await
+        {
+            Observation::Deferred { entries, .. } => entries,
+            other => unreachable!("the predicate admits only Deferred, got {other:?}"),
+        }
+    }
+
+    /// The mirror this client holds for `(channel, attribution)` right now, with
+    /// no pumping — what a daemon's own logic would read before it acts.
+    pub fn parked_view(&self, channel: &str, attribution: Option<&str>) -> &[DeferredViewEntry] {
+        self.views.get(channel, attribution)
+    }
+
     /// Send an alert.
     ///
     /// Fire-and-forget by the protocol's own shape rather than by choice: the
@@ -489,8 +614,14 @@ impl AttachClient {
                 let step = self.driver.on_input(input).await;
                 self.absorb(step).await;
             }
-            // Neither deadline is ever armed: this client registers no outbox
-            // and hosts no confined channel, so nothing here can arm one.
+            IoEvent::RetryDue => {
+                let now = self.driver.now();
+                let steps = self.outboxes.on_retry_tick(now);
+                let frames = self.take_outbox_steps(steps);
+                self.write(frames).await;
+            }
+            // The release deadline is never armed: this client hosts no confined
+            // channel, so there is no page-local parked set to release from.
             other => panic!("attach conformance: an unarmed deadline fired: {other:?}"),
         }
     }
@@ -534,12 +665,26 @@ impl AttachClient {
                 // Before the observation: a caller that awaits the attachment
                 // and immediately asserts on a subscription must not be able to
                 // observe the gap between the two.
-                let frames = self.subs.on_attached();
+                let mut frames = self.subs.on_attached();
+                // Must clear before the peer's re-seed: a mirror that survived
+                // the gap could name messages nobody holds.
+                self.views.clear();
+                let now = self.driver.now();
+                // Every queued flush survives: this client states no contract of
+                // its own that a flush could stop satisfying between two
+                // attachments.
+                let steps =
+                    self.outboxes
+                        .on_attached(facts.max_body_bytes as usize, now, |_, _| true);
+                frames.extend(self.take_outbox_steps(steps));
                 self.observed.push_back(Observation::Attached(facts));
                 self.emit(frames).await
             }
             ConnEvent::Detached { reason } => {
                 self.subs.on_detached();
+                let steps = self.outboxes.on_detached();
+                let frames = self.take_outbox_steps(steps);
+                debug_assert!(frames.is_empty(), "a detach produces no frames to send");
                 for (correlation, _) in self.pending.fail_all() {
                     self.observed
                         .push_back(Observation::PublishLost { correlation });
@@ -639,17 +784,28 @@ impl AttachClient {
                 correlation,
                 outcome,
             } => {
+                let now = self.driver.now();
+                let answer = self.outboxes.on_batch_result(correlation, outcome, now)?;
+                if let Some(batch) = answer.lost {
+                    self.observed.push_back(Observation::FlushLost {
+                        registrant: answer.registrant,
+                        batch: Box::new(batch),
+                    });
+                }
+                let frames = self.take_outbox_steps(answer.steps);
                 self.observed.push_back(Observation::BatchPublished {
                     correlation,
                     outcome,
                 });
-                Ok(Vec::new())
+                Ok(frames)
             }
             ServerFrame::DeferredView {
                 channel,
                 attribution,
                 entries,
             } => {
+                self.views
+                    .on_view(channel.clone(), attribution.clone(), entries.clone());
                 self.observed.push_back(Observation::Deferred {
                     channel,
                     attribution,
@@ -674,6 +830,15 @@ impl AttachClient {
             return None;
         }
         Some(self.driver.send(frames).await)
+    }
+
+    fn take_outbox_steps(&mut self, steps: OutboxSteps<String>) -> Vec<ClientFrame> {
+        self.driver.set_retry_wakeup(steps.retry_wakeup);
+        for registrant in steps.dropped {
+            self.observed
+                .push_back(Observation::FlushDropped { registrant });
+        }
+        steps.frames
     }
 
     /// [`emit`](AttachClient::emit) for a caller-initiated write, absorbing what

@@ -179,7 +179,7 @@ async fn retained_bodies(store: &dyn RetentionStore) -> Vec<String> {
 
 async fn deferred_bodies(store: &dyn RetentionStore, sender: &str) -> Vec<String> {
     store
-        .deferred_for_sender(sender, now())
+        .deferred_for_sender(sender)
         .await
         .iter()
         .map(|d| d.envelope.body.clone())
@@ -378,11 +378,13 @@ async fn deferred_view_is_sender_scoped_and_release_ordered() {
     }
 }
 
-/// The channel-wide peer of the sender view: every holder named once, sorted,
-/// on the same maturity boundary the sender views use — a sender whose only
-/// entry has come due is gone from both, because there is nothing left to view.
+/// The channel-wide peer of the sender view, on the *authority* boundary
+/// rather than the view's: every holder of something still cancellable, named
+/// once, sorted. A sender whose only entry has come due is absent, because its
+/// caller is offering an operator ops to run and a due entry is past acting on
+/// — while the sender's own view still shows that entry.
 #[tokio::test]
-async fn deferred_senders_names_every_holder_once_on_the_view_boundary() {
+async fn deferred_senders_names_every_holder_once_on_the_authority_boundary() {
     for store in stores(DEPTH).await {
         for (sender, body, offset) in [
             ("bob", "b", 60),
@@ -409,12 +411,18 @@ async fn deferred_senders_names_every_holder_once_on_the_view_boundary() {
             "the matured entry still holds its cap slot: {}",
             store.address()
         );
+        assert_eq!(
+            deferred_bodies(&*store, "carol").await,
+            vec!["matured"],
+            "carol's own view still holds the due entry: {}",
+            store.address()
+        );
         assert!(
             store
                 .deferred_senders(now() + Duration::seconds(120))
                 .await
                 .is_empty(),
-            "past every release time nothing is viewable: {}",
+            "past every release time nothing is actionable: {}",
             store.address()
         );
     }
@@ -452,9 +460,10 @@ async fn a_matured_but_unreleased_message_still_holds_its_cap_slot() {
         // Time passes, but nothing calls `release_due`.
         let after = release_at + Duration::seconds(1);
         assert_eq!(store.deferred_len().await, 1, "{}", store.address());
-        assert!(
-            store.deferred_for_sender("alice", after).await.is_empty(),
-            "a matured message is out of the sender view: {}",
+        assert_eq!(
+            store.deferred_for_sender("alice").await.len(),
+            1,
+            "a matured message is still in the sender view: {}",
             store.address()
         );
         let err = store
@@ -550,7 +559,8 @@ async fn cancel_removes_the_parked_message_entirely() {
 }
 
 /// A message that released between the view the caller acted on and the call is
-/// a reportable no-op, not a failure.
+/// a reportable no-op, not a failure. Nothing of it is held, so the outcome
+/// names no instant.
 #[tokio::test]
 async fn cancel_after_release_is_a_no_op() {
     for store in stores(DEPTH).await {
@@ -563,7 +573,9 @@ async fn cancel_after_release_is_a_no_op() {
             store
                 .cancel_deferred("alice", parked.message_uuid, now())
                 .await,
-            DeferralOutcome::NotDeferred,
+            DeferralOutcome::NotDeferred {
+                deliver_after: None
+            },
             "{}",
             store.address()
         );
@@ -575,7 +587,9 @@ async fn cancel_of_an_unknown_message_is_a_no_op() {
     for store in stores(DEPTH).await {
         assert_eq!(
             store.cancel_deferred("alice", Uuid::new_v4(), now()).await,
-            DeferralOutcome::NotDeferred,
+            DeferralOutcome::NotDeferred {
+                deliver_after: None
+            },
             "{}",
             store.address()
         );
@@ -680,7 +694,84 @@ async fn edit_after_release_is_a_no_op() {
                     now()
                 )
                 .await,
-            DeferralOutcome::NotDeferred,
+            DeferralOutcome::NotDeferred {
+                deliver_after: None
+            },
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// The view and the authority reads answer on different boundaries, alike on
+/// both stores: an entry whose release instant has passed with no release pass
+/// run is in its sender's view, carrying that past instant, and is past
+/// cancelling or editing. That is what lets an empty view mean "nothing
+/// standing" at every instant — the re-arm rule a self-ticking component
+/// reconciles from.
+#[tokio::test]
+async fn a_due_but_unreleased_entry_is_shown_and_is_not_cancellable() {
+    for store in stores(DEPTH).await {
+        let release_at = soon();
+        let msg = message_for(&*store, "alice", "due");
+        let parked = store.park(msg, release_at).await.expect("within cap");
+
+        // Its instant passes; nothing calls `release_due`.
+        let after = release_at + Duration::seconds(1);
+
+        let view = store.deferred_for_sender("alice").await;
+        assert_eq!(
+            view.iter().map(|d| d.release_at).collect::<Vec<_>>(),
+            vec![release_at],
+            "the view carries the instant that has passed: {}",
+            store.address()
+        );
+        assert_eq!(
+            store
+                .cancel_deferred("alice", parked.message_uuid, after)
+                .await,
+            DeferralOutcome::NotDeferred {
+                deliver_after: Some(release_at)
+            },
+            "a due entry is past cancelling, and the outcome names when it came \
+             due: {}",
+            store.address()
+        );
+        assert_eq!(
+            store
+                .edit_deferred(
+                    "alice",
+                    parked.message_uuid,
+                    Some("edited".into()),
+                    None,
+                    after
+                )
+                .await,
+            DeferralOutcome::NotDeferred {
+                deliver_after: Some(release_at)
+            },
+            "{}",
+            store.address()
+        );
+        assert!(
+            store.deferred_senders(after).await.is_empty(),
+            "a sender whose only entry is due holds nothing actionable: {}",
+            store.address()
+        );
+        assert_eq!(
+            deferred_bodies(&*store, "alice").await,
+            vec!["due"],
+            "the refused ops leave the entry alone: {}",
+            store.address()
+        );
+        assert_eq!(
+            store.release_due(after).await.released.len(),
+            1,
+            "release is what takes it: {}",
+            store.address()
+        );
+        assert!(
+            deferred_bodies(&*store, "alice").await.is_empty(),
             "{}",
             store.address()
         );

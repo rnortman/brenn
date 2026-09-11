@@ -1,14 +1,14 @@
 //! Activation pacing tests.
 //!
 //! These exercise `ActivationPacer` — the per-component activation gate — at the
-//! `admit` level, which is where every drain step (startup sweep + each notified
+//! `admit` level, which is where every drain step (the mount activation + each notified
 //! wake) is paced. The pacer owns everything it touches (its bucket, slug, and
 //! alert sink), so these tests construct it directly — no `WasmConsumerConfig`,
 //! no messenger, no SQLite. That keeps the timing pure (bucket + `sleep`), so
 //! paused-time assertions are deterministic — auto-advance cannot race a
 //! blocking call on the `admit` path.
 //!
-//! The one exception is `startup_sweep_drains_a_backlog_through_the_real_task`,
+//! The one exception is `the_mount_activation_drains_a_backlog_through_the_real_task`,
 //! which drives the real consumer task end-to-end (`spawn_wasm_consumer_task`)
 //! and therefore does build a messenger and use real time (see its own comment).
 //!
@@ -38,10 +38,10 @@ fn noop_pacer(slug: &str, pacing: ActivationPacing) -> ActivationPacer {
     ActivationPacer::new(pacing, slug.to_string(), dispatcher)
 }
 
-/// Burst admission plus the startup sweep: a fresh bucket admits `burst`
+/// Burst admission plus the mount activation: a fresh bucket admits `burst`
 /// activations back-to-back with no delay and never opens a throttle episode.
-/// The first admit models the startup sweep — paced through the same gate, but
-/// never delayed from a full bucket.
+/// The first admit models the mount activation — paced through the same gate,
+/// but never delayed from a full bucket.
 #[tokio::test(start_paused = true)]
 async fn burst_passes_untouched() {
     let pacing = ActivationPacing {
@@ -271,11 +271,11 @@ async fn second_episode_relogs_but_does_not_realert() {
 }
 
 /// The consumer task end to end: a backlog left by a prior process is dispatched
-/// by the startup sweep alone, with no wake ever sent. This is the one property
-/// no `drain_step` test can see — the sweep, the `notified()` loop, and the pacer
-/// crossing a real activation — so it runs the real task on real time.
+/// by the mount activation alone, with no wake ever sent. This is the one
+/// property no `drain_step` test can see — the mount, the `notified()` loop, and
+/// the pacer crossing a real activation — so it runs the real task on real time.
 #[tokio::test]
-async fn startup_sweep_drains_a_backlog_through_the_real_task() {
+async fn the_mount_activation_drains_a_backlog_through_the_real_task() {
     let slug = "pacing-sweep";
     let (messenger, channel, wasm_sub) = testutils::build_wasm_messenger(
         slug,
@@ -302,8 +302,8 @@ async fn startup_sweep_drains_a_backlog_through_the_real_task() {
         Depth::Bounded(2),
         Depth::Bounded(0),
     );
-    // A burst of 1: the sweep's own activation is the token, so the gate is
-    // crossed for real rather than configured away.
+    // A burst of 1: the mount activation is the token, so the gate is crossed
+    // for real rather than configured away.
     cfg.activation_pacing = ActivationPacing {
         burst: 1,
         min_period: Duration::from_millis(50),
@@ -313,6 +313,6 @@ async fn startup_sweep_drains_a_backlog_through_the_real_task() {
 
     assert!(
         wait_pending_empty(&messenger, &wasm_sub, Duration::from_secs(5)).await,
-        "the startup sweep alone must dispatch a backlog left by a prior process"
+        "the mount activation alone must dispatch a backlog left by a prior process"
     );
 }

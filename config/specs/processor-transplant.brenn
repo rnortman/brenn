@@ -6,18 +6,30 @@
 ///
 /// The guest is deliberately input-agnostic: it iterates whatever input windows
 /// the host binds and summarizes each one, so no input port is load-bearing for
-/// it. Both inputs are therefore optional, and the two named here are the ones
-/// the harnesses bind — a deployment that bound neither would still get a
+/// it. Every input is therefore optional, and the ones named here are the ones
+/// the harnesses bind — a deployment that bound none of them would still get a
 /// well-formed transcript.
 ///
-/// `out` is not optional: every activation publishes its summary there, and the
-/// deferral markers name it as the only port they park, cancel, and edit on.
-/// Bodies are free-form (a JSON summary, echo markers), so no port carries a
-/// doctype.
+/// `sampled` is the port a host conformance run binds at `push_depth = 0`: a
+/// window that is context only and never wakes its owner. The guest treats it
+/// like any other input, so what the port proves is the host's gate, not the
+/// guest's.
+///
+/// `tick` is the self-publish chain: the guest parks its next tick on it when
+/// the port's deferred window is empty and config names `tick_ms`, so a
+/// standing tick is re-armed exactly once however many activations see it.
+///
+/// `out` and `report` are not optional. Every activation publishes its
+/// activation report on `report`; `out` carries the echo markers and is the
+/// only port the deferral markers park, cancel, and edit on. Bodies are
+/// free-form (a JSON report, echo markers), so no port carries a doctype.
 component ProcessorTransplant {
   abi = processor;
   requires = [ports, log, config];
   optional in in;
   optional in ctx;
+  optional in sampled;
+  optional io tick;
   out out;
+  out report;
 }

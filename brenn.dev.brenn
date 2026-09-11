@@ -204,7 +204,9 @@ new pfin: Pfin;
 // subsumes its predecessor. Event streams (`toast`, `takeover`) keep the burst
 // depth, and an unbound `io tick`/`io toast-tick` resolves to an anonymous
 // page-local ring where a wake subsumes its predecessor and `retain_depth = 2`
-// covers a cancel and its replacement.
+// covers a cancel and its replacement. An `io state` port is the same anonymous
+// ring at the depths a state variable takes: `retain_depth = 1` so the newest
+// body is always in context, `push_depth = 0` so writing it wakes nobody.
 /// The echo-loop fixture. `alert` is granted because `noise = alarm` demands the
 /// alert plane, which boot checks.
 surface dev-stub {
@@ -213,6 +215,8 @@ surface dev-stub {
     grants = [ports, log, dom];
     in messages <- dev_stub { push_depth = 8; noise = alarm; }
     out out -> dev_stub;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   // TODO(standard-chrome-vocabulary): this block is transcribed once per page,
   // here and in every repository that authors one; the reserved plane names are
@@ -225,6 +229,7 @@ surface dev-stub {
     in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
     in toast <- "local:brenn/toast" { push_depth = 8; }
     io toast-tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
 
@@ -238,18 +243,21 @@ surface bar {
     grants = [ports, log, dom];
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new p2: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_b;
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new p3: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_c;
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new mode: ModeClock {
@@ -257,6 +265,7 @@ surface bar {
     in config <- bar_mode { push_depth = 1; }
     out theme -> "local:brenn/theme";
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new meeting: Meeting {
@@ -265,6 +274,7 @@ surface bar {
     io acks <-> bar_acks;
     out takeover -> "local:brenn/takeover";
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new chrome: Chrome {
@@ -278,6 +288,7 @@ surface bar {
     in toast <- "local:brenn/toast" { push_depth = 8; }
     out overlay-state -> "local:brenn/overlay-state";
     io toast-tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
 
@@ -292,18 +303,21 @@ surface bar-pixel {
     grants = [ports, log, dom];
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new p2: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_b;
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new p3: Protobar {
     grants = [ports, log, dom];
     in messages <- bar_c;
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new meeting: Meeting {
@@ -312,6 +326,7 @@ surface bar-pixel {
     io acks <-> bar_acks;
     out takeover -> "local:brenn/takeover";
     io tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
   new chrome: Chrome {
@@ -325,6 +340,7 @@ surface bar-pixel {
     in toast <- "local:brenn/toast" { push_depth = 8; }
     out overlay-state -> "local:brenn/overlay-state";
     io toast-tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
 
@@ -340,30 +356,44 @@ surface bar-feeder {
   new feed-a: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_a;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-b: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_b;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-c: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_c;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-layout: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_layout;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-mode: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_mode;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-agenda: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_agenda;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-acks: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_acks;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new chrome: Chrome {
     grants = [ports, log, dom, page-dom];
@@ -373,6 +403,7 @@ surface bar-feeder {
     in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
     in toast <- "local:brenn/toast" { push_depth = 8; }
     io toast-tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
 

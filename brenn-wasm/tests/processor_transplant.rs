@@ -30,6 +30,20 @@ use brenn_wasm::{
 use std::collections::HashMap;
 
 const OUT_CHANNEL: &str = "brenn:transplant-out";
+const REPORT_CHANNEL: &str = "brenn:transplant-report";
+const TICK_CHANNEL: &str = "brenn:transplant-tick";
+
+/// The port a published message came out of, named from the channel it landed
+/// on — the host carries the address, the transcript carries the port, because
+/// the port is what the script and the surface half both speak.
+fn port_of(channel_address: &str) -> &'static str {
+    match channel_address {
+        OUT_CHANNEL => "out",
+        REPORT_CHANNEL => "report",
+        TICK_CHANNEL => "tick",
+        other => panic!("the fixture published to an unbound channel: {other}"),
+    }
+}
 
 fn script() -> serde_json::Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -157,14 +171,12 @@ fn transcript_entry(outcome: ProcessorOutcome) -> serde_json::Value {
             let mut immediate: Vec<serde_json::Value> = Vec::new();
             let mut deferred: Vec<serde_json::Value> = Vec::new();
             for p in &publishes {
-                assert_eq!(
-                    p.channel_address, OUT_CHANNEL,
-                    "the fixture publishes only to its one bound output port"
-                );
+                let port = port_of(&p.channel_address);
                 match p.deliver_after {
-                    None => immediate.push(serde_json::Value::String(p.payload.clone())),
-                    Some(when) => deferred
-                        .push(serde_json::json!({ "body": p.payload, "deliver_after": when })),
+                    None => immediate.push(serde_json::json!({ "port": port, "body": p.payload })),
+                    Some(when) => deferred.push(serde_json::json!({
+                        "port": port, "body": p.payload, "deliver_after": when
+                    })),
                 }
             }
             let ops: Vec<serde_json::Value> = deferred_ops.iter().map(op_entry).collect();
@@ -191,6 +203,8 @@ fn transcript_entry(outcome: ProcessorOutcome) -> serde_json::Value {
 fn load(config: HashMap<String, String>) -> ProcessorComponent {
     let mut output_ports = HashMap::new();
     output_ports.insert("out".to_string(), common::out_spec(OUT_CHANNEL));
+    output_ports.insert("report".to_string(), common::out_spec(REPORT_CHANNEL));
+    output_ports.insert("tick".to_string(), common::out_spec(TICK_CHANNEL));
     // The transpilable profile, exactly: ports + log + config. No store, mqtt,
     // or tools — importing any of those would make the artifact backend-only
     // and its surface declaration a boot panic.
@@ -202,6 +216,8 @@ fn load(config: HashMap<String, String>) -> ProcessorComponent {
         input_amplification_mt: HashMap::from([
             ("in".to_string(), 1000u64),
             ("ctx".to_string(), 1000u64),
+            ("sampled".to_string(), 1000u64),
+            ("tick".to_string(), 1000u64),
         ]),
         mqtt_sinks: HashMap::new(),
         config,

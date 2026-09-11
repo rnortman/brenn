@@ -4,8 +4,8 @@ use super::*;
 
 /// Publish one `brenn:` message to a channel with a WASM subscriber.
 /// After `drain_all_channels`, the push row is marked delivered (no pending rows).
-/// `drain_all_channels` is the startup-sweep / drain step: it assembles the window
-/// and invokes the guest (demo component → Ok).
+/// `drain_all_channels` is the drain step: it assembles the window and invokes
+/// the guest (demo component → Ok).
 #[tokio::test]
 async fn brenn_message_creates_push_row_and_consumer_invoked_once() {
     let slug = "consumer-fanout";
@@ -31,7 +31,7 @@ async fn brenn_message_creates_push_row_and_consumer_invoked_once() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // After drain: the row is delivered (no more pending).
     let rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -75,7 +75,7 @@ async fn batching_n_messages_delivered_in_one_invocation() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // After one drain step: all rows delivered.
     let rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -119,7 +119,7 @@ async fn retained_context_prefix_in_window() {
         )
         .await;
     }
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Verify those 2 rows are now delivered.
     let pending_after_first =
@@ -134,7 +134,7 @@ async fn retained_context_prefix_in_window() {
 
     // Drain again — the window should have context prefix from the 2 prior messages.
     // The demo component accepts the window (Ok). Assert the 3rd row is delivered.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     let pending_after_second =
         brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
@@ -143,14 +143,14 @@ async fn retained_context_prefix_in_window() {
     );
 }
 
-// ── Crash-recovery (startup sweep) AC ────────────────────────────────────
+// ── Crash-recovery (the mount activation) AC ─────────────────────────────
 
 /// Pre-insert a push row (simulating rows left undelivered by a crash) and
 /// run drain_all_channels without having processed the row in a prior drain.
-/// This is the "startup sweep" path: the task picks up undelivered rows and
-/// invokes the guest. The row must be delivered after the sweep.
+/// This is the mount-activation path: the task picks up undelivered rows and
+/// invokes the guest. The row must be delivered after the drain.
 #[tokio::test]
-async fn crash_recovery_startup_sweep_re_invokes_undelivered_rows() {
+async fn crash_recovery_mount_activation_re_invokes_undelivered_rows() {
     let slug = "consumer-crash";
     let (messenger, channel, wasm_sub) =
         testutils::build_wasm_messenger(slug, "crash-ch", Depth::Unbounded, Depth::Unbounded).await;
@@ -162,11 +162,15 @@ async fn crash_recovery_startup_sweep_re_invokes_undelivered_rows() {
 
     // Verify the message is owed (as it would be after a crash restart).
     let rows = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
-    assert_eq!(rows.len(), 1, "one unconsumed message before startup sweep");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one unconsumed message before the mount activation"
+    );
     assert_eq!(rows[0].0, channel.address);
 
-    // Startup sweep: drain_all_channels runs once (before any wake — simulates
-    // the task body's unconditional first drain in run_consumer).
+    // Mount activation: drain_all_channels runs once (before any wake —
+    // simulates the task body's unconditional first drain in run_consumer).
     let (cfg, _handle, _db) = build_cfg(
         slug,
         Arc::clone(&messenger),
@@ -174,13 +178,13 @@ async fn crash_recovery_startup_sweep_re_invokes_undelivered_rows() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // The row must now be delivered — at-least-once on the Immediate no-deadline case.
     let rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_after.is_empty(),
-        "startup sweep must deliver the undelivered row (crash recovery AC)"
+        "the mount activation must deliver the undelivered row (crash recovery AC)"
     );
 }
 
@@ -246,7 +250,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
         activation_pacing: unthrottled_pacing(),
     };
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Ack-at-start: the position moved past the batch BEFORE the guest ran, not
     // only on a successful outcome. A regression to advance-on-Ok-only would leave
@@ -258,7 +262,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
     );
 
     // A second drain must find nothing new (no redelivery loop — N=1 terminal).
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     let rows_second = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_second.is_empty(),
@@ -409,7 +413,7 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // After drain: row delivered.
     let rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -448,7 +452,7 @@ async fn push_depth_zero_wasm_subscription_never_invoked() {
         Depth::Unbounded,
     );
     // Drain finds nothing and invokes nothing — no panic, no error.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     let owed_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(owed_after.is_empty(), "and is owed nothing after it");
 }

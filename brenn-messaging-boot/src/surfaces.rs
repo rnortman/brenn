@@ -181,31 +181,6 @@ pub(super) fn assert_page_queue_deliverable(
     );
 }
 
-/// Refuse to start when a component instance has input bindings but not one that
-/// can ever activate it.
-///
-/// The instance grain, not the surface's: activations are minted per instance,
-/// so a surface with one triggering component says nothing about a sibling whose
-/// every port is context-only. `resolve_wasm_consumers` makes the same check at
-/// its own principal's grain.
-///
-/// An instance with *no* input bindings is untouched — a purely presentational
-/// component is live config. It still publishes: a gesture on it causes an
-/// activation of its own, which is where its publishes are made.
-///
-/// # Panics
-///
-/// When every one of the instance's input bindings resolves to `push_depth = 0`.
-pub(super) fn assert_instance_can_activate(slug: &str, instance: &str, push_depths: &[u64]) {
-    assert!(
-        push_depths.is_empty() || push_depths.iter().any(|d| *d >= 1),
-        "config: [[surface]] {slug:?}: component {instance:?} has {} input binding(s), all with \
-         push_depth = 0 (sampled/context-only) — this component can never activate, so its \
-         context windows are never read; at least one of its bindings must have push_depth > 0",
-        push_depths.len(),
-    );
-}
-
 /// Assert one resolved backstop burst covers a maximal conforming activation
 /// flush.
 ///
@@ -1028,6 +1003,12 @@ pub(crate) fn resolve_surfaces(
             Vec::with_capacity(surface.subscriptions.len() + io_subscriptions.len());
         let mut wire_subscriptions: Vec<ResolvedSurfaceSubscription> = Vec::new();
         let mut seen_sub_ports: HashSet<(&str, &str)> = HashSet::new();
+        // The authored input bindings, per instance: `(instance, port,
+        // push-enabled)`. A free `io` port's input half is the instance's own
+        // writing to itself over its own ring and is left out; an `io` port
+        // bound to a declared channel arrives here as an ordinary subscription
+        // and is counted, because another publisher can wake it.
+        let mut authored_inputs: Vec<(String, String, bool)> = Vec::new();
         // One resolved subscription per **(instance, channel)**: each
         // component's depths and noise on a channel are resolved independently.
         //
@@ -1252,6 +1233,9 @@ pub(crate) fn resolve_surfaces(
                 sub.noise,
             );
 
+            if direction != "io_port" {
+                authored_inputs.push((sub.instance.clone(), sub.port.clone(), push_depth >= 1));
+            }
             subscriptions.push(SurfaceBinding {
                 channel_address: channel.clone(),
                 instance: sub.instance.clone(),
@@ -1263,15 +1247,19 @@ pub(crate) fn resolve_surfaces(
         }
 
         // Per instance, not per surface: activations are minted per instance, so
-        // one triggering component says nothing about a sibling whose every port
-        // is context-only.
+        // one triggering component says nothing about a sibling whose every
+        // authored binding is context-only.
         for comp in &resolved_components {
-            let push_depths: Vec<u64> = subscriptions
+            let bindings: Vec<(String, bool)> = authored_inputs
                 .iter()
-                .filter(|b| b.instance == comp.instance)
-                .map(|b| b.push_depth)
+                .filter(|(instance, _, _)| *instance == comp.instance)
+                .map(|(_, port, push_enabled)| (port.clone(), *push_enabled))
                 .collect();
-            assert_instance_can_activate(slug, &comp.instance, &push_depths);
+            super::warn_when_nothing_can_activate(
+                &format!("[[surface]] {slug:?}"),
+                &format!("component {:?}", comp.instance),
+                &bindings,
+            );
         }
 
         // A subscription count over the burst bound trips the peer's meter at

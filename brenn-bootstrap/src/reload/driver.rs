@@ -539,6 +539,10 @@ impl ReloadDriver {
         //     a surface that did not otherwise move, and a kernel from another
         //     tree than the running binary's release is a restart.
         let serving_surface_roots = self.env.surface_roots();
+        // A kind this scan withholds is alerted where the scan is adopted
+        // (`refresh_surface_roots`), not here: everything below can still
+        // refuse the reload, and a refused reload leaves the serving roots —
+        // and therefore what is withheld — exactly as they were.
         let kind_differences = serving_surface_roots.kind_differences(&candidate_surface_roots);
         if let Err(refusals) =
             surface_kernel_refusal(&serving_surface_roots, &candidate_surface_roots)
@@ -2342,6 +2346,12 @@ channel scratch at "ephemeral:scratch" {{
         /// shape a release installs: the kernel pair at its root and one
         /// `processor/<kind>/` directory per kind it serves.
         pub(crate) surface_assets: Option<PathBuf>,
+        /// A second surface tree, declared under a mount of its own, in the
+        /// shape a component bundle installs: kinds and no kernel pair. Present
+        /// only for the cases about a kind whose record this binary does not
+        /// read, which is a withheld kind under a bundle mount and a boot
+        /// refusal under brenn's own.
+        pub(crate) surface_bundle: Option<PathBuf>,
         /// Stand up the MQTT subsystem the way boot does, against whatever
         /// broker the document's `mqtt_client` names — one real supervisor per
         /// declared client, dialing and staying connected. Needs a broker to be
@@ -2380,6 +2390,7 @@ channel scratch at "ephemeral:scratch" {{
             components_roots,
             tool_registry,
             surface_assets,
+            surface_bundle,
             mqtt_live,
             dispatcher,
         } = fixture;
@@ -2389,6 +2400,9 @@ channel scratch at "ephemeral:scratch" {{
         let mounts = tree.mounts(&components_roots);
         if let Some(assets) = &surface_assets {
             mounts.install(SURFACE_MOUNT, &[("surface", assets)]);
+        }
+        if let Some(bundle) = &surface_bundle {
+            mounts.install(SURFACE_BUNDLE_MOUNT, &[("surface", bundle)]);
         }
         let loaded_mounts = mounts.load();
         let components_roots = loaded_mounts.roots.components_roots.clone();
@@ -2569,6 +2583,11 @@ channel scratch at "ephemeral:scratch" {{
             &loaded_mounts.roots.surface_roots,
             &plan.surfaces,
         );
+        // Boot's own announcement, called here for the same reason the
+        // description publish below is: a fixture that skipped it would leave
+        // the operator's only unprompted notice of a withheld kind unreachable
+        // from every test.
+        crate::alert_withheld_kinds(&alert_dispatcher, &surface_roots);
 
         // Without this the fresh side would read back whatever the database
         // it booted over still retained rather than what boot publishes.
@@ -4686,7 +4705,7 @@ new sifter: Demo {{
         install_package(components.path(), &staged_module(&tree));
         // A message the channel already holds. The arriving consumer's position
         // is primed behind the retained tail, exactly as at boot, so this is
-        // what its startup sweep drains — which is how the test sees that the
+        // what its mount activation drains — which is how the test sees that the
         // task is really running rather than merely registered.
         let work = booted
             .messenger
@@ -5320,6 +5339,7 @@ channel spare at "brenn:spare" {
     /// A `SurfaceRoots` spelled directly, for the message-level cases below.
     fn roots_of(kernel: &str, kinds: &[(&str, &str, &str)]) -> brenn_surface_server::SurfaceRoots {
         brenn_surface_server::SurfaceRoots {
+            withheld: Default::default(),
             kernel: Some(brenn_surface_server::KernelRoot::for_test(kernel)),
             kinds: kinds
                 .iter()
@@ -5331,6 +5351,7 @@ channel spare at "brenn:spare" {
                             root: PathBuf::from(root),
                             source_sha256: "s".to_string(),
                             spec_sha256: "p".to_string(),
+                            cores: Vec::new(),
                         },
                     )
                 })
@@ -8200,6 +8221,11 @@ channel spill at "ephemeral:spill" {
     /// The mount a fixture's deployed surface tree is declared under.
     pub(crate) const SURFACE_MOUNT: &str = "surface-release";
 
+    /// The mount a fixture's component bundle is declared under: a surface tree
+    /// carrying kinds and no kernel pair, which is what makes a stale record
+    /// under it withheld rather than a boot refusal.
+    pub(crate) const SURFACE_BUNDLE_MOUNT: &str = "surface-bundle";
+
     /// The prefix `[surface_description]` defaults to, and so the root of every
     /// derived address a surface-carrying document declares.
     const SURFACE_PREFIX: &str = "surface";
@@ -8793,6 +8819,313 @@ channel spill at "ephemeral:spill" {
                 .source_sha256,
             brenn_lib::util::sha256_hex(b"the-upgraded-artifact"),
             "the served roots must be the ones the reload was decided against",
+        );
+    }
+
+    // ── a withheld kind, and the two transitions a reload converges ─────────
+    //
+    // A kind whose record this binary does not read is withheld under a bundle
+    // mount: not served, alerted, and picked up at the reload that follows the
+    // bundle's re-release. The rig below is the only one in this suite with two
+    // surface trees, because that is what the distinction rests on — brenn's
+    // own tree is the one carrying the kernel pair, and a stale record under it
+    // is a boot refusal rather than a withholding.
+
+    /// Write `panel`'s class module into `tree`'s module root, the kernel pair
+    /// into brenn's own surface tree, and `panel`'s deployed assets into the
+    /// bundle's, at record version `record_v`.
+    ///
+    /// Everything but `record_v` is a function of the kind's name, so the two
+    /// versions of a kind differ in exactly the field the withholding decision
+    /// reads — which is what the bundle's re-release looks like from here.
+    fn write_bundled_panel_kind(
+        tree: &Tree,
+        kernel: &std::path::Path,
+        bundle: &std::path::Path,
+        record_v: u32,
+    ) {
+        let modules = tree.modules();
+        std::fs::create_dir_all(&modules).expect("a module root");
+        let spec = format!(
+            "component Panel {{\n    {}\n    in feed;\n}}\n",
+            brenn_dsl::fixture_text::processor_header("dom, page-dom"),
+        );
+        std::fs::write(modules.join("panel.brenn"), &spec).expect("the class module is writable");
+        std::fs::create_dir_all(kernel).expect("brenn's own surface tree");
+        brenn_surface_server::test_fixtures::write_kernel_pair(kernel);
+        std::fs::create_dir_all(bundle).expect("the bundle's surface tree");
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            bundle,
+            "panel",
+            b"component-bytes-for-panel",
+            spec.as_bytes(),
+            Vec::new(),
+            true,
+            |manifest| manifest["v"] = serde_json::json!(record_v),
+        );
+    }
+
+    /// One surface of a bundled `panel`, whose record declares `record_v`.
+    ///
+    /// Both tempdirs are returned: dropping either takes a declared mount out
+    /// from under the running process.
+    async fn boot_one_bundled_panel_surface(
+        record_v: u32,
+    ) -> (Tree, tempfile::TempDir, tempfile::TempDir, Booted) {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_bundled_panel_kind(&tree, kernel.path(), bundle.path(), record_v);
+        tree.write(&surface_document("deskbar", "panel", "Panel", ""));
+        let booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        (tree, kernel, bundle, booted)
+    }
+
+    /// The bodies of every "surface kind withheld" alert raised so far.
+    ///
+    /// The severity is asserted here rather than returned: every caller wants
+    /// the same one, and an alert that reached the operator at `Info` would
+    /// otherwise pass every assertion below.
+    fn withheld_alerts(booted: &Booted) -> Vec<String> {
+        booted
+            .captured
+            .lock()
+            .expect("alert capture")
+            .iter()
+            .filter(|(_, title, _)| title == brenn_surface_server::WITHHELD_ALERT_TITLE)
+            .map(|(severity, _, body)| {
+                assert!(
+                    matches!(severity, brenn_obs::alerting::AlertSeverity::Warning),
+                    "a withheld kind is a warning, not {severity}: {body}",
+                );
+                body.clone()
+            })
+            .collect()
+    }
+
+    /// Poll until `wanted` withheld alerts have drained, or panic. Alerts
+    /// arrive asynchronously after the reload that raised them returns.
+    async fn withheld_alerts_until(booted: &Booted, wanted: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let seen = withheld_alerts(booted);
+            if seen.len() >= wanted {
+                return seen;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "wanted {wanted} withheld alert(s), saw {:?}",
+            withheld_alerts(booted)
+        );
+    }
+
+    /// The served roots the driver is deciding against right now.
+    fn serving_roots(booted: &Booted) -> Arc<brenn_surface_server::SurfaceRoots> {
+        booted
+            .driver
+            .env
+            .surface_roots
+            .read()
+            .expect("the cell is uncontended")
+            .clone()
+    }
+
+    /// **A bundle's re-release converges a withheld kind into service.** The
+    /// process booted over a record it cannot read, so the kind was withheld
+    /// and the surface mounting it came up on the withheld manifest. The
+    /// operator re-releases the bundle against this brenn; nothing in the
+    /// document moves, and the kind's arrival in the served set is the whole
+    /// witness — `Offered`, which promotes the surface stamping it, so its
+    /// pages come back for assets that now exist.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_withheld_kind_that_comes_back_at_its_record_converges_and_restarts_its_surface() {
+        let (tree, kernel, bundle, mut booted) = boot_one_bundled_panel_surface(2).await;
+        let booted_roots = serving_roots(&booted);
+        assert!(
+            booted_roots.withheld.contains_key("panel"),
+            "boot must withhold a kind whose record it does not read: {:?}",
+            booted_roots.kinds.keys().collect::<Vec<_>>(),
+        );
+        assert!(!booted_roots.kinds.contains_key("panel"));
+        // Boot's own announcement: the process is up and serving a page that
+        // cannot bring the instance up, so this alert is the only unprompted
+        // notice the operator gets.
+        let boot_alerts = withheld_alerts_until(&booted, 1).await;
+        assert_eq!(boot_alerts.len(), 1, "{boot_alerts:?}");
+        assert!(boot_alerts[0].contains("panel"), "{boot_alerts:?}");
+        assert!(
+            boot_alerts[0].contains(SURFACE_BUNDLE_MOUNT),
+            "the operator is told which mount to re-release: {boot_alerts:?}",
+        );
+        let page = attach_a_session(&booted, "deskbar");
+
+        write_bundled_panel_kind(&tree, kernel.path(), bundle.path(), 3);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.kinds_changed, vec!["panel".to_string()]);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "the page has to come back for the assets it was denied",
+        );
+        let after = serving_roots(&booted);
+        assert!(
+            after.kinds.contains_key("panel"),
+            "the re-released kind must be served: {:?}",
+            after.withheld.keys().collect::<Vec<_>>(),
+        );
+        assert!(after.withheld.is_empty(), "{:?}", after.withheld);
+    }
+
+    /// **A kind whose record goes stale under a running process is withheld,
+    /// alerted once, and takes its surface with it.** The other direction: a
+    /// bundle installed at a record this binary does not read, under a document
+    /// that did not move. `Withdrawn` promotes the surface, whose pages come
+    /// back onto the withheld manifest, and the operator is told — once. A
+    /// second reload finding the same kind still withheld says nothing: an
+    /// alert repeated at every reload is one an operator learns to ignore.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kind_that_goes_stale_is_withheld_alerted_once_and_restarts_its_surface() {
+        let (tree, kernel, bundle, mut booted) = boot_one_bundled_panel_surface(3).await;
+        assert!(serving_roots(&booted).kinds.contains_key("panel"));
+        assert!(
+            withheld_alerts(&booted).is_empty(),
+            "nothing is withheld yet",
+        );
+        let page = attach_a_session(&booted, "deskbar");
+
+        write_bundled_panel_kind(&tree, kernel.path(), bundle.path(), 2);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.kinds_changed, vec!["panel".to_string()]);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "the page has to come back onto the withheld manifest",
+        );
+        let after = serving_roots(&booted);
+        let held = after
+            .withheld
+            .get("panel")
+            .unwrap_or_else(|| panic!("{:?}", after.kinds.keys().collect::<Vec<_>>()));
+        assert!(!after.kinds.contains_key("panel"));
+        assert_eq!(held.record_v, 2);
+        assert_eq!(held.mount, SURFACE_BUNDLE_MOUNT);
+        let alerts = withheld_alerts_until(&booted, 1).await;
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].contains("panel"), "{alerts:?}");
+        assert!(
+            alerts[0].contains(SURFACE_BUNDLE_MOUNT),
+            "the operator is told which mount to re-release: {alerts:?}",
+        );
+
+        // The same scan again: still withheld, and already told.
+        booted.driver.reload(TriggerSource::Signal).await;
+        assert_eq!(
+            booted.last_status().await.outcome,
+            Outcome::Unchanged,
+            "nothing moved between the two scans",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            withheld_alerts(&booted).len(),
+            1,
+            "a kind withheld in both scans is alerted once",
+        );
+    }
+
+    /// **A bundle re-released and still unreadable is applied, and alerted
+    /// again.** The operator acted on the boot alert and rebuilt against the
+    /// wrong brenn, so the kind is withheld before and after — the one shape
+    /// the served map cannot witness. Reporting `unchanged` here would tell an
+    /// operator watching the reload outcome that their install did nothing,
+    /// while the page, the alert and the description documents all still
+    /// carried the version they had just replaced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rereleased_kind_this_binary_still_cannot_read_is_applied_and_realerted() {
+        let (tree, kernel, bundle, mut booted) = boot_one_bundled_panel_surface(2).await;
+        let boot_alerts = withheld_alerts_until(&booted, 1).await;
+        assert!(boot_alerts[0].contains("v = 2"), "{boot_alerts:?}");
+        let page = attach_a_session(&booted, "deskbar");
+
+        // Rebuilt against a brenn newer than the one running.
+        let ahead = brenn_surface_server::processor_assets::MANIFEST_VERSION + 1;
+        write_bundled_panel_kind(&tree, kernel.path(), bundle.path(), ahead);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.kinds_changed, vec!["panel".to_string()]);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "the page has to come back onto the reason this scan found",
+        );
+        let after = serving_roots(&booted);
+        assert_eq!(
+            after
+                .withheld
+                .get("panel")
+                .unwrap_or_else(|| panic!("{:?}", after.kinds.keys().collect::<Vec<_>>()))
+                .record_v,
+            ahead,
+        );
+        let alerts = withheld_alerts_until(&booted, 2).await;
+        assert_eq!(alerts.len(), 2, "{alerts:?}");
+        assert!(
+            alerts[1].contains(&format!("v = {ahead}")),
+            "the second alert names the version the operator actually shipped: {alerts:?}",
+        );
+    }
+
+    /// **A refused reload that scanned a stale record alerts about nothing.**
+    /// The scan found the bundle's kind withheld and the kernel rewritten under
+    /// its own root; the second refuses the reload, so the process keeps
+    /// serving the kind and nothing about it is withheld. An alert here would
+    /// name a state this process never entered — and, since the "already told"
+    /// question is asked of the roots being served, would be raised again at
+    /// every refused reload that followed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_record_in_a_refused_reload_is_not_alerted() {
+        let (tree, kernel, bundle, mut booted) = boot_one_bundled_panel_surface(3).await;
+        assert!(serving_roots(&booted).kinds.contains_key("panel"));
+
+        write_bundled_panel_kind(&tree, kernel.path(), bundle.path(), 2);
+        std::fs::write(
+            kernel.path().join(brenn_surface_server::KERNEL_ARTIFACT),
+            b"export function instantiate() { /* the next release */ }",
+        )
+        .expect("the kernel module is writable");
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused, "{:?}", status.refusals);
+        let after = serving_roots(&booted);
+        assert!(
+            after.withheld.is_empty() && after.kinds.contains_key("panel"),
+            "a refused reload serves what it served: {:?}",
+            after.withheld.keys().collect::<Vec<_>>(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            withheld_alerts(&booted).is_empty(),
+            "{:?}",
+            withheld_alerts(&booted),
         );
     }
 

@@ -3,9 +3,14 @@
 /// It holds `dom` because it draws: a message area rebuilt from the block tree
 /// its body convention parses to, and a status line carrying the drop and
 /// malformed-body counters.
+///
+/// Its priority slots, its view handles and the last render it diffs against
+/// ride the retained `state` port between activations, because linear memory
+/// does not.
 component Protobar {
   abi = processor;
   requires = [ports, log, dom];
   in messages: "brenn.panel.message@1";
   io tick;
+  io state;
 }

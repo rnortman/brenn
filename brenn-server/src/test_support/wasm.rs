@@ -14,7 +14,7 @@ use brenn_lib::messaging::{
     NoiseLevel, ParticipantId, ResolvedChannel, ResolvedSubscription, Sink, SubscriberEntry,
     SubscriberEntryKind, WakeMin, WasmInputPort,
 };
-use brenn_messaging::{Messenger, WakeRouter, config::Depth, query::NoopWakeRouter};
+use brenn_messaging::{Messenger, MountDebt, WakeRouter, config::Depth, query::NoopWakeRouter};
 use brenn_messaging_store::db::upsert_channels;
 use indexmap::IndexMap;
 use rusqlite::OptionalExtension;
@@ -134,10 +134,14 @@ pub async fn activation_new_messages(
         },
         amplification_mt: 1_000,
     }];
+    // `Settled`: this asks what a *delivery* would serve. A mount activation
+    // windows every allowed port whatever it holds, which would answer a
+    // different question — what the port retains, not what the subscriber is
+    // owed.
     messenger
-        .load_activation_snapshot(&subscriber, &inputs)
+        .load_activation_snapshot(&subscriber, &inputs, MountDebt::Settled)
         .await
-        .map(|snapshots| {
+        .map(|(_wake, snapshots)| {
             snapshots
                 .iter()
                 .flat_map(|snapshot| snapshot.new_entries())

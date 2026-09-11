@@ -260,7 +260,7 @@ async fn forgejo_push_emits_event_both_remotes_ssh_first() {
     let body = webhook_body(&[("x-forgejo-event", "push")], &payload, "git-forgejo");
     testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let out_rows = brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(out_rows.len(), 1, "exactly one push event published");
@@ -295,7 +295,7 @@ async fn github_push_sets_forge_github() {
     let body = webhook_body(&[("x-github-event", "push")], &payload, "git-github");
     testutils::insert_bus_message(&messenger, &github_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert_eq!(
         brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub)
@@ -323,7 +323,7 @@ async fn forgejo_port_falls_back_to_gitea_event_header() {
     let body = webhook_body(&[("x-gitea-event", "push")], &payload, "git-forgejo");
     testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert_eq!(
         brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub)
@@ -344,7 +344,7 @@ async fn non_push_event_dropped_no_publish() {
     let body = webhook_body(&[("x-forgejo-event", "issues")], &payload, "git-forgejo");
     testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Input row acked, nothing published.
     assert!(
@@ -370,7 +370,7 @@ async fn missing_event_header_dropped_no_publish() {
     let body = webhook_body(&[("x-some-other", "value")], &payload, "git-forgejo");
     testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Input row acked, nothing published — a warn-drop, distinct from a
     // quarantine (which also publishes nothing but records a failure).
@@ -415,7 +415,7 @@ async fn malformed_payload_json_dropped_no_publish() {
     );
     testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert!(
         brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub)
@@ -447,7 +447,7 @@ async fn ssh_only_and_clone_only_payloads() {
     let body = webhook_body(&[("x-forgejo-event", "push")], &payload, "git-forgejo");
     testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert_eq!(
         brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub)
@@ -474,7 +474,7 @@ async fn duplicate_ssh_clone_deduped() {
     let body = webhook_body(&[("x-forgejo-event", "push")], &payload, "git-forgejo");
     testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let event = read_latest(&messenger, &out_entry.address)
         .await
@@ -499,7 +499,7 @@ async fn malformed_envelope_quarantines() {
     )
     .await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Row acked (at-most-once), nothing published, failure recorded.
     assert!(

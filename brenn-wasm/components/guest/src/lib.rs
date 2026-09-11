@@ -7,6 +7,8 @@
 // - `store::Transaction` RAII guard — eliminates the leaked-tx trap footgun
 // - `log` / `alert` modules — fire-and-forget diagnostics
 // - `config` module — operator config access
+// - `RetainedState<T>` — a component's state on a retained `io` port, which
+//   is where it lives: linear memory is activation-scoped
 // - `dom` module — element handles and mutators, for a page-hosted component
 // - `export_processor!` macro — wires `Processor` impl to the WIT export
 //
@@ -249,6 +251,17 @@ impl Activation {
         self.windows
             .iter()
             .filter(move |window| Some(window.port()) != sync)
+    }
+
+    /// Drop one port's window, so a component folding through
+    /// [`Self::delivered_windows`] never sees it.
+    ///
+    /// The one caller is [`RetainedState::around`], which reads the state body
+    /// out of the window and then takes it away: the port is the SDK's own
+    /// mechanism, and a component asked to recognize and skip it every time
+    /// would have one more thing to forget on every activation.
+    fn drop_window(&mut self, port: &str) {
+        self.windows.retain(|window| window.port() != port);
     }
 }
 
@@ -667,6 +680,11 @@ impl<T: serde::Serialize> OutPort<T> {
         }
     }
 
+    /// The logical output port name this handle publishes on.
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
     /// Serialize `value` and publish with the port's configured default urgency.
     pub fn publish(&self, value: &T) -> Result<(), Error> {
         publish_json(self.name, value)
@@ -677,6 +695,242 @@ impl<T: serde::Serialize> OutPort<T> {
         let payload =
             serde_json::to_string(value).map_err(|e| Error::failed(format!("serialize: {e}")))?;
         publish_with_urgency(self.name, &payload, urgency)
+    }
+}
+
+// ── retained state ────────────────────────────────────────────────────────────
+
+/// A component's state, kept on a retained `io` port instead of in linear
+/// memory.
+///
+/// Linear memory is activation-scoped: an instance's statics, `thread_local!`s
+/// and heap live for exactly one activation, so a value a component wants on
+/// the next one has to go back out onto the bus. The channel carrying it is the
+/// state variable — `retain_depth = 1` so the newest body is always in the
+/// port's context window, `push_depth = 0` so writing it never wakes its own
+/// author.
+///
+/// The port is an ordinary `io` port in the specification:
+///
+/// ```text
+/// io state;
+/// ```
+///
+/// and an ordinary binding in the document that stamps the instance:
+///
+/// ```text
+/// io state { push_depth = 0; retain_depth = 1; }
+/// ```
+///
+/// Those two depths are this helper's, not an operator's choice, and nothing
+/// checks them: a wider `retain_depth` keeps dead bodies alive behind the one
+/// `load` reads, and a `push_depth` above zero makes every state write wake its
+/// own author.
+// TODO(retained-state-port-attribute): the pair belongs on the port in the
+// specification, so no document transcribes it and no binding can override it.
+///
+/// The idiom is load, work, store, and [`RetainedState::around`] is all three —
+/// a component's `receive` is one call to it. [`RetainedState::load`] and
+/// [`RetainedState::store`] are underneath it, for a component whose shape
+/// `around` does not fit.
+///
+/// `store` publishes through the ordinary buffer, so a state write is discarded
+/// with everything else when the activation returns `Err` — the state a failed
+/// activation would have left behind is exactly the state nobody wants kept.
+/// It also skips the publish outright when the serialized bytes match what
+/// `load` read, so an activation that changed nothing costs no message and no
+/// budget. That skip is a byte comparison, so a state body must serialize the
+/// same way twice: a `std::collections::HashMap` in a body iterates in an order
+/// seeded per instance and defeats it, where a `BTreeMap` does not.
+///
+/// Host resources the component holds by handle — DOM elements — are owned by
+/// the mount and not by the memory, so a [`dom::Node`] stored in a state body
+/// names the same element on the next activation.
+pub struct RetainedState<T> {
+    port: OutPort<T>,
+    /// The serialized body `load` read, so `store` can tell an unchanged state
+    /// from a changed one. `None` before the first `load`, which makes the
+    /// first `store` unconditional.
+    seen: Option<String>,
+}
+
+/// What a component does when a retained state body is lost — either one it
+/// cannot deserialize, or one the host refused to accept. The one decision
+/// [`RetainedState::around`] leaves to its caller.
+///
+/// Which answer is right depends on what the state holds. A component whose
+/// state carries [`dom::Node`] handles cannot carry on without them — it would
+/// build a second view over the first — so it fails the activation. One whose
+/// state is a recomputable summary loses a recomputation and nothing else, so
+/// it carries on.
+///
+/// Both losses are ordinary events rather than host faults: an unreadable body
+/// is a version skew across a deploy, and a refused write is a body over the
+/// host's per-message cap or a spent publish budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateLoss {
+    /// Fail the activation: an unreadable body is refused before `body` runs,
+    /// and a refused write is refused after it.
+    FailActivation,
+    /// Log it and carry on: an unreadable body starts from `T::default()`, and
+    /// a refused write leaves the last body that was accepted for the next
+    /// activation to reconcile from.
+    Recover,
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> RetainedState<T> {
+    /// Bind a state cell to a port handle — normally the specification's own,
+    /// `spec::state()`.
+    pub const fn new(port: OutPort<T>) -> Self {
+        RetainedState { port, seen: None }
+    }
+
+    /// The newest state body on the port's window, deserialized.
+    ///
+    /// `Ok(None)` where the window holds nothing at all: a first mount, or a
+    /// realm that did not survive whatever came before. `Err` where a body is
+    /// there and is not this type — a version skew across a deploy is an
+    /// ordinary event, so the caller decides (typically: log it, start from a
+    /// default, and let the next `store` overwrite).
+    ///
+    /// An unbound state port is a deployment fault, not a first mount, and
+    /// fails the activation: a component that silently started from a default
+    /// every time would look exactly like one whose state never persists.
+    pub fn load(&mut self, activation: &Activation) -> Result<Option<T>, Error> {
+        let name = self.port.name();
+        let window = activation
+            .port_windows()
+            .find(|w| w.port() == name)
+            .ok_or_else(|| {
+                Error::failed(format!(
+                    "retained state: no window for port {name:?}; the port is not bound"
+                ))
+            })?;
+        // A window is context then new, so the newest body is the last new one
+        // where there is one and the last context one otherwise.
+        let Some(raw) = window.new_raw().last().or(window.context_raw().last()) else {
+            return Ok(None);
+        };
+        let envelope: MessageEnvelope = serde_json::from_str(raw)
+            .map_err(|e| Error::malformed(format!("retained state envelope JSON: {e}")))?;
+        self.seen = Some(envelope.body.clone());
+        let value = serde_json::from_str(&envelope.body)
+            .map_err(|e| Error::malformed(format!("retained state body JSON: {e}")))?;
+        Ok(Some(value))
+    }
+
+    /// Publish `value` as the port's new retained body, unless it serializes to
+    /// the bytes [`RetainedState::load`] already read.
+    ///
+    /// **Requires grant:** `"ports"`.
+    pub fn store(&mut self, value: &T) -> Result<(), Error> {
+        let body = serde_json::to_string(value)
+            .map_err(|e| Error::failed(format!("retained state serialize: {e}")))?;
+        if self.seen.as_deref() == Some(body.as_str()) {
+            return Ok(());
+        }
+        publish(self.port.name(), &body)?;
+        self.seen = Some(body);
+        Ok(())
+    }
+
+    /// Publish `value`, reporting a refusal the way `loss` asks for.
+    ///
+    /// A refusal here is not a deployment fault the component can be sure of:
+    /// the per-message cap is measured against a body whose size is driven by
+    /// what the component was sent, and the publish budget is a bucket that
+    /// refills. So neither kind traps. What both mean is that this activation's
+    /// state did not land, which is the loss [`StateLoss`] answers for.
+    fn store_or_report(&mut self, value: &T, loss: StateLoss) -> Result<(), Error> {
+        let Err(err) = self.store(value) else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_string(value).map_or(0, |body| body.len());
+        let detail = format!(
+            "retained state publish on port {:?} ({bytes} bytes) was refused: {err:?}",
+            self.port.name(),
+        );
+        match loss {
+            StateLoss::FailActivation => Err(Error::failed(detail)),
+            StateLoss::Recover => {
+                log::error(detail);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned + Default> RetainedState<T> {
+    /// Run one activation around a state cell: load the state, hand it to
+    /// `body` along with the activation, store what `body` left.
+    ///
+    /// This is the whole idiom, so a component's `receive` is the call and
+    /// nothing else:
+    ///
+    /// ```rust,ignore
+    /// fn receive(activation: Activation) -> Result<Option<String>, Error> {
+    ///     RetainedState::around(
+    ///         activation,
+    ///         spec::state::<Panel>(),
+    ///         StateLoss::FailActivation,
+    ///         |activation, panel| {
+    ///             on_activation(activation, panel)?;
+    ///             Ok(None)
+    ///         },
+    ///     )
+    /// }
+    /// ```
+    ///
+    /// The activation `body` is handed has **no window on the state port**: the
+    /// port is this helper's own mechanism, the body has already been read off
+    /// it, and a component folding through
+    /// [`Activation::delivered_windows`] would otherwise have to recognize and
+    /// skip its own state on every activation. Nothing else about the
+    /// activation changes.
+    ///
+    /// `body`'s answer is the activation's — `Ok(None)` for one that answers
+    /// nothing, the reply for a sync call that does. An `Err` from `body` is
+    /// returned as it stands and **nothing is stored**: a page discards a failed
+    /// activation's publishes anyway, and the state a failed activation would
+    /// have left is exactly the state nobody wants kept.
+    ///
+    /// A host that refuses the store — a body over its per-message cap, a spent
+    /// publish budget — is the other way this activation's state is lost, and
+    /// `loss` answers for it on the same terms as an unreadable body. Neither
+    /// traps: a state body's size is driven by what the component was sent, so a
+    /// large message would otherwise be a way to kill an instance.
+    ///
+    /// **Requires grant:** `"ports"`.
+    pub fn around<R>(
+        mut activation: Activation,
+        port: OutPort<T>,
+        loss: StateLoss,
+        body: impl FnOnce(&Activation, &mut T) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let mut cell = RetainedState::new(port);
+        let mut state = match cell.load(&activation) {
+            Ok(state) => state.unwrap_or_default(),
+            Err(err) => match loss {
+                StateLoss::FailActivation => {
+                    return Err(Error::failed(format!(
+                        "retained state on port {:?} is unreadable: {err:?}",
+                        cell.port.name()
+                    )));
+                }
+                StateLoss::Recover => {
+                    log::error(format!(
+                        "retained state on port {:?} is unreadable, starting from the default: \
+                         {err:?}",
+                        cell.port.name()
+                    ));
+                    T::default()
+                }
+            },
+        };
+        activation.drop_window(cell.port.name());
+        let answer = body(&activation, &mut state)?;
+        cell.store_or_report(&state, loss)?;
+        Ok(answer)
     }
 }
 
@@ -1147,9 +1401,11 @@ pub mod dom {
     //! written for a component author to read. A kind reaching for something off
     //! them is reaching for the page, which is not what this capability is.
     //!
-    //! State between activations is ordinary struct state: the component is
-    //! instantiated once per instance and lives for the page, so a handle held
-    //! in a field is still that element on the next activation.
+    //! **Handles outlive the memory that names them.** A handle is owned by the
+    //! mount, not by the instance: linear memory is activation-scoped, so a
+    //! component carries its handles across activations in its retained state
+    //! ([`crate::RetainedState`]), and the element a handle named when it was
+    //! stored is the element it names when it is read back.
 
     use crate::bindings::brenn::processor::dom as raw;
 

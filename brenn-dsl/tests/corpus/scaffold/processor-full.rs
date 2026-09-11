@@ -1,9 +1,10 @@
 // Generated from processor-full.brenn — do not edit.
 
 //! A specification exercising the whole generated processor surface: both port
-//! directions, an `io` port, an optional port, the substrate-wired tool-result
-//! inbox its `tools` requirement obliges, doctypes, and every capability word
-//! that names an SDK module.
+//! directions, an `io` port, the `io state` port a component's retained state
+//! lives on, an optional port, the substrate-wired tool-result inbox its
+//! `tools` requirement obliges, doctypes, and every capability word that names
+//! an SDK module.
 //!
 //! The prose is carried into the generated module, so this paragraph is part of
 //! what the golden pins.
@@ -24,15 +25,17 @@ pub enum InPort {
     Retries,
     ToolResults,
     Tick,
+    State,
 }
 
 impl InPort {
     /// Every inbound port, in the order the specification declares them.
-    pub const ALL: [InPort; 4] = [
+    pub const ALL: [InPort; 5] = [
         InPort::Commands,
         InPort::Retries,
         InPort::ToolResults,
         InPort::Tick,
+        InPort::State,
     ];
 
     /// The name this port is published and bound under.
@@ -42,6 +45,7 @@ impl InPort {
             InPort::Retries => "retries",
             InPort::ToolResults => "tool-results",
             InPort::Tick => "tick",
+            InPort::State => "state",
         }
     }
 
@@ -52,6 +56,7 @@ impl InPort {
             "retries" => Some(InPort::Retries),
             "tool-results" => Some(InPort::ToolResults),
             "tick" => Some(InPort::Tick),
+            "state" => Some(InPort::State),
             _ => None,
         }
     }
@@ -107,6 +112,22 @@ pub const fn tick<T: TickPayload>() -> brenn_guest::OutPort<T> {
     brenn_guest::OutPort::new("tick")
 }
 
+/// The payload types this guest publishes on the `state` port. Bind a type to
+/// the port once, as an impl:
+/// `impl spec::StatePayload for Body<'_> {}`
+#[cfg(target_arch = "wasm32")]
+pub trait StatePayload: serde::Serialize {}
+
+/// A typed publish handle for the `state` port, over any payload bound to it
+/// by `StatePayload`. An owned payload binds through a `const`:
+/// `const OUT: OutPort<Body> = spec::state();`
+/// A borrowed payload cannot be named in one, so publish it inline:
+/// `spec::state().publish(&body)?`.
+#[cfg(target_arch = "wasm32")]
+pub const fn state<T: StatePayload>() -> brenn_guest::OutPort<T> {
+    brenn_guest::OutPort::new("state")
+}
+
 /// The port names as text, for the parts of the SDK that take one.
 pub mod port {
     /// Doctype: `brenn.scaffold.commands@1`.
@@ -116,6 +137,7 @@ pub mod port {
     /// Doctype: `brenn.scaffold.results@1`.
     pub const RESULTS: &str = "results";
     pub const TICK: &str = "tick";
+    pub const STATE: &str = "state";
 }
 
 // One re-export per capability the specification declares. Reaching a

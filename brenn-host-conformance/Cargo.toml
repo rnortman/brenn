@@ -1,0 +1,35 @@
+[package]
+name = "brenn-host-conformance"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "One component driven through each host's real scheduling path — the hosting-semantics conformance suite"
+
+# Test-only: nothing in the tree depends on this crate. The library half is the
+# `Host` trait, the report projection and the scenario bodies, and its dependency
+# set is the assertion — no host crate appears here, so a scenario that reached
+# for one would fail to compile. The adapters live in this crate's own test
+# build, which is where every host crate is named.
+[dependencies]
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store", features = ["testutils"] }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+brenn-attach-client = { version = "0.1.0", path = "../attach/client" }
+brenn-attach-proto = { version = "0.1.0", path = "../attach/proto" }
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
+brenn-page-harness = { version = "0.1.0", path = "../surface/page-harness" }
+brenn-surface-contract = { version = "0.1.0", path = "../surface/contract" }
+brenn-surface-kernel = { version = "0.1.0", path = "../surface/kernel" }
+brenn-surface-schema = { version = "0.1.0", path = "../surface/schema" }
+brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }
+brenn-wasm-dispatch = { version = "0.1.0", path = "../brenn-wasm-dispatch", features = ["testutils"] }
+chrono = "0.4.44"
+indexmap = "2"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
+uuid = { version = "1.23.0", features = ["v4"] }

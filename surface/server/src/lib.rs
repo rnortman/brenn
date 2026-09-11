@@ -329,6 +329,71 @@ pub struct SurfaceRoots {
     /// Wire kind → the one root whose `processor/<kind>/` holds it, and what
     /// that tree currently holds.
     pub kinds: std::collections::BTreeMap<String, KindRoot>,
+    /// Wire kind → the tree offering it that this host declines to serve,
+    /// because its record names a hosting contract this binary does not read.
+    ///
+    /// A kind is here instead of in `kinds`, never as well: nothing resolves an
+    /// asset URL for it, no page brings it up, and its description documents
+    /// say so. The state is the expected middle of a rolling upgrade — a bundle
+    /// correct when it was built and correct again when it is rebuilt — so it
+    /// is a warning and an alert rather than a refusal to start. A record
+    /// mismatch under brenn's own mount is a broken install and still panics.
+    pub withheld: std::collections::BTreeMap<String, WithheldKind>,
+}
+
+/// The title every "this kind is withheld" alert carries, at boot and at the
+/// reload that adopts a scan holding one.
+///
+/// One string for one condition: the operator sees the same title whichever
+/// path found it, and a test filtering for the alert names it rather than
+/// re-spelling it.
+pub const WITHHELD_ALERT_TITLE: &str = "surface kind withheld";
+
+/// One installed kind this host will not serve: where it is, what its record
+/// declares, and why that is not readable here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithheldKind {
+    /// The mount offering this kind, as its root list names it.
+    pub mount: String,
+    /// The surface tree whose `processor/<kind>/` holds it.
+    pub root: std::path::PathBuf,
+    /// The schema version the record declares.
+    pub record_v: u32,
+    /// One sentence naming both versions and the migration. It is what the
+    /// alert carries, what the page manifest hands the kernel, and what the
+    /// kind's description documents state.
+    pub reason: String,
+}
+
+impl WithheldKind {
+    /// The alert body: the reason, plus where the tree that carries it is.
+    ///
+    /// Rendered here because boot and reload both announce this condition and
+    /// an operator comparing the two notices should be reading one sentence,
+    /// not two independently edited ones.
+    pub fn alert_body(&self) -> String {
+        format!(
+            "{} (mount {}, tree {})",
+            self.reason,
+            self.mount,
+            self.root.display()
+        )
+    }
+}
+
+/// Where one kind stands with this host.
+///
+/// The two states are exclusive and together exhaustive for any kind a declared
+/// mount offers: boot refuses a configured kind no mount offers at all, so a
+/// kind that reaches a reader here is served from a root or withheld from one.
+/// `Served(None)` is the served kind whose root a caller does not need — or one
+/// nothing offers, which only a caller outside the boot-validated set can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindPlacement<'a> {
+    /// Served, from this root where one is known.
+    Served(Option<&'a std::path::Path>),
+    /// Not served, for the reason the entry carries.
+    Withheld(&'a WithheldKind),
 }
 
 /// The installed surface kernel: the tree serving the module pair every page
@@ -382,6 +447,15 @@ pub struct KindRoot {
     pub source_sha256: String,
     /// SHA-256 of the authored specification packaged beside it.
     pub spec_sha256: String,
+    /// The core wasm modules the transpiled glue asks for, by file name, off
+    /// the kind's record.
+    ///
+    /// The page manifest carries them because the sync-instantiation glue looks
+    /// a core module up synchronously: it cannot fetch one, so the page
+    /// compiles them all at bring-up and answers from a map. Held here rather
+    /// than re-read per request — the record was already read and walked at
+    /// scan time, and a page render must not touch the filesystem.
+    pub cores: Vec<String>,
 }
 
 impl KindRoot {
@@ -394,7 +468,17 @@ impl KindRoot {
             root,
             source_sha256: String::new(),
             spec_sha256: String::new(),
+            cores: Vec::new(),
         }
+    }
+
+    /// A kind root naming the core modules a page would compile for it, for
+    /// tests that exercise the page manifest.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn for_test_with_cores(root: impl Into<std::path::PathBuf>, cores: &[&str]) -> Self {
+        let mut held = Self::for_test(root.into());
+        held.cores = cores.iter().map(|core| (*core).to_string()).collect();
+        held
     }
 
     /// Whether two scans found the same installation of this kind: the same
@@ -414,12 +498,41 @@ impl SurfaceRoots {
         self.kinds.get(kind).map(|held| held.root.as_path())
     }
 
+    /// The withheld entry for one kind, or `None` where this host serves it
+    /// (or has never heard of it). A caller that has to act on both states
+    /// reads [`Self::placement`] instead, which cannot answer twice.
+    pub fn withheld_kind(&self, kind: &str) -> Option<&WithheldKind> {
+        self.withheld.get(kind)
+    }
+
+    /// Whether this host serves one kind, and from where, or withholds it and
+    /// why — the one read that cannot represent both at once.
+    pub fn placement(&self, kind: &str) -> KindPlacement<'_> {
+        match self.withheld.get(kind) {
+            Some(held) => KindPlacement::Withheld(held),
+            None => KindPlacement::Served(self.kind_root(kind)),
+        }
+    }
+
+    /// The core module file names one kind's transpiled glue asks for, or
+    /// `None` where no installed root offers the kind. The page manifest names
+    /// them so the browser can compile them before the first activation.
+    pub fn kind_cores(&self, kind: &str) -> Option<&[String]> {
+        self.kinds.get(kind).map(|held| held.cores.as_slice())
+    }
+
     /// Every kind on which `self` and `other` disagree, keyed by kind name.
     ///
     /// `self` is the set held — what is being served — and `other` the set just
     /// scanned. A kind absent from the result is byte-for-byte the same
     /// installation in both, which is what makes this map the closure input for
     /// "which surfaces does an installed tree move".
+    ///
+    /// Withheld kinds are compared too, on their record version and their tree:
+    /// a kind withheld on both sides whose bundle was re-installed is a change
+    /// an operator just made, and everything a reader says about it — the page
+    /// manifest's reason, the description documents, the alert — is derived
+    /// from what moved.
     pub fn kind_differences(&self, other: &SurfaceRoots) -> BTreeMap<String, KindDifference> {
         let mut out = BTreeMap::new();
         for (kind, held) in &self.kinds {
@@ -455,6 +568,29 @@ impl SurfaceRoots {
                     },
                 );
             }
+        }
+        // A kind withheld on both sides never enters the served map, so the
+        // loops above cannot see it change.
+        for (kind, held) in &self.withheld {
+            let Some(now) = other.withheld.get(kind) else {
+                // Withheld here and served there is already `Offered` above.
+                continue;
+            };
+            if now.record_v == held.record_v && now.root == held.root {
+                continue;
+            }
+            let difference = if now.mount == held.mount {
+                KindDifference::Reinstalled {
+                    mount: now.mount.clone(),
+                    root: now.root.clone(),
+                }
+            } else {
+                KindDifference::Moved {
+                    from: held.mount.clone(),
+                    to: now.mount.clone(),
+                }
+            };
+            out.insert(kind.clone(), difference);
         }
         out
     }
@@ -596,8 +732,43 @@ pub fn validate_surface_assets_in(
     // instantiated kind.
     let mut manifests: HashMap<String, processor_assets::ProcessorManifest> = HashMap::new();
     let mut kinds: std::collections::BTreeMap<String, KindRoot> = std::collections::BTreeMap::new();
+    let mut withheld: std::collections::BTreeMap<String, WithheldKind> =
+        std::collections::BTreeMap::new();
     for (kind, root) in holders {
-        let manifest = processor_assets::read_processor_record_in(cx, &root, &kind);
+        let manifest = match processor_assets::read_processor_record_or_version_in(cx, &root, &kind)
+        {
+            Ok(manifest) => manifest,
+            Err(record_v) => {
+                let reason = processor_assets::version_mismatch_reason(&kind, record_v);
+                // brenn's own surface tree travels in one tarball with the
+                // kernel and the binary and is installed as a sync, so a record
+                // the binary beside it cannot read is a broken install and
+                // nothing an operator can converge. Under any other declared
+                // mount it is the ordinary middle of a rolling upgrade: the
+                // bundle is authored on its own schedule, and a host that
+                // cannot start until every third party has shipped is not
+                // deployable.
+                assert!(root != kernel.root, "{when}: {reason}{verdict}");
+                let mount = roots.source().name(&root);
+                tracing::warn!(
+                    kind = %kind,
+                    mount = %mount,
+                    root = %root.display(),
+                    record_v,
+                    "{WITHHELD_ALERT_TITLE}"
+                );
+                withheld.insert(
+                    kind,
+                    WithheldKind {
+                        mount,
+                        root,
+                        record_v,
+                        reason,
+                    },
+                );
+                continue;
+            }
+        };
         // Together with the kernel line above, this is the operator's answer to
         // which release each installed kind came from.
         tracing::info!(
@@ -614,6 +785,7 @@ pub fn validate_surface_assets_in(
                 root,
                 source_sha256: manifest.source_sha256.clone(),
                 spec_sha256: manifest.spec_sha256.clone(),
+                cores: manifest.cores(&kind),
             },
         );
         manifests.insert(kind, manifest);
@@ -621,6 +793,7 @@ pub fn validate_surface_assets_in(
     let roots = SurfaceRoots {
         kernel: Some(kernel),
         kinds,
+        withheld,
     };
     if surfaces.is_empty() {
         return roots;
@@ -633,6 +806,15 @@ pub fn validate_surface_assets_in(
     let mut verified: BTreeSet<&str> = BTreeSet::new();
     for surface in surfaces {
         for comp in &surface.components {
+            // A withheld kind has no record to bind anything against, and the
+            // configuration that names it compiled against the bundle's
+            // authored module, which did not move. So the instance is skipped
+            // here and reported to its page as withheld; the kind's own
+            // artifacts, grants and class hash are questions for the release
+            // that can read its record.
+            if roots.withheld.contains_key(comp.kind.as_str()) {
+                continue;
+            }
             let manifest = manifests.get(comp.kind.as_str()).unwrap_or_else(|| {
                 panic!(
                     "{when}: [[surface]] {:?} component {:?} names kind {:?}, which no installed \
@@ -1599,6 +1781,42 @@ mod tests {
         validate_surface_assets(&mount_roots(&[]), &[resolved("deskbar")]);
     }
 
+    /// The page manifest's core-module URLs are minted from the scanned root's
+    /// `cores`, and nothing else fills that field: a scan that stopped reading
+    /// the record's file list would serve every kind an empty list and fail
+    /// every component's bring-up in the browser, with no Rust test to see it.
+    #[test]
+    fn a_scanned_root_carries_the_records_core_modules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        let kind = "panel";
+        let core = format!("{kind}.core.wasm");
+        let second = format!("{kind}.core2.wasm");
+        write_processor_tree(dir.path(), kind, &[], |manifest| {
+            let files = manifest["files"].as_array_mut().expect("files");
+            files.push(serde_json::Value::String(core.clone()));
+            files.push(serde_json::Value::String(second.clone()));
+        });
+        std::fs::write(
+            crate::processor_assets::kind_dir(dir.path(), kind).join(&core),
+            b"core",
+        )
+        .expect("write core");
+        std::fs::write(
+            crate::processor_assets::kind_dir(dir.path(), kind).join(&second),
+            b"core2",
+        )
+        .expect("write second core");
+
+        let roots = validate_one_root(dir.path(), &[]);
+        assert_eq!(
+            roots.kind_cores(kind),
+            Some([core, second].as_slice()),
+            "the source component artifact is not a core module, and the record's other files \
+             are not `.wasm`"
+        );
+    }
+
     #[test]
     fn validate_surface_assets_passes_with_all_records_present() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1702,17 +1920,240 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "manifest declares v = 3")]
-    fn validate_surface_assets_panics_on_processor_manifest_version() {
+    #[should_panic(expected = "manifest declares v = 2")]
+    fn a_stale_record_under_brenns_own_mount_is_a_boot_refusal() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
+        // brenn's surface tree, its kernel and its binary travel in one tarball
+        // and are installed as a sync, so a record the binary cannot read is a
+        // broken install and nothing an operator can converge.
         write_processor_tree(dir.path(), "transplant", &["ports"], |m| {
-            m["v"] = serde_json::json!(3);
+            m["v"] = serde_json::json!(2);
         });
         validate_one_root(
             dir.path(),
             &[resolved_with_processor("deskbar", "transplant")],
         );
+    }
+
+    /// The withheld case, and the whole of what it means for the served set: a
+    /// bundle mount's stale kind is not served, every other kind still is, and
+    /// the process is up.
+    #[test]
+    fn a_stale_record_under_a_bundle_mount_is_withheld() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(brenn.path(), "chrome", &["ports"], |_| {});
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+
+        assert!(roots.kinds.contains_key("chrome"));
+        assert!(!roots.kinds.contains_key("fleet"));
+        let held = roots.withheld_kind("fleet").expect("fleet is withheld");
+        assert_eq!(held.record_v, 2);
+        assert_eq!(held.mount, "fleet-bundle");
+        assert_eq!(held.root, bundle.path());
+        assert!(
+            held.reason.contains("declares v = 2") && held.reason.contains("retained `io` port"),
+            "the reason names both versions and the migration: {}",
+            held.reason
+        );
+        assert_eq!(roots.kind_root("fleet"), None);
+        assert_eq!(roots.kind_cores("fleet"), None);
+    }
+
+    /// A configured instance of a withheld kind is not a configuration error:
+    /// the document compiled against the bundle's authored module, which did not
+    /// move, and the instance's verdict is the page's to deliver.
+    #[test]
+    fn a_configured_instance_of_a_withheld_kind_does_not_refuse_the_boot() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_with_processor("deskbar", "fleet")],
+        );
+        assert!(roots.withheld.contains_key("fleet"));
+    }
+
+    /// The phase ordering: the version verdict is read off a shape that is only
+    /// `{ v }`, so a record from a version that added a field is withheld as the
+    /// skew it is rather than refused for the field's name.
+    #[test]
+    fn a_stale_record_of_a_foreign_shape_is_withheld_not_parsed() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(4);
+            m["a_field_from_the_future"] = serde_json::json!("whatever");
+        });
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+        assert_eq!(
+            roots.withheld_kind("fleet").map(|held| held.record_v),
+            Some(4)
+        );
+    }
+
+    /// The other half of the ordering: a record whose `v` this server *does*
+    /// read is held to the whole shape, wherever it is installed. A foreign
+    /// field there is build drift, not version skew.
+    #[test]
+    #[should_panic(expected = "does not parse")]
+    fn a_current_record_of_a_foreign_shape_still_panics_under_a_bundle_mount() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["a_field_from_the_future"] = serde_json::json!("whatever");
+        });
+        validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+    }
+
+    /// A withheld kind's tree is a real surface tree, so the root it lives under
+    /// offers something — the "mount path one directory off" refusal must not
+    /// fire on it.
+    #[test]
+    fn a_root_offering_only_a_withheld_kind_offers_something() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+    }
+
+    /// A kind in neither map is still the configuration error it was: withheld
+    /// is a verdict about an installed tree, not a way to accept a kind nothing
+    /// offers.
+    #[test]
+    #[should_panic(expected = "which no installed surface tree offers")]
+    fn a_kind_no_root_offers_is_still_refused_beside_a_withheld_one() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[resolved_with_processor("deskbar", "absent")],
+        );
+    }
+
+    /// Withheld → served is an `Offered` difference and served → withheld a
+    /// `Withdrawn` one, which is what promotes the surfaces stamping the kind to
+    /// `changed` at both transitions. Both follow from a kind being in `kinds`
+    /// or not, with no reference to the withheld map.
+    #[test]
+    fn the_withheld_transitions_are_ordinary_kind_differences() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        let mounts = mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]);
+        let withholding = validate_surface_assets(&mounts, &[]);
+
+        // The bundle is re-released against this brenn.
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |_| {});
+        let serving = validate_surface_assets(&mounts, &[]);
+
+        let offered = withholding.kind_differences(&serving);
+        assert!(matches!(
+            offered.get("fleet"),
+            Some(KindDifference::Offered { mount }) if mount == "fleet-bundle"
+        ));
+        let withdrawn = serving.kind_differences(&withholding);
+        assert!(matches!(
+            withdrawn.get("fleet"),
+            Some(KindDifference::Withdrawn { mount, .. }) if mount == "fleet-bundle"
+        ));
+    }
+
+    /// A bundle re-installed and *still* unreadable is a difference, on either
+    /// witness it moved on.
+    ///
+    /// This is the case the withholding exists for: the operator acted on the
+    /// alert and the kind is still dead. Comparing only the served map would
+    /// make the two scans identical, so the reload would report that nothing
+    /// moved, keep the boot-time reason in the description documents, and say
+    /// nothing — over an install the operator is waiting on.
+    #[test]
+    fn a_rereleased_bundle_this_host_still_cannot_read_is_a_difference() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let moved = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        let held = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+
+        // Rebuilt, but against a brenn newer than this one.
+        write_processor_tree(bundle.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(crate::processor_assets::MANIFEST_VERSION + 1);
+        });
+        let rebuilt = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", bundle.path())]),
+            &[],
+        );
+        assert!(
+            matches!(
+                held.kind_differences(&rebuilt).get("fleet"),
+                Some(KindDifference::Reinstalled { mount, .. }) if mount == "fleet-bundle"
+            ),
+            "{:?}",
+            held.kind_differences(&rebuilt),
+        );
+
+        // Not rebuilt at all: the same stale record behind a fresh versioned
+        // tree, which is what a re-install without a rebuild looks like.
+        write_processor_tree(moved.path(), "fleet", &["ports"], |m| {
+            m["v"] = serde_json::json!(2);
+        });
+        let reinstalled = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("fleet-bundle", moved.path())]),
+            &[],
+        );
+        assert!(
+            matches!(
+                held.kind_differences(&reinstalled).get("fleet"),
+                Some(KindDifference::Reinstalled { root, .. }) if root == moved.path()
+            ),
+            "{:?}",
+            held.kind_differences(&reinstalled),
+        );
+
+        // And the byte-identical re-scan is still nothing.
+        assert!(held.kind_differences(&held.clone()).is_empty());
     }
 
     #[test]
@@ -2532,6 +2973,7 @@ mod tests {
     fn roots_with(kinds: &[(&str, &str, &str, &str, &str)]) -> SurfaceRoots {
         SurfaceRoots {
             kernel: Some(KernelRoot::for_test("/kernel")),
+            withheld: Default::default(),
             kinds: kinds
                 .iter()
                 .map(|(kind, mount, root, source, spec)| {
@@ -2542,6 +2984,7 @@ mod tests {
                             root: std::path::PathBuf::from(root),
                             source_sha256: (*source).to_string(),
                             spec_sha256: (*spec).to_string(),
+                            cores: Vec::new(),
                         },
                     )
                 })

@@ -471,9 +471,9 @@ fn park(store: &mut ChannelStore<String>, sender: &str, body: &str, release_at: 
         .expect("the case parks inside the cap");
 }
 
-fn parked_bodies(store: &ChannelStore<String>, sender: &str, now: ReleaseTime) -> Vec<String> {
+fn parked_bodies(store: &ChannelStore<String>, sender: &str) -> Vec<String> {
     store
-        .deferred_for_sender(sender, now)
+        .deferred_for_sender(sender)
         .map(|e| e.message.body.clone())
         .collect()
 }
@@ -539,21 +539,26 @@ fn next_release_is_the_soonest_deadline_due_or_not() {
     assert_eq!(s.next_release(), Some(9_000));
 }
 
-/// The sender filter is the whole authorization story, and the cutoff is
-/// `release_at > now`: an entry whose time has come is out of the view before
-/// the sweep takes it, since there is nothing left to cancel or edit.
+/// The sender filter is the whole authorization story, and the view is every
+/// unreleased entry: one whose time has come is still shown, until the sweep
+/// takes it.
 #[test]
-fn a_senders_view_holds_its_own_still_parked_messages_only() {
+fn a_senders_view_holds_its_own_unreleased_messages_only() {
     let mut s = store(4);
     park(&mut s, ALICE, "mine-late", 9_000);
     park(&mut s, BOB, "not-mine", 5_000);
     park(&mut s, ALICE, "mine-due", 5_000);
-    assert_eq!(parked_bodies(&s, ALICE, 0), ["mine-due", "mine-late"]);
-    assert_eq!(parked_bodies(&s, ALICE, 5_000), ["mine-late"]);
-    assert_eq!(parked_bodies(&s, BOB, 0), ["not-mine"]);
+    assert_eq!(parked_bodies(&s, ALICE), ["mine-due", "mine-late"]);
+    assert_eq!(parked_bodies(&s, BOB), ["not-mine"]);
     assert_eq!(
-        parked_bodies(&s, "attacher:test#nobody", 0),
+        parked_bodies(&s, "attacher:test#nobody"),
         Vec::<String>::new()
+    );
+    s.release_due(5_000);
+    assert_eq!(
+        parked_bodies(&s, ALICE),
+        ["mine-late"],
+        "the sweep is what takes an entry out of the view"
     );
 }
 
@@ -582,7 +587,7 @@ fn a_full_deferred_set_refuses_the_park_and_names_its_cap() {
     park(&mut s, ALICE, "two", 5_000);
     let refused = s.park(ALICE, env("three"), 5_000);
     assert_eq!(refused, Err(QuotaExceeded { cap: 2 }));
-    assert_eq!(parked_bodies(&s, ALICE, 0), ["one", "two"]);
+    assert_eq!(parked_bodies(&s, ALICE), ["one", "two"]);
 }
 
 #[test]
@@ -695,26 +700,34 @@ fn the_two_op_failures_are_distinguished() {
     s.release_due(5_000);
     assert_eq!(
         s.apply_defer_op(ALICE, id, DeferOp::Cancel, 0),
-        DeferOpOutcome::NotParked
+        DeferOpOutcome::NotParked {
+            deliver_after: None
+        },
+        "nothing of that identity is held any more"
     );
 }
 
-/// The window between a release time arriving and the sweep taking the entry: the
-/// message is due, so it is out of the sender's view and out of an op's reach —
-/// the answer the peer gives for the same op on a channel that crosses the wire.
+/// The window between a release time arriving and the sweep taking the entry:
+/// the message is due, so it is still in the sender's view and already out of
+/// an op's reach — the answer the peer gives for the same op on a channel that
+/// crosses the wire.
 #[test]
-fn an_op_on_a_due_but_unswept_message_reaches_nothing() {
+fn a_due_but_unswept_message_is_shown_and_reaches_nothing() {
     let mut s = store(4);
     park(&mut s, ALICE, "due", 5_000);
     let id = s.parked().next().expect("parked").0.message_id;
     assert_eq!(
-        parked_bodies(&s, ALICE, 5_000),
-        Vec::<String>::new(),
-        "the view already excluded it"
+        parked_bodies(&s, ALICE),
+        ["due"],
+        "the view shows it until the sweep takes it"
     );
     assert_eq!(
         s.apply_defer_op(ALICE, id, DeferOp::Cancel, 5_000),
-        DeferOpOutcome::NotParked
+        DeferOpOutcome::NotParked {
+            deliver_after: Some(5_000)
+        },
+        "the entry is still held, so the outcome carries the instant that separates \
+         a lost race from a component acting on a due entry"
     );
     let released = s.release_due(5_000).released;
     assert_eq!(

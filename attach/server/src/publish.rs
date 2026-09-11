@@ -501,7 +501,7 @@ pub async fn handle_publish_batch(
                 if applied_any {
                     ctx.messenger.dispatch_kick();
                 }
-                emit_views(ctx, attribution, op_channels, flush_now).await;
+                emit_views(ctx, attribution, op_channels).await;
                 return violation;
             }
         }
@@ -569,7 +569,7 @@ pub async fn handle_publish_batch(
         .map(|entry| entry.channel)
         .chain(op_channels)
         .collect();
-    emit_views(ctx, attribution, touched, flush_now).await;
+    emit_views(ctx, attribution, touched).await;
 
     let frame = ServerFrame::PublishBatchResult {
         correlation,
@@ -715,9 +715,12 @@ fn assert_publishable(
 /// The three outcomes:
 ///
 /// - **Applied** — the parked set changed, so its view owes a restatement.
-/// - **`NotDeferred`** — the message released between the snapshot the attacher
-///   acted on and this frame. Logged and counted, never punished: a conforming
-///   attacher can always lose that race. The view is restated regardless: a wrong
+/// - **`NotDeferred`** — the message is past its release time at flush: it
+///   matured between the snapshot the attacher acted on and this frame, or the
+///   attacher acted on an entry its mirror already showed as due. Logged with
+///   the target's instant, counted, never punished: a conforming attacher can
+///   always lose that race, and the log line is where the other case is read.
+///   The view is restated regardless: a wrong
 ///   mirror (dropped emission, say) can provoke ops naming schedules the server
 ///   does not hold, and without a restatement the phantom entry would be
 ///   cancelled over and over. A recompute is idempotent, so restating on a
@@ -754,15 +757,17 @@ async fn apply_deferred_op(
     };
     match outcome {
         DeferralOutcome::Applied => Ok(OpEffect::Applied),
-        DeferralOutcome::NotDeferred => {
+        DeferralOutcome::NotDeferred { deliver_after } => {
             ctx.messenger
                 .record_deferred_control_race(sender.as_str(), op.channel);
             info!(
                 attacher = %ctx.profile.attacher().as_str(),
                 attribution = attribution.unwrap_or("<attacher>"),
                 channel = op.channel,
-                "attach deferred control op is a no-op — the message released between the \
-                 activation's snapshot and the flush"
+                deliver_after = ?deliver_after,
+                now = %now,
+                "attach deferred control op is a no-op — the target is past its release time at \
+                 flush"
             );
             Ok(OpEffect::Raced)
         }
@@ -779,17 +784,12 @@ async fn apply_deferred_op(
 /// Deduped because one flush can park on and aim an op at the same channel, and
 /// the view is recomputed from the store — so the second emission would carry the
 /// same snapshot the first did.
-async fn emit_views(
-    ctx: &AttachSessionCtx,
-    attribution: Option<&str>,
-    channels: Vec<&str>,
-    now: DateTime<Utc>,
-) {
+async fn emit_views(ctx: &AttachSessionCtx, attribution: Option<&str>, channels: Vec<&str>) {
     let mut channels = channels;
     channels.sort_unstable();
     channels.dedup();
     for channel in channels {
-        broadcast_deferred_view(ctx, attribution, channel, now).await;
+        broadcast_deferred_view(ctx, attribution, channel).await;
     }
 }
 
@@ -860,17 +860,19 @@ pub async fn broadcast_deferred_view(
     ctx: &AttachSessionCtx,
     attribution: Option<&str>,
     channel: &str,
-    now: DateTime<Utc>,
 ) {
     let sender = parked_sender(ctx, attribution);
     let _order = ctx.messenger.lock_deferred_view_gate().await;
     let entries = deferred_view_entries(
         &ctx.messenger
-            .deferred_view_for_sender(channel, sender.as_str(), now)
+            .deferred_view_for_sender(channel, sender.as_str())
             .await,
     );
+    // Keyed by the registry key, which is what a session registers under — a
+    // surface's is its bare slug, and the participant id the profile states is a
+    // different spelling that no registration answers to.
     ctx.registry.push_deferred_view(
-        ctx.profile.attacher().as_str(),
+        &ctx.profile.attach_scope().registry_key(),
         &DeferredViewPush {
             channel: channel.to_string(),
             attribution: attribution.map(str::to_string),
@@ -895,13 +897,12 @@ pub async fn seed_deferred_views(
     ctx: &AttachSessionCtx,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
-    let now = Utc::now();
     let targets = ctx.profile.deferred_view_targets();
     for target in targets {
         let sender = parked_sender(ctx, target.attribution.as_deref());
         let entries = deferred_view_entries(
             &ctx.messenger
-                .deferred_view_for_sender(&target.channel, sender.as_str(), now)
+                .deferred_view_for_sender(&target.channel, sender.as_str())
                 .await,
         );
         if entries.is_empty() {
@@ -917,7 +918,7 @@ pub async fn seed_deferred_views(
             return FrameOutcome::Disconnect;
         }
     }
-    for orphan in orphaned_parked_sets(ctx, targets, now).await {
+    for orphan in orphaned_parked_sets(ctx, targets, Utc::now()).await {
         warn!(
             attacher = %ctx.profile.attacher().as_str(),
             attribution = orphan.attribution.as_deref().unwrap_or("<attacher>"),

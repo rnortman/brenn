@@ -16,11 +16,13 @@
 //! text and never parses markup, so a layout label, a banner line and a toast
 //! are inert regardless of content.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use brenn_envelope::MessageEnvelope;
-use brenn_guest::{Activation, Error, Processor, dom, log, page_dom, publish, repark};
+use brenn_guest::{
+    Activation, Error, Processor, RetainedState, StateLoss, dom, log, page_dom, publish, repark,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::layout::LayoutKind;
 use crate::logic::{
@@ -74,29 +76,37 @@ const TOAST_SOURCE_ATTR: &str = "data-toast-source";
 /// The attribute hiding the banner between states.
 const HIDDEN_ATTRIBUTE: &str = "hidden";
 
-// One instantiation backs one instance for the page's lifetime, so the decision
-// core and every element handle chrome holds are ordinary interior-mutable
-// module state.
-thread_local! {
-    static CHROME: RefCell<Chrome> = RefCell::new(Chrome::new());
-}
+impl crate::spec::StatePayload for Chrome {}
 
-/// Chrome's page-lifetime state.
+/// Everything chrome carries between activations, which rides its retained
+/// `state` port because linear memory does not survive one.
+///
+/// The handles in it do survive: a handle is owned by the mount, so the element
+/// one named when it was stored is the element it names when it is read back —
+/// which is what lets the toast map and the layout sections be built once and
+/// written into thereafter.
+#[derive(Serialize, Deserialize)]
 struct Chrome {
     core: ChromeCore,
     /// The page elements chrome owns, built by the mount activation.
     view: Option<View>,
     /// Whether the core has been told which instance chrome runs as.
     identified: bool,
-    /// The live toast elements, keyed by the core's page-lifetime toast id.
-    toasts: HashMap<u64, dom::Node>,
+    /// The live toast elements, keyed by the core's minted toast id.
+    ///
+    /// This map and the two below are ordered rather than hashed: the state
+    /// write is skipped by comparing serialized bytes, and a hashed map
+    /// iterates in an order seeded per instance, so a body that had not changed
+    /// would re-serialize differently and be written anyway.
+    toasts: BTreeMap<u64, dom::Node>,
     /// One layout section per arrangeable instance, built on first arrange.
-    sections: HashMap<String, dom::Node>,
+    sections: BTreeMap<String, dom::Node>,
     /// A section's panel-label header, where one is rendered.
-    labels: HashMap<String, dom::Node>,
+    labels: BTreeMap<String, dom::Node>,
 }
 
 /// The page furniture chrome builds once and writes into thereafter.
+#[derive(Serialize, Deserialize)]
 struct View {
     /// The surface root, which holds every instance wrapper.
     page_root: dom::Node,
@@ -109,20 +119,22 @@ struct View {
     toast_container: dom::Node,
 }
 
-impl Chrome {
-    fn new() -> Chrome {
+impl Default for Chrome {
+    fn default() -> Chrome {
         Chrome {
             // The instance name is not known until the first surface-state
             // roster arrives; nothing is arrangeable before then.
             core: ChromeCore::new(String::new()),
             view: None,
             identified: false,
-            toasts: HashMap::new(),
-            sections: HashMap::new(),
-            labels: HashMap::new(),
+            toasts: BTreeMap::new(),
+            sections: BTreeMap::new(),
+            labels: BTreeMap::new(),
         }
     }
+}
 
+impl Chrome {
     /// The view, which every activation after the mount one has.
     fn view(&self) -> &View {
         self.view
@@ -135,10 +147,20 @@ struct ChromeComponent;
 
 impl Processor for ChromeComponent {
     fn receive(activation: Activation) -> Result<Option<String>, Error> {
-        CHROME.with(|chrome| on_activation(&activation, &mut chrome.borrow_mut()))?;
-        // Mount is answered with nothing, and a click on a toast cancels no
-        // default action worth cancelling.
-        Ok(None)
+        // Starting from a default state would lose the page furniture and build
+        // a second banner over the first, so an unreadable body fails the
+        // activation and chrome takes its error card.
+        RetainedState::around(
+            activation,
+            crate::spec::state::<Chrome>(),
+            StateLoss::FailActivation,
+            |activation, chrome| {
+                on_activation(activation, chrome)?;
+                // Mount is answered with nothing, and a click on a toast cancels
+                // no default action worth cancelling.
+                Ok(None)
+            },
+        )
     }
 }
 

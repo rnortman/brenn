@@ -314,10 +314,20 @@ impl DeferredMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferralOutcome {
     Applied,
-    /// The message is no longer parked — it released between the view the
-    /// caller acted on and this call. Inherent to scheduling, so it is a
-    /// reportable no-op rather than a failure.
-    NotDeferred,
+    /// The message is past the cutoff an edit or cancel may act within: it is
+    /// due, or it is gone. `deliver_after` is the instant it was due at when
+    /// the store still holds it, and `None` when nothing of that id is held at
+    /// all.
+    ///
+    /// Both are one fact — the caller named an entry it may no longer act on —
+    /// and one outcome, because nothing downstream does anything different
+    /// about them. The instant is what separates the two in a log line: a
+    /// caller that lost the release race against one it read moments ago, from
+    /// one acting on an entry its view already showed as due, which the
+    /// doctrine forbids.
+    NotDeferred {
+        deliver_after: Option<DateTime<Utc>>,
+    },
     /// The message is parked, but under a different sender. Distinct from
     /// [`NotDeferred`](Self::NotDeferred) because the two mean opposite things
     /// about the caller: losing the release race is what a correct caller does
@@ -631,17 +641,29 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// resolving a subscriber set here.
     async fn release_due(&self, now: DateTime<Utc>) -> ReleaseOutcome;
 
-    /// One sender's parked messages on this channel, soonest release first.
-    async fn deferred_for_sender(&self, sender: &str, now: DateTime<Utc>) -> Vec<DeferredMessage>;
+    /// One sender's unreleased messages on this channel, soonest release
+    /// first — every entry no release pass has taken, whatever its
+    /// `deliver_after` says.
+    ///
+    /// Clock-free by design: this is the view a sender reconciles its own
+    /// schedule from, and "is anything of mine standing?" is a question about
+    /// the store's state, not about an instant. An entry that has come due is
+    /// here, carrying its past instant, until release moves it into retention;
+    /// the sender reads the instant and knows it is due. Cancel and edit answer
+    /// on a different boundary (`> now`), so a due entry is shown here and is
+    /// not cancellable — which is what lets an empty view mean "nothing
+    /// standing" at every instant, on every store.
+    async fn deferred_for_sender(&self, sender: &str) -> Vec<DeferredMessage>;
 
-    /// Who holds something parked on this channel at `now` — every distinct
-    /// sender, once, sorted.
+    /// Who holds something still cancellable on this channel at `now` — every
+    /// distinct sender, once, sorted.
     ///
     /// The channel-wide peer of [`RetentionStore::deferred_for_sender`], for a
     /// caller that must ask "whose schedules are here?" before it knows which
-    /// senders to name. It answers on the same `now` boundary as the sender
-    /// views, so a sender whose only entry has matured is absent from both: it
-    /// has nothing left that can be viewed, cancelled, or edited.
+    /// senders to name. It answers on the *authority* boundary rather than the
+    /// view's: its one caller offers an operator the chance to cancel or edit,
+    /// and a sender whose only entry has come due has nothing to offer — the
+    /// next release pass takes it.
     ///
     /// Sorted rather than release-ordered because the question is set
     /// membership, and a stable order is what lets both implementations be held
@@ -652,19 +674,19 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// quantity the deferred cap bounds, and the one [`RetentionStore::park`]
     /// admits against.
     ///
-    /// Clock-free, and deliberately not the size of the sender views: a message
-    /// that has come due but that no release pass has taken yet is out of the
-    /// deferred *view* (it can no longer be cancelled or edited) while still
-    /// holding its cap slot, because the resources the cap bounds are still
-    /// held. Both stores count it the same way, which is what keeps a park
-    /// admitted on one class from being refused on the other.
+    /// Clock-free, as the sender views are: a message that has come due but
+    /// that no release pass has taken yet still holds its cap slot, because the
+    /// resources the cap bounds are still held. Both stores count it the same
+    /// way, which is what keeps a park admitted on one class from being refused
+    /// on the other.
     async fn deferred_len(&self) -> u64;
 
     /// Cancel one of `sender`'s parked messages, named by its message uuid.
     ///
-    /// The outcome distinguishes a lost release race
+    /// The outcome distinguishes an entry past the cutoff
     /// ([`DeferralOutcome::NotDeferred`]) from an id belonging to another sender
-    /// ([`DeferralOutcome::WrongSender`]).
+    /// ([`DeferralOutcome::WrongSender`]). The cutoff is `now`: a due entry is
+    /// in the sender's view and is not cancellable.
     async fn cancel_deferred(
         &self,
         sender: &str,

@@ -5,6 +5,10 @@
 /// Draws the connection banner and the toast container, so it holds `dom`; it
 /// also arranges every other instance's wrapper and stamps the page's theme and
 /// takeover state, which is what `page-dom` is for.
+///
+/// Its decision core and every element handle it holds — the page furniture,
+/// the live toasts, the per-instance layout sections — ride the retained
+/// `state` port between activations, because linear memory does not.
 component Chrome {
   abi = processor;
   requires = [ports, log, dom, page-dom];
@@ -17,4 +21,5 @@ component Chrome {
   in toast: "brenn.surface.toast@1";
   optional out overlay-state: "brenn.surface.overlay-state@1";
   io toast-tick;
+  io state;
 }

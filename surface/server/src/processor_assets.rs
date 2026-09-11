@@ -25,7 +25,15 @@ use crate::AssetContext;
 /// Manifest schema version this server understands. A tree written by a
 /// different version is a deploy/toolchain mismatch, not something to
 /// best-effort parse.
-const MANIFEST_VERSION: u32 = 2;
+///
+/// The number is the hosting contract the artifact was built against, not just
+/// the record's own shape. v3 is the per-activation instance: the transpile is
+/// `--instantiation sync` and the page names the core modules from the record's
+/// file list instead of letting the glue discover them. A kind built against v2
+/// may keep state in linear memory across activations, which no host gives it
+/// any more, so its record is refused rather than run under a lifetime it was
+/// not written for.
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// The package namespace every processor host interface lives under. An import
 /// outside this namespace (a stray `wasi:*` a dependency dragged in, or a future
@@ -55,6 +63,15 @@ const SURFACE_IMPORTS: [&str; 7] = [
 const KNOWN_IMPORTS: [&str; 10] = [
     "types", "ports", "log", "alert", "config", "store", "mqtt", "tools", "dom", "page-dom",
 ];
+
+/// The one promise every record makes, whatever version wrote it: an integer
+/// `v`. Parsed on its own, without `deny_unknown_fields`, so that a record from
+/// a version whose shape this server cannot read still answers which version it
+/// is.
+#[derive(Debug, serde::Deserialize)]
+struct RecordVersion {
+    v: u32,
+}
 
 /// The build manifest emitted beside a transpiled processor kind.
 ///
@@ -92,6 +109,27 @@ pub struct ProcessorManifest {
     /// Every file the transpile emitted. jco's output set is version-dependent,
     /// so validation trusts this list rather than hard-coding a file shape.
     pub files: Vec<String>,
+}
+
+impl ProcessorManifest {
+    /// The core modules the transpiled glue will ask for, by file name.
+    ///
+    /// The sync-instantiation glue looks a core module up synchronously and
+    /// cannot fetch one it has not been handed, so the page has to compile them
+    /// all at bring-up — which means naming them, and the record is where their
+    /// names already are. Every `.wasm` the transpile emitted except the source
+    /// component copied in beside it, which is provenance and not a core.
+    ///
+    /// Read off `files`, which boot validation has already walked file by file,
+    /// so a name here is a file that exists under the kind's root.
+    pub fn cores(&self, kind: &str) -> Vec<String> {
+        let source = component_artifact(kind);
+        self.files
+            .iter()
+            .filter(|file| file.ends_with(".wasm") && **file != source)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Directory holding a processor kind's transpiled tree.
@@ -163,6 +201,28 @@ pub fn read_processor_record_in(
     kind: &str,
 ) -> ProcessorManifest {
     let AssetContext { when, verdict } = cx;
+    read_processor_record_or_version_in(cx, surface_root, kind)
+        .unwrap_or_else(|found| panic!("{when}: {}{verdict}", version_mismatch_reason(kind, found)))
+}
+
+/// The same read, with the version verdict handed back instead of panicked on.
+///
+/// `Err(v)` is the record's own `v`, for a record this server does not read.
+/// The caller decides what a version mismatch means where it found the tree: a
+/// broken install under brenn's own mount, or a bundle mid-upgrade under any
+/// other declared mount, which is withheld rather than fatal.
+///
+/// # Panics
+///
+/// On a missing/unreadable manifest, a manifest whose `v` does not parse, and —
+/// once the version matches — everything [`read_processor_record_in`] panics
+/// on.
+pub fn read_processor_record_or_version_in(
+    cx: AssetContext,
+    surface_root: &Path,
+    kind: &str,
+) -> Result<ProcessorManifest, u32> {
+    let AssetContext { when, verdict } = cx;
     let dir = kind_dir(surface_root, kind);
     let manifest_path = dir.join("manifest.json");
 
@@ -174,6 +234,24 @@ pub fn read_processor_record_in(
             manifest_path.display(),
         )
     });
+    // The version verdict comes first, off a shape that is only the one field:
+    // a record from a version that added or dropped a field would otherwise be
+    // refused by `deny_unknown_fields` below, naming a key instead of the
+    // version skew that is the real cause — and a mismatch has to read as a
+    // mismatch wherever the tree was found, because that is what decides
+    // between a panic and a withheld kind.
+    let declared: RecordVersion = serde_json::from_str(&raw).unwrap_or_else(|err| {
+        panic!(
+            "{when}: processor component {kind:?} asset manifest at {} declares no readable schema \
+             version ({err}) — every record carries an integer `v` as its first promise. Rebuild \
+             the surface assets with a matching toolchain.{verdict}",
+            manifest_path.display(),
+        )
+    });
+    if declared.v != MANIFEST_VERSION {
+        return Err(declared.v);
+    }
+
     let manifest: ProcessorManifest = serde_json::from_str(&raw).unwrap_or_else(|err| {
         panic!(
             "{when}: processor component {kind:?} asset manifest at {} does not parse ({err}) — the \
@@ -183,13 +261,6 @@ pub fn read_processor_record_in(
         )
     });
 
-    assert!(
-        manifest.v == MANIFEST_VERSION,
-        "{when}: processor component {kind:?} asset manifest declares v = {}, but this server reads \
-         v = {MANIFEST_VERSION} — the deployed surface assets were built by a different version. \
-         Rebuild and redeploy.{verdict}",
-        manifest.v,
-    );
     assert!(
         manifest.kind == kind,
         "{when}: processor asset tree at {} carries a manifest for kind {:?} — the tree and its \
@@ -213,7 +284,23 @@ pub fn read_processor_record_in(
     assert_spec_name_derives(cx, kind, &manifest);
     assert_import_profile(cx, kind, &manifest);
 
-    manifest
+    Ok(manifest)
+}
+
+/// Why a record this server does not read is refused or withheld, in one
+/// sentence naming both versions and the migration.
+///
+/// One text for both dispositions: the operator reads the same cause whether
+/// the stale tree is brenn's own (a boot panic) or a bundle's (withheld), and
+/// the two would otherwise drift into describing the same skew differently.
+pub fn version_mismatch_reason(kind: &str, found: u32) -> String {
+    format!(
+        "processor component {kind:?} asset manifest declares v = {found}, but this server reads \
+         v = {MANIFEST_VERSION} — the deployed surface assets were built by a different version. \
+         v3 is the per-activation instance: a component's linear memory lives for one activation, \
+         and a kind built before that keeps state across activations it will no longer get. \
+         Rebuild the kind against this brenn (state moves to a retained `io` port) and redeploy."
+    )
 }
 
 /// The byte half: the two digests that bind the record to the artifacts beside
@@ -432,6 +519,42 @@ mod tests {
     use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 
     use super::{KNOWN_IMPORTS, SURFACE_IMPORTS};
+
+    /// The core list is the transpile's own `.wasm` output and nothing else.
+    /// The source component is copied in beside it as provenance and is not a
+    /// core: handing it to the glue's lookup would be handing it a component
+    /// where it asked for a module.
+    #[test]
+    fn cores_are_the_emitted_wasm_files_without_the_source_artifact() {
+        let manifest = super::ProcessorManifest {
+            v: super::MANIFEST_VERSION,
+            kind: "panel".to_string(),
+            source_sha256: String::new(),
+            jco_version: String::new(),
+            spec: "panel.spec.brenn".to_string(),
+            spec_sha256: String::new(),
+            imports: Vec::new(),
+            files: [
+                "panel.js",
+                "panel.d.ts",
+                "panel.core.wasm",
+                "panel.core2.wasm",
+                "panel.component.wasm",
+                "panel.spec.brenn",
+                "interfaces/brenn-processor-ports.d.ts",
+            ]
+            .iter()
+            .map(|f| (*f).to_string())
+            .collect(),
+        };
+        assert_eq!(
+            manifest.cores("panel"),
+            vec![
+                "panel.core.wasm".to_string(),
+                "panel.core2.wasm".to_string()
+            ],
+        );
+    }
 
     /// The interface name in an import list that is no capability: it carries
     /// the shared types every processor speaks and no host implements it.

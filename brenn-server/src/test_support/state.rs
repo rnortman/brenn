@@ -148,6 +148,7 @@ pub fn test_app_with_surface_roots(
     state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
         kernel: Some(brenn_surface_server::KernelRoot::for_test(tmp.path())),
         kinds,
+        withheld: Default::default(),
     }));
     let app = build_router(state, None, 0, 2576)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));

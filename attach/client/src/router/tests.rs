@@ -355,7 +355,7 @@ fn schedule_of(
     origin: Origin<'_>,
 ) -> Vec<(String, ReleaseTime)> {
     router
-        .parked_for(stores, PLANE, origin, 0)
+        .parked_for(stores, PLANE, origin)
         .into_iter()
         .map(|entry| (entry.body, entry.deliver_after))
         .collect()
@@ -449,16 +449,17 @@ fn a_schedule_reads_back_in_the_shape_the_peer_answers_for_a_wire_channel() {
         &mut stores,
         scheduled(PLANE, Origin::Sub("widget-7"), "body", 42, SOON),
     ));
-    let entries = router.parked_for(&stores, PLANE, Origin::Sub("widget-7"), 0);
+    let entries = router.parked_for(&stores, PLANE, Origin::Sub("widget-7"));
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].message_id, Uuid::from_u128(42));
     assert_eq!(entries[0].body, "body");
     assert_eq!(entries[0].deliver_after, SOON);
+    router.release_due(&mut stores, SOON);
     assert!(
         router
-            .parked_for(&stores, PLANE, Origin::Sub("widget-7"), SOON)
+            .parked_for(&stores, PLANE, Origin::Sub("widget-7"))
             .is_empty(),
-        "an entry whose time has come is out of the view before the sweep takes it"
+        "the sweep is what takes an entry out of the view"
     );
 }
 
@@ -699,26 +700,33 @@ fn an_op_naming_a_released_message_is_the_benign_race() {
             now: SOON,
         },
     );
-    assert_eq!(answer, DeferOpAnswer::NotParked);
+    assert_eq!(
+        answer,
+        DeferOpAnswer::NotParked {
+            deliver_after: None
+        },
+        "the sweep took it, so nothing is held to name an instant"
+    );
 }
 
 /// The same race one turn earlier: the release time has arrived but the embedder
-/// has not swept yet. The message is still physically parked, and it is still
-/// beyond an op's reach — the schedule stopped showing it at its release time,
-/// and the peer answers the same for a channel that crosses the wire.
+/// has not swept yet. The message is still physically parked and the schedule
+/// still shows it, carrying its past instant — and it is beyond an op's reach
+/// all the same, which is what the peer answers for a channel that crosses the
+/// wire.
 #[test]
-fn an_op_on_a_due_but_unswept_message_is_the_same_benign_race() {
+fn a_due_but_unswept_message_is_shown_and_is_beyond_an_ops_reach() {
     let mut stores = stores(4);
     let mut router = router(TestPlanes::default());
     parked_until(router.route(
         &mut stores,
         scheduled(PLANE, Origin::Attacher, "due", 7, SOON),
     ));
-    assert!(
-        router
-            .parked_for(&stores, PLANE, Origin::Attacher, SOON)
-            .is_empty(),
-        "at its release time the schedule no longer shows it"
+    let view = router.parked_for(&stores, PLANE, Origin::Attacher);
+    assert_eq!(
+        view.iter().map(|e| e.deliver_after).collect::<Vec<_>>(),
+        vec![SOON],
+        "the schedule shows it with the instant that has passed"
     );
     let answer = router.apply_op(
         &mut stores,
@@ -730,7 +738,13 @@ fn an_op_on_a_due_but_unswept_message_is_the_same_benign_race() {
             now: SOON,
         },
     );
-    assert_eq!(answer, DeferOpAnswer::NotParked);
+    assert_eq!(
+        answer,
+        DeferOpAnswer::NotParked {
+            deliver_after: Some(SOON)
+        },
+        "the entry is still held: the answer carries the instant it came due at"
+    );
     let swept = router.release_due(&mut stores, SOON);
     assert_eq!(
         swept[0].released[0].body, "due",
@@ -747,7 +761,7 @@ fn nothing_is_scheduled_before_the_attachment_has_an_identity() {
     let mut router = LocalRouter::new(TestPlanes::default());
     assert!(
         router
-            .parked_for(&stores, PLANE, Origin::Attacher, 0)
+            .parked_for(&stores, PLANE, Origin::Attacher)
             .is_empty()
     );
     let answer = router.apply_op(
@@ -760,7 +774,12 @@ fn nothing_is_scheduled_before_the_attachment_has_an_identity() {
             now: NOW,
         },
     );
-    assert_eq!(answer, DeferOpAnswer::NotParked);
+    assert_eq!(
+        answer,
+        DeferOpAnswer::NotParked {
+            deliver_after: None
+        }
+    );
 }
 
 #[test]
@@ -790,5 +809,5 @@ fn a_transportable_channels_schedule_is_not_the_routers_to_answer() {
     let mut stores = ChannelStores::<String>::new(Uuid::from_u128(0xE90C));
     stores.ensure("ephemeral:demo", 4);
     let router = router(TestPlanes::default());
-    router.parked_for(&stores, "ephemeral:demo", Origin::Attacher, 0);
+    router.parked_for(&stores, "ephemeral:demo", Origin::Attacher);
 }

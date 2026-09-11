@@ -292,8 +292,11 @@ pub struct BatchDeferredOp {
     ///
     /// An id parked by a *different* sender is a protocol violation, not an
     /// outcome: a conforming client can only name what a sender-scoped view
-    /// showed it. A message that simply released between the snapshot and this
-    /// frame is the benign race instead, which the server logs and counts.
+    /// showed it. A message past its release instant at flush is the benign
+    /// no-op instead, which the server logs and counts — and the view shows an
+    /// entry whose instant has passed, so a client that names one gets that
+    /// no-op rather than an applied op. Read `deliver_after` before acting: an
+    /// entry already due is not cancellable or editable.
     pub message_id: Uuid,
     pub op: DeferredOpKind,
 }
@@ -454,6 +457,13 @@ pub enum ServerFrame {
     /// changes, and once per nonempty set after [`Welcome`](ServerFrame::Welcome).
     /// The client clears every mirror at `Welcome`, so a set with no frame is
     /// empty.
+    ///
+    /// Every entry the sender parked that no release pass has taken is here,
+    /// including one whose `deliver_after` has already passed, carried with
+    /// that past instant. So an empty set means nothing is standing, at every
+    /// instant — and an entry in the set is not necessarily actionable: a
+    /// [`BatchDeferredOp`] naming a due one is a no-op. A client that treats
+    /// every entry as cancellable must read `deliver_after`.
     DeferredView {
         channel: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

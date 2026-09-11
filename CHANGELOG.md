@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.21.0]
+
 ### Added
 
 - **Webhook endpoints converge at reload.** Adding, removing, or editing a
@@ -28,6 +30,78 @@ All notable changes to Brenn are documented here.
 
 ### Changed
 
+- **BREAKING (surface components): a component's linear memory lives for one
+  activation.** The browser page now instantiates a kind's compiled module
+  inside its activation entry and drops the instance when the entry returns, as
+  the backend has always done. A surface component that kept state in a
+  `thread_local!`, a static or the heap across activations stops working. There
+  is no shim. State is externalized instead: declare an `io state` port, bind it
+  `push_depth = 0; retain_depth = 1`, and use the guest SDK's `RetainedState`,
+  which reads the newest body out of that port's context window at the top of an
+  activation and publishes the new one at the bottom only when it changed. Host
+  resources reached by handle are unaffected -- a DOM node handle is owned by the
+  mount, not by the memory, and travels in the published state like any other
+  field. Two signals for a stale kind: the surface asset record version goes
+  from 2 to 3, so a kind built before this change is withheld (see below) with a
+  message naming the lifetime; and `brenn-page-harness` instantiates per
+  activation, so an unmigrated kind fails its own suite before it is packaged.
+  Every in-tree kind is migrated; out-of-tree kinds migrate before they are
+  rebuilt against a release carrying this.
+- **A surface kind whose record this host cannot read is withheld, not fatal.**
+  A record-version mismatch under a **bundle** mount no longer refuses the boot.
+  The kind is left out of the served set, one `Warning` alert per withheld kind
+  goes out at boot (and at the reload that first withholds it), the page
+  manifest of every surface configuring it names the instance under `withheld`
+  with the reason, the kernel marks that instance `failed` and reports it, its
+  help and schema documents state the withholding, and `/surface-static` answers
+  for it with a plain 404 and no fail2ban signal. The reload after the bundle's
+  re-release serves it, with no restart. A withheld *chrome* instance renders
+  the reason as the page's terminal state rather than spending the reload cap --
+  no reload can clear it. A record mismatch under **brenn's own mount** is still
+  a boot refusal: the surface tree, the kernel and the binary travel in one
+  tarball, so a mismatch there is a broken install. The backend package record
+  keeps its boot panic under every mount for now. Record reading is two-phase,
+  so a record whose *shape* is foreign is reported as the version skew it is
+  rather than as an unknown field.
+- **Every backend WASM consumer receives one activation when its task starts.**
+  At boot and at every reload that starts or replaces a consumer, the component
+  is activated once with whatever its windows hold -- possibly nothing at all --
+  plus its deferred windows, exactly as a surface instance is at mount. A
+  component whose only input is its own deferred tick can therefore run on the
+  backend at all; before this it never activated. A component that reads its
+  first message without checking the window now fails loudly at every start
+  (alert and log naming wake kind `mount`), and that failure writes no
+  quarantine rows, because a mount that consumed nothing has nothing to
+  quarantine. The backend package record stays at version 2: the entry ABI did
+  not change.
+- **BREAKING (components and attachers): a deferred window holds every
+  unreleased message, due or not.** The window a component is shown on an
+  output port -- and the attach protocol's `DeferredView` frame -- used to hold
+  only the entries whose release time was still in the future, so a message
+  parked before an outage whose instant passed during it was invisible until
+  the host's release pass caught up. It is now every entry no release pass has
+  taken, carried with its own `deliver_after`, which may be in the past. An
+  empty window therefore means "nothing standing" at every instant, which is
+  what the re-arm rule (park a tick at mount iff the deferred window holds
+  none) needs to be exact. Cancel and edit keep their cutoff: an entry already
+  due is shown and is not cancellable -- the op is the existing no-op outcome,
+  now logged with the target's instant and the flush's. No compatibility shim
+  for either the WIT or the attach frame: a component or attacher that treated
+  every entry in the window as cancellable must read `deliver_after`.
+- **A component whose every input binding is sampled is live config, not a boot
+  refusal.** Boot used to panic on a surface instance or a WASM consumer whose
+  bindings were all `push_depth = 0`, on the ground that it could never
+  activate. It can: every mount is owed one activation, so such a component runs
+  once at mount and thereafter on its own deferred ticks or on gestures -- which
+  is exactly the shape of an instance whose only binding is its retained `io
+  state` port. The refusal is now a `tracing::warn!` naming the ports, so a
+  config that could not start before starts now.
+- **The page manifest names each kind's core modules.** Transpilation moved to
+  jco's `--instantiation sync`, whose core-module lookup is synchronous and so
+  cannot fetch -- which is what lets an instance be minted inside a sync-call
+  activation. `ManifestComponent` gains `cores`, the `.wasm` entries of the
+  kind's boot-validated record as build-stamped URLs, and the page compiles them
+  all at bring-up.
 - **One wildcard webhook route.** The per-endpoint route fold is replaced by a
   single `/webhooks/{*tail}` route matched for every HTTP method, with the
   endpoint ceiling enforced in-handler before the body is buffered past it. An
@@ -44,6 +118,13 @@ All notable changes to Brenn are documented here.
 
 ### Fixed
 
+- **A surface page is told when its parked set changes.** Every
+  `DeferredView` restatement -- the one a flush that parked, edited or cancelled
+  owes -- was addressed to the page's participant id rather than to the key its
+  session registered under, so it reached nobody. A page saw its parked set only
+  in the snapshot seeded behind `Welcome`, and mirrored a stale one until it
+  reattached. Daemons on the remote route were unaffected: their two spellings
+  coincide.
 - **Webhook event delivery no longer panics on a reload race.** A request
   holding an endpoint entry whose mount was removed mid-flight gets a channel-
   miss warning instead of a false host-bug panic and a Critical alert.

@@ -192,8 +192,8 @@ sed -i 's/"kind": "panel"/"kind": "elsewhere"/' "$tree/surface/processor/panel/m
 reject "a processor record staged under another kind's name" "but it is staged under panel"
 
 build_tree "$tree" surface
-sed -i 's/"v": 2,/"v": 1,/' "$tree/surface/processor/panel/manifest.json"
-reject "a record version the host does not read" "states record version 1"
+sed -i 's/"v": 3,/"v": 2,/' "$tree/surface/processor/panel/manifest.json"
+reject "a record version the host does not read" "states record version 2"
 
 # The record's file list is what boot validation walks, so a file it does not
 # list is one the host never verifies and the install sync copies anyway.

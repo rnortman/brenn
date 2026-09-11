@@ -9,10 +9,16 @@ description = "The messaging runtime: the Messenger engine, the channel stores, 
 # the app config aggregate and the ACL gates. Nothing in brenn-lib reaches back:
 # the half of the subsystem brenn-lib's own production code reads lives there,
 # in `brenn_lib::messaging`, and this crate re-exports it.
+#
+# Depends on brenn-activation because this crate assembles WASM activations: it
+# owns `load_activation_snapshot`, `PortSnapshot` and `WASM_WINDOW_MAX_NEW`, so
+# the rules an activation is owed — the mount debt, the readiness gate — are
+# read from the crate that states them rather than restated here.
 [features]
 testutils = ["brenn-messaging-store/testutils"]
 
 [dependencies]
+brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
 brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
 brenn-db = { version = "0.1.0", path = "../brenn-db" }

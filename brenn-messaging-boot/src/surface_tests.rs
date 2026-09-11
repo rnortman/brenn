@@ -2986,29 +2986,6 @@ fn a_retain_zero_channel_with_no_surface_binding_boots() {
     assert_eq!(resolved.len(), 1);
 }
 
-/// An instance every one of whose ports is context-only can never activate, so
-/// its context windows are never read — dead config at the instance grain, the
-/// check `resolve_wasm_consumers` makes at its own principal's.
-#[test]
-#[should_panic(expected = "input binding(s), all with push_depth = 0")]
-fn an_instance_whose_every_binding_is_context_only_panics() {
-    surfaces::assert_instance_can_activate("deskbar", "protobar", &[0, 0]);
-}
-
-/// One triggering port is enough: the depth-0 siblings window as context on the
-/// activations it mints.
-#[test]
-fn an_instance_with_one_triggering_binding_can_activate() {
-    surfaces::assert_instance_can_activate("deskbar", "protobar", &[0, 1, 0]);
-}
-
-/// A component with no input bindings is not judged: a purely presentational
-/// component is live config, and has been since before activations existed.
-#[test]
-fn an_instance_with_no_input_bindings_is_not_judged() {
-    surfaces::assert_instance_can_activate("deskbar", "protobar", &[]);
-}
-
 // --- Free ports and the auto namespace ---
 
 /// A channel-less surface subscription is a free port; with no `link` binding
@@ -3086,6 +3063,47 @@ fn a_free_io_port_with_the_ports_grant_resolves() {
         s.subscriptions[0].channel_address
     );
     assert_eq!(s.outputs[0].instance, "protobar");
+}
+
+/// A component whose only binding is the retained `io` port its own state rides
+/// resolves, and says nothing at boot.
+///
+/// That port is the component writing to itself over a ring nothing else
+/// reaches, so it is not an authored input: counting it would put the
+/// never-activates warning on every conforming migrated kind, at every boot,
+/// which is how an operator learns to skip the one line it exists to say.
+#[test]
+#[tracing_test::traced_test]
+fn an_instance_bound_only_to_its_own_state_port_resolves_and_says_nothing() {
+    use brenn_lib::messaging::config::Depth;
+    let mut raw = io_surface_raw(vec![ComponentGrant::Ports]);
+    raw.io_ports[0].port = "state".to_string();
+    raw.io_ports[0].push_depth = Some(Depth::Bounded(0));
+    raw.io_ports[0].retain_depth = Some(Depth::Bounded(1));
+
+    let resolved = resolve_lowered(raw);
+    assert_eq!(resolved[0].subscriptions.len(), 1);
+    assert!(!logs_contain("activates once at mount"));
+}
+
+/// ...and a component whose only *authored* input is sampled resolves too,
+/// with the warning naming the port.
+///
+/// A mount is owed one activation on every host, so such a component runs once
+/// and thereafter on gestures or its own deferred ticks. Legitimate config, and
+/// still worth a line, because it is also what a mistyped depth looks like.
+#[test]
+#[tracing_test::traced_test]
+fn an_instance_whose_every_authored_input_is_sampled_resolves_and_warns() {
+    use brenn_lib::messaging::config::Depth;
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.subscriptions[0].push_depth = Some(Depth::Bounded(0));
+
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    assert_eq!(resolved.len(), 1);
+    assert!(logs_contain("activates once at mount"));
+    assert!(logs_contain("messages"));
 }
 
 /// A hand-written `local:auto.<cid>` on a surface binding is rejected: the page

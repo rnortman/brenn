@@ -124,18 +124,21 @@ assembly BarSurface(slug: String, skin: String) {
       grants = [ports, log, dom];
       in messages <- bar_a;
       io tick { push_depth = 1; retain_depth = 2; }
+      io state { push_depth = 0; retain_depth = 1; }
 
     }
     new p2: Protobar {
       grants = [ports, log, dom];
       in messages <- bar_b;
       io tick { push_depth = 1; retain_depth = 2; }
+      io state { push_depth = 0; retain_depth = 1; }
 
     }
     new p3: Protobar {
       grants = [ports, log, dom];
       in messages <- bar_c;
       io tick { push_depth = 1; retain_depth = 2; }
+      io state { push_depth = 0; retain_depth = 1; }
 
     }
     new chrome: Chrome {
@@ -147,6 +150,7 @@ assembly BarSurface(slug: String, skin: String) {
       in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
       in toast <- "local:brenn/toast" { push_depth = 8; }
       io toast-tick { push_depth = 1; retain_depth = 2; }
+      io state { push_depth = 0; retain_depth = 1; }
 
     }
 
@@ -182,18 +186,26 @@ surface bar-feeder {
   new feed-a: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_a;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-b: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_b;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-c: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_c;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new feed-layout: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_layout;
+    io state { push_depth = 0; retain_depth = 1; }
+
   }
   new chrome: Chrome {
     grants = [ports, log, dom, page-dom];
@@ -203,6 +215,7 @@ surface bar-feeder {
     in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
     in toast <- "local:brenn/toast" { push_depth = 8; }
     io toast-tick { push_depth = 1; retain_depth = 2; }
+    io state { push_depth = 0; retain_depth = 1; }
 
   }
 

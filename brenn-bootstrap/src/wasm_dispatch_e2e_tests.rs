@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use brenn_lib::access::test_fixtures::delivery_policy_for_addresses;
 use brenn_lib::messaging::{Urgency, WebhookEnvelope};
-use brenn_messaging::WasmPublish;
+use brenn_messaging::{MountDebt, WasmPublish};
 use brenn_wasm::{ProcessorComponent, ProcessorDeferredOp};
 
 use chrono::Utc;
@@ -36,7 +36,7 @@ async fn end_to_end_demo_webhook_to_brenn_output() {
     testutils::insert_bus_message(&messenger, &in_entry, &wh_body, ChannelScheme::Webhook).await;
 
     // Drain: demo component extracts inner body and publishes to "out" port.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Verify the WASM push row is consumed.
     let in_rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -122,7 +122,7 @@ async fn all_or_nothing_trap_after_publish_discards_output() {
     )
     .await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // All input rows must be acked (delivered), but output channel must have no rows.
     let in_rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
@@ -267,7 +267,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
         activation_pacing: unthrottled_pacing(),
     };
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Ack-at-start: the position moved past the batch even though the guest
     // returned Err — the advance runs before the guest (at-most-once).
@@ -278,7 +278,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
     );
 
     // A second drain must find nothing (no redelivery).
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
     let rows_second = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_second.is_empty(),
@@ -315,7 +315,7 @@ async fn call_order_flush_monotonic_timestamps() {
             .await;
     }
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Query the 3 messages on the output channel ordered by publish_ts_ns ASC.
     let ts_list: Vec<i64> = {
@@ -380,7 +380,7 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
 
     // Drain: demo publishes to output channel → publish_from_wasm inserts push row
     // with wake=Immediate for the downstream subscriber.
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // The downstream subscriber's position now trails the published output.
     let out_pending = brenn_messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
@@ -493,7 +493,7 @@ async fn guest_publish_deferred_parks_with_a_host_stamped_now() {
     testutils::insert_bus_message(&messenger, &in_entry, &wh_body, ChannelScheme::Webhook).await;
 
     let before = Utc::now();
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let in_rows_after = brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(in_rows_after.is_empty(), "WASM input row must be delivered");
@@ -558,7 +558,7 @@ async fn output_port_deferred_view_reflects_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // Read the parked message's deliver_after so we can assert the guest saw it.
     let parked_da: String = {
@@ -595,7 +595,7 @@ async fn output_port_deferred_view_reflects_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     // The immediate summary the guest published reports its own parked message.
     let summary: String = {
@@ -644,7 +644,7 @@ async fn output_port_defer_cancel_removes_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let parked_before: i64 = {
         let conn = messenger.db().lock().await;
@@ -675,7 +675,7 @@ async fn output_port_defer_cancel_removes_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let parked_after: i64 = {
         let conn = messenger.db().lock().await;
@@ -721,7 +721,7 @@ async fn output_port_defer_edit_reschedules_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let before_ms: i64 = {
         let conn = messenger.db().lock().await;
@@ -759,7 +759,7 @@ async fn output_port_defer_edit_reschedules_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     let (after_ms, still_parked): (i64, i64) = {
         let conn = messenger.db().lock().await;
@@ -829,11 +829,7 @@ async fn a_deferred_op_naming_another_senders_parked_message_panics() {
         .await;
     let now = Utc::now();
     let foreign = messenger
-        .deferred_view_for_sender(
-            "brenn:e2e-out",
-            ParticipantId::for_wasm(other).as_str(),
-            now,
-        )
+        .deferred_view_for_sender("brenn:e2e-out", ParticipantId::for_wasm(other).as_str())
         .await;
     let uuid = foreign
         .first()
@@ -1101,7 +1097,7 @@ async fn a_mixed_class_activation_settles_each_port_in_its_own_domain() {
         "the consumer is owed the ring message before draining"
     );
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert!(
         brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
@@ -1158,7 +1154,7 @@ async fn drain_step_consumes_a_ring_backed_ephemeral_input() {
 
     // The drain must consume the ring-triggered activation without panicking
     // (an ephemeral-only trigger delivers rows with no push ids).
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert!(
         !ring.has_deliverable(&wasm_sub),
@@ -1177,7 +1173,7 @@ async fn ring_backed_trap_quarantines_without_claim_ids() {
 
     append_ring_message(&messenger, &entry, "__trap__".to_string()).await;
 
-    drain_step(&cfg, &wasm_sub).await;
+    drain_step(&cfg, &wasm_sub, MountDebt::Settled).await;
 
     assert!(
         !ring.has_deliverable(&wasm_sub),
@@ -1422,7 +1418,7 @@ async fn an_io_port_timer_loop_delivers_the_guests_own_deferred_wake() {
     );
 
     fire_trigger(&messenger, "__defer__").await;
-    drain_step(cfg, &subscriber).await;
+    drain_step(cfg, &subscriber, MountDebt::Settled).await;
 
     assert!(
         owed_pairs(&messenger, &subscriber).await.is_empty(),
@@ -1440,7 +1436,7 @@ async fn an_io_port_timer_loop_delivers_the_guests_own_deferred_wake() {
         "the released wake is owed to the same port that scheduled it"
     );
 
-    drain_step(cfg, &subscriber).await;
+    drain_step(cfg, &subscriber, MountDebt::Settled).await;
     assert!(
         owed_pairs(&messenger, &subscriber).await.is_empty(),
         "the component consumed its own wake"
@@ -1472,7 +1468,7 @@ async fn a_link_carries_one_components_publish_into_anothers_activation() {
     );
 
     fire_trigger(&messenger, "hand-off-payload").await;
-    drain_step(&cfgs[0], &producer_sub).await;
+    drain_step(&cfgs[0], &producer_sub, MountDebt::Settled).await;
 
     assert_eq!(
         owed_pairs(&messenger, &reader_sub).await,
@@ -1480,7 +1476,7 @@ async fn a_link_carries_one_components_publish_into_anothers_activation() {
         "the connection delivered the producer's publish to the reader, body intact"
     );
 
-    drain_step(&cfgs[1], &reader_sub).await;
+    drain_step(&cfgs[1], &reader_sub, MountDebt::Settled).await;
     assert!(
         owed_pairs(&messenger, &reader_sub).await.is_empty(),
         "the reader's activation consumed the hand-off"
@@ -1650,7 +1646,7 @@ async fn a_durable_named_io_port_channel_carries_a_schedule_across_a_restart() {
         assert_eq!(cfgs[0].outputs[0].channel_address, "brenn:ticker.timer");
 
         fire_trigger(&messenger, "__defer__").await;
-        drain_step(&cfgs[0], &subscriber).await;
+        drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
 
         let parked: i64 = {
             let conn = messenger.db().lock().await;
@@ -1697,7 +1693,7 @@ async fn a_durable_named_io_port_channel_carries_a_schedule_across_a_restart() {
         "the released wake is owed to the io_port that scheduled it, one process ago"
     );
 
-    drain_step(&cfgs[0], &subscriber).await;
+    drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
     assert!(
         owed_pairs(&messenger, &subscriber).await.is_empty(),
         "the component consumed the wake it scheduled before the restart"

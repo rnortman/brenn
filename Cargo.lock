@@ -661,6 +661,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-surface-contract",
  "brenn-surface-test-fixtures",
+ "serde",
 ]
 
 [[package]]
@@ -719,6 +720,31 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "brenn-host-conformance"
+version = "0.1.0"
+dependencies = [
+ "brenn-attach-client",
+ "brenn-attach-proto",
+ "brenn-envelope",
+ "brenn-lib",
+ "brenn-messaging",
+ "brenn-messaging-store",
+ "brenn-obs",
+ "brenn-page-harness",
+ "brenn-surface-contract",
+ "brenn-surface-kernel",
+ "brenn-surface-schema",
+ "brenn-wasm",
+ "brenn-wasm-dispatch",
+ "chrono",
+ "indexmap",
+ "rusqlite",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -798,6 +824,7 @@ name = "brenn-messaging"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "brenn-activation",
  "brenn-budget",
  "brenn-common",
  "brenn-db",
@@ -1127,6 +1154,7 @@ dependencies = [
 name = "brenn-surface-kernel"
 version = "0.1.0"
 dependencies = [
+ "brenn-activation",
  "brenn-attach-client",
  "brenn-attach-proto",
  "brenn-budget",
@@ -1143,6 +1171,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-test",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1293,6 +1322,7 @@ name = "brenn-wasm-dispatch"
 version = "0.1.0"
 dependencies = [
  "brenn-common",
+ "brenn-host-conformance",
  "brenn-lib",
  "brenn-messaging",
  "brenn-messaging-store",

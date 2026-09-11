@@ -210,7 +210,7 @@ pub enum IngestOutcome {
 }
 
 /// Per-meeting escalation thresholds (seconds before/after start).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Escalation {
     takeover_secs: i64,
     critical_secs: i64,
@@ -228,7 +228,7 @@ impl Default for Escalation {
 }
 
 /// One meeting from the current snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Meeting {
     id: String,
     start: DateTime<Utc>,
@@ -279,7 +279,7 @@ impl Meeting {
 /// A stored ack for one meeting: the latest action seen for its `meeting_id`,
 /// the occurrence it acked, and the publish timestamp that ordered it (and bounds
 /// its pruning).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AckRecord {
     action: AckAction,
     start: DateTime<Utc>,
@@ -289,14 +289,14 @@ struct AckRecord {
 /// The occurrence a Dismiss/Snooze button acks: the active meeting's id and its
 /// `start`. Both travel on the wire so an ack binds to one occurrence rather than
 /// to a reusable id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckTarget {
     pub meeting_id: String,
     pub start: DateTime<Utc>,
 }
 
 /// A dismiss/snooze action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AckAction {
     /// Permanent removal.
     Dismiss,
@@ -401,7 +401,7 @@ enum AckParse {
 
 /// Meeting escalation state: the last-good snapshot, the ack map, and a
 /// page-lifetime fault counter.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MeetingState {
     meetings: Vec<Meeting>,
     acks: BTreeMap<String, AckRecord>,

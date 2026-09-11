@@ -74,7 +74,7 @@ pub(crate) const DEFAULT_LIGHT_START: u16 = 7 * 60;
 pub(crate) const DEFAULT_DARK_START: u16 = 19 * 60;
 
 /// The computed theme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub enum Theme {
     Dark,
     Light,
@@ -101,7 +101,7 @@ impl Theme {
 }
 
 /// The effective operating mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub(crate) enum Mode {
     /// Day/night switching by [`Schedule`].
     Auto,
@@ -137,7 +137,7 @@ impl Mode {
 /// span is the half-open interval `[light_start, dark_start)` with wraparound,
 /// which is total and well-defined for any distinct pair (including a light span
 /// that wraps past midnight, i.e. `light_start > dark_start`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 struct Schedule {
     light_start: u16,
     dark_start: u16,
@@ -181,7 +181,7 @@ fn forward_delta(now: u16, boundary: u16) -> u16 {
 }
 
 /// The effective config. Rebuilt wholesale from each accepted snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 struct Config {
     mode: Mode,
     schedule: Schedule,
@@ -354,7 +354,10 @@ pub(crate) fn fmt_hhmm(minutes: u16) -> String {
 
 /// Mode-clock state: the effective config, the last theme dispatched (for
 /// change-only dispatch), and a page-lifetime malformed-config counter.
-#[derive(Debug, Default)]
+/// Serialized whole onto the instance's retained `state` port at the end of
+/// every activation and read back at the start of the next one, because linear
+/// memory does not survive between them.
+#[derive(Debug, Default, Deserialize, serde::Serialize)]
 pub struct ModeClock {
     config: Config,
     last_dispatched: Option<Theme>,

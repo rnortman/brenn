@@ -1,0 +1,50 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The library half is host-neutral by dependency list: the trait, the report
+# projection and the scenario bodies reach for no host crate, and none is a
+# `deps` entry here. The adapters are `cfg(test)` inside the same sources, so
+# they compile only into the test binary below.
+rust_library(
+    name = "brenn-host-conformance",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+# The adapters. `data` is the probe: one artifact, driven by every host.
+rust_test(
+    name = "brenn-host-conformance_test",
+    size = "large",
+    crate = ":brenn-host-conformance",
+    data = ["//brenn-wasm:fixture_processor_transplant"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [
+        "//attach/client",
+        "//attach/proto",
+        "//brenn-envelope",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-obs",
+        "//brenn-wasm",
+        "//brenn-wasm-dispatch",
+        "//surface/contract",
+        "//surface/kernel",
+        "//surface/page-harness",
+        "//surface/schema",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-host-conformance_doc_test",
+    crate = ":brenn-host-conformance",
+)

@@ -43,6 +43,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use brenn_activation::schedule;
+// Re-exported: `load_activation_snapshot` takes one and returns the other, so a
+// caller that names this crate's activation read already names this crate.
+pub use brenn_activation::schedule::{MountDebt, Wake};
 use brenn_db::{Db, format_ts_for_db};
 use brenn_lib::config::{AppTable, ServerConfig};
 #[cfg(any(test, feature = "testutils"))]
@@ -1125,9 +1129,12 @@ impl Messenger {
             .unwrap_or(&0)
     }
 
-    /// Count one deferred-control op (defer-cancel / defer-edit) that was a no-op
-    /// at flush for `(consumer, channel)` because its target released between the
-    /// activation snapshot and flush.
+    /// Count one deferred-control op (defer-cancel / defer-edit) that was a
+    /// no-op at flush for `(consumer, channel)` because its target was past its
+    /// release time. One counter for both ways that happens — a target that
+    /// matured between the activation's snapshot and the flush, and one the
+    /// snapshot already showed as due — because the log line at each site
+    /// carries the target's instant and separates them there.
     pub fn record_deferred_control_race(&self, consumer: &str, channel: &str) {
         *self
             .deferred_control_races
@@ -1459,9 +1466,11 @@ impl Messenger {
     /// only messages whose recorded sender equals `sender` are returned, so a
     /// caller passing a component's own `wasm:<slug>` identity can see only that
     /// component's schedule, even on a channel other components also publish to.
-    /// A message that has matured but not yet been taken by a release pass is out
-    /// of the view (it can no longer be cancelled or edited); `now` is the instant
-    /// that boundary is judged against.
+    /// Every unreleased message is in the view, whatever its `deliver_after`
+    /// says: a matured entry no release pass has taken is shown, carrying its
+    /// past instant, so an empty view means "nothing standing" at every
+    /// instant. Cancel and edit answer on their own `> now` boundary, so such
+    /// an entry is shown here and is not cancellable.
     ///
     /// # Panics
     ///
@@ -1471,10 +1480,9 @@ impl Messenger {
         &self,
         channel_address: &str,
         sender: &str,
-        now: DateTime<Utc>,
     ) -> Vec<store::DeferredMessage> {
         self.store_for_bound_output(channel_address)
-            .deferred_for_sender(sender, now)
+            .deferred_for_sender(sender)
             .await
     }
 
@@ -1917,7 +1925,7 @@ impl Messenger {
             // surface component reads that set from a page-side mirror of the
             // backend's answer. The page cannot compute the change itself — the
             // release ran here, on this clock — so the recomputed view is pushed.
-            self.push_released_surface_views(&entry.address, &outcome.released, now)
+            self.push_released_surface_views(&entry.address, &outcome.released)
                 .await;
             let remaining = store.next_release().await;
             fold(remaining, &mut sweep);
@@ -1951,7 +1959,6 @@ impl Messenger {
         &self,
         channel_address: &str,
         released: &[store::Released],
-        now: DateTime<Utc>,
     ) {
         let mut components: Vec<(&str, &str)> = released
             .iter()
@@ -1969,7 +1976,7 @@ impl Messenger {
             // wakes bus-wide.
             let _order = self.deferred_view_gate.lock().await;
             let view = self
-                .deferred_view_for_sender(channel_address, sender.as_str(), now)
+                .deferred_view_for_sender(channel_address, sender.as_str())
                 .await;
             self.router
                 .push_surface_deferred_view(slug, instance, channel_address, &view)
@@ -2883,8 +2890,20 @@ impl Messenger {
     }
 
     /// Assemble the full multi-port activation snapshot for `subscriber`: one
-    /// [`PortSnapshot`] per input port, in `inputs` order, or `None` when no
-    /// port was owed anything (no activation).
+    /// [`PortSnapshot`] per input port, in `inputs` order, with the [`Wake`]
+    /// that picked it, or `None` when this subscriber is not ready to run.
+    ///
+    /// `mount` is where this consumer stands with the activation every mount is
+    /// owed. A backend consumer's positions exist before its task starts, so its
+    /// debt is [`MountDebt::Owed`] from the first instruction of the task and
+    /// [`MountDebt::Settled`] for every later step. The gate itself is
+    /// [`schedule::readiness`], shared with the surface kernel.
+    ///
+    /// The two wakes differ in what an empty window means. A
+    /// [`Wake::Delivery`] whose windows turned out to hold nothing new is no
+    /// activation at all. A [`Wake::Mount`] windows every allowed port whatever
+    /// it holds and is returned regardless: the component that cannot publish
+    /// from its connect-time code gets the one activation it needs to arm from.
     ///
     /// **Per-port snapshot consistency:** a store hands over its window and the
     /// subscriber's drop total together, under whatever lock it keeps them
@@ -2910,7 +2929,8 @@ impl Messenger {
         &self,
         subscriber: &ParticipantId,
         inputs: &[WasmInputPort],
-    ) -> Option<Vec<PortSnapshot>> {
+        mount: MountDebt,
+    ) -> Option<(Wake, Vec<PortSnapshot>)> {
         self.pending_bus_pushes_scan_count
             .fetch_add(1, Ordering::Relaxed);
 
@@ -2957,19 +2977,31 @@ impl Messenger {
         // coalesce — must not pay for K of those. `has_deliverable` answers
         // "anything unseen and still retained?" from positions alone, and no
         // port owed anything means no window below could hold anything new.
-        let mut any_deliverable = false;
-        for ((input, store), allowed) in inputs.iter().zip(&stores).zip(&allowed) {
-            if *allowed
-                && input.sub.push_depth.is_push_enabled()
-                && store.has_deliverable(subscriber).await
-            {
-                any_deliverable = true;
-                break;
+        //
+        // An owed mount wins over any delivery, so nothing is probed for it:
+        // `readiness` answers `Mount` without the fold at all, and every allowed
+        // port is windowed below regardless of what it holds. Otherwise the fold
+        // is an `any` over `PortReadiness::is_ready`, run in port order and
+        // stopping at the first ready port — one ready port is the whole answer,
+        // and each further probe is a store read.
+        let mut any_port_ready = false;
+        if mount != MountDebt::Owed {
+            for ((input, store), allowed) in inputs.iter().zip(&stores).zip(&allowed) {
+                let push_enabled = input.sub.push_depth.is_push_enabled();
+                let port = schedule::PortReadiness {
+                    allowed: *allowed,
+                    push_enabled,
+                    deliverable: *allowed
+                        && push_enabled
+                        && store.has_deliverable(subscriber).await,
+                };
+                if port.is_ready() {
+                    any_port_ready = true;
+                    break;
+                }
             }
         }
-        if !any_deliverable {
-            return None;
-        }
+        let wake = schedule::readiness(mount, any_port_ready)?;
 
         // One window read per port builds context and new together. Pure reads:
         // no position moves here, so the None path below leaves every port
@@ -3004,7 +3036,11 @@ impl Messenger {
                     }),
             );
         }
-        if windows.iter().all(|w| w.new_entries().is_empty()) {
+        // The ring/durable consistency backstop: a position that reported
+        // something deliverable and then windowed nothing new is not an
+        // activation. It applies to a delivery only — a mount activation with
+        // nothing new is the guarantee being kept, not an empty step to elide.
+        if wake == Wake::Delivery && windows.iter().all(|w| w.new_entries().is_empty()) {
             return None;
         }
 
@@ -3025,7 +3061,7 @@ impl Messenger {
             });
         }
 
-        Some(snapshots)
+        Some((wake, snapshots))
     }
 
     /// Mark a set of ingress rows delivered. Idempotent.
@@ -4121,7 +4157,7 @@ mod tests {
         park(bob.as_str(), "bob-mid", 45).await;
 
         let alice_view = messenger
-            .deferred_view_for_sender(&ephemeral.address, alice.as_str(), now)
+            .deferred_view_for_sender(&ephemeral.address, alice.as_str())
             .await;
         let bodies: Vec<&str> = alice_view
             .iter()
@@ -4134,7 +4170,7 @@ mod tests {
         );
 
         let bob_view = messenger
-            .deferred_view_for_sender(&ephemeral.address, bob.as_str(), now)
+            .deferred_view_for_sender(&ephemeral.address, bob.as_str())
             .await;
         assert_eq!(bob_view.len(), 1);
         assert_eq!(bob_view[0].envelope.body, "bob-mid");
@@ -4409,7 +4445,7 @@ mod tests {
             .await;
         assert_eq!(outcome, DeferralOutcome::Applied);
         let alice_view = messenger
-            .deferred_view_for_sender(&ephemeral.address, alice.as_str(), now)
+            .deferred_view_for_sender(&ephemeral.address, alice.as_str())
             .await;
         assert_eq!(alice_view.len(), 1);
         assert_eq!(alice_view[0].envelope.body, "alice-rescheduled");
@@ -4421,7 +4457,7 @@ mod tests {
         assert_eq!(outcome, DeferralOutcome::Applied);
         assert!(
             messenger
-                .deferred_view_for_sender(&ephemeral.address, bob.as_str(), now)
+                .deferred_view_for_sender(&ephemeral.address, bob.as_str())
                 .await
                 .is_empty()
         );
@@ -4431,7 +4467,12 @@ mod tests {
         let outcome = messenger
             .cancel_deferred_for_sender(&ephemeral.address, bob.as_str(), bob_uuid, now)
             .await;
-        assert_eq!(outcome, DeferralOutcome::NotDeferred);
+        assert_eq!(
+            outcome,
+            DeferralOutcome::NotDeferred {
+                deliver_after: None
+            }
+        );
     }
 
     /// A non-durable channel in the directory with no store is the two halves of
@@ -4753,8 +4794,8 @@ mod tests {
             },
             amplification_mt: 1000,
         }];
-        let snapshot = restarted
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snapshot) = restarted
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("the surviving position is still owed the backlog");
         let bodies: Vec<&str> = snapshot[0]
@@ -4838,8 +4879,8 @@ mod tests {
             amplification_mt: 1000,
         }];
 
-        let parked_snapshot = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, parked_snapshot) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("the pending row triggers");
         let bodies: Vec<&str> = parked_snapshot[0]
@@ -4858,8 +4899,8 @@ mod tests {
             .release_due(release_at + chrono::Duration::seconds(1))
             .await;
 
-        let released_snapshot = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, released_snapshot) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("the pending row still triggers");
         let bodies: Vec<&str> = released_snapshot[0]
@@ -4950,8 +4991,8 @@ mod tests {
         }];
 
         let scan_before = messenger.pending_bus_pushes_scan_count();
-        let snapshots = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snapshots) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("expected Some — channel has pending rows");
         let scan_after = messenger.pending_bus_pushes_scan_count();
@@ -5042,8 +5083,8 @@ mod tests {
             amplification_mt: 1000,
         }];
 
-        let snapshots = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snapshots) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("expected Some — channel has pending rows");
         assert_eq!(snapshots.len(), 1, "one port → one snapshot");
@@ -5070,25 +5111,28 @@ mod tests {
 
         assert!(
             messenger
-                .load_activation_snapshot(&wasm_sub, &inputs)
+                .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
                 .await
                 .is_none(),
             "nothing is held back for a later drain"
         );
     }
 
-    /// A consumer whose every port is sampled reads nothing, so it never
-    /// activates and is owed nothing — a sampled port holds no position for a
-    /// retained message to be measured against. The all-sampled shape is the
-    /// edge case: the snapshot has an empty readable port set to fold over.
+    /// A consumer whose every port is sampled activates once, at mount, and
+    /// never again on traffic.
+    ///
+    /// A sampled port holds no position, so nothing is ever owed on it and no
+    /// message published to it can wake its owner. The mount debt is what makes
+    /// such a consumer run at all: the port is windowed as context, the
+    /// activation happens, and the subsequent publish still does nothing.
     #[tokio::test]
-    async fn load_activation_snapshot_sampled_only_ports_never_activate() {
+    async fn load_activation_snapshot_sampled_only_ports_activate_at_mount_only() {
         let slug = "sampled-only";
         let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
             slug,
             "sampled-only-ch",
             config::Depth::Bounded(0),
-            config::Depth::Bounded(0),
+            config::Depth::Bounded(8),
         )
         .await;
 
@@ -5101,19 +5145,42 @@ mod tests {
                 channel_uuid: channel.uuid,
                 channel_address: channel.address.clone(),
                 push_depth: config::Depth::Bounded(0),
-                retain_depth: config::Depth::Bounded(0),
+                retain_depth: config::Depth::Bounded(4),
                 noise: config::NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
         }];
 
+        let (wake, snapshots) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Owed)
+            .await
+            .expect("a mount is owed one activation whatever its ports hold");
+        assert_eq!(wake, Wake::Mount);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].new_len(),
+            0,
+            "a sampled port is served context, never new"
+        );
+        assert_eq!(
+            snapshots[0].context().len(),
+            1,
+            "the retained message is in the window as context"
+        );
+        assert!(
+            snapshots[0].advance_span().is_none(),
+            "a sampled port holds no position to advance"
+        );
+
+        super::testutils::insert_bus_message(&messenger, &channel, "later", ChannelScheme::Brenn)
+            .await;
         assert!(
             messenger
-                .load_activation_snapshot(&wasm_sub, &inputs)
+                .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
                 .await
                 .is_none(),
-            "a sampled port never activates"
+            "a sampled port never activates on traffic"
         );
         assert!(
             !messenger
@@ -5121,6 +5188,187 @@ mod tests {
                 .has_deliverable(&wasm_sub)
                 .await,
             "a sampled port holds no position, so nothing is owed on it"
+        );
+    }
+
+    /// A mount activation over channels with nothing on them at all: still one
+    /// activation, with every bound port present and empty.
+    #[tokio::test]
+    async fn load_activation_snapshot_mount_over_an_empty_channel_still_activates() {
+        let slug = "empty-mount";
+        let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
+            slug,
+            "empty-mount-ch",
+            config::Depth::Bounded(4),
+            config::Depth::Bounded(4),
+        )
+        .await;
+
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: config::Depth::Bounded(4),
+                retain_depth: config::Depth::Bounded(4),
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+
+        let (wake, snapshots) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Owed)
+            .await
+            .expect("the mount debt is unconditional");
+        assert_eq!(wake, Wake::Mount);
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].entries.is_empty(), "nothing to window");
+
+        assert!(
+            messenger
+                .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
+                .await
+                .is_none(),
+            "the settled debt leaves an empty channel with no reason to activate"
+        );
+    }
+
+    /// The debt does not change what a port is *served*: a mount over a channel
+    /// with history delivers that history as new, exactly as the delivery that
+    /// would otherwise have carried it, and advances over it.
+    #[tokio::test]
+    async fn load_activation_snapshot_mount_over_history_delivers_it_as_new() {
+        let slug = "mount-history";
+        let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
+            slug,
+            "mount-history-ch",
+            config::Depth::Bounded(4),
+            config::Depth::Bounded(8),
+        )
+        .await;
+
+        super::testutils::insert_bus_message(&messenger, &channel, "one", ChannelScheme::Brenn)
+            .await;
+        super::testutils::insert_bus_message(&messenger, &channel, "two", ChannelScheme::Brenn)
+            .await;
+
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: config::Depth::Bounded(4),
+                retain_depth: config::Depth::Bounded(4),
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+
+        let (wake, mount) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Owed)
+            .await
+            .expect("the mount debt is unconditional");
+        assert_eq!(wake, Wake::Mount);
+        assert_eq!(mount[0].new_len(), 2, "the backlog arrives in the mount");
+
+        let (wake, delivery) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
+            .await
+            .expect("the same backlog, read again: nothing advanced it");
+        assert_eq!(
+            wake,
+            Wake::Delivery,
+            "a settled debt over a port with something owed is an ordinary delivery"
+        );
+        assert_eq!(delivery[0].new_len(), 2);
+    }
+
+    /// The `Owed` debt wins over a deliverable port: one activation per mount,
+    /// not one of each shape. A host that answered `Delivery` here would settle
+    /// the debt at assembly and still owe a second, empty activation.
+    #[tokio::test]
+    async fn load_activation_snapshot_an_owed_mount_outranks_a_delivery() {
+        let slug = "mount-outranks";
+        let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
+            slug,
+            "mount-outranks-ch",
+            config::Depth::Bounded(4),
+            config::Depth::Bounded(8),
+        )
+        .await;
+
+        super::testutils::insert_bus_message(&messenger, &channel, "owed", ChannelScheme::Brenn)
+            .await;
+
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: config::Depth::Bounded(4),
+                retain_depth: config::Depth::Bounded(4),
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+
+        let (wake, _snapshots) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Owed)
+            .await
+            .expect("something is owed on the port and a mount is owed too");
+        assert_eq!(wake, Wake::Mount);
+    }
+
+    /// An ACL-denied port at mount: every window empty, the activation still
+    /// happens. The debt is unconditional, and a consumer that may read nothing
+    /// is still owed the activation it arms its own schedule from.
+    #[tokio::test]
+    async fn load_activation_snapshot_mount_activates_with_every_port_denied() {
+        let slug = "denied-mount";
+        let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
+            slug,
+            "denied-mount-ch",
+            config::Depth::Bounded(4),
+            config::Depth::Bounded(8),
+        )
+        .await;
+        // No registration covers this subscriber, so the gate denies every port.
+        let messenger = Messenger::new(
+            messenger.db.clone(),
+            messenger.directory().clone(),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        );
+
+        super::testutils::insert_bus_message(&messenger, &channel, "unseen", ChannelScheme::Brenn)
+            .await;
+
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: config::Depth::Bounded(4),
+                retain_depth: config::Depth::Bounded(4),
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+
+        let (wake, snapshots) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Owed)
+            .await
+            .expect("the mount debt does not ask the ACL gate for permission");
+        assert_eq!(wake, Wake::Mount);
+        assert!(
+            snapshots[0].entries.is_empty(),
+            "a denied port is served nothing, at mount as at any other read"
         );
     }
 
@@ -5195,10 +5443,12 @@ mod tests {
         };
         let inputs = vec![port(&attached), port(&orphan)];
 
-        let snapshot = messenger.load_activation_snapshot(&wasm_sub, &inputs).await;
+        let snapshot = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
+            .await;
         panic!(
             "the read survived an unattached port, returning {} snapshots",
-            snapshot.map_or(0, |s| s.len())
+            snapshot.map_or(0, |(_wake, snaps)| snaps.len())
         );
     }
 
@@ -6567,8 +6817,8 @@ mod tests {
             .collect();
 
         let inputs = vec![ring_input(&channel, Depth::Bounded(2), Depth::Bounded(8))];
-        let snapshots = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snapshots) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("ring cursor has deliverable messages");
         assert_eq!(snapshots.len(), 1);
@@ -6616,7 +6866,7 @@ mod tests {
         let inputs = vec![ring_input(&channel, Depth::Bounded(4), Depth::Bounded(8))];
         assert!(
             messenger
-                .load_activation_snapshot(&wasm_sub, &inputs)
+                .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
                 .await
                 .is_none(),
             "an attached cursor with nothing owed does not trigger"
@@ -6627,8 +6877,8 @@ mod tests {
         let env = ring_envelope(&channel.address, ChannelScheme::Local, "late");
         let mid = env.message_id;
         messenger.ring_store_for(&channel).append(env);
-        let snap = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snap) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("the late publish is owed");
         assert_eq!(
@@ -6663,8 +6913,8 @@ mod tests {
         }
 
         let inputs = vec![ring_input(&channel, Depth::Bounded(8), Depth::Bounded(2))];
-        let snap = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snap) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("the surviving two are owed");
         assert_eq!(snap[0].new_len(), 2, "only the two retained survive");
@@ -6797,8 +7047,8 @@ mod tests {
             Depth::Bounded(0),
             noise,
         )];
-        let snap = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snap) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("three owed, push_depth 1");
         assert_eq!(snap[0].new_len(), 1, "only the newest delivered");
@@ -6915,8 +7165,8 @@ mod tests {
             },
             amplification_mt: 1000,
         }];
-        let snap = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snap) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("three owed, push_depth 1");
         assert_eq!(snap[0].new_len(), 1, "only the newest delivered");
@@ -7429,8 +7679,8 @@ mod tests {
                 amplification_mt: 1000,
             },
         ];
-        let snaps = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
+        let (_wake, snaps) = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs, MountDebt::Settled)
             .await
             .expect("the durable port triggers the activation");
         assert_eq!(snaps.len(), 2);

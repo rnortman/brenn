@@ -1,23 +1,34 @@
 //! A recording page host for surface-placed components, as a library.
 //!
-//! One instantiation of a built component artifact, driven through scripted
-//! activations against a fake element tree, reduced to an ordered transcript of
-//! what the component asked the page to do. Everything a component can reach on
+//! A built component artifact, driven through scripted activations against a
+//! fake element tree, reduced to an ordered transcript of what the component
+//! asked the page to do. Everything a component can reach on
 //! the page is answered here: `dom`, `page-dom`, `ports`, `log`, `alert` and
 //! `config`.
 //!
 //! This is not a second hosting. The backend host refuses `dom` structurally,
 //! and nothing here goes through it: the harness builds its own linker over the
 //! same WIT and links exactly the grants the caller names, so an artifact that
-//! acquired another import fails at instantiation rather than at boot. Two
-//! differences from the backend host are deliberate and are what make the
-//! fixture faithful to the page:
+//! acquired another import fails at instantiation rather than at boot. One
+//! difference from the backend host is deliberate and is what makes the fixture
+//! faithful to the page: activations may be sync calls, which is how a mount and
+//! a gesture arrive.
 //!
-//!   - one instantiation drives the whole script, because a page-hosted
-//!     instance is instantiated once and lives for the page, and a mounted
-//!     kind's view handles are ordinary struct state across activations;
-//!   - activations may be sync calls, which is how a mount and a gesture
-//!     arrive.
+//! [`Kind`] is the compiled artifact and [`Harness`] one mounted instance of
+//! it. **A `Harness` instantiates the artifact once per activation**, which is
+//! the contract's lifetime and the page's: linear memory lives for one
+//! activation, and a conforming kind keeps its state on a retained `io` port
+//! rather than in a static. A kind that kept state across calls fails its own
+//! suite here, in or out of tree, rather than surviving to a browser.
+//!
+//! What does survive is the [`Page`]: the element tree, the handle tables and
+//! the config are owned by the mount, not by the memory, so a handle minted in
+//! one activation names the same element in the next.
+//!
+//! One channel is simulated rather than scripted: a kind's `io state` port,
+//! named through [`Harness::retaining_state`]. State lives there precisely
+//! because it cannot live in memory, so a script that did not round-trip it
+//! would make every activation after the first look like a first mount.
 //!
 //! The recording host is held to the real vocabulary: the allow-list
 //! predicates, the mount port and the gesture body field names all come from
@@ -94,6 +105,13 @@ pub struct Page {
     pub alerts: Vec<Alert>,
     /// What every publish answers. `None` is acceptance.
     pub publish_answer: Option<ports::PublishError>,
+    /// What a publish on one named port answers, ahead of `publish_answer`.
+    ///
+    /// A script about one port's refusal — a kind's `io state` port most of all,
+    /// whose publish the SDK makes and the component never sees — needs the
+    /// component's own outputs to keep working, or the refusal under test is
+    /// not the one that happened.
+    pub publish_answer_on: BTreeMap<String, ports::PublishError>,
     /// The operator config the component reads, fixed for the instance's
     /// lifetime as it is on a real host.
     pub config: BTreeMap<String, String>,
@@ -124,6 +142,7 @@ impl Page {
             parked: Vec::new(),
             alerts: Vec::new(),
             publish_answer: None,
+            publish_answer_on: BTreeMap::new(),
             config,
             page_root: None,
             body: None,
@@ -373,15 +392,26 @@ impl dom::Host for Page {
     }
 }
 
+impl Page {
+    /// What a publish on `port` answers: the port's own refusal where one is
+    /// set, the blanket one otherwise, and `None` for acceptance.
+    fn publish_refusal(&self, port: &str) -> Option<ports::PublishError> {
+        self.publish_answer_on
+            .get(port)
+            .or(self.publish_answer.as_ref())
+            .cloned()
+    }
+}
+
 impl ports::Host for Page {
     fn publish(&mut self, port: String, payload: String) -> Result<(), ports::PublishError> {
         self.record(format!("ports.publish({port}, {payload:?})"));
-        match &self.publish_answer {
+        match self.publish_refusal(&port) {
             None => {
                 self.published.push((port, payload));
                 Ok(())
             }
-            Some(refusal) => Err(refusal.clone()),
+            Some(refusal) => Err(refusal),
         }
     }
 
@@ -394,12 +424,12 @@ impl ports::Host for Page {
         self.record(format!(
             "ports.publish-with-urgency({port}, {payload:?}, {urgency:?})"
         ));
-        match &self.publish_answer {
+        match self.publish_refusal(&port) {
             None => {
                 self.published.push((port, payload));
                 Ok(())
             }
-            Some(refusal) => Err(refusal.clone()),
+            Some(refusal) => Err(refusal),
         }
     }
 
@@ -412,12 +442,12 @@ impl ports::Host for Page {
         self.record(format!(
             "ports.publish-deferred({port}, {payload:?}, {deliver_after})"
         ));
-        match &self.publish_answer {
+        match self.publish_refusal(&port) {
             None => {
                 self.parked.push((port, payload, deliver_after));
                 Ok(())
             }
-            Some(refusal) => Err(refusal.clone()),
+            Some(refusal) => Err(refusal),
         }
     }
 
@@ -514,11 +544,33 @@ impl config::Host for Page {
     }
 }
 
-/// One instantiation of the artifact, its recording page, and the way to drive
-/// activations at it.
+/// One mounted instance of the artifact: its recording page, the compiled kind
+/// it is instantiated from, and the way to drive activations at it.
+///
+/// The artifact is instantiated per activation, so nothing a component leaves
+/// in its linear memory reaches the next call. The page is the other half of
+/// that rule — it is mount-owned and outlives every instance.
 pub struct Harness {
     store: Store<Page>,
-    instance: bindings::Processor,
+    kind: Kind,
+    /// The instance's retained-state channel, where its kind declares one.
+    state: Option<RetainedState>,
+}
+
+/// The one channel a script has to carry itself: a kind's `io state` port.
+///
+/// Linear memory is activation-scoped, so a conforming kind reads its state out
+/// of this port's context window and publishes the new one back before it
+/// returns. Nothing else in this harness is a channel — every other window is
+/// the caller's script — but a state port that did not round-trip would make
+/// every activation after the first one look like a first mount.
+///
+/// Only a successful activation's publish is retained. The page buffers and
+/// flushes atomically, and the harness records each call as it is made, so the
+/// discard a refusal or a trap earns is applied here.
+struct RetainedState {
+    port: String,
+    body: Option<String>,
 }
 
 impl Harness {
@@ -530,6 +582,32 @@ impl Harness {
     /// — so it links nothing and is accepted for the symmetry with a
     /// specification's `requires` list.
     pub fn new(artifact: &Path, page: Page, grants: &[ComponentGrant]) -> Harness {
+        Kind::compile(artifact, grants).instantiate(page)
+    }
+}
+
+/// One compiled artifact, instantiable as often as a caller asks.
+///
+/// Compilation is the expensive half and the linked profile is a property of the
+/// kind, not of an instance, so both are paid once and every instantiation after
+/// that is a fresh linear memory. A [`Harness`] holds its kind because it
+/// instantiates from it on every activation; cloning is three `Arc`s.
+#[derive(Clone)]
+pub struct Kind {
+    engine: Engine,
+    component: Component,
+    linker: Linker<Page>,
+}
+
+impl Kind {
+    /// Compile `artifact` and link exactly the grants named. An artifact that
+    /// acquired another import fails at the first [`Self::instantiate`], which is
+    /// the deny-by-default the production host has.
+    ///
+    /// `Takeover` names no WIT interface — it is a binding right, not an import
+    /// — so it links nothing and is accepted for the symmetry with a
+    /// specification's `requires` list.
+    pub fn compile(artifact: &Path, grants: &[ComponentGrant]) -> Kind {
         let engine = Engine::new(&Config::new()).expect("wasmtime engine");
         let component = Component::from_file(&engine, artifact)
             .unwrap_or_else(|err| panic!("the component artifact {}: {err}", artifact.display()));
@@ -567,10 +645,51 @@ impl Harness {
                 ),
             }
         }
-        let mut store = Store::new(&engine, page);
-        let instance = bindings::Processor::instantiate(&mut store, &component, &linker)
-            .expect("the artifact instantiates against the linked profile");
-        Harness { store, instance }
+        Kind {
+            engine,
+            component,
+            linker,
+        }
+    }
+
+    /// Mount one instance of this kind over `page`.
+    ///
+    /// Nothing is instantiated here: a guest exists only inside an activation,
+    /// so the first linear memory is built by the first [`Harness::receive`].
+    pub fn instantiate(&self, page: Page) -> Harness {
+        Harness {
+            store: Store::new(&self.engine, page),
+            kind: self.clone(),
+            state: None,
+        }
+    }
+}
+
+impl Harness {
+    /// Carry this instance's `io state` port across the activations of a
+    /// script: every activation gains the port's window holding the newest body
+    /// the instance published on it, as context.
+    ///
+    /// A kind whose specification declares one needs this whether the script
+    /// drives one instance or one per activation — the port is where its state
+    /// lives either way.
+    pub fn retaining_state(mut self, port: &str) -> Harness {
+        self.state = Some(RetainedState {
+            port: port.to_string(),
+            body: None,
+        });
+        self
+    }
+
+    /// Put `body` on the retained-state port as though the instance had
+    /// published it, for a script about what a kind does with a state body it
+    /// did not write — a version skew across a deploy, most of all.
+    pub fn seeding_state(mut self, body: &str) -> Harness {
+        self.state
+            .as_mut()
+            .expect("seed a state port this instance retains")
+            .body = Some(body.to_string());
+        self
     }
 
     /// Drive the mount activation and discard its transcript, so a script's
@@ -598,10 +717,98 @@ impl Harness {
     /// observable output of an activation that touches neither the page nor a
     /// port, so it is reachable rather than asserted away.
     pub fn call_returning(&mut self, activation: types::Activation) -> Option<String> {
-        self.instance
-            .call_receive(&mut self.store, &activation)
+        self.receive(&activation)
             .expect("the activation did not trap")
             .expect("the activation was not refused")
+    }
+
+    /// Drive one activation and answer what it did, unjudged: the outer `Err` is
+    /// a trap, the inner one a refusal, and `Ok(Ok(_))` carries the reply.
+    ///
+    /// The `call_*` methods above are assertions over this. A host adapter that
+    /// must map all three outcomes onto its own vocabulary — a trap is terminal on
+    /// one host and quarantined on another — reads them here instead.
+    pub fn receive(
+        &mut self,
+        activation: &types::Activation,
+    ) -> wasmtime::Result<Result<Option<String>, types::ReceiveError>> {
+        let activation = self.windowed(activation);
+        // A fresh store and a fresh instance per activation: its statics, its
+        // heap and its `thread_local!`s start empty, and the store they live in
+        // is dropped with them. A store keeps every instance it ever made alive
+        // until it is dropped, so instantiating into a long-lived one would hold
+        // a script's whole history of linear memories. The page moves across
+        // because it belongs to the mount and not to the memory.
+        let page = std::mem::take(self.store.data_mut());
+        self.store = Store::new(&self.kind.engine, page);
+        let instance = bindings::Processor::instantiate(
+            &mut self.store,
+            &self.kind.component,
+            &self.kind.linker,
+        )
+        .expect("the artifact instantiates against the linked profile");
+        // Where this activation's publishes start: `published` accumulates for
+        // the life of the harness, and a body an earlier activation published
+        // and then discarded by failing must not be retained by a later one.
+        let published_from = self.store.data().published.len();
+        let outcome = instance.call_receive(&mut self.store, &activation);
+        if matches!(outcome, Ok(Ok(_))) {
+            self.retain_state(published_from);
+        }
+        outcome
+    }
+
+    /// The caller's activation with the retained-state window appended, where
+    /// this instance has one.
+    fn windowed(&self, activation: &types::Activation) -> types::Activation {
+        let Some(state) = &self.state else {
+            return activation.clone();
+        };
+        assert!(
+            !activation.ports.iter().any(|w| w.port == state.port),
+            "the harness windows {:?} itself; a script must not",
+            state.port
+        );
+        // The WIT records derive `Clone`; a harness that appends a window of
+        // its own must not edit the caller's script.
+        let mut activation = activation.clone();
+        let envelopes: Vec<String> = state
+            .body
+            .iter()
+            .map(|body| envelope("state", body))
+            .collect();
+        activation.ports.push(types::PortWindow {
+            port: state.port.clone(),
+            // Wholly context: a sampled port holds no position, so nothing on
+            // it is ever new to the instance that wrote it.
+            new_from: envelopes.len() as u32,
+            envelopes,
+            dropped: 0,
+        });
+        activation
+    }
+
+    /// Take the newest body this activation published on the state port.
+    ///
+    /// `published_from` is where this activation's publishes start. Only they
+    /// are eligible: a page discards the whole buffer of an activation that
+    /// fails, so a state body an earlier activation published and lost must
+    /// stay lost.
+    fn retain_state(&mut self, published_from: usize) {
+        let Some(port) = self.state.as_ref().map(|s| s.port.clone()) else {
+            return;
+        };
+        let newest = self.store.data().published[published_from..]
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == port)
+            .map(|(_, body)| body.clone());
+        if let Some(body) = newest {
+            self.state
+                .as_mut()
+                .expect("the port was read from the same field")
+                .body = Some(body);
+        }
     }
 
     /// Drive one activation expecting the instance to die in it.
@@ -612,8 +819,7 @@ impl Harness {
     /// which is what makes the instance terminal and earns it an error card.
     pub fn call_expecting_a_trap(&mut self, activation: types::Activation) {
         let error = self
-            .instance
-            .call_receive(&mut self.store, &activation)
+            .receive(&activation)
             .expect_err("the activation must trap");
         let error = format!("{error:#}");
         assert!(error.contains("wasm trap"), "{error}");
@@ -626,8 +832,7 @@ impl Harness {
         &mut self,
         activation: types::Activation,
     ) -> types::ReceiveError {
-        self.instance
-            .call_receive(&mut self.store, &activation)
+        self.receive(&activation)
             .expect("a refused activation does not trap")
             .expect_err("the activation must be refused")
     }

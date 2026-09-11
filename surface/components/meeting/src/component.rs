@@ -21,10 +21,11 @@
 //! call runs on the press's own event stack, so the occurrence this component
 //! recorded at its last render *is* what the user saw when they pressed.
 
-use std::cell::RefCell;
-
-use brenn_guest::{Activation, Error, Processor, dom, log, publish, repark};
+use brenn_guest::{
+    Activation, Error, Processor, RetainedState, StateLoss, dom, log, publish, repark,
+};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::logic::{
     AckAction, AckTarget, ActivationWindow, MeetingState, Recompute, SNOOZE_SECS, TakeoverAction,
@@ -59,15 +60,16 @@ const STATE_ATTRIBUTE: &str = "data-state";
 const HIDDEN_ATTRIBUTE: &str = "hidden";
 
 impl crate::spec::TakeoverPayload for TakeoverBody {}
+impl crate::spec::StatePayload for Panel {}
 
-// One instantiation backs one instance for the page's lifetime, so the state
-// machine, the view handles and the announced-takeover flag are ordinary
-// interior-mutable module state. That is what lets two declarations of this one
-// kind each keep their own agenda.
-thread_local! {
-    static PANEL: RefCell<Panel> = RefCell::new(Panel::new());
-}
-
+/// Everything this instance carries between activations, which rides its
+/// retained `state` port because linear memory does not survive one. Two
+/// declarations of this one kind each keep their own agenda because each has
+/// its own port, bound to its own anonymous ring.
+///
+/// The handles in it do survive: a handle is owned by the mount, so the element
+/// one named when it was stored is the element it names when it is read back.
+#[derive(Default, Serialize, Deserialize)]
 struct Panel {
     state: MeetingState,
     /// The elements an activation writes into, built by the mount activation.
@@ -81,6 +83,7 @@ struct Panel {
 }
 
 /// The panel's semantic child elements, updated in place on each recompute.
+#[derive(Serialize, Deserialize)]
 struct View {
     root: dom::Node,
     label: dom::Node,
@@ -91,15 +94,6 @@ struct View {
 }
 
 impl Panel {
-    fn new() -> Panel {
-        Panel {
-            state: MeetingState::new(),
-            view: None,
-            active: None,
-            last_takeover: false,
-        }
-    }
-
     /// The view, which every activation after the mount one has.
     fn view(&self) -> &View {
         self.view
@@ -112,10 +106,20 @@ struct MeetingComponent;
 
 impl Processor for MeetingComponent {
     fn receive(activation: Activation) -> Result<Option<String>, Error> {
-        PANEL.with(|panel| on_activation(&activation, &mut panel.borrow_mut()))?;
-        // Mount is answered with nothing, and neither button's default action is
-        // one this component cancels.
-        Ok(None)
+        // Starting from a default state would lose the view and trap on the
+        // first `view()`, so an unreadable body fails the activation and the
+        // instance takes its error card.
+        RetainedState::around(
+            activation,
+            crate::spec::state::<Panel>(),
+            StateLoss::FailActivation,
+            |activation, panel| {
+                on_activation(activation, panel)?;
+                // Mount is answered with nothing, and neither button's default
+                // action is one this component cancels.
+                Ok(None)
+            },
+        )
     }
 }
 
@@ -140,7 +144,7 @@ fn on_activation(activation: &Activation, panel: &mut Panel) -> Result<(), Error
     }
     for window in activation.delivered_windows() {
         // The tick's payload is irrelevant — the wake is the message.
-        if InPort::of(window)? == InPort::Tick {
+        if matches!(InPort::of(window)?, InPort::Tick) {
             continue;
         }
         let notes = panel

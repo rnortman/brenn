@@ -1,5 +1,5 @@
 {
-  "checksum": "afb92e616b0abec16cbdce34a1891f5ac86cdc25fa725d66dd85657e59afe62c",
+  "checksum": "0d4dcf496b051f737b6d418d39f6900fa8dbcedb356f2b68f6e6aef09e532479",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -3291,6 +3291,17 @@
         "compile_data_glob": [
           "**"
         ],
+        "deps": {
+          "common": [],
+          "selects": {
+            "cfg(target_arch = \"wasm32\")": [
+              {
+                "id": "serde 1.0.228",
+                "target": "serde"
+              }
+            ]
+          }
+        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -3556,6 +3567,71 @@
             {
               "id": "tempfile 3.27.0",
               "target": "tempfile"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-host-conformance 0.1.0": {
+      "name": "brenn-host-conformance",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_host_conformance",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_host_conformance",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
+              "id": "tokio 1.52.3",
+              "target": "tokio"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "indexmap 2.14.0",
+              "target": "indexmap"
+            },
+            {
+              "id": "rusqlite 0.39.0",
+              "target": "rusqlite"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             }
           ],
           "selects": {}
@@ -5133,6 +5209,10 @@
               {
                 "id": "tokio 1.52.3",
                 "target": "tokio"
+              },
+              {
+                "id": "tracing-test 0.2.6",
+                "target": "tracing_test"
               }
             ],
             "cfg(target_arch = \"wasm32\")": [
@@ -36558,6 +36638,7 @@
     "brenn-git 0.1.0": "brenn-git",
     "brenn-graf 0.1.0": "brenn-graf",
     "brenn-hooks 0.1.0": "brenn-hooks",
+    "brenn-host-conformance 0.1.0": "brenn-host-conformance",
     "brenn-lib 0.1.0": "brenn-lib",
     "brenn-meeting 0.1.0": "surface/components/meeting",
     "brenn-messaging 0.1.0": "brenn-messaging",

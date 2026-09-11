@@ -296,6 +296,19 @@ impl ClosePolicy {
     }
 }
 
+/// Which pre-registration verdict a bring-up report carries: the loader tried
+/// and failed, or the host never offered the kind at all.
+///
+/// One body serves both — the guards, the `failed` row, the report and the table
+/// actions are identical — and this is the only thing it branches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bringup {
+    /// The loader imported, instantiated or registered, and it failed.
+    LoadFailed,
+    /// The host withheld the kind; nothing was loaded.
+    Withheld,
+}
+
 /// An effect an executor must apply, in order — most by the DOM executor, but
 /// [`KernelAction::AttachPort`] by the event loop's executor (a task spawn, not a
 /// web-sys effect).
@@ -319,6 +332,11 @@ pub enum KernelAction {
     PublishControl { channel: String, body: String },
     /// Ask the bootstrap to perform a capped page reload.
     RequestReload { reason: String },
+    /// Tell the bootstrap the page is terminally broken: render `message` and
+    /// latch it. No reload, and the reload counter is untouched — this is for a
+    /// condition reloading cannot clear, where spending the cap would end on a
+    /// generic message naming neither the cause nor the cure.
+    StaticFailure { message: String },
     /// Replace the content of the instance's wrapper with an error card carrying
     /// `reason` (rendered as text). `kind` stamps the wrapper's `data-kind` for
     /// the case where the wrapper is created fresh here.
@@ -748,6 +766,33 @@ impl KernelCore {
     /// only observable a headless instance has); the inconsistency is reported
     /// instead, and the live row left telling the truth.
     pub fn on_processor_load_failed(&mut self, instance: &str, detail: &str) -> Vec<KernelAction> {
+        self.fail_before_registration(instance, detail, Bringup::LoadFailed)
+    }
+
+    /// A declared instance whose kind this host is not serving: its record names
+    /// a hosting contract this binary does not read, so the page manifest
+    /// carried a reason instead of a module URL and nothing was ever loaded.
+    ///
+    /// Every observable a load failure has, and one difference. A load failure of
+    /// the chrome instance asks for the capped reload, because a failed import
+    /// or a refused instantiation may be transient. This is not transient: the
+    /// page would reload into the same manifest until the cap tripped and then
+    /// render a message naming neither the kind nor the cure. So a withheld
+    /// chrome instance ends in a [`KernelAction::StaticFailure`] carrying the
+    /// reason, with the connect indicator retired — there is no chrome to hand
+    /// it to. The kernel and its link stay up: the `failed` row is published,
+    /// the report reaches the backend, and the reload a surface restart sends
+    /// still navigates the page once the bundle's re-release has converged.
+    pub fn on_processor_withheld(&mut self, instance: &str, reason: &str) -> Vec<KernelAction> {
+        self.fail_before_registration(instance, reason, Bringup::Withheld)
+    }
+
+    fn fail_before_registration(
+        &mut self,
+        instance: &str,
+        detail: &str,
+        how: Bringup,
+    ) -> Vec<KernelAction> {
         if self.registered.contains(instance) {
             return vec![KernelAction::Report {
                 level: LogLevel::Warn,
@@ -769,24 +814,47 @@ impl KernelCore {
                 subject: Some(instance.to_string()),
             }];
         }
-        let reason = format!("processor load failed: {detail}");
+        let reason = match how {
+            Bringup::LoadFailed => format!("processor load failed: {detail}"),
+            Bringup::Withheld => format!("processor kind withheld: {detail}"),
+        };
         if !self.mark_instance_failed(instance, &reason) {
             return Vec::new();
         }
+        let message = match how {
+            Bringup::LoadFailed => {
+                format!("processor instance {instance} failed to load: {detail}")
+            }
+            Bringup::Withheld => format!(
+                "processor instance {instance} was not brought up: its kind is withheld by this \
+                 host ({detail})"
+            ),
+        };
         let mut actions = vec![KernelAction::Report {
             level: LogLevel::Error,
-            message: format!("processor instance {instance} failed to load: {detail}"),
+            message,
             subject: Some(instance.to_string()),
         }];
         // The table actions go on the wire first either way: a reload request is
         // applied as a navigation, so anything queued behind it may never leave.
         actions.extend(self.instance_table_actions());
-        // A page with no layout engine is not a page to keep: the capped
-        // bootstrap reload follows the corrected status.
-        if self.chrome_instance.as_deref() == Some(instance) {
-            actions.push(KernelAction::RequestReload {
+        if self.chrome_instance.as_deref() != Some(instance) {
+            return actions;
+        }
+        match how {
+            // A page with no layout engine is not a page to keep: the capped
+            // bootstrap reload follows the corrected status.
+            Bringup::LoadFailed => actions.push(KernelAction::RequestReload {
                 reason: "chrome mount failed".to_string(),
-            });
+            }),
+            Bringup::Withheld => {
+                // Nothing will ever hand the indicator to chrome, so it is
+                // retired here rather than left spinning over the message.
+                actions.extend(self.retire_connect_indicator());
+                actions.push(KernelAction::StaticFailure {
+                    message: detail.to_string(),
+                });
+            }
         }
         actions
     }
@@ -2959,6 +3027,102 @@ mod tests {
         assert!(
             core.on_processor_load_failed("counter-a", "instantiate threw")
                 .is_empty()
+        );
+    }
+
+    /// A withheld non-chrome instance has every observable a load failure has and
+    /// nothing more: a `failed` row with the reason, the death report, no error
+    /// card (there is no host element — it was never registered), and no reload.
+    #[test]
+    fn a_withheld_instance_fails_its_row_like_any_other_bringup_failure() {
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(vec![
+            entry("fleet-1", "fleet"),
+            entry("counter-a", "counter"),
+        ]));
+
+        let reason = "manifest declares v = 2, but this server reads v = 3";
+        let actions = core.on_processor_withheld("fleet-1", reason);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            KernelAction::Report { subject: Some(s), message, level: LogLevel::Error }
+                if s == "fleet-1" && message.contains(reason)
+        )));
+        assert!(publishes_control(&actions, LOCAL_SURFACE_STATE_CHANNEL));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, KernelAction::ErrorCard { .. })),
+            "nothing was registered, so there is no host element to card into"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                KernelAction::RequestReload { .. } | KernelAction::StaticFailure { .. }
+            )),
+            "one withheld component is not the page's problem, got {actions:?}"
+        );
+        let failed = status_within(&actions)
+            .iter()
+            .find(|i| i.instance == "fleet-1")
+            .expect("fleet-1 row")
+            .clone();
+        assert_eq!(failed.state, InstanceState::Failed);
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("processor kind withheld: manifest declares v = 2, but this server reads v = 3")
+        );
+        assert_eq!(core.instances[1].state, InstanceState::Pending);
+    }
+
+    /// The one divergence from a load failure. A load failure of chrome may be
+    /// transient, so it asks for the capped reload; a withheld chrome is not —
+    /// the page would reload into the same manifest until the cap tripped and
+    /// then render a message naming neither the kind nor the cure. So the reason
+    /// is the page's terminal state, and the connect indicator is retired
+    /// because no chrome will ever take it.
+    #[test]
+    fn a_withheld_chrome_is_a_static_failure_rather_than_a_reload() {
+        let mut core = KernelCore::new();
+        let mut bindings = document(
+            vec![
+                granted_entry("chrome", "chrome", &["dom", "page-dom"]),
+                granted_entry("panel-a", "panel", &["dom"]),
+            ],
+            vec![],
+        );
+        bindings.chrome_instance = "chrome".to_string();
+        core.on_event(&connected(bindings, false));
+
+        let reason = "manifest declares v = 2, but this server reads v = 3";
+        let actions = core.on_processor_withheld("chrome", reason);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, KernelAction::RequestReload { .. })),
+            "reloading cannot clear this, got {actions:?}"
+        );
+        assert!(
+            actions.contains(&KernelAction::StaticFailure {
+                message: reason.to_string(),
+            }),
+            "the page's terminal message is the scan's own sentence, got {actions:?}"
+        );
+        assert!(
+            actions.contains(&KernelAction::RemoveConnectIndicator),
+            "there is no chrome to hand the indicator to, got {actions:?}"
+        );
+        let failure = actions
+            .iter()
+            .position(|a| matches!(a, KernelAction::StaticFailure { .. }))
+            .expect("the static failure");
+        let status = actions
+            .iter()
+            .position(|a| matches!(a, KernelAction::SendStatus { .. }))
+            .expect("the corrected status table");
+        assert!(
+            status < failure,
+            "the table goes on the wire ahead of the terminal render, got {actions:?}"
         );
     }
 

@@ -3,7 +3,7 @@
 //! One task per `[[wasm_consumer]]`. Each task owns its consumer's
 //! `ProcessorComponent` + a `Notify` clone and runs a serialized drain loop:
 //!
-//!   1. Startup sweep: run one drain step unconditionally, which is the
+//!   1. Mount activation: run one drain step unconditionally, which is the
 //!      crash-recovery trigger.
 //!   2. `loop { drain_fully(); notified.await; }` — coalesced wakes.
 //!
@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort, WasmOutputPort};
 use brenn_lib::messaging::{ParticipantId, Urgency};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
-use brenn_messaging::{Messenger, WasmBatchFailure, WasmPublish};
+use brenn_messaging::{Messenger, MountDebt, Wake, WasmBatchFailure, WasmPublish};
 use brenn_messaging_store::store::{DeferralOutcome, MessageSeq, instant_of, release_time_of};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use brenn_obs::security::{SecurityEventType, log_component_security_event};
@@ -60,8 +60,12 @@ fn processor_urgency_to_messaging(u: ProcessorUrgency) -> Urgency {
 /// the port binding and the index range at buffer time against the very window
 /// captured here, so an unbound port or an index outside the captured snapshot is
 /// a host invariant violation (the two disagree about the delivered window) and
-/// panics. A [`DeferralOutcome::NotDeferred`] is the benign drain-vs-release race:
-/// logged, not a failure. A [`DeferralOutcome::WrongSender`] is the same class of
+/// panics. A [`DeferralOutcome::NotDeferred`] is a target past its release time
+/// at flush: logged with that instant and this flush's `now`, not a failure.
+/// The instant is what tells the two ways to get here apart — a target that
+/// matured between the drain and the flush, which any component can lose, and a
+/// component acting on an entry its own deferred window already showed as due,
+/// which the doctrine forbids. A [`DeferralOutcome::WrongSender`] is the same class of
 /// violation as a bad index — the snapshot this host built named a message parked
 /// under someone else — and panics too.
 pub async fn apply_deferred_ops(
@@ -121,14 +125,16 @@ pub async fn apply_deferred_ops(
         };
         match outcome {
             DeferralOutcome::Applied => {}
-            DeferralOutcome::NotDeferred => {
+            DeferralOutcome::NotDeferred { deliver_after } => {
                 cfg.messenger
                     .record_deferred_control_race(&cfg.slug, &out.channel_address);
                 info!(
                     slug = %cfg.slug,
                     port = %port,
-                    "wasm_dispatch: deferred control op is a no-op — the message released between \
-                     the activation snapshot and flush"
+                    deliver_after = ?deliver_after,
+                    now = %now,
+                    "wasm_dispatch: deferred control op is a no-op — the target is past its \
+                     release time at flush"
                 );
             }
             DeferralOutcome::WrongSender => panic!(
@@ -141,6 +147,11 @@ pub async fn apply_deferred_ops(
 }
 
 /// Configuration for a single WASM consumer dispatch task.
+///
+/// `Clone` because the config is moved into its task: restarting a consumer over
+/// the same component, messenger and ports needs a second one, which is what a
+/// remount is.
+#[derive(Clone)]
 pub struct WasmConsumerConfig {
     pub slug: String,
     pub component: Arc<ProcessorComponent>,
@@ -216,7 +227,7 @@ impl ActivationPacer {
     }
 
     /// Admit one activation, delaying (never dropping) when the bucket is empty.
-    /// Called before every `drain_step` (startup sweep + each notified wake).
+    /// Called before every `drain_step` (the mount activation + each notified wake).
     /// Blocks for at most ~`min_period` per call.
     async fn admit(&mut self) {
         match self.bucket.try_consume() {
@@ -420,25 +431,29 @@ pub fn spawn_wasm_consumer_task(cfg: WasmConsumerConfig) -> ConsumerHandle {
     ConsumerHandle { stop, join }
 }
 
-/// Main body of the consumer task. Runs the startup sweep then enters the drain loop.
+/// Main body of the consumer task. Delivers the mount activation, then enters
+/// the drain loop.
 async fn run_consumer(cfg: WasmConsumerConfig, mut stop: tokio::sync::watch::Receiver<bool>) {
     let subscriber = ParticipantId::for_wasm(&cfg.slug);
 
-    // Per-component activation pacer. Every drain step — startup sweep and
-    // each notified wake — is admitted through this single gate, so the
-    // startup sweep and external eager wakes are all paced. The bucket starts
-    // full, so the startup sweep and any burst below `burst` never delay.
+    // Per-component activation pacer. Every drain step — the mount activation
+    // and each notified wake — is admitted through this single gate, so the
+    // mount and external eager wakes are all paced. The bucket starts full, so
+    // the mount activation and any burst below `burst` never delay.
     let mut pacer = ActivationPacer::new(
         cfg.activation_pacing,
         cfg.slug.clone(),
         cfg.alert_dispatcher.clone(),
     );
 
-    // Startup sweep: crash-recovery re-dispatch trigger.
-    // Runs before the first `notified.await` so undelivered rows left by a prior crash
-    // are re-loaded and re-invoked on restart, not waiting for a new wake.
+    // The mount activation: this consumer's task starting is the host putting
+    // the instance into service, and every mount is owed one activation whether
+    // or not a bound channel happens to hold anything. A mount activation
+    // windows every allowed port, so undelivered rows left by a prior crash and
+    // the backlog a reload primed both arrive in it — and it is what a
+    // component with nothing but a self-tick chain arms from.
     pacer.admit().await;
-    drain_step(&cfg, &subscriber).await;
+    drain_step(&cfg, &subscriber, MountDebt::Owed).await;
 
     // Serialized drain loop, woken by external eager wakes (`spawn_eager_wake`).
     // A wake sets a one-permit flag; any wakes that arrive during a drain step
@@ -462,32 +477,48 @@ async fn run_consumer(cfg: WasmConsumerConfig, mut stop: tokio::sync::watch::Rec
             }
         }
         pacer.admit().await;
-        drain_step(&cfg, &subscriber).await;
+        drain_step(&cfg, &subscriber, MountDebt::Settled).await;
     }
 }
 
 /// One drain step: assemble a multi-port activation snapshot → invoke guest once
 /// → dispose.
 ///
+/// `mount` is where this consumer stands with the activation every mount is
+/// owed: `Owed` for the first step of a consumer task, `Settled` for every step
+/// after it. A `Wake::Mount` step windows every allowed port whatever it holds,
+/// so it can carry nothing new; a `Wake::Delivery` step always carries
+/// something.
+///
 /// Returns immediately (no-op) when `load_activation_snapshot` returns `None`
-/// (no triggering port has pending rows).
+/// (the mount debt is settled and no triggering port has pending rows).
 ///
 /// Single-scan design: `load_activation_snapshot` performs one subscriber-scoped
 /// pending-push scan under one DB lock hold covering all K input ports (AC 7).
-pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId) {
+pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mount: MountDebt) {
     // Step 1: assemble multi-port snapshot (single scan, T₀ hermetic).
-    // Returns None when no triggering input has pending rows → no activation.
-    let Some(snapshots) = cfg
+    // Returns None when the debt is settled and no triggering input has pending
+    // rows → no activation.
+    let Some((wake, snapshots)) = cfg
         .messenger
-        .load_activation_snapshot(subscriber, &cfg.inputs)
+        .load_activation_snapshot(subscriber, &cfg.inputs, mount)
         .await
     else {
         return;
     };
 
-    debug_assert!(
-        snapshots.iter().any(|s| s.new_len() > 0),
-        "drain_step: snapshot is Some but no port has new messages — invariant violated"
+    // What the guest is handed: everything new on a delivery, and whatever the
+    // ports hold on a mount, which may be nothing at all.
+    let carried_new = snapshots.iter().any(|s| s.new_len() > 0);
+    // A mount is owed whatever its ports hold; a delivery is caused by new
+    // messages and cannot have none. The second is an invariant of the store and
+    // the gate, not a condition, so it is checked on every build: a delivery with
+    // nothing new means the snapshot disagrees with the positions it was read
+    // from, and continuing would disposition an activation against messages
+    // nobody can name.
+    assert!(
+        wake == Wake::Mount || carried_new,
+        "drain_step: a delivery snapshot has no port with new messages — invariant violated"
     );
     debug_assert_eq!(
         snapshots.len(),
@@ -584,7 +615,7 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId) {
     for out in &cfg.outputs {
         let parked = cfg
             .messenger
-            .deferred_view_for_sender(&out.channel_address, sender, now)
+            .deferred_view_for_sender(&out.channel_address, sender)
             .await;
         let entries: Vec<ProcessorDeferredEntry> = parked
             .iter()
@@ -696,6 +727,7 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId) {
                 .collect();
             info!(
                 slug = %cfg.slug,
+                wake = ?wake,
                 ports = ?port_batches,
                 publish_count = publishes.len(),
                 "wasm_dispatch: activation consumed successfully"
@@ -707,24 +739,21 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId) {
             let triggering_summary = format_triggering_summary(&snapshots);
             warn!(
                 slug = %cfg.slug,
+                wake = ?wake,
                 triggering_ports = ?triggering_summary,
                 diagnostic = %diag,
                 "wasm_dispatch: guest returned error — quarantining activation"
             );
             cfg.alert_dispatcher.alert(
                 AlertSeverity::Warning,
-                format!("WASM consumer {} activation failed (err)", cfg.slug),
+                format!(
+                    "WASM consumer {} {} activation failed (err)",
+                    cfg.slug,
+                    wake_word(wake)
+                ),
                 format!("{}\ndiagnostic={diag}", triggering_summary.join("\n")),
             );
-            let backing = collect_failure_backing(&snapshots);
-            debug_assert!(
-                !backing.is_empty(),
-                "drain_step: collect_failure_backing returned empty for Some snapshot \
-                 — invariant violated (snapshot Some implies at least one port has new messages)"
-            );
-            let failures = build_activation_failure_refs(&backing, subscriber, "err", &diag);
-            cfg.messenger
-                .record_wasm_activation_failure(&failures)
+            record_activation_failure(cfg, subscriber, &snapshots, wake, carried_new, "err", &diag)
                 .await;
         }
         ProcessorOutcome::Trap(msg) => {
@@ -732,27 +761,80 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId) {
             let triggering_summary = format_triggering_summary(&snapshots);
             warn!(
                 slug = %cfg.slug,
+                wake = ?wake,
                 triggering_ports = ?triggering_summary,
                 trap = %diag,
                 "wasm_dispatch: guest trapped — quarantining activation"
             );
             cfg.alert_dispatcher.alert(
                 AlertSeverity::Warning,
-                format!("WASM consumer {} activation trapped", cfg.slug),
+                format!(
+                    "WASM consumer {} {} activation trapped",
+                    cfg.slug,
+                    wake_word(wake)
+                ),
                 format!("{}\ntrap={diag}", triggering_summary.join("\n")),
             );
-            let backing = collect_failure_backing(&snapshots);
-            debug_assert!(
-                !backing.is_empty(),
-                "drain_step: collect_failure_backing returned empty for Some snapshot \
-                 — invariant violated (snapshot Some implies at least one port has new messages)"
-            );
-            let failures = build_activation_failure_refs(&backing, subscriber, "trap", &diag);
-            cfg.messenger
-                .record_wasm_activation_failure(&failures)
-                .await;
+            record_activation_failure(
+                cfg,
+                subscriber,
+                &snapshots,
+                wake,
+                carried_new,
+                "trap",
+                &diag,
+            )
+            .await;
         }
     }
+}
+
+/// How a wake kind reads in an alert title and a warn line.
+///
+/// A mount activation that fails is the error path an operator meets at every
+/// boot and every reload converge, and it writes no failure rows — the alert and
+/// the warn line are the whole record, so they have to say which kind of
+/// activation died. Without it a mount over empty windows is indistinguishable
+/// from an ordinary delivery whose ports happened to carry nothing new.
+fn wake_word(wake: Wake) -> &'static str {
+    match wake {
+        Wake::Mount => "mount",
+        Wake::Delivery => "delivery",
+    }
+}
+
+/// Quarantine the messages a failed activation consumed, if it consumed any.
+///
+/// A mount activation can carry nothing new. Nothing was consumed then, so there
+/// is no message to quarantine and `build_activation_failure_refs` has no
+/// message ids to name — the alert and the log above are the whole record. The
+/// failure rows exist to say which messages a component choked on, not that it
+/// choked.
+async fn record_activation_failure(
+    cfg: &WasmConsumerConfig,
+    subscriber: &ParticipantId,
+    snapshots: &[brenn_messaging::PortSnapshot],
+    wake: Wake,
+    carried_new: bool,
+    disposition: &'static str,
+    diag: &str,
+) {
+    // Only a mount can legitimately carry nothing new. A delivery that reaches
+    // here without `carried_new` would mean the assertion in `drain_step` was
+    // bypassed; skipping its rows would hide the bug.
+    if wake == Wake::Mount && !carried_new {
+        return;
+    }
+    let backing = collect_failure_backing(snapshots);
+    debug_assert!(
+        !backing.is_empty(),
+        "drain_step: collect_failure_backing returned empty for an activation that carried new \
+         messages — invariant violated"
+    );
+    let failures = build_activation_failure_refs(&backing, subscriber, disposition, diag);
+    cfg.messenger
+        .record_wasm_activation_failure(&failures)
+        .await;
 }
 
 fn format_triggering_summary(snapshots: &[brenn_messaging::PortSnapshot]) -> Vec<String> {

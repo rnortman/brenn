@@ -556,6 +556,10 @@ pub struct RPort {
 pub enum PortDir {
     In,
     Out,
+    // TODO(retained-state-port-attribute): a retained-state port is an `io`
+    // port whose depths are dictated by the guest helper that reads it, not by
+    // the operator, and every document transcribes them by hand today. The
+    // marker that would fix it is declared here, on the direction.
     Io,
 }
 

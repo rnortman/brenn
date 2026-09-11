@@ -39,11 +39,18 @@ const ECHO_IN_PORT: &str = "messages";
 /// The one output port it publishes on.
 const ECHO_OUT_PORT: &str = "out";
 
+/// The `io` port its state rides between activations.
+const ECHO_STATE_PORT: &str = "state";
+
 /// Echo-stub's sync port names, its own vocabulary — not bound in the
 /// specification.
 const SEND: &str = "send";
 const SEND_CUSTOM: &str = "send-custom";
 const PANIC: &str = "panic";
+
+/// The delivered body that makes echo-stub fail *after* its state has been
+/// stored.
+const FAIL_AFTER_STORE: &str = "__fail-after-store__";
 
 /// The component's scrollback cap. A copy of its own private constant; the test
 /// that uses it asserts the observable bound rather than the number.
@@ -55,6 +62,11 @@ const ACKS_PORT: &str = "acks";
 const DISMISS: &str = "dismiss";
 const SNOOZE: &str = "snooze";
 
+/// The `io` port meeting's state rides between activations, and the `out` port
+/// it announces a takeover transition on.
+const MEETING_STATE_PORT: &str = "state";
+const MEETING_TAKEOVER_PORT: &str = "takeover";
+
 /// The instance chrome runs as in this fixture, and the one other instance
 /// already registered on the page it arranges.
 const CHROME_INSTANCE: &str = "chrome";
@@ -64,6 +76,9 @@ const SIBLING_INSTANCE: &str = "panel-1";
 /// vocabulary, bound to nothing in the specification.
 const TOAST_DISMISS: &str = "toast-dismiss";
 
+/// The `io` port chrome's state rides between activations.
+const CHROME_STATE_PORT: &str = "state";
+
 /// echo-stub, linked with exactly what its specification requires.
 fn echo_stub() -> Harness {
     Harness::new(
@@ -71,6 +86,7 @@ fn echo_stub() -> Harness {
         Page::new(),
         &[Ports, Log, Dom],
     )
+    .retaining_state(ECHO_STATE_PORT)
 }
 
 /// echo-stub, mounted: every test past the mount transcript is about what an
@@ -79,21 +95,65 @@ fn echo_stub_mounted() -> Harness {
     Harness::mount(echo_stub())
 }
 
-fn meeting() -> Harness {
-    Harness::mount(Harness::new(
+/// mode-clock's bound ports: the retained config snapshot, the boundary wake it
+/// parks for itself, and the port its state rides.
+const MODE_TICK_PORT: &str = "tick";
+const MODE_STATE_PORT: &str = "state";
+const MODE_THEME_PORT: &str = "theme";
+
+/// mode-clock, the one headless kind: it holds `dom` for the zone offset and
+/// draws nothing.
+fn mode_clock() -> Harness {
+    Harness::new(
+        &common::artifact_path("brenn_mode_clock"),
+        Page::new(),
+        &[Ports, Log, Dom],
+    )
+    .retaining_state(MODE_STATE_PORT)
+}
+
+/// protobar's bound ports, and the markers on the two elements it builds.
+const PROTOBAR_IN_PORT: &str = "messages";
+const PROTOBAR_STATE_PORT: &str = "state";
+const PROTOBAR_MESSAGE_MARKER: &str = "data-protobar-message";
+const PROTOBAR_STATUS_MARKER: &str = "data-protobar-status";
+
+/// protobar: the kind whose whole state — priority slots, view handles and the
+/// render it diffs against — rides the state port.
+fn protobar() -> Harness {
+    Harness::new(
+        &common::artifact_path("brenn_protobar"),
+        Page::new(),
+        &[Ports, Log, Dom],
+    )
+    .retaining_state(PROTOBAR_STATE_PORT)
+}
+
+fn meeting_unmounted() -> Harness {
+    Harness::new(
         &common::artifact_path("brenn_meeting"),
         Page::new(),
         &[Ports, Log, Dom],
-    ))
+    )
+    .retaining_state(MEETING_STATE_PORT)
+}
+
+fn meeting() -> Harness {
+    Harness::mount(meeting_unmounted())
 }
 
 /// chrome, the one kind holding page authority.
-fn chrome() -> Harness {
-    Harness::mount(Harness::new(
+fn chrome_unmounted() -> Harness {
+    Harness::new(
         &common::artifact_path("brenn_chrome"),
         Page::with_page_authority(CHROME_INSTANCE, SIBLING_INSTANCE),
         &[Ports, Log, Dom, PageDom],
-    ))
+    )
+    .retaining_state(CHROME_STATE_PORT)
+}
+
+fn chrome() -> Harness {
+    Harness::mount(chrome_unmounted())
 }
 
 /// An ordinary delivery on echo-stub's one bound input port.
@@ -134,6 +194,10 @@ const MOUNT_TRANSCRIPT: &[&str] = &[
     "dom.listen(n6, click, send-custom)",
     "dom.listen(n7, click, panic)",
     "dom.set-text(n2, \"sent: 0  drops: 0\")",
+    // The last thing every activation does: the state the next one reads back.
+    // The handles in it are the elements built above, which the mount owns and
+    // the memory does not.
+    "ports.publish(state, \"{\\\"view\\\":{\\\"status\\\":2,\\\"scrollback\\\":3,\\\"input\\\":5},\\\"entries\\\":[],\\\"drops\\\":0,\\\"sent\\\":0}\")",
 ];
 
 #[test]
@@ -165,8 +229,195 @@ fn the_mount_activation_builds_the_view_and_wires_its_gestures() {
         ]
     );
     assert!(
-        harness.page().published.is_empty(),
-        "mounting publishes nothing"
+        harness.page().published_on(ECHO_OUT_PORT).is_empty(),
+        "mounting publishes nothing but its own state"
+    );
+}
+
+/// The retained-state port is where a kind's state lives between activations,
+/// and the counters here prove the round trip: linear memory holds nothing
+/// across calls, so a `sent` that advances can only have come back off the
+/// port.
+#[test]
+fn the_state_port_carries_the_counters_between_activations() {
+    let mut harness = echo_stub_mounted();
+    let send = harness.page().marked_child(ROOT, "data-echo-send");
+    harness.call(gesture(SEND, send));
+    let after_first = state_writes(harness.transcript());
+    harness.call(gesture(SEND, send));
+    let after_second = state_writes(harness.transcript());
+
+    assert_eq!(after_first.len(), 1, "{after_first:?}");
+    assert_eq!(after_second.len(), 1, "{after_second:?}");
+    assert!(after_first[0].contains("\\\"sent\\\":1"), "{after_first:?}");
+    assert!(
+        after_second[0].contains("\\\"sent\\\":2"),
+        "the second press counted from the first press's state: {after_second:?}"
+    );
+}
+
+/// An unchanged state costs no message and no budget: the helper compares what
+/// it is asked to store with what it read and publishes only a difference.
+#[test]
+fn an_activation_that_changes_nothing_writes_no_state() {
+    let mut harness = echo_stub_mounted();
+    harness.call(delivery(&["seen before"], &[], 0));
+    let writes = state_writes(harness.transcript());
+    assert!(
+        writes.is_empty(),
+        "nothing about this activation changed the state: {writes:?}"
+    );
+}
+
+/// A state body that is not this kind's shape is a version skew across a
+/// deploy, not a host fault. echo-stub cannot go on without its view handles,
+/// so it refuses the activation rather than rebuilding a second view over the
+/// first one.
+#[test]
+fn a_state_body_this_kind_cannot_read_refuses_the_activation() {
+    let mut harness = echo_stub().seeding_state("{\"view\":\"not a view\"}");
+    let refusal = harness.call_expecting_a_refusal(mount());
+    let refusal = format!("{refusal:?}");
+    assert!(
+        refusal.contains("retained state on port \\\"state\\\" is unreadable"),
+        "{refusal}"
+    );
+}
+
+/// The state publishes in a transcript, in order.
+fn state_writes(transcript: Vec<String>) -> Vec<String> {
+    transcript
+        .into_iter()
+        .filter(|line| line.starts_with("ports.publish(state,"))
+        .collect()
+}
+
+/// A kind whose `io state` port is not bound sees no window on it. That is a
+/// deployment fault and not a first mount, and the two must not look alike: a
+/// cell that started from a default instead would make an instance whose state
+/// never persists behave exactly like one that has none yet.
+#[test]
+fn an_unbound_state_port_refuses_the_activation_by_name() {
+    let mut harness = Harness::new(
+        &common::artifact_path("brenn_echo_stub"),
+        Page::new(),
+        &[Ports, Log, Dom],
+    );
+    let refusal = harness.call_expecting_a_refusal(mount());
+    let refusal = format!("{refusal:?}");
+    assert!(refusal.contains("no window for port"), "{refusal}");
+    assert!(refusal.contains("state"), "{refusal}");
+    assert!(refusal.contains("the port is not bound"), "{refusal}");
+}
+
+/// The state write is the SDK's publish, not the component's, and a host that
+/// refuses it has lost this activation's state. echo-stub's state carries its
+/// view handles, so it cannot go on from the body it read: the activation
+/// fails, whichever refusal it was. Neither is a trap — a state body's size is
+/// driven by what the component was sent, so trapping on the per-message cap
+/// would make a large message a way to kill an instance.
+#[test]
+fn a_refused_state_write_fails_an_activation_whose_state_holds_handles() {
+    for refusal in [
+        ports::PublishError::QuotaExceeded,
+        ports::PublishError::InvalidPayload("payload 99 bytes exceeds max 8".to_string()),
+    ] {
+        let mut harness = echo_stub_mounted();
+        harness
+            .page()
+            .publish_answer_on
+            .insert(ECHO_STATE_PORT.to_string(), refusal.clone());
+        let send = harness.page().marked_child(ROOT, "data-echo-send");
+        let error = harness.call_expecting_a_refusal(gesture(SEND, send));
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("retained state publish on port \\\"state\\\""),
+            "{refusal:?}: {error}"
+        );
+        assert!(
+            error.contains("bytes) was refused"),
+            "the diagnostic names the body's size: {error}"
+        );
+    }
+}
+
+/// The other half of that decision: a kind whose state is a recomputable
+/// summary loses a recomputation and nothing else, so a refused write is
+/// reported and the activation stands — which is what keeps its self-tick
+/// chain, parked in the same activation, alive.
+#[test]
+fn a_refused_state_write_is_reported_where_the_state_is_recomputable() {
+    let mut harness = mode_clock();
+    harness.page().publish_answer_on.insert(
+        MODE_STATE_PORT.to_string(),
+        ports::PublishError::QuotaExceeded,
+    );
+    harness.call(mount());
+
+    let transcript = harness.transcript();
+    assert!(
+        transcript
+            .iter()
+            .any(|line| line.starts_with("log.error(") && line.contains("state")),
+        "the refusal is reported, not swallowed: {transcript:?}"
+    );
+    assert_eq!(
+        harness.page().published_on(MODE_THEME_PORT).len(),
+        1,
+        "the recompute this activation did still reached the shell"
+    );
+    assert_eq!(
+        harness
+            .page()
+            .parked
+            .iter()
+            .filter(|(port, _, _)| port == MODE_TICK_PORT)
+            .count(),
+        1,
+        "and the chain that causes the next activation is still armed"
+    );
+}
+
+/// A page discards a failed activation's whole publish buffer, so the harness
+/// must too: a suite that kept the state body a failing activation wrote would
+/// model a lifetime the browser does not have, in tree and out of it.
+#[test]
+fn a_failed_activation_leaves_the_last_committed_state_body() {
+    let mut harness = echo_stub_mounted();
+    harness.call(delivery(&[], &["first"], 1));
+    harness.transcript();
+
+    // This one renders, counts its drops and writes its state, and only then
+    // fails.
+    harness.call_expecting_a_refusal(delivery(&[], &[FAIL_AFTER_STORE], 4));
+    assert_eq!(
+        state_writes(harness.transcript()).len(),
+        1,
+        "the failing activation did publish a state body"
+    );
+
+    harness.call(delivery(&[], &["third"], 0));
+    let status = harness.page().marked_child(ROOT, "data-echo-status");
+    assert_eq!(
+        harness.page().text_of(status),
+        "sent: 0  drops: 1",
+        "the failed activation's four drops went with its publish buffer"
+    );
+}
+
+/// The body a state-cell hands the component has no window on the state port:
+/// the port is the SDK's own mechanism and a component folding through its
+/// delivered windows must not meet its own state as traffic. echo-stub says so
+/// by refusing such a window, so every one of its scripts above pins the rule.
+#[test]
+fn the_state_window_is_taken_off_the_activation_the_component_sees() {
+    let mut harness = echo_stub_mounted();
+    harness.call(delivery(&[], &["one message"], 0));
+    let scrollback = harness.page().marked_child(ROOT, "data-echo-scrollback");
+    assert_eq!(
+        harness.page().children(scrollback).len(),
+        1,
+        "the state envelope is not a delivery"
     );
 }
 
@@ -249,7 +500,7 @@ fn a_quota_refusal_is_logged_and_leaves_the_counter_where_it_was() {
         transcript.iter().any(|line| line.starts_with("log.error(")),
         "the one transient refusal is reported, not swallowed: {transcript:?}"
     );
-    assert!(harness.page().published.is_empty());
+    assert!(harness.page().published_on(ECHO_OUT_PORT).is_empty());
     let status = harness.page().marked_child(ROOT, "data-echo-status");
     assert_eq!(
         harness.page().text_of(status),
@@ -276,7 +527,7 @@ fn a_structural_refusal_takes_the_instance_down() {
     let send = harness.page().marked_child(ROOT, "data-echo-send");
     harness.call_expecting_a_trap(gesture(SEND, send));
     assert!(
-        harness.page().published.is_empty(),
+        harness.page().published_on(ECHO_OUT_PORT).is_empty(),
         "the refused publish reached nothing"
     );
 }
@@ -446,8 +697,14 @@ fn a_press_with_nothing_on_screen_acks_nothing_and_does_not_trap() {
 fn a_quota_refused_ack_still_takes_the_meeting_off_this_device() {
     // The user dismissed the meeting. A refused publish means the other devices
     // keep escalating, not that this one should.
+    //
+    // The refusal is the ack port's alone: a refused *state* write is a
+    // different loss with a different answer, pinned on its own below.
     let mut harness = escalated_meeting();
-    harness.page().publish_answer = Some(ports::PublishError::QuotaExceeded);
+    harness
+        .page()
+        .publish_answer_on
+        .insert(ACKS_PORT.to_string(), ports::PublishError::QuotaExceeded);
     let dismiss = meeting_button(&mut harness, "data-meeting-dismiss");
     harness.call(gesture(DISMISS, dismiss));
 
@@ -462,6 +719,37 @@ fn a_quota_refused_ack_still_takes_the_meeting_off_this_device() {
         harness.page().text_of(label),
         "NO MEETINGS",
         "the local ack applies whatever the bus said"
+    );
+}
+
+/// The takeover announcement rides the state port: it goes out on a transition
+/// and not on every recompute, which is only true if the flag the last
+/// activation set is the flag this one reads.
+#[test]
+fn the_takeover_announcement_is_made_once_across_activations() {
+    let mut harness = escalated_meeting();
+    let after_first = harness.page().published_on(MEETING_TAKEOVER_PORT).len();
+    harness.call(delivery_on(AGENDA_PORT, &[&agenda(true)], &[], 0));
+    let after_second = harness.page().published_on(MEETING_TAKEOVER_PORT).len();
+
+    assert_eq!(after_first, 1, "the escalation announced the takeover once");
+    assert_eq!(
+        after_second, after_first,
+        "the second recompute saw the announcement the first one recorded"
+    );
+}
+
+/// A state body that is not meeting's shape is a version skew across a deploy.
+/// Starting from a default would lose the view handles and build a second panel
+/// over the first, so the activation is refused instead.
+#[test]
+fn a_state_body_meeting_cannot_read_refuses_the_activation() {
+    let mut harness = meeting_unmounted().seeding_state("{\"view\":\"not a view\"}");
+    let refusal = harness.call_expecting_a_refusal(mount());
+    let refusal = format!("{refusal:?}");
+    assert!(
+        refusal.contains("retained state on port \\\"state\\\" is unreadable"),
+        "{refusal}"
     );
 }
 
@@ -575,6 +863,86 @@ fn a_click_on_a_toast_dismisses_that_toast_and_a_click_on_the_gap_dismisses_none
     );
 }
 
+/// A state body that is not chrome's shape is a version skew across a deploy.
+/// Starting from a default would lose the page furniture and build a second
+/// banner over the first, so the activation is refused instead.
+#[test]
+fn a_state_body_chrome_cannot_read_refuses_the_activation() {
+    let mut harness = chrome_unmounted().seeding_state("{\"view\":\"not a view\"}");
+    let refusal = harness.call_expecting_a_refusal(mount());
+    let refusal = format!("{refusal:?}");
+    assert!(
+        refusal.contains("retained state on port \\\"state\\\" is unreadable"),
+        "{refusal}"
+    );
+}
+
+// protobar: the kind whose view handles, priority slots and last render all
+// ride one state body
+
+/// The mount activation builds the bar's two elements and draws an empty
+/// status line — nothing has been delivered yet.
+#[test]
+fn the_protobar_mount_activation_builds_its_two_elements() {
+    let mut harness = protobar();
+    harness.call(mount());
+
+    let message = harness.page().marked_child(ROOT, PROTOBAR_MESSAGE_MARKER);
+    let status = harness.page().marked_child(ROOT, PROTOBAR_STATUS_MARKER);
+    assert_eq!(harness.page().text_of(message), "");
+    assert_eq!(harness.page().text_of(status), "");
+}
+
+/// Everything protobar carries between activations is in one state body: the
+/// two view handles it writes through, the slot holding the live message, the
+/// drop counter, and the render it diffs the next one against. A second
+/// delivery that writes into the *same* elements and sums its drops onto the
+/// first one's can only have read all four back off the port.
+#[test]
+fn the_protobar_state_port_carries_its_view_slots_and_counters() {
+    let mut harness = protobar();
+    harness.call(mount());
+    let message = harness.page().marked_child(ROOT, PROTOBAR_MESSAGE_MARKER);
+    let status = harness.page().marked_child(ROOT, PROTOBAR_STATUS_MARKER);
+
+    harness.call(delivery_on(PROTOBAR_IN_PORT, &[], &["first message"], 2));
+    assert_eq!(harness.page().text_of(status), "dropped: 2");
+    let rendered = harness.page().children(message);
+    assert_eq!(rendered.len(), 1, "the message subtree is one paragraph");
+
+    harness.call(delivery_on(PROTOBAR_IN_PORT, &[], &[], 3));
+    assert_eq!(
+        harness.page().text_of(status),
+        "dropped: 5",
+        "the second activation counted from the first one's state"
+    );
+    assert_eq!(
+        harness.page().children(message),
+        rendered,
+        "nothing about the displayed message changed, so the render it diffs \
+         against came back off the port and the subtree was left alone"
+    );
+    assert_eq!(
+        harness.page().marked_child(ROOT, PROTOBAR_MESSAGE_MARKER),
+        message,
+        "and the handle it wrote through is the one the mount built"
+    );
+}
+
+/// A state body that is not protobar's shape is a version skew across a
+/// deploy. Starting from a default would lose the view handles and build a
+/// second bar over the first, so the activation is refused instead.
+#[test]
+fn a_state_body_protobar_cannot_read_refuses_the_activation() {
+    let mut harness = protobar().seeding_state("{\"view\":\"not a view\"}");
+    let refusal = harness.call_expecting_a_refusal(mount());
+    let refusal = format!("{refusal:?}");
+    assert!(
+        refusal.contains("retained state on port \\\"state\\\" is unreadable"),
+        "{refusal}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The harness itself: what it links, and what it records
 // ---------------------------------------------------------------------------
@@ -600,12 +968,17 @@ fn a_grant_the_caller_did_not_name_is_not_linked() {
     // Deny-by-default, the production host's rule: the linker holds exactly the
     // profile the specification requires, so an artifact that acquired an
     // import nobody granted fails at instantiation rather than at boot.
+    //
+    // Instantiation is inside the activation (linear memory is
+    // activation-scoped), so mounting is not what refuses; the first
+    // activation is.
     let refused = std::panic::catch_unwind(|| {
-        Harness::new(
+        let mut harness = Harness::new(
             &common::artifact_path("brenn_echo_stub"),
             Page::new(),
             &[Ports, Log],
-        )
+        );
+        harness.call(brenn_page_harness::mount());
     });
     assert!(
         refused.is_err(),
@@ -663,5 +1036,81 @@ fn the_alert_impl_records_what_the_component_paged_about() {
             .iter()
             .any(|line| line.starts_with("alert.alert(critical,")),
         "the alert is in the transcript beside the DOM calls"
+    );
+}
+
+// mode-clock: the headless kind, and the one whose whole observable behaviour
+// is a decision carried from one activation to the next
+
+/// The first recompute always dispatches — that is what converges the shell off
+/// the page's initial stamp — and it parks the boundary that will cause the
+/// next one.
+#[test]
+fn the_mount_recompute_dispatches_a_theme_and_parks_the_next_boundary() {
+    let mut harness = mode_clock();
+    harness.call(mount());
+
+    assert_eq!(harness.page().published_on(MODE_THEME_PORT).len(), 1);
+    let parked: Vec<&str> = harness
+        .page()
+        .parked
+        .iter()
+        .filter(|(port, _, _)| port == MODE_TICK_PORT)
+        .map(|(_, body, _)| body.as_str())
+        .collect();
+    assert_eq!(parked, ["{}"], "the boundary wake is the message");
+}
+
+/// mode-clock's state is a recomputable summary — the theme is a function of
+/// the clock and the config — so a body it cannot read is reported and the
+/// activation starts over from the default rather than failing. The store that
+/// ends it overwrites the bad body, which is what stops the skew repeating on
+/// every activation forever.
+#[test]
+fn a_state_body_mode_clock_cannot_read_starts_from_the_default() {
+    let mut harness = mode_clock().seeding_state("{\"config\":\"nonsense\"}");
+    harness.call(mount());
+
+    let transcript = harness.transcript();
+    assert!(
+        transcript
+            .iter()
+            .any(|line| line.starts_with("log.error(") && line.contains("unreadable")),
+        "the skew is reported, not swallowed: {transcript:?}"
+    );
+    assert_eq!(
+        state_writes(transcript).len(),
+        1,
+        "the default-derived state overwrote the body it could not read"
+    );
+    assert_eq!(
+        harness.page().published_on(MODE_THEME_PORT).len(),
+        1,
+        "and the recompute the default asked for still happened"
+    );
+
+    // The overwrite is what the next activation reads: it converges instead of
+    // reporting the same skew again.
+    harness.call(delivery_on(MODE_TICK_PORT, &[], &["{}"], 0));
+    let transcript = harness.transcript();
+    assert!(
+        !transcript.iter().any(|line| line.starts_with("log.error(")),
+        "{transcript:?}"
+    );
+}
+
+/// The dispatch-on-change decision lives in the state machine, and the state
+/// machine lives on the `state` port: a second recompute at the same instant
+/// re-dispatches nothing only if the first one's decision came back.
+#[test]
+fn a_second_recompute_at_the_same_instant_dispatches_nothing() {
+    let mut harness = mode_clock();
+    harness.call(mount());
+    harness.call(delivery_on(MODE_TICK_PORT, &[], &["{}"], 0));
+
+    assert_eq!(
+        harness.page().published_on(MODE_THEME_PORT).len(),
+        1,
+        "the theme is unchanged, so the second activation had nothing to say"
     );
 }

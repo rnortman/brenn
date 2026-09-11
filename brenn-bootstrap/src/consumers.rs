@@ -370,8 +370,9 @@ pub(crate) type ConsumerRegistry = HashMap<String, RunningConsumer>;
 
 /// Start a loaded consumer's dispatch task.
 ///
-/// The task runs the startup sweep before its first wait, so a backlog left by
-/// a prior process is drained without waiting for a new wake.
+/// The task delivers the mount activation before its first wait: every mount is
+/// owed one activation, and it windows every port, so a backlog left by a prior
+/// process is drained in it without waiting for a new wake.
 ///
 /// The KV store is opened here rather than at the load, because the file admits
 /// one holder: a replacement for a running consumer is loaded while the old

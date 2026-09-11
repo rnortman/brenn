@@ -25,13 +25,31 @@ use crate::state::AppState;
 /// The component-module manifest embedded in the page as JSON.
 ///
 /// Produced by the backend, consumed only by the TS bootstrap; never a WS frame
-/// and never touched by ts-rs. Two fields: `kernel` is the fixed kernel artifact
-/// URL, `components` maps each configured instance to its kind's transpiled
-/// module URL. All URLs carry `?v=` set to the serving build id.
+/// and never touched by ts-rs. Three fields: `kernel` is the fixed kernel
+/// artifact URL, `components` maps each configured instance to its kind's
+/// transpiled module URL and the core modules that module instantiates over,
+/// and `withheld` names each configured instance this host is not serving. All
+/// URLs carry `?v=` set to the serving build id.
 #[derive(Serialize)]
 struct SurfaceManifest {
     kernel: String,
     components: Vec<ManifestComponent>,
+    withheld: Vec<WithheldInstance>,
+}
+
+/// One configured instance whose kind this host withholds: no module URL, no
+/// cores, nothing to bring up.
+///
+/// It is named rather than omitted because the page owes the kernel a verdict
+/// for every declared instance — an instance the manifest simply left out would
+/// sit `pending` forever with no row, no report and nothing to read.
+#[derive(Serialize)]
+struct WithheldInstance {
+    instance: String,
+    kind: String,
+    /// The record-version sentence, as the scan wrote it: what the page shows
+    /// and what the kernel's failure row carries.
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -39,19 +57,57 @@ struct ManifestComponent {
     instance: String,
     kind: String,
     module: String,
+    /// The kind's core wasm modules, as build-stamped URLs.
+    ///
+    /// Named by the backend rather than discovered by the glue: the transpiled
+    /// module instantiates synchronously, so its core-module lookup cannot
+    /// fetch, and the page has to have compiled every core before the first
+    /// activation.
+    cores: Vec<String>,
 }
 
 /// The transpiled module URL for one declared instance.
 ///
 /// It carries no per-instance query, and must not: the jco `--instantiation`
 /// module instantiates nothing at evaluation, so one evaluation per kind is
-/// correct and per-instance isolation comes from calling its `instantiate` once
-/// per instance. Forcing extra evaluations would only duplicate glue.
+/// correct and the per-activation instance comes from calling its `instantiate`
+/// inside the entry. Forcing extra evaluations would only duplicate glue.
 fn module_url(entry: &brenn_lib::messaging::config::ResolvedComponent, build_id: &str) -> String {
     format!(
         "/surface-static/{}?v={build_id}",
         processor_module_path(&entry.kind)
     )
+}
+
+/// The core-module URLs for one kind, minted exactly as `module_url` mints the
+/// glue's: same directory, same build stamp.
+///
+/// # Panics
+///
+/// If no installed root offers the kind. Boot validation refuses a
+/// configuration naming a kind no root offers, and a kind an installed root
+/// offers but this host withholds never reaches here, so a miss is a broken
+/// boot invariant and not an operator mistake.
+fn core_urls(
+    kind: &str,
+    roots: &brenn_surface_server::SurfaceRoots,
+    build_id: &str,
+) -> Vec<String> {
+    let cores = roots.kind_cores(kind).unwrap_or_else(|| {
+        panic!(
+            "surface component kind {kind:?} is configured but no installed surface root offers \
+             it — boot validation guarantees a root for every configured kind"
+        )
+    });
+    cores
+        .iter()
+        .map(|core| {
+            format!(
+                "/surface-static/{}?v={build_id}",
+                brenn_surface_contract::processor_asset_path(kind, core)
+            )
+        })
+        .collect()
 }
 
 /// GET /surface/{slug} — the surface page a browser tab loads.
@@ -76,22 +132,29 @@ pub async fn surface_page(
     //    JSON-encoded manifest cannot break out of its `<script>` container
     //    regardless of future field additions; the metas are HTML-escaped.
     let build_id = state.build_id;
-    // One entry per declared instance: a trap poisons one instance and never its
-    // siblings of the same kind, because each is its own `instantiate` of the
-    // kind's one evaluated module.
-    let manifest_components: Vec<ManifestComponent> = runtime
-        .resolved
-        .components
-        .iter()
-        .map(|entry| ManifestComponent {
+    let roots = state.surface_roots();
+    let mut manifest_components: Vec<ManifestComponent> = Vec::new();
+    let mut withheld: Vec<WithheldInstance> = Vec::new();
+    for entry in &runtime.resolved.components {
+        if let Some(held) = roots.withheld_kind(&entry.kind) {
+            withheld.push(WithheldInstance {
+                instance: entry.instance.clone(),
+                kind: entry.kind.clone(),
+                reason: held.reason.clone(),
+            });
+            continue;
+        }
+        manifest_components.push(ManifestComponent {
             instance: entry.instance.clone(),
             kind: entry.kind.clone(),
             module: module_url(entry, build_id),
-        })
-        .collect();
+            cores: core_urls(&entry.kind, &roots, build_id),
+        });
+    }
     let manifest = SurfaceManifest {
         kernel: format!("/surface-static/{KERNEL_ARTIFACT}?v={build_id}"),
         components: manifest_components,
+        withheld,
     };
     // `serde_json` escapes `"`/`\` but not `<`; escaping `<` to its JSON unicode
     // escape keeps the value identical while preventing a `</script>` breakout.
@@ -201,6 +264,7 @@ mod tests {
         state: crate::state::AppState,
         resolved: ResolvedSurface,
     ) -> (axum::Router, String) {
+        install_kind_roots(&state, &resolved);
         state.surfaces.set_runtimes(install_surface_runtimes(
             vec![resolved],
             // The page renders from the resolved bindings alone, but the surface
@@ -217,6 +281,25 @@ mod tests {
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
         let (token, _) = setup_authenticated_user(db).await;
         (router, token)
+    }
+
+    /// Install a surface root for every kind the fixture declares. A kind with
+    /// no root violates a boot invariant the page panics on.
+    fn install_kind_roots(state: &crate::state::AppState, resolved: &ResolvedSurface) {
+        let kinds = resolved.components.iter().map(|comp| {
+            (
+                comp.kind.clone(),
+                brenn_surface_server::KindRoot::for_test_with_cores(
+                    std::path::PathBuf::from("/surface"),
+                    &[&format!("{}.core.wasm", comp.kind)],
+                ),
+            )
+        });
+        state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+            withheld: Default::default(),
+            kernel: Some(brenn_surface_server::KernelRoot::for_test("/surface")),
+            kinds: kinds.collect(),
+        }));
     }
 
     /// One authenticated GET of a surface page.
@@ -422,6 +505,12 @@ mod tests {
             "missing manifest echo-stub module URL: {body}"
         );
         assert!(
+            body.contains(&format!(
+                r#""cores":["/surface-static/processor/echo-stub/echo-stub.core.wasm?v={TEST_BUILD_ID}"]"#
+            )),
+            "missing manifest echo-stub core URLs: {body}"
+        );
+        assert!(
             body.contains(r#""instance":"echo-stub""#),
             "missing manifest component instance: {body}"
         );
@@ -540,6 +629,56 @@ mod tests {
             "missing echo-stub module URL: {body}"
         );
         assert!(!body.contains("instance=echo-stub"), "{body}");
+    }
+
+    /// A configured instance whose kind this host withholds is named, with the
+    /// reason, and carries no module URL — the page owes the kernel a verdict for
+    /// every declared instance, and an omitted one would sit `pending` forever.
+    #[tokio::test]
+    async fn a_configured_instance_of_a_withheld_kind_is_named_not_served() {
+        let resolved = SurfaceFixture::new("deskbar", "echo-stub")
+            .processor("fleet-1", "fleet", Default::default())
+            .build();
+        let db = crate::test_support::init_db_memory();
+        let state = test_state(&db);
+        let (router, token) = router_over(&db, state.clone(), resolved.clone()).await;
+        // `router_over` installed a root for every kind; withhold one of them,
+        // which is what the scan does for a bundle mid-upgrade.
+        let mut roots = (*state.surface_roots()).clone();
+        roots.kinds.remove("fleet");
+        roots.withheld.insert(
+            "fleet".to_string(),
+            brenn_surface_server::WithheldKind {
+                mount: "fleet-bundle".to_string(),
+                root: std::path::PathBuf::from("/mnt/fleet/surface"),
+                record_v: 2,
+                reason: "manifest declares v = 2, but this server reads v = 3".to_string(),
+            },
+        );
+        state.set_surface_roots(std::sync::Arc::new(roots));
+
+        let response = get_surface(&router, "deskbar", &token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response.into_body()).await;
+
+        assert!(
+            body.contains(r#""withheld":[{"instance":"fleet-1","kind":"fleet","reason":"#),
+            "the withheld instance is named with its reason: {body}"
+        );
+        assert!(
+            body.contains("manifest declares v = 2"),
+            "the page carries the scan's own sentence: {body}"
+        );
+        assert!(
+            !body.contains("processor/fleet/fleet.js"),
+            "a withheld kind has no module URL to load: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                r#""module":"/surface-static/processor/echo-stub/echo-stub.js?v={TEST_BUILD_ID}""#
+            )),
+            "its siblings are served as usual: {body}"
+        );
     }
 
     #[tokio::test]

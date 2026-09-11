@@ -22,7 +22,7 @@ use std::sync::Mutex as StdMutex;
 
 use brenn_lib::messaging::config::{NoiseLevel, SystemChannelTuning};
 use brenn_lib::tools::ResolvedToolGrant;
-use brenn_messaging::Messenger;
+use brenn_messaging::{Messenger, MountDebt};
 use tokio::sync::Mutex;
 
 use brenn_git::sync::CloneInfo;
@@ -356,7 +356,7 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
 
     // The guest fired exactly one async call for the matched slug.
     let requests =
@@ -382,7 +382,7 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     executor.drain_step().await;
 
     // Step 3: the result activates the consumer, which publishes the outcome.
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
     let outcome = read_latest(&harness.messenger, &harness.outcomes_addr)
         .await
         .expect("outcome event published");
@@ -410,7 +410,7 @@ async fn push_event_no_match_fires_no_call() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
 
     assert!(
         brenn_messaging::testutils::owed_everywhere(&harness.messenger, &harness.executor_sub)
@@ -435,7 +435,7 @@ async fn call_id_sequence_is_monotonic_across_activations() {
             ChannelScheme::Brenn,
         )
         .await;
-        drain_step(&harness.cfg, &guest_sub).await;
+        drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
     }
 
     let requests =
@@ -464,7 +464,7 @@ async fn drive_result(harness: &ConsumerHarness, result_body: &str) {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &harness.guest_sub).await;
+    drain_step(&harness.cfg, &harness.guest_sub, MountDebt::Settled).await;
 }
 
 #[tokio::test]
@@ -559,7 +559,7 @@ async fn missing_remote_config_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -596,7 +596,7 @@ async fn empty_remote_config_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -630,7 +630,7 @@ async fn duplicate_slug_config_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -665,7 +665,7 @@ async fn denied_tool_call_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -701,7 +701,7 @@ async fn unknown_push_event_schema_version_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub).await;
+    drain_step(&harness.cfg, &guest_sub, MountDebt::Settled).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,

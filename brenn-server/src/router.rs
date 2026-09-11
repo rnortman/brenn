@@ -134,7 +134,9 @@ pub(crate) async fn not_found(
 /// everything else from the root holding the kernel module pair and the flat
 /// sidecars. A kind no root offers — and every request at all on a surface-less
 /// deployment — is a 404 and a fail2ban signal: a page manifest never emits such
-/// a URL, so asking for one is a probe.
+/// a URL, so asking for one is a probe. A kind an installed root offers and this
+/// host withholds is a plain 404: the tree is real and the host's own decision
+/// is why nothing is served from it.
 async fn surface_static(
     axum::extract::State(state): axum::extract::State<AppState>,
     Extension(client_ip::ClientIp(ip)): Extension<client_ip::ClientIp>,
@@ -146,7 +148,23 @@ async fn surface_static(
     // swapping the roots mid-request leaves this request serving the tree it
     // resolved against, which is the tree the page manifest was written for.
     let roots = state.surface_roots();
-    let root = match brenn_surface_server::processor_kind_from_path(path) {
+    let kind = brenn_surface_server::processor_kind_from_path(path);
+    // A kind this host withholds is a declared kind it is deliberately not
+    // serving, not an unrecognized URL: the page manifest named the instance as
+    // withheld and brought nothing up, so the request is either a stale page or
+    // an operator looking. Either way it is not fail2ban signal.
+    if let Some(kind) = kind
+        && let Some(withheld) = roots.withheld_kind(kind)
+    {
+        tracing::info!(
+            kind = %kind,
+            mount = %withheld.mount,
+            record_v = withheld.record_v,
+            "surface asset requested for a withheld kind"
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = match kind {
         Some(kind) => roots.kind_root(kind),
         None => roots.kernel.as_ref().map(|kernel| kernel.root.as_path()),
     };
@@ -1921,6 +1939,7 @@ mod tests {
         let db = crate::test_support::init_db_memory();
         let state = test_state(&db);
         state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+            withheld: Default::default(),
             kernel: Some(brenn_surface_server::KernelRoot::for_test(brenn.path())),
             kinds: [
                 (
@@ -1983,6 +2002,63 @@ mod tests {
         assert_eq!(unmapped.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A withheld kind's tree is real and declared; the host's own decision is
+    /// why nothing is served from it. That is not a probe, so the 404 carries no
+    /// fail2ban signal — while a kind in neither map keeps the one it had.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_withheld_kinds_assets_are_a_plain_404_and_an_unknown_kinds_are_a_probe() {
+        let brenn = tempfile::tempdir().unwrap();
+        std::fs::write(brenn.path().join("brenn_surface_kernel.js"), "export {};").unwrap();
+        let db = crate::test_support::init_db_memory();
+        let state = test_state(&db);
+        state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+            kernel: Some(brenn_surface_server::KernelRoot::for_test(brenn.path())),
+            kinds: Default::default(),
+            withheld: [(
+                "fleet".to_string(),
+                brenn_surface_server::WithheldKind {
+                    mount: "fleet-bundle".to_string(),
+                    root: brenn.path().to_path_buf(),
+                    record_v: 2,
+                    reason: "manifest declares v = 2".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }));
+        let app = build_router(state, None, 0, 2576)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+        let (session_token, _) = setup_authenticated_user(&db).await;
+
+        let fetch = async |path: &str| {
+            app.clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("cookie", format!("brenn_session={session_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+
+        let withheld = fetch("/surface-static/processor/fleet/fleet.js").await;
+        assert_eq!(withheld.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !logs_contain("security_event=true"),
+            "a withheld kind is a declared kind this host is not serving, not a probe"
+        );
+        assert!(logs_contain("surface asset requested for a withheld kind"));
+
+        let unknown = fetch("/surface-static/processor/nope/nope.js").await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert!(
+            logs_contain("security_event=true"),
+            "a kind no declared mount offers is still fail2ban signal"
+        );
+    }
+
     #[tokio::test]
     async fn surface_static_serves_from_whichever_roots_are_installed() {
         let first = tempfile::tempdir().unwrap();
@@ -1997,6 +2073,7 @@ mod tests {
 
         let roots = |dir: &std::path::Path| {
             std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+                withheld: Default::default(),
                 kernel: Some(brenn_surface_server::KernelRoot::for_test(dir)),
                 kinds: [(
                     "chrome".to_string(),
@@ -2443,6 +2520,7 @@ mod tests {
         let mut state = test_state(&db);
         state.static_dir = tmp.path().to_path_buf();
         state.set_surface_roots(std::sync::Arc::new(brenn_surface_server::SurfaceRoots {
+            withheld: Default::default(),
             kernel: Some(brenn_surface_server::KernelRoot::for_test(tmp.path())),
             kinds: std::collections::BTreeMap::new(),
         }));

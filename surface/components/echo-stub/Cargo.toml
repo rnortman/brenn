@@ -8,8 +8,12 @@ description = "Brenn surface echo-stub — minimal dev/test component exercising
 [lib]
 crate-type = ["cdylib"]
 
-# No ungated [dependencies]: nothing is needed by both the host and wasm32
-# builds.
+# The component's retained state is serde-serialized onto its `state` port, and
+# the derive is on a wasm32-only type — so serde is a guest-side dependency and
+# nothing here is needed by both builds.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
 

@@ -215,8 +215,14 @@ def surface_processor_assets(name, kind, component, spec, visibility = ["//visib
         args = [
             "transpile",
             bindir_relative(staged_component),
+            # Sync instantiation: `instantiate` returns the instance rather than
+            # a promise, so the page can mint one inside an activation entry —
+            # including a sync-call activation inside a gesture's dispatch,
+            # which cannot await. Its cost is that the glue's core-module lookup
+            # is synchronous too, so the page compiles every core at bring-up
+            # from the names the kind's record carries.
             "--instantiation",
-            "async",
+            "sync",
             "--name",
             kind,
             "--out-dir",

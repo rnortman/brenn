@@ -182,6 +182,13 @@ fn load_record(package_dir: &Path) -> PackageRecord {
             path.display(),
         )
     });
+    // TODO(stale-package-record-withheld): a package under a bundle mount whose
+    // record this host does not read should be withheld — its consumers not
+    // started, one alert naming it, and the reload after the bundle's
+    // re-release starting them — instead of this boot panic. brenn's own mount
+    // keeps the panic: there the binary and the packages travel in one tarball,
+    // so a mismatch is a broken install. The surface record already works this
+    // way.
     assert!(
         record.v == RECORD_VERSION,
         "boot: package record {} declares version {}, but this host reads v{RECORD_VERSION}. A \

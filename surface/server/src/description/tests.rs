@@ -21,6 +21,7 @@ const PREFIX: &str = "surface";
 /// arrangement the sidecar readers see in tree.
 fn roots(dir: &Path, surfaces: &[ResolvedSurface]) -> crate::SurfaceRoots {
     crate::SurfaceRoots {
+        withheld: Default::default(),
         kernel: Some(crate::KernelRoot::for_test(dir)),
         kinds: surfaces
             .iter()
@@ -466,7 +467,7 @@ fn kind_help_embeds_sidecar_verbatim_under_header() {
     let help = build_kind_help(
         "protobar",
         &surfaces,
-        Some(dir.path()),
+        KindPlacement::Served(Some(dir.path())),
         "2026-07-13T00:00:00Z",
     );
     // Generated header names the kind, module, and mounting surface/channel.
@@ -485,7 +486,7 @@ fn kind_help_missing_sidecar_produces_stub() {
     let help = build_kind_help(
         "protobar",
         &surfaces,
-        Some(dir.path()),
+        KindPlacement::Served(Some(dir.path())),
         "2026-07-13T00:00:00Z",
     );
     assert!(help.contains("Component kind `protobar`"));
@@ -526,6 +527,7 @@ fn each_kind_reads_the_sidecars_of_the_root_that_installed_it() {
 
     let surfaces = multi_surface_config();
     let roots = crate::SurfaceRoots {
+        withheld: Default::default(),
         kernel: Some(crate::KernelRoot::for_test(brenn.path())),
         kinds: [
             (
@@ -581,7 +583,11 @@ fn kind_schema_carries_verbatim_json_or_null() {
     )
     .unwrap();
     // With a sidecar: schema embedded verbatim.
-    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["v"], 1);
     assert_eq!(doc["kind"], "protobar");
@@ -590,10 +596,95 @@ fn kind_schema_carries_verbatim_json_or_null() {
     assert!(doc["ts"].is_string());
 
     // No sidecar (echo-stub): schema is JSON null, channel still uniform.
-    let body = build_kind_schema("echo-stub", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema(
+        "echo-stub",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["kind"], "echo-stub");
     assert_eq!(doc["schema"], serde_json::Value::Null);
+}
+
+/// A withheld kind ships no readable record and therefore no sidecars, so both
+/// documents would otherwise be byte-identical to a served kind that ships none
+/// — the one state an operator most needs told apart from "this component has
+/// no docs".
+#[test]
+fn a_withheld_kinds_documents_say_so_and_a_served_kinds_do_not() {
+    let dir = tempfile::tempdir().unwrap();
+    // The withheld tree ships both sidecars. They are the whole point of the
+    // suppression: a host that read them would publish documentation for a kind
+    // it is not serving, written against a hosting contract it cannot read.
+    std::fs::write(
+        dir.path().join("brenn_protobar.help.md"),
+        "## Payload\n\nthe withheld tree's own prose",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("brenn_protobar.schema.json"),
+        r#"{"type":"object","properties":{"text":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    let withheld = crate::WithheldKind {
+        mount: "fleet-bundle".to_string(),
+        root: dir.path().to_path_buf(),
+        record_v: 2,
+        reason: "manifest declares v = 2, but this server reads v = 3".to_string(),
+    };
+    let surfaces = multi_surface_config();
+
+    let help = build_kind_help(
+        "protobar",
+        &surfaces,
+        KindPlacement::Withheld(&withheld),
+        "2026-07-13T00:00:00Z",
+    );
+    assert!(help.contains("## Withheld"));
+    assert!(help.contains("manifest declares v = 2"));
+    assert!(help.contains("fleet-bundle"));
+    assert!(
+        !help.contains("the withheld tree's own prose"),
+        "a withheld tree's sidecars are not read: {help}",
+    );
+    // The stub follows instead, in its own words rather than the withheld
+    // paragraph's — the two both say "ships no documentation".
+    assert!(help.contains("not found next to"), "{help}");
+
+    let body = build_kind_schema(
+        "protobar",
+        KindPlacement::Withheld(&withheld),
+        "2026-07-13T00:00:00Z",
+    );
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // Additive: `v` does not move, because the same number is what every
+    // installed bundle's `.dimensions.json` is checked against.
+    assert_eq!(doc["v"], 1);
+    assert_eq!(doc["withheld"], withheld.reason);
+    assert_eq!(
+        doc["schema"],
+        serde_json::Value::Null,
+        "the withheld tree's schema sidecar is not published either",
+    );
+
+    // The same tree, served: every assertion above flips, which is what makes
+    // them assertions about the placement rather than about an empty directory.
+    let served = build_kind_help(
+        "protobar",
+        &surfaces,
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
+    assert!(!served.contains("## Withheld"));
+    assert!(served.contains("the withheld tree's own prose"), "{served}");
+    let served: serde_json::Value = serde_json::from_str(&build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    ))
+    .unwrap();
+    assert_eq!(served.get("withheld"), None);
+    assert_eq!(served["schema"]["properties"]["text"]["type"], "string");
 }
 
 #[test]
@@ -605,7 +696,11 @@ fn kind_schema_malformed_sidecar_panics() {
         "{ this is not json",
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
 }
 
 // ── dimensions vocabulary ────────────────────────────────────────────────────
@@ -613,7 +708,11 @@ fn kind_schema_malformed_sidecar_panics() {
 #[test]
 fn kind_schema_dimensions_null_when_absent() {
     let dir = tempfile::tempdir().unwrap();
-    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(
         doc.as_object().unwrap().contains_key("dimensions"),
@@ -630,7 +729,11 @@ fn kind_schema_dimensions_published_validated() {
         r#"{"v":1,"min_width":320,"max_width":1280,"min_height":200}"#,
     )
     .unwrap();
-    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     let dims = &doc["dimensions"];
     assert_eq!(dims["v"], 1);
@@ -650,7 +753,11 @@ fn kind_schema_dimensions_malformed_panics() {
         "{ not json",
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
 }
 
 #[test]
@@ -662,7 +769,11 @@ fn kind_schema_dimensions_unknown_field_panics() {
         r#"{"v":1,"min_width":320,"depth":10}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
 }
 
 #[test]
@@ -674,7 +785,11 @@ fn kind_schema_dimensions_empty_panics() {
         r#"{"v":1}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
 }
 
 #[test]
@@ -686,7 +801,11 @@ fn kind_schema_dimensions_min_gt_max_panics() {
         r#"{"v":1,"min_width":1280,"max_width":320}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
 }
 
 /// The height axis is the second conjunct of the inversion check; without this
@@ -700,7 +819,11 @@ fn kind_schema_dimensions_min_gt_max_height_panics() {
         r#"{"v":1,"min_height":800,"max_height":200}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
 }
 
 /// `min == max` is a legitimate fixed-size kind: the boundary is `lo <= hi`, and
@@ -713,7 +836,11 @@ fn kind_schema_dimensions_fixed_axis_accepted() {
         r#"{"v":1,"min_width":640,"max_width":640}"#,
     )
     .unwrap();
-    let body = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let body = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["dimensions"]["min_width"], 640);
     assert_eq!(doc["dimensions"]["max_width"], 640);
@@ -730,7 +857,11 @@ fn kind_schema_dimensions_wrong_version_panics() {
         r#"{"v":2,"min_width":320}"#,
     )
     .unwrap();
-    let _ = build_kind_schema("protobar", Some(dir.path()), "2026-07-13T00:00:00Z");
+    let _ = build_kind_schema(
+        "protobar",
+        KindPlacement::Served(Some(dir.path())),
+        "2026-07-13T00:00:00Z",
+    );
 }
 
 // ── instance-config channel reservation ──────────────────────────────────────

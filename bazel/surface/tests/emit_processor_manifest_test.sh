@@ -66,8 +66,8 @@ for pair in \
 done
 
 # The version is a number, so the string scrape above cannot read it.
-if ! grep -qE '^[[:space:]]*"v"[[:space:]]*:[[:space:]]*2,' "$record"; then
-    fail "the record does not declare v = 2: $(cat "$record")"
+if ! grep -qE '^[[:space:]]*"v"[[:space:]]*:[[:space:]]*3,' "$record"; then
+    fail "the record does not declare v = 3: $(cat "$record")"
 fi
 
 # The specification is staged before this runs, so it joins the observed file

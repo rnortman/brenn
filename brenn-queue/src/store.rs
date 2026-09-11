@@ -74,11 +74,17 @@ pub enum Attached {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnedDeferred<'a, M> {
     Owned(DeferredId, &'a Deferred<M>),
-    /// Still parked, but under `owner`.
+    /// Still held, but under `owner`.
     WrongSender {
         owner: &'a str,
     },
-    /// Not parked at all: released, cancelled, or never parked. The benign
+    /// The sender's, still held, and past the authority cutoff — its release
+    /// time has arrived and no release pass has taken it yet. The sender's view
+    /// shows it, carrying this instant, and nothing may act on it.
+    PastCutoff {
+        release_at: ReleaseTime,
+    },
+    /// Not held at all: released, cancelled, or never parked. The benign
     /// outcome of racing the release loop.
     NotFound,
 }
@@ -344,11 +350,14 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
         ReleaseReport { released, overflow }
     }
 
-    /// One sender's messages still parked at `now`, release order.
+    /// One sender's unreleased messages, release order.
     ///
-    /// Parked is exactly `release_at > now`: an entry whose time has come is
-    /// out of the view even before the release pass takes it, because there is
-    /// nothing left to cancel or edit.
+    /// Parked is exactly "no release pass has taken it yet", whatever
+    /// `release_at` says: an entry whose instant has passed is in this view,
+    /// carrying that past instant, until a release moves it into retention.
+    /// The owner reads the instant and knows the entry is due. Cancel and edit
+    /// keep their own `> cutoff` authority boundary, so a due entry is shown
+    /// here and is not cancellable.
     ///
     /// The sender filter is the whole authorization story for a per-sender
     /// view: a caller scoped to a sender can never observe another sender's
@@ -356,11 +365,8 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
     pub fn deferred_for_sender<'a>(
         &'a self,
         sender: &'a str,
-        now: ReleaseTime,
     ) -> impl Iterator<Item = &'a Deferred<M>> {
-        self.deferred
-            .for_sender(sender)
-            .filter(move |e| e.release_at > now)
+        self.deferred.for_sender(sender)
     }
 
     /// Every message still parked at `now`, release order — the operator's read
@@ -386,6 +392,13 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
     /// message by is a payload field this crate knows nothing about. The
     /// ownership rule is not the host's, which is why it is decided here.
     ///
+    /// The scan spans every held entry, due or not, and `cutoff` decides the
+    /// last question rather than the first: an entry the sender can see in its
+    /// view but may no longer act on answers
+    /// [`OwnedDeferred::PastCutoff`] carrying its instant, and one belonging to
+    /// someone else answers [`OwnedDeferred::WrongSender`] whether or not it is
+    /// due. Filtering by the cutoff first would report both as "never there".
+    ///
     /// The scan is bounded by the deferred cap, which is the channel's depth.
     pub fn owned_deferred(
         &self,
@@ -393,16 +406,17 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
         matches: impl Fn(&M) -> bool,
         cutoff: ReleaseTime,
     ) -> OwnedDeferred<'_, M> {
-        let Some(entry) = self
-            .deferred
-            .iter()
-            .find(|e| e.release_at > cutoff && matches(&e.message))
-        else {
+        let Some(entry) = self.deferred.iter().find(|e| matches(&e.message)) else {
             return OwnedDeferred::NotFound;
         };
         if entry.sender != sender {
             return OwnedDeferred::WrongSender {
                 owner: &entry.sender,
+            };
+        }
+        if entry.release_at <= cutoff {
+            return OwnedDeferred::PastCutoff {
+                release_at: entry.release_at,
             };
         }
         OwnedDeferred::Owned(entry.id, entry)
@@ -806,16 +820,20 @@ mod tests {
     }
 
     #[test]
-    fn a_sender_view_holds_only_its_own_still_parked_entries() {
+    fn a_sender_view_holds_its_own_unreleased_entries_due_or_not() {
         let mut c = core(8);
         c.park("alice", "mine-due", 100).expect("under the cap");
         c.park("alice", "mine-later", 300).expect("under the cap");
         c.park("bob", "theirs", 300).expect("under the cap");
-        let view: Vec<&'static str> = c
-            .deferred_for_sender("alice", 200)
-            .map(|e| e.message)
-            .collect();
-        assert_eq!(view, vec!["mine-later"], "due entries leave the view");
+        let view: Vec<&'static str> = c.deferred_for_sender("alice").map(|e| e.message).collect();
+        assert_eq!(
+            view,
+            vec!["mine-due", "mine-later"],
+            "an entry no release pass has taken is in the view, due or not"
+        );
+        c.release_due(200);
+        let after: Vec<&'static str> = c.deferred_for_sender("alice").map(|e| e.message).collect();
+        assert_eq!(after, vec!["mine-later"], "release is what removes it");
     }
 
     // ── Ownership of a parked entry ───────────────────────────────────────
@@ -841,20 +859,26 @@ mod tests {
     fn owned_deferred_reports_another_senders_entry_rather_than_panicking() {
         let mut c = core(8);
         c.park("bob", "theirs", 300).expect("under the cap");
+        c.park("bob", "theirs-due", 100).expect("under the cap");
         assert_eq!(
             c.owned_deferred("alice", is("theirs"), 200),
             OwnedDeferred::WrongSender { owner: "bob" }
         );
+        assert_eq!(
+            c.owned_deferred("alice", is("theirs-due"), 200),
+            OwnedDeferred::WrongSender { owner: "bob" },
+            "ownership is decided before the cutoff is"
+        );
     }
 
     #[test]
-    fn owned_deferred_finds_nothing_once_the_entry_is_due_or_gone() {
+    fn owned_deferred_separates_a_due_entry_from_a_gone_one() {
         let mut c = core(8);
         let id = c.park("alice", "mine", 100).expect("under the cap");
         assert_eq!(
             c.owned_deferred("alice", is("mine"), 200),
-            OwnedDeferred::NotFound,
-            "a due entry is past cancelling"
+            OwnedDeferred::PastCutoff { release_at: 100 },
+            "a due entry is in the sender's view and past cancelling"
         );
         c.cancel_deferred(id).expect("still held");
         assert_eq!(

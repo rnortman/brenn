@@ -23,10 +23,9 @@
 //! the operator log (not a trap) so one buggy publisher cannot brick a bar
 //! showing other publishers' live messages.
 
-use std::cell::RefCell;
-
-use brenn_guest::{Activation, Error, Processor, dom, log, repark};
+use brenn_guest::{Activation, Error, Processor, RetainedState, StateLoss, dom, log, repark};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::logic::{Display, Ingest, ProtobarState};
 use crate::markdown::{Block, Inline, Style};
@@ -47,14 +46,16 @@ const STATUS_MARKER: &str = "data-protobar-status";
 /// message occupies the bar.
 const PRIORITY_ATTRIBUTE: &str = "data-priority";
 
-// One instantiation backs one instance for the page's lifetime, so the state
-// machine, the view handles and the last render are ordinary interior-mutable
-// module state. That is what lets p1 and p2 — two declarations of this one kind
-// — each keep their own slots.
-thread_local! {
-    static BAR: RefCell<Protobar> = RefCell::new(Protobar::new());
-}
+impl crate::spec::StatePayload for Protobar {}
 
+/// Everything this instance carries between activations, which rides its
+/// retained `state` port because linear memory does not survive one. That is
+/// what lets p1 and p2 — two declarations of this one kind — each keep their
+/// own slots: each has its own port, bound to its own anonymous ring.
+///
+/// The handles in it do survive: a handle is owned by the mount, so the element
+/// one named when it was stored is the element it names when it is read back.
+#[derive(Default, Serialize, Deserialize)]
 struct Protobar {
     state: ProtobarState,
     /// The elements an activation writes into, built by the mount activation.
@@ -64,20 +65,13 @@ struct Protobar {
     last: Option<Display>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct View {
     message: dom::Node,
     status: dom::Node,
 }
 
 impl Protobar {
-    fn new() -> Protobar {
-        Protobar {
-            state: ProtobarState::new(),
-            view: None,
-            last: None,
-        }
-    }
-
     /// The view, which every activation after the mount one has.
     fn view(&self) -> &View {
         self.view
@@ -90,10 +84,20 @@ struct ProtobarComponent;
 
 impl Processor for ProtobarComponent {
     fn receive(activation: Activation) -> Result<Option<String>, Error> {
-        BAR.with(|bar| on_activation(&activation, &mut bar.borrow_mut()))?;
-        // Mount is the only sync-call activation this component sees, and the
-        // mount call is answered with nothing.
-        Ok(None)
+        // Starting from a default state would lose the view and trap on the
+        // first `view()`, so an unreadable body fails the activation and the
+        // instance takes its error card.
+        RetainedState::around(
+            activation,
+            crate::spec::state::<Protobar>(),
+            StateLoss::FailActivation,
+            |activation, bar| {
+                on_activation(activation, bar)?;
+                // Mount is the only sync-call activation this component sees,
+                // and the mount call is answered with nothing.
+                Ok(None)
+            },
+        )
     }
 }
 
@@ -108,7 +112,8 @@ fn on_activation(activation: &Activation, bar: &mut Protobar) -> Result<(), Erro
     }
     let now = activation_instant(activation)?;
     for window in activation.delivered_windows() {
-        if InPort::of(window)? == InPort::Tick {
+        // The tick's payload is irrelevant — the wake is the message.
+        if matches!(InPort::of(window)?, InPort::Tick) {
             continue;
         }
         let port = window.port();

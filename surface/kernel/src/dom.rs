@@ -6,7 +6,8 @@
 
 use crate::contract::ActivationError;
 use crate::contract::{
-    ENTRY_REPLY_FIELD, PROCESSOR_START, SURFACE_READY, SURFACE_RELOAD, SURFACE_ROOT_ID,
+    ENTRY_REPLY_FIELD, PROCESSOR_START, SURFACE_FAILURE, SURFACE_READY, SURFACE_RELOAD,
+    SURFACE_ROOT_ID,
 };
 use crate::front::SurfaceHandle;
 use crate::schema::LogLevel;
@@ -213,6 +214,7 @@ pub(crate) fn apply_action(action: &KernelAction, handle: &SurfaceHandle) {
             handle.publish_control(channel, body.clone());
         }
         KernelAction::RequestReload { reason } => request_reload(reason),
+        KernelAction::StaticFailure { message } => static_failure(message),
         KernelAction::ErrorCard {
             instance,
             kind,
@@ -559,6 +561,14 @@ pub fn start_processors(instances: &[String]) {
 pub fn request_reload(reason: &str) {
     let detail = detail_object(&[("reason", JsValue::from_str(reason))]);
     dispatch_window_event(SURFACE_RELOAD, Some(&detail));
+}
+
+/// Dispatch the `brenn-surface-failure { message }` seam event on `window`. The
+/// TS bootstrap renders the message as the page's terminal state and latches it,
+/// reloading nothing. `message` reaches the detail as a string primitive.
+pub fn static_failure(message: &str) {
+    let detail = detail_object(&[("message", JsValue::from_str(message))]);
+    dispatch_window_event(SURFACE_FAILURE, Some(&detail));
 }
 
 /// The kernel's panic-hook body: log the panic message and best-effort dispatch

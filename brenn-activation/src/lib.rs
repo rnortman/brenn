@@ -1,4 +1,6 @@
-//! The `processor.wit` activation carrier, declared once.
+//! The component contract: the `processor.wit` activation carrier, the rules a
+//! component is owed under it, and the one scheduling predicate both hosts
+//! share.
 //!
 //! An activation is the only delivery shape a component sees: every bound input
 //! port of one instance, windowed, handed to the instance's entry in one call.
@@ -11,6 +13,224 @@
 //! re-declares it. The generic parameter `E` survives only so this crate's own
 //! tests can window `&'static str` bodies; it has exactly one production
 //! instantiation.
+//!
+//! This crate carries the *rules* as well as the shapes, and both hosts compile
+//! against it. A rule written on one host's side only is a rule the other host's
+//! author never reads as an obligation, which is how two hosts that both believe
+//! they implement one component model come to differ in what they deliver. The
+//! host conformance suite (`brenn-host-conformance`) is the executable half of
+//! this text: a rule here that no scenario there drives is a rule only in prose.
+//!
+//! # The invariant
+//!
+//! > **There is one component model. Any component runs on any host that can
+//! > satisfy its imports. Hosting eligibility is an import profile, not a
+//! > component kind.**
+//!
+//! Every rule below is subordinate to that sentence, and it is the test a change
+//! to either host has to pass. A component importing `store`/`mqtt`/`tools` is
+//! backend-only; a component importing DOM capability is surface-only. Both are
+//! the *same* rule reading a different import profile, not two kinds of thing.
+//! Components see exactly one mechanism: **messages on named ports**.
+//!
+//! A behaviour one host has and the other does not is a bug unless it appears in
+//! "Host-specific behaviours" below, with its reason. Silence here is not
+//! "host-defined".
+//!
+//! # Delivery: the activation is the only shape
+//!
+//! A component on any hosting and any ABI sees exactly one delivery shape, the
+//! **activation**: every bound input port windowed — retained context first, new
+//! messages after, split by `new_from`, with a `dropped` delta — the whole thing
+//! delivered by one call to the component's entry, publishes buffered during the
+//! call and flushed atomically iff it returns ok.  There is no per-envelope
+//! event, no drop marker, and no component-visible gap.
+//!
+//! The doctrine that shape encodes, because a port author must be able to read
+//! it somewhere:
+//!
+//! - **The port is a view, not a pipe.** An input port views a sliding window of
+//!   its channel's stream. Messages before `new_from` are **seen** — still in the
+//!   view because retention has not displaced them yet. Seeing a message again is
+//!   not an error and not "duplicate delivery"; it is what "seen" means. A
+//!   component needing exactly-once-seen tracks its own high-water by
+//!   `message_id`.
+//! - **Attach is a delivery point.** When a port's queue comes into existence —
+//!   the instance's first registration, a re-registration, a binding added or a
+//!   port rebound by a later bindings document — the channel's retained tail,
+//!   capped at the binding's `push_depth`, arrives as **new**, not as context. So
+//!   a message published before its consumer existed still reaches that consumer
+//!   and still wakes it; a component may rely on `new` alone to catch up on
+//!   attach. The symmetric cost is that a re-attach re-delivers what the
+//!   component already folded, so a side-effecting fold owes itself at-most-once
+//!   handling by `message_id`.
+//! - **`dropped` is a counter, not a marker in the stream.** It is the delivery
+//!   loss on that binding since the port's previous activation. The lost message
+//!   itself is not gone: it remains visible as retained context in this or any
+//!   later activation whose `retain_depth` still covers it. Recovery *is*
+//!   retention — there is no gap-and-replay choreography and no terminal port
+//!   failure. The carrier counts it in `u64` and the WIT world types it `u32`,
+//!   so a host lowering an activation **saturates** at `u32::MAX` rather than
+//!   refusing: a saturated count still says "you lost more than you can count",
+//!   which is the whole of what a component does with the figure.
+//! - **Err consumes.** The messages an activation was assembled for are acked
+//!   when it is assembled, so returning err (or trapping) does not redeliver
+//!   them; they reappear only as retained context.
+//! - **Attach events are legitimately everything-is-new.** A page reload is the
+//!   widest of them: cursors, rings and registrations die with the page, so
+//!   everything in the first windows after a reload is new. A backend process
+//!   restart is the same event on the other host, narrowed by whatever the
+//!   durable store kept. A fresh attach that finds a ring already populated — the
+//!   priming rule above — is the narrower one. Neither is a bug.
+//! - **Pending activations coalesce.** An instance woken three times while it is
+//!   running is run once afterwards, and the window's `new_from` shows what
+//!   accumulated. Coalescing is the correct behaviour of a view, not a
+//!   degradation path.
+//! - **One instant per activation.** A host takes one clock reading per assembly
+//!   and uses it for both the deferred-view boundary and the `now` the component
+//!   is handed, so a component computing `now + delay` cannot park a message
+//!   behind a view it was already shown.
+//! - **Every mount gets one activation, guaranteed.** See below.
+//!
+//! # What a mount is, and what it is owed
+//!
+//! A **mount** is a host putting an instance into service:
+//!
+//! - **Surface:** the instance's registration, once a bindings document wires it.
+//!   A registration made before the page's first document waits for that document
+//!   ([`schedule::MountDebt::Unwired`]). A page reload is a new mount.
+//! - **Backend:** the consumer task starting — at boot, and for every arriving or
+//!   replaced consumer at reload converge. Positions exist before the task
+//!   starts, so the debt is owed from the task's first instruction and there is
+//!   no unwired state. A process restart is a new mount exactly as a page reload
+//!   is.
+//!
+//! Every mount is owed exactly **one** activation, unconditionally. An activation
+//! with nothing to deliver is otherwise never assembled; the **mount activation**
+//! is the deliberate, once-per-mount exception. Its windows carry whatever
+//! retained context and new messages exist — possibly nothing at all — and its
+//! deferred windows ride along as always. It carries no marker: a component that
+//! needs to know whether this is its first activation tracks that itself, and
+//! most simply recompute from their windows.
+//!
+//! It exists so that a component's first output — its first state report, the
+//! first tick of a deferred self-publish chain — has somewhere to come from that
+//! is inside an activation, where the buffered publish seam and the deferred
+//! ops live. A component cannot publish from its connect-time code, so an
+//! activation that only happens when a bound channel happens to hold history is
+//! not something a component can build on.
+//!
+//! Exactly one is delivered per mount. An instance that deregisters and registers
+//! again, a consumer that is stopped and started, a restarted process: each is a
+//! new mount and is owed a new one. A second bindings document mid-attachment is
+//! not. The debt is settled **at assembly**, not at completion: an activation the
+//! instance trapped in still happened, and the guarantee is one activation per
+//! mount, not one successful one.
+//!
+//! [`schedule::readiness`] is that guarantee as machinery: both hosts ask it, and
+//! neither keeps a gate of its own.
+//!
+//! # A deferred self-publish chain re-arms at mount only if it is empty
+//!
+//! There is no timer concept and no arming API. **A timer is a deferred
+//! self-publish**: a component declares an `io` port, publishes its next tick to
+//! itself with a `deliver_after` computed from the activation's own `now`, and
+//! the tick arrives as an ordinary message on an ordinary input port.
+//! Rescheduling and cancelling are the cancel/edit ops against the
+//! [`DeferredWindow`] the activation is handed, so they ride the same flush rule:
+//! an entry that errs schedules nothing.
+//!
+//! At every mount the component is shown its own parked messages and reconciles
+//! from them. On a durable channel a tick parked before a restart survives it and
+//! appears in the mount activation's deferred window; on an ephemeral or local
+//! channel it does not and the window is empty. Either way the rule is the same
+//! and the component never has to know which happened: **park a tick at mount iff
+//! the deferred window holds none.** A chain that re-arms unconditionally runs at
+//! twice its cadence after a restart; one that never re-arms is a component that
+//! stops ticking after one.
+//!
+//! The window a host presents holds **every** entry the component parked on
+//! that port that no release pass has taken — including one whose release
+//! instant has already passed, carried with that past instant. "Parked" means
+//! "not yet released", not "release time in the future", so an empty window
+//! means no tick is standing at every instant, on either host, which is what
+//! the rule above needs to be exact. A message parked before an outage whose
+//! instant passed during it is therefore shown at the next mount, not hidden
+//! until the host's release pass catches up. The edge that comes with it: such
+//! an entry may be read but not cancelled or edited — the authority cutoff is
+//! still the release instant — so a component that wants it gone waits for it
+//! to arrive.
+//!
+//! # An instance's linear memory lives for one activation
+//!
+//! An instance's linear memory — statics, thread-locals, the heap, everything in
+//! it — lives for **one activation**. A component MUST NOT carry state in it
+//! from one activation to the next: no host promises that memory survives, and a
+//! component that relies on it is silently wrong. Every host enforces it: the
+//! backend builds a store and instantiates per activation, the browser page's
+//! loader mints an instance inside its activation entry and drops it when the
+//! entry returns, and `brenn-page-harness` instantiates per activation too — so
+//! a kind's own suite, in or out of tree, catches a component that carries
+//! state in memory before it is packaged.
+//!
+//! A component keeps state by **publishing it**: an `io` port bound
+//! `push_depth = 0; retain_depth = 1` — sampled, so it never wakes its owner;
+//! retained, so the newest state is always in that port's context window. The
+//! component reads its state back out of that window at the top of every
+//! activation and publishes the new one at the bottom. That is the same rule the
+//! message bus states for state everywhere else: a retained channel *is* a state
+//! variable, and there is no separate key-value store to reach for. The guest
+//! SDK's `RetainedState` is the idiom in one line.
+//!
+//! **Host resources are owned by the mount, not by the memory.** A DOM element
+//! handle on the surface, the KV store on the backend: a handle minted in one
+//! activation names the same resource in the next, because the host's handle
+//! tables live as long as the mount does. A handle is therefore ordinary state,
+//! carried in a published state body like any other field — and a handle to a
+//! resource the component has since destroyed traps on use, exactly as a stale
+//! struct field would.
+//!
+//! # Host-specific behaviours
+//!
+//! The whole list. Each entry is a difference a component can observe, and each
+//! has a reason that is about the host's substrate rather than about its author's
+//! taste. Anything not here is one rule on both hosts.
+//!
+//! - **Sync activations (surface only).** A browser gesture needs its reply in
+//!   the same task, while the user activation is live, so the surface can assemble
+//!   and run an activation inside the event handler's own `dispatchEvent` and read
+//!   a reply out of it. The backend has no such caller and mints only async
+//!   activations.
+//! - **The sync mount of a `dom`-granted surface instance.** An instance holding
+//!   the `dom` grant is mounted synchronously by its registration: the host
+//!   element is created by that registration and must be filled in the same task,
+//!   so the browser never paints an empty host. Such a component sees
+//!   `sync = Some(MOUNT_SYNC_PORT)` and the mount request in that port's window.
+//!   **Every other mount, on either host, is the async shape** — `sync: None`, the
+//!   ordinary assembly. A backend instance never holds `dom`, so every backend
+//!   mount is the async one.
+//! - **The ACL gate (backend only).** The backend is the trust plane and decides
+//!   per port whether an instance may read a channel at all; a denied port
+//!   windows empty. The surface's authority is its bindings document: a port it
+//!   must not read is a port it does not bind.
+//! - **Trap disposition.** The surface takes a trapped instance terminal and
+//!   error-cards it; the backend quarantines the activation and carries on. One
+//!   instance per activation removed the surface's *stated* reason (a poisoned
+//!   memory) but not its real one: DOM effects are immediate and
+//!   non-transactional, so a trapped rendering activation may leave a half-built
+//!   subtree no later activation can be trusted to repair, and the error card is
+//!   the page's honest state. The backend has no such irreversibility. This is
+//!   the one deliberate host difference in error handling; everything else there
+//!   — Err consumes, the flush rule, the side-effect gradient — is one rule.
+//! - **Import profile.** `store`, `mqtt` and `tools` are backend-only; `dom` and
+//!   `page-dom` are surface-only. This is the invariant working, not an exception
+//!   to it: a component's hosting eligibility is exactly its import list.
+//! - **`ephemeral:` bindings for backend consumers.** Not implementable today: a
+//!   backend WASM consumer cannot bind an `ephemeral:` channel, because the
+//!   registry forks on the address realm. A gap in the machinery rather than a
+//!   rule about components, listed here so it is not read as one.
+
+pub mod schedule;
 
 /// One activation: every bound input port of one instance, windowed.
 ///
@@ -277,8 +497,6 @@ mod tests {
     /// never a silent drift.
     #[test]
     fn activation_shape_frozen() {
-        // Two context envelopes then one new: `new_from` indexes the first new
-        // message, so it is also the context length.
         let window = PortWindow {
             port: "agenda".to_string(),
             envelopes: vec!["seen-1", "seen-2", "new-1"],
@@ -320,7 +538,6 @@ mod tests {
         assert_eq!(*dropped, 1u64);
         assert_eq!(&envelopes[..*new_from as usize], &window.envelopes[..2]);
 
-        // A pure-context window: nothing new, `new_from == envelopes.len()`.
         let context_only = PortWindow {
             port: "clock".to_string(),
             envelopes: vec!["seen-1"],
@@ -346,7 +563,6 @@ mod tests {
     /// count (including the pure-context zero), and the whole-set `dropped` fold.
     #[test]
     fn accessors_split_count_and_fold() {
-        // A window with two context envelopes, two new, and a nonzero drop.
         let with_new = PortWindow {
             port: "messages".to_string(),
             envelopes: vec!["c-1", "c-2", "n-1", "n-2"],
@@ -356,8 +572,7 @@ mod tests {
         assert_eq!(with_new.new_envelopes(), &["n-1", "n-2"]);
         assert_eq!(with_new.new_len(), 2);
 
-        // A pure-context window: `new_from == len`, so no new messages and a
-        // zero count — the `saturating_sub` edge.
+        // The `saturating_sub` edge: `new_from == len`.
         let context_only = PortWindow {
             port: "clock".to_string(),
             envelopes: vec!["c-1"],
@@ -367,8 +582,7 @@ mod tests {
         assert!(context_only.new_envelopes().is_empty());
         assert_eq!(context_only.new_len(), 0);
 
-        // `new_from == 0`: every envelope is new and none is context — the shape a
-        // sync port's window always has, and a first delivery's.
+        // The shape a sync port's window always has, and a first delivery's.
         let all_new = PortWindow {
             port: "ack".to_string(),
             envelopes: vec!["n-1"],
@@ -378,7 +592,6 @@ mod tests {
         assert_eq!(all_new.new_envelopes(), &["n-1"]);
         assert_eq!(all_new.new_len(), 1);
 
-        // `total_dropped` folds `dropped` across every port, not any other field.
         let activation = Activation {
             ports: vec![with_new, context_only, all_new],
             deferred: vec![],
@@ -516,8 +729,6 @@ mod tests {
         };
         assert_eq!(with_new.latest_new(), Some(&"n-2"));
 
-        // Pure context: nothing new, so nothing to apply — the `None` an idle
-        // port's activation yields.
         let context_only = PortWindow {
             port: "config".to_string(),
             envelopes: vec!["c-1"],
@@ -557,8 +768,6 @@ mod tests {
         };
         assert_eq!(context_only.latest_wins_misconfiguration(), None);
 
-        // Three new: the report names the port and the count, so the operator
-        // knows which binding's push_depth to fix.
         let three_new = PortWindow {
             port: "layout".to_string(),
             envelopes: vec!["c-1", "n-1", "n-2", "n-3"],

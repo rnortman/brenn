@@ -395,15 +395,12 @@ fn wasm_consumer_explicit_wake_min_panics() {
     resolve(&raw, &dir);
 }
 
-/// A consumer whose single subscription has push_depth=0 (sampled/context-only)
-/// can never activate → panic.
-///
-/// Replaces the old `wasm_consumer_inherited_noise_on_pull_only_ok` test: that
-/// test asserted no-panic on a pull-only sub, but the multi-port design
-/// explicitly makes all-sampled-only consumers dead config.
+/// A consumer whose every subscription is sampled is live config: every mount is
+/// owed an activation, so it is activated once when its task starts and reads
+/// its context windows there. Nothing wakes it on traffic afterwards, which is
+/// what a sampled binding asks for.
 #[test]
-#[should_panic(expected = "can never activate")]
-fn wasm_consumer_all_sampled_inputs_panics() {
+fn wasm_consumer_all_sampled_inputs_resolves() {
     let (dir, chan_addr) = make_dir_with_noise("brenn:pullonly-dead-test", NoiseLevel::Alarm);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "consumer-d".to_string(),
@@ -415,8 +412,9 @@ fn wasm_consumer_all_sampled_inputs_panics() {
         }],
         ..minimal_wasm_consumer()
     }];
-    // Panics: the single input has push_depth=0 → consumer can never activate.
-    resolve(&raw, &dir);
+    let resolved = resolve(&raw, &dir);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].inputs.len(), 1);
 }
 
 /// push_depth=0 AND retain_depth=0 → dead port, can never trigger and never

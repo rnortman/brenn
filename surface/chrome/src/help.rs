@@ -240,24 +240,27 @@ mod tests {
         }
     }
 
-    /// The exclusion the exhaustive match makes deliberately, pinned. The
+    /// The two exclusions the exhaustive match makes deliberately, pinned. The
     /// compiler holds that every declared port is *considered*;
     /// `every_port_is_documented` then asserts over whatever rows it was
-    /// handed, so it stays green if `toast-tick` gains one. It must not: the
-    /// port is chrome's own deferred self-wake, nothing else ever publishes to
-    /// it, and an operator has nothing to bind — a row would be a documented
-    /// binding that cannot exist.
+    /// handed, so it stays green if `toast-tick` or `state` gains one. Neither
+    /// must: one is chrome's own deferred self-wake and the other its own
+    /// retained state, nothing else ever publishes to either, and an operator
+    /// has nothing to bind — a row would be a documented binding that cannot
+    /// exist.
     #[test]
-    fn the_self_wake_port_is_the_one_port_with_no_row() {
+    fn the_self_written_ports_are_the_ones_with_no_row() {
         let doc = help_markdown();
-        assert!(
-            !doc.contains("| `toast-tick` |"),
-            "the self-wake port gained a help row"
-        );
+        for port in ["toast-tick", "state"] {
+            assert!(
+                !doc.contains(&format!("| `{port}` |")),
+                "the self-written port `{port}` gained a help row"
+            );
+        }
         assert_eq!(
             input_port_docs().len(),
-            crate::spec::InPort::ALL.len() - 1,
-            "every declared inbound port but the self-wake one carries a row"
+            crate::spec::InPort::ALL.len() - 2,
+            "every declared inbound port but the two self-written ones carries a row"
         );
     }
 

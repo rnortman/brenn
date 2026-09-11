@@ -144,6 +144,7 @@ filegroup(
         "//brenn-git:policy_srcs",
         "//brenn-graf:policy_srcs",
         "//brenn-hooks:policy_srcs",
+        "//brenn-host-conformance:policy_srcs",
         "//brenn-lib:policy_srcs",
         "//brenn-messaging:policy_srcs",
         "//brenn-messaging-boot:policy_srcs",

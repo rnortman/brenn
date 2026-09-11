@@ -3,6 +3,10 @@
 /// and reads dismiss/snooze acks so every device converges — hence `io acks`.
 /// Draws its own panel — label, title, countdown, sub-line and a Dismiss/Snooze
 /// button row — so it holds `dom`.
+///
+/// Its state machine, its view handles and the occurrence a button press acks
+/// ride the retained `state` port between activations, because linear memory
+/// does not.
 component Meeting {
   abi = processor;
   requires = [ports, log, takeover, dom];
@@ -10,4 +14,5 @@ component Meeting {
   io acks;
   out takeover: "brenn.surface.takeover@1";
   io tick;
+  io state;
 }

@@ -45,23 +45,23 @@ async fn a_stop_while_parked_ends_the_task() {
         Depth::Bounded(0),
     );
     let handle = spawn_wasm_consumer_task(cfg);
-    // The startup sweep has nothing to do here; waiting for the subscriber to
-    // be owed nothing is what says the loop reached its wait.
+    // The mount activation has nothing to do here; waiting for the subscriber
+    // to be owed nothing is what says the loop reached its wait.
     assert!(wait_pending_empty(&messenger, &wasm_sub, JOIN_DEADLINE).await);
 
     assert!(handle.stop.send(true).is_ok());
     join_within(handle.join).await;
 }
 
-/// The signal, arriving before the startup sweep can have finished: the sweep
-/// runs before the loop and so before the arm exists at all, and its rows are
-/// consumed whatever the signal says.
+/// The signal, arriving before the mount activation can have finished: the
+/// mount runs before the loop and so before the arm exists at all, and its rows
+/// are consumed whatever the signal says.
 ///
-/// This pins the sweep's own imperviousness. The loop's step is
+/// This pins the mount activation's own imperviousness. The loop's step is
 /// `a_stop_during_a_drain_step_lets_the_step_finish` below, which is where the
 /// arm is.
 #[tokio::test]
-async fn a_stop_before_the_startup_sweep_does_not_preempt_it() {
+async fn a_stop_before_the_mount_activation_does_not_preempt_it() {
     let slug = "stop-mid-step";
     let (messenger, channel, wasm_sub) = testutils::build_wasm_messenger(
         slug,
@@ -87,8 +87,8 @@ async fn a_stop_before_the_startup_sweep_does_not_preempt_it() {
         Depth::Bounded(0),
     );
     let handle = spawn_wasm_consumer_task(cfg);
-    // No await between the spawn and the signal, so the sweep is at best
-    // partway through it.
+    // No await between the spawn and the signal, so the mount activation is at
+    // best partway through it.
     assert!(handle.stop.send(true).is_ok());
     join_within(handle.join).await;
 
@@ -96,7 +96,7 @@ async fn a_stop_before_the_startup_sweep_does_not_preempt_it() {
         brenn_messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
             .await
             .is_empty(),
-        "the startup sweep must run to completion whatever the stop signal says"
+        "the mount activation must run to completion whatever the stop signal says"
     );
 }
 
@@ -151,11 +151,11 @@ async fn an_unstopped_loop_keeps_draining() {
     let handle = spawn_wasm_consumer_task(cfg);
     assert!(wait_pending_empty(&messenger, &wasm_sub, JOIN_DEADLINE).await);
 
-    testutils::insert_bus_message(&messenger, &channel, "after-sweep", ChannelScheme::Brenn).await;
+    testutils::insert_bus_message(&messenger, &channel, "after-mount", ChannelScheme::Brenn).await;
     notify.notify_one();
     assert!(
         wait_pending_empty(&messenger, &wasm_sub, JOIN_DEADLINE).await,
-        "a running loop must drain a row published after its startup sweep"
+        "a running loop must drain a row published after its mount activation"
     );
     handle.stop_and_join().await;
 }
@@ -165,7 +165,7 @@ async fn an_unstopped_loop_keeps_draining() {
 /// consumed and their publishes go out before the task leaves.
 ///
 /// The step is held open through the pacer rather than through the guest: a
-/// burst of one is spent on the startup sweep, so the wake's `admit` sleeps a
+/// burst of one is spent on the mount activation, so the wake's `admit` sleeps a
 /// whole `min_period`, and the throttle alert is the observation that the wake
 /// has been taken up and the step is committed. Sending the signal before that
 /// observation would race the two `select!` arms, which is a different
@@ -180,9 +180,9 @@ async fn a_stop_during_a_drain_step_lets_the_step_finish() {
         Depth::Bounded(0),
     )
     .await;
-    // One row for the sweep, so waiting for the subscriber to be owed nothing
-    // says the sweep is over and its token is spent.
-    testutils::insert_bus_message(&messenger, &channel, "sweep-row", ChannelScheme::Brenn).await;
+    // One row for the mount, so waiting for the subscriber to be owed nothing
+    // says the mount activation is over and its token is spent.
+    testutils::insert_bus_message(&messenger, &channel, "mount-row", ChannelScheme::Brenn).await;
 
     let (mut cfg, _alerts, _db) = build_cfg(
         slug,

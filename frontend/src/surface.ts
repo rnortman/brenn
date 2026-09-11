@@ -317,28 +317,49 @@ export function installGlobalHandlers(): void {
 
 /**
  * A component-module entry in the surface manifest: one declared **instance**,
- * its config `kind`, and the build-ID-stamped module URL. Shape mirrored from
- * `page.rs`'s `ManifestComponent` — backend-produced, bootstrap-consumed, never
- * a WS frame and never touched by ts-rs.
+ * its config `kind`, the build-ID-stamped module URL, and the URLs of the core
+ * wasm modules that module instantiates over. Shape mirrored from `page.rs`'s
+ * `ManifestComponent` — backend-produced, bootstrap-consumed, never a WS frame
+ * and never touched by ts-rs.
  *
  * One entry per instance, not per kind: sibling instances of one kind name the
- * same transpiled module and differ in the `instantiate` built on it, which is
- * where the per-instance linear memory comes from.
+ * same transpiled module and the same cores, and differ in the import table
+ * built for each — which carries the instance id every host call is checked
+ * against.
+ *
+ * `cores` is named by the backend and not discovered here: the transpiled glue
+ * looks a core module up synchronously, so nothing may be fetched at that
+ * point and every core has to be compiled at bring-up.
  */
 export interface ManifestComponent {
     instance: string;
     kind: string;
     module: string;
+    cores: string[];
+}
+
+/**
+ * One configured instance this host is not serving, because its kind's record
+ * names a hosting contract the backend does not read. It carries no module URL
+ * and no cores: there is nothing to bring up, and `reason` is what the page and
+ * the kernel's failure row say instead.
+ */
+export interface WithheldInstance {
+    instance: string;
+    kind: string;
+    reason: string;
 }
 
 /**
  * The component-module manifest embedded in the page. Shape mirrored from
  * `page.rs`'s `SurfaceManifest`: `kernel` is the kernel module URL, `components`
- * lists each configured component's module URL.
+ * lists each configured component's module URL, and `withheld` names each
+ * configured instance the backend declined to serve.
  */
 export interface SurfaceManifest {
     kernel: string;
     components: ManifestComponent[];
+    withheld: WithheldInstance[];
 }
 
 /** Structural guard: the parsed JSON matches the frozen manifest shape. */
@@ -350,6 +371,22 @@ function isSurfaceManifest(value: unknown): value is SurfaceManifest {
     if (typeof obj.kernel !== "string" || !Array.isArray(obj.components)) {
         return false;
     }
+    if (
+        !Array.isArray(obj.withheld) ||
+        !obj.withheld.every((w): w is WithheldInstance => {
+            if (typeof w !== "object" || w === null) {
+                return false;
+            }
+            const entry = w as Record<string, unknown>;
+            return (
+                typeof entry.instance === "string" &&
+                typeof entry.kind === "string" &&
+                typeof entry.reason === "string"
+            );
+        })
+    ) {
+        return false;
+    }
     return obj.components.every((c): c is ManifestComponent => {
         if (typeof c !== "object" || c === null) {
             return false;
@@ -358,7 +395,9 @@ function isSurfaceManifest(value: unknown): value is SurfaceManifest {
         return (
             typeof entry.instance === "string" &&
             typeof entry.kind === "string" &&
-            typeof entry.module === "string"
+            typeof entry.module === "string" &&
+            Array.isArray(entry.cores) &&
+            entry.cores.every((core) => typeof core === "string")
         );
     });
 }
@@ -473,6 +512,7 @@ export interface KernelModule extends WasmModule {
         entry: (activation: string) => void,
     ): boolean;
     brenn_processor_load_failed(instance: string, detail: string): void;
+    brenn_processor_withheld(instance: string, reason: string): void;
     /**
      * The DOM capability seam. Node handles are the WIT `u64`, so they cross as
      * `bigint`. Every one of these throws on a refusal — an unknown handle, a tag
@@ -538,9 +578,9 @@ export interface KernelModule extends WasmModule {
  */
 interface ProcessorModule {
     instantiate(
-        getCoreModule: (name: string) => Promise<WebAssembly.Module>,
+        getCoreModule: (name: string) => WebAssembly.Module,
         imports: Record<string, Record<string, unknown>>,
-    ): Promise<ProcessorInstance>;
+    ): ProcessorInstance;
 }
 
 /** What a transpiled `world processor` exports: the activation entry point. */
@@ -638,12 +678,17 @@ export async function loadKernel(
 
 /**
  * Load a transpiled processor kind's module once and memoize it, along with the
- * compiled core `WebAssembly.Module`s it asks for. One compiled module per core
- * file per kind: sibling instances share the code and differ only in the
- * instantiation (and thus the linear memory) built on it.
+ * compiled core `WebAssembly.Module`s it instantiates over. One evaluated glue
+ * module and one compiled core module per kind, for the page.
  *
- * The core files are named relative to the glue, so they resolve against the
- * kind's module URL.
+ * Compiling is the expensive half and is the half that does not vary: an
+ * instance is minted per activation out of these, so a kind's code is compiled
+ * once however many activations it sees.
+ *
+ * The glue asks for a core by file name and the lookup is synchronous —
+ * `--instantiation sync` cannot await, which is what lets an instance be minted
+ * inside a gesture's activation entry. So every core is fetched and compiled
+ * here, at bring-up, and `coreLookup` is a map read.
  */
 class ProcessorKindCache {
     private readonly modules = new Map<string, Promise<ProcessorModule>>();
@@ -660,20 +705,48 @@ class ProcessorKindCache {
         return mod;
     }
 
-    coreLoader(
-        moduleUrl: string,
-    ): (name: string) => Promise<WebAssembly.Module> {
+    /**
+     * Compile every core the manifest names for a kind, keyed by the basename
+     * the glue will ask for, and answer from that map afterwards. Awaited once
+     * per instance at bring-up; the second caller for a kind awaits the same
+     * compilations.
+     */
+    async coreLookup(
+        coreUrls: string[],
+    ): Promise<(name: string) => WebAssembly.Module> {
+        const compiled = new Map<string, WebAssembly.Module>();
+        await Promise.all(
+            coreUrls.map(async (url) => {
+                let core = this.cores.get(url);
+                if (core === undefined) {
+                    core = WebAssembly.compileStreaming(fetch(url));
+                    this.cores.set(url, core);
+                }
+                compiled.set(coreBasename(url), await core);
+            }),
+        );
         return (name) => {
-            const url = new URL(name, new URL(moduleUrl, document.baseURI))
-                .href;
-            let core = this.cores.get(url);
+            const core = compiled.get(name);
             if (core === undefined) {
-                core = WebAssembly.compileStreaming(fetch(url));
-                this.cores.set(url, core);
+                throw new Error(
+                    `the transpiled module asked for core '${name}', which the page ` +
+                        `manifest does not name (it names ${[...compiled.keys()].join(", ")}) — ` +
+                        "the served assets and the page that named them are from different builds",
+                );
             }
             return core;
         };
     }
+}
+
+/**
+ * The file name a core URL names, which is the name the glue asks for. Strips
+ * the directory and the `?v=` build stamp the backend mints every asset URL
+ * with.
+ */
+function coreBasename(url: string): string {
+    const path = url.split("?")[0] ?? url;
+    return path.slice(path.lastIndexOf("/") + 1);
 }
 
 /**
@@ -892,6 +965,26 @@ export function activationEntry(
 }
 
 /**
+ * The activation entry the loader registers: one fresh guest instance per call.
+ *
+ * `mint` builds the instance — the transpiled module's `instantiate` over the
+ * kind's compiled cores and this instance's import table — and its result is
+ * used for exactly one activation and then dropped, which is what makes linear
+ * memory activation-scoped on the page. Compilation is not repeated; only
+ * instantiation is, and that is allocating the guest's initial memory and
+ * running its start function.
+ *
+ * An instantiation that throws is that activation's **trap**: the throw leaves
+ * the entry the way a trapping `receive` does, and the kernel reads it as
+ * one — the activation did not run.
+ */
+export function perActivationEntry(
+    mint: () => ProcessorInstance,
+): (activation: string) => string | { reply: string } | undefined {
+    return (json: string) => activationEntry(mint())(json);
+}
+
+/**
  * The operator's account of a `receive-error`. The variant lifts to
  * `{ tag, val }`; both arms carry a string, and neither is ever parsed — this is
  * the diagnostic that reaches the failure record for that activation.
@@ -904,15 +997,21 @@ function describeReceiveError(payload: unknown): string {
 }
 
 /**
- * Bring up one headless processor instance: instantiate the kind's transpiled
- * module with this instance's imports, then register its `receive` with the
- * kernel. Its own instantiation means its own linear memory — a trap poisons
- * this instance and no sibling.
+ * Bring up one headless processor instance: resolve the kind's transpiled module
+ * and compile its cores, build this instance's import table, and register an
+ * activation entry that mints a fresh instance per call.
  *
- * Every failure — import, instantiate, or a registration the kernel refuses —
- * is reported to the kernel, which marks the instance `failed` and reports the
- * death. There is no error card to render: a headless instance has no wrapper,
- * so the status row is the observable. One instance's failure is one
+ * Linear memory is activation-scoped, so nothing is instantiated here. The
+ * instance an activation runs on is built at the top of the entry and dropped
+ * when it returns: a component's statics, its heap and its `thread_local!`s do
+ * not survive to the next activation, on this host or any other. A component
+ * that needs state across activations publishes it on a retained `io` port and
+ * reads it back out of that port's window.
+ *
+ * Every failure — import, core compilation, or a registration the kernel
+ * refuses — is reported to the kernel, which marks the instance `failed` and
+ * reports the death. There is no error card to render: a headless instance has
+ * no wrapper, so the status row is the observable. One instance's failure is one
  * instance's; the surface keeps running.
  */
 async function startProcessor(
@@ -922,14 +1021,12 @@ async function startProcessor(
 ): Promise<void> {
     try {
         const mod = await cache.module(component.module);
-        const instance = await mod.instantiate(
-            cache.coreLoader(component.module),
-            processorImports(kernel, component.instance),
-        );
+        const getCoreModule = await cache.coreLookup(component.cores);
+        const imports = processorImports(kernel, component.instance);
         if (
             !kernel.brenn_processor_register(
                 component.instance,
-                activationEntry(instance),
+                perActivationEntry(() => mod.instantiate(getCoreModule, imports)),
             )
         ) {
             // The kernel already reported why (unknown instance, wrong ABI, or a
@@ -965,9 +1062,38 @@ export async function startProcessors(
     instances: string[],
     importModule: ModuleImporter = defaultImporter,
 ): Promise<void> {
+    // Before anything is loaded: every declared instance owes its page a
+    // verdict, and a withheld one's is already decided. Doing it first means the
+    // kernel has the whole picture — including a withheld chrome, whose terminal
+    // message must not be raced by a sibling's bring-up error card.
+    const declared = new Set(instances);
+    const withheld = new Set<string>();
+    for (const held of manifest.withheld) {
+        if (!declared.has(held.instance)) {
+            // The manifest and the kernel disagree about which instances this
+            // page runs, which is a broken deploy: say so rather than drop the
+            // entry, because the page owes a verdict for every declared
+            // instance and this one belongs to no declaration.
+            console.error(
+                `surface page manifest withholds instance '${held.instance}' ` +
+                    `(kind '${held.kind}') the kernel did not ask to start`,
+            );
+            continue;
+        }
+        withheld.add(held.instance);
+        console.error(
+            `surface processor instance '${held.instance}' ` +
+                `(kind '${held.kind}') is withheld: ${held.reason}`,
+        );
+        kernel.brenn_processor_withheld(held.instance, held.reason);
+    }
     const cache = new ProcessorKindCache(importModule);
     await Promise.all(
         instances.map(async (instance) => {
+            if (withheld.has(instance)) {
+                // Already reported above, with the reason the backend wrote.
+                return;
+            }
             const component = manifest.components.find(
                 (c) => c.instance === instance,
             );
@@ -1030,6 +1156,7 @@ export function processorStartInstances(
  */
 const SURFACE_RELOAD_EVENT = "brenn-surface-reload";
 const SURFACE_READY_EVENT = "brenn-surface-ready";
+const SURFACE_FAILURE_EVENT = "brenn-surface-failure";
 const PROCESSOR_START_EVENT = "brenn-processor-start";
 
 /**
@@ -1044,7 +1171,20 @@ export function seamReloadReason(detail: unknown): string {
 }
 
 /**
- * Install the two kernel-to-bootstrap seam listeners on `window`:
+ * The message to render for a `brenn-surface-failure` seam event. The kernel
+ * supplies `detail = { message }`, but it is a separately deployed wasm
+ * artifact, so a missing or non-string message falls back rather than throwing.
+ * Exported for the unit tests.
+ */
+export function seamFailureMessage(detail: unknown): string {
+    const d = detail as { message?: unknown } | null | undefined;
+    return typeof d?.message === "string"
+        ? d.message
+        : "This surface cannot start. Check the server logs.";
+}
+
+/**
+ * Install the kernel-to-bootstrap seam listeners on `window`:
  * `brenn-surface-reload` (`detail = { reason }`) funnels every kernel-requested
  * reload — stale build, kernel panic, changed bindings — through `cappedReload`;
  * `brenn-surface-ready` resets the reload counter on the first successful
@@ -1066,6 +1206,13 @@ function installSeamListeners(
     });
     window.addEventListener(SURFACE_READY_EVENT, () => {
         resetReloadCount();
+    });
+    // Terminal by construction: no reload, and the counter is left alone. The
+    // kernel raises this for a page a reload cannot fix, so spending the cap
+    // would only end on a message naming neither the cause nor the cure.
+    window.addEventListener(SURFACE_FAILURE_EVENT, (ev: Event) => {
+        terminalFailureRendered = true;
+        renderStaticFailure(seamFailureMessage((ev as CustomEvent).detail));
     });
     // `brenn-processor-start` names the headless instances to bring up. Dispatch
     // is synchronous and bring-up is not, so the handler cannot await: it starts

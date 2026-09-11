@@ -272,13 +272,19 @@ fn apply_confined_ops<P: PlanePolicy>(
         );
         match answer {
             DeferOpAnswer::Applied => {}
-            DeferOpAnswer::NotParked => {
+            DeferOpAnswer::NotParked { deliver_after } => {
+                // The two fields are what separates a component that lost a
+                // benign race from one that acted on an entry its own deferred
+                // window showed as already due, which the doctrine forbids and
+                // nothing else here counts.
                 tracing::info!(
                     instance,
                     %port,
                     %channel,
-                    "surface client: deferred control op is a no-op — the message released between \
-                     the activation's snapshot and the flush"
+                    deliver_after,
+                    now = ctx.now_ms,
+                    "surface client: deferred control op is a no-op — the target is past its \
+                     release time at flush"
                 );
                 ctx.schedules.count_deferred_race(instance);
             }

@@ -464,6 +464,10 @@ instance may leave unwired, and the capabilities the component needs:
 /// Draws the connection banner and the toast container, so it holds `dom`; it
 /// also arranges every other instance's wrapper and stamps the page's theme and
 /// takeover state, which is what `page-dom` is for.
+///
+/// Its decision core and every element handle it holds — the page furniture,
+/// the live toasts, the per-instance layout sections — ride the retained
+/// `state` port between activations, because linear memory does not.
 component Chrome {
   abi = processor;
   requires = [ports, log, dom, page-dom];
@@ -476,6 +480,7 @@ component Chrome {
   in toast: "brenn.surface.toast@1";
   optional out overlay-state: "brenn.surface.overlay-state@1";
   io toast-tick;
+  io state;
 }
 ```
 
@@ -686,7 +691,12 @@ surface bar {
   skin = "bench";
   acl subscribe [prefix "brenn:alice-desk."];
   acl publish [prefix "brenn:alice-desk.out."];
-  new p1: Protobar { grants = [ports, log]; in messages <- bar_a; io tick; }
+  new p1: Protobar {
+    grants = [ports, log];
+    in messages <- bar_a;
+    io tick;
+    io state { push_depth = 0; retain_depth = 1; }
+  }
   new chrome: Chrome {
     grants = [ports, log];
     chrome = true;
@@ -695,6 +705,7 @@ surface bar {
     in surface-state <- "local:brenn/surface-state";
     in toast <- "local:brenn/toast";
     io toast-tick;
+    io state { push_depth = 0; retain_depth = 1; }
   }
 }
 ```
@@ -762,6 +773,7 @@ assembly Deskbar(slug: String, driver: Agent) {
       in surface-state <- "local:brenn/surface-state";
       in toast <- "local:brenn/toast";
       io toast-tick;
+      io state { push_depth = 0; retain_depth = 1; }
     }
   }
   grant driver subscribe prefix f"brenn:{slug}.";

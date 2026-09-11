@@ -55,6 +55,7 @@ rust_test(
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm-dispatch"},
     deps = all_crate_deps(normal_dev = True) + [
         "//brenn-common",
+        "//brenn-host-conformance",
         "//brenn-lib",
         "//brenn-messaging",
         "//brenn-messaging-store",

@@ -44,7 +44,7 @@ a boot refusal on somebody else's machine:
   new interface, and no existing shape moves;
 - the **backend package record** (`package.json`, below) — `v` is the whole
   story, and a bump re-releases every bundle;
-- the **surface record** `processor/<kind>/manifest.json` v2 and the served
+- the **surface record** `processor/<kind>/manifest.json` v3 and the served
   layout `processor/<kind>/{<kind>.js, <kind>.component.wasm,
   <kind>.spec.brenn, manifest.json, …}`;
 - the grant-word set and the import→capability mapping both hosts reconcile
@@ -55,9 +55,21 @@ a boot refusal on somebody else's machine:
 
 A new class attribute arrives with a default, a new grant word is a new WIT
 interface, a new record field is a `v` bump, and no existing vocabulary in that
-subset changes meaning. Breaking one of these is a deliberate coordinated
-event: every bundle is re-released against the new brenn before brenn's pin
-moves, and the design that makes the cut says so.
+subset changes meaning. Breaking one of these is a deliberate event, and the
+design that makes the cut says so — but it is not a coordinated one, because
+bundles are authored on their own schedules and a host that cannot start until
+every third party has shipped is not deployable.
+
+So a runtime-record bump is **withheld, not fatal, under a bundle mount**. A
+surface kind whose record names a version this host does not read is not served:
+it is left out of the served kind set, alerted once, named as `withheld` in the
+page manifest of every surface configuring it (whose instances go `failed` with
+the reason), described as withheld in its help and schema documents, and 404ed
+under `/surface-static` with no fail2ban signal. The reload that follows the
+bundle's re-release picks it up with no restart. The same record mismatch under
+**brenn's own mount** is still a boot refusal: the surface tree, the kernel and
+the binary travel in one tarball and are installed as a sync, so a mismatch
+there is a broken install and not a version skew anybody can converge.
 
 **Build-time contracts are hard-cut, at the pin.** These are consumed against a
 commit the consumer names in its own `git_override`: the macros in
@@ -136,7 +148,7 @@ is no shared stem left for it to derive one from.
 
 | field | meaning |
 |---|---|
-| `v` | Record schema version. This host reads `2` and refuses anything else. |
+| `v` | Record schema version. This host reads `2` and refuses anything else — with a boot panic under every mount, including a bundle's. Unlike the surface record above, the backend record has no withholding policy yet; `TODO(stale-package-record-withheld)` is the entry for giving it one. |
 | `name` | The package's name — the directory's basename, and the module name a configuration imports. |
 | `world` | The WIT package the artifact targets: `brenn:processor` or `brenn:replay`. |
 | `artifact` | The artifact's basename within the package directory. No path separator; must end `.wasm`. |
@@ -806,7 +818,7 @@ packaged verbatim copy of the author's specification, a content hash of it in a
 versioned `deny_unknown_fields` record, and byte-hash equality checked at boot —
 and only the carrier differs.
 
-`processor/<kind>/manifest.json` is v2: `source_sha256`, `jco_version`,
+`processor/<kind>/manifest.json` is v3: `source_sha256`, `jco_version`,
 `imports` and `files` plus `spec` and `spec_sha256`, with the packaged copy in
 the kind directory as `<kind>.spec.brenn`. The spec fields are required; there
 is no spec-less surface kind.

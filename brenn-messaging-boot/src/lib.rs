@@ -248,6 +248,47 @@ fn resolve_publish_millitokens(value: Option<f64>, default: f64, field: &str) ->
     (v * MILLITOKENS_PER_PUBLISH as f64).round() as u64
 }
 
+/// Warn once at boot when a component has authored input bindings and not one
+/// that can wake it.
+///
+/// Not a refusal: since a mount activation is owed unconditionally, an
+/// all-sampled component is live config — it mounts, reads its context windows
+/// and answers gestures. But an operator who meant to drive one and bound its
+/// one real input `push_depth = 0` gets a component that goes quiet forever,
+/// and this line is the only place that ever knew.
+///
+/// `bindings` pairs each *authored* input port with whether its resolved
+/// `push_depth` is push-enabled. Authored only: a free `io` port's input half is
+/// the component's own writing-to-itself over a ring nothing else reaches, and
+/// is sampled by design, so counting it here would warn about every conforming
+/// retained-state port. An `io` port bound to a *declared* channel is not that:
+/// the channel is shared, another publisher can put a message on it, and the
+/// binding is counted like any other input on both hosts.
+fn warn_when_nothing_can_activate(context: &str, principal: &str, bindings: &[(String, bool)]) {
+    let Some(ports) = ports_that_never_activate(bindings) else {
+        return;
+    };
+    tracing::warn!(
+        context = %context,
+        principal = %principal,
+        ports = ?ports,
+        "every input binding is push_depth = 0 (sampled/context-only): this component activates \
+         once at mount and never again on traffic. Intended for a component driven only by \
+         gestures or its own deferred ticks; a mistake for one meant to react to a channel, \
+         which needs push_depth > 0 on the binding that drives it"
+    );
+}
+
+/// The ports to name in that warning, or `None` where there is nothing to say:
+/// no authored input bindings at all (a presentational component, live config),
+/// or at least one that is push-enabled.
+fn ports_that_never_activate(bindings: &[(String, bool)]) -> Option<Vec<&str>> {
+    if bindings.is_empty() || bindings.iter().any(|(_, push_enabled)| *push_enabled) {
+        return None;
+    }
+    Some(bindings.iter().map(|(port, _)| port.as_str()).collect())
+}
+
 #[cfg(test)]
 mod auto_tests;
 #[cfg(test)]

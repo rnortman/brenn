@@ -1,5 +1,26 @@
 # TODOs
 
+## `stale-package-record-withheld`
+
+A `brenn:processor` package whose `package.json` `v` this host does not read is
+a boot panic (`brenn-lib/src/wasm_package.rs`, the `record.v == RECORD_VERSION`
+assert). For a package under **brenn's own mount** that is right: the binary and
+its packages travel in one tarball and are installed as a sync, so a mismatch is
+a broken install. For a package under a **bundle mount** it is the wrong loud
+failure — the bundle was correct when it was built and will be correct when it
+is rebuilt, and a host that cannot start until every third party has shipped is
+not deployable.
+
+The surface record already does the right thing: a stale kind under a bundle
+mount is withheld, alerted, and picked up at the reload after the bundle's
+re-release. Give the backend record the same policy: the package's consumers are
+not started, the alert names it, and the reload after the re-release starts
+them.
+
+Done when a boot over a bundle mount holding a stale record starts every other
+consumer, alerts once per withheld package, and a reload after the bundle is
+replaced starts its consumers without a restart.
+
 ## `library-module-body-gate`
 
 `library_module_test` (`bazel/wasm/defs.bzl`) compiles a one-line root document
@@ -3024,3 +3045,55 @@ Done = a withdrawal issued while disconnected reaches the broker on the next
 connect, observed the way the removal cases observe the live one (the broker's
 own `Received UNSUBSCRIBE` record), and the status body says which of the two
 things a deferral was.
+
+## `backend-wasm-ephemeral-binding`
+
+A backend WASM consumer can bind `brenn:` channels and nothing else. The
+registry forks on the address realm and the `ephemeral:` arm was never written
+for this subscriber kind, so a component whose specification is realm-neutral —
+every one of them is — can be hosted on one realm in the browser and on a
+different one on the backend, for no reason either the contract or
+`processor.wit` states.
+
+It is a gap in the machinery, never a decision. The surface binds both realms
+today; the transplant script and the host conformance suite are both
+`brenn:`-only for this reason alone, and both say so where a reader meets them
+(`brenn-wasm/tests/processor_transplant.rs`, the script's `_doc`).
+
+Code site (`TODO(backend-wasm-ephemeral-binding)`): the ignored scenario in
+`brenn-host-conformance/src/tests/backend.rs`, and the realm assertion in that
+adapter's constructor, which is where the fork is felt.
+
+Done = `self_tick_chain_ephemeral` passes with its `ignore` removed: the probe's
+`io tick` port bound to an `ephemeral:` channel, the chain sustaining itself,
+and the remount scenario's `ephemeral:` reading — an empty deferred window, and
+the component re-arming from what it is shown — asserted beside the durable one.
+
+## `retained-state-port-attribute`
+
+`RetainedState` (`brenn-wasm/components/guest/src/lib.rs`) works only against a
+port bound `push_depth = 0; retain_depth = 1`, and nothing checks that it is.
+`retain_depth > 1` keeps dead state bodies alive on the ring behind the one the
+helper's `.last()` reads; `push_depth > 0` turns every state write into a
+self-wake. Neither is an operator tuning decision — both are dictated by the
+helper — and yet the pair is transcribed per instance per document
+(`brenn.dev.brenn`, `brenn.e2e.brenn`, every prod document, and every
+out-of-tree surface document that hosts a stateful kind), which is one more
+place to get it wrong with every new stateful kind and every new deployment.
+
+The shape is a port attribute in the *specification* — `io state retained;`, or
+a `retained` marker on the port declaration — that the DSL resolves to the pair
+and refuses to let a binding override, the way the free-`io` form already
+claims a port without an arrow. One declaration in `config/specs/<kind>.brenn`,
+zero per instance.
+
+Not a patch: it adds vocabulary to the config DSL, which is a grammar every
+out-of-tree bundle author and every operator reads, and it has to settle what a
+binding that names a depth on such a port does (refuse at compile, refuse at
+boot, or silently lose) and whether the attribute is the only way a state port
+may be declared. That is a design decision about an external interface, not an
+implementation choice. Code sites: `brenn-dsl/src/resolved.rs` (`PortDir::Io`)
+and the helper's own doc comment.
+
+Done when a kind declares its state port once and no document binds depths on
+it.

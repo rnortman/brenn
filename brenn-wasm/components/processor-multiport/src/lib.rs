@@ -8,6 +8,15 @@
 // Sentinels in new envelope bodies (checked before the summary publish):
 //   "__trap__"  — traps (unreachable!); no output produced.
 //   "__err__"   — returns Err(ProcessingFailed); no output produced.
+//
+// One sentinel is checked over *context* envelopes instead:
+//   "__err_on_context__" — returns Err(ProcessingFailed). An activation that
+//                 carries nothing new can still be dispositioned, which is what
+//                 a mount activation over a port with no backlog looks like.
+//   "__trap_on_context__" — traps (unreachable!). The same case on the other
+//                 disposition arm: a host quarantines what an activation
+//                 consumed, and a mount that consumed nothing has nothing to
+//                 name.
 //   "__reply__" — buffers one publish, then answers the activation. Only a
 //                 sync-call activation may be answered and no backend
 //                 activation is one, so a host that reads this ok flushes a
@@ -42,6 +51,22 @@ impl Processor for ProcessorMultiport {
 
         let mut summary_parts: Vec<PortSummary<'_>> = Vec::with_capacity(windows.len());
         for window in &windows {
+            // Checked over context rather than new, so an activation carrying
+            // nothing new can still fail: that is the only way to reach the
+            // disposition of a mount activation over a port with no backlog.
+            for env in window.context_envelopes() {
+                let env = env?;
+                if env.body == "__err_on_context__" {
+                    return Err(Error::failed(
+                        "processor-multiport: deliberate err on __err_on_context__ sentinel",
+                    ));
+                }
+                if env.body == "__trap_on_context__" {
+                    unreachable!(
+                        "processor-multiport: deliberate trap on __trap_on_context__ sentinel"
+                    );
+                }
+            }
             for env in window.new_envelopes() {
                 let env = env?;
                 if env.body == "__trap__" {

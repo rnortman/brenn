@@ -41,7 +41,7 @@ use brenn_lib::tools::ResolvedToolGrant;
 use brenn_lib::util::hmac_sha256_hex;
 use brenn_lib::webhook::config::{ResolvedWebhookEndpoint, WebhookOwner};
 use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
-use brenn_messaging::Messenger;
+use brenn_messaging::{Messenger, MountDebt};
 use brenn_webhook::service::WebhookService;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -519,7 +519,12 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
     );
 
     // --- Step 2: parser activation → normalized push event on git-repo-sync. ---
-    drain_step(&pipeline.parser_cfg, &pipeline.parser_sub).await;
+    drain_step(
+        &pipeline.parser_cfg,
+        &pipeline.parser_sub,
+        MountDebt::Settled,
+    )
+    .await;
     let event = read_latest(&pipeline.messenger, "brenn:git-repo-sync")
         .await
         .expect("parser must publish a normalized push event");
@@ -530,7 +535,12 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
     );
 
     // --- Step 3: consumer push activation → one call-async on the tool bus. ---
-    drain_step(&pipeline.consumer_cfg, &pipeline.consumer_sub).await;
+    drain_step(
+        &pipeline.consumer_cfg,
+        &pipeline.consumer_sub,
+        MountDebt::Settled,
+    )
+    .await;
     let requests =
         brenn_messaging::testutils::owed_everywhere(&pipeline.messenger, &pipeline.executor_sub)
             .await;
@@ -544,7 +554,12 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
     pipeline.executor.drain_step().await;
 
     // --- Step 5: consumer result activation → outcome event published. ---
-    drain_step(&pipeline.consumer_cfg, &pipeline.consumer_sub).await;
+    drain_step(
+        &pipeline.consumer_cfg,
+        &pipeline.consumer_sub,
+        MountDebt::Settled,
+    )
+    .await;
 
     read_latest(&pipeline.messenger, "brenn:git-repo-sync-outcomes")
         .await

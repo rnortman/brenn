@@ -486,9 +486,9 @@ impl RetentionStore for DbStore {
         }
     }
 
-    async fn deferred_for_sender(&self, sender: &str, now: DateTime<Utc>) -> Vec<DeferredMessage> {
+    async fn deferred_for_sender(&self, sender: &str) -> Vec<DeferredMessage> {
         let conn = self.db.lock().await;
-        db::list_deferred_for_sender(&conn, self.channel_uuid, sender, now)
+        db::list_deferred_for_sender(&conn, self.channel_uuid, sender)
             .into_iter()
             .map(|row| DeferredMessage {
                 release_at: row.release_at,
@@ -514,15 +514,24 @@ impl RetentionStore for DbStore {
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
         let conn = self.db.lock().await;
-        let Some(lookup) = db::lookup_deferred(&conn, self.channel_uuid, message_uuid, now) else {
-            return DeferralOutcome::NotDeferred;
+        let Some(lookup) = db::lookup_deferred(&conn, self.channel_uuid, message_uuid) else {
+            return DeferralOutcome::NotDeferred {
+                deliver_after: None,
+            };
         };
         if !Self::owned_by(&lookup, sender) {
             return DeferralOutcome::WrongSender;
         }
+        if lookup.release_at <= now {
+            return DeferralOutcome::NotDeferred {
+                deliver_after: Some(lookup.release_at),
+            };
+        }
         match db::delete_deferred(&conn, self.channel_uuid, lookup.message_id, now) {
             true => DeferralOutcome::Applied,
-            false => DeferralOutcome::NotDeferred,
+            false => DeferralOutcome::NotDeferred {
+                deliver_after: None,
+            },
         }
     }
 
@@ -535,11 +544,18 @@ impl RetentionStore for DbStore {
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
         let conn = self.db.lock().await;
-        let Some(lookup) = db::lookup_deferred(&conn, self.channel_uuid, message_uuid, now) else {
-            return DeferralOutcome::NotDeferred;
+        let Some(lookup) = db::lookup_deferred(&conn, self.channel_uuid, message_uuid) else {
+            return DeferralOutcome::NotDeferred {
+                deliver_after: None,
+            };
         };
         if !Self::owned_by(&lookup, sender) {
             return DeferralOutcome::WrongSender;
+        }
+        if lookup.release_at <= now {
+            return DeferralOutcome::NotDeferred {
+                deliver_after: Some(lookup.release_at),
+            };
         }
         let applied = db::edit_deferred(
             &conn,
@@ -551,7 +567,9 @@ impl RetentionStore for DbStore {
         );
         match applied {
             true => DeferralOutcome::Applied,
-            false => DeferralOutcome::NotDeferred,
+            false => DeferralOutcome::NotDeferred {
+                deliver_after: None,
+            },
         }
     }
 }

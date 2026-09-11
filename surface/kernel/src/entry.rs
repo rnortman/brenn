@@ -549,6 +549,24 @@ pub fn brenn_processor_load_failed(instance: &str, detail: &str) {
     });
 }
 
+/// Report that a processor instance was never brought up because this host
+/// withholds its kind: the page manifest named it under `withheld`, carrying the
+/// `reason` the boot/reload scan wrote, instead of a module URL.
+///
+/// Called by the bootstrap for every withheld entry before it brings up the
+/// rest, so an operator reading the page sees the verdict for every declared
+/// instance and not only for the ones that got as far as loading.
+#[wasm_bindgen]
+pub fn brenn_processor_withheld(instance: &str, reason: &str) {
+    with_processor_host("processor withheld", |host| {
+        let actions = host
+            .core
+            .borrow_mut()
+            .on_processor_withheld(instance, reason);
+        dom::apply_actions(&actions, &host.handle);
+    });
+}
+
 // ── the DOM capability seam ─────────────────────────────────────────────────
 //
 // One export per WIT function of `brenn:processor/dom` and

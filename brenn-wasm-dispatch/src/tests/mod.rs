@@ -4,7 +4,7 @@
 //!
 //! These tests verify the full dispatch + Messenger + ProcessorComponent
 //! integration path: window assembly, guest invocation, per-batch disposition,
-//! crash-recovery (startup sweep), always-trap quarantine, batching coalescing,
+//! crash-recovery (the mount activation), always-trap quarantine, batching coalescing,
 //! retained-context prefix, push-overflow dropped counter, and the webhook
 //! (publish_transport_ingress) fan-out path.
 //!
@@ -766,6 +766,8 @@ mod alerter;
 mod fanout;
 #[cfg(test)]
 mod git_forge_parser;
+#[cfg(test)]
+mod mount;
 #[cfg(test)]
 mod multiport;
 #[cfg(test)]

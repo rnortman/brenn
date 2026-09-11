@@ -31,7 +31,7 @@ const SLOT_COUNT: usize = Urgency::ALL.len();
 
 /// Rendered display: the message as a block tree the DOM glue walks, and the
 /// status line it writes via `textContent`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Display {
     /// The block tree for the message area. Plain and bare bodies are one
     /// paragraph; `format: "markdown"` bodies are the parsed markdown tree; the
@@ -102,7 +102,7 @@ pub enum Ingest {
 /// One priority slot's occupant. The slot's priority is its index in
 /// [`ProtobarState::slots`]. The body is parsed to its block tree once, at
 /// store time, so `display` is a clone rather than a re-parse.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SlotEntry {
     message: Vec<Block>,
     /// Display lifetime. `None` persists until replaced.
@@ -233,7 +233,7 @@ impl ParsedBody {
 
 /// Protobar display state. One slot per priority level; drops and the malformed
 /// counter accumulate for the page lifetime.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProtobarState {
     slots: [Option<SlotEntry>; SLOT_COUNT],
     drops: u64,
@@ -913,5 +913,51 @@ mod tests {
         let mut state = ProtobarState::new();
         let result = state.on_message("messages", "not json", now());
         assert!(matches!(result, Err(ContractViolation::BadEnvelope(_))));
+    }
+
+    #[test]
+    fn state_survives_a_json_round_trip_at_maximum_block_depth() {
+        // The state body is the only recursive one among the surface kinds, and
+        // it is carried between activations as JSON. A maximally nested block
+        // tree — the parser caps at `MAX_DEPTH + 2`, reached here from inputs far
+        // past the cap in all three nesting forms — must survive the write and
+        // the read back, or an instance stores state it can never load again.
+        let mut state = ProtobarState::new();
+
+        let mut list = String::new();
+        for level in 0..100 {
+            list.push_str(&"  ".repeat(level));
+            list.push_str(&format!("- L{level}\n"));
+        }
+        let quote = format!("{}core", "> ".repeat(200));
+        let emphasis = format!("{}core{}", "*".repeat(200), "*".repeat(200));
+
+        for (urgency, body) in [
+            (Urgency::Low, list),
+            (Urgency::Normal, quote),
+            (Urgency::High, emphasis),
+        ] {
+            assert_eq!(
+                state.on_message(
+                    "messages",
+                    &structured(serde_json::json!({
+                        "text": body,
+                        "priority": urgency.as_str(),
+                        "format": "markdown",
+                    })),
+                    now(),
+                ),
+                Ok(Ingest::Accepted)
+            );
+        }
+
+        let written = serde_json::to_string(&state).expect("state serializes");
+        let read_back: ProtobarState =
+            serde_json::from_str(&written).expect("state deserializes at full depth");
+        assert_eq!(
+            serde_json::to_string(&read_back).expect("state re-serializes"),
+            written
+        );
+        assert!(rendered_text(&read_back.display(now())).contains("core"));
     }
 }

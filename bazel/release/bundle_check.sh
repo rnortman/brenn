@@ -320,8 +320,8 @@ if [ -d "$pkg/surface" ]; then
         fi
         label="surface/processor/$kind/manifest.json"
         stated_v="$(record_number "$record" v)"
-        if [ "$stated_v" != "2" ]; then
-            fail "$label states record version ${stated_v:-none}; the host reads 2 and refuses anything else"
+        if [ "$stated_v" != "3" ]; then
+            fail "$label states record version ${stated_v:-none}; the host reads 3 and refuses anything else"
         fi
         stated_kind="$(record_field "$record" kind)"
         if [ "$stated_kind" != "$kind" ]; then

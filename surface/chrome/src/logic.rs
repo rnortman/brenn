@@ -18,6 +18,7 @@
 //! which overlay is up.
 
 use brenn_envelope::MessageEnvelope;
+use serde::{Deserialize, Serialize};
 
 use crate::layout::{LayoutDoc, LayoutKind, Panel};
 use crate::wire::{
@@ -90,7 +91,7 @@ impl ActivationWindow<'_> {
 /// The wire strings are the frozen `THEME_*` constants, shared with any
 /// theme-driving component so a theme published on `local:brenn/theme` carries
 /// the same vocabulary chrome parses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
     /// Primary for every skin; the page default and the value a surface with no
     /// theme-driving component holds forever.
@@ -125,7 +126,7 @@ impl Theme {
 /// banner but never reasons about the connection. The plane carries no `Fatal`
 /// detail (the plane's payload is fixed at `{v, state}`), so — unlike the retired
 /// shell's `BannerState` — `Fatal` carries none: chrome renders its own text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BannerState {
     /// The initial connection attempt is in flight.
     Connecting,
@@ -305,7 +306,7 @@ fn overlay_layout_doc(instance: &str) -> LayoutDoc {
 }
 
 /// One arrangeable instance, as learned from the surface-state plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ArrangeInstance {
     instance: String,
     state: InstanceState,
@@ -323,7 +324,7 @@ pub(crate) const TOAST_TTL_MS: u64 = 8_000;
 
 /// A rendered toast chrome is tracking for its lifetime: the core's page-lifetime
 /// handle and, for a non-`error` toast, the wall-clock instant it auto-dismisses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ActiveToast {
     /// The core-minted handle the DOM half keys its element on.
     id: u64,
@@ -335,7 +336,7 @@ struct ActiveToast {
 /// The chrome component's DOM-free state and transition logic.
 ///
 /// Not `Eq`: `base_layout` holds a [`LayoutDoc`] whose `ratio` is an `f64`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChromeCore {
     /// Chrome's own instance id, excluded from arrangement (chrome never places
     /// itself in a panel).
@@ -765,11 +766,13 @@ fn fold_class(port: Option<InPort>) -> FoldClass {
         | Some(InPort::Theme)
         | Some(InPort::LinkState)
         | Some(InPort::SurfaceState) => FoldClass::LatestWins,
-        // Chrome's own deferred self-wake never reaches the fold, and an
-        // unbound name is reported message by message.
-        Some(InPort::Takeover) | Some(InPort::Toast) | Some(InPort::ToastTick) | None => {
-            FoldClass::EventStream
-        }
+        // Chrome's own deferred self-wake and its own retained state never
+        // reach the fold, and an unbound name is reported message by message.
+        Some(InPort::Takeover)
+        | Some(InPort::Toast)
+        | Some(InPort::ToastTick)
+        | Some(InPort::State)
+        | None => FoldClass::EventStream,
     }
 }
 
@@ -834,10 +837,10 @@ fn input_port_doc(port: InPort) -> Option<PortDoc> {
             PortChannel::Address(proto::LOCAL_TOAST_CHANNEL),
             "transient notices (live-only, retains nothing)",
         ),
-        // Chrome parks its own toast-expiry wake here and nothing else ever
-        // publishes to it, so an operator has nothing to bind and the table
-        // carries no row.
-        InPort::ToastTick => return None,
+        // Chrome parks its own toast-expiry wake here and writes its own state
+        // there, and nothing else ever publishes to either, so an operator has
+        // nothing to bind and the table carries no row.
+        InPort::ToastTick | InPort::State => return None,
     };
     Some(PortDoc {
         port: port.name(),
@@ -876,9 +879,9 @@ pub fn fold(core: &mut ChromeCore, port: &str, body: &str, now_ms: u64) -> Vec<C
         Some(InPort::SurfaceState) => core.on_surface_state(body, now_ms),
         Some(InPort::Takeover) => core.on_takeover(body, now_ms),
         Some(InPort::Toast) => core.on_toast(body, now_ms),
-        // Consumed by the activation seam before reaching fold; arriving
-        // here is unexpected, so treat it as unbound.
-        Some(InPort::ToastTick) | None => vec![ChromeAction::Log {
+        // Both are consumed by the activation seam before reaching fold;
+        // arriving here is unexpected, so treat them as unbound.
+        Some(InPort::ToastTick) | Some(InPort::State) | None => vec![ChromeAction::Log {
             level: LogLevel::Warn,
             message: format!("chrome received on unbound port {port:?}"),
         }],

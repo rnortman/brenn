@@ -3,11 +3,13 @@
 ///
 /// It holds `dom` for one function on that interface and draws nothing: the
 /// theme follows the *browser-local* day, and only the page can say what the
-/// local zone offset is.
+/// local zone offset is. Its state machine rides the retained `state` port
+/// between activations, because linear memory does not.
 component ModeClock {
   abi = processor;
   requires = [ports, log, dom];
   in config;
   out theme: "brenn.surface.theme@1";
   io tick;
+  io state;
 }

@@ -1019,7 +1019,14 @@ pub(crate) fn refresh_records(
     }
 }
 
-/// Point the served surface asset tree at the roots this reload scanned.
+/// Point the served surface asset tree at the roots this reload scanned, and
+/// alert on every kind this makes withheld that was not withheld before.
+///
+/// The alert belongs here and not at the scan: a refused reload changes
+/// nothing — the old roots are still being served and nothing is withheld — so
+/// an alert raised from a candidate the process never adopted names a state
+/// that never existed, and would be raised again at every refused reload, since
+/// the "already told" question is asked of the roots being replaced.
 ///
 /// A kind whose mount swapped its symlink onto a fresh versioned tree is
 /// byte-for-byte the installation this process is already serving, so nothing
@@ -1031,9 +1038,36 @@ pub(crate) fn refresh_records(
 /// Runs on the applied and the unchanged path alike: a byte-identical
 /// re-install is exactly the case that produces no delta.
 pub(crate) fn refresh_surface_roots(env: &ReloadEnv, roots: brenn_surface_server::SurfaceRoots) {
+    let replaced = env.surface_roots();
+    // Newly withheld only: a kind withheld before this adoption and after it,
+    // over the same record in the same tree, has already been alerted (at boot,
+    // or at the reload that first adopted it), and an alert repeated at every
+    // reload is one an operator learns to ignore. A re-installed bundle whose
+    // record this host still does not read is not that case: the operator acted
+    // on the first alert and the kind is still dead, which is the one moment
+    // they most need told — so the "already said" question is asked of the
+    // record and the tree, not of the kind name.
+    let newly_withheld: Vec<brenn_surface_server::WithheldKind> = roots
+        .withheld
+        .iter()
+        .filter(|(kind, held)| {
+            replaced
+                .withheld
+                .get(*kind)
+                .is_none_or(|before| before.record_v != held.record_v || before.root != held.root)
+        })
+        .map(|(_, held)| held.clone())
+        .collect();
     *env.surface_roots
         .write()
         .expect("the surface-roots lock is held only for a clone and a swap") = Arc::new(roots);
+    for held in newly_withheld {
+        env.alert_dispatcher.alert(
+            brenn_obs::alerting::AlertSeverity::Warning,
+            brenn_surface_server::WITHHELD_ALERT_TITLE.to_string(),
+            held.alert_body(),
+        );
+    }
 }
 
 /// Log one UNSUBSCRIBE outcome and say whether the filter is still at the
@@ -1719,7 +1753,8 @@ fn pruned_here(delta: &PlanDelta, channel_uuid: Uuid, app_slug: &str) -> bool {
 /// one treats it as a host bug; then the subscriber entries, taken from the
 /// plan rather than re-derived, so the entry this consumer joins a channel with
 /// is byte-for-byte the one a fresh boot would have folded; then the delivery
-/// binding, so a wake raised by the priming below has somewhere to land; then
+/// binding, so a wake raised while the task is coming up has somewhere to land;
+/// then
 /// the position, which primes behind the retained tail exactly as at boot; and
 /// only then the task.
 async fn start_consumers(
@@ -1732,7 +1767,6 @@ async fn start_consumers(
 ) {
     let mut loaded: HashMap<String, LoadedConsumer> = loaded.into_iter().collect();
     let live = env.messenger.directory();
-    let mut primed_any = false;
 
     for slug in arriving(delta) {
         let kind = SubscriberEntryKind::Wasm(slug.clone());
@@ -1783,11 +1817,14 @@ async fn start_consumers(
             // Must match the depth the port's window reads at, or the first
             // read retunes the cursor.
             let push_depth = Depth::Bounded(input.sub.push_depth.clamped_to(WASM_WINDOW_MAX_NEW));
-            let attached = env
-                .messenger
+            // The `Attached` verdict is not read here: whether this attach
+            // primed a fresh position or carried one over, the consumer's mount
+            // activation windows and advances every port from its task's first
+            // instruction, so a primed backlog is drained before any kick raised
+            // here could land.
+            env.messenger
                 .attach_subscriber(&input.sub.channel_address, &slug, &participant, push_depth)
                 .await;
-            primed_any |= attached == brenn_messaging_store::store::Attached::Created;
         }
 
         registry.insert(
@@ -1802,10 +1839,6 @@ async fn start_consumers(
         "reload commit: prepare loaded components nothing started ({:?}) — host bug",
         loaded.keys().collect::<Vec<_>>(),
     );
-    // Drain the primed backlog now rather than at the next poll, as boot does.
-    if primed_any {
-        env.messenger.dispatch_kick();
-    }
 }
 
 /// The consumers leaving service: removed outright, or replaced by a new

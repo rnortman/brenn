@@ -530,15 +530,17 @@ impl RingStore {
         ReleasedBatch { messages, overflow }
     }
 
-    /// One sender's messages still parked at `now`, ordered by release time.
+    /// One sender's unreleased messages, ordered by release time — due
+    /// entries included, until a release pass takes them.
     ///
     /// The sender filter is the whole authorization story: a caller scoped to a
-    /// sender can never observe another sender's parked message, so an edit or
-    /// cancel naming an id from this view needs no further identity check.
-    pub fn deferred_for_sender(&self, sender: &str, now: DateTime<Utc>) -> Vec<DeferredMessage> {
+    /// sender can never observe another sender's parked message. An id from
+    /// this view is therefore the sender's, but not necessarily still
+    /// cancellable: cancel and edit answer on their own `> now` boundary.
+    pub fn deferred_for_sender(&self, sender: &str) -> Vec<DeferredMessage> {
         self.state()
             .core
-            .deferred_for_sender(sender, release_time_of(now))
+            .deferred_for_sender(sender)
             .map(Self::view)
             .collect()
     }
@@ -571,19 +573,21 @@ impl RingStore {
     /// Number of unreleased messages held channel-wide — the deferred set's
     /// occupancy against its cap.
     ///
-    /// A message whose release time has arrived is out of the sender views
-    /// (there is nothing left to cancel or edit) but still occupies its slot
-    /// until the release loop takes it, because it is still held in memory.
-    /// That is what the cap bounds, so that is what this counts.
+    /// A message whose release time has arrived is still in the sender views
+    /// and still occupies its slot until the release loop takes it, because it
+    /// is still held in memory. That is what the cap bounds, so that is what
+    /// this counts.
     pub fn deferred_len(&self) -> usize {
         self.state().core.deferred_len()
     }
 
     /// Cancel one of `sender`'s parked messages.
     ///
-    /// `NotDeferred` means the entry is no longer parked — it released between
-    /// the view the caller acted on and this call. That race is inherent to
-    /// scheduling, so it is a reportable no-op rather than a failure.
+    /// `NotDeferred` means the entry is past the cutoff — due, or gone. The
+    /// first is inherent to scheduling (the entry matured between the view the
+    /// caller acted on and this call) and the second is what a caller acting on
+    /// an entry its view already showed as due gets, so it is a reportable
+    /// no-op rather than a failure either way.
     /// `WrongSender` means the entry is parked under someone else; the caller
     /// judges that, since only the caller knows where the id came from.
     pub fn cancel_deferred(
@@ -599,7 +603,9 @@ impl RingStore {
         };
         match state.core.cancel_deferred(id).is_some() {
             true => DeferralOutcome::Applied,
-            false => DeferralOutcome::NotDeferred,
+            false => DeferralOutcome::NotDeferred {
+                deliver_after: None,
+            },
         }
     }
 
@@ -632,7 +638,9 @@ impl RingStore {
         let release_at = release_at.map(release_time_of);
         match state.core.edit_deferred(id, edited, release_at).is_ok() {
             true => DeferralOutcome::Applied,
-            false => DeferralOutcome::NotDeferred,
+            false => DeferralOutcome::NotDeferred {
+                deliver_after: None,
+            },
         }
     }
 
@@ -656,7 +664,12 @@ impl RingStore {
         ) {
             OwnedDeferred::Owned(id, _) => Ok(id),
             OwnedDeferred::WrongSender { .. } => Err(DeferralOutcome::WrongSender),
-            OwnedDeferred::NotFound => Err(DeferralOutcome::NotDeferred),
+            OwnedDeferred::PastCutoff { release_at } => Err(DeferralOutcome::NotDeferred {
+                deliver_after: Some(instant_of(release_at)),
+            }),
+            OwnedDeferred::NotFound => Err(DeferralOutcome::NotDeferred {
+                deliver_after: None,
+            }),
         }
     }
 
@@ -853,8 +866,8 @@ impl RetentionStore for RingStore {
         }
     }
 
-    async fn deferred_for_sender(&self, sender: &str, now: DateTime<Utc>) -> Vec<DeferredMessage> {
-        RingStore::deferred_for_sender(self, sender, now)
+    async fn deferred_for_sender(&self, sender: &str) -> Vec<DeferredMessage> {
+        RingStore::deferred_for_sender(self, sender)
     }
 
     async fn deferred_senders(&self, now: DateTime<Utc>) -> Vec<String> {
@@ -1423,12 +1436,12 @@ mod tests {
         s.park(envelope("alice", "a-soon"), at(1_000)).unwrap();
 
         let alice: Vec<String> = s
-            .deferred_for_sender("alice", now())
+            .deferred_for_sender("alice")
             .iter()
             .map(|d| d.envelope.body.clone())
             .collect();
         assert_eq!(alice, vec!["a-soon", "a-late"]);
-        assert_eq!(s.deferred_for_sender("bob", now()).len(), 1);
+        assert_eq!(s.deferred_for_sender("bob").len(), 1);
         assert_eq!(s.deferred(now()).len(), 3);
     }
 
@@ -1443,7 +1456,9 @@ mod tests {
         assert_eq!(s.deferred_len(), 0);
         assert_eq!(
             s.cancel_deferred("alice", id, now()),
-            DeferralOutcome::NotDeferred
+            DeferralOutcome::NotDeferred {
+                deliver_after: None
+            }
         );
     }
 
@@ -1454,7 +1469,9 @@ mod tests {
         assert_eq!(s.release_due(at(1_000)).messages.len(), 1);
         assert_eq!(
             s.cancel_deferred("alice", id, now()),
-            DeferralOutcome::NotDeferred
+            DeferralOutcome::NotDeferred {
+                deliver_after: None
+            }
         );
     }
 
@@ -1468,7 +1485,7 @@ mod tests {
             s.edit_deferred("alice", late, Some("edited".into()), Some(at(500)), now()),
             DeferralOutcome::Applied
         );
-        let view = s.deferred_for_sender("alice", now());
+        let view = s.deferred_for_sender("alice");
         assert_eq!(view[0].envelope.body, "edited");
         assert_eq!(view[0].release_at, at(500));
         assert_eq!(view[1].envelope.body, "soon");
@@ -1482,7 +1499,9 @@ mod tests {
         s.release_due(at(1_000));
         assert_eq!(
             s.edit_deferred("alice", id, Some("edited".into()), None, now()),
-            DeferralOutcome::NotDeferred
+            DeferralOutcome::NotDeferred {
+                deliver_after: None
+            }
         );
     }
 
@@ -1501,7 +1520,7 @@ mod tests {
             s.edit_deferred("alice", id, Some("edited".into()), None, now()),
             DeferralOutcome::WrongSender
         );
-        assert_eq!(s.deferred_for_sender("bob", now())[0].envelope.body, "b");
+        assert_eq!(s.deferred_for_sender("bob")[0].envelope.body, "b");
         assert_eq!(s.deferred_len(), 1);
     }
 }

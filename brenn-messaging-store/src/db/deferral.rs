@@ -39,14 +39,20 @@ pub struct DeferredLookup {
 }
 
 /// Columns 0-11 as `row_to_message_envelope` expects them, plus `m.id` at 12,
-/// for the messages on one channel whose `deliver_after` stands in the `cmp`
-/// relation to `?2`.
+/// for the messages on one channel that are unreleased, optionally narrowed to
+/// those whose `deliver_after` stands in the `cmp` relation to `?2`.
 ///
-/// The two callers want opposite sides of the same instant — still parked
-/// (`>`) and come due (`<=`) — and building both from one place is what keeps
-/// them from drifting apart into a query that reports future messages as
-/// released.
-fn deferred_select(cmp: &str) -> String {
+/// Three callers, three boundaries. The guest-facing view takes `None` — every
+/// unreleased message, due or not, because "parked" means "no release pass has
+/// taken it". The authority reads want opposite sides of one instant — still
+/// cancellable (`>`) and come due (`<=`) — and building all three from one
+/// place is what keeps them from drifting apart into a query that reports
+/// future messages as released.
+fn deferred_select(cmp: Option<&str>) -> String {
+    let cmp = match cmp {
+        Some(cmp) => format!("AND m.deliver_after {cmp} ?2"),
+        None => String::new(),
+    };
     format!(
         "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
@@ -56,7 +62,7 @@ fn deferred_select(cmp: &str) -> String {
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
          WHERE m.channel_uuid = ?1
            AND m.deliver_after IS NOT NULL
-           AND m.deliver_after {cmp} ?2"
+           {cmp}"
     )
 }
 
@@ -64,8 +70,13 @@ fn parse_release(s: &str) -> DateTime<Utc> {
     parse_rfc3339(s).unwrap_or_else(|| panic!("messaging: malformed deliver_after in db: {s:?}"))
 }
 
-/// Parked messages on `channel_uuid` published by `sender`, soonest release
-/// first.
+/// Unreleased messages on `channel_uuid` published by `sender`, soonest
+/// release first.
+///
+/// Clock-free: an entry whose `deliver_after` has passed but that no release
+/// pass has taken is here, carrying that past instant. The owner reads the
+/// instant and knows the entry is due; cancel and edit keep their own `> now`
+/// authority boundary, so such an entry is shown and is not cancellable.
 ///
 /// The sender filter is the whole authorization story for the callers that use
 /// it: a component scoped to its own sender identity cannot name a message it
@@ -74,22 +85,17 @@ pub fn list_deferred_for_sender(
     conn: &Connection,
     channel_uuid: Uuid,
     sender: &str,
-    now: DateTime<Utc>,
 ) -> Vec<DeferredRow> {
     let sql = format!(
-        "{} AND m.sender = ?3 ORDER BY m.deliver_after ASC, m.id ASC",
-        deferred_select(">")
+        "{} AND m.sender = ?2 ORDER BY m.deliver_after ASC, m.id ASC",
+        deferred_select(None)
     );
     let mut stmt = conn
         .prepare(&sql)
         .expect("prepare list_deferred_for_sender");
     let rows = stmt
         .query_map(
-            rusqlite::params![
-                channel_uuid.as_bytes().to_vec(),
-                format_ts_for_db(now),
-                sender
-            ],
+            rusqlite::params![channel_uuid.as_bytes().to_vec(), sender],
             |row| {
                 let deliver_after: String = row.get(6)?;
                 Ok(DeferredRow {
@@ -103,12 +109,12 @@ pub fn list_deferred_for_sender(
     rows.map(|r| r.expect("read deferred row")).collect()
 }
 
-/// Every sender holding at least one message still parked on `channel_uuid` at
-/// `now`, once each, sorted.
+/// Every sender holding at least one still-cancellable message on
+/// `channel_uuid` at `now`, once each, sorted.
 ///
-/// The same `now` boundary [`list_deferred_for_sender`] applies, for the same
-/// reason: a matured entry no release pass has taken is out of every view, so a
-/// sender holding only those has nothing here either.
+/// The cancel boundary, not [`list_deferred_for_sender`]'s: this answers the
+/// operator's "whose schedules can I act on?", and a sender whose only entry
+/// has come due has nothing actionable — the next release pass takes it.
 pub fn list_deferred_senders(
     conn: &Connection,
     channel_uuid: Uuid,
@@ -171,22 +177,24 @@ pub fn deferred_cap_refusal(
     (count_deferred(conn, channel_uuid) >= cap).then_some(cap)
 }
 
-/// Identity and owner of one parked message, or `None` when it is no longer
-/// parked — released, cancelled, or never on this channel.
+/// Identity, owner and release instant of one unreleased message, or `None`
+/// when nothing of that id is held — released, cancelled, or never on this
+/// channel.
+///
+/// Clock-free: the caller compares `release_at` against its own cutoff, so it
+/// can tell an entry it may no longer act on from one that is not there at all.
 pub fn lookup_deferred(
     conn: &Connection,
     channel_uuid: Uuid,
     message_uuid: Uuid,
-    now: DateTime<Utc>,
 ) -> Option<DeferredLookup> {
     conn.query_row(
         "SELECT id, sender, deliver_after FROM messaging_messages
          WHERE channel_uuid = ?1 AND uuid = ?2
-           AND deliver_after IS NOT NULL AND deliver_after > ?3",
+           AND deliver_after IS NOT NULL",
         rusqlite::params![
             channel_uuid.as_bytes().to_vec(),
-            message_uuid.as_bytes().to_vec(),
-            format_ts_for_db(now)
+            message_uuid.as_bytes().to_vec()
         ],
         |row| {
             let release: String = row.get(2)?;
@@ -349,7 +357,7 @@ pub fn release_due_for_channel(
     {
         let sql = format!(
             "{} ORDER BY m.deliver_after ASC, m.id ASC",
-            deferred_select("<=")
+            deferred_select(Some("<="))
         );
         let mut stmt = tx.prepare(&sql).expect("prepare release_due_for_channel");
         let rows = stmt

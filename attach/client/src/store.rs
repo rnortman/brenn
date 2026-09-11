@@ -78,15 +78,27 @@ pub enum DeferOp {
 /// What became of a control op.
 ///
 /// Three outcomes because the two failures mean opposite things about the
-/// caller. [`Self::NotParked`] is the benign race any conforming publisher can
-/// lose: the message released between the view it read and the op it sent. A
+/// caller. [`Self::NotParked`] is an entry past the authority cutoff: it came
+/// due between the view the publisher read and the op it sent, or the publisher
+/// acted on one its view already showed as due, which the doctrine forbids. A
 /// [`Self::WrongSender`] is not a race at all — the identity came from a
 /// sender-scoped view, so it can only mean the caller built one wrong.
+///
+/// `NotParked` carries the target's release instant where the store still holds
+/// the entry, which is the only thing that separates those two causes: a caller
+/// with the instant and its own `now` can say whether the entry had come due
+/// before it read its view, and one without them cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeferOpOutcome {
     Applied,
-    NotParked,
-    WrongSender { owner: String },
+    NotParked {
+        /// The instant the still-held target is owed at, or `None` where
+        /// nothing of that identity is held any more.
+        deliver_after: Option<ReleaseTime>,
+    },
+    WrongSender {
+        owner: String,
+    },
 }
 
 /// One reader's activation view of a channel, with its position already moved
@@ -355,21 +367,23 @@ impl<K: Eq + Hash + Clone> ChannelStore<K> {
         self.core.release_due(now)
     }
 
-    /// One sender's messages still parked at `now`, soonest release first — the
-    /// view a publisher is shown of its own schedule.
+    /// One sender's unreleased messages, soonest release first — the view a
+    /// publisher is shown of its own schedule.
     ///
-    /// Still parked is exactly `release_at > now`: an entry whose time has come
-    /// is out of the view before the release pass takes it, since there is
-    /// nothing left to cancel or edit.
+    /// Parked is exactly "no release pass has taken it": an entry whose time
+    /// has come is in the view, carrying its past instant, until the sweep
+    /// takes it. The publisher reads the instant and knows it is due, so an
+    /// empty view means "nothing standing" at every instant.
+    /// [`Self::apply_defer_op`] keeps the `> now` cutoff, so such an entry is
+    /// shown and is not cancellable.
     ///
     /// The sender filter is the whole authorization story: a caller scoped to a
     /// sender can never observe, cancel or edit another's schedule.
     pub fn deferred_for_sender<'a>(
         &'a self,
         sender: &'a str,
-        now: ReleaseTime,
     ) -> impl Iterator<Item = &'a Deferred<MessageEnvelope>> {
-        self.core.deferred_for_sender(sender, now)
+        self.core.deferred_for_sender(sender)
     }
 
     /// The identity that parked each message still held here, across senders.
@@ -397,12 +411,12 @@ impl<K: Eq + Hash + Clone> ChannelStore<K> {
     /// view carried — and is applied only to an entry `sender` owns and only
     /// while it is still parked at `now`.
     ///
-    /// `now` is the same cutoff [`Self::deferred_for_sender`] answers against, so
-    /// an op reaches exactly what the view showed: an entry whose release time has
-    /// arrived answers [`DeferOpOutcome::NotParked`] whether or not the release
-    /// pass has taken it yet. The sweep runs on the embedder's turn, so without
-    /// the cutoff a cancel landing in the window between the release time and the
-    /// sweep would retract a message that was already due.
+    /// `now` is the authority cutoff, which [`Self::deferred_for_sender`]
+    /// deliberately does not share: an entry whose release time has arrived is
+    /// in the view and answers [`DeferOpOutcome::NotParked`] here, whether or
+    /// not the release pass has taken it yet. The sweep runs on the embedder's
+    /// turn, so without the cutoff a cancel landing in the window between the
+    /// release time and the sweep would retract a message that was already due.
     pub fn apply_defer_op(
         &mut self,
         sender: &str,
@@ -430,7 +444,20 @@ impl<K: Eq + Hash + Clone> ChannelStore<K> {
                         }),
                     },
                 ),
-                OwnedDeferred::NotFound => return DeferOpOutcome::NotParked,
+                // Due and gone are one outcome: the op named an entry past the
+                // cutoff either way. A due entry is the one the sender's view
+                // still shows, carrying its past instant — which travels with
+                // the outcome, since it is what tells the two causes apart.
+                OwnedDeferred::PastCutoff { release_at } => {
+                    return DeferOpOutcome::NotParked {
+                        deliver_after: Some(release_at),
+                    };
+                }
+                OwnedDeferred::NotFound => {
+                    return DeferOpOutcome::NotParked {
+                        deliver_after: None,
+                    };
+                }
                 OwnedDeferred::WrongSender { owner } => {
                     return DeferOpOutcome::WrongSender {
                         owner: owner.to_string(),
