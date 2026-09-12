@@ -3086,29 +3086,6 @@ connect, observed the way the removal cases observe the live one (the broker's
 own `Received UNSUBSCRIBE` record), and the status body says which of the two
 things a deferral was.
 
-## `backend-wasm-ephemeral-binding`
-
-A backend WASM consumer can bind `brenn:` channels and nothing else. The
-registry forks on the address realm and the `ephemeral:` arm was never written
-for this subscriber kind, so a component whose specification is realm-neutral —
-every one of them is — can be hosted on one realm in the browser and on a
-different one on the backend, for no reason either the contract or
-`processor.wit` states.
-
-It is a gap in the machinery, never a decision. The surface binds both realms
-today; the transplant script and the host conformance suite are both
-`brenn:`-only for this reason alone, and both say so where a reader meets them
-(`brenn-wasm/tests/processor_transplant.rs`, the script's `_doc`).
-
-Code site (`TODO(backend-wasm-ephemeral-binding)`): the ignored scenario in
-`brenn-host-conformance/src/tests/backend.rs`, and the realm assertion in that
-adapter's constructor, which is where the fork is felt.
-
-Done = `self_tick_chain_ephemeral` passes with its `ignore` removed: the probe's
-`io tick` port bound to an `ephemeral:` channel, the chain sustaining itself,
-and the remount scenario's `ephemeral:` reading — an empty deferred window, and
-the component re-arming from what it is shown — asserted beside the durable one.
-
 ## `retained-state-port-attribute`
 
 `RetainedState` (`brenn-wasm/components/guest/src/lib.rs`) works only against a

@@ -6,9 +6,11 @@
 //! state in linear memory (scenario 7), are each hosted identically or not at
 //! all, and nothing that drives the entry directly can tell which.
 
+use brenn_envelope::ChannelScheme;
+
 use crate::{
-    Host, InputBinding, MountSpec, Realm, Report, TrapDisposition, assert_fresh_memory,
-    await_reports, port, settle,
+    Host, InputBinding, MountSpec, Report, TrapDisposition, assert_fresh_memory, await_reports,
+    port, settle,
 };
 
 /// A push-enabled input binding with room for a small batch.
@@ -69,13 +71,12 @@ pub mod mount_over_empty_channels {
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
-        let spec = spec();
+    pub async fn run<H: Host>(host: &mut H, spec: &MountSpec) {
         host.mount().await;
         let reports = settle(host, 1).await;
         assert_eq!(reports.len(), 1, "a mount is owed exactly one activation");
         let report = &reports[0];
-        assert_shape(report, &spec);
+        assert_shape(report, spec);
         for window in &report.ports {
             assert_eq!(
                 (window.context_len, window.new_len, window.dropped),
@@ -117,14 +118,14 @@ pub mod mount_over_history {
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
+    pub async fn run<H: Host>(host: &mut H, spec: &MountSpec) {
         for i in 0..PUBLISHED {
             host.publish(port::IN, &format!("history-{i}")).await;
         }
         host.mount().await;
         let reports = settle(host, 1).await;
         assert_eq!(reports.len(), 1, "the history arrives in the mount, once");
-        assert_shape(&reports[0], &spec());
+        assert_shape(&reports[0], spec);
         let window = reports[0].port(port::IN).expect("the bound input");
         assert_eq!(
             window.new_len, PUSH_DEPTH as usize,
@@ -147,25 +148,19 @@ pub mod self_tick_chain {
     /// sustaining itself rather than firing once.
     pub const RELEASES: usize = 3;
 
-    pub fn spec() -> MountSpec {
-        spec_in(Realm::Durable)
-    }
-
-    /// The same scenario in a named realm. The `ephemeral:` instance is the
-    /// crate's one known-failing scenario.
-    pub fn spec_in(realm: Realm) -> MountSpec {
+    /// The wiring, with the `io tick` port bound in the scheme under test.
+    pub fn spec_in(scheme: ChannelScheme) -> MountSpec {
         MountSpec {
             inputs: vec![pushed(port::IN)],
-            tick: Some(realm),
+            tick: Some(scheme),
             tick_ms: Some(TICK_MS),
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
-        let spec = spec();
+    pub async fn run<H: Host>(host: &mut H, spec: &MountSpec) {
         host.mount().await;
         let reports = await_reports(host, 1 + RELEASES).await;
-        assert_shape(&reports[0], &spec);
+        assert_shape(&reports[0], spec);
         assert!(
             reports[0]
                 .deferred(port::TICK)
@@ -180,7 +175,7 @@ pub mod self_tick_chain {
             "the mount activation is owed, not triggered by a tick",
         );
         for (i, report) in reports[1..].iter().enumerate() {
-            assert_shape(report, &spec);
+            assert_shape(report, spec);
             assert_eq!(
                 report.port(port::TICK).expect("the io port").new_len,
                 1,
@@ -214,7 +209,7 @@ pub mod sampled_only_wiring {
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
+    pub async fn run<H: Host>(host: &mut H, spec: &MountSpec) {
         host.mount().await;
         let mounted = settle(host, 1).await;
         assert_eq!(
@@ -222,7 +217,7 @@ pub mod sampled_only_wiring {
             1,
             "a consumer whose only input is sampled still gets its mount",
         );
-        assert_shape(&mounted[0], &spec());
+        assert_shape(&mounted[0], spec);
 
         host.publish(port::SAMPLED, "sampled-body").await;
         assert!(
@@ -246,7 +241,7 @@ pub mod err_consumes {
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
+    pub async fn run<H: Host>(host: &mut H, _spec: &MountSpec) {
         host.mount().await;
         assert_eq!(settle(host, 1).await.len(), 1, "the mount activation");
 
@@ -282,7 +277,7 @@ pub mod trap_disposition {
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
+    pub async fn run<H: Host>(host: &mut H, _spec: &MountSpec) {
         host.mount().await;
         assert_eq!(settle(host, 1).await.len(), 1, "the mount activation");
 
@@ -330,7 +325,7 @@ pub mod state_does_not_survive {
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
+    pub async fn run<H: Host>(host: &mut H, _spec: &MountSpec) {
         host.mount().await;
         assert_eq!(settle(host, 1).await.len(), 1, "the mount activation");
 
@@ -345,25 +340,25 @@ pub mod state_does_not_survive {
     }
 }
 
-/// 8. Remount: a new mount is owed its own activation, and a durable parked tick
-///    is still there when it arrives — so a conforming component does not
-///    double-arm.
+/// 8. Remount: a new mount is owed its own activation, and a parked tick is
+///    still there when it arrives — the store outlives the registration on every
+///    scheme — so a conforming component does not double-arm.
 pub mod remount {
     use super::*;
 
     /// Far enough out that the tick is still parked when the remount lands.
     pub const TICK_MS: u64 = 60_000;
 
-    pub fn spec() -> MountSpec {
+    /// The wiring, with the `io tick` port bound in the scheme under test.
+    pub fn spec_in(scheme: ChannelScheme) -> MountSpec {
         MountSpec {
             inputs: vec![pushed(port::IN)],
-            tick: Some(Realm::Durable),
+            tick: Some(scheme),
             tick_ms: Some(TICK_MS),
         }
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
-        let spec = spec();
+    pub async fn run<H: Host>(host: &mut H, spec: &MountSpec) {
         host.mount().await;
         let first = settle(host, 1).await;
         assert_eq!(first.len(), 1, "the first mount activation");
@@ -379,7 +374,7 @@ pub mod remount {
         host.remount().await;
         let second = settle(host, 1).await;
         assert_eq!(second.len(), 1, "a remount is a mount and is owed one too");
-        assert_shape(&second[0], &spec);
+        assert_shape(&second[0], spec);
         assert_eq!(
             second[0]
                 .deferred(port::TICK)
@@ -387,8 +382,8 @@ pub mod remount {
                 .payloads
                 .len(),
             1,
-            "a durable parked tick survives the remount, and the probe re-arms \
-             only into an empty window — so it is still exactly one",
+            "a parked tick survives the remount, and the probe re-arms only \
+             into an empty window — so it is still exactly one",
         );
         assert_fresh_memory(&first);
         assert_fresh_memory(&second);
@@ -419,10 +414,11 @@ pub mod due_tick_is_shown_at_mount {
     /// with nobody there to take it.
     pub const OUTAGE: Duration = Duration::from_millis(1_300);
 
-    pub fn spec() -> MountSpec {
+    /// The wiring, with the `io tick` port bound in the scheme under test.
+    pub fn spec_in(scheme: ChannelScheme) -> MountSpec {
         MountSpec {
             inputs: vec![pushed(port::IN)],
-            tick: Some(Realm::Durable),
+            tick: Some(scheme),
             tick_ms: Some(TICK_MS),
         }
     }
@@ -433,8 +429,7 @@ pub mod due_tick_is_shown_at_mount {
             .expect("the io port's deferred window")
     }
 
-    pub async fn run<H: Host>(host: &mut H) {
-        let spec = spec();
+    pub async fn run<H: Host>(host: &mut H, spec: &MountSpec) {
         host.mount().await;
         let first = await_reports(host, 1).await;
         assert_eq!(first.len(), 1, "the mount activation");
@@ -455,7 +450,7 @@ pub mod due_tick_is_shown_at_mount {
         host.remount_after(OUTAGE).await;
         let second = await_reports(host, 1).await;
         assert_eq!(second.len(), 1, "a remount is a mount and is owed one too");
-        assert_shape(&second[0], &spec);
+        assert_shape(&second[0], spec);
         let window = tick_window(&second[0]);
         assert_eq!(
             window.payloads.len(),

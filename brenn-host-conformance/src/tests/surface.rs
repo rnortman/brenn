@@ -21,12 +21,17 @@
 //! # Why every channel is `local:`
 //!
 //! A transportable channel's authority is the peer, so driving one here would mean
-//! scripting a server rather than hosting a component. A page-confined channel's
-//! authority is the page itself, which is the half under test — and it is also the
-//! realm with the lifetime [`Realm::Durable`] names on this host: a `local:`
-//! channel's store outlives any one registration, so a message parked on it is
-//! still parked across a remount, exactly as a `brenn:` channel's is on the
-//! backend.
+//! scripting a server rather than hosting a component — the script would be what
+//! got tested. A page-confined channel's authority is the page itself, which is
+//! the half under test, and its store outlives any one registration, so a message
+//! parked on it is still parked across a remount exactly as a `brenn:` channel's
+//! is on the backend.
+//!
+//! So [`EXCLUDED`] names the schemes a real page binds and this adapter does not,
+//! each of them transportable, and that is what [`Host::schemes`] subtracts. Their
+//! hosting on the surface is pinned by the e2e suite against a real server — the
+//! `dev-stub` echo loop over an `ephemeral:` channel in the dev and e2e
+//! assemblies — rather than by this adapter.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -53,7 +58,10 @@ use brenn_surface_schema::{
     Binding, ComponentEntry, LocalChannel, NoiseLevel, OutputBinding, Urgency as SchemaUrgency,
 };
 
-use crate::{Host, MountSpec, Realm, Report, TrapDisposition, port, scenarios};
+use brenn_envelope::ChannelScheme;
+use brenn_envelope::grants::{ComponentHost, EntityKind, Plane, bindable_schemes};
+
+use crate::{Host, MountSpec, Report, TrapDisposition, port, scenarios};
 
 /// Workspace-relative, as every runfiles tree is laid out like the workspace.
 const PROBE_WASM: &str = "brenn-wasm/target/components/brenn_processor_transplant.wasm";
@@ -83,9 +91,26 @@ const RING_DEPTH: u64 = 64;
 /// the budget suite's subject, not this one's.
 const FILL_MT: u64 = 1_000_000_000;
 
-/// The page-confined channel a port is bound to.
-fn channel_for(port: &str) -> String {
-    format!("local:probe/{port}")
+/// The schemes a surface-placed component may bind that this adapter does not
+/// drive. Every one of them is transportable, which is the whole reason: their
+/// authority is the peer this adapter does not have.
+const EXCLUDED: &[ChannelScheme] = &[ChannelScheme::Brenn, ChannelScheme::Ephemeral];
+
+/// The channel a port is bound to, in the given scheme. The scheme is threaded
+/// rather than spelled `local:` here so that the scheme a spec names is the
+/// scheme the port is actually bound in: a run named for a scheme it did not
+/// drive is the false confidence this suite exists to delete.
+fn channel_for(scheme: ChannelScheme, port: &str) -> String {
+    format!("{}probe/{port}", scheme.prefix())
+}
+
+/// The scheme every port a scenario does not vary is bound in.
+///
+/// Read off [`Host::schemes`] rather than written out, so the trait's statement
+/// that the unvaried ports use the first entry stays true under a reordering of
+/// that list instead of quietly becoming false.
+fn default_scheme() -> ChannelScheme {
+    Surface::schemes()[0]
 }
 
 /// One page-placed probe instance.
@@ -126,7 +151,7 @@ fn document(spec: &MountSpec) -> BindingsDocument {
         .inputs
         .iter()
         .map(|b| Binding {
-            channel: channel_for(b.port),
+            channel: channel_for(default_scheme(), b.port),
             instance: PROBE.to_string(),
             port: b.port.to_string(),
             push_depth: u64::from(b.push_depth),
@@ -136,26 +161,18 @@ fn document(spec: &MountSpec) -> BindingsDocument {
         .collect();
     let mut outputs: Vec<OutputBinding> = [port::OUT, port::REPORT]
         .into_iter()
-        .map(output_binding)
+        .map(|port| output_binding(default_scheme(), port))
         .collect();
-    if let Some(realm) = spec.tick {
-        // TODO(backend-wasm-ephemeral-binding): the ephemeral variant of the
-        // self-tick chain is a backend gap and is driven against the backend
-        // adapter alone; the surface's durable realm is its confined store.
-        assert_eq!(
-            realm,
-            Realm::Durable,
-            "the surface's remount-surviving realm is the confined store",
-        );
+    if let Some(scheme) = spec.tick {
         subscriptions.push(Binding {
-            channel: channel_for(port::TICK),
+            channel: channel_for(scheme, port::TICK),
             instance: PROBE.to_string(),
             port: port::TICK.to_string(),
             push_depth: 4,
             retain_depth: 8,
             noise: NoiseLevel::Metered,
         });
-        outputs.push(output_binding(port::TICK));
+        outputs.push(output_binding(scheme, port::TICK));
     }
     let local_channels: Vec<LocalChannel> = subscriptions
         .iter()
@@ -208,9 +225,9 @@ fn document(spec: &MountSpec) -> BindingsDocument {
     }
 }
 
-fn output_binding(port: &str) -> OutputBinding {
+fn output_binding(scheme: ChannelScheme, port: &str) -> OutputBinding {
     OutputBinding {
-        channel: channel_for(port),
+        channel: channel_for(scheme, port),
         instance: PROBE.to_string(),
         port: port.to_string(),
         urgency: SchemaUrgency::Normal,
@@ -226,6 +243,15 @@ fn wall_ms() -> u64 {
 
 impl Surface {
     fn new(spec: &MountSpec) -> Surface {
+        // The scheme a spec names is bound, not silently replaced: a scheme this
+        // adapter drives nowhere must fail here rather than run under `local:`
+        // and pass as a scheme it never touched.
+        if let Some(scheme) = spec.tick {
+            assert!(
+                Surface::schemes().contains(&scheme),
+                "the surface adapter drives no port in {scheme:?}; see EXCLUDED",
+            );
+        }
         let document = document(spec);
         let mut channels: HashMap<String, String> = HashMap::new();
         for binding in &document.subscriptions {
@@ -296,14 +322,31 @@ impl Surface {
     /// read.
     fn take_reports(&mut self) -> Vec<Report> {
         let channel = self.channels[port::REPORT].clone();
-        let fresh: Vec<(u64, String)> = self
+        let retained: Vec<(u64, String)> = self
             .page
             .stores
             .get(&channel)
             .expect("the report channel is declared by the adapter's document")
             .retained()
-            .filter(|(_, seq)| *seq > self.read_through)
             .map(|(envelope, seq)| (seq, envelope.body.clone()))
+            .collect();
+        // The ring holds the newest `RING_DEPTH` entries, so a full one may have
+        // evicted a report this adapter never returned, and the store cannot tell
+        // that apart from a quiet channel. Refuse instead: a lost report reads as
+        // a missing activation, which is the misattribution this suite exists to
+        // prevent. Both adapters must refuse on overflow over the same read shape;
+        // see `RETAIN_DEPTH` in `backend.rs`.
+        assert!(
+            retained.len() < RING_DEPTH as usize
+                || retained
+                    .first()
+                    .is_some_and(|(oldest, _)| *oldest <= self.read_through),
+            "the report ring is full and no longer reaches what this adapter last \
+             returned, so a report may have been evicted unread — raise RING_DEPTH",
+        );
+        let fresh: Vec<(u64, String)> = retained
+            .into_iter()
+            .filter(|(seq, _)| *seq > self.read_through)
             .collect();
         if let Some((seq, _)) = fresh.last() {
             self.read_through = *seq;
@@ -421,6 +464,10 @@ fn to_wit(activation: &brenn_surface_contract::Activation) -> types::Activation 
 }
 
 impl Host for Surface {
+    fn schemes() -> &'static [ChannelScheme] {
+        &[ChannelScheme::Local]
+    }
+
     fn trap_disposition(&self) -> TrapDisposition {
         TrapDisposition::Terminal
     }
@@ -503,22 +550,88 @@ impl Host for Surface {
     }
 }
 
+/// One scenario against a fresh adapter, in one arm per shape. The spec is
+/// built once and read by both the mount and the body, and the scheme-varied
+/// arm's list is asserted to be [`Host::schemes`] entire.
 macro_rules! surface_scenario {
     ($name:ident) => {
         #[tokio::test]
         async fn $name() {
-            let mut host = Surface::new(&scenarios::$name::spec());
-            scenarios::$name::run(&mut host).await;
+            let spec = scenarios::$name::spec();
+            let mut host = Surface::new(&spec);
+            scenarios::$name::run(&mut host, &spec).await;
+        }
+    };
+    ($name:ident, [$($run:ident => $scheme:expr),+ $(,)?]) => {
+        /// One test per scheme, named for it, so a divergence is legible from
+        /// the failing test's name rather than from a parameter in its body.
+        mod $name {
+            use super::*;
+
+            $(
+                #[tokio::test]
+                async fn $run() {
+                    let spec = scenarios::$name::spec_in($scheme);
+                    let mut host = Surface::new(&spec);
+                    scenarios::$name::run(&mut host, &spec).await;
+                }
+            )+
+
+            #[test]
+            fn covers_every_scheme() {
+                assert_eq!(
+                    &[$($scheme),+][..],
+                    Surface::schemes(),
+                    "every scheme the adapter says it drives is driven by a run \
+                     of this scenario, in the adapter's own order",
+                );
+            }
         }
     };
 }
 
 surface_scenario!(mount_over_empty_channels);
 surface_scenario!(mount_over_history);
-surface_scenario!(self_tick_chain);
 surface_scenario!(sampled_only_wiring);
 surface_scenario!(err_consumes);
 surface_scenario!(trap_disposition);
 surface_scenario!(state_does_not_survive);
-surface_scenario!(remount);
-surface_scenario!(due_tick_is_shown_at_mount);
+
+surface_scenario!(self_tick_chain, [local => ChannelScheme::Local]);
+surface_scenario!(remount, [local => ChannelScheme::Local]);
+surface_scenario!(due_tick_is_shown_at_mount, [local => ChannelScheme::Local]);
+
+/// The scheme list is the adapter's claim about what it drives, tied to the
+/// table the host is gated on by subtraction rather than by predicate: the full
+/// surface row minus the schemes the header names as excluded. Deriving it as
+/// "the confined subset" would stay `[Local]` under any widening and never fire;
+/// subtracting a named list makes a new surface scheme a failure here until the
+/// adapter either covers it or names it excluded for the same stated reason —
+/// which the second assertion is: every exclusion is transportable.
+#[test]
+fn schemes_are_the_surface_row_minus_the_named_exclusions() {
+    let row = bindable_schemes(
+        EntityKind::Component(ComponentHost::Surface),
+        Plane::Subscribe,
+    );
+    let kept: Vec<ChannelScheme> = row
+        .iter()
+        .copied()
+        .filter(|scheme| !EXCLUDED.contains(scheme))
+        .collect();
+    assert_eq!(
+        Surface::schemes(),
+        kept,
+        "the adapter drives the surface's bindable schemes minus its named exclusions",
+    );
+    for scheme in EXCLUDED {
+        assert!(
+            scheme
+                .capabilities()
+                .expect("an excluded scheme names a pub/sub channel")
+                .transportable,
+            "{scheme:?} is excluded because its authority is the peer, so it must be \
+             transportable",
+        );
+    }
+}

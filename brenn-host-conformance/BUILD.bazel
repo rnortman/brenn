@@ -8,15 +8,17 @@ exports_files(["Cargo.toml"])
 
 # The library half is host-neutral by dependency list: the trait, the report
 # projection and the scenario bodies reach for no host crate, and none is a
-# `deps` entry here. The adapters are `cfg(test)` inside the same sources, so
-# they compile only into the test binary below.
+# `deps` entry here. `//brenn-envelope` is not a host crate — it is the shared
+# vocabulary both hosts are written against, and it depends on no host either.
+# The adapters are `cfg(test)` inside the same sources, so they compile only into
+# the test binary below.
 rust_library(
     name = "brenn-host-conformance",
     srcs = glob(["src/**/*.rs"]),
     edition = "2024",
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + ["//brenn-envelope"],
 )
 
 # The adapters. `data` is the probe: one artifact, driven by every host.
@@ -30,7 +32,6 @@ rust_test(
     deps = all_crate_deps(normal_dev = True) + [
         "//attach/client",
         "//attach/proto",
-        "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging",
         "//brenn-messaging-store",

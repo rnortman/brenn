@@ -4,6 +4,16 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Documented which channel schemes each component placement may bind**
+  (`docs/message-bus.md` §2.1.1): a parity matrix covering backend consumers
+  and surface instances for every scheme, sourced to `bindable_schemes`.
+- Host-conformance suite now exercises `ephemeral:` and `local:` on the
+  backend, not just `brenn:`. The backend adapter publishes and reads through
+  the production `Messenger` path instead of raw SQL, and the three
+  previously-ignored scheme-varied scenarios run on all three schemes with
+  identical assertions. A `publish_policy_for_addresses` test fixture in
+  `brenn-lib` supports the narrowed publish authority.
+
 ## [0.22.0]
 
 ### Added

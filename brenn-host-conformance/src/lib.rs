@@ -25,6 +25,27 @@
 //! and one that can only be waited on leaves it `None` and pays the quiet
 //! period. Same scenario bodies either way.
 //!
+//! # What a scheme survives
+//!
+//! The scenarios' one variable is the scheme the `io tick` port is bound in, and
+//! it is a variable they *vary* rather than branch on — on either host, over any
+//! scheme that host can bind, every assertion below reads the same. What differs
+//! between the schemes is what their stores survive, and no scenario here
+//! performs the event that separates them:
+//!
+//! - **A consumer remount, or a page re-registration: every scheme survives it.**
+//!   A store outlives the registration that reads it on both hosts. The backend's
+//!   rings live in the process's `RingStores`, which stopping and restarting a
+//!   consumer task does not touch; a page's confined stores live in the page.
+//! - **A process restart: `brenn:` only.** That is what durability is, and it is
+//!   the axis these scenarios do not drive.
+//! - **A page reload: the transportable schemes.** `brenn:` and `ephemeral:`
+//!   messages belong to the server, so a reloaded page re-reads them over the
+//!   wire; a `local:` channel goes with the page that held it.
+//!
+//! A scheme-varied scenario that reads differently on one scheme is therefore a
+//! hosting bug, not a scheme property.
+//!
 //! The comparison is report-for-report, and a [`Report`] is deliberately a
 //! projection rather than the probe's own JSON: message ids, wall-clock
 //! instants and release times are host-minted and differ between two correct
@@ -33,6 +54,8 @@
 //! counter — and drops what it does not.
 
 use std::time::Duration;
+
+use brenn_envelope::ChannelScheme;
 
 /// The probe's ports, as its specification names them.
 pub mod port {
@@ -63,19 +86,6 @@ pub const QUIET_PERIOD: Duration = Duration::from_millis(300);
 /// Polling granularity for both of the above.
 const POLL: Duration = Duration::from_millis(10);
 
-/// The wire class a channel is bound in. `Durable` survives a remount and
-/// carries a parked message across it; `Ephemeral` does not.
-///
-/// Named by what it promises rather than by an address prefix, because the two
-/// hosts spell it differently: the backend's is a `brenn:` channel backed by the
-/// durable store, the surface's is a `local:` channel whose confined store
-/// outlives any one registration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Realm {
-    Durable,
-    Ephemeral,
-}
-
 /// One input port's binding. `push_depth == 0` is a sampled port: it holds no
 /// position, is served its window as context, and never wakes its owner.
 #[derive(Debug, Clone, Copy)]
@@ -89,12 +99,14 @@ pub struct InputBinding {
 ///
 /// `out` and `report` are not optional in the probe's specification, so every
 /// adapter binds them and the spec does not name them. `tick` is the `io` port
-/// and is named here because its realm is what scenarios 3 and 8 vary.
+/// and is named here because its scheme is what scenarios 3, 8 and 9 vary. It is
+/// the only varied port: an `io` port is an input and an output over one
+/// channel, so varying it alone exercises both planes on the scheme under test.
 #[derive(Debug, Clone)]
 pub struct MountSpec {
     pub inputs: Vec<InputBinding>,
-    /// Bind the `io tick` port in this realm; `None` leaves it unbound.
-    pub tick: Option<Realm>,
+    /// Bind the `io tick` port in this scheme; `None` leaves it unbound.
+    pub tick: Option<ChannelScheme>,
     /// The probe's `tick_ms` config key. The probe re-arms its chain only when
     /// this is set, and only when `tick`'s deferred window is empty.
     pub tick_ms: Option<u64>,
@@ -236,6 +248,21 @@ impl Report {
 /// act of putting it into service.
 #[allow(async_fn_in_trait)]
 pub trait Host {
+    /// The pub/sub schemes this adapter can bind a port in. The scheme-varied
+    /// scenarios run once per entry; every port they do not vary, and every port
+    /// of every other scenario, is bound in the first.
+    ///
+    /// Load-bearing both ways. A scheme listed here must have a corresponding
+    /// run in each adapter's scheme-varied scenarios, or those scenarios fail.
+    /// The first entry is the default: ports a scenario does not vary are bound
+    /// in it, so reordering changes what runs under which scheme.
+    ///
+    /// Stated by the adapter rather than derived from the host, because it is a
+    /// property of what the adapter can *drive*: the surface adapter has no peer
+    /// by construction, so it names only the confined scheme even though a real
+    /// page binds the transportable ones too.
+    fn schemes() -> &'static [ChannelScheme];
+
     /// This host's stated disposition for a trapped instance.
     fn trap_disposition(&self) -> TrapDisposition;
 

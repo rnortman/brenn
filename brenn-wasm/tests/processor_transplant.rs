@@ -12,13 +12,10 @@
 // halves read `transplant.json`, so a change to the script or its expected
 // transcript is answered by both hosts or by neither.
 //
-// Wire class: the script is `brenn:`-bound throughout. That is an owner scoping
-// decision, not doctrine — backend WASM consumers cannot bind `ephemeral:`
-// channels yet (a registry fork, never a decision), and closing that gap is its
-// own design and implementation effort. The `ephemeral:`-bound variant of this
-// fixture is that effort's standing obligation and extends this criterion with
-// no further ratification. Nothing in the surface half is class-aware, so the
-// deferral costs the criterion nothing beyond coverage of the backend hosting.
+// Wire class: the script is `brenn:`-bound throughout and class-blind by
+// construction — a channel address here is a string the fixture maps back to a
+// port name (`port_of`) and never reaches a store. Per-scheme hosting behavior
+// is covered by the conformance suite's scheme-varied scenarios.
 
 mod common;
 

@@ -99,6 +99,35 @@ are not transportable; `brenn:` (durable) and `ephemeral:` channels are. There
 is presently no durable and not-transportable channel type, but in principle
 there could be.
 
+### 2.1.1 Which schemes each placement may bind
+
+The two component placements — a top-level WASM consumer on the backend, and a
+page-placed instance on a surface — bind the same three pub/sub schemes. A
+component's specification says nothing about schemes, and both hosts honour that:
+
+| Scheme | Backend consumer | Surface instance |
+|---|---|---|
+| `brenn:` | subscribe + publish, durable store | subscribe + publish, over the wire — the server is the authority |
+| `ephemeral:` | subscribe + publish, server-side ring | subscribe + publish, over the wire onto that same ring |
+| `local:` | subscribe + publish, server-side ring in the **server** realm | subscribe + publish, the page's own store in the **page** realm |
+| `webhook:`, `mqtt:` | subscribe only — they are ingress | not bindable: a page reaches no broker and no endpoint |
+| `pwa_push:` | an egress adapter, not a channel | not bindable, same reason |
+
+`local:` is two disjoint namespaces sharing one scheme, and that is deliberate:
+a confined channel's contents never leave the host that holds them, so the
+server's `local:foo` and a page's `local:foo` are different channels (§2.6).
+
+The table's source is `bindable_schemes` in `brenn-envelope`, which every
+config front end and every boot builder reads — a diagnostic from one and a
+panic from the other, one table. The three places it deviates from the raw
+capability families, and why, are documented on that function. Agents are a
+separate row and a narrower one: an agent may not bind `local:` at all, which is
+a trust decision about LLM principals rather than a property of the scheme.
+
+That the *hosting* is the same per scheme and not merely the admissibility is
+what the host-conformance suite pins: it runs one scenario body over each scheme
+a host binds, with identical assertions.
+
 Removing a declared `[[channel]]` block — deleting it, renaming it, or
 commenting it out to debug — does not retire the channel. Its history stays, and
 any dynamic subscriptions on it lie dormant: not delivered to, not deleted, and

@@ -8,9 +8,13 @@ description = "One component driven through each host's real scheduling path —
 # Test-only: nothing in the tree depends on this crate. The library half is the
 # `Host` trait, the report projection and the scenario bodies, and its dependency
 # set is the assertion — no host crate appears here, so a scenario that reached
-# for one would fail to compile. The adapters live in this crate's own test
-# build, which is where every host crate is named.
+# for one would fail to compile. `brenn-envelope` is the one workspace crate, and
+# it is not a host either: it is the shared vocabulary both hosts are written
+# against, and "the same answer per scheme on every host" is a statement in it.
+# The adapters live in this crate's own test build, which is where every host
+# crate is named.
 [dependencies]
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["rt", "time", "sync", "macros"] }
 
@@ -21,7 +25,6 @@ brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store", 
 brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
 brenn-attach-client = { version = "0.1.0", path = "../attach/client" }
 brenn-attach-proto = { version = "0.1.0", path = "../attach/proto" }
-brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-page-harness = { version = "0.1.0", path = "../surface/page-harness" }
 brenn-surface-contract = { version = "0.1.0", path = "../surface/contract" }
 brenn-surface-kernel = { version = "0.1.0", path = "../surface/kernel" }
