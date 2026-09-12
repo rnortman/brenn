@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.22.0]
+
 ### Added
 
 - **Config-carrying mounts** close the authorship gap (security-posture B9):
