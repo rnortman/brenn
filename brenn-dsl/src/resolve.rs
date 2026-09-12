@@ -35,8 +35,8 @@ use crate::model::{
     AttachmentTargetAttrs, Attr, AttrBlock, AttrMap, Binding as BindStmt, ChanAddr, ChanRef,
     ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
     InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapDepths, MapValues, Matcher,
-    MatcherVal, McpServerStmt, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs, OutTail,
-    Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, PrincipalDef, RateLimitAttrs,
+    MatcherVal, McpServerStmt, MountDef, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs,
+    OutTail, Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, PrincipalDef, RateLimitAttrs,
     SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail, SurfaceDef, ToolBlock,
     TypedBlock, UNBOUNDED, UseStmt, UuidPin, Value, WordList,
 };
@@ -45,8 +45,8 @@ use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent,
     RAttachmentTarget, RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks,
     RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort, RPrincipal, RRateLimit,
-    RRemote, RSection, RStamp, RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal, RValue,
-    RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId, str_value,
+    RRemote, RRepoMount, RSection, RStamp, RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal,
+    RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId, StampOrigin, str_value,
 };
 use crate::roots::{RootList, RootSource, scan_roots};
 use crate::source::SourceFile;
@@ -63,6 +63,61 @@ const MODULE_EXT: &str = "brenn";
 /// `@` in a name, so no tree import can ever produce a key in this namespace.
 const PKG_SIGIL: &str = "@";
 
+/// What leads a mounted root's module key.
+///
+/// A config-carrying mount's tree is loaded under keys of its own so that two
+/// mounts each holding `helpers.brenn` are two modules. The grammar admits no
+/// `:` in a name, so no tree import and no packaged import can produce a key in
+/// this namespace.
+pub(crate) const MOUNT_SIGIL: &str = "mount:";
+
+/// The module key of a mounted root's entry file.
+fn mount_key(mount: &str) -> String {
+    format!("{MOUNT_SIGIL}{mount}")
+}
+
+/// The mounted root a module key belongs to, and the tree path within it.
+///
+/// `mount:automations` is the entry, whose path is empty; `mount:automations::a`
+/// is the tree module `a` of that root.
+fn mount_of(key: &str) -> Option<(&str, &str)> {
+    let rest = key.strip_prefix(MOUNT_SIGIL)?;
+    Some(match rest.split_once("::") {
+        Some((mount, path)) => (mount, path),
+        None => (rest, ""),
+    })
+}
+
+/// Whether a key names a file of some mounted root's tree.
+fn is_mounted(key: &str) -> bool {
+    key.starts_with(MOUNT_SIGIL)
+}
+
+/// The module key and display place for a config-carrying mount's file.
+///
+/// `module` is empty for the entry file. This is the single definition of the
+/// mount-key namespace; callers must not build `mount:<name>::…` by hand.
+pub fn mounted_module(mount: &str, module: &str) -> (String, PathBuf) {
+    let entry = mount_key(mount);
+    let key = match module.is_empty() {
+        true => entry,
+        false => tree_key(&entry, module),
+    };
+    let place = Loader::place(&key, Path::new(""));
+    (key, place)
+}
+
+/// A tree import written in `key`, as the key it resolves to.
+///
+/// A tree path is relative to the authority root it was written in, so a `use`
+/// in a fragment reaches the fragment's own tree and never the deployment's.
+fn tree_key(key: &str, module: &str) -> String {
+    match mount_of(key) {
+        Some((mount, _)) => format!("{MOUNT_SIGIL}{mount}::{module}"),
+        None => module.to_string(),
+    }
+}
+
 /// What a compile reads and nothing else: the root document and the module
 /// roots its packaged imports resolve against.
 ///
@@ -76,8 +131,93 @@ const PKG_SIGIL: &str = "@";
 pub struct DocumentInputs {
     pub root: PathBuf,
     pub module_roots: RootList,
+    /// The config-carrying mounts whose `config/` trees are part of this
+    /// document. Each is loaded, not searched; empty for every document that
+    /// is not a deployment read off a host's mounts.
+    pub mounted: Vec<MountedRoot>,
     /// Which vocabulary this document is being read as.
     pub role: DocumentRole,
+}
+
+/// One config-carrying mount, as a compile input.
+///
+/// A mount whose `config/` tree the document reads: its entry `main.brenn` is
+/// compiled as part of the deployment, under the ceiling of the principal the
+/// mounts document declared it `under`. Unlike a module root, it is not
+/// searched — it is loaded.
+///
+/// The two spans are the mounts document's, and they are what a refusal about
+/// the ceiling cites: the line naming the mount, and the `under` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedRoot {
+    /// The mount's name, which is the namespace its config declares under.
+    pub mount: String,
+    /// `<canonical mount path>/config`.
+    pub dir: PathBuf,
+    /// The principal the mount is under, as written.
+    pub under: String,
+    /// Where the mount's name was written.
+    pub span: Span,
+    /// Where the `under` clause was written.
+    pub under_span: Span,
+}
+
+/// One config-carrying mount named by a flag rather than by a mounts document.
+///
+/// `--mounted NAME=PRINCIPAL=DIR` is the workstation form: it certifies a root
+/// against the ceilings its host's mounts document names, with the fragment
+/// itself absent or supplied directly. A flag carries no document, and every
+/// refusal a mounted root can draw is positioned on one of its two spans —
+/// [`Diagnostic::at`] panics on a span with no filename — so the tool gives the
+/// flag one. The `mount` line the flag means is rendered, parsed under the
+/// flag's own text as its filename, and its spans are what a refusal cites.
+///
+/// The parse is also the whole grammar check on `NAME` and `PRINCIPAL`: a name
+/// the grammar does not admit, or a `::`-bearing ceiling, is refused here
+/// rather than by a second validator that would have to agree with it.
+///
+/// The rendered `path` is a placeholder and is never read. `DIR` is the config
+/// root itself — the directory holding `main.brenn` — the way `--modules DIR`
+/// names a module root directly; the `/config` join belongs to the mounts
+/// document's own builder, where `path` is a *mount* root.
+pub fn mounted_flag(flag: &str) -> Result<MountedRoot, String> {
+    let filename = format!("--mounted {flag}");
+    let mut parts = flag.splitn(3, '=');
+    let (Some(mount), Some(under), Some(dir)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(format!(
+            "{filename}: a mounted root is spelled NAME=PRINCIPAL=DIR — the mount's name, \
+             the principal its config runs under, and the directory holding its \
+             `main.{MODULE_EXT}`"
+        ));
+    };
+    let text = format!("mount {mount} under {under} {{\n    path = \"/m\";\n}}\n");
+    let file = crate::parse_str(&text, &filename).map_err(|error| error.to_string())?;
+    // One item, and it is the one that was rendered: a `NAME` carrying its own
+    // braces would otherwise parse as a second declaration nobody wrote.
+    let one = match file.items.len() {
+        1 => file.items.first().expect("one item"),
+        _ => return Err(format!("{filename}: this is not one mount declaration")),
+    };
+    let Item::Mount(def) = one.value() else {
+        return Err(format!("{filename}: this is not a mount declaration"));
+    };
+    if def.name.value() != mount {
+        return Err(format!("{filename}: `{mount}` is not a mount name"));
+    }
+    let Some(path) = def.under.as_ref() else {
+        return Err(format!("{filename}: `{under}` is not a principal name"));
+    };
+    let written = written_handle(path).map_err(|error| error.to_string())?;
+    if written.dotted() != under {
+        return Err(format!("{filename}: `{under}` is not a principal name"));
+    }
+    Ok(MountedRoot {
+        mount: mount.to_string(),
+        dir: PathBuf::from(dir),
+        under: under.to_string(),
+        span: one.span().clone(),
+        under_span: path.head.span().clone(),
+    })
 }
 
 /// What a document is, and with it what its top level admits.
@@ -92,6 +232,10 @@ pub enum DocumentRole {
     /// Every `@`-keyed module is read as one whatever the root's role is; the
     /// variant exists so a tool can read one directly as what it is.
     Packaged,
+    /// A config-carrying mount's own text: deployment statements under a
+    /// ceiling. Every `mount:`-keyed module is read as one whatever the root's
+    /// role is, the way a packaged module is.
+    Mounted,
 }
 
 impl DocumentInputs {
@@ -100,6 +244,7 @@ impl DocumentInputs {
         Self {
             root: root.into(),
             module_roots: RootList::default(),
+            mounted: Vec::new(),
             role: DocumentRole::Deployment,
         }
     }
@@ -109,6 +254,20 @@ impl DocumentInputs {
         Self {
             root: root.into(),
             module_roots: vec![module_root.into()].into(),
+            mounted: Vec::new(),
+            role: DocumentRole::Deployment,
+        }
+    }
+
+    /// A deployment document with a module root list and no mounted roots.
+    ///
+    /// For callers that name their module roots directly — the CLI, a check
+    /// tool, a test — rather than deriving them from a mounts document.
+    pub fn deployment(root: impl Into<PathBuf>, module_roots: impl Into<RootList>) -> Self {
+        Self {
+            root: root.into(),
+            module_roots: module_roots.into(),
+            mounted: Vec::new(),
             role: DocumentRole::Deployment,
         }
     }
@@ -118,6 +277,7 @@ impl DocumentInputs {
         Self {
             root: root.into(),
             module_roots: RootList::default(),
+            mounted: Vec::new(),
             role: DocumentRole::Mounts,
         }
     }
@@ -129,7 +289,7 @@ impl DocumentInputs {
 /// not populate them (it takes modules already in memory).
 pub fn compile(inputs: &DocumentInputs) -> Result<DerivedConfig, Vec<Diagnostic>> {
     let Loaded { modules, sources } = load(inputs)?;
-    let config = resolve_files(modules, ROOT_KEY, inputs.role)?;
+    let config = resolve_files(modules, ROOT_KEY, inputs.role, &inputs.mounted)?;
     Ok(crate::derive::derive(config)?.with_files(sources))
 }
 
@@ -146,6 +306,7 @@ pub fn resolve_files(
     files: Vec<(String, File)>,
     root: &str,
     role: DocumentRole,
+    mounted: &[MountedRoot],
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     assert!(
         files.iter().any(|(key, _)| key == root),
@@ -153,16 +314,21 @@ pub fn resolve_files(
     );
     let mut errors = Vec::new();
     check_document_discipline(&files, role, &mut errors);
+    check_mount_names(&files, mounted, &mut errors);
     let mut index = Index::build(&files, &mut errors);
     index.resolve_constants(&files, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
-    let Emitted { config, withheld } = emit_entities(&index, files, &mut errors);
+    let Emitted {
+        mut config,
+        withheld,
+    } = emit_entities(&index, files, mounted, &mut errors);
     check_identity(&config, &mut errors);
     check_grants(&config, &withheld, &mut errors);
     check_principal_chains(&config, &mut errors);
-    check_addresses(&config, &mut errors);
+    check_mount_ceilings(&config, &withheld, &mut errors);
+    check_addresses(&mut config, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -183,6 +349,27 @@ const MOUNTS_REFUSAL: &str = "a mounts document declares mounts and constants an
 const MOUNT_IN_DEPLOYMENT_REFUSAL: &str = "a `mount` is declared in the mounts document named by `--mounts`, not in a deployment \
      document: a mount path is a fact about one host and a deployment document is \
      host-independent";
+
+/// What a fragment is refused a `channel at` block with.
+const MOUNTED_TUNING_REFUSAL: &str = "a mount's config sizes the channels it declares; a family the deployment mints \
+     is the deployment's to tune";
+
+/// What a fragment is refused a `component` declaration with.
+const MOUNTED_CLASS_REFUSAL: &str = "a mount's config instantiates component classes and declares none; a class is \
+     declared by the package that ships it and reached with `use @<name>::*;`";
+
+/// What a fragment is refused a top-level `grant` with.
+const MOUNTED_GRANT_REFUSAL: &str = "a top-level `grant` aims authority at an entity outside this mount's namespace; \
+     a mount's config grants only in the bodies it stamps";
+
+/// What a fragment is refused a top-level `acl` with.
+///
+/// Its own sentence rather than the `grant` one: the two items are refused for
+/// the same reason and an author who pasted an `acl` is told about the item
+/// they wrote.
+const MOUNTED_ACL_REFUSAL: &str = "an acl statement needs an enclosing entity body; a mount's config writes its \
+     `acl` lines in the bodies it stamps, and a top-level one would aim authority \
+     outside this mount's namespace";
 
 /// Hold every file to the discipline of the role it is read under.
 ///
@@ -228,6 +415,8 @@ fn check_document_discipline(
         // tree module of a deployment document to the deployment vocabulary.
         let role = if is_packaged(key) {
             DocumentRole::Packaged
+        } else if is_mounted(key) {
+            DocumentRole::Mounted
         } else {
             role
         };
@@ -235,6 +424,7 @@ fn check_document_discipline(
             DocumentRole::Packaged => check_packaged_file(file, errors),
             DocumentRole::Mounts => check_mounts_file(file, errors),
             DocumentRole::Deployment => check_deployment_file(file, errors),
+            DocumentRole::Mounted => check_mounted_file(file, errors),
         }
     }
 }
@@ -266,6 +456,94 @@ fn check_packaged_file(file: &File, errors: &mut Vec<Diagnostic>) {
                 item.span().clone(),
             )),
             _ => errors.push(Diagnostic::at(DISCIPLINE_REFUSAL, item.span().clone())),
+        }
+    }
+}
+
+/// Hold a config-carrying mount's own text to what a ceiling can bound.
+///
+/// A fragment places components and channels and wires them. What it may not
+/// write is of two kinds. A **host fact** — a path, a secret file, a container
+/// setting — is the operator's because it is about this machine and not about
+/// the arrangement. An **entity whose authority is not spelled in ceiling
+/// words** — an agent's model and MCP servers, a surface, a remote — cannot be
+/// capped by the principal the mount is `under`, so admitting one would be
+/// authority no `under` line bounds.
+///
+/// Two refusals are their own sentences rather than the general one, because
+/// what is wrong with them is not that they are effectful:
+///
+/// - A **tuning** (`channel at prefix "…"`) names a system-minted family by raw
+///   address — the `mqtt:` and `webhook:` families a deployment's own blocks
+///   mint. It carries no stamp, so nothing would bound it, and a fragment
+///   tuning the operator's broker family would reach the ceiling never
+///   granted.
+/// - A **component class** is declared by its package. A fragment reaches
+///   classes through `use @…`, the way every deployment does.
+///
+/// A `principal` is admitted: a fragment slices its own ceiling for what it
+/// stamps, and every chain it writes bottoms out at the principal the mounts
+/// document names, never at the operator.
+///
+/// The walk stops at the item level, as the packaged one does: an assembly a
+/// fragment stamps may place a surface in its body, and refusing that is the
+/// expansion pass's, at the `new` that is the consent.
+fn check_mounted_file(file: &File, errors: &mut Vec<Diagnostic>) {
+    for item in &file.items {
+        match item.value() {
+            Item::ConstDef(_)
+            | Item::Assembly(_)
+            | Item::Link(_)
+            | Item::Inst(_)
+            | Item::Principal(_)
+            | Item::UuidPins(_) => {}
+            Item::Channel(def) => {
+                if let crate::model::ChannelDef::Tuning(_) = &**def {
+                    errors.push(Diagnostic::at(MOUNTED_TUNING_REFUSAL, item.span().clone()));
+                }
+            }
+            Item::Component(_) => {
+                errors.push(Diagnostic::at(MOUNTED_CLASS_REFUSAL, item.span().clone()));
+            }
+            Item::Mount(_) => {
+                errors.push(Diagnostic::at(
+                    MOUNT_IN_DEPLOYMENT_REFUSAL,
+                    item.span().clone(),
+                ));
+            }
+            Item::Grant(_) => {
+                errors.push(Diagnostic::at(MOUNTED_GRANT_REFUSAL, item.span().clone()));
+            }
+            Item::Acl(_) => {
+                errors.push(Diagnostic::at(MOUNTED_ACL_REFUSAL, item.span().clone()));
+            }
+            Item::Agent(_)
+            | Item::Surface(_)
+            | Item::Remote(_)
+            | Item::Webhook(_)
+            | Item::Repo(_)
+            | Item::MqttClient(_)
+            | Item::McpServer(_) => {
+                let kindword =
+                    declared_name(item.value()).map_or("that", |(kind, _)| kind.describe());
+                errors.push(Diagnostic::at(
+                    format!(
+                        "a mount's config places components and channels; {kindword} is the \
+                         deployment's to declare"
+                    ),
+                    item.span().clone(),
+                ));
+            }
+            Item::Section(node) => {
+                let (kindword, span) = crate::model::section_kindword(node);
+                errors.push(Diagnostic::at(
+                    format!(
+                        "a mount's config places components and channels; the `{kindword}` \
+                         section is the deployment's to write"
+                    ),
+                    span,
+                ));
+            }
         }
     }
 }
@@ -320,6 +598,11 @@ fn load(inputs: &DocumentInputs) -> Result<Loaded, Vec<Diagnostic>> {
     }
     let mut loader = Loader {
         root_dir,
+        mounted: inputs
+            .mounted
+            .iter()
+            .filter_map(|mounted| Some((mounted.mount.clone(), mounted_dir(&mounted.dir)?)))
+            .collect(),
         module_roots: inputs.module_roots.clone(),
         reported_missing_module_root: false,
         files: Vec::new(),
@@ -329,6 +612,63 @@ fn load(inputs: &DocumentInputs) -> Result<Loaded, Vec<Diagnostic>> {
         errors: Vec::new(),
     };
     loader.visit(ROOT_KEY.to_string(), root.to_path_buf(), &mut Vec::new());
+    // Each mounted root after the deployment tree and in declaration order:
+    // the document identity is the read order, and a fragment is part of the
+    // document rather than something the root reaches by import.
+    for mounted in &inputs.mounted {
+        let entry = mounted.dir.join(format!("main.{MODULE_EXT}"));
+        let Some(root) = loader.mounted.get(&mounted.mount).cloned() else {
+            // Two faults share this arm because one test tells them apart: the
+            // tree is absent, or it is there and is not a directory of its own.
+            let message = match mounted.dir.symlink_metadata() {
+                Ok(_) => format!(
+                    "`{}`: `{}` is not a directory of its own; a mount's config tree is \
+                     read as the directory it is, so that nothing under it can name a \
+                     file outside it",
+                    mounted.mount,
+                    mounted.dir.display()
+                ),
+                // A `config/` tree with no entry is a document fact, not a mount
+                // fact, so it is reported here with every other document refusal —
+                // positioned at the line of the mounts document that declared it.
+                Err(_) => format!(
+                    "`{}` carries config and `{}` is not there",
+                    mounted.mount,
+                    entry.display()
+                ),
+            };
+            loader
+                .errors
+                .push(Diagnostic::at(message, mounted.span.clone()));
+            continue;
+        };
+        // Containment is settled on the link itself, before following it.
+        // A link outside the tree gets one refusal whether or not its target
+        // exists — varying the answer would leak host-path information.
+        let absent = match entry.symlink_metadata() {
+            Err(_) => true,
+            Ok(_) if !within(&entry, &root) => {
+                loader.errors.push(Diagnostic::at(
+                    escapes(&entry, &mounted.mount),
+                    mounted.span.clone(),
+                ));
+                continue;
+            }
+            Ok(_) => !entry.is_file(),
+        };
+        if absent {
+            loader.errors.push(Diagnostic::at(
+                format!(
+                    "`{}` carries config and `{}` is not there",
+                    mounted.mount,
+                    entry.display()
+                ),
+                mounted.span.clone(),
+            ));
+            continue;
+        }
+        loader.visit(mount_key(&mounted.mount), entry, &mut Vec::new());
+    }
     if !loader.errors.is_empty() {
         return Err(loader.errors);
     }
@@ -394,8 +734,55 @@ fn check_module_roots(module_roots: &RootList, root: &Path) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// A config-carrying mount's `config/` directory as the kernel sees it, or
+/// `None` when it is absent or is not a directory of its own.
+///
+/// The mount author owns every byte under `config/`, symbolic links included,
+/// and a clone lays them down as they were committed. Refusing a linked tree
+/// root here is what makes [`within`] a containment rule rather than a
+/// formality: with `config` itself a link, every file "inside" it would be
+/// inside whatever it points at.
+fn mounted_dir(dir: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    dir.canonicalize().ok()
+}
+
+/// Whether a path names a file inside `root`, with every link followed first.
+///
+/// The grammar bounds a tree *key* — no `..`, no absolute head — which is a
+/// statement about names and none about inodes. A fragment file may be a
+/// symbolic link to anything the server's user can read: the operator's own
+/// root document, a webhook secret, a broker password. Parsing one and
+/// reporting on it turns the compiler into a file oracle over the host, on the
+/// channel the mount author already reads. So the rule is about inodes:
+/// canonicalize, and require the mount's own canonical directory as a prefix.
+fn within(path: &Path, root: &Path) -> bool {
+    matches!(path.canonicalize(), Ok(real) if real.starts_with(root))
+}
+
+/// What a fragment file that leaves its mount is refused with.
+///
+/// It names the path as written and never what the link resolves to: the
+/// resolved path is a fact about the host the mount author is being kept from
+/// learning, and this text reaches them on `brenn:config.status`.
+fn escapes(path: &Path, mount: &str) -> String {
+    format!(
+        "`{}` leaves the config tree of mount `{mount}`: a mount's config is read only \
+         from the directory the mounts document declares, so a link out of it is not a \
+         module",
+        path.display()
+    )
+}
+
 struct Loader {
     root_dir: PathBuf,
+    /// Each config-carrying mount's `config/` directory, by mount name. A
+    /// `mount:`-keyed module's tree path resolves under its own entry, never
+    /// under the deployment's root directory.
+    mounted: HashMap<String, PathBuf>,
     /// Where `@` imports resolve, in the order the caller named them. Empty is
     /// not a default: a document that reaches for a packaged module without one
     /// is refused naming what should have offered one. A module is under exactly
@@ -449,7 +836,13 @@ impl Loader {
             .iter()
             .filter(|stmt| !packaged || stmt.pkg)
             .filter_map(|stmt| use_target(stmt).and_then(Result::ok))
-            .map(|target| (target.module, target.span))
+            .map(|target| {
+                let module = match target.module.starts_with(PKG_SIGIL) {
+                    true => target.module,
+                    false => tree_key(&key, &target.module),
+                };
+                (module, target.span)
+            })
             .collect();
         self.sources.push(SourceFile {
             path: place,
@@ -480,7 +873,7 @@ impl Loader {
                     self.seen.insert(module, PathBuf::new());
                     continue;
                 }
-                Located::Missing(message) => {
+                Located::Missing(message) | Located::Outside(message) => {
                     self.errors.push(Diagnostic::at(message, span));
                     // Poison it so a second `use` of the same missing module is
                     // not a second report of the same absence.
@@ -520,18 +913,52 @@ impl Loader {
     /// already refused a name present under two, so the first root holding it
     /// is the only one.
     fn locate(&self, key: &str) -> Located {
-        let relative = Self::relative_path(key);
         if !is_packaged(key) {
-            let path = self.root_dir.join(&relative);
-            return if path.is_file() {
-                Located::File(path)
-            } else {
+            let mounted = mount_of(key);
+            let (root_dir, relative) = match mounted {
+                // The entry file is visited directly, never reached by a `use`,
+                // so a mounted key here always carries a tree path. The recorded
+                // directory is canonical, which is what `within` compares
+                // against.
+                Some((mount, path)) => (
+                    self.mounted
+                        .get(mount)
+                        .cloned()
+                        .expect("a mounted key names a declared mount"),
+                    Self::path_of(path),
+                ),
+                None => (self.root_dir.clone(), Self::relative_path(key)),
+            };
+            let path = root_dir.join(&relative);
+            let missing = || {
                 Located::Missing(format!(
-                    "no module `{key}`: expected `{}`",
-                    display_relative(&path, &self.root_dir)
+                    "no module `{}`: expected `{}`",
+                    module_label(key),
+                    display_relative(&path, &root_dir)
                 ))
             };
+            // Under a mount, containment is decided before existence and on the
+            // name rather than on what it resolves to. Asking `is_file` first
+            // follows the link, so the choice between "no module" and "leaves
+            // the config tree" would be a fact about a host path the author is
+            // being kept from learning: one `use` per probe, answered on
+            // `brenn:config.status`. Everything outside the tree gets one
+            // answer, whether or not it is there.
+            if let Some((mount, _)) = mounted {
+                match std::fs::symlink_metadata(&path) {
+                    Err(_) => return missing(),
+                    Ok(_) if !within(&path, &root_dir) => {
+                        return Located::Outside(escapes(&path, mount));
+                    }
+                    Ok(_) => {}
+                }
+            }
+            if !path.is_file() {
+                return missing();
+            }
+            return Located::File(path);
         }
+        let relative = Self::relative_path(key);
         if self.module_roots.is_empty() {
             return Located::NoModuleRoot;
         }
@@ -556,6 +983,13 @@ impl Loader {
         if key == ROOT_KEY {
             return PathBuf::from(path.file_name().unwrap_or(path.as_os_str()));
         }
+        if let Some((mount, tree)) = mount_of(key) {
+            let within = match tree.is_empty() {
+                true => PathBuf::from(format!("main.{MODULE_EXT}")),
+                false => Self::path_of(tree),
+            };
+            return PathBuf::from(format!("{MOUNT_SIGIL}{mount}")).join(within);
+        }
         let relative = Self::relative_path(key);
         if !is_packaged(key) {
             return relative;
@@ -565,8 +999,13 @@ impl Loader {
 
     /// A module key as a path under whichever root it resolves against.
     fn relative_path(key: &str) -> PathBuf {
+        Self::path_of(module_name(key))
+    }
+
+    /// `::`-joined segments as a path, with the module extension.
+    fn path_of(name: &str) -> PathBuf {
         let mut path = PathBuf::new();
-        for segment in module_name(key).split("::") {
+        for segment in name.split("::") {
             path.push(segment);
         }
         path.set_extension(MODULE_EXT);
@@ -582,6 +1021,8 @@ enum Located {
     /// A file that is not on disk, with the message that says where it was
     /// looked for.
     Missing(String),
+    /// A fragment file that resolves outside the mount it was reached through.
+    Outside(String),
 }
 
 /// What a packaged module that is not on disk is reported as.
@@ -1983,8 +2424,19 @@ struct Scope<'a> {
     /// The instantiation's bindings, where there is an instantiation.
     params: Option<&'a ParamBindings>,
     /// The handle every entity of this body is stamped under, where the body is
-    /// an assembly's.
+    /// an assembly's. Relative to the authority root: it is what the handle
+    /// tables are keyed by, and a reference written in the same authority root
+    /// spells it.
     prefix: Option<&'a HandlePath>,
+    /// The authority root's own namespace: the mount's name where this is a
+    /// config-carrying mount's text, and nothing where it is the deployment's.
+    /// It leads every handle that is *emitted* and no handle that is looked up,
+    /// because a fragment's references are written in its own terms.
+    mount: Option<&'a HandlePath>,
+    /// The mount's ceiling, where this is a config-carrying mount's top level.
+    /// A `principal` written here with no `under` takes it as its parent. Only
+    /// the top level carries it: a `principal` is an item, never a body's.
+    ceiling: Option<&'a HandlePath>,
     /// The file the top-level instantiation was written in. Stamped handles
     /// belong to it rather than to the file that declared the assembly, because
     /// that is the file a reference from outside reaches them through.
@@ -2004,6 +2456,8 @@ impl<'a> Scope<'a> {
             outer: FileScope::in_file(index, file, channels, links, stamps),
             params: None,
             prefix: None,
+            mount: None,
+            ceiling: None,
             root: file,
         }
     }
@@ -2033,9 +2487,29 @@ impl<'a> Scope<'a> {
             .collect()
     }
 
+    /// The handle an entity written here is looked up by: what a reference in
+    /// the same authority root spells, and what the handle tables are keyed by.
+    fn key(&self, name: Spanned<String>) -> HandlePath {
+        HandlePath::stamp(self.prefix, name)
+    }
+
     /// The handle an entity written here is stamped under.
     fn handle(&self, name: Spanned<String>) -> HandlePath {
-        HandlePath::stamp(self.prefix, name)
+        namespaced(self.mount, self.key(name))
+    }
+
+    /// The handle a `principal` named here carries.
+    ///
+    /// One segment under the authority root's namespace, never under the
+    /// enclosing body's prefix: a principal belongs to the text that declares
+    /// it, and a `new y: B under q` written at any depth of a fragment's own
+    /// assembly names the same `q` the fragment's top level declared. Every
+    /// site that mints or resolves one goes through this: a handle minted bare
+    /// where the model holds a namespaced one reads in derivation as a stamp
+    /// under a label with no authority, which is an assertion rather than a
+    /// refusal.
+    fn principal_handle(&self, name: Spanned<String>) -> HandlePath {
+        HandlePath::stamp(self.mount, name)
     }
 
     /// What this body stamped in one handle space under the name a path spells.
@@ -2269,14 +2743,218 @@ impl Emitted {
 
 /// Resolve every class-free declaration in every file.
 ///
+/// What a config-carrying mount's files resolve under.
+///
+/// One per mounted root, shared by every file of its tree: the stamp the mount
+/// is recorded as, and the handle everything it declares hangs beneath.
+struct MountSite {
+    stamp: StampId,
+    prefix: HandlePath,
+    /// The principal the mounts document declares the mount `under`. A
+    /// principal the fragment declares with no `under` of its own hangs here,
+    /// which is what roots every chain in a fragment at the ceiling.
+    ceiling: HandlePath,
+}
+
+/// Every config-carrying mount, as expansion needs it.
+///
+/// One argument rather than two: the stamps seed the recorded list and the
+/// sites index the files, and a call that passed one without the other would
+/// expand a fragment under a stamp nothing recorded.
+struct Fragments<'a> {
+    /// The mount stamps, in `MountedRoot` order, which is `StampId` order.
+    stamps: Vec<RStamp>,
+    /// Parallel to the loaded files: what each one resolves under.
+    sites: &'a [Option<MountSite>],
+}
+
+/// Mint one stamp per config-carrying mount, and say which files belong to it.
+///
+/// The stamps come first in the recorded list, before expansion records any of
+/// its own, because a [`StampId`] is a position in that list and the frames the
+/// fragments are expanded under carry one.
+///
+/// A mount stamp writes no body: `wrote_body = false` is what makes its ceiling
+/// exactly the principal it is `under` — the narrowing and dead-ceiling passes
+/// both return at once for a stamp that wrote nothing — and the mount is the
+/// operator's declaration of that boundary, not a narrowing of it.
+fn mount_sites(
+    files: &[(String, File)],
+    mounted: &[MountedRoot],
+) -> (Vec<RStamp>, Vec<Option<MountSite>>) {
+    let stamps: Vec<RStamp> = mounted
+        .iter()
+        .map(|root| RStamp {
+            handle: HandlePath(vec![Spanned::new(root.mount.clone(), root.span.clone())]),
+            origin: StampOrigin::Mount,
+            package: None,
+            packaged_site: false,
+            parent: None,
+            under: Some(HandlePath(vec![Spanned::new(
+                root.under.clone(),
+                root.under_span.clone(),
+            )])),
+            under_span: Some(root.under_span.clone()),
+            wrote_body: false,
+            grants: None,
+            acls: Vec::new(),
+            handed: Vec::new(),
+            span: root.span.clone(),
+        })
+        .collect();
+    let slots: HashMap<&str, usize> = mounted
+        .iter()
+        .enumerate()
+        .map(|(index, root)| (root.mount.as_str(), index))
+        .collect();
+    let sites = files
+        .iter()
+        .map(|(key, _)| {
+            let (mount, _) = mount_of(key)?;
+            let index = *slots.get(mount)?;
+            Some(MountSite {
+                stamp: StampId(index),
+                prefix: HandlePath(vec![Spanned::new(
+                    mounted[index].mount.clone(),
+                    mounted[index].span.clone(),
+                )]),
+                ceiling: HandlePath(vec![Spanned::new(
+                    mounted[index].under.clone(),
+                    mounted[index].under_span.clone(),
+                )]),
+            })
+        })
+        .collect();
+    (stamps, sites)
+}
+
+/// Refuse a mount name that a deployment-tree file already declares.
+///
+/// A mount's name prefixes every handle its config declares, so a deployment
+/// handle of the same name and a fragment handle under it are two spellings
+/// that read as one another's. The mount's name is the mounts document's and
+/// the handle is the deployment's; either is editable, and the refusal names
+/// both so it is clear which.
+fn check_mount_names(
+    files: &[(String, File)],
+    mounted: &[MountedRoot],
+    errors: &mut Vec<Diagnostic>,
+) {
+    if mounted.is_empty() {
+        return;
+    }
+    let names: HashMap<&str, &MountedRoot> = mounted
+        .iter()
+        .map(|root| (root.mount.as_str(), root))
+        .collect();
+    for (key, file) in files {
+        if is_packaged(key) || is_mounted(key) {
+            continue;
+        }
+        for item in &file.items {
+            let Some((kind, name)) = declared_name(item.value()) else {
+                continue;
+            };
+            let Some(root) = names.get(name.value().as_str()) else {
+                continue;
+            };
+            errors.push(two_site(
+                format!(
+                    "`{}` is a mount and {} here; a mount's name prefixes everything its \
+                     config declares",
+                    root.mount,
+                    kind.describe()
+                ),
+                root.span.clone(),
+                "the handle it collides with",
+                name.span().clone(),
+            ));
+        }
+    }
+}
+
+/// Refuse a config-carrying mount whose ceiling names no principal.
+///
+/// The mount stamp is minted before any principal is emitted — `under` is
+/// carried from the mounts document, where no principal can be declared — so
+/// the name is checked here, once every principal the deployment writes is in
+/// the model. It has to be a refusal and not a later assertion: derivation
+/// resolves a stamp's `under` through a map it expects resolution to have
+/// filled, and reaches an `unreachable!` for a label with no authority.
+fn check_mount_ceilings(
+    config: &ResolvedConfig,
+    withheld: &Withheld,
+    errors: &mut Vec<Diagnostic>,
+) {
+    for stamp in &config.stamps {
+        if !stamp.is_mount() {
+            continue;
+        }
+        let Some(under) = &stamp.under else {
+            continue;
+        };
+        let label = under.dotted();
+        let declared = config
+            .principals
+            .iter()
+            .find(|principal| principal.handle.dotted() == label);
+        match declared.map(|principal| principal.origin) {
+            // The deployment's own: what a ceiling is.
+            Some(None) => continue,
+            // A fragment's. A mount's ceiling is the operator's to write, and a
+            // mount naming one a mount declares would be a ceiling inside the
+            // authority it bounds. Only reachable across authority roots, since
+            // a fragment principal's handle leads with its own mount's name.
+            Some(Some(StampId(origin))) => {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`{}` is under `{label}`, which the mount `{}` declares; a mount's \
+                         ceiling is the deployment's to write",
+                        stamp.handle.dotted(),
+                        config.stamps[origin].handle.dotted()
+                    ),
+                    stamp
+                        .under_span
+                        .clone()
+                        .expect("a mount stamp carries its `under` clause"),
+                ));
+                continue;
+            }
+            None => {}
+        }
+        // A principal whose own body was refused was withheld where it was
+        // written, and that diagnostic is the answer; a second one here would
+        // send the operator to the mounts document for a fault in the root.
+        if withheld.grantable(&label) || withheld.handles.contains_key(&label) {
+            continue;
+        }
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` is under `{label}`, which the deployment declares no `principal` for",
+                stamp.handle.dotted()
+            ),
+            stamp
+                .under_span
+                .clone()
+                .expect("a mount stamp carries its `under` clause"),
+        ));
+    }
+}
+
 /// Channels go first and in two steps — every address, then every body —
 /// because a matcher elsewhere in the document names a channel by handle and
 /// gets a [`ChanId`] back, and an address itself can name no channel.
 fn emit_entities(
     index: &Index,
     files: Vec<(String, File)>,
+    mounted: &[MountedRoot],
     errors: &mut Vec<Diagnostic>,
 ) -> Emitted {
+    // Every file of a config-carrying mount's tree resolves under that mount's
+    // stamp and stamps its handles under the mount's name. The stamps are
+    // minted here, before anything is emitted, because a `StampId` is a
+    // position in the recorded list and the frames expansion builds carry one.
+    let (mount_stamps, sites) = mount_sites(&files, mounted);
     // Taken before the files are consumed into their item lists: a class's
     // identity is its declaring file's, and only the file carries it.
     let declaring: Vec<Declaring> = files
@@ -2289,6 +2967,7 @@ fn emit_entities(
     let modules: Vec<Vec<Spanned<Item>>> = files.into_iter().map(|(_, file)| file.items).collect();
     let mut config = Emitted::default();
     let (mut channels, declared, minted) = channel_addresses(index, &modules, errors);
+
     let (mut links, minted_links) = link_handles(&modules);
     let mut stamps = StampTable::default();
     // Expansion runs between the addresses and the bodies: an assembly stamps
@@ -2310,6 +2989,10 @@ fn emit_entities(
             &mut handles,
             &mut stamps,
             (minted, minted_links),
+            Fragments {
+                stamps: mount_stamps,
+                sites: &sites,
+            },
             errors,
         )
     };
@@ -2348,7 +3031,14 @@ fn emit_entities(
     );
 
     for (position, items) in modules.into_iter().enumerate() {
-        let scope = Scope::top(index, position, &channels, &links, &stamps);
+        let site = sites[position].as_ref();
+        let mut scope = Scope::top(index, position, &channels, &links, &stamps);
+        // A fragment's top level is the mount's body: its handles hang beneath
+        // the mount's name, and what it emits belongs to the mount's stamp.
+        if let Some(site) = site {
+            scope.mount = Some(&site.prefix);
+            scope.ceiling = Some(&site.ceiling);
+        }
         for (offset, item) in items.into_iter().enumerate() {
             // Only a section can be in the set, and a refused one is dropped
             // whole rather than resolved.
@@ -2356,6 +3046,7 @@ fn emit_entities(
                 continue;
             }
             let declaration = declared.get(&(position, offset)).cloned();
+            let marks = Marks::of(&config);
             emit_item(
                 item.into_value(),
                 declaration,
@@ -2365,6 +3056,10 @@ fn emit_entities(
                 &mut config,
                 errors,
             );
+            if let Some(site) = site {
+                check_mounted_kinds(marks, &config, &config.stamps[site.stamp.0], errors);
+            }
+            marks.attribute(&mut config, site.map(|site| site.stamp));
         }
     }
     // Stamped channels take the ids after every declared one, and they were
@@ -2568,7 +3263,43 @@ fn emit_item(
         }
         // An mcp server has no wire identity of its own, so nothing to check.
         Item::McpServer(def) => emit_named!(def, config.mcp_servers, None),
-        Item::Mount(def) => emit_named!(def, config.mounts, Some(Family::Mount)),
+        // A mount is the one `keyword name { attrs }` form with a clause of
+        // its own, so it does not go through `emit_named!`.
+        Item::Mount(def) => {
+            let MountDef {
+                doc,
+                name,
+                under,
+                body,
+            } = *def;
+            let (attrs, mut refused) = resolve_attrs(body.attrs, scope, errors);
+            let handle = HandlePath(vec![name]);
+            let mut ceiling = None;
+            let mut under_span = None;
+            if let Some(path) = under {
+                under_span = Some(path.head.span().clone());
+                match written_handle(&path) {
+                    Ok(written) => ceiling = Some(written),
+                    Err(error) => {
+                        errors.push(error);
+                        refused.drop_part();
+                    }
+                }
+            }
+            match refused.any() {
+                true => {
+                    check_charset(&named_slug(&handle), Family::Mount, errors);
+                    config.withhold(&handle, Grantable::No);
+                }
+                false => config.mounts.push(RMount {
+                    handle,
+                    attrs,
+                    under: ceiling,
+                    under_span,
+                    doc,
+                }),
+            }
+        }
         Item::Acl(stmt) => errors.push(Diagnostic::at(
             "an acl statement needs an enclosing entity body (surface, agent, remote, \
              or a new instance); at top level, grant authority to a named running \
@@ -2672,12 +3403,13 @@ fn emit_link(stmt: LinkStmt, scope: &Scope<'_>, config: &mut Emitted) {
     // walk over the same items in the same order.
     let id = LinkId(config.links.len());
     let span = stmt.handle.span().clone();
+    let key = scope.key(stmt.handle.clone()).dotted();
     let handle = scope.handle(stmt.handle);
     assert_eq!(
         scope
             .outer
             .links
-            .get(scope.root, &handle.dotted())
+            .get(scope.root, &key)
             .map(|declared| declared.0),
         Some(id.0),
         "a link's id is its position in the resolved config"
@@ -2870,6 +3602,8 @@ fn emit_pin(pin: UuidPin) -> Result<RPin, Diagnostic> {
     Ok(RPin {
         address,
         uuid: spanned_str(&pin.uuid)?,
+        // Attributed with everything else the item emitted.
+        origin: None,
     })
 }
 
@@ -2973,7 +3707,7 @@ fn emit_principal(
     config: &mut Emitted,
     errors: &mut Vec<Diagnostic>,
 ) {
-    let handle = HandlePath(vec![def.name.clone()]);
+    let handle = scope.principal_handle(def.name.clone());
     let span = def.name.span().clone();
     let mut refused = Refused::default();
     for (key, value) in def.attrs.entries() {
@@ -3003,7 +3737,11 @@ fn emit_principal(
                 None
             }
         },
-        None => None,
+        // A fragment's implicit root. The ceiling has no name inside the mount
+        // — the fragment's files cannot see a deployment handle — so the
+        // resolver fills it in, and every chain the fragment writes ends at the
+        // principal the mounts document named instead of at the operator.
+        None => scope.ceiling.cloned(),
     };
     if refused.any() {
         config.withhold(&handle, Grantable::No);
@@ -3012,6 +3750,8 @@ fn emit_principal(
     config.principals.push(RPrincipal {
         handle,
         parent,
+        // Filled during attribution by the caller's `Marks`.
+        origin: None,
         grants,
         acls,
         span,
@@ -3032,6 +3772,11 @@ const STAMP_UNDER_READING: &str = "a stamp is under a `principal`";
 /// may name is another `principal` declaration. A running entity is refused by
 /// name: an agent's authority is partly derived from its own wiring, and what
 /// it would mean for an arrangement to hold exactly that is not decided.
+///
+/// The handle comes back namespaced by the authority root the clause is written
+/// in, not by the enclosing body: this is reached from a `principal`'s own
+/// `under` at a file's top level and from a stamp's `under` at any depth of an
+/// assembly body, and a fragment's `q` is one handle from both.
 fn principal_under(
     path: &PathRef,
     scope: &Scope<'_>,
@@ -3050,7 +3795,7 @@ fn principal_under(
             symbol.span.clone(),
         ));
     }
-    Ok(HandlePath(vec![Spanned::new(name, span)]))
+    Ok(scope.principal_handle(Spanned::new(name, span)))
 }
 
 /// The `acl` statements of an entity body, resolved.
@@ -4727,6 +5472,9 @@ fn emit_agent(
         ),
         params: Some(&params),
         prefix: None,
+        mount: None,
+        // A class body declares no principal.
+        ceiling: None,
         root: symbol.file,
     };
     let class = (**class).clone();
@@ -4984,7 +5732,14 @@ fn bind_entity(
             ParamVal::Agent(handle)
         }
         ParamType::Repo if symbol.kind == SymKind::Repo => ParamVal::Repo(handle),
-        ParamType::Principal if symbol.kind == SymKind::Principal => ParamVal::Principal(handle),
+        // Namespaced where an agent's and a repo's handles are not: a fragment
+        // declares neither of those, and the handle bound here is what
+        // `handed_principals` records and what a `new … under <param>` inside
+        // the arrangement resolves to. Bare, it would name no principal the
+        // model holds.
+        ParamType::Principal if symbol.kind == SymKind::Principal => {
+            ParamVal::Principal(scope.principal_handle(Spanned::new(name.clone(), span.clone())))
+        }
         ParamType::Agent | ParamType::Repo | ParamType::Principal => {
             return Err(two_site(
                 format!(
@@ -5171,7 +5926,7 @@ fn emit_mounts(
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
     refused: &mut Refused,
-) -> Vec<RMount> {
+) -> Vec<RRepoMount> {
     let mut resolved = Vec::new();
     for mount in mounts {
         let span = mount.repo.head.span().clone();
@@ -5191,13 +5946,37 @@ fn emit_mounts(
             refused.drop_part();
             continue;
         }
-        resolved.push(RMount {
+        resolved.push(RRepoMount {
             repo_span: Spanned::new(mount.repo.head.value().clone(), span),
             repo,
             tail,
         });
     }
     resolved
+}
+
+/// A path as a handle, with no lookup: the name as the author wrote it.
+///
+/// For a position whose symbol is not in this document's scope — a mount's
+/// `under`, which names a principal of the deployment document and is resolved
+/// there. A `::` segment is a module qualification, which no handle carries.
+fn written_handle(path: &PathRef) -> Result<HandlePath, Diagnostic> {
+    let mut segments = vec![path.head.clone()];
+    for segment in &path.segs {
+        match segment {
+            PathSeg::Inst(seg) => segments.push(seg.name.clone()),
+            PathSeg::Module(seg) => {
+                return Err(Diagnostic::at(
+                    format!(
+                        "`{}` is a module path; a principal is named by its handle",
+                        path.spelling(),
+                    ),
+                    seg.name.span().clone(),
+                ));
+            }
+        }
+    }
+    Ok(HandlePath(segments))
 }
 
 /// What a `mount` names: a `repo` declaration, or a `Repo` parameter bound to
@@ -5232,6 +6011,8 @@ fn resolve_repo(path: &PathRef, scope: &Scope<'_>) -> Result<HandlePath, Diagnos
             symbol.span.clone(),
         ));
     }
+    // Never namespaced: a repo handle is the deployment's, and `principal_handle`
+    // is the answer for principals alone.
     Ok(HandlePath(vec![Spanned::new(name, span)]))
 }
 
@@ -5948,8 +6729,8 @@ fn stamp_record(
     handed.sort_by_key(|id| id.0);
     handed.dedup();
     Some(Some(RStamp {
-        handle: parent.stamp(inst.handle.clone()),
-        assembly: def.name.clone(),
+        handle: parent.handle(inst.handle.clone()),
+        origin: StampOrigin::Assembly(def.name.clone()),
         package,
         packaged_site,
         parent: parent.stamp,
@@ -6028,9 +6809,15 @@ struct Frame {
     /// belong to that file, because that is where a reference from outside
     /// reaches them through the instance's name.
     root: usize,
-    /// The handle the body's entities hang beneath. Always set for a body; the
-    /// top-level frame has none, which is what makes it the top level.
+    /// The handle the body's entities hang beneath, relative to the authority
+    /// root. Always set for a body; the top-level frame has none, which is what
+    /// makes it the top level.
     prefix: Option<HandlePath>,
+    /// The authority root's namespace, where this frame is a config-carrying
+    /// mount's text. Copied unchanged into every child frame, where `prefix`
+    /// deepens: it is the fragment's whole tree that is namespaced, not one
+    /// body of it.
+    mount: Option<HandlePath>,
     params: ParamBindings,
     /// The nearest recorded stamp this body was expanded inside, which is what
     /// the entities it emits belong to.
@@ -6050,13 +6837,34 @@ impl Frame {
             outer: FileScope::in_file(index, self.file, channels, links, stamps),
             params: Some(&self.params),
             prefix: self.prefix.as_ref(),
+            mount: self.mount.as_ref(),
+            // A body declares no principal, so nothing here reads a ceiling.
+            ceiling: None,
             root: self.root,
         }
     }
 
-    /// The handle a name written in this body is stamped under.
+    /// The handle a name written in this body is looked up by, within its
+    /// authority root.
     fn stamp(&self, name: Spanned<String>) -> HandlePath {
         HandlePath::stamp(self.prefix.as_ref(), name)
+    }
+
+    /// The handle a name written in this body is stamped under.
+    fn handle(&self, name: Spanned<String>) -> HandlePath {
+        namespaced(self.mount.as_ref(), self.stamp(name))
+    }
+}
+
+/// One handle under an authority root's namespace.
+///
+/// The deployment tree has none and a handle written there is itself; a
+/// config-carrying mount's is the mount's name, which every handle its config
+/// declares hangs beneath.
+fn namespaced(mount: Option<&HandlePath>, handle: HandlePath) -> HandlePath {
+    match mount {
+        Some(mount) => HandlePath(mount.0.iter().cloned().chain(handle.0).collect()),
+        None => handle,
     }
 }
 
@@ -6105,8 +6913,13 @@ fn expand_assemblies(
     handles: &mut Handles<'_>,
     stamps: &mut StampTable,
     minted: (usize, usize),
+    fragments: Fragments<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Expansion {
+    let Fragments {
+        stamps: seeded,
+        sites,
+    } = fragments;
     let (minted, minted_links) = minted;
     let mut walk = Walk {
         index,
@@ -6114,19 +6927,25 @@ fn expand_assemblies(
         next: minted,
         next_link: minted_links,
         out: Vec::new(),
-        recorded: Vec::new(),
+        recorded: seeded,
         handed: Vec::new(),
         root: (0, 0),
         seq: 0,
     };
+    // A fragment's top-level frame is not the top level: its instantiations
+    // stamp under the mount's name and belong to the mount's stamp, which is
+    // what puts everything the fragment runs under the ceiling the operator
+    // wrote on the mount line.
     let frames: Vec<Rc<Frame>> = (0..modules.len())
         .map(|position| {
+            let site = sites[position].as_ref();
             Rc::new(Frame {
                 file: position,
                 root: position,
                 prefix: None,
+                mount: site.map(|site| site.prefix.clone()),
                 params: ParamBindings::new(),
-                stamp: None,
+                stamp: site.map(|site| site.stamp),
             })
         })
         .collect();
@@ -6355,6 +7174,7 @@ impl Waits<'_> {
             file: symbol.file,
             root: frame.root,
             prefix: None,
+            mount: frame.mount.clone(),
             params: ParamBindings::new(),
             stamp: None,
         };
@@ -6551,6 +7371,7 @@ impl Walk<'_> {
             file: symbol.file,
             root: parent.root,
             prefix: Some(parent.stamp(inst.handle.clone())),
+            mount: parent.mount.clone(),
             params,
             stamp,
         });
@@ -6712,7 +7533,55 @@ fn emit_stamped(
             Err(error) => errors.push(error),
         },
     }
+    if stamped.frame.mount.is_some() {
+        let id = stamp.unwrap_or_else(|| unreachable!("a fragment's body is stamped"));
+        check_mounted_kinds(marks, config, &config.stamps[id.0], errors);
+    }
     marks.attribute(config, stamp);
+}
+
+/// Refuse an entity a ceiling cannot bound, emitted from inside a mount's
+/// config.
+///
+/// The discipline pass stops at the item level, so a fragment that stamps a
+/// packaged assembly whose *body* places a surface or an agent passes it. The
+/// `new` is the consent to the whole arrangement, so the `new` is where this is
+/// refused: the assembly is fine for a deployment to stamp and only a fragment
+/// cannot use it. Read off what was emitted rather than off the item, because
+/// an agent arrives as an `Inst` against an agent class and telling the two
+/// apart again here would be a second copy of class resolution.
+///
+/// The agent arm is a backstop rather than a live path: an agent class is
+/// declarable only in a deployment document, handles do not cross an authority
+/// root, and no assembly item is an agent — so nothing a fragment can write
+/// reaches one today. It is here because the rule is about what a ceiling can
+/// bound, not about which vocabulary happens to be admitted this release.
+fn check_mounted_kinds(
+    marks: Marks,
+    config: &Emitted,
+    stamp: &RStamp,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let mut refuse = |kind: &str| {
+        let places = match &stamp.origin {
+            // Written in the fragment itself: there is no arrangement between
+            // the text and the entity.
+            StampOrigin::Mount => format!("the config of mount `{}`", stamp.handle.dotted()),
+            StampOrigin::Assembly(name) => {
+                format!("`{}`, stamping `{}`,", stamp.handle.dotted(), name.value())
+            }
+        };
+        errors.push(Diagnostic::at(
+            format!("{places} places {kind}; a mount's config places components and channels"),
+            stamp.span.clone(),
+        ));
+    };
+    if config.surfaces.len() > marks.surfaces {
+        refuse("a surface");
+    }
+    if config.agents.len() > marks.agents {
+        refuse("an agent");
+    }
 }
 
 /// Where each authority-bearing vector ended before one stamped item was
@@ -6730,6 +7599,8 @@ struct Marks {
     consumers: usize,
     agents: usize,
     grants: usize,
+    principals: usize,
+    uuid_pins: usize,
 }
 
 impl Marks {
@@ -6749,13 +7620,15 @@ impl Marks {
             tunings: _,
             // A link joins two channels and holds no authority of its own.
             links: _,
-            // A pin is an address's identity.
-            uuid_pins: _,
+            // A pin is an address's identity, and which text may re-identify
+            // a channel is the declaring authority root's question.
+            uuid_pins,
             // A remote is the deployment's own peer; no arrangement stamps one.
             remotes: _,
-            // The two records the ceiling model is written in. A principal is
-            // deployer text by discipline, and a stamp carries its own parent.
-            principals: _,
+            // A principal is declared by the deployment or by one mount's
+            // config, and which of the two is what a mount's `under` clause is
+            // held to; a stamp carries its own parent.
+            principals,
             stamps: _,
             // A handed principal is an argument, not an entity.
             handed_principals: _,
@@ -6778,6 +7651,8 @@ impl Marks {
             consumers: consumers.len(),
             agents: agents.len(),
             grants: grants.len(),
+            principals: principals.len(),
+            uuid_pins: uuid_pins.len(),
         }
     }
 
@@ -6803,8 +7678,14 @@ impl Marks {
         for agent in &mut config.agents[self.agents..] {
             agent.stamp = stamp;
         }
+        for principal in &mut config.principals[self.principals..] {
+            principal.origin = stamp;
+        }
         for grant in &mut config.grants[self.grants..] {
             grant.stamp = stamp;
+        }
+        for pin in &mut config.uuid_pins[self.uuid_pins..] {
+            pin.origin = stamp;
         }
     }
 }
@@ -6975,7 +7856,12 @@ fn check_identity(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     }
     let clients = handles(&config.mqtt_clients);
     check_family(clients.iter(), Family::MqttClient, errors);
-    check_family(handles(&config.mounts).iter(), Family::Mount, errors);
+    let mounts: Vec<Spanned<String>> = config
+        .mounts
+        .iter()
+        .map(|mount| named_slug(&mount.handle))
+        .collect();
+    check_family(mounts.iter(), Family::Mount, errors);
 }
 
 /// Every `grant`'s target names a running entity authority can be held by.
@@ -7042,11 +7928,14 @@ fn check_grants(config: &ResolvedConfig, withheld: &Withheld, errors: &mut Vec<D
 /// equally part of it, and one message per member would be one mistake reported
 /// as several.
 fn check_principal_chains(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
-    let slots: HashMap<&str, usize> = config
+    // Keyed on the whole dotted handle: two mounts each declaring `q` are
+    // `a.q` and `b.q`, and a map on first segments would walk one chain into
+    // the other's parents.
+    let slots: HashMap<String, usize> = config
         .principals
         .iter()
         .enumerate()
-        .map(|(index, principal)| (principal.handle.0[0].value().as_str(), index))
+        .map(|(index, principal)| (principal.handle.dotted(), index))
         .collect();
     let mut reported: HashSet<usize> = HashSet::new();
     for start in 0..config.principals.len() {
@@ -7073,7 +7962,7 @@ fn check_principal_chains(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>)
             let Some(parent) = &config.principals[at].parent else {
                 break;
             };
-            let Some(&next) = slots.get(parent.0[0].value().as_str()) else {
+            let Some(&next) = slots.get(&parent.dotted()) else {
                 break;
             };
             at = next;
@@ -7091,11 +7980,16 @@ fn principal_cycle(config: &ResolvedConfig, closer: usize, members: &[usize]) ->
         reading.push_str(&format!(" `{link}`, which is under"));
     }
     reading.truncate(reading.len() - ", which is under".len());
+    // The last segment, not the first: a fragment principal's handle leads with
+    // its mount's name, whose span is the mounts document's `mount` line, and
+    // the refusal belongs on the `under` clause that closed the cycle.
     let span = config.principals[closer]
         .parent
         .as_ref()
         .expect("the closing declaration is under something")
-        .0[0]
+        .0
+        .last()
+        .expect("a handle has a segment")
         .span()
         .clone();
     Diagnostic::at(
@@ -7104,57 +7998,164 @@ fn principal_cycle(config: &ResolvedConfig, closer: usize, members: &[usize]) ->
     )
 }
 
-/// The two rules that read every address in the expanded document at once.
+/// One of the document's text trees under one authority.
 ///
-/// Both are post-expansion because an assembly stamps channels: two
+/// The deployment tree — the root document and everything it `use`s — is one;
+/// each config-carrying mount's `config/` tree is another. It is read off a
+/// position's stamp chain, never off the file the position is written in: a
+/// rule keyed on files would refuse a fragment's second file for naming a
+/// channel the fragment's first file declared, and accept one deployment file
+/// naming another's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityRoot {
+    Deployment,
+    Mount(StampId),
+}
+
+impl AuthorityRoot {
+    /// What a refusal calls this root.
+    fn label(self, stamps: &[RStamp]) -> String {
+        match self {
+            AuthorityRoot::Deployment => "the deployment document".to_string(),
+            AuthorityRoot::Mount(StampId(id)) => {
+                format!("the config of mount `{}`", stamps[id].handle.dotted())
+            }
+        }
+    }
+}
+
+/// The authority root of every recorded stamp, by [`StampId`].
+///
+/// One pass in recording order resolves every chain: a stamp is recorded after
+/// the stamp it was expanded inside, and a mount's stamp is minted before
+/// anything its fragment expands.
+fn authority_roots(stamps: &[RStamp]) -> Vec<AuthorityRoot> {
+    let mut roots: Vec<AuthorityRoot> = Vec::with_capacity(stamps.len());
+    for (index, stamp) in stamps.iter().enumerate() {
+        let root = match stamp.origin {
+            StampOrigin::Mount => AuthorityRoot::Mount(StampId(index)),
+            StampOrigin::Assembly(_) => match stamp.parent {
+                Some(StampId(parent)) => {
+                    assert!(
+                        parent < index,
+                        "a stamp is recorded after the stamp it is nested in"
+                    );
+                    roots[parent]
+                }
+                None => AuthorityRoot::Deployment,
+            },
+        };
+        roots.push(root);
+    }
+    roots
+}
+
+/// The authority root an entity carrying this stamp belongs to.
+fn authority_of(stamp: Option<StampId>, roots: &[AuthorityRoot]) -> AuthorityRoot {
+    match stamp {
+        Some(StampId(id)) => roots[id],
+        None => AuthorityRoot::Deployment,
+    }
+}
+
+/// A declared address: the channel that holds it, what names it, and which
+/// authority root's text declared it.
+struct Declared {
+    id: ChanId,
+    handle: String,
+    root: AuthorityRoot,
+}
+
+/// The rules that read every address in the expanded document at once.
+///
+/// All of them are post-expansion because an assembly stamps channels: two
 /// instantiations that write one address collide only once both have been
 /// stamped, and the site to cite is the shared declaration inside the body.
-fn check_addresses(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
+fn check_addresses(config: &mut ResolvedConfig, errors: &mut Vec<Diagnostic>) {
+    let roots = authority_roots(&config.stamps);
     // The first declaration of each address holds it; a later one is the
     // collision. Tunings are not here: a tuning is a matcher over a family, not
     // an identity, and derivation refuses one on a declarable address outright,
     // so no tuning key can be a channel's address.
-    let declared = check_unique(
-        config.channels.iter().map(|channel| {
-            (
-                channel.address.value().as_str(),
-                &channel.handle,
-                channel.address.span(),
-            )
-        }),
-        |address, _, span, prior_handle, prior_span| {
-            two_site(
-                format!("two channels declare the address `{address}`"),
-                span.clone(),
-                format!("`{}` declares it here", prior_handle.dotted()),
-                prior_span.clone(),
-            )
-        },
-        errors,
-    );
+    let declared: HashMap<String, Declared> = {
+        let held = check_unique(
+            config.channels.iter().enumerate().map(|(index, channel)| {
+                (
+                    channel.address.value().clone(),
+                    Declared {
+                        id: ChanId(index),
+                        handle: channel.handle.dotted(),
+                        root: authority_of(channel.stamp, &roots),
+                    },
+                    channel.address.span(),
+                )
+            }),
+            |address, _, span, prior, prior_span| {
+                two_site(
+                    format!("two channels declare the address `{address}`"),
+                    span.clone(),
+                    format!("`{}` declares it here", prior.handle),
+                    prior_span.clone(),
+                )
+            },
+            errors,
+        );
+        // Owned, and the borrowed spans dropped with it: the walk below rewrites
+        // the positions this map is compared against.
+        held.into_iter()
+            .map(|(address, (found, _))| (address, found))
+            .collect()
+    };
+    check_pins(config, &declared, &roots, errors);
+    resolve_literals(config, &declared, &roots, errors);
+}
 
-    // One spelling: where a channel exists, it is named. A second spelling of
-    // its address is a second name for one thing, and every later pass that
-    // keys on identity would see two.
-    for (text, span) in literal_addresses(config) {
-        if let Some((handle, _)) = declared.get(text) {
-            errors.push(Diagnostic::at(
-                format!(
-                    "`{text}` is the address channel `{}` declares; name the channel, \
-                     not its address",
-                    handle.dotted()
-                ),
-                span.clone(),
-            ));
+/// A pin re-identifies a channel, which is the text that declared it that may
+/// do so.
+///
+/// Re-identifying a channel one did not declare is the migration `collect_pins`
+/// guards against, done from the wrong side. A pin naming an address nothing
+/// declares is derivation's refusal, not this one's.
+fn check_pins(
+    config: &ResolvedConfig,
+    declared: &HashMap<String, Declared>,
+    roots: &[AuthorityRoot],
+    errors: &mut Vec<Diagnostic>,
+) {
+    for pin in &config.uuid_pins {
+        let Some(found) = declared.get(pin.address.value()) else {
+            continue;
+        };
+        if found.root == authority_of(pin.origin, roots) {
+            continue;
         }
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` is declared by {}; a pin travels with the declaration",
+                pin.address.value(),
+                found.root.label(&config.stamps),
+            ),
+            pin.address.span().clone(),
+        ));
     }
 }
 
 /// Every address written as a string literal where a declared channel could
 /// have been named instead: bindings, subscriptions and `exact` matchers.
 ///
-/// A `prefix` matcher is not one of them — it is written about a family, and
-/// the family a declared channel belongs to is not that channel.
+/// Within one authority root the rule is one spelling: where a channel exists,
+/// it is named, and a second spelling of its address is a second name for one
+/// thing that every later pass keying on identity would see twice.
+///
+/// Across authority roots the address *is* the interface — it is what an
+/// operator's `acl` lines already spell, and neither tree can see the other's
+/// handles. So a literal whose declaration belongs to another authority root is
+/// resolved to that declaration in place, and doctype propagation, ACL
+/// derivation, the reach rules and the messaging plan all see one channel with
+/// one identity.
+///
+/// A `prefix` matcher is not one of these positions — it is written about a
+/// family, and the family a declared channel belongs to is not that channel.
 ///
 /// The value positions inside an entity are not covered, with one known
 /// exception. The value language admits a matcher anywhere a value goes, so
@@ -7170,28 +8171,37 @@ fn check_addresses(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
 /// there and lowering resolves either against the declared channels, so a
 /// literal that names no declared channel is refused at that site instead of
 /// here — the failure this rule exists to prevent (an address that resolves to
-/// nothing, or to two things) cannot survive it. A further address-bearing
-/// attribute value must either carry that same resolution or be added to this
-/// walk; leaving it with neither is what silently unwires it.
-fn literal_addresses(config: &ResolvedConfig) -> Vec<(&str, &Span)> {
+/// nothing, or to two things) cannot survive it. An agent is the deployment's
+/// to declare, so that site names no channel across an authority root. A
+/// further address-bearing attribute value must either carry that same
+/// resolution or be added to this walk; leaving it with neither is what
+/// silently unwires it.
+fn resolve_literals(
+    config: &mut ResolvedConfig,
+    declared: &HashMap<String, Declared>,
+    roots: &[AuthorityRoot],
+    errors: &mut Vec<Diagnostic>,
+) {
     // Destructured, not field-accessed: this walk is a hand-written mirror of
     // the resolved model, and a new entity vector has to be answered for here
-    // or the one-spelling rule quietly stops covering it. Adding a field to
+    // or the rules quietly stop covering it. Adding a field to
     // `ResolvedConfig` breaks this pattern.
     let ResolvedConfig {
         channels: _,
         tunings: _,
         // A link has no address at all, so it spells none.
         links: _,
+        // A pin is keyed by address all the way to the identity store, so it is
+        // held to its declaration's authority root rather than rewritten.
         uuid_pins: _,
-        surfaces: _,
-        consumers: _,
-        agents: _,
-        remotes: _,
+        surfaces,
+        consumers,
+        agents,
+        remotes,
         // A ceiling's `acl` lines name channels the same way an entity's do.
-        principals: _,
+        principals,
         // A stamp's ceiling lines do too.
-        stamps: _,
+        stamps,
         // A handed principal is a handle, and it spells no address.
         handed_principals: _,
         // A webhook block carries attrs, no chan_ref.
@@ -7201,64 +8211,131 @@ fn literal_addresses(config: &ResolvedConfig) -> Vec<(&str, &Span)> {
         mcp_servers: _,
         // A mount body holds a path, and paths are not addresses.
         mounts: _,
-        grants: _,
+        grants,
         sections: _,
     } = config;
-    let mut found = Vec::new();
-    for surface in &config.surfaces {
-        acl_literals(&surface.acls, &mut found);
-        for component in &surface.components {
-            binding_literals(&component.bindings, &mut found);
+    for surface in surfaces.iter_mut() {
+        acl_literals(
+            &mut surface.acls,
+            authority_of(surface.stamp, roots),
+            declared,
+            errors,
+        );
+        for component in &mut surface.components {
+            binding_literals(
+                &mut component.bindings,
+                authority_of(component.stamp, roots),
+                declared,
+                errors,
+            );
         }
     }
-    for consumer in &config.consumers {
-        acl_literals(&consumer.acls, &mut found);
-        binding_literals(&consumer.bindings, &mut found);
+    for consumer in consumers.iter_mut() {
+        let root = authority_of(consumer.stamp, roots);
+        acl_literals(&mut consumer.acls, root, declared, errors);
+        binding_literals(&mut consumer.bindings, root, declared, errors);
     }
-    for agent in &config.agents {
-        acl_literals(&agent.acls, &mut found);
-        for sub in &agent.subs {
-            chan_ref_literal(&sub.chan, &mut found);
+    for agent in agents.iter_mut() {
+        let root = authority_of(agent.stamp, roots);
+        acl_literals(&mut agent.acls, root, declared, errors);
+        for sub in &mut agent.subs {
+            chan_ref_literal(&mut sub.chan, root, declared, errors);
         }
     }
-    for remote in &config.remotes {
-        acl_literals(&remote.acls, &mut found);
+    for remote in remotes.iter_mut() {
+        // A `remote` is a top-level item a fragment is refused, and no assembly
+        // body holds one, so a remote is the deployment's wherever it is read.
+        acl_literals(
+            &mut remote.acls,
+            AuthorityRoot::Deployment,
+            declared,
+            errors,
+        );
     }
-    for principal in &config.principals {
-        acl_literals(&principal.acls, &mut found);
+    for principal in principals.iter_mut() {
+        acl_literals(
+            &mut principal.acls,
+            authority_of(principal.origin, roots),
+            declared,
+            errors,
+        );
     }
-    for stamp in &config.stamps {
-        acl_literals(&stamp.acls, &mut found);
+    for (index, stamp) in stamps.iter_mut().enumerate() {
+        acl_literals(&mut stamp.acls, roots[index], declared, errors);
     }
-    for grant in &config.grants {
-        matcher_literal(&grant.m, &mut found);
+    for grant in grants.iter_mut() {
+        matcher_literal(
+            &mut grant.m,
+            authority_of(grant.stamp, roots),
+            declared,
+            errors,
+        );
     }
-    found
 }
 
-fn acl_literals<'a>(acls: &'a [RAcl], found: &mut Vec<(&'a str, &'a Span)>) {
+/// What a second spelling inside one authority root is refused with.
+fn one_spelling(address: &str, handle: &str, span: &Span) -> Diagnostic {
+    Diagnostic::at(
+        format!(
+            "`{address}` is the address channel `{handle}` declares; name the channel, \
+             not its address"
+        ),
+        span.clone(),
+    )
+}
+
+fn acl_literals(
+    acls: &mut [RAcl],
+    root: AuthorityRoot,
+    declared: &HashMap<String, Declared>,
+    errors: &mut Vec<Diagnostic>,
+) {
     for acl in acls {
-        for matcher in &acl.matchers {
-            matcher_literal(matcher, found);
+        for matcher in &mut acl.matchers {
+            matcher_literal(matcher, root, declared, errors);
         }
     }
 }
 
-fn binding_literals<'a>(bindings: &'a [RBinding], found: &mut Vec<(&'a str, &'a Span)>) {
+fn binding_literals(
+    bindings: &mut [RBinding],
+    root: AuthorityRoot,
+    declared: &HashMap<String, Declared>,
+    errors: &mut Vec<Diagnostic>,
+) {
     for binding in bindings {
-        if let Some(chan) = &binding.chan {
-            chan_ref_literal(chan, found);
+        if let Some(chan) = &mut binding.chan {
+            chan_ref_literal(chan, root, declared, errors);
         }
     }
 }
 
-fn chan_ref_literal<'a>(chan: &'a RChanRef, found: &mut Vec<(&'a str, &'a Span)>) {
-    if let RChanRef::Addr(address) = chan {
-        found.push((address.value().as_str(), address.span()));
+fn chan_ref_literal(
+    chan: &mut RChanRef,
+    root: AuthorityRoot,
+    declared: &HashMap<String, Declared>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let RChanRef::Addr(address) = chan else {
+        return;
+    };
+    let Some(found) = declared.get(address.value()) else {
+        return;
+    };
+    if found.root == root {
+        errors.push(one_spelling(address.value(), &found.handle, address.span()));
+        return;
     }
+    let id = found.id;
+    *chan = RChanRef::Decl(id);
 }
 
-fn matcher_literal<'a>(matcher: &'a RMatcher, found: &mut Vec<(&'a str, &'a Span)>) {
+fn matcher_literal(
+    matcher: &mut RMatcher,
+    root: AuthorityRoot,
+    declared: &HashMap<String, Declared>,
+    errors: &mut Vec<Diagnostic>,
+) {
     match matcher.kind.value() {
         MatcherKind::Exact => {}
         // A prefix is written about a family, and the family a declared channel
@@ -7269,9 +8346,25 @@ fn matcher_literal<'a>(matcher: &'a RMatcher, found: &mut Vec<(&'a str, &'a Span
         | MatcherKind::Endpoint
         | MatcherKind::Client => return,
     }
-    if let RMatcherVal::Lit(text) = matcher.val.value() {
-        found.push((text.as_str(), matcher.val.span()));
+    let found = match matcher.val.value() {
+        RMatcherVal::Lit(text) => declared.get(text.as_str()),
+        RMatcherVal::Chan(_) => None,
+    };
+    let Some(found) = found else {
+        return;
+    };
+    if found.root == root {
+        errors.push(one_spelling(
+            match matcher.val.value() {
+                RMatcherVal::Lit(text) => text.as_str(),
+                RMatcherVal::Chan(_) => unreachable!("a literal was matched above"),
+            },
+            &found.handle,
+            matcher.val.span(),
+        ));
+        return;
     }
+    *matcher.val.value_mut() = RMatcherVal::Chan(found.id);
 }
 
 /// A handle used as an identity, with the span of the segment that named it.
@@ -7365,7 +8458,7 @@ mod tests {
     fn emitted(source: &str) -> (Emitted, Vec<Diagnostic>) {
         let (index, files, mut errors) = indexed_files(source);
         assert!(errors.is_empty(), "{errors:?}");
-        let emitted = emit_entities(&index, files, &mut errors);
+        let emitted = emit_entities(&index, files, &[], &mut errors);
         (emitted, errors)
     }
 
@@ -7401,6 +8494,7 @@ mod tests {
             file: 0,
             root: 0,
             prefix: None,
+            mount: None,
             params: ParamBindings::new(),
             stamp: None,
         };
@@ -7465,6 +8559,7 @@ mod tests {
             file: 0,
             root: 0,
             prefix: None,
+            mount: None,
             params: ParamBindings::new(),
             stamp: None,
         };

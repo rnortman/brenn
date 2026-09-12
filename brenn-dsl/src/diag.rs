@@ -240,6 +240,7 @@ mod tests {
             vec![(String::new(), file)],
             "",
             crate::DocumentRole::Deployment,
+            &[],
         )
         .expect_err("a top-level acl is refused at resolve");
         errors.pop().expect("one refusal").span

@@ -626,7 +626,7 @@ exclusively that release's. A component built elsewhere cannot land in either:
 the next brenn deploy deletes it. So the host takes more than one of each, and
 learns the whole list from one place.
 
-A **mount** is one directory holding up to three trees plus a `VERSION` file,
+A **mount** is one directory holding up to four trees plus a `VERSION` file,
 which the operator has *declared* to the host. The declaration is the act of
 consent: what is under a declared mount may be resolved, loaded and served; what
 is not declared is invisible. Nothing discovers a mount — no directory scan, no
@@ -638,9 +638,17 @@ naming it. brenn's own release is a mount like any other.
 | `components/` | one `<name>/` package directory per backend component, plus `components/deployed-components.txt` and the `scripts/manifest_names.sh` an installer execs to read it | the WASM loader |
 | `surface/` | `processor/<kind>/` per page-hosted kind — the transpiled tree, the component bytes, the packaged spec, the record binding them | the HTTP server |
 | `modules/` | the authored module of every one of them, flat | the compiler |
+| `config/` | the mount's own deployment text, entry `main.brenn` | the compiler, at document compile |
+
+The first three are *offered*: what is under them is resolved, loaded and served
+when a configuration names it. `config/` is different — it is **compiled**, as
+part of the deployment document, under the ceiling the mount is declared
+`under`. A mount carrying it is a **config-carrying mount**, and its author
+writes deployment statements the host runs (`config-dsl.md`, *Mounted
+documents*).
 
 A mount ships the trees its release has and no others; a mount holding none of
-the three is refused, which is what a path pointed one directory off looks like.
+the four is refused, which is what a path pointed one directory off looks like.
 `modules/` is present and empty when a bundle owes it nothing: a replay-world
 package ships no specification, so a bundle whose packages are all replay-world
 is imported by no configuration and named instead by a `replay_protection`
@@ -659,6 +667,9 @@ brenn --config /home/brenn/config/brenn-prod.brenn \
 ```
 mount brenn { path = "/home/brenn/brenn/release"; }
 mount caser { path = "/home/brenn/brenn/bundles/caser"; }
+mount automations under assistant-automations {
+  path = "/home/brenn/.brenn-prod/repos/automations";
+}
 ```
 
 The document admits `mount` and `const` statements and nothing else; it imports
@@ -666,15 +677,25 @@ nothing, and a `mount` in the deployment document is refused just as firmly.
 Every `path` is absolute, no two are the same, and no one nests inside another —
 a nested mount would make one release's tree part of another's. Each declared
 path must be a directory holding a readable `VERSION` and at least one of the
-three trees, or the host refuses to start and a reload refuses to converge.
+four trees, or the host refuses to start and a reload refuses to converge.
+`VERSION` is required of a config-carrying mount like any other; its content is
+that repository's own release counter.
+
+The optional `under` clause names a `principal` of the deployment document and
+is what makes the mount config-carrying. It and the `config/` tree are required
+of each other: a mount offering `config/` and `under` no one is refused, and so
+is a mount `under` a principal that offers no `config/`.
 
 The paths are canonicalized once per read, which is what makes the symlink
 install scheme below atomic from the host's side.
 
-`brenn mounts --mounts FILE` prints one line per declared mount — name, declared
-path, and either `ok:<version>:<trees>`, `missing`, or `fault:<message>` — and
+`brenn mounts --mounts FILE` prints one tab-separated line of four fields per
+declared mount — name, declared path, either `ok:<version>:<trees>`, `missing`
+or `fault:<message>`, and the ceiling as `under:<principal>` or empty — and
 exits on the document's own validity rather than the filesystem's, so an
-installer can read the declaration of a mount it is about to create.
+installer can read the declaration of a mount it is about to create. The fourth
+field is written on every line, empty tail included, so the field count does not
+depend on the mount.
 
 ### One name, one mount
 

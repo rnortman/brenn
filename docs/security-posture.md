@@ -125,7 +125,10 @@ backend is the invoker.)
 (B8 is inside the box marked "operator config", which is why it needs naming
 separately: a packaged component's `.brenn` text is compiled together with the
 operator's document, so it enters the trust anchor as configuration. The
-operator's stamp of it is a delegation, not an endorsement.)
+operator's stamp of it is a delegation, not an endorsement. B10 is inside that
+box for the same reason and goes one step further: a config-carrying mount's
+`config/` tree is deployment text somebody else wrote, and the operator's
+`under` line is the delegation.)
 
 | ID | Boundary | Direction of distrust |
 |----|----------|----------------------|
@@ -139,6 +142,7 @@ operator's stamp of it is a delegation, not an endorsement.)
 | **B7** | Authenticated remote attacher (native daemon) → backend | daemon-supplied data untrusted; identity is bounded to the `[[remote]]` principal and its ACLs |
 | **B8** | Packaged module text → compiler | author-supplied configuration text untrusted; what an arrangement may confer is bounded by the ceiling the deployer stamped it under |
 | **B9** | Reload requester → running configuration | the requester chooses the *moment*, never the content; what a reload can do is bounded by what the document on disk says |
+| **B10** | Mount author → running configuration | the author chooses a config-carrying mount's content; the ceiling chooses what that content may reach; the mounts document and the root document stay outside every mount |
 
 ---
 
@@ -967,17 +971,21 @@ line, it is owned by the operator, and nothing the process runs may write it.
 A deployment that lets any principal write the mounts document has given that
 principal the packaged-module and component authority of boundary B8 over any
 tree it can also write, at the next reload rather than at the next bounce — the
-same authorship gap as below, with a wider blast radius.
+same authorship exposure as below, with a wider blast radius.
 
-**What is *not* guarded here — the authorship gap.** Nothing in this boundary
-says who was allowed to *write* the file the reload reads. A principal that can
-edit the deployment's document can widen its own ceiling, and reload turns that
-edit into a running change a few seconds later rather than at the next bounce.
-The compile-time file-ownership rule that closes it — which principal may write
-which file — is designed with the tool that writes the file, and until it exists
-the config tree's filesystem permissions are the whole answer. A deployment that
-grants an agent `publish` on the request channel should grant it no write access
-to the config tree.
+**Who was allowed to write the file.** Nothing in *this* boundary says so: a
+principal that can edit the deployment's root document can widen its own
+ceiling, and reload turns that edit into a running change seconds later rather
+than at the next bounce. The root document and the mounts document have no
+authorship rule and are not getting one — they are the operator's text, and the
+config tree's filesystem permissions are the whole answer for them. A deployment
+that grants an agent `publish` on the request channel must grant it no write
+access to either file.
+
+What does exist now is a place such an agent may write whose contents the
+compiler bounds: a **config-carrying mount** (B10). That is the answer to "the
+assistant writes an automation and applies it" — not a loosening of this
+paragraph.
 
 The gap's reach grew with what a reload converges, and the shape is worth stating
 plainly: such a principal can now widen any agent's authority, its own included
@@ -998,6 +1006,106 @@ channel to no principal that can write the document".
 influences what is applied is a finding, as is any convergence outcome that is
 not what a fresh boot of the same document would have produced. So is a refusal
 that mutates anything.
+
+---
+
+## 9d. Boundary B10 — Mount Author → Running Configuration
+
+**Who:** whoever can write a config-carrying mount's `config/` tree — in
+practice, whoever can push to the repository a sync clones into it, or edit the
+clone on the host. That is deliberately not the operator: the shape this
+boundary exists for is an agent that authors its own automations.
+
+**Trust decision: the author chooses the content; the ceiling chooses the
+reach.** A config-carrying mount is declared `under` a `principal` the operator
+writes in the deployment document, and the mount's whole `config/` tree is
+compiled as one stamp under that principal's authority, with no default reach
+of its own (`docs/config-dsl.md`, *Mounted documents*). Three inputs stay
+outside every mount and stay the operator's: the root document, the mounts
+document, and — where the author is a containerized agent — the container's
+bind-mount set. Nothing the author can reach widens any of them.
+
+**What the compiler bounds:**
+
+- **Vocabulary.** A fragment declares channels, instantiates classes, stamps
+  assemblies, links them, and declares principals beneath its own ceiling. It is
+  refused an `agent`, a `surface`, a `remote`, a `webhook`, a `repo`, an
+  `mqtt_client`, an `mcp_server`, a settings section, a `mount`, a component
+  class, a channel tuning, and a top-level `grant` or `acl`. An assembly it
+  stamps that places a surface or an agent in its body is refused at the `new`.
+- **Reach.** Every grant word, every binding and every channel the fragment
+  declares must fit under the ceiling. Declaring a channel confers nothing: an
+  address the ceiling reaches on neither plane is refused at the declaration, so
+  the author cannot mint a namespace the operator did not write.
+- **Namespace.** Handles never cross an authority root. The fragment cannot name
+  the deployment's entities, only its addresses, and only where the ceiling
+  reaches them.
+- **Identity.** Everything the fragment declares is handled under the mount's
+  name, so no fragment can shadow or collide with the operator's handles or
+  another fragment's.
+
+**Threats:**
+
+- **Escalation by authorship.** The author writes text the host runs. Bounded by
+  the ceiling, and the ceiling is a line only the operator can edit. Widening it
+  is a request the author makes to the operator, and the operator's `principal`
+  and `mount … under` lines are what answer it — together, in one reload, since
+  a ceiling nothing is under is refused as dead config.
+- **Denial of change.** Accepted, and worth stating plainly: a config-carrying
+  mount is a declared mount, so its author can refuse every subsequent reload —
+  the operator's included — and every release and bundle install on the host, by
+  emptying its `VERSION`, deleting its `config/` tree, or committing a fragment
+  that does not compile. This is the first agent-writable directory inside the
+  host's install gate. What is denied is the host's ability to *change*: the old
+  document keeps running, a refused install stops nothing, and nothing outside
+  the ceiling's reach is touched either way. The operator's lever is the mounts
+  document and the root — removing the `mount` line and its ceiling in one
+  reload — and both are outside the mount.
+- **Exhausting the host's storage.** A ceiling caps *reach*, not *size*: a
+  fragment sizes the channels it declares, and `retain_depth = unbounded` on a
+  durable channel inside the ceiling's own prefix is admitted, as is a consumer
+  the fragment stamps that publishes to it in a loop. The store those rings live
+  in is the one every entity on the host shares, so this reaches past the
+  ceiling in a way nothing else here does — it is availability of what *runs*,
+  not only of change. Accepted for now, and named so it is not mistaken for
+  covered: the mitigations are the operator's, not the compiler's — a filesystem
+  quota on the store, and the alert channel. Closing it means bounding depth
+  under a ceiling, which is a design question about what a ceiling is, not a
+  missing check — tracked as `ceiling-channel-depth`.
+- **Reading the host's channels.** A fragment reaches a deployment channel by
+  address, never by handle, and only where the ceiling holds the matching reach.
+  An operator who writes no reach has delegated no listening.
+
+**The boundary this rule rests on is the author's filesystem reach.** The
+compiler bounds what the *fragment* says; it says nothing about what else the
+author can write. A containerized agent sees the container image, its home, and
+its declared repo mounts, so its writable config surface is exactly the mounts
+it was given. A **bare, non-containerized agent runs as the server's own user
+with no filesystem restriction**, and for such an agent this rule bounds
+nothing — it can edit the root document directly. So: an agent granted `publish`
+on the reload channel is containerized, or it is trusted with the root. That is
+a deployment posture, enforced by the operator's configuration rather than by
+any code path.
+
+**Reading the host through the compiler.** A fragment's files are the author's
+bytes, and a `.brenn` file under `config/` can be a symbolic link to anything
+the server's user reads — the operator's root document, a webhook `secret_file`,
+a broker `password_file`. The compiler reports on whatever it is handed, on the
+status channel the mount author already subscribes to, so following such a link
+would make it a file oracle over the host and possibly a reader of secrets.
+The loader refuses it: a mount's `config/` must be a directory of its own, and
+every file read under it must canonicalize back inside it
+(`brenn-dsl/src/resolve.rs`, `within`). The refusal names the path as written
+and never what it resolved to, and containment is settled before existence is:
+a link out of the tree is refused with one sentence whether or not its target is
+there, so the *choice* of sentence is not a bit read off a host path either.
+
+**What the reviewer verifies:** any path by which a fragment reaches authority
+its mount's ceiling does not hold is a finding, as is any path by which the
+compiler reads a `config/` tree of a mount the mounts document did not declare
+`under` a principal, or reads any file a mount's `config/` tree does not itself
+contain. So is any fragment vocabulary that lowers to an entity whose authority
+is not spelled in ceiling words.
 
 ---
 

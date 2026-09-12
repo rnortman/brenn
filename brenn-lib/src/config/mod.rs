@@ -44,8 +44,14 @@ pub use brenn_approval_rules::ApprovalRuleConfig;
 pub use brenn_dsl::DocumentInputs;
 /// Which vocabulary a document is read as.
 pub use brenn_dsl::DocumentRole;
+/// One config-carrying mount, as a compile input.
+pub use brenn_dsl::MountedRoot;
 /// One file of a loaded document: its place within the document, and its hash.
 pub use brenn_dsl::SourceFile;
+/// One config-carrying mount named by a `--mounted` flag rather than by a
+/// mounts document. Beside [`deployment_inputs`], which is the other way a
+/// [`MountedRoot`] reaches the compiler.
+pub use brenn_dsl::mounted_flag;
 /// A list of install roots and how it was named — a flag, or the mounts.
 pub use brenn_dsl::roots::RootList;
 pub use claude_defaults::*;

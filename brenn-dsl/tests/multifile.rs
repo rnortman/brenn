@@ -11,33 +11,7 @@ use std::path::{Path, PathBuf};
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::resolved::StampId;
 use brenn_dsl::roots::RootList;
-use brenn_dsl::{DocumentInputs, DocumentRole, compile};
-
-/// A scratch directory of this test's own, emptied first so a run never
-/// inherits what a previous one left behind.
-///
-/// `TEST_TMPDIR` is the runner's own scratch, cleaned up for us; a plain run
-/// with no runner falls back to the system temp directory.
-fn scratch_dir(name: &str) -> PathBuf {
-    let base = std::env::var("TEST_TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
-    let dir = base.join(format!("{name}-{}", std::process::id()));
-    // A test that tightened the directory's mode to observe an unlistable
-    // module root leaves it that way when it fails or when it runs as a user
-    // for whom the tightening does nothing; loosen it back before the removal
-    // so this run is not refused for the last one's arrangements.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _restored = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("scratch directory {}: {error}", dir.display()),
-    }
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+use brenn_dsl::{DocumentInputs, compile};
 
 /// One fixture tree's root file.
 fn root(tree: &str) -> PathBuf {
@@ -62,11 +36,7 @@ fn modules(tree: &str) -> PathBuf {
 
 /// A fixture tree's root file with the module roots to compile it against.
 fn inputs(tree: &str, module_roots: &[PathBuf]) -> DocumentInputs {
-    DocumentInputs {
-        root: root(tree),
-        module_roots: module_roots.to_vec().into(),
-        role: DocumentRole::Deployment,
-    }
+    DocumentInputs::deployment(root(tree), module_roots.to_vec())
 }
 
 /// Compile a fixture tree, expecting it to fail, and return the diagnostics.
@@ -257,11 +227,10 @@ fn a_packaged_import_with_no_module_root_names_the_flag() {
 /// an operator to pass it sends them to a second error.
 #[test]
 fn a_host_with_no_mount_offering_modules_says_so_instead_of_naming_the_flag() {
-    let errors = match compile(&DocumentInputs {
-        root: root("pkg-no-root"),
-        module_roots: RootList::mounts("modules", Vec::new()),
-        role: DocumentRole::Deployment,
-    }) {
+    let errors = match compile(&DocumentInputs::deployment(
+        root("pkg-no-root"),
+        RootList::mounts("modules", Vec::new()),
+    )) {
         Ok(_) => panic!("`pkg-no-root` was expected not to compile"),
         Err(errors) => errors,
     };
@@ -295,7 +264,7 @@ fn a_module_root_that_is_not_a_directory_is_refused_whatever_the_document_import
 fn a_module_root_that_cannot_be_listed_is_refused_as_the_root_and_not_as_absent_modules() {
     use std::os::unix::fs::PermissionsExt;
 
-    let modules = scratch_dir("unlistable-module-root");
+    let modules = support::scratch("unlistable-module-root");
     std::fs::write(modules.join("widget.brenn"), "const skin = \"bench\";\n").unwrap();
     std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o000)).unwrap();
     // Root reads a mode-000 directory anyway, and then there is nothing to
@@ -546,7 +515,7 @@ fn a_missing_packaged_module_names_every_root_it_was_looked_for_under() {
 fn a_directory_named_like_a_module_is_not_a_duplicate_of_the_module() {
     // Import resolution requires a file; a stray `widget.brenn/` directory
     // under a second root is not a duplicate and cannot shadow the real module.
-    let decoy = scratch_dir("decoy-module-root");
+    let decoy = support::scratch("decoy-module-root");
     std::fs::create_dir_all(decoy.join("widget.brenn")).unwrap();
     compile(&inputs("pkg-ok", &[modules("pkg-ok"), decoy.clone()]))
         .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
@@ -775,7 +744,7 @@ fn the_order_of_the_module_roots_is_not_part_of_the_identity() {
     // A second root holding nothing the document imports changes where a module
     // was found and not what was read, so the identity is unmoved by it — and
     // by the order the two roots were named in.
-    let empty = scratch_dir("identity-empty-root");
+    let empty = support::scratch("identity-empty-root");
     let real = modules("pkg-ok");
     let one = compiled("doc-identity", &[real.clone(), empty.clone()]);
     let other = compiled("doc-identity", &[empty, real]);
@@ -786,7 +755,7 @@ fn the_order_of_the_module_roots_is_not_part_of_the_identity() {
 fn one_byte_of_a_packaged_module_moves_the_identity() {
     // The module roots are a copy this test owns, so the byte it edits is its
     // own; the root document is the fixture either way.
-    let root_dir = scratch_dir("identity-modules");
+    let root_dir = support::scratch("identity-modules");
     for name in ["widget.brenn", "base.brenn"] {
         std::fs::copy(modules("pkg-ok").join(name), root_dir.join(name)).unwrap();
     }
@@ -824,7 +793,7 @@ fn where_the_tree_lives_is_not_part_of_the_identity() {
 /// The `doc-identity` tree and the packaged modules it imports, copied into a
 /// scratch directory of their own.
 fn staged_copy(name: &str) -> PathBuf {
-    let dir = scratch_dir(name);
+    let dir = support::scratch(name);
     let tree = dir.join("tree");
     std::fs::create_dir_all(tree.join("wiring")).unwrap();
     std::fs::copy(root("doc-identity"), tree.join("main.brenn")).unwrap();
@@ -846,10 +815,6 @@ fn staged_copy(name: &str) -> PathBuf {
 
 /// Compile the copy `staged_copy` left in `dir`.
 fn compiled_at(dir: &Path) -> brenn_dsl::derived::DerivedConfig {
-    let inputs = DocumentInputs {
-        root: dir.join("tree/main.brenn"),
-        module_roots: vec![dir.join("modules")].into(),
-        role: DocumentRole::Deployment,
-    };
+    let inputs = DocumentInputs::deployment(dir.join("tree/main.brenn"), vec![dir.join("modules")]);
     compile(&inputs).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)))
 }

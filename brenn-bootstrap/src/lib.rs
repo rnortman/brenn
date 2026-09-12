@@ -43,7 +43,7 @@ use tracing::info;
 
 use brenn_server::state::AppState;
 
-pub use config_check::{run_config_check, tool_module_roots};
+pub use config_check::{run_config_check, tool_roots};
 pub use config_diff::run_config_diff;
 pub use config_status::run_config_status;
 pub use mounts_cmd::run_mounts;

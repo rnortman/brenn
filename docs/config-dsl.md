@@ -163,14 +163,29 @@ installed trees it may read at all:
 ```
 mount brenn { path = "/home/brenn/brenn/release"; }
 mount caser { path = "/home/brenn/brenn/bundles/caser"; }
+mount automations under assistant-automations {
+  path = "/home/brenn/.brenn-prod/repos/automations";
+}
 ```
 
 Each `path` is an absolute directory holding a `VERSION` file and at least one
-of `components/`, `surface/` and `modules/`; those are the components roots, the
-surface roots and the module roots, derived rather than named one flag at a
-time (`component-packages.md`, *Mounts*). Paths are absolute, distinct, and
-non-nesting, and they are canonicalized once per read, so a mount path may be
-the symlink an installer swaps.
+of `components/`, `surface/`, `modules/` and `config/`; those are the components
+roots, the surface roots, the module roots and the mounted documents, derived
+rather than named one flag at a time (`component-packages.md`, *Mounts*). Paths
+are absolute, distinct, and non-nesting, and they are canonicalized once per
+read, so a mount path may be the symlink an installer swaps.
+
+The optional `under` clause names a `principal` the deployment document
+declares, and it is what makes a mount **config-carrying**: the `config/` tree
+of such a mount is compiled as part of the deployment under that principal's
+ceiling (*Mounted documents*). The clause and the tree are required of each
+other in both directions. A mount offering `config/` and `under` no one is
+refused — the root document is the only text that runs under no ceiling — and a
+mount `under` a principal that offers no `config/` is refused too, because a
+ceiling caps what a mount's config declares and that mount declares nothing.
+The ceiling and the `mount` line live and die together: a `principal` no stamp
+and no mount is under delegates nothing and is refused as dead config, so the
+two arrive in one reload and leave in one.
 
 The document admits `mount` and `const` and nothing else, and it imports
 nothing. Symmetrically, a `mount` in the deployment document is refused: mount
@@ -178,14 +193,19 @@ paths are environment facts, and the deployment document is host-independent by
 contract — which is exactly what lets `config-check` certify it on a
 workstation.
 
-`brenn mounts --mounts FILE` lists what is declared and what is installed:
+`brenn mounts --mounts FILE` lists what is declared and what is installed, one
+tab-separated line of four fields per mount — name, declared path, status, and
+the ceiling as `under:<principal>` or empty:
 
 ```
-brenn      /home/brenn/brenn/release          ok:0.20.0:components,surface,modules
-caser      /home/brenn/brenn/bundles/caser    missing
+brenn        /home/brenn/brenn/release                  ok:0.20.0:components,surface,modules
+caser        /home/brenn/brenn/bundles/caser            missing
+automations  /home/brenn/.brenn-prod/repos/automations  ok:1:config  under:assistant-automations
 ```
 
-It exits on the document's validity, not the filesystem's, so an installer can
+The fourth field is written on every line, empty tail included, so a reader
+splitting on tabs sees the same field count throughout. It exits on the
+document's validity, not the filesystem's, so an installer can
 read the declaration of a mount it is about to create. Boot and reload apply the
 strict form: every declared mount must be installed.
 
@@ -1029,6 +1049,126 @@ file — and an assembly declares none either, since a definition inside an
 assembly body would open a second definition-scoping regime. An assembly reaches
 a principal the way it reaches an agent: as a parameter (*Assemblies*).
 
+### Mounted documents
+
+A config-carrying mount's `config/` tree is a **fragment**: deployment text
+somebody other than the operator wrote, compiled as part of the deployment
+under the ceiling the mounts document's `under` clause names. The author's
+authority over the tree is whatever gets them write access to it — a push to
+the repository a sync clones, an editor on the host — and the `under` line is
+how much of the deployment that authority reaches.
+
+**Layout.** `<mount>/config/main.brenn` is the entry. Tree `use` statements
+resolve relative to `<mount>/config/`, exactly as the root's resolve relative to
+the root's directory, and the grammar's no-`..`, no-absolute-head rule keeps
+them inside it. `use @<name>::…` resolves against the same module roots the
+root's imports do, so a fragment reaches every mount's vocabulary, brenn's
+included.
+
+**One document, one compile.** A fragment is not a second document. There is one
+compile, one document identity, one set of refusals and one reload: a fragment
+that does not compile, or that exceeds its ceiling, refuses the whole reload
+with the old document still running, exactly as a broken module of the
+operator's own tree does. Compiling fragments separately and skipping a bad one
+would be a fallback, and there are none.
+
+**What a fragment may write.** The vocabulary is narrowed to what a ceiling can
+bound:
+
+| item | admitted? |
+|---|---|
+| `use`, `const`, `channel` declarations, `link`, `assembly`, `new`, `uuid_pins` | yes |
+| `principal` | yes, rooted at the ceiling (below) |
+| `channel at [prefix] "<addr>"` (tuning) | refused — a tuning names a system-minted family by raw address, carries no stamp, and would reach where the ceiling never granted |
+| `component` class declarations | refused — a class is declared by its package; a fragment reaches classes through `use @…` |
+| top-level `grant` and `acl` | refused — either aims authority at an entity outside the mount's namespace |
+| `agent`, `surface`, `remote`, `webhook`, `repo`, `mqtt_client`, `mcp_server`, settings sections | refused — each is a host fact or an entity whose authority is not spelled in ceiling words |
+| `mount` | refused, as in any deployment document |
+
+The discipline pass stops at the item level, so a fragment stamping a packaged
+assembly whose *body* places a surface or an agent passes it and is refused at
+the `new` instead — the `new` is the consent to the whole arrangement, and the
+assembly stays perfectly good for the deployment to stamp. What a fragment can
+end up running is top-level consumers, channels and links; no surface means no
+page-hosted placement either.
+
+**The mount is a stamp, and its ceiling is exactly `p`.** Each config-carrying
+mount enters the document as one synthetic stamp, `under` the principal the
+mounts document named and writing no ceiling body of its own — which is the
+whole mechanism by which its authority is precisely that principal's, with no
+narrowing and no amendment. Every handle the fragment declares, at any depth,
+is `<mount>.<name>`, so two authors cannot collide on a handle; they can only
+collide on an address, which is refused as it always was.
+
+**No default reach.** Stamping an arrangement is consent to a body the deployer
+read, so the deployer's stamp reaches the channels that body declares.
+Declaring a mount is consent to whatever its author writes next, which is
+consent to no address at all. A channel a fragment declares is therefore
+authorized like one it binds: its address must be subsumed by reach the ceiling
+holds, and a declared address the ceiling reaches on neither plane is refused at
+the declaration. The practical shape is an operator who writes
+`acl publish [prefix "brenn:automations."];` and its `subscribe` twin, and an
+author who builds inside that namespace.
+
+**Principals inside a fragment.** A fragment slices its own authority for what
+it stamps: `principal q { … }` is under the mount's ceiling, `principal r under
+q { … }` is under that, and every chain bottoms out at the ceiling rather than
+at the operator, whose authority is unreachable from a fragment by
+construction. The ceiling itself has no name inside the fragment — `under` in a
+fragment names fragment principals only — and a fragment principal's handle is
+`<mount>.<q>`, so two fragments each declaring `q` are two principals. Every
+rule of *Principals* above then applies unchanged: `q` must narrow the ceiling,
+consent text that consents to nothing is refused, and a principal nothing is
+under is dead.
+
+The ceiling is the one exemption. Its words cap text the author has not written
+yet, so a principal with a mount under it keeps its `grants` and `acl` lines
+even when the fragment is empty. Liveness is not exempted: a ceiling `principal`
+with no mount and no stamp under it delegates nothing and is refused as dead
+config. So a ceiling and the `mount … under` line that claims it arrive in one
+reload and leave in one, and a document read without its mounts refuses every
+ceiling the root declares — correctly, for what was read.
+
+**Across authority roots, the address is the contract.** An **authority root**
+is one text tree under one authority: the deployment tree, or one mount's
+`config/` tree. Handles never cross one. A fragment cannot see the deployment's
+names and the deployment cannot see a fragment's, so the only spelling either
+side has for the other's channel is its address — which is what the operator's
+`acl` lines already write. A literal address naming a channel another authority
+root declares therefore resolves to that declaration instead of being refused,
+for a binding, for an agent's subscription and for an `exact` ACL matcher; every
+later pass sees one channel with the two spellings collapsed to one identity.
+Within a single authority root the one-spelling rule stands: where a channel
+exists, it is named. Two consequences to hold onto — a fragment naming a root
+channel still has to fit the ceiling's reach on the plane it binds, and an
+operator who binds a root port to a fragment's address owns the refusal when
+that fragment goes away.
+
+A `uuid_pins` section may pin only an address a channel in its own authority
+root declares. Re-identifying a channel one did not declare is the migration
+hazard pins exist to guard, done from the wrong side.
+
+**A fragment never needs a restart.** Everything the discipline admits lowers
+into the blocks a reload converges — channels, links and consumers — so a
+fragment edit is by construction a converging change, whatever else is in the
+same reload.
+
+**Diagnostics name the host's path.** A refusal in a fragment renders with the
+filename the host read, `<mount path>/config/main.brenn`, with line and column.
+An author working inside a container sees a path that is not the one their
+tools use; mapping it is theirs to do from their own mount list.
+
+**A fragment's files never leave its own tree.** The grammar bounds a tree
+*key* — no `..`, no absolute head — which is a statement about names and none
+about what inode a name resolves to, and every byte under `config/` is the
+author's, symbolic links included. So the loader bounds the inodes as well: a
+mount's `config/` must be a directory of its own rather than a link to one, and
+every file read under it must resolve back inside it. A link out of the tree is
+not a module, and the refusal names the path as written rather than what it
+pointed at. Without the rule, an author could aim the compiler at the
+operator's own document or at a secret file and read the answer off the reload
+status.
+
 ## Ownership
 
 **The component specification is owned by the component's author, in full.** The
@@ -1144,6 +1284,24 @@ describes the old shape, the three rules below were true and are not any more.
 brenn config-check <root.brenn>     # compile the tree; refusals are positioned
 brennfmt --check <file>             # canonical formatting
 ```
+
+Two flag families name what a check compiles against, and exactly one applies to
+an invocation. `--mounts <FILE>` is the host's own declaration: the module roots
+and the config-carrying mounts both come off it, and nothing else is admitted
+beside it. `--modules <DIR>` is the workstation form, and its companion
+`--mounted NAME=PRINCIPAL=DIR` names one config-carrying mount the deployment's
+mounts document declares, repeatable, in declaration order. `DIR` is the config
+root itself — the directory holding `main.brenn` — as `--modules DIR` names a
+module root directly.
+
+`--mounted` is not optional bookkeeping: a ceiling `principal` is live only
+while a mount is under it, so a `--modules` check of a root that declares one is
+refused for the dead principal until the flag says which mount claims it. Point
+it at a scratch directory holding an empty `main.brenn` to certify the root
+against its ceilings and nothing about any fragment's contents — which is what
+an off-host gate can honestly say — or at the real tree, which is what a check
+running on the host does. A refusal drawn by the flag is positioned on the
+flag's own text, which stands in for the mounts-document line it has none of.
 
 `make check` in this repo runs both over every shipped document. The formatting
 gate globs every `.brenn` file in the tree and the compile gate globs the roots,

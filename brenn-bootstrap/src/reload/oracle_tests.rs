@@ -26,14 +26,15 @@ use brenn_server::test_support::init_db_file;
 
 use super::driver::TriggerSource;
 use super::driver::tests::{
-    BootFixture, Booted, READER, SPILL_ACL_BY_ADDRESS, Tree, async_tool_registry, bearer_endpoint,
-    boot, boot_with, conversation_of, document, document_covering_work, document_push_subscribing,
-    document_push_subscribing_acl, document_subscribing, document_with_a_broker_only,
-    document_with_a_consumer, document_with_an_mqtt_consumer, document_with_clients,
-    document_with_webhooks, insert_dynamic_row, insert_push_dynamic_row, install_package,
-    install_package_from, push_owner_covering_work, seat_a_conversation, seat_position, seat_user,
-    spill_channel, staged_module, subscriber_debug_lines, surface_document, surfaces_document,
-    write_surface_kind,
+    BootFixture, Booted, CEILING, CONFIG_MOUNT, FRAGMENT_ADDRESS, FRAGMENT_CONSUMER, READER,
+    SPILL_ACL_BY_ADDRESS, Tree, async_tool_registry, bearer_endpoint, boot, boot_with,
+    conversation_of, document, document_covering_work, document_push_subscribing,
+    document_push_subscribing_acl, document_subscribing, document_with,
+    document_with_a_broker_only, document_with_a_consumer, document_with_an_mqtt_consumer,
+    document_with_clients, document_with_webhooks, fragment, insert_dynamic_row,
+    insert_push_dynamic_row, install_package, install_package_from, push_owner_covering_work,
+    restage, seat_a_conversation, seat_position, seat_user, spill_channel, staged_module,
+    subscriber_debug_lines, surface_document, surfaces_document, write_surface_kind,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -2644,6 +2645,144 @@ async fn a_per_call_edit_matches_a_fresh_boot() {
                     .any(|line| line.contains("telescope")),
                 "the swapped table carries what the route reads: {:?}",
                 reloaded.agent_per_call,
+            );
+        },
+    )
+    .await;
+}
+
+// ── The oracle over a config-carrying mount ───────────────────────────────
+
+/// The rig every fragment transition boots on: a document tree with the
+/// packaged class a fragment instantiates, and the components root its package
+/// is installed into. The caller holds both — dropping either takes the mount
+/// out from under both processes.
+fn fragment_fixture(
+    components: &std::path::Path,
+) -> impl Fn(brenn_db::Db) -> BootFixture + use<'_> {
+    let roots = vec![components.to_path_buf()];
+    move |db| BootFixture {
+        db: Some(db),
+        components_roots: roots.clone(),
+        ..BootFixture::default()
+    }
+}
+
+/// **A config-carrying mount arrives.** Nothing in the running process came
+/// from a mount's own document, and one reload has to produce a channel and a
+/// consumer that did — under the mount's name, bounded by the ceiling the
+/// operator wrote in the same edit.
+///
+/// The fresh side re-derives the mounts from the same directory, so what it
+/// boots is the mounts document as it stands after the transition: the oracle
+/// statement holds over the mounts document and not only over the root.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fragment_arriving_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with(""));
+    install_package(components.path(), &staged_module(&tree));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        fragment_fixture(components.path()),
+        async |booted| {
+            restage(&tree, &components, &document_with(CEILING));
+            booted
+                .mounts
+                .config(CONFIG_MOUNT, "automator", &fragment(4));
+            booted.driver.reload(TriggerSource::Signal).await;
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{FRAGMENT_ADDRESS} "))),
+                "{:?}",
+                reloaded.channels
+            );
+            assert!(
+                reloaded
+                    .running
+                    .iter()
+                    .any(|line| line.starts_with(FRAGMENT_CONSUMER)),
+                "{:?}",
+                reloaded.running
+            );
+        },
+    )
+    .await;
+}
+
+/// **A fragment is edited.** The mounts document does not move and the root
+/// does not move; the only bytes that change are the mount author's, and the
+/// process has to end up where a restart would have put it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fragment_edit_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with(CEILING));
+    install_package(components.path(), &staged_module(&tree));
+    tree.mounts(&[components.path().to_path_buf()])
+        .config(CONFIG_MOUNT, "automator", &fragment(4));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        fragment_fixture(components.path()),
+        async |booted| {
+            booted.mounts.edit(CONFIG_MOUNT, &fragment(16));
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.channels_changed,
+                vec![FRAGMENT_ADDRESS.to_string()]
+            );
+        },
+        |reloaded| {
+            assert!(
+                reloaded
+                    .channels
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{FRAGMENT_ADDRESS} "))),
+                "{:?}",
+                reloaded.channels
+            );
+        },
+    )
+    .await;
+}
+
+/// **A config-carrying mount is withdrawn.** The operator takes the mount line
+/// and its ceiling out together, and the process has to retire what the
+/// fragment declared as completely as a boot without it would never have had
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fragment_leaving_matches_a_fresh_boot() {
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with(CEILING));
+    install_package(components.path(), &staged_module(&tree));
+    tree.mounts(&[components.path().to_path_buf()])
+        .config(CONFIG_MOUNT, "automator", &fragment(4));
+
+    a_reload_matches_a_fresh_boot(
+        &tree,
+        fragment_fixture(components.path()),
+        async |booted| {
+            restage(&tree, &components, &document_with(""));
+            booted.mounts.uninstall(CONFIG_MOUNT);
+            booted.mounts.write();
+            booted.driver.reload(TriggerSource::Signal).await;
+            assert_eq!(
+                booted.last_status().await.delta.consumers_removed,
+                vec![FRAGMENT_CONSUMER.to_string()]
+            );
+        },
+        |reloaded| {
+            assert!(
+                !reloaded
+                    .running
+                    .iter()
+                    .any(|line| line.starts_with(FRAGMENT_CONSUMER)),
+                "{:?}",
+                reloaded.running
             );
         },
     )

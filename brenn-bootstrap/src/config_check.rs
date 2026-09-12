@@ -21,30 +21,49 @@
 //! destined for another host. What the check does read is exactly its declared
 //! inputs: the root document, and the module roots its packaged imports resolve
 //! against.
+//!
+//! Which config-carrying mounts are part of the document is a declared input
+//! too, and the two forms name them differently. A `--mounts` check reads the
+//! mounts document's own names, which is the host's declaration and the whole
+//! answer. A `--modules` check reads the mounted roots `--mounted` names and no
+//! others, so a root declaring a ceiling `principal` is refused by that form —
+//! the ceiling is dead config until a mount is under it — until one is given.
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 
-use brenn_lib::config::{BrennConfig, DocumentInputs, DocumentRole, RootList, check_config};
+use brenn_lib::config::{BrennConfig, Roots, check_config, deployment_inputs};
 use brenn_lib::panic_util::{CONFIG_REFUSAL, catch_quietly, panic_message};
 use brenn_messaging_boot::resolve_messaging_offline;
 
-/// The module roots a config tool certifies against, from whichever of the two
-/// flag families the operator used.
+/// The roots a config tool certifies against, from whichever of the two flag
+/// families the operator used.
 ///
 /// Precondition: `Cli::validate` has already refused both flags at once.
 /// A declared mount that is not installed is an `Err`, because a check against
 /// roots the host does not have is a check of nothing. Neither flag yields the
 /// empty workstation list — a document with no packaged import needs no root.
-pub fn tool_module_roots(
+///
+/// The two forms differ in more than the module list: `--mounts` is the host's
+/// own declaration, so the config-carrying mounts it names are part of the
+/// document the check compiles and no second source of them is admitted, while
+/// `--modules` has no document to read them off and takes them from
+/// `--mounted NAME=PRINCIPAL=DIR` instead — one per config-carrying mount the
+/// deployment's mounts document declares, in declaration order.
+pub fn tool_roots(
     mounts: Option<&Path>,
     modules: &[std::path::PathBuf],
-) -> Result<RootList, String> {
+    mounted: &[String],
+) -> Result<Roots, String> {
     let Some(path) = mounts else {
-        return Ok(modules.to_vec().into());
+        let config_roots = mounted
+            .iter()
+            .map(|flag| brenn_lib::config::mounted_flag(flag))
+            .collect::<Result<Vec<_>, String>>()?;
+        return Ok(Roots::modules(modules.to_vec().into(), config_roots));
     };
-    brenn_lib::config::try_load_mounts(Some(path)).map(|mounts| mounts.roots.module_roots)
+    brenn_lib::config::try_load_mounts(Some(path)).map(|mounts| mounts.roots)
 }
 
 /// Check one config file, print the verdict. Returns whether it would load.
@@ -52,12 +71,8 @@ pub fn tool_module_roots(
 /// Strictly stronger than [`check_config`]: a document that compiles and lowers
 /// clean can still be refused here, by a messaging gate that reads only the
 /// configuration.
-pub fn run_config_check(file: &Path, module_roots: &RootList) -> bool {
-    let inputs = DocumentInputs {
-        root: file.to_path_buf(),
-        module_roots: module_roots.clone(),
-        role: DocumentRole::Deployment,
-    };
+pub fn run_config_check(file: &Path, roots: &Roots) -> bool {
+    let inputs = deployment_inputs(file, roots);
     let document = match check_config(&inputs) {
         Ok(document) => document,
         Err(report) => {
@@ -255,6 +270,7 @@ mod tests {
 
     use brenn_dsl::fixture_text::processor_header;
     use brenn_dsl::processor_needs;
+    use brenn_lib::config::{DocumentInputs, RootList};
     use brenn_lib::messaging::config::Depth;
     // The counterpart constant, read only here: these tests are what hold it
     // disjoint from `REFUSAL_PREFIXES`.
@@ -281,8 +297,9 @@ mod tests {
         )
         .unwrap();
 
-        let roots = tool_module_roots(Some(&file), &[]).expect("the mount is installed");
-        assert_eq!(*roots, [mount.join("modules")]);
+        let roots = tool_roots(Some(&file), &[], &[]).expect("the mount is installed");
+        assert_eq!(*roots.module_roots, [mount.join("modules")]);
+        assert!(roots.config_roots.is_empty());
     }
 
     /// A declared mount with nothing behind it is an error rather than a
@@ -300,7 +317,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = tool_module_roots(Some(&file), &[]).expect_err("the mount is not installed");
+        let report = tool_roots(Some(&file), &[], &[]).expect_err("the mount is not installed");
         assert!(report.contains("later"), "{report}");
     }
 
@@ -308,11 +325,12 @@ mod tests {
     /// nothing: a document with no packaged import is checkable with no roots.
     #[test]
     fn neither_flag_is_the_empty_flag_sourced_list() {
-        let roots = tool_module_roots(None, &[]).expect("no flag is not a failure");
-        assert!(roots.is_empty());
-        let roots = tool_module_roots(None, &[PathBuf::from("/srv/specs")])
+        let roots = tool_roots(None, &[], &[]).expect("no flag is not a failure");
+        assert!(roots.module_roots.is_empty());
+        let roots = tool_roots(None, &[PathBuf::from("/srv/specs")], &[])
             .expect("the workstation form reads no environment");
-        assert_eq!(*roots, [PathBuf::from("/srv/specs")]);
+        assert_eq!(*roots.module_roots, [PathBuf::from("/srv/specs")]);
+        assert!(roots.config_roots.is_empty());
     }
 
     /// Exercises both `run_config_check` (the boolean) and `check_config` (the
@@ -329,7 +347,7 @@ mod tests {
     fn check(name: &str, contents: &str) -> (bool, String) {
         let dir = tempfile::tempdir().unwrap();
         let inputs = brenn_lib::config::stage_fixture(dir.path(), name, contents);
-        let ok = run_config_check(&inputs.root, &inputs.module_roots);
+        let ok = workstation_check(&inputs);
         let config = check_config(&inputs);
         assert!(
             config.is_ok() || !ok,
@@ -558,13 +576,215 @@ new alice_sink: Sink {
         (dir, file, modules)
     }
 
+    /// A deployment root declaring one ceiling, beside a mounts document
+    /// declaring one config-carrying mount under it — the `--mounts` form, and
+    /// the layout the host itself reads.
+    ///
+    /// Returns the tempdir (which the caller holds), the root document and the
+    /// mounts document. `fragment` is the mount's entry text, so a case can
+    /// hand one that compiles and one that does not.
+    fn mounted_document(fragment: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let modules = dir.path().join("mount/modules");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(modules.join("sink.brenn"), PACKAGED_SINK).unwrap();
+        let config = dir.path().join("mount/config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("main.brenn"), fragment).unwrap();
+        std::fs::write(dir.path().join("mount/VERSION"), "1\n").unwrap();
+
+        let file = dir.path().join("main.brenn");
+        std::fs::write(
+            &file,
+            [
+                SURFACE_INDEX_DECL,
+                r#"
+principal automator {
+    grants = [ports];
+    acl publish [prefix "brenn:automations."];
+    acl subscribe [prefix "brenn:automations."];
+}
+"#,
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let mounts = dir.path().join("mounts.brenn");
+        std::fs::write(
+            &mounts,
+            format!(
+                "mount automations under automator {{ path = \"{}\"; }}\n",
+                dir.path().join("mount").display(),
+            ),
+        )
+        .unwrap();
+        (dir, file, mounts)
+    }
+
+    /// A fragment that stays inside its ceiling: one channel in the namespace
+    /// the operator's `acl` lines reach, wired to a consumer of its own.
+    const GOOD_FRAGMENT: &str = r#"use @sink::Sink;
+
+channel digest at "brenn:automations.digest" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+channel replies at "brenn:automations.replies" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+
+new sifter: Sink {
+    grants = [ports];
+    in messages <- digest;
+    out events -> replies;
+}
+"#;
+
+    /// The `--mounts` form compiles the config-carrying mounts' trees as part
+    /// of the document: the fragment's own channels and consumers are checked,
+    /// not merely the root's.
+    #[test]
+    fn the_mounts_form_checks_a_config_carrying_mount_s_document() {
+        let (_dir, file, mounts) = mounted_document(GOOD_FRAGMENT);
+        let roots = tool_roots(Some(&mounts), &[], &[]).expect("the mount is installed");
+        assert_eq!(roots.config_roots.len(), 1);
+        assert!(run_config_check(&file, &roots));
+    }
+
+    /// And reports the fragment's refusals as the host would: positioned in the
+    /// mount's own file, so an author reading the verdict is sent to the text
+    /// they wrote rather than to the operator's.
+    #[test]
+    fn a_fragment_s_refusal_is_reported_against_the_mount_s_own_file() {
+        let (_dir, file, mounts) = mounted_document(
+            r#"channel elsewhere at "brenn:elsewhere" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+"#,
+        );
+        let roots = tool_roots(Some(&mounts), &[], &[]).expect("the mount is installed");
+        assert!(!run_config_check(&file, &roots));
+        let report = check_config(&deployment_inputs(&file, &roots))
+            .expect_err("the fragment exceeds its ceiling");
+        assert!(
+            report.contains("mount/config/main.brenn:1:")
+                && report.contains("brenn:elsewhere")
+                && report.contains("automator"),
+            "{report}",
+        );
+    }
+
+    /// A ceiling `principal` is live only while a mount is under it, so the
+    /// `--modules` form — which has no mounts document to read one off — refuses
+    /// a root that declares one. That is correct for what it read, and it is
+    /// why the flag below exists.
+    #[test]
+    fn the_modules_form_refuses_a_root_declaring_a_ceiling() {
+        let (_dir, file, _mounts) = mounted_document(GOOD_FRAGMENT);
+        let roots = tool_roots(None, &[], &[]).expect("no flag is not a failure");
+        assert!(!run_config_check(&file, &roots));
+        let report = check_config(&deployment_inputs(&file, &roots))
+            .expect_err("a ceiling nothing is under is dead config");
+        assert!(report.contains("automator"), "{report}");
+    }
+
+    /// `--mounted NAME=PRINCIPAL=DIR` is what the workstation form names them
+    /// with. Pointed at a stub whose entry is empty, it certifies the root
+    /// against the ceilings its mounts document declares and nothing about any
+    /// fragment's contents.
+    #[test]
+    fn a_mounted_stub_makes_the_ceiling_live() {
+        let (dir, file, _mounts) = mounted_document(GOOD_FRAGMENT);
+        let stub = dir.path().join("stub");
+        std::fs::create_dir_all(&stub).unwrap();
+        std::fs::write(stub.join("main.brenn"), "").unwrap();
+        let flag = format!("automations=automator={}", stub.display());
+        let roots = tool_roots(None, &[], std::slice::from_ref(&flag)).expect("the flag parses");
+        assert_eq!(roots.config_roots.len(), 1);
+        assert_eq!(roots.config_roots[0].dir, stub, "`DIR` is the config root");
+        assert!(run_config_check(&file, &roots));
+    }
+
+    /// Pointed at the real tree instead — which is what the installers' pre-stop
+    /// check does, running where the fragment lives — it checks the fragment too.
+    #[test]
+    fn a_mounted_flag_naming_the_real_tree_checks_the_fragment() {
+        let (dir, file, _mounts) = mounted_document(
+            r#"channel elsewhere at "brenn:elsewhere" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
+"#,
+        );
+        let flag = format!(
+            "automations=automator={}",
+            dir.path().join("mount/config").display()
+        );
+        let roots = tool_roots(None, &[], std::slice::from_ref(&flag)).expect("the flag parses");
+        assert!(!run_config_check(&file, &roots));
+    }
+
+    /// A flag whose ceiling the root does not declare is refused, positioned on
+    /// the flag's own rendering — the filename is the flag as typed, which is
+    /// what keeps `Diagnostic::at` from panicking on a span with no file.
+    #[test]
+    fn a_mounted_flag_naming_an_undeclared_principal_is_refused_at_the_flag() {
+        let (dir, file, _mounts) = mounted_document(GOOD_FRAGMENT);
+        let stub = dir.path().join("stub");
+        std::fs::create_dir_all(&stub).unwrap();
+        std::fs::write(stub.join("main.brenn"), "").unwrap();
+        let flag = format!("automations=nobody={}", stub.display());
+        let roots = tool_roots(None, &[], std::slice::from_ref(&flag)).expect("the flag parses");
+        let report = check_config(&deployment_inputs(&file, &roots))
+            .expect_err("the root declares no `nobody`");
+        assert!(
+            report.contains(&format!("--mounted {flag}:1:")) && report.contains("nobody"),
+            "{report}"
+        );
+    }
+
+    /// A `DIR` holding no entry document is refused the same way, at the flag.
+    #[test]
+    fn a_mounted_flag_with_no_entry_document_is_refused_at_the_flag() {
+        let (dir, file, _mounts) = mounted_document(GOOD_FRAGMENT);
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let flag = format!("automations=automator={}", empty.display());
+        let roots = tool_roots(None, &[], std::slice::from_ref(&flag)).expect("the flag parses");
+        let report =
+            check_config(&deployment_inputs(&file, &roots)).expect_err("there is no `main.brenn`");
+        assert!(
+            report.contains(&format!("--mounted {flag}:1:")) && report.contains("main.brenn"),
+            "{report}"
+        );
+    }
+
+    /// A flag that is not three `=`-separated parts is the caller's mistake and
+    /// is refused before anything is read.
+    #[test]
+    fn a_mounted_flag_of_the_wrong_shape_is_refused() {
+        let message = tool_roots(None, &[], &["automations=automator".to_string()])
+            .expect_err("two parts is not three");
+        assert!(message.contains("NAME=PRINCIPAL=DIR"), "{message}");
+    }
+
     /// The check reads no facts beyond its declared inputs, and the module root
     /// is one of them: the same document checks against whichever module tree
     /// the caller names, and is refused when it names none.
     #[test]
     fn a_document_importing_packaged_modules_checks_against_the_module_root() {
         let (_dir, file, modules) = packaged_document();
-        assert!(run_config_check(&file, &vec![modules].into()));
+        assert!(run_config_check(
+            &file,
+            &Roots::modules(vec![modules].into(), Vec::new())
+        ));
     }
 
     #[test]
@@ -641,16 +861,12 @@ new relay: Relay {
         .unwrap();
         assert!(run_config_check(
             &file,
-            &vec![modules.clone(), bundle.clone()].into()
+            &Roots::modules(vec![modules.clone(), bundle.clone()].into(), Vec::new()),
         ));
         // Either root alone leaves exactly the other's import unresolved.
         for (root, missing) in [(&modules, "bundle"), (&bundle, "sink")] {
-            let inputs = DocumentInputs {
-                root: file.clone(),
-                module_roots: vec![root.clone()].into(),
-                role: DocumentRole::Deployment,
-            };
-            assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+            let inputs = DocumentInputs::deployment(file.clone(), vec![root.clone()]);
+            assert!(!workstation_check(&inputs));
             let report = check_config(&inputs).expect_err("one import must be unresolved");
             assert!(
                 report.contains(&format!("no packaged module `{missing}`")),
@@ -672,12 +888,8 @@ new relay: Relay {
     fn a_module_installed_under_two_roots_is_refused_naming_both() {
         let (dir, file, modules) = packaged_document();
         let copy = duplicate_release(dir.path(), &modules);
-        let inputs = DocumentInputs {
-            root: file,
-            module_roots: vec![modules.clone(), copy.clone()].into(),
-            role: DocumentRole::Deployment,
-        };
-        assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+        let inputs = DocumentInputs::deployment(file, vec![modules.clone(), copy.clone()]);
+        assert!(!workstation_check(&inputs));
         let report = check_config(&inputs).expect_err("the duplicate must be refused");
         assert!(
             report.contains("packaged module `sink` is installed under more than one"),
@@ -696,13 +908,12 @@ new relay: Relay {
         let copy = duplicate_release(dir.path(), &modules);
         let plain = dir.path().join("plain.brenn");
         std::fs::write(&plain, "const host = \"example.com\";\n").unwrap();
-        assert!(run_config_check(&plain, &vec![modules.clone()].into()));
-        let inputs = DocumentInputs {
-            root: plain,
-            module_roots: vec![modules, copy].into(),
-            role: DocumentRole::Deployment,
-        };
-        assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+        assert!(run_config_check(
+            &plain,
+            &Roots::modules(vec![modules.clone()].into(), Vec::new())
+        ));
+        let inputs = DocumentInputs::deployment(plain, vec![modules, copy]);
+        assert!(!workstation_check(&inputs));
         let report = check_config(&inputs).expect_err("the duplicate must be refused");
         assert!(
             report.contains("packaged module `sink` is installed under more than one"),
@@ -754,11 +965,14 @@ new relay: Relay {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let file = dir.path().join("main.brenn");
         std::fs::write(&file, contents).expect("the document is writable");
-        refusal_of(&DocumentInputs {
-            root: file,
-            module_roots: module_roots.clone(),
-            role: DocumentRole::Deployment,
-        })
+        refusal_of(&DocumentInputs::deployment(file, module_roots.clone()))
+    }
+
+    fn workstation_check(inputs: &DocumentInputs) -> bool {
+        run_config_check(
+            &inputs.root,
+            &Roots::modules(inputs.module_roots.clone(), Vec::new()),
+        )
     }
 
     /// Check `inputs`, holding both layers: the front end accepts the document
@@ -778,7 +992,7 @@ new relay: Relay {
                 .expect_err("an offline gate must refuse this configuration"),
         };
         assert!(
-            !run_config_check(&inputs.root, &inputs.module_roots),
+            !workstation_check(inputs),
             "the offline pass refused it but the verdict passed it",
         );
         message
@@ -1281,7 +1495,7 @@ new alice: Assistant();
             "main.brenn",
             &parity_document("push_bob", "push_alice"),
         );
-        assert!(!run_config_check(&inputs.root, &inputs.module_roots));
+        assert!(!workstation_check(&inputs));
         let report = check_config(&inputs).expect_err("the binding must be refused");
         assert!(report.contains("push_bob"), "{report}");
     }
@@ -1381,7 +1595,10 @@ new alice: Assistant();
         let root = repo_root();
         let specs = root.join("config/specs");
         assert!(
-            run_config_check(&root.join(filename), &vec![specs.clone()].into()),
+            run_config_check(
+                &root.join(filename),
+                &Roots::modules(vec![specs.clone()].into(), Vec::new())
+            ),
             "{filename} must pass config-check"
         );
         // The outcome, not the mechanism: a shipped root that stamps the
@@ -1466,11 +1683,7 @@ new alice: Assistant();
         let dir = tempfile::tempdir().expect("a temporary directory");
         let root = dir.path().join("stamped.brenn");
         std::fs::write(&root, contents).expect("the document is writable");
-        let inputs = DocumentInputs {
-            root,
-            module_roots: vec![repo_root().join("config/specs")].into(),
-            role: DocumentRole::Deployment,
-        };
+        let inputs = DocumentInputs::deployment(root, vec![repo_root().join("config/specs")]);
         match check_config(&inputs) {
             Ok(document) => document.config,
             Err(report) => panic!("the document must compile: {report}"),
@@ -1566,11 +1779,7 @@ new alice: Assistant();
         let root = dir.path().join("brenn.dev.brenn");
         std::fs::write(&root, shipped.replace(stamp, "")).expect("the document is writable");
 
-        let inputs = DocumentInputs {
-            root,
-            module_roots: vec![repo_root().join("config/specs")].into(),
-            role: DocumentRole::Deployment,
-        };
+        let inputs = DocumentInputs::deployment(root, vec![repo_root().join("config/specs")]);
         let report = check_config(&inputs).expect_err("the pins name channels nothing declares");
         assert!(
             report.contains("brenn:surface-errors") && report.contains("brenn:surface.index"),
@@ -1674,7 +1883,10 @@ surface panel {{
         )
         .expect("the document is writable");
         assert!(
-            run_config_check(&file, &vec![repo_root().join("config/specs")].into()),
+            run_config_check(
+                &file,
+                &Roots::modules(vec![repo_root().join("config/specs")].into(), Vec::new())
+            ),
             "the stamps each case below omits are the whole of what it owes",
         );
     }

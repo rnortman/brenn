@@ -43,7 +43,7 @@ use brenn_dsl::model::{
 };
 use brenn_dsl::resolved::{
     ClassRef, MatcherKind, PortDir, RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer,
-    RHooks, RMatcherVal, RMcp, RMount, RNamed, RRemote, RSection, RSubscribe, RSurface, RTail,
+    RHooks, RMatcherVal, RMcp, RNamed, RRemote, RRepoMount, RSection, RSubscribe, RSurface, RTail,
     RToolGrant, RVal, RValue, RWebhook, RWebhookBlock, ResolvedConfig as DslResolved, scheme,
 };
 
@@ -2029,7 +2029,7 @@ fn tool_grants(tools: &[RToolGrant]) -> Vec<ToolGrantRaw> {
 }
 
 /// One `[[app.mount]]`, from a `mount` statement's tail.
-fn mount(entry: &RMount, errors: &mut Vec<Diagnostic>) -> MountConfigRaw {
+fn mount(entry: &RRepoMount, errors: &mut Vec<Diagnostic>) -> MountConfigRaw {
     let MountTail {
         access,
         working_dir,

@@ -1,5 +1,5 @@
 //! The mounts document: what it declares, what the host refuses, and what the
-//! three root lists derive to.
+//! root lists derive to.
 //!
 //! Every fixture builds a real tree under a tempdir, because everything this
 //! module does past the compile is a filesystem question — a `VERSION` file, a
@@ -30,6 +30,14 @@ fn document(dir: &Path, body: &str) -> PathBuf {
 /// One `mount name { path = "…"; }` line.
 fn line(name: &str, path: &Path) -> String {
     format!("mount {name} {{ path = \"{}\"; }}\n", path.display())
+}
+
+/// One `mount name under p { path = "…"; }` line.
+fn line_under(name: &str, under: &str, path: &Path) -> String {
+    format!(
+        "mount {name} under {under} {{ path = \"{}\"; }}\n",
+        path.display(),
+    )
 }
 
 // ── the happy path ───────────────────────────────────────────────────────────
@@ -140,11 +148,10 @@ fn a_host_with_no_mounts_is_refused_in_the_mounts_words() {
     .unwrap();
 
     let roots = load_mounts(None).roots;
-    let errors = brenn_dsl::compile(&brenn_dsl::DocumentInputs {
+    let errors = brenn_dsl::compile(&brenn_dsl::DocumentInputs::deployment(
         root,
-        module_roots: roots.module_roots,
-        role: brenn_dsl::DocumentRole::Deployment,
-    })
+        roots.module_roots,
+    ))
     .expect_err("a packaged import with no root does not compile");
     assert!(
         errors.iter().any(|error| error.message
@@ -192,7 +199,7 @@ fn a_relative_path_is_refused() {
     assert!(report.contains("demo"), "and which mount: {report}");
 }
 
-/// A tab in a path. The `brenn mounts` listing is one line per mount with three
+/// A tab in a path. The `brenn mounts` listing is one line per mount with four
 /// tab-separated fields, so a path holding a tab or a newline is a line an
 /// installer parses as two mounts or as extra fields.
 #[test]
@@ -373,4 +380,132 @@ fn a_listing_reports_each_mount_separately() {
     };
     assert!(message.contains("VERSION"), "{message}");
     assert_eq!(statuses[2].1, MountStatus::Missing);
+}
+
+// ── config-carrying mounts ───────────────────────────────────────────────────
+
+/// A `config/` tree is detected like the other three, and a mount that offers
+/// one derives a config root naming the mount, the canonical directory and the
+/// ceiling as written. Config roots are not searched, so the list is a `Vec` in
+/// declaration order and a mount offering no config contributes nothing to it.
+#[test]
+fn a_config_tree_derives_a_config_root_under_its_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = install(dir.path(), "release", "0.20.0", &[MountTree::Modules]);
+    let automations = install(
+        dir.path(),
+        "automations",
+        "1",
+        &[MountTree::Config, MountTree::Modules],
+    );
+    let file = document(
+        dir.path(),
+        &format!(
+            "{}{}",
+            line("brenn", &release),
+            line_under("automations", "assistant-automations", &automations),
+        ),
+    );
+
+    let loaded = try_load_mounts(Some(&file)).expect("both mounts are installed");
+
+    assert_eq!(
+        loaded.config.mounts[1].trees,
+        [MountTree::Modules, MountTree::Config],
+        "`config/` is detected by its directory, like every other tree"
+    );
+    assert_eq!(
+        loaded.config.mounts[1]
+            .under
+            .as_ref()
+            .map(|under| under.value().as_str()),
+        Some("assistant-automations"),
+    );
+    assert_eq!(
+        loaded.config.mounts[0].under, None,
+        "a mount with no config is under no one"
+    );
+
+    let config_roots = &loaded.roots.config_roots;
+    assert_eq!(
+        config_roots.len(),
+        1,
+        "only the mount offering `config/` contributes one"
+    );
+    assert_eq!(config_roots[0].mount, "automations");
+    assert_eq!(
+        config_roots[0].dir,
+        automations.canonicalize().unwrap().join("config"),
+        "a config root is the canonical mount path's `config/`",
+    );
+    assert_eq!(config_roots[0].under, "assistant-automations");
+    assert!(
+        !loaded.roots.module_roots.is_empty(),
+        "a config-carrying mount still offers its other trees"
+    );
+
+    // The two spans, by position and not merely by presence. `Diagnostic::at`
+    // panics on a span carrying no filename, and the refusals these positions
+    // draw are the ones this slice exists to produce — so a regression here is
+    // a panic in `prepare` or an operator sent to the wrong word. The mount's
+    // own name answers "this mount is broken"; the `under` clause answers "this
+    // ceiling is wrong"; neither is the `path` value.
+    let position = brenn_dsl::diag::Diagnostic::span_line_col;
+    let (line, column) = position(&config_roots[0].span).expect("the mount's name is positioned");
+    assert_eq!((line, column), (2, "mount ".len() as i64 + 1));
+    let (line, column) =
+        position(&config_roots[0].under_span).expect("the `under` clause is positioned");
+    assert_eq!(
+        (line, column),
+        (2, "mount automations under ".len() as i64 + 1)
+    );
+}
+
+/// The ceiling and the tree are one declaration written in two places: config
+/// under nobody is text the compiler has no ceiling for.
+#[test]
+fn config_under_no_principal_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let automations = install(dir.path(), "automations", "1", &[MountTree::Config]);
+    let file = document(dir.path(), &line("automations", &automations));
+
+    let report = try_load_mounts(Some(&file)).expect_err("a ceiling is not optional here");
+    assert!(
+        report.contains("carries config and is under no principal"),
+        "{report}"
+    );
+}
+
+/// The other half: a ceiling caps what a mount's config declares, so one on a
+/// mount that declares nothing caps nothing. It is not a cap on the mount's
+/// other trees — what an instance of a packaged class may hold is written at
+/// the instantiation site.
+#[test]
+fn a_ceiling_on_a_mount_with_no_config_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = install(dir.path(), "bundle", "1.4.2", &[MountTree::Modules]);
+    let file = document(dir.path(), &line_under("demo", "assistant", &bundle));
+
+    let report = try_load_mounts(Some(&file)).expect_err("a ceiling over nothing is a fault");
+    assert!(
+        report.contains("is under `assistant` and carries no config"),
+        "{report}"
+    );
+}
+
+/// The layout rule does not fork for one tree: a config-only mount commits a
+/// `VERSION` file like every other mount, and the repository's own release
+/// counter is what goes in it.
+#[test]
+fn a_config_only_mount_still_needs_a_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let automations = dir.path().join("automations");
+    std::fs::create_dir_all(automations.join("config")).unwrap();
+    let file = document(
+        dir.path(),
+        &line_under("automations", "assistant-automations", &automations),
+    );
+
+    let report = try_load_mounts(Some(&file)).expect_err("no VERSION is no mount");
+    assert!(report.contains("VERSION"), "{report}");
 }

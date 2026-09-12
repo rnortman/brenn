@@ -3826,6 +3826,7 @@ fn a_file_built_without_a_source_hash_is_refused_at_class_resolution() {
         vec![(String::new(), root), ("@spec".to_string(), module)],
         "",
         brenn_dsl::DocumentRole::Deployment,
+        &[],
     );
 }
 
@@ -4515,6 +4516,40 @@ fn a_mounts_document_resolves_its_mounts() {
             // precisely so a deployment's bundle root is written once.
             "/home/alice/brenn/bundles/brenn-component-demo",
         ]
+    );
+}
+
+/// A config-carrying mount records the principal its `under` clause names, as
+/// written and with the clause's span. The name is not resolved here: a mounts
+/// document declares no principal, and the deployment document the ceiling
+/// governs is where it has to resolve.
+#[test]
+fn a_mount_records_the_ceiling_it_is_declared_under() {
+    let config = resolved_mounts(
+        "mount brenn { path = \"/home/alice/brenn/release\"; }\n\
+         mount automations under assistant-automations { path = \"/home/alice/auto\"; }\n",
+    );
+
+    let ceilings: Vec<Option<String>> = config
+        .mounts
+        .iter()
+        .map(|mount| mount.under.as_ref().map(|under| under.dotted()))
+        .collect();
+    assert_eq!(ceilings, [None, Some("assistant-automations".to_string())]);
+    assert!(
+        config.mounts[1].under_span.is_some(),
+        "the clause carries its own position, which is what a refusal about the ceiling cites"
+    );
+    assert!(config.mounts[0].under_span.is_none());
+}
+
+/// `::` is a module qualification and a principal is named by its handle, so a
+/// module path in an `under` clause is refused where it is written.
+#[test]
+fn a_mount_ceiling_is_a_handle_and_not_a_module_path() {
+    assert_eq!(
+        mounts_refusals("mount automations under authority::assistant { path = \"/a\"; }\n"),
+        ["`authority::assistant` is a module path; a principal is named by its handle"]
     );
 }
 

@@ -223,7 +223,11 @@ fn load_config_defaults_carry_an_empty_document() {
 fn load_config_reports_every_file_of_a_multi_file_document() {
     let dir = tempfile::tempdir().unwrap();
     let inputs = stage_fixture(dir.path(), "main.brenn", FENCED_DOCUMENT);
-    let document = load_config_from(Some(&inputs.root), &inputs.module_roots, dir.path());
+    let document = load_config_from(
+        Some(&inputs.root),
+        &Roots::modules(inputs.module_roots.clone(), Vec::new()),
+        dir.path(),
+    );
     assert_eq!(
         document.file_places(),
         format!("main.brenn @{PACKAGED_MODULE}.brenn")
@@ -266,7 +270,11 @@ server {
 fn an_explicit_load_reports_the_root_and_module_roots_it_read() {
     let dir = tempfile::tempdir().unwrap();
     let inputs = stage_fixture(dir.path(), "main.brenn", FENCED_DOCUMENT);
-    let document = load_config_from(Some(&inputs.root), &inputs.module_roots, dir.path());
+    let document = load_config_from(
+        Some(&inputs.root),
+        &Roots::modules(inputs.module_roots.clone(), Vec::new()),
+        dir.path(),
+    );
     let reported = document
         .inputs
         .expect("a load from a tree reports its tree");

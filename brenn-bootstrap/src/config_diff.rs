@@ -11,23 +11,23 @@
 
 use std::path::Path;
 
-use brenn_lib::config::{BrennConfig, RootList, load_config, sort_order_dead_collections};
+use brenn_lib::config::{BrennConfig, Roots, load_config, sort_order_dead_collections};
 use similar::TextDiff;
 
 /// Load both files, compare, print the verdict. Returns whether they are equal,
 /// which the binary turns into its exit status.
 ///
-/// One module-root list serves both sides: the two documents being compared are
-/// versions of one deployment, so a diff across two module universes is not a
+/// One set of roots serves both sides: the two documents being compared are
+/// versions of one deployment, so a diff across two root universes is not a
 /// real operation.
 ///
 /// # Panics
 ///
 /// Panics if either file fails to load — the differ compares valid configs, and
 /// an invalid one is a louder failure than a diff.
-pub fn run_config_diff(a: &Path, b: &Path, module_roots: &RootList) -> bool {
-    let config_a = load_config(Some(a), module_roots).config;
-    let config_b = load_config(Some(b), module_roots).config;
+pub fn run_config_diff(a: &Path, b: &Path, roots: &Roots) -> bool {
+    let config_a = load_config(Some(a), roots).config;
+    let config_b = load_config(Some(b), roots).config;
     let (equal, rendering) = diff(
         config_a,
         config_b,
@@ -231,7 +231,7 @@ new alice_sink: Sink {{
     #[test]
     fn both_sides_of_a_diff_resolve_against_the_module_root() {
         let (_dir, modules, a, same, other) = packaged_pair();
-        let roots = vec![modules].into();
+        let roots = Roots::modules(vec![modules].into(), Vec::new());
         assert!(run_config_diff(&a, &same, &roots));
         assert!(!run_config_diff(&a, &other, &roots));
     }

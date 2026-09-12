@@ -63,7 +63,7 @@ use crate::resolved::scheme::{config_identified, spellable_quoted_list, split_sp
 use crate::resolved::{
     ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
     RChannel, RMatcher, RMatcherVal, RPort, RStamp, RSurface, RTail, RToolGrant, RTuning, RVal,
-    RValue, RWordList, ResolvedConfig, StampId, str_value,
+    RValue, RWordList, ResolvedConfig, StampId, StampOrigin, str_value,
 };
 
 /// Derive a resolved document.
@@ -2963,6 +2963,17 @@ fn check_dead_principals(
         let Some(written) = bodies[index].as_ref() else {
             continue;
         };
+        // A mount's ceiling caps text that is not written yet: the fragment's
+        // author writes it, on their own cadence, in a repository the operator
+        // does not edit. A day-one fragment that declares nothing would make
+        // every word and every `acl` line the operator wrote to bound it read
+        // as dead config. The mount is the arrangement that holds them.
+        if stamps
+            .iter()
+            .any(|StampId(index)| config.stamps[*index].is_mount())
+        {
+            continue;
+        }
         let held: Vec<(&Confers, &[(Family, DEntry)])> = stamps
             .iter()
             .map(|stamp| {
@@ -3446,9 +3457,66 @@ fn check_stamps(
         effective.reach.extend(default.iter().cloned());
         let held = confers.get(&StampId(index)).unwrap_or(&nothing);
         check_fit(config, stamp, held, &effective, delegated, errors);
+        if stamp.is_mount() {
+            check_mount_channels(config, stamp, StampId(index), &effective, errors);
+        }
         if !reported[index] {
             check_dead_ceiling(stamp, &bodies[index], held, &default, errors);
         }
+    }
+}
+
+/// That every channel a mount's config declares sits where its ceiling reaches.
+///
+/// The other half of a mount stamp holding no default reach. A binding to an
+/// address outside the ceiling is already refused by the fit rule, but a
+/// channel nothing binds confers nothing and would slip through — and a channel
+/// nobody may reach is a ring of messages the document says nothing about. One
+/// refusal per channel, and only when *neither* plane reaches it: a fragment
+/// that may publish and not subscribe is a real arrangement, and the fit rule
+/// is what says so at each binding.
+fn check_mount_channels(
+    config: &ResolvedConfig,
+    stamp: &RStamp,
+    id: StampId,
+    effective: &Authority,
+    errors: &mut Vec<Diagnostic>,
+) {
+    for channel in &config.channels {
+        if !ancestry(config, channel.stamp).contains(&id) {
+            continue;
+        }
+        // TODO(ceiling-channel-depth): the address is all this reads. A
+        // fragment sizes its own rings, so a ceiling bounds where its channels
+        // live and not how much of the store they take.
+        //
+        // A confined address, or one no family is spelled over: the serving
+        // host authorizes it and no ceiling holds it.
+        let entries = exact_entries(channel);
+        if entries.is_empty() {
+            continue;
+        }
+        if entries.iter().any(|(family, entry)| {
+            effective
+                .family(*family)
+                .any(|held| entry.subsumed_by(held))
+        }) {
+            continue;
+        }
+        let label = stamp
+            .under
+            .as_ref()
+            .map(HandlePath::dotted)
+            .expect("resolution refuses a mount that is under no one");
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` declares `{}` and `{label}` reaches it on no plane; a mount's \
+                 channels live where its principal's reach is written",
+                stamp.handle.dotted(),
+                channel.address.value()
+            ),
+            channel.address.span().clone(),
+        ));
     }
 }
 
@@ -3477,10 +3545,7 @@ fn check_dead_ceiling(
     if !stamp.wrote_body {
         return;
     }
-    let stamped = match &stamp.package {
-        Some(package) => format!("`{}` from `@{package}`", stamp.assembly.value()),
-        None => format!("`{}`", stamp.assembly.value()),
-    };
+    let stamped = stamped_label(stamp);
     // Whose file the dead text is in, the same fact the fit rule reports. A
     // stamp written in packaged text is an author narrowing a nested
     // arrangement, so the line is in a module every deployment that stamps the
@@ -3626,10 +3691,19 @@ fn confers(config: &ResolvedConfig, conferred: &Conferred) -> HashMap<StampId, C
 /// which stamping it is the consent to mint, and a channel handed in as an
 /// argument, which naming it in the argument list is the consent to reach.
 /// Both are exact entries on both planes of the address's own scheme.
+///
+/// A mount stamp holds neither. Stamping an arrangement is the deployer reading
+/// a body and consenting to what it declares; declaring a mount is consenting
+/// to whatever its author writes next, which is no consent to an address at
+/// all. So a mount's channels live where its principal's reach is written, and
+/// nothing a fragment declares widens the ceiling the mounts document named.
 fn default_reach(config: &ResolvedConfig) -> HashMap<StampId, Vec<(Family, DEntry)>> {
     let mut reach: HashMap<StampId, Vec<(Family, DEntry)>> = HashMap::new();
     let mut add = |stamp: Option<StampId>, channel: &RChannel| {
         for id in ancestry(config, stamp) {
+            if config.stamps[id.0].is_mount() {
+                continue;
+            }
             reach.entry(id).or_default().extend(exact_entries(channel));
         }
     };
@@ -3680,6 +3754,22 @@ fn ancestry(config: &ResolvedConfig, stamp: Option<StampId>) -> Vec<StampId> {
     chain
 }
 
+/// How a refusal names what a stamp stamped.
+///
+/// An assembly stamp is its class, qualified by the package that declares it
+/// where there is one. A mount stamp has no class: what it stamps is the whole
+/// `config/` tree of the mount, and the mount's name is what the operator can
+/// act on.
+fn stamped_label(stamp: &RStamp) -> String {
+    match &stamp.origin {
+        StampOrigin::Assembly(name) => match &stamp.package {
+            Some(package) => format!("`{}` from `@{package}`", name.value()),
+            None => format!("`{}`", name.value()),
+        },
+        StampOrigin::Mount => format!("the config of mount `{}`", stamp.handle.dotted()),
+    }
+}
+
 /// That what a stamp's arrangement confers fits under its effective ceiling.
 ///
 /// One refusal per excess. A word is reported once with every instance holding
@@ -3695,10 +3785,7 @@ fn check_fit(
     delegated: &Delegated,
     errors: &mut Vec<Diagnostic>,
 ) {
-    let stamped = match &stamp.package {
-        Some(package) => format!("`{}` from `@{package}`", stamp.assembly.value()),
-        None => format!("`{}`", stamp.assembly.value()),
-    };
+    let stamped = stamped_label(stamp);
     // Whose file a refusal here belongs to. A stamp written in packaged text is
     // an author narrowing a nested arrangement, so an arrangement that exceeds
     // it is the author's to fix and no line the deployer writes can answer it.
@@ -3707,6 +3794,9 @@ fn check_fit(
         false => "",
     };
     let all: Vec<&str> = confers.words.keys().map(String::as_str).collect();
+    // TODO(ceiling-tool-resources): a word is the whole grain here. `tools` held
+    // by a ceiling covers every registry tool and every `allow` resource a stamp
+    // beneath it writes, which is the one hole left in a mount's ceiling.
     for (word, holders) in &confers.words {
         if effective.words.contains_key(word) {
             continue;

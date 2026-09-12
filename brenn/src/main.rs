@@ -28,12 +28,12 @@ async fn main() -> ExitCode {
             return ExitCode::from(bootstrap::run_config_status(db));
         }
         Some(cli::Commands::ConfigDiff { a, b }) => {
-            let module_roots = check_module_roots(&cli);
-            return verdict(bootstrap::run_config_diff(a, b, &module_roots));
+            let roots = check_roots(&cli);
+            return verdict(bootstrap::run_config_diff(a, b, &roots));
         }
         Some(cli::Commands::ConfigCheck { file }) => {
-            let module_roots = check_module_roots(&cli);
-            return verdict(bootstrap::run_config_check(file, &module_roots));
+            let roots = check_roots(&cli);
+            return verdict(bootstrap::run_config_check(file, &roots));
         }
         _ => {}
     }
@@ -43,8 +43,7 @@ async fn main() -> ExitCode {
     // derives, and a mount that is declared but not installed is a boot panic
     // rather than a document that compiles against half a host.
     let mounts = brenn_lib::config::load_mounts(cli.mounts.as_deref());
-    let document =
-        brenn_lib::config::load_config(cli.config.as_deref(), &mounts.roots.module_roots);
+    let document = brenn_lib::config::load_config(cli.config.as_deref(), &mounts.roots);
 
     match cli.command.unwrap_or(cli::Commands::Serve) {
         cli::Commands::Invite => bootstrap::run_invite(&document.config).await,
@@ -61,14 +60,13 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The module roots a config tool checks against, as
-/// [`bootstrap::tool_module_roots`] derives them, with a fault printed and the
-/// process ended.
+/// The roots a config tool checks against, as [`bootstrap::tool_roots`]
+/// derives them, with a fault printed and the process ended.
 ///
 /// Exits rather than returning a verdict — the tool has not read its document
 /// yet, so there is no diff and no `ok` line to withhold.
-fn check_module_roots(cli: &cli::Cli) -> brenn_lib::config::RootList {
-    match bootstrap::tool_module_roots(cli.mounts.as_deref(), &cli.modules) {
+fn check_roots(cli: &cli::Cli) -> brenn_lib::config::Roots {
+    match bootstrap::tool_roots(cli.mounts.as_deref(), &cli.modules, &cli.mounted) {
         Ok(roots) => roots,
         Err(report) => {
             eprintln!("{report}");

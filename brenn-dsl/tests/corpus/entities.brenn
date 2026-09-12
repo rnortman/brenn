@@ -123,3 +123,9 @@ mcp_server graf {
 mount example-bundle {
     path = "/home/alice/brenn/bundles/example-bundle";
 }
+
+/// A config-carrying mount: its `config/` tree is compiled as part of the
+/// deployment, under the ceiling this `under` clause names.
+mount example-automations under example_author {
+    path = "/home/alice/brenn/repos/example-automations";
+}

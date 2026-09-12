@@ -10,7 +10,7 @@ use brenn_dsl::derived::DerivedConfig;
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::model::File;
 use brenn_dsl::resolved::ResolvedConfig;
-use brenn_dsl::{DocumentRole, parse_str, resolve_files};
+use brenn_dsl::{DocumentRole, MountedRoot, parse_str, resolve_files};
 
 /// The directory the corpus fixtures live in.
 ///
@@ -161,7 +161,93 @@ pub fn compile_tree_as(
             )),
         }
     }
-    resolve_files(files, "", role)
+    resolve_files(files, "", role, &[])
+}
+
+/// Resolve a deployment tree beside one config-carrying mount's own tree.
+///
+/// `mounted` is the mount's name, the principal it is `under`, and its files:
+/// the entry keyed `""` and any tree module keyed by its `::` path. The spans
+/// the mounts document would have given stand in as the entry file's first
+/// position, which is what a refusal about the ceiling cites.
+pub fn compile_with_mount(
+    modules: &[(&str, &str)],
+    mount: &str,
+    under: &str,
+    fragment: &[(&str, &str)],
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    compile_with_mounts(modules, &[(mount, under, fragment)])
+}
+
+/// One config-carrying mount for the multi-mount helpers: its name, the
+/// principal it is `under`, and its files — the entry keyed `""` and any tree
+/// module keyed by its `::` path.
+pub type MountFixture<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+/// Resolve a deployment tree beside any number of config-carrying mounts.
+///
+/// The multi-mount form is the steady state a host runs — brenn's own release
+/// mount beside one or more authors' — and several rules only mean anything
+/// with more than one: the per-mount namespace, the per-mount tree-module keys,
+/// two distinct authority roots, and what one fragment may spell of another's.
+pub fn compile_with_mounts(
+    modules: &[(&str, &str)],
+    mounts: &[MountFixture<'_>],
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    let roots: Vec<MountedRoot> = mounts
+        .iter()
+        .map(|(mount, under, _)| {
+            mounted_root(
+                mount,
+                under,
+                &std::path::PathBuf::from(format!("/m/{mount}/config")),
+            )
+        })
+        .collect();
+    let mut files: Vec<(String, File)> = modules
+        .iter()
+        .map(|(key, source)| {
+            let filename = if key.is_empty() { "main" } else { key };
+            (
+                (*key).to_string(),
+                parsed(source, &format!("{filename}.brenn")),
+            )
+        })
+        .collect();
+    for (mount, _, fragment) in mounts {
+        for (key, source) in *fragment {
+            // The key and the place come from the crate that owns the
+            // namespace: the key is what selects the mounted role, so a fixture
+            // spelling it by hand would go on asserting deployment behaviour if
+            // the sigil moved.
+            let (module_key, place) = brenn_dsl::mounted_module(mount, key);
+            files.push((module_key, parsed(source, &place.display().to_string())));
+        }
+    }
+    resolve_files(files, "", DocumentRole::Deployment, &roots)
+}
+
+/// Derive a document with one config-carrying mount, in memory.
+///
+/// The pass the ceiling rules live in: a mount stamp's reach, the narrowing of
+/// a fragment's own principals and the dead-config exemption its ceiling gets
+/// are all derivation's, and a suite that stopped at resolution would assert
+/// none of them.
+pub fn derive_with_mount(
+    modules: &[(&str, &str)],
+    mount: &str,
+    under: &str,
+    fragment: &[(&str, &str)],
+) -> Result<DerivedConfig, Vec<Diagnostic>> {
+    compile_with_mount(modules, mount, under, fragment).and_then(brenn_dsl::derive::derive)
+}
+
+/// Derive a document with any number of config-carrying mounts, in memory.
+pub fn derive_with_mounts(
+    modules: &[(&str, &str)],
+    mounts: &[MountFixture<'_>],
+) -> Result<DerivedConfig, Vec<Diagnostic>> {
+    compile_with_mounts(modules, mounts).and_then(brenn_dsl::derive::derive)
 }
 
 /// One fixture source, parsed. A fixture that does not parse is a broken test
@@ -300,4 +386,57 @@ pub fn derive_errors_tree(modules: &[(&str, &str)]) -> Vec<Diagnostic> {
 /// Just the messages, for a panic that has to say what went wrong.
 pub fn messages(errors: &[Diagnostic]) -> Vec<&str> {
     errors.iter().map(|error| error.message.as_str()).collect()
+}
+
+/// A scratch directory of this test's own, emptied first so a run never
+/// inherits what a previous one left behind.
+pub fn scratch(name: &str) -> PathBuf {
+    let base = std::env::var("TEST_TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
+    let dir = base.join(format!("{name}-{}", std::process::id()));
+    // A test that tightened the directory's mode to observe an unlistable
+    // module root leaves it that way when it fails or when it runs as a user
+    // for whom the tightening does nothing; loosen it back before the removal
+    // so this run is not refused for the last one's arrangements.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _restored = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("{}: {error}", dir.display()),
+    }
+    std::fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+    dir
+}
+
+/// One config-carrying mount as a compile input, with the spans a mounts
+/// document would have given it standing in as a parsed `mount` line.
+///
+/// The two spans are taken from the two places production takes them from —
+/// the mount's own name and the `under` clause's — and are therefore different
+/// columns. A fixture that collapsed them would let a refusal cite either one
+/// and still read as "positioned at the `under` clause".
+pub fn mounted_root(mount: &str, under: &str, dir: &std::path::Path) -> MountedRoot {
+    let text = format!("mount {mount} under {under} {{\n    path = \"/m\";\n}}\n");
+    let doc = parsed(&text, "prod.mounts.brenn");
+    let item = &doc.items[0];
+    let brenn_dsl::model::Item::Mount(def) = item.value() else {
+        panic!("the rendered line is a mount declaration");
+    };
+    let under_span = def
+        .under
+        .as_ref()
+        .expect("the rendered line carries an `under` clause")
+        .head
+        .span()
+        .clone();
+    MountedRoot {
+        mount: mount.to_string(),
+        dir: dir.to_path_buf(),
+        under: under.to_string(),
+        span: def.name.span().clone(),
+        under_span,
+    }
 }

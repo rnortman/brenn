@@ -88,7 +88,7 @@ pub enum Item {
     Repo(Box<NamedAttrDef<RepoAttrs>>),
     MqttClient(Box<NamedAttrDef<MqttClientAttrs>>),
     McpServer(Box<NamedAttrDef<McpServerAttrs>>),
-    Mount(Box<NamedAttrDef<MountAttrs>>),
+    Mount(Box<MountDef>),
     Acl(Box<AclStmt>),
     Grant(Box<GrantStmt>),
     Section(SectionNode),
@@ -131,7 +131,7 @@ impl File {
         repos => Repo(NamedAttrDef<RepoAttrs>),
         mqtt_clients => MqttClient(NamedAttrDef<MqttClientAttrs>),
         mcp_servers => McpServer(NamedAttrDef<McpServerAttrs>),
-        mounts => Mount(NamedAttrDef<MountAttrs>),
+        mounts => Mount(MountDef),
         acls => Acl(AclStmt),
         grants => Grant(GrantStmt),
         }
@@ -548,6 +548,21 @@ pub struct NamedAttrDef<A> {
     pub doc: Option<DocComment>,
     pub name: Spanned<String>,
     pub body: AttrBlock<A>,
+}
+
+/// `mount brenn under p { path = "…"; }` — a declared mount.
+///
+/// Shaped like [`NamedAttrDef`] and not served by it, because of `under`: the
+/// principal whose authority bounds what the mount's `config/` tree declares.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MountDef {
+    pub doc: Option<DocComment>,
+    pub name: Spanned<String>,
+    /// The principal this mount's config runs under, or `None` for a mount
+    /// that carries no config.
+    pub under: Option<PathRef>,
+    pub body: AttrBlock<MountAttrs>,
 }
 
 /// What an agent body says about an mcp server: which form was written is what

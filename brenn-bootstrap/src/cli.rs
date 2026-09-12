@@ -33,6 +33,22 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub modules: Vec<PathBuf>,
 
+    /// One config-carrying mount the deployment's mounts document declares:
+    /// its name, the principal its config runs under, and the directory
+    /// holding its `main.brenn`. The `--modules` family's companion, for the
+    /// same reason and with the same rules — off-host there is no mounts
+    /// document to read a ceiling's claimant off, and a root that declares a
+    /// ceiling `principal` nothing is under is refused as dead config.
+    ///
+    /// `DIR` is the config root itself, as `--modules DIR` is a module root.
+    /// Point it at an empty stub to certify the root against the ceilings its
+    /// mounts document names and nothing about any fragment, or at the real
+    /// tree where the fragment lives.
+    ///
+    /// Repeatable, in the mounts document's declaration order.
+    #[arg(long, value_name = "NAME=PRINCIPAL=DIR")]
+    pub mounted: Vec<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -104,6 +120,22 @@ impl Cli {
     /// argument conflict does.
     pub fn validate(&self) -> Result<(), clap::Error> {
         let command = self.command.as_ref().unwrap_or(&Commands::Serve);
+        if !self.mounted.is_empty() && !command.takes_modules() {
+            return Err(Self::conflict(format!(
+                "`{}` does not take --mounted: a host's config-carrying mounts come from \
+                 --mounts, which names them and their ceilings together. --mounted is the \
+                 workstation form, and only `config-check` and `config-diff` take it",
+                command.name(),
+            )));
+        }
+        if !self.mounted.is_empty() && self.mounts.is_some() {
+            return Err(Self::conflict(
+                "--mounts and --mounted both name config-carrying mounts: pass --mounts to \
+                 check against the host's own declaration, or --mounted to name them by \
+                 hand, never both"
+                    .to_string(),
+            ));
+        }
         if !self.modules.is_empty() && !command.takes_modules() {
             return Err(Self::conflict(format!(
                 "`{}` does not take --modules: a host's module roots come from --mounts, \
@@ -166,6 +198,71 @@ mod tests {
                 .is_err(),
             "a subcommand of its own does not take the flag"
         );
+    }
+
+    /// `--mounted` belongs to the `--modules` family in every rule: same
+    /// subcommands, same conflict with `--mounts`, same side of the subcommand.
+    /// The workstation gate and both installers spell it beside `--modules`, so
+    /// which orderings parse is a contract there too.
+    #[test]
+    fn the_mounted_root_follows_every_rule_the_module_root_does() {
+        let cli = Cli::try_parse_from([
+            "brenn",
+            "--modules",
+            "/srv/modules",
+            "--mounted",
+            "automations=automator=/srv/stub",
+            "config-check",
+            "x",
+        ])
+        .expect("the flag precedes the subcommand");
+        assert_eq!(cli.mounted, ["automations=automator=/srv/stub"]);
+        cli.validate().expect("config-check takes both flags");
+
+        assert!(
+            Cli::try_parse_from([
+                "brenn",
+                "config-check",
+                "--mounted",
+                "automations=automator=/srv/stub",
+                "x"
+            ])
+            .is_err(),
+            "a subcommand of its own does not take the flag"
+        );
+    }
+
+    /// The host's own declaration names every config-carrying mount and their
+    /// ceilings together; a second source beside it is two answers.
+    #[test]
+    fn the_mounted_root_and_the_mounts_document_are_refused_together() {
+        let cli = Cli::try_parse_from([
+            "brenn",
+            "--mounts",
+            "/etc/mounts.brenn",
+            "--mounted",
+            "automations=automator=/srv/stub",
+            "config-check",
+            "x",
+        ])
+        .expect("both flags parse");
+        let error = cli.validate().expect_err("only one of them names mounts");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    /// And a host operation takes neither: `serve` derives its mounts from
+    /// `--mounts`, which is the whole of its environment-fact surface.
+    #[test]
+    fn serve_does_not_take_a_mounted_root() {
+        let cli = Cli::try_parse_from([
+            "brenn",
+            "--mounted",
+            "automations=automator=/srv/stub",
+            "serve",
+        ])
+        .expect("the flag parses");
+        let error = cli.validate().expect_err("serve takes no workstation flag");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 
     /// The unit spells `--mounts` before `serve`; the installer spells it after

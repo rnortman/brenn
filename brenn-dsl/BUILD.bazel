@@ -94,6 +94,8 @@ dsl_test(name = "authority")
 
 dsl_test(name = "expand")
 
+dsl_test(name = "mounted")
+
 dsl_test(name = "multifile")
 
 dsl_test(name = "scaffold")

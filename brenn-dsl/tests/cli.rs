@@ -120,19 +120,6 @@ fn a_secondary_location_prints_as_file_line_column() {
 
 // ── scaffold and grant-parity ────────────────────────────────────────────────
 
-/// A private directory to write fixture inputs and generator output into.
-///
-/// `TEST_TMPDIR` is the runner's own scratch, cleaned up for us; the fallback
-/// is for a run outside one.
-fn scratch(name: &str) -> PathBuf {
-    let base = std::env::var_os("TEST_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(name);
-    std::fs::create_dir_all(&base).unwrap_or_else(|error| panic!("{}: {error}", base.display()));
-    base
-}
-
 fn write(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
@@ -155,7 +142,7 @@ fn spec_text(requires: &str) -> String {
 
 #[test]
 fn grant_parity_exits_zero_when_the_two_agree() {
-    let dir = scratch("grant-parity-ok");
+    let dir = support::scratch("grant-parity-ok");
     let spec = write(&dir, "spec.brenn", &spec_text("ports"));
     let imports = write(
         &dir,
@@ -174,7 +161,7 @@ fn grant_parity_exits_zero_when_the_two_agree() {
 
 #[test]
 fn grant_parity_exits_nonzero_on_drift_and_renders_the_diagnostic() {
-    let dir = scratch("grant-parity-drift");
+    let dir = support::scratch("grant-parity-drift");
     let spec = write(&dir, "spec.brenn", &spec_text("ports, store"));
     let imports = write(
         &dir,
@@ -199,7 +186,7 @@ fn grant_parity_exits_nonzero_on_drift_and_renders_the_diagnostic() {
 /// comparing against nothing. It is refused by name.
 #[test]
 fn grant_parity_refuses_an_empty_import_list() {
-    let dir = scratch("grant-parity-empty");
+    let dir = support::scratch("grant-parity-empty");
     let spec = write(&dir, "spec.brenn", &spec_text("ports"));
     let imports = write(&dir, "imports.txt", "\n  \n");
     let output = run(&[
@@ -217,7 +204,7 @@ fn grant_parity_refuses_an_empty_import_list() {
 
 #[test]
 fn grant_parity_names_an_import_list_it_cannot_read() {
-    let dir = scratch("grant-parity-unreadable");
+    let dir = support::scratch("grant-parity-unreadable");
     let spec = write(&dir, "spec.brenn", &spec_text("ports"));
     let missing = dir.join("no-such-imports.txt");
     let output = run(&[
@@ -237,7 +224,7 @@ fn grant_parity_names_an_import_list_it_cannot_read() {
 /// generated module into a file the build compiles.
 #[test]
 fn scaffold_refuses_a_two_class_specification_until_class_names_one() {
-    let dir = scratch("scaffold-two-class");
+    let dir = support::scratch("scaffold-two-class");
     let spec = write(
         &dir,
         "spec.brenn",
@@ -304,7 +291,7 @@ fn classes_text(names: &[&str]) -> String {
 }
 
 fn wire_kind(dir: &str, names: &[&str], extra: &[&str]) -> Output {
-    let dir = scratch(dir);
+    let dir = support::scratch(dir);
     let spec = write(&dir, "spec.brenn", &classes_text(names));
     let spec = spec.display().to_string();
     let mut args = vec!["wire-kind", spec.as_str()];

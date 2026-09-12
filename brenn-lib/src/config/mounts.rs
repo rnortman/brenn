@@ -1,12 +1,13 @@
 //! The mounts document: which installed trees the host may read.
 //!
 //! A **mount** is one directory in the bundle shape — `components/`,
-//! `surface/`, `modules/`, whichever the release ships, plus a `VERSION` file —
-//! that the operator has *declared* to the host. The declaration is the act of
-//! consent: what is under a declared mount may be resolved, loaded and served;
-//! what is not declared is invisible. Brenn's own release is a mount like any
-//! other. Nothing discovers a mount — no directory scan, no installer — so the
-//! only way a tree becomes readable is that someone wrote a line naming it.
+//! `surface/`, `modules/`, `config/`, whichever the release ships, plus a
+//! `VERSION` file — that the operator has *declared* to the host.  The
+//! declaration is the act of consent: what is under a declared mount may be
+//! resolved, loaded and served; what is not declared is invisible.  Brenn's
+//! own release is a mount like any other.  Nothing discovers a mount — no
+//! directory scan, no installer — so the only way a tree becomes readable is
+//! that someone wrote a line naming it.
 //!
 //! The document is read in two stages, and the split is what the `mounts`
 //! subcommand and the installer need:
@@ -30,32 +31,39 @@ use std::path::{Path, PathBuf};
 
 use brenn_dsl::diag::Diagnostic;
 use brenn_dsl::roots::RootList;
-use brenn_dsl::{DocumentInputs, Span};
+use brenn_dsl::{DocumentInputs, MountedRoot, Span, Spanned};
 
 use super::dsl_lower::{expect_str, keep};
 
 /// The name of the file that says which revision of a mount is installed.
 const VERSION_FILE: &str = "VERSION";
 
-/// One of the three trees a mount may offer.
+/// One of the four trees a mount may offer.
 ///
-/// Three, because the three have three different consumers with three different
-/// install cadences: `modules/` is read by the compiler, `components/` by the
-/// WASM loader, `surface/` by the HTTP server. The unification a mount performs
-/// is at the operator's surface and the install unit, not in the loaders.
+/// Four, because the four have four different consumers with four different
+/// install cadences: `modules/` is read by the compiler at import, `config/` by
+/// the compiler at document load, `components/` by the WASM loader, `surface/`
+/// by the HTTP server. The unification a mount performs is at the operator's
+/// surface and the install unit, not in the loaders.
+///
+/// `config/` is the one tree a mount does not merely *offer*: its entry
+/// document is compiled as part of the deployment, under the ceiling of the
+/// principal the mount is declared `under`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MountTree {
     Components,
     Surface,
     Modules,
+    Config,
 }
 
 impl MountTree {
     /// Every tree, in the order a listing names them.
-    pub const ALL: [MountTree; 3] = [
+    pub const ALL: [MountTree; 4] = [
         MountTree::Components,
         MountTree::Surface,
         MountTree::Modules,
+        MountTree::Config,
     ];
 
     /// The subdirectory of a mount this tree is installed as.
@@ -64,6 +72,7 @@ impl MountTree {
             MountTree::Components => "components",
             MountTree::Surface => "surface",
             MountTree::Modules => "modules",
+            MountTree::Config => "config",
         }
     }
 }
@@ -76,9 +85,18 @@ impl MountTree {
 pub struct MountDecl {
     pub name: String,
     pub path: PathBuf,
+    /// The principal this mount's `config/` tree runs under, as written, with
+    /// the span of the `under` clause. `None` for a mount that carries no
+    /// config.
+    pub under: Option<Spanned<String>>,
     /// Where the `path` value was written, so an on-disk fault found later can
-    /// still be cited at the line that caused it.
+    /// still be cited at the value that caused it.
     pub span: Span,
+    /// Where the mount's own name was written. Distinct from `span` because a
+    /// fault about the *mount* — its config tree, its ceiling, its name — is
+    /// not a fault about the path it declares, and sending an operator to the
+    /// `path` value to answer one is sending them to the wrong word.
+    pub name_span: Span,
 }
 
 /// A compiled mounts document: what it declares.
@@ -96,8 +114,15 @@ pub struct Mount {
     pub path: PathBuf,
     /// The first line of the mount's `VERSION` file.
     pub version: String,
-    /// Which of the three trees this mount offers, in [`MountTree::ALL`] order.
+    /// Which of the four trees this mount offers, in [`MountTree::ALL`] order.
     pub trees: Vec<MountTree>,
+    /// The principal this mount's `config/` tree runs under, as written.
+    pub under: Option<Spanned<String>>,
+    /// Where the mount's name was written. Carried forward from the
+    /// declaration because a mount's config is compiled as part of the
+    /// deployment, and every diagnostic about what it declares has to be able
+    /// to cite the declaration that admitted it.
+    pub span: Span,
 }
 
 /// Every mount the host has been told about.
@@ -106,14 +131,39 @@ pub struct MountsConfig {
     pub mounts: Vec<Mount>,
 }
 
-/// The three root lists the mounts derive, in declaration order.
+/// The roots the mounts derive, in declaration order.
 ///
 /// A mount that does not offer a tree contributes no root for it.
+///
+/// `config_roots` is not a [`RootList`] and is not searched: a config root is
+/// loaded, one document per mount, so what a reader needs of it is the mount's
+/// name and its ceiling rather than a search order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Roots {
     pub module_roots: RootList,
     pub components_roots: RootList,
     pub surface_roots: RootList,
+    pub config_roots: Vec<MountedRoot>,
+}
+
+impl Roots {
+    /// The roots a workstation tool derives from its flags: the `--modules`
+    /// list, and one config root per `--mounted` flag.
+    ///
+    /// The two flags are separate because the host's own mounts document is not
+    /// available off-host. A root that declares a ceiling `principal` needs a
+    /// mount under it to be live, so a check with no `--mounted` refuses one —
+    /// correctly for what it read. `--mounted` is how the caller says which
+    /// mounts the host declares; what it points `DIR` at is either an empty
+    /// stub (certifying the root's ceilings and nothing about any fragment) or
+    /// the real tree, where the check runs where the fragment lives.
+    pub fn modules(module_roots: RootList, config_roots: Vec<MountedRoot>) -> Self {
+        Self {
+            module_roots,
+            config_roots,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for Roots {
@@ -128,6 +178,7 @@ impl Default for Roots {
             module_roots: empty(MountTree::Modules),
             components_roots: empty(MountTree::Components),
             surface_roots: empty(MountTree::Surface),
+            config_roots: Vec::new(),
         }
     }
 }
@@ -176,7 +227,7 @@ pub enum MountStatus {
 }
 
 impl MountsConfig {
-    /// The three root lists, in declaration order.
+    /// The roots the mounts derive, in declaration order.
     pub fn roots(&self) -> Roots {
         let roots_of = |tree: MountTree| -> RootList {
             RootList::mounts(
@@ -188,11 +239,52 @@ impl MountsConfig {
                     .collect(),
             )
         };
+        // A mount offering `config/` is `under` a principal: `verify_one`
+        // refuses the pair in either order, so the `expect` is that refusal
+        // having run.
+        let config_roots = self
+            .mounts
+            .iter()
+            .filter(|mount| mount.trees.contains(&MountTree::Config))
+            .map(|mount| {
+                let under = mount
+                    .under
+                    .as_ref()
+                    .expect("a mount offering `config/` is under a principal");
+                MountedRoot {
+                    mount: mount.name.clone(),
+                    dir: mount.path.join(MountTree::Config.dir_name()),
+                    under: under.value().clone(),
+                    span: mount.span.clone(),
+                    under_span: under.span().clone(),
+                }
+            })
+            .collect();
         Roots {
             module_roots: roots_of(MountTree::Modules),
             components_roots: roots_of(MountTree::Components),
             surface_roots: roots_of(MountTree::Surface),
+            config_roots,
         }
+    }
+}
+
+/// What the deployment document compiles against, on a host with these mounts.
+///
+/// The one place the root, the module roots and the config-carrying mounts are
+/// put together. Boot, reload step 1 and `config-check --mounts` all reach the
+/// compiler through it, so the three cannot disagree about which fragments are
+/// part of the document — a disagreement that would let a check certify a
+/// document the host then refuses, or the reverse.
+///
+/// A free function rather than an inherent constructor because
+/// [`DocumentInputs`] is `brenn-dsl`'s and [`Roots`] is this crate's.
+pub fn deployment_inputs(root: &Path, roots: &Roots) -> DocumentInputs {
+    DocumentInputs {
+        root: root.to_path_buf(),
+        module_roots: roots.module_roots.clone(),
+        mounted: roots.config_roots.clone(),
+        role: brenn_dsl::DocumentRole::Deployment,
     }
 }
 
@@ -246,10 +338,31 @@ pub fn compile_mounts(path: &Path) -> Result<MountsDocument, String> {
             ));
             continue;
         }
+        // The `under` handle is not resolved here: a mounts document declares
+        // no principal, and the name has to resolve in the deployment document
+        // the ceiling governs.
+        let under = declared.under.as_ref().map(|handle| {
+            Spanned::new(
+                handle.dotted(),
+                declared
+                    .under_span
+                    .clone()
+                    .expect("an `under` handle carries its clause's span"),
+            )
+        });
+        let name_span = declared
+            .handle
+            .0
+            .first()
+            .expect("a mount handle is one segment")
+            .span()
+            .clone();
         mounts.push(MountDecl {
             name: declared.handle.dotted(),
             path: declared_path,
+            under,
             span: value.span().clone(),
+            name_span,
         });
     }
     let entries: Vec<(&str, &Path, &Span)> = mounts
@@ -359,17 +472,42 @@ fn verify_one(declared: &MountDecl) -> Result<Mount, String> {
         .collect();
     if trees.is_empty() {
         return Err(format!(
-            "mount `{name}`: {} holds none of `components/`, `surface/`, `modules/`, so it \
-             offers the host nothing — the path is one directory off, or the install did \
-             not finish",
+            "mount `{name}`: {} holds none of `components/`, `surface/`, `modules/`, \
+             `config/`, so it offers the host nothing — the path is one directory off, or \
+             the install did not finish",
             path.display(),
         ));
+    }
+    // A `config/` tree and an `under` clause are one declaration written in two
+    // places, and either without the other is a fault. A `config/` tree under
+    // nobody would be text the compiler has no ceiling for; an `under` on a
+    // mount that carries none is a ceiling over nothing, and it is not a cap on
+    // the mount's other trees — what an instance may hold is written at the
+    // instantiation site.
+    match (&declared.under, trees.contains(&MountTree::Config)) {
+        (None, true) => {
+            return Err(format!(
+                "mount `{name}` carries config and is under no principal: a mount's config \
+                 runs under a ceiling, and the root document is the only text that runs \
+                 under none",
+            ));
+        }
+        (Some(under), false) => {
+            return Err(format!(
+                "mount `{name}` is under `{}` and carries no config: a ceiling caps what a \
+                 mount's config declares, and this mount declares nothing",
+                under.value(),
+            ));
+        }
+        (None, false) | (Some(_), true) => {}
     }
     Ok(Mount {
         name: name.clone(),
         path,
         version,
         trees,
+        under: declared.under.clone(),
+        span: declared.name_span.clone(),
     })
 }
 

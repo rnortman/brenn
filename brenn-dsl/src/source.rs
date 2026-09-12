@@ -64,6 +64,40 @@ mod tests {
     }
 
     #[test]
+    fn a_mounted_place_is_in_the_identity() {
+        // A fragment's place is `mount:<name>/<relative>`, and it hashes like
+        // any other: a golden, so that the identity a host reports as `applied`
+        // covers a config-carrying mount's tree with the same framing.
+        let files = vec![
+            file("main.brenn", "aa"),
+            file(
+                &crate::resolve::mounted_module("automations", "")
+                    .1
+                    .display()
+                    .to_string(),
+                "bb",
+            ),
+        ];
+        assert_eq!(
+            document_sha256(&files),
+            "c101dc15928359bdc8398e5057022bfde6574169e717686581751ce417a8534d"
+        );
+        // The mount's name is part of the place, so one fragment moving to
+        // another mount is another document.
+        let moved = vec![
+            file("main.brenn", "aa"),
+            file(
+                &crate::resolve::mounted_module("other", "")
+                    .1
+                    .display()
+                    .to_string(),
+                "bb",
+            ),
+        ];
+        assert_ne!(document_sha256(&files), document_sha256(&moved));
+    }
+
+    #[test]
     fn a_field_boundary_cannot_be_forged() {
         // Without the separators, `("ab", "c")` and `("a", "bc")` would hash
         // equal, and a renamed module could impersonate an edited one.

@@ -41,7 +41,8 @@ use indexmap::IndexMap;
 use tracing::{info, warn};
 
 use brenn_lib::config::{
-    AppConfig, DocumentInputs, LoadedDocument, LoadedMounts, Roots, check_config, try_load_mounts,
+    AppConfig, DocumentInputs, LoadedDocument, LoadedMounts, Roots, check_config,
+    deployment_inputs, try_load_mounts,
 };
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
@@ -827,13 +828,11 @@ impl ReloadDriver {
     }
 
     /// What a candidate compiles under: the deployment document, read against
-    /// the module roots this reload's mounts derive.
+    /// the roots this reload's mounts derive — the module roots its packaged
+    /// imports resolve through, and the config-carrying mounts whose trees are
+    /// part of the document.
     fn inputs(&self, roots: &Roots) -> DocumentInputs {
-        DocumentInputs {
-            root: self.env.config_path.clone(),
-            module_roots: roots.module_roots.clone(),
-            role: brenn_lib::config::DocumentRole::Deployment,
-        }
+        deployment_inputs(&self.env.config_path, roots)
     }
 
     /// The candidate's agent map, resolved as boot resolves it.
@@ -2018,6 +2017,11 @@ channel scratch at "ephemeral:scratch" {{
 
         /// Rewrite the document over whatever mount directories exist now, so a
         /// case can retire one between reloads.
+        ///
+        /// A mount's ceiling is read back off the sidecar [`UNDER_FILE`] rather
+        /// than held in this struct: the document is rewritten from the
+        /// directories on disk, so a case that installs a config mount and then
+        /// installs another must not lose the first one's `under` clause.
         pub(crate) fn write(&self) {
             let mut names: Vec<String> = std::fs::read_dir(&self.dir)
                 .expect("the mounts directory is readable")
@@ -2029,12 +2033,48 @@ channel scratch at "ephemeral:scratch" {{
             let mut text = String::new();
             for name in names {
                 let path = self.dir.join(&name);
+                let under = match std::fs::read_to_string(path.join(UNDER_FILE)) {
+                    Ok(principal) => format!("under {} ", principal.trim()),
+                    Err(_) => String::new(),
+                };
                 text.push_str(&format!(
-                    "mount {name} {{ path = \"{}\"; }}\n",
+                    "mount {name} {under}{{ path = \"{}\"; }}\n",
                     path.display()
                 ));
             }
             std::fs::write(self.path(), text).expect("the mounts document is writable");
+        }
+
+        /// Declare a config-carrying mount under `principal`, with `main.brenn`
+        /// holding `fragment`, and return the mount's `config/` directory.
+        ///
+        /// A real directory rather than a symlink to one elsewhere: a case
+        /// rewrites the fragment between reloads, and the tree it rewrites is
+        /// the one the compiler reads.
+        pub(crate) fn config(&self, name: &str, principal: &str, fragment: &str) -> PathBuf {
+            let path = self.dir.join(name);
+            let config = path.join("config");
+            std::fs::create_dir_all(&config).expect("a config tree");
+            std::fs::write(path.join("VERSION"), "test\n").expect("a VERSION");
+            std::fs::write(path.join(UNDER_FILE), principal).expect("a ceiling");
+            std::fs::write(config.join("main.brenn"), fragment).expect("a fragment");
+            self.write();
+            config
+        }
+
+        /// Rewrite a config mount's entry document, the way its author pushing
+        /// a commit into the clone does.
+        pub(crate) fn edit(&self, name: &str, fragment: &str) {
+            std::fs::write(self.dir.join(name).join("config/main.brenn"), fragment)
+                .expect("the fragment is writable");
+        }
+
+        /// Move a config mount's ceiling to another principal, which is the
+        /// operator's edit and not the author's.
+        pub(crate) fn move_ceiling(&self, name: &str, principal: &str) {
+            std::fs::write(self.dir.join(name).join(UNDER_FILE), principal)
+                .expect("the ceiling is writable");
+            self.write();
         }
 
         /// Declare one more mount and put it in the document, the way an
@@ -2081,6 +2121,11 @@ channel scratch at "ephemeral:scratch" {{
 
     /// The mounts document's name inside a fixture's mounts directory.
     const MOUNTS_FILE: &str = "mounts.brenn";
+
+    /// Where a fixture mount records the principal its `config/` tree runs
+    /// under. A dotfile inside the mount, which `verify_one` reads past: it
+    /// looks for `VERSION` and the four tree directories and nothing else.
+    const UNDER_FILE: &str = ".under";
 
     /// A booted process the driver decides against: the messaging layer the
     /// document brought up, the driver holding that document as its baseline,
@@ -2406,16 +2451,11 @@ channel scratch at "ephemeral:scratch" {{
         }
         let loaded_mounts = mounts.load();
         let components_roots = loaded_mounts.roots.components_roots.clone();
-        let module_roots = loaded_mounts.roots.module_roots.clone();
         let db = db.unwrap_or_else(init_db_memory);
         let tool_registry = tool_registry
             .unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
-        let document = check_config(&DocumentInputs {
-            root: tree.root(),
-            module_roots,
-            role: brenn_lib::config::DocumentRole::Deployment,
-        })
-        .expect("the fixture document must load");
+        let document = check_config(&deployment_inputs(&tree.root(), &loaded_mounts.roots))
+            .expect("the fixture document must load");
         // Resolved by the same function boot and reload call, so the
         // document and the map cannot disagree.
         let runtime_dir = tree.runtime_dir();
@@ -10567,5 +10607,419 @@ new sifter: Sifter {{
         ));
         let booted = boot(&tree, vec![]).await;
         (tree, booted)
+    }
+
+    // ---------------------------------------------------------------------
+    // Config-carrying mounts: a mount's `config/` tree is part of the document
+    // ---------------------------------------------------------------------
+
+    /// The name every case below declares its config mount under, and so the
+    /// namespace every handle its fragment writes hangs beneath.
+    pub(crate) const CONFIG_MOUNT: &str = "automations";
+
+    /// The ceiling the operator writes for that mount: a namespace of its own
+    /// to build in, the work channel to read, and the one grant word its
+    /// consumers need.
+    pub(crate) const CEILING: &str = r#"
+principal automator {
+    grants = [ports];
+    acl publish [prefix "brenn:automations.", exact work];
+    acl subscribe [prefix "brenn:automations.", exact work];
+}
+"#;
+
+    /// A second ceiling, identical in reach, for the case that moves a mount
+    /// from one principal to another and expects nothing to move with it.
+    const SPARE_CEILING: &str = r#"
+principal spare-automator {
+    grants = [ports];
+    acl publish [prefix "brenn:automations.", exact work];
+    acl subscribe [prefix "brenn:automations.", exact work];
+}
+"#;
+
+    /// The deployment half of a config-mount case: the floor, `ceilings`, and
+    /// the component class a fragment instantiates.
+    ///
+    /// The class is declared here and stamped nowhere: a fragment declares no
+    /// component class (a mounted document instantiates and declares none), so
+    /// the vocabulary has to reach it through the packaged module the way an
+    /// installed package's does.
+    ///
+    /// `ceilings` is a parameter because a ceiling is live only while a mount
+    /// is under it: a principal nothing delegates to is dead config and refused,
+    /// so the operator's `principal` line and the mounts document's `under`
+    /// line arrive together and leave together.
+    pub(crate) fn document_with(ceilings: &str) -> String {
+        document(&format!(
+            r#"{ceilings}
+{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [ports];
+    in inbound;
+    out digest;
+}}
+{PACKAGED}
+"#
+        ))
+    }
+
+    /// A fragment declaring one channel in its ceiling's namespace and one
+    /// consumer reading the deployment's work channel — which it can only spell
+    /// by address, handles not crossing an authority boundary.
+    ///
+    /// `retain` sizes the declared channel, so a case can edit the fragment
+    /// into a document that differs in exactly one convergible number.
+    pub(crate) fn fragment(retain: u32) -> String {
+        format!(
+            r#"use @{PACKAGED_MODULE}::*;
+
+channel digest at "brenn:automations.digest" {{
+    push_depth = 1;
+    retain_depth = {retain};
+    standing_retain_depth = 64;
+}}
+
+new sifter: Demo {{
+    grants = [ports];
+    in inbound <- "brenn:work" {{ push_depth = 4; }}
+    out digest -> digest;
+}}
+"#
+        )
+    }
+
+    /// The address the fragment declares, and the slug its consumer takes —
+    /// the mount's name leading the handle written inside it.
+    pub(crate) const FRAGMENT_ADDRESS: &str = "brenn:automations.digest";
+    pub(crate) const FRAGMENT_CONSUMER: &str = "automations.sifter";
+
+    /// Boot a process over a document with no ceiling and no config mount
+    /// declared, and hand back the tree, the components root and the process.
+    ///
+    /// The root is complete without its mounts, so this boots clean — which is
+    /// the precondition every case here rests on, and the reason a fragment can
+    /// be added by a reload at all.
+    async fn boot_without_fragment() -> (Tree, tempfile::TempDir, Booted) {
+        let tree = Tree::holding(&document_with(""));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        (tree, components, booted)
+    }
+
+    /// Rewrite the root document and re-install the package its fenced half
+    /// becomes.
+    ///
+    /// Both halves or neither: the packaged module is the file the fragment's
+    /// class was declared in, so a root edit that moves the module's bytes moves
+    /// the spec hash the consumer carries, and an install left behind is the
+    /// spec-binding refusal rather than the case's own subject.
+    pub(crate) fn restage(tree: &Tree, components: &tempfile::TempDir, text: &str) {
+        tree.write(text);
+        install_package(components.path(), &staged_module(tree));
+    }
+
+    /// [`boot_without_fragment`] with the ceiling written, the config mount
+    /// declared under it and its fragment applied by one reload: where every
+    /// case that edits, retires or re-ceilings a fragment starts.
+    async fn boot_with_fragment() -> (Tree, tempfile::TempDir, Booted) {
+        let (tree, components, mut booted) = boot_without_fragment().await;
+        restage(&tree, &components, &document_with(CEILING));
+        booted
+            .mounts
+            .config(CONFIG_MOUNT, "automator", &fragment(4));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        (tree, components, booted)
+    }
+
+    /// The whole shape this slice exists for: a directory the operator declared
+    /// `under` a principal carries a document, and what that document declares
+    /// arrives by reload, under the mount's name, with no restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fragment_arrives_by_reload_under_its_mount_s_name() {
+        let (tree, components, mut booted) = boot_without_fragment().await;
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve(FRAGMENT_ADDRESS)
+                .is_none(),
+            "the fragment is not declared yet",
+        );
+
+        restage(&tree, &components, &document_with(CEILING));
+        booted
+            .mounts
+            .config(CONFIG_MOUNT, "automator", &fragment(4));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.channels_added,
+            vec![FRAGMENT_ADDRESS.to_string()]
+        );
+        assert_eq!(
+            status.delta.consumers_added,
+            vec![FRAGMENT_CONSUMER.to_string()],
+            "the mount's name leads every handle its config writes",
+        );
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve(FRAGMENT_ADDRESS)
+                .is_some(),
+            "the fragment's channel is in the directory",
+        );
+        let mount = status
+            .mounts
+            .iter()
+            .find(|mount| mount.name == CONFIG_MOUNT)
+            .expect("the status body lists the config mount");
+        assert_eq!(mount.under.as_deref(), Some("automator"));
+        assert!(mount.trees.contains(&"config".to_string()), "{mount:?}");
+    }
+
+    /// A fragment edit is a level-2 delta by construction: everything a mounted
+    /// document may declare lowers into the convergible blocks. The assertion
+    /// is on the level-1 comparison being empty, not merely on the outcome —
+    /// an `applied` reload would not distinguish "converged" from "there was
+    /// nothing a restart would have been needed for".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fragment_edit_needs_no_restart() {
+        let (_tree, _components, mut booted) = boot_with_fragment().await;
+
+        booted.mounts.edit(CONFIG_MOUNT, &fragment(16));
+        let baseline = booted.driver.baseline().document.config.clone();
+        let candidate = check_config(&deployment_inputs(
+            &booted.driver.env.config_path,
+            &booted.mounts.load().roots,
+        ))
+        .expect("the edited fragment compiles");
+        let level_one = non_convergible_differences(&baseline, &candidate.config);
+        assert!(
+            level_one.refusals.is_empty(),
+            "a fragment edit is a level-2 delta: {:?}",
+            level_one.refusals,
+        );
+
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.channels_changed,
+            vec![FRAGMENT_ADDRESS.to_string()]
+        );
+    }
+
+    /// A fragment that does not compile refuses the whole reload — the
+    /// operator's own pending edits with it — with the old document still
+    /// running and the refusal naming the mount's file, line and column.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fragment_that_does_not_compile_refuses_the_reload() {
+        let (_tree, _components, mut booted) = boot_with_fragment().await;
+        let running = booted.driver.baseline().document.document_sha256.clone();
+
+        booted.mounts.edit(CONFIG_MOUNT, "\nchannel broken at {\n");
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        assert_eq!(status.running_document_sha256, running);
+        let report = status.refusals.join("\n");
+        assert!(
+            report.contains(&format!("{CONFIG_MOUNT}/config/main.brenn"))
+                && report.contains("line 2"),
+            "the refusal names the mount's own file on disk, with a line: {report}",
+        );
+        assert_eq!(
+            booted.driver.baseline().document.document_sha256,
+            running,
+            "the old document is still running",
+        );
+    }
+
+    /// A fragment reaching past its ceiling is refused on the same terms, which
+    /// is the rule this slice exists for: the mount's `under` line, not the
+    /// filesystem, is what bounds what its author can put on the bus.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fragment_exceeding_its_ceiling_refuses_the_reload() {
+        let (_tree, _components, mut booted) = boot_with_fragment().await;
+        let running = booted.driver.baseline().document.document_sha256.clone();
+
+        booted.mounts.edit(
+            CONFIG_MOUNT,
+            &format!(
+                "{}\nchannel elsewhere at \"brenn:elsewhere\" {{ push_depth = 1; \
+                 retain_depth = 4; standing_retain_depth = 4; }}\n",
+                fragment(4),
+            ),
+        );
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        let report = status.refusals.join("\n");
+        assert!(
+            report.contains("brenn:elsewhere") && report.contains("automator"),
+            "the refusal names the address and the ceiling: {report}",
+        );
+        assert!(
+            report.contains(&format!("{CONFIG_MOUNT}/config/main.brenn:15:")),
+            "positioned at the declaration, in the mount's own file: {report}",
+        );
+        assert_eq!(booted.driver.baseline().document.document_sha256, running);
+    }
+
+    /// The declared-channel rule above is the ceiling's second line of defence.
+    /// The first is the fit rule, over what the fragment's own bodies *confer*:
+    /// an `acl` reaching past the ceiling is reach the operator never wrote,
+    /// whether or not any channel is declared for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fragment_acl_past_its_ceiling_refuses_the_reload() {
+        let (_tree, _components, mut booted) = boot_with_fragment().await;
+        let running = booted.driver.baseline().document.document_sha256.clone();
+
+        booted.mounts.edit(
+            CONFIG_MOUNT,
+            &fragment(4).replace(
+                "    grants = [ports];\n",
+                "    grants = [ports];\n    acl subscribe [prefix \"brenn:secrets.\"];\n",
+            ),
+        );
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        let report = status.refusals.join("\n");
+        assert!(
+            report.contains("brenn:secrets.")
+                && report.contains(&format!("the config of mount `{CONFIG_MOUNT}`")),
+            "the refusal names the reach and the stamp that would hold it: {report}",
+        );
+        assert_eq!(booted.driver.baseline().document.document_sha256, running);
+    }
+
+    /// The operator's lever: the mount line. Taking it out retires everything
+    /// the fragment declared, the way a deleted module's entities are retired.
+    /// The ceiling goes with it, because a principal nothing delegates to is
+    /// dead config.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_config_mount_retires_what_its_fragment_declared() {
+        let (tree, components, mut booted) = boot_with_fragment().await;
+
+        restage(&tree, &components, &document_with(""));
+        booted.mounts.uninstall(CONFIG_MOUNT);
+        booted.mounts.write();
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(
+            status.delta.consumers_removed,
+            vec![FRAGMENT_CONSUMER.to_string()]
+        );
+        assert_eq!(
+            status.delta.channels_removed,
+            vec![FRAGMENT_ADDRESS.to_string()]
+        );
+        assert!(
+            status.mounts.iter().all(|mount| mount.name != CONFIG_MOUNT),
+            "the mount is gone from the status body too",
+        );
+    }
+
+    /// Moving a mount's ceiling to a different principal of the same reach
+    /// recompiles the fragment under it and lowers to the same projection: a
+    /// ceiling is a compile-time bound and nothing that runs reads it, so there
+    /// is nothing for a reload to promote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ceiling_moved_to_a_principal_that_fits_changes_nothing() {
+        let (tree, components, mut booted) = boot_with_fragment().await;
+
+        restage(&tree, &components, &document_with(SPARE_CEILING));
+        booted.mounts.move_ceiling(CONFIG_MOUNT, "spare-automator");
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Unchanged, "{:?}", status.refusals);
+        let mount = status
+            .mounts
+            .iter()
+            .find(|mount| mount.name == CONFIG_MOUNT)
+            .expect("the status body lists the config mount");
+        assert_eq!(mount.under.as_deref(), Some("spare-automator"));
+    }
+
+    /// A `config/` tree with no entry document is a *document* fault, not a
+    /// mount-verification one: the file's absence is reported by the compiler
+    /// at step 1, in the same report as every other document refusal, and
+    /// positioned at the mounts document's own `mount` line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_mount_with_no_entry_document_refuses_at_step_one() {
+        let (tree, components, mut booted) = boot_without_fragment().await;
+        restage(&tree, &components, &document_with(CEILING));
+        let config = booted
+            .mounts
+            .config(CONFIG_MOUNT, "automator", &fragment(4));
+        std::fs::remove_file(config.join("main.brenn")).expect("the entry is removable");
+
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        let report = status.refusals.join("\n");
+        assert!(
+            report.contains(CONFIG_MOUNT) && report.contains("main.brenn"),
+            "the refusal names the mount and the file it wanted: {report}",
+        );
+        // And it is positioned on the mount's own name, not on the `path` value
+        // further along the line. Which of the two the operator is sent to is
+        // the difference between "this mount is broken" and "this path is
+        // wrong".
+        let mounts = booted.mounts.path().display().to_string();
+        let positioned = report
+            .lines()
+            .find(|line| line.starts_with(&mounts))
+            .unwrap_or_else(|| panic!("the refusal is not in the mounts document: {report}"));
+        let column = positioned
+            .strip_prefix(&format!("{mounts}:"))
+            .and_then(|rest| rest.split(':').nth(1))
+            .unwrap_or_else(|| panic!("the refusal carries no position: {positioned}"));
+        assert_eq!(column, (b"mount ".len() + 1).to_string(), "{positioned}");
     }
 }

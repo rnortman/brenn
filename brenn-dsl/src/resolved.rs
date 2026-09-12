@@ -79,7 +79,7 @@ pub struct ResolvedConfig {
     /// Declared mounts. Only a mounts document carries any: the resolver
     /// refuses a `mount` written in a deployment document, and a mounts
     /// document is the only thing that admits one.
-    pub mounts: Vec<RNamed<MountAttrs<RVal>>>,
+    pub mounts: Vec<RMount>,
     pub grants: Vec<RGrant>,
     /// The server's own configuration sections, typed by their kindword.
     pub sections: Vec<RSection>,
@@ -413,6 +413,11 @@ pub struct RTuning {
 pub struct RPin {
     pub address: Spanned<String>,
     pub uuid: Spanned<String>,
+    /// The mount stamp whose `config/` tree writes this pin, or `None` for one
+    /// the deployment writes. A pin re-identifies a channel, which is the
+    /// declaring text's to do, so this is compared with the declaration's own
+    /// authority root.
+    pub origin: Option<StampId>,
 }
 
 /// A surface and everything written inside it.
@@ -630,7 +635,7 @@ pub struct RAgent {
     /// later diagnostic cites when it has to say where an agent came from.
     pub class: Spanned<String>,
     pub attrs: AgentAttrs<RVal>,
-    pub mounts: Vec<RMount>,
+    pub mounts: Vec<RRepoMount>,
     pub mcps: Vec<RMcp>,
     pub subs: Vec<RSubscribe>,
     pub acls: Vec<RAcl>,
@@ -651,8 +656,11 @@ pub struct RAgent {
 }
 
 /// `mount ws { working_dir = true; }` — the repo resolved to its handle.
+///
+/// An agent's repo mount, distinct from [`RMount`], which is a declared mount
+/// of installed trees.
 #[derive(Debug, PartialEq)]
-pub struct RMount {
+pub struct RRepoMount {
     pub repo: HandlePath,
     pub repo_span: Spanned<String>,
     pub tail: MountTail<RVal>,
@@ -701,8 +709,15 @@ pub struct RRemote {
 pub struct RPrincipal {
     pub handle: HandlePath,
     /// The principal this one is `under`, or `None` for one under the operator,
-    /// whose authority cannot be inherited.
+    /// whose authority cannot be inherited. A principal declared in a mount's
+    /// config with no `under` carries the mount's ceiling here: a fragment's
+    /// chains bottom out at the ceiling the operator wrote, never at the
+    /// operator.
     pub parent: Option<HandlePath>,
+    /// The mount stamp whose `config/` tree declares this principal, or `None`
+    /// for one the deployment declares. What tells a ceiling the mounts
+    /// document names apart from a name a fragment minted.
+    pub origin: Option<StampId>,
     /// The words it writes, or `None` where it writes no `grants` line and
     /// inherits the axis.
     pub grants: Option<RWordList>,
@@ -713,17 +728,34 @@ pub struct RPrincipal {
     pub doc: Option<DocComment>,
 }
 
-/// One `new` against an assembly, recorded because what it stamps is capped.
+/// What a recorded stamp is a stamp *of*.
 ///
-/// A stamp is recorded when it is the packaged boundary — a `new` in
+/// Two shapes hold authority under a ceiling. A `new` against an assembly is
+/// the one written in text; a config-carrying mount is the one the mounts
+/// document declares, minted with no text of its own so that everything its
+/// `config/` tree emits hangs under a stamp the operator wrote the ceiling of.
+#[derive(Debug, PartialEq)]
+pub enum StampOrigin {
+    /// `new x: A …` — the assembly the `new` names, as it is written.
+    Assembly(Spanned<String>),
+    /// A config-carrying mount's synthetic stamp. Its name is the handle.
+    Mount,
+}
+
+/// One `new` against an assembly, or one config-carrying mount, recorded
+/// because what it stamps is capped.
+///
+/// An assembly stamp is recorded when it is the packaged boundary — a `new` in
 /// non-packaged text against an assembly a packaged module declares — or when
 /// it wrote a ceiling of its own. Every other assembly stamp records nothing,
-/// and the entities it emits belong to the nearest recorded ancestor.
+/// and the entities it emits belong to the nearest recorded ancestor. A mount
+/// stamp is recorded always: it is the only thing holding its fragment's
+/// entities under the principal the mount is `under`.
 #[derive(Debug, PartialEq)]
 pub struct RStamp {
-    /// The `new` handle in the file that wrote it.
+    /// The `new` handle in the file that wrote it, or the mount's name.
     pub handle: HandlePath,
-    pub assembly: Spanned<String>,
+    pub origin: StampOrigin,
     /// The packaged module that declares the assembly, or `None` for one
     /// declared in the configuration tree. `Some` from non-packaged text is
     /// what makes the stamp the packaged boundary.
@@ -756,9 +788,16 @@ pub struct RStamp {
     /// Channels handed in as `Channel` arguments — reach the deployer consented
     /// to by naming them.
     pub handed: Vec<ChanId>,
-    /// Where the `new` handle is written: what a refusal about the whole stamp
-    /// cites.
+    /// Where the `new` handle is written, or the `mount` line: what a refusal
+    /// about the whole stamp cites.
     pub span: Span,
+}
+
+impl RStamp {
+    /// Whether this stamp is a config-carrying mount's.
+    pub fn is_mount(&self) -> bool {
+        matches!(self.origin, StampOrigin::Mount)
+    }
 }
 
 /// A `webhook` and its typed sub-blocks.
@@ -776,6 +815,24 @@ pub struct RWebhook {
 pub struct RNamed<A> {
     pub handle: HandlePath,
     pub attrs: A,
+    pub doc: Option<DocComment>,
+}
+
+/// `mount brenn under p { path = "…"; }`, resolved.
+///
+/// Shaped like [`RNamed`] and not served by it, because of `under`: the
+/// principal whose authority bounds everything the mount's `config/` tree
+/// declares. The handle is not resolved to a principal here — a mounts
+/// document declares no principal, and the deployment document is where the
+/// name has to resolve.
+#[derive(Debug, PartialEq)]
+pub struct RMount {
+    pub handle: HandlePath,
+    pub attrs: MountAttrs<RVal>,
+    /// The principal named by `under`, as written.
+    pub under: Option<HandlePath>,
+    /// Where the `under` clause was written, for a refusal about the ceiling.
+    pub under_span: Option<Span>,
     pub doc: Option<DocComment>,
 }
 

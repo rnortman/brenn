@@ -1352,7 +1352,10 @@ fn a_stamp_of_a_packaged_assembly_records_the_boundary() {
     ));
     assert_eq!(stamps(&config), ["demo"]);
     let stamp = &config.stamps[0];
-    assert_eq!(stamp.assembly.value(), "DemoPage");
+    let brenn_dsl::resolved::StampOrigin::Assembly(assembly) = &stamp.origin else {
+        panic!("a `new` records an assembly stamp");
+    };
+    assert_eq!(assembly.value(), "DemoPage");
     assert_eq!(stamp.package.as_deref(), Some("fixtures"));
     assert!(!stamp.packaged_site, "the `new` is the deployer's text");
     assert_eq!(stamp.parent, None);

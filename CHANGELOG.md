@@ -4,6 +4,35 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Config-carrying mounts** close the authorship gap (security-posture B9):
+  a mount declared `under` a principal and offering a `config/` tree has that
+  tree compiled as part of the deployment, bounded by that principal's words
+  and reach. An assistant or any non-operator author can now declare channels,
+  place components and wire them without being able to reach past the ceiling
+  the operator wrote. A fragment that exceeds its ceiling, or fails to compile,
+  refuses the whole reload with the old document still running. See
+  `docs/config-dsl.md` *Mounted documents* and boundary **B10** in
+  `docs/security-posture.md`.
+
+- **`--mounted NAME=PRINCIPAL=DIR` flag** on `config-check` and `config-diff`,
+  naming a config-carrying mount the deployment's mounts document declares.
+  Needed because a ceiling principal is dead config without its mount, so a
+  `--modules` check of a root that declares one refuses until the flag says
+  which mount claims it.
+
+### Changed
+
+- **BREAKING (mounts document): `brenn mounts` prints four tab-separated
+  fields, not three.** The fourth is the ceiling (`under:<principal>` or
+  empty). Readers splitting on three fixed fields will fold the ceiling into
+  the status; `cut -f3` readers are unaffected.
+- A mount with `config/` but no `under` is refused, and so is `under` with no
+  `config/`. A ceiling principal with nothing beneath it is dead config, so the
+  `principal` line and its `mount … under` line must arrive and leave in one
+  reload.
+
 ## [0.21.0]
 
 ### Added

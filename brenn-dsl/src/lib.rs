@@ -49,7 +49,9 @@ use fltk_serde_core::ParseToTargetError;
 
 use diag::Diagnostic;
 
-pub use resolve::{DocumentInputs, DocumentRole, compile, resolve_files};
+pub use resolve::{
+    DocumentInputs, DocumentRole, MountedRoot, compile, mounted_flag, mounted_module, resolve_files,
+};
 pub use source::{SourceFile, document_sha256};
 
 /// The position type every diagnostic and every resolved value carries.
@@ -58,6 +60,13 @@ pub use source::{SourceFile, document_sha256};
 /// [`diag::Diagnostic`] or of a [`resolved::RVal`] reads and constructs spans,
 /// and the crate that owns the type is this crate's own dependency.
 pub use fltk_cst_core::Span;
+
+/// A value with the position it was written at.
+///
+/// Re-exported for the same reason [`Span`] is: a consumer that reads a
+/// resolved value reads its position, and the crate that owns the type is this
+/// crate's own dependency.
+pub use fltk_serde_core::Spanned;
 
 /// How deep a document may nest before the parse is refused.
 ///

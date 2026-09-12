@@ -284,8 +284,11 @@ pub struct StatusMount {
     pub name: String,
     pub path: String,
     pub version: String,
-    /// Which of `components`, `surface`, `modules` the mount offers.
+    /// Which of `components`, `surface`, `modules`, `config` the mount offers.
     pub trees: Vec<String>,
+    /// The principal the mount's `config/` tree runs under, or `None` for a
+    /// mount that carries none.
+    pub under: Option<String>,
 }
 
 impl StatusMount {
@@ -303,6 +306,7 @@ impl StatusMount {
                     .iter()
                     .map(|tree| tree.dir_name().to_string())
                     .collect(),
+                under: mount.under.as_ref().map(|under| under.value().clone()),
             })
             .collect()
     }
@@ -792,6 +796,7 @@ mod tests {
                 path: "/home/brenn/brenn/release".to_string(),
                 version: "0.20.0".to_string(),
                 trees: vec!["components".to_string(), "modules".to_string()],
+                under: None,
             }],
             refusals: vec!["apps[assistant] differs: this change needs a restart".to_string()],
         };

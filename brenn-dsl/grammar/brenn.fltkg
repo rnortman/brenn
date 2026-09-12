@@ -182,10 +182,12 @@ mcp_server_def := doc:doc? , %"mcp_server" : name:name , body:body_block , ;
 // only in a mounts document, which the resolver holds; the grammar admits the
 // form wherever an item goes, and `name` is the mount's slug.
 //
-// Shaped like `repo_def` rather than carrying attrs of its own, so the body
-// goes through `body_block` and the layout is the one every named definition
-// already has.
-mount_def := doc:doc? , %"mount" : name:name , body:body_block , ;
+// `under p` names the principal whose authority bounds everything the mount's
+// `config/` tree declares. It is the same clause a principal writes.
+//
+// Shaped like `repo_def` apart from that clause, so the body goes through
+// `body_block` and the layout is the one every named definition already has.
+mount_def := doc:doc? , %"mount" : name:name , under:under_clause? , body:body_block , ;
 
 // Inside an agent body the bare form references a top-level definition and the
 // braced form defines one inline — the language's only inline-definition site,
