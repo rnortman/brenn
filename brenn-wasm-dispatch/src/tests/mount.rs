@@ -95,7 +95,7 @@ async fn a_consumer_task_activates_once_over_an_empty_channel() {
         )
         .await;
 
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     assert_eq!(
         await_activations(&messenger, &out_entry.address, 1).await,
         1,
@@ -136,14 +136,14 @@ async fn a_restart_is_a_new_mount() {
     // A second config over the same component, messenger and ports: what a
     // restart gives a consumer, since the config is moved into its task.
     let second = cfg.clone();
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     assert_eq!(
         await_activations(&messenger, &out_entry.address, 1).await,
         1
     );
     handle.stop_and_join().await;
 
-    let handle = spawn_wasm_consumer_task(second);
+    let handle = spawn_wasm_consumer_task(second, sync_request_channel().1);
     assert_eq!(
         await_activations(&messenger, &out_entry.address, 2).await,
         2,
@@ -169,7 +169,7 @@ async fn a_sampled_only_consumer_activates_at_mount_and_not_on_traffic() {
         .await;
     let notify = Arc::clone(&cfg.notify);
 
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     assert_eq!(
         await_activations(&messenger, &out_entry.address, 1).await,
         1,

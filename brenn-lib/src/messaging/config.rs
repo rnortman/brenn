@@ -137,73 +137,48 @@ impl Depth {
             _ => Depth::Unbounded,
         }
     }
+}
 
-    /// Collapses this depth to a concrete count bounded by `max`: `Unbounded`
-    /// becomes `max`, a bounded depth is capped at `max`.
-    pub fn clamped_to(self, max: u64) -> u64 {
-        match self {
-            Depth::Unbounded => max,
-            Depth::Bounded(n) => n.min(max),
+pub use brenn_envelope::{BACKEND_FATAL_NOISE_REFUSAL, NoiseLevel, NoiseLevelParseError};
+
+pub use brenn_activation::WINDOW_DEPTH_CEILING;
+
+/// Resolve one WASM input port's configured window depth to the bounded count a
+/// host will actually serve.
+///
+/// One activation carries its whole window in memory and hands it to the guest
+/// in one call, so [`WINDOW_DEPTH_CEILING`] is the deepest window either host
+/// will build — the same number on both, because a component is owed the same
+/// window wherever it runs.
+///
+/// `unbounded` resolves to the ceiling: on a WASM binding it has always meant
+/// "as deep as the host will go", and collapsing it here, once, is what keeps
+/// [`Depth::Unbounded`] out of every downstream reader of a resolved WASM
+/// subscription. A *bounded* depth above the ceiling is refused instead of
+/// capped — a cap serves a component a narrower window than its configuration
+/// says and tells nobody.
+///
+/// `context` names the binding in the operator's own vocabulary; `which` is the
+/// knob (`"push_depth"` / `"retain_depth"`).
+///
+/// # Panics
+///
+/// On a bounded depth above the ceiling.
+pub fn resolve_wasm_window_depth(depth: Depth, which: &str, context: &str) -> Depth {
+    match depth {
+        Depth::Unbounded => Depth::Bounded(WINDOW_DEPTH_CEILING),
+        Depth::Bounded(n) => {
+            assert!(
+                n <= WINDOW_DEPTH_CEILING,
+                "{context} resolves to {which} = {n}, above the window ceiling of \
+                 {WINDOW_DEPTH_CEILING} — one activation carries its whole window in memory, so \
+                 no host will build a deeper one. Lower {which} to {WINDOW_DEPTH_CEILING} or \
+                 less."
+            );
+            Depth::Bounded(n)
         }
     }
 }
-
-/// Noise level for push_depth-overflow events (per-subscriber).
-///
-/// The rungs are a monotone loudness ladder — each does everything the rung
-/// below it does and more: `metered` counts; `alarm` counts and alerts; `fatal`
-/// counts, alerts, and kills the instance. Declaration order is the ladder
-/// order, so `Silent < Metered < Alarm < Fatal` and "at least this loud" reads
-/// as a comparison.
-///
-/// `Fatal` is enacted only on the surface (kernel-side), never on the backend
-/// overflow path: a backend subscription that resolves to `Fatal` is rejected
-/// where its noise resolves ([`resolve_subscription_params`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NoiseLevel {
-    /// No signal on overflow.
-    Silent,
-    /// Increment a per-channel/per-subscriber drop counter.
-    Metered,
-    /// Increment the counter and fire an alert (superset of metered).
-    Alarm,
-    /// Everything `alarm` does, plus kill the overflowing instance. Surface-only
-    /// (kernel-enacted); never valid on a backend subscription.
-    Fatal,
-}
-
-impl NoiseLevel {
-    /// Parse from a wire/DB string. Returns `None` on unknown values.
-    ///
-    /// Mirrors [`crate::messaging::WakeMin::parse`] — the sister per-subscription
-    /// enum — so the `MessageSubscribe` intercept decodes both optional enum
-    /// fields the same way instead of carrying a private one-off `parse_noise`.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "silent" => Some(Self::Silent),
-            "metered" => Some(Self::Metered),
-            "alarm" => Some(Self::Alarm),
-            "fatal" => Some(Self::Fatal),
-            _ => None,
-        }
-    }
-
-    /// Whether the backend overflow path can enact this level. It cannot enact
-    /// `fatal`: that rung kills the overflowing instance and only the surface
-    /// kernel has a kill wire.
-    ///
-    /// The single statement of the rule. Callers supply their own refusal shape
-    /// with [`BACKEND_FATAL_NOISE_REFUSAL`] as the reason.
-    pub fn is_backend_enactable(self) -> bool {
-        self != Self::Fatal
-    }
-}
-
-/// The reason half of every refusal of a backend-side `fatal`, so the operator
-/// reads the same sentence wherever the rung is refused.
-pub const BACKEND_FATAL_NOISE_REFUSAL: &str = "fatal is surface-only (the backend overflow path \
-     has no kill) — set a backend-valid noise level (silent/metered/alarm)";
 
 /// Eviction sink for a channel (per-channel / global only, never per-subscriber).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -557,6 +532,23 @@ pub struct WasmConsumerConfigRaw {
     /// port (publish drops) from a name the specification never declared (the
     /// activation traps).
     pub declared_out_ports: Vec<String>,
+    /// Every port name this instance's class declares `sync`, sorted and
+    /// duplicate-free — the complete vocabulary of names a caller may raise a
+    /// sync-call activation of this component on. Not a body key: the class's
+    /// fact, carried through lowering so the host can refuse a caller naming a
+    /// port the specification never declared.
+    pub sync_ports: Vec<String>,
+    /// Every port name this instance's class declares `call`, sorted and
+    /// duplicate-free — the complete vocabulary of names this component may ask
+    /// a peer through. Not a body key: the class's fact, carried through
+    /// lowering so the host can tell a declared-but-unbound port (answered
+    /// `unwired`) from a name the specification never declared (the activation
+    /// traps).
+    pub call_ports: Vec<String>,
+    /// The `call` bindings this instance holds: each one of its `call` ports
+    /// wired to one top-level peer's `sync` port. Carried by a statement, not a
+    /// key.
+    pub calls: Vec<WasmConsumerCallRaw>,
     /// Capability interfaces to link for this component (deny-by-default).
     /// Required — no default. The operator states intent explicitly; an unstated
     /// `grants` is refused. Empty list = zero-capability consumer.
@@ -686,6 +678,22 @@ pub struct WasmConsumerConfigRaw {
     pub tool_grants: Vec<crate::tools::config::ToolGrantRaw>,
 }
 
+/// One `call` binding of a top-level consumer (`call <port> -> <slug>.<port>`).
+///
+/// A call names an instance, never a channel, so this carries no address and no
+/// tail vocabulary. Both ends name declared items: the port is one the caller's
+/// class declares `call`, the target is a consumer of the same placement, and
+/// the port it names is one the target's class declares `sync`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmConsumerCallRaw {
+    /// The caller's own `call` port.
+    pub port: String,
+    /// The peer's slug: the key the host looks a call target up by.
+    pub target: String,
+    /// The `sync` port of the peer that answers.
+    pub target_port: String,
+}
+
 #[cfg(any(test, feature = "testutils"))]
 impl WasmConsumerConfigRaw {
     /// Minimal raw consumer subscribing (port `in`) to each of `channels`, with
@@ -698,6 +706,9 @@ impl WasmConsumerConfigRaw {
             package: package.to_string(),
             spec_sha256: String::new(),
             declared_out_ports: vec![],
+            sync_ports: vec![],
+            call_ports: vec![],
+            calls: vec![],
             grants: vec![],
             store_path: None,
             store_size_limit: None,
@@ -1004,6 +1015,10 @@ pub struct SurfaceConfigRaw {
     /// Combined input+output port declarations (`[[surface.io_port]]`) — the
     /// self-loop, made structural. See [`SurfaceIoPortRaw`].
     pub io_ports: Vec<SurfaceIoPortRaw>,
+    /// Static instance/port → instance/port call bindings. Flat under the
+    /// surface: the raw config's shape names the instance a binding belongs to
+    /// rather than nesting it.
+    pub calls: Vec<SurfaceCallRaw>,
     /// Skin (CSS pack + vendored fonts) this surface wears. Absent ⇒ `"bench"`.
     /// Validated at resolution against the compiled-in skin registry; an unknown
     /// name is a boot panic.
@@ -1025,6 +1040,24 @@ pub struct SurfaceConfigRaw {
     /// above the bus per-sender refill (`EPHEMERAL_SENDER_REFILL_AMOUNT`/s), for
     /// the same layering reason as `publish_burst`.
     pub publish_per_sec: Option<u32>,
+}
+
+/// One `call` binding of a surface component (`call <port> -> <instance>.<port>`).
+///
+/// The surface twin of [`WasmConsumerCallRaw`], carrying the caller's instance
+/// name because the table is the surface's rather than the component's. Caller
+/// and callee are instances of the same surface: a call never crosses a
+/// placement, and never crosses the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceCallRaw {
+    /// The calling instance.
+    pub instance: String,
+    /// The caller's own `call` port.
+    pub port: String,
+    /// The instance that answers.
+    pub target_instance: String,
+    /// The `sync` port of that instance.
+    pub target_port: String,
 }
 
 /// A component module to mount on a surface (`[[surface.component]]`).
@@ -1052,6 +1085,16 @@ pub struct SurfaceComponentRaw {
     /// port (publish drops) from a name the specification never declared (the
     /// activation traps).
     pub declared_out_ports: Vec<String>,
+    /// Every port name this instance's class declares `sync`, sorted and
+    /// duplicate-free. Not a body key: the class's fact, carried through
+    /// lowering so the kernel can refuse a `dom.listen` on a name the
+    /// specification never declared.
+    pub sync_ports: Vec<String>,
+    /// Every port name this instance's class declares `call`, sorted and
+    /// duplicate-free. Not a body key: the class's fact, carried through
+    /// lowering so the kernel can tell an unbound declared port from a name the
+    /// specification never declared.
+    pub call_ports: Vec<String>,
     /// Override for this instance's durable send-budget burst: how many
     /// publishes it may make back-to-back before the refill rate binds. Absent ⇒
     /// [`SURFACE_SEND_BURST`].
@@ -1121,6 +1164,8 @@ impl SurfaceComponentRaw {
             instance: None,
             spec_sha256: String::new(),
             declared_out_ports: vec![],
+            sync_ports: vec![],
+            call_ports: vec![],
             send_burst: None,
             send_refill_secs: None,
             grants: vec![],
@@ -1540,6 +1585,22 @@ pub struct WasmOutputPort {
     pub budget: WasmSinkBudget,
 }
 
+/// One resolved `call` port: the caller's port, and the peer's port that
+/// answers it.
+///
+/// The whole of what a host needs to serve `calls.call(port, payload)`: the
+/// target slug names the consumer to raise a sync-call activation on, and the
+/// target port names the window that activation fabricates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmCallPort {
+    /// The caller's own `call` port, as its specification declares it.
+    pub port: String,
+    /// The peer consumer's slug.
+    pub target_slug: String,
+    /// The peer's `sync` port.
+    pub target_port: String,
+}
+
 /// Fully resolved `[[wasm_consumer]]` block, ready for use by bootstrap and dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedWasmConsumer {
@@ -1555,6 +1616,21 @@ pub struct ResolvedWasmConsumer {
     /// name outside it contradicts the specification the artifact is hash-bound
     /// to, and traps the activation.
     pub declared_out_ports: BTreeSet<String>,
+    /// Every port name the class declares `sync`: the complete vocabulary of
+    /// names a caller may raise a sync-call activation of this consumer on. A
+    /// caller naming anything else is a caller bug, and the host says so
+    /// rather than assembling an activation the component cannot read.
+    pub sync_ports: BTreeSet<String>,
+    /// Every port name the class declares `call`: the complete vocabulary this
+    /// consumer may ask a peer through. A name in it that [`calls`](Self::calls)
+    /// does not wire is answered `unwired`; a name outside it contradicts the
+    /// specification the artifact is hash-bound to and traps the activation.
+    pub call_ports: BTreeSet<String>,
+    /// The `call` ports this consumer holds, in declaration order: each one
+    /// wired to one peer consumer's `sync` port. A `call` port the document
+    /// leaves unbound is absent here, and the host answers its caller
+    /// `unwired`.
+    pub calls: Vec<WasmCallPort>,
     /// Granted capability interfaces for this component (deny-by-default).
     /// Determines which host functions are linked at component load time.
     pub grants: BTreeSet<ComponentGrant>,
@@ -1609,6 +1685,14 @@ pub struct ResolvedComponent {
     /// declared name drops, and one to a name outside the set traps the
     /// instance.
     pub declared_out_ports: BTreeSet<String>,
+    /// Every port name the class declares `sync`. The kernel refuses a
+    /// `dom.listen` on a name outside it, as it refuses a publish to a name
+    /// outside the out-port vocabulary.
+    pub sync_ports: BTreeSet<String>,
+    /// Every port name the class declares `call`. The kernel answers `unwired`
+    /// for one this document does not bind, and traps on a name outside the
+    /// set, as it does on a publish to a name outside the out-port vocabulary.
+    pub call_ports: BTreeSet<String>,
     /// This instance's durable send budget: its own declared override, or the
     /// defaults. Server-side only — the page is told nothing about it, because
     /// the server is the authority and a mirrored bucket has no reader yet.
@@ -1653,6 +1737,8 @@ impl ResolvedComponent {
             kind: kind.to_string(),
             spec_sha256: String::new(),
             declared_out_ports: BTreeSet::new(),
+            sync_ports: BTreeSet::new(),
+            call_ports: BTreeSet::new(),
             send_budget: AttachSendBudget::default(),
             parked_batch_depth: DEFAULT_PARKED_BATCH_DEPTH,
             chrome: false,
@@ -1706,6 +1792,9 @@ pub struct ResolvedSurface {
     /// Resolved output bindings (component/port → channel), each carrying its
     /// resolved default publish urgency.
     pub outputs: Vec<SurfaceOutput>,
+    /// Resolved call bindings (component/port → component/port), in declaration
+    /// order.
+    pub calls: Vec<SurfaceCall>,
     /// Resolved access-control policy (grants + ACLs) for this surface,
     /// built via `build_surface_policy`.
     pub policy: crate::access::AppPolicy,
@@ -1797,6 +1886,22 @@ pub struct SurfaceBinding {
     /// lands in a later phase — no surface path consumes it yet, exactly as the
     /// durable subscriber entry already carries an unread `noise`.
     pub noise: NoiseLevel,
+}
+
+/// A resolved static surface call binding (component/port → component/port).
+///
+/// Neither an input nor an output: a call names no channel, publishes nothing,
+/// and never crosses the wire. Caller and callee are instances of one surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceCall {
+    /// The calling instance.
+    pub instance: String,
+    /// Its own `call` port.
+    pub port: String,
+    /// The instance that answers.
+    pub target_instance: String,
+    /// The `sync` port of that instance.
+    pub target_port: String,
 }
 
 /// A resolved static surface output binding (component/port → channel).

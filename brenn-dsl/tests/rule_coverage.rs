@@ -145,6 +145,7 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
     ("in_b", "statements.brenn", Some("in inbound <- ")),
     ("out_b", "statements.brenn", Some("out outbound -> ")),
     ("io_b", "statements.brenn", Some("io tick {")),
+    ("call_b", "statements.brenn", Some("call ask -> p1.ping;")),
     ("io_target", "statements.brenn", Some("<-> acks;")),
     // Authority.
     ("acl_stmt", "statements.brenn", Some("acl subscribe [")),

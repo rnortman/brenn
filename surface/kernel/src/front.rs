@@ -38,12 +38,13 @@
 //! # The fifth seam: the in-flight buffer
 //!
 //! A `dom` component publishes by dispatching an event, which surfaces on the
-//! kernel's root listener — a stack with no way to reach the buffer the runner is
+//! kernel's root listener — a stack with no way to reach the buffer the driver is
 //! holding across the entry call. So the buffer is shared through
-//! [`InFlightSlot`]: the runner fills it for exactly the duration of an
-//! invocation, and [`SurfaceHandle::try_buffered_publish`] and its siblings route
-//! into it. Wasm-only, for the same reason: nothing else can be mid-activation
-//! and dispatching an event at the same time.
+//! [`InFlightSlot`], which is a stack: a driver pushes a buffer for exactly the
+//! duration of an invocation, a peer's call pushes another on top of it, and
+//! [`SurfaceHandle::try_buffered_publish`] and its siblings route into whichever
+//! is innermost. Wasm-only, for the same reason: nothing else can be
+//! mid-activation and dispatching an event at the same time.
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
@@ -64,10 +65,9 @@ use serde_json::Number;
 use crate::bindings::channel_is_transportable;
 use crate::outbound::{PublishCheckReject, check_publish};
 use crate::page::SurfacePage;
-#[cfg(target_arch = "wasm32")]
 use crate::publish_buffer::PublishBuffer;
 use crate::runner::RunnerCommand;
-use crate::session::Event;
+use crate::session::{Effect, Event};
 
 /// The event sink's capacity. This traffic is low-rate by construction — an
 /// attachment's lifecycle, a component's fate, an answer to something asked for —
@@ -180,31 +180,160 @@ pub enum TelemetryCommand {
     },
 }
 
-/// The buffer of the activation currently on the stack, and whose it is.
+/// The buffer of one activation on the stack, and whose it is.
 ///
 /// Exists only so the kernel's publish route can tell a publish that belongs in a
 /// buffer from one that belongs nowhere, and reach the buffer for the former.
 /// Activations are serialized per instance and synchronous on the one JS thread,
-/// so at most one instance is ever mid-activation: a publish whose resolved
-/// instance **is** this occupant is buffered; anything else is refused.
-#[cfg(target_arch = "wasm32")]
+/// so a publish whose resolved instance **is** the innermost occupant is
+/// buffered; anything else is refused.
+///
+/// The type and the stack it lives on are built on both targets even though only
+/// the browser has a driver that pushes one: the rules they carry — which frame a
+/// publish joins, which frame a call may be admitted from, which frame's effects
+/// come back when — have no second enforcer anywhere, so they are stated where a
+/// native test can reach them.
 pub struct InFlightPublish {
     /// The instance whose entry is on the stack.
     pub instance: String,
     /// That activation's buffer — the sole quota authority for the call.
     pub buffer: PublishBuffer,
+    /// What the peers this entry called have already asked the page to enact.
+    ///
+    /// A nested call turns the page twice — the callee's assembly and its
+    /// completion — and both turns' effects are owed to whichever driver is
+    /// running this entry. It cannot be handed to that driver directly (the
+    /// driver is blocked inside the entry call, holding its effect list on its
+    /// own stack), and it cannot be sent to the loop on its own, because the
+    /// driver enacts its list *after* the entry returns and the callee committed
+    /// first: sending would put the caller's frames on the wire ahead of the
+    /// callee's. So it rides on the caller's own frame and is drained by the
+    /// invocation that pops it, into that driver's list, in commit order.
+    pub effects: Vec<Effect>,
 }
 
-/// The in-flight slot, shared between the runner (which installs the buffer for
-/// exactly the duration of an entry invocation and takes it back on return) and
-/// the handle (which the kernel's publish route asks).
+/// The in-flight **stack**: the buffers of the activations whose entries are on
+/// the stack right now, innermost last.
+///
+/// A stack and not a slot because an entry may call a peer: the callee's
+/// activation is assembled and invoked from inside the caller's, so the callee's
+/// buffer sits on top while the caller's waits underneath, and each returns to
+/// the top as its own entry returns. Empty means no activation is on the stack at
+/// all. The depth is bounded by the document's acyclic call graph.
+#[derive(Default)]
+pub struct InFlightStack(Vec<InFlightPublish>);
+
+impl InFlightStack {
+    /// Put `instance`'s buffer on the stack for the duration of its entry call.
+    pub fn push(&mut self, instance: &str, buffer: PublishBuffer) {
+        self.0.push(InFlightPublish {
+            instance: instance.to_string(),
+            buffer,
+            effects: Vec::new(),
+        });
+    }
+
+    /// Take `instance`'s frame back off: its buffer, and whatever the peers it
+    /// called stashed on it.
+    ///
+    /// # Panics
+    ///
+    /// If the top of the stack is not `instance`'s. Every frame this entry
+    /// pushed popped itself on the way out, so a top belonging to somebody else
+    /// means a driver lost track of its own invocation — and the buffer about to
+    /// be flushed would be another component's.
+    pub fn pop_of(&mut self, instance: &str) -> (PublishBuffer, Vec<Effect>) {
+        let frame = self
+            .0
+            .pop()
+            .expect("surface runner: the in-flight buffer vanished during an activation");
+        assert_eq!(
+            frame.instance, instance,
+            "surface runner: the in-flight stack top belongs to another activation"
+        );
+        (frame.buffer, frame.effects)
+    }
+
+    /// Run `f` against the innermost in-flight activation's buffer, but only when
+    /// that activation is `instance`'s.
+    ///
+    /// The innermost and no other: a caller blocked in a `call` is not the entry
+    /// on the stack, and a publish it could still reach from there would join a
+    /// buffer while somebody else's activation runs. Its own frame becomes the top
+    /// again when the callee returns, which is when it can publish again.
+    pub fn with_innermost<R>(
+        &mut self,
+        instance: &str,
+        f: impl FnOnce(&mut PublishBuffer) -> R,
+    ) -> Option<R> {
+        let frame = self.0.last_mut()?;
+        if frame.instance != instance {
+            return None;
+        }
+        Some(f(&mut frame.buffer))
+    }
+
+    /// The chain a call raised from inside the innermost activation carries:
+    /// every instance whose entry is on the stack, outermost first.
+    pub fn chain(&self) -> Vec<String> {
+        self.0.iter().map(|frame| frame.instance.clone()).collect()
+    }
+
+    /// Park a nested turn's effects on the innermost frame, for the reason
+    /// [`InFlightPublish::effects`] gives.
+    ///
+    /// # Panics
+    ///
+    /// If no activation is on the stack: a peer call turned the page from
+    /// outside any activation, which the seam refuses before the door is asked.
+    pub fn stash(&mut self, effects: Vec<Effect>) {
+        if effects.is_empty() {
+            return;
+        }
+        self.0
+            .last_mut()
+            .expect("surface kernel: a peer call turned the page outside any activation")
+            .effects
+            .extend(effects);
+    }
+}
+
+/// One invocation's stack discipline: the buffer goes on for exactly the
+/// duration of the entry call and comes back off with whatever the peers this
+/// entry called stashed on it.
+///
+/// Popped unconditionally — the entry returned, and a trap here is an exception
+/// the wrapper already caught and classified, so leaving the buffer on the stack
+/// would let a publish made after it join an activation that is over.
+///
+/// Over a `&RefCell` and a closure rather than inside the browser's invocation,
+/// so the ordering this encodes — the callee's effects before the caller's own,
+/// which is the order the two turns committed in — is a statement a native test
+/// can drive.
+pub fn invoke_over_stack(
+    slot: &std::cell::RefCell<InFlightStack>,
+    instance: &str,
+    buffer: PublishBuffer,
+    entry: impl FnOnce() -> crate::activation::ActivationOutcome,
+) -> (
+    crate::activation::ActivationOutcome,
+    PublishBuffer,
+    Vec<Effect>,
+) {
+    slot.borrow_mut().push(instance, buffer);
+    let outcome = entry();
+    let (buffer, effects) = slot.borrow_mut().pop_of(instance);
+    (outcome, buffer, effects)
+}
+
+/// The stack as the drivers and the handle share it.
 ///
 /// `Rc<RefCell<…>>` and wasm-only: one JS thread, nothing to make `Send` for.
 /// Borrow discipline is safe by construction — the entry is synchronous, and the
-/// kernel's listener runs only via DOM dispatch from inside it, so the runner
-/// never touches the cell while the entry is on the stack.
+/// kernel's listener runs only via DOM dispatch from inside it, so no driver
+/// touches the cell while an entry is on the stack.
 #[cfg(target_arch = "wasm32")]
-pub type InFlightSlot = std::rc::Rc<std::cell::RefCell<Option<InFlightPublish>>>;
+pub type InFlightSlot = std::rc::Rc<std::cell::RefCell<InFlightStack>>;
 
 /// The other side of the front door: everything the layer that owns the page
 /// serves it through.
@@ -322,8 +451,9 @@ pub struct SurfaceHandle {
     telemetry_tx: Mutex<mpsc::Sender<TelemetryCommand>>,
     /// The publish pre-check, refreshed by the layer that owns the page.
     gate: Arc<Mutex<SurfaceGate>>,
-    /// The in-flight activation's buffer, filled by the layer that owns the page
-    /// and read synchronously by [`try_buffered_publish`](Self::try_buffered_publish).
+    /// The in-flight activations' buffers, innermost last, pushed by the layer
+    /// that owns the page and read synchronously by
+    /// [`try_buffered_publish`](Self::try_buffered_publish).
     #[cfg(target_arch = "wasm32")]
     in_flight: InFlightSlot,
     /// The caller-facing correlation space, monotone for the handle's life. Only
@@ -655,25 +785,38 @@ impl SurfaceHandle {
         })
     }
 
-    /// Run `f` against the in-flight activation's buffer, but only when the
-    /// activation on the stack is `instance`'s.
+    /// Admit one synchronous call to a peer against the caller's own activation
+    /// budgets, but only when the caller is the entry on the stack.
+    ///
+    /// `Some(result)` — the caller is the innermost in-flight activation, and its
+    /// buffer has ruled on the call's cost ([`PublishBuffer::admit_call`]).
+    ///
+    /// `None` — no activation is in flight, or the innermost is somebody else's.
+    /// A caller blocked in a `call` of its own is the second case: its frame is
+    /// underneath the callee's, and a call it could still make from there would
+    /// spend a budget while another component's activation runs. The seam answers
+    /// `not-permitted`, exactly as it does for a publish from the same place.
+    #[cfg(target_arch = "wasm32")]
+    pub fn try_call_admission(
+        &self,
+        instance: &str,
+        payload: &str,
+    ) -> Option<Result<(), brenn_surface_contract::CallError>> {
+        self.with_in_flight(instance, |buffer| buffer.admit_call(payload))
+    }
+
+    /// [`InFlightStack::with_innermost`] over the shared stack.
     ///
     /// A short synchronous borrow that calls out to nothing: every buffer method
-    /// touches only the buffer. The runner cannot be holding this cell — it
-    /// installed the buffer and is blocked in the entry call this dispatch came
-    /// from.
+    /// touches only the buffer. No driver can be holding this cell — each pushed
+    /// its buffer and is blocked in the entry call this dispatch came from.
     #[cfg(target_arch = "wasm32")]
     fn with_in_flight<R>(
         &self,
         instance: &str,
         f: impl FnOnce(&mut PublishBuffer) -> R,
     ) -> Option<R> {
-        let mut slot = self.in_flight.borrow_mut();
-        let in_flight = slot.as_mut()?;
-        if in_flight.instance != instance {
-            return None;
-        }
-        Some(f(&mut in_flight.buffer))
+        self.in_flight.borrow_mut().with_innermost(instance, f)
     }
 
     /// The publish sender, held across the call for the reason the struct's own

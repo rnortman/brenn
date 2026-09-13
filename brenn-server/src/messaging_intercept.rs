@@ -1416,7 +1416,7 @@ async fn handle_message_subscribe(
         Some(serde_json::Value::Null) => None,
         Some(v) => match v
             .as_str()
-            .and_then(brenn_lib::messaging::config::NoiseLevel::parse)
+            .and_then(|s| s.parse::<brenn_lib::messaging::config::NoiseLevel>().ok())
         {
             Some(n) => Some(n),
             None => {

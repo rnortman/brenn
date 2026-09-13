@@ -300,23 +300,14 @@ async fn build_pipeline() -> Pipeline {
         test_out_spec("brenn:git-repo-sync".to_string()),
     );
     let parser_component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: Path::new(PARSER_WASM),
-        slug: PARSER_SLUG,
         declared_out_ports: parser_outputs.keys().cloned().collect(),
         output_ports: parser_outputs,
         input_amplification_mt: parser_amp,
-        mqtt_sinks: HashMap::new(),
-        config: HashMap::new(),
         grants: [ComponentGrant::Ports, ComponentGrant::Log]
             .into_iter()
             .collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(Path::new(PARSER_WASM), PARSER_SLUG)
     }));
     let parser_cfg = WasmConsumerConfig {
         slug: PARSER_SLUG.to_string(),
@@ -330,8 +321,8 @@ async fn build_pipeline() -> Pipeline {
                 sub: ResolvedSubscription {
                     channel_uuid: forgejo_wh.uuid,
                     channel_address: forgejo_wh.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -342,8 +333,8 @@ async fn build_pipeline() -> Pipeline {
                 sub: ResolvedSubscription {
                     channel_uuid: github_wh.uuid,
                     channel_address: github_wh.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -351,6 +342,7 @@ async fn build_pipeline() -> Pipeline {
             },
         ],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -387,12 +379,9 @@ async fn build_pipeline() -> Pipeline {
     let mut consumer_outputs = HashMap::new();
     consumer_outputs.insert("outcomes".to_string(), test_out_spec(outcomes_addr.clone()));
     let consumer_component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: Path::new(CONSUMER_WASM),
-        slug: CONSUMER_SLUG,
         declared_out_ports: consumer_outputs.keys().cloned().collect(),
         output_ports: consumer_outputs,
         input_amplification_mt: consumer_amp,
-        mqtt_sinks: HashMap::new(),
         config: consumer_config,
         grants: [
             ComponentGrant::Ports,
@@ -405,12 +394,9 @@ async fn build_pipeline() -> Pipeline {
         .into_iter()
         .collect(),
         store_path: Some(consumer_store.path()),
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
         tool_host: Some(tool_host),
+        ..ProcessorLoadSpec::minimal(Path::new(CONSUMER_WASM), CONSUMER_SLUG)
     }));
     // The store is opened at the start rather than at the load; this harness
     // stands in for both.
@@ -427,8 +413,8 @@ async fn build_pipeline() -> Pipeline {
                 sub: ResolvedSubscription {
                     channel_uuid: sync_ch.uuid,
                     channel_address: sync_ch.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -437,6 +423,7 @@ async fn build_pipeline() -> Pipeline {
             inbox_input_port(CONSUMER_SLUG, &inbox_channel),
         ],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 

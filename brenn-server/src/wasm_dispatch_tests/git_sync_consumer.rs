@@ -187,12 +187,9 @@ async fn consumer_harness(
     amp.insert("tool-results".to_string(), 1000u64);
 
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: Path::new(CONSUMER_WASM),
-        slug,
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: amp,
-        mqtt_sinks: HashMap::new(),
         config,
         grants: [
             ComponentGrant::Ports,
@@ -205,14 +202,11 @@ async fn consumer_harness(
         .into_iter()
         .collect(),
         store_path: Some(store.path()),
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: Arc::new(CapturingProcAlerter {
             events: Arc::clone(&alerts),
         }),
-        output_acl: allow_all(),
-        mqtt_publish: None,
         tool_host: Some(tool_host),
+        ..ProcessorLoadSpec::minimal(Path::new(CONSUMER_WASM), slug)
     }));
     // The store is opened at the start rather than at the load; this fixture
     // stands in for both.
@@ -230,8 +224,8 @@ async fn consumer_harness(
                 sub: ResolvedSubscription {
                     channel_uuid: push_ch.uuid,
                     channel_address: push_ch.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -240,6 +234,7 @@ async fn consumer_harness(
             inbox_input_port(slug, &inbox_channel),
         ],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 

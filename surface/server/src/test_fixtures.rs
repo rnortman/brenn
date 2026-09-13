@@ -190,6 +190,7 @@ pub fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
                 capacity_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
             },
         }],
+        calls: vec![],
         policy: AppPolicy::default(),
         allowed_users: vec![],
         publish_burst: 60,

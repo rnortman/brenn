@@ -3,8 +3,8 @@ use std::time::Duration;
 use brenn_lib::messaging::config::{
     ActivationPacing, BACKEND_FATAL_NOISE_REFUSAL, DEFAULT_WASM_INPUT_AMPLIFICATION,
     DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth,
-    ResolvedSubscription, ResolvedWasmConsumer, WasmConsumerConfigRaw, WasmInputPort,
-    WasmOutputPort, WasmSinkBudget,
+    ResolvedSubscription, ResolvedWasmConsumer, WasmCallPort, WasmConsumerConfigRaw, WasmInputPort,
+    WasmOutputPort, WasmSinkBudget, resolve_wasm_window_depth,
 };
 use brenn_lib::messaging::{
     ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, bindable_schemes,
@@ -44,7 +44,8 @@ use super::resolve_publish_millitokens;
 /// - empty port name or port name containing non-unreserved chars
 /// - output channel is not a pub/sub scheme (`brenn:`/`ephemeral:`/`local:`) —
 ///   `mqtt:`/`webhook:`/`pwa_push:` egress never rides the buffered path
-/// - consumer has no subscriptions but has ≥1 output (dead config)
+/// - consumer has no subscriptions and no `sync` port but has ≥1 output (nothing can
+///   activate it, so the outputs are dead config)
 /// - duplicate grant entries in `grants` list
 /// - `outputs` non-empty but `ports` not granted (dead config)
 /// - `[wasm_consumer.config]` table present but `config` not granted (dead config)
@@ -237,13 +238,18 @@ pub(crate) fn resolve_wasm_consumers(
         // the lowering pass assigned — the two directions cannot be wired apart.
         let (io_subscriptions, io_outputs) = super::auto::wasm_io_bindings(&consumer.io_ports);
 
-        // Validate: outputs-without-inputs is dead config. An io_port carries an
-        // input half, so a consumer whose only subscription is one still activates.
+        // Validate: outputs with nothing that can activate the consumer is dead
+        // config. An io_port carries an input half, so a consumer whose only
+        // subscription is one still activates — and so does a declared `sync`
+        // port, whose activations a caller raises rather than a channel, which is
+        // why a pure-RPC callee with outputs and no subscription is live config.
         assert!(
-            !(consumer.subscriptions.is_empty() && io_subscriptions.is_empty())
+            !(consumer.subscriptions.is_empty()
+                && io_subscriptions.is_empty()
+                && consumer.sync_ports.is_empty())
                 || consumer.outputs.is_empty(),
-            "[[wasm_consumer]] {slug:?}: has output port(s) but no subscriptions — \
-             a consumer with no inputs never activates; its outputs are dead config",
+            "[[wasm_consumer]] {slug:?}: has output port(s) but no subscriptions and no sync \
+             port — nothing can activate it, so its outputs are dead config",
         );
 
         // Resolve input ports.
@@ -340,8 +346,20 @@ pub(crate) fn resolve_wasm_consumers(
 
             // The whole ladder: sub → the channel's own rung.
             let ch = &entry.resolved_channel;
-            let push_depth = sub.push_depth.unwrap_or(ch.push_depth);
-            let retain_depth = sub.retain_depth.unwrap_or(ch.retain_depth);
+            let depth_context = format!(
+                "[[wasm_consumer]] {slug:?}: {kind} on channel {:?}",
+                entry.address
+            );
+            let push_depth = resolve_wasm_window_depth(
+                sub.push_depth.unwrap_or(ch.push_depth),
+                "push_depth",
+                &depth_context,
+            );
+            let retain_depth = resolve_wasm_window_depth(
+                sub.retain_depth.unwrap_or(ch.retain_depth),
+                "retain_depth",
+                &depth_context,
+            );
             if sub.noise.is_some() && push_depth == Depth::Bounded(0) {
                 panic!(
                     "[[wasm_consumer]] {slug:?}: {kind} on channel {:?} has noise configured \
@@ -837,17 +855,11 @@ pub(crate) fn resolve_wasm_consumers(
         // contradicts the specification the artifact is hash-bound to and traps
         // the activation, so a malformed entry here would trap a component that
         // did nothing wrong.
-        let mut declared_out_ports: BTreeSet<String> = BTreeSet::new();
-        for port in &consumer.declared_out_ports {
-            crate::assert_port_name(
-                &format!("[[wasm_consumer]] {slug:?}: declared out-port name"),
-                port,
-            );
-            assert!(
-                declared_out_ports.insert(port.clone()),
-                "[[wasm_consumer]] {slug:?}: declared out-port name {port:?} appears twice",
-            );
-        }
+        let declared_out_ports = crate::port_vocabulary(
+            &format!("[[wasm_consumer]] {slug:?}"),
+            "out",
+            &consumer.declared_out_ports,
+        );
         // Belt and suspenders over the compiler: the resolver refuses a binding
         // naming a port the class does not declare, so a bound output outside
         // the vocabulary means lowering and resolution disagree about which
@@ -862,11 +874,72 @@ pub(crate) fn resolve_wasm_consumers(
             );
         }
 
+        // The class's sync vocabulary, as lowering carried it: the names a
+        // caller may raise a sync-call activation on. A caller naming anything
+        // else is refused by the host, so a malformed entry here would refuse a
+        // caller that did nothing wrong.
+        let sync_ports = crate::port_vocabulary(
+            &format!("[[wasm_consumer]] {slug:?}"),
+            "sync",
+            &consumer.sync_ports,
+        );
+        // Belt and suspenders over the compiler, the same shape as the bound-output
+        // check above: a class may not declare one name twice, so a sync port
+        // sharing a bound port's name means lowering and resolution disagree about
+        // this class's vocabulary. Nothing downstream can tell the two apart — the
+        // fabricated request window would carry a bound input's name, and the host
+        // would read the collision as the sync window and grant the real input
+        // nothing.
+        for port in &sync_ports {
+            assert!(
+                !seen_port_names.contains(port),
+                "[[wasm_consumer]] {slug:?}: declared sync-port name {port:?} is also a bound \
+                 input or output port — a sync port names no binding, and one name cannot \
+                 stand for both",
+            );
+        }
+
+        // The class's call vocabulary, on the same terms: the names this
+        // consumer may ask a peer through. A bound call port outside it, or a
+        // name that is also a bound input or output, is lowering and resolution
+        // disagreeing about the class.
+        let call_ports = crate::port_vocabulary(
+            &format!("[[wasm_consumer]] {slug:?}"),
+            "call",
+            &consumer.call_ports,
+        );
+        for port in &call_ports {
+            assert!(
+                !seen_port_names.contains(port),
+                "[[wasm_consumer]] {slug:?}: declared call-port name {port:?} is also a bound \
+                 input or output port — a call port names no channel, and one name cannot \
+                 stand for both",
+            );
+            assert!(
+                !sync_ports.contains(port),
+                "[[wasm_consumer]] {slug:?}: port name {port:?} is declared both `call` and \
+                 `sync` — one name cannot both ask and answer",
+            );
+        }
+
+        let calls: Vec<WasmCallPort> = consumer
+            .calls
+            .iter()
+            .map(|call| WasmCallPort {
+                port: call.port.clone(),
+                target_slug: call.target.clone(),
+                target_port: call.target_port.clone(),
+            })
+            .collect();
+
         result.push(ResolvedWasmConsumer {
             slug: slug.clone(),
             package: consumer.package.clone(),
             spec_sha256: consumer.spec_sha256.clone(),
             declared_out_ports,
+            sync_ports,
+            call_ports,
+            calls,
             grants,
             store_path,
             max_page_count,
@@ -878,5 +951,41 @@ pub(crate) fn resolve_wasm_consumers(
             mqtt_sinks,
         });
     }
+    check_call_targets(&result);
     result
+}
+
+/// Hold every consumer's `call` bindings against the consumers the document
+/// resolved beside it.
+///
+/// The rules and their refusals are [`crate::check_call_wiring`]'s, shared with
+/// the surface placement; what is here is this placement's names for the things
+/// the rules are about.
+///
+/// Panics if any call names a consumer this document does not declare, binds one
+/// port twice, targets a port the callee does not declare `sync`, or closes a
+/// call cycle.
+fn check_call_targets(consumers: &[ResolvedWasmConsumer]) {
+    let edges: Vec<crate::CallEdge<'_>> = consumers
+        .iter()
+        .flat_map(|consumer| {
+            consumer.calls.iter().map(move |call| crate::CallEdge {
+                label: format!(
+                    "[[wasm_consumer]] {:?}: call port {:?}",
+                    consumer.slug, call.port
+                ),
+                caller: &consumer.slug,
+                port: &call.port,
+                caller_call_ports: &consumer.call_ports,
+                target: &call.target_slug,
+                target_port: &call.target_port,
+            })
+        })
+        .collect();
+    crate::check_call_wiring(&edges, |slug| {
+        consumers
+            .iter()
+            .find(|c| c.slug == slug)
+            .map(|c| &c.sync_ports)
+    });
 }

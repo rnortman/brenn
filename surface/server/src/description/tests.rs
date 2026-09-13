@@ -68,6 +68,7 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
         allowed_users: vec![],
         publish_burst: 60,
         publish_per_sec: 1,
+        calls: vec![],
     }
 }
 

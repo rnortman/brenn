@@ -648,6 +648,7 @@ pub async fn run_server(
             mqtt_service: mqtt_result.service.clone(),
             tool_registry: &tool_registry_core,
             max_payload_bytes: config.messaging.max_body_bytes,
+            sync_router: messaging_result.router.clone(),
         };
         messaging_result
             .wasm_consumers
@@ -661,17 +662,20 @@ pub async fn run_server(
             .collect()
     };
 
-    // Register each loaded consumer's `Notify` on the WakeRouter as its
-    // ParkedNotify delivery binding. The router stores one Arc clone; the task
-    // gets another. Must happen before set_state so bindings are present when
-    // the first WASM push arrives.
+    // Register each loaded consumer's `Notify` and sync-request sender on the
+    // WakeRouter as its WasmConsumer delivery binding. The router stores one
+    // clone of each; the task gets the other halves. Must happen before
+    // set_state so bindings are present when the first WASM push arrives.
     if let Some(ref router) = messaging_result.router {
         use brenn_lib::messaging::SubscriberEntryKind;
         use brenn_server::messaging_router::DeliveryBinding;
         for (slug, loaded) in &loaded_consumers {
             router.register_delivery_binding(
                 SubscriberEntryKind::Wasm(slug.clone()),
-                DeliveryBinding::ParkedNotify(loaded.notify.clone()),
+                DeliveryBinding::WasmConsumer {
+                    notify: loaded.notify.clone(),
+                    sync: loaded.sync_tx.clone(),
+                },
             );
         }
     }

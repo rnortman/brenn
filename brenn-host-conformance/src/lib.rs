@@ -55,6 +55,7 @@
 
 use std::time::Duration;
 
+use brenn_activation::sync::SyncAnswer;
 use brenn_envelope::ChannelScheme;
 
 /// The probe's ports, as its specification names them.
@@ -69,7 +70,21 @@ pub mod port {
     pub const OUT: &str = "out";
     /// The activation report, one per activation.
     pub const REPORT: &str = "report";
+    /// The declared `sync` port a scenario calls the probe on.
+    pub const ASK: &str = "ask";
 }
+
+/// The publish-body cap both adapters configure, and therefore the reply cap on
+/// both hosts.
+///
+/// One constant rather than a question asked of each [`Host`], because the
+/// scenarios that drive it are one byte either side of it and a suite whose two
+/// adapters disagreed about the number would be asserting two different things
+/// under one name. Small on purpose: a megabyte reply built inside a
+/// fuel-and-epoch-bounded activation could trap for a reason that is not the
+/// cap and read as a pass, and the `BODY_CAP`-exactly control that sits beside
+/// the oversize case is what makes the trap attributable to the cap alone.
+pub const BODY_CAP: u64 = 64 * 1024;
 
 /// How long a scenario waits for a report it expects. Generous on purpose: real
 /// time with a wide bound cannot flake on scheduling jitter, it can only hang on
@@ -299,6 +314,13 @@ pub trait Host {
     /// unless [`Host::hold_releases`] is set.
     async fn drain(&mut self) -> Vec<Report>;
 
+    /// Raise a sync call on the probe's declared `sync` port and answer what it
+    /// answered.
+    ///
+    /// What is under test is the shape both hosts owe a caller: one ordinary
+    /// activation, plus a reply.
+    async fn sync_call(&mut self, port: &str, body: &str) -> SyncAnswer;
+
     /// Stop running the release pass inside [`Host::drain`], so a scenario can
     /// read reports while a due message stays unreleased.
     ///
@@ -361,6 +383,20 @@ pub async fn settle<H: Host>(host: &mut H, want: usize) -> Vec<Report> {
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// Spend the quiet period telling the host nothing, so that whatever it had
+/// already been told about is finished before the caller's next step.
+///
+/// [`settle`] cannot serve here, and the difference is the point: every drain it
+/// takes is itself a wake on a host whose instance is driven by one, so it
+/// always returns with one more wake outstanding. A scenario whose next step
+/// must land on a host that is *idle* — not merely quiet — pauses here first.
+/// Without it, "publish, then immediately call" is a race the publish's own wake
+/// can win, and a scenario that lost it would be asserting about an activation
+/// it did not mean.
+pub async fn quiesce() {
+    tokio::time::sleep(QUIET_PERIOD).await;
 }
 
 /// Wait until `want` reports have accumulated since the last drain, and return

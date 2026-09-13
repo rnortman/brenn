@@ -158,23 +158,15 @@ async fn tool_harness(
     ));
 
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: Path::new(TOOL_WASM),
-        slug,
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: tool_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports, ComponentGrant::Tools]
             .into_iter()
             .collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
         tool_host: Some(tool_host),
+        ..ProcessorLoadSpec::minimal(Path::new(TOOL_WASM), slug)
     }));
     let cfg = WasmConsumerConfig {
         slug: slug.to_string(),
@@ -192,8 +184,8 @@ async fn tool_harness(
                 sub: ResolvedSubscription {
                     channel_uuid: trigger.uuid,
                     channel_address: trigger.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -202,6 +194,7 @@ async fn tool_harness(
             inbox_input_port(slug, &inbox_channel),
         ],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 

@@ -62,6 +62,11 @@
 //! ordinary activation shape plus a return obligation, which is why a component
 //! reads its request through the same window API as everything else.
 //!
+//! The facility itself is `brenn-activation`'s — the shape, the request
+//! envelope, the answer vocabulary — and is not this host's to define. What is
+//! written here is what is the page's: the gesture cause, the mount cause, and
+//! the door they run through.
+//!
 //! - **One live request, no history.** A sync port has no queue, no retention and
 //!   no position. Its window is exactly the one minted request (`new_from == 0`,
 //!   `dropped == 0`), and it appears in `ports` only on the activation it caused.
@@ -71,18 +76,22 @@
 //!   usual, the deferred windows ride along, `now` is set, publishes buffer and
 //!   flush iff the entry returns ok. A sync activation consumes queued input like
 //!   any other, so no async activation follows it for input it already drained.
-//! - **Kernel-originated in v1.** The two callers are the kernel's own gesture
-//!   listeners, installed by a component's `dom.listen`, and the mount call
-//!   ([`MOUNT_SYNC_PORT`]). A gesture is why the class exists: the same-task
-//!   reply gives a live gesture token and the chance to suppress the browser's
-//!   default action.
-//!   Component-to-component sync bindings are not representable — the bindings
-//!   document has no class field and no sync vocabulary — and are reserved for the
-//!   follow-on that builds them.
-//! - **Port names are the component's, and must not collide.** A component chooses
-//!   a sync port name at request time; it is bound to nothing and configured
-//!   nowhere. A name that collides with one of the instance's bound input ports is
-//!   refused, because the activation's `ports` list must be unambiguous.
+//! - **Three callers.** Two are the kernel's own: the gesture listeners a
+//!   component installs with `dom.listen`, and the mount call
+//!   ([`MOUNT_SYNC_PORT`]). A gesture is why the class exists on this host: the
+//!   same-task reply gives a live gesture token and the chance to suppress the
+//!   browser's default action. The third is a **peer**, through the `calls`
+//!   import: the document wires a caller's `call` port to a callee's `sync` port
+//!   ([`CallBinding`](brenn_surface_schema::CallBinding)), and the callee's whole
+//!   activation runs inside the caller's. The three differ in who asks and in
+//!   what the request is judged against; below the door they are one pass.
+//! - **Port names are declared `sync` in the specification.** A component does
+//!   not choose one at request time: the class declares `sync <name>;` beside
+//!   its `in`/`out`/`io` ports, and a `dom.listen` on anything else ends the
+//!   activation. The name cannot collide with a bound input port, because a
+//!   class may not declare one name twice — which is what keeps the
+//!   activation's `ports` list unambiguous. A sync port binds to no channel,
+//!   so it carries no depth, no noise rung, no doctype and no `optional`.
 //! - **The request envelope.** Freshly minted by the kernel: sender is the
 //!   requesting instance, `channel` is `local:brenn/sync/<port>` (see
 //!   [`SYNC_CHANNEL_PREFIX`]) and `envelope_type` is `local`. Sync-ness is the
@@ -376,28 +385,13 @@ pub type Activation = brenn_activation::ProcessorActivation;
 /// JSON — the `envelope-json` of `processor.wit`, not a decoded struct.
 pub type PortWindow = brenn_activation::ProcessorPortWindow;
 
-/// The address family the kernel mints a sync-call activation's request envelope
-/// on: `local:brenn/sync/<port>`.
+/// The sync-call vocabulary, re-exported: the address family a request rides on
+/// and the channel builder for one port.
 ///
-/// **Never routed and never bindable.** The envelope exists only inside the
-/// activation's sync window — it never enters a ring, never passes the router and
-/// never crosses the wire — so these addresses are deliberately absent from
-/// [`brenn_surface_schema::RESERVED_LOCAL_CHANNELS`], which enumerates the
-/// *routable* reserved channels. Absence is the enforcement: boot rejects a
-/// `local:brenn/*` binding the table does not name, and the kernel's plane policy
-/// admits nobody to a reserved-but-undefined address, so a component can neither
-/// bind nor write one and no new check was needed to make that true.
-pub const SYNC_CHANNEL_PREFIX: &str = "local:brenn/sync/";
-
-/// The channel a sync-call activation's request envelope carries for `port` —
-/// [`SYNC_CHANNEL_PREFIX`] plus the port name.
-///
-/// Sync-ness is the activation's own `sync` field, never a property of the
-/// envelope: the envelope's `envelope_type` is `local`, which is truthful on
-/// every axis that field answers (page-local, never on the wire, no durable row).
-pub fn sync_channel(port: &str) -> String {
-    format!("{SYNC_CHANNEL_PREFIX}{port}")
-}
+/// Defined in `brenn-activation` because both hosts mint the same request — a
+/// sync-call activation is a facility of the component model, not of this page.
+/// Named here because this is the file a surface component's author reads.
+pub use brenn_activation::sync::{SYNC_CHANNEL_PREFIX, sync_channel};
 
 /// One output port's view onto the messages this component itself has parked on
 /// that port's channel, soonest release first.
@@ -455,6 +449,55 @@ pub enum DeferError {
     /// An edit's release time is not a representable timestamp. Refused here
     /// rather than left to collapse into an immediate release downstream.
     InvalidDeliverAfter,
+}
+
+/// Why a component's synchronous call to a peer did not answer.
+///
+/// The `processor.wit` `call-error` variants verbatim — a component's call-error
+/// vocabulary does not change with its hosting, and the backend host maps the
+/// same [`brenn_activation::sync::SyncAnswer`] onto the same six words.
+///
+/// Note which of these are answers and which are deployment facts. `unwired` and
+/// `refused` say something about the document or the peer's state, not about the
+/// caller; `quota-exceeded` and `invalid-payload` say the caller asked for more
+/// than its activation may spend. None of them ends the caller's activation — a
+/// port outside the caller's declared `call` vocabulary does, and that is a trap
+/// rather than a variant here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallError {
+    /// Ungranted, or the call came from outside an in-flight activation of the
+    /// calling instance.
+    NotPermitted,
+    /// A declared `call` port the deployer left unbound: nobody to answer.
+    Unwired,
+    /// The peer did not run — it is not in service, it is terminal, or (on the
+    /// page) it holds `dom` and its mount has not run yet.
+    Refused,
+    /// The peer ran and did not answer ok: it erred or trapped, and its buffer
+    /// flushed nothing.
+    Failed,
+    /// The payload failed host validation. Carries the host's account of why,
+    /// which is the one call-error variant with a payload.
+    InvalidPayload(String),
+    /// The activation's call budget — shared with publishes — is exhausted.
+    QuotaExceeded,
+}
+
+/// The WIT `call-error` wire string for one refused call.
+///
+/// The single executable definition of the values, shared by the kernel that
+/// writes them and the guest glue that lifts them, so the seam cannot drift by
+/// hand-copied literal. `invalid-payload`'s own detail string is carried beside
+/// the tag rather than in it, exactly as the WIT variant carries it.
+pub fn call_error_str(error: &CallError) -> &'static str {
+    match error {
+        CallError::NotPermitted => "not-permitted",
+        CallError::Unwired => "unwired",
+        CallError::Refused => "refused",
+        CallError::Failed => "failed",
+        CallError::InvalidPayload(_) => "invalid-payload",
+        CallError::QuotaExceeded => "quota-exceeded",
+    }
 }
 
 /// Why an activation entry returned unsuccessfully.
@@ -815,6 +858,23 @@ mod tests {
     }
 
     #[test]
+    fn call_error_strings_are_frozen() {
+        // Same argument as the publish and defer statuses, with one more party:
+        // the backend host lifts the identical six words out of its own bindgen
+        // enum, so a rename here is a component seeing two vocabularies for one
+        // facility depending on where it was placed.
+        assert_eq!(call_error_str(&CallError::NotPermitted), "not-permitted");
+        assert_eq!(call_error_str(&CallError::Unwired), "unwired");
+        assert_eq!(call_error_str(&CallError::Refused), "refused");
+        assert_eq!(call_error_str(&CallError::Failed), "failed");
+        assert_eq!(
+            call_error_str(&CallError::InvalidPayload("too big".to_string())),
+            "invalid-payload"
+        );
+        assert_eq!(call_error_str(&CallError::QuotaExceeded), "quota-exceeded");
+    }
+
+    #[test]
     fn gesture_body_field_names_frozen() {
         // The kernel writes this body and a guest SDK it cannot link parses it;
         // a rename on one side alone is a gesture that silently stops carrying
@@ -866,10 +926,108 @@ mod tests {
             GUEST.contains(&needle),
             "the guest spells no `{needle}`; the two halves of the mount port have drifted"
         );
-        // The colon is what reserves it: `assemble_sync` panics on a sync port
-        // that collides with a bound input port, and no specification identifier
-        // can spell one.
+        // The colon is what reserves it: a specification identifier cannot spell
+        // one, so no class can declare this name and nothing can collide with the
+        // kernel's own mount cause.
         assert!(MOUNT_SYNC_PORT.contains(':'));
+    }
+
+    #[test]
+    fn every_listened_port_is_declared_sync_in_its_kinds_specification() {
+        // `dom.listen` on a port the specification does not declare `sync` traps
+        // the activation that installs the listener — which is the mount, in the
+        // browser, in the stack CI does not run. So the two halves are held
+        // together here instead: the kind's source names the ports it listens
+        // on, its specification declares them, and a typo in either half is this
+        // test rather than a component that renders nothing on a live page.
+        //
+        // Same shape as the mount-port check above, and the same reason. The row
+        // set is not a judgement about which kinds listen — it is every staged
+        // kind, held complete against the served tree below, so a new kind that
+        // listens cannot be missed by being left out.
+        const KINDS: [(&str, &str, &str); 6] = [
+            (
+                "chrome",
+                include_str!("../../chrome/src/component.rs"),
+                include_str!("../../../config/specs/chrome.brenn"),
+            ),
+            (
+                "echo-stub",
+                include_str!("../../components/echo-stub/src/component.rs"),
+                include_str!("../../../config/specs/echo-stub.brenn"),
+            ),
+            (
+                "meeting",
+                include_str!("../../components/meeting/src/component.rs"),
+                include_str!("../../../config/specs/meeting.brenn"),
+            ),
+            (
+                "mode-clock",
+                include_str!("../../components/mode-clock/src/component.rs"),
+                include_str!("../../../config/specs/mode-clock.brenn"),
+            ),
+            (
+                "protobar",
+                include_str!("../../components/protobar/src/component.rs"),
+                include_str!("../../../config/specs/protobar.brenn"),
+            ),
+            (
+                "processor-transplant",
+                include_str!("../../../brenn-wasm/components/processor-transplant/src/lib.rs"),
+                include_str!("../../../config/specs/processor-transplant.brenn"),
+            ),
+        ];
+
+        // The served tree is the kind set: a kind reaches a page by being staged
+        // into it, so a kind staged with no row here is a kind this gate does not
+        // read. Derived rather than trusted to a comment, because the failure of
+        // a hand-maintained table is silent and browser-only.
+        const PATHS: &str = include_str!("../../dist-paths.txt");
+        let mut staged: Vec<&str> = PATHS
+            .lines()
+            .filter_map(|line| line.strip_prefix("processor/"))
+            .filter_map(|rest| rest.split('/').next())
+            .collect();
+        staged.sort_unstable();
+        staged.dedup();
+        assert!(!staged.is_empty(), "no kind is staged at all");
+        for kind in &staged {
+            assert!(
+                KINDS.iter().any(|(named, _, _)| named == kind),
+                "the staged kind {kind:?} has no row here, so nothing holds its `listen` calls                  against its specification — add one"
+            );
+        }
+
+        let mut listened_anywhere = 0;
+        for (kind, source, spec) in KINDS {
+            assert!(
+                staged.contains(&kind),
+                "{kind} is not staged into the served tree, so this row reads a kind no page                  loads — drop it"
+            );
+            let mut listened = Vec::new();
+            for tail in source.split("dom::SyncPort(\"").skip(1) {
+                let name = tail
+                    .split_once('"')
+                    .unwrap_or_else(|| panic!("{kind}: an unterminated `dom::SyncPort(\"` literal"))
+                    .0;
+                listened.push(name);
+            }
+            listened_anywhere += listened.len();
+            for port in listened {
+                let declaration = format!("sync {port};");
+                assert!(
+                    spec.lines().any(|line| line.trim() == declaration),
+                    "{kind} listens on port {port:?}, which config/specs/{kind}.brenn does not \
+                     declare (`{declaration}`) — the kernel would trap the mount activation that \
+                     installs the listener"
+                );
+            }
+        }
+        assert!(
+            listened_anywhere > 0,
+            "no kind listens on anything, which means the literal form changed and this scan \
+             now matches nothing"
+        );
     }
 
     #[test]

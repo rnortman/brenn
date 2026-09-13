@@ -6,11 +6,12 @@
 //! state in linear memory (scenario 7), are each hosted identically or not at
 //! all, and nothing that drives the entry directly can tell which.
 
+use brenn_activation::sync::SyncAnswer;
 use brenn_envelope::ChannelScheme;
 
 use crate::{
     Host, InputBinding, MountSpec, Report, TrapDisposition, assert_fresh_memory, await_reports,
-    port, settle,
+    port, quiesce, settle,
 };
 
 /// A push-enabled input binding with room for a small batch.
@@ -494,5 +495,242 @@ pub mod due_tick_is_shown_at_mount {
         assert_fresh_memory(&second);
         assert_fresh_memory(&third);
         assert_fresh_memory(&fourth);
+    }
+}
+
+/// 10. A sync call is one ordinary activation plus a reply.
+///
+/// The two halves of the facility's definition, asserted together: the
+/// activation the request causes is composed exactly as an async one is — every
+/// bound input windowed, every output's deferred window present, the clock
+/// handed over — with one fabricated window carrying the request and nothing
+/// else, and the buffer it built is flushed *before* the caller is answered.
+///
+/// Flush-before-reply is read the only way a caller can read it: the report is
+/// on its channel by the time the answer is in hand, without the scenario
+/// having driven the host in between.
+pub mod a_sync_call_is_an_activation_plus_a_reply {
+    use super::*;
+
+    pub fn spec() -> MountSpec {
+        MountSpec {
+            inputs: vec![pushed(port::IN), sampled(port::SAMPLED)],
+            tick: None,
+            tick_ms: None,
+        }
+    }
+
+    pub async fn run<H: Host>(host: &mut H, spec: &MountSpec) {
+        host.mount().await;
+        assert_eq!(settle(host, 1).await.len(), 1, "the mount activation");
+
+        let answer = host.sync_call(port::ASK, "__reply__").await;
+        // The probe's reply names the port it was asked on, that port read back
+        // as an item, the request body, whether the request is attributed to the
+        // target's own bare name — the same answer on both hosts, where a
+        // participant-vocabulary spelling would differ — and the ports the
+        // activation *delivered*, the whole window list minus the request's own.
+        assert_eq!(
+            answer,
+            SyncAnswer::Ok(Some(format!(
+                "replied:{}:mount=false:request=__reply__:bare-identity=true:delivered=[{},{}]",
+                port::ASK,
+                port::IN,
+                port::SAMPLED,
+            ))),
+            "a sync call is answered with the reply its callee returned",
+        );
+
+        let reports = host.drain().await;
+        assert_eq!(
+            reports.len(),
+            1,
+            "the request caused exactly one activation, and its buffer was \
+             flushed before the answer came back",
+        );
+        let report = &reports[0];
+        assert_shape(report, spec);
+        let request = report
+            .port(port::ASK)
+            .expect("the request's own window is in the activation");
+        assert_eq!(
+            (request.context_len, request.new_len, request.dropped),
+            (0, 1, 0),
+            "the sync window holds exactly the one live request as new: a sync \
+             port has no retention and no position, so nothing is context and \
+             nothing can have been passed unserved",
+        );
+        for window in &report.ports {
+            if window.port != port::ASK {
+                assert_eq!(
+                    (window.context_len, window.new_len),
+                    (0, 0),
+                    "port {:?} was windowed over a channel that never carried \
+                     anything — the request does not stand in for delivery",
+                    window.port,
+                );
+            }
+        }
+        assert_fresh_memory(&reports);
+
+        assert!(
+            settle(host, 0).await.is_empty(),
+            "a sync call is the whole activation it caused; nothing follows it",
+        );
+    }
+}
+
+/// 11. A sync call consumes queued input: it is an ordinary activation, so the
+///     messages waiting on the instance's bound ports are delivered by it and
+///     are gone from the cursor afterwards.
+pub mod a_sync_call_consumes_queued_input {
+    use super::*;
+
+    pub fn spec() -> MountSpec {
+        MountSpec {
+            inputs: vec![pushed(port::IN)],
+            tick: None,
+            tick_ms: None,
+        }
+    }
+
+    pub async fn run<H: Host>(host: &mut H, _spec: &MountSpec) {
+        host.mount().await;
+        assert_eq!(settle(host, 1).await.len(), 1, "the mount activation");
+
+        // Published and *not* drained: the queued message must still be waiting
+        // when the request arrives, or the scenario proves nothing. The pause is
+        // what makes "not drained" true — a host still holding a wake from the
+        // mount's own settling would spend it on this publish.
+        quiesce().await;
+        host.publish(port::IN, "queued").await;
+        let answer = host.sync_call(port::ASK, "__reply__").await;
+        assert!(
+            matches!(answer, SyncAnswer::Ok(Some(_))),
+            "the request was answered: {answer:?}",
+        );
+
+        let reports = host.drain().await;
+        assert_eq!(reports.len(), 1, "one request, one activation");
+        let window = reports[0].port(port::IN).expect("the bound input");
+        assert_eq!(
+            (window.context_len, window.new_len),
+            (0, 1),
+            "the queued message is delivered as new by the request's own \
+             activation",
+        );
+        assert_fresh_memory(&reports);
+
+        assert!(
+            settle(host, 0).await.is_empty(),
+            "and it was consumed there — no async activation follows for it",
+        );
+    }
+}
+
+/// 13. A reply to an activation that asked nothing is a trap of the callee.
+///
+/// The instruction arrives on an ordinary input port, so the activation it
+/// causes is async and the reply it returns is unasked-for. The trap is the
+/// *host's*, not the probe's: the probe answers unconditionally, which is what
+/// leaves the rule to the host to enforce.
+pub mod a_reply_to_an_async_activation_is_a_trap {
+    use super::*;
+
+    pub fn spec() -> MountSpec {
+        MountSpec {
+            inputs: vec![pushed(port::IN)],
+            tick: None,
+            tick_ms: None,
+        }
+    }
+
+    pub async fn run<H: Host>(host: &mut H, _spec: &MountSpec) {
+        host.mount().await;
+        assert_eq!(settle(host, 1).await.len(), 1, "the mount activation");
+
+        host.publish(port::IN, "__answer__:1").await;
+        assert!(
+            settle(host, 0).await.is_empty(),
+            "the activation trapped, so its buffer — the report included — was \
+             discarded and never reached the channel",
+        );
+
+        // The disposition is the one deliberate host difference, asserted per
+        // host exactly as scenario 6 does: what is expected is what is waited
+        // for.
+        host.publish(port::IN, "after-reply").await;
+        let want = match host.trap_disposition() {
+            TrapDisposition::Quarantine => 1,
+            TrapDisposition::Terminal => 0,
+        };
+        let after = settle(host, want).await;
+        match host.trap_disposition() {
+            TrapDisposition::Quarantine => {
+                assert_eq!(after.len(), 1, "the backend quarantines and carries on");
+                assert_fresh_memory(&after);
+            }
+            TrapDisposition::Terminal => assert!(
+                after.is_empty(),
+                "the surface takes a trapped instance terminal",
+            ),
+        }
+    }
+}
+
+/// 14. An oversize reply is a trap of the callee.
+///
+/// A reply is bounded by the same cap as a publish body, so a callee cannot hand
+/// a caller more than it could have published. The control is the other half of
+/// the argument: the two replies differ by one byte, so the trap on the second
+/// can be nothing but the cap.
+pub mod an_oversize_reply_is_a_trap {
+    use super::*;
+
+    use crate::BODY_CAP;
+
+    pub fn spec() -> MountSpec {
+        MountSpec {
+            inputs: vec![pushed(port::IN)],
+            tick: None,
+            tick_ms: None,
+        }
+    }
+
+    pub async fn run<H: Host>(host: &mut H, _spec: &MountSpec) {
+        host.mount().await;
+        assert_eq!(settle(host, 1).await.len(), 1, "the mount activation");
+
+        // The cap is inclusive, and this control runs first: on a host whose
+        // trap disposition is terminal there is no instance left after the
+        // oversize call.
+        let at_cap = host
+            .sync_call(port::ASK, &format!("__answer__:{BODY_CAP}"))
+            .await;
+        assert_eq!(
+            at_cap,
+            SyncAnswer::Ok(Some("x".repeat(BODY_CAP as usize))),
+            "a reply of exactly the cap is admissible",
+        );
+        assert_eq!(
+            host.drain().await.len(),
+            1,
+            "and its activation's buffer flushed",
+        );
+
+        let over = host
+            .sync_call(port::ASK, &format!("__answer__:{}", BODY_CAP + 1))
+            .await;
+        assert_eq!(
+            over,
+            SyncAnswer::Trap,
+            "one byte over the cap is a trap of the callee, not a truncation \
+             and not an answer given in its place",
+        );
+        assert!(
+            settle(host, 0).await.is_empty(),
+            "a trapped activation flushes nothing, so its report never reached \
+             the channel",
+        );
     }
 }

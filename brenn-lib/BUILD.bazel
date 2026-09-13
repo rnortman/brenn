@@ -8,6 +8,7 @@ policy_srcs()
 exports_files(["Cargo.toml"])
 
 FIRST_PARTY_DEPS = [
+    "//brenn-activation",
     "//brenn-approval-rules",
     "//brenn-budget",
     "//brenn-common",

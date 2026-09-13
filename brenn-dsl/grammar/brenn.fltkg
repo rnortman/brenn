@@ -88,7 +88,12 @@ component_class := doc:doc? , %"component" : name:cname , %"{" , (attrs:attr | p
 // want of `=`; the declaration form then gets the input back, exactly as
 // `channel_def`'s two alternatives rely on.
 port_decl := optional:"optional"? , dir:port_dir : name:name , doctype:port_doctype? , %";" , ;
-port_dir := into:"in" | outof:"out" | both:"io" ;
+// `sync` and `call` are the two odd classes: neither is bound to a channel, so
+// neither takes a tail, a doctype or `optional`. `sync` names the port a caller
+// — a browser gesture, host code, or a peer component — raises a sync-call
+// activation on; `call` names the port this component asks a peer through, and
+// is wired to one peer's `sync` port by a `call` binding.
+port_dir := into:"in" | outof:"out" | both:"io" | sync:"sync" | call:"call" ;
 port_doctype := %":" , ty:str_like ;
 
 // An agent body mixes attrs with five statement forms. `section` is last and
@@ -129,11 +134,18 @@ inst_body := %"{" , (attrs:attr | bindings:binding | acls:acl_stmt | blocks:sect
 // ── bindings ─────────────────────────────────────────────────────────────────
 //
 // Direction is the alternative, never a field: `in`/`out`/`io` plus the free-io
-// form, which names a port and tunes it without connecting it.
-binding := into:in_b | outof:out_b | both:io_b ;
+// form, which names a port and tunes it without connecting it, plus `call`,
+// which names no channel at all.
+binding := into:in_b | outof:out_b | both:io_b | calls:call_b ;
 in_b := %"in" : port:name , %"<-" , chan:chan_ref , tail:tail_block? , semi:";"? , ;
 out_b := %"out" : port:name , %"->" , chan:chan_ref , tail:tail_block? , semi:";"? , ;
 io_b := %"io" : port:name , target:io_target? , tail:tail_block? , semi:";"? , ;
+// `call lookup -> geo.resolve;` — the caller's port, then the peer instance and
+// the `sync` port of it that answers. The target is a path and never a
+// `chan_ref`: a call reaches an instance, and no address names one. The tail is
+// admitted for symmetry with the other three forms and refused non-empty by the
+// resolver — a call carries no window, no rate and no doctype.
+call_b := %"call" : port:name , %"->" , target:path , tail:tail_block? , semi:";"? , ;
 io_target := %"<->" , chan:chan_ref ;
 
 // A handle or dotted path where a declaration exists, a literal address where

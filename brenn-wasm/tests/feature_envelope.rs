@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use brenn_wasm::{ProcessorComponent, ProcessorLoadSpec, store::DEFAULT_MAX_PAGE_COUNT};
+use brenn_wasm::{ProcessorComponent, ProcessorLoadSpec};
 use wasmtime::{Engine, Instance, Module, Store};
 
 mod common;
@@ -163,21 +163,16 @@ fn loaded_processor() -> ProcessorComponent {
     let mut ports = HashMap::new();
     ports.insert("out".to_string(), common::out_spec("brenn:test-out"));
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &common::artifact_path("brenn_processor_demo"),
-        slug: "feature-envelope",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants: [brenn_wasm::ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: common::noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(
+            &common::artifact_path("brenn_processor_demo"),
+            "feature-envelope",
+        )
     })
 }
 

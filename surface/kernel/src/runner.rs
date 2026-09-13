@@ -179,8 +179,8 @@ pub struct SurfaceRunner<C: TransportConnector> {
     /// of a registered instance and every scheduling decision about it; this map
     /// holds the one thing it cannot.
     entries: SharedEntries,
-    /// The in-flight activation's buffer, shared with the platform half's front
-    /// door. Filled for exactly the duration of an entry invocation; a `dom`
+    /// The in-flight activations' buffers, shared with the platform half's front
+    /// door. Pushed for exactly the duration of an entry invocation; a `dom`
     /// component's publish reaches it from a DOM listener, which is a code path
     /// with no way to the buffer on this stack.
     #[cfg(target_arch = "wasm32")]
@@ -236,6 +236,24 @@ pub struct SurfaceRunner<C: TransportConnector> {
     /// resolve nothing against a clock, and reading a broken one would panic
     /// instead of reporting.
     clock_usable: bool,
+}
+
+/// One entry call, as it came back: how it finished, the buffer it left, and what
+/// the peers it called already committed.
+///
+/// A struct rather than a parameter list because the last field is the one a
+/// transcription gets wrong — the callee's effects travel with the completion they
+/// must precede, so there is one place that orders them.
+struct Invoked {
+    instance: String,
+    /// Which registration of that instance ran, carried back on the completion.
+    generation: u64,
+    outcome: ActivationOutcome,
+    buffer: PublishBuffer,
+    /// The committed turns of the peers this activation called, in the order the
+    /// page took them. Empty for an activation that called nobody, and always
+    /// empty on the native build, which has no calls seam.
+    called: Vec<Effect>,
 }
 
 impl<C: TransportConnector> SurfaceRunner<C> {
@@ -681,25 +699,27 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// The stretch is the point. Effects are requests — a frame to write, a
     /// deadline to restate, an event for the platform half — and every one of them
     /// is performed asynchronously anyway, so nothing is lost by deferring them
-    /// past the completion. What is *gained* is the dichotomy the browser's sync
-    /// door needs: an entry is on the stack iff an activation is in flight. Enact
-    /// the assembly's effects in between and the page holds an instance in flight
+    /// past the completion. What is *gained* is that the page's own in-flight
+    /// state is the whole truth about whether an entry is on the stack: enact the
+    /// assembly's effects in between and the page holds an instance in flight
     /// across an await with nobody's entry running, and a genuine user gesture
     /// landing in that window would be refused as re-entrant.
+    ///
+    /// The page cell is **not** held across the invocation. An entry may call a
+    /// peer, and that call turns the page from inside this stack; the one
+    /// in-flight fact lives in the scheduler, which is what both the sync door
+    /// and a chained call read.
     ///
     /// One clock reading covers the whole stretch, for the same reason a flush's
     /// stamps share one: it is one commit, and its parts must agree about when now
     /// was.
     fn run_activation(&self, now: Millis, now_ms: u64) -> Vec<Effect> {
-        // Held across the invocation deliberately: on wasm this borrow *is* the
-        // "an entry is on the stack" fact the sync door reads.
-        let mut page = self.page.borrow_mut();
-        let (ready, mut effects) = turn::dispatch(&mut page, now, now_ms);
+        let (ready, mut effects) = turn::dispatch(&mut self.page.borrow_mut(), now, now_ms);
         // The window's own loud rungs — an `alarm` binding's alert and toast, a
         // `fatal` binding's kill — ride in these effects, and the kill is why there
         // may be no entry to run.
         let Some(ready) = ready else { return effects };
-        self.invoke_and_complete(&mut page, ready, &mut effects, now, now_ms);
+        self.invoke_and_complete(ready, &mut effects, now, now_ms);
         effects
     }
 
@@ -738,12 +758,17 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     ///
     /// Answers the effects and whether the mount is still owed.
     fn mount_activation(&self, instance: &str, now: Millis, now_ms: u64) -> (Vec<Effect>, bool) {
-        let mut page = self.page.borrow_mut();
         let (dispatch, mut effects) = turn::dispatch_sync(
-            &mut page,
-            instance,
-            MOUNT_SYNC_PORT,
-            MOUNT_REQUEST_BODY.to_string(),
+            &mut self.page.borrow_mut(),
+            crate::outward::SyncCall {
+                instance,
+                port: MOUNT_SYNC_PORT,
+                body: MOUNT_REQUEST_BODY,
+                // The mount is the page's own cause, not a peer's: nothing is on
+                // the stack above it, so it is judged by the page-wide
+                // re-entrancy rule like a gesture.
+                chain: &[],
+            },
             self.driver.new_stamp(),
             now,
             now_ms,
@@ -756,7 +781,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             // for a mount call to build.
             SyncDispatch::Refused(_) | SyncDispatch::Killed => false,
             SyncDispatch::Ready(ready) => {
-                self.invoke_and_complete(&mut page, *ready, &mut effects, now, now_ms);
+                self.invoke_and_complete(*ready, &mut effects, now, now_ms);
                 false
             }
         };
@@ -765,9 +790,13 @@ impl<C: TransportConnector> SurfaceRunner<C> {
 
     /// Call an assembled activation's entry and fold its completion into the
     /// page, appending the completion turn's effects to `effects`.
+    ///
+    /// The page cell is borrowed for the completion and not for the entry call:
+    /// an entry that calls a peer turns the page from inside this stack, and a
+    /// borrow held across the invocation would make that nested turn a panic
+    /// instead of the ordinary pass it is.
     fn invoke_and_complete(
         &self,
-        page: &mut SurfacePage,
         ready: ReadyActivation,
         effects: &mut Vec<Effect>,
         now: Millis,
@@ -780,14 +809,44 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             buffer,
             drops: _,
         } = ready;
-        let (outcome, buffer) = self.invoke(&instance, &activation, buffer);
+        let (outcome, buffer, called) = self.invoke(&instance, &activation, buffer);
+        self.complete(
+            Invoked {
+                instance,
+                generation,
+                outcome,
+                buffer,
+                called,
+            },
+            effects,
+            now,
+            now_ms,
+        );
+    }
+
+    /// Fold one finished invocation into the page, appending what it asks for to
+    /// `effects` behind whatever the peers it called already committed.
+    ///
+    /// The order is the rule: a callee's turn happened while this activation was
+    /// still running, so what the callee asked for is enacted before anything this
+    /// activation's own completion asks for. Inverting it would put a caller's
+    /// publishes on the wire ahead of publishes the page already committed.
+    fn complete(&self, invoked: Invoked, effects: &mut Vec<Effect>, now: Millis, now_ms: u64) {
+        let Invoked {
+            instance,
+            generation,
+            outcome,
+            buffer,
+            called,
+        } = invoked;
+        effects.extend(called);
         // One stamp per buffered publish: the page is the router for a flush's
         // confined entries and reads no entropy of its own. Minted for every
         // entry whatever its class, for the same reason a single publish is —
         // only the page resolves which channel a port names.
         let stamps = self.driver.flush_stamps(buffer.len());
         effects.extend(turn::on_input(
-            page,
+            &mut self.page.borrow_mut(),
             Input::ActivationDone(Box::new(Completed {
                 instance,
                 generation,
@@ -806,14 +865,17 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         instance: &str,
         activation: &Activation,
         buffer: PublishBuffer,
-    ) -> (ActivationOutcome, PublishBuffer) {
+    ) -> (ActivationOutcome, PublishBuffer, Vec<Effect>) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let entries = self.entries.borrow();
             let Some(entry) = entries.get(instance) else {
-                return (missing_entry_trap(), buffer);
+                return (missing_entry_trap(), buffer, Vec::new());
             };
-            invoke_native(entry, activation, buffer)
+            let (outcome, buffer) = invoke_native(entry, activation, buffer);
+            // The native build has no calls seam — `brenn_processor_call` is the
+            // browser's export — so an entry here can have asked for nothing.
+            (outcome, buffer, Vec::new())
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1200,11 +1262,11 @@ pub(crate) fn invoke_shared(
     instance: &str,
     activation: &Activation,
     buffer: PublishBuffer,
-) -> (ActivationOutcome, PublishBuffer) {
+) -> (ActivationOutcome, PublishBuffer, Vec<Effect>) {
     let entries = entries.borrow();
     match entries.get(instance) {
         Some(entry) => invoke_wasm(entry, activation, slot, instance, buffer),
-        None => (missing_entry_trap(), buffer),
+        None => (missing_entry_trap(), buffer, Vec::new()),
     }
 }
 
@@ -1220,9 +1282,10 @@ pub(crate) fn invoke_shared(
 /// kernel never parses it, but it is the only answer an operator has to "failed
 /// *how*?", and this boundary is the only place it exists.
 ///
-/// It is also where the reply is judged against the activation that earned it: a
-/// `Result` cannot say "ok, but only if you asked me something", so the check
-/// belongs at the call, where both halves are in hand.
+/// The reply's own admissibility is not judged here. Whether anything asked for
+/// one, and whether it fits the page's body cap, are facts about the activation
+/// rather than about the return, and they are ruled on where the completion is
+/// taken — the one seam every invocation of this kernel reaches.
 ///
 /// Takes the buffer by value and hands it back so both builds' invocations share
 /// one call shape; the wasm build cannot pass `&mut` (see below).
@@ -1239,14 +1302,6 @@ fn invoke_native(
         entry(activation, &mut buffer)
     }));
     let outcome = match called {
-        // A reply on an activation that asked no question is a trap, not an ok:
-        // the entry answered something other than what it was handed, so its
-        // buffer was built under a misapprehension and must not be flushed. The
-        // browser's return-value classifier rules the same way on the same fact;
-        // this is the other boundary the same rule has to hold at.
-        Ok(Ok(Some(reply))) if activation.sync.is_none() => ActivationOutcome::Trap(format!(
-            "activation entry replied {reply:?} to an activation with no sync port"
-        )),
         Ok(Ok(reply)) => ActivationOutcome::Ok(reply),
         Ok(Err(err)) => ActivationOutcome::Err(err),
         Err(payload) => ActivationOutcome::Trap(unwind_message(payload)),
@@ -1291,20 +1346,8 @@ fn invoke_wasm(
     slot: &crate::front::InFlightSlot,
     instance: &str,
     buffer: PublishBuffer,
-) -> (ActivationOutcome, PublishBuffer) {
-    *slot.borrow_mut() = Some(crate::front::InFlightPublish {
-        instance: instance.to_string(),
-        buffer,
-    });
-    let outcome = entry(activation);
-    // Taken back unconditionally: the entry returned (a trap here is a JS exception
-    // the wrapper already caught and classified), so leaving the buffer installed
-    // would let a publish made after it join an activation that is over.
-    let in_flight = slot
-        .borrow_mut()
-        .take()
-        .expect("surface runner: the in-flight buffer vanished during an activation");
-    (outcome, in_flight.buffer)
+) -> (ActivationOutcome, PublishBuffer, Vec<Effect>) {
+    crate::front::invoke_over_stack(slot, instance, buffer, || entry(activation))
 }
 
 /// Hand the executor control once, then resolve.

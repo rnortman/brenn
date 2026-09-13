@@ -40,12 +40,12 @@
 #[cfg(test)]
 mod tests;
 
+use brenn_activation::sync::{sync_request, within_body_cap};
 use brenn_attach_client::Millis;
 use brenn_attach_client::publish::OutboxSteps;
 use brenn_attach_client::router::{MessageStamp, ReleaseTimer, ReleasedChannel};
 use brenn_attach_proto::{AlertSeverity, ClientFrame, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES};
-use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
-use brenn_surface_contract::sync_channel;
+use brenn_envelope::grants::ComponentGrant;
 use brenn_surface_schema::{
     CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, ToastBody, ToastSeverity, ToastSource,
 };
@@ -56,6 +56,10 @@ use crate::outbound::truncate_report_field;
 use crate::page::SurfacePage;
 use crate::planes::SurfacePlanes;
 use crate::publish_buffer::PublishBuffer;
+
+/// The refusal vocabulary is the facility's, not this page's: both hosts answer
+/// a caller in the same words.
+pub use brenn_activation::sync::SyncRefusal;
 
 /// The instance the next [`dispatch`] would assemble for, or `None` when nothing
 /// is ready — the wake question, at the grain a caller budgets a turn in.
@@ -119,57 +123,23 @@ pub fn dispatch(page: &mut SurfacePage, now_ms: u64) -> Option<ReadyActivation> 
     Some(schedules.assemble(&instance, generation, &mut ctx))
 }
 
-/// Why a sync-call activation request was not admitted.
+/// One sync-call request, as a caller states it.
 ///
-/// Every one of them is a bug — in the component that requested it, or in the
-/// kernel that let the request through — never a configured outcome and never a
-/// state a conforming page reaches. The requester is told, and faults on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncRefusal {
-    /// An activation — of any instance — is already in flight, so an entry is on
-    /// the stack and this request came from inside it. One JS thread means a
-    /// genuine user gesture can never arrive re-entrant; only an event a component
-    /// dispatched programmatically during an activation can.
-    ReEntrant,
-    /// The instance holds no activation entry: never registered, deregistered, or
-    /// still inside the connect-time code that runs *before* its registration
-    /// completes.
-    Unregistered,
-    /// The instance is terminal. It has no next activation of any flavor.
-    Failed,
-    /// No bindings document is in force, so there is no wiring to window against.
-    Unwired,
-    /// The requested sync port name is already a bound input port of the instance.
-    /// Admitting it would put two windows with one name in `ports`.
-    PortCollision,
-}
-
-impl SyncRefusal {
-    /// The operator-facing sentence for this refusal — the breadcrumb the kernel
-    /// leaves next to the answer the requester gets.
-    pub fn describe(&self, instance: &str, port: &str) -> String {
-        match self {
-            Self::ReEntrant => format!(
-                "refused sync activation of {instance} on port {port}: an activation is already \
-                 in flight, so this request came from inside an entry"
-            ),
-            Self::Unregistered => format!(
-                "refused sync activation of {instance} on port {port}: the instance holds no \
-                 activation entry"
-            ),
-            Self::Failed => format!(
-                "refused sync activation of {instance} on port {port}: the instance is terminal"
-            ),
-            Self::Unwired => format!(
-                "refused sync activation of {instance} on port {port}: no bindings document is in \
-                 force"
-            ),
-            Self::PortCollision => format!(
-                "refused sync activation of {instance} on port {port}: that name is already a \
-                 bound input port of the instance"
-            ),
-        }
-    }
+/// A struct rather than a parameter list for the reason [`Completed`] is one:
+/// the four travel together through two layers, and the caller is the only party
+/// that can put them in the wrong order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncCall<'a> {
+    /// The identity the caller resolved, never one the component claimed.
+    pub instance: &'a str,
+    /// The sync port the request arrives on — the component's own.
+    pub port: &'a str,
+    /// The request payload — the component's own.
+    pub body: &'a str,
+    /// The instances whose activations are already on the stack above this
+    /// request, outermost first. Empty for a caller that is not one of them: a
+    /// gesture, the mount, a native caller.
+    pub chain: &'a [String],
 }
 
 /// Assemble a sync-call activation for the named instance, or say why not.
@@ -186,14 +156,38 @@ impl SyncRefusal {
 /// the edge that reads clocks and entropy — this layer mints neither. `now_ms` is
 /// the same instant in the currency an activation's `now` and its deferred cutoff
 /// are stated in.
+///
+/// # The chain is what re-entrancy is judged against
+///
+/// `chain` is the instances whose activations are already on the stack above this
+/// request, outermost first — empty for a caller that is not one of them (a
+/// gesture, the mount), and the caller's own stack for a component's `call`.
+///
+/// With an **empty** chain the rule is the page-wide one: anything in flight
+/// means this request came from inside somebody's entry, which a genuine gesture
+/// never can on one JS thread, so it is refused. With a **non-empty** chain the
+/// caller being in flight is what a call *is*, so only the target being in flight
+/// refuses — and after the document's acyclicity check that is unreachable, since
+/// the only way a page's target is in flight while its caller runs is that it is
+/// in the caller's own chain.
+///
+/// # Panics
+///
+/// If the target is already in the chain. The document is the only source of call
+/// wiring and it refused cycles, so reaching here means the compiler and the
+/// kernel disagree about the graph, which is not a state to assemble from.
 pub fn dispatch_sync(
     page: &mut SurfacePage,
-    instance: &str,
-    port: &str,
-    body: String,
+    call: SyncCall<'_>,
     stamp: MessageStamp,
     now_ms: u64,
 ) -> Result<ReadyActivation, SyncRefusal> {
+    let SyncCall {
+        instance,
+        port,
+        body,
+        chain,
+    } = call;
     let SurfacePage {
         connect,
         stores,
@@ -205,9 +199,19 @@ pub fn dispatch_sync(
         views,
         body_cap,
     } = page;
+    assert!(
+        !chain.iter().any(|caller| caller == instance),
+        "surface client: sync call of {instance} on port {port} found it already in the caller's \
+         chain — the document's acyclicity check was bypassed"
+    );
     // Ordered from the page-wide fact to the narrowest one, so a re-entrant
     // request is named as re-entrant whatever else is also wrong with it.
-    if schedules.any_in_flight() {
+    let re_entrant = if chain.is_empty() {
+        schedules.any_in_flight()
+    } else {
+        schedules.in_flight(instance)
+    };
+    if re_entrant {
         return Err(SyncRefusal::ReEntrant);
     }
     if !registrations.is_registered(instance) || !schedules.is_tracked(instance) {
@@ -216,19 +220,33 @@ pub fn dispatch_sync(
     if registrations.is_failed(instance) {
         return Err(SyncRefusal::Failed);
     }
+    // A `dom` instance's mount is the sync call that fills its host element, and
+    // the runner's mount pass is what makes it — never the scheduler's debt. So a
+    // peer's call arriving first would run a handler against an element its author
+    // has not filled. Only a chained request can be here before that pass: a
+    // gesture cannot reach an unmounted instance, because the mount is what
+    // installs the listener.
+    if !chain.is_empty()
+        && schedules.owes_mount_activation(instance)
+        && connect
+            .bindings()
+            .is_some_and(|bindings| bindings.instance_granted(instance, ComponentGrant::Dom))
+    {
+        return Err(SyncRefusal::Unmounted);
+    }
     let Some(bindings) = connect.bindings() else {
         return Err(SyncRefusal::Unwired);
     };
-    if bindings
-        .inputs_of(instance)
-        .any(|binding| binding.port == port)
-    {
-        return Err(SyncRefusal::PortCollision);
-    }
     let generation = registrations
         .generation(instance)
         .expect("surface client: a registered instance holds a generation");
-    let request = sync_request(instance, port, body, stamp);
+    let request = sync_request(
+        instance,
+        port,
+        body.to_string(),
+        stamp.message_id,
+        stamp.publish_ts,
+    );
     let mut ctx = ActivationCtx {
         bindings,
         stores,
@@ -238,35 +256,6 @@ pub fn dispatch_sync(
         now_ms,
     };
     Ok(schedules.assemble_sync(instance, generation, port, request, &mut ctx))
-}
-
-/// Mint the envelope a sync-call activation's request rides in on.
-///
-/// The address is the never-routed [`sync_channel`] family, and `envelope_type`
-/// is `Local` because that is what this message is on every axis the field
-/// answers: page-local, never on the wire, no durable row. Sync-ness itself is
-/// the activation's `sync` field, not a property of the envelope.
-///
-/// `source` and `sender` are both the requesting instance: the kernel mints this
-/// on the component's behalf and hands it straight back to that same component,
-/// so there is no other honest attribution and no peer identity in play.
-fn sync_request(instance: &str, port: &str, body: String, stamp: MessageStamp) -> MessageEnvelope {
-    MessageEnvelope {
-        message_id: stamp.message_id,
-        source: instance.to_string(),
-        channel: sync_channel(port),
-        sender: instance.to_string(),
-        publish_ts: stamp.publish_ts,
-        body,
-        reply_to: None,
-        delivery_deadline: None,
-        // Never parked: the request is delivered by the activation it causes, and
-        // the activation is assembled around it.
-        deliver_after: None,
-        impetus: None,
-        urgency: Urgency::Normal,
-        envelope_type: ChannelScheme::Local,
-    }
 }
 
 /// One activation's completion, as the caller hands it back.
@@ -394,6 +383,7 @@ pub fn on_activation_done(
             ..Completion::nothing(instance, outcome)
         };
     }
+    let outcome = judge_reply(page, &instance, outcome);
     let mut ctx = flush_ctx(page, now, now_ms);
     let flushed = match &outcome {
         ActivationOutcome::Ok(_) => {
@@ -427,6 +417,44 @@ pub fn on_activation_done(
         killed,
         ..Completion::nothing(instance, outcome)
     }
+}
+
+/// Rule an ok's reply admissible, or turn the completion into a trap.
+///
+/// Both questions an entry's own boundary cannot answer, because both are about
+/// the activation rather than the return: whether anything asked for a reply,
+/// and whether the reply fits the cap every body on this page is held to. The
+/// assembly recorded the first and the attachment states the second, so this is
+/// where the facility's two reply rules live — one seam, reached by every
+/// invocation the page has, rather than one rule per invocation boundary.
+///
+/// A trap here takes the ordinary trap path below: the buffer is discarded and
+/// the instance is terminal, which is what a component that answered a question
+/// nobody asked has earned.
+fn judge_reply(
+    page: &SurfacePage,
+    instance: &str,
+    outcome: ActivationOutcome,
+) -> ActivationOutcome {
+    let ActivationOutcome::Ok(Some(reply)) = &outcome else {
+        return outcome;
+    };
+    if page.schedules.in_flight_sync(instance).is_none() {
+        return ActivationOutcome::Trap(
+            "activation entry replied to an activation that asked nothing".to_string(),
+        );
+    }
+    // Saturating: the attachment states the cap in `u64` and a reply is bounded
+    // by the address space it was built in, so a cap past `usize::MAX` is a cap
+    // no reply can reach.
+    let cap = usize::try_from(page.body_cap).unwrap_or(usize::MAX);
+    if !within_body_cap(reply, cap) {
+        return ActivationOutcome::Trap(format!(
+            "activation entry replied with {} bytes, over the {cap}-byte reply cap",
+            reply.len(),
+        ));
+    }
+    outcome
 }
 
 /// What one completion's flush leg produced, before the identity goes back on it.

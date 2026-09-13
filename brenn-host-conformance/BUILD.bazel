@@ -18,7 +18,10 @@ rust_library(
     edition = "2024",
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = all_crate_deps(normal = True) + ["//brenn-envelope"],
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-activation",
+        "//brenn-envelope",
+    ],
 )
 
 # The adapters. `data` is the probe: one artifact, driven by every host.

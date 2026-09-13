@@ -2195,6 +2195,9 @@ fn planes(dir: PortDir) -> &'static [Plane] {
         PortDir::In => &[Plane::Subscribe],
         PortDir::Out => &[Plane::Publish],
         PortDir::Io => &[Plane::Subscribe, Plane::Publish],
+        // Neither a sync nor a call port is on either plane: neither is bound
+        // to a channel, so there is no position for an acl entry to be about.
+        PortDir::Sync | PortDir::Call => &[],
     }
 }
 

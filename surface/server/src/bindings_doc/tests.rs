@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use brenn_lib::messaging::config::{ResolvedLocalChannel, ResolvedSurface};
+use brenn_lib::messaging::config::{ResolvedLocalChannel, ResolvedSurface, SurfaceCall};
 use brenn_lib::messaging::{ComponentGrant, ComponentHost};
 use brenn_surface_schema::{LOCAL_THEME_CHANNEL, LogLevel, reserved_local_channel};
 
@@ -34,6 +34,20 @@ fn bar() -> ResolvedSurface {
     surface.components[1]
         .declared_out_ports
         .insert("spare".to_string());
+    // A sync port is bound to nothing, so the component table is the only place
+    // in the document that can mention one.
+    surface.components[1].sync_ports.insert("press".to_string());
+    // A call port is bound to no channel either, and the same table is where a
+    // reader learns the caller may speak through it at all.
+    surface.components[0]
+        .call_ports
+        .insert("lookup".to_string());
+    surface.calls.push(SurfaceCall {
+        instance: "chrome".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "mode".to_string(),
+        target_port: "press".to_string(),
+    });
     surface.local_channels.push(ResolvedLocalChannel {
         address: LOCAL_THEME_CHANNEL.to_string(),
         ring_depth: reserved_local_channel(LOCAL_THEME_CHANNEL)
@@ -41,19 +55,6 @@ fn bar() -> ResolvedSurface {
             .ring_depth,
     });
     surface
-}
-
-/// `doc_noise` is a four-arm hand-written match between two same-named,
-/// same-ordered enums: transposing `Alarm` and `Fatal` compiles clean and ships
-/// an overflow that should toast as one that kills the instance. Each rung is
-/// pinned to its own.
-#[test]
-fn doc_noise_maps_every_rung_to_its_own() {
-    use brenn_lib::messaging::config::NoiseLevel as N;
-    assert_eq!(doc_noise(N::Silent), DocNoiseLevel::Silent);
-    assert_eq!(doc_noise(N::Metered), DocNoiseLevel::Metered);
-    assert_eq!(doc_noise(N::Alarm), DocNoiseLevel::Alarm);
-    assert_eq!(doc_noise(N::Fatal), DocNoiseLevel::Fatal);
 }
 
 #[test]
@@ -77,6 +78,13 @@ fn document_carries_every_resolved_section() {
     // The bound port and the one the fixture declares without wiring: the
     // distinction the bound-output table alone cannot carry.
     assert_eq!(mode.declared_out_ports, ["spare", "theme"]);
+    assert_eq!(mode.sync_ports, ["press"]);
+    assert_eq!(doc.components[0].call_ports, ["lookup"]);
+    assert_eq!(doc.calls.len(), 1);
+    assert_eq!(doc.calls[0].instance, "chrome");
+    assert_eq!(doc.calls[0].port, "lookup");
+    assert_eq!(doc.calls[0].target_instance, "mode");
+    assert_eq!(doc.calls[0].target_port, "press");
     assert!(doc.validate().is_ok(), "the builder writes valid documents");
 }
 

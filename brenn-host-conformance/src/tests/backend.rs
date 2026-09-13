@@ -23,6 +23,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use brenn_activation::sync::{SyncAnswer, SyncRefusal};
 use brenn_envelope::addressing::nondurable_channel_uuid;
 use brenn_envelope::grants::{ComponentHost, EntityKind, Plane, bindable_schemes};
 use brenn_lib::access::test_fixtures::{publish_policy_for_addresses, wasm_policies_from_entries};
@@ -42,11 +43,11 @@ use brenn_messaging_store::store::{MessageSeq, RingStores};
 use brenn_obs::alerting::noop_alert_dispatcher;
 use brenn_wasm::{
     ComponentGrant, GuestAlertSeverity, ProcessorAlerter, ProcessorComponent, ProcessorLoadSpec,
-    ProcessorUrgency, SinkBudget, store::DEFAULT_MAX_PAGE_COUNT,
+    ProcessorUrgency, SinkBudget,
 };
 use brenn_wasm_dispatch::{ConsumerHandle, WasmConsumerConfig, spawn_wasm_consumer_task};
 
-use crate::{Host, MountSpec, Report, TrapDisposition, port, scenarios};
+use crate::{BODY_CAP, Host, MountSpec, Report, TrapDisposition, port, scenarios};
 
 /// Workspace-relative, as every runfiles tree is laid out like the workspace.
 const PROBE_WASM: &str = "brenn-wasm/target/components/brenn_processor_transplant.wasm";
@@ -177,6 +178,10 @@ struct Backend {
     /// Channel per port name, both directions.
     channels: HashMap<String, ChannelEntry>,
     handle: Option<ConsumerHandle>,
+    /// The sending half of the running task's request channel. Held rather than
+    /// dropped, because dropping it would take the sync arm of that task's
+    /// select with it.
+    sync_tx: Option<tokio::sync::mpsc::Sender<brenn_wasm_dispatch::SyncRequest>>,
     /// The report channel's own store, read under [`HOST`]'s identity.
     reports: Arc<dyn brenn_messaging_store::store::RetentionStore>,
     /// The identity that read holds — a sampled reader, so it holds no position
@@ -345,15 +350,12 @@ impl Backend {
         }
 
         let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-            component_path: std::path::Path::new(PROBE_WASM),
-            slug,
             declared_out_ports: output_ports.keys().cloned().collect::<BTreeSet<_>>(),
             output_ports,
             input_amplification_mt: in_names
                 .iter()
                 .map(|name| ((*name).to_string(), 1000u64))
                 .collect(),
-            mqtt_sinks: HashMap::new(),
             config,
             grants: [
                 ComponentGrant::Ports,
@@ -362,13 +364,12 @@ impl Backend {
             ]
             .into_iter()
             .collect(),
-            store_path: None,
-            max_page_count: DEFAULT_MAX_PAGE_COUNT,
-            max_payload_bytes: 1024 * 1024,
+            // The reply cap is the body cap, and the suite's two adapters must
+            // agree on the number: see `BODY_CAP`.
+            max_payload_bytes: BODY_CAP as usize,
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
-            mqtt_publish: None,
-            tool_host: None,
+            ..ProcessorLoadSpec::minimal(std::path::Path::new(PROBE_WASM), slug)
         }));
 
         let (alert_dispatcher, alerts) = noop_alert_dispatcher();
@@ -381,6 +382,10 @@ impl Backend {
                 alert_dispatcher,
                 inputs,
                 outputs,
+                // The probe's specification declares one sync port, and a
+                // declared port is what makes a request on it admissible at
+                // all: the drain step panics on any other name.
+                sync_ports: [port::ASK.to_string()].into_iter().collect(),
                 // Effectively no pacing: what a starved consumer does is the
                 // pacing suite's subject, not this one's.
                 activation_pacing: ActivationPacing {
@@ -391,6 +396,7 @@ impl Backend {
             subscriber,
             channels,
             handle: None,
+            sync_tx: None,
             reports,
             reader: ParticipantId::for_system(HOST),
             read_through: None,
@@ -402,6 +408,40 @@ impl Backend {
 
     fn config(&self) -> WasmConsumerConfig {
         self.template.clone()
+    }
+
+    /// Spawn the consumer's task over a fresh request channel, keeping the
+    /// sending half: a mount is a new task, and the callers of the old one have
+    /// nothing to say to it.
+    fn start_task(&mut self) {
+        let (sync_tx, sync_rx) = brenn_wasm_dispatch::sync_request_channel();
+        self.sync_tx = Some(sync_tx);
+        self.handle = Some(spawn_wasm_consumer_task(self.config(), sync_rx));
+    }
+
+    /// The native caller's request path, as a live backend's would be: hand the
+    /// request to the consumer's own task and block on the reply.
+    async fn request(&self, port: &str, body: &str) -> SyncAnswer {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sender = self
+            .sync_tx
+            .as_ref()
+            .expect("a sync call before the probe was mounted");
+        if sender
+            .send(brenn_wasm_dispatch::SyncRequest {
+                port: port.to_string(),
+                body: body.to_string(),
+                chain: Vec::new(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return SyncAnswer::Refused(SyncRefusal::Unregistered);
+        }
+        answer
+            .await
+            .unwrap_or(SyncAnswer::Refused(SyncRefusal::Unregistered))
     }
 
     /// A publish this adapter expects the production gate to refuse.
@@ -447,7 +487,7 @@ impl Host for Backend {
             }
             self.attached = true;
         }
-        self.handle = Some(spawn_wasm_consumer_task(self.config()));
+        self.start_task();
     }
 
     async fn publish(&mut self, port: &str, body: &str) {
@@ -474,7 +514,11 @@ impl Host for Backend {
         // Nothing releases while the task is down: the dispatcher's pass is
         // this adapter's `drain`, and the scenario is not draining.
         tokio::time::sleep(idle).await;
-        self.handle = Some(spawn_wasm_consumer_task(self.config()));
+        self.start_task();
+    }
+
+    async fn sync_call(&mut self, port: &str, body: &str) -> SyncAnswer {
+        self.request(port, body).await
     }
 
     fn hold_releases(&mut self, hold: bool) {
@@ -585,6 +629,10 @@ backend_scenario!(sampled_only_wiring);
 backend_scenario!(err_consumes);
 backend_scenario!(trap_disposition);
 backend_scenario!(state_does_not_survive);
+backend_scenario!(a_sync_call_is_an_activation_plus_a_reply);
+backend_scenario!(a_sync_call_consumes_queued_input);
+backend_scenario!(a_reply_to_an_async_activation_is_a_trap);
+backend_scenario!(an_oversize_reply_is_a_trap);
 
 backend_scenario!(self_tick_chain, [
     brenn => ChannelScheme::Brenn,

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use brenn_activation::WINDOW_DEPTH_CEILING;
 use brenn_db::Db;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::{
@@ -127,7 +128,7 @@ pub async fn activation_new_messages(
         sub: ResolvedSubscription {
             channel_uuid: entry.uuid,
             channel_address: entry.address.clone(),
-            push_depth: Depth::Unbounded,
+            push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
             retain_depth: Depth::Bounded(0),
             noise: NoiseLevel::Silent,
             wake_min: WakeMin::Normal,

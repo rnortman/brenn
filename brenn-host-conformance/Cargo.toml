@@ -8,12 +8,15 @@ description = "One component driven through each host's real scheduling path —
 # Test-only: nothing in the tree depends on this crate. The library half is the
 # `Host` trait, the report projection and the scenario bodies, and its dependency
 # set is the assertion — no host crate appears here, so a scenario that reached
-# for one would fail to compile. `brenn-envelope` is the one workspace crate, and
-# it is not a host either: it is the shared vocabulary both hosts are written
-# against, and "the same answer per scheme on every host" is a statement in it.
+# for one would fail to compile. `brenn-envelope` and `brenn-activation` are the
+# two workspace crates, and neither is a host: they are the shared vocabulary
+# both hosts are written against — the scheme a scenario varies, and the answer
+# a sync call is owed — so "the same answer on every host" is a statement in
+# them.
 # The adapters live in this crate's own test build, which is where every host
 # crate is named.
 [dependencies]
+brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
 brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["rt", "time", "sync", "macros"] }

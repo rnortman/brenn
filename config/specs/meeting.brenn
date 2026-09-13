@@ -10,6 +10,8 @@
 component Meeting {
   abi = processor;
   requires = [ports, log, takeover, dom];
+  sync dismiss;
+  sync snooze;
   in agenda;
   io acks;
   out takeover: "brenn.surface.takeover@1";

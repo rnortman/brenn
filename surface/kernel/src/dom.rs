@@ -684,7 +684,7 @@ pub fn wrap_activation_entry(instance: &str, entry: js_sys::Function) -> Activat
             Ok(value) if value.is_undefined() || value.is_null() => ActivationOutcome::Ok(None),
             Ok(value) => match value.as_string() {
                 Some(message) => ActivationOutcome::Err(ActivationError { message }),
-                None => classify_reply(&value, activation.sync.is_some()),
+                None => classify_reply(&value),
             },
             Err(thrown) => ActivationOutcome::Trap(js_error_message(&thrown)),
         }
@@ -692,25 +692,21 @@ pub fn wrap_activation_entry(instance: &str, entry: js_sys::Function) -> Activat
 }
 
 /// Classify an activation entry's non-string, non-nullish return: an object
-/// carrying a string [`ENTRY_REPLY_FIELD`] is a sync reply, anything else is a
-/// trap.
+/// carrying a string [`ENTRY_REPLY_FIELD`] is a reply, anything else is a trap.
 ///
-/// `is_sync` is the activation's own `sync` field, and it gates the whole shape
-/// rather than merely the reply's usefulness: an entry that answers an async
-/// activation is a component that lost track of why it was called, and reading
-/// its ok would flush a buffer built under a misapprehension.
-fn classify_reply(value: &JsValue, is_sync: bool) -> ActivationOutcome {
+/// Shape only. Whether a reply was *asked for*, and whether it fits the page's
+/// body cap, are facts about the activation rather than about the return, and
+/// they are ruled on where the completion is taken — one seam for both rules,
+/// reached by every invocation this kernel has rather than by this one alone.
+fn classify_reply(value: &JsValue) -> ActivationOutcome {
     let reply = value
         .is_object()
         .then(|| Reflect::get(value, &JsValue::from_str(ENTRY_REPLY_FIELD)).ok())
         .flatten()
         .and_then(|field| field.as_string());
-    match (reply, is_sync) {
-        (Some(reply), true) => ActivationOutcome::Ok(Some(reply)),
-        (Some(_), false) => ActivationOutcome::Trap(
-            "activation entry replied to an activation that asked nothing".to_string(),
-        ),
-        (None, _) => ActivationOutcome::Trap(
+    match reply {
+        Some(reply) => ActivationOutcome::Ok(Some(reply)),
+        None => ActivationOutcome::Trap(
             "activation entry returned neither undefined, an error string, nor a reply object"
                 .to_string(),
         ),

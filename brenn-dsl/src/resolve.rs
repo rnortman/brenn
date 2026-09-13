@@ -32,8 +32,8 @@ use crate::derived::DerivedConfig;
 use crate::diag::{Diagnostic, check_unique, duplicate_statement, or_list, two_site};
 use crate::model::{
     AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem,
-    AttachmentTargetAttrs, Attr, AttrBlock, AttrMap, Binding as BindStmt, ChanAddr, ChanRef,
-    ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
+    AttachmentTargetAttrs, Attr, AttrBlock, AttrMap, Binding as BindStmt, CallBinding, ChanAddr,
+    ChanRef, ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
     InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapDepths, MapValues, Matcher,
     MatcherVal, McpServerStmt, MountDef, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs,
     OutTail, Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, PrincipalDef, RateLimitAttrs,
@@ -43,10 +43,11 @@ use crate::model::{
 use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent,
-    RAttachmentTarget, RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks,
-    RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort, RPrincipal, RRateLimit,
-    RRemote, RRepoMount, RSection, RStamp, RSubscribe, RSurface, RTail, RToolGrant, RTuning, RVal,
-    RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId, StampOrigin, str_value,
+    RAttachmentTarget, RBinding, RCall, RChanRef, RChannel, RComponentInst, RConsumer, RGrant,
+    RHooks, RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort, RPrincipal,
+    RRateLimit, RRemote, RRepoMount, RSection, RStamp, RSubscribe, RSurface, RTail, RToolGrant,
+    RTuning, RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId,
+    StampOrigin, str_value,
 };
 use crate::roots::{RootList, RootSource, scan_roots};
 use crate::source::SourceFile;
@@ -327,6 +328,7 @@ pub fn resolve_files(
     check_identity(&config, &mut errors);
     check_grants(&config, &withheld, &mut errors);
     check_principal_chains(&config, &mut errors);
+    check_calls(&mut config, &mut errors);
     check_mount_ceilings(&config, &withheld, &mut errors);
     check_addresses(&mut config, &mut errors);
     if !errors.is_empty() {
@@ -4346,6 +4348,7 @@ fn class_ref(
         });
     }
     check_tool_result_port(class, &ports, &needs.requires, errors);
+    check_unbound_ports(&ports, errors);
     Some(ClassRef {
         name: class.name.clone(),
         abi,
@@ -4355,6 +4358,53 @@ fn class_ref(
         spec_sha256: spec_sha256.clone(),
         package: package.clone(),
     })
+}
+
+/// A `sync` or `call` port's declaration, against the two annotations neither
+/// can carry.
+///
+/// Neither class is bound to a channel. A sync port's window is the one request
+/// a call mints, delivered by the activation that request causes; a call port
+/// names a peer, never an address. So there is nothing for a doctype to
+/// constrain — no channel whose document contract it could be checked against —
+/// and nothing for `optional` to be about: an instance never binds a sync port,
+/// and a call port left unbound is already legal, answered `unwired` at the
+/// import. A sync port with no caller is ordinary in the same way: a gesture
+/// port has no caller in the document at all.
+///
+/// The remaining tuning knobs — `push_depth`, `retain_depth`, `noise` — are
+/// binding tail attributes. A sync port cannot be bound at all, and a `call`
+/// binding's tail is refused non-empty where it is resolved, so neither needs a
+/// rule here.
+fn check_unbound_ports(ports: &[RPort], errors: &mut Vec<Diagnostic>) {
+    for port in ports
+        .iter()
+        .filter(|port| matches!(port.dir, PortDir::Sync | PortDir::Call))
+    {
+        let word = port.dir.as_str();
+        if let Some(doctype) = &port.doctype {
+            errors.push(two_site(
+                format!(
+                    "{word} port `{}` carries a doctype; a {word} port binds to no channel, so \
+                     there is no document contract to agree with",
+                    port.name.value()
+                ),
+                doctype.span().clone(),
+                "declared here",
+                port.name.span().clone(),
+            ));
+        }
+        if port.optional {
+            errors.push(Diagnostic::at(
+                format!(
+                    "{word} port `{}` cannot be `optional`: leaving it unwired is already \
+                     legal, and nothing else `optional` would say applies to it",
+                    port.name.value()
+                ),
+                port.name.span().clone(),
+            ));
+        }
+    }
 }
 
 /// The `tool-results` port, which is the class's to declare and nobody's to
@@ -4593,6 +4643,8 @@ fn port_dir(dir: &DeclDir) -> PortDir {
         DeclDir::Into => PortDir::In,
         DeclDir::Outof => PortDir::Out,
         DeclDir::Both => PortDir::Io,
+        DeclDir::Sync => PortDir::Sync,
+        DeclDir::Call => PortDir::Call,
     }
 }
 
@@ -4734,6 +4786,7 @@ fn emit_component(
             attrs: body.attrs,
             acls: body.acls,
             bindings: body.bindings,
+            calls: body.calls,
             tools: body.tools,
         },
         body.refused,
@@ -4757,6 +4810,7 @@ fn emit_consumer(
     let ResolvedBody {
         attrs,
         bindings,
+        calls,
         acls,
         tools,
         refused,
@@ -4795,6 +4849,7 @@ fn emit_consumer(
         attrs,
         acls,
         bindings,
+        calls,
         tools,
         doc: inst.doc,
     });
@@ -4925,6 +4980,7 @@ fn resolve_class(
 struct ResolvedBody {
     attrs: Vec<(String, RVal)>,
     bindings: Vec<RBinding>,
+    calls: Vec<RCall>,
     acls: Vec<RAcl>,
     tools: Vec<RToolGrant>,
     refused: Refused,
@@ -4953,6 +5009,7 @@ fn instance_body(
     let body = body.into_value();
     let (attrs, mut refused) = instance_attrs(&body.attrs, place, scope, errors);
     let mut bindings = Vec::new();
+    let mut calls = Vec::new();
     let mut named_ports = Vec::new();
     let bound = check_unique(
         body.bindings.iter().enumerate().map(|(at, binding)| {
@@ -4984,8 +5041,9 @@ fn instance_body(
             refused.drop_part();
             continue;
         }
-        match resolve_binding(binding, class, scope, errors) {
-            Some(binding) => bindings.push(binding),
+        match resolve_binding(binding, class, place, scope, errors) {
+            Some(Bound::Chan(binding)) => bindings.push(*binding),
+            Some(Bound::Call(call)) => calls.push(call),
             None => refused.drop_part(),
         }
     }
@@ -5012,6 +5070,7 @@ fn instance_body(
     ResolvedBody {
         attrs,
         bindings,
+        calls,
         acls: resolved,
         tools,
         refused,
@@ -5024,6 +5083,7 @@ fn bound_port(binding: &BindStmt) -> &Spanned<String> {
         BindStmt::Into(bound) => &bound.port,
         BindStmt::Outof(bound) => &bound.port,
         BindStmt::Both(bound) => &bound.port,
+        BindStmt::Calls(bound) => &bound.port,
     }
 }
 
@@ -5053,7 +5113,13 @@ fn check_required_ports(
     errors: &mut Vec<Diagnostic>,
 ) {
     for port in &class.ports {
+        // A sync port is satisfied by declaring it: it is bound to no channel,
+        // and a sync port with no caller is an ordinary component — a gesture
+        // port has no caller anywhere in the document. A call port is satisfied
+        // the same way: unbound, the import answers `unwired`, which is a state
+        // the component is written for.
         if port.optional
+            || matches!(port.dir, PortDir::Sync | PortDir::Call)
             || port.name.value() == TOOL_RESULT_INPUT_PORT
             || named_ports.iter().any(|named| named == port.name.value())
         {
@@ -5116,34 +5182,143 @@ fn instance_attrs(
     (resolved, refused)
 }
 
+/// What one binding statement resolved to: a port connected to a channel, or a
+/// port wired to a peer.
+///
+/// One `resolve_binding`, because the two share every rule that is about the
+/// statement rather than about what it connects: the port is the class's, it
+/// faces the way the statement does, and it is bound once.
+enum Bound {
+    /// Boxed: an `RBinding` carries an `io` tail, which is the union of the two
+    /// directions and several times the size of a call's three names.
+    Chan(Box<RBinding>),
+    Call(RCall),
+}
+
 /// One binding, once the port it names is one the class declares in that
 /// direction.
 fn resolve_binding(
     binding: BindStmt,
     class: &ClassRef,
+    place: Placement,
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> Option<RBinding> {
+) -> Option<Bound> {
     match binding {
         BindStmt::Into(bound) => {
             check_port(class, &bound.port, PortDir::In, errors)?;
             let chan = bound_chan(Some(&bound.chan), scope, errors)?;
             let (tail, refused) = typed_tail(bound.tail, InTail::empty, scope, errors);
             bound_binding(bound.port, chan, RTail::In(tail), &refused)
+                .map(|binding| Bound::Chan(Box::new(binding)))
         }
         BindStmt::Outof(bound) => {
             check_port(class, &bound.port, PortDir::Out, errors)?;
             let chan = bound_chan(Some(&bound.chan), scope, errors)?;
             let (tail, refused) = typed_tail(bound.tail, OutTail::empty, scope, errors);
             bound_binding(bound.port, chan, RTail::Out(tail), &refused)
+                .map(|binding| Bound::Chan(Box::new(binding)))
         }
         BindStmt::Both(bound) => {
             check_port(class, &bound.port, PortDir::Io, errors)?;
             let chan = bound_chan(bound.target.as_ref(), scope, errors)?;
             let (tail, refused) = typed_tail(bound.tail, IoTail::empty, scope, errors);
             bound_binding(bound.port, chan, RTail::Io(Box::new(tail)), &refused)
+                .map(|binding| Bound::Chan(Box::new(binding)))
+        }
+        BindStmt::Calls(bound) => {
+            check_port(class, &bound.port, PortDir::Call, errors)?;
+            resolve_call(bound, place, scope, errors).map(Bound::Call)
         }
     }
+}
+
+/// A `call` binding: validates the shape (two elements, no modules, no tail)
+/// and resolves the handle space. Peer existence, port direction, and cycle
+/// detection are deferred to `check_calls`, which runs after all instances are
+/// emitted.
+fn resolve_call(
+    bound: CallBinding,
+    place: Placement,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<RCall> {
+    if let Some(tail) = &bound.tail
+        && !tail.attrs.is_empty()
+    {
+        errors.push(Diagnostic::at(
+            format!(
+                "call port `{}` carries a tail; a call is tuned by nothing — its request and \
+                 its reply are bounded by the deployment's body cap and its budget is the \
+                 caller's own",
+                bound.port.value()
+            ),
+            bound.port.span().clone(),
+        ));
+        return None;
+    }
+    if bound
+        .target
+        .segs
+        .iter()
+        .any(|seg| matches!(seg, PathSeg::Module(_)))
+    {
+        errors.push(Diagnostic::at(
+            "a call target names a peer of this deployment, not a module; write \
+             `<instance>.<port>`",
+            bound.target.head.span().clone(),
+        ));
+        return None;
+    }
+    let segments = Scope::segments(&bound.target);
+    // The last segment is the port; what leads up to it names the peer. A
+    // surface's components are one flat list, so there the peer is one name.
+    let peer_is_one_name = matches!(place, Placement::Surface);
+    let Some((target_port, peer)) = segments
+        .split_last()
+        .filter(|(_, peer)| !peer_is_one_name || peer.is_empty())
+    else {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{}` does not name a peer's port; a call target is `<instance>.<port>`",
+                dotted_path(bound.target.head.value(), &segments)
+            ),
+            bound.target.head.span().clone(),
+        ));
+        return None;
+    };
+    let written = Spanned::new(
+        dotted_path(bound.target.head.value(), peer),
+        bound.target.head.span().clone(),
+    );
+    // The handle spaces this reference may name, innermost first: what this
+    // body stamped, then what the authority root's top level holds. A surface's
+    // instance list is neither — it is flat, and its names are its own.
+    let candidates = match place {
+        Placement::Surface => vec![written.value().clone()],
+        Placement::TopLevel => {
+            let peer_path = |prefix: Option<&HandlePath>| {
+                let mut path = HandlePath::stamp(prefix, bound.target.head.clone());
+                for segment in peer {
+                    path = path.child((*segment).clone());
+                }
+                namespaced(scope.mount, path).dotted()
+            };
+            let stamped = peer_path(scope.prefix);
+            let root = peer_path(None);
+            if stamped == root {
+                vec![stamped]
+            } else {
+                vec![stamped, root]
+            }
+        }
+    };
+    Some(RCall {
+        port: bound.port,
+        target: written,
+        candidates,
+        target_port: (*target_port).clone(),
+    })
 }
 
 /// The channel a binding names, or `None` on a free `io` port.
@@ -5226,8 +5401,9 @@ fn check_port(
         Some(declared) if declared.dir != dir => {
             errors.push(two_site(
                 format!(
-                    "port `{}` is an `{}` port, bound as `{}`",
+                    "port `{}` is {} `{}` port, bound as `{}`",
                     port.value(),
+                    port_article(declared.dir),
                     declared.dir.as_str(),
                     dir.as_str()
                 ),
@@ -5238,6 +5414,13 @@ fn check_port(
             None
         }
         Some(_) => Some(()),
+    }
+}
+
+fn port_article(dir: PortDir) -> &'static str {
+    match dir {
+        PortDir::In | PortDir::Out | PortDir::Io => "an",
+        PortDir::Sync | PortDir::Call => "a",
     }
 }
 
@@ -6594,6 +6777,7 @@ fn binding_port(binding: &BindStmt) -> &Spanned<String> {
         BindStmt::Into(dir) => &dir.port,
         BindStmt::Outof(dir) => &dir.port,
         BindStmt::Both(io) => &io.port,
+        BindStmt::Calls(call) => &call.port,
     }
 }
 
@@ -7914,6 +8098,212 @@ fn check_grants(config: &ResolvedConfig, withheld: &Withheld, errors: &mut Vec<D
             ));
         }
     }
+}
+
+/// One instance as the call graph sees it: what a peer's `call` names it by,
+/// what a host looks it up by, and the class whose ports answer.
+struct Peer {
+    /// What a sibling's `call` target spells: a surface instance's handle, a
+    /// consumer's dotted handle.
+    key: String,
+    /// What the hosts look the callee up by, which is the same name inside a
+    /// surface and the slug at the top level. A resolved [`RCall`] carries this
+    /// so nothing downstream has to re-resolve a handle.
+    runtime: String,
+    /// The instance name's span, which a cycle is reported at.
+    at: Span,
+    class: ClassRef,
+}
+
+/// Every `call` binding in the document, against the peers it could name.
+///
+/// Three rules, none of which one instance's body can answer: the target is an
+/// instance placed beside the caller, the port it names is declared `sync` on
+/// that instance's class, and the graph the bindings form does not close on
+/// itself. The first is what keeps a call off the wire — a surface instance and
+/// a backend consumer are never peers, and a call across the two is a refusal
+/// rather than an RPC. The third is what makes a chain terminate without any
+/// host holding a timeout: a caller waits for its callee, so a cycle is a
+/// deadlock the document can be read for.
+///
+/// Takes the config by mutable reference to rewrite each target from the handle
+/// the document wrote to the name a host resolves.
+fn check_calls(config: &mut ResolvedConfig, errors: &mut Vec<Diagnostic>) {
+    for index in 0..config.surfaces.len() {
+        let peers: Vec<Peer> = config.surfaces[index]
+            .components
+            .iter()
+            .map(|inst| Peer {
+                key: inst.instance.value().clone(),
+                runtime: inst.instance.value().clone(),
+                at: inst.instance.span().clone(),
+                class: inst.class.clone(),
+            })
+            .collect();
+        let calls = config.surfaces[index]
+            .components
+            .iter_mut()
+            .map(|inst| &mut inst.calls)
+            .collect();
+        check_call_group(&peers, calls, "this surface", errors);
+    }
+    let peers: Vec<Peer> = config
+        .consumers
+        .iter()
+        .map(|consumer| Peer {
+            key: consumer.handle.dotted(),
+            runtime: consumer.slug.value().clone(),
+            at: consumer.slug.span().clone(),
+            class: consumer.class.clone(),
+        })
+        .collect();
+    let calls = config
+        .consumers
+        .iter_mut()
+        .map(|consumer| &mut consumer.calls)
+        .collect();
+    check_call_group(&peers, calls, "this document's top level", errors);
+}
+
+/// One placement's call graph. `calls[i]` is `peers[i]`'s bindings.
+fn check_call_group(
+    peers: &[Peer],
+    calls: Vec<&mut Vec<RCall>>,
+    place: &str,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let slots: HashMap<&str, usize> = peers
+        .iter()
+        .enumerate()
+        .map(|(index, peer)| (peer.key.as_str(), index))
+        .collect();
+    let mut edges: Vec<Vec<(usize, Span)>> = vec![Vec::new(); peers.len()];
+    for (from, bindings) in calls.into_iter().enumerate() {
+        bindings.retain_mut(|call| {
+            // The caller's own body's spelling before the top level's, which is
+            // the order the candidates are in.
+            let Some(&to) = call
+                .candidates
+                .iter()
+                .find_map(|candidate| slots.get(candidate.as_str()))
+            else {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`{}` names no instance of {place}; a call reaches a peer placed \
+                         beside the caller, and a call that would cross the wire is refused \
+                         — publish and subscribe instead",
+                        call.target.value()
+                    ),
+                    call.target.span().clone(),
+                ));
+                return false;
+            };
+            let peer = &peers[to];
+            let Some(port) = peer
+                .class
+                .ports
+                .iter()
+                .find(|port| port.name.value() == call.target_port.value())
+            else {
+                errors.push(two_site(
+                    format!(
+                        "`{}` declares no port `{}`; it declares {}",
+                        peer.class.name.value(),
+                        call.target_port.value(),
+                        port_list(&peer.class)
+                    ),
+                    call.target_port.span().clone(),
+                    "the class is declared here",
+                    peer.class.name.span().clone(),
+                ));
+                return false;
+            };
+            if port.dir != PortDir::Sync {
+                errors.push(two_site(
+                    format!(
+                        "port `{}` of `{}` is declared `{}`, and a call is answered by a \
+                         `sync` port",
+                        port.name.value(),
+                        peer.class.name.value(),
+                        port.dir.as_str()
+                    ),
+                    call.target_port.span().clone(),
+                    "the port is declared here",
+                    port.name.span().clone(),
+                ));
+                return false;
+            }
+            edges[from].push((to, call.target.span().clone()));
+            // From here on the target is what a host resolves, not what the
+            // document wrote: inside a surface the two are the same name, and
+            // at the top level the handle becomes the consumer's slug. The
+            // spellings it could have been are spent.
+            call.target = Spanned::new(peer.runtime.clone(), call.target.span().clone());
+            call.candidates = Vec::new();
+            true
+        });
+    }
+    check_call_cycles(peers, &edges, errors);
+}
+
+/// The call graph, against the one property a chain's termination rests on.
+///
+/// One refusal per cycle, at the binding that closes it, with the whole cycle
+/// spelled: every binding in it is equally part of it, and one message per
+/// member would report one mistake several times. The walk is the ordinary
+/// three-colour depth-first search; a node already finished is a diamond
+/// (`A→B`, `A→C`, `B→D`, `C→D`), which is legal and common.
+fn check_call_cycles(peers: &[Peer], edges: &[Vec<(usize, Span)>], errors: &mut Vec<Diagnostic>) {
+    let mut state = vec![0u8; peers.len()];
+    let mut path: Vec<usize> = Vec::new();
+    for start in 0..peers.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        walk_calls(start, peers, edges, &mut state, &mut path, errors);
+    }
+}
+
+/// One depth-first walk of the call graph, refusing every back edge it meets.
+fn walk_calls(
+    node: usize,
+    peers: &[Peer],
+    edges: &[Vec<(usize, Span)>],
+    state: &mut [u8],
+    path: &mut Vec<usize>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    state[node] = 1;
+    path.push(node);
+    for (next, at) in &edges[node] {
+        match state[*next] {
+            0 => walk_calls(*next, peers, edges, state, path, errors),
+            1 => {
+                let from = path
+                    .iter()
+                    .position(|member| member == next)
+                    .expect("a grey node is on the current path");
+                let mut cycle: Vec<&str> = path[from..]
+                    .iter()
+                    .map(|at| peers[*at].key.as_str())
+                    .collect();
+                cycle.push(peers[*next].key.as_str());
+                errors.push(two_site(
+                    format!(
+                        "this call closes a cycle: {}. A caller waits for its callee, so a \
+                         cycle of calls is a deadlock; break it with a publish",
+                        cycle.join(" → ")
+                    ),
+                    at.clone(),
+                    "the instance the cycle returns to is declared here",
+                    peers[*next].at.clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    path.pop();
+    state[node] = 2;
 }
 
 /// Every principal chain bottoms out at the operator.

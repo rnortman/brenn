@@ -5,11 +5,13 @@ use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Binding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL, LOCAL_TOAST_CHANNEL,
-    LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency, reserved_local_channel,
+    Binding, CallBinding, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_THEME_CHANNEL,
+    LOCAL_TOAST_CHANNEL, LocalChannel, LogLevel, NoiseLevel, OutputBinding, Urgency,
+    reserved_local_channel,
 };
 
 use super::AppliedBindings;
+use brenn_envelope::grants::ComponentGrant;
 
 const WIRE: &str = "brenn:site.bar.in";
 const OTHER_WIRE: &str = "ephemeral:site.bar.signal";
@@ -22,6 +24,8 @@ fn component(instance: &str) -> ComponentEntry {
         config: BTreeMap::new(),
         grants: vec![],
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
     }
 }
 
@@ -81,6 +85,7 @@ fn doc() -> BindingsDocument {
             error_channel: Some("brenn:site.surface.bar.errors".to_string()),
             error_report_floor: Some(LogLevel::Warn),
         },
+        calls: vec![],
     })
 }
 
@@ -90,6 +95,40 @@ fn applied(doc: &BindingsDocument) -> AppliedBindings {
 
 fn refusal(doc: &BindingsDocument) -> String {
     AppliedBindings::apply(&doc.to_body()).expect_err("the document is refused")
+}
+
+/// The grant question is asked on the guest's synchronous path — once per
+/// chained call — and answered off the index built with the rest of them, so a
+/// word is parsed once and not compared per question.
+#[test]
+fn an_instances_grants_are_read_off_the_parsed_index() {
+    let mut doc = doc();
+    doc.components[0].grants = vec!["dom".to_string(), "ports".to_string()];
+    let applied = applied(&doc);
+    assert!(applied.instance_granted("p1", ComponentGrant::Dom));
+    assert!(applied.instance_granted("p1", ComponentGrant::Ports));
+    assert!(!applied.instance_granted("p1", ComponentGrant::Calls));
+    assert!(
+        !applied.instance_granted("p2", ComponentGrant::Dom),
+        "a sibling's grants are its own"
+    );
+    assert!(
+        !applied.instance_granted("stranger", ComponentGrant::Dom),
+        "an instance this surface does not declare holds nothing"
+    );
+}
+
+/// A word this build cannot parse is the kernel core's refusal of the whole
+/// document, made before the page is wired. Answering "not granted" here
+/// instead would be deny-by-typo — a capability the operator granted, silently
+/// disabled — so the seam that skipped the core is what dies.
+#[test]
+#[should_panic(expected = "capability word this build does not know")]
+fn asking_about_an_instance_with_an_unknown_grant_word_is_a_panic() {
+    let mut doc = doc();
+    doc.components[0].grants = vec!["telepathy".to_string()];
+    let applied = applied(&doc);
+    let _ = applied.instance_granted("p1", ComponentGrant::Dom);
 }
 
 #[test]
@@ -182,6 +221,46 @@ fn an_output_resolves_by_instance_and_port() {
         applied.output("chrome", "out").is_none(),
         "a port is resolved on its own instance, never a sibling's"
     );
+}
+
+/// [`doc`] with `p1` calling `p2`'s declared `resolve` port.
+fn doc_with_call() -> BindingsDocument {
+    let mut doc = doc();
+    doc.components[0].call_ports = vec!["lookup".to_string()];
+    doc.components[1].sync_ports = vec!["resolve".to_string()];
+    doc.calls = vec![CallBinding {
+        instance: "p1".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "p2".to_string(),
+        target_port: "resolve".to_string(),
+    }];
+    doc
+}
+
+/// A call resolves on the calling instance's own port; an unwired port resolves
+/// to `None`.
+#[test]
+fn a_call_resolves_by_instance_and_port() {
+    let applied = applied(&doc_with_call());
+    let call = applied
+        .call_target("p1", "lookup")
+        .expect("p1 calls through lookup");
+    assert_eq!(call.target_instance, "p2");
+    assert_eq!(call.target_port, "resolve");
+    assert!(applied.call_target("p1", "nonesuch").is_none());
+    assert!(
+        applied.call_target("p2", "lookup").is_none(),
+        "a call port is resolved on its own instance, never a sibling's"
+    );
+    assert!(applied.call_target("stranger", "lookup").is_none());
+}
+
+/// A page whose document wires no call at all: every probe answers `None`
+/// rather than panicking on a missing index.
+#[test]
+fn a_document_without_calls_resolves_none() {
+    let applied = applied(&doc());
+    assert!(applied.call_target("p1", "lookup").is_none());
 }
 
 /// The fan-out table: one arriving envelope is windowed for every binding on the

@@ -44,7 +44,7 @@ async fn a_stop_while_parked_ends_the_task() {
         Depth::Bounded(4),
         Depth::Bounded(0),
     );
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     // The mount activation has nothing to do here; waiting for the subscriber
     // to be owed nothing is what says the loop reached its wait.
     assert!(wait_pending_empty(&messenger, &wasm_sub, JOIN_DEADLINE).await);
@@ -86,7 +86,7 @@ async fn a_stop_before_the_mount_activation_does_not_preempt_it() {
         Depth::Bounded(4),
         Depth::Bounded(0),
     );
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     // No await between the spawn and the signal, so the mount activation is at
     // best partway through it.
     assert!(handle.stop.send(true).is_ok());
@@ -119,7 +119,7 @@ async fn a_dropped_stop_sender_ends_the_task() {
         Depth::Bounded(4),
         Depth::Bounded(0),
     );
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     assert!(wait_pending_empty(&messenger, &wasm_sub, JOIN_DEADLINE).await);
 
     let ConsumerHandle { stop, join } = handle;
@@ -148,7 +148,7 @@ async fn an_unstopped_loop_keeps_draining() {
         Depth::Bounded(0),
     );
     let notify = Arc::clone(&cfg.notify);
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     assert!(wait_pending_empty(&messenger, &wasm_sub, JOIN_DEADLINE).await);
 
     testutils::insert_bus_message(&messenger, &channel, "after-mount", ChannelScheme::Brenn).await;
@@ -198,7 +198,7 @@ async fn a_stop_during_a_drain_step_lets_the_step_finish() {
         min_period: STEP_WINDOW,
     };
     let notify = Arc::clone(&cfg.notify);
-    let handle = spawn_wasm_consumer_task(cfg);
+    let handle = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
     assert!(wait_pending_empty(&messenger, &wasm_sub, JOIN_DEADLINE).await);
 
     for i in 0..3 {

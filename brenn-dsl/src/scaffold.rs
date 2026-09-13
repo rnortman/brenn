@@ -503,6 +503,7 @@ fn sdk_module(grant: ComponentGrant) -> Option<&'static str> {
         ComponentGrant::Config => Some("config"),
         ComponentGrant::Mqtt => Some("mqtt"),
         ComponentGrant::Tools => Some("tools"),
+        ComponentGrant::Calls => Some("calls"),
         ComponentGrant::Dom => Some("dom"),
         ComponentGrant::PageDom => Some("page_dom"),
         ComponentGrant::Ports | ComponentGrant::Takeover => None,

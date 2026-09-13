@@ -9,6 +9,7 @@
 // - `config` module — operator config access
 // - `RetainedState<T>` — a component's state on a retained `io` port, which
 //   is where it lives: linear memory is activation-scoped
+// - `calls` module — call a peer component and read its reply inline
 // - `dom` module — element handles and mutators, for a page-hosted component
 // - `export_processor!` macro — wires `Processor` impl to the WIT export
 //
@@ -1185,6 +1186,97 @@ pub mod config {
         match get_parsed::<T>(key)? {
             Some(v) => Ok(v),
             None => Err(Error::failed(format!("config {key}: missing"))),
+        }
+    }
+}
+
+// ── calls ─────────────────────────────────────────────────────────────────────
+
+pub mod calls {
+    //! Calling a peer component and reading its reply inline.
+    //!
+    //! **Requires grant:** `"calls"` in the component's grants. If the grant is
+    //! absent the host does not link the `brenn:processor/calls` interface and
+    //! any import of it causes a load-time panic.
+    //!
+    //! The port names a `call` port the specification declares and the document
+    //! wires to a peer's `sync` port. A name the specification does not declare
+    //! ends the activation, exactly as a publish to an undeclared port does; a
+    //! declared port the deployer left unbound answers [`CallError::Unwired`].
+    //!
+    //! **Not transactional with the activation outcome.** The peer's activation
+    //! runs to completion and its ok flushes its own buffer before the call
+    //! returns; a later err or trap here does not retract it, the same rule
+    //! [`crate::mqtt`] carries. A guest needing all-or-nothing semantics across
+    //! a call and its own publishes must not mix the two.
+    //!
+    //! A call is weighed against this activation's own call budget, beside
+    //! `publish`: one counter over both. It bounds how many calls an activation
+    //! makes, not what one costs — a call runs a whole activation of the peer,
+    //! uncoalesced and with the peer's own budgets.
+
+    use super::Error;
+    use crate::bindings::brenn::processor::calls::{self as raw};
+
+    /// Why a call did not answer, for a guest that classifies before it gives
+    /// up. [`call`] flattens this into an [`Error`]; reach for [`try_call`] to
+    /// keep it.
+    pub use crate::bindings::brenn::processor::calls::CallError;
+
+    /// Whether a later activation may retry this failure. Only a peer that did
+    /// not run is transient — it may be mid-mount, mid-reload or briefly out of
+    /// service. An ungranted or unwired port, an oversize payload and an
+    /// exhausted budget are all permanent for this activation, and a peer that
+    /// ran and failed will fail again on the same input.
+    pub fn is_transient(e: &CallError) -> bool {
+        matches!(e, CallError::Refused)
+    }
+
+    /// Human-readable rendering of a `CallError` for a diagnostic message.
+    fn call_err(port: &str, e: CallError) -> Error {
+        let variant = match e {
+            CallError::NotPermitted => String::from("not-permitted"),
+            CallError::Unwired => String::from("unwired"),
+            CallError::Refused => String::from("refused"),
+            CallError::Failed => String::from("failed"),
+            CallError::InvalidPayload(m) => format!("invalid-payload: {m}"),
+            CallError::QuotaExceeded => String::from("quota-exceeded"),
+        };
+        Error::failed(format!("call {port}: {variant}"))
+    }
+
+    /// Call the peer wired to `port`, keeping the failure variant.
+    ///
+    /// `Ok(None)` is a peer that ran and answered nothing, which is a
+    /// conforming answer and not a failure.
+    pub fn try_call(port: &str, payload: &str) -> Result<Option<String>, CallError> {
+        raw::call(port, payload)
+    }
+
+    /// Call the peer wired to `port`.
+    ///
+    /// Diagnostic on error: `"call {port}: {variant}"`.
+    pub fn call(port: &str, payload: &str) -> Result<Option<String>, Error> {
+        try_call(port, payload).map_err(|e| call_err(port, e))
+    }
+
+    /// Call the peer wired to `port` with a JSON-serialized request, and
+    /// deserialize its reply.
+    ///
+    /// A peer that answers nothing is `Ok(None)`; a peer whose reply does not
+    /// deserialize is an [`Error::MalformedEnvelope`], because the two ends of
+    /// a call agree on a dialect the same way two ends of a channel do.
+    pub fn call_json<Req: serde::Serialize, Rep: serde::de::DeserializeOwned>(
+        port: &str,
+        request: &Req,
+    ) -> Result<Option<Rep>, Error> {
+        let body = serde_json::to_string(request)
+            .map_err(|e| Error::failed(format!("call {port}: serialize request: {e}")))?;
+        match call(port, &body)? {
+            None => Ok(None),
+            Some(reply) => serde_json::from_str(&reply).map(Some).map_err(|e| {
+                Error::MalformedEnvelope(format!("call {port}: deserialize reply: {e}"))
+            }),
         }
     }
 }

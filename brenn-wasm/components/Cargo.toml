@@ -24,6 +24,7 @@ members = [
     "guest",
     "git-forge-parser",
     "git-sync-consumer",
+    "processor-call-test",
     "processor-config",
     "processor-demo",
     "processor-dual",

@@ -95,6 +95,13 @@ pub enum Wake {
     /// An ordinary delivery: some allowed, push-enabled port is owed a message
     /// its channel still holds.
     Delivery,
+    /// A sync call: a caller asked this instance to run and is waiting for its
+    /// reply. Never returned by [`readiness`] — the gate answers the async
+    /// question, and a request is not a readiness fact but a caller's demand.
+    /// It is here so that a host's logs, failure records and assembly
+    /// invariants name this wake with one word on both hosts: in particular
+    /// "a delivery carried something new" is an invariant of `Delivery` alone.
+    Sync,
 }
 
 /// The whole async activation gate: `Mount` if the debt is owed, else

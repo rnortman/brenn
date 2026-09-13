@@ -19,6 +19,11 @@
 /// the port's deferred window is empty and config names `tick_ms`, so a
 /// standing tick is re-armed exactly once however many activations see it.
 ///
+/// `ask` is the sync port the host conformance suite calls the probe on. A sync
+/// port has no binding and no caller of its own in this document: what it
+/// declares is that a request on that name is admissible, which is what lets a
+/// native caller — the suite's adapters, on either host — raise one.
+///
 /// `out` and `report` are not optional. Every activation publishes its
 /// activation report on `report`; `out` carries the echo markers and is the
 /// only port the deferral markers park, cancel, and edit on. Bodies are
@@ -30,6 +35,7 @@ component ProcessorTransplant {
   optional in ctx;
   optional in sampled;
   optional io tick;
+  sync ask;
   out out;
   out report;
 }

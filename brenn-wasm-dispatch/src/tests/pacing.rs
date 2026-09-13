@@ -309,7 +309,7 @@ async fn the_mount_activation_drains_a_backlog_through_the_real_task() {
         min_period: Duration::from_millis(50),
     };
 
-    let _task = spawn_wasm_consumer_task(cfg);
+    let _task = spawn_wasm_consumer_task(cfg, sync_request_channel().1);
 
     assert!(
         wait_pending_empty(&messenger, &wasm_sub, Duration::from_secs(5)).await,

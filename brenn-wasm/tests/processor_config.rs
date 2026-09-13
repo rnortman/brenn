@@ -37,23 +37,16 @@ fn load_config_component(config: HashMap<String, String>) -> ProcessorComponent 
     ports.insert("out".to_string(), common::out_spec("brenn:config-test-out"));
     // processor-config imports: types + ports + config
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &config_artifact(),
-        slug: "config-test",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         config,
         grants: [ComponentGrant::Ports, ComponentGrant::Config]
             .into_iter()
             .collect(),
-        store_path: None,
-        max_page_count: brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: Arc::new(common::NoopAlerter),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&config_artifact(), "config-test")
     })
 }
 

@@ -499,6 +499,7 @@ component Chrome {
   in surface-state: "brenn.surface.surface-state@1";
   in toast: "brenn.surface.toast@1";
   optional out overlay-state: "brenn.surface.overlay-state@1";
+  sync toast-dismiss;
   io toast-tick;
   io state;
 }
@@ -507,8 +508,24 @@ component Chrome {
 - `abi` is `processor`, the one artifact shape both hosts load. Where an
   instance runs is decided by where it is placed and what it is granted, not by
   the word.
-- A port is `in` (the component receives on it), `out` (it publishes on it), or
-  `io` (both).
+- A port is `in` (the component receives on it), `out` (it publishes on it),
+  `io` (both), `sync` (it answers a call on it), or `call` (it asks a peer on
+  it and reads the reply inline).
+- A `sync` port is the odd one: it is bound to no channel. It names a port a
+  caller — a browser gesture the component asked for with `dom.listen`, host
+  code, or a peer component — raises a **sync-call activation** on: one request
+  in, one reply out, inside one otherwise ordinary activation. So it carries no
+  channel, no `push_depth`, no `retain_depth`, no `noise` rung, no doctype and
+  no `optional`; each of those is a compile error on it, and an instance never
+  binds it. A `sync` port with no caller is legal and ordinary — a gesture port
+  has no caller anywhere in the document. A `dom.listen` on a name the class
+  does not declare `sync` ends the activation, on the same terms a publish to
+  an undeclared port does.
+- A `call` port is the other end of that, and bound to no channel for the same
+  reason: it names one peer, not an address. It carries no tuning and no
+  doctype, and `optional` on it is a compile error — a `call` port an instance
+  leaves unbound is already legal, and the import answers `unwired`. Which peer
+  it reaches is the deployer's, written as a `call` binding on the instance.
 - `optional` before the direction is the author saying an instance may
   legitimately leave this port unwired. Every port without it must be bound by
   every instance, at every placement; the resolver refuses the instance
@@ -609,6 +626,51 @@ can see — and both are held at or under the channel's ceiling: its
 scheme.
 A deeper binding is not clamped, it is refused at boot, naming the channel
 (`docs/message-bus.md` §2.1, §2.2).
+
+Both depths are additionally held at or under an absolute ceiling of **1000**,
+at both placements. One activation carries its whole window in memory and hands
+it to the guest in one call, so that is the deepest window either host will
+build — and the same number on both, because a component is owed the same
+window wherever it runs. A depth above it is refused at boot, naming the port,
+the value and the ceiling; it is never silently capped. On a backend consumer's
+binding `unbounded` is still accepted and means exactly that ceiling; a page
+binding must give a number.
+
+A fifth binding form wires no channel at all:
+
+```
+surface kiosk {
+  new geo: Geocoder { io cache { push_depth = 0; retain_depth = 1; } }
+  new menu: Menu {
+    call lookup -> geo.resolve;
+    out out -> "ephemeral:kiosk.out";
+  }
+}
+```
+
+`call <port> -> <instance>.<port>` wires this instance's `call` port to the
+`sync` port of one peer. The target is an instance and a port of it; no address
+names an instance, and the form takes no tail. Five rules, all compile errors:
+
+- The peer is **placed beside the caller** — in the same `surface` block, or
+  both at the top level. A surface instance and a backend consumer are never
+  peers: a call across them would be an RPC over the wire, which the bus
+  already does with a reply channel and which this is deliberately not.
+- At the top level the peer is named the way a channel is: what the body the
+  caller was written in stamped, and failing that what the document's top level
+  holds. So a consumer an assembly stamped calls one written beside the
+  assembly by its bare name, and a consumer at the top level calls one an
+  assembly stamped by the handle it stamped it under —
+  `call lookup -> desk.geo.resolve`. A mounted document's names lead with its
+  own mount either way, so a fragment's call never leaves its namespace. Inside
+  a surface the components are one flat list and the peer is one name.
+- The port the peer answers on is declared `sync` on the peer's class.
+- A `call` port is bound at most once — it reaches one peer. A `sync` port may
+  be called by any number of peers.
+- The graph of `call` bindings across the whole document is **acyclic**. A
+  caller waits for its callee, so a cycle is a deadlock; the refusal spells the
+  cycle out. A diamond is not a cycle and is admitted.
+- Leaving a `call` port unbound is legal. The import answers `unwired`.
 
 `io port { … }` with no arrow is a **free io** form: it claims the port and tunes
 it without connecting it, which is how a timer port gets an anonymous

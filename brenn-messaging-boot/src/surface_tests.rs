@@ -12,7 +12,7 @@ use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
     DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC, ResolvedComponent,
-    ResolvedLocalChannel,
+    ResolvedLocalChannel, SurfaceCall, SurfaceCallRaw,
 };
 use brenn_lib::messaging::config::{Depth, SendRate};
 
@@ -570,6 +570,18 @@ fn a_surface_output_outside_the_declared_vocabulary_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
+/// A sync port that names a bound port is a vocabulary the kernel cannot serve:
+/// the fabricated request window would carry the bound port's name. Belt and
+/// suspenders over the compiler's duplicate-declaration rule.
+#[test]
+#[should_panic(expected = "is also a bound input or output port")]
+fn a_surface_sync_port_naming_a_bound_port_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components[0].sync_ports = vec!["messages".to_string()];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
 /// A declared name is held to the charset every port name is held to: it is
 /// what the kernel compares a component's publish against, and what a trap
 /// diagnostic prints.
@@ -586,7 +598,7 @@ fn a_declared_surface_out_port_outside_the_charset_panics() {
 /// Refused rather than deduplicated: the two halves of lowering disagree, and
 /// which one is right is not this code's guess to make.
 #[test]
-#[should_panic(expected = "declares out-port name \"out\" twice")]
+#[should_panic(expected = "declared out-port name \"out\" appears twice")]
 fn a_declared_surface_out_port_named_twice_panics() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
@@ -638,6 +650,154 @@ fn a_surface_output_on_a_tools_address_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
+/// The fixture surface with `sidecar` answering `protobar`'s call.
+fn surface_raw_with_call(
+    calls: Vec<SurfaceCallRaw>,
+) -> brenn_lib::messaging::config::SurfaceConfigRaw {
+    let mut raw = valid_surface_raw();
+    raw.components[0].call_ports = vec!["lookup".to_string()];
+    raw.components[1].sync_ports = vec!["resolve".to_string()];
+    raw.calls = calls;
+    raw
+}
+
+#[test]
+fn a_surface_carries_the_call_bindings_the_document_wired() {
+    let dir = surface_dir();
+    let raw = surface_raw_with_call(vec![SurfaceCallRaw {
+        instance: "protobar".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "sidecar".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    assert_eq!(
+        resolved[0].calls,
+        vec![SurfaceCall {
+            instance: "protobar".to_string(),
+            port: "lookup".to_string(),
+            target_instance: "sidecar".to_string(),
+            target_port: "resolve".to_string(),
+        }],
+    );
+}
+
+#[test]
+#[should_panic(expected = "vocabulary does not describe the lowered bindings")]
+fn a_surface_call_binding_outside_the_declared_vocabulary_panics() {
+    let dir = surface_dir();
+    let mut raw = surface_raw_with_call(vec![SurfaceCallRaw {
+        instance: "protobar".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "sidecar".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    raw.components[0].call_ports.clear();
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A call port that names a bound port is the sync twin's rule one rung over: a
+/// call port names no channel, so one name standing for both is lowering and
+/// resolution disagreeing about this class's vocabulary.
+#[test]
+#[should_panic(expected = "declares call port \"messages\", which is also a bound input")]
+fn a_surface_call_port_naming_a_bound_port_panics() {
+    let dir = surface_dir();
+    let mut raw = surface_raw_with_call(vec![]);
+    raw.components[0].call_ports = vec!["messages".to_string()];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// The one rule that is this placement's alone: the caller is an instance this
+/// surface declares. It is also how the caller's own vocabulary is found, so a
+/// binding naming a stranger has no class to be held against at all.
+#[test]
+#[should_panic(expected = "names an instance this surface does not declare")]
+fn a_surface_call_from_an_instance_the_surface_does_not_declare_panics() {
+    let dir = surface_dir();
+    let raw = surface_raw_with_call(vec![SurfaceCallRaw {
+        instance: "stranger".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "sidecar".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+#[test]
+#[should_panic(expected = "both `call` and `sync`")]
+fn a_surface_port_declared_both_call_and_sync_panics() {
+    let dir = surface_dir();
+    let mut raw = surface_raw_with_call(vec![]);
+    raw.components[1].call_ports = vec!["resolve".to_string()];
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+#[test]
+#[should_panic(expected = "does not declare — a call reaches a peer of the caller's own")]
+fn a_surface_call_to_an_instance_of_another_placement_panics() {
+    let dir = surface_dir();
+    let raw = surface_raw_with_call(vec![SurfaceCallRaw {
+        instance: "protobar".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "stranger".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+#[test]
+#[should_panic(expected = "declare `sync` (it declares")]
+fn a_surface_call_to_an_undeclared_sync_port_panics() {
+    let dir = surface_dir();
+    let raw = surface_raw_with_call(vec![SurfaceCallRaw {
+        instance: "protobar".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "sidecar".to_string(),
+        target_port: "messages".to_string(),
+    }]);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A cycle on the page is worse than on the backend: the gate's assert runs
+/// inside the kernel on the browser's main thread, so a cycle that reaches it
+/// kills the whole tab, at whatever moment a gesture first reaches the cycle.
+/// Refusing the surface at boot is the same rule the consumer placement gets.
+#[test]
+#[should_panic(expected = "a caller waits for its callee, so a cycle of calls is a deadlock")]
+fn a_surface_call_cycle_panics() {
+    let dir = surface_dir();
+    let mut raw = surface_raw_with_call(vec![SurfaceCallRaw {
+        instance: "protobar".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "sidecar".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    raw.components[0].sync_ports = vec!["answer".to_string()];
+    raw.components[1].call_ports = vec!["back".to_string()];
+    raw.calls.push(SurfaceCallRaw {
+        instance: "sidecar".to_string(),
+        port: "back".to_string(),
+        target_instance: "protobar".to_string(),
+        target_port: "answer".to_string(),
+    });
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+#[test]
+#[should_panic(expected = "is bound twice")]
+fn a_surface_call_port_bound_twice_panics() {
+    let dir = surface_dir();
+    let call = SurfaceCallRaw {
+        instance: "protobar".to_string(),
+        port: "lookup".to_string(),
+        target_instance: "sidecar".to_string(),
+        target_port: "resolve".to_string(),
+    };
+    let raw = surface_raw_with_call(vec![call.clone(), call]);
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
 /// The field-by-field pin on what resolution puts on a `ResolvedComponent`.
 ///
 /// [`surface_resolves_happy_path`] compares whole values, but every literal in
@@ -654,6 +814,8 @@ fn every_field_of_a_resolved_component_is_pinned() {
         kind,
         spec_sha256,
         declared_out_ports,
+        sync_ports,
+        call_ports,
         send_budget,
         parked_batch_depth,
         chrome,
@@ -661,6 +823,7 @@ fn every_field_of_a_resolved_component_is_pinned() {
         grants,
     } = &resolved[0].components[0];
 
+    assert!(call_ports.is_empty());
     assert_eq!(instance, "protobar");
     assert_eq!(kind, "protobar");
     assert_eq!(*spec_sha256, spec_hash("protobar"));
@@ -670,6 +833,8 @@ fn every_field_of_a_resolved_component_is_pinned() {
         declared_out_ports.iter().cloned().collect::<Vec<_>>(),
         ["out".to_string()]
     );
+    // `protobar` holds `dom` but never listens, so it declares no sync port.
+    assert!(sync_ports.is_empty());
     assert_eq!(
         *send_budget,
         brenn_lib::messaging::config::AttachSendBudget::default()
@@ -851,6 +1016,48 @@ fn surface_durable_retain_depth_unbounded_panics() {
     raw.subscriptions[0].push_depth = Some(Depth::Bounded(8));
     raw.subscriptions[0].retain_depth = None;
     resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A bounded depth above the shared window ceiling is refused, on the same
+/// binding and in the same shape as the unbounded refusal beside it.
+#[test]
+#[should_panic(expected = "resolves to push_depth = 1001, above the page depth ceiling of 1000")]
+fn surface_push_depth_above_the_ceiling_panics() {
+    use brenn_lib::messaging::config::Depth;
+    let (dir, _addr) = make_brenn_dir("brenn:alerts");
+    let mut raw = durable_surface_raw();
+    raw.subscriptions[0].push_depth =
+        Some(Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING + 1));
+    raw.subscriptions[0].retain_depth = Some(Depth::Bounded(4));
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// The retain side of the same ceiling.
+#[test]
+#[should_panic(expected = "resolves to retain_depth = 1001, above the page depth ceiling of 1000")]
+fn surface_retain_depth_above_the_ceiling_panics() {
+    use brenn_lib::messaging::config::Depth;
+    let (dir, _addr) = make_brenn_dir("brenn:alerts");
+    let mut raw = durable_surface_raw();
+    raw.subscriptions[0].push_depth = Some(Depth::Bounded(8));
+    raw.subscriptions[0].retain_depth =
+        Some(Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING + 1));
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// Exactly at the ceiling passes, on both depths — the refusal is above it, not
+/// at it.
+#[test]
+fn surface_depths_at_the_ceiling_resolve() {
+    use brenn_lib::messaging::config::Depth;
+    let at = brenn_activation::WINDOW_DEPTH_CEILING;
+    let (dir, _addr) = make_brenn_dir("brenn:alerts");
+    let mut raw = durable_surface_raw();
+    raw.subscriptions[0].push_depth = Some(Depth::Bounded(at));
+    raw.subscriptions[0].retain_depth = Some(Depth::Bounded(at));
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    assert_eq!(resolved[0].subscriptions[0].push_depth, at);
+    assert_eq!(resolved[0].subscriptions[0].retain_depth, at);
 }
 
 /// Explicit per-subscription durable knobs override the channel defaults.

@@ -53,9 +53,10 @@ use crate::access::raw::{
 use crate::messaging::config::{
     BACKEND_FATAL_NOISE_REFUSAL, ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw,
     LinkHostRaw, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel,
-    SendRate, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw,
-    SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
-    WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
+    SendRate, SurfaceCallRaw, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw,
+    SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerCallRaw, WasmConsumerConfigRaw,
+    WasmConsumerIoPortRaw, WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw,
+    WasmConsumerSubscriptionRaw,
 };
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 use crate::messaging::{AttachGrant, ComponentGrant, Urgency, WakeMin};
@@ -2606,6 +2607,17 @@ fn consumer(
         // A class fact, not a body key: carried from the declaring file.
         spec_sha256: instance.class.spec_sha256.clone(),
         declared_out_ports: declared_out_ports(&instance.class),
+        sync_ports: sync_ports(&instance.class),
+        call_ports: call_ports(&instance.class),
+        calls: instance
+            .calls
+            .iter()
+            .map(|call| WasmConsumerCallRaw {
+                port: call.port.value().clone(),
+                target: call.target.value().clone(),
+                target_port: call.target_port.value().clone(),
+            })
+            .collect(),
         grants: authority
             .grants
             .iter()
@@ -2656,6 +2668,56 @@ fn declared_out_ports(class: &ClassRef) -> Vec<String> {
     // seam that states it.
     names.dedup();
     names
+}
+
+/// Every port name a class declares `sync`, sorted and duplicate-free.
+///
+/// The caller-facing half of the same contract `declared_out_ports` holds for
+/// publishes: a host refuses a sync call on a name outside this set, because a
+/// name the specification never declared is a name the artifact it is
+/// hash-bound to cannot read.
+fn sync_ports(class: &ClassRef) -> Vec<String> {
+    ports_named(class, PortDir::Sync)
+}
+
+/// Every port name a class declares `call`, sorted and duplicate-free.
+///
+/// The vocabulary a guest's `calls.call` is held to: a name in it that the
+/// document wired reaches its peer, a name in it the document left unbound is
+/// answered `unwired`, and a name outside it traps the activation.
+fn call_ports(class: &ClassRef) -> Vec<String> {
+    ports_named(class, PortDir::Call)
+}
+
+/// The declared names of one port direction, sorted and duplicate-free.
+fn ports_named(class: &ClassRef, dir: PortDir) -> Vec<String> {
+    let mut names: Vec<String> = class
+        .ports
+        .iter()
+        .filter(|port| port.dir == dir)
+        .map(|port| port.name.value().clone())
+        .collect();
+    names.sort();
+    // The resolver refuses a class declaring one name twice, so this removes
+    // nothing; it holds the duplicate-free half of the contract at the seam
+    // that states it.
+    names.dedup();
+    names
+}
+
+/// The `call` statements one surface instance holds, in the surface's flat
+/// table form.
+fn surface_calls(instance: &RComponentInst, name: &str) -> Vec<SurfaceCallRaw> {
+    instance
+        .calls
+        .iter()
+        .map(|call| SurfaceCallRaw {
+            instance: name.to_string(),
+            port: call.port.value().clone(),
+            target_instance: call.target.value().clone(),
+            target_port: call.target_port.value().clone(),
+        })
+        .collect()
 }
 
 /// A consumer's bindings, split into the three raw families they land in.
@@ -2992,6 +3054,7 @@ fn surface(
         subscriptions: bindings.subscriptions,
         outputs: bindings.outputs,
         io_ports: bindings.io_ports,
+        calls: bindings.calls,
         skin: opt_str(skin.as_ref(), "skin", errors),
         allowed_users: opt_strings(allowed_users.as_ref(), "allowed_users", errors)
             .unwrap_or_default(),
@@ -3006,6 +3069,7 @@ struct SurfaceBindings {
     subscriptions: Vec<SurfaceSubscriptionRaw>,
     outputs: Vec<SurfaceOutputRaw>,
     io_ports: Vec<SurfaceIoPortRaw>,
+    calls: Vec<SurfaceCallRaw>,
 }
 
 /// `[[surface.component]]` per instance placed on the surface, and the bindings
@@ -3044,6 +3108,8 @@ fn surface_components(
             // A class fact, not a body key: carried from the declaring file.
             spec_sha256: instance.class.spec_sha256.clone(),
             declared_out_ports: declared_out_ports(&instance.class),
+            sync_ports: sync_ports(&instance.class),
+            call_ports: call_ports(&instance.class),
             send_burst: body.int("send_burst", errors),
             send_refill_secs: body.int("send_refill_secs", errors),
             // A depth is a count or a bare word, so it was projected out of
@@ -3080,6 +3146,7 @@ fn surface_components(
             owner: &owner,
         };
         surface_bindings(resolved, instance, &at, &mut bindings, endpoints, errors);
+        bindings.calls.extend(surface_calls(instance, &name));
     }
     (components, bindings)
 }

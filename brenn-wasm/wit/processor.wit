@@ -175,13 +175,13 @@ interface types {
     /// inventing an instant.
     ///
     /// `sync` names the live sync port when this is a **sync-call** activation:
-    /// an ordinary activation plus a return obligation. It is `none` on every
-    /// asynchronous delivery, which is every activation a message causes, and
-    /// on every activation a backend host mints — a headless component has no
-    /// cause that could be synchronous. The named port appears in `ports`
-    /// carrying exactly one envelope, the live request, so a guest consumes it
-    /// through the same window API as everything else. The obligation is
-    /// `receive`'s reply: only a sync-call activation may answer.
+    /// an ordinary activation plus a return obligation. It is `some` on any
+    /// activation a sync call caused, on any host, and `none` on every
+    /// asynchronous delivery, which is every activation a message causes. The
+    /// named port appears in `ports` carrying exactly one envelope, the live
+    /// request, so a guest consumes it through the same window API as
+    /// everything else. The obligation is `receive`'s reply: only a sync-call
+    /// activation may answer.
     record activation {
         ports: list<port-window>,
         deferred: list<deferred-window>,
@@ -505,6 +505,52 @@ interface mqtt {
     ) -> result<_, mqtt-publish-error>;
 }
 
+interface calls {
+    /// Failure modes a guest can observe from a synchronous call to a peer.
+    ///
+    /// The variants separate what the caller can do something about (a port it
+    /// never declared is its own bug; an unbound one is the deployer's) from
+    /// what it cannot (the peer erred, trapped, or is not in service).
+    variant call-error {
+        /// Ungranted, or the call is outside an in-flight activation.
+        not-permitted,
+        /// A declared `call` port the deployer left unbound: nobody to answer.
+        unwired,
+        /// The peer did not run: it is not in service, or it is terminal. On
+        /// the page this also covers a `dom` peer whose mount has not run yet,
+        /// which is an ordinary transient of a page coming up.
+        refused,
+        /// The peer ran and did not answer ok — it erred or trapped. Its
+        /// buffer flushed nothing.
+        failed,
+        /// Payload failed host validation (oversize).
+        invalid-payload(string),
+        /// The activation's call budget is exhausted.
+        quota-exceeded,
+    }
+
+    /// Call the peer wired to `port` and return its reply inline. IMMEDIATE and
+    /// NOT transactional with the caller's outcome: the peer's activation
+    /// runs to completion, and its ok flushes its buffer, before this returns —
+    /// a caller that later errs or traps does not retract it (the same rule as
+    /// `mqtt.mqtt-publish`). A `port` the specification does not declare traps
+    /// the activation, as in `ports.publish`.
+    ///
+    /// The peer's activation is an ordinary one plus a return obligation: it
+    /// reads whatever its own bound ports hold, and its publishes go to its own
+    /// channels. Nothing of the caller's is visible to it but `payload`.
+    ///
+    /// A call is weighed against the caller's own per-activation call budget,
+    /// beside `ports.publish` and `mqtt.mqtt-publish` — one counter over all
+    /// three. What that bounds is how many calls an activation makes, not what
+    /// one costs: a call is one whole activation of the peer, uncoalesced, with
+    /// the peer's own budgets, where N publishes onto a channel coalesce into
+    /// at most one wake of a subscriber. So the caller's call ceiling bounds
+    /// how many peer activations it raises, each peer's own ceilings bound what
+    /// that peer then does, and the acyclic call graph bounds the depth.
+    call: func(port: string, payload: string) -> result<option<string>, call-error>;
+}
+
 interface tools {
     /// Failure modes a guest can observe from a tool call. Mirrors the host-side
     /// `ToolError` (the native registry's error type); the fast and async classes
@@ -724,6 +770,7 @@ world processor {
     import config;
     import mqtt;
     import tools;
+    import calls;
     import dom;
     import page-dom;
 
@@ -732,11 +779,12 @@ world processor {
     /// entries as context, and returns one result for the whole activation.
     /// Published messages (via the ports import) are buffered during execution
     /// and flushed atomically iff this returns ok; err/trap discards the buffer.
-    /// A sync-call activation may answer its caller: `ok(some(reply))` is that
-    /// answer, and the reply's dialect belongs to whatever raised the call. An
-    /// ordinary activation must answer `ok(none)`; a `some` on one is a host
-    /// trap, because a component replying to a cause that asked nothing has
-    /// lost track of why it was called.
+    /// A sync-call activation — one whose `sync` is `some`, on either host —
+    /// may answer its caller: `ok(some(reply))` is that answer, and the reply's
+    /// dialect belongs to whatever raised the call. Only such an activation may
+    /// answer. An ordinary activation must answer `ok(none)`; a `some` on one is
+    /// a host trap, because a component replying to a cause that asked nothing
+    /// has lost track of why it was called.
     ///
     /// LINEAR MEMORY LIVES FOR ONE ACTIVATION. A component must not carry
     /// state in statics, thread-locals or the heap from one call to the next:

@@ -29,7 +29,7 @@ use brenn_budget::{
     defer_refusal_kind, publish_refusal_kind,
 };
 use brenn_envelope::Urgency;
-use brenn_surface_contract::{DeferError, PublishError};
+use brenn_surface_contract::{CallError, DeferError, PublishError};
 use uuid::Uuid;
 
 use brenn_attach_client::store::DeferOp;
@@ -88,6 +88,22 @@ fn publish_error(refusal: GateRefusal) -> PublishFault {
             unreachable!("publish_refusal_kind never answers invalid-deliver-after")
         }
     })
+}
+
+/// A gate verdict as the component sees it on the peer-call path.
+///
+/// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
+/// backend host and with the publish path above: a call's payload becomes the one
+/// envelope in the callee's window, so it is judged — and spelled to the guest —
+/// exactly as a published body is.
+fn call_error(refusal: GateRefusal) -> CallError {
+    match publish_refusal_kind(refusal) {
+        RefusalKind::InvalidPayload(detail) => CallError::InvalidPayload(detail),
+        RefusalKind::QuotaExceeded => CallError::QuotaExceeded,
+        RefusalKind::InvalidDeliverAfter => {
+            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
+        }
+    }
 }
 
 /// A gate verdict as the component sees it on the control-op path.
@@ -323,6 +339,40 @@ impl PublishBuffer {
     /// the component is deliberately told nothing.
     pub fn dropped(&self) -> usize {
         self.gate.dropped()
+    }
+
+    /// Admit one synchronous call to a peer against this activation's budgets.
+    ///
+    /// A call is weighed exactly as a publish is, and against the same counters:
+    /// the per-activation call ceiling first — charged whether or not the call
+    /// is admitted, so a component looping on refusals pays for them — then the
+    /// payload against the publish-body cap, because the payload becomes the one
+    /// envelope in the callee's fabricated window and a window entry is a
+    /// published body wherever it came from.
+    ///
+    /// One counter over both bounds the *number* of calls, not their cost: a
+    /// call is one whole activation of the peer, uncoalesced and with the peer's
+    /// own ceilings, where N publishes onto a channel coalesce into at most one
+    /// wake. The caller's ceiling bounds how many peers it raises, each peer's
+    /// own ceilings bound what that peer then does, and the document's acyclic
+    /// call graph bounds the depth. The page has no pacer, so that product is
+    /// the whole bound on one chain's main-thread time.
+    ///
+    /// What this does *not* judge is the port: whether the caller declared it,
+    /// and whether the deployer wired it, are facts about the document rather
+    /// than about the budget, and they are decided at the seam on either side of
+    /// this call — the first before it (a trap), the second after it (`unwired`).
+    /// The backend's `do_call` charges in the same order for the same reasons.
+    pub fn admit_call(&mut self, payload: &str) -> Result<(), CallError> {
+        self.gate.charge_call().map_err(call_error)?;
+        let cap = self.gate.max_body_bytes();
+        if !brenn_activation::sync::within_body_cap(payload, cap) {
+            return Err(call_error(GateRefusal::BodyTooLarge {
+                len: payload.len(),
+                max: cap,
+            }));
+        }
+        Ok(())
     }
 
     /// Publish `body` from this instance's output `port`, at the port's
@@ -627,6 +677,44 @@ mod tests {
             max_body_bytes,
             HashMap::new(),
         )
+    }
+
+    #[test]
+    fn a_call_payload_is_capped_exactly_as_a_published_body_is() {
+        let mut buf = buffer(8);
+        assert_eq!(
+            buf.admit_call(&"a".repeat(8)),
+            Ok(()),
+            "the cap is inclusive"
+        );
+        assert_eq!(
+            buf.admit_call(&"a".repeat(9)),
+            Err(CallError::InvalidPayload(
+                "payload 9 bytes exceeds max 8".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_call_spends_the_budget_a_publish_would_have_spent() {
+        // One activation, one ceiling: calls and publishes draw on the same
+        // counter, so the number of the two together is what is bounded.
+        let mut buf = buffer(64);
+        let mut calls = 0;
+        loop {
+            match buf.admit_call("x") {
+                Ok(()) => calls += 1,
+                Err(CallError::QuotaExceeded) => break,
+                Err(other) => panic!("unexpected call refusal: {other:?}"),
+            }
+            assert!(calls < 100_000, "the call ceiling is not bounding anything");
+        }
+        assert!(calls > 0, "the fixture must admit at least one call");
+        assert_eq!(
+            buf.publish("notes", "y".to_string()),
+            Err(PortFault::Refused(PublishError::QuotaExceeded)),
+            "the calls spent the publish family's own ceiling"
+        );
     }
 
     /// The whole point of the buffer-time rule: entries each well inside the body

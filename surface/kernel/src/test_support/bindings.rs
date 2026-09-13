@@ -53,6 +53,8 @@ pub(crate) fn component_with_grants(instance: &str, kind: &str, grants: &[&str])
         // a fixture component states a vocabulary only when the vocabulary is
         // what the suite is about.
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
     }
 }
 
@@ -160,5 +162,6 @@ pub(crate) fn doc(
         local_channels,
         chrome_instance: CHROME.to_string(),
         platform: platform(),
+        calls: vec![],
     })
 }

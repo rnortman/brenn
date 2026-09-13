@@ -1,5 +1,5 @@
 {
-  "checksum": "0d4dcf496b051f737b6d418d39f6900fa8dbcedb356f2b68f6e6aef09e532479",
+  "checksum": "743fc68e32673b1b33af64793910834c66e18acb1e92f2c50cd71f198daa2781",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2273,8 +2273,16 @@
         "deps": {
           "common": [
             {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
               "id": "serde 1.0.228",
               "target": "serde"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             }
           ],
           "selects": {}

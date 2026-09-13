@@ -190,17 +190,67 @@
 //! resource the component has since destroyed traps on use, exactly as a stale
 //! struct field would.
 //!
+//! # The sync-call activation
+//!
+//! One shape, on every host: **an ordinary activation plus a return
+//! obligation.** A caller hands a target instance a port name and a request
+//! body; the host assembles the same activation it would have assembled for a
+//! mount — every bound input port windowed and its position advanced, every
+//! deferred window snapshotted, one clock reading — and pushes one more window,
+//! last in `ports`, carrying the one request envelope with `new_from == 0` and
+//! `dropped == 0`. The carrier's `sync` field names that port, which is how the
+//! component knows it owes an answer, and `receive`'s return value is the
+//! answer. [`sync`] holds the vocabulary and mints the request.
+//!
+//! What follows from "ordinary activation" is the whole contract, and none of it
+//! is negotiable per host:
+//!
+//! - **It settles the mount debt** if one was owed. There is no second, empty
+//!   activation afterwards — the guarantee is one activation per mount, not one
+//!   of a particular shape. Whether a request can arrive while the debt is owed
+//!   is the host's scheduling — see the observable-differences list.
+//! - **It consumes queued input.** Every bound port windows and advances, so no
+//!   async activation follows for input this one already drained.
+//! - **The flush rule is unchanged, and the flush precedes the reply.** An ok
+//!   flushes the whole buffer — deferred ops, then publishes — and only then is
+//!   the reply handed back, so a caller that has its answer knows the callee's
+//!   publishes already landed. An err or a trap flushes nothing and answers
+//!   [`sync::SyncAnswer::Err`] or [`sync::SyncAnswer::Trap`].
+//! - **It is paced like any other activation**: delayed, never dropped. A caller
+//!   waits.
+//! - **Both bodies are capped like a publish body** ([`sync::within_body_cap`]);
+//!   an oversize reply traps the callee, and an oversize request is a caller
+//!   bug the host refuses to assemble.
+//!
+//! A sync port is not a channel. It has no queue, no retention and no position:
+//! its window is exactly the one minted request, and it appears in `ports` only
+//! on the activation it caused. None of the gap, replay or `dropped` vocabulary
+//! applies to it, because there is no stream to have a view onto.
+//!
 //! # Host-specific behaviours
 //!
-//! The whole list. Each entry is a difference a component can observe, and each
-//! has a reason that is about the host's substrate rather than about its author's
-//! taste. Anything not here is one rule on both hosts.
+//! The whole list, in two sections with two different admission criteria. The
+//! first is the load-bearing one: presence there means *a component can tell*.
+//! The second exists so that the first keeps that meaning — a substrate
+//! difference a component cannot observe is still worth writing down, but
+//! filing it beside an observable one would dilute what the list is for.
 //!
-//! - **Sync activations (surface only).** A browser gesture needs its reply in
-//!   the same task, while the user activation is live, so the surface can assemble
-//!   and run an activation inside the event handler's own `dispatchEvent` and read
-//!   a reply out of it. The backend has no such caller and mints only async
-//!   activations.
+//! Anything in neither section is one rule on both hosts. Silence here is not
+//! "host-defined".
+//!
+//! ## Differences a component can observe
+//!
+//! Each entry is a difference a component can observe, and each has a reason
+//! that is about the host's substrate rather than about its author's taste.
+//!
+//! - **Sync-call causes.** The sync-call activation is one shape on both hosts:
+//!   an ordinary activation plus a return obligation, assembled by the same
+//!   assembly, answered through `receive`'s return value. What differs is who
+//!   can raise one. A browser gesture and the DOM mount exist only on the page,
+//!   because a gesture needs its reply while the user activation is still live
+//!   and the host element must be filled in the same task. A native caller
+//!   exists on both — the kernel on the page, host code on the backend — and so
+//!   does a component's own call to a peer. **No host may refuse the shape.**
 //! - **The sync mount of a `dom`-granted surface instance.** An instance holding
 //!   the `dom` grant is mounted synchronously by its registration: the host
 //!   element is created by that registration and must be filled in the same task,
@@ -209,6 +259,20 @@
 //!   **Every other mount, on either host, is the async shape** — `sync: None`, the
 //!   ordinary assembly. A backend instance never holds `dom`, so every backend
 //!   mount is the async one.
+//! - **A call before the callee's mount (surface only).** On the page a peer's
+//!   call can reach an instance before its own mount pass. A non-`dom` callee
+//!   takes the call as its first activation: the mount debt is settled by it and
+//!   no `sync: None` mount follows. A `dom` callee does not take it — the call is
+//!   refused ([`sync::SyncRefusal::Unmounted`], `refused` to a `calls` caller)
+//!   until its mount has run, because that mount fills the host element and
+//!   nothing else may run against it first. On the backend the mount activation
+//!   is always first: the consumer task settles it before it reads a request, and
+//!   a caller who arrives earlier waits through it. Substrate reason: the backend
+//!   consumer is a task with a sequential prologue; the page's mount is a pass
+//!   over a set, and a nested call from inside that pass can run ahead of it.
+//!   Consequence for authors: do not key initialization on "the first activation
+//!   has `sync: None`", and a page caller must treat `refused` from a peer as
+//!   ordinary during mount rather than as the peer being dead.
 //! - **The ACL gate (backend only).** The backend is the trust plane and decides
 //!   per port whether an instance may read a channel at all; a denied port
 //!   windows empty. The surface's authority is its bindings document: a port it
@@ -225,12 +289,59 @@
 //! - **Import profile.** `store`, `mqtt` and `tools` are backend-only; `dom` and
 //!   `page-dom` are surface-only. This is the invariant working, not an exception
 //!   to it: a component's hosting eligibility is exactly its import list.
-//! - **`ephemeral:` bindings for backend consumers.** Not implementable today: a
-//!   backend WASM consumer cannot bind an `ephemeral:` channel, because the
-//!   registry forks on the address realm. A gap in the machinery rather than a
-//!   rule about components, listed here so it is not read as one.
+//! - **Activation time bound (backend only).** The backend bounds every
+//!   activation by fuel and by a wall-clock epoch deadline and traps past it;
+//!   the page has neither, and the browser's own slow-script guard is the only
+//!   bound there. A component that runs for forty seconds is a trap on the
+//!   backend and a hung tab on the page. Substrate reason: the page runs the
+//!   guest synchronously on the browser's main thread, which has no epoch
+//!   ticker and nothing that can interrupt a running WASM call. A call to a
+//!   peer runs that peer's activation nested inside the caller's, so on the
+//!   page a chain of calls is one main-thread run whose time is the sum of the
+//!   chain's, bounded by nothing but the slow-script guard.
+//!
+//! ## Substrate differences a component cannot observe
+//!
+//! Admission criterion: the component is handed identical inputs and its
+//! outputs land identically. What differs is latency shape, operator surface or
+//! configuration vocabulary. These are here so a reader of the first list can
+//! trust that everything left out of it is one rule — not so a host author can
+//! reach for them as licence.
+//!
+//! - **Pacing shape.** The backend delays a runaway consumer by token bucket,
+//!   because it shares a process with everything else and the throttle is a
+//!   security event worth recording. The page bounds one pass by registration
+//!   count and hops a macrotask, because it is a single-threaded event loop
+//!   that must yield to paint. Neither drops an activation: both delay.
+//! - **Failure record.** The backend writes per-batch failure rows and alerts;
+//!   the page emits an activation-failed event and a counter. The backend is
+//!   the trust plane and has a database; the page has neither. Neither tells
+//!   the component.
+//! - **`Depth::Unbounded` vocabulary.** Both hosts serve a bounded window depth
+//!   exactly and refuse one above [`WINDOW_DEPTH_CEILING`]. `unbounded` is
+//!   accepted only on a backend WASM binding, where it resolves to the ceiling;
+//!   the page refuses it at boot, because a page-local ring lives in page
+//!   memory and the attach protocol carries depths as counts end to end. A
+//!   component cannot tell a window resolved from `unbounded` from one
+//!   configured at the ceiling.
 
 pub mod schedule;
+pub mod sync;
+
+/// The deepest window either host will serve on one port of a component
+/// activation, for both `push_depth` (the new portion) and `retain_depth` (the
+/// retained context).
+///
+/// A window is assembled in memory and handed to the guest in one call, so its
+/// size is a bound on what a host can build per activation, not a preference.
+/// The number is the same on both hosts because a component is owed the same
+/// window wherever it runs: a depth one host would serve and the other would
+/// not is exactly the class of difference this crate exists to refuse.
+///
+/// A configured depth above this is **refused** where it resolves — never
+/// capped. A silently capped depth is a component served a window it did not
+/// ask for, with nothing anywhere saying so.
+pub const WINDOW_DEPTH_CEILING: u64 = 1_000;
 
 /// One activation: every bound input port of one instance, windowed.
 ///

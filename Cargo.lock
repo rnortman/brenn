@@ -391,7 +391,10 @@ dependencies = [
 name = "brenn-activation"
 version = "0.1.0"
 dependencies = [
+ "brenn-envelope",
+ "chrono",
  "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -503,6 +506,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "brenn-activation",
  "brenn-attach-proto",
  "brenn-attach-server",
  "brenn-automation",
@@ -726,6 +730,7 @@ dependencies = [
 name = "brenn-host-conformance"
 version = "0.1.0"
 dependencies = [
+ "brenn-activation",
  "brenn-attach-client",
  "brenn-attach-proto",
  "brenn-envelope",
@@ -754,6 +759,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "base64ct",
+ "brenn-activation",
  "brenn-approval-rules",
  "brenn-budget",
  "brenn-common",
@@ -851,6 +857,7 @@ name = "brenn-messaging-boot"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "brenn-activation",
  "brenn-budget",
  "brenn-cc-profile",
  "brenn-db",
@@ -1074,6 +1081,7 @@ dependencies = [
  "axum",
  "axum-helmet",
  "base64ct",
+ "brenn-activation",
  "brenn-approval-rules",
  "brenn-attach-client",
  "brenn-attach-conformance",
@@ -1235,6 +1243,7 @@ name = "brenn-tool-registry"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "brenn-activation",
  "brenn-envelope",
  "brenn-git",
  "brenn-lib",
@@ -1321,6 +1330,7 @@ dependencies = [
 name = "brenn-wasm-dispatch"
 version = "0.1.0"
 dependencies = [
+ "brenn-activation",
  "brenn-common",
  "brenn-host-conformance",
  "brenn-lib",

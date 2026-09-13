@@ -33,6 +33,8 @@ fn component(instance: &str, parked_batch_depth: u64) -> ComponentEntry {
         config: BTreeMap::new(),
         grants: vec![],
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
     }
 }
 
@@ -72,6 +74,7 @@ fn doc(outputs: Vec<OutputBinding>, error: Option<(&str, LogLevel)>) -> Bindings
             error_channel: error.map(|(channel, _)| channel.to_string()),
             error_report_floor: error.map(|(_, floor)| floor),
         },
+        calls: vec![],
     })
 }
 

@@ -6,8 +6,8 @@ use brenn_lib::messaging::config::{
     AttachSendBudget, DEFAULT_PARKED_BATCH_DEPTH, DEFAULT_WASM_PUBLISH_CAPACITY,
     DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, MessagingGlobalConfig, NoiseLevel,
     ResolvedComponent, ResolvedLocalChannel, ResolvedSubscription, ResolvedSurface,
-    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceComponentRaw, SurfaceConfigRaw,
-    SurfaceOutput, SurfaceOutputRaw,
+    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceCall, SurfaceCallRaw, SurfaceComponentRaw,
+    SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw,
 };
 use brenn_lib::messaging::{
     ChannelScheme, ComponentGrant, ComponentHost, EntityKind, MessagingDirectory, Plane, Urgency,
@@ -17,6 +17,37 @@ use indexmap::IndexMap;
 
 use super::auto::AutoWiring;
 use super::resolve_publish_millitokens;
+
+/// The page-side half of the shared window-depth ceiling: a configured depth
+/// above [`WINDOW_DEPTH_CEILING`](brenn_activation::WINDOW_DEPTH_CEILING) is
+/// refused at boot, naming the binding, the value and the ceiling.
+///
+/// One ceiling, both placements. A backend consumer and a page instance are
+/// owed the same window, so a depth one host would serve and the other would
+/// not is the class of difference the component contract exists to refuse —
+/// and on the page the bound is also literal: every one of these depths is a
+/// queue or a ring living in the tab's own memory.
+///
+/// # Panics
+///
+/// On a depth above the ceiling.
+fn assert_page_depth_within_ceiling(
+    slug: &str,
+    context: &str,
+    channel: &str,
+    which: &str,
+    depth: u64,
+) {
+    assert!(
+        depth <= brenn_activation::WINDOW_DEPTH_CEILING,
+        "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to {which} = \
+         {depth}, above the page depth ceiling of {} — a surface binding's queues and rings live \
+         in page memory and one activation carries the whole window, so the kernel will not build \
+         a deeper one. Lower {which} to {} or less.",
+        brenn_activation::WINDOW_DEPTH_CEILING,
+        brenn_activation::WINDOW_DEPTH_CEILING,
+    );
+}
 
 /// Fold one `local:` binding's `retain_depth` into the channel's resolved ring
 /// depth.
@@ -56,7 +87,16 @@ fn accumulate_local_ring_depth(
     }
     let depth = match retain_depth {
         None => 1,
-        Some(Depth::Bounded(n)) => n.max(1),
+        Some(Depth::Bounded(n)) => {
+            assert_page_depth_within_ceiling(
+                slug,
+                "binding on local channel",
+                channel,
+                "retain_depth",
+                n,
+            );
+            n.max(1)
+        }
         Some(Depth::Unbounded) => panic!(
             "config: [[surface]] {slug:?}: binding on local channel {channel:?} sets \
              retain_depth = \"unbounded\" — a local channel's retained ring lives in page memory \
@@ -133,6 +173,7 @@ fn resolve_page_queue_depth(
              to a bounded push_depth; set it on the binding or on the channel rung"
         )
     };
+    assert_page_depth_within_ceiling(slug, context, channel, "push_depth", n);
     n
 }
 
@@ -299,6 +340,7 @@ fn resolve_context_ring_depth(
              replays must be bounded; set it on the binding or on the channel rung"
         )
     };
+    assert_page_depth_within_ceiling(slug, context, channel, "retain_depth", n);
     n
 }
 
@@ -371,35 +413,30 @@ fn resolve_component_grants(
     grants
 }
 
-/// Resolve a component instance's declared outbound port vocabulary — every
-/// `out` and `io` port name its class declares, as lowering carried it.
+/// Resolve a component instance's declared port vocabulary of one class — every
+/// `out`/`io` port name, or every `sync` port name, its class declares, as
+/// lowering carried it.
 ///
-/// The kernel refuses a publish outside this set, so a malformed entry here
-/// would trap a component that did nothing wrong; the names are held to the
-/// same charset as a binding's.
+/// The kernel refuses a publish outside the out-port set and a `dom.listen`
+/// outside the sync set, so a malformed entry here would trap a component that
+/// did nothing wrong. [`crate::port_vocabulary`] is the rule; this names the
+/// placement.
 ///
 /// # Panics
 ///
 /// On an empty name, a name outside the unreserved charset, and a repeated
 /// name (the resolver refuses a class declaring one name twice).
-fn resolve_declared_out_ports(
+fn resolve_port_vocabulary(
     slug: &str,
     instance: &str,
-    comp: &SurfaceComponentRaw,
+    class: &str,
+    names: &[String],
 ) -> BTreeSet<String> {
-    let mut declared = BTreeSet::new();
-    for port in &comp.declared_out_ports {
-        crate::assert_port_name(
-            &format!("config: [[surface]] {slug:?}: component {instance:?} declared out-port name"),
-            port,
-        );
-        assert!(
-            declared.insert(port.clone()),
-            "config: [[surface]] {slug:?}: component {instance:?} declares out-port name \
-             {port:?} twice",
-        );
-    }
-    declared
+    crate::port_vocabulary(
+        &format!("config: [[surface]] {slug:?}: component {instance:?}"),
+        class,
+        names,
+    )
 }
 
 /// Resolve a component instance's static config map — the page-lifetime
@@ -688,7 +725,14 @@ pub(crate) fn resolve_surfaces(
                 // Carried, not checked here: validated at boot by the surface
                 // asset gate.
                 spec_sha256: comp.spec_sha256.clone(),
-                declared_out_ports: resolve_declared_out_ports(slug, instance, comp),
+                declared_out_ports: resolve_port_vocabulary(
+                    slug,
+                    instance,
+                    "out",
+                    &comp.declared_out_ports,
+                ),
+                sync_ports: resolve_port_vocabulary(slug, instance, "sync", &comp.sync_ports),
+                call_ports: resolve_port_vocabulary(slug, instance, "call", &comp.call_ports),
                 config: resolve_component_config(slug, instance, comp),
                 grants,
                 send_budget: resolve_send_budget(slug, instance, comp),
@@ -1370,6 +1414,47 @@ pub(crate) fn resolve_surfaces(
                 );
             }
 
+            // Same shape for the sync vocabulary, in the other direction: a class
+            // may not declare one name twice, so a sync port sharing a bound
+            // port's name means lowering and resolution disagree about this
+            // class's vocabulary. Nothing downstream could tell the two apart —
+            // the fabricated request window would carry a bound port's name.
+            for port in &comp.sync_ports {
+                let bound = subscriptions
+                    .iter()
+                    .any(|b| b.instance == instance && b.port == *port)
+                    || outputs
+                        .iter()
+                        .any(|o| o.instance == instance && o.port == *port);
+                assert!(
+                    !bound,
+                    "config: [[surface]] {slug:?}: component {instance:?} declares sync port \
+                     {port:?}, which is also a bound input or output port — a sync port names \
+                     no binding, and one name cannot stand for both",
+                );
+            }
+
+            // And for the call vocabulary, which binds no channel either.
+            for port in &comp.call_ports {
+                let bound = subscriptions
+                    .iter()
+                    .any(|b| b.instance == instance && b.port == *port)
+                    || outputs
+                        .iter()
+                        .any(|o| o.instance == instance && o.port == *port);
+                assert!(
+                    !bound,
+                    "config: [[surface]] {slug:?}: component {instance:?} declares call port \
+                     {port:?}, which is also a bound input or output port — a call port names \
+                     no channel, and one name cannot stand for both",
+                );
+                assert!(
+                    !comp.sync_ports.contains(port),
+                    "config: [[surface]] {slug:?}: component {instance:?} declares port \
+                     {port:?} both `call` and `sync` — one name cannot both ask and answer",
+                );
+            }
+
             // `config` ⟺ a config map, both directions. A map no component may
             // read is unread configuration; a grant with no map behind it reads
             // nothing.
@@ -1440,6 +1525,8 @@ pub(crate) fn resolve_surfaces(
             })
             .collect();
 
+        let calls = resolve_surface_calls(slug, &resolved_components, &surface.calls);
+
         result.push(ResolvedSurface {
             slug: slug.clone(),
             skin,
@@ -1448,6 +1535,7 @@ pub(crate) fn resolve_surfaces(
             wire_subscriptions,
             local_channels,
             outputs,
+            calls,
             policy,
             allowed_users: surface.allowed_users.clone(),
             publish_burst,
@@ -1455,6 +1543,65 @@ pub(crate) fn resolve_surfaces(
         });
     }
     result
+}
+
+/// Resolve one surface's `call` bindings, holding each against the instances it
+/// names.
+///
+/// The rules and their refusals are [`crate::check_call_wiring`]'s, shared with
+/// the consumer placement; what is here is this placement's names for the things
+/// the rules are about, plus the one rule that is only this placement's — the
+/// caller must be an instance this surface declares, which is also how the
+/// caller's own vocabulary is found.
+///
+/// Panics if any call names an instance this surface does not declare, binds one
+/// port twice, targets a port the callee's class does not declare `sync`, or
+/// closes a call cycle.
+fn resolve_surface_calls(
+    slug: &str,
+    components: &[ResolvedComponent],
+    raw: &[SurfaceCallRaw],
+) -> Vec<SurfaceCall> {
+    let edges: Vec<crate::CallEdge<'_>> = raw
+        .iter()
+        .map(|call| {
+            let caller = components
+                .iter()
+                .find(|c| c.instance == call.instance)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "config: [[surface]] {slug:?}: call binding on {:?}/{:?} names an \
+                         instance this surface does not declare",
+                        call.instance, call.port,
+                    )
+                });
+            crate::CallEdge {
+                label: format!(
+                    "config: [[surface]] {slug:?}: call port {:?}/{:?}",
+                    call.instance, call.port
+                ),
+                caller: &caller.instance,
+                port: &call.port,
+                caller_call_ports: &caller.call_ports,
+                target: &call.target_instance,
+                target_port: &call.target_port,
+            }
+        })
+        .collect();
+    crate::check_call_wiring(&edges, |instance| {
+        components
+            .iter()
+            .find(|c| c.instance == instance)
+            .map(|c| &c.sync_ports)
+    });
+    raw.iter()
+        .map(|call| SurfaceCall {
+            instance: call.instance.clone(),
+            port: call.port.clone(),
+            target_instance: call.target_instance.clone(),
+            target_port: call.target_port.clone(),
+        })
+        .collect()
 }
 
 /// Inject the substrate error-reporting grant onto every resolved surface's

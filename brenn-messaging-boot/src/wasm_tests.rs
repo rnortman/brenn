@@ -11,8 +11,8 @@ use super::wasm::{DEFAULT_ACTIVATION_BURST, DEFAULT_ACTIVATION_MIN_PERIOD};
 use super::*;
 use brenn_lib::messaging::ComponentGrant;
 use brenn_lib::messaging::config::{
-    Depth, WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
-    WasmSinkBudget,
+    Depth, WasmCallPort, WasmConsumerCallRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
+    WasmConsumerSubscriptionRaw, WasmSinkBudget,
 };
 use std::time::Duration;
 
@@ -320,6 +320,84 @@ fn wasm_consumer_explicit_noise_overrides_channel() {
     }];
     let result = resolve(&raw, &dir);
     assert_eq!(result[0].inputs[0].sub.noise, NoiseLevel::Metered);
+}
+
+// --- Window depth ceiling ---
+
+/// `unbounded` on a WASM binding resolves to the ceiling, once, at resolution —
+/// so nothing downstream ever reads `Unbounded` off a consumer's subscription.
+#[test]
+fn wasm_consumer_unbounded_depths_resolve_to_the_ceiling() {
+    let (dir, chan_addr) = make_dir_with_noise("brenn:ceiling-unbounded", NoiseLevel::Silent);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "ceiling-unbounded".to_string(),
+        package: "p".to_string(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            push_depth: Some(Depth::Unbounded),
+            retain_depth: Some(Depth::Unbounded),
+            ..sub_raw(&chan_addr, "in")
+        }],
+        ..minimal_wasm_consumer()
+    }];
+    let result = resolve(&raw, &dir);
+    let ceiling = Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING);
+    assert_eq!(result[0].inputs[0].sub.push_depth, ceiling);
+    assert_eq!(result[0].inputs[0].sub.retain_depth, ceiling);
+}
+
+/// A depth exactly at the ceiling is served exactly, on both depths.
+#[test]
+fn wasm_consumer_depths_at_the_ceiling_resolve_verbatim() {
+    let (dir, chan_addr) = make_dir_with_noise("brenn:ceiling-exact", NoiseLevel::Silent);
+    let at = brenn_activation::WINDOW_DEPTH_CEILING;
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "ceiling-exact".to_string(),
+        package: "p".to_string(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            push_depth: Some(Depth::Bounded(at)),
+            retain_depth: Some(Depth::Bounded(at)),
+            ..sub_raw(&chan_addr, "in")
+        }],
+        ..minimal_wasm_consumer()
+    }];
+    let result = resolve(&raw, &dir);
+    assert_eq!(result[0].inputs[0].sub.push_depth, Depth::Bounded(at));
+    assert_eq!(result[0].inputs[0].sub.retain_depth, Depth::Bounded(at));
+}
+
+/// One over the ceiling on `push_depth` is refused, not capped.
+#[test]
+#[should_panic(expected = "resolves to push_depth = 1001, above the window ceiling of 1000")]
+fn wasm_consumer_push_depth_above_the_ceiling_is_refused() {
+    let (dir, chan_addr) = make_dir_with_noise("brenn:ceiling-push", NoiseLevel::Silent);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "ceiling-push".to_string(),
+        package: "p".to_string(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            push_depth: Some(Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING + 1)),
+            ..sub_raw(&chan_addr, "in")
+        }],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// One over the ceiling on `retain_depth` is refused too.
+#[test]
+#[should_panic(expected = "resolves to retain_depth = 2000, above the window ceiling of 1000")]
+fn wasm_consumer_retain_depth_above_the_ceiling_is_refused() {
+    let (dir, chan_addr) = make_dir_with_noise("brenn:ceiling-retain", NoiseLevel::Silent);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "ceiling-retain".to_string(),
+        package: "p".to_string(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            push_depth: Some(Depth::Bounded(5)),
+            retain_depth: Some(Depth::Bounded(2000)),
+            ..sub_raw(&chan_addr, "in")
+        }],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
 }
 
 /// Explicit noise + resolved push_depth = 0 → panic at bootstrap.
@@ -810,6 +888,256 @@ fn a_resolved_consumer_carries_the_ports_its_class_declares_but_binds_none_of() 
         1,
         "only the bound port has a sink; the other two are vocabulary and nothing else",
     );
+}
+
+/// The sync vocabulary reaches the host as its own set, beside the outbound one
+/// and sharing nothing with it: a sync port is bound to no channel, so
+/// resolution has nothing else to carry it on.
+#[test]
+fn a_resolved_consumer_carries_the_sync_ports_its_class_declares() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "geo".to_string(),
+        package: "geo".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        sync_ports: vec!["lookup".to_string(), "resolve".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+
+    let consumer = &resolve(&raw, &dir)[0];
+    assert_eq!(
+        consumer.sync_ports.iter().cloned().collect::<Vec<_>>(),
+        ["lookup", "resolve"],
+    );
+    assert!(consumer.declared_out_ports.is_empty());
+}
+
+/// A pure-RPC callee — one `sync` port, outputs, and no subscription at all —
+/// is live config, not dead: a caller activates it, and its outputs flush on
+/// every ok. The dead-config rule is "nothing can activate it", and a declared
+/// sync port is one of the things that can.
+#[test]
+fn a_consumer_activated_only_by_callers_resolves_with_its_outputs() {
+    let dir = dir_of(vec![brenn_entry("brenn:geo-log")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "geo".to_string(),
+        package: "geo".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "geo-log".to_string(),
+        )],
+        subscriptions: vec![],
+        outputs: vec![out_raw("log", "brenn:geo-log")],
+        declared_out_ports: vec!["log".to_string()],
+        sync_ports: vec!["resolve".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+
+    let consumer = &resolve(&raw, &dir)[0];
+    assert!(consumer.inputs.is_empty());
+    assert_eq!(consumer.outputs.len(), 1);
+    assert_eq!(
+        consumer.sync_ports.iter().cloned().collect::<Vec<_>>(),
+        ["resolve"],
+    );
+}
+
+/// The name is the join key between a caller and a window, so a repeat is a
+/// vocabulary that cannot say which port a call means.
+#[test]
+#[should_panic(expected = "declared sync-port name \"resolve\" appears twice")]
+fn a_repeated_sync_port_name_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "geo".to_string(),
+        package: "geo".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        sync_ports: vec!["resolve".to_string(), "resolve".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+    let _ = resolve(&raw, &dir);
+}
+
+/// A pair of fixture consumers, the second calling the first.
+fn call_pair(calls: Vec<WasmConsumerCallRaw>) -> Vec<WasmConsumerConfigRaw> {
+    vec![
+        WasmConsumerConfigRaw {
+            slug: "geo".to_string(),
+            package: "geo".to_string(),
+            grants: vec![ComponentGrant::Ports],
+            subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+            sync_ports: vec!["resolve".to_string()],
+            ..minimal_wasm_consumer()
+        },
+        WasmConsumerConfigRaw {
+            slug: "menu".to_string(),
+            package: "menu".to_string(),
+            grants: vec![ComponentGrant::Ports],
+            subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+            call_ports: vec!["lookup".to_string()],
+            calls,
+            ..minimal_wasm_consumer()
+        },
+    ]
+}
+
+#[test]
+fn a_resolved_consumer_carries_the_call_ports_the_document_wired() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = call_pair(vec![WasmConsumerCallRaw {
+        port: "lookup".to_string(),
+        target: "geo".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+
+    let resolved = resolve(&raw, &dir);
+    assert_eq!(
+        resolved[1].calls,
+        vec![WasmCallPort {
+            port: "lookup".to_string(),
+            target_slug: "geo".to_string(),
+            target_port: "resolve".to_string(),
+        }],
+    );
+    assert!(resolved[0].calls.is_empty());
+    // The declared vocabulary travels beside the wiring: a call port the
+    // document did not bind is here and not in `calls`.
+    assert_eq!(
+        resolved[1].call_ports.iter().cloned().collect::<Vec<_>>(),
+        vec!["lookup".to_string()],
+    );
+}
+
+#[test]
+#[should_panic(expected = "vocabulary does not describe the lowered bindings")]
+fn a_call_binding_outside_the_declared_vocabulary_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let mut raw = call_pair(vec![WasmConsumerCallRaw {
+        port: "lookup".to_string(),
+        target: "geo".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    raw[1].call_ports.clear();
+    let _ = resolve(&raw, &dir);
+}
+
+#[test]
+#[should_panic(expected = "both `call` and `sync`")]
+fn a_port_declared_both_call_and_sync_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let mut raw = call_pair(vec![]);
+    raw[0].call_ports = vec!["resolve".to_string()];
+    let _ = resolve(&raw, &dir);
+}
+
+#[test]
+#[should_panic(expected = "does not declare — a call reaches a peer of the caller's own")]
+fn a_call_to_an_undeclared_consumer_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = call_pair(vec![WasmConsumerCallRaw {
+        port: "lookup".to_string(),
+        target: "stranger".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    let _ = resolve(&raw, &dir);
+}
+
+#[test]
+#[should_panic(expected = "declare `sync` (it declares")]
+fn a_call_to_an_undeclared_sync_port_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = call_pair(vec![WasmConsumerCallRaw {
+        port: "lookup".to_string(),
+        target: "geo".to_string(),
+        target_port: "inbound".to_string(),
+    }]);
+    let _ = resolve(&raw, &dir);
+}
+
+/// One `call` port reaches one peer. Two bindings on one port would make the
+/// target of a call whichever the host indexed first.
+#[test]
+#[should_panic(expected = "call port \"lookup\" is bound twice")]
+fn a_call_port_bound_twice_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = call_pair(vec![
+        WasmConsumerCallRaw {
+            port: "lookup".to_string(),
+            target: "geo".to_string(),
+            target_port: "resolve".to_string(),
+        },
+        WasmConsumerCallRaw {
+            port: "lookup".to_string(),
+            target: "geo".to_string(),
+            target_port: "resolve".to_string(),
+        },
+    ]);
+    let _ = resolve(&raw, &dir);
+}
+
+/// The rule the whole termination argument rests on: a caller waits for its
+/// callee, so a cycle of calls is two consumer tasks deadlocked on each other.
+/// The resolver refuses one at compile time; a document that reaches boot with
+/// one is the compiler and the boot path disagreeing, and refusing is a better
+/// answer than the deadlock.
+#[test]
+#[should_panic(expected = "a caller waits for its callee, so a cycle of calls is a deadlock")]
+fn a_call_cycle_between_two_consumers_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let mut raw = call_pair(vec![WasmConsumerCallRaw {
+        port: "lookup".to_string(),
+        target: "geo".to_string(),
+        target_port: "resolve".to_string(),
+    }]);
+    raw[1].sync_ports = vec!["answer".to_string()];
+    raw[0].call_ports = vec!["back".to_string()];
+    raw[0].calls = vec![WasmConsumerCallRaw {
+        port: "back".to_string(),
+        target: "menu".to_string(),
+        target_port: "answer".to_string(),
+    }];
+    let _ = resolve(&raw, &dir);
+}
+
+/// A call port that names a bound input is the same disagreement one rung over:
+/// a call port names no channel, so one name standing for both means lowering
+/// and resolution disagree about this class's vocabulary. Belt and suspenders
+/// over the compiler's duplicate-declaration rule.
+#[test]
+#[should_panic(expected = "declared call-port name \"inbound\" is also a bound input")]
+fn a_call_port_naming_a_bound_input_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "menu".to_string(),
+        package: "menu".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        call_ports: vec!["inbound".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+    let _ = resolve(&raw, &dir);
+}
+
+/// A sync port that names a bound input is a vocabulary no host can serve: the
+/// fabricated request window would carry the bound port's name, so the guest
+/// would be handed two windows with one name and the real input's amplification
+/// grant would be read as the request's. Belt and suspenders over the
+/// compiler's duplicate-declaration rule.
+#[test]
+#[should_panic(expected = "is also a bound input or output port")]
+fn a_sync_port_naming_a_bound_input_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch")]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "geo".to_string(),
+        package: "geo".to_string(),
+        grants: vec![ComponentGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "inbound")],
+        sync_ports: vec!["inbound".to_string()],
+        ..minimal_wasm_consumer()
+    }];
+    let _ = resolve(&raw, &dir);
 }
 
 /// A bound output the class does not declare is the two halves of lowering

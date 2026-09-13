@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use brenn_activation::sync::{SyncAnswer, SyncRefusal};
 use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::remote::ResolvedRemote;
 use brenn_lib::messaging::{
@@ -64,12 +65,32 @@ pub enum DeliveryBinding {
     /// dispatch task holds an `Arc` clone and awaits it; `spawn_eager_wake`
     /// calls `notify_one`.
     ParkedNotify(Arc<tokio::sync::Notify>),
+    /// A WASM consumer's off-loop task: the same parked wake as
+    /// [`DeliveryBinding::ParkedNotify`], plus the one thing a consumer has that
+    /// no other parked subscriber does — a request channel its task serves
+    /// between drain steps. Every wake, route and shape decision treats the two
+    /// arms identically; what this arm adds is reachable only through
+    /// [`WakeRouterImpl::sync_call`].
+    WasmConsumer {
+        notify: Arc<tokio::sync::Notify>,
+        sync: tokio::sync::mpsc::Sender<brenn_wasm_dispatch::SyncRequest>,
+    },
     /// Deliver via the conversation's active bridge; wake via
     /// `state.spawn_eager_wake` (app subscribers).
     ConversationBridge,
     /// Fan out to the attach registry's attached, subscribed sessions for this
     /// key — a browser surface's or a remote daemon's, on identical terms.
     AttachSessions,
+}
+
+/// A binding arm's name, for the panic that meets one where it does not belong.
+fn binding_word(binding: &DeliveryBinding) -> &'static str {
+    match binding {
+        DeliveryBinding::ParkedNotify(_) => "ParkedNotify",
+        DeliveryBinding::WasmConsumer { .. } => "WasmConsumer",
+        DeliveryBinding::ConversationBridge => "ConversationBridge",
+        DeliveryBinding::AttachSessions => "AttachSessions",
+    }
 }
 
 /// The attach-registry key for an attach-shaped subscriber, or `None` for a kind
@@ -137,6 +158,74 @@ impl WakeRouterImpl {
         self.bindings.register(key, binding);
     }
 
+    /// Call one WASM consumer synchronously and return its answer.
+    ///
+    /// The native caller API for the sync-call facility: the request is handed
+    /// to the consumer's own task, which serves it between two drain steps, and
+    /// the answer comes back once that activation has finished and — on the ok
+    /// path — flushed.
+    ///
+    /// There is no caller-side timeout, because termination is by construction:
+    /// every backend activation is bounded by fuel and by an epoch deadline, the
+    /// pacer delays boundedly and never drops, and the document's acyclicity
+    /// check means no request can end up waiting on itself.
+    ///
+    /// Three ways to get nothing: no binding under the slug, a tombstone, or a
+    /// send that fails because the consumer's task has dropped its receiver on
+    /// its way out of service. All three are one fact for the caller — the
+    /// target is not in service — and answer [`SyncRefusal::Unregistered`].
+    ///
+    /// # Panics
+    ///
+    /// If the slug's live binding is not a
+    /// [`DeliveryBinding::WasmConsumer`]. Every WASM consumer is registered with
+    /// that arm and nothing else is registered under a `Wasm` key, so anything
+    /// else is a bootstrap wiring bug.
+    pub async fn sync_call(
+        &self,
+        slug: &str,
+        port: &str,
+        body: String,
+        chain: &[String],
+    ) -> SyncAnswer {
+        let key = SubscriberEntryKind::Wasm(slug.to_string());
+        let sender = match self.bindings.get(&key) {
+            Lookup::Live(DeliveryBinding::WasmConsumer { sync, .. }) => sync,
+            Lookup::Live(other) => panic!(
+                "sync_call: consumer {slug:?} holds a {} delivery binding — every WASM consumer \
+                 is registered as WasmConsumer, so this is a bootstrap wiring bug",
+                binding_word(&other)
+            ),
+            Lookup::Retired | Lookup::Unknown => {
+                return SyncAnswer::Refused(SyncRefusal::Unregistered);
+            }
+        };
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = brenn_wasm_dispatch::SyncRequest {
+            port: port.to_string(),
+            body,
+            chain: chain.to_vec(),
+            reply,
+        };
+        if sender.send(request).await.is_err() {
+            return SyncAnswer::Refused(SyncRefusal::Unregistered);
+        }
+        match answer.await {
+            Ok(answer) => answer,
+            // The task dropped the sender without answering, which it does only
+            // by dying; from here it is a target that is no longer in service.
+            Err(_) => {
+                warn!(
+                    slug = %slug,
+                    port = %port,
+                    "sync_call: the consumer task ended without answering its caller"
+                );
+                SyncAnswer::Refused(SyncRefusal::Unregistered)
+            }
+        }
+    }
+
     /// Retire one subscriber's delivery binding: the key leaves the live table
     /// and becomes a tombstone. Called once the subscriber's directory entries
     /// are gone and its task has joined, so what remains is only work already in
@@ -155,6 +244,19 @@ impl WakeRouterImpl {
     /// [`Self::has_delivery_binding`].
     pub fn delivery_binding_retired(&self, key: &SubscriberEntryKind) -> bool {
         self.bindings.is_retired(key)
+    }
+
+    /// Whether the live binding under `key` is the consumer-shaped arm a sync
+    /// call can be handed to — i.e. [`DeliveryBinding::WasmConsumer`] rather
+    /// than any other binding variant.
+    pub fn is_sync_callable(&self, key: &SubscriberEntryKind) -> bool {
+        matches!(
+            self.bindings.map(key, |binding| matches!(
+                binding,
+                DeliveryBinding::WasmConsumer { .. }
+            )),
+            Lookup::Live(true)
+        )
     }
 
     /// Register the `AttachSessions` delivery route for one surface. This is
@@ -206,7 +308,9 @@ impl WakeRouterImpl {
         match self.bindings.map(key, |binding| match binding {
             DeliveryBinding::ConversationBridge => DeliveryRoute::ConversationBridge,
             DeliveryBinding::AttachSessions => DeliveryRoute::AttachSessions,
-            DeliveryBinding::ParkedNotify(_) => DeliveryRoute::Parked,
+            DeliveryBinding::ParkedNotify(_) | DeliveryBinding::WasmConsumer { .. } => {
+                DeliveryRoute::Parked
+            }
         }) {
             Lookup::Live(route) => route,
             Lookup::Retired => DeliveryRoute::Gone,
@@ -530,7 +634,10 @@ impl WakeRouter for WakeRouterImpl {
             // Notify the off-loop parked dispatch task (WASM consumer or system
             // component, e.g. the tool executor). The task holds an `Arc` clone;
             // `notify_one` sets its permit.
-            Lookup::Live(DeliveryBinding::ParkedNotify(notify)) => {
+            Lookup::Live(
+                DeliveryBinding::ParkedNotify(notify)
+                | DeliveryBinding::WasmConsumer { notify, .. },
+            ) => {
                 notify.notify_one();
             }
             Lookup::Live(DeliveryBinding::ConversationBridge) => {
@@ -660,7 +767,9 @@ impl WakeRouter for WakeRouterImpl {
             DeliveryBinding::ConversationBridge | DeliveryBinding::AttachSessions => {
                 DeliveryShape::Inline
             }
-            DeliveryBinding::ParkedNotify(_) => DeliveryShape::ParkedWake,
+            DeliveryBinding::ParkedNotify(_) | DeliveryBinding::WasmConsumer { .. } => {
+                DeliveryShape::ParkedWake
+            }
         }) {
             Lookup::Live(shape) => shape,
             // Retired: the row is parked with nobody behind it. `ParkedWake` is
@@ -1114,6 +1223,161 @@ mod tests {
         router
             .wake_owed(&conv_key(), &ParticipantId::for_conversation(42), false)
             .await;
+    }
+
+    // ── The native sync-call API ────────────────────────────────────────────
+
+    fn wasm_key(slug: &str) -> SubscriberEntryKind {
+        SubscriberEntryKind::Wasm(slug.to_string())
+    }
+
+    /// A live `WasmConsumer` arm hands the request to whoever holds the
+    /// receiver and answers with what that side sends back. This is the whole
+    /// resolution the router owns; what the consumer's loop then does with the
+    /// request is the dispatch crate's own suite.
+    #[tokio::test]
+    async fn sync_call_on_a_live_consumer_sends_and_awaits() {
+        let router = Arc::new(WakeRouterImpl::new(ActiveBridges::new()));
+        let (sync, mut requests) = brenn_wasm_dispatch::sync_request_channel();
+        router.register_delivery_binding(
+            wasm_key("geo"),
+            DeliveryBinding::WasmConsumer {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                sync,
+            },
+        );
+
+        let served = tokio::spawn(async move {
+            let request = requests.recv().await.expect("the call arrives");
+            assert_eq!(request.port, "resolve");
+            assert_eq!(request.body, "{\"q\":\"pier\"}");
+            assert_eq!(request.chain, vec!["menu".to_string()]);
+            request
+                .reply
+                .send(SyncAnswer::Ok(Some("answered".to_string())))
+                .expect("the caller is still waiting");
+        });
+
+        let answer = router
+            .sync_call(
+                "geo",
+                "resolve",
+                "{\"q\":\"pier\"}".to_string(),
+                &["menu".to_string()],
+            )
+            .await;
+        assert_eq!(answer, SyncAnswer::Ok(Some("answered".to_string())));
+        served.await.expect("the serving task finished");
+    }
+
+    /// A slug nothing ever bound is not in service, which is the one fact the
+    /// caller needs.
+    #[tokio::test]
+    async fn sync_call_on_an_unbound_slug_is_unregistered() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        assert_eq!(
+            router
+                .sync_call("nobody", "resolve", String::new(), &[])
+                .await,
+            SyncAnswer::Refused(SyncRefusal::Unregistered)
+        );
+    }
+
+    /// A tombstone is the same fact: the consumer was here and left.
+    #[tokio::test]
+    async fn sync_call_on_a_retired_consumer_is_unregistered() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        let (sync, _requests) = brenn_wasm_dispatch::sync_request_channel();
+        router.register_delivery_binding(
+            wasm_key("geo"),
+            DeliveryBinding::WasmConsumer {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                sync,
+            },
+        );
+        router.retire_delivery_binding(&wasm_key("geo"));
+        assert_eq!(
+            router.sync_call("geo", "resolve", String::new(), &[]).await,
+            SyncAnswer::Refused(SyncRefusal::Unregistered)
+        );
+    }
+
+    /// The third way to get nothing: the binding is live but the task that held
+    /// the receiver has gone. The send fails, and it is the same fact again.
+    #[tokio::test]
+    async fn sync_call_with_a_dropped_receiver_is_unregistered() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        let (sync, requests) = brenn_wasm_dispatch::sync_request_channel();
+        router.register_delivery_binding(
+            wasm_key("geo"),
+            DeliveryBinding::WasmConsumer {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                sync,
+            },
+        );
+        drop(requests);
+        assert_eq!(
+            router.sync_call("geo", "resolve", String::new(), &[]).await,
+            SyncAnswer::Refused(SyncRefusal::Unregistered)
+        );
+    }
+
+    /// Nothing but a `WasmConsumer` is ever registered under a `Wasm` key, so
+    /// anything else there is a bootstrap wiring bug rather than a refusal to
+    /// hand back.
+    #[tokio::test]
+    #[should_panic(expected = "bootstrap wiring bug")]
+    async fn sync_call_on_a_parked_notify_under_a_wasm_key_panics() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.register_delivery_binding(
+            wasm_key("geo"),
+            DeliveryBinding::ParkedNotify(Arc::new(tokio::sync::Notify::new())),
+        );
+        let _ = router.sync_call("geo", "resolve", String::new(), &[]).await;
+    }
+
+    /// A `WasmConsumer` arm routes and shapes as `Parked`/`ParkedWake`: its
+    /// rows are served by its own task, not the shared dispatch loop.
+    #[test]
+    fn a_wasm_consumer_arm_routes_and_shapes_exactly_as_a_parked_notify_does() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        let (sync, _requests) = brenn_wasm_dispatch::sync_request_channel();
+        router.register_delivery_binding(
+            wasm_key("geo"),
+            DeliveryBinding::WasmConsumer {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                sync,
+            },
+        );
+        assert!(matches!(
+            router.delivery_route(&wasm_key("geo")),
+            DeliveryRoute::Parked
+        ));
+        assert_eq!(
+            router.delivery_shape(&wasm_key("geo")),
+            DeliveryShape::ParkedWake
+        );
+    }
+
+    /// The wake half of the new arm is the old one: a consumer is woken by a
+    /// `notify_one` on the handle its task parks on, exactly as a system
+    /// subscriber still is.
+    #[tokio::test]
+    async fn a_wasm_consumer_arm_wakes_through_its_notify() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (sync, _requests) = brenn_wasm_dispatch::sync_request_channel();
+        router.register_delivery_binding(
+            wasm_key("geo"),
+            DeliveryBinding::WasmConsumer {
+                notify: Arc::clone(&notify),
+                sync,
+            },
+        );
+        router.spawn_eager_wake(&wasm_key("geo"), &ParticipantId::for_wasm("geo"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the consumer's task was woken");
     }
 
     /// `deliver` for a parked (`wasm:`) subscriber panics — reaching it is a

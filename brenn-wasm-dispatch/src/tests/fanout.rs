@@ -210,22 +210,10 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
     let (alert_dispatcher, captured_alerts, alert_handle) = make_capturing_alerter_with_severity();
     let _db = tempfile::NamedTempFile::new().unwrap();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let notify = Arc::new(Notify::new());
     let cfg = WasmConsumerConfig {
@@ -239,14 +227,15 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
             sub: ResolvedSubscription {
                 channel_uuid: channel.uuid,
                 channel_address: channel.address.clone(),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                 noise: NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
         }],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 

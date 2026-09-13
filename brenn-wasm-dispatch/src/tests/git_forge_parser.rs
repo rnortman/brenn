@@ -151,23 +151,14 @@ async fn build_parser_setup(
     output_ports.insert("push-events".to_string(), test_out_spec(out_addr));
 
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(GIT_FORGE_PARSER_WASM),
-        slug,
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: amp,
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports, ComponentGrant::Log]
             .into_iter()
             .collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(GIT_FORGE_PARSER_WASM), slug)
     }));
     let notify = Arc::new(Notify::new());
     let cfg = WasmConsumerConfig {
@@ -182,8 +173,8 @@ async fn build_parser_setup(
                 sub: ResolvedSubscription {
                     channel_uuid: forgejo_entry.uuid,
                     channel_address: forgejo_entry.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -194,8 +185,8 @@ async fn build_parser_setup(
                 sub: ResolvedSubscription {
                     channel_uuid: github_entry.uuid,
                     channel_address: github_entry.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -203,6 +194,7 @@ async fn build_parser_setup(
             },
         ],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 

@@ -825,6 +825,8 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
         package: "colliding".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![ComponentGrant::Mqtt],
         store_path: None,
         store_size_limit: None,
@@ -847,6 +849,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     };
 
     let config = BrennConfig {

@@ -396,6 +396,12 @@ impl DomHost {
     /// The closure is `forget`ed either way — one leaked slot per abandoned
     /// listener, which is not the steady state of any rendering pattern.
     ///
+    /// `port` must be one the instance's specification declares `sync`; anything
+    /// else traps the activation, as a publish to an undeclared port does. The
+    /// check is here rather than at the gesture because the trap has to name the
+    /// mistake where it was made: a listener installed on a name nothing can
+    /// answer would fail silently, once per gesture, forever.
+    ///
     /// Nothing about the activation happens here. The listener runs later, on the
     /// browser's own event stack, which is the whole reason the sync door exists.
     pub fn listen(
@@ -406,6 +412,15 @@ impl DomHost {
         port: &str,
     ) -> Result<(), String> {
         self.granted(instance, ComponentGrant::Dom, "dom.listen")?;
+        // A `let`-temporary for the same reason `granted` takes one: the borrow
+        // must not be live across anything that can re-enter the core.
+        let declared = self.core.borrow().declares_sync_port(instance, port);
+        if !declared {
+            return Err(format!(
+                "dom: instance {instance} listens on port {port:?}, which its specification does \
+                 not declare `sync`"
+            ));
+        }
         let element = self.element(instance, node)?;
         let host = Rc::clone(self);
         let instance = instance.to_string();

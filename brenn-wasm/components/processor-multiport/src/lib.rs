@@ -17,10 +17,17 @@
 //                 disposition arm: a host quarantines what an activation
 //                 consumed, and a mount that consumed nothing has nothing to
 //                 name.
-//   "__reply__" — buffers one publish, then answers the activation. Only a
-//                 sync-call activation may be answered and no backend
-//                 activation is one, so a host that reads this ok flushes a
-//                 buffer it should have discarded.
+//   "__reply__" — buffers one publish, then answers the activation with the
+//                 same per-port summary an ordinary activation publishes. Only
+//                 a sync-call activation may be answered, so on an async one a
+//                 host that reads this ok flushes a buffer it should have
+//                 discarded; on a sync one the summary is how a case reads back
+//                 what the request's activation was windowed.
+//   "__long_reply__" — answers with a reply far past any deployment's body cap,
+//                 buffering nothing first. A reply is capped like a publish
+//                 body, and this is the shape that reaches the cap with an
+//                 empty buffer behind it, so the trap under test is the cap's
+//                 and not a refused publish upstream of it.
 //
 // This fixture makes activation count and multi-port window composition directly
 // assertable from the output channel: one summary per activation, with per-port
@@ -50,6 +57,7 @@ impl Processor for ProcessorMultiport {
         let windows: Vec<_> = activation.port_windows().collect();
 
         let mut summary_parts: Vec<PortSummary<'_>> = Vec::with_capacity(windows.len());
+        let mut answering = false;
         for window in &windows {
             // Checked over context rather than new, so an activation carrying
             // nothing new can still fail: that is the only way to reach the
@@ -78,13 +86,10 @@ impl Processor for ProcessorMultiport {
                     ));
                 }
                 if env.body == "__reply__" {
-                    // A reply answers a sync-call activation, and no backend
-                    // activation is one. The host must trap this rather than
-                    // read it as an ok and flush the buffer — so the buffer is
-                    // deliberately non-empty when the reply is returned, which
-                    // is what makes the discard observable rather than vacuous.
-                    publish("out", "buffered-before-reply")?;
-                    return Ok(Some(String::from("unasked-for reply")));
+                    answering = true;
+                }
+                if env.body == "__long_reply__" {
+                    return Ok(Some("x".repeat(4096)));
                 }
             }
             // Count context envelopes through `context_envelopes()` to exercise
@@ -104,6 +109,14 @@ impl Processor for ProcessorMultiport {
 
         let json = serde_json::to_string(&summary_parts)
             .map_err(|e| Error::failed(format!("serialize summary: {e}")))?;
+        if answering {
+            // The buffer is deliberately non-empty beside the answer: on an
+            // async activation that is what makes the host's discard observable
+            // rather than vacuous, and on a sync one it is what makes
+            // flush-before-reply observable.
+            publish("out", "buffered-before-reply")?;
+            return Ok(Some(json));
+        }
         publish("out", &json)?;
         Ok(None)
     }

@@ -40,6 +40,7 @@ bindgen!({
 pub use brenn::replay::store::StoreError;
 pub use brenn::replay::types::Header;
 
+use brenn_activation::sync::CallDisposition;
 use brenn_common::sanitize_untrusted_str;
 
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
@@ -671,16 +672,20 @@ mod processor_bindings {
         with: {
             "brenn:processor/store.transaction": crate::store::Transaction,
         },
-        // The `ports` entry points are the only imports that can end an
-        // activation rather than answer it: a publish naming a port the
-        // component's specification does not declare is a contract violation, and
-        // the host traps instead of refusing call by call. Every other interface
-        // keeps the plain result signature.
-        imports: { "brenn:processor/ports": trappable },
+        // `ports` and `calls` are the imports that can end an activation rather
+        // than answer it: naming a port the component's specification does not
+        // declare is a contract violation, and the host traps instead of
+        // refusing call by call. Every other interface keeps the plain result
+        // signature.
+        imports: {
+            "brenn:processor/ports": trappable,
+            "brenn:processor/calls": trappable,
+        },
     });
 }
 
 use processor_bindings::ProcessorPre;
+use processor_bindings::brenn::processor::calls::CallError as CallWitError;
 use processor_bindings::brenn::processor::mqtt::MqttPublishError as MqttPublishWitError;
 use processor_bindings::brenn::processor::ports::DeferError;
 use processor_bindings::brenn::processor::ports::PublishError;
@@ -847,6 +852,35 @@ pub trait ToolHost: Send + Sync {
 /// linked; `None` = no tool surface (the interface is then unlinked and the host
 /// fns unreachable, so `None` is a structural backstop, like `mqtt_publish`).
 pub type ToolHostFn = Arc<dyn ToolHost>;
+
+/// One `call` port of a component, resolved to the peer it reaches.
+///
+/// The document is the only source of call wiring, so this table is complete:
+/// a declared port absent from it is one the deployer left unbound, and the
+/// guest is answered `unwired`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessorCallTarget {
+    /// The peer consumer's slug, as the host looks it up.
+    pub target_slug: String,
+    /// The peer's declared `sync` port that answers.
+    pub target_port: String,
+}
+
+/// Host callback performing one synchronous call to a peer component.
+///
+/// The seam between this crate and whatever owns the other consumers: it takes
+/// the target slug and port, the request body, and the call chain the callee
+/// must be handed, and answers with [`SyncAnswer`]. Blocking is the caller's
+/// business — the guest is already stopped on the stack, and the backend runs
+/// every activation on a blocking thread.
+///
+/// Contract: it MUST NOT panic on guest-supplied input. A body the callee
+/// cannot take, a peer that is gone, a peer that trapped — each is a
+/// [`SyncAnswer`] variant, never a panic, because [`ProcessorData::do_call`]
+/// invokes it without a `catch_unwind` boundary. Same seam as
+/// [`MqttPublishFn`] and [`ToolHostFn`].
+pub type SyncCallerFn =
+    Arc<dyn Fn(&str, &str, String, &[String]) -> brenn_activation::sync::SyncAnswer + Send + Sync>;
 
 /// Cap + debug-escape a guest-controlled port name for safe logging, using the
 /// `{:?}`-quoted form.
@@ -1215,11 +1249,23 @@ pub enum SinkKey {
 /// `(amplification_mt, new_count)` pairs off the wasmtime host's windows. A
 /// window port absent from `amplification_mt` is a host invariant violation
 /// (windows are built from the same config that populates the map) — panic.
+///
+/// A sync-call activation's request window is the one window no binding backs:
+/// it is fabricated around the caller's request rather than read off a channel,
+/// so it names no bound input and carries no amplification. It grants nothing.
+/// A caller's own `call` is weighed against the *caller's* budget, which is
+/// where a chain's amplification is bounded; granting the callee for being
+/// asked would let a pair of components mint budget by calling each other.
 fn compute_grant_input_mt(
     amplification_mt: &HashMap<String, u64>,
     activation: &ProcessorActivation,
 ) -> u64 {
-    brenn_budget::grant_input_mt(activation.ports.iter().map(|pw| {
+    let sync = activation.sync.as_deref();
+    let windows = activation
+        .ports
+        .iter()
+        .filter(move |pw| Some(pw.port.as_str()) != sync);
+    brenn_budget::grant_input_mt(windows.map(|pw| {
         let amp = amplification_mt.get(&pw.port).copied().unwrap_or_else(|| {
             panic!(
                 "host invariant: no amplification for activation window port {:?}",
@@ -1264,6 +1310,11 @@ pub enum ProcessorOutcome {
     Ok {
         publishes: Vec<ProcessorPublish>,
         deferred_ops: Vec<ProcessorDeferredOp>,
+        /// The reply, on a sync-call activation the guest answered with one.
+        /// `None` on every async activation — the world admits a reply only
+        /// where a caller asked for it — and on a sync call the guest answered
+        /// without one.
+        reply: Option<String>,
     },
     /// Guest returned `result::err` — typed batch rejection.
     Err(ProcessorReceiveError),
@@ -1349,6 +1400,34 @@ struct ProcessorData {
     /// buffer time. Populated in `invoke` before the guest runs; a port absent
     /// here (unbound, or one that carried no deferred window) admits no index.
     deferred_index_bounds: HashMap<String, u32>,
+    /// Host seam for the `calls` interface. `None` when the component lacks the
+    /// `Calls` grant; the host fn is then unreachable (the interface is
+    /// unlinked), so `None` is a structural backstop rather than a live path.
+    sync_caller: Option<SyncCallerFn>,
+    /// This component's declared `call` port vocabulary. A name outside it is
+    /// the component contradicting the specification its artifact is
+    /// hash-bound to, and traps the activation.
+    declared_call_ports: Arc<std::collections::BTreeSet<String>>,
+    /// Declared `call` port → the peer it is wired to. A declared port absent
+    /// here is unbound, and its caller is answered `unwired`.
+    calls: Arc<HashMap<String, ProcessorCallTarget>>,
+    /// The chain the callee of any call made from this activation is handed:
+    /// every slug already running above it, this component last. A peer finding
+    /// itself in it is a cycle the document was supposed to refuse.
+    call_chain: Arc<Vec<String>>,
+    /// When this activation's store was built. Paired with
+    /// [`blocked`](Self::blocked) to charge the epoch deadline to the caller's
+    /// own running time rather than to a peer's.
+    activation_start: Instant,
+    /// How long this activation has been stopped inside `calls.call` waiting on
+    /// a peer. The epoch-deadline callback subtracts it from elapsed wall time,
+    /// so a caller is never charged for a slow callee.
+    blocked: std::time::Duration,
+    /// How much running time of its own this activation is allowed, as the
+    /// deadline it was armed with. Read by the epoch-deadline callback, which
+    /// re-arms the remainder rather than the whole; a test hatch that arms a
+    /// shorter deadline overrides this so the two stay one number.
+    epoch_budget: std::time::Duration,
 }
 
 impl ProcessorData {
@@ -1363,6 +1442,23 @@ impl ProcessorData {
 
 // --- ports::Host impl ---
 
+/// How many further epoch ticks an activation that has run `own` of its
+/// `budget` is owed, or `None` when the budget is spent.
+///
+/// Rounded up: a remainder under one tick is still time the activation has not
+/// spent, and a zero-tick extension would re-enter the deadline callback without
+/// the guest making progress.
+fn epoch_extension(own: std::time::Duration, budget: std::time::Duration) -> Option<u64> {
+    let left = budget.checked_sub(own)?;
+    if left.is_zero() {
+        return None;
+    }
+    Some(
+        left.as_millis()
+            .div_ceil(u128::from(PROCESSOR_EPOCH_TICK_MS)) as u64,
+    )
+}
+
 /// A gate verdict as the guest sees it on the publish path.
 ///
 /// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
@@ -1371,6 +1467,22 @@ fn publish_error(refusal: GateRefusal) -> PublishError {
     match publish_refusal_kind(refusal) {
         RefusalKind::InvalidPayload(detail) => PublishError::InvalidPayload(detail),
         RefusalKind::QuotaExceeded => PublishError::QuotaExceeded,
+        RefusalKind::InvalidDeliverAfter => {
+            unreachable!("publish_refusal_kind never answers invalid-deliver-after")
+        }
+    }
+}
+
+/// A gate verdict as the guest sees it on the peer-call path.
+///
+/// The classification is [`brenn_budget::publish_refusal_kind`], shared with the
+/// publish path above and with the surface kernel: a call's payload becomes the
+/// one envelope in the callee's window, so it is judged — and spelled to the
+/// guest — exactly as a published body is.
+fn call_error(refusal: GateRefusal) -> CallWitError {
+    match publish_refusal_kind(refusal) {
+        RefusalKind::InvalidPayload(detail) => CallWitError::InvalidPayload(detail),
+        RefusalKind::QuotaExceeded => CallWitError::QuotaExceeded,
         RefusalKind::InvalidDeliverAfter => {
             unreachable!("publish_refusal_kind never answers invalid-deliver-after")
         }
@@ -1612,6 +1724,81 @@ impl ProcessorData {
         std::mem::take(&mut self.deferred_op_buffer)
     }
 
+    /// One synchronous call to a peer component (the `calls.call` import).
+    ///
+    /// The outer `wasmtime::Result` is the host's verdict on whether the
+    /// activation may continue: a port outside the component's declared `call`
+    /// vocabulary takes the outer `Err` and ends it, exactly as an undeclared
+    /// publish port does. Everything else the guest sees as a `call-error`.
+    ///
+    /// Not transactional with the caller's outcome: the peer's activation runs
+    /// to completion and its ok flushes its own buffer before this returns.
+    fn do_call(
+        &mut self,
+        port: String,
+        payload: String,
+    ) -> wasmtime::Result<Result<Option<String>, CallWitError>> {
+        // A name the specification never declared is the component
+        // contradicting the artifact it is hash-bound to.
+        if !self.declared_call_ports.contains(&port) {
+            return Err(undeclared_port_trap(&self.slug, &port));
+        }
+        // Per-activation total-call budget, shared with `do_publish` and
+        // `do_mqtt_publish`: one counter bounds how many of all three this
+        // activation makes. It does not make a call as cheap as a publish — a
+        // call runs a whole peer activation, uncoalesced and with the peer's own
+        // budgets — so what is bounded here is the number of peers this
+        // activation raises. Charged first, and a refused call consumes budget
+        // too, exactly as on those paths.
+        if let Err(refusal) = self.gate.charge_call() {
+            return Ok(Err(call_error(refusal)));
+        }
+        // The payload becomes the one envelope in the callee's fabricated
+        // window, so it takes the same cap a publish body does.
+        let cap = self.gate.max_body_bytes();
+        if !brenn_activation::sync::within_body_cap(&payload, cap) {
+            return Ok(Err(call_error(GateRefusal::BodyTooLarge {
+                len: payload.len(),
+                max: cap,
+            })));
+        }
+        // A declared port the deployer left unbound reaches nobody. That is a
+        // deployment fact, not a guest bug, so it is answered and not trapped.
+        let Some(target) = self.calls.get(&port) else {
+            return Ok(Err(CallWitError::Unwired));
+        };
+        let target_slug = target.target_slug.clone();
+        let target_port = target.target_port.clone();
+
+        // The callback is `Some` iff the `Calls` capability is linked (the host
+        // fn is unreachable otherwise). `.expect` is the structural backstop,
+        // like `mqtt_publish` — linker gating is the real gate.
+        let caller = self.sync_caller.as_ref().expect(
+            "calls.call host fn invoked without a sync_caller callback (Calls grant linked \
+             but callback unset)",
+        );
+        let chain = Arc::clone(&self.call_chain);
+        // The guest is stopped on this stack for the whole wait. Charge it to
+        // `blocked` so the epoch deadline measures this activation's own
+        // running time and not a peer's queue position, pacing delay or run.
+        let waited_from = Instant::now();
+        let answer = caller(&target_slug, &target_port, payload, &chain);
+        self.blocked += waited_from.elapsed();
+
+        // Which of the two words a non-reply is belongs to the answer's own
+        // crate: both hosts speak one `SyncAnswer`, so a peer state a caller
+        // cannot distinguish must not be two different `call-error`s depending
+        // on where the caller was placed. This host lifts its bindgen type from
+        // the disposition and decides nothing further.
+        Ok(
+            match brenn_activation::sync::call_disposition(answer, &self.slug, &port) {
+                Ok(reply) => Ok(reply),
+                Err(CallDisposition::Failed) => Err(CallWitError::Failed),
+                Err(CallDisposition::Refused) => Err(CallWitError::Refused),
+            },
+        )
+    }
+
     /// Synchronous MQTT publish (the `mqtt.mqtt-publish` import).
     ///
     /// Unlike `do_publish` (buffered, flushed at activation end), this reaches
@@ -1845,6 +2032,20 @@ impl ProcessorData {
 fn bind_ports(data: &mut ProcessorData, ports: HashMap<String, OutputPortSpec>) {
     data.declared_out_ports = Arc::new(ports.keys().cloned().collect());
     data.output_ports = Arc::new(ports);
+}
+
+/// The one `calls` entry point is a trappable import: the outer
+/// `wasmtime::Result` is the host's own verdict on whether the activation may
+/// continue, and the inner result is what the guest sees. Only a call naming a
+/// port outside the component's declared vocabulary takes the outer `Err`.
+impl processor_bindings::brenn::processor::calls::Host for ProcessorData {
+    fn call(
+        &mut self,
+        port: String,
+        payload: String,
+    ) -> wasmtime::Result<Result<Option<String>, CallWitError>> {
+        self.do_call(port, payload)
+    }
 }
 
 // --- mqtt::Host impl ---
@@ -2471,6 +2672,10 @@ fn add_capability_to_linker(
             _,
             HasSelf<ProcessorData>,
         >(linker, |d| d),
+        ComponentGrant::Calls => processor_bindings::brenn::processor::calls::add_to_linker::<
+            _,
+            HasSelf<ProcessorData>,
+        >(linker, |d| d),
         // Callers must not pass a word that names no interface.
         ComponentGrant::Takeover => unreachable!("`takeover` links no interface"),
         // Callers must not pass a word this host cannot implement. Both are
@@ -2540,6 +2745,61 @@ pub struct ProcessorLoadSpec<'a> {
     /// when the `Tools` capability is not linked, so `None` is a structural
     /// backstop.
     pub tool_host: Option<ToolHostFn>,
+    /// Every port name the component's specification declares `call`. A call to
+    /// a name in it that `calls` does not wire is answered `unwired`; a name
+    /// outside it traps the activation.
+    pub declared_call_ports: std::collections::BTreeSet<String>,
+    /// The resolved `call` wiring: declared port → the peer it reaches. A subset
+    /// of `declared_call_ports`' names, asserted so at load.
+    pub calls: HashMap<String, ProcessorCallTarget>,
+    /// Host seam for the `calls` interface. `Some` iff the component has the
+    /// `Calls` grant; `None` = no peer-call surface. The caller (bootstrap)
+    /// enforces the invariant; the host fn is unreachable when the `Calls`
+    /// capability is not linked, so `None` is a structural backstop.
+    pub sync_caller: Option<SyncCallerFn>,
+}
+
+impl<'a> ProcessorLoadSpec<'a> {
+    /// The spec of a component that imports nothing and is wired to nothing:
+    /// every capability seam absent, every table empty, the store closed.
+    ///
+    /// Every default is the deny-by-default answer — no grants, no peer caller,
+    /// no MQTT, no tools, no store, an allow-all output ACL over an empty port
+    /// table (which wires nothing) and an alerter that drops.
+    ///
+    /// Not a `Default` impl: a component has no meaningful path or slug, and a
+    /// `..Default::default()` that silently supplied "" for both would turn a
+    /// forgotten field into a component that loads as somebody else.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn minimal(component_path: &'a Path, slug: &'a str) -> Self {
+        /// Drops every guest alert: a fixture that means to read one passes its
+        /// own.
+        struct SilentAlerter;
+        impl ProcessorAlerter for SilentAlerter {
+            fn alert(&self, _severity: GuestAlertSeverity, _title: &str, _body: &str) {}
+        }
+        Self {
+            component_path,
+            slug,
+            output_ports: HashMap::new(),
+            declared_out_ports: std::collections::BTreeSet::new(),
+            input_amplification_mt: HashMap::new(),
+            mqtt_sinks: HashMap::new(),
+            config: HashMap::new(),
+            grants: std::collections::BTreeSet::new(),
+            store_path: None,
+            max_page_count: crate::store::DEFAULT_MAX_PAGE_COUNT,
+            max_payload_bytes: 1024 * 1024,
+            alerter: Arc::new(SilentAlerter),
+            output_acl: Arc::new(|_| true),
+            mqtt_publish: None,
+            tool_host: None,
+            declared_call_ports: std::collections::BTreeSet::new(),
+            calls: HashMap::new(),
+            sync_caller: None,
+        }
+    }
 }
 
 /// A component's KV store: where it lives, and the handle once it is open.
@@ -2624,6 +2884,13 @@ pub struct ProcessorComponent {
     /// `None` when the component lacks the `Tools` grant (the `tools` interface is
     /// then unlinked and the host fns unreachable).
     tool_host: Option<ToolHostFn>,
+    /// The specification's declared `call` port vocabulary.
+    declared_call_ports: Arc<std::collections::BTreeSet<String>>,
+    /// Declared `call` port → the peer the document wired it to.
+    calls: Arc<HashMap<String, ProcessorCallTarget>>,
+    /// `None` when the component lacks the `Calls` grant (the `calls` interface
+    /// is then unlinked and the host fn unreachable).
+    sync_caller: Option<SyncCallerFn>,
 }
 
 /// The store resource limiter every processor activation runs under.
@@ -2760,6 +3027,28 @@ impl ProcessorComponent {
             },
         );
 
+        // Invariant: the sync-caller seam and the Calls grant must agree, on
+        // the same terms and for the same reason as the two above — a linked
+        // `calls` interface without a caller would `.expect`-panic at the first
+        // guest call.
+        assert_eq!(
+            spec.sync_caller.is_some(),
+            spec.grants.contains(&ComponentGrant::Calls),
+            "component {}: sync_caller seam ({}) and Calls grant ({}) must both be set or both \
+             absent",
+            spec.slug,
+            if spec.sync_caller.is_some() {
+                "Some"
+            } else {
+                "None"
+            },
+            if spec.grants.contains(&ComponentGrant::Calls) {
+                "granted"
+            } else {
+                "not granted"
+            },
+        );
+
         let component = Component::from_file(&engine, spec.component_path).unwrap_or_else(|e| {
             panic!(
                 "failed to load processor component from {}: {e}\n\
@@ -2843,6 +3132,20 @@ impl ProcessorComponent {
             publish_carry.insert(SinkKey::MqttClient(client.clone()), 0);
         }
 
+        // Same rule on the call side: a wired port outside the declared
+        // vocabulary would be reachable by the host and unreachable by the
+        // guest, which traps on it. Config resolution refuses it; asserted
+        // again because a hand-built load spec does not pass through that.
+        for port in spec.calls.keys() {
+            assert!(
+                spec.declared_call_ports.contains(port),
+                "processor {}: call port {port:?} is wired but is not in the component's \
+                 declared call vocabulary {:?}",
+                spec.slug,
+                spec.declared_call_ports,
+            );
+        }
+
         Self {
             engine,
             processor_pre,
@@ -2859,6 +3162,9 @@ impl ProcessorComponent {
             output_acl: spec.output_acl,
             mqtt_publish: spec.mqtt_publish,
             tool_host: spec.tool_host,
+            declared_call_ports: Arc::new(spec.declared_call_ports),
+            calls: Arc::new(spec.calls),
+            sync_caller: spec.sync_caller,
         }
     }
 
@@ -2949,6 +3255,7 @@ impl ProcessorComponent {
         &self,
         total_envelope_count: usize,
         publish_budget_by_sink: HashMap<SinkKey, u64>,
+        call_chain: Vec<String>,
     ) -> Store<ProcessorData> {
         let limits = processor_store_limits();
         let mut store = Store::new(
@@ -2974,6 +3281,15 @@ impl ProcessorComponent {
                 tool_call_count: 0,
                 deferred_op_buffer: Vec::new(),
                 deferred_index_bounds: HashMap::new(),
+                sync_caller: self.sync_caller.clone(),
+                declared_call_ports: Arc::clone(&self.declared_call_ports),
+                calls: Arc::clone(&self.calls),
+                call_chain: Arc::new(call_chain),
+                activation_start: Instant::now(),
+                blocked: std::time::Duration::ZERO,
+                // Overwritten by `arm_epoch` below, which is the only thing that
+                // sets this field and the deadline it must agree with.
+                epoch_budget: std::time::Duration::ZERO,
             },
         );
         store.limiter(|d| &mut d.limits);
@@ -2982,8 +3298,40 @@ impl ProcessorComponent {
         store
             .set_fuel(fuel)
             .unwrap_or_else(|e| panic!("failed to set fuel on processor store: {e}"));
-        store.set_epoch_deadline(PROCESSOR_EPOCH_DEADLINE_TICKS);
+        Self::arm_epoch(&mut store, PROCESSOR_EPOCH_DEADLINE_TICKS);
         store
+    }
+
+    /// Arm this store's epoch deadline at `ticks`, and record the same number as
+    /// the activation's own time budget.
+    ///
+    /// The two are one fact in two currencies — wasmtime counts ticks, the
+    /// deadline callback below reasons in wall time — and nothing outside this
+    /// function may set either, because a store whose `epoch_budget` disagrees
+    /// with the deadline it was armed with either runs past the one hard time
+    /// bound this host has against a runaway component, or traps early for no
+    /// visible reason. Both are silent.
+    ///
+    /// The deadline bounds this activation's *own* running time. It is armed in
+    /// wall-clock ticks against a free-running engine epoch, so a caller stopped
+    /// inside `calls.call` would otherwise spend its budget on a peer's pacing
+    /// delay, queue position and run — recursively down a chain, with the
+    /// outermost caller trapping for somebody else's work. When the deadline
+    /// fires, give back whatever the activation spent blocked and let it run on;
+    /// a chain's total wall time is still bounded by depth × the deadline, and
+    /// the document's acyclicity bounds depth.
+    fn arm_epoch(store: &mut Store<ProcessorData>, ticks: u64) {
+        store.set_epoch_deadline(ticks);
+        store.data_mut().epoch_budget =
+            std::time::Duration::from_millis(PROCESSOR_EPOCH_TICK_MS * ticks);
+        store.epoch_deadline_callback(|store| {
+            let data = store.data();
+            let own = data.activation_start.elapsed().saturating_sub(data.blocked);
+            Ok(match epoch_extension(own, data.epoch_budget) {
+                Some(ticks) => wasmtime::UpdateDeadline::Continue(ticks),
+                None => wasmtime::UpdateDeadline::Interrupt,
+            })
+        });
     }
 
     /// Invoke the component's `receive` export with `activation`.
@@ -2993,11 +3341,28 @@ impl ProcessorComponent {
     /// and `ProcessorOutcome::Trap` on a guest trap or resource exhaustion — does NOT
     /// panic on a trap (contained, alerted by caller).
     pub fn handle(&self, activation: ProcessorActivation) -> ProcessorOutcome {
+        self.handle_in_chain(activation, Vec::new())
+    }
+
+    /// [`handle`](Self::handle) with the call chain this activation was reached
+    /// through, caller-first and excluding this component.
+    ///
+    /// A sync-call activation carries its requester's chain; an async one
+    /// carries none. Either way this component is appended before the guest
+    /// runs, so a peer it calls is handed the whole stack above it and can
+    /// recognize a cycle the document was supposed to refuse.
+    pub fn handle_in_chain(
+        &self,
+        activation: ProcessorActivation,
+        inbound_chain: Vec<String>,
+    ) -> ProcessorOutcome {
         let total_envelopes: usize = activation.ports.iter().map(|pw| pw.envelopes.len()).sum();
         let grant_input_mt = compute_grant_input_mt(&self.input_amplification_mt, &activation);
         let mut carry = self.lock_carry_for_activation();
         let budgets = self.seed_publish_budgets(&carry, grant_input_mt);
-        let store = self.make_store(total_envelopes, budgets);
+        let mut chain = inbound_chain;
+        chain.push(self.slug.to_string());
+        let store = self.make_store(total_envelopes, budgets, chain);
         Self::invoke(store, activation, &self.processor_pre, &mut carry)
     }
 
@@ -3047,11 +3412,13 @@ impl ProcessorComponent {
         let grant_input_mt = compute_grant_input_mt(&self.input_amplification_mt, &activation);
         let mut carry = self.lock_carry_for_activation();
         let budgets = self.seed_publish_budgets(&carry, grant_input_mt);
-        let mut store = self.make_store(0, budgets);
+        let mut store = self.make_store(0, budgets, vec![self.slug.to_string()]);
         store
             .set_fuel(fuel)
             .unwrap_or_else(|e| panic!("handle_with_limits: set_fuel: {e}"));
-        store.set_epoch_deadline(epoch_deadline);
+        // The override is the whole budget for this activation, so the deadline
+        // and the budget the callback re-arms against move together.
+        Self::arm_epoch(&mut store, epoch_deadline);
         Self::invoke(store, activation, &self.processor_pre, &mut carry)
     }
 
@@ -3076,7 +3443,7 @@ impl ProcessorComponent {
         let grant_input_mt = compute_grant_input_mt(&self.input_amplification_mt, &activation);
         let mut carry = self.lock_carry_for_activation();
         let budgets = self.seed_publish_budgets(&carry, grant_input_mt);
-        let mut store = self.make_store(total_envelopes, budgets);
+        let mut store = self.make_store(total_envelopes, budgets, vec![self.slug.to_string()]);
         // Override the memory_size limit on the already-constructed store's ProcessorData.
         // StoreLimits is not mutable after construction; instead we replace the entire limits
         // field. The rest of the store settings (fuel, epoch, etc.) come from make_store.
@@ -3096,16 +3463,11 @@ impl ProcessorComponent {
         carry: &mut HashMap<SinkKey, u64>,
     ) -> ProcessorOutcome {
         let activation_now = activation.now;
-        // A headless processor has no cause that could ever be sync — no element,
-        // no DOM event, and a timer is an ordinary deferred self-publish. So a
-        // sync-call activation reaching here is not a shape to degrade into an
-        // async one; it is a caller that built something this host cannot
-        // honestly deliver. The world carries the field, and this host always
-        // lowers `none` into it.
-        assert!(
-            activation.sync.is_none(),
-            "wasm host: a sync-call activation cannot be lowered into the processor world"
-        );
+        // The sync-call activation is one shape on both hosts. What a backend
+        // host has that a page does not is a *cause* — a browser gesture — and
+        // that difference is upstream of here: this lowers whatever the caller
+        // assembled, and a `some` means somebody is blocked on the reply.
+        let activation_sync = activation.sync.clone();
         let wit_ports: Vec<_> = activation
             .ports
             .into_iter()
@@ -3152,7 +3514,7 @@ impl ProcessorComponent {
             ports: wit_ports,
             deferred: wit_deferred,
             now: activation_now,
-            sync: None,
+            sync: activation_sync.clone(),
         };
         let instance = match processor_pre.instantiate(&mut store) {
             Ok(i) => i,
@@ -3163,15 +3525,31 @@ impl ProcessorComponent {
             Err(e) => return ProcessorOutcome::Trap(format!("instantiation failed: {e:#}")),
         };
         let outcome = match instance.call_receive(&mut store, &wit_activation) {
-            // A reply answers a sync-call activation, and this host mints none:
-            // `sync` is asserted `None` above. So a `some` here is a guest that
-            // answered a cause that asked nothing, and reading its ok would flush
-            // a buffer built under a misapprehension — the same rule the page
-            // host applies, applied where it can only ever fire one way.
-            Ok(Ok(Some(_))) => ProcessorOutcome::Trap(String::from(
+            // A reply answers a sync-call activation and nothing else. A `some`
+            // on an async one is a guest that answered a cause that asked
+            // nothing, and reading its ok would flush a buffer built under a
+            // misapprehension — the same rule the page host applies.
+            Ok(Ok(Some(_))) if activation_sync.is_none() => ProcessorOutcome::Trap(String::from(
                 "receive replied to an activation that asked nothing",
             )),
-            Ok(Ok(None)) => {
+            // A reply is bounded by the same cap as a publish body, so a callee
+            // cannot hand a caller more than it could have published. Over it is
+            // a trap of the callee, which is what wrote it; truncating it or
+            // answering in its place would hand the caller something the callee
+            // never said.
+            Ok(Ok(Some(reply)))
+                if !brenn_activation::sync::within_body_cap(
+                    &reply,
+                    store.data().gate.max_body_bytes(),
+                ) =>
+            {
+                ProcessorOutcome::Trap(format!(
+                    "receive replied with {} bytes, over the {}-byte reply cap",
+                    reply.len(),
+                    store.data().gate.max_body_bytes()
+                ))
+            }
+            Ok(Ok(reply)) => {
                 // All buffers flush together, on Ok only. On Err/Trap this arm is
                 // never taken, so the buffers drop with the store below — a trapped
                 // activation therefore fires no port publish, no tool call, and no
@@ -3182,6 +3560,7 @@ impl ProcessorComponent {
                 ProcessorOutcome::Ok {
                     publishes,
                     deferred_ops,
+                    reply,
                 }
             }
             Ok(Err(re)) => ProcessorOutcome::Err(re),
@@ -3291,6 +3670,15 @@ impl ProcessorComponent {
         if let Some(store) = self.store.as_ref() {
             store.open(&self.store_holder());
         }
+    }
+
+    /// The deployment's body cap, as this component's host applies it.
+    ///
+    /// One number for every body that crosses this host's boundary in either
+    /// direction: a publish payload, a reply handed back out of a sync-call
+    /// activation, and the request body handed in to one.
+    pub fn max_payload_bytes(&self) -> usize {
+        self.max_payload_bytes
     }
 
     /// How this component names itself in a store panic.
@@ -3481,6 +3869,15 @@ mod processor_store_host_tests {
             tool_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
+            sync_caller: None,
+            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
+            calls: Arc::new(HashMap::new()),
+            call_chain: Arc::new(Vec::new()),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
         };
         (db, kv, data)
     }
@@ -3531,6 +3928,15 @@ mod processor_store_host_tests {
             tool_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
+            sync_caller: None,
+            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
+            calls: Arc::new(HashMap::new()),
+            call_chain: Arc::new(Vec::new()),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
         }
     }
 
@@ -4152,6 +4558,15 @@ mod processor_store_host_tests {
             tool_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
+            sync_caller: None,
+            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
+            calls: Arc::new(HashMap::new()),
+            call_chain: Arc::new(Vec::new()),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
         }
     }
 
@@ -4500,6 +4915,15 @@ mod processor_store_host_tests {
             tool_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
+            sync_caller: None,
+            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
+            calls: Arc::new(HashMap::new()),
+            call_chain: Arc::new(Vec::new()),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
         }
     }
 
@@ -4880,6 +5304,51 @@ mod processor_store_host_tests {
         );
     }
 
+    /// The fabricated request window of a sync-call activation grants nothing.
+    /// A caller's `call` is weighed against the caller's own budget, so granting
+    /// the callee for being asked is how a pair of components would mint budget
+    /// by calling each other.
+    #[test]
+    fn a_sync_request_window_grants_no_budget() {
+        let amp = HashMap::from([("a".to_string(), 1000u64)]);
+        let mut act = ProcessorActivation {
+            ports: vec![
+                ProcessorPortWindow {
+                    port: "a".to_string(),
+                    envelopes: (0..3).map(|i| i.to_string()).collect(),
+                    new_from: 0,
+                    dropped: 0,
+                },
+                ProcessorPortWindow {
+                    port: "ask".to_string(),
+                    envelopes: vec!["the request".to_string()],
+                    new_from: 0,
+                    dropped: 0,
+                },
+            ],
+            deferred: vec![],
+            now: None,
+            sync: Some("ask".to_string()),
+        };
+        assert_eq!(
+            compute_grant_input_mt(&amp, &act),
+            3000,
+            "the bound window's contribution alone"
+        );
+
+        // And a request window whose port *is* in the map still grants nothing:
+        // the filter is on the activation's own `sync` port, not on whether an
+        // amplification happens to be registered for the name.
+        let amp = HashMap::from([("a".to_string(), 1000u64), ("ask".to_string(), 9000u64)]);
+        assert_eq!(compute_grant_input_mt(&amp, &act), 3000);
+
+        // Without the request the same activation is the ordinary arithmetic —
+        // so the number above is the filter's doing and not an empty window's.
+        act.ports.pop();
+        act.sync = None;
+        assert_eq!(compute_grant_input_mt(&amp, &act), 3000);
+    }
+
     /// A window port absent from the amplification map is a host invariant
     /// violation — panic.
     #[test]
@@ -4952,6 +5421,15 @@ mod processor_store_host_tests {
             tool_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
+            sync_caller: None,
+            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
+            calls: Arc::new(HashMap::new()),
+            call_chain: Arc::new(Vec::new()),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
         };
         // Drain A.
         data.do_publish_declared("a".to_string(), "p".to_string(), None, None)
@@ -5152,6 +5630,306 @@ mod processor_store_host_tests {
     }
 }
 
+// ── calls::Host unit tests ────────────────────────────────────────────────────
+//
+// Direct trait-impl tests for `do_call` on ProcessorData: the host's three
+// dispositions for a named port (trap, `unwired`, reach the peer), the budget it
+// shares with publishes, and the `SyncAnswer` → `call-error` mapping.
+
+#[cfg(test)]
+mod epoch_extension_tests {
+    use std::time::Duration;
+
+    use super::{PROCESSOR_EPOCH_TICK_MS, epoch_extension};
+
+    /// The `Continue` arm is what gives a caller back the time it spent stopped
+    /// inside `calls.call`. An arm that never converges is an activation with no
+    /// time bound at all — a runaway component holding a blocking thread, which
+    /// the pacer does not cover because it delays and does not kill.
+    #[test]
+    fn an_activation_under_its_budget_is_extended_by_what_is_left() {
+        let budget = Duration::from_millis(PROCESSOR_EPOCH_TICK_MS * 10);
+        assert_eq!(
+            epoch_extension(Duration::ZERO, budget),
+            Some(10),
+            "nothing spent is the whole budget"
+        );
+        assert_eq!(
+            epoch_extension(Duration::from_millis(PROCESSOR_EPOCH_TICK_MS * 4), budget),
+            Some(6)
+        );
+    }
+
+    /// Rounded up, and never to zero: a zero-tick extension re-enters the
+    /// callback without the guest having made progress, which is a spin.
+    #[test]
+    fn a_remainder_under_one_tick_is_still_one_tick() {
+        let budget = Duration::from_millis(PROCESSOR_EPOCH_TICK_MS * 2);
+        let own = Duration::from_millis(PROCESSOR_EPOCH_TICK_MS * 2 - 1);
+        assert_eq!(epoch_extension(own, budget), Some(1));
+    }
+
+    #[test]
+    fn a_spent_budget_is_no_extension() {
+        let budget = Duration::from_millis(PROCESSOR_EPOCH_TICK_MS * 3);
+        assert_eq!(epoch_extension(budget, budget), None, "exactly spent");
+        assert_eq!(
+            epoch_extension(budget + Duration::from_millis(1), budget),
+            None,
+            "overspent: the subtraction must not wrap into a fresh budget"
+        );
+    }
+}
+
+#[cfg(test)]
+mod processor_calls_host_tests {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::{Arc, Mutex};
+
+    use brenn_activation::sync::{SyncAnswer, SyncRefusal};
+
+    use super::*;
+
+    /// No-op alerter: nothing here exercises the alert path.
+    struct NoopAlerter;
+    impl ProcessorAlerter for NoopAlerter {
+        fn alert(&self, _severity: GuestAlertSeverity, _title: &str, _body: &str) {}
+    }
+
+    /// The declared, wired call port every test here reaches through.
+    const WIRED: &str = "lookup";
+    /// A declared call port the document left unbound.
+    const UNBOUND: &str = "orphan";
+
+    /// What the seam was asked, so a test can assert the host passed the target
+    /// and the chain through unchanged.
+    type Seen = Arc<Mutex<Vec<(String, String, String, Vec<String>)>>>;
+
+    /// The `call-error` variant as a stable word, so a test can compare two
+    /// without the bindgen type carrying an `Eq` it does not need in production.
+    fn word(answer: &Result<Option<String>, CallWitError>) -> String {
+        match answer {
+            Ok(None) => "ok".to_string(),
+            Ok(Some(reply)) => format!("ok:{reply}"),
+            Err(CallWitError::NotPermitted) => "not-permitted".to_string(),
+            Err(CallWitError::Unwired) => "unwired".to_string(),
+            Err(CallWitError::Refused) => "refused".to_string(),
+            Err(CallWitError::Failed) => "failed".to_string(),
+            Err(CallWitError::InvalidPayload(m)) => format!("invalid-payload:{m}"),
+            Err(CallWitError::QuotaExceeded) => "quota-exceeded".to_string(),
+        }
+    }
+
+    /// A `ProcessorData` with one wired call port and one unbound declared one,
+    /// over a caller that answers `answer` and records what it was asked.
+    fn make_call_data(answer: SyncAnswer) -> (ProcessorData, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let caller: SyncCallerFn =
+            Arc::new(move |slug: &str, port: &str, body, chain: &[String]| {
+                recorded.lock().unwrap().push((
+                    slug.to_string(),
+                    port.to_string(),
+                    body,
+                    chain.to_vec(),
+                ));
+                answer.clone()
+            });
+        let mut calls = HashMap::new();
+        calls.insert(
+            WIRED.to_string(),
+            ProcessorCallTarget {
+                target_slug: "geo".to_string(),
+                target_port: "resolve".to_string(),
+            },
+        );
+        let declared: BTreeSet<String> = [WIRED.to_string(), UNBOUND.to_string()].into();
+        let data = ProcessorData {
+            resource_table: ResourceTable::new(),
+            limits: StoreLimitsBuilder::new().build(),
+            kv_store: None,
+            output_ports: Arc::new(HashMap::new()),
+            declared_out_ports: Arc::new(BTreeSet::new()),
+            config: Arc::new(HashMap::new()),
+            slug: Arc::from("menu"),
+            gate: ActivationGate::new(1024, HashMap::new()),
+            publish_suppressed_by_sink: HashMap::new(),
+            publish_buffer: Vec::new(),
+            alerter: Arc::new(NoopAlerter),
+            output_acl: Arc::new(|_| true),
+            mqtt_publish: None,
+            log_call_count: 0,
+            alert_call_count: 0,
+            tool_host: None,
+            tool_request_buffer: Vec::new(),
+            tool_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
+            sync_caller: Some(caller),
+            declared_call_ports: Arc::new(declared),
+            calls: Arc::new(calls),
+            call_chain: Arc::new(vec!["menu".to_string()]),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
+        };
+        (data, seen)
+    }
+
+    #[test]
+    fn a_port_the_specification_does_not_declare_traps_the_activation() {
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
+        let err = data
+            .do_call("stranger".to_string(), "{}".to_string())
+            .expect_err("an undeclared call port ends the activation");
+        assert!(err.to_string().contains("stranger"), "{err}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the peer must not be asked"
+        );
+    }
+
+    #[test]
+    fn a_declared_port_the_document_left_unbound_answers_unwired() {
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
+        let answer = data.do_call(UNBOUND.to_string(), "{}".to_string()).unwrap();
+        assert_eq!(word(&answer), "unwired");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the peer must not be asked"
+        );
+    }
+
+    #[test]
+    fn a_wired_port_reaches_its_peer_with_the_chain_this_activation_carries() {
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(Some("42".to_string())));
+        let answer = data
+            .do_call(WIRED.to_string(), "{\"q\":1}".to_string())
+            .unwrap();
+        assert_eq!(word(&answer), "ok:42");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [(
+                "geo".to_string(),
+                "resolve".to_string(),
+                "{\"q\":1}".to_string(),
+                vec!["menu".to_string()],
+            )]
+        );
+    }
+
+    #[test]
+    fn a_peer_that_answered_nothing_is_an_ok_with_no_reply() {
+        let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
+        assert_eq!(
+            word(&data.do_call(WIRED.to_string(), String::new()).unwrap()),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn an_erring_or_trapping_peer_is_failed_and_a_refusal_is_refused() {
+        for (answer, expected) in [
+            (SyncAnswer::Err("boom".to_string()), "failed"),
+            (SyncAnswer::Trap, "failed"),
+            (SyncAnswer::Refused(SyncRefusal::Unregistered), "refused"),
+            (SyncAnswer::Refused(SyncRefusal::Failed), "refused"),
+            (SyncAnswer::Refused(SyncRefusal::Unwired), "refused"),
+            (SyncAnswer::Refused(SyncRefusal::Unmounted), "refused"),
+        ] {
+            let (mut data, _) = make_call_data(answer.clone());
+            assert_eq!(
+                word(&data.do_call(WIRED.to_string(), String::new()).unwrap()),
+                expected,
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "acyclicity check was bypassed")]
+    fn a_re_entrant_refusal_reaching_the_mapping_is_a_host_panic() {
+        let (mut data, _) = make_call_data(SyncAnswer::Refused(SyncRefusal::ReEntrant));
+        let _ = data.do_call(WIRED.to_string(), String::new());
+    }
+
+    /// The wait is charged to `blocked`, which is the whole of what keeps a
+    /// caller from spending its epoch budget on a peer's queue position, pacing
+    /// delay and run. Without this the outermost caller of a slow chain traps
+    /// for somebody else's work.
+    #[test]
+    fn the_wait_for_a_slow_peer_is_charged_to_the_activations_blocked_time() {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let caller: SyncCallerFn =
+            Arc::new(move |slug: &str, port: &str, body, chain: &[String]| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                recorded.lock().unwrap().push((
+                    slug.to_string(),
+                    port.to_string(),
+                    body,
+                    chain.to_vec(),
+                ));
+                SyncAnswer::Ok(None)
+            });
+        let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
+        data.sync_caller = Some(caller);
+        assert_eq!(data.blocked, std::time::Duration::ZERO);
+        let answer = data.do_call(WIRED.to_string(), String::new()).unwrap();
+        assert_eq!(word(&answer), "ok");
+        assert!(
+            data.blocked >= std::time::Duration::from_millis(50),
+            "the peer slept 60ms and the caller was charged {:?}",
+            data.blocked
+        );
+    }
+
+    #[test]
+    fn an_oversize_payload_is_refused_before_the_peer_is_asked() {
+        let (mut data, seen) = make_call_data(SyncAnswer::Ok(None));
+        let cap = data.gate.max_body_bytes();
+        let answer = data
+            .do_call(WIRED.to_string(), "x".repeat(cap + 1))
+            .unwrap();
+        assert!(word(&answer).starts_with("invalid-payload:"), "{answer:?}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the peer must not be asked"
+        );
+        // Exactly at the cap is legal: the cap is inclusive, as it is on the
+        // reply side.
+        let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
+        assert_eq!(
+            word(&data.do_call(WIRED.to_string(), "x".repeat(cap)).unwrap()),
+            "ok"
+        );
+    }
+
+    /// The two paths have to meet for this to say anything: draining one and
+    /// asking the other is what "one counter" means, and it is the whole of the
+    /// bound on how many peer activations one activation can induce.
+    #[test]
+    fn calls_share_the_activations_call_budget_with_publishes() {
+        let (mut data, _) = make_call_data(SyncAnswer::Ok(None));
+        // Drain the shared per-activation call budget through the call path.
+        while word(&data.do_call(WIRED.to_string(), String::new()).unwrap()) == "ok" {}
+        assert_eq!(
+            word(&data.do_call(WIRED.to_string(), String::new()).unwrap()),
+            "quota-exceeded",
+        );
+        assert!(
+            matches!(
+                data.do_publish("out".to_string(), String::new(), None, None)
+                    .unwrap(),
+                Err(PublishError::QuotaExceeded)
+            ),
+            "a publish spends the counter the calls drained"
+        );
+    }
+}
+
 // ── config::Host unit tests ───────────────────────────────────────────────────
 //
 // Direct trait-impl tests for config::Host on ProcessorData and StoreData.
@@ -5203,6 +5981,15 @@ mod processor_config_host_tests {
             tool_call_count: 0,
             deferred_op_buffer: Vec::new(),
             deferred_index_bounds: HashMap::new(),
+            sync_caller: None,
+            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
+            calls: Arc::new(HashMap::new()),
+            call_chain: Arc::new(Vec::new()),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
         };
         (db, kv, data)
     }

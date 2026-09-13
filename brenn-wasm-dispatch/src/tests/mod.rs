@@ -29,7 +29,7 @@ pub use std::sync::Arc;
 use brenn_lib::messaging::WebhookEnvelope;
 pub use brenn_lib::messaging::config::{
     ActivationPacing, Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel,
-    ResolvedSubscription, Sink, WasmInputPort,
+    ResolvedSubscription, Sink, WINDOW_DEPTH_CEILING, WasmInputPort, resolve_wasm_window_depth,
 };
 pub use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, ParticipantId, SubscriberEntry,
@@ -219,22 +219,10 @@ pub fn build_cfg(
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let db = tempfile::NamedTempFile::new().unwrap();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let notify = Arc::new(Notify::new());
     let cfg = WasmConsumerConfig {
@@ -248,14 +236,15 @@ pub fn build_cfg(
             sub: ResolvedSubscription {
                 channel_uuid: channel_entry.uuid,
                 channel_address: channel_entry.address.clone(),
-                push_depth,
-                retain_depth,
+                push_depth: resolve_wasm_window_depth(push_depth, "push_depth", slug),
+                retain_depth: resolve_wasm_window_depth(retain_depth, "retain_depth", slug),
                 noise: NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
         }],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
     (cfg, alert_handle, db)
@@ -311,22 +300,10 @@ pub async fn build_multi_channel_setup(
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let store_db = tempfile::NamedTempFile::new().unwrap();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let notify = Arc::new(Notify::new());
     let inputs = arc_entries
@@ -337,8 +314,8 @@ pub async fn build_multi_channel_setup(
             sub: ResolvedSubscription {
                 channel_uuid: e.uuid,
                 channel_address: e.address.clone(),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                 noise: NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
@@ -353,6 +330,7 @@ pub async fn build_multi_channel_setup(
         alert_dispatcher,
         inputs,
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
     (
@@ -481,22 +459,12 @@ pub async fn build_multiport_setup_with_depths(
     output_ports.insert("out".to_string(), test_out_spec(out_addr));
 
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(MULTIPORT_WASM),
-        slug,
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(MULTIPORT_WASM), slug)
     }));
     let notify = Arc::new(Notify::new());
     let inputs: Vec<WasmInputPort> = in_entries
@@ -509,8 +477,8 @@ pub async fn build_multiport_setup_with_depths(
                 sub: ResolvedSubscription {
                     channel_uuid: e.uuid,
                     channel_address: e.address.clone(),
-                    push_depth,
-                    retain_depth,
+                    push_depth: resolve_wasm_window_depth(push_depth, "push_depth", slug),
+                    retain_depth: resolve_wasm_window_depth(retain_depth, "retain_depth", slug),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -526,6 +494,7 @@ pub async fn build_multiport_setup_with_depths(
         alert_dispatcher,
         inputs,
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -696,22 +665,12 @@ pub async fn build_two_channel_setup(
     output_ports.insert("out".to_string(), test_out_spec(out_addr.clone()));
     let store_db = tempfile::NamedTempFile::new().unwrap();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let notify = Arc::new(Notify::new());
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
@@ -726,8 +685,8 @@ pub async fn build_two_channel_setup(
             sub: ResolvedSubscription {
                 channel_uuid: in_uuid,
                 channel_address: in_addr,
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                 noise: NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
@@ -743,6 +702,7 @@ pub async fn build_two_channel_setup(
                 capacity_mt: 1_000_000,
             },
         }],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -778,3 +738,5 @@ mod renotify;
 mod scan;
 #[cfg(test)]
 mod stop;
+#[cfg(test)]
+mod sync;

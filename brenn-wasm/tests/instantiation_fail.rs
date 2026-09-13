@@ -22,11 +22,9 @@
 //     (including package imports), the resource-limit case is covered as a
 //     load-time panic test rather than an instantiation test.
 
-use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
 
-use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 use brenn_wasm::{ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome};
 
 mod common;
@@ -60,21 +58,10 @@ fn write_wat_to_tempfile(wat_src: &str, slug: &str) -> tempfile::NamedTempFile {
 /// filled in here; callers supply only `component_path` and `slug`.
 fn spec_for_test<'a>(component_path: &'a std::path::Path, slug: &'a str) -> ProcessorLoadSpec<'a> {
     ProcessorLoadSpec {
-        component_path,
-        slug,
-        output_ports: HashMap::new(),
-        declared_out_ports: std::collections::BTreeSet::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
-        config: HashMap::new(),
-        grants: std::collections::BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(component_path, slug)
     }
 }
 
@@ -153,21 +140,10 @@ fn instantiation_fail_trap_arm_fires_on_memory_limit() {
     let component_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/components/brenn_processor_exhaust.wasm");
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path,
-        slug: "exhaust-memlimit-test",
-        output_ports: HashMap::new(),
-        declared_out_ports: std::collections::BTreeSet::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
-        config: HashMap::new(),
-        grants: std::collections::BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path, "exhaust-memlimit-test")
     });
 
     // Drive with a 1-byte memory cap — the fixture's initial memory allocation

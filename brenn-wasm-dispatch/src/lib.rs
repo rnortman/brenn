@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
+use brenn_activation::sync::{SyncAnswer, SyncRefusal, sync_request};
 use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort, WasmOutputPort};
 use brenn_lib::messaging::{ParticipantId, Urgency};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
@@ -162,6 +163,11 @@ pub struct WasmConsumerConfig {
     pub inputs: Vec<WasmInputPort>,
     /// Resolved output ports for this consumer (one per bound publish channel).
     pub outputs: Vec<WasmOutputPort>,
+    /// The `sync` port vocabulary this consumer's specification declares. A
+    /// request naming anything else is a caller that bypassed the static
+    /// checks, which is why [`drain_step_sync`] asserts on it rather than
+    /// refusing.
+    pub sync_ports: std::collections::BTreeSet<String>,
     /// Per-component activation pacing. The consumer task builds its
     /// `ActivationPacer` (a `TokenBucket` over activations) from this and gates
     /// every drain step through it.
@@ -424,16 +430,82 @@ impl ConsumerHandle {
     }
 }
 
+/// One sync call waiting to be served by a consumer's task.
+///
+/// The request half of the facility on this host: a caller hands one of these
+/// to the consumer's own loop, which is the sole owner of guest invocation for
+/// its slug, and blocks on `reply`. That is the whole re-entrancy story on the
+/// backend — a request is served between two drain steps, never inside one.
+pub struct SyncRequest {
+    /// The declared `sync` port of the target the request is addressed to.
+    pub port: String,
+    /// The request body, which becomes the one envelope in that port's window.
+    pub body: String,
+    /// The slugs already running in this call's chain, caller-first. The target
+    /// appearing in it would be a cycle the document was supposed to refuse.
+    pub chain: Vec<String>,
+    /// Where the answer goes. Answered exactly once, after the activation's own
+    /// flush on the ok path.
+    pub reply: tokio::sync::oneshot::Sender<SyncAnswer>,
+}
+
+/// Why one drain step is running.
+///
+/// The two causes assemble the same activation and differ in one thing each:
+/// the gate may decide there is nothing to do, and a request may not be
+/// refused — somebody is blocked on it.
+enum Cause {
+    /// The async gate: a mount is owed, or a bound port is ready. May assemble
+    /// nothing at all.
+    Gate(MountDebt),
+    /// A sync call. Always assembles, and always answers.
+    Sync(SyncRequest),
+}
+
+/// How many unserved sync requests a consumer's task will hold before a caller
+/// waits to hand one over.
+///
+/// A sender that has to wait is not backpressure on anything: the caller of a
+/// sync call is blocked on the reply regardless, so waiting to be enqueued and
+/// waiting to be served are the same wait. The bound exists so a runaway caller
+/// cannot grow this queue without limit.
+const SYNC_REQUEST_QUEUE_DEPTH: usize = 32;
+
+/// Mint the request channel one consumer's callers and its task share.
+///
+/// Both halves are minted together and away from either end, because the sender
+/// is registered with the router before the task that owns the receiver exists.
+#[must_use]
+pub fn sync_request_channel() -> (
+    tokio::sync::mpsc::Sender<SyncRequest>,
+    tokio::sync::mpsc::Receiver<SyncRequest>,
+) {
+    tokio::sync::mpsc::channel(SYNC_REQUEST_QUEUE_DEPTH)
+}
+
 /// Spawn the off-loop dispatch task for one WASM consumer.
-pub fn spawn_wasm_consumer_task(cfg: WasmConsumerConfig) -> ConsumerHandle {
+///
+/// `sync_rx` is the receiving half of [`sync_request_channel`] — the task is its
+/// sole owner, which is what serializes a sync call against every other
+/// activation of the same consumer. It is not a [`WasmConsumerConfig`] field
+/// because that value is cloned to remount a consumer over the same component
+/// and ports, and a receiver has exactly one owner.
+pub fn spawn_wasm_consumer_task(
+    cfg: WasmConsumerConfig,
+    sync_rx: tokio::sync::mpsc::Receiver<SyncRequest>,
+) -> ConsumerHandle {
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
-    let join = tokio::spawn(async move { run_consumer(cfg, stop_rx).await });
+    let join = tokio::spawn(async move { run_consumer(cfg, sync_rx, stop_rx).await });
     ConsumerHandle { stop, join }
 }
 
 /// Main body of the consumer task. Delivers the mount activation, then enters
 /// the drain loop.
-async fn run_consumer(cfg: WasmConsumerConfig, mut stop: tokio::sync::watch::Receiver<bool>) {
+async fn run_consumer(
+    cfg: WasmConsumerConfig,
+    mut sync_rx: tokio::sync::mpsc::Receiver<SyncRequest>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
     let subscriber = ParticipantId::for_wasm(&cfg.slug);
 
     // Per-component activation pacer. Every drain step — the mount activation
@@ -453,7 +525,7 @@ async fn run_consumer(cfg: WasmConsumerConfig, mut stop: tokio::sync::watch::Rec
     // the backlog a reload primed both arrive in it — and it is what a
     // component with nothing but a self-tick chain arms from.
     pacer.admit().await;
-    drain_step(&cfg, &subscriber, MountDebt::Owed).await;
+    drain(&cfg, &subscriber, Cause::Gate(MountDebt::Owed)).await;
 
     // Serialized drain loop, woken by external eager wakes (`spawn_eager_wake`).
     // A wake sets a one-permit flag; any wakes that arrive during a drain step
@@ -464,20 +536,52 @@ async fn run_consumer(cfg: WasmConsumerConfig, mut stop: tokio::sync::watch::Rec
     // step: a step that has begun is owed to whoever published into it, so its
     // publishes go out and the loop leaves afterwards.
     loop {
-        tokio::select! {
-            () = cfg.notify.notified() => {}
+        let cause = tokio::select! {
+            () = cfg.notify.notified() => Cause::Gate(MountDebt::Settled),
+            // A closed-and-empty request channel disables this arm rather than
+            // ending the loop: the stop signal is the only exit, and a consumer
+            // whose callers have all gone still serves its bound inputs.
+            Some(req) = sync_rx.recv() => Cause::Sync(req),
             result = stop.changed() => {
                 // Either a signal or a dropped sender: both mean nobody is
                 // holding this consumer in service any more.
                 if result.is_err() || *stop.borrow_and_update() {
                     info!(slug = %cfg.slug, "wasm_dispatch: consumer task stopping");
+                    refuse_pending_sync_requests(&cfg.slug, &mut sync_rx);
                     return;
                 }
                 continue;
             }
-        }
+        };
         pacer.admit().await;
-        drain_step(&cfg, &subscriber, MountDebt::Settled).await;
+        drain(&cfg, &subscriber, cause).await;
+    }
+}
+
+/// Answer every request this task will never serve, on its way out.
+///
+/// A caller blocked on a consumer that left service is owed the fact, not a
+/// wait that ends when its own process does. The channel is closed first, so a
+/// request racing the stop fails at the send and the caller API turns that into
+/// the same refusal.
+fn refuse_pending_sync_requests(
+    slug: &str,
+    sync_rx: &mut tokio::sync::mpsc::Receiver<SyncRequest>,
+) {
+    sync_rx.close();
+    while let Ok(req) = sync_rx.try_recv() {
+        let port = req.port.clone();
+        if req
+            .reply
+            .send(SyncAnswer::Refused(SyncRefusal::Unregistered))
+            .is_err()
+        {
+            info!(
+                slug = %slug,
+                port = %port,
+                "wasm_dispatch: a pending sync caller had already gone when its consumer stopped"
+            );
+        }
     }
 }
 
@@ -490,21 +594,89 @@ async fn run_consumer(cfg: WasmConsumerConfig, mut stop: tokio::sync::watch::Rec
 /// so it can carry nothing new; a `Wake::Delivery` step always carries
 /// something.
 ///
+/// [`drain_step_sync`] is the other cause, and shares this whole body.
+///
 /// Returns immediately (no-op) when `load_activation_snapshot` returns `None`
 /// (the mount debt is settled and no triggering port has pending rows).
 ///
 /// Single-scan design: `load_activation_snapshot` performs one subscriber-scoped
 /// pending-push scan under one DB lock hold covering all K input ports (AC 7).
 pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mount: MountDebt) {
+    drain(cfg, subscriber, Cause::Gate(mount)).await;
+}
+
+/// One sync-call drain step: assemble the same activation with the request
+/// windowed last, invoke the guest once, dispose, and answer the caller.
+///
+/// The answer is sent after the ok arm's flush, never before: a caller that has
+/// the reply has the callee's publishes too.
+pub async fn drain_step_sync(
+    cfg: &WasmConsumerConfig,
+    subscriber: &ParticipantId,
+    request: SyncRequest,
+) {
+    drain(cfg, subscriber, Cause::Sync(request)).await;
+}
+
+async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Cause) {
     // Step 1: assemble multi-port snapshot (single scan, T₀ hermetic).
-    // Returns None when the debt is settled and no triggering input has pending
-    // rows → no activation.
-    let Some((wake, snapshots)) = cfg
-        .messenger
-        .load_activation_snapshot(subscriber, &cfg.inputs, mount)
-        .await
-    else {
-        return;
+    // The gate returns None when the debt is settled and no triggering input has
+    // pending rows → no activation. A request has no gate in front of it: the
+    // caller is already blocked, every allowed port is windowed as an owed
+    // mount's is, and the debt this settles is settled by the activation
+    // happening at all.
+    let (wake, snapshots, mut sync) = match cause {
+        Cause::Gate(mount) => {
+            let Some((wake, snapshots)) = cfg
+                .messenger
+                .load_activation_snapshot(subscriber, &cfg.inputs, mount)
+                .await
+            else {
+                return;
+            };
+            (wake, snapshots, None)
+        }
+        Cause::Sync(req) => {
+            // Both are caller bugs, not guest input: a native caller names a
+            // port the specification declares, and a component caller is wired
+            // by a document that refused cycles. Reaching either means the
+            // static checks and this host disagree about the wiring, which is
+            // not a state to carry on from.
+            assert!(
+                cfg.sync_ports.contains(&req.port),
+                "wasm_dispatch: sync request for {} names port {:?}, which its specification \
+                 does not declare sync",
+                cfg.slug,
+                req.port
+            );
+            assert!(
+                !req.chain.contains(&cfg.slug),
+                "wasm_dispatch: sync request for {} arrives with {} already in its own call \
+                 chain ({:?}) — the document's acyclicity check was bypassed",
+                cfg.slug,
+                cfg.slug,
+                req.chain
+            );
+            // The request body becomes the one envelope in the fabricated
+            // window, so it takes the deployment's body cap. Without this the
+            // request side would be the one path into a window that no cap
+            // guards.
+            let cap = cfg.component.max_payload_bytes();
+            assert!(
+                brenn_activation::sync::within_body_cap(&req.body, cap),
+                "wasm_dispatch: sync request for {} on port {:?} carries {} bytes, over the \
+                 deployment's {cap}-byte body cap — a caller may not hand a guest an envelope \
+                 its own host would refuse to publish",
+                cfg.slug,
+                req.port,
+                req.body.len(),
+            );
+            let snapshots = cfg
+                .messenger
+                .load_sync_activation_snapshot(subscriber, &cfg.inputs)
+                .await;
+            (Wake::Sync, snapshots, Some(req))
+        }
     };
 
     // What the guest is handed: everything new on a delivery, and whatever the
@@ -517,7 +689,7 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
     // from, and continuing would disposition an activation against messages
     // nobody can name.
     assert!(
-        wake == Wake::Mount || carried_new,
+        wake != Wake::Delivery || carried_new,
         "drain_step: a delivery snapshot has no port with new messages — invariant violated"
     );
     debug_assert_eq!(
@@ -572,7 +744,7 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
     }
 
     // Step 3: assemble ProcessorPortWindow per snapshot.
-    let ports: Vec<ProcessorPortWindow> = snapshots
+    let mut ports: Vec<ProcessorPortWindow> = snapshots
         .iter()
         .zip(&dropped_per_port)
         .map(|(snap, dropped)| {
@@ -636,18 +808,38 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
         });
     }
 
+    // The request rides last in `ports`, in a window of its own that no channel
+    // backs: one envelope, all of it new, nothing dropped. Minted here because
+    // this is the edge that reads entropy and the clock; `now` is the same
+    // single reading the rest of the assembly used.
+    if let Some(req) = &sync {
+        let request = sync_request(&cfg.slug, &req.port, req.body.clone(), Uuid::new_v4(), now);
+        ports.push(ProcessorPortWindow {
+            port: req.port.clone(),
+            envelopes: vec![request.to_envelope_json()],
+            new_from: 0,
+            dropped: 0,
+        });
+    }
+
     let activation = ProcessorActivation {
         ports,
         deferred,
         now: Some(now_ms),
-        // Backend dispatch is message-caused, always: nothing here has a caller
-        // blocked on a reply, and the guest world could not express one.
-        sync: None,
+        sync: sync.as_ref().map(|req| req.port.clone()),
     };
 
     // Step 4: invoke the guest. CPU-bound → spawn_blocking.
+    //
+    // The chain a request arrived with is handed on: a peer this activation
+    // calls is told every slug already running above it, which is how a cycle
+    // the document was supposed to refuse is recognized. An async activation
+    // starts a chain of its own.
+    let inbound_chain = sync.as_ref().map_or_else(Vec::new, |req| req.chain.clone());
     let component = cfg.component.clone();
-    let join_result = tokio::task::spawn_blocking(move || component.handle(activation)).await;
+    let join_result =
+        tokio::task::spawn_blocking(move || component.handle_in_chain(activation, inbound_chain))
+            .await;
     let outcome = match join_result {
         Ok(outcome) => outcome,
         Err(join_err) => {
@@ -681,6 +873,7 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
         ProcessorOutcome::Ok {
             publishes,
             deferred_ops,
+            reply,
         } => {
             // `now` is the same drain-time instant the deferred view was taken
             // against, keeping the snapshot boundary consistent.
@@ -732,6 +925,9 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
                 publish_count = publishes.len(),
                 "wasm_dispatch: activation consumed successfully"
             );
+            // After the flush, never before: a caller holding the reply holds a
+            // callee whose publishes have already gone out.
+            answer_sync(&cfg.slug, sync.take(), SyncAnswer::Ok(reply));
         }
         ProcessorOutcome::Err(err) => {
             let diag =
@@ -755,6 +951,7 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
             );
             record_activation_failure(cfg, subscriber, &snapshots, wake, carried_new, "err", &diag)
                 .await;
+            answer_sync(&cfg.slug, sync.take(), SyncAnswer::Err(diag));
         }
         ProcessorOutcome::Trap(msg) => {
             let diag = brenn_common::sanitize_untrusted_str(&msg, PROCESSOR_MAX_DIAG_BYTES);
@@ -785,7 +982,31 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
                 &diag,
             )
             .await;
+            answer_sync(&cfg.slug, sync.take(), SyncAnswer::Trap);
         }
+    }
+    debug_assert!(
+        sync.is_none(),
+        "drain: a sync-call activation finished without answering its caller"
+    );
+}
+
+/// Hand one answer back, when this activation had a caller.
+///
+/// A send that fails is a caller that went away while its callee ran — the
+/// answer has nowhere to go and nothing is owed, which is the one outcome here
+/// that is neither a bug nor worth an alert.
+fn answer_sync(slug: &str, request: Option<SyncRequest>, answer: SyncAnswer) {
+    let Some(request) = request else {
+        return;
+    };
+    let port = request.port.clone();
+    if request.reply.send(answer).is_err() {
+        info!(
+            slug = %slug,
+            port = %port,
+            "wasm_dispatch: sync caller had gone before its answer was ready"
+        );
     }
 }
 
@@ -800,6 +1021,7 @@ fn wake_word(wake: Wake) -> &'static str {
     match wake {
         Wake::Mount => "mount",
         Wake::Delivery => "delivery",
+        Wake::Sync => "sync call",
     }
 }
 
@@ -819,10 +1041,10 @@ async fn record_activation_failure(
     disposition: &'static str,
     diag: &str,
 ) {
-    // Only a mount can legitimately carry nothing new. A delivery that reaches
-    // here without `carried_new` would mean the assertion in `drain_step` was
-    // bypassed; skipping its rows would hide the bug.
-    if wake == Wake::Mount && !carried_new {
+    // A mount and a sync call can both legitimately carry nothing new. A
+    // delivery that reaches here without `carried_new` would mean the assertion
+    // in `drain` was bypassed; skipping its rows would hide the bug.
+    if wake != Wake::Delivery && !carried_new {
         return;
     }
     let backing = collect_failure_backing(snapshots);

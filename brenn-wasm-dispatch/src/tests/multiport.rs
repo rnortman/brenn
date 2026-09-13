@@ -27,22 +27,10 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
     let (alert_dispatcher, captured_alerts, cap_handle) = make_capturing_alerter_with_severity();
     let _db2 = tempfile::NamedTempFile::new().unwrap();
     let component2 = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let notify2 = Arc::new(tokio::sync::Notify::new());
     let cfg2 = WasmConsumerConfig {
@@ -53,6 +41,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
         alert_dispatcher,
         inputs: cfg.inputs.clone(),
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -407,6 +396,7 @@ async fn a_denied_port_is_empty_and_unadvanced_beside_a_served_sibling() {
         alert_dispatcher,
         inputs: cfg.inputs.clone(),
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
     drain_step(&denied_cfg, &wasm_sub, MountDebt::Settled).await;
@@ -646,8 +636,6 @@ async fn multiport_err_outcome_quarantines_both_channels() {
     let (alert_dispatcher, captured_alerts, cap_handle) = make_capturing_alerter_with_severity();
     let _db2 = tempfile::NamedTempFile::new().unwrap();
     let component2 = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(MULTIPORT_WASM),
-        slug,
         declared_out_ports: ["out".to_string()].into_iter().collect(),
         output_ports: {
             let mut m = std::collections::HashMap::new();
@@ -658,17 +646,9 @@ async fn multiport_err_outcome_quarantines_both_channels() {
             m
         },
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(MULTIPORT_WASM), slug)
     }));
     let notify2 = Arc::new(tokio::sync::Notify::new());
     let cfg2 = WasmConsumerConfig {
@@ -679,6 +659,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
         alert_dispatcher,
         inputs: cfg.inputs.clone(),
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -1139,22 +1120,12 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
 
     let _store_db = tempfile::NamedTempFile::new().unwrap();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DUAL_WASM),
-        slug,
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DUAL_WASM), slug)
     }));
 
     let (alert_dispatcher, _alert_handle) = noop_alert_dispatcher();
@@ -1171,8 +1142,8 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
                 sub: ResolvedSubscription {
                     channel_uuid: in0_arc.uuid,
                     channel_address: in0_arc.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -1183,8 +1154,8 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
                 sub: ResolvedSubscription {
                     channel_uuid: in1_arc.uuid,
                     channel_address: in1_arc.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
@@ -1192,6 +1163,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
             },
         ],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 

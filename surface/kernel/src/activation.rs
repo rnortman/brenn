@@ -70,10 +70,10 @@ use crate::registry::{BindingKey, Registrations, SurfaceStores};
 /// channels' stores; this is the bookkeeping that surrounds an activation.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct InstanceSchedule {
-    /// Whether an activation is in flight. Invocations are serialized per
+    /// The activation in flight, if any. Invocations are serialized per
     /// instance: anything arriving during a handler coalesces into the next
     /// activation rather than overlapping this one.
-    in_flight: bool,
+    in_flight: Option<InFlight>,
     /// Whether this mount still owes its guaranteed first activation.
     mount: MountDebt,
     /// Activations whose entry returned err, lifetime. An err is a failed
@@ -102,6 +102,19 @@ struct InstanceSchedule {
     /// benign race a conforming component can always lose, worth counting because
     /// one that *always* races is scheduling too close to its own activation rate.
     deferred_races: u64,
+}
+
+/// What the assembly recorded about the activation it handed out, for the
+/// completion to be judged against.
+///
+/// The completion is where the page classifies an entry's return, and the one
+/// question it cannot answer from the return alone is whether anything asked
+/// for it. The assembly knows; the entry's own boundary does not.
+#[derive(Debug, PartialEq, Eq)]
+struct InFlight {
+    /// The sync port the activation was assembled with, or `None` on an async
+    /// one. A reply is admissible only on `Some`.
+    sync: Option<String>,
 }
 
 /// The scheduler state of every instance the page holds an activation entry for.
@@ -170,7 +183,7 @@ pub enum ActivationOutcome {
     ///
     /// `None` is ordinary completion and the only shape an async activation can
     /// finish in — a reply nobody asked for is a contract break, caught at the
-    /// invocation boundary that classified the return.
+    /// completion, which is the one seam every invocation of this page reaches.
     Ok(Option<String>),
     /// Returned err, with the component's description of why. The buffer is
     /// discarded and a failure is counted; the instance keeps running and keeps
@@ -389,7 +402,23 @@ impl Schedules {
     /// Whether an activation of `instance` is in flight. `false` for an instance
     /// this table does not hold.
     pub fn in_flight(&self, instance: &str) -> bool {
-        self.instances.get(instance).is_some_and(|s| s.in_flight)
+        self.instances
+            .get(instance)
+            .is_some_and(|s| s.in_flight.is_some())
+    }
+
+    /// The sync port the in-flight activation of `instance` was assembled with.
+    ///
+    /// `None` for an instance with nothing in flight and for one running an
+    /// async activation — which are the same answer to the only question this
+    /// serves: whether a reply carried on the completion was asked for.
+    pub fn in_flight_sync(&self, instance: &str) -> Option<&str> {
+        self.instances
+            .get(instance)?
+            .in_flight
+            .as_ref()?
+            .sync
+            .as_deref()
     }
 
     /// Whether **any** instance has an activation in flight.
@@ -400,7 +429,9 @@ impl Schedules {
     /// dispatching an event that makes *another* component request a sync
     /// activation is the same re-entrancy.
     pub fn any_in_flight(&self) -> bool {
-        self.instances.values().any(|schedule| schedule.in_flight)
+        self.instances
+            .values()
+            .any(|schedule| schedule.in_flight.is_some())
     }
 
     /// Lifetime count of activations of `instance` whose entry returned err.
@@ -481,7 +512,7 @@ impl Schedules {
             .instances
             .iter()
             .filter(|(instance, schedule)| {
-                !schedule.in_flight
+                schedule.in_flight.is_none()
                     && registrations.is_registered(instance)
                     && !registrations.is_failed(instance)
             })
@@ -568,10 +599,9 @@ impl Schedules {
     ///
     /// # Panics
     ///
-    /// As [`Self::assemble`], plus: if `sync_port` names a bound input port of the
-    /// instance. The caller gates that (a colliding request is refused, not
-    /// assembled); reaching here means the gate did not run, and an ambiguous
-    /// `ports` list is not something to hand a component.
+    /// As [`Self::assemble`]. A sync port cannot collide with a bound input
+    /// port: the specification declares both, and it may not declare one name
+    /// twice, so the `ports` list this builds is unambiguous by construction.
     pub fn assemble_sync<P: PlanePolicy>(
         &mut self,
         instance: &str,
@@ -580,12 +610,6 @@ impl Schedules {
         request: MessageEnvelope,
         ctx: &mut ActivationCtx<'_, P>,
     ) -> ReadyActivation {
-        assert!(
-            !ctx.bindings
-                .inputs_of(instance)
-                .any(|binding| binding.port == sync_port),
-            "surface client: sync port {sync_port} collides with a bound input port of {instance}"
-        );
         self.assemble_windows(instance, generation, Some((sync_port, request)), ctx)
     }
 
@@ -607,10 +631,12 @@ impl Schedules {
             .get_mut(instance)
             .unwrap_or_else(|| panic!("surface client: assembling for unscheduled {instance}"));
         assert!(
-            !schedule.in_flight,
+            schedule.in_flight.is_none(),
             "surface client: {instance} already has an activation in flight"
         );
-        schedule.in_flight = true;
+        schedule.in_flight = Some(InFlight {
+            sync: sync.as_ref().map(|(port, _)| (*port).to_string()),
+        });
         // Settled at assembly, not at completion: an activation the instance
         // trapped in still happened, and the guarantee is one activation per
         // mount, not one successful one.
@@ -808,7 +834,7 @@ impl Schedules {
     /// nothing here can order the two.
     pub fn finish_ok(&mut self, instance: &str, carry: HashMap<String, u64>) {
         let schedule = self.schedule_mut(instance);
-        schedule.in_flight = false;
+        schedule.in_flight = None;
         schedule.carry_mt = carry;
     }
 
@@ -821,7 +847,7 @@ impl Schedules {
     /// On an instance this table does not hold.
     pub fn finish_err(&mut self, instance: &str, carry: HashMap<String, u64>) {
         let schedule = self.schedule_mut(instance);
-        schedule.in_flight = false;
+        schedule.in_flight = None;
         schedule.carry_mt = carry;
         schedule.entry_err_activations += 1;
     }
@@ -834,7 +860,7 @@ impl Schedules {
     ///
     /// On an instance this table does not hold.
     pub fn finish_terminal(&mut self, instance: &str) {
-        self.schedule_mut(instance).in_flight = false;
+        self.schedule_mut(instance).in_flight = None;
     }
 
     fn schedule_mut(&mut self, instance: &str) -> &mut InstanceSchedule {

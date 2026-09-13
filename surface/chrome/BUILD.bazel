@@ -5,6 +5,10 @@ policy_srcs()
 
 exports_files(["Cargo.toml"])
 
+# The kind's source, for `//surface/contract`'s test that every port it listens
+# on is declared `sync` in its specification.
+exports_files(["src/component.rs"])
+
 surface_processor_component(
     deps = [
         "//brenn-envelope",

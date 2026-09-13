@@ -19,7 +19,6 @@ use std::sync::Arc;
 use brenn_envelope::grants::{ComponentGrant, ComponentHost};
 use brenn_wasm::{
     ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, capability_for_import,
-    store::DEFAULT_MAX_PAGE_COUNT,
 };
 
 mod common;
@@ -51,21 +50,10 @@ fn wat_to_tempfile(wat_src: &str) -> tempfile::NamedTempFile {
 #[should_panic(expected = "requires ungranted capability \"ports\"")]
 fn ungranted_known_capability_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-no-grants",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
-        grants: BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo-no-grants")
     });
 }
 
@@ -83,21 +71,10 @@ fn unrecognized_import_panics() {
 )"#;
     let wasm_file = wat_to_tempfile(bogus_wat);
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: wasm_file.path(),
-        slug: "bogus-import",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
-        grants: BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(wasm_file.path(), "bogus-import")
     });
 }
 
@@ -109,21 +86,10 @@ fn unrecognized_import_panics() {
 #[should_panic(expected = "grant check failed")]
 fn multiple_violations_listed() {
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_log"),
-        slug: "log-no-grants",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
-        grants: BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_log"), "log-no-grants")
     });
 }
 
@@ -133,21 +99,10 @@ fn multiple_violations_listed() {
 fn multiple_violations_names_both_capabilities() {
     let result = std::panic::catch_unwind(|| {
         ProcessorComponent::load(ProcessorLoadSpec {
-            component_path: &component_path("brenn_processor_log"),
-            slug: "log-no-grants-2",
-            declared_out_ports: std::collections::BTreeSet::new(),
-            output_ports: std::collections::HashMap::new(),
             input_amplification_mt: common::amp_in(),
-            mqtt_sinks: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            grants: BTreeSet::new(),
-            store_path: None,
-            max_page_count: DEFAULT_MAX_PAGE_COUNT,
-            max_payload_bytes: 1024 * 1024,
             alerter: noop_alerter(),
             output_acl: common::allow_all(),
-            mqtt_publish: None,
-            tool_host: None,
+            ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_log"), "log-no-grants-2")
         });
     });
     let err = result.expect_err("must panic");
@@ -175,21 +130,11 @@ fn subset_grants_loads_and_invokes() {
         .into_iter()
         .collect();
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_log"),
-        slug: "log-subset",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_log"), "log-subset")
     });
     // An empty activation (no new envelopes) returns Ok from the log fixture.
     let outcome = comp.handle(ProcessorActivation {
@@ -225,21 +170,10 @@ fn degenerate_empty_grants_load_succeeds() {
     // The component may trap on invoke due to type mismatch — that's out of scope here.
     let _result = std::panic::catch_unwind(|| {
         ProcessorComponent::load(ProcessorLoadSpec {
-            component_path: wasm_file.path(),
-            slug: "noop-wat",
-            declared_out_ports: std::collections::BTreeSet::new(),
-            output_ports: std::collections::HashMap::new(),
             input_amplification_mt: common::amp_in(),
-            mqtt_sinks: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            grants: BTreeSet::new(),
-            store_path: None,
-            max_page_count: DEFAULT_MAX_PAGE_COUNT,
-            max_payload_bytes: 1024 * 1024,
             alerter: noop_alerter(),
             output_acl: common::allow_all(),
-            mqtt_publish: None,
-            tool_host: None,
+            ..ProcessorLoadSpec::minimal(wasm_file.path(), "noop-wat")
         })
     });
     // The grant check must pass: if it panicked, the message must NOT be a grant violation.
@@ -265,21 +199,13 @@ fn degenerate_empty_grants_load_succeeds() {
 fn degenerate_empty_grants_invoke_succeeds() {
     // processor-exhaust imports only types; with no new envelopes it returns Ok.
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_exhaust"),
-        slug: "exhaust-empty-grants",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
-        grants: BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_exhaust"),
+            "exhaust-empty-grants",
+        )
     });
     // Empty activation: no new envelopes → exhaust returns Ok (no spin).
     let outcome = comp.handle(ProcessorActivation {
@@ -311,23 +237,20 @@ fn superset_grants_loads() {
         .collect();
     let db = tempfile::NamedTempFile::new().unwrap();
     let _comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-all-grants",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants,
         store_path: Some(db.path()),
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
         // ALL grants includes Mqtt; the load invariant requires a callback then.
         mqtt_publish: Some(common::ok_mqtt_publish()),
         // ALL grants includes Tools; the load invariant requires a seam then.
         tool_host: Some(common::noop_tool_host()),
+        // ALL grants includes Calls; the load invariant requires a caller then.
+        sync_caller: Some(std::sync::Arc::new(|_: &str, _: &str, _, _| {
+            brenn_activation::sync::SyncAnswer::Ok(None)
+        })),
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo-all-grants")
     });
 }
 
@@ -335,21 +258,14 @@ fn superset_grants_loads() {
 fn load_with(extra: ComponentGrant) {
     let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Ports, extra].into();
     let _comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-page-capability",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_demo"),
+            "demo-page-capability",
+        )
     });
 }
 
@@ -696,21 +612,60 @@ fn tools_capability_maps_and_is_in_all() {
 fn tools_grant_without_seam_panics() {
     let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Tools].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_exhaust"),
-        slug: "tools-no-seam",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_exhaust"), "tools-no-seam")
+    });
+}
+
+/// The sync-caller seam and the `Calls` grant must agree at load, on the same
+/// terms as the two above. A linked `calls` interface with nobody behind it
+/// `.expect`-panics inside the host function at the first guest call — mid
+/// activation, in production — rather than at boot, which is what this assert
+/// exists to prevent.
+#[test]
+#[should_panic(
+    expected = "sync_caller seam (None) and Calls grant (granted) must both be set or both absent"
+)]
+fn calls_grant_without_sync_caller_panics() {
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Calls].into_iter().collect();
+    ProcessorComponent::load(ProcessorLoadSpec {
+        input_amplification_mt: common::amp_in(),
+        grants,
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_exhaust"), "calls-no-seam")
+    });
+}
+
+/// A wired `call` port outside the component's declared call vocabulary is
+/// reachable by the host and unreachable by the guest, which can only trap on
+/// it. Config resolution refuses it; a hand-built load spec does not pass
+/// through that, so load asserts it too.
+#[test]
+#[should_panic(expected = "is wired but is not in the component's declared call vocabulary")]
+fn a_wired_call_port_outside_the_declared_vocabulary_panics() {
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Calls].into_iter().collect();
+    ProcessorComponent::load(ProcessorLoadSpec {
+        input_amplification_mt: common::amp_in(),
+        grants,
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        sync_caller: Some(std::sync::Arc::new(|_: &str, _: &str, _, _| {
+            brenn_activation::sync::SyncAnswer::Ok(None)
+        })),
+        calls: [(
+            "lookup".to_string(),
+            brenn_wasm::ProcessorCallTarget {
+                target_slug: "geo".to_string(),
+                target_port: "resolve".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_exhaust"), "calls-unwired")
     });
 }
 
@@ -726,21 +681,15 @@ fn tools_grant_without_seam_panics() {
 fn load_store_path_without_store_grant_panics() {
     let db = tempfile::NamedTempFile::new().unwrap();
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_store_rt"),
-        slug: "store-rt-no-grant",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: BTreeSet::new(), // Store not granted
         store_path: Some(db.path()),
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_store_rt"),
+            "store-rt-no-grant",
+        )
     });
 }
 
@@ -756,20 +705,14 @@ fn load_store_path_without_store_grant_panics() {
 )]
 fn load_store_grant_without_store_path_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_store_rt"),
-        slug: "store-rt-no-path",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Store].into_iter().collect(),
         store_path: None, // Store granted but no path
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_store_rt"),
+            "store-rt-no-path",
+        )
     });
 }

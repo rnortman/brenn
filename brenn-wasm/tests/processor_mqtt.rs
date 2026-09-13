@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION;
 use brenn_wasm::{
     ComponentGrant, MqttPublishFn, MqttPublishOutcome, ProcessorActivation, ProcessorComponent,
-    ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow, store::DEFAULT_MAX_PAGE_COUNT,
+    ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
 };
 
 mod common;
@@ -68,21 +68,12 @@ fn trap_after_publish_activation() -> ProcessorActivation {
 fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
     let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Mqtt].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path(),
-        slug: "mqtt-test",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: common::noop_alerter(),
         output_acl: common::allow_all(),
         mqtt_publish: Some(mqtt_publish),
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path(), "mqtt-test")
     })
 }
 

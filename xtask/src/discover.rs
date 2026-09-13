@@ -159,6 +159,7 @@ mod tests {
             ("replay-generic", Family::Raw),
             ("git-forge-parser", Family::Guest),
             ("git-sync-consumer", Family::Guest),
+            ("processor-call-test", Family::Guest),
             ("processor-config", Family::Guest),
             ("processor-demo", Family::Guest),
             ("processor-dual", Family::Guest),

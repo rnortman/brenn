@@ -26,6 +26,8 @@ fn component(instance: &str) -> ComponentEntry {
         config: BTreeMap::new(),
         grants: vec![],
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
     }
 }
 
@@ -59,6 +61,7 @@ fn doc(instances: &[&str]) -> BindingsDocument {
             error_channel: None,
             error_report_floor: None,
         },
+        calls: vec![],
     })
 }
 

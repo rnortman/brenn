@@ -435,6 +435,36 @@ pub struct RSurface {
     pub doc: Option<DocComment>,
 }
 
+/// One `call` port wired to one peer's `sync` port.
+///
+/// The target is resolved to the peer's own name at its placement — a surface
+/// instance's handle, a consumer's slug — because that is what a host looks a
+/// call target up by. Both ends are known to be a declared port of the right
+/// class before this is built.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RCall {
+    /// The `call` port of the instance that holds this binding.
+    pub port: Spanned<String>,
+    /// The peer: what the document wrote until the document-wide call check
+    /// resolves it, and the name a host looks the peer up by after — a surface
+    /// instance's handle, or a top-level consumer's slug.
+    pub target: Spanned<String>,
+    /// The handles the reference may name, the caller's own body first, each
+    /// already in the authority root's namespace.
+    ///
+    /// A peer is named the way a channel is: what the enclosing body stamped
+    /// before what the authority root's top level holds. So a consumer an
+    /// assembly stamped reaches one written beside the assembly, and a consumer
+    /// at the top level reaches one an assembly stamped by the handle it
+    /// stamped it under. A fragment's candidates all lead with its mount, which
+    /// is what keeps a mounted document's calls inside its own namespace.
+    ///
+    /// Emptied once the check has picked one and rewritten `target`.
+    pub candidates: Vec<String>,
+    /// The `sync` port of the peer that answers.
+    pub target_port: Spanned<String>,
+}
+
 /// A component instance inside a surface.
 #[derive(Debug, PartialEq)]
 pub struct RComponentInst {
@@ -459,6 +489,9 @@ pub struct RComponentInst {
     /// over the wire; neither substitutes for the other.
     pub acls: Vec<RAcl>,
     pub bindings: Vec<RBinding>,
+    /// The `call` bindings it holds: each one port of this instance wired to a
+    /// peer in the same surface.
+    pub calls: Vec<RCall>,
     /// The `tool` statements it holds. Always empty on a surface: the surface
     /// host links no tools interface, and the statement is refused there.
     pub tools: Vec<RToolGrant>,
@@ -480,6 +513,9 @@ pub struct RConsumer {
     pub attrs: Vec<(String, RVal)>,
     pub acls: Vec<RAcl>,
     pub bindings: Vec<RBinding>,
+    /// The `call` bindings it holds: each one port of this consumer wired to
+    /// another top-level consumer.
+    pub calls: Vec<RCall>,
     /// The `tool` statements it holds, which its `tools` grant consents to.
     pub tools: Vec<RToolGrant>,
     pub doc: Option<DocComment>,
@@ -566,6 +602,16 @@ pub enum PortDir {
     // the operator, and every document transcribes them by hand today. The
     // marker that would fix it is declared here, on the direction.
     Io,
+    /// Answers a sync call. Bound to no channel and tuned by nothing: a sync
+    /// port's window is the one request the call mints, so it has no depth, no
+    /// noise rung, no doctype and no `optional`. Who may call it is decided by
+    /// the host on one side and, for a peer's `call`, by the document.
+    Sync,
+    /// Asks a peer and reads the reply inline. The other end of a [`PortDir::Sync`]
+    /// port, and tuned by nothing for the same reason. Wired by a `call`
+    /// binding to exactly one peer's sync port, or left unbound, which the
+    /// import answers `unwired`.
+    Call,
 }
 
 impl PortDir {
@@ -575,6 +621,8 @@ impl PortDir {
             PortDir::In => "in",
             PortDir::Out => "out",
             PortDir::Io => "io",
+            PortDir::Sync => "sync",
+            PortDir::Call => "call",
         }
     }
 }

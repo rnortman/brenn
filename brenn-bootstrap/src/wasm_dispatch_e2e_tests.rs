@@ -223,25 +223,16 @@ async fn err_outcome_acks_push_row_at_activation_start() {
     // publish("out", …) → NotPermitted → the guest returns Err.
     let _db = tempfile::NamedTempFile::new().unwrap();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
         declared_out_ports: ["out".to_string()].into_iter().collect(),
         output_ports: std::collections::HashMap::from([(
             "out".to_string(),
             test_out_spec("brenn:denied".to_string()),
         )]),
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
         output_acl: std::sync::Arc::new(|_| false),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let notify = Arc::new(Notify::new());
@@ -256,14 +247,15 @@ async fn err_outcome_acks_push_row_at_activation_start() {
             sub: ResolvedSubscription {
                 channel_uuid,
                 channel_address: channel_addr,
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                 noise: NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
         }],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -892,21 +884,10 @@ async fn build_ring_backed_consumer(
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let cfg = WasmConsumerConfig {
         slug: slug.to_string(),
@@ -919,14 +900,15 @@ async fn build_ring_backed_consumer(
             sub: ResolvedSubscription {
                 channel_uuid: uuid,
                 channel_address: entry.address.clone(),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+                retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
                 noise: NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
         }],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -1024,29 +1006,18 @@ async fn build_mixed_class_consumer(
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new(DEMO_WASM),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: std::collections::HashMap::new(),
         input_amplification_mt: test_amp_map(),
-        mqtt_sinks: std::collections::HashMap::new(),
-        config: std::collections::HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_proc_alerter(),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), slug)
     }));
     let port = |name: &str, entry_uuid, address: String| WasmInputPort {
         port: name.to_string(),
         sub: ResolvedSubscription {
             channel_uuid: entry_uuid,
             channel_address: address,
-            push_depth: Depth::Unbounded,
-            retain_depth: Depth::Unbounded,
+            push_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
+            retain_depth: Depth::Bounded(WINDOW_DEPTH_CEILING),
             noise: NoiseLevel::Silent,
             wake_min: WakeMin::Normal,
         },
@@ -1063,6 +1034,7 @@ async fn build_mixed_class_consumer(
             port("in1", ring_entry.uuid, ring_entry.address.clone()),
         ],
         outputs: vec![],
+        sync_ports: std::collections::BTreeSet::new(),
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -1304,21 +1276,17 @@ async fn boot_dispatch(
                 // The dispatch harness loads the built artifact straight from
                 // the workspace: what it exercises is the wiring above the
                 // loader, not the package resolution boot does.
-                component_path: std::path::Path::new(DEMO_WASM),
-                slug: &consumer.slug,
                 declared_out_ports,
                 output_ports,
                 input_amplification_mt,
                 mqtt_sinks,
                 config: consumer.config.clone(),
                 grants,
-                store_path: None,
                 max_page_count: consumer.max_page_count,
                 max_payload_bytes: config.messaging.max_body_bytes,
                 alerter: noop_proc_alerter(),
                 output_acl,
-                mqtt_publish: None,
-                tool_host: None,
+                ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), &consumer.slug)
             }));
             WasmConsumerConfig {
                 slug: consumer.slug.clone(),
@@ -1328,6 +1296,7 @@ async fn boot_dispatch(
                 alert_dispatcher: alert_dispatcher.clone(),
                 inputs: consumer.inputs.clone(),
                 outputs: consumer.outputs.clone(),
+                sync_ports: std::collections::BTreeSet::new(),
                 activation_pacing: unthrottled_pacing(),
             }
         })
@@ -1759,6 +1728,283 @@ async fn renaming_a_durable_auto_channel_writes_a_fresh_row() {
             uuid::Uuid::from_slice(uuid).unwrap(),
             brenn_lib::messaging::durable_auto_channel_uuid(bare),
             "each row is keyed by the uuid derived from its own name"
+        );
+    }
+}
+
+/// The peer-call path, end to end: real consumer tasks, a real
+/// [`WakeRouterImpl`], and the very `sync_caller` closure a booted consumer is
+/// loaded with ([`crate::consumers::sync_caller_over`]).
+///
+/// Everything below this seam is pinned elsewhere — the host function against a
+/// fake caller in `brenn-wasm`, the drain's sync arm against a test-held channel
+/// in `brenn-wasm-dispatch`, the router's resolution in `brenn-server`. What no
+/// other suite can reach is the composition: a guest's `calls.call` reaching a
+/// peer's activation through a `Handle::block_on` from the blocking thread, the
+/// chain accumulating one slug per hop, and the callee's buffer flushing before
+/// its caller is handed the reply.
+mod peer_calls {
+    use std::sync::{Arc, Mutex};
+
+    use brenn_lib::messaging::config::{
+        Depth, NoiseLevel, ResolvedChannel, Sink, WasmOutputPort, WasmSinkBudget,
+    };
+    use brenn_lib::messaging::{
+        ChannelEntry, ChannelScheme, ComponentGrant, MessagingDirectory, ParticipantId,
+        SubscriberEntry, SubscriberEntryKind, Urgency, WakeMin,
+    };
+    use brenn_server::active_bridge::ActiveBridges;
+    use brenn_server::messaging_router::{DeliveryBinding, WakeRouterImpl};
+    use brenn_wasm::{ProcessorCallTarget, ProcessorComponent, ProcessorLoadSpec};
+    use brenn_wasm_dispatch::tests::*;
+    use brenn_wasm_dispatch::{WasmConsumerConfig, spawn_wasm_consumer_task, sync_request_channel};
+    use indexmap::IndexMap;
+    use tokio::sync::Notify;
+
+    /// The one fixture that imports `brenn:processor/calls`. Wired to itself it
+    /// is a chain of any depth: `call:<rest>` asks its peer `<rest>`.
+    const CALL_TEST_WASM: &str = "brenn-wasm/target/components/brenn_processor_call_test.wasm";
+    /// The channel every consumer in these cases publishes its answer to.
+    const OUT_ADDRESS: &str = "brenn:e2e-call-out";
+    /// The declared `sync` port each consumer answers on.
+    const ANSWER: &str = "answer";
+    /// The declared `call` port each consumer asks through.
+    const ASK: &str = "ask";
+
+    /// What each hop was asked and the chain it was handed, in call order.
+    type Hops = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+    /// A chain of `slugs`, each wired to the next, over one shared output
+    /// channel. Returns the router every call travels through, the messenger the
+    /// publishes land in, the hop log, and the consumer handles to keep alive.
+    async fn wire_chain(
+        slugs: &[&str],
+    ) -> (
+        Arc<WakeRouterImpl>,
+        Arc<brenn_messaging::Messenger>,
+        Hops,
+        Vec<ConsumerHandle>,
+        Vec<tempfile::NamedTempFile>,
+    ) {
+        let db = init_db_memory_lib_slice();
+        let out_uuid = uuid::Uuid::new_v4();
+        let reader = "e2e-call-reader";
+        let out_entry = ChannelEntry {
+            uuid: out_uuid,
+            address: OUT_ADDRESS.to_string(),
+            description: None,
+            resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                standing_retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                sink: Sink::Drop,
+                wake_min: WakeMin::Normal,
+            },
+            subscribers: vec![SubscriberEntry {
+                kind: SubscriberEntryKind::Wasm(reader.to_string()),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                wake_min: None,
+            }],
+            transport_type: ChannelScheme::Brenn,
+            mount: None,
+        };
+        {
+            let conn = db.lock().await;
+            upsert_channels(&conn, std::slice::from_ref(&out_entry));
+        }
+        let messenger = brenn_messaging::Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(vec![out_entry.clone()])),
+            Arc::from("test"),
+            Arc::new(IndexMap::new()),
+            Arc::new(NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
+            brenn_lib::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .with_subscriber_registrations(brenn_messaging::testutils::wasm_registrations(
+            wasm_policies_from_entries(std::slice::from_ref(&out_entry)),
+        ));
+        let out_entry = Arc::new(out_entry);
+        // The reader holds a position, or nothing the components publish is owed
+        // to anyone and the rows cannot be read back.
+        brenn_messaging::testutils::attach_wasm_port(
+            &messenger,
+            &out_entry,
+            reader,
+            &ParticipantId::for_wasm(reader),
+            Depth::Unbounded,
+        )
+        .await;
+
+        let router = Arc::new(WakeRouterImpl::new(ActiveBridges::new()));
+        let hops: Hops = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        let mut stores = Vec::new();
+        for (i, slug) in slugs.iter().enumerate() {
+            // Each consumer calls the next one along; the last calls nobody, so
+            // the graph is the acyclic path the document would have refused to
+            // close.
+            let calls: std::collections::HashMap<String, ProcessorCallTarget> = slugs
+                .get(i + 1)
+                .map(|peer| {
+                    (
+                        ASK.to_string(),
+                        ProcessorCallTarget {
+                            target_slug: (*peer).to_string(),
+                            target_port: ANSWER.to_string(),
+                        },
+                    )
+                })
+                .into_iter()
+                .collect();
+            let mut output_ports = std::collections::HashMap::new();
+            output_ports.insert("out".to_string(), test_out_spec(OUT_ADDRESS.to_string()));
+            // The seam under test, wrapped only to record what each hop was
+            // asked — the closure inside is the one `load_consumer` builds.
+            let inner = crate::consumers::sync_caller_over(Arc::clone(&router));
+            let log = Arc::clone(&hops);
+            let caller: brenn_wasm::SyncCallerFn = Arc::new(
+                move |target_slug: &str, target_port: &str, body: String, chain: &[String]| {
+                    log.lock()
+                        .unwrap()
+                        .push((target_slug.to_string(), chain.to_vec()));
+                    inner(target_slug, target_port, body, chain)
+                },
+            );
+            let store_db = tempfile::NamedTempFile::new().unwrap();
+            let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
+                declared_out_ports: output_ports.keys().cloned().collect(),
+                output_ports,
+                input_amplification_mt: test_amp_map(),
+                grants: [ComponentGrant::Ports, ComponentGrant::Calls]
+                    .into_iter()
+                    .collect(),
+                alerter: noop_proc_alerter(),
+                declared_call_ports: [ASK.to_string()].into_iter().collect(),
+                calls,
+                sync_caller: Some(caller),
+                ..ProcessorLoadSpec::minimal(std::path::Path::new(CALL_TEST_WASM), slug)
+            }));
+            stores.push(store_db);
+            let notify = Arc::new(Notify::new());
+            let (alert_dispatcher, _alert_handle) = noop_alert_dispatcher();
+            let (sync_tx, sync_rx) = sync_request_channel();
+            let cfg = WasmConsumerConfig {
+                slug: (*slug).to_string(),
+                component,
+                notify: Arc::clone(&notify),
+                messenger: Arc::clone(&messenger),
+                alert_dispatcher,
+                inputs: vec![],
+                outputs: vec![WasmOutputPort {
+                    port: "out".to_string(),
+                    channel_uuid: out_uuid,
+                    channel_address: OUT_ADDRESS.to_string(),
+                    default_urgency: Urgency::Normal,
+                    budget: WasmSinkBudget {
+                        fill_mt: 1_000_000,
+                        capacity_mt: 1_000_000,
+                    },
+                }],
+                sync_ports: [ANSWER.to_string()].into_iter().collect(),
+                activation_pacing: unthrottled_pacing(),
+            };
+            router.register_delivery_binding(
+                SubscriberEntryKind::Wasm((*slug).to_string()),
+                DeliveryBinding::WasmConsumer {
+                    notify,
+                    sync: sync_tx,
+                },
+            );
+            handles.push(spawn_wasm_consumer_task(cfg, sync_rx));
+        }
+        (router, messenger, hops, handles, stores)
+    }
+
+    /// Every body on the shared output channel, oldest first — which is the
+    /// order the flushes happened in.
+    async fn published(messenger: &brenn_messaging::Messenger) -> Vec<String> {
+        let conn = messenger.db().lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.body FROM messaging_messages m \
+                 JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+                 WHERE c.address = ?1 ORDER BY m.publish_ts_ns, m.rowid",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![OUT_ADDRESS], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    /// Two consumers wired `call -> sync`: the caller's activation reads the
+    /// callee's reply inline, and the callee's own publish is on its channel
+    /// before the caller's, because a callee's ok flushes its buffer before the
+    /// answer is handed back.
+    #[tokio::test]
+    async fn a_caller_reads_its_peers_reply_and_the_peers_publish_landed_first() {
+        let (router, messenger, hops, _handles, _stores) = wire_chain(&["caller", "callee"]).await;
+
+        let answer = router
+            .sync_call("caller", ANSWER, "call:leaf".to_string(), &[])
+            .await;
+
+        assert_eq!(
+            answer,
+            brenn_activation::sync::SyncAnswer::Ok(Some("via:answer:leaf".to_string())),
+            "the caller answered with what its peer replied"
+        );
+        assert_eq!(
+            published(&messenger).await,
+            vec!["answer:leaf".to_string(), "via:answer:leaf".to_string()],
+            "the callee's publish reached its channel before the caller's"
+        );
+        assert_eq!(
+            hops.lock().unwrap().clone(),
+            vec![("callee".to_string(), vec!["caller".to_string()])],
+            "the peer was handed the caller's own chain"
+        );
+    }
+
+    /// Three deep: every hop appends itself, so the innermost callee is handed
+    /// the whole stack above it. Nothing below this suite composes the hops —
+    /// each one is plausible alone, and the acyclicity assert both hosts carry
+    /// is worth exactly what this accumulation is.
+    #[tokio::test]
+    async fn a_three_deep_chain_hands_each_peer_the_stack_above_it() {
+        let (router, messenger, hops, _handles, _stores) = wire_chain(&["a", "b", "c"]).await;
+
+        let answer = router
+            .sync_call("a", ANSWER, "call:call:leaf".to_string(), &[])
+            .await;
+
+        assert_eq!(
+            answer,
+            brenn_activation::sync::SyncAnswer::Ok(Some("via:via:answer:leaf".to_string())),
+            "each hop wrapped the one below it"
+        );
+        assert_eq!(
+            published(&messenger).await,
+            vec![
+                "answer:leaf".to_string(),
+                "via:answer:leaf".to_string(),
+                "via:via:answer:leaf".to_string(),
+            ],
+            "the innermost callee flushed first and the outermost caller last"
+        );
+        assert_eq!(
+            hops.lock().unwrap().clone(),
+            vec![
+                ("b".to_string(), vec!["a".to_string()]),
+                ("c".to_string(), vec!["a".to_string(), "b".to_string()]),
+            ],
+            "the chain accumulates one slug per hop, caller-first"
         );
     }
 }

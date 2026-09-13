@@ -812,6 +812,10 @@ describe("surface processor bring-up", () => {
                     _d?: bigint,
                 ) => "",
             ),
+            brenn_processor_call: vi.fn(
+                (_i: string, _p: string, _y: string) =>
+                    undefined as string | undefined,
+            ),
             brenn_processor_log: vi.fn(),
             brenn_processor_alert: vi.fn(),
             brenn_processor_config_get: vi.fn(
@@ -1140,6 +1144,17 @@ describe("surface processor bring-up", () => {
         expect(kernel.brenn_processor_config_get).toHaveBeenCalledWith(
             "p1",
             "greeting",
+        );
+
+        kernel.brenn_processor_call.mockReturnValueOnce("42");
+        const calls = captured?.["brenn:processor/calls"] as {
+            call: (port: string, payload: string) => string | undefined;
+        };
+        expect(calls.call("lookup", "{}")).toBe("42");
+        expect(kernel.brenn_processor_call).toHaveBeenCalledWith(
+            "p1",
+            "lookup",
+            "{}",
         );
     });
 

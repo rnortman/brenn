@@ -154,21 +154,9 @@ pub fn out_spec(channel_address: &str) -> OutputPortSpec {
 /// should construct `ProcessorLoadSpec` directly.
 pub fn load_processor_noop(name: &str, slug: &str) -> brenn_wasm::ProcessorComponent {
     brenn_wasm::ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &artifact_path(name),
-        slug,
-        output_ports: HashMap::new(),
-        declared_out_ports: std::collections::BTreeSet::new(),
         input_amplification_mt: amp_in(),
-        mqtt_sinks: HashMap::new(),
-        config: HashMap::new(),
-        grants: std::collections::BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: Arc::new(NoopAlerter),
-        output_acl: allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&artifact_path(name), slug)
     })
 }
 

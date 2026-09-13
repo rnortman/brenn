@@ -616,7 +616,11 @@ contributors are not asked to install a browser driver.
 
 Code site (`TODO(surface-wasm-test-in-ci)`): `surface/kernel/src/dom_host.rs`,
 the browser suite over the live DOM capability host, which is the whole of what
-the five migrated kinds render through and is compiled by nothing in CI.
+the five migrated kinds render through and is compiled by nothing in CI. The
+`calls` seam is the other one: `surface/kernel/src/entry.rs`'s
+`brenn_processor_call` and `surface/kernel/src/sync_door.rs`'s `SyncDoor::call`
+are browser-only compositions — each decision they make is pinned natively, the
+order they ask them in is not.
 
 ---
 

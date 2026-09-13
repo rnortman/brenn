@@ -65,6 +65,10 @@ pub enum ComponentGrant {
     Mqtt,
     /// `brenn:processor/tools` — invoke registry tools, fast and async.
     Tools,
+    /// `brenn:processor/calls` — call a peer component's declared `sync` port
+    /// and read its reply inline. Legal on both hosts: the callee side of a
+    /// sync call is an ordinary activation, which both hosts assemble.
+    Calls,
     /// Fullscreen takeover of the page the component is placed on. Names no WIT
     /// interface: the capability is a binding to a takeover-plane channel, and
     /// the grant is what consents to that binding.
@@ -94,7 +98,7 @@ pub enum ComponentHost {
 impl ComponentGrant {
     /// Every capability a component may be granted, in the order they are
     /// listed.
-    pub const ALL: [ComponentGrant; 10] = [
+    pub const ALL: [ComponentGrant; 11] = [
         ComponentGrant::Ports,
         ComponentGrant::Store,
         ComponentGrant::Log,
@@ -102,6 +106,7 @@ impl ComponentGrant {
         ComponentGrant::Config,
         ComponentGrant::Mqtt,
         ComponentGrant::Tools,
+        ComponentGrant::Calls,
         ComponentGrant::Takeover,
         ComponentGrant::Dom,
         ComponentGrant::PageDom,
@@ -117,6 +122,7 @@ impl ComponentGrant {
             Self::Config => "config",
             Self::Mqtt => "mqtt",
             Self::Tools => "tools",
+            Self::Calls => "calls",
             Self::Takeover => "takeover",
             Self::Dom => "dom",
             Self::PageDom => "page-dom",
@@ -153,6 +159,7 @@ impl ComponentGrant {
             Self::Config => "brenn:processor/config@0.1.0",
             Self::Mqtt => "brenn:processor/mqtt@0.1.0",
             Self::Tools => "brenn:processor/tools@0.1.0",
+            Self::Calls => "brenn:processor/calls@0.1.0",
             Self::Dom => "brenn:processor/dom@0.1.0",
             Self::PageDom => "brenn:processor/page-dom@0.1.0",
             Self::Takeover => return None,
@@ -193,13 +200,15 @@ impl ComponentGrant {
     /// The unified capability this grant becomes once a policy is built, or
     /// `None` for the one grant that names no capability.
     ///
-    /// Four grants name none, for three reasons. `Takeover` is consent to a
+    /// Five grants name none, for four reasons. `Takeover` is consent to a
     /// binding, gated at the binding, and no policy grant set carries it.
     /// `Tools` names authority the resolved tool-grant map carries in full, key
-    /// by key, so there is no single capability it becomes. `Dom` and `PageDom`
-    /// are gated in the page, by the kernel, on the grant word itself, and the
-    /// backend policy vocabulary has no term for either. Whether a `None` here
-    /// is a refusal or a skip belongs to the caller.
+    /// by key, so there is no single capability it becomes. `Calls` reaches a
+    /// peer of the caller's own placement and no channel, so no ACL plane names
+    /// what it may do; the document's wiring is the whole authority. `Dom` and
+    /// `PageDom` are gated in the page, by the kernel, on the grant word
+    /// itself, and the backend policy vocabulary has no term for either.
+    /// Whether a `None` here is a refusal or a skip belongs to the caller.
     pub fn app_capability(self) -> Option<AppCapability> {
         Some(match self {
             Self::Ports => AppCapability::MessagingPublish,
@@ -208,7 +217,9 @@ impl ComponentGrant {
             Self::Alert => AppCapability::WasmAlert,
             Self::Config => AppCapability::WasmConfig,
             Self::Mqtt => AppCapability::MqttPublish,
-            Self::Tools | Self::Takeover | Self::Dom | Self::PageDom => return None,
+            Self::Tools | Self::Calls | Self::Takeover | Self::Dom | Self::PageDom => {
+                return None;
+            }
         })
     }
 }
@@ -736,6 +747,7 @@ mod tests {
             | ComponentGrant::Config
             | ComponentGrant::Mqtt
             | ComponentGrant::Tools
+            | ComponentGrant::Calls
             | ComponentGrant::Takeover
             | ComponentGrant::Dom
             | ComponentGrant::PageDom => {}
@@ -928,12 +940,13 @@ mod tests {
     }
 
     #[test]
-    fn four_component_grants_name_no_capability_and_the_rest_name_one() {
+    fn five_component_grants_name_no_capability_and_the_rest_name_one() {
         for grant in ComponentGrant::ALL {
             let mapped = grant.app_capability();
             match grant {
                 ComponentGrant::Takeover
                 | ComponentGrant::Tools
+                | ComponentGrant::Calls
                 | ComponentGrant::Dom
                 | ComponentGrant::PageDom => assert_eq!(mapped, None),
                 _ => assert!(mapped.is_some(), "{grant:?} names no capability"),

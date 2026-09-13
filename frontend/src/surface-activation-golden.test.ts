@@ -103,17 +103,18 @@ describe("the golden activation", () => {
     it("answers the sync call the kernel minted", () => {
         // The request body is the guest's `__reply__` marker, so the guest
         // reports its sync accessors back: the port it read out of `sync`, that
-        // port compared against the mount item, and the ports this activation
-        // delivered — everything the lift's `sync` mapping feeds. A lift that
-        // dropped `sync` turns a sync call into a fire-and-forget activation and
-        // fails here rather than silently.
+        // port compared against the mount item, whether the request is
+        // attributed to the target's own bare name, and the ports this
+        // activation delivered — everything the lift's `sync` mapping feeds. A
+        // lift that dropped `sync` turns a sync call into a fire-and-forget
+        // activation and fails here rather than silently.
         const delivered = parsed.ports
             .map((window) => window.port)
             .filter((port) => port !== parsed.sync);
         expect(answer).toEqual({
             reply:
                 `replied:${parsed.sync}:mount=true:request=__reply__:` +
-                `delivered=[${delivered.join(",")}]`,
+                `bare-identity=true:delivered=[${delivered.join(",")}]`,
         });
     });
 

@@ -1205,6 +1205,8 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
         package: "deadwasm".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1233,6 +1235,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1271,6 +1274,8 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
         package: "undeclared".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![ComponentGrant::Mqtt],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1293,6 +1298,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1338,6 +1344,8 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
         package: "aclless".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1360,6 +1368,7 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1405,6 +1414,8 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
         package: "scoped-wasm".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         // Non-empty ⇒ MessagingSubscribe grant is derived, but the matcher names
         // a different channel, so allows_channel_access("brenn:secret-channel") is false.
@@ -1435,6 +1446,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1474,6 +1486,8 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
         package: "covered-wasm".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![ChannelMatcherRaw::Exact(subscribed.to_string())],
         ephemeral_subscribe_acl: vec![],
@@ -1502,6 +1516,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1549,6 +1564,8 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
         package: "undeclared-sub".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1572,6 +1589,7 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1610,6 +1628,8 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
         package: "processor-demo".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec!["out".to_string()],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![ComponentGrant::Ports],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1648,6 +1668,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
         activation_min_period_ms: Some(1000),
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1696,6 +1717,8 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
         package: "processor-demo".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1725,6 +1748,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1766,6 +1790,8 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
         package: "consume-mqtt".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1797,6 +1823,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
@@ -1854,6 +1881,8 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
         package: "consume-mqtt".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
@@ -1883,6 +1912,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }];
 
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());

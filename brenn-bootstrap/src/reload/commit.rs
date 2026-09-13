@@ -32,7 +32,7 @@ use brenn_lib::messaging::config::{Depth, DormantSubscription};
 use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntryKind};
 use brenn_lib::mqtt::config::MqttClientConfig;
 use brenn_lib::wasm_package::Verified;
-use brenn_messaging::{Messenger, WASM_WINDOW_MAX_NEW};
+use brenn_messaging::Messenger;
 use brenn_messaging_boot::MessagingPlan;
 use brenn_server::messaging_router::DeliveryBinding;
 
@@ -1799,7 +1799,10 @@ async fn start_consumers(
         });
         env.router.register_delivery_binding(
             kind.clone(),
-            DeliveryBinding::ParkedNotify(one.notify.clone()),
+            DeliveryBinding::WasmConsumer {
+                notify: one.notify.clone(),
+                sync: one.sync_tx.clone(),
+            },
         );
         if let Some(grants) = &env.tool_caller_grants {
             // Off the plan, which is the one derivation of this table: a caller
@@ -1815,8 +1818,16 @@ async fn start_consumers(
         let participant = ParticipantId::for_wasm(&slug);
         for input in &consumer.inputs {
             // Must match the depth the port's window reads at, or the first
-            // read retunes the cursor.
-            let push_depth = Depth::Bounded(input.sub.push_depth.clamped_to(WASM_WINDOW_MAX_NEW));
+            // read retunes the cursor. Resolution has already refused anything
+            // above the ceiling, so a miss here is a resolution bug.
+            let push_depth = input.sub.push_depth;
+            assert!(
+                matches!(push_depth, Depth::Bounded(n) if n <= brenn_activation::WINDOW_DEPTH_CEILING),
+                "reload: consumer {slug:?} port {:?} resolved to push_depth {push_depth:?}, above \
+                 the window ceiling ({})",
+                input.port,
+                brenn_activation::WINDOW_DEPTH_CEILING,
+            );
             // The `Attached` verdict is not read here: whether this attach
             // primed a fresh position or carried one over, the consumer's mount
             // activation windows and advances every port from its task's first

@@ -233,6 +233,24 @@ no cron abstraction, no timer service with its own lifecycle and failure modes.
 Time-based triggering is publication with a coordinate on the time axis, and
 everything that is true of messages is true of timers.
 
+### 2.4a A sync call is not a message on the bus
+
+A component can also be *called* synchronously: one request in, one reply out,
+inside one ordinary activation of the callee. None of it is a publication. The
+request is minted around the caller's payload, rides in a fabricated window of
+its own, and is delivered to exactly one instance — the target — and to nobody
+else. It is never retained, never routed, never seen by a subscriber, and its
+address family (`local:brenn/sync/<port>`) is bindable by nothing. A call has no
+`deliver_after`, no urgency ladder, no drop count, and no cursor.
+
+So none of the reasoning in this document applies to it, and the inverse is the
+part worth remembering: **RPC across the wire is pub/sub with a reply channel**,
+which the bus already supports and which the sync call deliberately is not. A
+call goes to an instance in the same placement, its caller is blocked for the
+whole of the callee's activation, and the call graph is acyclic by refusal at
+compile time. Anything that needs to cross a host boundary, survive a restart,
+fan out, or be retried is a message, not a call.
+
 ### 2.5 State by retention
 
 Because channels persist independent of consumption, a retained channel *is* a

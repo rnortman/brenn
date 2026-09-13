@@ -748,6 +748,60 @@ which topics a client may publish to and subscribe from. Inbound MQTT payloads a
 untrusted (prompt-injection vector); the broker ACL, not `nolocal`, is what keeps a
 client from injecting into topics it should not reach.
 
+### 8.3 Component-to-component calls (the `calls` grant)
+
+A component holding the `calls` grant can call the peer wired to one of its
+declared `call` ports and read that peer's reply inline. The grant is
+deny-by-default like every other: a component whose specification does not
+require `calls` cannot reach the import at all, and a declared `call` port the
+operator left unwired answers `unwired` rather than reaching anything. Who may
+call whom is operator wiring — a `call` binding names one peer instance and one
+port that peer declares `sync` — and the depth of any chain is bounded at
+compile time, because a document whose `call` graph has a cycle is refused.
+
+A call is charged against the caller's shared per-activation call ceiling
+(`MAX_PUBLISH_CALLS_PER_ACTIVATION`, 512 — one counter over `ports.publish`,
+`mqtt.mqtt-publish` and `calls.call`) and its payload against the publish-body
+cap; an oversize reply traps the callee. **What that bounds is how many peer
+activations one activation raises, not what one of them costs.** A call is one
+whole, uncoalesced activation of the peer under the peer's own ceilings —
+unlike N publishes onto a channel, which coalesce into at most one wake of a
+subscriber. Each peer's own ceilings bound what that peer then does, and the
+acyclic graph bounds the depth.
+
+Both substrate halves, and the residual each leaves:
+
+- **Backend.** Every callee activation passes the callee's own activation pacer
+  before it runs, on the same terms as any other activation: the pacer delays,
+  it never refuses. The caller is stopped on its stack for the wait, and that
+  wait is deliberately **not** charged against the caller's epoch deadline — a
+  caller must not trap because its peer is slow. So one activation's fan-out
+  costs about `call ceiling × pacing period` per level, plus one epoch per
+  level, times the chain's depth: a caller that fans 512 calls at a peer paced
+  to one activation per second after its burst waits on the order of minutes,
+  uncharged. **Accepted risk, named:** for that whole time the caller holds one
+  blocking-pool thread per chain level and its own serialized drain loop serves
+  none of its bound inputs, whose bounded channels evict on exactly the terms
+  §8.2 records for pacing; and the callee's single drain loop is the one running
+  the fan-out, one paced admission at a time, so the callee's own bound inputs
+  go unserved for the same duration. The cost is contained to the chain — the
+  callee cannot be driven faster than its operator-set period, and the blocking
+  pool holds one thread per level with the depth bounded — so no consumer
+  outside the chain is reached. The operator's levers are the callee's pacer
+  period and burst on one side and the `call` wiring on the other. The
+  alternative, charging the wait to the caller's epoch, is rejected: it makes
+  the outermost caller trap for somebody else's slowness.
+- **Page.** There is no pacer and no epoch. A call runs the peer's activation
+  nested inside the caller's, on the browser's main thread, so a chain's time is
+  the sum of the chain's and is bounded by nothing but the browser's slow-script
+  guard. That is the browser co-host asymmetry this section already records —
+  a page component needs no grant at all to hold the main thread — and not a
+  property of the `calls` grant.
+
+Cross-host calls do not exist: a call whose caller and callee are not placed
+together is refused at compile time.
+
+
 ---
 
 ## 9. Boundary B6 — Hosted-App Subprocesses

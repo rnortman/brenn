@@ -17,6 +17,7 @@ rust_library(
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
+        "//brenn-activation",
         "//brenn-common",
         "//brenn-lib",
         "//brenn-messaging",
@@ -54,6 +55,7 @@ rust_test(
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm-dispatch"},
     deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-activation",
         "//brenn-common",
         "//brenn-host-conformance",
         "//brenn-lib",

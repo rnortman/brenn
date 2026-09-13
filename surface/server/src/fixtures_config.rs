@@ -46,6 +46,7 @@ impl SurfaceFixture {
                 wire_subscriptions: vec![],
                 local_channels: vec![],
                 outputs: vec![],
+                calls: vec![],
                 policy: AppPolicy::default(),
                 allowed_users: vec![],
                 publish_burst: 60,

@@ -40,6 +40,10 @@ component Protobar {
   abi = processor;
   requires = [ports, log];
   in messages: "brenn.panel.message@1";
+
+  // A sync port answers a call and binds to nothing, so it ends on its
+  // terminator the way a doctype-less declaration does.
+  sync ping;
 }
 
 // `optional` reads as an attr key and as a port marker in one body: the attr
@@ -51,6 +55,7 @@ component EchoStub {
   optional = [takeover];
   in inbound: "brenn.panel.message@1";
   out outbound;
+  call ask;
 
   // A port declaration with no doctype ends on the terminator itself.
   optional io acks;
@@ -139,6 +144,9 @@ assembly Deskbar(slug: String, driver: Agent) {
       out outbound -> "local:brenn/takeover";
       in inbound <- "local:brenn/theme" { push_depth = 8; }
 
+      // A call names a peer and a `sync` port of it; nothing else in the
+      // language reaches an instance rather than a channel.
+      call ask -> p1.ping;
     }
 
   }

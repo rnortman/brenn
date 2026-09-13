@@ -7,6 +7,7 @@
 //! owns a task: [`build_messaging`] returns a [`MessagingResult`] and the
 //! composition root above spawns from it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use brenn_lib::config::{AppConfig, BrennConfig};
@@ -56,6 +57,180 @@ fn assert_port_name(context: &str, port: &str) {
         port.chars().all(brenn_lib::messaging::is_unreserved_char),
         "{context} {port:?} must consist of RFC 3986 unreserved characters only (A-Za-z0-9._~-)",
     );
+}
+
+/// Fold one class's declared port vocabulary of `class` kind into a set, holding
+/// every name to the shared charset and refusing a repeat.
+///
+/// The one statement of what a legal vocabulary is, for every port class at
+/// every placement: a consumer's out-ports and sync ports, a surface
+/// component's. A vocabulary is what the hosts judge a component's own words
+/// against — a publish, a `dom.listen`, a caller's request — so a malformed
+/// entry would refuse a component that did nothing wrong, and two placements
+/// refusing different vocabularies is a divergence that only shows up on a
+/// deploy.
+///
+/// `context` is a pre-formatted label naming the block and the placement
+/// (`[[wasm_consumer]] "filter"`), in the style [`assert_port_name`] takes;
+/// `class` is the port class as the specification spells it (`out`, `sync`).
+///
+/// # Panics
+///
+/// On an empty name, a name outside the unreserved charset, and a repeated
+/// name (the resolver refuses a class declaring one name twice).
+fn port_vocabulary(context: &str, class: &str, names: &[String]) -> BTreeSet<String> {
+    let mut declared = BTreeSet::new();
+    for port in names {
+        assert_port_name(&format!("{context}: declared {class}-port name"), port);
+        assert!(
+            declared.insert(port.clone()),
+            "{context}: declared {class}-port name {port:?} appears twice",
+        );
+    }
+    declared
+}
+
+/// One resolved `call` binding, as the shared backstop reads it.
+///
+/// A minimal view on purpose: the two placements carry their wiring in
+/// differently-shaped tables (a consumer's on the consumer, a surface's flat
+/// under the surface), and the rules below are about none of that.
+pub(crate) struct CallEdge<'a> {
+    /// A pre-formatted label naming the block, the placement and this binding,
+    /// in the style [`assert_port_name`]'s context takes — everything the
+    /// operator needs to find the line, and the only part of a refusal that is
+    /// per-placement.
+    pub(crate) label: String,
+    /// The caller, as the peer lookup and the graph key it: a consumer's slug, a
+    /// surface component's instance name.
+    pub(crate) caller: &'a str,
+    /// The caller's `call` port this binding names.
+    pub(crate) port: &'a str,
+    /// The caller class's declared `call`-port vocabulary.
+    pub(crate) caller_call_ports: &'a BTreeSet<String>,
+    /// The peer this call reaches, keyed as `caller` is.
+    pub(crate) target: &'a str,
+    /// The peer's port that answers.
+    pub(crate) target_port: &'a str,
+}
+
+/// Hold every resolved `call` binding of one placement against the peers beside
+/// it.
+///
+/// The one statement of the four rules for both placements: a call names a port
+/// its own class declares `call`, one `call` port reaches one peer, the peer is
+/// an instance of the caller's own placement declaring that port `sync`, and the
+/// graph the bindings form does not close on itself. Belt and suspenders over
+/// the resolver, which refuses all four at compile time — but a boot that
+/// accepted a shape the compiler refuses is exactly the disagreement a backstop
+/// exists to catch, and the fourth rule is the one the whole termination
+/// argument rests on: a caller waits for its callee, so a cycle is two tasks
+/// deadlocked on the backend and a killed tab on the page, raised at whatever
+/// moment a gesture first reaches the cycle. Dying at boot is the better answer
+/// to all four.
+///
+/// `sync_ports` answers, for a peer name, that peer's declared `sync`
+/// vocabulary, or `None` for a name this placement does not declare.
+///
+/// # Panics
+///
+/// On any of the four.
+pub(crate) fn check_call_wiring<'a>(
+    edges: &[CallEdge<'a>],
+    sync_ports: impl Fn(&str) -> Option<&'a BTreeSet<String>>,
+) {
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for edge in edges {
+        // A binding names a port the caller's class declares `call`; anything
+        // else would wire a name the guest cannot reach.
+        assert!(
+            edge.caller_call_ports.contains(edge.port),
+            "{} is bound but is not in the class's declared call-port vocabulary {:?} — the \
+             lowered vocabulary does not describe the lowered bindings",
+            edge.label,
+            edge.caller_call_ports,
+        );
+        // One `call` port reaches one peer. Two bindings on one port would make
+        // the target of a call whichever the host indexed first.
+        assert!(
+            seen.insert((edge.caller, edge.port)),
+            "{} is bound twice",
+            edge.label,
+        );
+        let declared = sync_ports(edge.target).unwrap_or_else(|| {
+            panic!(
+                "{} targets {:?}, which this placement does not declare — a call reaches a \
+                 peer of the caller's own placement and never crosses one",
+                edge.label, edge.target,
+            )
+        });
+        assert!(
+            declared.contains(edge.target_port),
+            "{} targets {:?}/{:?}, which the target's class does not declare `sync` (it \
+             declares {:?}) — a call is answered by a declared sync port or by nothing",
+            edge.label,
+            edge.target,
+            edge.target_port,
+            declared,
+        );
+    }
+    check_call_acyclic(edges);
+}
+
+/// Refuse a `call` graph that closes on itself, naming the cycle.
+///
+/// Three-colour depth-first walk, one refusal at the edge that closes a cycle:
+/// every member is equally part of it, and one message per member would be one
+/// mistake reported as several. The same shape, and the same reason, as the
+/// resolver's own pass.
+fn check_call_acyclic(edges: &[CallEdge<'_>]) {
+    let mut out: BTreeMap<&str, Vec<&CallEdge<'_>>> = BTreeMap::new();
+    for edge in edges {
+        out.entry(edge.caller).or_default().push(edge);
+    }
+    // 0 unvisited, 1 on the current path, 2 finished.
+    let mut state: BTreeMap<&str, u8> = BTreeMap::new();
+    let mut path: Vec<&str> = Vec::new();
+    for edge in edges {
+        walk_call_edges(edge.caller, &out, &mut state, &mut path);
+    }
+}
+
+fn walk_call_edges<'a>(
+    node: &'a str,
+    out: &BTreeMap<&'a str, Vec<&'a CallEdge<'a>>>,
+    state: &mut BTreeMap<&'a str, u8>,
+    path: &mut Vec<&'a str>,
+) {
+    match state.get(node) {
+        Some(2) => return,
+        Some(1) => unreachable!("a node on the current path is never re-entered from the top"),
+        _ => {}
+    }
+    state.insert(node, 1);
+    path.push(node);
+    for edge in out.get(node).into_iter().flatten() {
+        match state.get(edge.target).copied().unwrap_or(0) {
+            1 => {
+                let from = path
+                    .iter()
+                    .position(|n| *n == edge.target)
+                    .expect("a node coloured on-path is on the path");
+                let mut cycle: Vec<&str> = path[from..].to_vec();
+                cycle.push(edge.target);
+                panic!(
+                    "{} closes a call cycle {} — a caller waits for its callee, so a cycle \
+                     of calls is a deadlock",
+                    edge.label,
+                    cycle.join(" -> "),
+                );
+            }
+            2 => {}
+            _ => walk_call_edges(edge.target, out, state, path),
+        }
+    }
+    path.pop();
+    state.insert(node, 2);
 }
 
 /// Hold one bound address out of the namespaces the tool substrate mints into.
@@ -1246,10 +1421,20 @@ pub async fn commit_messaging(
         for inp in &c.inputs {
             // The same spelling the port's window reads at, so the depth the
             // cursor row caches is the one the first read would retune it to.
-            let push_depth = brenn_lib::messaging::config::Depth::Bounded(
-                inp.sub
-                    .push_depth
-                    .clamped_to(brenn_messaging::WASM_WINDOW_MAX_NEW),
+            // Resolution refused anything above the ceiling, so a miss here is
+            // a resolution bug.
+            let push_depth = inp.sub.push_depth;
+            assert!(
+                matches!(
+                    push_depth,
+                    brenn_lib::messaging::config::Depth::Bounded(n)
+                        if n <= brenn_activation::WINDOW_DEPTH_CEILING
+                ),
+                "boot: consumer {:?} port {:?} resolved to push_depth {push_depth:?}, above the \
+                 window ceiling ({})",
+                c.slug,
+                inp.port,
+                brenn_activation::WINDOW_DEPTH_CEILING,
             );
             let attached = messenger
                 .attach_subscriber(&inp.sub.channel_address, &c.slug, &subscriber, push_depth)

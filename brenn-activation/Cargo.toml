@@ -5,18 +5,33 @@ edition = "2024"
 publish = false
 description = "The processor.wit activation carrier — one shape, every host"
 
-# Dependency-free and std-only, deliberately: both hosts depend on this crate,
-# and one of them (the surface kernel, via `brenn-surface-contract`) compiles to
-# wasm32. An envelope is its JSON text at both placements, and a `String` needs
-# no dependency; the generic parameter is what keeps the envelope type out of
-# this crate's dependency list even so, and this crate's own tests are its only
-# other instantiation.
+# No host crate, deliberately: both hosts depend on this crate, and one of them
+# (the surface kernel, via `brenn-surface-contract`) compiles to wasm32. The one
+# workspace dependency is the envelope vocabulary, because minting a sync-call
+# request is a rule of the facility rather than a host's own business, and a
+# rule stated on one host's side only is a rule the other host's author never
+# reads as an obligation. `brenn-envelope` depends on no workspace crate and
+# compiles for wasm32.
+#
+# An envelope windowed at a guest is still its JSON text at both placements, and
+# a `String` needs no dependency; the generic parameter is what keeps the carrier
+# free of an envelope type even so, and this crate's own tests are its only other
+# instantiation.
+#
+# Two third-party dependencies, both `brenn-envelope`'s own and both here only so
+# the envelope's field types can be spelled in a signature: `chrono` for the
+# publish timestamp and `uuid` for the message id. Neither is featured beyond
+# what naming the type costs — the generating and serializing halves are the
+# envelope's business, not this crate's.
 #
 # One optional dependency: `serde`, off by default. The surface's `dom` profile
 # crosses a JS module boundary per activation, and JSON is the codec that boundary
 # takes — so the carrier needs a derive there and nowhere else. Gated so the
-# wasmtime host keeps the dependency-free crate it has today.
+# wasmtime host keeps the derive-free crate it has today.
 [dependencies]
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
+chrono = { version = "0.4.44", default-features = false, features = ["alloc"] }
+uuid = { version = "1.23.0" }
 serde = { version = "1.0.228", default-features = false, features = ["derive"], optional = true }
 
 [features]

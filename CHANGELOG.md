@@ -4,6 +4,43 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Component-to-component synchronous calls.** A component can now call a
+  peer and receive its reply inline, on either host, through a new `calls` WIT
+  import (`brenn:processor/calls`). The caller declares a `call` port; the
+  callee declares a `sync` port; the operator wires them in the DSL with
+  `call <port> -> <instance>.<port>`. The call graph must be acyclic (enforced
+  at compile time). A call runs the peer's activation to completion, flushes
+  its buffer, and hands the reply back before the caller resumes. Both hosts
+  share one contract (`brenn-activation`), one conformance suite, and identical
+  guest SDK verbs. See `docs/config-dsl.md` for the grammar and
+  `docs/component-packages.md` for the contract-evolution entry.
+- **Sync-call activations on the backend.** The facility that the page kernel
+  used for DOM gestures is now a two-host primitive. Backend consumers can be
+  called synchronously by native code through `MessagingRouter::sync_call`,
+  which is also how the `calls` import reaches a peer. The "headless component
+  has no sync cause" restriction is removed.
+- **BREAKING: WASM binding depths above 1000 are refused at boot.** Both hosts
+  now enforce a shared `WINDOW_DEPTH_CEILING` (1000) as a hard refusal rather
+  than silently capping. A deployment whose config carries a depth above 1000
+  on any WASM or surface binding will fail to boot until the value is lowered.
+  `Depth::Unbounded` on a backend binding resolves to the ceiling once and is
+  never seen downstream.
+- **BREAKING: `dom.listen` requires a declared `sync` port.** A surface
+  component that calls `dom.listen(node, event, port)` must declare `sync
+  <port>;` in its specification. Existing in-tree kinds (chrome, echo-stub,
+  meeting) have been updated; out-of-tree kinds pay this cut at their next
+  rebuild. The runtime `PortCollision` refusal is replaced by a compile-time
+  duplicate-declaration check.
+- Unified the `NoiseLevel` enum: one shared type in `brenn-envelope`, replacing
+  two hand-copied definitions in `brenn-lib` and `surface/schema`. Wire
+  spelling, ordering, and `is_backend_enactable()` are defined once.
+- The host-specific behaviours record in `brenn-activation` is rewritten as two
+  sections (observable differences vs. substrate differences), with sync-call
+  causes, the activation time bound, pacing shape, failure record, and the
+  `Unbounded` vocabulary each stated with its substrate reason.
+- Documented the sync-call facility in `docs/message-bus.md` (a sync call is
+  not a message on the bus) and recorded the `calls` grant in
+  `docs/security-posture.md` (new section 8.3).
 - **Documented which channel schemes each component placement may bind**
   (`docs/message-bus.md` §2.1.1): a parity matrix covering backend consumers
   and surface instances for every scheme, sourced to `bindable_schemes`.

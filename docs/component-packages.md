@@ -71,6 +71,25 @@ bundle's re-release picks it up with no restart. The same record mismatch under
 the binary travel in one tarball and are installed as a sync, so a mismatch
 there is a broken install and not a version skew anybody can converge.
 
+An additive change in force now: **`brenn:processor/calls`**, the interface a
+component reaches a peer through. It is a new interface and a new grant word
+(`calls`), so nothing existing moves and a bundle built before it is unaffected:
+a kind that does not name `calls` in `requires` does not import it, and its
+artifact, its record and its spec are what they were. A kind that *does* is
+hosted on either placement — the interface is legal on the backend and on a
+surface — and needs a brenn new enough to link it, which is the ordering rule
+every bundle already follows: release brenn before a bundle that needs a newer
+brenn.
+
+One runtime contract is a **candidate for deletion**, recorded here so that a
+bundle author meets it before it happens rather than after: `brenn:replay` is
+the one world native backend code calls synchronously per request, and the
+backend host now mints sync-call activations for any processor with a declared
+`sync` port. A replay component could therefore be an ordinary processor that
+answers a `sync check;` port, and the world would go. That is an external ABI
+cut — out-of-tree replay components are first-class consumers of it — so it is
+its own coordinated event with its own design, and nothing has been decided.
+
 **Build-time contracts are hard-cut, at the pin.** These are consumed against a
 commit the consumer names in its own `git_override`: the macros in
 `bazel/wasm/defs.bzl` and `bazel/surface/dist.bzl`, `brenn-guest`'s Rust API,
@@ -80,6 +99,14 @@ when it next bumps that pin, and nothing before, because nothing that is
 already deployed reads them. `examples/component/` is the canary that a cut is
 complete on brenn's side; a consumer repository's CI at its next pin bump is
 where the cut is paid.
+
+A cut of this kind in force now: **a `dom.listen` port must be declared `sync`
+in the specification.** A `dom`-granted kind that calls `listen` adds a
+`sync <name>;` line per port it listens on, or its mount activation ends the
+first time it installs a listener. The specification and the artifact travel
+together and are hash-bound, so this is a rebuild per kind at the next pin bump,
+never a deployment skew. A `dom`-granted kind that never calls `listen` is
+untouched.
 
 Freezing the macro vocabulary of a one-operator ecosystem buys nothing a pin
 does not already buy, which is why the two are split rather than held to one

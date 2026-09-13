@@ -490,6 +490,105 @@ impl Urgency {
 }
 
 // ---------------------------------------------------------------------------
+// Noise level
+// ---------------------------------------------------------------------------
+
+/// Noise level for `push_depth`-overflow events, per subscriber.
+///
+/// The rungs are a monotone loudness ladder — each does everything the rung
+/// below it does and more: `metered` counts; `alarm` counts and alerts; `fatal`
+/// counts, alerts, and kills the instance. Declaration order is the ladder
+/// order, so `Silent < Metered < Alarm < Fatal` and "at least this loud" reads
+/// as a comparison; the `derive(Ord)` is load-bearing.
+///
+/// One type for both hosts. The backend resolves a subscription's rung and the
+/// surface server resolves a binding's; the page never re-runs the ladder, it
+/// receives the resolved rung and enacts it on overflow. Wire spelling is the
+/// serde-lowercase name, and [`FromStr`](std::str::FromStr) is its exact
+/// inverse.
+///
+/// `Fatal` is enacted only on the surface (kernel-side), never on the backend
+/// overflow path: a backend subscription that resolves to `Fatal` is refused
+/// where its noise resolves, because only the kernel has a kill wire. On a
+/// chrome binding the kill takes chrome's fatal path (a capped bootstrap
+/// reload) — an operator who marks a chrome binding `fatal` has declared
+/// "overflow here reloads the page".
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum NoiseLevel {
+    /// Overflow drops oldest; no further signal.
+    Silent,
+    /// Silent, plus a per-channel/per-subscriber lifetime drop counter.
+    Metered,
+    /// Metered, plus an alert (and, on the page, a toast on every overflowing
+    /// activation).
+    Alarm,
+    /// Everything `alarm` does, plus killing the overflowing instance.
+    /// Surface-only (kernel-enacted); never valid on a backend subscription.
+    Fatal,
+}
+
+/// The error [`NoiseLevel`]'s [`FromStr`](std::str::FromStr) returns: the string
+/// is not one of the four lowercase rung names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoiseLevelParseError;
+
+impl std::fmt::Display for NoiseLevelParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("expected one of: silent, metered, alarm, fatal")
+    }
+}
+
+impl std::error::Error for NoiseLevelParseError {}
+
+impl std::str::FromStr for NoiseLevel {
+    type Err = NoiseLevelParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "silent" => Ok(Self::Silent),
+            "metered" => Ok(Self::Metered),
+            "alarm" => Ok(Self::Alarm),
+            "fatal" => Ok(Self::Fatal),
+            _ => Err(NoiseLevelParseError),
+        }
+    }
+}
+
+impl NoiseLevel {
+    /// Every rung in ascending ladder order.
+    pub const ALL: [NoiseLevel; 4] = [Self::Silent, Self::Metered, Self::Alarm, Self::Fatal];
+
+    /// The lowercase wire string — the inverse of the
+    /// [`FromStr`](std::str::FromStr) impl and of the serde serialization.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Silent => "silent",
+            Self::Metered => "metered",
+            Self::Alarm => "alarm",
+            Self::Fatal => "fatal",
+        }
+    }
+
+    /// Whether the backend overflow path can enact this level. It cannot enact
+    /// `fatal`: that rung kills the overflowing instance and only the surface
+    /// kernel has a kill wire.
+    ///
+    /// The single statement of the rule. Callers supply their own refusal shape
+    /// with [`BACKEND_FATAL_NOISE_REFUSAL`] as the reason.
+    pub fn is_backend_enactable(self) -> bool {
+        self != Self::Fatal
+    }
+}
+
+/// The reason half of every refusal of a backend-side `fatal`, so the operator
+/// reads the same sentence wherever the rung is refused.
+pub const BACKEND_FATAL_NOISE_REFUSAL: &str = "fatal is surface-only (the backend overflow path \
+     has no kill) — set a backend-valid noise level (silent/metered/alarm)";
+
+// ---------------------------------------------------------------------------
 // Epoch-millisecond times
 // ---------------------------------------------------------------------------
 
@@ -1129,5 +1228,48 @@ mod tests {
         assert_eq!(v["payload"], json!({ "text": "22.5" }));
         assert_eq!(v["received_at"], json!("2023-11-14T22:13:20Z"));
         assert_eq!(v["qos"], json!(1));
+    }
+
+    #[test]
+    fn noise_level_ord_is_ascending_loudness() {
+        assert!(NoiseLevel::Silent < NoiseLevel::Metered);
+        assert!(NoiseLevel::Metered < NoiseLevel::Alarm);
+        assert!(NoiseLevel::Alarm < NoiseLevel::Fatal);
+        // "at least this loud" as a comparison.
+        assert!(NoiseLevel::Fatal >= NoiseLevel::Alarm);
+        // `ALL` is that ladder, in order, with every rung present once.
+        assert_eq!(
+            NoiseLevel::ALL,
+            [
+                NoiseLevel::Silent,
+                NoiseLevel::Metered,
+                NoiseLevel::Alarm,
+                NoiseLevel::Fatal
+            ]
+        );
+    }
+
+    #[test]
+    fn noise_level_wire_codec_covers_every_rung() {
+        for (level, s) in [
+            (NoiseLevel::Silent, "silent"),
+            (NoiseLevel::Metered, "metered"),
+            (NoiseLevel::Alarm, "alarm"),
+            (NoiseLevel::Fatal, "fatal"),
+        ] {
+            assert_eq!(serde_json::to_value(level).unwrap(), json!(s));
+            assert_eq!(level.as_str(), s);
+            assert_eq!(s.parse::<NoiseLevel>(), Ok(level));
+        }
+        assert_eq!("Fatal".parse::<NoiseLevel>(), Err(NoiseLevelParseError));
+        assert_eq!("".parse::<NoiseLevel>(), Err(NoiseLevelParseError));
+    }
+
+    #[test]
+    fn only_fatal_is_not_backend_enactable() {
+        assert!(NoiseLevel::Silent.is_backend_enactable());
+        assert!(NoiseLevel::Metered.is_backend_enactable());
+        assert!(NoiseLevel::Alarm.is_backend_enactable());
+        assert!(!NoiseLevel::Fatal.is_backend_enactable());
     }
 }

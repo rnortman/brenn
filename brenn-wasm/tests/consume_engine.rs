@@ -12,7 +12,7 @@ use brenn_wasm::{
     ComponentGrant, PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE, PROCESSOR_MAX_INSTANCES,
     PROCESSOR_MAX_MEMORIES, PROCESSOR_MAX_MEMORY_BYTES, PROCESSOR_MAX_TABLE_ELEMENTS,
     PROCESSOR_MAX_TABLES, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec,
-    ProcessorOutcome, ProcessorPortWindow, ProcessorUrgency, store::DEFAULT_MAX_PAGE_COUNT,
+    ProcessorOutcome, ProcessorPortWindow, ProcessorUrgency,
 };
 use tracing_test::traced_test;
 
@@ -35,21 +35,10 @@ fn component_path(name: &str) -> std::path::PathBuf {
 fn load_component(name: &str, slug: &str) -> ProcessorComponent {
     // exhaust / mem_exhaust import only `types` — no capability grants needed.
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path(name),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
-        grants: std::collections::BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path(name), slug)
     })
 }
 
@@ -60,21 +49,13 @@ fn load_dual() -> ProcessorComponent {
     // processor-dual imports: types + ports
     let grants = [ComponentGrant::Ports].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_dual"),
-        slug: "dual",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_dual"), "dual")
     })
 }
 
@@ -82,21 +63,13 @@ fn load_demo(output_ports: HashMap<String, brenn_wasm::OutputPortSpec>) -> Proce
     // processor-demo imports: types + ports
     let grants = [ComponentGrant::Ports].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo",
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo")
     })
 }
 
@@ -111,21 +84,12 @@ fn load_demo_with_out() -> ProcessorComponent {
 fn load_demo_declaring_out_unwired() -> ProcessorComponent {
     let grants = [ComponentGrant::Ports].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo",
         declared_out_ports: ["out".to_string()].into_iter().collect(),
-        output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo")
     })
 }
 
@@ -134,26 +98,25 @@ fn load_demo_no_ports() -> ProcessorComponent {
 }
 
 fn load_multiport() -> ProcessorComponent {
+    load_multiport_with_payload_cap(1024 * 1024)
+}
+
+/// The multiport fixture under a named payload cap — the ceiling a publish body
+/// and a sync-call reply are both held to.
+fn load_multiport_with_payload_cap(max_payload_bytes: usize) -> ProcessorComponent {
     let mut ports = HashMap::new();
     ports.insert("out".to_string(), common::out_spec("brenn:multiport-out"));
     // processor-multiport imports: types + ports
     let grants = [ComponentGrant::Ports].into_iter().collect();
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_multiport"),
-        slug: "multiport",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants,
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
+        max_payload_bytes,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_multiport"), "multiport")
     })
 }
 
@@ -180,21 +143,12 @@ fn load_store_component(name: &str, slug: &str) -> (ProcessorComponent, tempfile
 /// replacement for a consumer that is still running.
 fn load_store_component_at(name: &str, slug: &str, store: &std::path::Path) -> ProcessorComponent {
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path(name),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants: [ComponentGrant::Store].into_iter().collect(),
         store_path: Some(store),
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path(name), slug)
     })
 }
 
@@ -264,21 +218,10 @@ fn load_valid_component_succeeds() {
 #[should_panic]
 fn load_missing_path_panics() {
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: std::path::Path::new("/nonexistent/processor.wasm"),
-        slug: "test",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
-        grants: std::collections::BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(std::path::Path::new("/nonexistent/processor.wasm"), "test")
     });
 }
 
@@ -328,16 +271,20 @@ fn handle_no_new_envelopes_does_not_fail() {
 }
 
 #[test]
-#[should_panic(expected = "cannot be lowered into the processor world")]
-fn handle_panics_on_a_sync_call_activation() {
-    // The processor world has no sync vocabulary, so a sync-call activation
-    // reaching this host is a caller error, not a shape to silently degrade
-    // into an async one.
+fn handle_lowers_a_sync_call_activation() {
+    // The sync-call activation is one shape on both hosts. This host mints them
+    // for a native caller and for a peer's `call`, so the carrier's `sync` is
+    // lowered into the world rather than refused at the boundary.
     let comp = load_demo_with_out();
     let mut activation =
         single_port_activation("in", vec![envelope_json("brenn:test", "hello")], 0);
     activation.sync = Some("press".to_string());
-    comp.handle(activation);
+    match comp.handle(activation) {
+        // The demo fixture answers nothing, which is a conforming callee: a
+        // sync-call activation may answer, it is not obliged to.
+        ProcessorOutcome::Ok { reply, .. } => assert_eq!(reply, None),
+        other => panic!("a sync-call activation must lower and run, got {other:?}"),
+    }
 }
 
 // ── Webhook publish path ──────────────────────────────────────────────────────
@@ -386,21 +333,15 @@ fn loading_a_bound_port_outside_the_declared_vocabulary_panics() {
     let mut ports = HashMap::new();
     ports.insert("out".to_string(), common::out_spec("brenn:test-out"));
     let _ = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-undeclared-binding",
-        declared_out_ports: std::collections::BTreeSet::new(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(
+            &component_path("brenn_processor_demo"),
+            "demo-undeclared-binding",
+        )
     });
 }
 
@@ -453,21 +394,13 @@ fn load_demo_out_with_acl(channel: &str, acl: brenn_wasm::OutputAclFn) -> Proces
     let mut ports = HashMap::new();
     ports.insert("out".to_string(), common::out_spec(channel));
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-acl",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: acl,
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo-acl")
     })
 }
 
@@ -523,21 +456,14 @@ fn handle_oversized_payload_returns_processing_failed() {
     // Set tiny max_payload_bytes so webhook body triggers invalid-payload.
     // processor-demo imports: types + ports
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-tiny",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
         max_payload_bytes: 1, // 1 byte cap
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo-tiny")
     });
     let activation = single_port_activation(
         "in",
@@ -611,21 +537,13 @@ fn two_webhook_envelopes_produce_two_buffered_publishes() {
     ports.insert("out".to_string(), common::out_spec("brenn:channel-a"));
     // processor-demo imports: types + ports
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-multi",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo-multi")
     });
     // Two webhook envelopes → two publishes, both resolved to "brenn:channel-a".
     let activation = single_port_activation(
@@ -670,21 +588,13 @@ fn load_demo_budgeted(
         },
     );
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path("brenn_processor_demo"),
-        slug: "demo-budget",
         declared_out_ports: ports.keys().cloned().collect(),
         output_ports: ports,
         input_amplification_mt: HashMap::from([("in".to_string(), amp_mt)]),
-        mqtt_sinks: HashMap::new(),
         grants: [ComponentGrant::Ports].into_iter().collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
-        config: HashMap::new(),
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path("brenn_processor_demo"), "demo-budget")
     })
 }
 
@@ -862,14 +772,11 @@ fn multi_port_publishes_routed_independently() {
     }
 }
 
-// ── The synchronous channel, on a host that mints none ───────────────────────
+// ── The synchronous channel ──────────────────────────────────────────────────
 
-/// This host always lowers `sync: none`, because a headless component has no
-/// cause that could be synchronous. The world carries the field anyway — one
-/// world, two hostings — so the guest can always answer, and the rule that only
-/// a sync-call activation may be answered has to hold here as well as in the
-/// page. It holds as a trap: reading an unasked-for ok would flush a buffer the
-/// component built while confused about why it was running.
+/// Only a sync-call activation may be answered, and this host enforces that as
+/// a trap: reading an unasked-for ok would flush a buffer the component built
+/// while confused about why it was running.
 ///
 /// The fixture publishes before it replies, so the discard is what is under
 /// test and not just the outcome variant: an arm that flushed and then trapped,
@@ -899,10 +806,11 @@ fn a_reply_to_an_activation_that_asked_nothing_traps() {
     }
 }
 
-/// The other half of the rule: `ok(none)` is the only ok shape this host reads,
-/// and an ordinary activation reaching an ordinary guest produces it.
+/// The other half of the rule: `ok(none)` is the only ok shape an *async*
+/// activation may take, and an ordinary activation reaching an ordinary guest
+/// produces it.
 #[test]
-fn an_ordinary_activation_returns_the_only_ok_this_host_reads() {
+fn an_ordinary_activation_returns_the_only_ok_an_async_cause_admits() {
     let comp = load_multiport();
     let activation = ProcessorActivation {
         ports: vec![ProcessorPortWindow {
@@ -923,24 +831,84 @@ fn an_ordinary_activation_returns_the_only_ok_this_host_reads() {
     }
 }
 
-/// A sync-call activation is a shape this host cannot honestly deliver: there is
-/// no element, no gesture, and no caller waiting on a stack. It is refused where
-/// it is built rather than degraded into an asynchronous one.
+/// A reply on a sync-call activation is read, and the buffer the callee built
+/// beside it flushes with it: the answer and the publishes are one ok.
 #[test]
-#[should_panic(expected = "cannot be lowered into the processor world")]
-fn lowering_a_sync_call_activation_is_refused() {
+fn a_reply_on_a_sync_call_activation_is_read() {
     let comp = load_multiport();
-    let _ = comp.handle(ProcessorActivation {
-        ports: vec![ProcessorPortWindow {
-            port: "in".to_string(),
-            envelopes: vec![envelope_json("brenn:test", "click")],
-            new_from: 0,
-            dropped: 0,
-        }],
+    let activation = ProcessorActivation {
+        ports: vec![
+            ProcessorPortWindow {
+                port: "in".to_string(),
+                envelopes: vec![envelope_json("brenn:test", "__reply__")],
+                new_from: 0,
+                dropped: 0,
+            },
+            // The request rides last, in the fabricated window a sync-call
+            // activation carries: a name of its own, which no binding backs.
+            ProcessorPortWindow {
+                port: "ask".to_string(),
+                envelopes: vec![envelope_json("local:brenn/sync/ask", "ask")],
+                new_from: 0,
+                dropped: 0,
+            },
+        ],
         deferred: vec![],
         now: None,
-        sync: Some("in".to_string()),
-    });
+        sync: Some("ask".to_string()),
+    };
+    match comp.handle(activation) {
+        ProcessorOutcome::Ok {
+            publishes, reply, ..
+        } => {
+            let reply = reply.expect("the callee answered");
+            assert!(
+                reply.contains("\"port\":\"in\""),
+                "the reply is the callee's own summary of what it was windowed: {reply}"
+            );
+            assert_eq!(
+                publishes.len(),
+                1,
+                "the callee's buffer flushes with its answer"
+            );
+        }
+        other => panic!("a reply on a sync-call activation must be read, got {other:?}"),
+    }
+}
+
+/// A reply is bounded by the same cap as a publish body. Over it, the callee
+/// traps — it is the callee that wrote it — and nothing it buffered flushes.
+#[test]
+fn an_oversize_reply_traps_the_callee() {
+    let comp = load_multiport_with_payload_cap(1024);
+    let activation = ProcessorActivation {
+        ports: vec![
+            ProcessorPortWindow {
+                port: "in".to_string(),
+                envelopes: vec![envelope_json("brenn:test", "__long_reply__")],
+                new_from: 0,
+                dropped: 0,
+            },
+            // The request rides last, in the fabricated window a sync-call
+            // activation carries: a name of its own, which no binding backs.
+            ProcessorPortWindow {
+                port: "ask".to_string(),
+                envelopes: vec![envelope_json("local:brenn/sync/ask", "ask")],
+                new_from: 0,
+                dropped: 0,
+            },
+        ],
+        deferred: vec![],
+        now: None,
+        sync: Some("ask".to_string()),
+    };
+    match comp.handle(activation) {
+        ProcessorOutcome::Trap(message) => assert!(
+            message.contains("reply cap"),
+            "the trap must name the cap: {message}"
+        ),
+        other => panic!("an oversize reply must trap the callee, got {other:?}"),
+    }
 }
 
 // ── Context/new split via context_envelopes() ────────────────────────────────
@@ -1489,21 +1457,10 @@ fn run_wat_processor(slug: &str, wat_src: &str) -> ProcessorOutcome {
     wasm_file.flush().expect("flush wasm");
 
     let comp = ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: wasm_file.path(),
-        slug,
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
-        config: HashMap::new(),
-        grants: std::collections::BTreeSet::new(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(wasm_file.path(), slug)
     });
     comp.handle(ProcessorActivation {
         ports: vec![],

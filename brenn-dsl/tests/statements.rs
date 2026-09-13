@@ -118,6 +118,7 @@ fn a_port_declaration_carries_a_direction_and_an_optional_doctype() {
         vec![
             ("inbound", &PortDir::Into),
             ("outbound", &PortDir::Outof),
+            ("ask", &PortDir::Call),
             ("acks", &PortDir::Both),
         ]
     );

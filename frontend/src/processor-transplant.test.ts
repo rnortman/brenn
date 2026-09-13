@@ -122,11 +122,15 @@ function hasOwn(target: object, key: string): boolean {
  * identical expansion — the script names the identity, both harnesses supply
  * the same frame around it.
  */
-function envelope(pair: { id: string; body: string }): string {
+function envelope(
+    pair: { id: string; body: string },
+    overrides: Record<string, unknown> = {},
+): string {
     return JSON.stringify({
         ...script.envelope_template,
         message_id: pair.id,
         body: pair.body,
+        ...overrides,
     });
 }
 
@@ -245,7 +249,7 @@ async function runScript(): Promise<TranscriptEntry[]> {
         const record: KernelActivation = {
             ports: activation.ports.map((p) => ({
                 port: p.port,
-                envelopes: p.envelopes.map(envelope),
+                envelopes: p.envelopes.map((pair) => envelope(pair)),
                 new_from: p.new_from,
                 dropped: p.dropped,
             })),
@@ -335,10 +339,13 @@ describe("processor transplant — surface hosting", () => {
                 ports: [
                     {
                         port,
+                        // A request is attributed to its own target, by the bare
+                        // name the page knows the instance by — the shape the
+                        // kernel mints, which the guest reports back.
                         envelopes: [envelope({
                             id: "9a1d0a3e-0000-4000-8000-00000000f1ed",
                             body: "__reply__",
-                        })],
+                        }, { source: "transplant", sender: "transplant" })],
                         new_from: 0,
                         dropped: 0,
                     },
@@ -358,7 +365,9 @@ describe("processor transplant — surface hosting", () => {
             } satisfies KernelActivation),
         );
         expect(answered).toEqual({
-            reply: `replied:${port}:mount=true:request=__reply__:delivered=[in]`,
+            reply:
+                `replied:${port}:mount=true:request=__reply__:` +
+                `bare-identity=true:delivered=[in]`,
         });
 
         // And the other arm from the same instance: an activation naming no

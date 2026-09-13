@@ -115,43 +115,12 @@ impl LogLevel {
 }
 
 /// A binding's overflow loudness rung, as resolved by the server and carried on
-/// [`Binding`]. 1:1 with the backend `brenn-lib` `NoiseLevel`; serialized
-/// lowercase so the wire strings match that shared vocabulary. The page never
-/// re-runs the ladder — it receives the resolved rung and enacts it on overflow.
-///
-/// Declaration order is the loudness ladder (`Silent < Metered < Alarm <
-/// Fatal`); `Ord` lets the kernel read "at least this loud" as a comparison.
-///
-/// **`Fatal` on a binding means overflow here kills the instance.** It is opt-in
-/// per binding and never a default. On a chrome binding the kill takes chrome's
-/// fatal path (a capped bootstrap reload) — an operator who marks a chrome
-/// binding `fatal` has declared "overflow here reloads the page".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NoiseLevel {
-    /// Overflow drops oldest; no further signal.
-    Silent,
-    /// Silent, plus a per-binding lifetime drop counter in the kernel.
-    Metered,
-    /// Metered, plus a backend alert and a toast on every overflowing activation.
-    Alarm,
-    /// Alarm, plus killing the overflowing instance.
-    Fatal,
-}
-
-impl NoiseLevel {
-    /// The [`NoiseLevel`] for a lowercase wire string, or `None` for anything
-    /// else — the inverse of the serde-lowercase serialization.
-    pub fn from_wire_str(s: &str) -> Option<Self> {
-        match s {
-            "silent" => Some(Self::Silent),
-            "metered" => Some(Self::Metered),
-            "alarm" => Some(Self::Alarm),
-            "fatal" => Some(Self::Fatal),
-            _ => None,
-        }
-    }
-}
+/// [`Binding`]. The one shared rung vocabulary, defined in `brenn-envelope`
+/// beside [`Urgency`](brenn_envelope::Urgency) so the backend's resolution and
+/// the page's enactment name one type rather than two hand-copied ladders. The
+/// page never re-runs the ladder — it receives the resolved rung and enacts it
+/// on overflow.
+pub use brenn_envelope::NoiseLevel;
 
 // ---------------------------------------------------------------------------
 // Bindings
@@ -218,6 +187,28 @@ pub struct ComponentEntry {
     /// the bindings, so an undeclared inbound port is unreachable by
     /// construction.
     pub declared_out_ports: Vec<String>,
+    /// Every port name this instance's component kind declares `sync` — the
+    /// complete vocabulary of names a caller may raise a sync-call activation
+    /// of this instance on. Sorted and duplicate-free, for the same
+    /// byte-stability reason [`ComponentEntry::declared_out_ports`] states.
+    ///
+    /// Carried because a sync port is bound to no channel, so nothing else in
+    /// this document mentions one. The kernel refuses a `dom.listen` on a name
+    /// outside this set: a component listening on a port its specification
+    /// never declared is contradicting the specification its artifact is
+    /// hash-bound to.
+    pub sync_ports: Vec<String>,
+    /// Every port name this instance's component kind declares `call` — the
+    /// complete vocabulary of names this instance may ask a peer through.
+    /// Sorted and duplicate-free, for the same byte-stability reason
+    /// [`ComponentEntry::declared_out_ports`] states.
+    ///
+    /// Carried because a `call` port the deployer chose not to wire is bound to
+    /// nothing, so the call table alone cannot tell it from a name the
+    /// specification never mentioned. The first is answered `unwired`; the
+    /// second is the component contradicting its own specification, and the
+    /// kernel ends the activation for it.
+    pub call_ports: Vec<String>,
     /// This instance's static config map, read through the component's `config`
     /// import. Empty unless the instance declares one.
     ///
@@ -300,6 +291,26 @@ pub struct OutputBinding {
     /// accumulate, clamped at the start of each activation. Resolved at boot
     /// from the binding's `publish_capacity`.
     pub capacity_mt: u64,
+}
+
+/// One call binding: a component instance's `call` port wired to a peer
+/// instance's `sync` port.
+///
+/// Neither a [`Binding`] nor an [`OutputBinding`]: a call names no channel, so
+/// it carries no depth, no loudness, no urgency and no budget. It reaches a
+/// peer of the same surface, inside the page, and never crosses the wire — the
+/// reply is the callee's return value, not a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallBinding {
+    /// The calling instance.
+    pub instance: String,
+    /// Its own `call` port, the name the guest passes to `calls.call`.
+    pub port: String,
+    /// The instance that answers.
+    pub target_instance: String,
+    /// The `sync` port of that instance: the port whose window the callee's
+    /// activation fabricates.
+    pub target_port: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -837,8 +848,9 @@ mod tests {
 
     #[test]
     fn noise_level_wire_codec_covers_every_rung() {
-        // Every rung serializes to its lowercase string and `from_wire_str`
-        // inverts it — the exhaustive mapping the wire contract depends on.
+        // The rung the document carries is the shared `brenn-envelope` type;
+        // this pins the spelling the bindings document actually puts on the
+        // wire. The ladder order itself is pinned where the type is defined.
         for (level, s) in [
             (NoiseLevel::Silent, "silent"),
             (NoiseLevel::Metered, "metered"),
@@ -846,19 +858,10 @@ mod tests {
             (NoiseLevel::Fatal, "fatal"),
         ] {
             assert_eq!(serde_json::to_value(level).unwrap(), json!(s));
-            assert_eq!(NoiseLevel::from_wire_str(s), Some(level));
+            assert_eq!(s.parse::<NoiseLevel>().unwrap(), level);
         }
-        assert_eq!(NoiseLevel::from_wire_str("Fatal"), None);
-        assert_eq!(NoiseLevel::from_wire_str(""), None);
-    }
-
-    #[test]
-    fn noise_level_ord_is_ascending_loudness() {
-        assert!(NoiseLevel::Silent < NoiseLevel::Metered);
-        assert!(NoiseLevel::Metered < NoiseLevel::Alarm);
-        assert!(NoiseLevel::Alarm < NoiseLevel::Fatal);
-        // "at least this loud" as a comparison.
-        assert!(NoiseLevel::Fatal >= NoiseLevel::Alarm);
+        assert!("Fatal".parse::<NoiseLevel>().is_err());
+        assert!("".parse::<NoiseLevel>().is_err());
     }
 
     #[test]

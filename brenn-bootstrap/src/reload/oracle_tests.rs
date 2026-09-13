@@ -1411,6 +1411,53 @@ async fn a_mount_added_since_boot_matches_a_fresh_boot() {
     .await;
 }
 
+/// Every WASM consumer reaches the router as the consumer-shaped delivery
+/// binding — at boot, and at the reload that starts one.
+///
+/// The arm is what carries a consumer's request channel, so a site left on
+/// `ParkedNotify` is undetectable until the first native sync call against that
+/// consumer panics the server: delivery keeps working, and nothing else
+/// surfaces it. Asserted here, where the registration sites actually run,
+/// rather than over a hand-registered binding.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_consumer_registration_site_binds_the_consumer_shaped_arm() {
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&document_with_a_tool_granted_consumer());
+    install_package(components.path(), &staged_module(&tree));
+    let mut booted = boot_with(
+        &tree,
+        BootFixture {
+            components_roots: vec![components.path().to_path_buf()],
+            tool_registry: Some(async_tool_registry()),
+            ..BootFixture::default()
+        },
+    )
+    .await;
+
+    let sifter = SubscriberEntryKind::Wasm("sifter".to_string());
+    let grinder = SubscriberEntryKind::Wasm("grinder".to_string());
+    assert!(
+        booted.router.is_sync_callable(&sifter),
+        "the boot site registers the consumer arm"
+    );
+    assert!(
+        !booted.router.has_delivery_binding(&grinder),
+        "and nothing is bound for a consumer the document does not carry yet"
+    );
+
+    tree.write(&document_with_two_consumers());
+    install_package(components.path(), &staged_module(&tree));
+    booted.driver.reload(TriggerSource::Signal).await;
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.consumers_added, vec!["grinder".to_string()]);
+    assert!(
+        booted.router.is_sync_callable(&grinder),
+        "and so does the site a reload's arriving consumer takes"
+    );
+    assert!(booted.router.is_sync_callable(&sifter));
+}
+
 /// A channel under a continuous publisher while its only consumer is retired.
 ///
 /// The retired-key rule is what this exercises from the outside: a publish that

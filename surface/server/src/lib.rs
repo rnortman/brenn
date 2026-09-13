@@ -1519,6 +1519,7 @@ mod tests {
             allowed_users: vec![],
             publish_burst: 60,
             publish_per_sec: 1,
+            calls: vec![],
         }
     }
 

@@ -1452,15 +1452,18 @@ async fn a_publish_to_an_unwired_declared_port_delivers_nothing_and_runs_on() {
 }
 
 /// A reply answers a question, and an async activation asked none. An entry that
-/// returns one anyway is a trap at the native seam exactly as it is at the
-/// browser's — its buffer was built under a misapprehension, so the one thing that
-/// must not happen is a flush.
+/// returns one anyway is a trap — its buffer was built under a misapprehension,
+/// so the one thing that must not happen is a flush.
+///
+/// Ruled at the completion, which is why the run reaches it at all: the native
+/// invocation reports the return as the entry gave it, and the page is what
+/// knows whether anything asked.
 ///
 /// The mount activation is the async activation used, because it needs nothing
 /// arranged: it is guaranteed, it carries no sync port, and it runs before any
 /// delivery could.
 #[tokio::test(start_paused = true)]
-async fn a_reply_to_an_async_activation_traps_at_the_native_seam() {
+async fn a_reply_to_an_async_activation_traps_at_the_completion() {
     let controls = Controls::new();
     let (feed, _closed, _writes) = controls.succeed();
     let mut running = spawn(&controls);
@@ -1480,12 +1483,12 @@ async fn a_reply_to_an_async_activation_traps_at_the_native_seam() {
     assert!(matches!(
         running.event().await,
         Event::ActivationFailed { instance, message }
-            if instance == "p1" && message.contains("no sync port")
+            if instance == "p1" && message.contains("asked nothing")
     ));
     assert!(matches!(
         running.event().await,
         Event::InstanceFailed { instance, reason }
-            if instance == "p1" && reason.contains("no sync port")
+            if instance == "p1" && reason.contains("asked nothing")
     ));
     assert!(
         !controls
@@ -2229,4 +2232,72 @@ async fn a_trap_in_the_mount_activation_kills_the_instance() {
             if instance == "p1" && reason.contains("building its UI")
     ));
     running.task.abort();
+}
+
+/// A called peer's committed turn is enacted before the caller's own completion.
+#[test]
+fn a_called_peers_effects_precede_the_callers_own_completion() {
+    let controls = Controls::new();
+    let (_front, _events, channels) = raw_front(8);
+    let now = Millis(1_000);
+    let now_ms = 1_000;
+    let page = pages::configured_page(
+        CONFIG,
+        EPOCH,
+        pages::facts(),
+        &["p1", "p2", fixtures::CHROME],
+        &doc(),
+        now,
+    );
+    let runner = SurfaceRunner::new(page, config(), controls.connector(), channels);
+
+    let (dispatch, _) = turn::dispatch_sync(
+        &mut runner.page.borrow_mut(),
+        crate::outward::SyncCall {
+            instance: "p1",
+            port: "ask",
+            body: "{}",
+            chain: &[],
+        },
+        brenn_attach_client::driver::new_stamp(),
+        now,
+        now_ms,
+    );
+    let mut ready = dispatch
+        .ready_or_answer()
+        .expect("p1 assembles a sync-call activation");
+    ready
+        .buffer
+        .publish("out", "the caller's own".to_string())
+        .expect("p1 binds the wire output");
+
+    let called = vec![Effect::PublishControl {
+        channel: NOTES.to_string(),
+        body: "the callee's own".to_string(),
+    }];
+    let mut effects = Vec::new();
+    runner.complete(
+        Invoked {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Ok(None),
+            buffer: ready.buffer,
+            called: called.clone(),
+        },
+        &mut effects,
+        now,
+        now_ms,
+    );
+
+    assert_eq!(
+        effects.first(),
+        called.first(),
+        "the callee's turn leads: {effects:?}",
+    );
+    assert!(
+        effects[1..]
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendFrame(_))),
+        "and the caller's own buffered publish is behind it, not in front: {effects:?}",
+    );
 }

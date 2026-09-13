@@ -978,6 +978,7 @@ impl ReloadDriver {
             mqtt_service: self.env.mqtt_service.clone(),
             tool_registry: &self.env.tool_registry,
             max_payload_bytes: self.env.max_payload_bytes,
+            sync_router: Some(self.env.router.clone()),
         };
         let mut loaded = Vec::new();
         let mut refusals = Vec::new();
@@ -2572,13 +2573,17 @@ channel scratch at "ephemeral:scratch" {{
                     mqtt_service: mqtt.0.clone(),
                     tool_registry: &tool_registry,
                     max_payload_bytes: document.config.messaging.max_body_bytes,
+                    sync_router: Some(router.clone()),
                 },
                 consumer,
                 None,
             );
             router.register_delivery_binding(
                 SubscriberEntryKind::Wasm(consumer.slug.clone()),
-                DeliveryBinding::ParkedNotify(one.notify.clone()),
+                DeliveryBinding::WasmConsumer {
+                    notify: one.notify.clone(),
+                    sync: one.sync_tx.clone(),
+                },
             );
             registry.insert(
                 consumer.slug.clone(),

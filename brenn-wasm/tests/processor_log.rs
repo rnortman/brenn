@@ -6,14 +6,12 @@
 // `wasm_guest` target to isolate guest-emitted events from host infrastructure
 // events that may also be captured.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use brenn_wasm::{
     ComponentGrant, GuestAlertSeverity, PROCESSOR_MAX_ALERT_CALLS_PER_ACTIVATION,
     PROCESSOR_MAX_ALERT_TITLE_BYTES, PROCESSOR_MAX_LOG_CALLS_PER_ACTIVATION, ProcessorActivation,
     ProcessorAlerter, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorPortWindow,
-    store::DEFAULT_MAX_PAGE_COUNT,
 };
 use tracing_test::traced_test;
 
@@ -32,23 +30,13 @@ fn component_path() -> std::path::PathBuf {
 fn load_log_component(alerter: Arc<dyn ProcessorAlerter>) -> ProcessorComponent {
     // processor-log imports: types + log + alert
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &component_path(),
-        slug: "log-test",
-        declared_out_ports: std::collections::BTreeSet::new(),
-        output_ports: HashMap::new(),
         input_amplification_mt: common::amp_in(),
-        mqtt_sinks: HashMap::new(),
-        config: HashMap::new(),
         grants: [ComponentGrant::Log, ComponentGrant::Alert]
             .into_iter()
             .collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter,
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&component_path(), "log-test")
     })
 }
 

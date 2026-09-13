@@ -23,14 +23,14 @@ use serde::{Deserialize, Serialize};
 use brenn_envelope::is_local_channel;
 
 use crate::{
-    Binding, ComponentEntry, LocalChannel, LogLevel, OutputBinding, reserved_local_channel,
-    surface_bindable_address,
+    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding,
+    reserved_local_channel, surface_bindable_address,
 };
 
 /// The body-schema version stamped on every bindings document. Bumped whenever
 /// the document's shape changes; a reader that does not recognize the value
 /// refuses the document rather than guessing at its fields.
-pub const BINDINGS_DOCUMENT_VERSION: u32 = 2;
+pub const BINDINGS_DOCUMENT_VERSION: u32 = 5;
 
 /// Lowest admissible [`PlatformSection::status_interval_secs`]. The status
 /// channel is a heartbeat, not a meter: below this the kernel would write
@@ -65,6 +65,11 @@ pub struct BindingsDocument {
     pub subscriptions: Vec<Binding>,
     /// Instance/port → channel, each carrying the port's default urgency.
     pub outputs: Vec<OutputBinding>,
+    /// Instance/port → instance/port: the calls this surface's components may
+    /// raise on each other. No channel is involved, so these appear in no
+    /// subscription and no router table; the kernel resolves a `calls.call` to
+    /// the peer named here and answers `unwired` for a port absent from it.
+    pub calls: Vec<CallBinding>,
     /// Every distinct `local:` channel some binding above names, with the ring
     /// depth its page-local router must retain. Page-local channels have no
     /// `[[channel]]` block and no directory entry — the per-surface config block
@@ -186,6 +191,20 @@ impl BindingsDocument {
                     c.instance, c.declared_out_ports
                 ));
             }
+            if c.sync_ports.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(format!(
+                    "bindings document declares component instance {}'s sync vocabulary {:?}, \
+                     which is not sorted and duplicate-free",
+                    c.instance, c.sync_ports
+                ));
+            }
+            if c.call_ports.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(format!(
+                    "bindings document declares component instance {}'s call vocabulary {:?}, \
+                     which is not sorted and duplicate-free",
+                    c.instance, c.call_ports
+                ));
+            }
         }
         // A port publishes onto one channel. Two entries for one port would make
         // a component's publish resolve to whichever the reader indexed first,
@@ -233,6 +252,75 @@ impl BindingsDocument {
                     b.instance, b.port
                 ));
             }
+        }
+        // A `call` port reaches one peer. Two entries for one port would make
+        // the target of a call whichever the reader indexed first.
+        let mut bound_call_ports = BTreeSet::new();
+        for c in &self.calls {
+            if !bound_call_ports.insert((&c.instance, &c.port)) {
+                return Err(format!(
+                    "bindings document binds call port {}/{} twice",
+                    c.instance, c.port
+                ));
+            }
+        }
+        // Both ends of a call must be instances this document declares, and the
+        // port that answers must be one the callee's specification declares
+        // `sync`.
+        let sync: BTreeMap<&String, &Vec<String>> = self
+            .components
+            .iter()
+            .map(|c| (&c.instance, &c.sync_ports))
+            .collect();
+        for c in &self.calls {
+            let Some(caller) = self.components.iter().find(|e| e.instance == c.instance) else {
+                return Err(format!(
+                    "bindings document binds call port {}/{}, naming an instance absent from \
+                     the component list",
+                    c.instance, c.port
+                ));
+            };
+            // A binding names a port the caller's kind declares `call`. Wiring
+            // a name outside that vocabulary would give the kernel a target for
+            // a port the guest can only trap on.
+            if !caller.call_ports.contains(&c.port) {
+                return Err(format!(
+                    "bindings document binds call port {}/{}, which the caller's declared call \
+                     vocabulary does not contain",
+                    c.instance, c.port
+                ));
+            }
+            match sync.get(&c.target_instance) {
+                None => {
+                    return Err(format!(
+                        "bindings document wires call port {}/{} to instance {}, which is \
+                         absent from the component list",
+                        c.instance, c.port, c.target_instance
+                    ));
+                }
+                Some(ports) if !ports.contains(&c.target_port) => {
+                    return Err(format!(
+                        "bindings document wires call port {}/{} to {}/{}, which the target's \
+                         declared sync vocabulary does not contain",
+                        c.instance, c.port, c.target_instance, c.target_port
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        // And the one rule about the graph rather than about an edge. The kernel
+        // *asserts* this one when a call is raised — a panic inside a component's
+        // entry, at whatever moment a gesture first reaches the cycle, which
+        // takes the tab with it. Every other structural rule of this document is
+        // read here so that a writer the server did not write is refused at the
+        // seam; this one is read here so the refusal happens instead of the
+        // panic.
+        if let Some(cycle) = call_cycle(&self.calls) {
+            return Err(format!(
+                "bindings document wires a cycle of calls {}; a caller waits for its callee, \
+                 so a cycle is a deadlock",
+                cycle.join(" -> ")
+            ));
         }
         // A confined channel's ring depth is one number. Two entries for one
         // address state two, and a reader folding them by `max` would resolve the
@@ -392,6 +480,63 @@ impl BindingsDocument {
     }
 }
 
+/// A cycle in a document's `call` graph, spelled out, or `None` where there is
+/// none.
+///
+/// The ordinary three-colour depth-first search, and the same rule the resolver
+/// and the boot backstop each state in their own terms. An instance calling
+/// itself is the one-node case and needs no separate reading. Walked with an
+/// explicit stack rather than by recursion: this reads a document the kernel did
+/// not write, and a chain of instances is exactly as long as that document says.
+fn call_cycle(calls: &[CallBinding]) -> Option<Vec<String>> {
+    let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for call in calls {
+        out.entry(call.instance.as_str())
+            .or_default()
+            .push(call.target_instance.as_str());
+    }
+    // 0 unvisited, 1 on the current path, 2 finished.
+    let mut state: BTreeMap<&str, u8> = BTreeMap::new();
+    let mut path: Vec<&str> = Vec::new();
+    for call in calls {
+        let start = call.instance.as_str();
+        if state.get(start).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        state.insert(start, 1);
+        path.push(start);
+        // Each frame is a node and the index of the edge it walks next.
+        let mut stack: Vec<(&str, usize)> = vec![(start, 0)];
+        while let Some((node, edge)) = stack.pop() {
+            let Some(&target) = out.get(node).and_then(|targets| targets.get(edge)) else {
+                state.insert(node, 2);
+                path.pop();
+                continue;
+            };
+            stack.push((node, edge + 1));
+            match state.get(target).copied().unwrap_or(0) {
+                1 => {
+                    let from = path
+                        .iter()
+                        .position(|node| *node == target)
+                        .expect("a node coloured on-path is on the path");
+                    let mut cycle: Vec<String> =
+                        path[from..].iter().map(|node| node.to_string()).collect();
+                    cycle.push(target.to_string());
+                    return Some(cycle);
+                }
+                2 => {}
+                _ => {
+                    state.insert(target, 1);
+                    path.push(target);
+                    stack.push((target, 0));
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -407,6 +552,8 @@ mod tests {
             config: BTreeMap::new(),
             grants: vec![],
             declared_out_ports: vec!["alt".to_string(), "out".to_string()],
+            sync_ports: vec!["press".to_string()],
+            call_ports: vec![],
         }
     }
 
@@ -446,6 +593,7 @@ mod tests {
                     .expect("the theme plane is reserved")
                     .ring_depth,
             }],
+            calls: vec![],
             chrome_instance: "chrome".to_string(),
             platform: PlatformSection {
                 geometry_channel: "brenn:site.surface.bar.geometry".to_string(),
@@ -455,6 +603,114 @@ mod tests {
                 error_report_floor: Some(LogLevel::Warn),
             },
         }
+    }
+
+    /// [`doc`] with `p1` calling the chrome's declared `resolve` port.
+    fn doc_with_call() -> BindingsDocument {
+        let mut doc = doc();
+        doc.components[0].call_ports = vec!["lookup".to_string()];
+        doc.components[1].sync_ports = vec!["resolve".to_string()];
+        doc.calls = vec![CallBinding {
+            instance: "p1".to_string(),
+            port: "lookup".to_string(),
+            target_instance: "chrome".to_string(),
+            target_port: "resolve".to_string(),
+        }];
+        doc
+    }
+
+    #[test]
+    fn a_call_binding_round_trips_through_its_body() {
+        let doc = doc_with_call();
+        assert_eq!(BindingsDocument::parse(&doc.to_body()).unwrap(), doc);
+    }
+
+    #[test]
+    fn rejects_a_repeated_call_port() {
+        let mut doc = doc_with_call();
+        doc.calls.push(doc.calls[0].clone());
+        let err = doc.validate().expect_err("a call port reaches one peer");
+        assert!(err.contains("lookup") && err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_call_from_an_undeclared_instance() {
+        let mut doc = doc_with_call();
+        doc.calls[0].instance = "stranger".to_string();
+        let err = doc
+            .validate()
+            .expect_err("both ends are declared instances");
+        assert!(err.contains("stranger"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_call_to_an_undeclared_instance() {
+        let mut doc = doc_with_call();
+        doc.calls[0].target_instance = "stranger".to_string();
+        let err = doc
+            .validate()
+            .expect_err("both ends are declared instances");
+        assert!(err.contains("stranger"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_call_from_a_port_outside_the_callers_call_vocabulary() {
+        let mut doc = doc_with_call();
+        doc.calls[0].port = "unspoken".to_string();
+        let err = doc
+            .validate()
+            .expect_err("a call is made through a declared call port");
+        assert!(err.contains("call vocabulary"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unsorted_call_vocabulary() {
+        let mut doc = doc_with_call();
+        doc.components[0].call_ports = vec!["lookup".to_string(), "ask".to_string()];
+        let err = doc
+            .validate()
+            .expect_err("the declared vocabulary is sorted and duplicate-free");
+        assert!(err.contains("call vocabulary"), "{err}");
+    }
+
+    /// The kernel asserts this one when the call is raised, so a document that
+    /// carries it is a panic inside a component's entry deferred to whenever a
+    /// gesture first reaches it. Refused here instead.
+    #[test]
+    fn rejects_a_self_call() {
+        let mut doc = doc_with_call();
+        doc.components[0].sync_ports = vec!["lookup".to_string()];
+        doc.calls[0].target_instance = "p1".to_string();
+        doc.calls[0].target_port = "lookup".to_string();
+        let err = doc
+            .validate()
+            .expect_err("an instance does not call itself");
+        assert!(err.contains("p1 -> p1"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_call_cycle() {
+        let mut doc = doc_with_call();
+        doc.components[1].call_ports = vec!["back".to_string()];
+        doc.components[0].sync_ports = vec!["answer".to_string()];
+        doc.calls.push(CallBinding {
+            instance: "chrome".to_string(),
+            port: "back".to_string(),
+            target_instance: "p1".to_string(),
+            target_port: "answer".to_string(),
+        });
+        let err = doc.validate().expect_err("a cycle of calls is a deadlock");
+        assert!(err.contains("p1 -> chrome -> p1"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_call_to_a_port_outside_the_targets_sync_vocabulary() {
+        let mut doc = doc_with_call();
+        doc.calls[0].target_port = "unheard".to_string();
+        let err = doc
+            .validate()
+            .expect_err("a call is answered by a declared sync port");
+        assert!(err.contains("sync vocabulary"), "{err}");
     }
 
     #[test]
@@ -566,6 +822,26 @@ mod tests {
         let mut repeated = doc();
         repeated.components[0].declared_out_ports = vec!["out".to_string(), "out".to_string()];
         let err = repeated.validate().expect_err("the vocabulary repeats");
+        assert!(err.contains("sorted and duplicate-free"), "{err}");
+    }
+
+    /// The sync vocabulary carries the same claim as the out-port one, and it
+    /// is the reason the reload diff stays quiet: a reordered `sync` line in a
+    /// specification would otherwise bounce every page on every delivery.
+    #[test]
+    fn rejects_a_sync_vocabulary_that_is_not_sorted_and_duplicate_free() {
+        let mut unsorted = doc();
+        unsorted.components[0].sync_ports = vec!["press".to_string(), "dismiss".to_string()];
+        let err = unsorted
+            .validate()
+            .expect_err("the sync vocabulary is out of order");
+        assert!(err.contains("sorted and duplicate-free"), "{err}");
+
+        let mut repeated = doc();
+        repeated.components[0].sync_ports = vec!["press".to_string(), "press".to_string()];
+        let err = repeated
+            .validate()
+            .expect_err("the sync vocabulary repeats");
         assert!(err.contains("sorted and duplicate-free"), "{err}");
     }
 

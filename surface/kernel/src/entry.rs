@@ -127,6 +127,7 @@ pub fn start() -> KernelHandle {
         *cell.borrow_mut() = Some(ProcessorHost {
             core: Rc::clone(&core),
             handle: Rc::clone(&handle),
+            door: Rc::clone(&door),
         });
     });
 
@@ -155,6 +156,10 @@ pub fn start() -> KernelHandle {
 struct ProcessorHost {
     core: Rc<RefCell<KernelCore>>,
     handle: Rc<SurfaceHandle>,
+    /// The pass a `calls.call` runs its peer's whole activation on. The same door
+    /// a gesture reaches, held here rather than in its own cell because a call is
+    /// a processor import like any other and arrives through this seam.
+    door: Rc<crate::sync_door::SyncDoor>,
 }
 
 thread_local! {
@@ -451,6 +456,118 @@ pub fn brenn_processor_defer_edit(
             Some(Ok(())) => Ok(String::new()),
             Some(Err(fault)) => port_answer(host, instance, fault, crate::logic::defer_error_str),
             None => Ok("not-permitted".to_string()),
+        }
+    })
+}
+
+/// Ask [`KernelCore::component_calls_gate`] whether `instance` may call a peer,
+/// reporting the refusal if it may not.
+///
+/// The `calls` family's twin of [`ports_granted`], and separate from it for the
+/// reason the grants are separate: a component that may publish is not thereby a
+/// component that may reach into a peer's activation. Same shape — the decision
+/// is the core's, the report is the seam's.
+fn calls_granted(core: &Rc<RefCell<KernelCore>>, handle: &SurfaceHandle, instance: &str) -> bool {
+    let verdict = core.borrow().component_calls_gate(instance);
+    match verdict {
+        Ok(()) => true,
+        Err(refusal) => {
+            dom::apply_actions(std::slice::from_ref(&refusal), handle);
+            false
+        }
+    }
+}
+
+/// The thrown value one `call-error` lifts from: the shape jco's import glue
+/// reads a `result`'s error out of.
+///
+/// `{ payload: { tag, val } }`, the same envelope the port family's refusals are
+/// thrown in — and the only variant with a `val` is `invalid-payload`, which
+/// carries the host's account of what was wrong with the payload.
+fn call_error_thrown(error: &crate::contract::CallError) -> JsValue {
+    let payload = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &payload,
+        &JsValue::from_str("tag"),
+        &JsValue::from_str(crate::contract::call_error_str(error)),
+    )
+    .expect("surface kernel: a fresh object refused a property");
+    if let crate::contract::CallError::InvalidPayload(detail) = error {
+        js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("val"),
+            &JsValue::from_str(detail),
+        )
+        .expect("surface kernel: a fresh object refused a property");
+    }
+    let thrown = js_sys::Object::new();
+    js_sys::Reflect::set(&thrown, &JsValue::from_str("payload"), &payload)
+        .expect("surface kernel: a fresh object refused a property");
+    thrown.into()
+}
+
+/// A processor instance's `calls.call` import: one synchronous call to the peer
+/// the document wired `port` to, answered inline.
+///
+/// `instance` is the caller, from the loader's own closure over the manifest
+/// entry — never a name the component supplied, exactly as on the publish family.
+///
+/// The whole of the callee's activation happens before this returns: assembled,
+/// invoked, completed, and — if it returned ok — flushed. It is **not**
+/// transactional with the caller's own outcome, which the WIT states on the
+/// import: a caller that later errs or traps does not retract what its peer
+/// published.
+///
+/// Both answers travel as a thrown value, because that is how jco's glue lifts a
+/// `result`: an `Err` here is thrown into the guest's own call. A [`CallError`]
+/// is thrown as the variant envelope the guest lifts and carries on from
+/// ([`call_error_thrown`]); a port outside the caller's declared `call`
+/// vocabulary is thrown as a bare string, which the entry wrapper classifies as
+/// the trap it is — the component contradicting the specification its artifact is
+/// hash-bound to, exactly as an undeclared publish port is.
+///
+/// Every decision it makes is stated where a native test can reach it — the
+/// vocabulary in [`crate::logic::KernelCore`], the admission in
+/// [`crate::publish_buffer::PublishBuffer::admit_call`], the answer in
+/// [`crate::calls::call_answer`], the stack discipline in
+/// [`crate::front::InFlightStack`]. TODO(surface-wasm-test-in-ci): the order
+/// they are asked in, and this export itself, are browser-only and pinned by
+/// nothing that runs.
+///
+/// [`CallError`]: crate::contract::CallError
+#[wasm_bindgen]
+pub fn brenn_processor_call(
+    instance: &str,
+    port: &str,
+    payload: String,
+) -> Result<Option<String>, JsValue> {
+    with_processor_host("processor call", |host| {
+        // The declared vocabulary first, and before any budget is spent: a name
+        // the specification does not contain is not a refusal the component could
+        // act on, so there is no answer to charge it for.
+        if !host.core.borrow().declares_call_port(instance, port) {
+            return Err(undeclared_port_trap(host, instance, port));
+        }
+        if !calls_granted(&host.core, &host.handle, instance) {
+            return Err(call_error_thrown(&crate::contract::CallError::NotPermitted));
+        }
+        // The caller's own activation is the budget authority, so a call from
+        // outside one — or from a caller that is not the entry on the stack — has
+        // nothing to charge and is refused on that ground alone.
+        match host.handle.try_call_admission(instance, &payload) {
+            Some(Ok(())) => {}
+            Some(Err(refusal)) => return Err(call_error_thrown(&refusal)),
+            // TODO(surface-wasm-test-in-ci): this None arm (no in-flight
+            // activation → "not-permitted") depends on the live wasm host slot
+            // and can only be pinned by the browser test runner.
+            None => return Err(call_error_thrown(&crate::contract::CallError::NotPermitted)),
+        }
+        match host.door.call(instance, port, payload) {
+            // A declared port the deployer left unbound reaches nobody. A
+            // deployment fact, not a component bug, so it is answered.
+            None => Err(call_error_thrown(&crate::contract::CallError::Unwired)),
+            Some(answer) => crate::calls::call_answer(instance, port, answer)
+                .map_err(|err| call_error_thrown(&err)),
         }
     })
 }

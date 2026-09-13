@@ -22,7 +22,7 @@ mod common;
 use brenn_wasm::{
     ComponentGrant, ProcessorActivation, ProcessorComponent, ProcessorDeferredEntry,
     ProcessorDeferredOp, ProcessorDeferredWindow, ProcessorLoadSpec, ProcessorOutcome,
-    ProcessorPortWindow, store::DEFAULT_MAX_PAGE_COUNT,
+    ProcessorPortWindow,
 };
 use std::collections::HashMap;
 
@@ -164,6 +164,7 @@ fn transcript_entry(outcome: ProcessorOutcome) -> serde_json::Value {
         ProcessorOutcome::Ok {
             publishes,
             deferred_ops,
+            ..
         } => {
             let mut immediate: Vec<serde_json::Value> = Vec::new();
             let mut deferred: Vec<serde_json::Value> = Vec::new();
@@ -206,8 +207,6 @@ fn load(config: HashMap<String, String>) -> ProcessorComponent {
     // or tools — importing any of those would make the artifact backend-only
     // and its surface declaration a boot panic.
     ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &artifact(),
-        slug: "transplant",
         declared_out_ports: output_ports.keys().cloned().collect(),
         output_ports,
         input_amplification_mt: HashMap::from([
@@ -216,7 +215,6 @@ fn load(config: HashMap<String, String>) -> ProcessorComponent {
             ("sampled".to_string(), 1000u64),
             ("tick".to_string(), 1000u64),
         ]),
-        mqtt_sinks: HashMap::new(),
         config,
         grants: [
             ComponentGrant::Ports,
@@ -225,13 +223,9 @@ fn load(config: HashMap<String, String>) -> ProcessorComponent {
         ]
         .into_iter()
         .collect(),
-        store_path: None,
-        max_page_count: DEFAULT_MAX_PAGE_COUNT,
-        max_payload_bytes: 1024 * 1024,
         alerter: common::noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: None,
-        tool_host: None,
+        ..ProcessorLoadSpec::minimal(&artifact(), "transplant")
     })
 }
 

@@ -43,15 +43,16 @@
 #[cfg(test)]
 mod tests;
 
+use brenn_activation::sync::SyncAnswer;
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::ConnEvent;
 use brenn_attach_client::router::MessageStamp;
 use brenn_attach_proto::ServerFrame;
 
-use crate::activation::ReadyActivation;
+use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::command::{self, Command};
 use crate::inbound;
-use crate::outward::{self, Completed, SyncRefusal};
+use crate::outward::{self, Completed, SyncCall, SyncRefusal};
 use crate::page::SurfacePage;
 use crate::session::{Effect, Reactions};
 
@@ -179,6 +180,36 @@ pub enum SyncDispatch {
     Refused(SyncRefusal),
 }
 
+impl SyncDispatch {
+    /// The assembled activation, or the answer a caller already has.
+    ///
+    /// The two non-`Ready` arms map to an answer without anything having run,
+    /// and they map the same way for every caller. Spelled here so a caller
+    /// cannot transcribe it differently: a second transcription is a second
+    /// rule, and a rule of the facility has one.
+    pub fn ready_or_answer(self) -> Result<ReadyActivation, SyncAnswer> {
+        match self {
+            SyncDispatch::Ready(ready) => Ok(*ready),
+            SyncDispatch::Killed => Err(SyncAnswer::Trap),
+            SyncDispatch::Refused(refusal) => Err(SyncAnswer::Refused(refusal)),
+        }
+    }
+}
+
+/// The answer a finished sync-call activation's **ruled** outcome is.
+///
+/// Read off the outcome [`complete`] returns and never off the one the caller
+/// handed in: the page is where a reply is ruled admissible, so an entry that
+/// replied to a question nobody asked, or over the cap, is a trap here even
+/// though its own return said ok.
+pub fn answer_for(outcome: ActivationOutcome) -> SyncAnswer {
+    match outcome {
+        ActivationOutcome::Ok(reply) => SyncAnswer::Ok(reply),
+        ActivationOutcome::Err(err) => SyncAnswer::Err(err.message),
+        ActivationOutcome::Trap(_) => SyncAnswer::Trap,
+    }
+}
+
 /// Assemble a sync-call activation for a **named** instance, and answer the turn
 /// that took.
 ///
@@ -187,25 +218,27 @@ pub enum SyncDispatch {
 /// answer, so the request cannot be queued and answered later. An ordinary turn
 /// in every other respect — verdicts folded, release deadline restated.
 ///
-/// `port` names the sync port the request arrives on and `body` is its payload,
-/// both the component's own; `instance` is the identity the caller resolved,
-/// never one the component claimed. `stamp` mints the request envelope.
+/// `call` is the request: whose it is, which port, the payload, and the chain of
+/// activations already on the stack above it — empty for a gesture and for a
+/// mount, the caller's own stack for a component's `call`. The chain is what
+/// re-entrancy is judged against; see [`outward::dispatch_sync`]. `stamp` mints
+/// the request envelope.
 ///
 /// # Panics
 ///
 /// If the instance is registered with no bindings document in force — the gates
-/// answer that as a refusal rather than reaching an assembly.
+/// answer that as a refusal rather than reaching an assembly — or if the target
+/// is already in the chain.
 pub fn dispatch_sync(
     page: &mut SurfacePage,
-    instance: &str,
-    port: &str,
-    body: String,
+    call: SyncCall<'_>,
     stamp: MessageStamp,
     now: Millis,
     now_ms: u64,
 ) -> (SyncDispatch, Vec<Effect>) {
+    let (instance, port) = (call.instance, call.port);
     let mut reactions = Reactions::new();
-    let answer = match outward::dispatch_sync(page, instance, port, body, stamp, now_ms) {
+    let answer = match outward::dispatch_sync(page, call, stamp, now_ms) {
         Ok(mut ready) => {
             // The verdicts are the page's to enact, and one of them may be the
             // kill that means there is no entry to run.
@@ -224,6 +257,42 @@ pub fn dispatch_sync(
     };
     reactions.end_turn(page);
     (answer, reactions.into_effects())
+}
+
+/// Fold one activation's completion and answer **how the page ruled on it**.
+///
+/// The third pass a caller asks for rather than one an [`Input`] brings, and the
+/// only one whose answer is not an activation: a sync-call requester is blocked
+/// on the reply, and the reply it is owed is the one the page accepted — not the
+/// one the entry returned. The two differ whenever [`outward::on_activation_done`]
+/// rules a reply inadmissible, which is the whole reason that rule lives there.
+///
+/// [`Input::ActivationDone`] is the same fold for a caller that needs no answer.
+pub fn complete(
+    page: &mut SurfacePage,
+    done: Completed,
+    now: Millis,
+    now_ms: u64,
+) -> (ActivationOutcome, Vec<Effect>) {
+    let mut reactions = Reactions::new();
+    let outcome = fold_completion(page, done, &mut reactions, now, now_ms);
+    reactions.end_turn(page);
+    (outcome, reactions.into_effects())
+}
+
+/// The completion pass both callers run: take it, and hand back the outcome the
+/// page ruled on before the completion is folded away into reactions.
+fn fold_completion(
+    page: &mut SurfacePage,
+    done: Completed,
+    reactions: &mut Reactions,
+    now: Millis,
+    now_ms: u64,
+) -> ActivationOutcome {
+    let completion = outward::on_activation_done(page, done, now, now_ms);
+    let outcome = completion.outcome.clone();
+    reactions.completion(page, completion, now, now_ms);
+    outcome
 }
 
 /// The input's own pass, ahead of the release restatement every turn ends with.
@@ -250,8 +319,7 @@ fn route(
         Input::ActivationRegistered { instance } => on_registered(page, &instance, reactions),
         Input::ActivationDeregistered { instance } => on_deregistered(page, &instance, reactions),
         Input::ActivationDone(done) => {
-            let completion = outward::on_activation_done(page, *done, now, now_ms);
-            reactions.completion(page, completion, now, now_ms);
+            fold_completion(page, *done, reactions, now, now_ms);
         }
         Input::RetryDue => {
             let steps = outward::on_retry_tick(page, now);

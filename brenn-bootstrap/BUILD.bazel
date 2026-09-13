@@ -14,6 +14,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
         "//attach/server",
+        "//brenn-activation",
         "//brenn-automation",
         "//brenn-common",
         "//brenn-db",
@@ -81,6 +82,10 @@ rust_test(
         # The config-map reload case asks a guest what its config map holds, so
         # that a `config`-only edit is observed by the activation rather than
         # only by the delta.
+        # The peer-call family wires consumers of the one fixture that imports
+        # `brenn:processor/calls` into a chain and drives it through a real
+        # router.
+        "//brenn-wasm:fixture_processor_call_test",
         "//brenn-wasm:fixture_processor_config",
         "//brenn-wasm:fixture_processor_demo",
         # The bundle-shaped reload case installs a second artifact under one

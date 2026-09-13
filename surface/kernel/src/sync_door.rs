@@ -14,31 +14,36 @@
 //! for, because the activation itself is the answer — and everything below it is
 //! the same code the loop runs.
 //!
-//! # Why only a `dom`-granted instance has one
+//! # Its second caller: a component calling a peer
 //!
-//! The gesture is the whole reason: a user-activation token exists because a
-//! browser event fired on an element. A headless instance has no element and no
-//! gesture, so there is nothing for a synchronous pass to preserve. DOM-forced,
-//! not a distinction the kernel chose to keep — every other privileged entry
-//! serves every instance the same way.
+//! [`SyncDoor::call`] is the same pass for the `calls.call` import. A gesture is
+//! DOM-forced — a user-activation token exists because a browser event fired on
+//! an element, so a headless instance has no gesture and nothing to preserve —
+//! but a *call* is not: any instance the document wires may raise one, and it
+//! needs the synchronous pass for the other reason, that the reply is the value
+//! the guest is blocked on. The two differ in who asks and in what the request is
+//! judged against (a chain), and in nothing below that.
 //!
 //! # What the door does not do
 //!
-//! It enacts nothing. Both of its turns' effects go back to the loop over a
-//! channel and are performed there, in arrival order, interleaved with nothing.
-//! That is what keeps frame order equal to page order with two callers driving one
-//! page: the door mutates the page and queues the consequences; the loop remains
-//! the only thing that writes a socket, arms a deadline or emits an event.
+//! It enacts nothing. A gesture's two turns' effects go back to the loop over a
+//! channel and are performed there, in arrival order, interleaved with nothing;
+//! a call's go onto the caller's in-flight frame and are drained by the driver
+//! that is already running. That is what keeps frame order equal to page order
+//! with two callers driving one page: the door mutates the page and queues the
+//! consequences; the loop remains the only thing that writes a socket, arms a
+//! deadline or emits an event.
 //!
-//! # Re-entrancy is a borrow
+//! # Re-entrancy is the page's own fact
 //!
-//! An entry is on the stack iff an activation is in flight, and an activation in
-//! flight iff the page cell is borrowed — the run's activation pass holds its
-//! borrow across the invocation for precisely this reason. So a request that
-//! arrives from inside somebody's entry finds the cell borrowed and is refused,
-//! and the check costs a `try_borrow_mut`. The page answers the same question
-//! itself ([`crate::outward::SyncRefusal::ReEntrant`]); this is the layer that can
-//! answer it without borrowing.
+//! An entry is on the stack iff an activation is in flight, and the page holds
+//! that fact in its scheduler. A gesture's request carries an **empty chain**, so
+//! [`crate::outward::dispatch_sync`] judges it by the page-wide rule: anything in
+//! flight means it came from inside somebody's entry — programmatically, since one
+//! JS thread means a genuine gesture never can — and it is refused.
+//!
+//! A component calling a peer turns the page from inside its own entry, so no
+//! driver holds a borrow across an invocation. One fact, checked in one place.
 
 use std::cell::RefCell;
 
@@ -46,41 +51,26 @@ use futures_channel::mpsc;
 
 use brenn_attach_client::driver::{flush_stamps, new_stamp};
 use brenn_attach_client::transport::clock::{Clock, epoch_ms, wall_now};
-use brenn_surface_contract::ActivationError;
 
-use crate::activation::{ActivationOutcome, ReadyActivation};
+use crate::activation::ReadyActivation;
 use crate::front::InFlightSlot;
-use crate::outward::{Completed, SyncRefusal};
-use crate::page::SurfacePage;
+use crate::outward::{Completed, SyncCall};
 use crate::runner::{SharedEntries, SharedPage, invoke_shared};
 use crate::session::Effect;
-use crate::turn::{self, Input, SyncDispatch};
+use crate::turn;
 
-/// How one sync-call request finished, in the kernel's own vocabulary: the reply
-/// on ok, the component's account on err, and which refusal it was for the
-/// breadcrumb.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncAnswer {
-    /// The entry returned ok, with the reply it answered its caller with (or
-    /// `None` if it answered without one). Its buffer flushed.
-    Ok(Option<String>),
-    /// The entry returned err, carrying its own account. The buffer was discarded
-    /// and a failure counted; the instance keeps running.
-    Err(ActivationError),
-    /// The instance is terminal without having answered: its entry trapped, or the
-    /// assembly's own loud-rung verdict killed it before the entry could run. Both
-    /// are one fact for the requester — stop.
-    Trap,
-    /// Nothing was assembled and no entry ran. Always a bug; the refusal says
-    /// whose.
-    Refused(SyncRefusal),
-}
+/// How one sync-call request finished. The facility's vocabulary, shared with
+/// the backend host: the reply on ok, the component's own account on err, and
+/// which refusal it was for the breadcrumb.
+pub use brenn_activation::sync::SyncAnswer;
 
-/// The seam a gesture's sync-call request runs through.
+/// The seam a sync-call request runs through — a gesture's
+/// ([`request`](Self::request)) or a component's ([`call`](Self::call)).
 ///
 /// Holds exactly what a whole activation needs and nothing else: the page to turn,
-/// the entries to call, the in-flight slot a buffered publish routes through, and
-/// the way back to the loop for the effects. Taken from the runner before it is
+/// the entries to call, the in-flight stack a buffered publish routes through and
+/// a nested call's effects ride on, and the way back to the loop for a gesture's
+/// effects. Taken from the runner before it is
 /// spawned ([`crate::runner::SurfaceRunner::sync_door`]) and held for the page's
 /// life.
 pub struct SyncDoor {
@@ -131,30 +121,32 @@ impl SyncDoor {
     /// them would leave a page whose state nothing on screen or on the wire
     /// reflects.
     pub fn request(&self, instance: &str, port: &str, body: String) -> SyncAnswer {
-        // The borrow *is* the re-entrancy question: the run's activation pass holds
-        // it across the entry call, so a request from inside an entry finds it
-        // taken. Nothing else holds it across an await.
-        let Ok(mut page) = self.page.try_borrow_mut() else {
-            return SyncAnswer::Refused(SyncRefusal::ReEntrant);
-        };
         // One reading for the whole stretch, as the loop's own activation pass
         // takes: assembly, the request envelope's `publish_ts` and the completion
         // are one commit and must agree about when now was.
         let now = self.clock.now();
         let now_ms = epoch_ms(wall_now());
-        let (dispatch, mut effects) =
-            turn::dispatch_sync(&mut page, instance, port, body, new_stamp(), now, now_ms);
-        let answer = match dispatch {
-            SyncDispatch::Refused(refusal) => SyncAnswer::Refused(refusal),
-            // Terminal before its entry ran: nothing is in flight and no completion
-            // is owed, so the kill's own effects are all that is left to hand back.
-            SyncDispatch::Killed => SyncAnswer::Trap,
-            SyncDispatch::Ready(ready) => self.run(&mut page, *ready, &mut effects, now, now_ms),
+        // Empty chain: a gesture is nobody's callee, so the page-wide re-entrancy
+        // rule is the one that judges it.
+        let (dispatch, mut effects) = turn::dispatch_sync(
+            &mut self.page.borrow_mut(),
+            SyncCall {
+                instance,
+                port,
+                body: &body,
+                chain: &[],
+            },
+            new_stamp(),
+            now,
+            now_ms,
+        );
+        // A refusal and a kill are answers already — the kill's own effects are
+        // all that is left to hand back, since nothing is in flight and no
+        // completion is owed. Both mappings are the facility's, not this door's.
+        let answer = match dispatch.ready_or_answer() {
+            Err(answer) => answer,
+            Ok(ready) => self.run(ready, &mut effects, now, now_ms),
         };
-        // Released before the effects are offered: `try_send` is not a turn, but
-        // holding a page borrow past the work that needs it is how the next hazard
-        // gets written.
-        drop(page);
         // Every admitted request hands its effects over, empty list included,
         // because the send is also the loop's wake. The loop arms its activations
         // arm from a readiness snapshot taken before it parked, and a sync
@@ -177,9 +169,12 @@ impl SyncDoor {
 
     /// Invoke one assembled sync activation and fold its completion, appending the
     /// completion turn's effects to what the assembly already asked for.
+    ///
+    /// Borrows the page for the completion and never across the entry call: an
+    /// entry may call a peer, and that call turns this page from inside this
+    /// stack.
     fn run(
         &self,
-        page: &mut SurfacePage,
         ready: ReadyActivation,
         effects: &mut Vec<Effect>,
         now: brenn_attach_client::Millis,
@@ -192,37 +187,102 @@ impl SyncDoor {
             buffer,
             drops: _,
         } = ready;
-        let (outcome, buffer) = invoke_shared(
+        let (outcome, buffer, called) = invoke_shared(
             &self.entries,
             &self.in_flight,
             &instance,
             &activation,
             buffer,
         );
-        // Read before the outcome is moved into the completion: the requester's
-        // answer is this fact, and the completion is what the page does about it.
-        let answer = match &outcome {
-            ActivationOutcome::Ok(reply) => SyncAnswer::Ok(reply.clone()),
-            ActivationOutcome::Err(err) => SyncAnswer::Err(err.clone()),
-            ActivationOutcome::Trap(_) => SyncAnswer::Trap,
-        };
+        // What this activation's own callees asked for, ahead of what it asks for
+        // itself: they turned the page first.
+        effects.extend(called);
         // One stamp per buffered publish, minted here for the reason the loop mints
         // its own: this is an edge that reads clocks and entropy, and the page
         // reads neither.
         let stamps = flush_stamps(buffer.len());
-        effects.extend(turn::on_input(
-            page,
-            Input::ActivationDone(Box::new(Completed {
+        // The answer is read off the completion and never off the outcome handed
+        // in — see `turn::answer_for`.
+        let (ruled, done_effects) = turn::complete(
+            &mut self.page.borrow_mut(),
+            Completed {
                 instance,
                 generation,
                 outcome,
                 buffer,
                 stamps,
-            })),
+            },
             now,
             now_ms,
-        ));
-        answer
+        );
+        effects.extend(done_effects);
+        turn::answer_for(ruled)
+    }
+
+    /// Run one component's `calls.call` to its peer and answer it.
+    ///
+    /// The door's second caller, and the reason the door is not only the
+    /// gesture's: a call is the same request the gesture raises — assembly,
+    /// entry, completion, all on the requester's own stack — differing only in
+    /// who asks and what the request is judged against. A gesture's caller is the
+    /// browser and its chain is empty; a call's caller is an activation of this
+    /// page, so its chain is the in-flight stack and the target is looked up in
+    /// the document rather than named by the requester.
+    ///
+    /// `None` is a declared `call` port the deployer left unbound — nobody to
+    /// ask, which the seam answers `unwired`. The port's *declaredness* is not
+    /// judged here: that is the caller's own specification and the seam traps on
+    /// it before asking the door anything.
+    ///
+    /// Nothing is enacted and nothing is sent. Both turns' effects are stashed on
+    /// the caller's in-flight frame, for the reason
+    /// [`crate::front::InFlightPublish::effects`] gives.
+    ///
+    /// TODO(surface-wasm-test-in-ci): this body is browser-only and is driven by
+    /// no runner. What it composes is pinned natively — the gate in
+    /// [`crate::turn`], the stack in [`crate::front::InFlightStack`], the answer
+    /// in [`crate::calls::call_answer`] — but the composition is not.
+    ///
+    /// # Panics
+    ///
+    /// If no activation is on the stack. A call reaching the door outside one is
+    /// refused at the seam (`not-permitted`), so arriving here means the seam's
+    /// admission was bypassed.
+    pub fn call(&self, caller: &str, port: &str, payload: String) -> Option<SyncAnswer> {
+        let (target_instance, target_port) = {
+            let page = self.page.borrow();
+            let target = page.connect.bindings()?.call_target(caller, port)?;
+            (target.target_instance.clone(), target.target_port.clone())
+        };
+        // The stack is the chain: every instance whose entry is on it is above
+        // this request, outermost first, and the caller is its top. Snapshotted
+        // before the dispatch so the borrow does not span a turn.
+        let chain: Vec<String> = self.in_flight.borrow().chain();
+        let now = self.clock.now();
+        let now_ms = epoch_ms(wall_now());
+        let (dispatch, mut effects) = turn::dispatch_sync(
+            &mut self.page.borrow_mut(),
+            SyncCall {
+                instance: &target_instance,
+                port: &target_port,
+                body: &payload,
+                chain: &chain,
+            },
+            new_stamp(),
+            now,
+            now_ms,
+        );
+        let answer = match dispatch.ready_or_answer() {
+            Err(answer) => answer,
+            Ok(ready) => self.run(ready, &mut effects, now, now_ms),
+        };
+        self.stash(effects);
+        Some(answer)
+    }
+
+    /// Park a nested turn's effects on the caller's in-flight frame.
+    fn stash(&self, effects: Vec<Effect>) {
+        self.in_flight.borrow_mut().stash(effects);
     }
 
     /// Hand a turn's effects to the loop, which is the only thing that performs

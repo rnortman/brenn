@@ -63,6 +63,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-call-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
 name = "brenn-processor-config"
 version = "0.1.0"
 dependencies = [

@@ -17,6 +17,7 @@ brenn-dsl = { version = "0.1.0", path = "../brenn-dsl" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 brenn-usage-db = { version = "0.1.0", path = "../brenn-usage-db" }
 brenn-ws-types = { version = "0.1.0", path = "../brenn-ws-types" }
+brenn-activation = { path = "../brenn-activation" }
 brenn-envelope = { path = "../brenn-envelope" }
 argon2 = "0.5.3"
 async-trait = "0.1.89"

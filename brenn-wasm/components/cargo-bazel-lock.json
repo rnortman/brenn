@@ -1,5 +1,5 @@
 {
-  "checksum": "930abed62ab89fa53b2d9e6ec8885fb48ac76efb9d914c1ba03df201ebd83750",
+  "checksum": "79fc7cc8a271728e3e37fec301d4105e127a7bd50fab183d8616315bf5899f1c",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -340,6 +340,24 @@
           ],
           "selects": {}
         },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-call-test 0.1.0": {
+      "name": "brenn-processor-call-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -3956,6 +3974,7 @@
     "brenn-git-forge-parser 0.1.0": "brenn-wasm/components/git-forge-parser",
     "brenn-git-sync-consumer 0.1.0": "brenn-wasm/components/git-sync-consumer",
     "brenn-guest 0.1.0": "brenn-wasm/components/guest",
+    "brenn-processor-call-test 0.1.0": "brenn-wasm/components/processor-call-test",
     "brenn-processor-config 0.1.0": "brenn-wasm/components/processor-config",
     "brenn-processor-demo 0.1.0": "brenn-wasm/components/processor-demo",
     "brenn-processor-dual 0.1.0": "brenn-wasm/components/processor-dual",

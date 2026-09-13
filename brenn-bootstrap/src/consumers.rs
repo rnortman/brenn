@@ -210,6 +210,11 @@ pub(crate) struct ConsumerLoadContext<'a> {
     pub tool_registry: &'a Arc<brenn_tool_registry::ToolRegistry>,
     /// `[messaging].max_body_bytes`, the ceiling on one published payload.
     pub max_payload_bytes: usize,
+    /// The wake router, which is also how one consumer reaches another's
+    /// sync-request channel. A consumer holding the `calls` grant gets a caller
+    /// over it; `None` is a host with no router, where such a consumer cannot
+    /// be loaded at all.
+    pub sync_router: Option<Arc<brenn_server::messaging_router::WakeRouterImpl>>,
 }
 
 /// A loaded consumer: the instantiated component, what the package bound, and
@@ -221,6 +226,13 @@ pub(crate) struct LoadedConsumer {
     pub component: Arc<brenn_wasm::ProcessorComponent>,
     pub verified: Verified,
     pub notify: Arc<Notify>,
+    /// The sending half of the consumer's sync-request channel, minted here for
+    /// the same reason the `Notify` is: the delivery binding that carries a
+    /// caller's request to the task is registered before the task exists.
+    pub sync_tx: tokio::sync::mpsc::Sender<brenn_wasm_dispatch::SyncRequest>,
+    /// The receiving half. The task is its sole owner, which is what serializes
+    /// a sync call against every other activation of this consumer.
+    pub sync_rx: tokio::sync::mpsc::Receiver<brenn_wasm_dispatch::SyncRequest>,
 }
 
 /// Load one resolved consumer: check its store's parent, wire its load spec to
@@ -257,6 +269,7 @@ pub(crate) fn load_consumer(
         assert_store_parent_exists(&consumer.slug, store_path);
     }
     let notify = Arc::new(Notify::new());
+    let (sync_tx, sync_rx) = brenn_wasm_dispatch::sync_request_channel();
     let ConsumerLoadParts {
         output_ports,
         declared_out_ports,
@@ -300,6 +313,40 @@ pub(crate) fn load_consumer(
             ctx.alert_dispatcher.clone(),
         )))
     };
+    // Peer-call seam. Built iff the consumer holds the `Calls` grant — the
+    // `calls` interface is linked iff this is `Some`, and
+    // `ProcessorComponent::load` re-asserts that invariant.
+    //
+    // The closure blocks on the router's future via the captured runtime
+    // handle: the guest is already stopped on a blocking thread for the call.
+    let sync_caller: Option<brenn_wasm::SyncCallerFn> = if consumer
+        .grants
+        .contains(&brenn_lib::messaging::ComponentGrant::Calls)
+    {
+        let router = ctx.sync_router.clone().unwrap_or_else(|| {
+            panic!(
+                "consumer {}: holds the `calls` grant on a host with no wake router — there is \
+                 no peer it could reach",
+                consumer.slug,
+            )
+        });
+        Some(sync_caller_over(router))
+    } else {
+        None
+    };
+    let calls: std::collections::HashMap<String, brenn_wasm::ProcessorCallTarget> = consumer
+        .calls
+        .iter()
+        .map(|call| {
+            (
+                call.port.clone(),
+                brenn_wasm::ProcessorCallTarget {
+                    target_slug: call.target_slug.clone(),
+                    target_port: call.target_port.clone(),
+                },
+            )
+        })
+        .collect();
     let (component, verified) = load_verified_consumer(
         ctx.components_roots,
         &consumer.package,
@@ -323,6 +370,9 @@ pub(crate) fn load_consumer(
             output_acl,
             mqtt_publish,
             tool_host,
+            declared_call_ports: consumer.call_ports.clone(),
+            calls,
+            sync_caller,
         },
     );
     let store_path_present = consumer.store_path.is_some();
@@ -342,6 +392,8 @@ pub(crate) fn load_consumer(
         component: Arc::new(component),
         verified,
         notify,
+        sync_tx,
+        sync_rx,
     }
 }
 
@@ -368,6 +420,36 @@ pub(crate) struct RunningConsumer {
 /// second answer to "what is running" beside the directory's subscribers.
 pub(crate) type ConsumerRegistry = HashMap<String, RunningConsumer>;
 
+/// The peer-call seam a consumer holding the `calls` grant is loaded with.
+///
+/// One statement of it, so the closure a component's calls actually travel
+/// through is the one a test can drive: it captures the runtime handle at load
+/// and blocks on the router's future from the guest's blocking thread, which is
+/// where the guest is already stopped. A copy written beside a test would prove
+/// the copy.
+///
+/// # Panics
+///
+/// If no tokio runtime is entered — the handle is captured here, not at the
+/// call.
+pub(crate) fn sync_caller_over(
+    router: Arc<brenn_server::messaging_router::WakeRouterImpl>,
+) -> brenn_wasm::SyncCallerFn {
+    let handle = tokio::runtime::Handle::current();
+    Arc::new(
+        move |target_slug: &str, target_port: &str, body: String, chain: &[String]| {
+            let router = router.clone();
+            let target_slug = target_slug.to_string();
+            let target_port = target_port.to_string();
+            handle.block_on(async move {
+                router
+                    .sync_call(&target_slug, &target_port, body, chain)
+                    .await
+            })
+        },
+    )
+}
+
 /// Start a loaded consumer's dispatch task.
 ///
 /// The task delivers the mount activation before its first wait: every mount is
@@ -390,8 +472,8 @@ pub(crate) fn start_consumer(
     alert_dispatcher: &AlertDispatcher,
 ) -> RunningConsumer {
     loaded.component.open_store();
-    let handle =
-        brenn_wasm_dispatch::spawn_wasm_consumer_task(brenn_wasm_dispatch::WasmConsumerConfig {
+    let handle = brenn_wasm_dispatch::spawn_wasm_consumer_task(
+        brenn_wasm_dispatch::WasmConsumerConfig {
             slug: consumer.slug.clone(),
             component: loaded.component.clone(),
             notify: loaded.notify,
@@ -399,8 +481,11 @@ pub(crate) fn start_consumer(
             alert_dispatcher: alert_dispatcher.clone(),
             inputs: consumer.inputs.clone(),
             outputs: consumer.outputs.clone(),
+            sync_ports: consumer.sync_ports.clone(),
             activation_pacing: consumer.activation_pacing,
-        });
+        },
+        loaded.sync_rx,
+    );
     info!(slug = %consumer.slug, "wasm_dispatch: consumer task spawned");
     RunningConsumer {
         verified: loaded.verified,
@@ -492,6 +577,9 @@ mod tests {
                 output_acl: std::sync::Arc::new(|_| true),
                 mqtt_publish: None,
                 tool_host: None,
+                declared_call_ports: Default::default(),
+                calls: Default::default(),
+                sync_caller: None,
             }
         }
 
@@ -703,6 +791,8 @@ mod tests {
             package: "tooler".to_string(),
             spec_sha256: String::new(),
             declared_out_ports: std::collections::BTreeSet::new(),
+            sync_ports: std::collections::BTreeSet::new(),
+            call_ports: std::collections::BTreeSet::new(),
             grants: grants.iter().copied().collect(),
             store_path: None,
             max_page_count: 1,
@@ -715,6 +805,7 @@ mod tests {
                 min_period: std::time::Duration::from_millis(1),
             },
             mqtt_sinks: std::collections::HashMap::new(),
+            calls: vec![],
         }
     }
 
@@ -778,6 +869,7 @@ mod tests {
             mqtt_service: brenn_mqtt::MqttService::new(),
             tool_registry: &tool_registry,
             max_payload_bytes: 1024,
+            sync_router: None,
         };
         let mut consumer = tool_consumer(&[brenn_lib::messaging::ComponentGrant::Ports], &[]);
         consumer.store_path = Some(std::path::PathBuf::from(

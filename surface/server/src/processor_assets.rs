@@ -52,16 +52,17 @@ const PROCESSOR_PACKAGE: &str = "brenn:processor";
 /// no host implements it (jco resolves it structurally). It is listed here
 /// because the manifest reports the world's imports truthfully, and a
 /// type-carrying import must not read as an unsatisfiable one.
-const SURFACE_IMPORTS: [&str; 7] = [
-    "types", "ports", "log", "alert", "config", "dom", "page-dom",
+const SURFACE_IMPORTS: [&str; 8] = [
+    "types", "ports", "log", "alert", "config", "calls", "dom", "page-dom",
 ];
 
 /// Every WIT interface name `processor.wit` defines. An import outside this set
 /// is manifest/toolchain drift (the build wrote a name no world declares), which
 /// is a different operator problem from declaring a backend-only component on a
 /// surface — and gets its own panic.
-const KNOWN_IMPORTS: [&str; 10] = [
-    "types", "ports", "log", "alert", "config", "store", "mqtt", "tools", "dom", "page-dom",
+const KNOWN_IMPORTS: [&str; 11] = [
+    "types", "ports", "log", "alert", "config", "store", "mqtt", "tools", "calls", "dom",
+    "page-dom",
 ];
 
 /// The one promise every record makes, whatever version wrote it: an integer

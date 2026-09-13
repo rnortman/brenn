@@ -495,6 +495,27 @@ struct InstanceStatus {
 /// the backend host and this kernel all read from one crate.
 pub type GrantSet = BTreeSet<ComponentGrant>;
 
+/// What one component entry says about the instance it declares, indexed once
+/// from the bindings document at apply time.
+///
+/// One map and not three: every field here is the same kind of question — what
+/// this instance's specification says it may do or may be asked — asked at the
+/// same moments, keyed by the same id, and refused as one document. A sixth
+/// per-instance fact is a field here rather than a fourth walk of the same list.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct InstanceFacts {
+    /// The capabilities its entry declares, parsed. The kernel's whole runtime
+    /// enforcement input: a capability the operator did not write is one this
+    /// page refuses to exercise, whatever the component asks for.
+    grants: GrantSet,
+    /// What its specification says it may be asked, read once per `dom.listen`
+    /// and once per call.
+    sync_ports: BTreeSet<String>,
+    /// What its specification says it may ask through, read once per
+    /// `calls.call`.
+    call_ports: BTreeSet<String>,
+}
+
 /// Why a bindings document was refused: what an operator reads, and the short
 /// reason the reload request carries.
 struct DocumentRefusal {
@@ -502,7 +523,7 @@ struct DocumentRefusal {
     reason: &'static str,
 }
 
-/// Parse every component entry's grant words, or refuse the document.
+/// Index every component entry's per-instance facts, or refuse the document.
 ///
 /// An unknown word is server/kernel build skew — the document was written by a
 /// backend whose vocabulary this page's assets predate — and the page's answer is
@@ -516,9 +537,9 @@ struct DocumentRefusal {
 /// either entry would enforce one entry's grants while every other reader of this
 /// list (the config map, the mount plan) took the first — one instance name
 /// standing for two different components.
-fn parse_instance_grants(
+fn parse_instance_facts(
     bindings: &BindingsDocument,
-) -> Result<HashMap<String, GrantSet>, DocumentRefusal> {
+) -> Result<HashMap<String, InstanceFacts>, DocumentRefusal> {
     let mut parsed = HashMap::with_capacity(bindings.components.len());
     for entry in &bindings.components {
         let mut grants = GrantSet::new();
@@ -537,7 +558,12 @@ fn parse_instance_grants(
                 }
             }
         }
-        if parsed.insert(entry.instance.clone(), grants).is_some() {
+        let facts = InstanceFacts {
+            grants,
+            sync_ports: entry.sync_ports.iter().cloned().collect(),
+            call_ports: entry.call_ports.iter().cloned().collect(),
+        };
+        if parsed.insert(entry.instance.clone(), facts).is_some() {
             return Err(DocumentRefusal {
                 message: format!(
                     "refused the bindings document: instance {:?} is declared twice, so no reader of it can say which component the name means",
@@ -568,12 +594,11 @@ pub struct KernelCore {
     /// ([`KernelCore::instance_grants`]); a conforming kernel never sends an
     /// `Alert` either scope would refuse.
     alert_granted: bool,
-    /// Instance → the capabilities its component entry declares, parsed once
-    /// from the bindings document. Empty until the page is first configured, and
-    /// the kernel's whole runtime enforcement input: a capability the operator
-    /// did not write is one this page refuses to exercise, whatever the
-    /// component asks for.
-    instance_grants: HashMap<String, GrantSet>,
+    /// Instance → what its component entry declares: its grants, its sync-port
+    /// vocabulary and its call-port vocabulary, indexed in one pass from the
+    /// bindings document. Empty until the page is first configured, so every
+    /// question fails closed before the first `Connected`.
+    instance_facts: HashMap<String, InstanceFacts>,
     /// The last geometry reported, for no-change suppression; `None` until the
     /// first `SendGeometry`. A resize that lands back on the same viewport (a
     /// device rotating and rotating back, a debounce coalescing a jitter) emits
@@ -644,7 +669,7 @@ impl KernelCore {
             link_state: LinkState::Connecting,
             bindings: None,
             alert_granted: false,
-            instance_grants: HashMap::new(),
+            instance_facts: HashMap::new(),
             last_geometry: None,
             instances: Vec::new(),
             registered: HashSet::new(),
@@ -937,6 +962,32 @@ impl KernelCore {
         }
     }
 
+    /// Whether `instance` may call a peer, and the refusal to report if it may
+    /// not.
+    ///
+    /// The `calls` family's own gate, separate from
+    /// [`component_ports_gate`](Self::component_ports_gate) because the grants
+    /// are: publishing states something on a channel a deployer bound, while a
+    /// call runs a peer's whole activation inside this one, and an operator who
+    /// granted the first did not thereby grant the second.
+    ///
+    /// The runtime half of a gate boot already applied — a kind whose artifact
+    /// imports `calls` without the word in its `requires` is refused before it is
+    /// served — so a conforming page never reaches the refusal. It exists for the
+    /// same reason the ports gate's does: a non-conforming loader is the one
+    /// thing the kernel cannot assume away.
+    pub fn component_calls_gate(&self, instance: &str) -> Result<(), KernelAction> {
+        if self.instance_granted(instance, ComponentGrant::Calls) {
+            Ok(())
+        } else {
+            Err(ungranted_capability(
+                instance,
+                ComponentGrant::Calls,
+                "calls.call",
+            ))
+        }
+    }
+
     /// Whether `instance` has registered an activation entry. The gate's state,
     /// readable so a caller can assert on it.
     #[cfg(test)]
@@ -977,7 +1028,9 @@ impl KernelCore {
     /// fails closed.
     pub fn instance_grants(&self, instance: &str) -> &GrantSet {
         static NONE: GrantSet = GrantSet::new();
-        self.instance_grants.get(instance).unwrap_or(&NONE)
+        self.instance_facts
+            .get(instance)
+            .map_or(&NONE, |facts| &facts.grants)
     }
 
     /// Whether `instance` holds `grant` — the question every privileged kernel
@@ -985,6 +1038,32 @@ impl KernelCore {
     /// seam cannot ask it a different way.
     pub fn instance_granted(&self, instance: &str, grant: ComponentGrant) -> bool {
         self.instance_grants(instance).contains(&grant)
+    }
+
+    /// Whether `instance`'s component kind declares `port` as a sync port.
+    ///
+    /// The vocabulary a `dom.listen` is judged against, on the same terms a
+    /// publish is judged against the out-port vocabulary: a name outside it is
+    /// the component contradicting the specification its artifact is
+    /// hash-bound to. An instance no document declares has no sync vocabulary
+    /// and answers `false`, which is deny-by-default with no existence oracle
+    /// in the difference — the same answer [`instance_grants`] gives.
+    pub fn declares_sync_port(&self, instance: &str, port: &str) -> bool {
+        self.instance_facts
+            .get(instance)
+            .is_some_and(|facts| facts.sync_ports.contains(port))
+    }
+
+    /// Whether `instance`'s component kind declares `port` as a call port.
+    ///
+    /// The vocabulary a `calls.call` is judged against, on the same terms:
+    /// a name outside it traps the activation, while a name inside it the
+    /// document left unbound is answered `unwired`. An instance no document
+    /// declares answers `false`, deny-by-default with no existence oracle.
+    pub fn declares_call_port(&self, instance: &str, port: &str) -> bool {
+        self.instance_facts
+            .get(instance)
+            .is_some_and(|facts| facts.call_ports.contains(port))
     }
 
     /// Fold one control-plane [`Event`] into the core, returning the actions
@@ -1268,7 +1347,7 @@ impl KernelCore {
         // it. Stale assets are the only way it happens and the capped bootstrap
         // reload is the only thing that heals it — the same answer, for the same
         // reason, as a transport-version mismatch.
-        let instance_grants = match parse_instance_grants(bindings) {
+        let instance_facts = match parse_instance_facts(bindings) {
             Ok(parsed) => parsed,
             Err(refusal) => {
                 let mut actions = vec![KernelAction::Report {
@@ -1283,7 +1362,7 @@ impl KernelCore {
                 return actions;
             }
         };
-        self.instance_grants = instance_grants;
+        self.instance_facts = instance_facts;
         self.bindings = Some(bindings.clone());
         self.chrome_instance = if bindings.chrome_instance.is_empty() {
             None
@@ -1774,6 +1853,8 @@ mod tests {
             config: Default::default(),
             grants: vec![],
             declared_out_ports: vec![],
+            sync_ports: vec![],
+            call_ports: vec![],
         }
     }
 
@@ -1820,6 +1901,7 @@ mod tests {
                 error_channel: None,
                 error_report_floor: None,
             },
+            calls: vec![],
         }
     }
 
@@ -2044,6 +2126,92 @@ mod tests {
         let core = connect(vec![granted_entry("p1", "protobar", &["alert"])], true);
         assert!(
             core.instance_grants("ghost").is_empty(),
+            "deny-by-default, and no existence oracle in the difference"
+        );
+    }
+
+    // ── per-instance sync vocabulary ──────────────────────────────────────
+
+    #[test]
+    fn a_configured_instances_sync_ports_are_read_off_its_component_entry() {
+        let core = connect(
+            vec![
+                ComponentEntry {
+                    sync_ports: vec!["press".to_string()],
+                    ..entry("p1", "protobar")
+                },
+                entry("p2", "protobar"),
+            ],
+            true,
+        );
+        assert!(core.declares_sync_port("p1", "press"));
+        assert!(
+            !core.declares_sync_port("p1", "other"),
+            "a name outside the vocabulary is the component contradicting its specification"
+        );
+        assert!(
+            !core.declares_sync_port("p2", "press"),
+            "a sibling of the same kind holds only its own entry's vocabulary"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_instance_and_an_unconfigured_page_declare_no_sync_port() {
+        assert!(!KernelCore::new().declares_sync_port("p1", "press"));
+        let core = connect(
+            vec![ComponentEntry {
+                sync_ports: vec!["press".to_string()],
+                ..entry("p1", "protobar")
+            }],
+            true,
+        );
+        assert!(
+            !core.declares_sync_port("stranger", "press"),
+            "deny-by-default, and no existence oracle in the difference"
+        );
+    }
+
+    // ── per-instance call vocabulary ──────────────────────────────────────
+
+    /// The page's whole enforcement of the declared call vocabulary, and it
+    /// fails closed: an apply path that stopped copying `call_ports` would trap
+    /// every caller's activation rather than refuse a call, so the index is
+    /// worth reading for directly.
+    #[test]
+    fn a_configured_instances_call_ports_are_read_off_its_component_entry() {
+        let core = connect(
+            vec![
+                ComponentEntry {
+                    call_ports: vec!["lookup".to_string()],
+                    ..entry("p1", "protobar")
+                },
+                entry("p2", "protobar"),
+            ],
+            true,
+        );
+        assert!(core.declares_call_port("p1", "lookup"));
+        assert!(
+            !core.declares_call_port("p1", "other"),
+            "a name outside the vocabulary is the component contradicting its specification"
+        );
+        assert!(
+            !core.declares_call_port("p2", "lookup"),
+            "a sibling of the same kind holds only its own entry's vocabulary"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_instance_and_an_unconfigured_page_declare_no_call_port() {
+        assert!(!KernelCore::new().declares_call_port("p1", "lookup"));
+        let core = connect(
+            vec![ComponentEntry {
+                call_ports: vec!["lookup".to_string()],
+                ..entry("p1", "protobar")
+            }],
+            true,
+        );
+        assert!(
+            !core.declares_call_port("stranger", "lookup"),
             "deny-by-default, and no existence oracle in the difference"
         );
     }
@@ -3286,6 +3454,30 @@ mod tests {
                 assert!(message.contains(what), "{seam}: {message}");
                 assert!(message.contains("ports capability"), "{seam}: {message}");
             }
+        }
+    }
+
+    /// `calls` is its own grant and its own gate: a `ports` grant admits nothing
+    /// here, which is the whole reason the two verdicts are separate.
+    #[test]
+    fn the_calls_gate_is_not_the_ports_gate() {
+        let granted = connect(vec![granted_entry("p1", "protobar", &["calls"])], true);
+        assert_eq!(granted.component_calls_gate("p1"), Ok(()));
+
+        let ports_only = connect(vec![granted_entry("p1", "protobar", &["ports"])], true);
+        for instance in ["p1", "ghost"] {
+            let Err(KernelAction::Report {
+                level,
+                message,
+                subject,
+            }) = ports_only.component_calls_gate(instance)
+            else {
+                panic!("a calls-less instance ({instance}) was admitted");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert_eq!(subject.as_deref(), Some(instance));
+            assert!(message.contains("calls.call"), "{message}");
+            assert!(message.contains("calls capability"), "{message}");
         }
     }
 

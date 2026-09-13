@@ -10,6 +10,9 @@ component EchoStub {
   abi = processor;
   requires = [ports, log, dom];
   optional in messages;
+  sync send;
+  sync send-custom;
+  sync panic;
   out out;
   io state;
 }

@@ -125,6 +125,11 @@ pub mod dom_table;
 #[cfg(target_arch = "wasm32")]
 pub mod dom_host;
 
+/// The component-to-component call: what a caller's `calls.call` is answered
+/// with, and the rules that decide it. Host-independent and natively testable,
+/// so the browser-only seam above it carries no decision of its own.
+pub mod calls;
+
 /// The synchronous side door onto a running page: the seam a component's gesture
 /// reaches an activation through. Browser target only, for the same reason the
 /// in-flight slot is — nothing else can be mid-dispatch on the loop's own thread.
@@ -144,9 +149,11 @@ pub use entry::{KernelHandle, start};
 mod wasm_test_util;
 
 pub use activation::{ActivationOutcome, ReadyActivation};
-#[cfg(target_arch = "wasm32")]
-pub use front::InFlightPublish;
-pub use front::{ActivationEntry, EventStream, PublishReject, SurfaceGate, SurfaceHandle, new};
+pub use calls::call_answer;
+pub use front::{
+    ActivationEntry, EventStream, InFlightPublish, InFlightStack, PublishReject, SurfaceGate,
+    SurfaceHandle, invoke_over_stack, new,
+};
 pub use outbound::PublishStatus;
 pub use publish_buffer::PublishBuffer;
 pub use runner::SurfaceRunner;

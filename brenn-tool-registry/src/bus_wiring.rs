@@ -15,7 +15,7 @@ use brenn_lib::access::acl::{AclSet, ChannelMatcher};
 use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::messaging::config::{
     MILLITOKENS_PER_PUBLISH, MessagingGlobalConfig, ResolvedChannel, ResolvedSubscription,
-    SystemChannelTuning, WasmInputPort, resolve_system_channel,
+    SystemChannelTuning, WasmInputPort, resolve_system_channel, resolve_wasm_window_depth,
 };
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, canonical_address, tool_channel_uuid_from_address,
@@ -94,11 +94,20 @@ pub fn result_inbox_entry(
 /// is not read.
 pub fn inbox_subscription(slug: &str, ch: &ResolvedChannel) -> ResolvedSubscription {
     let address = canonical_address(&result_inbox_name(slug));
+    let context = format!(
+        "the tool-result inbox {address:?} of [[wasm_consumer]] {slug:?}, whose rungs both take \
+         the inbox channel's retain_depth,"
+    );
     ResolvedSubscription {
         channel_uuid: tool_channel_uuid_from_address(&address),
         channel_address: address,
-        push_depth: ch.retain_depth,
-        retain_depth: ch.retain_depth,
+        // The inbox is a WASM input port like any other, so its depths take the
+        // shared window ceiling: `unbounded` tuning resolves to the ceiling and
+        // anything above it is refused here rather than capped at the window
+        // read. Each call is labelled with the rung it resolves, so the two
+        // refusals are told apart in a log.
+        push_depth: resolve_wasm_window_depth(ch.retain_depth, "push_depth", &context),
+        retain_depth: resolve_wasm_window_depth(ch.retain_depth, "retain_depth", &context),
         noise: ch.noise,
         wake_min: ch.wake_min,
     }
@@ -396,6 +405,51 @@ mod tests {
         let sub = inbox_subscription("sync", &inbox.resolved_channel);
         assert_eq!(sub.push_depth, Depth::Bounded(20));
         assert_eq!(sub.retain_depth, Depth::Bounded(20));
+    }
+
+    /// The inbox's tuning at `retain_depth`, for the ceiling cases. Its standing
+    /// depth is unbounded so the ceiling under test is the window one and not a
+    /// channel-level bound in front of it.
+    fn inbox_tuning_at_retain(address: &str, retain_depth: Depth) -> SystemChannelTuning {
+        let raw = ChannelConfigRaw {
+            push_depth: Some(Depth::Bounded(100)),
+            retain_depth: Some(retain_depth),
+            standing_retain_depth: Some(Depth::Unbounded),
+            noise: None,
+            wake_min: None,
+            ..ChannelConfigRaw::minimal(address)
+        };
+        build_system_channel_tuning(&[raw], &MessagingGlobalConfig::default())
+    }
+
+    /// The inbox is a WASM input port, so an `unbounded` tuning resolves to the
+    /// shared window ceiling here rather than reaching a host as `Unbounded`.
+    #[test]
+    fn an_unbounded_inbox_tuning_resolves_both_rungs_to_the_ceiling() {
+        let tuned = inbox_tuning_at_retain("brenn:tool-results/sync", Depth::Unbounded);
+        let inbox = result_inbox_entry("sync", &tuned, &MessagingGlobalConfig::default());
+        let sub = inbox_subscription("sync", &inbox.resolved_channel);
+        assert_eq!(
+            sub.push_depth,
+            Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING)
+        );
+        assert_eq!(
+            sub.retain_depth,
+            Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING)
+        );
+    }
+
+    /// And a tuning above that ceiling is refused at boot, naming the inbox —
+    /// never capped on the way to the window read.
+    #[test]
+    #[should_panic(expected = "the tool-result inbox")]
+    fn an_inbox_tuning_above_the_ceiling_panics() {
+        let tuned = inbox_tuning_at_retain(
+            "brenn:tool-results/sync",
+            Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING + 1),
+        );
+        let inbox = result_inbox_entry("sync", &tuned, &MessagingGlobalConfig::default());
+        let _ = inbox_subscription("sync", &inbox.resolved_channel);
     }
 
     /// A tool request channel stays reapable once the executor is folded onto

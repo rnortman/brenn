@@ -72,6 +72,8 @@ fn doc(kind: &str) -> BindingsDocument {
             config: BTreeMap::new(),
             grants: vec![],
             declared_out_ports: vec![],
+            sync_ports: vec![],
+            call_ports: vec![],
         }],
         subscriptions: vec![Binding {
             channel: WIRE.to_string(),
@@ -103,6 +105,7 @@ fn doc(kind: &str) -> BindingsDocument {
             error_channel: None,
             error_report_floor: None,
         },
+        calls: vec![],
     })
 }
 

@@ -179,6 +179,8 @@ pub fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
         package: "probe".to_string(),
         spec_sha256: String::new(),
         declared_out_ports: vec![],
+        sync_ports: vec![],
+        call_ports: vec![],
         grants: vec![],
         store_path: None,
         store_size_limit: None,
@@ -199,6 +201,7 @@ pub fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
         activation_min_period_ms: None,
         mqtt_outputs: vec![],
         tool_grants: vec![],
+        calls: vec![],
     }
 }
 
@@ -487,6 +490,7 @@ pub fn minimal_surface_raw() -> SurfaceConfigRaw {
         allowed_users: vec![],
         publish_burst: None,
         publish_per_sec: None,
+        calls: vec![],
     }
 }
 

@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
+use brenn_activation::sync::SyncAnswer;
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::driver::{flush_stamps, new_stamp};
@@ -47,7 +48,7 @@ use brenn_page_harness::{Kind, Page, types};
 use brenn_surface_contract::ActivationError;
 use brenn_surface_kernel::ActivationOutcome;
 use brenn_surface_kernel::activation::ReadyActivation;
-use brenn_surface_kernel::outward::Completed;
+use brenn_surface_kernel::outward::{Completed, SyncCall};
 use brenn_surface_kernel::page::SurfacePage;
 use brenn_surface_kernel::publish_buffer::PublishBuffer;
 use brenn_surface_kernel::turn::{self, Input};
@@ -61,7 +62,7 @@ use brenn_surface_schema::{
 use brenn_envelope::ChannelScheme;
 use brenn_envelope::grants::{ComponentHost, EntityKind, Plane, bindable_schemes};
 
-use crate::{Host, MountSpec, Report, TrapDisposition, port, scenarios};
+use crate::{BODY_CAP, Host, MountSpec, Report, TrapDisposition, port, scenarios};
 
 /// Workspace-relative, as every runfiles tree is laid out like the workspace.
 const PROBE_WASM: &str = "brenn-wasm/target/components/brenn_processor_transplant.wasm";
@@ -139,7 +140,9 @@ fn facts() -> AttachmentFacts {
         participant_id: "surface:conf".to_string(),
         session_id: "s-conf".to_string(),
         heartbeat_secs: 20,
-        max_body_bytes: 64 * 1024,
+        // The reply cap is the body cap, and the suite's two adapters must agree
+        // on the number: see `BODY_CAP`.
+        max_body_bytes: BODY_CAP,
         max_frame_bytes: 256 * 1024,
         alert_granted: false,
     }
@@ -201,6 +204,10 @@ fn document(spec: &MountSpec) -> BindingsDocument {
                     .map(|g| (*g).to_string())
                     .collect(),
                 declared_out_ports,
+                // The probe's specification declares one sync port, and the
+                // document is where the page reads that declaration.
+                sync_ports: vec![port::ASK.to_string()],
+                call_ports: vec![],
             },
             ComponentEntry {
                 instance: CHROME.to_string(),
@@ -209,6 +216,8 @@ fn document(spec: &MountSpec) -> BindingsDocument {
                 config: BTreeMap::new(),
                 grants: vec!["ports".to_string()],
                 declared_out_ports: vec![],
+                sync_ports: vec![],
+                call_ports: vec![],
             },
         ],
         subscriptions,
@@ -222,6 +231,7 @@ fn document(spec: &MountSpec) -> BindingsDocument {
             error_channel: None,
             error_report_floor: None,
         },
+        calls: vec![],
     }
 }
 
@@ -316,6 +326,39 @@ impl Surface {
             self.feed(Input::ActivationDone(Box::new(done)));
         }
         panic!("the page never stopped being ready");
+    }
+
+    /// The native caller's request path on this host: one `dispatch_sync`, the
+    /// entry, and the completion, all on the caller's own stack.
+    fn request(&mut self, port: &str, body: &str) -> SyncAnswer {
+        let (now, now_ms) = (self.now(), wall_ms());
+        let (dispatch, _effects) = turn::dispatch_sync(
+            &mut self.page,
+            SyncCall {
+                instance: PROBE,
+                port,
+                body,
+                // A native caller is nobody's callee.
+                chain: &[],
+            },
+            new_stamp(),
+            now,
+            now_ms,
+        );
+        // Both mappings are the kernel's own — this adapter drives the page's
+        // seams and transcribes none of its rules.
+        let ready = match dispatch.ready_or_answer() {
+            Ok(ready) => ready,
+            Err(answer) => return answer,
+        };
+        let done = invoke(&self.kind, &self.config, ready);
+        let (now, now_ms) = (self.now(), wall_ms());
+        // Read off the completion rather than off the outcome handed in: the
+        // page is where a reply is ruled admissible, so an entry that replied
+        // to a question nobody asked, or over the cap, is a trap here even
+        // though its own return said ok.
+        let (ruled, _effects) = turn::complete(&mut self.page, done, now, now_ms);
+        turn::answer_for(ruled)
     }
 
     /// The reports the probe has published on its report channel since the last
@@ -518,6 +561,10 @@ impl Host for Surface {
         });
     }
 
+    async fn sync_call(&mut self, port: &str, body: &str) -> SyncAnswer {
+        self.request(port, body)
+    }
+
     fn hold_releases(&mut self, hold: bool) {
         self.releases_held = hold;
     }
@@ -596,6 +643,10 @@ surface_scenario!(sampled_only_wiring);
 surface_scenario!(err_consumes);
 surface_scenario!(trap_disposition);
 surface_scenario!(state_does_not_survive);
+surface_scenario!(a_sync_call_is_an_activation_plus_a_reply);
+surface_scenario!(a_sync_call_consumes_queued_input);
+surface_scenario!(a_reply_to_an_async_activation_is_a_trap);
+surface_scenario!(an_oversize_reply_is_a_trap);
 
 surface_scenario!(self_tick_chain, [local => ChannelScheme::Local]);
 surface_scenario!(remount, [local => ChannelScheme::Local]);

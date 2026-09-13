@@ -302,6 +302,8 @@ pub enum PortDir {
     Into,
     Outof,
     Both,
+    Sync,
+    Call,
 }
 
 /// `agent PersonalAssistant(slug: String) { ... }`.
@@ -423,6 +425,8 @@ pub enum Binding {
     /// Boxed: an `io` tail is the union of the two directions, so this variant
     /// is half again the size of either of the others.
     Both(Box<IoBinding>),
+    /// `call lookup -> geo.resolve;`
+    Calls(CallBinding),
 }
 
 /// A directional binding: a port connected to a channel. One struct for `in`
@@ -439,6 +443,18 @@ pub struct DirBinding<T> {
     pub port: Spanned<String>,
     pub chan: ChanRef,
     pub tail: Option<AttrBlock<T>>,
+    /// Whether a `;` terminated the statement.
+    pub semi: bool,
+}
+
+/// A call binding: this instance's `call` port wired to one peer's `sync` port.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CallBinding {
+    pub port: Spanned<String>,
+    /// `<instance>.<port>`: the peer and the `sync` port of it that answers.
+    pub target: PathRef,
+    pub tail: Option<AttrBlock>,
     /// Whether a `;` terminated the statement.
     pub semi: bool,
 }

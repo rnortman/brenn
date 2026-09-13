@@ -40,6 +40,8 @@ fn surface_component_keys_account_for_every_field() {
         instance,
         spec_sha256,
         declared_out_ports,
+        sync_ports,
+        call_ports,
         send_burst,
         send_refill_secs,
         parked_batch_depth,
@@ -58,6 +60,14 @@ fn surface_component_keys_account_for_every_field() {
             "declared_out_ports",
             "is the class's declared port vocabulary, carried through lowering",
         ),
+        (
+            "sync_ports",
+            "is the class's declared sync vocabulary, carried through lowering",
+        ),
+        (
+            "call_ports",
+            "is the class's declared call vocabulary, carried through lowering",
+        ),
     ];
     assert_parity(
         "surface component",
@@ -74,6 +84,9 @@ fn consumer_keys_account_for_every_field() {
         package,
         spec_sha256,
         declared_out_ports,
+        sync_ports,
+        call_ports,
+        calls,
         grants,
         store_path,
         store_size_limit,
@@ -97,6 +110,7 @@ fn consumer_keys_account_for_every_field() {
     });
     let statement = "carried by a statement, not a key";
     let omitted = [
+        ("calls", statement),
         ("subscriptions", statement),
         ("outputs", statement),
         ("io_ports", statement),
@@ -122,6 +136,14 @@ fn consumer_keys_account_for_every_field() {
         (
             "declared_out_ports",
             "is the class's declared port vocabulary, carried through lowering",
+        ),
+        (
+            "sync_ports",
+            "is the class's declared sync vocabulary, carried through lowering",
+        ),
+        (
+            "call_ports",
+            "is the class's declared call vocabulary, carried through lowering",
         ),
     ];
     assert_parity("consumer", &fields, &CONSUMER_KEYS, &omitted);

@@ -13,7 +13,7 @@
 //   4. Publish one marker per new envelope body to "out".
 //   5. Re-arm the self-tick chain if config names one and nothing is parked.
 //   6. Run the deferral markers below, in window order.
-//   7. Honour the err/trap sentinels below.
+//   7. Honour the err/trap/reply/answer sentinels below.
 //
 // Markers, matched against a new envelope's body. A body starting with "__" is
 // always a marker; an unrecognized or unparseable one is an error, never a
@@ -24,16 +24,23 @@
 //                                   activation with nothing flushed.
 //   "__trap__"                    — trap after the same buffering. Same
 //                                   discard, plus the instance is terminal.
+//   "__answer__:<bytes>"          — answer the activation with a body of exactly
+//                                   <bytes> bytes, on a sync-call activation and
+//                                   on an async one alike. The host is what rules
+//                                   a reply admissible — asked for at all, and
+//                                   within the body cap — so a fixture that
+//                                   refused either case itself would answer those
+//                                   questions in the host's place.
 //   "__reply__"                   — answer the activation, reporting the sync
 //                                   port it arrived on, that port compared
 //                                   against the mount item, the request body,
-//                                   and the ports the activation delivered.
-//                                   Only a sync-call activation may be
-//                                   answered, and no backend activation is one,
-//                                   so the script never carries this: the
-//                                   surface half drives it directly to pin how a
-//                                   reply crosses the transpiled seam and what
-//                                   the sync accessors read on either side of it.
+//                                   whether the request is attributed to the
+//                                   target's own bare name, and the ports the
+//                                   activation delivered.
+//                                   An activation that is no sync call fails
+//                                   the marker rather than answering, because
+//                                   what it reports is the sync accessors and
+//                                   there is nothing for them to read.
 //   "__park__:<delay_ms>"         — publish-deferred "parked:<delay_ms>" at
 //                                   `now + delay_ms`.
 //   "__cancel__:<index>"          — defer-cancel that index of "out"'s window.
@@ -124,6 +131,7 @@ enum Marker {
     Err,
     Trap,
     Reply,
+    Answer { bytes: u64 },
     Park { delay_ms: u64 },
     Cancel { index: u32 },
     Edit { index: u32, delay_ms: u64 },
@@ -149,6 +157,7 @@ fn parse_marker(body: &str) -> Result<Option<Marker>, Error> {
         "__err__" => Marker::Err,
         "__trap__" => Marker::Trap,
         "__reply__" => Marker::Reply,
+        "__answer__" => Marker::Answer { bytes: arg(0)? },
         "__park__" => Marker::Park { delay_ms: arg(0)? },
         "__cancel__" => Marker::Cancel {
             index: arg(0)? as u32,
@@ -192,7 +201,9 @@ impl Processor for ProcessorTransplant {
                 ids.push(env.message_id.to_string());
                 match parse_marker(&env.body)? {
                     None => markers.push(format!("{}:{}", window.port(), env.body)),
-                    Some(m @ (Marker::Err | Marker::Trap | Marker::Reply)) => sentinel = Some(m),
+                    Some(
+                        m @ (Marker::Err | Marker::Trap | Marker::Reply | Marker::Answer { .. }),
+                    ) => sentinel = Some(m),
                     Some(m) => actions.push(m),
                 }
             }
@@ -284,8 +295,8 @@ impl Processor for ProcessorTransplant {
                 Marker::Retime { index, delay_ms } => {
                     defer_edit(OUT, *index, None, Some(release_at(*delay_ms)?))?
                 }
-                Marker::Err | Marker::Trap | Marker::Reply => {
-                    unreachable!("err/trap/reply are sentinels, not actions")
+                Marker::Err | Marker::Trap | Marker::Reply | Marker::Answer { .. } => {
+                    unreachable!("err/trap/reply/answer are sentinels, not actions")
                 }
             }
         }
@@ -307,13 +318,28 @@ impl Processor for ProcessorTransplant {
                     .delivered_windows()
                     .map(|window| window.port())
                     .collect();
+                let request = request?;
+                // The request is attributed to the target itself, by the name
+                // its own placement knows it as — not by either host's
+                // participant vocabulary, which would spell the same instance
+                // differently on each. Reported as the one boolean rather than
+                // the string, because the name is the deployment's and the rule
+                // is the facility's.
+                let bare_identity = request.sender == request.source
+                    && !request.sender.is_empty()
+                    && !request.sender.contains(':');
                 Ok(Some(format!(
-                    "replied:{port}:mount={}:request={}:delivered=[{}]",
+                    "replied:{port}:mount={}:request={}:bare-identity={bare_identity}:delivered=[{}]",
                     activation.sync_is(brenn_guest::dom::MOUNT),
-                    request?.body,
+                    request.body,
                     delivered.join(","),
                 )))
             }
+            // Unconditional, and of exactly the length asked for: the two
+            // rules this drives — a reply nobody asked for, and a reply over
+            // the cap — are the host's, and both are only observable if the
+            // guest hands over what it was told to regardless.
+            Some(Marker::Answer { bytes }) => Ok(Some("x".repeat(bytes as usize))),
             _ => Ok(None),
         }
     }

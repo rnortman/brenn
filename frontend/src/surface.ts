@@ -496,6 +496,21 @@ export interface KernelModule extends WasmModule {
         body: string | undefined,
         deliverAfter: bigint | undefined,
     ): string;
+    /**
+     * One synchronous call to the peer the document wired `port` to, answered
+     * inline with the peer's reply (`undefined` for a peer that replied nothing).
+     *
+     * Unlike the port family this throws for *both* failures, because that is how
+     * the glue lifts a WIT `result`: a `call-error` is thrown as the
+     * `{ payload: { tag, val } }` envelope the guest lifts into its error variant,
+     * and a port outside the caller's declared `call` vocabulary is thrown as a
+     * bare string, which carries no `payload` and so escapes as the trap it is.
+     */
+    brenn_processor_call(
+        instance: string,
+        port: string,
+        payload: string,
+    ): string | undefined;
     brenn_processor_log(instance: string, level: string, message: string): void;
     brenn_processor_alert(
         instance: string,
@@ -834,6 +849,12 @@ function processorImports(
                         deliverAfter,
                     ),
                 ),
+        },
+        "brenn:processor/calls": {
+            // No wrapper: the kernel answers in the glue's own two shapes, so
+            // there is nothing here to translate.
+            call: (port: string, payload: string) =>
+                kernel.brenn_processor_call(instance, port, payload),
         },
         "brenn:processor/log": {
             log: (level: string, message: string) =>

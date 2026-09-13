@@ -6,12 +6,15 @@
 mod support;
 
 use brenn_dsl::model::IntOrWord;
-use brenn_dsl::resolved::{ChanId, MatcherKind, RChanRef, RMatcherVal, RTail, RValue};
+use brenn_dsl::resolved::{
+    ChanId, MatcherKind, RCall, RChanRef, RMatcherVal, RTail, RValue, ResolvedConfig,
+};
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use support::{
-    at, compile, compile_tree, messages, mounts_refusals, packaged, refusal, refusal_tree,
-    refusals, refusals_tree, resolve_errors, resolved, resolved_mounts, resolved_tree,
+    PACKAGED, at, compile, compile_tree, messages, mounts_refusals, packaged, refusal,
+    refusal_tree, refusals, refusals_tree, resolve_errors, resolved, resolved_mounts,
+    resolved_tree,
 };
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -1186,6 +1189,455 @@ fn a_port_a_class_does_not_declare_names_the_ones_it_does() {
     );
 }
 
+/// A sync port is bound to nothing and required of nobody: declaring it is the
+/// whole of its wiring, and an instance that names no binding for it is
+/// complete.
+#[test]
+fn a_sync_port_needs_no_binding_and_carries_none() {
+    let config = resolved(&surface_doc(
+        "    abi = processor; requires = [];\n    in messages;\n    sync press;\n",
+        "        in messages <- messages;\n",
+    ));
+    let component = &config.surfaces[0].components[0];
+    assert_eq!(component.bindings.len(), 1);
+    let declared: Vec<(&str, &str)> = component
+        .class
+        .ports
+        .iter()
+        .map(|port| (port.dir.as_str(), port.name.value().as_str()))
+        .collect();
+    assert_eq!(declared, [("in", "messages"), ("sync", "press")]);
+}
+
+/// The direction check answers it: a sync port faces no channel, so binding one
+/// is the same mistake as binding an `io` port as `in`.
+#[test]
+fn a_sync_port_cannot_be_bound_to_a_channel() {
+    assert_eq!(
+        refusal(&surface_doc(
+            "    abi = processor; requires = [];\n    sync press;\n",
+            "        in press <- messages;\n",
+        )),
+        "port `press` is a `sync` port, bound as `in`"
+    );
+}
+
+/// A doctype is the document contract a *binding* must agree with. A sync port
+/// has no binding, so the annotation would constrain nothing.
+#[test]
+fn a_sync_port_carries_no_doctype() {
+    assert_eq!(
+        refusal(&surface_doc(
+            "    abi = processor; requires = [];\n    sync press: \"brenn.press@1\";\n",
+            "",
+        )),
+        "sync port `press` carries a doctype; a sync port binds to no channel, so there is no \
+         document contract to agree with"
+    );
+}
+
+/// `optional` is the author permitting an instance to leave a port unwired.
+/// Neither of the two unbound classes has anything for the word to permit: an
+/// instance never wires a sync port, and a call port left unwired is legal on
+/// its own.
+#[test]
+fn an_unbound_port_cannot_be_optional() {
+    assert_eq!(
+        refusal(&surface_doc(
+            "    abi = processor; requires = [];\n    optional sync press;\n",
+            "",
+        )),
+        "sync port `press` cannot be `optional`: leaving it unwired is already legal, and \
+         nothing else `optional` would say applies to it"
+    );
+    assert_eq!(
+        refusal(&surface_doc(
+            "    abi = processor; requires = [];\n    optional call lookup;\n",
+            "",
+        )),
+        "call port `lookup` cannot be `optional`: leaving it unwired is already legal, and \
+         nothing else `optional` would say applies to it"
+    );
+}
+
+/// One name, one port, whatever the two classes are: a sync port sharing a name
+/// with a bound input would put two windows with one name in an activation, and
+/// the duplicate-declaration rule is what refuses it.
+#[test]
+fn a_sync_port_may_not_share_a_name_with_an_input_port() {
+    assert_eq!(
+        refusal(&surface_doc(
+            "    abi = processor; requires = [];\n    in messages;\n    sync messages;\n",
+            "        in messages <- messages;\n",
+        )),
+        "port `messages` is declared twice"
+    );
+}
+
+// ── call ports and the wiring ────────────────────────────────────────────────
+
+/// A surface holding a callee and a caller, with the caller's body written in.
+///
+/// `Geocoder` declares the `sync` port a call is answered by and an optional
+/// `in` port, which is what a call aimed at the wrong class of port names.
+fn call_doc(caller_body: &str) -> String {
+    format!(
+        concat!(
+            "component Geocoder {{\n",
+            "    abi = processor; requires = [];\n",
+            "    sync resolve;\n",
+            "    optional in feed;\n",
+            "}}\n",
+            "component Menu {{\n",
+            "    abi = processor; requires = [];\n",
+            "    call lookup;\n",
+            "}}\n",
+            "surface kiosk {{\n",
+            "    grants = [subscribe];\n",
+            "    new geo: Geocoder {{\n    }}\n",
+            "    new menu: Menu {{\n{}    }}\n",
+            "}}\n",
+        ),
+        caller_body
+    )
+}
+
+/// A document of `count` instances of one class that both calls and answers,
+/// with the call bindings written in.
+fn chain_doc(count: usize, calls: &[(usize, usize)]) -> String {
+    let mut doc = String::from(concat!(
+        "component Node {\n",
+        "    abi = processor; requires = [];\n",
+        "    sync answer;\n",
+        "    call a;\n",
+        "    call b;\n",
+        "}\n",
+        "surface kiosk {\n",
+        "    grants = [subscribe];\n",
+    ));
+    for node in 0..count {
+        doc.push_str(&format!("    new n{node}: Node {{\n"));
+        let mut port = ["a", "b"].into_iter();
+        for (from, to) in calls.iter().filter(|(from, _)| *from == node) {
+            let _ = from;
+            doc.push_str(&format!(
+                "        call {} -> n{to}.answer;\n",
+                port.next().expect("at most two calls per node")
+            ));
+        }
+        doc.push_str("    }\n");
+    }
+    doc.push_str("}\n");
+    doc
+}
+
+/// The resolved shape: the caller carries the binding, the callee carries
+/// nothing, and the target is the name a host looks the peer up by.
+#[test]
+fn a_call_binding_names_a_peer_and_the_sync_port_that_answers() {
+    let config = resolved(&call_doc("        call lookup -> geo.resolve;\n"));
+    let surface = &config.surfaces[0];
+    let [geo, menu] = &surface.components[..] else {
+        panic!("two instances");
+    };
+    assert!(geo.calls.is_empty(), "the callee holds no binding");
+    let [call] = &menu.calls[..] else {
+        panic!("one call binding");
+    };
+    assert_eq!(call.port.value(), "lookup");
+    assert_eq!(call.target.value(), "geo");
+    assert_eq!(call.target_port.value(), "resolve");
+    assert!(menu.bindings.is_empty(), "a call binds no channel");
+}
+
+/// A call port left unbound is legal: the import answers `unwired`, which is a
+/// state the component is written for.
+#[test]
+fn a_call_port_needs_no_binding() {
+    let config = resolved(&call_doc(""));
+    assert!(config.surfaces[0].components[1].calls.is_empty());
+}
+
+#[test]
+fn a_call_to_an_instance_the_placement_does_not_hold_is_refused() {
+    assert_eq!(
+        refusal(&call_doc("        call lookup -> atlas.resolve;\n")),
+        "`atlas` names no instance of this surface; a call reaches a peer placed beside the \
+         caller, and a call that would cross the wire is refused — publish and subscribe instead"
+    );
+}
+
+#[test]
+fn a_call_to_a_port_the_peer_does_not_declare_is_refused() {
+    assert_eq!(
+        refusal(&call_doc("        call lookup -> geo.locate;\n")),
+        "`Geocoder` declares no port `locate`; it declares `sync resolve`, `in feed`"
+    );
+}
+
+/// A call is answered by a `sync` port and by nothing else: aimed at an `in`
+/// port it would deliver a message the peer reads from a window it never
+/// declared, with nobody to answer.
+#[test]
+fn a_call_aimed_at_a_port_that_is_not_sync_is_refused() {
+    assert_eq!(
+        refusal(&call_doc("        call lookup -> geo.feed;\n")),
+        "port `feed` of `Geocoder` is declared `in`, and a call is answered by a `sync` port"
+    );
+}
+
+#[test]
+fn a_call_port_is_bound_once() {
+    assert_eq!(
+        refusal(&call_doc(
+            "        call lookup -> geo.resolve;\n        call lookup -> geo.resolve;\n",
+        )),
+        "this instance binds port `lookup` twice; a port is wired once"
+    );
+}
+
+/// The tail the grammar admits for symmetry with the other three binding forms
+/// carries nothing: a call has no window to size, no rate to bound and no
+/// document contract to agree with.
+#[test]
+fn a_call_binding_carries_no_tail_attributes() {
+    assert_eq!(
+        refusal(&call_doc(
+            "        call lookup -> geo.resolve { push_depth = 4; }\n"
+        )),
+        "call port `lookup` carries a tail; a call is tuned by nothing — its request and its \
+         reply are bounded by the deployment's body cap and its budget is the caller's own"
+    );
+    // An empty tail says nothing and is admitted, as it is on every other form.
+    let config = resolved(&call_doc("        call lookup -> geo.resolve { }\n"));
+    assert_eq!(config.surfaces[0].components[1].calls.len(), 1);
+}
+
+#[test]
+fn a_call_target_names_an_instance_and_a_port() {
+    assert_eq!(
+        refusal(&call_doc("        call lookup -> geo;\n")),
+        "`geo` does not name a peer's port; a call target is `<instance>.<port>`"
+    );
+    assert_eq!(
+        refusal(&call_doc("        call lookup -> kiosk.geo.resolve;\n")),
+        "`kiosk.geo.resolve` does not name a peer's port; a call target is `<instance>.<port>`"
+    );
+    assert_eq!(
+        refusal(&call_doc("        call lookup -> geo::resolve;\n")),
+        "a call target names a peer of this deployment, not a module; write `<instance>.<port>`"
+    );
+}
+
+/// A `call` port is bound by a `call` binding and by no other: the direction
+/// check that refuses an `io` port bound as `in` refuses this too.
+#[test]
+fn a_call_port_bound_as_an_input_is_refused() {
+    assert_eq!(
+        refusal(&format!(
+            "channel feed at \"brenn:kiosk.feed\";\n{}",
+            call_doc("        in lookup <- feed;\n")
+        )),
+        "port `lookup` is a `call` port, bound as `in`"
+    );
+}
+
+/// A caller waits for its callee, so a cycle of calls is a deadlock. Refused
+/// once, at the binding that closes it, with the whole cycle named.
+#[test]
+fn a_two_node_call_cycle_is_refused() {
+    assert_eq!(
+        refusal(&chain_doc(2, &[(0, 1), (1, 0)])),
+        "this call closes a cycle: n0 → n1 → n0. A caller waits for its callee, so a cycle of \
+         calls is a deadlock; break it with a publish"
+    );
+}
+
+#[test]
+fn a_three_node_call_cycle_is_refused() {
+    assert_eq!(
+        refusal(&chain_doc(3, &[(0, 1), (1, 2), (2, 0)])),
+        "this call closes a cycle: n0 → n1 → n2 → n0. A caller waits for its callee, so a cycle \
+         of calls is a deadlock; break it with a publish"
+    );
+}
+
+#[test]
+fn an_instance_calling_itself_is_refused() {
+    assert_eq!(
+        refusal(&chain_doc(1, &[(0, 0)])),
+        "this call closes a cycle: n0 → n0. A caller waits for its callee, so a cycle of calls \
+         is a deadlock; break it with a publish"
+    );
+}
+
+/// A diamond is not a cycle: `n3` is reached twice and finished once, which the
+/// three-colour walk tells apart from a node still on the path.
+#[test]
+fn a_diamond_of_calls_is_admitted() {
+    let config = resolved(&chain_doc(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]));
+    let calls: usize = config.surfaces[0]
+        .components
+        .iter()
+        .map(|inst| inst.calls.len())
+        .sum();
+    assert_eq!(calls, 4);
+}
+
+/// Two top-level consumers call each other by the handles the document wrote,
+/// and what the resolved binding carries is the slug — the name the backend
+/// host looks a consumer up by.
+#[test]
+fn a_top_level_call_resolves_to_the_peer_slug() {
+    let config = resolved(&format!(
+        concat!(
+            "{fence}",
+            "component Geocoder {{\n    abi = processor; requires = [];\n    sync resolve;\n}}\n",
+            "component Menu {{\n    abi = processor; requires = [];\n    call lookup;\n}}\n",
+            "{fence}",
+            "new geo: Geocoder {{\n    slug = \"geocoder\";\n    grants = [];\n}}\n",
+            "new menu: Menu {{\n",
+            "    slug = \"menu\";\n    grants = [];\n",
+            "    call lookup -> geo.resolve;\n",
+            "}}\n",
+        ),
+        fence = PACKAGED
+    ));
+    let menu = config
+        .consumers
+        .iter()
+        .find(|consumer| consumer.slug.value() == "menu")
+        .expect("the caller");
+    let [call] = &menu.calls[..] else {
+        panic!("one call binding");
+    };
+    assert_eq!(call.target.value(), "geocoder");
+    assert_eq!(call.target_port.value(), "resolve");
+}
+
+/// A document whose consumers are stamped by an assembly, with the assembly's
+/// body and the top level's own text written in.
+///
+/// The shape production configurations are written in: everything that is
+/// placed is placed by an assembly, and the top level is instantiations.
+fn stamped_call_doc(body: &str, top: &str) -> String {
+    format!(
+        concat!(
+            "{fence}",
+            "component Geocoder {{\n    abi = processor; requires = [];\n    sync resolve;\n}}\n",
+            "component Menu {{\n    abi = processor; requires = [];\n    call lookup;\n}}\n",
+            "assembly Deskbar(tag: String) {{\n{body}}}\n",
+            "{fence}",
+            "new geo: Geocoder {{\n    slug = \"geocoder\";\n    grants = [];\n}}\n",
+            "new desk: Deskbar(tag = \"desk\");\n",
+            "{top}",
+        ),
+        fence = PACKAGED,
+        body = body,
+        top = top
+    )
+}
+
+/// The call binding one consumer of a resolved document holds.
+fn one_call<'a>(config: &'a ResolvedConfig, slug: &str) -> &'a RCall {
+    let consumer = config
+        .consumers
+        .iter()
+        .find(|consumer| consumer.slug.value() == slug)
+        .unwrap_or_else(|| panic!("no consumer `{slug}`"));
+    let [call] = &consumer.calls[..] else {
+        panic!("`{slug}` holds one call binding");
+    };
+    call
+}
+
+/// A consumer an assembly stamped calls one the document wrote beside the
+/// assembly. The placement rule is the placement's — both are top-level backend
+/// consumers — so the body a caller is written in narrows nothing.
+#[test]
+fn a_stamped_consumer_calls_a_peer_at_the_top_level() {
+    let config = resolved(&stamped_call_doc(
+        concat!(
+            "    new menu: Menu {\n        slug = f\"{tag}-menu\";\n        grants = [];\n",
+            "        call lookup -> geo.resolve;\n    }\n",
+        ),
+        "",
+    ));
+    assert_eq!(one_call(&config, "desk-menu").target.value(), "geocoder");
+}
+
+/// The same name written in a body that stamped one of its own names that body's
+/// instance, the way a channel reference does: the inner scope first.
+#[test]
+fn a_stamped_consumer_calls_its_own_bodys_peer_first() {
+    let config = resolved(&stamped_call_doc(
+        concat!(
+            "    new geo: Geocoder {\n        slug = f\"{tag}-geo\";\n        grants = [];\n    }\n",
+            "    new menu: Menu {\n        slug = f\"{tag}-menu\";\n        grants = [];\n",
+            "        call lookup -> geo.resolve;\n    }\n",
+        ),
+        "",
+    ));
+    assert_eq!(one_call(&config, "desk-menu").target.value(), "desk-geo");
+}
+
+/// And the other way round: a consumer at the top level names one an assembly
+/// stamped by the handle it was stamped under.
+#[test]
+fn a_top_level_consumer_calls_a_stamped_peer_by_its_handle() {
+    let config = resolved(&stamped_call_doc(
+        "    new geo: Geocoder {\n        slug = f\"{tag}-geo\";\n        grants = [];\n    }\n",
+        concat!(
+            "new hub: Menu {\n    slug = \"hub\";\n    grants = [];\n",
+            "    call lookup -> desk.geo.resolve;\n}\n",
+        ),
+    ));
+    assert_eq!(one_call(&config, "hub").target.value(), "desk-geo");
+}
+
+/// A target no handle space holds is refused by the name the document wrote,
+/// not by the handle one of the two spaces would have stamped it under.
+#[test]
+fn a_stamped_call_to_nothing_is_refused_by_what_was_written() {
+    assert_eq!(
+        refusal(&stamped_call_doc(
+            concat!(
+                "    new menu: Menu {\n        slug = f\"{tag}-menu\";\n        grants = [];\n",
+                "        call lookup -> atlas.resolve;\n    }\n",
+            ),
+            "",
+        )),
+        "`atlas` names no instance of this document's top level; a call reaches a peer placed \
+         beside the caller, and a call that would cross the wire is refused — publish and \
+         subscribe instead"
+    );
+}
+
+/// A surface instance and a backend consumer are never peers: a call between
+/// them would be an RPC over the wire, which the bus already does with a reply
+/// channel and which this facility deliberately is not.
+#[test]
+fn a_call_across_the_two_placements_is_refused() {
+    let refusal = refusal(&format!(
+        concat!(
+            "{fence}",
+            "component Geocoder {{\n    abi = processor; requires = [];\n    sync resolve;\n}}\n",
+            "component Menu {{\n    abi = processor; requires = [];\n    call lookup;\n}}\n",
+            "{fence}",
+            "new geo: Geocoder {{\n    slug = \"geocoder\";\n    grants = [];\n}}\n",
+            "surface kiosk {{\n",
+            "    grants = [subscribe];\n",
+            "    new menu: Menu {{\n        call lookup -> geo.resolve;\n    }}\n",
+            "}}\n",
+        ),
+        fence = PACKAGED
+    ));
+    assert!(
+        refusal.starts_with("`geo` names no instance of this surface;"),
+        "{refusal}"
+    );
+}
+
 #[test]
 fn a_port_bound_the_wrong_way_says_which_way_it_faces() {
     assert_eq!(
@@ -1453,7 +1905,7 @@ fn a_need_names_a_capability() {
         refusal("component Panel {\n    abi = processor; requires = [frobnicate];\n}\n"),
         "`frobnicate` is not a capability a component holds; a spec's `requires` names \
          the same words a `grants` list does: `ports`, `store`, `log`, `alert`, \
-         `config`, `mqtt`, `tools`, `takeover`, `dom` or `page-dom`"
+         `config`, `mqtt`, `tools`, `calls`, `takeover`, `dom` or `page-dom`"
     );
     assert!(
         refusal(

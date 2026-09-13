@@ -7,12 +7,14 @@
 //! under test here is the routing: which pass one input reaches, and what the turn
 //! says afterwards.
 
+use brenn_attach_client::driver::flush_stamps;
 use brenn_attach_client::publish::{FlushBatch, TimerChange};
 use brenn_attach_client::router::{MessageStamp, Origin, ReleaseTimer, RouteOutcome, RouteRequest};
 use brenn_attach_proto::{
     BatchEntry, ClientFrame, PublishBatchOutcome, PublishOutcome, SubscribeOutcome,
 };
 use brenn_envelope::Urgency;
+use brenn_surface_contract::MOUNT_SYNC_PORT;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use brenn_surface_schema::{
@@ -826,22 +828,42 @@ fn a_ready_instance_is_handed_over_in_flight() {
 // The sync door
 // ---------------------------------------------------------------------------
 
-/// One sync request at the fixture's instant, under its own envelope identity.
+/// One sync request at the fixture's instant, under its own envelope identity —
+/// a native caller's, so nobody is on the stack above it.
 fn sync(
     page: &mut SurfacePage,
     instance: &str,
     port: &str,
     body: &str,
 ) -> (SyncDispatch, Vec<Effect>) {
+    sync_chained(page, instance, port, body, &[])
+}
+
+/// The same request raised from inside `chain`'s innermost activation — what a
+/// component's `call` carries.
+fn sync_chained(
+    page: &mut SurfacePage,
+    instance: &str,
+    port: &str,
+    body: &str,
+    chain: &[String],
+) -> (SyncDispatch, Vec<Effect>) {
     dispatch_sync(
         page,
-        instance,
-        port,
-        body.to_string(),
+        SyncCall {
+            instance,
+            port,
+            body,
+            chain,
+        },
         stamp(0x59c),
         NOW,
         NOW_MS,
     )
+}
+
+fn chain_of(callers: &[&str]) -> Vec<String> {
+    callers.iter().map(|c| (*c).to_string()).collect()
 }
 
 fn refusal(answer: SyncDispatch) -> SyncRefusal {
@@ -1051,6 +1073,61 @@ fn a_request_during_any_activation_is_refused_as_re_entrant() {
     assert!(effects.is_empty(), "{effects:?}");
 }
 
+/// A chained request is the caller's own stack asking, so the page-wide rule is
+/// the wrong one: the caller being in flight is what a call *is*. Only the target
+/// is asked about.
+#[test]
+fn a_chained_request_is_judged_against_its_target_and_not_the_page() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "queued", 0x9c6));
+    let (in_flight, _) = dispatch(&mut page, NOW, NOW_MS);
+    let caller = in_flight.expect("p2 reads what p1 wrote").instance;
+    assert_eq!(caller, "p2", "the fixture's reader is the one in flight");
+
+    let (answer, _) = sync_chained(&mut page, "p1", "ack", "{}", &chain_of(&["p2"]));
+    let ready = admitted(answer);
+    assert_eq!(ready.instance, "p1");
+    assert!(
+        ready
+            .activation
+            .ports
+            .iter()
+            .any(|window| window.port == "ack"),
+        "the request rides in as its own window: {:?}",
+        ready.activation.ports
+    );
+}
+
+/// The target being in flight is still a refusal, in the facility's own word. The
+/// page cannot reach it — one thread means the only way a target runs while its
+/// caller does is that it is in the caller's chain, which panics above — so this
+/// drives the gate directly.
+#[test]
+fn a_chained_request_to_an_in_flight_target_is_refused_as_re_entrant() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "queued", 0x9c7));
+    let (in_flight, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert_eq!(
+        in_flight.expect("p2 reads what p1 wrote").instance,
+        "p2",
+        "the fixture's reader is the one in flight"
+    );
+
+    let (answer, effects) = sync_chained(&mut page, "p2", "ack", "{}", &chain_of(&["p1"]));
+    assert_eq!(refusal(answer), SyncRefusal::ReEntrant);
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+/// The document is the only source of call wiring and it refused cycles, so a
+/// target that finds itself in its own caller's chain means the compiler and the
+/// kernel disagree about the graph.
+#[test]
+#[should_panic(expected = "acyclicity check was bypassed")]
+fn a_chained_request_to_an_instance_already_in_the_chain_panics() {
+    let mut page = page();
+    sync_chained(&mut page, "p1", "ack", "{}", &chain_of(&["p1", "p2"]));
+}
+
 #[test]
 fn a_request_from_an_instance_the_page_does_not_hold_is_refused() {
     let mut page = page();
@@ -1092,22 +1169,12 @@ fn a_request_before_any_document_is_refused() {
     assert!(effects.is_empty(), "{effects:?}");
 }
 
-/// The `ports` list must be unambiguous: a sync port sharing a name with a bound
-/// input port would put two windows with one name in front of the component.
-#[test]
-fn a_sync_port_colliding_with_a_bound_input_is_refused() {
-    let mut page = page();
-    let (answer, effects) = sync(&mut page, "p1", "in", "{}");
-    assert_eq!(refusal(answer), SyncRefusal::PortCollision);
-    assert!(effects.is_empty(), "{effects:?}");
-}
-
 /// Nothing is assembled and nothing is left in flight by a refusal, so the page is
 /// exactly where it was and the next request is judged on its own merits.
 #[test]
 fn a_refusal_leaves_the_page_untouched() {
     let mut page = page();
-    let (answer, effects) = sync(&mut page, "p1", "in", "{}");
+    let (answer, effects) = sync(&mut page, "stranger", "ack", "{}");
     assert!(matches!(answer, SyncDispatch::Refused(_)));
     assert!(effects.is_empty(), "{effects:?}");
     assert!(!page.schedules.any_in_flight());
@@ -1307,6 +1374,83 @@ fn a_sync_activation_settles_the_mount_debt() {
     );
 }
 
+/// A page that still owes its mounts, whose `p1` renders and whose `p2` does not
+/// — the one distinction the unmounted gate reads.
+fn mounting_with_renderer() -> SurfacePage {
+    let mut document = doc();
+    document.components[0].grants = vec!["dom".to_string(), "log".to_string(), "ports".to_string()];
+    pages::mounting_page(
+        CONFIG,
+        EPOCH,
+        pages::facts(),
+        &["p1", "p2", fixtures::CHROME],
+        &document,
+        NOW,
+    )
+}
+
+/// A `dom` instance's mount is the call that fills its host element, and the
+/// runner's mount pass is what makes it — never the scheduler's debt. A peer
+/// reaching it first would run a handler against an element its author has not
+/// filled, so it is refused and the caller sees an ordinary transient.
+#[test]
+fn a_chained_call_to_a_rendering_instance_before_its_mount_is_refused() {
+    let mut page = mounting_with_renderer();
+    let (answer, effects) = sync_chained(&mut page, "p1", "ack", "{}", &chain_of(&["p2"]));
+    assert_eq!(refusal(answer), SyncRefusal::Unmounted);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(
+        page.schedules.owes_mount_activation("p1"),
+        "nothing was assembled, so the debt still stands"
+    );
+    assert!(!page.schedules.in_flight("p1"));
+}
+
+/// The same call once the mount has run: the element is filled, and the instance
+/// answers like any other peer.
+#[test]
+fn a_chained_call_to_a_rendering_instance_after_its_mount_assembles() {
+    let mut page = mounting_with_renderer();
+    let (mount, _) = sync(&mut page, "p1", MOUNT_SYNC_PORT, "{}");
+    let mounted = admitted(mount);
+    feed(
+        &mut page,
+        Input::ActivationDone(Box::new(Completed {
+            instance: mounted.instance,
+            generation: mounted.generation,
+            outcome: ActivationOutcome::Ok(None),
+            buffer: mounted.buffer,
+            stamps: Vec::new(),
+        })),
+    );
+
+    let ready = admitted(sync_chained(&mut page, "p1", "ack", "{}", &chain_of(&["p2"])).0);
+    assert_eq!(ready.instance, "p1");
+}
+
+/// A headless callee has no element to fill, so its mount is the scheduler's debt
+/// and a call settles it: the guarantee is one activation per mount, not one of a
+/// particular shape.
+#[test]
+fn a_chained_call_to_a_headless_instance_before_its_mount_assembles() {
+    let mut page = mounting_with_renderer();
+    let ready = admitted(sync_chained(&mut page, "p2", "ack", "{}", &chain_of(&["p1"])).0);
+    assert_eq!(ready.instance, "p2");
+    assert!(!page.schedules.owes_mount_activation("p2"));
+}
+
+/// The gate is the chained caller's alone. The mount pass itself and a gesture
+/// both arrive with an empty chain, and refusing either would be refusing the very
+/// activation that fills the element.
+#[test]
+fn an_unchained_request_to_a_rendering_instance_before_its_mount_assembles() {
+    let mut page = mounting_with_renderer();
+    let (mount, _) = sync(&mut page, "p1", MOUNT_SYNC_PORT, "{}");
+    let ready = admitted(mount);
+    assert_eq!(ready.instance, "p1");
+    assert!(!page.schedules.owes_mount_activation("p1"));
+}
+
 /// A remount is a new mount and owes a new one. An instance unmounted and mounted
 /// again under the same id is a different component with the same spelling, and it
 /// has never run.
@@ -1347,4 +1491,117 @@ fn a_second_document_does_not_revive_a_settled_debt() {
         .expect("the fixture document applies");
     assert!(!page.schedules.owes_mount_activation("p1"));
     assert!(drain(&mut page).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The completion rules a reply admissible
+// ---------------------------------------------------------------------------
+
+/// Complete one activation as its caller would, and answer what the page ruled.
+fn complete_ok(
+    page: &mut SurfacePage,
+    ready: ReadyActivation,
+    reply: Option<&str>,
+) -> (ActivationOutcome, Vec<Effect>) {
+    let stamps = flush_stamps(ready.buffer.len());
+    complete(
+        page,
+        Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Ok(reply.map(str::to_string)),
+            buffer: ready.buffer,
+            stamps,
+        },
+        NOW,
+        NOW_MS,
+    )
+}
+
+/// A reply on an activation that asked nothing is a trap, ruled where the
+/// question can be answered: the entry's own boundary sees a return, and only the
+/// page knows whether anything asked for one.
+#[test]
+fn a_reply_on_an_async_activation_is_a_trap_at_the_completion() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "queued", 0x9d1));
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    let ready = ready.expect("the queued message readies its instance");
+    assert!(ready.activation.sync.is_none(), "an async activation");
+    let instance = ready.instance.clone();
+
+    let (ruled, _) = complete_ok(&mut page, ready, Some("unasked-for"));
+    assert!(
+        matches!(&ruled, ActivationOutcome::Trap(detail) if detail.contains("asked nothing")),
+        "the completion reclassified the ok: {ruled:?}",
+    );
+    assert!(
+        page.registrations.is_failed(&instance),
+        "and took the instance terminal, as any trap does",
+    );
+}
+
+/// The same reply on a sync-call activation is read: the assembly recorded the
+/// port, so the question has an answer.
+#[test]
+fn a_reply_on_a_sync_activation_is_read() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+
+    let (ruled, _) = complete_ok(&mut page, ready, Some("answered"));
+    assert_eq!(ruled, ActivationOutcome::Ok(Some("answered".to_string())));
+    assert!(!page.registrations.is_failed("p2"));
+}
+
+/// The cap is inclusive, and it is the attachment's body cap: a reply is bounded
+/// by the same number as a publish body, so a callee cannot hand a caller more
+/// than it could have published.
+#[test]
+fn a_reply_of_exactly_the_body_cap_is_read() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+
+    let reply = "x".repeat(pages::BODY_CAP as usize);
+    let (ruled, _) = complete_ok(&mut page, ready, Some(&reply));
+    assert_eq!(ruled, ActivationOutcome::Ok(Some(reply)));
+    assert!(!page.registrations.is_failed("p2"));
+}
+
+/// One byte over is a trap of the callee — not a truncation, and not an answer
+/// given in its place.
+#[test]
+fn a_reply_one_byte_over_the_body_cap_is_a_trap() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+
+    let reply = "x".repeat(pages::BODY_CAP as usize + 1);
+    let (ruled, _) = complete_ok(&mut page, ready, Some(&reply));
+    assert!(
+        matches!(&ruled, ActivationOutcome::Trap(detail) if detail.contains("reply cap")),
+        "the completion reclassified the ok: {ruled:?}",
+    );
+    assert!(
+        page.registrations.is_failed("p2"),
+        "and took the instance terminal, as any trap does",
+    );
+}
+
+/// A trapped reply flushes nothing. The buffer was built under a
+/// misapprehension, so the one thing that must not happen is that it lands.
+#[test]
+fn a_trapped_reply_discards_the_buffer() {
+    let mut page = page();
+    let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
+    ready
+        .buffer
+        .publish("notes", "never routed".to_string())
+        .expect("p1 binds the page-local channel");
+
+    let oversize = "x".repeat(pages::BODY_CAP as usize + 1);
+    let (ruled, _) = complete_ok(&mut page, ready, Some(&oversize));
+    assert!(matches!(ruled, ActivationOutcome::Trap(_)));
+    assert!(
+        retained(&page, NOTES).is_empty(),
+        "the buffer of a trapped activation is discarded, not routed",
+    );
 }

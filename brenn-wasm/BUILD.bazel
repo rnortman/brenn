@@ -13,6 +13,7 @@ policy_srcs()
 COMPONENT_NAMES = [
     "git-forge-parser",
     "git-sync-consumer",
+    "processor-call-test",
     "processor-config",
     "processor-demo",
     "processor-dual",
@@ -344,6 +345,7 @@ WASM_TEST_SUITES = [
         [],
     ),
     ("instantiation_fail", ["processor-exhaust"], [], [], []),
+    ("processor_calls", ["processor-call-test"], [], [], []),
     ("processor_config", ["processor-config"], [], [], []),
     ("processor_log", ["processor-log"], [], [], []),
     ("processor_mqtt", ["processor-mqtt-test"], [], [], []),

@@ -20,6 +20,7 @@ component Chrome {
   in surface-state: "brenn.surface.surface-state@1";
   in toast: "brenn.surface.toast@1";
   optional out overlay-state: "brenn.surface.overlay-state@1";
+  sync toast-dismiss;
   io toast-tick;
   io state;
 }

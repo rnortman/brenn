@@ -46,9 +46,9 @@ use crate::messaging::Urgency;
 use crate::messaging::WakeMin;
 use crate::messaging::config::{
     ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw, LinkHostRaw, MessagingConfigRaw,
-    MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel, SendRate, Sink,
+    MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel, SendRate, Sink, SurfaceCallRaw,
     SurfaceComponentRaw, SurfaceConfigRaw, SurfaceIoPortRaw, SurfaceOutputRaw,
-    SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
+    SurfaceSubscriptionRaw, WasmConsumerCallRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
     WasmConsumerMqttOutputRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
 use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
@@ -260,6 +260,7 @@ fn surface(slug: &str, grants: Vec<AttachGrant>) -> SurfaceConfigRaw {
         allowed_users: vec![],
         publish_burst: None,
         publish_per_sec: None,
+        calls: vec![],
     }
 }
 
@@ -3948,6 +3949,7 @@ surface alice_desk {
                 allowed_users: vec!["alice".to_string(), "bob".to_string()],
                 publish_burst: Some(32),
                 publish_per_sec: Some(4),
+                calls: vec![],
             }],
             ..Default::default()
         },
@@ -5377,6 +5379,106 @@ fn a_consumers_tool_statements_lower_to_raw_grants() {
             }),
         }]
     );
+}
+
+/// A `sync` port is vocabulary and nothing else: it contributes no
+/// subscription, no output and no `io_port`, and it travels to the host as its
+/// own list so a caller naming a port the specification never declared is
+/// refused rather than assembled.
+#[test]
+fn a_sync_port_lowers_to_vocabulary_and_no_binding() {
+    let config = config_from_dsl(concat!(
+        "channel outcomes at \"brenn:outcomes\" {\n",
+        "    push_depth = 8; retain_depth = 8; standing_retain_depth = 8;\n}\n",
+        "// ── packaged ──\n",
+        "component Geocoder {\n    abi = processor; requires = [ports];\n",
+        "    sync resolve;\n    sync lookup;\n    out outcomes;\n}\n",
+        "// ── packaged ──\n",
+        "new geo: Geocoder {\n",
+        "    grants = [ports];\n",
+        "    out outcomes -> outcomes;\n",
+        "}\n",
+    ));
+    let consumer = &config.wasm_consumers[0];
+    // Sorted and duplicate-free, as the document's stability rule requires.
+    assert_eq!(
+        consumer.sync_ports,
+        vec!["lookup".to_string(), "resolve".to_string()]
+    );
+    // Neither vocabulary borrows from the other, and neither becomes a binding.
+    assert_eq!(consumer.declared_out_ports, vec!["outcomes".to_string()]);
+    assert_eq!(consumer.subscriptions, vec![]);
+    assert_eq!(consumer.io_ports, vec![]);
+    assert_eq!(consumer.outputs.len(), 1);
+}
+
+/// A top-level `call` binding lowers to the consumer's own call table, carrying
+/// the peer's slug: a call reaches an instance, so nothing about it lands in a
+/// subscription, an output or an `io_port`.
+#[test]
+fn a_consumers_call_binding_lowers_to_its_call_table() {
+    let config = config_from_dsl(concat!(
+        "// ── packaged ──\n",
+        "component Geocoder {\n    abi = processor; requires = [];\n",
+        "    sync resolve;\n}\n",
+        "component Menu {\n    abi = processor; requires = [];\n",
+        "    call lookup;\n}\n",
+        "// ── packaged ──\n",
+        "new geo: Geocoder {\n    grants = [];\n}\n",
+        "new menu: Menu {\n    grants = [];\n",
+        "    call lookup -> geo.resolve;\n}\n",
+    ));
+    let menu = config
+        .wasm_consumers
+        .iter()
+        .find(|c| c.slug == "menu")
+        .expect("the document declares a `menu` consumer");
+    assert_eq!(
+        menu.calls,
+        vec![WasmConsumerCallRaw {
+            port: "lookup".to_string(),
+            target: "geo".to_string(),
+            target_port: "resolve".to_string(),
+        }]
+    );
+    assert_eq!(menu.subscriptions, vec![]);
+    assert_eq!(menu.outputs, vec![]);
+    assert_eq!(menu.io_ports, vec![]);
+    // The callee holds the vocabulary and no binding of its own.
+    let geo = &config.wasm_consumers[0];
+    assert_eq!(geo.sync_ports, vec!["resolve".to_string()]);
+    assert_eq!(geo.calls, vec![]);
+}
+
+/// A surface `call` binding lands in the surface's flat table, carrying the
+/// calling instance — the shape every other surface binding table has, and what
+/// lets the bindings document name both ends.
+#[test]
+fn a_surface_call_binding_lowers_to_the_surfaces_call_table() {
+    let config = config_from_dsl(concat!(
+        "// ── packaged ──\n",
+        "component Geocoder {\n    abi = processor; requires = [];\n",
+        "    sync resolve;\n}\n",
+        "component Menu {\n    abi = processor; requires = [];\n",
+        "    call lookup;\n}\n",
+        "// ── packaged ──\n",
+        "surface kiosk {\n    grants = [];\n",
+        "    new geo: Geocoder { grants = []; }\n",
+        "    new menu: Menu { grants = [];\n",
+        "        call lookup -> geo.resolve;\n    }\n",
+        "}\n",
+    ));
+    assert_eq!(
+        config.surfaces[0].calls,
+        vec![SurfaceCallRaw {
+            instance: "menu".to_string(),
+            port: "lookup".to_string(),
+            target_instance: "geo".to_string(),
+            target_port: "resolve".to_string(),
+        }]
+    );
+    assert_eq!(config.surfaces[0].subscriptions, vec![]);
+    assert_eq!(config.surfaces[0].outputs, vec![]);
 }
 
 /// Stated as the whole subscription/output/io triple rather than a `tool-results`

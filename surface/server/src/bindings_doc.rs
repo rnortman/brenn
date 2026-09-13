@@ -13,13 +13,13 @@
 //! a reconnecting surface can compare what it is handed against what it is
 //! running and reload only on a real difference.
 
-use brenn_lib::messaging::config::{ResolvedSurface, SurfaceBinding, SurfaceOutput};
+use brenn_lib::messaging::config::{ResolvedSurface, SurfaceBinding, SurfaceCall, SurfaceOutput};
 use brenn_messaging::{Messenger, PublishResult};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
 use brenn_surface_schema::{
-    Binding, ComponentEntry, LocalChannel, LogLevel, NoiseLevel as DocNoiseLevel, OutputBinding,
+    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding,
 };
 
 use super::description::{
@@ -48,19 +48,7 @@ fn doc_binding(b: &SurfaceBinding) -> Binding {
         port: b.port.clone(),
         push_depth: b.push_depth,
         retain_depth: b.retain_depth,
-        noise: doc_noise(b.noise),
-    }
-}
-
-/// Map a resolved `brenn-lib` `NoiseLevel` to the document's form. Exhaustive: a
-/// new rung that fails to map is a compile error, never a runtime fallback.
-fn doc_noise(n: brenn_lib::messaging::config::NoiseLevel) -> DocNoiseLevel {
-    use brenn_lib::messaging::config::NoiseLevel as N;
-    match n {
-        N::Silent => DocNoiseLevel::Silent,
-        N::Metered => DocNoiseLevel::Metered,
-        N::Alarm => DocNoiseLevel::Alarm,
-        N::Fatal => DocNoiseLevel::Fatal,
+        noise: b.noise,
     }
 }
 
@@ -75,6 +63,15 @@ fn doc_output(b: &SurfaceOutput) -> OutputBinding {
         urgency: b.default_urgency,
         fill_mt: b.budget.fill_mt,
         capacity_mt: b.budget.capacity_mt,
+    }
+}
+
+fn doc_call(c: &SurfaceCall) -> CallBinding {
+    CallBinding {
+        instance: c.instance.clone(),
+        port: c.port.clone(),
+        target_instance: c.target_instance.clone(),
+        target_port: c.target_port.clone(),
     }
 }
 
@@ -110,11 +107,16 @@ pub fn build_bindings_document(
                 // `BTreeSet`, and the document's determinism rule needs the order
                 // to be a function of the names alone.
                 declared_out_ports: c.declared_out_ports.iter().cloned().collect(),
+                // Sorted by construction, for the same reason.
+                sync_ports: c.sync_ports.iter().cloned().collect(),
+                // Sorted by construction, for the same reason.
+                call_ports: c.call_ports.iter().cloned().collect(),
                 config: c.config.clone(),
             })
             .collect(),
         subscriptions: resolved.subscriptions.iter().map(doc_binding).collect(),
         outputs: resolved.outputs.iter().map(doc_output).collect(),
+        calls: resolved.calls.iter().map(doc_call).collect(),
         // Page-local channels have no `[[channel]]` block and no directory
         // entry, so this table is the only place their ring depths can come
         // from.

@@ -482,3 +482,196 @@ fn a_publish_after_the_run_is_over_panics() {
     front.channels.publish_rx.close();
     let _ = front.handle.publish("p1", "out", "hi".into());
 }
+
+// ── the in-flight stack ───────────────────────────────────────────────────────
+//
+// The rules below have no second enforcer: the browser's driver is the only
+// thing that pushes a frame, and `TODO(surface-wasm-test-in-ci)` records that no
+// gate compiles that half. So the stack itself is written on both targets and
+// read here — a frame popped for the wrong activation, a publish joining the
+// wrong buffer, or effects surfacing after the caller's own would each ship
+// green otherwise, and first show as a live page committing turns out of order.
+
+use crate::activation::ActivationOutcome;
+use crate::publish_buffer::{OutputSpec, PublishBuffer};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+
+/// A buffer bound to one confined port, wide enough that only the rules under
+/// test refuse anything.
+fn frame_buffer() -> PublishBuffer {
+    PublishBuffer::new(
+        HashMap::from([(
+            "notes".to_string(),
+            OutputSpec {
+                channel: NOTES.to_string(),
+                default_urgency: Urgency::Normal,
+            },
+        )]),
+        Arc::new(BTreeSet::from(["notes".to_string()])),
+        HashMap::from([("notes".to_string(), 1_000_000)]),
+        1024,
+        HashMap::new(),
+    )
+}
+
+/// A recognizable effect.
+fn effect(body: &str) -> Effect {
+    Effect::PublishControl {
+        channel: NOTES.to_string(),
+        body: body.to_string(),
+    }
+}
+
+/// The bodies a list of [`Effect::PublishControl`]s carries, in order.
+fn bodies(effects: &[Effect]) -> Vec<String> {
+    effects
+        .iter()
+        .map(|effect| match effect {
+            Effect::PublishControl { body, .. } => body.clone(),
+            other => panic!("unexpected effect {other:?}"),
+        })
+        .collect()
+}
+
+/// A callee's publish joins the callee's buffer while the caller's waits
+/// underneath, and the caller's own frame becomes reachable again the moment the
+/// callee returns.
+#[test]
+fn a_publish_joins_the_innermost_frame_and_no_other() {
+    let mut stack = InFlightStack::default();
+    assert!(
+        stack.with_innermost("p1", |_| ()).is_none(),
+        "no activation is on the stack at all"
+    );
+    stack.push("p1", frame_buffer());
+    stack.push("p2", frame_buffer());
+    assert!(
+        stack
+            .with_innermost("p1", |buffer| buffer.publish("notes", "outer".to_string()))
+            .is_none(),
+        "a caller blocked in a call of its own is not the entry on the stack"
+    );
+    assert_eq!(
+        stack.with_innermost("p2", |buffer| buffer.publish("notes", "inner".to_string())),
+        Some(Ok(())),
+    );
+    let (buffer, _) = stack.pop_of("p2");
+    assert_eq!(buffer.len(), 1, "the callee's publish is the callee's");
+    assert_eq!(
+        stack.with_innermost("p1", |buffer| buffer.publish("notes", "outer".to_string())),
+        Some(Ok(())),
+        "the caller is the top again once its callee returned"
+    );
+}
+
+/// The same rule on the admission the `calls` seam asks for: a call is admitted
+/// against the caller's own budget only while the caller *is* the entry on the
+/// stack, and the seam answers `not-permitted` otherwise.
+#[test]
+fn a_call_is_admitted_only_from_the_frame_on_top() {
+    let mut stack = InFlightStack::default();
+    assert!(
+        stack
+            .with_innermost("p1", |buffer| buffer.admit_call("x"))
+            .is_none(),
+        "no activation is in flight"
+    );
+    stack.push("p1", frame_buffer());
+    stack.push("p2", frame_buffer());
+    assert!(
+        stack
+            .with_innermost("p1", |buffer| buffer.admit_call("x"))
+            .is_none(),
+        "a caller already blocked in a call may not spend its budget again"
+    );
+    assert_eq!(
+        stack.with_innermost("p2", |buffer| buffer.admit_call("x")),
+        Some(Ok(())),
+    );
+}
+
+/// Each frame carries its own stash, and a pop returns that frame's and nobody
+/// else's, in the order the nested turns committed in.
+#[test]
+fn a_pop_returns_its_own_frames_effects_in_commit_order() {
+    let mut stack = InFlightStack::default();
+    stack.push("p1", frame_buffer());
+    stack.stash(vec![effect("caller-first")]);
+    stack.push("p2", frame_buffer());
+    stack.stash(vec![effect("callee")]);
+    let (_, callee) = stack.pop_of("p2");
+    assert_eq!(bodies(&callee), ["callee"]);
+    stack.stash(vec![effect("caller-second")]);
+    let (_, caller) = stack.pop_of("p1");
+    assert_eq!(bodies(&caller), ["caller-first", "caller-second"]);
+}
+
+/// An empty stash is not a push: a turn that asked the page for nothing leaves
+/// the frame as it was.
+#[test]
+fn an_empty_stash_leaves_the_frame_alone() {
+    let mut stack = InFlightStack::default();
+    stack.push("p1", frame_buffer());
+    stack.stash(Vec::new());
+    let (_, effects) = stack.pop_of("p1");
+    assert!(effects.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "the in-flight stack top belongs to another activation")]
+fn popping_a_frame_that_is_not_this_activations_panics() {
+    let mut stack = InFlightStack::default();
+    stack.push("p1", frame_buffer());
+    stack.push("p2", frame_buffer());
+    let _ = stack.pop_of("p1");
+}
+
+#[test]
+#[should_panic(expected = "the in-flight buffer vanished during an activation")]
+fn popping_an_empty_stack_panics() {
+    let _ = InFlightStack::default().pop_of("p1");
+}
+
+#[test]
+#[should_panic(expected = "turned the page outside any activation")]
+fn stashing_outside_any_activation_panics() {
+    InFlightStack::default().stash(vec![effect("orphan")]);
+}
+
+/// One invocation, end to end: the entry publishes into its own frame and calls
+/// a peer, and what comes back is the entry's buffer plus the peer's effects —
+/// *before* the driver states this activation's own, which is the ordering the
+/// whole stash exists for.
+#[test]
+fn an_invocation_hands_back_its_callees_effects_with_its_own_buffer() {
+    let slot = RefCell::new(InFlightStack::default());
+    let (outcome, buffer, effects) = invoke_over_stack(&slot, "p1", frame_buffer(), || {
+        // What `SyncDoor::call` does from inside the caller's entry: run the
+        // peer's whole activation on this stack, then park its effects on the
+        // caller's frame.
+        let (_, callee_buffer, callee_effects) =
+            invoke_over_stack(&slot, "p2", frame_buffer(), || {
+                slot.borrow_mut()
+                    .with_innermost("p2", |buffer| buffer.publish("notes", "peer".to_string()));
+                ActivationOutcome::Ok(None)
+            });
+        assert_eq!(callee_buffer.len(), 1, "the peer's publish is the peer's");
+        assert!(callee_effects.is_empty(), "the peer called nobody");
+        slot.borrow_mut().stash(vec![effect("peer-committed")]);
+        slot.borrow_mut()
+            .with_innermost("p1", |buffer| buffer.publish("notes", "mine".to_string()));
+        ActivationOutcome::Ok(None)
+    });
+    assert!(matches!(outcome, ActivationOutcome::Ok(None)));
+    assert_eq!(
+        buffer.len(),
+        1,
+        "the caller's own publish came back with it"
+    );
+    assert_eq!(bodies(&effects), ["peer-committed"]);
+    assert!(
+        slot.borrow_mut().with_innermost("p1", |_| ()).is_none(),
+        "the invocation left nothing on the stack"
+    );
+}

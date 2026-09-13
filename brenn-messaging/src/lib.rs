@@ -75,23 +75,6 @@ pub use publish::{
 };
 pub use query::{MessageQuery, QueryError};
 
-// ---------------------------------------------------------------------------
-// WASM consumer window bounds
-// ---------------------------------------------------------------------------
-
-/// Maximum number of retained-context messages passed to a WASM consumer in one
-/// window: an `Unbounded` retain_depth is clamped to this value to keep the
-/// window argument finite. 1 000 is a conservative default; operators can
-/// configure a lower `retain_depth` per subscription.
-pub const WASM_WINDOW_MAX_RETAIN: u64 = 1_000;
-
-/// Maximum number of new (unprocessed) messages in the new-portion of a WASM
-/// consumer window when `push_depth = Unbounded`. Mirrors `WASM_WINDOW_MAX_RETAIN`:
-/// the window-size bound requires clamping both sides when either is
-/// `Unbounded`. A bounded `push_depth` already caps the new portion at
-/// `push_depth`, so the clamp is only reached for `Unbounded` consumers.
-pub const WASM_WINDOW_MAX_NEW: u64 = 1_000;
-
 /// One port's slice of a multi-port activation snapshot.
 ///
 /// Coupled to [`brenn_wasm::ProcessorPortWindow`]; changes here must track
@@ -1677,10 +1660,10 @@ impl Messenger {
     /// consumer's position from which [`Messenger::load_activation_snapshot`]
     /// draws its ring-backed NEW rows.
     ///
-    /// `push_depth` bounds how many owed messages one activation takes; the
-    /// caller applies any per-participant clamp (e.g. `WASM_WINDOW_MAX_NEW`)
-    /// before calling. A cursor coming into existence is primed behind the
-    /// retained tail, capped by `push_depth`.
+    /// `push_depth` bounds how many owed messages one activation takes, and is
+    /// the depth the port's window will read at — the caller passes the
+    /// resolved bounded depth, not a raw configured one. A cursor coming into
+    /// existence is primed behind the retained tail, capped by `push_depth`.
     ///
     /// # Panics
     ///
@@ -2917,12 +2900,8 @@ impl Messenger {
     /// position nothing reads — `detach` and the sampled-attach demotion rule
     /// remove it, and nothing else was ever written per message.
     ///
-    /// **The delivery-time ACL gate lives here** for this family: a port whose
-    /// policy no longer covers its channel is served nothing and advanced over
-    /// nothing, so a restored policy delivers the backlog that accumulated,
-    /// bounded by retention. This is the read-side enforcement point the
-    /// capability model requires to be structural rather than resting on the
-    /// boot-time validation holding forever.
+    /// The delivery-time ACL gate is [`Messenger::activation_port_access`], run
+    /// before anything reads a position.
     ///
     /// Panics on any DB error (fail-fast; the DB is host infrastructure).
     pub async fn load_activation_snapshot(
@@ -2934,42 +2913,8 @@ impl Messenger {
         self.pending_bus_pushes_scan_count
             .fetch_add(1, Ordering::Relaxed);
 
-        // Resolving by address keeps the directory the single authority on
-        // which channel a port names.
-        let entries: Vec<Arc<ChannelEntry>> = inputs
-            .iter()
-            .map(|input| {
-                self.directory
-                    .resolve(&input.sub.channel_address)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "messaging: input port {:?} names channel {:?}, which is not in the \
-                             directory",
-                            input.port, input.sub.channel_address
-                        )
-                    })
-            })
-            .collect();
-        let stores: Vec<Arc<dyn store::RetentionStore>> =
-            entries.iter().map(|entry| self.store_for(entry)).collect();
-
-        // The registration key the gate reads the policy under. This is the WASM
-        // activation path, so the component's own identity is that key.
-        let kind = SubscriberEntryKind::Wasm(subscriber.as_wasm_slug().to_string());
-
-        // Denial is decided before anything else reads a position: a denied port
-        // must not contribute to the trigger decision below, or a revoked
-        // subscriber would still be activated by traffic it cannot be shown.
-        let allowed: Vec<bool> = entries
-            .iter()
-            .map(|entry| {
-                let allowed = self.channel_access_allowed(&kind, &entry.address);
-                if !allowed {
-                    self.warn_acl_denied(entry, subscriber);
-                }
-                allowed
-            })
-            .collect();
+        let (entries, stores) = self.resolve_activation_inputs(inputs);
+        let allowed = self.activation_port_access(subscriber, &entries);
 
         // Trigger gate: a window read carries up to
         // `max(push_depth, retain_depth)` envelopes per port, and a drain step
@@ -3003,14 +2948,127 @@ impl Messenger {
         }
         let wake = schedule::readiness(mount, any_port_ready)?;
 
-        // One window read per port builds context and new together. Pure reads:
-        // no position moves here, so the None path below leaves every port
-        // exactly as it found it and the dispatcher advances only once it has
-        // decided to activate. A denied port is not read at all — an empty
-        // window carries no entries to show the guest and no span to advance
-        // over, which is the "serves nothing, moves nothing" the gate promises.
+        let windows = self
+            .window_activation_ports(subscriber, inputs, &stores, &allowed)
+            .await;
+        // The ring/durable consistency backstop: a position that reported
+        // something deliverable and then windowed nothing new is not an
+        // activation. It applies to a delivery only — a mount activation with
+        // nothing new is the guarantee being kept, not an empty step to elide.
+        if wake == Wake::Delivery && windows.iter().all(|w| w.new_entries().is_empty()) {
+            return None;
+        }
+
+        Some((wake, Self::activation_snapshots(inputs, windows, &stores)))
+    }
+
+    /// Assemble the multi-port activation snapshot a **sync call** runs against:
+    /// the same assembly, with no gate in front of it.
+    ///
+    /// A request is not a readiness fact. Its caller is already blocked on the
+    /// reply, so there is nothing to decide and nothing to elide: every allowed
+    /// port is windowed whatever it holds, exactly as an owed mount's is, and
+    /// the activation happens. A mount debt this settles is the caller's to
+    /// record — [`Wake::Sync`] is what the host names the activation, and the
+    /// mount guarantee is one activation per mount, not one of a particular
+    /// shape.
+    ///
+    /// Every other property of [`Messenger::load_activation_snapshot`] holds
+    /// here unchanged: one scan, the delivery-time ACL gate, pure reads that
+    /// move no position.
+    pub async fn load_sync_activation_snapshot(
+        &self,
+        subscriber: &ParticipantId,
+        inputs: &[WasmInputPort],
+    ) -> Vec<PortSnapshot> {
+        self.pending_bus_pushes_scan_count
+            .fetch_add(1, Ordering::Relaxed);
+
+        let (entries, stores) = self.resolve_activation_inputs(inputs);
+        let allowed = self.activation_port_access(subscriber, &entries);
+        let windows = self
+            .window_activation_ports(subscriber, inputs, &stores, &allowed)
+            .await;
+        Self::activation_snapshots(inputs, windows, &stores)
+    }
+
+    /// Resolve every input port's channel entry and retention store, in `inputs`
+    /// order.
+    ///
+    /// Resolving by address keeps the directory the single authority on which
+    /// channel a port names.
+    fn resolve_activation_inputs(
+        &self,
+        inputs: &[WasmInputPort],
+    ) -> (Vec<Arc<ChannelEntry>>, Vec<Arc<dyn store::RetentionStore>>) {
+        let entries: Vec<Arc<ChannelEntry>> = inputs
+            .iter()
+            .map(|input| {
+                self.directory
+                    .resolve(&input.sub.channel_address)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "messaging: input port {:?} names channel {:?}, which is not in the \
+                             directory",
+                            input.port, input.sub.channel_address
+                        )
+                    })
+            })
+            .collect();
+        let stores: Vec<Arc<dyn store::RetentionStore>> =
+            entries.iter().map(|entry| self.store_for(entry)).collect();
+        (entries, stores)
+    }
+
+    /// The delivery-time ACL verdict per input port, in `entries` order.
+    ///
+    /// **The delivery-time ACL gate lives here** for this family: a port whose
+    /// policy no longer covers its channel is served nothing and advanced over
+    /// nothing, so a restored policy delivers the backlog that accumulated,
+    /// bounded by retention. This is the read-side enforcement point the
+    /// capability model requires to be structural rather than resting on the
+    /// boot-time validation holding forever.
+    ///
+    /// Denial is decided before anything else reads a position: a denied port
+    /// must not contribute to the trigger decision, or a revoked subscriber
+    /// would still be activated by traffic it cannot be shown.
+    fn activation_port_access(
+        &self,
+        subscriber: &ParticipantId,
+        entries: &[Arc<ChannelEntry>],
+    ) -> Vec<bool> {
+        // The registration key the gate reads the policy under. This is the WASM
+        // activation path, so the component's own identity is that key.
+        let kind = SubscriberEntryKind::Wasm(subscriber.as_wasm_slug().to_string());
+        entries
+            .iter()
+            .map(|entry| {
+                let allowed = self.channel_access_allowed(&kind, &entry.address);
+                if !allowed {
+                    self.warn_acl_denied(entry, subscriber);
+                }
+                allowed
+            })
+            .collect()
+    }
+
+    /// One window read per port, building context and new together.
+    ///
+    /// Pure reads: no position moves here, so a caller that decides against
+    /// activating leaves every port exactly as it found it and the dispatcher
+    /// advances only once it has decided to activate. A denied port is not read
+    /// at all — an empty window carries no entries to show the guest and no span
+    /// to advance over, which is the "serves nothing, moves nothing" the gate
+    /// promises.
+    async fn window_activation_ports(
+        &self,
+        subscriber: &ParticipantId,
+        inputs: &[WasmInputPort],
+        stores: &[Arc<dyn store::RetentionStore>],
+        allowed: &[bool],
+    ) -> Vec<store::SubscriberWindow> {
         let mut windows: Vec<store::SubscriberWindow> = Vec::with_capacity(inputs.len());
-        for ((input, store), allowed) in inputs.iter().zip(&stores).zip(&allowed) {
+        for ((input, store), allowed) in inputs.iter().zip(stores).zip(allowed) {
             if !allowed {
                 windows.push(store::SubscriberWindow::empty());
                 continue;
@@ -3018,13 +3076,23 @@ impl Messenger {
             // A WASM port's position is created at boot and torn down by
             // nothing: no dynamic unsubscribe path targets a WASM subscriber.
             // Absence here is a wiring bug, so it stays fail-fast.
+            // Both depths arrive resolved and bounded: a WASM consumer's
+            // subscription refuses `Unbounded` and refuses anything above the
+            // ceiling where it resolves, so a violation here is a resolution
+            // bug and not operator input.
+            let push = window_depth(
+                &input.sub.push_depth,
+                subscriber,
+                &input.sub.channel_address,
+            );
+            let retain = window_depth(
+                &input.sub.retain_depth,
+                subscriber,
+                &input.sub.channel_address,
+            );
             windows.push(
                 store
-                    .window(
-                        subscriber,
-                        Depth::Bounded(input.sub.push_depth.clamped_to(WASM_WINDOW_MAX_NEW)),
-                        Depth::Bounded(input.sub.retain_depth.clamped_to(WASM_WINDOW_MAX_RETAIN)),
-                    )
+                    .window(subscriber, Depth::Bounded(push), Depth::Bounded(retain))
                     .await
                     .unwrap_or_else(|| {
                         panic!(
@@ -3036,16 +3104,18 @@ impl Messenger {
                     }),
             );
         }
-        // The ring/durable consistency backstop: a position that reported
-        // something deliverable and then windowed nothing new is not an
-        // activation. It applies to a delivery only — a mount activation with
-        // nothing new is the guarantee being kept, not an empty step to elide.
-        if wake == Wake::Delivery && windows.iter().all(|w| w.new_entries().is_empty()) {
-            return None;
-        }
+        windows
+    }
 
+    /// Fold the windows into one [`PortSnapshot`] per input port, in `inputs`
+    /// order.
+    fn activation_snapshots(
+        inputs: &[WasmInputPort],
+        windows: Vec<store::SubscriberWindow>,
+        stores: &[Arc<dyn store::RetentionStore>],
+    ) -> Vec<PortSnapshot> {
         let mut snapshots: Vec<PortSnapshot> = Vec::with_capacity(inputs.len());
-        for ((input, window), store) in inputs.iter().zip(windows).zip(&stores) {
+        for ((input, window), store) in inputs.iter().zip(windows).zip(stores) {
             let sub = &input.sub;
             snapshots.push(PortSnapshot {
                 port: input.port.clone(),
@@ -3060,8 +3130,7 @@ impl Messenger {
                 push_enabled: sub.push_depth.is_push_enabled(),
             });
         }
-
-        Some((wake, snapshots))
+        snapshots
     }
 
     /// Mark a set of ingress rows delivered. Idempotent.
@@ -3125,6 +3194,28 @@ impl Messenger {
 
         tx.commit()
             .unwrap_or_else(|e| panic!("record_wasm_activation_failure: commit tx: {e}"));
+    }
+}
+
+/// One resolved window depth as the count the store reads at.
+///
+/// A WASM consumer's depths are resolved and bounded at or below
+/// [`brenn_activation::WINDOW_DEPTH_CEILING`] where its subscription resolves,
+/// which is where an operator's out-of-range value is refused by name. Reaching
+/// either arm here means resolution handed the assembly something it promised
+/// it would not, so this is a panic and not a clamp: a silently narrowed window
+/// is a component served less than its configuration says.
+fn window_depth(depth: &config::Depth, subscriber: &ParticipantId, channel_address: &str) -> u64 {
+    match depth {
+        config::Depth::Bounded(n) if *n <= brenn_activation::WINDOW_DEPTH_CEILING => *n,
+        other => panic!(
+            "messaging: WASM subscriber {} on {} resolved to depth {other:?}, which is not a \
+             bounded depth at or below the window ceiling ({}) — the subscription resolver is \
+             supposed to have refused or bounded it",
+            subscriber.as_str(),
+            channel_address,
+            brenn_activation::WINDOW_DEPTH_CEILING,
+        ),
     }
 }
 
@@ -4871,8 +4962,8 @@ mod tests {
             sub: config::ResolvedSubscription {
                 channel_uuid: channel.uuid,
                 channel_address: channel.address.clone(),
-                push_depth: config::Depth::Unbounded,
-                retain_depth: config::Depth::Unbounded,
+                push_depth: config::Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING),
+                retain_depth: config::Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING),
                 noise: config::NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
@@ -4982,8 +5073,8 @@ mod tests {
             sub: config::ResolvedSubscription {
                 channel_uuid: channel.uuid,
                 channel_address: channel.address.clone(),
-                push_depth: config::Depth::Unbounded,
-                retain_depth: config::Depth::Unbounded,
+                push_depth: config::Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING),
+                retain_depth: config::Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING),
                 noise: config::NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
@@ -6780,8 +6871,16 @@ mod tests {
             sub: config::ResolvedSubscription {
                 channel_uuid: channel.uuid,
                 channel_address: channel.address.clone(),
-                push_depth,
-                retain_depth,
+                push_depth: config::resolve_wasm_window_depth(
+                    push_depth,
+                    "push_depth",
+                    &channel.address,
+                ),
+                retain_depth: config::resolve_wasm_window_depth(
+                    retain_depth,
+                    "retain_depth",
+                    &channel.address,
+                ),
                 noise: config::NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
             },
@@ -7014,8 +7113,16 @@ mod tests {
             sub: config::ResolvedSubscription {
                 channel_uuid: channel.uuid,
                 channel_address: channel.address.clone(),
-                push_depth,
-                retain_depth,
+                push_depth: config::resolve_wasm_window_depth(
+                    push_depth,
+                    "push_depth",
+                    &channel.address,
+                ),
+                retain_depth: config::resolve_wasm_window_depth(
+                    retain_depth,
+                    "retain_depth",
+                    &channel.address,
+                ),
                 noise,
                 wake_min: WakeMin::Normal,
             },
@@ -7671,8 +7778,8 @@ mod tests {
                 sub: config::ResolvedSubscription {
                     channel_uuid: durable.uuid,
                     channel_address: durable.address.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
+                    push_depth: Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING),
+                    retain_depth: Depth::Bounded(brenn_activation::WINDOW_DEPTH_CEILING),
                     noise: config::NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },

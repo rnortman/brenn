@@ -8,6 +8,7 @@ publish = false
 async-trait = "0.1.89"
 axum = { version = "0.8.8", features = ["ws", "multipart"] }
 brenn-attach-server = { version = "0.1.0", path = "../attach/server" }
+brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
 brenn-automation = { version = "0.1.0", path = "../brenn-automation" }
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
