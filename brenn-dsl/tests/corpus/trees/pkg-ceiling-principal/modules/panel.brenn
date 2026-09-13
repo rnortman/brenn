@@ -17,6 +17,7 @@ assembly Page(slug: String) {
         slug = slug;
         grants = [subscribe];
         new panel: Panel {
+            chrome = true;
             grants = [dom];
             in messages <- out;
         }

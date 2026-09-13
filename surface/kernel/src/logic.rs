@@ -1175,6 +1175,10 @@ impl KernelCore {
             // of this surface that no longer holds, and a page cannot re-wire
             // itself in place. The capped bootstrap reload is the only honest
             // answer.
+            //
+            // TODO(surface-incremental-rewire): a document differing only by
+            // added or removed component entries whose kinds are already
+            // fetched could be applied in place instead.
             Event::WiringChanged => {
                 let mut actions = self.set_link_state(LinkState::Reloading);
                 actions.push(KernelAction::RequestReload {

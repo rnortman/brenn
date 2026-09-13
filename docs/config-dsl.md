@@ -474,7 +474,10 @@ port bound to one link must name the same document.
 
 A `component` class is a component's specification. It states the artifact ABI,
 the ports, the document type on each port where there is one, which ports an
-instance may leave unwired, and the capabilities the component needs:
+instance may leave unwired, and the capabilities the component needs. A module
+may ship arrangements of its classes beside them: the `chrome` module below
+also carries `StandardChrome`, the assembly a page stamps instead of writing
+the chrome's reserved-plane wiring out by hand.
 
 ```
 /// The page chrome: layout, theme, takeover stack, banner, toasts, and
@@ -502,6 +505,48 @@ component Chrome {
   sync toast-dismiss;
   io toast-tick;
   io state;
+}
+
+/// Every reserved `local:brenn/*` control plane bound at the depth its shape
+/// takes, the takeover pair among them, and the page's layout channel handed
+/// in by the caller.
+///
+/// The reserved names are the kernel's, not the author's, and an omitted plane
+/// boots and goes quiet rather than refusing. The layout channel is a parameter
+/// because one channel may drive several pages and belongs where its publishers
+/// are.
+///
+/// The takeover pair is unconditional: every page that stamps this holds
+/// `takeover` and binds both of its planes. A page that must not reach the
+/// takeover plane has no opt-out here and writes its own chrome block instead.
+///
+/// The bindings and depths below are one-place; a stamp's ceiling body is not.
+/// Each stamp spells the five grant words this body reaches and the slug it
+/// places on, because the words and the placement a packaged arrangement holds
+/// are the stamping document's consent — so a grant word added here is still an
+/// edit to every stamp in every repository.
+///
+/// TODO(chrome-no-layout-placeholder): `layout` is a required entity parameter
+/// and entity parameters carry no defaults, so a page with no layout publisher
+/// declares a channel nothing publishes to purely to fill this slot.
+assembly StandardChrome(slug: String, layout: Channel) {
+  extend surface f"{slug}" {
+    new chrome: Chrome {
+      grants = [ports, log, takeover, dom, page-dom];
+      chrome = true;
+      in layout <- layout { push_depth = 1; }
+      in theme <- "local:brenn/theme" { push_depth = 1; }
+      in takeover <- "local:brenn/takeover" { push_depth = 8; }
+      in link-state <- "local:brenn/link-state" { push_depth = 1; }
+      in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
+      in toast <- "local:brenn/toast" { push_depth = 8; }
+      out overlay-state -> "local:brenn/overlay-state";
+      io toast-tick { push_depth = 1; retain_depth = 2; }
+      io state { push_depth = 0; retain_depth = 1; }
+
+    }
+
+  }
 }
 ```
 
@@ -796,6 +841,64 @@ surface bar {
 }
 ```
 
+#### Extending a surface
+
+A second statement places components on a surface **declared somewhere else**:
+
+```
+extend surface "alice-desk" {
+  new weather: Weather {
+    grants = [ports, log, dom];
+    in city <- city { push_depth = 1; retain_depth = 1; }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+}
+```
+
+The head names the surface **by slug**, never by handle: the slug is the
+surface's address — its URL, its participant identity and its runtime-table key
+— and it is the one spelling that works from every authority root. Any
+string-typed value does, so `extend surface f"{slug}" { … }` inside a
+parameterised assembly is the ordinary form. The body admits `new` statements
+and nothing else; attach rights, skin and audience stay with the surface, and
+channels and links are ordinary statements beside the block.
+
+A surface is **one thing however many blocks wrote it**. The merged component
+set is what every later rule reads: instance names are unique across the whole
+surface, an explicit `acl` on the surface must cover every contributed binding
+as it covers a body one, a derived ACL widens to hold them, and the lowered
+document and the bindings the page mounts are indistinguishable from a surface
+written in one block. Only authority follows the block: each component is
+checked against the ceiling of the stamp that placed it.
+
+Four refusals follow from that:
+
+- **No surface has that slug.** A contribution lands on a surface the
+  deployment declares; there is no forward reference and no implicit creation.
+- **A block that places nothing.** A contribution is a placement: an empty body
+  would still name a slug and so still hold a `surfaces` ceiling entry alive
+  while capping nothing, which is what an empty `grants` line is refused for.
+- **Two blocks place one instance name.** An instance name is the runtime
+  identity `surface:<slug>#<name>`, and the layout document names it, so a
+  collision is an address collision and is refused with both sites named.
+- **Zero or two chromes on the merged surface.** Every surface holds exactly
+  one component with `chrome = true`, counted after every contribution has
+  landed.
+
+A packaged module places nothing, so `extend surface` is refused there at item
+level, exactly as `new` is; a packaged *assembly* may carry one, because the
+stamp is the consent.
+
+**A kind is described by the document that ships it.** A surface kind's two
+description channels, `brenn:<prefix>.kind.<kind>.help` and `.schema`, must be
+declared for every kind any surface places, or the plan is refused naming both
+addresses. Which document declares them is not fixed: brenn's own kinds are the
+deployment's line, and a kind shipped by a bundle that carries a `config/` tree
+is declared in that fragment — `use @surface-description::*;` and
+`new <k>_desc: KindDescription(kind = "<k>");`. Both describing one kind is an
+address collision; neither is the plan refusal. So a bundle that ships a new
+kind and places it needs no edit to the deployment's own text.
+
 ### Agents
 
 An agent class is an application: an LLM conversation with a sandbox, mounted
@@ -1055,12 +1158,34 @@ principal ui_readonly under ui { grants = [dom, log, page-dom, ports]; }
 principal household under ui { acl publish [prefix "brenn:house.cmd."]; }
 ```
 
-The body is `grants` and `acl` lines and nothing else, and the words come from
+The body is `grants`, `surfaces` and `acl` lines and nothing else, and the words come from
 every grant vocabulary at once: `page-dom` beside `ephemeral_subscribe`, and the
 one spelling the two vocabularies share, `alert`, covering both a component's
 alert capability and a surface's alert attach right. Both words consent to the
 same consequence — this arrangement may page the operator — so a deployment
 spells that consent once.
+
+**`surfaces` is the third axis: where an arrangement may place components.**
+
+```
+principal assistant_automations {
+  grants = [ports, log, dom];
+  acl subscribe [prefix "brenn:automations.", prefix "brenn:r-deskbar.in."];
+  acl publish [prefix "brenn:automations."];
+  surfaces = ["r-deskbar"];
+}
+```
+
+A list of slugs, each of which must be a surface the merged document carries —
+a slug no surface holds caps no placement and is refused at the entry. It is
+attenuated exactly as `grants` is: a written line replaces the inherited one, a
+slug the parent does not hold is excess, and a list identical to the inherited
+one narrows nothing. What it caps is `extend surface`: every contribution block
+confers its slug on the stamp it was expanded inside and on every stamp above
+it, and a block whose slug the effective ceiling does not hold is refused at the
+block head. A stamp with no `surfaces` — the default — places on no page. The
+deployment's own top-level text has no ceiling and is not checked; an assembly
+stamped `under p` is, as its channels and consumers already are.
 
 **`under` delegates, and delegation only narrows.** One relation, *attenuation*,
 holds the whole chain together: a principal declared under another holds no more
@@ -1092,8 +1217,9 @@ authorized by the host that serves it.
 **Consent text that consents to nothing is refused**, so what a reader sees is
 true. A written axis identical to the one it replaces narrows nothing. A ceiling
 word no instance in the stamp's subtree holds caps nothing, and so does
-`grants = [];` over an arrangement that holds no capability. An `acl` line in a
-family the arrangement reaches nowhere beyond its own and its handed channels
+`grants = [];` over an arrangement that holds no capability. A `surfaces` entry
+no contribution under the holder lands on is dead on the same terms. An `acl`
+line in a family the arrangement reaches nowhere beyond its own and its handed channels
 caps nothing either. Each is dead config and each is refused where it is
 written.
 
@@ -1145,18 +1271,35 @@ bound:
 |---|---|
 | `use`, `const`, `channel` declarations, `link`, `assembly`, `new`, `uuid_pins` | yes |
 | `principal` | yes, rooted at the ceiling (below) |
+| `extend surface "<slug>"` | yes, for a slug the ceiling's `surfaces` holds — and never carrying `chrome = true` |
 | `channel at [prefix] "<addr>"` (tuning) | refused — a tuning names a system-minted family by raw address, carries no stamp, and would reach where the ceiling never granted |
 | `component` class declarations | refused — a class is declared by its package; a fragment reaches classes through `use @…` |
 | top-level `grant` and `acl` | refused — either aims authority at an entity outside the mount's namespace |
 | `agent`, `surface`, `remote`, `webhook`, `repo`, `mqtt_client`, `mcp_server`, settings sections | refused — each is a host fact or an entity whose authority is not spelled in ceiling words |
+| `chrome = true` on a contributed component | refused — the chrome is the surface's shell: it holds `page-dom`, the whole document rather than a contained subtree, and owns the layout channel and the reserved `local:brenn/*` planes |
 | `mount` | refused, as in any deployment document |
 
 The discipline pass stops at the item level, so a fragment stamping a packaged
 assembly whose *body* places a surface or an agent passes it and is refused at
 the `new` instead — the `new` is the consent to the whole arrangement, and the
 assembly stays perfectly good for the deployment to stamp. What a fragment can
-end up running is top-level consumers, channels and links; no surface means no
-page-hosted placement either.
+end up running is top-level consumers, channels and links, and components placed
+on surfaces the deployment declared.
+
+**A fragment curates a display; it does not create one.** The deployment writes
+the surface — its slug, its `allowed_users`, its attach `grants` and `acl`, and
+its chrome — and a fragment writes `extend surface "<slug>"` for a slug its
+ceiling's `surfaces` holds (*Surfaces*, *Principals*). So a mount decides what
+is on a page it can neither mint, nor open to a different audience, nor re-skin,
+and every contributed binding is capped twice over: by the ceiling's reach, and
+by the surface's own explicit `acl` where it has one. On a surface whose `acl`
+is explicit, a contribution's channels live under that ACL's prefixes or the
+operator widens it.
+
+The kind a contribution places must be described (*Extending a surface*), and a
+bundle carrying a `config/` tree describes its own kinds from inside it. What
+the operator writes is one standing `prefix "brenn:<prefix>.kind."` entry in the
+ceiling's reach — once per mount, never per kind.
 
 **The mount is a stamp, and its ceiling is exactly `p`.** Each config-carrying
 mount enters the document as one synthetic stamp, `under` the principal the
@@ -1215,9 +1358,11 @@ root declares. Re-identifying a channel one did not declare is the migration
 hazard pins exist to guard, done from the wrong side.
 
 **A fragment never needs a restart.** Everything the discipline admits lowers
-into the blocks a reload converges — channels, links and consumers — so a
-fragment edit is by construction a converging change, whatever else is in the
-same reload.
+into the blocks a reload converges — channels, links, consumers and surfaces —
+so a fragment edit is by construction a converging change, whatever else is in
+the same reload. A contribution added, removed or moved converges its surface,
+which closes that page's sessions and installs the successor; nothing else in
+the process is touched.
 
 **Diagnostics name the host's path.** A refusal in a fragment renders with the
 filename the host read, `<mount path>/config/main.brenn`, with line and column.

@@ -352,8 +352,9 @@ assembly Pod(slug: String) {
     new pa: Assistant(name = slug);
 }
 
+component Shell { abi = processor; requires = []; }
 assembly Watch(peer: Agent, feed: Channel) {
-    surface board { grants = [subscribe]; }
+    surface board { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
     grant peer subscribe exact feed;
 }
 ";

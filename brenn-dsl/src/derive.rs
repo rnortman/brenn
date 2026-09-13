@@ -891,6 +891,10 @@ struct Refs<'a> {
     channels: &'a [RChannel],
     clients: HashSet<String>,
     endpoints: HashSet<String>,
+    /// Every slug the merged document carries a surface for. What a ceiling's
+    /// `surfaces` line is held against: the root is complete, so a slug no
+    /// surface carries is a typo rather than a forward reference.
+    surfaces: HashSet<String>,
 }
 
 impl<'a> Refs<'a> {
@@ -906,6 +910,11 @@ impl<'a> Refs<'a> {
                 .webhooks
                 .iter()
                 .map(|webhook| webhook.slug.value().clone())
+                .collect(),
+            surfaces: config
+                .surfaces
+                .iter()
+                .map(|surface| surface.slug.value().clone())
                 .collect(),
         }
     }
@@ -2574,6 +2583,11 @@ fn bound_entry(
 #[derive(Clone, Default)]
 struct Authority {
     words: BTreeMap<String, Span>,
+    /// The surfaces this authority may place components on, by slug, each with
+    /// the position it was written at. Placement is a right of its own: it is
+    /// neither a word a component holds nor reach over a channel, and a ceiling
+    /// that says nothing about it caps it at nothing.
+    surfaces: BTreeMap<String, Span>,
     reach: Vec<(Family, DEntry)>,
 }
 
@@ -2584,6 +2598,12 @@ impl Authority {
     /// documents' spans are never equal.
     fn same_words(&self, other: &Authority) -> bool {
         self.words.keys().eq(other.words.keys())
+    }
+
+    /// Whether these two authorities place on the same surfaces. Keys only, for
+    /// the reason [`Authority::same_words`] reads keys only.
+    fn same_surfaces(&self, other: &Authority) -> bool {
+        self.surfaces.keys().eq(other.surfaces.keys())
     }
 
     /// Every entry of one family this authority holds.
@@ -2606,6 +2626,11 @@ impl Authority {
                 excess.push(Excess::Word(word.clone(), span.clone()));
             }
         }
+        for (slug, span) in &self.surfaces {
+            if !parent.surfaces.contains_key(slug) {
+                excess.push(Excess::Surface(slug.clone(), span.clone()));
+            }
+        }
         for (family, entry) in &self.reach {
             if !parent.family(*family).any(|held| entry.subsumed_by(held)) {
                 excess.push(Excess::Reach(
@@ -2622,6 +2647,7 @@ impl Authority {
 /// not, and where it was written.
 enum Excess {
     Word(String, Span),
+    Surface(String, Span),
     Reach(String, Span),
 }
 
@@ -2630,6 +2656,7 @@ impl Excess {
     fn describe(&self) -> String {
         match self {
             Excess::Word(word, _) => format!("`{word}` is not a word"),
+            Excess::Surface(slug, _) => format!("`{slug}` is not a surface"),
             Excess::Reach(name, _) => format!("`{name}` is not reach"),
         }
     }
@@ -2638,6 +2665,7 @@ impl Excess {
     fn what(&self) -> String {
         match self {
             Excess::Word(word, _) => format!("the word `{word}`"),
+            Excess::Surface(slug, _) => format!("placement on surface `{slug}`"),
             Excess::Reach(name, _) => format!("reach over `{name}`"),
         }
     }
@@ -2645,7 +2673,7 @@ impl Excess {
     /// Where it was written.
     fn span(&self) -> &Span {
         match self {
-            Excess::Word(_, span) | Excess::Reach(_, span) => span,
+            Excess::Word(_, span) | Excess::Surface(_, span) | Excess::Reach(_, span) => span,
         }
     }
 }
@@ -2663,9 +2691,11 @@ static CEILING_WORDS: LazyLock<BTreeSet<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
-/// A ceiling body: the `grants` line it writes and the `acl` lines it writes.
+/// A ceiling body: the `grants` line, the `surfaces` line and the `acl` lines
+/// it writes.
 struct Body<'a> {
     grants: Option<&'a RWordList>,
+    surfaces: Option<&'a [Spanned<String>]>,
     acls: &'a [RAcl],
 }
 
@@ -2676,6 +2706,9 @@ struct Written {
     /// Whether a `grants` line was written at all — which is what says the words
     /// axis is replaced rather than inherited. An empty list is a statement.
     wrote_words: bool,
+    /// The same question on the placement axis: whether a `surfaces` line was
+    /// written at all.
+    wrote_surfaces: bool,
     /// The families the `acl` lines resolved to, each with the plane word of the
     /// line that reached it. Replacement and the dead-config rules are keyed on
     /// these: a line replaces the inherited entries of the family it resolves
@@ -2690,7 +2723,7 @@ struct Written {
 impl Written {
     /// Whether the body wrote no axis at all.
     fn empty(&self) -> bool {
-        !self.wrote_words && self.families.is_empty()
+        !self.wrote_words && !self.wrote_surfaces && self.families.is_empty()
     }
 
     /// The entries this body wrote in one family.
@@ -2705,6 +2738,7 @@ fn written_authority(body: Body<'_>, refs: &Refs<'_>, errors: &mut Vec<Diagnosti
     let mut written = Written {
         axes: Authority::default(),
         wrote_words: false,
+        wrote_surfaces: false,
         families: Vec::new(),
         refused: false,
     };
@@ -2727,6 +2761,27 @@ fn written_authority(body: Body<'_>, refs: &Refs<'_>, errors: &mut Vec<Diagnosti
                 .axes
                 .words
                 .insert(word.name.value().clone(), word.name.span().clone());
+        }
+    }
+    if let Some(slugs) = body.surfaces {
+        written.wrote_surfaces = true;
+        for slug in slugs {
+            if !refs.surfaces.contains(slug.value()) {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "no surface has slug `{}`, so this caps no placement; a ceiling \
+                         names the surfaces the deployment declares",
+                        slug.value()
+                    ),
+                    slug.span().clone(),
+                ));
+                written.refused = true;
+                continue;
+            }
+            written
+                .axes
+                .surfaces
+                .insert(slug.value().clone(), slug.span().clone());
         }
     }
     for acl in body.acls {
@@ -2854,6 +2909,7 @@ fn check_ceilings(
         let written = written_authority(
             Body {
                 grants: principal.grants.as_ref(),
+                surfaces: principal.surfaces.as_deref(),
                 acls: &principal.acls,
             },
             refs,
@@ -2906,6 +2962,47 @@ fn check_ceilings(
     let defaults = default_reach(config);
     check_stamps(config, &confers, &defaults, &delegated, refs, errors);
     check_dead_principals(config, &confers, &defaults, &delegated, &bodies, errors);
+}
+
+/// One exact-keyed ceiling axis's dead-config rule.
+///
+/// A `grants` line and a `surfaces` line are the same question over two maps of
+/// exact keys — does anything under this ceiling ask for what the line names —
+/// so both are checked by one walk with the sentences handed in, in both the
+/// principal's direction and the stamp's. An `acl` line is not: what it caps is
+/// judged by subsumption over the reach an arrangement declares, which is a
+/// different comparison and stays written out where it is asked.
+struct DeadAxis<'a> {
+    /// Whether the ceiling wrote the line at all. A ceiling that wrote none
+    /// states nothing about the axis and has nothing here that could be dead.
+    wrote_line: bool,
+    /// What the line named, and where each entry is written.
+    keys: &'a BTreeMap<String, Span>,
+    /// Where the line itself is: the site of a whole line that caps nothing.
+    line: &'a Span,
+    /// Whether the arrangement asks for anything at all on this axis.
+    conferred_any: bool,
+    /// Whether the arrangement asks for this one entry.
+    conferred: &'a dyn Fn(&str) -> bool,
+    /// What an empty line that caps nothing is refused with.
+    line_refusal: String,
+    /// What one entry that caps nothing is refused with.
+    entry_refusal: &'a dyn Fn(&str) -> String,
+}
+
+fn check_dead_axis(axis: DeadAxis<'_>, errors: &mut Vec<Diagnostic>) {
+    // An arrangement that asks for nothing on this axis is stamped with no line
+    // at all; the empty list is text that caps nothing, and it reads as though
+    // the deployment had something in mind.
+    if axis.wrote_line && axis.keys.is_empty() && !axis.conferred_any {
+        errors.push(Diagnostic::at(axis.line_refusal, axis.line.clone()));
+    }
+    for (key, span) in axis.keys {
+        if (axis.conferred)(key) {
+            continue;
+        }
+        errors.push(Diagnostic::at((axis.entry_refusal)(key), span.clone()));
+    }
 }
 
 /// That every `principal` delegates its authority to something, and that every
@@ -2986,34 +3083,54 @@ fn check_dead_principals(
                 )
             })
             .collect();
-        if written.wrote_words
-            && written.axes.words.is_empty()
-            && held.iter().all(|(confers, _)| confers.words.is_empty())
-        {
-            errors.push(Diagnostic::at(
-                format!(
+        check_dead_axis(
+            DeadAxis {
+                wrote_line: written.wrote_words,
+                keys: &written.axes.words,
+                line: &principal.span,
+                conferred_any: held.iter().any(|(confers, _)| !confers.words.is_empty()),
+                conferred: &|word| {
+                    held.iter()
+                        .any(|(confers, _)| confers.words.contains_key(word))
+                },
+                line_refusal: format!(
                     "no arrangement under `{label}` holds a capability, so this `grants` \
                      line caps nothing; a principal that delegates no capability writes no \
                      `grants` line"
                 ),
-                principal.span.clone(),
-            ));
-        }
-        for (word, span) in &written.axes.words {
-            if held
-                .iter()
-                .any(|(confers, _)| confers.words.contains_key(word))
-            {
-                continue;
-            }
-            errors.push(Diagnostic::at(
-                format!(
-                    "`{word}` caps nothing — no arrangement under `{label}` holds it; a \
-                     ceiling word nothing reaches is dead config"
+                entry_refusal: &|word| {
+                    format!(
+                        "`{word}` caps nothing — no arrangement under `{label}` holds it; a \
+                         ceiling word nothing reaches is dead config"
+                    )
+                },
+            },
+            errors,
+        );
+        check_dead_axis(
+            DeadAxis {
+                wrote_line: written.wrote_surfaces,
+                keys: &written.axes.surfaces,
+                line: &principal.span,
+                conferred_any: held.iter().any(|(confers, _)| !confers.surfaces.is_empty()),
+                conferred: &|slug| {
+                    held.iter()
+                        .any(|(confers, _)| confers.surfaces.contains_key(slug))
+                },
+                line_refusal: format!(
+                    "no arrangement under `{label}` places a component, so this `surfaces` \
+                     line caps nothing; a principal that delegates no placement writes no \
+                     `surfaces` line"
                 ),
-                span.clone(),
-            ));
-        }
+                entry_refusal: &|slug| {
+                    format!(
+                        "`{slug}` caps nothing — no arrangement under `{label}` places a \
+                         component on it; a ceiling surface nothing reaches is dead config"
+                    )
+                },
+            },
+            errors,
+        );
         for (family, plane) in &written.families {
             if held
                 .iter()
@@ -3130,6 +3247,10 @@ fn attenuate(
         true => written.axes.words.clone(),
         false => inherited.words.clone(),
     };
+    let surfaces = match written.wrote_surfaces {
+        true => written.axes.surfaces.clone(),
+        false => inherited.surfaces.clone(),
+    };
     let mut reach = written.axes.reach.clone();
     for (family, entry) in &inherited.reach {
         if written.families.iter().any(|(held, _)| held == family) {
@@ -3137,7 +3258,14 @@ fn attenuate(
         }
         reach.push((*family, entry.clone()));
     }
-    (Authority { words, reach }, refused)
+    (
+        Authority {
+            words,
+            surfaces,
+            reach,
+        },
+        refused,
+    )
 }
 
 /// That a written axis holds no more than the axis it replaces, and that it
@@ -3197,6 +3325,22 @@ fn check_narrowing(
             written
                 .axes
                 .words
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| span.clone()),
+        ));
+    }
+    if written.wrote_surfaces && written.axes.same_surfaces(inherited) {
+        refused = true;
+        errors.push(Diagnostic::at(
+            format!(
+                "this `surfaces` list is what {above} places on, so it narrows nothing; \
+                 a ceiling axis that caps nothing is dead config"
+            ),
+            written
+                .axes
+                .surfaces
                 .values()
                 .next()
                 .cloned()
@@ -3427,6 +3571,7 @@ fn check_stamps(
         let written = written_authority(
             Body {
                 grants: stamp.grants.as_ref(),
+                surfaces: stamp.surfaces.as_deref(),
                 acls: &stamp.acls,
             },
             refs,
@@ -3559,31 +3704,51 @@ fn check_dead_ceiling(
         true => " — and that line is the author's: this stamp is the arrangement's own text",
         false => "",
     };
-    // An arrangement that holds no capability is stamped with no `grants` line
-    // at all; the empty list is text that caps nothing, and it reads as though
-    // the deployment had something in mind.
-    if written.wrote_words && written.axes.words.is_empty() && confers.words.is_empty() {
-        errors.push(Diagnostic::at(
-            format!(
+    check_dead_axis(
+        DeadAxis {
+            wrote_line: written.wrote_words,
+            keys: &written.axes.words,
+            line: &stamp.span,
+            conferred_any: !confers.words.is_empty(),
+            conferred: &|word| confers.words.contains_key(word),
+            line_refusal: format!(
                 "no instance stamped by {stamped} holds a capability, so this `grants` line \
                  caps nothing; the stamp of an arrangement that holds no capability \
                  writes no `grants` line{owner}"
             ),
-            stamp.span.clone(),
-        ));
-    }
-    for (word, span) in &written.axes.words {
-        if confers.words.contains_key(word) {
-            continue;
-        }
-        errors.push(Diagnostic::at(
-            format!(
-                "`{word}` caps nothing — no instance stamped by {stamped} holds it; a ceiling \
-                 word nothing reaches is dead config{owner}"
+            entry_refusal: &|word| {
+                format!(
+                    "`{word}` caps nothing — no instance stamped by {stamped} holds it; a \
+                     ceiling word nothing reaches is dead config{owner}"
+                )
+            },
+        },
+        errors,
+    );
+    // A `surfaces` line naming a display no block under this stamp contributes
+    // to is consent the arrangement never asked for, on the same terms as a
+    // word.
+    check_dead_axis(
+        DeadAxis {
+            wrote_line: written.wrote_surfaces,
+            keys: &written.axes.surfaces,
+            line: &stamp.span,
+            conferred_any: !confers.surfaces.is_empty(),
+            conferred: &|slug| confers.surfaces.contains_key(slug),
+            line_refusal: format!(
+                "nothing stamped by {stamped} places a component, so this `surfaces` line \
+                 caps nothing; the stamp of an arrangement that places nothing writes no \
+                 `surfaces` line{owner}"
             ),
-            span.clone(),
-        ));
-    }
+            entry_refusal: &|slug| {
+                format!(
+                    "`{slug}` caps nothing — nothing stamped by {stamped} places a component \
+                     on it; a ceiling surface nothing reaches is dead config{owner}"
+                )
+            },
+        },
+        errors,
+    );
     for (family, plane) in &written.families {
         // What the line has to cap: reach the arrangement asked for in this
         // family that the stamp's default reach does not already answer. A line
@@ -3632,6 +3797,11 @@ struct Confers {
     /// written. One refusal per missing word rather than one per instance, with
     /// every holder as a related site.
     words: BTreeMap<String, Vec<(String, Span)>>,
+    /// Each surface the arrangement places components on, with the head of
+    /// every contribution block that lands there. One refusal per block, because
+    /// each block is a separate act of placement and each is separately
+    /// removable.
+    surfaces: BTreeMap<String, Vec<Span>>,
     /// Each reach entry the arrangement itself wrote — its own `acl` statements,
     /// what its bindings derive, and what a `grant` inside it hands out — with
     /// the entity the entry is about.
@@ -3671,6 +3841,20 @@ fn confers(config: &ResolvedConfig, conferred: &Conferred) -> HashMap<StampId, C
                 held.reach
                     .push((*family, entry.clone(), entity.label.clone()));
             }
+        }
+    }
+    // A contribution is placement conferred on the block's own stamp and on
+    // every stamp it was expanded inside, for the reason an entity's words are:
+    // an outer ceiling is a statement about the whole subtree under it.
+    for contribution in &config.contributions {
+        for stamp in ancestry(config, contribution.stamp) {
+            confers
+                .entry(stamp)
+                .or_default()
+                .surfaces
+                .entry(contribution.slug.value().clone())
+                .or_default()
+                .push(contribution.slug.span().clone());
         }
     }
     for (grant, entry) in config.grants.iter().zip(&conferred.grants) {
@@ -3821,6 +4005,32 @@ fn check_fit(
         }
         errors.push(refusal);
     }
+    // Every slug the arrangement places on, as a `surfaces` line spells them:
+    // one list for the whole loop, as the words above take one.
+    let placed: Vec<String> = confers
+        .surfaces
+        .keys()
+        .map(|slug| format!("\"{slug}\""))
+        .collect();
+    for (slug, heads) in &confers.surfaces {
+        if effective.surfaces.contains_key(slug) {
+            continue;
+        }
+        for head in heads {
+            let mut refusal = Diagnostic::at(
+                format!(
+                    "{stamped} places components on surface `{slug}`, and this stamp's \
+                     ceiling places on no such surface: {}{owner}",
+                    surface_suggestion(slug, &placed, stamp, delegated)
+                ),
+                head.clone(),
+            );
+            refusal
+                .related
+                .push(("stamped here".to_string(), stamp.span.clone()));
+            errors.push(refusal);
+        }
+    }
     for (family, entry, holder) in &confers.reach {
         if effective
             .family(*family)
@@ -3904,7 +4114,7 @@ fn word_suggestion(word: &str, all: &[&str], stamp: &RStamp, delegated: &Delegat
              body hands down less"
         ),
         (Some(under), _) => {
-            let missing = missing_in_chain(word, &under, delegated);
+            let missing = missing_in_chain(word, &under, delegated, |authority| &authority.words);
             match missing.is_empty() {
                 true => format!(
                     "add `{word}` to `{under}`, or stamp under a principal that \
@@ -3921,6 +4131,45 @@ fn word_suggestion(word: &str, all: &[&str], stamp: &RStamp, delegated: &Delegat
              not hold it either"
         ),
         (None, None) => format!("write it — `grants = [{}];`", all.join(", ")),
+    }
+}
+
+/// Where a missing surface can be written. The same cases as a word's, and the
+/// same reason: placement enters a chain at its root and a child can only
+/// narrow.
+///
+/// `all` is every slug the arrangement places on, as the suggested line spells
+/// them.
+fn surface_suggestion(slug: &str, all: &[String], stamp: &RStamp, delegated: &Delegated) -> String {
+    match (stamp.under.as_ref().map(HandlePath::dotted), stamp.parent) {
+        (Some(under), _) if delegated.authority(&under).surfaces.contains_key(slug) => format!(
+            "add `{slug}` to this stamp's `surfaces` — `{under}` places on it, and this \
+             stamp's body hands down less"
+        ),
+        (Some(under), _) => {
+            // Only the principals that lack the slug: a slug is an exact key,
+            // so naming one that already holds it would send the operator to
+            // widen a ceiling that needs no widening.
+            let missing =
+                missing_in_chain(slug, &under, delegated, |authority| &authority.surfaces);
+            match missing.is_empty() {
+                true => format!(
+                    "a mount's contributions land where its principal's `surfaces` are \
+                     written, so add `{slug}` to `{under}`"
+                ),
+                false => format!(
+                    "a mount's contributions land where its principal's `surfaces` are \
+                     written, so add `{slug}` to `{under}`, and to the principals it is \
+                     under: {}",
+                    quoted_list(&missing)
+                ),
+            }
+        }
+        (None, Some(_)) => format!(
+            "add `{slug}` to this ceiling's `surfaces`, and to the enclosing stamp's if \
+             that one does not place on it either"
+        ),
+        (None, None) => format!("write it — `surfaces = [{}];`", all.join(", ")),
     }
 }
 
@@ -3966,13 +4215,22 @@ fn reach_suggestion(
     }
 }
 
-/// Every principal in this one's chain that does not hold the word either,
+/// Every principal in this one's chain that does not hold the key either,
 /// root-first.
-fn missing_in_chain(word: &str, under: &str, delegated: &Delegated) -> Vec<String> {
+///
+/// `axis` picks the map the key is looked up in — the words a ceiling holds, or
+/// the surfaces it places on. Both are exact keys, which is what makes one walk
+/// answer for both; reach is subsumption and asks a different question.
+fn missing_in_chain(
+    key: &str,
+    under: &str,
+    delegated: &Delegated,
+    axis: impl Fn(&Authority) -> &BTreeMap<String, Span>,
+) -> Vec<String> {
     delegated
         .chain(under)
         .into_iter()
-        .filter(|label| !delegated.authority(label).words.contains_key(word))
+        .filter(|label| !axis(delegated.authority(label)).contains_key(key))
         .collect()
 }
 
@@ -4991,6 +5249,11 @@ fn collect_doctypes<'a>(
                     RChanRef::Addr(address) => address.value().as_str(),
                     RChanRef::Link(_) => unreachable!("handled above"),
                 };
+                // TODO(surface-local-binding-joins-two-realms): a `local:`
+                // address is realm-scoped here and nowhere else, so a handle
+                // naming a declared server-realm `local:` channel may be
+                // handed to a surface binding and reaches an unrelated page
+                // ring with no diagnostic anywhere.
                 let ring = match ChannelScheme::of(address) {
                     Some(ChannelScheme::Local) => realm,
                     _ => Realm::Wire,

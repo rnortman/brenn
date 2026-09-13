@@ -831,11 +831,20 @@ bytes no installed root holds any more.
 
 Two things about the upgrade path are worth knowing before relying on it:
 
-- **A bundle carrying `surface/` still needs a restart.** Surfaces do not
-  converge at all: a document that changes one is refused, and a surface asset
-  tree that moved under an unmoved document is not noticed — the served tree and
-  the self-description publishes are both boot-time facts. Only backend packages
-  are held against their records.
+- **A bundle whose `surface/` tree moved bounces the pages that mount its
+  kinds.** Surfaces converge, and a kind whose installed bytes moved promotes
+  every surface mounting it into the surface delta: those pages are closed with
+  the reconfigured code and reload onto the successor, and every other surface
+  is untouched. The one thing under `surface/` that does not converge is the
+  kernel: every page loads it, so a kernel root that moved is a restart.
+- **A bundle upgrade that withdraws a kind a fragment places refuses the
+  reload.** The asset scan runs over the whole candidate surface list, so a kind
+  no installed mount offers any more is caught before anything is swapped, with
+  the old document still running and the refusal naming the kind and the surface
+  that would mount it. For a kind placed from a config-carrying mount's
+  `extend surface` block, that is the same accepted denial-of-change a fragment
+  that stops compiling is: the author's block and the bundle's contents are one
+  author's, and reconciling them is theirs.
 - **The trees can move while a reload is preparing** if the install is an rsync
   into a live directory, which is not atomic. The versioned-tree-plus-symlink
   layout above is the answer: the swap is one rename and the host resolves the
@@ -844,30 +853,65 @@ Two things about the upgrade path are worth knowing before relying on it:
   mismatch, which is the correct outcome but not a pleasant way to learn the
   rsync had not finished.
 
-### What a deployment still copies by hand
+### The vocabulary a page stamps: chrome and self-description
 
-One piece of brenn's own vocabulary still reaches a deployment by
-transcription rather than by import, and it drifts silently.
+The bindings of brenn's own page vocabulary reach a deployment as packaged
+modules a document imports, not as text it transcribes.
 
-The **chrome wiring**. A surface must hold exactly one chrome, and the block
-that wires its four reserved `local:brenn/*` control planes plus `io toast-tick`
-is written out per page. An unrecognised reserved name is refused; a *missing*
-plane is not, so a page whose chrome omits one boots and goes quiet.
-`TODO(standard-chrome-vocabulary)`.
+A surface must hold exactly one chrome, and the block that wires the reserved
+`local:brenn/*` control planes plus `io toast-tick` used to be written
+out per page — an unrecognised reserved name is refused, a *missing* plane is
+not, so a page whose chrome omitted one booted and went quiet. It is
+`use @chrome::*;` and one stamp per page now:
 
-Until it is packaged vocabulary, that block in a bundle repository's `config/`
-is a copy with a shelf life, and the pin bump that updates brenn is when it is
-re-copied. The self-description assemblies — `SurfaceCommons`,
-`SurfaceDescription(slug)` and `KindDescription(kind)` — are not in that
-position: they ship as a library module (*Library modules*, above), imported
-with `use @surface-description::*;`.
+```
+use @chrome::*;
 
-Each has its own arity, and a deployment whose stamps are missing is refused
-with every missing channel named at once. `config-check` makes that refusal — so
+new demo_chrome: StandardChrome(slug = "demo", layout = demo_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["demo"];
+}
+```
+
+The assembly's body is an `extend surface` block, so the stamp sits *beside* the
+surface rather than inside it, and the layout channel is a parameter because one
+channel may drive several pages and belongs where its publishers are. A page
+with no layout publisher declares an `ephemeral:` channel of its own, which
+nothing publishes to, and renders the default layout; the page's `in layout`
+binding is a transportable subscribe, so such a page states `subscribe` among
+its surface grants.
+
+Write that placeholder `ephemeral:` and not `local:`. A `local:` address on a
+surface binding names a *page* ring the kernel mints from the binding itself,
+while a `local:` channel declaration names a *server* ring only backend
+bindings join; the two share a spelling and exchange no message. Handing a
+`local:` declaration to `layout` therefore compiles, boots and renders exactly
+as an unbound port does — and invites the edit that never works, where an
+operator later publishes a layout document onto the declared channel and the
+page never sees it. The `subscribe` grant is what an honest placeholder costs.
+
+**What is one-place and what is not.** The bindings, the depths and the reserved
+plane set are the module's, and a change to them is one edit. The ceiling body
+is not: the grant words a stamp spells are exactly the words this assembly's
+body reaches, and the slug is spelled twice, so a grant word added to the chrome
+is still an edit to every stamp in every repository. That is deliberate — the
+words and the placement a packaged arrangement holds are the stamping
+document's act of consent, and a ceiling that said "whatever the body asks for"
+would consent to nothing. The takeover pair is unconditional for the same
+reading: every page stamping `StandardChrome` holds `takeover`, and a page that
+must not reach that plane writes its own chrome block.
+
+The self-description assemblies — `SurfaceCommons`, `SurfaceDescription(slug)`
+and `KindDescription(kind)` — ship the same way, as a library module (*Library
+modules*, above) imported with `use @surface-description::*;`.
+
+Each of the three self-description assemblies has its own arity, and a
+deployment whose stamps are missing is refused with every missing channel named
+at once. `config-check` makes that refusal — so
 the bundle installer's pre-stop check does too — and the fit test does not, since
 it compiles without lowering. `SurfaceCommons` is stamped **once per
 deployment**; `SurfaceDescription` **once per surface slug**;
-`KindDescription` **once per processor kind the deployment's pages instantiate**,
+`KindDescription` **once per processor kind, by the document that ships it** —
 the chrome kind included:
 
 ```
@@ -882,6 +926,23 @@ new chrome_kind_desc: KindDescription(kind = "chrome");
 `SurfaceCommons` carries the two channels every surface-serving deployment
 publishes on whatever surfaces it declares — the error lane and the topology
 index — which is why it is stamped once and not per slug.
+
+**Whose line a `KindDescription` is.** The channels are resolved through the
+directory and the plan does not care which document declared them, so the rule
+is that the kind's shipper describes it. brenn's own kinds, and the kinds of a
+bundle that carries no `config/` tree, are the deployment's line. A kind shipped
+by a bundle that *does* carry a `config/` tree is described in that fragment,
+under a ceiling reaching `prefix "brenn:<prefix>.kind."`. Both describing one
+kind is an address collision at compile with both sites named; neither is the
+plan refusal naming both missing addresses. Between them the two diagnostics
+make the rule self-enforcing, which is what lets a bundle ship a new kind, place
+it on a display from its own fragment, and need no edit to the deployment's
+text.
+
+A bundle repository that still carries a longhand chrome block is a copy no
+longer, and the pin bump that first installs a brenn release shipping
+`StandardChrome` is when it is replaced; `brenn-component-demo`'s two copies are
+pre-migration until that bump.
 
 ## Surface packages
 

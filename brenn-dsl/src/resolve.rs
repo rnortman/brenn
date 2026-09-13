@@ -37,17 +37,17 @@ use crate::model::{
     InlineTable, InstBody, IntOrWord, IoTail, Item, LinkStmt, MapDepths, MapValues, Matcher,
     MatcherVal, McpServerStmt, MountDef, MountStmt, MountTail, NamedAttrDef, NewStmt, OpenAttrs,
     OutTail, Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, PrincipalDef, RateLimitAttrs,
-    SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail, SurfaceDef, ToolBlock,
-    TypedBlock, UNBOUNDED, UseStmt, UuidPin, Value, WordList,
+    SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail, SurfaceDef, SurfaceExt,
+    ToolBlock, TypedBlock, UNBOUNDED, UseStmt, UuidPin, Value, WordList,
 };
 use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent,
-    RAttachmentTarget, RBinding, RCall, RChanRef, RChannel, RComponentInst, RConsumer, RGrant,
-    RHooks, RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort, RPrincipal,
-    RRateLimit, RRemote, RRepoMount, RSection, RStamp, RSubscribe, RSurface, RTail, RToolGrant,
-    RTuning, RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, StampId,
-    StampOrigin, str_value,
+    RAttachmentTarget, RBinding, RCall, RChanRef, RChannel, RComponentInst, RConsumer,
+    RContribution, RGrant, RHooks, RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort,
+    RPrincipal, RRateLimit, RRemote, RRepoMount, RSection, RStamp, RSubscribe, RSurface,
+    RSurfaceExt, RTail, RToolGrant, RTuning, RVal, RValue, RWebhook, RWebhookBlock, RWordList,
+    ResolvedConfig, StampId, StampOrigin, str_value,
 };
 use crate::roots::{RootList, RootSource, scan_roots};
 use crate::source::SourceFile;
@@ -324,8 +324,11 @@ pub fn resolve_files(
     let Emitted {
         mut config,
         withheld,
+        surface_exts,
     } = emit_entities(&index, files, mounted, &mut errors);
     check_identity(&config, &mut errors);
+    merge_surface_exts(&mut config, surface_exts, &withheld, &mut errors);
+    check_chrome(&config, &withheld, &mut errors);
     check_grants(&config, &withheld, &mut errors);
     check_principal_chains(&config, &mut errors);
     check_calls(&mut config, &mut errors);
@@ -457,6 +460,13 @@ fn check_packaged_file(file: &File, errors: &mut Vec<Diagnostic>) {
                 MOUNT_IN_DEPLOYMENT_REFUSAL,
                 item.span().clone(),
             )),
+            // Its own sentence: what is wrong is not that the block declares
+            // something, but that placing components is an effect.
+            Item::SurfaceExt(_) => errors.push(Diagnostic::at(
+                "a packaged module declares vocabulary and places nothing; `extend surface` \
+                 is an instantiation",
+                item.span().clone(),
+            )),
             _ => errors.push(Diagnostic::at(DISCIPLINE_REFUSAL, item.span().clone())),
         }
     }
@@ -497,6 +507,7 @@ fn check_mounted_file(file: &File, errors: &mut Vec<Diagnostic>) {
             | Item::Assembly(_)
             | Item::Link(_)
             | Item::Inst(_)
+            | Item::SurfaceExt(_)
             | Item::Principal(_)
             | Item::UuidPins(_) => {}
             Item::Channel(def) => {
@@ -1488,8 +1499,10 @@ fn stamped_name(item: &AssemblyItem) -> Option<&Spanned<String>> {
         AssemblyItem::Link(stmt) => Some(&stmt.handle),
         AssemblyItem::Surface(def) => Some(&def.name),
         AssemblyItem::Inst(inst) => Some(&inst.handle),
-        // A grant declares nothing; it names two things already declared.
-        AssemblyItem::Grant(_) => None,
+        // A grant declares nothing; it names two things already declared. A
+        // contribution declares no entity either: it names a surface by slug
+        // and the instances inside it are the surface's, not the block's.
+        AssemblyItem::SurfaceExt(_) | AssemblyItem::Grant(_) => None,
     }
 }
 
@@ -1515,7 +1528,11 @@ fn declared_name(item: &Item) -> Option<(SymKind, &Spanned<String>)> {
         Item::MqttClient(def) => (SymKind::MqttClient, &def.name),
         Item::McpServer(def) => (SymKind::McpServer, &def.name),
         Item::Mount(def) => (SymKind::Mount, &def.name),
-        Item::UuidPins(_) | Item::Acl(_) | Item::Grant(_) | Item::Section(_) => return None,
+        Item::UuidPins(_)
+        | Item::SurfaceExt(_)
+        | Item::Acl(_)
+        | Item::Grant(_)
+        | Item::Section(_) => return None,
     })
 }
 
@@ -2670,6 +2687,25 @@ enum Grantable {
 struct Withheld {
     handles: HashMap<String, Grantable>,
     prefixes: HashSet<String>,
+    /// The slugs of the withheld surfaces that had computed one. A handle says
+    /// nothing about a slug, and a contribution names a surface by slug alone,
+    /// so the merge needs the spelling itself to stay silent about a surface the
+    /// operator did write.
+    surface_slugs: HashSet<String>,
+    /// How many withheld surfaces had no slug worth recording, their own slug
+    /// value being what was refused. A surface whose slug is unknowable may be
+    /// the one a contribution names, so one of these silences the merge about
+    /// every unknown slug.
+    slugless_surfaces: usize,
+    /// The slugs the withheld `extend surface` blocks named. A withheld block
+    /// may be the one that placed its surface's chrome, so the chrome count is
+    /// silent about a surface one of these names: the author is already being
+    /// told what in the block was refused.
+    contribution_slugs: HashSet<String>,
+    /// How many withheld contributions named no slug this pass can spell, their
+    /// own head value being what was refused. One of these may have been any
+    /// surface's chrome, so it silences the chrome count everywhere.
+    slugless_contributions: usize,
 }
 
 impl Withheld {
@@ -2700,6 +2736,11 @@ impl Withheld {
 struct Emitted {
     config: ResolvedConfig,
     withheld: Withheld,
+    /// `extend surface` blocks, until the merge lands their components on the
+    /// surfaces they name. Emission-time state, beside the withheld handles and
+    /// for the same reason: the resolved model holds what a document *is*, and
+    /// a contribution is a step on the way to one merged surface.
+    surface_exts: Vec<RSurfaceExt>,
 }
 
 impl Deref for Emitted {
@@ -2720,6 +2761,37 @@ impl Emitted {
     /// Record that an entity was declared under this handle and withheld.
     fn withhold(&mut self, handle: &HandlePath, grantable: Grantable) {
         self.withheld.handles.insert(handle.dotted(), grantable);
+    }
+
+    /// Record the slug a withheld surface computed, or that it computed none.
+    ///
+    /// `checkable` is the surface's own predicate for whether the slug it holds
+    /// is the one the operator wrote: a refused slug value leaves the handle
+    /// standing in for it, and a handle is not a spelling anybody proposed.
+    fn withhold_surface_slug(&mut self, slug: &Spanned<String>, checkable: bool) {
+        match checkable {
+            true => {
+                self.withheld.surface_slugs.insert(slug.value().clone());
+            }
+            false => self.withheld.slugless_surfaces += 1,
+        }
+    }
+
+    /// Record the slug a withheld `extend surface` block named, or that it
+    /// named none.
+    ///
+    /// Recorded whatever the block was refused for: which component of it did
+    /// not resolve says nothing about whether the block was the surface's
+    /// chrome, and a component that did not resolve at all cannot be asked.
+    fn withhold_contribution(&mut self, slug: Option<&Spanned<String>>) {
+        match slug {
+            Some(slug) => {
+                self.withheld
+                    .contribution_slugs
+                    .insert(slug.value().clone());
+            }
+            None => self.withheld.slugless_contributions += 1,
+        }
     }
 
     /// Record that an instantiation was declared and never expanded: whatever
@@ -2799,6 +2871,7 @@ fn mount_sites(
             under_span: Some(root.under_span.clone()),
             wrote_body: false,
             grants: None,
+            surfaces: None,
             acls: Vec::new(),
             handed: Vec::new(),
             span: root.span.clone(),
@@ -3190,6 +3263,7 @@ fn emit_item(
         // instantiation that expands it.
         Item::ConstDef(_) | Item::Component(_) | Item::Agent(_) | Item::Assembly(_) => {}
         Item::Surface(def) => emit_surface(*def, scope, classes, config, errors),
+        Item::SurfaceExt(def) => emit_surface_ext(*def, scope, classes, config, errors),
         Item::Inst(inst) => emit_inst(*inst, scope, classes, agents, config, errors),
         Item::UuidPins(pins) => {
             for pin in pins.pins {
@@ -3686,16 +3760,63 @@ fn emit_grant(stmt: GrantStmt, scope: &Scope<'_>) -> Result<RGrant, Diagnostic> 
     })
 }
 
-/// The one key a principal's body admits.
-const PRINCIPAL_GRANTS: &str = "grants";
+// A ceiling is written in two statements — a `principal` body and a stamp's own
+// body — and both read the same two keys. That is by design and not a
+// coincidence: a stamp's body narrows the principal it is `under`, so the two
+// have to spell one axis one way or an operator would move a line between them
+// and change what it means. One constant per axis is what holds them together.
+
+/// The key a ceiling names capability words with.
+const CEILING_GRANTS_KEY: &str = "grants";
+
+/// The key a ceiling names the surfaces it may place components on with.
+const CEILING_SURFACES_KEY: &str = "surfaces";
 
 /// What a principal's body is refused with when it says anything else.
 ///
-/// One sentence rather than an unknown-key listing: the legal set is a single
-/// key, and what a reader needs is what a principal *is*, not that they mistyped
-/// `grants`.
+/// One sentence rather than an unknown-key listing: the legal set is two keys
+/// and a statement, and what a reader needs is what a principal *is*, not that
+/// they mistyped `grants`.
 const PRINCIPAL_BODY_REFUSAL: &str =
-    "a principal is authority and nothing else: `grants` and `acl` lines";
+    "a principal is authority and nothing else: `grants`, `surfaces` and `acl` lines";
+
+/// The `surfaces` list of a ceiling body, as the slugs it names.
+///
+/// Resolved through the value walk rather than read off the literal, because a
+/// ceiling written inside an assembly names its surfaces through the same
+/// parameters and constants the surface heads do — the shapes
+/// `SurfaceAttrs::slug` and an `extend surface` head already accept.
+fn slug_list(
+    value: &Spanned<Value>,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Vec<Spanned<String>>> {
+    let Value::List(list) = value.value() else {
+        errors.push(Diagnostic::at(
+            format!("`{CEILING_SURFACES_KEY}` is a list of slugs, and this is not a list"),
+            value.span().clone(),
+        ));
+        return None;
+    };
+    let mut slugs = Vec::new();
+    let mut refused = false;
+    for item in &list.items {
+        match resolve_value(item, scope).and_then(|resolved| {
+            str_value(&resolved, "a slug")
+                .map(|text| Spanned::new(text.to_string(), resolved.span().clone()))
+        }) {
+            Ok(slug) => slugs.push(slug),
+            Err(error) => {
+                errors.push(error);
+                refused = true;
+            }
+        }
+    }
+    match refused {
+        true => None,
+        false => Some(slugs),
+    }
+}
 
 /// `principal ui under site { grants = [dom]; acl publish [prefix "brenn:x."]; }`.
 ///
@@ -3713,16 +3834,26 @@ fn emit_principal(
     let span = def.name.span().clone();
     let mut refused = Refused::default();
     for (key, value) in def.attrs.entries() {
-        if key != PRINCIPAL_GRANTS {
+        if key != CEILING_GRANTS_KEY && key != CEILING_SURFACES_KEY {
             errors.push(Diagnostic::at(PRINCIPAL_BODY_REFUSAL, value.span().clone()));
             refused.drop_part();
         }
     }
-    let grants = match def.attrs.get(PRINCIPAL_GRANTS) {
+    let grants = match def.attrs.get(CEILING_GRANTS_KEY) {
         Some(value) => match RWordList::from_value(value) {
             Ok(words) => Some(words),
             Err(error) => {
                 errors.push(error);
+                refused.drop_part();
+                None
+            }
+        },
+        None => None,
+    };
+    let surfaces = match def.attrs.get(CEILING_SURFACES_KEY) {
+        Some(value) => match slug_list(value, scope, errors) {
+            Some(slugs) => Some(slugs),
+            None => {
                 refused.drop_part();
                 None
             }
@@ -3755,6 +3886,7 @@ fn emit_principal(
         // Filled during attribution by the caller's `Marks`.
         origin: None,
         grants,
+        surfaces,
         acls,
         span,
         doc: def.doc,
@@ -4176,12 +4308,32 @@ fn check_scheme(text: &str, span: &Span) -> Result<(), Diagnostic> {
 /// lowering cannot police.
 pub const SURFACE_COMPONENT_KEYS: [&str; 6] = [
     COMPONENT_GRANTS,
-    "chrome",
+    SURFACE_CHROME_KEY,
     "send_burst",
     "send_refill_secs",
     SURFACE_PARKED_DEPTH,
     "config",
 ];
+
+/// The key that says a component instance is its surface's chrome.
+///
+/// The chrome is the surface's shell, a mount's contribution places panels,
+/// and every surface holds exactly one.
+pub const SURFACE_CHROME_KEY: &str = "chrome";
+
+/// Where a component instance says it is its surface's chrome, if it does.
+///
+/// Extracted so the mount refusal and the singleton count answer "is this the
+/// chrome?" one way: two hand-rolled answers to one question are two rules
+/// that come to disagree. The span is the attr's value.
+fn chrome_flag(component: &RComponentInst) -> Option<&Span> {
+    component
+        .attrs
+        .iter()
+        .find(|(key, _)| key == SURFACE_CHROME_KEY)
+        .filter(|(_, value)| matches!(value.value(), RValue::Bool(true)))
+        .map(|(_, value)| value.span())
+}
 
 /// The key of a component instance's body whose value is a depth — a count, the
 /// word `unbounded`, or a name that resolves to a count.
@@ -4744,6 +4896,7 @@ fn emit_surface(
             check_charset(&slug, Family::Surface, errors);
         }
         config.withhold(&handle, Grantable::Yes);
+        config.withhold_surface_slug(&slug, checkable);
     } else {
         config.surfaces.push(RSurface {
             handle,
@@ -4755,6 +4908,80 @@ fn emit_surface(
             doc,
         });
     }
+}
+
+/// An `extend surface` block: components bound for a surface named by slug.
+///
+/// The mirror of [`emit_surface`] for the parts a contribution has. It resolves
+/// no attrs and no acls — a contribution places components and states nothing
+/// about the surface — and it checks instance names among the block's own
+/// siblings only. Two blocks colliding on one name is the merge's refusal,
+/// because only the merge knows which surface each of them landed on.
+///
+/// A component that did not resolve withholds the whole block, as one withholds
+/// the whole surface it was written in: half a contribution is not what the
+/// author wrote, and every later pass would read it as if it were. A withheld
+/// block is recorded, as a withheld surface is: the chrome count reads absence,
+/// and a block dropped for a mistake of its own may be the one that wrote the
+/// chrome.
+fn emit_surface_ext(
+    def: SurfaceExt,
+    scope: &Scope<'_>,
+    classes: &ClassTable,
+    config: &mut Emitted,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let SurfaceExt { doc, slug, insts } = def;
+    let slug = match resolve_value(&slug, scope).and_then(|value| {
+        str_value(&value, "a slug").map(|text| Spanned::new(text.to_string(), value.span().clone()))
+    }) {
+        Ok(slug) => slug,
+        // The head named no surface this pass can know, so there is nothing to
+        // land the components on and nothing to say about them.
+        Err(error) => {
+            errors.push(error);
+            config.withhold_contribution(None);
+            return;
+        }
+    };
+    // A block that places nothing is not a placement: it would still confer the
+    // slug on its stamp, keeping a `surfaces` ceiling entry alive against the
+    // dead-config rule while capping nothing. Refused on the same terms as an
+    // empty `grants` line, and dropped rather than withheld — a block with no
+    // instances cannot have been the one that wrote the shell, so the chrome
+    // count has nothing to suppress.
+    if insts.is_empty() {
+        errors.push(Diagnostic::at(
+            format!(
+                "this block places nothing on surface `{}`; an `extend surface` block \
+                 places at least one component",
+                slug.value()
+            ),
+            slug.span().clone(),
+        ));
+        return;
+    }
+    let mut components: Vec<RComponentInst> = Vec::new();
+    let mut refused = false;
+    for inst in insts {
+        match emit_component(inst, scope, classes, &components, errors) {
+            Some((component, component_refused)) => {
+                refused |= component_refused.any();
+                components.push(component);
+            }
+            None => refused = true,
+        }
+    }
+    if refused {
+        config.withhold_contribution(Some(&slug));
+        return;
+    }
+    config.surface_exts.push(RSurfaceExt {
+        slug,
+        stamp: None,
+        components,
+        doc,
+    });
 }
 
 /// One component instance inside a surface.
@@ -6749,13 +6976,10 @@ type AssemblyTable = TemplateTable<AssemblyDef>;
 
 // ── the stamp: what a `new` against an assembly consents to ─────────────────
 
-/// The one key a stamp's ceiling admits, which is the same key an instance's
-/// capabilities are written with.
-const STAMP_CEILING_KEY: &str = "grants";
-
 /// What a stamp's body is refused with when it says anything else.
-const STAMP_BODY_REFUSAL: &str = "a stamp's body is its ceiling: `grants` and `acl` lines, \
-     which cap what the arrangement may hold; per-instance values are assembly parameters";
+const STAMP_BODY_REFUSAL: &str = "a stamp's body is its ceiling: `grants`, `surfaces` and \
+     `acl` lines, which cap what the arrangement may hold; per-instance values are assembly \
+     parameters";
 
 /// What `under` on anything but an assembly stamp is refused with.
 fn refuse_under(inst: &NewStmt, holder: &str, errors: &mut Vec<Diagnostic>) {
@@ -6831,10 +7055,11 @@ fn stamp_record(
     let mut refused = false;
     let mut acls = Vec::new();
     let mut grants = None;
+    let mut surfaces = None;
     if let Some(body) = &inst.body {
         let body = body.value();
         for (key, value) in body.attrs.entries() {
-            if key != STAMP_CEILING_KEY {
+            if key != CEILING_GRANTS_KEY && key != CEILING_SURFACES_KEY {
                 errors.push(two_site(
                     STAMP_BODY_REFUSAL,
                     value.span().clone(),
@@ -6863,13 +7088,19 @@ fn stamp_record(
             ));
             refused = true;
         }
-        if let Some(value) = body.attrs.get(STAMP_CEILING_KEY) {
+        if let Some(value) = body.attrs.get(CEILING_GRANTS_KEY) {
             match RWordList::from_value(value) {
                 Ok(words) => grants = Some(words),
                 Err(error) => {
                     errors.push(error);
                     refused = true;
                 }
+            }
+        }
+        if let Some(value) = body.attrs.get(CEILING_SURFACES_KEY) {
+            match slug_list(value, scope, errors) {
+                Some(slugs) => surfaces = Some(slugs),
+                None => refused = true,
             }
         }
         let mut dropped = Refused::default();
@@ -6922,6 +7153,7 @@ fn stamp_record(
         under: under.map(|(handle, _)| handle),
         wrote_body: inst.body.is_some(),
         grants,
+        surfaces,
         acls,
         handed,
         span: inst.handle.span().clone(),
@@ -7615,7 +7847,12 @@ impl Walk<'_> {
                         self.push(item.value().clone(), None, &frame);
                     }
                 }
-                AssemblyItem::Grant(_) => self.push(item.value().clone(), None, &frame),
+                // A contribution stamps no entity of its own: what it places
+                // lands on a surface some other block declared, and the merge
+                // is what puts it there.
+                AssemblyItem::SurfaceExt(_) | AssemblyItem::Grant(_) => {
+                    self.push(item.value().clone(), None, &frame)
+                }
             }
         }
         chain.pop();
@@ -7711,6 +7948,7 @@ fn emit_stamped(
         }
         AssemblyItem::Link(stmt) => emit_link(*stmt, &scope, config),
         AssemblyItem::Surface(def) => emit_surface(*def, &scope, classes, config, errors),
+        AssemblyItem::SurfaceExt(def) => emit_surface_ext(*def, &scope, classes, config, errors),
         AssemblyItem::Inst(inst) => emit_inst(*inst, &scope, classes, agents, config, errors),
         AssemblyItem::Grant(stmt) => match emit_grant(*stmt, &scope) {
             Ok(grant) => config.grants.push(grant),
@@ -7735,6 +7973,10 @@ fn emit_stamped(
 /// an agent arrives as an `Inst` against an agent class and telling the two
 /// apart again here would be a second copy of class resolution.
 ///
+/// The chrome arm is the third, and it is a scan rather than a count: a
+/// contribution block from a mount is legal and only a `chrome = true` inside
+/// one is not.
+///
 /// The agent arm is a backstop rather than a live path: an agent class is
 /// declarable only in a deployment document, handles do not cross an authority
 /// root, and no assembly item is an agent — so nothing a fragment can write
@@ -7746,15 +7988,15 @@ fn check_mounted_kinds(
     stamp: &RStamp,
     errors: &mut Vec<Diagnostic>,
 ) {
+    let places = match &stamp.origin {
+        // Written in the fragment itself: there is no arrangement between the
+        // text and the entity.
+        StampOrigin::Mount => format!("the config of mount `{}`", stamp.handle.dotted()),
+        StampOrigin::Assembly(name) => {
+            format!("`{}`, stamping `{}`,", stamp.handle.dotted(), name.value())
+        }
+    };
     let mut refuse = |kind: &str| {
-        let places = match &stamp.origin {
-            // Written in the fragment itself: there is no arrangement between
-            // the text and the entity.
-            StampOrigin::Mount => format!("the config of mount `{}`", stamp.handle.dotted()),
-            StampOrigin::Assembly(name) => {
-                format!("`{}`, stamping `{}`,", stamp.handle.dotted(), name.value())
-            }
-        };
         errors.push(Diagnostic::at(
             format!("{places} places {kind}; a mount's config places components and channels"),
             stamp.span.clone(),
@@ -7765,6 +8007,21 @@ fn check_mounted_kinds(
     }
     if config.agents.len() > marks.agents {
         refuse("an agent");
+    }
+    for ext in &config.surface_exts[marks.surface_exts..] {
+        for component in &ext.components {
+            let Some(span) = chrome_flag(component) else {
+                continue;
+            };
+            errors.push(Diagnostic::at(
+                format!(
+                    "{places} places `{}` as chrome; the chrome is the surface's shell, and \
+                     a mount's contribution places panels",
+                    component.instance.value()
+                ),
+                span.clone(),
+            ));
+        }
     }
 }
 
@@ -7780,6 +8037,7 @@ fn check_mounted_kinds(
 struct Marks {
     channels: usize,
     surfaces: usize,
+    surface_exts: usize,
     consumers: usize,
     agents: usize,
     grants: usize,
@@ -7797,6 +8055,9 @@ impl Marks {
         let ResolvedConfig {
             channels,
             surfaces,
+            // Written by the merge, out of the blocks emission left on
+            // `Emitted`; nothing is emitted into it.
+            contributions: _,
             consumers,
             agents,
             grants,
@@ -7832,6 +8093,7 @@ impl Marks {
         Marks {
             channels: channels.len(),
             surfaces: surfaces.len(),
+            surface_exts: config.surface_exts.len(),
             consumers: consumers.len(),
             agents: agents.len(),
             grants: grants.len(),
@@ -7853,6 +8115,16 @@ impl Marks {
             // A stamped surface's instances were written in the same body, so
             // they came out of the same stamp.
             for component in &mut surface.components {
+                component.stamp = stamp;
+            }
+        }
+        for ext in &mut config.surface_exts[self.surface_exts..] {
+            ext.stamp = stamp;
+            // The components keep the stamp after the merge lands them on a
+            // surface some other authority root may have declared, which is
+            // what fit-checks each contributed binding against the ceiling that
+            // wrote it rather than against the surface's.
+            for component in &mut ext.components {
                 component.stamp = stamp;
             }
         }
@@ -8046,6 +8318,136 @@ fn check_identity(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
         .map(|mount| named_slug(&mount.handle))
         .collect();
     check_family(mounts.iter(), Family::Mount, errors);
+}
+
+/// Land every contribution's components on the surface its slug names.
+///
+/// A surface is one thing however many blocks wrote it: after this, nothing
+/// downstream can tell a contributed component from a body one, and every
+/// per-surface rule — the derived ACL, the bindings document, the send budgets
+/// — reads the merged set. Only the authority differs, and that rides on each
+/// component's own stamp.
+///
+/// Run in the error-accumulating window rather than after a clean compile, so
+/// this must not panic on anything an operator can type. Two surfaces on one
+/// slug is a typo `check_identity` already refused; the contribution lands on
+/// the first-declared one and adds no second diagnostic.
+///
+/// **A withheld surface silences the unknown-slug refusal.** A surface goes
+/// missing from the model in two shapes — one whose own body was refused, and
+/// an instantiation that never expanded — and neither is a surface the operator
+/// failed to write. The first is recognised by the slug it computed; the second
+/// is unknowable, as is a withheld surface whose own slug value was refused, so
+/// either of those silences the refusal for every contribution. Telling a mount
+/// author their slug is wrong because the operator mistyped an argument in a
+/// surface stamp would be a second, false diagnostic about text that is right.
+fn merge_surface_exts(
+    config: &mut ResolvedConfig,
+    exts: Vec<RSurfaceExt>,
+    withheld: &Withheld,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let mut position_of: HashMap<String, usize> = HashMap::new();
+    for (position, surface) in config.surfaces.iter().enumerate() {
+        position_of
+            .entry(surface.slug.value().clone())
+            .or_insert(position);
+    }
+    // Whether a surface this document meant to hold could be missing under any
+    // slug at all.
+    let unknowable = withheld.slugless_surfaces > 0 || !withheld.prefixes.is_empty();
+    for ext in exts {
+        let RSurfaceExt {
+            slug,
+            stamp,
+            components,
+            doc: _,
+        } = ext;
+        let Some(&position) = position_of.get(slug.value()) else {
+            if !unknowable && !withheld.surface_slugs.contains(slug.value()) {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "no surface has slug `{}`; a contribution lands on a surface the \
+                         deployment declares",
+                        slug.value()
+                    ),
+                    slug.span().clone(),
+                ));
+            }
+            continue;
+        };
+        for component in components {
+            // An instance name is the runtime identity `surface:<slug>#<name>`,
+            // which the layout document and every page-side lookup spell, so it
+            // is not namespaced by whoever contributed it: two authors on one
+            // name is an address collision and refused as one.
+            let prior = config.surfaces[position]
+                .components
+                .iter()
+                .find(|sibling| sibling.instance.value() == component.instance.value())
+                .map(|sibling| sibling.instance.span().clone());
+            match prior {
+                Some(prior) => errors.push(two_site(
+                    format!(
+                        "surface `{}` already has a component `{}`, placed here",
+                        slug.value(),
+                        component.instance.value()
+                    ),
+                    component.instance.span().clone(),
+                    "first placed here",
+                    prior,
+                )),
+                None => config.surfaces[position].components.push(component),
+            }
+        }
+        config.contributions.push(RContribution { slug, stamp });
+    }
+}
+
+/// Every surface holds exactly one chrome, counted over the merged set.
+///
+/// The compile-time half of the rule `resolve_surfaces` asserts at plan. It
+/// runs after the merge because which block placed a component says nothing
+/// about the surface's shape: a body chrome and a contributed one are two
+/// chromes, and a surface whose only chrome is contributed holds one.
+///
+/// A withheld surface is not counted: it is not in the model, and a surface the
+/// operator is already being told about does not need a second sentence saying
+/// what its refused body failed to hold. Neither is a surface a withheld
+/// *contribution* named, and for the same reason in the other direction: the
+/// block that was dropped may be the one that wrote the chrome, so saying the
+/// surface has none would be a second, false diagnostic about text that is
+/// there. A contribution whose own head was refused names no surface this pass
+/// can spell, so one of those silences the count everywhere.
+fn check_chrome(config: &ResolvedConfig, withheld: &Withheld, errors: &mut Vec<Diagnostic>) {
+    let unwritten = withheld.slugless_contributions > 0;
+    for surface in &config.surfaces {
+        let mut chromes = surface.components.iter().filter_map(chrome_flag);
+        let Some(first) = chromes.next() else {
+            if !unwritten && !withheld.contribution_slugs.contains(surface.slug.value()) {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "surface `{}` has no chrome; every surface holds exactly one, and \
+                         it is the surface's shell",
+                        surface.slug.value()
+                    ),
+                    surface.slug.span().clone(),
+                ));
+            }
+            continue;
+        };
+        if let Some(second) = chromes.next() {
+            errors.push(two_site(
+                format!(
+                    "surface `{}` holds a second chrome; every surface holds exactly one",
+                    surface.slug.value()
+                ),
+                second.clone(),
+                "first chrome here",
+                first.clone(),
+            ));
+        }
+    }
 }
 
 /// Every `grant`'s target names a running entity authority can be held by.
@@ -8585,6 +8987,8 @@ fn resolve_literals(
         // held to its declaration's authority root rather than rewritten.
         uuid_pins: _,
         surfaces,
+        // A contribution's record is a slug and a stamp; neither is an address.
+        contributions: _,
         consumers,
         agents,
         remotes,

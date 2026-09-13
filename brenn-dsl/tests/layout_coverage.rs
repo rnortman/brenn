@@ -90,6 +90,7 @@ const BRACED_RULES: &[&str] = &[
     "remote_def",
     "section",
     "surface_def",
+    "surface_ext",
     "tail_block",
     "uuid_pins",
     "webhook_def",

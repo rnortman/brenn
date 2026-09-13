@@ -22,6 +22,11 @@ use support::{
 const OPEN: &str = surface_any!();
 const NEEDS_NOTHING: &str = processor_needs!("");
 
+/// The chrome every surface holds, for the fixtures whose subject is something
+/// else: the class, and the line that places it.
+const CHROME_CLASS: &str = "component Shell { abi = processor; requires = []; }\n";
+const CHROME: &str = "    new shell: Shell { chrome = true; grants = []; }\n";
+
 // ── roles: which blocks declare and which tune ───────────────────────────────
 
 #[test]
@@ -604,7 +609,7 @@ fn a_surface_instance_carries_the_kind_its_class_folds_to() {
              component P1Panel { ",
         surface_any!(),
         " optional in messages; }\n\
-             surface desk {\n    grants = [];\n    new clock: ModeClock { grants = []; }\n    \
+             surface desk {\n    grants = [];\n    new clock: ModeClock { chrome = true; grants = []; }\n    \
              new panel: P1Panel { grants = []; }\n}\n",
     ));
     assert_eq!(
@@ -646,7 +651,7 @@ fn two_panels_granting(
             format!(
                 "const marker_one = 1;\ncomponent Panel {{ {first_body} }}\n\
                  surface first {{\n    grants = [];\n    \
-                 new view: Panel {{ grants = [{first_grants}]; }}\n}}\n"
+                 new view: Panel {{ chrome = true; grants = [{first_grants}]; }}\n}}\n"
             ),
         ),
         (
@@ -654,7 +659,7 @@ fn two_panels_granting(
             format!(
                 "const marker_two = 2;\ncomponent Panel {{ {second_body} }}\n\
                  surface second {{\n    grants = [];\n    \
-                 new view: Panel {{ grants = [{second_grants}]; }}\n}}\n"
+                 new view: Panel {{ chrome = true; grants = [{second_grants}]; }}\n}}\n"
             ),
         ),
     ]
@@ -682,7 +687,7 @@ fn the_package_a_class_arrived_in_is_not_one_of_its_wire_facts() {
         format!(
             "use @{package}::Panel;\n\nconst {marker} = 1;\n\
              surface {handle} {{\n    grants = [];\n    \
-             new view: Panel {{ grants = []; }}\n}}\n"
+             new view: Panel {{ chrome = true; grants = []; }}\n}}\n"
         )
     };
     let config = derived_tree(&[
@@ -779,7 +784,8 @@ fn two_classes_disagreeing_on_optionality_are_refused() {
             format!(
                 "const {marker} = 1;\ncomponent Panel {{ {OPEN} {port} }}\n\
                  surface {surface} {{\n    grants = [];\n    \
-                 new view: Panel {{ grants = []; in messages <- \"local:brenn/m\"; }}\n}}\n"
+                 new view: Panel {{ chrome = true; grants = []; \
+                 in messages <- \"local:brenn/m\"; }}\n}}\n"
             ),
         )
     };
@@ -814,7 +820,7 @@ fn two_classes_disagreeing_on_declared_needs_are_refused() {
                 "const {marker} = 1;\ncomponent Panel {{ abi = processor; {needs} \
                  optional in messages; }}\n\
                  surface {surface} {{\n    grants = [];\n    \
-                 new view: Panel {{ grants = [log]; }}\n}}\n"
+                 new view: Panel {{ chrome = true; grants = [log]; }}\n}}\n"
             ),
         )
     };
@@ -861,7 +867,7 @@ fn two_byte_identical_classes_folding_to_one_kind_stand() {
 fn planes(classes: &str, instances: &str) -> String {
     format!(
         "channel m at \"local:alice.m\" {{\n    push_depth = 4;\n    retain_depth = 16;\n}}\n\
-         {classes}surface page {{\n    grants = [];\n{instances}}}\n"
+         {CHROME_CLASS}{classes}surface page {{\n    grants = [];\n{instances}{CHROME}}}\n"
     )
 }
 
@@ -1049,7 +1055,7 @@ fn a_literal_address_participates() {
     // agreement check as a declared channel.
     let source = format!(
         "{}{}surface page {{\n    grants = [];\n\
-             new panel: Panel {{ grants = []; in messages <- \"local:alice.m\"; }}\n\
+             new panel: Panel {{ chrome = true; grants = []; in messages <- \"local:alice.m\"; }}\n\
              new board: Board {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n",
         tagged_class("Panel", ": \"alice.panel@1\""),
         tagged_class("Board", ": \"alice.board@1\"")
@@ -1094,7 +1100,8 @@ fn a_consumers_ports_participate() {
          // ── packaged ──\n\
           component Sink {{ {NEEDS_NOTHING} in messages: \"alice.sink@1\"; }}\n\
           // ── packaged ──\n\
-         {}surface page {{\n    grants = [subscribe];\n{}}}\n\
+         {}surface page {{\n    grants = [subscribe];\n{}{CHROME}}}\n\
+         {CHROME_CLASS}\
          new sink: Sink {{\n    slug = \"sink\";\n    \n    \
          grants = [];\n    in messages <- m;\n}}\n",
         tagged_class("Panel", ": \"alice.panel@1\""),
@@ -1122,7 +1129,8 @@ fn two_surfaces_reusing_one_local_name_are_two_channels() {
     let page = |surface: &str, class: &str| {
         format!(
             "surface {surface} {{\n    grants = [];\n    \
-             new view: {class} {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n"
+             new view: {class} {{ chrome = true; grants = []; \
+             in messages <- \"local:alice.m\"; }}\n}}\n"
         )
     };
     let source = format!(
@@ -1145,7 +1153,7 @@ fn a_page_local_name_and_a_server_local_name_are_two_channels() {
          component Sink {{ {NEEDS_NOTHING} in messages: \"alice.sink@1\"; }}\n\
          // ── packaged ──\n\
          {}surface page {{\n    grants = [];\n    \
-         new panel: Panel {{ grants = []; in messages <- \"local:alice.m\"; }}\n}}\n\
+         new panel: Panel {{ chrome = true; grants = []; in messages <- \"local:alice.m\"; }}\n}}\n\
          new sink: Sink {{\n    slug = \"sink\";\n    \n    \
          grants = [];\n    in messages <- \"local:alice.m\";\n}}\n",
         tagged_class("Panel", ": \"alice.panel@1\""),
@@ -1183,7 +1191,7 @@ fn expecting(tag: &str) -> String {
 #[test]
 fn a_channel_doctype_a_port_matches_stands() {
     let source = format!(
-        "{}{}surface page {{\n    grants = [];\n{}}}\n",
+        "{CHROME_CLASS}{}{}surface page {{\n    grants = [];\n{}{CHROME}}}\n",
         expecting("alice.panel@1"),
         tagged_class("Panel", ": \"alice.panel@1\""),
         tagged_inst("panel", "Panel"),
@@ -1194,7 +1202,7 @@ fn a_channel_doctype_a_port_matches_stands() {
 #[test]
 fn a_channel_doctype_a_port_contradicts_is_refused() {
     let source = format!(
-        "{}{}surface page {{\n    grants = [];\n{}}}\n",
+        "{CHROME_CLASS}{}{}surface page {{\n    grants = [];\n{}{CHROME}}}\n",
         expecting("alice.board@1"),
         tagged_class("Panel", ": \"alice.panel@1\""),
         tagged_inst("panel", "Panel"),
@@ -1222,7 +1230,7 @@ fn a_channel_doctype_over_disagreeing_ports_says_both_things() {
     // other, and the one that does not match the channel disagrees with the
     // channel too. Both are true and both are reported.
     let source = format!(
-        "{}{}{}surface page {{\n    grants = [];\n{}{}}}\n",
+        "{CHROME_CLASS}{}{}{}surface page {{\n    grants = [];\n{}{}{CHROME}}}\n",
         expecting("alice.panel@1"),
         tagged_class("Panel", ": \"alice.panel@1\""),
         tagged_class("Board", ": \"alice.board@1\""),
@@ -1263,7 +1271,7 @@ fn a_channel_doctype_with_no_doctyped_port_is_inert() {
     // Deliberately not dead config: the attr exists to catch a *future* binding,
     // so an expectation awaiting components is the state it is written in.
     let source = format!(
-        "{}{}surface page {{\n    grants = [];\n{}}}\n",
+        "{CHROME_CLASS}{}{}surface page {{\n    grants = [];\n{}{CHROME}}}\n",
         expecting("alice.panel@1"),
         tagged_class("Panel", ""),
         tagged_inst("panel", "Panel"),
@@ -1368,7 +1376,7 @@ assembly Pod(slug: String) {
     surface page {
         slug = slug;
         grants = [];
-        new panel: Panel { grants = []; in messages <- messages; }
+        new panel: Panel { chrome = true; grants = []; in messages <- messages; }
         new board: Board { grants = []; in messages <- messages; }
     }
 }

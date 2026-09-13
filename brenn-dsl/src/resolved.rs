@@ -52,6 +52,10 @@ pub struct ResolvedConfig {
     /// here.
     pub uuid_pins: Vec<RPin>,
     pub surfaces: Vec<RSurface>,
+    /// What each merged contribution was: the slug it landed on and the stamp
+    /// the block was expanded inside. The record the merge leaves behind, which
+    /// is what tells a ceiling that a stamp places on a surface.
+    pub contributions: Vec<RContribution>,
     /// Top-level component instances.
     pub consumers: Vec<RConsumer>,
     pub agents: Vec<RAgent>,
@@ -435,6 +439,30 @@ pub struct RSurface {
     pub doc: Option<DocComment>,
 }
 
+/// An `extend surface` block: components bound for a surface named by slug.
+///
+/// Emission-time only. The merge lands its components on the surface its slug
+/// names and keeps nothing but an [`RContribution`], because a surface is one
+/// thing however many blocks wrote it and every pass after the merge reads
+/// [`RSurface::components`].
+#[derive(Debug, PartialEq)]
+pub struct RSurfaceExt {
+    /// The surface these components land on. Its span is the block's head, and
+    /// the site every refusal about the block cites.
+    pub slug: Spanned<String>,
+    /// The recorded stamp this block was expanded inside.
+    pub stamp: Option<StampId>,
+    pub components: Vec<RComponentInst>,
+    pub doc: Option<DocComment>,
+}
+
+/// One merged contribution: which surface it landed on, and whose it was.
+#[derive(Debug, PartialEq)]
+pub struct RContribution {
+    pub slug: Spanned<String>,
+    pub stamp: Option<StampId>,
+}
+
 /// One `call` port wired to one peer's `sync` port.
 ///
 /// The target is resolved to the peer's own name at its placement — a surface
@@ -470,7 +498,9 @@ pub struct RCall {
 pub struct RComponentInst {
     /// The `new` handle, which is the runtime's instance name.
     pub instance: Spanned<String>,
-    /// The recorded stamp the enclosing surface was expanded inside.
+    /// The recorded stamp the block that placed this component was expanded
+    /// inside — the surface's for a body instance, the contribution's
+    /// otherwise.
     pub stamp: Option<StampId>,
     pub class: ClassRef,
     /// The parked window, in the count-or-word form a depth is written in.
@@ -750,9 +780,10 @@ pub struct RRemote {
 
 /// A bare principal: a declared bundle of authority with no running body.
 ///
-/// Two axes, each written or inherited: the `grants` words and the reach its
-/// `acl` lines state. What it comes to, and that it holds no more than the
-/// principal it is under, is derivation's — this side carries the text.
+/// Three axes, each written or inherited: the `grants` words, the surfaces its
+/// `surfaces` line names, and the reach its `acl` lines state. What it comes
+/// to, and that it holds no more than the principal it is under, is
+/// derivation's — this side carries the text.
 #[derive(Debug, PartialEq)]
 pub struct RPrincipal {
     pub handle: HandlePath,
@@ -769,6 +800,9 @@ pub struct RPrincipal {
     /// The words it writes, or `None` where it writes no `grants` line and
     /// inherits the axis.
     pub grants: Option<RWordList>,
+    /// The surfaces it may place components on, or `None` where it writes no
+    /// `surfaces` line and inherits the axis. Each entry is a slug.
+    pub surfaces: Option<Vec<Spanned<String>>>,
     pub acls: Vec<RAcl>,
     /// Where the name is written: what a refusal about the whole principal
     /// cites.
@@ -832,6 +866,9 @@ pub struct RStamp {
     /// The words the ceiling writes, or `None` where it writes no `grants`
     /// line and inherits the axis.
     pub grants: Option<RWordList>,
+    /// The surfaces the ceiling writes, or `None` where it writes no
+    /// `surfaces` line and inherits the axis.
+    pub surfaces: Option<Vec<Spanned<String>>>,
     pub acls: Vec<RAcl>,
     /// Channels handed in as `Channel` arguments — reach the deployer consented
     /// to by naming them.

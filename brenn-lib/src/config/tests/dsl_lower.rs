@@ -275,6 +275,14 @@ fn placed_component(kind: &str) -> SurfaceComponentRaw {
     }
 }
 
+/// The same, for the instance a fixture's surface holds as its chrome.
+fn chrome_component(kind: &str) -> SurfaceComponentRaw {
+    SurfaceComponentRaw {
+        chrome: true,
+        ..placed_component(kind)
+    }
+}
+
 /// The same, for an instance whose class declares outbound ports: the `out` and
 /// `io` names lowering carries beside the bindings, sorted.
 fn placed_component_declaring(kind: &str, out_ports: &[&str]) -> SurfaceComponentRaw {
@@ -3031,6 +3039,7 @@ surface alice_desk {
     grants = [subscribe, publish];
 
     new panel: Panel {
+        chrome = true;
         grants = [ports];
         io acks <-> acks;
     }
@@ -3985,6 +3994,7 @@ surface alice_desk {
     acl subscribe [prefix "ephemeral:alice-desk."];
 
     new panel: Panel {
+        chrome = true;
         grants = [];
         acl subscribe [prefix "ephemeral:alice-desk."];
         in messages <- cmd;
@@ -4000,7 +4010,7 @@ surface alice_desk {
             }],
             surfaces: vec![SurfaceConfigRaw {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Prefix("alice-desk.".to_string())],
-                components: vec![placed_component("panel")],
+                components: vec![chrome_component("panel")],
                 subscriptions: vec![surface_input(
                     "panel",
                     "messages",
@@ -4036,6 +4046,7 @@ surface alice_desk {
     grants = [subscribe, publish];
 
     new panel: Panel {
+        chrome = true;
         grants = [ports];
         io acks <-> acks {
             push_depth = 1;
@@ -4064,6 +4075,7 @@ surface alice_desk {
                 )],
                 components: vec![SurfaceComponentRaw {
                     grants: vec![ComponentGrant::Ports],
+                    chrome: true,
                     ..placed_component_declaring("panel", &["acks"])
                 }],
                 subscriptions: vec![SurfaceSubscriptionRaw {
@@ -4112,6 +4124,7 @@ surface alice_desk {
     grants = [subscribe, publish];
 
     new panel: Panel {
+        chrome = true;
         grants = [ports];
         io acks <-> acks;
     }
@@ -4133,6 +4146,7 @@ surface alice_desk {
                 )],
                 components: vec![SurfaceComponentRaw {
                     grants: vec![ComponentGrant::Ports],
+                    chrome: true,
                     ..placed_component_declaring("panel", &["acks"])
                 }],
                 subscriptions: vec![surface_input("panel", "acks", "ephemeral:alice-desk.acks")],
@@ -4186,6 +4200,7 @@ surface alice_desk {
     grants = [subscribe];
 
     new panel: Panel {
+        chrome = true;
         grants = [];
         in messages <- messages;
     }
@@ -4202,7 +4217,10 @@ surface alice_desk {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-desk.messages".to_string(),
                 )],
-                components: vec![placed_component_declaring("panel", &["outbound", "tick"])],
+                components: vec![SurfaceComponentRaw {
+                    chrome: true,
+                    ..placed_component_declaring("panel", &["outbound", "tick"])
+                }],
                 subscriptions: vec![surface_input(
                     "panel",
                     "messages",
@@ -4240,6 +4258,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        chrome = true;
         grants = [];
         in heard <- utterance { push_depth = 2; }
     }
@@ -4256,7 +4275,7 @@ surface alice_pod {
                 ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                     "alice-pod.utterance".to_string(),
                 )],
-                components: vec![placed_component("widget")],
+                components: vec![chrome_component("widget")],
                 subscriptions: vec![SurfaceSubscriptionRaw {
                     push_depth: Some(Depth::Bounded(2)),
                     ..surface_input("widget", "heard", "ephemeral:alice-pod.utterance")
@@ -4307,6 +4326,7 @@ surface alice_desk {
     skin = "bench";
 
     new panel: Panel {
+        chrome = true;
         grants = [];
         in messages <- alerts { push_depth = 4; }
     }
@@ -4317,6 +4337,7 @@ surface bob_desk {
     skin = "lab";
 
     new board: Board {
+        chrome = true;
         grants = [];
         in feed <- presence { push_depth = 2; }
     }
@@ -4342,7 +4363,7 @@ surface bob_desk {
                 SurfaceConfigRaw {
                     skin: Some("bench".to_string()),
                     subscribe_acl: vec![ChannelMatcherRaw::Exact("alice-alerts".to_string())],
-                    components: vec![placed_component("panel")],
+                    components: vec![chrome_component("panel")],
                     subscriptions: vec![SurfaceSubscriptionRaw {
                         push_depth: Some(Depth::Bounded(4)),
                         ..surface_input("panel", "messages", "brenn:alice-alerts")
@@ -4354,7 +4375,7 @@ surface bob_desk {
                     ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
                         "alice-desk.presence".to_string(),
                     )],
-                    components: vec![placed_component("board")],
+                    components: vec![chrome_component("board")],
                     subscriptions: vec![SurfaceSubscriptionRaw {
                         push_depth: Some(Depth::Bounded(2)),
                         ..surface_input("board", "feed", "ephemeral:alice-desk.presence")
@@ -4391,6 +4412,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        chrome = true;
         grants = [];
         in heard <- utterance { push_depth = 2; amplification = 0.5; }
     }
@@ -4404,7 +4426,7 @@ surface alice_pod {
     );
     assert_eq!(
         refusal.line_col(),
-        Some((17, 65)),
+        Some((18, 65)),
         "the span is the refused key's own value: {}",
         refusal.render()
     );
@@ -4433,6 +4455,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        chrome = true;
         grants = [ports];
         in heard <- utterance { push_depth = 2; }
         io tick { push_depth = 1; retain_depth = 2; amplification = 0.5; }
@@ -4448,7 +4471,7 @@ surface alice_pod {
     );
     assert_eq!(
         refusal.line_col(),
-        Some((19, 69)),
+        Some((20, 69)),
         "the span is the refused key's own value: {}",
         refusal.render()
     );
@@ -4476,6 +4499,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        chrome = true;
         grants = [];
         in heard <- utterance { push_depth = 2; amplification = "half"; }
     }
@@ -4513,6 +4537,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        chrome = true;
         grants = [];
         parked_batch_depth = -1;
 
@@ -4549,6 +4574,7 @@ surface alice_pod {
     grants = [subscribe];
 
     new widget: Widget {
+        chrome = true;
         grants = [];
         config = { depth = 3 };
 
@@ -5463,7 +5489,7 @@ fn a_surface_call_binding_lowers_to_the_surfaces_call_table() {
         "    call lookup;\n}\n",
         "// ── packaged ──\n",
         "surface kiosk {\n    grants = [];\n",
-        "    new geo: Geocoder { grants = []; }\n",
+        "    new geo: Geocoder { chrome = true; grants = []; }\n",
         "    new menu: Menu { grants = [];\n",
         "        call lookup -> geo.resolve;\n    }\n",
         "}\n",
@@ -5563,7 +5589,7 @@ fn a_link_lowers_to_its_endpoint_set() {
             // The surface states no rights: what a link's endpoints need is
             // injected at boot, once the channel it places exists.
             "    grants = [];\n",
-            "    new view: Panel {{\n",
+            "    new view: Panel {{\n        chrome = true;\n",
             "        grants = [ports];\n",
             "        in feed <- relay {{ push_depth = 8; retain_depth = 16; }}\n",
             "        io chatter <-> relay {{ push_depth = 2; retain_depth = 4; }}\n",
@@ -6118,5 +6144,87 @@ fn a_bare_agent_with_accounts_is_refused() {
         diagnostic.message.contains("--bare"),
         "{}",
         diagnostic.render(),
+    );
+}
+
+/// A surface written by three blocks lowers as one: the body's instances first,
+/// then each contribution's in document order. A contributed component is
+/// indistinguishable from a body one on the wire — instance, kind, chrome flag
+/// and the hash of the file its class was declared in — which is what lets the
+/// bindings document and the page manifest stay the shape they were.
+///
+/// The order is what the kernel compares documents by and what
+/// `principal_send_budgets` walks, so it is asserted rather than sorted.
+#[test]
+fn a_surface_lowers_its_contributions_after_its_body_in_block_order() {
+    assert_lowers(
+        concat!(
+            r#"
+channel utterance at "ephemeral:alice-pod.utterance" {
+    push_depth = 4;
+    retain_depth = 16;
+}
+
+component Widget {
+    "#,
+            surface_any!(),
+            r#"
+    optional in heard;
+}
+
+surface alice_pod {
+    slug = "alice-pod";
+    grants = [subscribe];
+
+    new shell: Widget {
+        chrome = true;
+        grants = [];
+        in heard <- utterance;
+    }
+}
+
+extend surface "alice-pod" {
+    new second: Widget { grants = []; }
+}
+
+extend surface "alice-pod" {
+    new third: Widget { grants = []; }
+}
+"#
+        ),
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(4)),
+                retain_depth: Some(Depth::Bounded(16)),
+                ..channel_at("ephemeral:alice-pod.utterance")
+            }],
+            surfaces: vec![SurfaceConfigRaw {
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-pod.utterance".to_string(),
+                )],
+                components: vec![
+                    SurfaceComponentRaw {
+                        instance: Some("shell".to_string()),
+                        chrome: true,
+                        ..SurfaceComponentRaw::minimal("widget")
+                    },
+                    SurfaceComponentRaw {
+                        instance: Some("second".to_string()),
+                        ..SurfaceComponentRaw::minimal("widget")
+                    },
+                    SurfaceComponentRaw {
+                        instance: Some("third".to_string()),
+                        ..SurfaceComponentRaw::minimal("widget")
+                    },
+                ],
+                subscriptions: vec![surface_input(
+                    "shell",
+                    "heard",
+                    "ephemeral:alice-pod.utterance",
+                )],
+                ..surface("alice-pod", vec![AttachGrant::EphemeralSubscribe])
+            }],
+            ..Default::default()
+        },
     );
 }

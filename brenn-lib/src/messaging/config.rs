@@ -4353,7 +4353,11 @@ channel demo at "ephemeral:protobar-demo" {
     /// dropped into a narrower posture than the operator wrote.
     #[test]
     fn an_unknown_surface_grant_word_is_refused() {
-        let diag = sole_refusal("surface bare { grants = [not_a_grant]; }");
+        let diag = sole_refusal(concat!(
+            "component Shell { abi = processor; requires = []; }\n",
+            "surface bare { grants = [not_a_grant]; \
+             new shell: Shell { chrome = true; grants = []; } }\n",
+        ));
         assert!(
             diag.render().contains("not_a_grant"),
             "the refusal must name the bad word, got: {}",

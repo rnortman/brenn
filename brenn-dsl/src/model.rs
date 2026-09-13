@@ -81,6 +81,7 @@ pub enum Item {
     Channel(Box<ChannelDef>),
     Link(Box<LinkStmt>),
     Surface(Box<SurfaceDef>),
+    SurfaceExt(Box<SurfaceExt>),
     Inst(Box<NewStmt>),
     Remote(Box<RemoteDef>),
     Principal(Box<PrincipalDef>),
@@ -124,6 +125,7 @@ impl File {
         channels => Channel(ChannelDef),
         links => Link(LinkStmt),
         surfaces => Surface(SurfaceDef),
+        surface_exts => SurfaceExt(SurfaceExt),
         instantiations => Inst(NewStmt),
         remotes => Remote(RemoteDef),
         principals => Principal(PrincipalDef),
@@ -153,6 +155,7 @@ impl AssemblyDef {
         channels => Channel(ChannelDef),
         links => Link(LinkStmt),
         surfaces => Surface(SurfaceDef),
+        surface_exts => SurfaceExt(SurfaceExt),
         instantiations => Inst(NewStmt),
         grants => Grant(GrantStmt),
         }
@@ -172,6 +175,7 @@ pub enum AssemblyItem {
     Channel(Box<ChannelDef>),
     Link(Box<LinkStmt>),
     Surface(Box<SurfaceDef>),
+    SurfaceExt(Box<SurfaceExt>),
     Inst(Box<NewStmt>),
     Grant(Box<GrantStmt>),
 }
@@ -358,6 +362,21 @@ pub struct SurfaceDef {
     pub name: Spanned<String>,
     pub attrs: SurfaceAttrs,
     pub acls: Vec<AclStmt>,
+    pub insts: Vec<NewStmt>,
+}
+
+/// `extend surface "alice-desk" { new weather: Weather { ... } }`.
+///
+/// Components placed on a surface some other block declares. The surface is
+/// named by its slug, which is the one spelling of it that crosses an authority
+/// boundary; the body takes instances and nothing else.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceExt {
+    pub doc: Option<DocComment>,
+    /// The slug of the surface these components land on, in any string-typed
+    /// value form: a literal, an f-string, a `const`, a `String` parameter.
+    pub slug: Spanned<Value>,
     pub insts: Vec<NewStmt>,
 }
 

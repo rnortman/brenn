@@ -271,6 +271,7 @@ mod tests {
     use brenn_dsl::fixture_text::processor_header;
     use brenn_dsl::processor_needs;
     use brenn_lib::config::{DocumentInputs, RootList};
+    use brenn_lib::messaging::ComponentGrant;
     use brenn_lib::messaging::config::Depth;
     // The counterpart constant, read only here: these tests are what hold it
     // disjoint from `REFUSAL_PREFIXES`.
@@ -1673,6 +1674,267 @@ new alice: Assistant();
     #[test]
     fn brenn_e2e_brenn_binds_to_its_packaged_specs() {
         shipped_config_binds_to_its_packaged_specs("brenn.e2e.brenn");
+    }
+
+    /// Every reserved control plane a chrome instance binds, and at which depth.
+    ///
+    /// Read against [`RESERVED_LOCAL_CHANNELS`] rather than instead of it: the
+    /// set comparison below is what notices a plane the kernel adds, and this
+    /// table is what notices a direction or a depth that moved.
+    const CHROME_INBOUND_PLANES: &[(&str, &str, u64)] = &[
+        (brenn_surface_schema::LOCAL_THEME_CHANNEL, "theme", 1),
+        (brenn_surface_schema::LOCAL_TAKEOVER_CHANNEL, "takeover", 8),
+        (
+            brenn_surface_schema::LOCAL_LINK_STATE_CHANNEL,
+            "link-state",
+            1,
+        ),
+        (
+            brenn_surface_schema::LOCAL_SURFACE_STATE_CHANNEL,
+            "surface-state",
+            1,
+        ),
+        (brenn_surface_schema::LOCAL_TOAST_CHANNEL, "toast", 8),
+    ];
+
+    /// The capability words a chrome instance holds, in `ComponentGrant`'s own
+    /// order.
+    const CHROME_GRANTS: &[ComponentGrant] = &[
+        ComponentGrant::Ports,
+        ComponentGrant::Log,
+        ComponentGrant::Takeover,
+        ComponentGrant::Dom,
+        ComponentGrant::PageDom,
+    ];
+
+    /// Every shipped page's chrome is wired whole, and holds exactly the words
+    /// the wiring needs.
+    ///
+    /// The six in-tree chromes are one `StandardChrome` body, so one edit
+    /// reaches every page here and every downstream root that stamps it — and
+    /// an omitted plane is not refused anywhere
+    /// (`TODO(chrome-missing-reserved-plane-silent)`): deleting a binding from
+    /// the assembly boots, renders, and goes quiet. The grants half is the same
+    /// argument about authority: widening the set the assembly reaches is
+    /// mechanical across the stamps, so the widening must cost a deliberate
+    /// edit here rather than passing green.
+    fn shipped_config_chrome_is_wired_whole(filename: &str) {
+        let root = repo_root();
+        let inputs = DocumentInputs::with_modules(root.join(filename), root.join("config/specs"));
+        let config = check_config(&inputs)
+            .unwrap_or_else(|report| panic!("{filename} must compile: {report}"))
+            .config;
+        assert!(
+            !config.surfaces.is_empty(),
+            "{filename} declares no surface; this test is reading the wrong document"
+        );
+        for surface in &config.surfaces {
+            let slug = &surface.slug;
+            let chromes: Vec<_> = surface.components.iter().filter(|c| c.chrome).collect();
+            assert_eq!(
+                chromes.len(),
+                1,
+                "{filename}: surface {slug} holds {} chrome components",
+                chromes.len(),
+            );
+            let chrome = chromes[0];
+            let instance = chrome.instance.as_deref().unwrap_or(&chrome.kind);
+
+            let mut grants = chrome.grants.clone();
+            grants.sort();
+            grants.dedup();
+            assert_eq!(
+                grants, CHROME_GRANTS,
+                "{filename}: surface {slug}'s chrome {instance} holds a different grant set; \
+                 a chrome's authority is the widest on a page and moves only on purpose",
+            );
+
+            // Every reserved plane, in either direction, against the contract's
+            // own list — so a plane the kernel adds goes red here instead of
+            // going quiet on six pages.
+            let mut bound: Vec<&str> = surface
+                .subscriptions
+                .iter()
+                .filter(|s| s.instance == instance)
+                .filter_map(|s| s.channel.as_deref())
+                .chain(
+                    surface
+                        .outputs
+                        .iter()
+                        .filter(|o| o.instance == instance)
+                        .filter_map(|o| o.channel.as_deref()),
+                )
+                .filter(|address| brenn_surface_schema::is_reserved_local_namespace(address))
+                .collect();
+            bound.sort_unstable();
+            bound.dedup();
+            let mut expected: Vec<&str> = brenn_surface_schema::RESERVED_LOCAL_CHANNELS
+                .iter()
+                .map(|plane| plane.address)
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(
+                bound, expected,
+                "{filename}: surface {slug}'s chrome {instance} does not bind every reserved \
+                 control plane; an omitted one boots and goes quiet",
+            );
+
+            for (address, port, push) in CHROME_INBOUND_PLANES {
+                let sub = surface
+                    .subscriptions
+                    .iter()
+                    .find(|s| s.instance == instance && s.port == *port)
+                    .unwrap_or_else(|| {
+                        panic!("{filename}: surface {slug}'s chrome binds no `in {port}`")
+                    });
+                assert_eq!(
+                    sub.channel.as_deref(),
+                    Some(*address),
+                    "{filename}: surface {slug}'s chrome binds `in {port}` elsewhere",
+                );
+                assert_eq!(
+                    sub.push_depth,
+                    Some(Depth::Bounded(*push)),
+                    "{filename}: surface {slug}'s chrome binds `in {port}` at another depth",
+                );
+            }
+            let overlay = surface
+                .outputs
+                .iter()
+                .find(|o| o.instance == instance && o.port == "overlay-state")
+                .unwrap_or_else(|| {
+                    panic!("{filename}: surface {slug}'s chrome binds no `out overlay-state`")
+                });
+            assert_eq!(
+                overlay.channel.as_deref(),
+                Some(brenn_surface_schema::LOCAL_OVERLAY_STATE_CHANNEL),
+                "{filename}: surface {slug}'s chrome reports overlay holdership elsewhere",
+            );
+
+            // The layout channel is the caller's, so its address is not pinned
+            // — but its realm is. A `local:` address on a surface binding names
+            // a page ring the kernel mints from the binding; a `local:` channel
+            // declaration names a server ring nothing on the page can reach, so
+            // a handle joining the two renders the default layout forever and
+            // refuses nothing (`TODO(surface-local-binding-joins-two-realms)`).
+            let layout = surface
+                .subscriptions
+                .iter()
+                .find(|s| s.instance == instance && s.port == "layout")
+                .unwrap_or_else(|| {
+                    panic!("{filename}: surface {slug}'s chrome binds no `in layout`")
+                });
+            let address = layout.channel.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "{filename}: surface {slug}'s layout binding is a free port; the stamp \
+                     supplies the channel"
+                )
+            });
+            assert!(
+                !address.starts_with("local:"),
+                "{filename}: surface {slug}'s chrome takes its layout from {address}, a page \
+                 ring nothing off the page can publish onto",
+            );
+            assert_eq!(
+                layout.push_depth,
+                Some(Depth::Bounded(1)),
+                "{filename}: surface {slug}'s chrome binds `in layout` at another depth",
+            );
+
+            for (port, push, retain) in [("toast-tick", 1, 2), ("state", 0, 1)] {
+                let io = surface
+                    .io_ports
+                    .iter()
+                    .find(|p| p.instance == instance && p.port == port)
+                    .unwrap_or_else(|| {
+                        panic!("{filename}: surface {slug}'s chrome declares no `io {port}`")
+                    });
+                assert_eq!(
+                    io.channel, None,
+                    "{filename}: surface {slug}'s chrome's `io {port}` names a channel; it is \
+                     the instance's own",
+                );
+                assert_eq!(
+                    (io.push_depth, io.retain_depth),
+                    (Some(Depth::Bounded(push)), Some(Depth::Bounded(retain))),
+                    "{filename}: surface {slug}'s chrome declares `io {port}` at other depths",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn brenn_dev_brenn_chrome_is_wired_whole() {
+        shipped_config_chrome_is_wired_whole("brenn.dev.brenn");
+    }
+
+    #[test]
+    fn brenn_e2e_brenn_chrome_is_wired_whole() {
+        shipped_config_chrome_is_wired_whole("brenn.e2e.brenn");
+    }
+
+    /// The e2e retire block excises a compilable document.
+    ///
+    /// `e2e/tests/surface-reload.spec.ts` deletes the marked region of
+    /// `brenn.e2e.brenn` and reloads the server, and that spec is hand-run
+    /// (`TODO(e2e-in-ci)`). The region holds three coupled declarations —
+    /// the surface, the `StandardChrome` stamp that supplies its chrome, and
+    /// the layout channel that stamp takes as an argument — so an edit that
+    /// leaves one of them outside the markers strands a stamp placing on a
+    /// surface the document no longer declares. This performs the same excision
+    /// and compiles the result.
+    #[test]
+    fn the_e2e_retire_block_excises_a_document_that_still_compiles() {
+        let root = repo_root();
+        let path = root.join("brenn.e2e.brenn");
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+        // The excision `retireFeeder` performs, transcribed: from the head of
+        // the doc comment introducing the begin marker to just past the end
+        // marker.
+        let begin = doc
+            .find("// e2e:retire-block:begin")
+            .expect("brenn.e2e.brenn carries a retire-block begin marker");
+        let end_marker = "// e2e:retire-block:end\n";
+        let end = doc
+            .find(end_marker)
+            .expect("brenn.e2e.brenn carries a retire-block end marker");
+        let head = doc[..begin]
+            .rfind("\n\n")
+            .expect("the marked region is preceded by a blank line");
+        let retired = format!("{}{}", &doc[..head + 1], &doc[end + end_marker.len()..]);
+        // The description stamp and the uuid pins for the feeder's slug live
+        // outside the markers on purpose and survive the excision; the three
+        // declarations the spec retires do not.
+        for retired_text in [
+            "surface bar-feeder",
+            "bar_feeder_chrome",
+            "channel bar_feeder_layout",
+        ] {
+            assert!(
+                !retired.contains(retired_text),
+                "the excision left `{retired_text}` behind; the markers no longer bracket the \
+                 surface, its chrome stamp and the layout channel that stamp takes"
+            );
+        }
+
+        // `use config::bar::*;` resolves against the document's own directory,
+        // so the excised copy needs that tree beside it.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let config_tree = std::fs::canonicalize(root.join("config"))
+            .expect("the config tree resolves; a relative link target would not");
+        std::os::unix::fs::symlink(config_tree, dir.path().join("config"))
+            .expect("the config tree is linkable");
+        let file = dir.path().join("brenn.e2e.brenn");
+        std::fs::write(&file, &retired).expect("the excised document is writable");
+        assert!(
+            run_config_check(
+                &file,
+                &Roots::modules(vec![root.join("config/specs")].into(), Vec::new())
+            ),
+            "brenn.e2e.brenn with its retire block excised must still compile; the surface \
+             reload spec deletes exactly this text against a live server"
+        );
     }
 
     fn repo_root() -> PathBuf {

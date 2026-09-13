@@ -813,6 +813,80 @@ fn the_same_assembly_stamped_by_the_deployment_is_fine() {
     .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
 }
 
+/// A fragment's `extend surface` block reaches the item-level discipline: a
+/// contribution is not one of the entities a mount may not write, and it is the
+/// authority pass that decides which surfaces this mount may place on.
+///
+/// Resolution alone is what this asserts — the ceiling in this suite's root
+/// writes no `surfaces` line, so the block is refused at derivation, which the
+/// `surfaces`-axis cases below assert.
+#[test]
+fn a_fragments_contribution_resolves_and_lands_on_the_merged_surface() {
+    let config = compile_with_mount(
+        &[
+            (
+                "",
+                &format!("use @inner::*;\n\n{CEILING}new page: Inner(slug = \"demo\");\n"),
+            ),
+            ("@inner", INNER),
+        ],
+        "automations",
+        "automator",
+        &[(
+            "",
+            &format!(
+                "use @inner::*;\n\n{}\nextend surface \"demo\" {{\n  \
+                 new extra: Panel {{ grants = [dom]; in messages <- digest; }}\n}}\n",
+                durable("digest", "brenn:automations.digest")
+            ),
+        )],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    let [surface] = &config.surfaces[..] else {
+        panic!("one surface");
+    };
+    let names: Vec<&str> = surface
+        .components
+        .iter()
+        .map(|component| component.instance.value().as_str())
+        .collect();
+    assert_eq!(names, ["panel", "extra"]);
+    // The contributed component keeps the mount's stamp, not the surface's:
+    // after the merge one surface holds components from two authority roots.
+    assert_eq!(surface.components[1].stamp, Some(StampId(0)));
+}
+
+/// The same block written by the deployment lands: what this rule is about is
+/// the authority root the block was expanded in.
+#[test]
+fn the_deployment_places_on_its_own_surface_from_anywhere() {
+    let config = compile_with_mount(
+        &[
+            (
+                "",
+                &format!(
+                    "use @inner::*;\n\n{CEILING}new page: Inner(slug = \"demo\");\n\n\
+                     extend surface \"demo\" {{\n  \
+                     new extra: Panel {{ grants = [dom]; in messages <- page.out; }}\n}}\n"
+                ),
+            ),
+            ("@inner", INNER),
+        ],
+        "automations",
+        "automator",
+        &[("", &durable("digest", "brenn:automations.digest"))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    let [surface] = &config.surfaces[..] else {
+        panic!("one surface");
+    };
+    assert_eq!(surface.components.len(), 2);
+    assert_eq!(
+        surface.components[1].stamp, None,
+        "the contribution is the deployment's own text"
+    );
+}
+
 /// A packaged arrangement placing a surface, for the two tests above.
 const INNER: &str = "\
 component Panel { abi = processor; requires = [dom]; in messages; }
@@ -822,7 +896,7 @@ assembly Inner(slug: String) {
     surface page {
         slug = slug;
         grants = [subscribe];
-        new panel: Panel { grants = [dom]; in messages <- out; }
+        new panel: Panel { chrome = true; grants = [dom]; in messages <- out; }
     }
 }
 ";
@@ -1742,4 +1816,600 @@ fn a_linked_tree_module_is_refused_whether_or_not_its_target_exists() {
 #[cfg(unix)]
 fn rendered(errors: &[Diagnostic]) -> Vec<String> {
     errors.iter().map(|error| error.render()).collect()
+}
+
+// ── the `surfaces` axis over a mount ─────────────────────────────────────────
+//
+// A mount's contributions land where its principal's `surfaces` are written and
+// nowhere else. The axis is the operator's line in the deployment's own text;
+// the fragment names the surface by slug, which is the contract across the
+// boundary.
+
+/// A packaged module holding the one class the placement fixtures instantiate.
+const PANEL: &str = "component Tile { abi = processor; requires = [dom]; in messages; }\n";
+
+/// A packaged assembly whose body is a contribution placing a shell, for the
+/// case where the block reaching a fragment is one the fragment stamps rather
+/// than one it wrote.
+const SHELL_PLACER: &str = "\
+assembly PlaceShell(slug: String, feed: Channel) {
+    extend surface f\"{slug}\" {
+        new extra: Tile { chrome = true; grants = [dom]; in messages <- feed; }
+    }
+}
+";
+
+/// A deployment declaring one surface of its own and a ceiling with the
+/// `surfaces` line a case writes.
+///
+/// The surface is written in the root's own text rather than stamped from an
+/// assembly, so the only recorded stamp in the document is the mount's and the
+/// sole fit refusal is the one a case is about.
+fn placement_root(axis: &str) -> String {
+    placement_root_with(axis, "chrome = true; ")
+}
+
+/// The same, with `demo`'s body chrome written by the caller: the one test that
+/// puts the chrome in a contribution needs the body to hold none.
+fn placement_root_with(axis: &str, demo_chrome: &str) -> String {
+    format!(
+        "use @panel::*;\n\n\
+         channel base at \"ephemeral:base.msgs\" {{ push_depth = 1; retain_depth = 1; }}\n\n\
+         surface demo {{\n  grants = [subscribe];\n  \
+         new host: Tile {{ {demo_chrome}grants = [dom]; in messages <- base; }}\n}}\n\n\
+         surface aux {{\n  grants = [subscribe];\n  \
+         new host: Tile {{ chrome = true; grants = [dom]; in messages <- base; }}\n}}\n\n\
+         principal automator {{\n  grants = [dom];\n{axis}  \
+         acl subscribe [prefix \"brenn:automations.\"];\n}}\n"
+    )
+}
+
+/// A fragment declaring its own channel and contributing one panel bound to it,
+/// with any extra keys on the contributed instance.
+fn placement_fragment(slug: &str, keys: &str) -> String {
+    format!(
+        "use @panel::*;\n\n{}\nextend surface \"{slug}\" {{\n  \
+         new extra: Tile {{ grants = [dom]; {keys}in messages <- digest; }}\n}}\n",
+        durable("digest", "brenn:automations.digest")
+    )
+}
+
+/// Derive the placement root beside a fragment, expecting refusals.
+fn placement_refusals(axis: &str, fragment: &str) -> Vec<Diagnostic> {
+    derive_with_mount(
+        &[("", &placement_root(axis)), ("@panel", PANEL)],
+        "automations",
+        "automator",
+        &[("", fragment)],
+    )
+    .expect_err("the fragment was expected not to derive")
+}
+
+#[test]
+fn a_mount_places_on_a_surface_its_principal_names() {
+    derive_with_mount(
+        &[
+            ("", &placement_root("  surfaces = [\"demo\"];\n")),
+            ("@panel", PANEL),
+        ],
+        "automations",
+        "automator",
+        &[("", &placement_fragment("demo", ""))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+/// A mount under a principal with no `surfaces` line places on no page, which
+/// is exactly what a config-carrying mount could do before the axis existed.
+#[test]
+fn a_mount_under_a_principal_with_no_surfaces_line_places_on_nothing() {
+    let refusals = placement_refusals("", &placement_fragment("demo", ""));
+    assert_eq!(
+        messages(&refusals),
+        [
+            "the config of mount `automations` places components on surface `demo`, and this \
+             stamp's ceiling places on no such surface: a mount's contributions land where \
+             its principal's `surfaces` are written, so add `demo` to `automator`"
+        ]
+    );
+}
+
+/// The axis is per slug: a principal that names one surface does not thereby
+/// name the deployment's others.
+#[test]
+fn a_mount_places_on_no_surface_its_principal_does_not_name() {
+    let refusals = placement_refusals("  surfaces = [\"demo\"];\n", &placement_fragment("aux", ""));
+    let expected = "the config of mount `automations` places components on surface `aux`, and \
+                    this stamp's ceiling places on no such surface";
+    assert!(
+        messages(&refusals)
+            .iter()
+            .any(|message| message.starts_with(expected)),
+        "{:?}",
+        messages(&refusals)
+    );
+}
+
+/// The chrome is the surface's shell and stays in the deployment's text. The
+/// refusal is at the attr, not the block: a contribution from a mount is legal
+/// and only this key inside one is not.
+#[test]
+fn a_fragment_may_not_place_the_chrome() {
+    let errors = compile_with_mount(
+        &[
+            ("", &placement_root("  surfaces = [\"demo\"];\n")),
+            ("@panel", PANEL),
+        ],
+        "automations",
+        "automator",
+        &[("", &placement_fragment("demo", "chrome = true; "))],
+    )
+    .expect_err("a mount does not write the chrome");
+    assert_eq!(
+        messages(&errors),
+        [
+            "the config of mount `automations` places `extra` as chrome; the chrome is the \
+             surface's shell, and a mount's contribution places panels",
+            // Both are true of the one key: the mount may not write it, and the
+            // surface it wrote it on already holds the shell the deployment gave
+            // it. The second is about the merged surface, which is a shape the
+            // authority refusal says nothing about.
+            "surface `demo` holds a second chrome; every surface holds exactly one",
+        ]
+    );
+}
+
+/// The same rule through a packaged assembly the fragment stamps. The stamp
+/// the refusal is attributed to is the assembly's, not the mount's — the
+/// innermost recorded one — so the sentence names it as an arrangement rather
+/// than telling the author a mount by that name exists.
+#[test]
+fn a_fragment_may_not_stamp_an_assembly_that_places_the_chrome() {
+    let errors = compile_with_mount(
+        &[
+            ("", &placement_root("  surfaces = [\"demo\"];\n")),
+            ("@panel", &format!("{PANEL}{SHELL_PLACER}")),
+        ],
+        "automations",
+        "automator",
+        &[(
+            "",
+            &format!(
+                "use @panel::*;\n\n{}\nnew placer: PlaceShell(slug = \"demo\", feed = digest);\n",
+                durable("digest", "brenn:automations.digest")
+            ),
+        )],
+    )
+    .expect_err("a mount does not write the chrome, however it is stamped");
+    assert_eq!(
+        messages(&errors),
+        [
+            "`automations.placer`, stamping `PlaceShell`, places `extra` as chrome; the \
+             chrome is the surface's shell, and a mount's contribution places panels",
+            "surface `demo` holds a second chrome; every surface holds exactly one",
+        ]
+    );
+}
+
+/// The same key written by the deployment is not refused: what the rule is
+/// about is the authority root the block was expanded in.
+#[test]
+fn the_deployment_writes_the_chrome_in_a_contribution_of_its_own() {
+    let root = format!(
+        "{}\nextend surface \"demo\" {{\n  \
+         new shell: Tile {{ grants = [dom]; chrome = true; in messages <- base; }}\n}}\n",
+        placement_root_with("  surfaces = [\"demo\"];\n", "")
+    );
+    let config = compile_with_mount(
+        &[("", &root), ("@panel", PANEL)],
+        "automations",
+        "automator",
+        &[("", &placement_fragment("demo", ""))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    assert_eq!(config.surfaces[0].components.len(), 3);
+    assert_eq!(config.surfaces[0].slug.value(), "demo");
+}
+
+// ── what a contribution's bindings are held to ───────────────────────────────
+//
+// Two caps, both the operator's: the surface's own explicit ACL, which
+// suppresses derivation and must
+// cover every binding on the merged surface; and the ceiling on the stamp the
+// surface itself was expanded inside, which a contributed binding confers on
+// through the surface's subject.
+
+/// A deployment whose one surface writes an explicit `acl subscribe` over its
+/// own `in.` prefix — prod's `Deskbar` shape — beside a ceiling naming it.
+///
+/// The principal's reach carries the same prefix, so the fragment may declare a
+/// channel there: what a case is about is the surface's ACL, and a reach
+/// refusal would answer first.
+const WALLED_ROOT: &str = "use @panel::*;\n\n\
+                           channel home at \"brenn:demo.in.home\" { push_depth = 1; \
+                           retain_depth = 1; standing_retain_depth = 1; }\n\n\
+                           surface demo {\n  grants = [subscribe];\n  \
+                           acl subscribe [prefix \"brenn:demo.in.\"];\n  \
+                           new host: Tile { chrome = true; grants = [dom]; \
+                           in messages <- home; }\n}\n\n\
+                           principal automator {\n  grants = [dom];\n  \
+                           surfaces = [\"demo\"];\n  \
+                           acl subscribe [prefix \"brenn:automations.\", \
+                           prefix \"brenn:demo.in.\"];\n}\n";
+
+/// A fragment contributing one panel bound to a channel of its own at `address`.
+fn walled_fragment(address: &str) -> String {
+    format!(
+        "use @panel::*;\n\n{}\nextend surface \"demo\" {{\n  \
+         new extra: Tile {{ grants = [dom]; in messages <- digest; }}\n}}\n",
+        durable("digest", address),
+    )
+}
+
+/// The surface's explicit ACL is a second cap on top of the ceiling: a
+/// contributed binding the operator's list does not cover is refused at the
+/// binding, by the same coverage rule that holds for a body instance.
+#[test]
+fn an_explicit_surface_acl_caps_a_contributed_binding() {
+    let errors = derive_with_mount(
+        &[("", WALLED_ROOT), ("@panel", PANEL)],
+        "automations",
+        "automator",
+        &[("", &walled_fragment("brenn:automations.digest"))],
+    )
+    .expect_err("the binding is outside the surface's own ACL");
+    let messages = messages(&errors);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("automations.digest"),
+        "the refusal names the binding's channel: {messages:?}"
+    );
+}
+
+/// The same fragment with its channel under the surface's prefix compiles: the
+/// operator's `acl` and the operator's `surfaces` line between them say where a
+/// mount's panels may read, and the fragment writes inside both.
+#[test]
+fn a_contributed_binding_under_the_surfaces_acl_is_accepted() {
+    derive_with_mount(
+        &[("", WALLED_ROOT), ("@panel", PANEL)],
+        "automations",
+        "automator",
+        &[("", &walled_fragment("brenn:demo.in.digest"))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+/// Where the surface derives its ACL instead, the derivation reads the merged
+/// component set: the `surface:<slug>` principal's reach grows to cover the
+/// fragment's binding. That widening is bounded by the ceiling, which every
+/// contributed binding is fit-checked against.
+#[test]
+fn a_derived_surface_acl_widens_with_its_contributions() {
+    let config = derive_with_mount(
+        &[
+            ("", &placement_root("  surfaces = [\"demo\"];\n")),
+            ("@panel", PANEL),
+        ],
+        "automations",
+        "automator",
+        &[("", &placement_fragment("demo", ""))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    // `demo` is the root's first surface; the derived list is positional with
+    // the resolved one.
+    let patterns: Vec<&str> = config.surfaces[0]
+        .acl
+        .brenn_subscribe
+        .iter()
+        .map(brenn_dsl::derived::DMatcher::pattern)
+        .collect();
+    assert_eq!(
+        patterns,
+        ["automations.digest"],
+        "the contribution's channel is in the surface's derived reach"
+    );
+}
+
+// ── the ceiling on the stamp the surface itself was declared in ──────────────
+
+/// A deployment whose surface is stamped from an assembly `under p`, with the
+/// mount's ceiling reaching `reach` and the operator's stamp ceiling reaching
+/// `stamp_reach`.
+///
+/// The surface's own subject carries the merged bounds, so a contributed
+/// binding is fit-checked against `p` as well as against the mount's principal.
+fn stamped_surface_root(stamp_reach: &str) -> String {
+    format!(
+        "use @panel::*;\n\n\
+         channel base at \"ephemeral:base.msgs\" {{ push_depth = 1; retain_depth = 1; }}\n\n\
+         assembly Page(slug: String) {{\n  surface page {{\n    slug = slug;\n    \
+         grants = [subscribe];\n    \
+         new host: Tile {{ chrome = true; grants = [dom]; in messages <- base; }}\n  }}\n}}\n\n\
+         principal holder {{\n  grants = [dom, subscribe];\n  \
+         acl subscribe [prefix \"ephemeral:base.\", {stamp_reach}];\n}}\n\n\
+         new demo: Page(slug = \"demo\") under holder;\n\n\
+         principal automator {{\n  grants = [dom];\n  surfaces = [\"demo\"];\n  \
+         acl subscribe [prefix \"brenn:automations.\"];\n}}\n"
+    )
+}
+
+/// The operator ceilinged the assembly that declares the surface, and the
+/// mount's ceiling promises more than that ceiling holds. Both are the
+/// operator's lines and the two have to be reconciled; better refused than a
+/// `surface:demo` principal running wider than the stamp that declared it.
+#[test]
+fn a_contribution_fits_under_the_stamp_the_surface_was_declared_in() {
+    let errors = derive_with_mount(
+        &[
+            ("", &stamped_surface_root("prefix \"brenn:other.\"")),
+            ("@panel", PANEL),
+        ],
+        "automations",
+        "automator",
+        &[("", &placement_fragment("demo", ""))],
+    )
+    .expect_err("the contributed binding is outside the surface stamp's ceiling");
+    let messages = messages(&errors);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("automations.digest") && messages[0].contains("holder"),
+        "the refusal names the binding and the operator's principal: {messages:?}"
+    );
+}
+
+/// The same document with the stamp's ceiling covering the fragment's channel:
+/// both ceilings hold, so the contribution lands.
+#[test]
+fn a_contribution_under_both_ceilings_is_accepted() {
+    derive_with_mount(
+        &[
+            ("", &stamped_surface_root("prefix \"brenn:automations.\"")),
+            ("@panel", PANEL),
+        ],
+        "automations",
+        "automator",
+        &[("", &placement_fragment("demo", ""))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+// ── a contributed binding is the contributor's, across the boundary ──────────
+
+/// Two classes whose `messages` port carries a document type, so two bindings
+/// of one channel from two authority roots can be made to agree or to disagree.
+const TAGGED_PANEL: &str = "component Feeder { abi = processor; requires = [dom]; \
+                            in messages: \"brenn.feed@1\"; }\n\
+                            component Staler { abi = processor; requires = [dom]; \
+                            in messages: \"brenn.stale@1\"; }\n";
+
+/// A deployment whose surface's body binds `home` through a class carrying the
+/// feed document type, with the ceiling naming the surface.
+fn tagged_root() -> String {
+    "use @tagged::*;\n\n\
+     channel home at \"brenn:demo.in.home\" { push_depth = 1; retain_depth = 1; \
+     standing_retain_depth = 1; }\n\n\
+     surface demo {\n  grants = [subscribe];\n  \
+     acl subscribe [prefix \"brenn:demo.in.\"];\n  \
+     new host: Feeder { chrome = true; grants = [dom]; in messages <- home; }\n}\n\n\
+     principal automator {\n  grants = [dom];\n  surfaces = [\"demo\"];\n  \
+     acl subscribe [prefix \"brenn:demo.in.\"];\n}\n"
+        .to_string()
+}
+
+/// A fragment contributing one instance of `class`, bound to the deployment's
+/// channel by the one spelling it has across the boundary: the address.
+fn tagged_fragment(class: &str) -> String {
+    format!(
+        "use @tagged::*;\n\nextend surface \"demo\" {{\n  \
+         new extra: {class} {{ grants = [dom]; in messages <- \"brenn:demo.in.home\"; }}\n}}\n"
+    )
+}
+
+/// A contributed binding's literal resolves to the deployment's declaration,
+/// which is what makes the slug-and-address contract usable at all: a fragment
+/// cannot spell the root's handle, so the address is the only spelling it has.
+///
+/// The rewrite reads the *component's* own stamp, not the surface's — after the
+/// merge one surface holds components from more than one root.
+#[test]
+fn a_contributed_binding_names_a_root_channel_by_address() {
+    let config = compile_with_mount(
+        &[("", &tagged_root()), ("@tagged", TAGGED_PANEL)],
+        "automations",
+        "automator",
+        &[("", &tagged_fragment("Feeder"))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    let [host, extra] = &config.surfaces[0].components[..] else {
+        panic!("the body's instance and the contribution's");
+    };
+    assert_eq!(host.bindings[0].chan, extra.bindings[0].chan);
+    assert_eq!(
+        extra.bindings[0].chan,
+        Some(RChanRef::Decl(channel_at(&config, "home"))),
+        "the contribution's literal is the root's declaration"
+    );
+}
+
+/// One channel carries one document, whichever root's text bound it: the body's
+/// instance and the contribution's agree here.
+#[test]
+fn a_contributed_binding_agrees_on_the_channels_doctype() {
+    derive_with_mount(
+        &[("", &tagged_root()), ("@tagged", TAGGED_PANEL)],
+        "automations",
+        "automator",
+        &[("", &tagged_fragment("Feeder"))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+/// And disagreeing, they are refused. Both claims are named, each at the file
+/// its class was declared in — which for a fragment's placement is the packaged
+/// module, since a fragment declares no class of its own.
+#[test]
+fn a_contributed_binding_conflicting_on_the_doctype_is_refused() {
+    let errors = derive_with_mount(
+        &[("", &tagged_root()), ("@tagged", TAGGED_PANEL)],
+        "automations",
+        "automator",
+        &[("", &tagged_fragment("Staler"))],
+    )
+    .expect_err("two document types on one channel");
+    let conflict = errors
+        .iter()
+        .find(|error| error.message.contains("different document types"))
+        .unwrap_or_else(|| panic!("{:?}", messages(&errors)));
+    assert!(
+        conflict.message.contains("`home` (`brenn:demo.in.home`)"),
+        "{}",
+        conflict.message
+    );
+    assert_eq!(conflict.related.len(), 2, "{}", conflict.message);
+}
+
+// ── a kind is described by the document that ships it ────────────────────────
+//
+// The two description channels a kind carries are an ordinary declaration, and
+// nothing downstream cares which authority root wrote it: the validator
+// resolves the derived address through the directory and stops there. So a
+// bundle that ships a kind describes it in its own fragment, and the operator's
+// part is one standing prefix in the mount's reach, written once.
+
+/// The library module the description vocabulary lives in, as the deployment's
+/// release mount ships it.
+const DESCRIPTION: &str = "assembly KindDescription(kind: String) {\n  \
+                           channel help at f\"brenn:surface.kind.{kind}.help\" {\n    \
+                           push_depth = 1; retain_depth = 1; standing_retain_depth = 1;\n  }\n  \
+                           channel schema at f\"brenn:surface.kind.{kind}.schema\" {\n    \
+                           push_depth = 1; retain_depth = 1; standing_retain_depth = 1;\n  }\n}\n";
+
+/// The deployment: the surface the fragment places on, and a ceiling whose
+/// reach carries `reach` beside the surface's own prefix.
+fn describing_root(reach: &str) -> String {
+    format!(
+        "use @panel::*;\n\n\
+         channel home at \"brenn:demo.in.home\" {{ push_depth = 1; retain_depth = 1; \
+         standing_retain_depth = 1; }}\n\n\
+         surface demo {{\n  grants = [subscribe];\n  \
+         new host: Tile {{ chrome = true; grants = [dom]; in messages <- home; }}\n}}\n\n\
+         principal automator {{\n  grants = [dom];\n  surfaces = [\"demo\"];\n  \
+         acl subscribe [prefix \"brenn:demo.in.\"{reach}];\n}}\n"
+    )
+}
+
+/// The fragment: it places its bundle's kind and describes it in the same text.
+const DESCRIBING_FRAGMENT: &str = "use @panel::*;\nuse @describe::*;\n\n\
+                                   new tile_desc: KindDescription(kind = \"tile\");\n\n\
+                                   extend surface \"demo\" {\n  \
+                                   new extra: Tile { grants = [dom]; \
+                                   in messages <- \"brenn:demo.in.home\"; }\n}\n";
+
+/// The v5 identity an unpinned `brenn:` address derives to, which is what a
+/// fragment's description channels get without writing a pin of their own.
+fn address_uuid(address: &str) -> uuid::Uuid {
+    let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"brenn.dsl-channel");
+    uuid::Uuid::new_v5(&namespace, address.as_bytes())
+}
+
+/// The whole rule in one document: the fragment declares its own kind's
+/// two description channels, under a principal reaching the family, and the
+/// channels resolve with the address-derived identity.
+#[test]
+fn a_fragment_describes_the_kind_its_bundle_ships() {
+    let config = derive_with_mount(
+        &[
+            ("", &describing_root(", prefix \"brenn:surface.kind.\"")),
+            ("@panel", PANEL),
+            ("@describe", DESCRIPTION),
+        ],
+        "automations",
+        "automator",
+        &[("", DESCRIBING_FRAGMENT)],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    for (handle, address) in [
+        ("automations.tile_desc.help", "brenn:surface.kind.tile.help"),
+        (
+            "automations.tile_desc.schema",
+            "brenn:surface.kind.tile.schema",
+        ),
+    ] {
+        let id = channel_at(&config.resolved, handle);
+        assert_eq!(
+            config.resolved.channels[id.0].address.value(),
+            address,
+            "`{handle}` is declared at its derived address"
+        );
+        let stamp = config.resolved.channels[id.0]
+            .stamp
+            .expect("a fragment's channel carries a stamp");
+        assert_eq!(
+            config.resolved.stamps[stamp.0].parent,
+            Some(StampId(0)),
+            "`{handle}` is stamped inside the mount's own stamp"
+        );
+        assert_eq!(
+            config.channel_uuids[id.0],
+            Some(address_uuid(address)),
+            "`{handle}` takes the address-derived identity, so no pin is needed"
+        );
+    }
+}
+
+/// The one constraint is the ceiling: the addresses are ordinary channels, and
+/// a fragment reaching neither of them is refused at its stamp, naming the
+/// principal whose line the operator has to widen.
+#[test]
+fn a_fragment_describing_a_kind_its_ceiling_does_not_reach_is_refused() {
+    let errors = derive_with_mount(
+        &[
+            ("", &describing_root("")),
+            ("@panel", PANEL),
+            ("@describe", DESCRIPTION),
+        ],
+        "automations",
+        "automator",
+        &[("", DESCRIBING_FRAGMENT)],
+    )
+    .expect_err("the description family is outside the mount's reach");
+    let messages = messages(&errors);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("brenn:surface.kind.tile.help")
+                && message.contains("automator")),
+        "{messages:?}"
+    );
+}
+
+/// Both roots describing one kind is an address collision, refused at compile
+/// with both sites named — which is the half of the rule that makes it
+/// self-enforcing without anything knowing whose kind it is.
+#[test]
+fn the_root_and_a_fragment_describing_one_kind_collide() {
+    let root = format!(
+        "use @describe::*;\n{}\nnew tile_desc: KindDescription(kind = \"tile\");\n",
+        describing_root(", prefix \"brenn:surface.kind.\""),
+    );
+    let errors = compile_with_mount(
+        &[("", &root), ("@panel", PANEL), ("@describe", DESCRIPTION)],
+        "automations",
+        "automator",
+        &[("", DESCRIBING_FRAGMENT)],
+    )
+    .expect_err("one address, two declarations");
+    let collision = errors
+        .iter()
+        .find(|error| error.message.contains("brenn:surface.kind.tile.help"))
+        .unwrap_or_else(|| panic!("{:?}", messages(&errors)));
+    assert!(
+        collision
+            .message
+            .contains("two channels declare the address"),
+        "{}",
+        collision.message
+    );
+    assert_eq!(collision.related.len(), 1, "the prior declaration is cited");
 }

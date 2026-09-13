@@ -6,7 +6,9 @@ channel cache at "ephemeral:alice.cache" {
     retain_depth = 16;
 }
 
+component Shell { abi = processor; requires = []; }
 surface alice_desk {
     grants = [subscribe];
     acl subscribe [exact cache];
+    new shell: Shell { chrome = true; grants = []; }
 }

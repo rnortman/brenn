@@ -788,6 +788,102 @@ Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/bar.spec.ts`, `publishVia`.
 
 ---
 
+## `chrome-missing-reserved-plane-silent`
+
+A chrome that binds every reserved `local:brenn/*` plane is now vocabulary — the
+`StandardChrome` assembly in `config/specs/chrome.brenn` — but the underlying
+hole is unchanged: an *unrecognised* reserved name is refused at plan, a
+*missing* one is not, so a chrome that omits `in toast <- "local:brenn/toast"`
+boots, renders, and silently never shows a toast. Stamping the assembly routes
+around it by construction; every longhand block still has it, and longhand
+blocks are expected to exist — `brenn-component-demo/spec/demo-panel.brenn:53`
+and `:99`, the operator's prod tree, and any out-of-tree author who writes the
+block rather than importing `@chrome`.
+
+The check is symmetric with one that already exists. `resolve_surfaces` walks
+every resolved component's bindings and asserts that a component granted
+`takeover` binds a takeover plane, naming the plane list in the panic. The same
+loop over the same data can assert that a component with `chrome = true` binds
+every `RESERVED_LOCAL_CHANNELS` entry.
+
+What to decide first is refusal versus warning. A hard refusal retires every
+longhand chrome in the ecosystem at the release that lands it — including a prod
+document the operator has not migrated — which is a roll-forward cut a bundle
+author does not control; a structured warn naming the missing planes costs a
+boot line instead. That is the design call, which is why this is written down
+rather than done.
+
+Code site (`TODO(chrome-missing-reserved-plane-silent)`):
+`brenn-messaging-boot/src/surfaces.rs`, beside the takeover assert in the
+per-component coherence loop.
+
+Done = a chrome binding fewer than every reserved plane is refused or warned at
+plan, with the missing planes named, and the demo bundle's copies pass it.
+
+## `chrome-no-layout-placeholder`
+
+`StandardChrome(slug, layout)` takes its layout channel as an entity parameter,
+and entity parameters carry no defaults (`brenn-dsl/src/resolve.rs`, "a `{}`
+parameter names an entity, and a default is a literal"). So a page with no
+layout publisher — the common shape for a simple page — declares a channel
+nothing ever publishes to purely to fill the slot: three such declarations
+across `brenn.dev.brenn` and `brenn.e2e.brenn`, and
+`docs/component-packages.md` documents it as the expected practice, so every
+downstream root inherits the ceremony.
+
+Two ways out, and which one is a design call. The chrome module can own the
+shape — a second small assembly that declares the placeholder itself and
+delegates the rest — which costs either a duplicated chrome body or a
+delegation form the DSL may not express; or the DSL admits an optional entity
+parameter, which is a resolve-side change with reach well past this module. The
+first adds packaged vocabulary out-of-tree authors then depend on, which is why
+it is not a local edit.
+
+Code site (`TODO(chrome-no-layout-placeholder)`): `config/specs/chrome.brenn`,
+at `StandardChrome`'s `layout` parameter.
+
+Done = a page with no layout publisher stamps one thing and declares no
+placeholder channel.
+
+## `surface-local-binding-joins-two-realms`
+
+A `local:` address means two different things depending on who binds it. On a
+surface binding the kernel mints a *page* ring from the binding itself; a
+`channel` declaration at top level names a *server* ring only backend bindings
+join. The two share a spelling and exchange no message, which is deliberate and
+documented (`brenn-lib/src/messaging/config.rs`, `SurfaceComponentRaw`'s port
+docs; `docs/message-bus.md` §2.1.1).
+
+What is not deliberate is that a document may join them by handle. Handing a
+declared server-realm `local:` channel to a surface binding — directly, or as
+an entity argument the way `StandardChrome(slug, layout)` takes one — compiles,
+plans, boots and reloads clean. Realm is consulted only for doctype keying, and
+ACL derivation skips confined families outright, so nothing refuses it and
+nothing warns. The page behaves as though the port were unbound; the operator
+who later publishes onto the declared channel spends a session on a config that
+is green everywhere and never moves the display. The in-tree placeholders were
+written that way once and are now `ephemeral:`, so nothing in this repository
+exhibits it — the hole is what an out-of-tree author walks into.
+
+The DSL already refuses the mirror case: a literal address spelling a channel
+the same authority root declares is refused as "one-spelling", because two
+names for one thing is an error. Two names that are *not* one thing, joinable
+by handle, is the same error inverted.
+
+Refusal versus advisory is the design call, and it is not obvious: a refusal is
+right on the merits but retires any out-of-tree document that already writes the
+shape, and a surface binding to a *literal* `local:` address must stay legal —
+it is the only way to reach the reserved planes — so the rule has to be about
+the handle, not the scheme.
+
+Code site (`TODO(surface-local-binding-joins-two-realms)`):
+`brenn-dsl/src/derive.rs`, at the doctype key's realm switch, which is the one
+place that already knows a surface `local:` address is realm-scoped.
+
+Done = a surface binding whose channel is a handle naming a declared
+server-realm `local:` channel is refused or advised at compile, naming both
+sites, and the reserved-plane literals are unaffected.
+
 ## `chrome-stale-sections-on-shrink`
 
 Chrome's `apply_layout` (wasm half) iterates only the *current* `instances`, and
@@ -2647,33 +2743,6 @@ line, a run of `make check` passes with it, the `make check` sentence under
 clause removed, and the operator has said whether a scheduled CI run of
 `make npm-audit` is wanted alongside it.
 
-## `standard-chrome-vocabulary`
-
-Every `surface` must hold exactly one chrome (`surface/server/src/bindings_doc.rs`),
-and every author writes the same eight-line `new chrome: Chrome { ... }` block
-wiring the four reserved `local:brenn/*` control planes plus `io toast-tick` at
-fixed depths. brenn carries seven copies (`brenn.dev.brenn`, `brenn.e2e.brenn`);
-`brenn-component-demo/spec/demo-panel.brenn` adds two more and makes the block
-an exemplar an out-of-tree author copies.
-
-The vocabulary is not the author's to know: the reserved names are the kernel's
-(`brenn_surface_schema::RESERVED_LOCAL_CHANNELS`) and an unrecognised one is
-refused, but a *missing* plane is not — a page whose chrome omits
-`in toast <- "local:brenn/toast"` boots and silently never shows a toast. A
-change to the control-plane set means editing every surface in every repository
-in the ecosystem, with no list of where they are.
-
-Code site (`TODO(standard-chrome-vocabulary)`): `brenn.dev.brenn`, above the
-first of its five copies of the block.
-
-Done = the standard wiring is vocabulary rather than prose — an assembly shipped
-in the packaged `chrome` module that a page stamps as `new chrome: StandardChrome;`,
-or default bindings on `Chrome`'s reserved ports so an unbound reserved plane
-wires itself — every in-tree page uses it, and the demo demonstrates the shared
-form. Which of the two is a design call (the first needs an assembly
-instantiation inside a `surface` body to resolve; the second is a new binding
-default regime), which is why this is written down rather than done.
-
 ## `mcp-script-path-precondition`
 
 `claude_defaults.mcp_script_path` names the noop MCP server every Claude Code
@@ -3146,3 +3215,60 @@ and the helper's own doc comment.
 
 Done when a kind declares its state port once and no document binds depths on
 it.
+
+
+## `surface-incremental-rewire`
+
+A reload that converges one surface closes its pages with `3002
+SURFACE_RECONFIGURED` and the kernel answers `Reconfigured` with a wholesale
+`location.reload()`; a bindings-document difference on a live link does the
+same. Any resolved difference in a surface marks it changed, so adding one
+component to a display bounces the whole page — every other instance on it
+unmounts and remounts, and the display flickers.
+
+Now that a mount's config fragment can add a component to a surface, that bounce
+is the routine path rather than an operator's occasional edit: the agent's loop
+is edit the fragment, reload, publish. Nothing about the added instance requires
+the running ones to be torn down.
+
+Fix = classify the delta. A bindings document differing from the running one
+only by added or removed component entries whose kinds the page has already
+fetched is an incremental apply: mount and unmount those instances in place and
+leave the rest running. The server's reload path then publishes the successor
+document without closing the surface's sessions for that class of delta.
+
+Done = a fragment adding or removing a panel on a live surface mounts or
+unmounts exactly that instance, with the other components' state and their
+subscriptions untouched and no page reload.
+
+Code sites (`TODO(surface-incremental-rewire)`): surface/kernel/src/logic.rs, at
+the `Event::WiringChanged` arm.
+
+
+## `component-descriptions-both-placements`
+
+A surface-placed kind carries two description channels,
+`brenn:<prefix>.kind.<kind>.help` and `.schema`, published at boot from the
+kind's sidecars in the surface asset tree and listed in the `.index` an LLM
+conversation reads. A backend-placed component carries neither: an agent that
+wants to drive a consumer has to read its spec out of the module tree, and
+`MessageChannelList` is the whole of its discovery.
+
+The two placements also name the artifact by different keys. On a surface a
+component's kind is the kebab fold of its class name, which is the directory the
+page fetches; in the backend a top-level consumer is resolved by `package`, the
+packaged module its class was declared in. One class, one `Abi::Processor`, two
+names — which is why a description family keyed by "kind" does not cover both
+without a decision about the key.
+
+Fix = publish a backend package's help and schema on the same description family
+a surface kind's are, from sidecars shipped in the package directory, list them
+in the `.index`, and key the family by the one name both placements resolve the
+artifact from. The key is the hard half: the rename touches the description
+address family prod pins by address and the page's `processor/<kind>/` URL.
+
+Done = an agent discovers a backend consumer's ports and document types the same
+way it discovers a panel's, by reading two channels the `.index` names.
+
+Code sites (`TODO(component-descriptions-both-placements)`):
+brenn-lib/src/wasm_package.rs, at `PackageRecord`.

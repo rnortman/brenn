@@ -942,6 +942,23 @@ fn validate_passes_for_valid_config() {
     validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
 }
 
+/// A contributed kind is a kind: the component a mount's fragment placed on the
+/// deployment's surface derives the same help and schema pair every other kind
+/// does, and a document declaring neither is refused here — naming both
+/// addresses, which is how the kind's shipper learns which two lines it owes.
+#[test]
+#[should_panic(expected = "surface.kind.weather.help")]
+fn validate_panics_on_a_placed_kind_no_document_described() {
+    let mut surfaces = multi_surface_config();
+    // The directory is the deployment's, built before the contribution: what
+    // the fragment added is a kind nobody declared the channels for.
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    surfaces[0]
+        .components
+        .push(ResolvedComponent::minimal("extra", "weather"));
+    validate_surface_description_set(&on_config(), &surfaces, Some(&dir));
+}
+
 #[test]
 #[should_panic(expected = "written forever")]
 fn validate_panics_on_unbounded_runtime_retain_depth() {

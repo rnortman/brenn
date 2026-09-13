@@ -1489,6 +1489,11 @@ pub(crate) fn resolve_surfaces(
             // `takeover` ⟸ a takeover-plane binding. The forward direction (a
             // binding without the grant) is refused at the binding itself; this
             // is the reverse, where the capability reaches nothing.
+            //
+            // TODO(chrome-missing-reserved-plane-silent): no rule here holds a
+            // `chrome = true` component to binding every reserved plane. An
+            // unrecognised `local:brenn/*` name is refused above; an omitted one
+            // boots and goes quiet.
             let binds_takeover = subscriptions
                 .iter()
                 .filter(|b| b.instance == instance)

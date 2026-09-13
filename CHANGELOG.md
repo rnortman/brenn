@@ -4,6 +4,24 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-09-13
+
+- **Mounts can now curate surfaces.** A new `extend surface "<slug>" { ... }`
+  statement lets a config-carrying mount place components on a surface the
+  deployment declares. A `surfaces` list on the mount's principal caps which
+  displays it may touch, and the surface's own ACL caps what it may bind
+  there. The chrome stays the deployment's; a mount contributes panels and
+  their wiring.
+- **`StandardChrome` assembly** in the packaged `chrome` module. Every in-tree
+  page now stamps one line instead of hand-writing eight lines of reserved-plane
+  wiring. The four chromes that previously omitted `takeover` bindings now carry
+  them; three pages that had no layout channel gain an ephemeral placeholder.
+- A principal's `surfaces` axis is attenuated, dead-checked and fit-checked
+  like `grants` and reach. A stamp body may write it too.
+- The merged-surface chrome rule is now enforced at compile time (exactly one
+  `chrome = true` per surface after all contributions land), backing up the
+  existing plan-stage assert.
+
 ## [0.23.1] — 2026-09-13
 
 - **BREAKING: `sync` and `call` ports are typed.** The specification is now the

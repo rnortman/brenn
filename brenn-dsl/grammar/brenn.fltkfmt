@@ -117,6 +117,14 @@ rule surface_def
     nest from after "{" to before "}";
 }
 
+rule surface_ext
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
 rule inst_body
 {
     after "{" { hard; }

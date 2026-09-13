@@ -124,6 +124,28 @@ channel dev_stub at "ephemeral:dev-stub" {
   push_depth = 1;
   retain_depth = 8;
 }
+/// Placeholder layout channels for pages nothing drives a layout onto: the
+/// chrome renders its default layout. `bar_layout` is not reusable here, since
+/// its documents name `bar`'s instances. The declaration exists because
+/// `StandardChrome`'s `layout` is an entity parameter and a literal address is
+/// not one.
+///
+/// `ephemeral:` and not `local:`, though nothing publishes here: a `local:`
+/// address on a surface binding names a *page* ring, while a `local:` channel
+/// declaration names a *server* ring, and the two exchange no message. A handle
+/// joining them would read as a channel an operator could later publish a
+/// layout onto, and that publish would land where the page cannot see it. The
+/// cost of the honest spelling is the `subscribe` grant each page below states.
+channel dev_stub_layout at "ephemeral:dev-stub.in.chrome.layout" {
+  description = "Layout documents for the dev-stub page (latest-wins)";
+  push_depth = 1;
+  retain_depth = 1;
+}
+channel bar_feeder_layout at "ephemeral:bar-feeder.in.chrome.layout" {
+  description = "Layout documents for the bar-feeder page (latest-wins)";
+  push_depth = 1;
+  retain_depth = 1;
+}
 new surface_commons: SurfaceCommons;
 new dev_stub_desc: SurfaceDescription(slug = "dev-stub");
 new bar_desc: SurfaceDescription(slug = "bar");
@@ -218,23 +240,13 @@ surface dev-stub {
     io state { push_depth = 0; retain_depth = 1; }
 
   }
-  // TODO(standard-chrome-vocabulary): this block is transcribed once per page,
-  // here and in every repository that authors one; the reserved plane names are
-  // the kernel's, and omitting one boots and goes quiet rather than refusing.
-  new chrome: Chrome {
-    grants = [ports, log, dom, page-dom];
-    chrome = true;
-    in theme <- "local:brenn/theme" { push_depth = 1; }
-    in link-state <- "local:brenn/link-state" { push_depth = 1; }
-    in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-    in toast <- "local:brenn/toast" { push_depth = 8; }
-    io toast-tick { push_depth = 1; retain_depth = 2; }
-    io state { push_depth = 0; retain_depth = 1; }
-
-  }
 
 }
 
+new dev_stub_chrome: StandardChrome(slug = "dev-stub", layout = dev_stub_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["dev-stub"];
+}
 /// Three-panel bar, skin `bench`.
 surface bar {
   grants = [subscribe, publish];
@@ -277,23 +289,13 @@ surface bar {
     io state { push_depth = 0; retain_depth = 1; }
 
   }
-  new chrome: Chrome {
-    grants = [ports, log, dom, page-dom, takeover];
-    chrome = true;
-    in layout <- bar_layout { push_depth = 1; }
-    in theme <- "local:brenn/theme" { push_depth = 1; }
-    in takeover <- "local:brenn/takeover" { push_depth = 8; }
-    in link-state <- "local:brenn/link-state" { push_depth = 1; }
-    in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-    in toast <- "local:brenn/toast" { push_depth = 8; }
-    out overlay-state -> "local:brenn/overlay-state";
-    io toast-tick { push_depth = 1; retain_depth = 2; }
-    io state { push_depth = 0; retain_depth = 1; }
-
-  }
 
 }
 
+new bar_chrome: StandardChrome(slug = "bar", layout = bar_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["bar"];
+}
 /// The same channels as `bar` under the `foundry` skin, which is dark-only —
 /// hence no mode-clock.
 surface bar-pixel {
@@ -329,30 +331,24 @@ surface bar-pixel {
     io state { push_depth = 0; retain_depth = 1; }
 
   }
-  new chrome: Chrome {
-    grants = [ports, log, dom, page-dom, takeover];
-    chrome = true;
-    in layout <- bar_layout { push_depth = 1; }
-    in theme <- "local:brenn/theme" { push_depth = 1; }
-    in takeover <- "local:brenn/takeover" { push_depth = 8; }
-    in link-state <- "local:brenn/link-state" { push_depth = 1; }
-    in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-    in toast <- "local:brenn/toast" { push_depth = 8; }
-    out overlay-state -> "local:brenn/overlay-state";
-    io toast-tick { push_depth = 1; retain_depth = 2; }
-    io state { push_depth = 0; retain_depth = 1; }
-
-  }
 
 }
 
+new bar_pixel_chrome: StandardChrome(slug = "bar-pixel", layout = bar_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["bar-pixel"];
+}
 /// Browser-driven publisher for the bar: one echo-stub per bar channel, driving
 /// the bar end to end with no LLM in the path.
+///
+/// `subscribe` is the chrome stamp's doing: `StandardChrome`'s `in layout`
+/// binding is a transportable subscribe, and a surface grants the transport its
+/// bindings reach or the derived entry is refused.
 ///
 /// No `allowed_users`, which is fine for single-user dev; a multi-user config
 /// copying this block must add it.
 surface bar-feeder {
-  grants = [publish];
+  grants = [subscribe, publish];
   new feed-a: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_a;
@@ -395,16 +391,11 @@ surface bar-feeder {
     io state { push_depth = 0; retain_depth = 1; }
 
   }
-  new chrome: Chrome {
-    grants = [ports, log, dom, page-dom];
-    chrome = true;
-    in theme <- "local:brenn/theme" { push_depth = 1; }
-    in link-state <- "local:brenn/link-state" { push_depth = 1; }
-    in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-    in toast <- "local:brenn/toast" { push_depth = 8; }
-    io toast-tick { push_depth = 1; retain_depth = 2; }
-    io state { push_depth = 0; retain_depth = 1; }
 
-  }
+}
 
+new bar_feeder_chrome: StandardChrome(slug = "bar-feeder",
+  layout = bar_feeder_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["bar-feeder"];
 }

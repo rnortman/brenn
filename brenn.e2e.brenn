@@ -114,7 +114,6 @@ new e2e: E2eFloor;
 /// subsumes its predecessor and `retain_depth = 2` covers a cancel and its
 /// replacement.
 ///
-/// No component here holds `takeover`, so chrome binds no takeover plane.
 assembly BarSurface(slug: String, skin: String) {
   surface bar {
     slug = f"{slug}";
@@ -141,20 +140,13 @@ assembly BarSurface(slug: String, skin: String) {
       io state { push_depth = 0; retain_depth = 1; }
 
     }
-    new chrome: Chrome {
-      grants = [ports, log, dom, page-dom];
-      chrome = true;
-      in layout <- bar_layout { push_depth = 1; }
-      in theme <- "local:brenn/theme" { push_depth = 1; }
-      in link-state <- "local:brenn/link-state" { push_depth = 1; }
-      in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-      in toast <- "local:brenn/toast" { push_depth = 8; }
-      io toast-tick { push_depth = 1; retain_depth = 2; }
-      io state { push_depth = 0; retain_depth = 1; }
-
-    }
 
   }
+  new chrome_stamp: StandardChrome(slug = f"{slug}", layout = bar_layout) {
+    grants = [dom, log, page-dom, ports, takeover];
+    surfaces = [f"{slug}"];
+  }
+
 }
 
 /// The backend half: the demo consumer's author ships the arrangement, this
@@ -172,17 +164,38 @@ new bar_pixel: BarSurface(slug = "bar-pixel", skin = "foundry");
 // markers, markers included, and reloads the server: that is how a surface is
 // retired out from under an open page. Keep the pair together.
 // e2e:retire-block:begin
+/// Placeholder layout channel for the feeder page: nothing publishes, so the
+/// chrome renders its default layout. `bar_layout` is not reusable here, since
+/// its documents name `bar`'s instances. The declaration exists because
+/// `StandardChrome`'s `layout` is an entity parameter and a literal address is
+/// not one.
+///
+/// `ephemeral:` and not `local:`, though nothing publishes here: a `local:`
+/// address on a surface binding names a *page* ring, while a `local:` channel
+/// declaration names a *server* ring, and the two exchange no message. A handle
+/// joining them would read as a channel an operator could later publish a
+/// layout onto, and that publish would land where the page cannot see it. The
+/// cost of the honest spelling is the `subscribe` grant the surface below
+/// states.
+channel bar_feeder_layout at "ephemeral:bar-feeder.in.chrome.layout" {
+  description = "Layout documents for the bar-feeder page (latest-wins)";
+  push_depth = 1;
+  retain_depth = 1;
+}
 /// Browser-driven publisher for the bar: one echo-stub per bar channel plus the
 /// layout channel. The specs type bodies and layout JSON and click send, driving
 /// the bar end to end.
 ///
-/// `grants = [publish]` plus the `out` bindings are the durable-publish pair;
-/// publish authority is derived from the bindings. No `allowed_users`, so any
-/// authenticated user may publish durably — harmless on this hermetic loopback
-/// harness, but a multi-user config copying this surface must add it. Chrome
-/// binds no layout channel here, so it renders the default layout.
+/// `publish` plus the `out` bindings are the durable-publish pair; publish
+/// authority is derived from the bindings. `subscribe` is the chrome stamp's
+/// doing: `StandardChrome`'s `in layout` binding is a transportable subscribe,
+/// and a surface grants the transport its bindings reach or the derived entry
+/// is refused. No `allowed_users`, so any
+/// authenticated user may publish
+/// durably — harmless on this hermetic loopback harness, but a multi-user
+/// config copying this surface must add it.
 surface bar-feeder {
-  grants = [publish];
+  grants = [subscribe, publish];
   new feed-a: EchoStub {
     grants = [ports, log, dom];
     out out -> bar_a;
@@ -207,18 +220,13 @@ surface bar-feeder {
     io state { push_depth = 0; retain_depth = 1; }
 
   }
-  new chrome: Chrome {
-    grants = [ports, log, dom, page-dom];
-    chrome = true;
-    in theme <- "local:brenn/theme" { push_depth = 1; }
-    in link-state <- "local:brenn/link-state" { push_depth = 1; }
-    in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-    in toast <- "local:brenn/toast" { push_depth = 8; }
-    io toast-tick { push_depth = 1; retain_depth = 2; }
-    io state { push_depth = 0; retain_depth = 1; }
 
-  }
+}
 
+new bar_feeder_chrome: StandardChrome(slug = "bar-feeder",
+  layout = bar_feeder_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["bar-feeder"];
 }
 // e2e:retire-block:end
 

@@ -132,6 +132,7 @@ assembly Deskbar(slug: String, driver: Agent) {
     acl subscribe [prefix f"brenn:{slug}."];
 
     new p1: Protobar {
+      chrome = true;
       grants = [ports, log];
       acl subscribe [prefix f"brenn:{slug}."];
       in messages <- messages_p1;
@@ -147,6 +148,20 @@ assembly Deskbar(slug: String, driver: Agent) {
       // A call names a peer and a `sync` port of it; nothing else in the
       // language reaches an instance rather than a channel.
       call ask -> p1.ping;
+    }
+
+  }
+
+  // A surface is one thing however many blocks wrote it. This block places a
+  // component on the page above, naming it by the slug it resolved rather
+  // than by its handle: the slug is the one spelling of a surface that
+  // crosses an authority boundary, so it is the only one a contribution has.
+  extend surface f"{slug}-panel" {
+    new gauge: Reserved {
+      grants = [ports];
+
+      in in <- acks { push_depth = 4; }
+      out out -> relay;
     }
 
   }
@@ -171,6 +186,19 @@ new alice_pa: PersonalAssistant(slug = "alice-pa",
   ws = ws_alice);
 
 new alice_desk: Deskbar(slug = "alice-desk", driver = alice_pa);
+
+// The item-level form, on a surface an assembly the deployment stamped
+// declares. A literal head, where the block inside the assembly wrote an
+// f-string: any string-typed value spells a slug.
+extend surface "alice-desk-panel" {
+  new ticker: EchoStub {
+    grants = [ports];
+
+    in inbound <- relay { push_depth = 8; }
+    out outbound -> relay;
+  }
+
+}
 
 // The `client` entry that authorizes egress is what mints the sink, so the
 // sink's budget rides the entry's tail rather than a block of its own.

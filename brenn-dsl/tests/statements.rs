@@ -30,6 +30,7 @@ fn the_statement_corpus_covers_every_top_level_form() {
             Item::Channel(_) => "channel",
             Item::Link(_) => "link",
             Item::Surface(_) => "surface",
+            Item::SurfaceExt(_) => "extend surface",
             Item::Inst(_) => "new",
             Item::Remote(_) => "remote",
             Item::Webhook(_) => "webhook",
@@ -51,6 +52,7 @@ fn the_statement_corpus_covers_every_top_level_form() {
         "channel",
         "link",
         "new",
+        "extend surface",
         "remote",
         "webhook",
         "repo",
@@ -62,6 +64,24 @@ fn the_statement_corpus_covers_every_top_level_form() {
     ] {
         assert!(seen.contains(&form), "the corpus is missing a {form}");
     }
+}
+
+/// `extend` and `surface` are two keywords, each taking `:` in the grammar
+/// rather than the `,` that spells optional whitespace. Written with `,` the
+/// rule would admit `extendsurface`, which is the kind of slack that becomes an
+/// ambiguity once another `extend` form exists.
+#[test]
+fn extend_and_surface_do_not_run_together() {
+    parse_str(
+        "extend surface \"alice-desk\" {\n    new p1: Panel {}\n}\n",
+        "t.brenn",
+    )
+    .expect("a parse");
+    parse_str(
+        "extendsurface \"alice-desk\" {\n    new p1: Panel {}\n}\n",
+        "t.brenn",
+    )
+    .expect_err("two keywords, not one word");
 }
 
 /// The two channel roles are two alternatives, and `prefix` is recorded.

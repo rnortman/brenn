@@ -3324,3 +3324,70 @@ fn surface_operator_written_auto_address_panics() {
         Some("local:auto.9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31".to_string());
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
+
+/// A surface whose component list was written by more than one block is one
+/// surface at boot: the merged list is what every per-surface rule reads, and
+/// nothing here can tell which block placed which instance.
+///
+/// The list order is the merged order the compiler fixed — body instances, then
+/// each contribution's — and `principal_send_budgets` walks it, so a contributed
+/// instance is budgeted like any other and in its place.
+#[test]
+fn a_merged_surface_resolves_in_list_order_and_budgets_every_instance() {
+    use brenn_lib::messaging::config::SurfaceComponentRaw;
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components.push(SurfaceComponentRaw {
+        instance: Some("extra".to_string()),
+        spec_sha256: spec_hash("protobar"),
+        grants: vec![ComponentGrant::Ports],
+        ..SurfaceComponentRaw::minimal("protobar")
+    });
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    let instances: Vec<&str> = resolved[0]
+        .components
+        .iter()
+        .map(|component| component.instance.as_str())
+        .collect();
+    assert_eq!(instances, ["protobar", "sidecar", "chrome", "extra"]);
+    let budgeted: Vec<Option<String>> = resolved[0]
+        .principal_send_budgets()
+        .map(|(principal, _)| principal)
+        .collect();
+    assert_eq!(
+        budgeted,
+        vec![
+            None,
+            Some("protobar".to_string()),
+            Some("sidecar".to_string()),
+            Some("chrome".to_string()),
+            Some("extra".to_string()),
+        ],
+        "the kernel grain, then one per instance in the merged order",
+    );
+}
+
+/// The chrome singleton is a property of the merged surface, not of any one
+/// block: a list carrying the deployment's chrome and a second one appended
+/// after it is the two-chrome panic, whoever appended it. The compile-time rule
+/// refuses this document first; the assert is the standing backstop for a raw
+/// config that never went through the DSL.
+#[test]
+#[should_panic(expected = "declares 2 components with `chrome = true`")]
+fn a_merged_surface_carrying_a_second_chrome_panics() {
+    use brenn_lib::messaging::config::SurfaceComponentRaw;
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    raw.components.push(SurfaceComponentRaw {
+        instance: Some("extra".to_string()),
+        spec_sha256: spec_hash("chrome"),
+        grants: vec![
+            ComponentGrant::Ports,
+            ComponentGrant::Dom,
+            ComponentGrant::PageDom,
+        ],
+        chrome: true,
+        ..SurfaceComponentRaw::minimal("chrome")
+    });
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}

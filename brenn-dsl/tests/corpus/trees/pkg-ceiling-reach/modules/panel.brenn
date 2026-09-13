@@ -18,6 +18,7 @@ assembly Page(slug: String) {
         grants = [subscribe];
         acl subscribe [prefix "brenn:house.", exact out];
         new panel: Panel {
+            chrome = true;
             grants = [dom];
             in messages <- out;
         }

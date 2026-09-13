@@ -54,7 +54,11 @@ fn sink(requires: &str) -> String {
 /// A surface granting the rights named and holding the statements written into
 /// it.
 fn surface_with(grants: &str, statements: &str) -> String {
-    format!("surface alice_desk {{\n    grants = [{grants}];\n{statements}}}\n")
+    format!(
+        "component Shell {{ abi = processor; requires = []; }}\n\
+         surface alice_desk {{\n    grants = [{grants}];\n{statements}    \
+         new shell: Shell {{ chrome = true; grants = []; }}\n}}\n"
+    )
 }
 
 /// A surface stating subscribe authority.
@@ -727,13 +731,14 @@ fn each_authority_belongs_to_the_entity_at_its_own_index() {
     // the vectors are parallel by position, so a mis-keyed lookup would hand one
     // principal another's rights and the length assertion would not notice.
     let config = derived(&format!(
-        "{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}",
         durable("alice_cmd", "brenn:alice.cmd"),
         durable("bob_cmd", "brenn:bob.cmd"),
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n    grants = [subscribe];\n    \
-         acl subscribe [prefix \"brenn:alice.in.\"];\n}\n",
+         acl subscribe [prefix \"brenn:alice.in.\"];\nnew shell: Shell { chrome = true; grants = []; } }\n",
         "surface bob_desk {\n    grants = [subscribe];\n    \
-         acl subscribe [prefix \"brenn:bob.in.\"];\n}\n",
+         acl subscribe [prefix \"brenn:bob.in.\"];\nnew shell: Shell { chrome = true; grants = []; } }\n",
         "agent Assistant() {\n    name = \"Assistant\";\n    grants = [publish];\n    \
          acl publish [prefix \"local:alice/\"];\n}\nnew alice: Assistant();\n",
         "agent Helper() {\n    name = \"Helper\";\n    grants = [publish];\n    \
@@ -806,7 +811,7 @@ fn panel_surface_with(grants: &str, statements: &str, bindings: &str) -> String 
     let ports = if sends { "ports" } else { "" };
     format!(
         "{}surface alice_desk {{\n    grants = [{grants}];\n{statements}    \
-         new p1: Panel {{\n        grants = [{ports}];\n{bindings}    }}\n}}\n",
+         new p1: Panel {{\n        chrome = true;\n        grants = [{ports}];\n{bindings}    }}\n}}\n",
         panel_class(ports)
     )
 }
@@ -822,7 +827,7 @@ fn placed_panel(grants: &str, body: &str) -> String {
     format!(
         "{}surface alice_desk {{\n    grants = [subscribe, publish];\n    \
          acl subscribe [prefix \"brenn:alice.\"];\n    acl publish [prefix \"brenn:alice.\"];\n    \
-         new p1: Panel {{\n        grants = [{grants}];\n{body}    }}\n}}\n",
+         new p1: Panel {{\n        chrome = true;\n        grants = [{grants}];\n{body}    }}\n}}\n",
         panel_class(grants)
     )
 }
@@ -919,7 +924,7 @@ fn two_positions_on_one_channel_derive_one_entry() {
         concat!(
             "surface alice_desk {\n",
             "    grants = [subscribe];\n",
-            "    new p1: Panel {\n        grants = [];\n        in messages <- cmd;\n    }\n",
+            "    new p1: Panel {\n        chrome = true;\n        grants = [];\n        in messages <- cmd;\n    }\n",
             "    new p2: Panel {\n        grants = [];\n        in messages <- cmd;\n    }\n",
             "}\n",
         ),
@@ -2049,7 +2054,7 @@ fn a_tail_that_carries_nothing_points_at_the_value_written() {
 #[test]
 fn a_placed_instance_states_its_grants_or_is_refused() {
     let source = format!(
-        "{}surface alice_desk {{\n    grants = [];\n    new p1: Panel {{}}\n}}\n",
+        "{}surface alice_desk {{\n    grants = [];\n    new p1: Panel {{ chrome = true; }}\n}}\n",
         panel_class("")
     );
     assert_eq!(
@@ -2115,7 +2120,7 @@ fn the_dom_capabilities_are_a_placed_instances_to_hold() {
 fn page_dom_granted_without_dom_is_refused() {
     let source = format!(
         "{}surface alice_desk {{\n    grants = [];\n    \
-         new p1: Panel {{\n        grants = [page-dom];\n    }}\n}}\n",
+         new p1: Panel {{\n        chrome = true;\n        grants = [page-dom];\n    }}\n}}\n",
         panel_class("dom, page-dom")
     );
     assert!(
@@ -2140,7 +2145,7 @@ fn a_dom_grant_no_spec_permits_is_refused() {
             "component Needy {\n    abi = processor; requires = []; optional = [takeover];\n",
             "    optional in messages;\n}\n",
             "surface alice_desk {\n    grants = [];\n",
-            "    new p1: Needy {\n        grants = [dom];\n    }\n}\n",
+            "    new p1: Needy {\n        chrome = true;\n        grants = [dom];\n    }\n}\n",
         )),
         "component `alice_desk.p1` grants `dom`, which `Needy` neither requires nor lists \
          optional: the spec is the vocabulary"
@@ -2308,7 +2313,7 @@ fn needy_panel(needs: &str, grants: &str) -> String {
          component Needy {{\n    abi = processor; {needs};\n    optional in messages;\n}}\n\
          // ── packaged ──\n\
          surface alice_desk {{\n    grants = [];\n    \
-         new p1: Needy {{\n        grants = [{grants}];\n    }}\n}}\n"
+         new p1: Needy {{\n        chrome = true;\n        grants = [{grants}];\n    }}\n}}\n"
     )
 }
 
@@ -2413,7 +2418,7 @@ fn a_surface_placement_of_a_backend_only_requirement_is_refused_twice() {
         "component Needy {\n    abi = processor; requires = [store];\n",
         "    optional in inbound;\n}\n",
         "surface alice_desk {\n    grants = [];\n",
-        "    new p1: Needy {\n        grants = [store];\n    }\n}\n",
+        "    new p1: Needy {\n        chrome = true;\n        grants = [store];\n    }\n}\n",
     ));
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert_eq!(
@@ -2430,7 +2435,7 @@ fn a_surface_placement_of_a_backend_only_requirement_is_refused_twice() {
 fn a_missing_grants_list_is_not_followed_by_fit_refusals() {
     let source = concat!(
         "component Needy {\n    abi = processor; requires = [log, alert];\n    optional in messages;\n}\n",
-        "surface alice_desk {\n    grants = [];\n    new p1: Needy {}\n}\n",
+        "surface alice_desk {\n    grants = [];\n    new p1: Needy { chrome = true; }\n}\n",
     );
     assert_eq!(
         derive_refusal(source),
@@ -2449,7 +2454,7 @@ fn a_takeover_grant_no_spec_permits_is_refused_even_with_the_wiring() {
         "component Needy {\n    abi = processor; requires = [ports];\n",
         "    optional in messages;\n    out takeover;\n}\n",
         "surface alice_desk {\n    grants = [];\n",
-        "    new p1: Needy {\n        grants = [ports, takeover];\n",
+        "    new p1: Needy {\n        chrome = true;\n        grants = [ports, takeover];\n",
         "        out takeover -> \"local:brenn/takeover\";\n    }\n}\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -2469,7 +2474,7 @@ fn a_permitted_takeover_grant_needs_no_takeover_binding() {
         "component Needy {\n    abi = processor; requires = []; optional = [takeover];\n",
         "    optional in messages;\n    optional out takeover;\n}\n",
         "surface alice_desk {\n    grants = [];\n",
-        "    new p1: Needy {\n        grants = [takeover];\n    }\n}\n",
+        "    new p1: Needy {\n        chrome = true;\n        grants = [takeover];\n    }\n}\n",
     ));
     assert_eq!(
         granted(&config.surface_components[0][0].grants),
@@ -2764,7 +2769,7 @@ fn two_arrangements(document: &str) -> String {
          \x20   surface page {{\n\
          \x20       slug = slug;\n\
          \x20       grants = [subscribe];\n\
-         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20       new panel: Panel {{ chrome = true; grants = [dom]; in messages <- out; }}\n\
          \x20   }}\n\
          }}\n\
          assembly Logger(slug: String) {{\n\
@@ -3236,7 +3241,7 @@ fn a_body_item_that_is_not_authority_is_refused() {
                 reach: "",
             },
         ])),
-        "a principal is authority and nothing else: `grants` and `acl` lines"
+        "a principal is authority and nothing else: `grants`, `surfaces` and `acl` lines"
     );
 }
 
@@ -3296,7 +3301,7 @@ fn packaged_page(body: &str) -> String {
          \x20   surface page {{\n\
          \x20       slug = slug;\n\
          \x20       grants = [subscribe];\n\
-         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20       new panel: Panel {{ chrome = true; grants = [dom]; in messages <- out; }}\n\
          \x20   }}\n\
          }}\n{PACKAGED}\
          new demo: Page(slug = \"demo\"){body}\n",
@@ -3420,7 +3425,7 @@ fn reach_a_stamps_own_body_dropped_names_the_stamps_ceiling() {
          \x20       slug = slug;\n\
          \x20       grants = [subscribe];\n\
          \x20       acl subscribe [exact out, prefix \"brenn:site.house.\", prefix \"brenn:site.shed.\"];\n\
-         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20       new panel: Panel {{ chrome = true; grants = [dom]; in messages <- out; }}\n\
          \x20   }}\n\
          }}\n{PACKAGED}\
          principal ui {{ grants = [dom, subscribe]; acl subscribe [prefix \"brenn:site.\"]; }}\n\
@@ -3467,7 +3472,7 @@ fn reach_beyond_the_ceiling_is_refused_at_the_authors_statement() {
          \x20       slug = slug;\n\
          \x20       grants = [subscribe];\n\
          \x20       acl subscribe [exact out, prefix \"brenn:house.\"];\n\
-         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20       new panel: Panel {{ chrome = true; grants = [dom]; in messages <- out; }}\n\
          \x20   }}\n\
          }}\n{PACKAGED}\
          new demo: Page(slug = \"demo\") {{ grants = [dom, subscribe]; }}\n",
@@ -3637,9 +3642,10 @@ fn one_alert_word_covers_both_vocabularies() {
     let config = derived(&format!(
         "{PACKAGED}component Sink {{ {} in messages; }}\n\
          \n\
+         component Shell {{ abi = processor; requires = []; }}\n\
          assembly Both(slug: String) {{\n\
          \x20   channel out at f\"ephemeral:{{slug}}.out\" {{ push_depth = 4; retain_depth = 16; }}\n\
-         \x20   surface page {{ slug = slug; grants = [subscribe, alert]; acl subscribe [exact out]; }}\n\
+         \x20   surface page {{ slug = slug; grants = [subscribe, alert]; acl subscribe [exact out]; new shell: Shell {{ chrome = true; grants = []; }} }}\n\
          \x20   new consume: Sink {{ grants = [alert]; in messages <- out; }}\n\
          }}\n{PACKAGED}\
          new demo: Both(slug = \"demo\") {{ grants = [alert, subscribe]; }}\n",
@@ -3693,7 +3699,7 @@ assembly Inner(slug: String) {
     surface page {
         slug = slug;
         grants = [subscribe];
-        new panel: Panel { grants = [dom]; in messages <- out; }
+        new panel: Panel { chrome = true; grants = [dom]; in messages <- out; }
     }
 }
 ";
@@ -3971,7 +3977,7 @@ fn a_confined_binding_needs_no_ceiling_line() {
          \x20   surface page {{\n\
          \x20       slug = slug;\n\
          \x20       grants = [subscribe];\n\
-         \x20       new panel: Panel {{\n\
+         \x20       new panel: Panel {{\n        chrome = true;\n\
          \x20           grants = [dom];\n\
          \x20           in messages <- out;\n\
          \x20           in theme <- \"local:brenn/theme\" {{ push_depth = 1; }}\n\
@@ -4008,7 +4014,7 @@ fn the_exact_arm_of_a_reach_suggestion_is_followable() {
          \x20       slug = slug;\n\
          \x20       grants = [subscribe];\n\
          \x20       acl subscribe [exact out, exact \"brenn:elsewhere\"];\n\
-         \x20       new panel: Panel {{ grants = [dom]; in messages <- out; }}\n\
+         \x20       new panel: Panel {{ chrome = true; grants = [dom]; in messages <- out; }}\n\
          \x20   }}\n\
          }}\n{PACKAGED}\
          new demo: Page(slug = \"demo\") {{ grants = [dom, subscribe];{} }}\n",
@@ -4608,4 +4614,433 @@ fn only_refusal(refusals: &[String]) -> &str {
         [one] => one,
         many => panic!("expected one refusal, found {many:?}"),
     }
+}
+
+// ── the `surfaces` axis ──────────────────────────────────────────────────────
+//
+// Placement is a right of its own: putting a component on a display is neither
+// a capability word nor reach over a channel, so a ceiling caps it on a third
+// axis, attenuated and fit-checked on the same terms as the other two. A
+// principal that writes no `surfaces` line places on nothing, which is what an
+// arrangement could do before the axis existed.
+
+/// A packaged module whose two arrangements each contribute one panel to a
+/// surface named by parameter.
+///
+/// The feed is a parameter rather than a declaration, so the arrangement's reach
+/// is what the deployer handed it and every case's sole refusal is about
+/// placement. The second arrangement holds a word the first does not, which is
+/// what lets a case narrow the words axis and inherit the placement one.
+const PLACER: &str = "\
+component Tile { abi = processor; requires = [dom]; in messages; }
+component Chatty { abi = processor; requires = [dom, log]; in messages; }
+
+assembly Place(slug: String, feed: Channel) {
+    extend surface f\"{slug}\" {
+        new tile: Tile { grants = [dom]; in messages <- feed; }
+    }
+}
+
+assembly PlaceChatty(slug: String, feed: Channel) {
+    extend surface f\"{slug}\" {
+        new chatter: Chatty { grants = [dom, log]; in messages <- feed; }
+    }
+}
+
+component Logger { abi = processor; requires = [log]; in messages; }
+
+assembly Quiet(feed: Channel) {
+    new logger: Logger { grants = [log]; in messages <- feed; }
+}
+
+assembly Nest(slug: String, feed: Channel) {
+    new inner: Place(slug = slug, feed = feed) { surfaces = []; }
+}
+";
+
+/// A deployment declaring three surfaces and the channel every contribution
+/// binds, with the principals and stamps a case writes.
+///
+/// Each surface holds a body instance of its own: a surface that grants a right
+/// nothing it holds states is refused for that, and the refusal would answer
+/// every case here instead of the one it asked for.
+fn placement(principals: &str, stamps: &str) -> String {
+    let mut surfaces = String::new();
+    for slug in ["demo", "aux", "spare"] {
+        surfaces.push_str(&format!(
+            "surface {slug} {{ grants = [subscribe];\n  \
+             new base: Tile {{ chrome = true; grants = [dom]; in messages <- feed; }}\n}}\n"
+        ));
+    }
+    format!(
+        "{PACKAGED}{PLACER}{PACKAGED}\
+         channel feed at \"ephemeral:feed\" {{ push_depth = 1; retain_depth = 1; }}\n\
+         {surfaces}{principals}{stamps}"
+    )
+}
+
+/// A stamp of `Place` onto one surface, under one principal, with any ceiling
+/// body of its own.
+fn place(handle: &str, slug: &str, under: &str, body: &str) -> String {
+    format!("new {handle}: Place(slug = \"{slug}\", feed = feed) under {under}{body}\n")
+}
+
+#[test]
+fn a_principal_that_names_the_surface_fits_a_contribution() {
+    derived(&placement(
+        "principal site { grants = [dom]; surfaces = [\"demo\"]; }\n",
+        &place("p", "demo", "site", ";"),
+    ));
+}
+
+#[test]
+fn a_principal_with_no_surfaces_line_places_on_nothing() {
+    assert_eq!(
+        derive_refusal(&placement(
+            "principal site { grants = [dom]; }\n",
+            &place("p", "demo", "site", ";"),
+        )),
+        "`Place` from `@fixtures` places components on surface `demo`, and this stamp's \
+         ceiling places on no such surface: a mount's contributions land where its \
+         principal's `surfaces` are written, so add `demo` to `site`"
+    );
+}
+
+#[test]
+fn a_principal_that_names_another_surface_places_on_this_one_not_at_all() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom]; surfaces = [\"aux\"]; }\n",
+        &place("p", "demo", "site", ";"),
+    ));
+    assert!(
+        refusals.iter().any(|refusal| refusal.starts_with(
+            "`Place` from `@fixtures` places components on surface `demo`, and this stamp's \
+             ceiling places on no such surface"
+        )),
+        "{refusals:?}"
+    );
+}
+
+/// The axis a child does not write is the parent's, entry for entry: `ui`
+/// narrows the words and says nothing about placement, and the stamp under it
+/// lands on a surface only `site` ever named.
+#[test]
+fn a_child_principal_inherits_the_axis_it_does_not_write() {
+    derived(&placement(
+        "principal site { grants = [dom, log]; surfaces = [\"demo\", \"aux\"]; }\n\
+         principal ui under site { grants = [dom]; }\n",
+        &format!(
+            "{}new q: PlaceChatty(slug = \"aux\", feed = feed) under site;\n",
+            place("p", "demo", "ui", ";"),
+        ),
+    ));
+}
+
+#[test]
+fn a_child_principal_may_replace_the_axis_with_a_subset() {
+    derived(&placement(
+        "principal site { grants = [dom]; surfaces = [\"demo\", \"aux\"]; }\n\
+         principal ui under site { surfaces = [\"demo\"]; }\n",
+        &format!(
+            "{}{}",
+            place("p", "demo", "ui", ";"),
+            place("q", "aux", "site", ";"),
+        ),
+    ));
+}
+
+#[test]
+fn a_child_principal_may_not_place_where_its_parent_does_not() {
+    assert_eq!(
+        derive_refusal(&placement(
+            "principal site { grants = [dom]; surfaces = [\"demo\"]; }\n\
+             principal ui under site { surfaces = [\"demo\", \"aux\"]; }\n",
+            &place("p", "demo", "ui", ";"),
+        )),
+        "`aux` is not a surface `site` holds, which `ui` is under: a principal holds no more \
+         than the one it is under, and everything a chain delegates is written at its root"
+    );
+}
+
+#[test]
+fn a_surfaces_axis_equal_to_the_inherited_one_is_refused() {
+    assert_eq!(
+        derive_refusal(&placement(
+            "principal site { grants = [dom]; surfaces = [\"demo\"]; }\n\
+             principal ui under site { surfaces = [\"demo\"]; }\n",
+            &place("p", "demo", "ui", ";"),
+        )),
+        "this `surfaces` list is what `site` places on, so it narrows nothing; a ceiling axis \
+         that caps nothing is dead config"
+    );
+}
+
+#[test]
+fn a_surfaces_entry_no_arrangement_places_on_is_dead_config() {
+    assert_eq!(
+        derive_refusal(&placement(
+            "principal site { grants = [dom]; surfaces = [\"demo\", \"aux\"]; }\n",
+            &place("p", "demo", "site", ";"),
+        )),
+        "`aux` caps nothing — no arrangement under `site` places a component on it; a ceiling \
+         surface nothing reaches is dead config"
+    );
+}
+
+#[test]
+fn a_stamps_ceiling_may_write_the_axis_itself() {
+    derived(&placement(
+        "principal site { grants = [dom]; surfaces = [\"demo\", \"aux\"]; }\n",
+        &format!(
+            "{}{}",
+            place("p", "demo", "site", " { surfaces = [\"demo\"]; }"),
+            place("q", "aux", "site", ";"),
+        ),
+    ));
+}
+
+#[test]
+fn a_stamps_surfaces_entry_nothing_under_it_places_on_is_dead_config() {
+    assert_eq!(
+        derive_refusal(&placement(
+            "principal site { grants = [dom]; \
+             surfaces = [\"demo\", \"aux\", \"spare\"]; }\n",
+            &format!(
+                "{}{}{}",
+                place("p", "demo", "site", " { surfaces = [\"demo\", \"aux\"]; }"),
+                place("q", "aux", "site", ";"),
+                place("r", "spare", "site", ";"),
+            ),
+        )),
+        "`aux` caps nothing — nothing stamped by `Place` from `@fixtures` places a component \
+         on it; a ceiling surface nothing reaches is dead config"
+    );
+}
+
+#[test]
+fn a_ceiling_names_no_surface_the_deployment_does_not_declare() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom]; surfaces = [\"nope\"]; }\n",
+        &place("p", "demo", "site", ";"),
+    ));
+    assert!(
+        refusals.iter().any(|refusal| refusal
+            == "no surface has slug `nope`, so this caps no placement; a ceiling names the \
+                surfaces the deployment declares"),
+        "{refusals:?}"
+    );
+}
+
+/// `surfaces` is a list, and the whole-value shape is refused before any entry
+/// is read. A scalar that parsed as one slug would be a ceiling wider than it
+/// reads on the axis whose whole job is to be narrow.
+#[test]
+fn a_surfaces_line_that_is_not_a_list_is_refused() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom]; surfaces = \"demo\"; }\n",
+        &place("p", "demo", "site", ";"),
+    ));
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal == "`surfaces` is a list of slugs, and this is not a list"),
+        "{refusals:?}"
+    );
+}
+
+/// And each entry is a slug: an item that is not a string names no surface.
+#[test]
+fn a_surfaces_entry_that_is_not_a_slug_is_refused() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom]; surfaces = [3]; }\n",
+        &place("p", "demo", "site", ";"),
+    ));
+    assert!(
+        refusals.iter().any(|refusal| refusal.contains("a slug")),
+        "{refusals:?}"
+    );
+}
+
+/// The stamp's own ceiling body reads the line through the same helper, and is
+/// its own call site: a shape refusal there is a different `refused` ledger.
+#[test]
+fn a_stamps_surfaces_line_that_is_not_a_list_is_refused() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom]; surfaces = [\"demo\"]; }\n",
+        &place("p", "demo", "site", " { surfaces = \"demo\"; }"),
+    ));
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal == "`surfaces` is a list of slugs, and this is not a list"),
+        "{refusals:?}"
+    );
+}
+
+/// An empty `surfaces` line over an arrangement that places nothing is a whole
+/// line that caps nothing — the axis's half of the rule an empty `grants` line
+/// is refused by, and the arm the entry refusals never reach.
+#[test]
+fn an_empty_surfaces_line_over_an_arrangement_that_places_nothing_is_dead_config() {
+    assert_eq!(
+        derive_refusal(&placement(
+            "principal site { grants = [log]; surfaces = []; }\n",
+            "new z: Quiet(feed = feed) under site;\n",
+        )),
+        "no arrangement under `site` places a component, so this `surfaces` line caps \
+         nothing; a principal that delegates no placement writes no `surfaces` line"
+    );
+}
+
+/// The same sentence from the stamp's side, which is the other instantiation of
+/// the one walk.
+#[test]
+fn an_empty_surfaces_line_on_a_stamp_over_an_arrangement_that_places_nothing_is_dead_config() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom, log]; surfaces = [\"demo\"]; }\n",
+        &format!(
+            "{}{}",
+            place("p", "demo", "site", ";"),
+            "new z: Quiet(feed = feed) under site { surfaces = []; }\n",
+        ),
+    ));
+    assert_eq!(
+        refusals,
+        [
+            "nothing stamped by `Quiet` from `@fixtures` places a component, so this \
+             `surfaces` line caps nothing; the stamp of an arrangement that places nothing \
+             writes no `surfaces` line"
+        ]
+    );
+}
+
+/// The axis's load-bearing distinction: a child that omits the line inherits
+/// the parent's placement, and a child that writes an empty one replaces it
+/// with nothing. Written empty, the stamp under it places nowhere.
+#[test]
+fn an_empty_surfaces_line_caps_placement_at_nothing() {
+    assert_eq!(
+        derive_refusal(&placement(
+            "principal site { grants = [dom]; surfaces = [\"demo\"]; }\n\
+             principal ui under site { surfaces = []; }\n",
+            &place("p", "demo", "ui", ";"),
+        )),
+        "`Place` from `@fixtures` places components on surface `demo`, and this stamp's \
+         ceiling places on no such surface: a mount's contributions land where its \
+         principal's `surfaces` are written, so add `demo` to `ui`"
+    );
+}
+
+/// Where the principal the stamp is under already places on the slug, the line
+/// to widen is the stamp's own body, not the operator's principal.
+#[test]
+fn a_stamp_narrower_than_the_principal_it_is_under_is_told_to_widen_itself() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom]; surfaces = [\"demo\", \"aux\"]; }\n",
+        &format!(
+            "{}{}",
+            place("p", "demo", "site", " { surfaces = [\"aux\"]; }"),
+            place("q", "aux", "site", ";"),
+        ),
+    ));
+    assert!(
+        refusals.iter().any(|refusal| refusal.ends_with(
+            "add `demo` to this stamp's `surfaces` — `site` places on it, and this stamp's \
+             body hands down less"
+        )),
+        "{refusals:?}"
+    );
+}
+
+/// A slug is an exact key, so the suggestion names every principal in the chain
+/// that lacks it — the one caller of the axis selector the chain walk takes.
+#[test]
+fn a_principal_chain_that_places_nowhere_is_named_root_first() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom, log]; }\n\
+         principal ui under site { grants = [dom]; }\n",
+        &place("p", "demo", "ui", ";"),
+    ));
+    assert!(
+        refusals.iter().any(|refusal| refusal.ends_with(
+            "a mount's contributions land where its principal's `surfaces` are written, so \
+             add `demo` to `ui`, and to the principals it is under: `site`"
+        )),
+        "{refusals:?}"
+    );
+}
+
+/// A ceiling written on a stamp inside another arrangement names no principal,
+/// so the line to write is this ceiling's, and the enclosing stamp's if that
+/// one places nowhere either.
+#[test]
+fn a_nested_stamps_missing_placement_names_the_enclosing_stamp() {
+    let refusals = derive_refusals(&placement(
+        "principal site { grants = [dom]; surfaces = [\"demo\"]; }\n",
+        "new nest: Nest(slug = \"demo\", feed = feed) under site;\n",
+    ));
+    assert!(
+        refusals.iter().any(|refusal| refusal.contains(
+            "add `demo` to this ceiling's `surfaces`, and to the enclosing stamp's if that \
+             one does not place on it either"
+        )),
+        "{refusals:?}"
+    );
+}
+
+/// And a stamp that is under nothing and inside nothing has the line to write
+/// spelled out for it.
+#[test]
+fn a_top_level_stamp_with_no_ceiling_is_told_to_write_the_line() {
+    let refusals = derive_refusals(&placement(
+        "",
+        "new p: Place(slug = \"demo\", feed = feed);\n",
+    ));
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal.ends_with("write it — `surfaces = [\"demo\"];`")),
+        "{refusals:?}"
+    );
+}
+
+/// The confinement in its nested form: a `Principal` handed into a stamped
+/// arrangement is a bound of its own and does not widen the ceiling it arrives
+/// inside, on the placement axis as on the words one.
+#[test]
+fn a_handed_principal_placing_beyond_the_enclosing_ceiling_is_refused() {
+    let holder = "use @placer::*;\n\nassembly Holder(ui: Principal, feed: Channel) {\n\
+                  \x20   new page: Place(slug = \"demo\", feed = feed) under ui \
+                  { surfaces = [\"demo\"]; }\n\
+                  }\n";
+    let mut surfaces = String::new();
+    for slug in ["demo", "aux"] {
+        surfaces.push_str(&format!(
+            "surface {slug} {{ grants = [subscribe];\n  \
+             new base: Tile {{ chrome = true; grants = [dom]; in messages <- feed; }}\n}}\n"
+        ));
+    }
+    let refusals = derive_refusals_tree(&[
+        (
+            "",
+            &format!(
+                "use @holder::*;\nuse @placer::*;\n\n\
+                 channel feed at \"ephemeral:feed\" {{ push_depth = 1; retain_depth = 1; }}\n\
+                 {surfaces}\
+                 principal wide {{ grants = [dom]; surfaces = [\"demo\", \"aux\"]; }}\n\
+                 new q: Place(slug = \"aux\", feed = feed) under wide;\n\
+                 new holder: Holder(ui = wide, feed = feed) \
+                 {{ grants = [dom]; surfaces = [\"demo\"]; }}\n"
+            ),
+        ),
+        ("@holder", holder),
+        ("@placer", PLACER),
+    ]);
+    assert!(
+        refusals.iter().any(|refusal| refusal
+            == "`wide` holds placement on surface `aux`, which the ceiling on the stamp \
+                `holder` does not: a principal handed into a stamped arrangement is a bound \
+                of its own, and the ceiling it arrives inside is not widened by one"),
+        "{refusals:?}"
+    );
 }

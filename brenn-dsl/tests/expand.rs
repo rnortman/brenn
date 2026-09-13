@@ -20,6 +20,11 @@ fn channels(config: &ResolvedConfig) -> Vec<String> {
 // ── what an instantiation stamps ─────────────────────────────────────────────
 
 /// The acid test: one assembly, two instantiations, two disjoint entity sets.
+/// The chrome class, in a module of its own: a class's `spec_sha256` is its
+/// declaring file's hash, so a case comparing two orderings of one document
+/// needs the class to arrive from a file both share.
+const SHELL: &str = "component Shell { abi = processor; requires = []; }\n";
+
 const PODS: &str = "\
 // ── packaged ──
 component Panel { abi = processor; requires = []; in messages; }
@@ -30,7 +35,7 @@ assembly Pod(slug: String, owner: Agent) {
     surface panel {
         slug = slug;
         grants = [subscribe];
-        new view: Panel { in messages <- messages; }
+        new view: Panel { chrome = true; in messages <- messages; }
     }
     grant owner subscribe prefix f\"brenn:{slug}.\";
 }
@@ -114,8 +119,9 @@ fn a_stamped_surface_slugs_to_what_its_parameter_said() {
 fn a_stamped_entity_with_no_slug_defaults_to_its_full_dotted_handle() {
     let config = resolved(
         "\
+component Shell { abi = processor; requires = []; }
 assembly Pod(slug: String) {
-    surface panel { grants = [subscribe]; }
+    surface panel { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 new alice: Pod(slug = \"alice\");
@@ -159,7 +165,7 @@ assembly Outer(slug: String) {
     new pod: Inner(addr = f\"brenn:{slug}.in.p1.messages\");
     surface panel {
         grants = [subscribe];
-        new view: Panel { in messages <- pod.messages; }
+        new view: Panel { chrome = true; in messages <- pod.messages; }
     }
 }
 
@@ -243,8 +249,8 @@ assembly Pod(slug: String) {
 new alice: Pod(slug = \"alice\") { chrome = false; }
 "
         ),
-        "a stamp's body is its ceiling: `grants` and `acl` lines, which cap what the \
-         arrangement may hold; per-instance values are assembly parameters"
+        "a stamp's body is its ceiling: `grants`, `surfaces` and `acl` lines, which cap \
+         what the arrangement may hold; per-instance values are assembly parameters"
     );
 }
 
@@ -396,8 +402,9 @@ fn a_body_reference_to_a_name_the_declaring_file_does_not_reach_is_refused() {
 fn two_instantiations_stamping_one_identity_cite_both() {
     let messages = refusals(
         "\
+component Shell { abi = processor; requires = []; }
 assembly Pod(slug: String) {
-    surface panel { slug = slug; grants = [subscribe]; }
+    surface panel { slug = slug; grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 new alice: Pod(slug = \"panel\");
@@ -438,9 +445,10 @@ fn a_channel_and_an_instance_under_one_name_in_an_assembly_body_are_refused() {
 component Panel { abi = processor; requires = []; }
 // ── packaged ──
 
+component Shell { abi = processor; requires = []; }
 assembly Pod() {
     channel panel at \"brenn:alice.panel\";
-    surface panel { grants = [subscribe]; }
+    surface panel { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 new alice: Pod();
@@ -715,6 +723,8 @@ new bob_pa: Assistant(name = \"bob-pa\", peer = alice);
 fn wired(order: &str) -> String {
     format!(
         "\
+use @shell::*;
+
 agent Assistant(name: String) {{
     slug = name;
     model = \"sonnet\";
@@ -728,6 +738,7 @@ assembly Pod(slug: String) {{
 assembly Watch(peer: Agent, feed: Channel) {{
     surface board {{
         grants = [subscribe];
+        new shell: Shell {{ chrome = true; grants = []; }}
     }}
     grant peer subscribe exact feed;
 }}
@@ -748,7 +759,7 @@ new alice: Pod(slug = \"alice\");
 
 #[test]
 fn an_agent_argument_may_name_a_stamped_agent() {
-    let config = resolved(&wired(PRODUCER_FIRST));
+    let config = resolved_tree(&[("", &wired(PRODUCER_FIRST)), ("@shell", SHELL)]);
     let principals: Vec<String> = config
         .grants
         .iter()
@@ -767,8 +778,8 @@ fn an_agent_argument_may_name_a_stamped_agent() {
 
 #[test]
 fn an_instantiation_resolves_the_same_whichever_order_it_is_written_in() {
-    let first = resolved(&wired(PRODUCER_FIRST));
-    let second = resolved(&wired(CONSUMER_FIRST));
+    let first = resolved_tree(&[("", &wired(PRODUCER_FIRST)), ("@shell", SHELL)]);
+    let second = resolved_tree(&[("", &wired(CONSUMER_FIRST)), ("@shell", SHELL)]);
     // Channels, surfaces and grants all land in source order either way, so the
     // two configs are the same document read twice.
     assert_eq!(channels(&first), ["alice.messages"]);
@@ -848,8 +859,9 @@ fn a_channel_argument_naming_nothing_is_still_undeclared() {
     assert_eq!(
         refusal(
             "\
+component Shell { abi = processor; requires = []; }
 assembly Watch(feed: Channel) {
-    surface board { grants = [subscribe]; }
+    surface board { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 new watch: Watch(feed = missing);
@@ -864,8 +876,9 @@ fn an_agent_argument_naming_a_stamped_surface_is_refused() {
     assert_eq!(
         refusal(
             "\
+component Shell { abi = processor; requires = []; }
 assembly Pod() {
-    surface panel { grants = [subscribe]; }
+    surface panel { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 assembly Watch(peer: Agent) {
@@ -885,8 +898,9 @@ fn an_agent_argument_naming_nothing_an_instantiation_stamped_is_refused() {
     assert_eq!(
         refusal(
             "\
+component Shell { abi = processor; requires = []; }
 assembly Pod() {
-    surface panel { grants = [subscribe]; }
+    surface panel { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 assembly Watch(peer: Agent) {
@@ -931,7 +945,7 @@ fn a_stamped_channel_is_named_rather_than_spelled_out() {
             "    channel messages at f\"brenn:{slug}.in.messages\";\n",
             "    surface panel {\n",
             "        grants = [subscribe];\n",
-            "        new view: Panel { in messages <- \"brenn:alice.in.messages\"; }\n",
+            "        new view: Panel { chrome = true; in messages <- \"brenn:alice.in.messages\"; }\n",
             "    }\n",
             "}\n",
             "new alice: Pod(slug = \"alice\");\n",
@@ -959,9 +973,11 @@ assembly Watch(feed: Channel) {
 new watch: Watch(feed = alice.messages);
 new alice: Pod(slug = \"alice\");
 
+component Shell { abi = processor; requires = []; }
 surface board {
     grants = [subscribe];
     acl subscribe [exact alice.messages, exact watch.echo];
+    new shell: Shell { chrome = true; grants = []; }
 }
 ",
     );
@@ -987,6 +1003,8 @@ fn a_nested_argument_waits_for_a_sibling_instantiation() {
     let document = |order: &str| {
         format!(
             "\
+use @shell::*;
+
 assembly Pod(slug: String) {{
     channel messages at f\"brenn:{{slug}}.in.messages\";
 }}
@@ -995,6 +1013,7 @@ assembly Inner(feed: Channel) {{
     surface board {{
         grants = [subscribe];
         acl subscribe [exact feed];
+        new shell: Shell {{ chrome = true; grants = []; }}
     }}
 }}
 
@@ -1013,8 +1032,8 @@ new outer: Outer();
 new outer: Outer();
 new alice: Pod(slug = \"alice\");
 ";
-    let first = resolved(&document(PRODUCER_FIRST));
-    let second = resolved(&document(CONSUMER_FIRST));
+    let first = resolved_tree(&[("", &document(PRODUCER_FIRST)), ("@shell", SHELL)]);
+    let second = resolved_tree(&[("", &document(CONSUMER_FIRST)), ("@shell", SHELL)]);
     assert_eq!(
         first
             .surfaces
@@ -1044,8 +1063,9 @@ assembly Pod(slug: String) {
     new pa: Assistant(name = slug);
 }
 
+component Shell { abi = processor; requires = []; }
 assembly Watch(peer: Agent, feed: Channel) {
-    surface board { grants = [subscribe]; }
+    surface board { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
     grant peer subscribe exact feed;
 }
 
@@ -1085,12 +1105,13 @@ fn a_repo_argument_naming_a_stamped_entity_is_refused() {
     assert_eq!(
         refusal(
             "\
+component Shell { abi = processor; requires = []; }
 assembly Pod() {
-    surface panel { grants = [subscribe]; }
+    surface panel { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 assembly Use(ws: Repo) {
-    surface board { grants = [subscribe]; }
+    surface board { grants = [subscribe]; new shell: Shell { chrome = true; grants = []; } }
 }
 
 new alice: Pod();
@@ -1264,6 +1285,7 @@ assembly Split(slug: String) {
         slug = slug;
         grants = [subscribe, publish];
         new panel: Panel {
+            chrome = true;
             grants = [ports];
             out clicks -> clicks;
             in total <- total;
@@ -1328,7 +1350,7 @@ assembly DemoPage(slug: String) {
     surface page {
         slug = slug;
         grants = [subscribe];
-        new panel: Panel { grants = [dom]; in messages <- out; }
+        new panel: Panel { chrome = true; grants = [dom]; in messages <- out; }
     }
 }
 // ── packaged ──
@@ -1475,7 +1497,7 @@ assembly Loop(feed: Channel) {{
     surface page {{
         slug = \"loop\";
         grants = [subscribe];
-        new panel: Panel {{ in messages <- feed; }}
+        new panel: Panel {{ chrome = true; in messages <- feed; }}
     }}
 }}
 
@@ -1553,8 +1575,8 @@ fn a_stamp_body_holds_no_binding() {
         refusal(&format!(
             "{PACKAGED_PAGE}\nchannel feed at \"ephemeral:feed\";\n\nnew demo: DemoPage(slug = \"demo\") {{\n    in messages <- feed;\n}}\n"
         )),
-        "a stamp's body is its ceiling: `grants` and `acl` lines, which cap what the \
-         arrangement may hold; per-instance values are assembly parameters"
+        "a stamp's body is its ceiling: `grants`, `surfaces` and `acl` lines, which cap \
+         what the arrangement may hold; per-instance values are assembly parameters"
     );
 }
 
@@ -1564,8 +1586,8 @@ fn a_stamp_body_holds_no_sub_block() {
         refusal(&format!(
             "{PACKAGED_PAGE}\nnew demo: DemoPage(slug = \"demo\") {{\n    tool git-repo-pull {{}}\n}}\n"
         )),
-        "a stamp's body is its ceiling: `grants` and `acl` lines, which cap what the \
-         arrangement may hold; per-instance values are assembly parameters"
+        "a stamp's body is its ceiling: `grants`, `surfaces` and `acl` lines, which cap \
+         what the arrangement may hold; per-instance values are assembly parameters"
     );
 }
 

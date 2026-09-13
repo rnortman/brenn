@@ -129,6 +129,11 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
     ),
     // Instantiation and wiring.
     ("surface_def", "statements.brenn", Some("surface panel {")),
+    (
+        "surface_ext",
+        "statements.brenn",
+        Some("extend surface \"alice-desk-panel\" {"),
+    ),
     ("new_stmt", "statements.brenn", Some("new p1: Protobar {")),
     (
         "arg_list",

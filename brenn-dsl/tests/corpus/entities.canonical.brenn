@@ -19,6 +19,10 @@ channel geometry at "brenn:alice-desk.geometry" {
   retain_depth = depths.geometry;
   standing_retain_depth = depths.status;
 }
+component Shell {
+  abi = processor;
+  requires = [];
+}
 surface alice_desk {
   grants = [subscribe, publish, takeover];
   skin = "bench";
@@ -27,6 +31,11 @@ surface alice_desk {
   publish_per_sec = 4;
 
   acl subscribe [prefix "brenn:alice-desk."];
+  new shell: Shell {
+    chrome = true;
+    grants = [];
+  }
+
 }
 
 agent PersonalAssistant(slug: String) {

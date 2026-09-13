@@ -740,6 +740,7 @@ surface bar {{
     acl publish [exact "ephemeral:bar-acks", exact "ephemeral:bar-out"];
 
     new panel: Panel {{
+        chrome = true;
         grants = [ports];
         in messages <- inbox {{ push_depth = 1; retain_depth = 2; }}
         out outbound -> outbox {{ urgency = low; }}

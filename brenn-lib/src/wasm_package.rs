@@ -66,6 +66,10 @@ const COMPONENTS_TREE: &str = "`components/` tree";
 /// Private, with the reading and the verifying of it private too: the two entry
 /// points below are the whole surface, so no caller can come to hold a record
 /// it has not verified — which is the mistake this module exists to prevent.
+///
+/// TODO(component-descriptions-both-placements): a backend package carries no
+/// help or schema sidecar, so its class has no description channels and no
+/// discovery surface beyond `MessageChannelList`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackageRecord {

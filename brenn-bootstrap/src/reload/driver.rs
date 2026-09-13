@@ -11027,4 +11027,457 @@ new sifter: Demo {{
             .unwrap_or_else(|| panic!("the refusal carries no position: {positioned}"));
         assert_eq!(column, (b"mount ".len() + 1).to_string(), "{positioned}");
     }
+
+    // ── a config-carrying mount curates a surface ───────────────────────────
+    //
+    // The two rigs above meet here: a display the deployment declares, chrome
+    // and all, and a mount whose `config/` tree places a panel on it. What
+    // these cases watch is the surface's own convergence — the merged
+    // component list, the pages that bounce, the successor's bindings
+    // document — driven by a document the operator never wrote.
+
+    /// The ceiling an operator writes for a mount that curates a display: a
+    /// namespace of its own to declare channels in, the one grant word its
+    /// panels hold, the surface it may place on, and the standing prefix that
+    /// lets it declare the description channels of the kinds it ships.
+    const CURATOR_CEILING: &str = r#"
+principal curator {
+    grants = [dom];
+    acl publish [prefix "brenn:automations."];
+    acl subscribe [prefix "brenn:automations.", prefix "brenn:surface.kind."];
+    surfaces = ["deskbar"];
+}
+"#;
+
+    /// A deployment declaring one `deskbar` surface holding its own chrome,
+    /// the description pair for each of `kinds`, and `ceilings`.
+    ///
+    /// `kinds` is a parameter because a kind the deployment does not describe
+    /// is the case where the mount describes it instead, and `ceilings` is one
+    /// for the reason every config-mount fixture's is: a principal nothing
+    /// delegates to is dead config, so it arrives with the mount line.
+    fn curated_document(kinds: &[&str], ceilings: &str) -> String {
+        let mut extra = description_channels("deskbar", kinds);
+        extra.push_str(
+            "channel deskbar_feed at \"ephemeral:deskbar.feed\" {\n    push_depth = 4;\n    \
+             retain_depth = 16;\n}\n\n\
+             surface deskbar {\n    grants = [subscribe];\n    \
+             new shell: Panel {\n        grants = [dom, page-dom];\n        chrome = true;\n        \
+             in feed <- deskbar_feed { push_depth = 2; }\n    }\n}\n\n",
+        );
+        extra.push_str(ceilings);
+        format!("use @panel::*;\n{}", document(&extra))
+    }
+
+    /// A fragment placing one `Tile` on the deployment's display, reading a
+    /// channel of its own in the namespace its ceiling gave it.
+    ///
+    /// `push` sizes the contributed binding, so a case can move the merged
+    /// surface by a number the deployment's text does not hold.
+    fn contribution(push: u32) -> String {
+        format!(
+            r#"use @tile::*;
+
+channel city at "brenn:automations.city" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+
+extend surface "deskbar" {{
+    new weather: Tile {{
+        grants = [dom];
+        in feed <- city {{ push_depth = {push}; }}
+    }}
+}}
+"#
+        )
+    }
+
+    /// The fragment with the block taken out and its channel left standing —
+    /// the author withdrawing a panel without retiring the wiring behind it.
+    const WITHDRAWN_CONTRIBUTION: &str = r#"channel city at "brenn:automations.city" {
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}
+"#;
+
+    /// The address a contribution's channel is declared at.
+    const CITY: &str = "brenn:automations.city";
+    /// The two addresses a `tile` description is published on.
+    const TILE_HELP: &str = "brenn:surface.kind.tile.help";
+    const TILE_SCHEMA: &str = "brenn:surface.kind.tile.schema";
+
+    /// The instances the surface's retained bindings document names.
+    async fn bound_instances(booted: &Booted) -> String {
+        newest_body(&booted.messenger, DESKBAR_BINDINGS)
+            .await
+            .expect("the surface's bindings document is retained")
+    }
+
+    /// A booted process serving `deskbar` with nothing curating it: the shape
+    /// the deployment compiles and boots to with every config mount absent,
+    /// which is the precondition every case below rests on.
+    async fn boot_curatable_surface(kinds: &[&str]) -> (Tree, tempfile::TempDir, Booted) {
+        let tree = Tree::new();
+        let assets = tempfile::tempdir().expect("a surface asset tree");
+        write_surface_kind(&tree, assets.path(), "panel", "Panel");
+        write_surface_kind_needing(&tree, assets.path(), "tile", "Tile", "dom");
+        tree.write(&curated_document(kinds, ""));
+        let booted = boot_with_panel(&tree, assets.path()).await;
+        (tree, assets, booted)
+    }
+
+    /// [`boot_curatable_surface`] with the ceiling written, the mount declared
+    /// under it and its contribution applied by one reload: where every case
+    /// that edits or withdraws a contribution starts.
+    async fn boot_curated_surface() -> (Tree, tempfile::TempDir, Booted) {
+        let (tree, assets, mut booted) = boot_curatable_surface(&["panel", "tile"]).await;
+        tree.write(&curated_document(&["panel", "tile"], CURATOR_CEILING));
+        booted
+            .mounts
+            .config(CONFIG_MOUNT, "curator", &contribution(2));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        (tree, assets, booted)
+    }
+
+    /// **A mount's contribution reaches a running display in one reload.** The
+    /// operator's two lines and the author's block arrive together: the
+    /// surface is replaced rather than added, its open pages are closed with
+    /// the reconfigured code, the successor's bindings document names the
+    /// contributed instance beside the deployment's chrome, and the channel
+    /// the fragment declared is folded into the surface's directory entries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fragment_places_a_component_on_the_deployment_s_surface() {
+        let (tree, _assets, mut booted) = boot_curatable_surface(&["panel", "tile"]).await;
+        assert!(serves_surface(&booted, "deskbar"));
+        let before = bound_instances(&booted).await;
+        assert!(!before.contains("weather"), "{before}");
+        let page = attach_a_session(&booted, "deskbar");
+
+        tree.write(&curated_document(&["panel", "tile"], CURATOR_CEILING));
+        booted
+            .mounts
+            .config(CONFIG_MOUNT, "curator", &contribution(2));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert!(status.delta.surfaces_added.is_empty(), "{:?}", status.delta);
+        assert_eq!(status.delta.channels_added, vec![CITY.to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+            "a curated surface's pages reload onto the merged component set",
+        );
+        assert!(serves_surface(&booted, "deskbar"), "the new runtime is in");
+        let after = bound_instances(&booted).await;
+        assert!(
+            after.contains("weather") && after.contains("shell"),
+            "the merged surface carries both roots' components: {after}",
+        );
+        assert!(
+            subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::Surface("deskbar".to_string())
+            )
+            .contains(&CITY.to_string()),
+            "the contributed binding is folded into the surface's directory entries",
+        );
+    }
+
+    /// **The block withdrawn takes the component off the display.** The same
+    /// shape back: one changed surface, one page bounce, and a bindings
+    /// document holding the deployment's own text and nothing else. The
+    /// channel stays, because the fragment still declares it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_withdrawn_contribution_takes_its_component_off_the_surface() {
+        let (_tree, _assets, mut booted) = boot_curated_surface().await;
+        let page = attach_a_session(&booted, "deskbar");
+
+        booted.mounts.edit(CONFIG_MOUNT, WITHDRAWN_CONTRIBUTION);
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert!(
+            status.delta.channels_removed.is_empty(),
+            "the fragment still declares its channel: {:?}",
+            status.delta,
+        );
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+        );
+        let after = bound_instances(&booted).await;
+        assert!(
+            !after.contains("weather") && after.contains("shell"),
+            "the merged surface is the deployment's text again: {after}",
+        );
+        assert!(
+            !subscribed_anywhere(
+                &booted.messenger,
+                &SubscriberEntryKind::Surface("deskbar".to_string())
+            )
+            .contains(&CITY.to_string()),
+        );
+    }
+
+    /// **A comment in a contribution moves nothing.** The merged surface is
+    /// what the delta compares, so bytes the author added above their block
+    /// lower to the surface that is already running and no page is bounced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_comment_only_edit_to_a_contribution_is_unchanged() {
+        let (_tree, _assets, mut booted) = boot_curated_surface().await;
+
+        booted.mounts.edit(
+            CONFIG_MOUNT,
+            &format!("// the city panel\n{}", contribution(2)),
+        );
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Unchanged, "{:?}", status.refusals);
+        assert!(
+            bound_instances(&booted).await.contains("weather"),
+            "the running surface is untouched",
+        );
+    }
+
+    /// **A contributed binding that moves is a changed surface.** The
+    /// contribution is the only thing that moved and it is not the
+    /// deployment's text, so the whole of the work is the surface's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contributed_binding_that_moves_replaces_the_surface() {
+        let (_tree, _assets, mut booted) = boot_curated_surface().await;
+        let page = attach_a_session(&booted, "deskbar");
+
+        booted.mounts.edit(CONFIG_MOUNT, &contribution(3));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert_eq!(
+            page.await.expect("the stand-in page task"),
+            brenn_surface_schema::SURFACE_RECONFIGURED_CLOSE_CODE,
+        );
+    }
+
+    /// **A contribution naming a kind no declared mount offers is refused.**
+    /// The document compiles — the class module is there, which is what the
+    /// compiler reads — and the asset scan over the whole candidate surface
+    /// list is what catches it, before anything is swapped and with the old
+    /// document still running. Without that scan it would be a page that
+    /// fetches a directory nothing serves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contribution_naming_a_kind_no_mount_offers_is_refused() {
+        let (tree, _assets, mut booted) = boot_curatable_surface(&["panel", "ghost"]).await;
+        // A class with a module and no deployed assets: the bundle that ships
+        // the kind is not installed, or ships it no longer.
+        std::fs::write(
+            tree.modules().join("ghost.brenn"),
+            format!(
+                "component Ghost {{\n    {}\n    in feed;\n}}\n",
+                brenn_dsl::fixture_text::processor_header("dom"),
+            ),
+        )
+        .expect("the class module is writable");
+        let running = booted.driver.baseline().document.document_sha256.clone();
+
+        tree.write(&curated_document(&["panel", "ghost"], CURATOR_CEILING));
+        booted.mounts.config(
+            CONFIG_MOUNT,
+            "curator",
+            &contribution(2)
+                .replace("@tile", "@ghost")
+                .replace("Tile", "Ghost"),
+        );
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        let report = status.refusals.join("\n");
+        assert!(
+            report.contains("ghost") && report.contains("deskbar"),
+            "the refusal names the kind and the surface that would mount it: {report}",
+        );
+        assert_eq!(
+            booted.driver.baseline().document.document_sha256,
+            running,
+            "the old document is still running",
+        );
+        assert!(!bound_instances(&booted).await.contains("weather"));
+    }
+
+    /// **The operator dropping the surface under a live contribution is
+    /// refused.** The fragment's block names a slug the root no longer
+    /// carries, which is a compile refusal at step 1, positioned in the mount
+    /// author's own file. The lever over a mount is the `principal` and
+    /// `mount … under` pair, not the surface it curates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_surface_dropped_under_a_live_contribution_refuses_the_reload() {
+        let (tree, _assets, mut booted) = boot_curated_surface().await;
+        let running = booted.driver.baseline().document.document_sha256.clone();
+
+        let mut without = description_channels("deskbar", &["panel", "tile"]);
+        without.push_str(CURATOR_CEILING);
+        tree.write(&format!("use @panel::*;\n{}", document(&without)));
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        let report = status.refusals.join("\n");
+        assert!(
+            report.contains("deskbar")
+                && report.contains(&format!("{CONFIG_MOUNT}/config/main.brenn")),
+            "the refusal names the slug, in the mount's own file: {report}",
+        );
+        assert_eq!(booted.driver.baseline().document.document_sha256, running);
+        assert!(serves_surface(&booted, "deskbar"), "nothing was touched");
+    }
+
+    /// **The loop this slice exists for, end to end.** A bundle ships a kind
+    /// the deployment has never heard of; the fragment beside it declares that
+    /// kind's two description channels and places it on the operator's
+    /// display. One reload, no root edit: the panel is on the page and its
+    /// help and schema are published on the addresses the mount author
+    /// declared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fragment_describes_and_places_the_kind_its_bundle_ships() {
+        let (tree, kernel, bundle, mut booted) = boot_curatable_bundle().await;
+        assert!(
+            booted.messenger.directory().resolve(TILE_HELP).is_none(),
+            "nothing describes the bundle's kind yet",
+        );
+
+        tree.write(&curated_document(&["panel"], CURATOR_CEILING));
+        booted
+            .mounts
+            .config(CONFIG_MOUNT, "curator", &described_contribution());
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.surfaces_changed, vec!["deskbar".to_string()]);
+        assert!(bound_instances(&booted).await.contains("weather"));
+        let help = newest_body(&booted.messenger, TILE_HELP)
+            .await
+            .expect("the kind's help document is published on the fragment's channel");
+        assert!(
+            help.contains("tile") && help.contains("deskbar"),
+            "the help document names the kind and every surface mounting it: {help}",
+        );
+        assert!(
+            newest_body(&booted.messenger, TILE_SCHEMA).await.is_some(),
+            "the schema document is published on the fragment's channel too",
+        );
+        drop((kernel, bundle));
+    }
+
+    /// **A contributed kind nobody described is a plan refusal.** The rule is
+    /// indifferent to which document declares the pair, so a fragment that
+    /// places its bundle's kind and forgets to describe it is refused on the
+    /// same terms a deployment would be, naming both addresses it wanted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contributed_kind_nobody_described_refuses_the_reload() {
+        let (tree, kernel, bundle, mut booted) = boot_curatable_bundle().await;
+        let running = booted.driver.baseline().document.document_sha256.clone();
+
+        tree.write(&curated_document(&["panel"], CURATOR_CEILING));
+        booted
+            .mounts
+            .config(CONFIG_MOUNT, "curator", &contribution(2));
+        assert!(
+            booted
+                .driver
+                .prepare_and_report(TriggerSource::Bus)
+                .await
+                .is_none()
+        );
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Refused);
+        let report = status.refusals.join("\n");
+        assert!(
+            report.contains(TILE_HELP) && report.contains(TILE_SCHEMA),
+            "the refusal names both addresses the kind's description needs: {report}",
+        );
+        assert_eq!(booted.driver.baseline().document.document_sha256, running);
+        drop((kernel, bundle));
+    }
+
+    /// [`contribution`] with the two description channels its kind's shipper
+    /// owes, which is what a `KindDescription` stamp lowers to.
+    fn described_contribution() -> String {
+        format!(
+            "{}\nchannel tile_help at \"{TILE_HELP}\" {{\n    push_depth = 1;\n    \
+             retain_depth = 1;\n    standing_retain_depth = 1;\n}}\n\n\
+             channel tile_schema at \"{TILE_SCHEMA}\" {{\n    push_depth = 1;\n    \
+             retain_depth = 1;\n    standing_retain_depth = 1;\n}}\n",
+            contribution(2),
+        )
+    }
+
+    /// A booted process serving `deskbar` out of brenn's own surface tree,
+    /// with `tile` offered by a second mount — a bundle's tree, kinds and no
+    /// kernel — and described by nobody.
+    async fn boot_curatable_bundle() -> (Tree, tempfile::TempDir, tempfile::TempDir, Booted) {
+        let tree = Tree::new();
+        let kernel = tempfile::tempdir().expect("brenn's own surface tree");
+        let bundle = tempfile::tempdir().expect("a bundle surface tree");
+        write_surface_kind(&tree, kernel.path(), "panel", "Panel");
+        write_bundled_tile(&tree, bundle.path());
+        tree.write(&curated_document(&["panel"], ""));
+        let booted = boot_with(
+            &tree,
+            BootFixture {
+                surface_assets: Some(kernel.path().to_path_buf()),
+                surface_bundle: Some(bundle.path().to_path_buf()),
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        (tree, kernel, bundle, booted)
+    }
+
+    /// Write `tile`'s class module into the tree's module root and its
+    /// deployed assets into a bundle's surface tree: kinds and no kernel pair,
+    /// which is what a component bundle installs beside brenn's own release.
+    fn write_bundled_tile(tree: &Tree, bundle: &std::path::Path) {
+        let modules = tree.modules();
+        std::fs::create_dir_all(&modules).expect("a module root");
+        let spec = format!(
+            "component Tile {{\n    {}\n    in feed;\n}}\n",
+            brenn_dsl::fixture_text::processor_header("dom"),
+        );
+        std::fs::write(modules.join("tile.brenn"), &spec).expect("the class module is writable");
+        std::fs::create_dir_all(bundle).expect("the bundle's surface tree");
+        brenn_surface_server::test_fixtures::write_processor_tree_from_bytes(
+            bundle,
+            "tile",
+            b"component-bytes-for-tile",
+            spec.as_bytes(),
+            Vec::new(),
+            true,
+            |_| {},
+        );
+    }
 }

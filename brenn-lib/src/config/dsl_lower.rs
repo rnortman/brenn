@@ -41,6 +41,7 @@ use brenn_dsl::model::{
     MountTail, MqttClientAttrs, OutTail, RemoteAttrs, RepoAttrs, SubscribeTail, SurfaceAttrs,
     WebhookAttrs, Word, section_key,
 };
+use brenn_dsl::resolve::SURFACE_CHROME_KEY;
 use brenn_dsl::resolved::{
     ClassRef, MatcherKind, PortDir, RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer,
     RHooks, RMatcherVal, RMcp, RNamed, RRemote, RRepoMount, RSection, RSubscribe, RSurface, RTail,
@@ -3119,7 +3120,7 @@ fn surface_components(
                 "parked_batch_depth",
                 errors,
             ),
-            chrome: body.bool("chrome", errors).unwrap_or_default(),
+            chrome: body.bool(SURFACE_CHROME_KEY, errors).unwrap_or_default(),
             config: body.string_map("config", errors),
             // The words this instance was given, in the runtime's own
             // spellings. A capability names no scheme, so derivation expands

@@ -70,7 +70,14 @@ fn a_parameter_default_is_a_literal_too() {
 
 #[test]
 fn a_name_declared_twice_cites_both_declarations() {
-    let source = "const skin = \"bench\";\nsurface skin {\n    grants = [subscribe];\n}\n";
+    let source = concat!(
+        "const skin = \"bench\";\n",
+        "surface skin {\n",
+        "    grants = [subscribe];\n",
+        "    new shell: Shell { chrome = true; grants = []; }\n",
+        "}\n",
+        "component Shell { abi = processor; requires = []; }\n",
+    );
     let errors = compile(source).expect_err("two declarations, one name");
     assert_eq!(errors[0].message, "`skin` is declared twice in this file");
     assert_eq!(errors[0].related.len(), 1);
@@ -1092,7 +1099,9 @@ fn surface_doc(class_body: &str, inst_body: &str) -> String {
             "surface alice_desk {{\n",
             "    grants = [subscribe];\n",
             "    new p1: Panel {{\n{}    }}\n",
+            "    new shell: Shell {{ chrome = true; grants = []; }}\n",
             "}}\n",
+            "component Shell {{ abi = processor; requires = []; }}\n",
         ),
         class_body, inst_body
     )
@@ -1274,6 +1283,422 @@ fn a_sync_port_may_not_share_a_name_with_an_input_port() {
     );
 }
 
+// ── contributions: `extend surface` and the merge ────────────────────────────
+
+/// A class, a surface holding one instance, and whatever else the case writes.
+///
+/// The surface's slug is stated rather than left to the handle, because a
+/// contribution names a surface by slug and a handle that happens to spell one
+/// would hide which of the two the merge read.
+fn contribution_doc(rest: &str) -> String {
+    format!(
+        concat!(
+            "channel messages at \"brenn:alice-desk.in.messages\";\n",
+            "component Panel {{\n",
+            "    abi = processor; requires = [];\n",
+            "    optional in messages;\n",
+            "}}\n",
+            "surface desk {{\n",
+            "    slug = \"alice-desk\";\n",
+            "    grants = [subscribe];\n",
+            "    new p1: Panel {{\n        chrome = true;\n",
+            "        in messages <- messages;\n",
+            "    }}\n",
+            "}}\n",
+            "{}",
+        ),
+        rest
+    )
+}
+
+#[test]
+fn a_contribution_lands_on_the_surface_its_slug_names() {
+    let config = resolved(&contribution_doc(
+        "extend surface \"alice-desk\" {\n    new p2: Panel {}\n}\n",
+    ));
+    let [surface] = &config.surfaces[..] else {
+        panic!("one surface, however many blocks wrote it");
+    };
+    let names: Vec<&str> = surface
+        .components
+        .iter()
+        .map(|component| component.instance.value().as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["p1", "p2"],
+        "the body's instances, then the block's"
+    );
+    // The blocks themselves are emission-time state and never reach the
+    // resolved model; what the merge leaves behind is the record below.
+    let [contribution] = &config.contributions[..] else {
+        panic!("one contribution recorded");
+    };
+    assert_eq!(contribution.slug.value(), "alice-desk");
+    assert_eq!(
+        contribution.stamp, None,
+        "written at the deployment's top level"
+    );
+}
+
+/// The slug is any string-typed value, and a block inside an assembly reaches
+/// the surface that assembly stamped through the parameter both of them read.
+#[test]
+fn a_contribution_in_an_assembly_names_its_surface_by_the_slug_it_resolved() {
+    let config = resolved(concat!(
+        "component Panel {\n",
+        "    abi = processor; requires = [];\n",
+        "    optional in messages;\n",
+        "}\n",
+        "assembly Bar(slug: String) {\n",
+        "    surface page {\n",
+        "        slug = f\"{slug}\";\n",
+        "        grants = [subscribe];\n",
+        "        new p1: Panel { chrome = true; }\n",
+        "    }\n",
+        "\n",
+        "    extend surface f\"{slug}\" {\n",
+        "        new p2: Panel {}\n",
+        "    }\n",
+        "}\n",
+        "new desk: Bar(slug = \"alice-desk\");\n",
+    ));
+    let [surface] = &config.surfaces[..] else {
+        panic!("one surface");
+    };
+    assert_eq!(surface.components.len(), 2);
+    let [contribution] = &config.contributions[..] else {
+        panic!("one contribution recorded");
+    };
+    assert_eq!(contribution.slug.value(), "alice-desk");
+    assert_eq!(
+        contribution.stamp, surface.stamp,
+        "both blocks came out of the one stamp"
+    );
+    assert_eq!(
+        surface.components[1].stamp, surface.stamp,
+        "a contributed component carries the stamp of the block that placed it"
+    );
+}
+
+#[test]
+fn a_contribution_lands_on_no_surface_the_document_declares() {
+    assert_eq!(
+        refusal(&contribution_doc(
+            "extend surface \"alice-bench\" {\n    new p2: Panel {}\n}\n",
+        )),
+        "no surface has slug `alice-bench`; a contribution lands on a surface the \
+         deployment declares"
+    );
+}
+
+/// An instance name is the runtime identity of one component on one page, so
+/// two blocks writing it is an address collision, refused with both sites.
+#[test]
+fn two_blocks_may_not_place_one_instance_name() {
+    let errors = resolve_errors(&contribution_doc(
+        "extend surface \"alice-desk\" {\n    new p1: Panel {}\n}\n",
+    ));
+    let [error] = &errors[..] else {
+        panic!("{:?}", messages(&errors));
+    };
+    assert_eq!(
+        error.message,
+        "surface `alice-desk` already has a component `p1`, placed here"
+    );
+    let [(related, _)] = &error.related[..] else {
+        panic!("the site that holds the name");
+    };
+    assert_eq!(related, "first placed here");
+}
+
+/// A surface whose own body was refused is withheld, not absent. Reading its
+/// absence as "no such surface" would tell the block's author their slug is
+/// wrong about a surface that was written.
+#[test]
+fn a_withheld_surface_leaves_the_contribution_alone() {
+    let errors = refusals(concat!(
+        "component Panel {\n",
+        "    abi = processor; requires = [];\n",
+        "    optional in messages;\n",
+        "}\n",
+        "component Shell { abi = processor; requires = []; }\n",
+        "surface desk {\n",
+        "    slug = \"alice-desk\";\n",
+        "    grants = [subscribe];\n",
+        "    skin = nothing;\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
+        "extend surface \"alice-desk\" {\n",
+        "    new p2: Panel {}\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("nothing"),
+        "the operator's one diagnostic, about their own text: {errors:?}"
+    );
+}
+
+/// A withheld surface whose *slug* is what was refused could be the one the
+/// block names, so every unknown slug goes unremarked.
+#[test]
+fn a_surface_with_an_unknowable_slug_silences_every_contribution() {
+    let errors = refusals(concat!(
+        "component Panel {\n",
+        "    abi = processor; requires = [];\n",
+        "    optional in messages;\n",
+        "}\n",
+        "component Shell { abi = processor; requires = []; }\n",
+        "surface desk {\n",
+        "    slug = nothing;\n",
+        "    grants = [subscribe];\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
+        "extend surface \"alice-bench\" {\n",
+        "    new p2: Panel {}\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        !errors[0].contains("no surface has slug"),
+        "the operator's refusal about their own slug, and no word to the block: {errors:?}"
+    );
+    assert!(errors[0].contains("nothing"), "{errors:?}");
+}
+
+/// The same, one level up: an instantiation that never expanded stamped no
+/// surface, and what it would have stamped is unknowable.
+#[test]
+fn a_refused_stamp_silences_every_contribution() {
+    let errors = refusals(concat!(
+        "component Panel {\n",
+        "    abi = processor; requires = [];\n",
+        "    optional in messages;\n",
+        "}\n",
+        "assembly Bar(slug: String) {\n",
+        "    surface page {\n",
+        "        slug = f\"{slug}\";\n",
+        "        grants = [subscribe];\n",
+        "        new p1: Panel { chrome = true; }\n",
+        "    }\n",
+        "}\n",
+        "new desk: Bar(slug = nothing);\n",
+        "extend surface \"alice-desk\" {\n",
+        "    new p2: Panel {}\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        !errors[0].contains("no surface has slug"),
+        "the refusal is at the root's stamp, not at the block: {errors:?}"
+    );
+    assert!(errors[0].contains("nothing"), "{errors:?}");
+}
+
+/// Two surfaces on one slug is a typo the identity pass already refuses. The
+/// merge is not to add a second diagnostic about it, and not to panic on the
+/// duplicate key either: it lands the block on the first-declared surface and
+/// the compile fails on the identity refusal alone.
+#[test]
+fn two_surfaces_on_one_slug_take_the_contribution_without_a_second_word() {
+    let errors = refusals(concat!(
+        "component Panel {\n",
+        "    abi = processor; requires = [];\n",
+        "    optional in messages;\n",
+        "}\n",
+        "component Shell { abi = processor; requires = []; }\n",
+        "surface desk {\n",
+        "    slug = \"alice-desk\";\n",
+        "    grants = [subscribe];\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
+        "surface bench {\n",
+        "    slug = \"alice-desk\";\n",
+        "    grants = [subscribe];\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
+        "extend surface \"alice-desk\" {\n",
+        "    new p2: Panel {}\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("two surfaces resolve to the identity `alice-desk`"),
+        "the identity refusal, which is the one the typo earns: {errors:?}"
+    );
+    assert!(!errors[0].contains("no surface has slug"), "{errors:?}");
+}
+
+/// A block places at least one component. One that places nothing still names
+/// a slug, so it would confer placement on its stamp and hold a `surfaces`
+/// ceiling entry alive against the dead-config rule while capping nothing —
+/// dead text wearing a live shape, refused on the terms an empty `grants` line
+/// is.
+#[test]
+fn a_contribution_that_places_nothing_is_refused() {
+    let errors = refusals(&contribution_doc("extend surface \"alice-desk\" {\n}\n"));
+    assert_eq!(
+        errors,
+        [
+            "this block places nothing on surface `alice-desk`; an `extend surface` block \
+             places at least one component"
+        ]
+    );
+}
+
+/// A component that did not resolve withholds the whole block, exactly as one
+/// withholds the whole surface it was written in: the author gets the
+/// component's refusal and nothing lands half-placed.
+#[test]
+fn a_refused_component_withholds_the_whole_block() {
+    let errors = refusals(&contribution_doc(concat!(
+        "extend surface \"alice-desk\" {\n",
+        "    new p2: Panel { in messages <- nothing; }\n",
+        "    new p3: Panel {}\n",
+        "}\n",
+    )));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("nothing"),
+        "the component's own refusal: {errors:?}"
+    );
+    assert!(
+        !errors[0].contains("no surface has slug") && !errors[0].contains("no chrome"),
+        "and no second sentence about the block or the surface: {errors:?}"
+    );
+}
+
+/// The chrome is counted over the merged surface, not over any one block: a
+/// surface nobody gave a shell to is refused at its own declaration, which is
+/// the compile-time half of the rule the plan stage asserts.
+#[test]
+fn a_surface_no_block_gave_a_chrome_is_refused() {
+    let errors = refusals(concat!(
+        "component Panel {\n    abi = processor; requires = [];\n}\n",
+        "surface desk {\n",
+        "    slug = \"alice-desk\";\n",
+        "    grants = [subscribe];\n",
+        "    new p1: Panel { grants = []; }\n",
+        "}\n",
+    ));
+    assert_eq!(
+        errors,
+        [
+            "surface `alice-desk` has no chrome; every surface holds exactly one, and it \
+             is the surface's shell"
+        ]
+    );
+}
+
+/// And two shells are refused wherever the second was written: a body chrome
+/// and a contribution's are two chromes on one surface, which is the case the
+/// count exists for.
+#[test]
+fn a_body_chrome_and_a_contributed_one_are_two_chromes() {
+    let errors = refusals(&contribution_doc(concat!(
+        "extend surface \"alice-desk\" {\n",
+        "    new p2: Panel { chrome = true; }\n",
+        "}\n",
+    )));
+    assert_eq!(
+        errors,
+        ["surface `alice-desk` holds a second chrome; every surface holds exactly one"]
+    );
+}
+
+/// A contribution may be the surface's only chrome: the merged count is one, so
+/// nothing is refused. What a mount may not do is a rule about authority, and
+/// it is written where the mount rules are.
+#[test]
+fn a_contributed_chrome_may_be_the_surfaces_only_one() {
+    let config = resolved(concat!(
+        "component Panel {\n    abi = processor; requires = [];\n}\n",
+        "surface desk {\n",
+        "    slug = \"alice-desk\";\n",
+        "    grants = [subscribe];\n",
+        "    new p1: Panel { grants = []; }\n",
+        "}\n",
+        "extend surface \"alice-desk\" {\n",
+        "    new shell: Panel { chrome = true; grants = []; }\n",
+        "}\n",
+    ));
+    let [surface] = &config.surfaces[..] else {
+        panic!("one surface");
+    };
+    assert_eq!(surface.components.len(), 2);
+}
+
+/// A block that did not resolve whole is not a block that placed nothing: it
+/// may be the one that wrote the shell. Counting chromes over a merged surface
+/// reads absence, so a withheld contribution silences the zero-chrome arm for
+/// the surface it named — otherwise every typo inside a chrome's body would
+/// come with a second refusal saying the surface has no chrome.
+#[test]
+fn a_withheld_contribution_does_not_make_its_surface_chromeless() {
+    let errors = refusals(concat!(
+        "component Panel {\n",
+        "    abi = processor; requires = [];\n",
+        "    optional in messages;\n",
+        "}\n",
+        "surface desk {\n",
+        "    slug = \"alice-desk\";\n",
+        "    grants = [subscribe];\n",
+        "    new p1: Panel { grants = []; }\n",
+        "}\n",
+        "extend surface \"alice-desk\" {\n",
+        "    new shell: Panel { chrome = true; grants = []; in messages <- nothing; }\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        !errors[0].contains("no chrome"),
+        "the author's own refusal, and no second sentence about the shell: {errors:?}"
+    );
+}
+
+/// And a block whose head is what was refused names no surface this pass can
+/// spell, so it silences the count everywhere: the shell it carried may have
+/// been any surface's.
+#[test]
+fn a_contribution_with_an_unknowable_slug_silences_the_chrome_count() {
+    let errors = refusals(concat!(
+        "component Panel {\n    abi = processor; requires = [];\n}\n",
+        "surface desk {\n",
+        "    slug = \"alice-desk\";\n",
+        "    grants = [subscribe];\n",
+        "    new p1: Panel { grants = []; }\n",
+        "}\n",
+        "extend surface nothing {\n",
+        "    new shell: Panel { chrome = true; grants = []; }\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        !errors[0].contains("has no chrome"),
+        "the head's own refusal, and no second sentence about the shell: {errors:?}"
+    );
+    assert!(errors[0].contains("nothing"), "{errors:?}");
+}
+
+#[test]
+fn a_packaged_module_places_nothing_on_a_surface() {
+    assert_eq!(
+        refusal(&format!(
+            concat!(
+                "{}\n",
+                "component Panel {{\n",
+                "    abi = processor; requires = [];\n",
+                "    optional in messages;\n",
+                "}}\n",
+                "extend surface \"alice-desk\" {{\n",
+                "    new p2: Panel {{}}\n",
+                "}}\n",
+                "{}\n",
+            ),
+            PACKAGED, PACKAGED
+        )),
+        "a packaged module declares vocabulary and places nothing; `extend surface` \
+         is an instantiation"
+    );
+}
+
 // ── call ports and the wiring ────────────────────────────────────────────────
 
 /// A surface holding a callee and a caller, with the caller's body written in.
@@ -1294,7 +1719,7 @@ fn call_doc(caller_body: &str) -> String {
             "}}\n",
             "surface kiosk {{\n",
             "    grants = [subscribe];\n",
-            "    new geo: Geocoder {{\n    }}\n",
+            "    new geo: Geocoder {{ chrome = true; }}\n",
             "    new menu: Menu {{\n{}    }}\n",
             "}}\n",
         ),
@@ -1317,6 +1742,9 @@ fn chain_doc(count: usize, calls: &[(usize, usize)]) -> String {
     ));
     for node in 0..count {
         doc.push_str(&format!("    new n{node}: Node {{\n"));
+        if node == 0 {
+            doc.push_str("        chrome = true;\n");
+        }
         let mut port = ["a", "b"].into_iter();
         for (from, to) in calls.iter().filter(|(from, _)| *from == node) {
             let _ = from;
@@ -1627,7 +2055,7 @@ fn a_call_across_the_two_placements_is_refused() {
             "new geo: Geocoder {{\n    slug = \"geocoder\";\n    grants = [];\n}}\n",
             "surface kiosk {{\n",
             "    grants = [subscribe];\n",
-            "    new menu: Menu {{\n        call lookup -> geo.resolve;\n    }}\n",
+            "    new menu: Menu {{\n        chrome = true;\n        call lookup -> geo.resolve;\n    }}\n",
             "}}\n",
         ),
         fence = PACKAGED
@@ -2169,7 +2597,7 @@ fn an_instance_of_a_spec_refused_class_reports_nothing_further() {
         "component Panel {\n    abi = processor;\n    in messages;\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
-        "    new p1: Panel {}\n",
+        "    new p1: Panel { chrome = true; }\n",
         "}\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -2182,7 +2610,7 @@ fn a_component_instantiation_takes_no_arguments() {
         "component Panel {\n    abi = processor; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
-        "    new p1: Panel(skin = \"bench\");\n",
+        "    new p1: Panel(skin = \"bench\") { chrome = true; }\n",
         "}\n",
     );
     assert_eq!(
@@ -2210,7 +2638,7 @@ fn one_surface_has_one_component_of_each_name() {
         "component Panel {\n    abi = processor; requires = [];\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
-        "    new p1: Panel {}\n",
+        "    new p1: Panel { chrome = true; }\n",
         "    new p1: Panel {}\n",
         "}\n",
     );
@@ -2223,7 +2651,7 @@ fn a_surface_contains_components_and_not_agents() {
         "agent Assistant(slug: String) {\n    slug = slug;\n}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
-        "    new p1: Assistant(slug = \"alice-pa\");\n",
+        "    new p1: Assistant(slug = \"alice-pa\") { chrome = true; }\n",
         "}\n",
     );
     assert_eq!(
@@ -2240,7 +2668,7 @@ fn a_surface_contains_components_and_not_assemblies() {
         "}\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
-        "    new p1: Desk(slug = \"alice-desk\");\n",
+        "    new p1: Desk(slug = \"alice-desk\") { chrome = true; }\n",
         "}\n",
     );
     assert_eq!(
@@ -2344,8 +2772,9 @@ fn every_repo_is_a_repo_and_not_all_of_them() {
 #[test]
 fn two_surfaces_may_not_resolve_to_one_identity() {
     let source = concat!(
-        "surface alice_desk {\n    grants = [subscribe];\n}\n",
-        "surface alice_wall {\n    grants = [subscribe];\n    slug = \"alice_desk\";\n}\n",
+        "component Shell { abi = processor; requires = []; }\n",
+        "surface alice_desk {\n    grants = [subscribe];\nnew shell: Shell { chrome = true; grants = []; } }\n",
+        "surface alice_wall {\n    grants = [subscribe];\n    slug = \"alice_desk\";\nnew shell: Shell { chrome = true; grants = []; } }\n",
     );
     assert_eq!(
         refusal(source),
@@ -2838,10 +3267,11 @@ new alice: Pa(mode = \"panel\");
 fn a_surface_slug_the_wire_cannot_carry_is_refused() {
     assert_eq!(
         refusal(concat!(
+            "component Shell { abi = processor; requires = []; }\n",
             "surface alice_desk {\n",
             "    grants = [subscribe];\n",
             "    slug = \"alice/desk\";\n",
-            "}\n",
+            "    new shell: Shell { chrome = true; grants = []; } }\n",
         )),
         "`alice/desk` is not a legal surface identity (letters, digits, `.`, `_`, \
          `~`, `-`); state one: `slug = \"alice-desk\";`"
@@ -2852,10 +3282,11 @@ fn a_surface_slug_the_wire_cannot_carry_is_refused() {
 fn a_slug_of_nothing_legal_is_told_to_write_a_name() {
     assert_eq!(
         refusal(concat!(
+            "component Shell { abi = processor; requires = []; }\n",
             "surface alice_desk {\n",
             "    grants = [subscribe];\n",
             "    slug = \"///\";\n",
-            "}\n",
+            "    new shell: Shell { chrome = true; grants = []; } }\n",
         )),
         "`///` is not a legal surface identity (letters, digits, `.`, `_`, `~`, \
          `-`); state one: `slug = \"a-name\";`"
@@ -2923,7 +3354,9 @@ fn a_misspelled_matcher_kind_is_refused_at_the_matcher() {
     let errors = compile(concat!(
         "channel alice_in at \"brenn:alice-desk.in.messages\";\n",
         "surface panel {\n    grants = [];\n",
-        "    acl subscribe [exakt \"brenn:alice-desk.in.messages\"];\n}\n",
+        "    acl subscribe [exakt \"brenn:alice-desk.in.messages\"];\n",
+        "    new shell: Shell { chrome = true; grants = []; }\n}\n",
+        "component Shell { abi = processor; requires = []; }\n",
     ))
     .expect_err("`exakt` spells neither kind");
     assert_eq!(errors.len(), 1);
@@ -2940,7 +3373,8 @@ fn a_misspelled_matcher_kind_is_refused_at_the_matcher() {
 fn a_misspelled_matcher_kind_in_a_grant_is_refused_too() {
     assert_eq!(
         refusal(concat!(
-            "surface panel {\n    grants = [];\n}\n",
+            "component Shell { abi = processor; requires = []; }\n",
+            "surface panel {\n    grants = [];\nnew shell: Shell { chrome = true; grants = []; } }\n",
             "grant panel subscribe exakt \"brenn:alice-desk.in.messages\";\n",
         )),
         "`exakt` is not a matcher kind; matchers are `exact`, `prefix`, `topic_filter`, \
@@ -2984,7 +3418,7 @@ fn a_prefix_on_a_declaration_is_refused() {
         "channel bob at \"brenn:bob.in.messages\";\n",
         "component Panel {\n    abi = processor; requires = [];\n    in messages;\n}\n",
         "surface alice_desk {\n    grants = [subscribe];\n",
-        "    new p1: Panel {\n        in messages <- alice;\n    }\n}\n",
+        "    new p1: Panel {\n        chrome = true;\n        in messages <- alice;\n    }\n}\n",
     );
     let diagnostics = resolve_errors(source);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -3055,9 +3489,13 @@ fn every_repeat_of_an_address_is_reported_against_the_first_holder() {
 #[test]
 fn every_repeat_of_an_identity_is_reported_against_the_first_holder() {
     let errors = compile(concat!(
-        "surface one {\n    grants = [];\n    slug = \"panel\";\n}\n",
-        "surface two {\n    grants = [];\n    slug = \"panel\";\n}\n",
-        "surface three {\n    grants = [];\n    slug = \"panel\";\n}\n",
+        "surface one {\n    grants = [];\n    slug = \"panel\";\n    \
+         new shell: Shell { chrome = true; grants = []; }\n}\n",
+        "surface two {\n    grants = [];\n    slug = \"panel\";\n    \
+         new shell: Shell { chrome = true; grants = []; }\n}\n",
+        "surface three {\n    grants = [];\n    slug = \"panel\";\n    \
+         new shell: Shell { chrome = true; grants = []; }\n}\n",
+        "component Shell { abi = processor; requires = []; }\n",
     ))
     .expect_err("one slug, three surfaces");
     assert_eq!(errors.len(), 2);
@@ -3138,10 +3576,11 @@ fn every_carrier_of_a_literal_address_is_held_to_the_one_spelling_rule() {
         "    out events;\n",
         "}\n",
         packaged!(),
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    acl subscribe [exact \"brenn:alice.cmd\"];\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
         "new alice_sink: Sink {\n",
         "    grants = [ports];\n",
         "    acl publish [exact \"brenn:alice.cmd\"];\n",
@@ -3161,10 +3600,11 @@ fn every_carrier_of_a_literal_address_is_held_to_the_one_spelling_rule() {
 fn a_matcher_in_an_attribute_value_is_outside_the_one_spelling_rule() {
     resolved(concat!(
         "channel alice_cmd at \"brenn:alice.cmd\";\n",
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    skin = exact \"brenn:alice.cmd\";\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
     ));
 }
 
@@ -3189,12 +3629,13 @@ fn a_literal_address_no_channel_declares_is_how_a_local_plane_is_named() {
 #[test]
 fn every_bad_value_in_a_surface_body_reaches_one_report() {
     let errors = refusals(concat!(
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    skin = nowhere;\n",
         "    allowed_users = elsewhere;\n",
         "    acl subscribe [exact missing];\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
     ));
     assert_eq!(errors.len(), 3, "{errors:?}");
     for name in ["nowhere", "elsewhere", "missing"] {
@@ -3211,15 +3652,16 @@ fn a_surface_whose_body_was_refused_is_not_in_the_model() {
     // half-resolved surface never reaches a later pass. Two surfaces sharing
     // one identity is a refusal of its own, and it is absent.
     let errors = refusals(concat!(
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    slug = \"panel\";\n",
         "    skin = nowhere;\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
         "surface alice_wall {\n",
         "    grants = [subscribe];\n",
         "    slug = \"panel\";\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("nowhere"), "{errors:?}");
@@ -3228,11 +3670,12 @@ fn a_surface_whose_body_was_refused_is_not_in_the_model() {
 #[test]
 fn a_bad_attr_elsewhere_does_not_hide_an_illegal_slug() {
     let errors = refusals(concat!(
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    slug = \"alice/desk\";\n",
         "    skin = nowhere;\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
     ));
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert!(
@@ -3252,10 +3695,11 @@ fn a_refused_slug_value_is_not_checked_as_an_identity() {
     // The slug's own value was refused, so there is no text to check the
     // charset of: one diagnostic, not a second about a substituted value.
     let errors = refusals(concat!(
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    slug = nowhere;\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("nowhere"), "{errors:?}");
@@ -3323,7 +3767,9 @@ fn a_refused_component_body_withholds_its_surface() {
         "surface alice_wall {\n",
         "    grants = [subscribe];\n",
         "    slug = \"panel\";\n",
+        "    new shell: Shell { chrome = true; grants = []; }\n",
         "}\n",
+        "component Shell { abi = processor; requires = []; }\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("nowhere"), "{errors:?}");
@@ -3340,10 +3786,11 @@ fn a_channel_with_a_refused_body_keeps_its_position() {
         "    send_rate = elsewhere;\n",
         "}\n",
         "channel second at \"brenn:alice-desk.out.p1\";\n",
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    acl subscribe [exact second];\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
     ));
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert!(
@@ -3536,12 +3983,13 @@ fn a_surface_missing_a_whole_component_is_withheld_too() {
         "surface alice_desk {\n",
         "    grants = [subscribe];\n",
         "    slug = \"panel\";\n",
-        "    new panel: Nowhere;\n",
+        "    new panel: Nowhere { chrome = true; }\n",
         "}\n",
+        "component Shell { abi = processor; requires = []; }\n",
         "surface alice_wall {\n",
         "    grants = [subscribe];\n",
         "    slug = \"panel\";\n",
-        "}\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("Nowhere"), "{errors:?}");
@@ -3594,12 +4042,12 @@ fn a_refused_value_in_an_assembly_body_is_reported_once_per_instantiation() {
     // resolves under its own body verdict: two of them report two refusals,
     // and neither surface reaches the model.
     let errors = refusals(concat!(
-        "assembly Pod(look: String) {\n",
+        "component Shell { abi = processor; requires = []; }\nassembly Pod(look: String) {\n",
         "    surface panel {\n",
         "        grants = [subscribe];\n",
         "        skin = look;\n",
         "        allowed_users = nowhere;\n",
-        "    }\n",
+        "    new shell: Shell { chrome = true; grants = []; } }\n",
         "}\n",
         "new alice_pod: Pod(look = \"bench\");\n",
         "new bob_pod: Pod(look = \"bench\");\n",
@@ -4459,7 +4907,7 @@ fn a_surface_placement_of_a_tree_declared_class_is_untouched() {
     let config = resolved(concat!(
         "component Panel { abi = processor; requires = []; in messages; }\n",
         "surface desk {\n    grants = [];\n    \
-         new p1: Panel { grants = []; in messages <- \"local:desk.m\"; }\n}\n",
+         new p1: Panel { chrome = true; grants = []; in messages <- \"local:desk.m\"; }\n}\n",
     ));
     assert_eq!(config.surfaces[0].components[0].class.package, None);
 }
@@ -4535,7 +4983,9 @@ fn a_packaged_module_instantiates_nothing() {
         "component Sink { abi = processor; requires = []; in messages; }\n\
          new sink: Sink { }\n",
         "agent Assistant() { name = \"Assistant\"; }\n",
-        "surface alice_desk { grants = [subscribe]; }\n",
+        "component Shell { abi = processor; requires = []; }\n\
+         surface alice_desk { grants = [subscribe]; \
+         new shell: Shell { chrome = true; grants = []; } }\n",
         "remote pod { token_file = \"/etc/brenn/pod.token\"; grants = [publish]; }\n",
         "webhook hook { mount = \"/webhooks/hook\"; }\n",
         "repo notes { remote = \"git@example.com:alice/notes.git\"; }\n",

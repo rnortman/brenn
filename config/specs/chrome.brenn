@@ -24,3 +24,45 @@ component Chrome {
   io toast-tick;
   io state;
 }
+
+/// Every reserved `local:brenn/*` control plane bound at the depth its shape
+/// takes, the takeover pair among them, and the page's layout channel handed
+/// in by the caller.
+///
+/// The reserved names are the kernel's, not the author's, and an omitted plane
+/// boots and goes quiet rather than refusing. The layout channel is a parameter
+/// because one channel may drive several pages and belongs where its publishers
+/// are.
+///
+/// The takeover pair is unconditional: every page that stamps this holds
+/// `takeover` and binds both of its planes. A page that must not reach the
+/// takeover plane has no opt-out here and writes its own chrome block instead.
+///
+/// The bindings and depths below are one-place; a stamp's ceiling body is not.
+/// Each stamp spells the five grant words this body reaches and the slug it
+/// places on, because the words and the placement a packaged arrangement holds
+/// are the stamping document's consent — so a grant word added here is still an
+/// edit to every stamp in every repository.
+///
+/// TODO(chrome-no-layout-placeholder): `layout` is a required entity parameter
+/// and entity parameters carry no defaults, so a page with no layout publisher
+/// declares a channel nothing publishes to purely to fill this slot.
+assembly StandardChrome(slug: String, layout: Channel) {
+  extend surface f"{slug}" {
+    new chrome: Chrome {
+      grants = [ports, log, takeover, dom, page-dom];
+      chrome = true;
+      in layout <- layout { push_depth = 1; }
+      in theme <- "local:brenn/theme" { push_depth = 1; }
+      in takeover <- "local:brenn/takeover" { push_depth = 8; }
+      in link-state <- "local:brenn/link-state" { push_depth = 1; }
+      in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
+      in toast <- "local:brenn/toast" { push_depth = 8; }
+      out overlay-state -> "local:brenn/overlay-state";
+      io toast-tick { push_depth = 1; retain_depth = 2; }
+      io state { push_depth = 0; retain_depth = 1; }
+
+    }
+
+  }
+}

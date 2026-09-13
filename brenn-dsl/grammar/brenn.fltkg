@@ -30,6 +30,7 @@ item := const_def:const_def
       | channel:channel_def
       | link:link_stmt
       | surface:surface_def
+      | surface_ext:surface_ext
       | inst:new_stmt
       | remote:remote_def
       | principal:principal_def
@@ -109,14 +110,23 @@ agent_class := doc:doc? , %"agent" : name:cname , params:param_list? , %"{" ,
 // dropped.
 assembly_def := doc:doc? , %"assembly" : name:cname , params:param_list , %"{" , items:assembly_item* , %"}"  , ;
 
-assembly_item := channel:channel_def | link:link_stmt | surface:surface_def | inst:new_stmt
-               | grant:grant_stmt ;
+assembly_item := channel:channel_def | link:link_stmt | surface:surface_def
+               | surface_ext:surface_ext | inst:new_stmt | grant:grant_stmt ;
 
 param_list := %"(" , (params:param , (%"," , params:param)*)? , %")" ;
 param := name:name , %":" , ty:cname , default:param_default? ;
 param_default := %"=" , value:value ;
 
 surface_def := doc:doc? , %"surface" : name:name , %"{" , (attrs:attr | acls:acl_stmt | insts:new_stmt)* , %"}"  , ;
+
+// `extend surface "r-deskbar" { new weather: Weather { … } }` — components
+// placed on a surface some other block declares, named by its slug rather than
+// by a handle. The body takes instances and nothing else: attach rights, skin
+// and audience are the surface's own block's.
+//
+// Both keywords take `:` after them: `,` is optional whitespace, and
+// `extendsurface` must not parse as this rule.
+surface_ext := doc:doc? , %"extend" : %"surface" : slug:value , %"{" , insts:new_stmt* , %"}"  , ;
 
 // One instantiation form for components, agents and assemblies: arguments for
 // the parameterized classes, a body for the ones configured per instance. On an

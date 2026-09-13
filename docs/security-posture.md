@@ -1082,11 +1082,29 @@ bind-mount set. Nothing the author can reach widens any of them.
 **What the compiler bounds:**
 
 - **Vocabulary.** A fragment declares channels, instantiates classes, stamps
-  assemblies, links them, and declares principals beneath its own ceiling. It is
+  assemblies, links them, declares principals beneath its own ceiling, and
+  places components on surfaces the deployment declared. It is
   refused an `agent`, a `surface`, a `remote`, a `webhook`, a `repo`, an
   `mqtt_client`, an `mcp_server`, a settings section, a `mount`, a component
   class, a channel tuning, and a top-level `grant` or `acl`. An assembly it
   stamps that places a surface or an agent in its body is refused at the `new`.
+- **Placement.** A fragment may place components on the deployment's surfaces
+  named in its ceiling's `surfaces` list and on no other; a ceiling with no
+  `surfaces` line places on no page at all. It cannot mint a surface, so it
+  chooses neither the slug — which is the URL and the participant identity —
+  nor `allowed_users`, nor the attach `grants` and `acl` the server enforces
+  for every `surface:<slug>#<instance>` principal. It cannot write the chrome:
+  `chrome = true` in a fragment is refused at the attr, which is what keeps
+  `page-dom` — the whole page document rather than a contained subtree — out of
+  a mount's hands. A contributed binding is capped twice: by the ceiling's
+  reach, and, where the surface writes an explicit `acl`, by that ACL, which the
+  binding must be covered by exactly as a body instance's is.
+- **Kind descriptions.** A fragment may declare the two description channels of
+  a kind its own bundle ships. Their *content* is system-published from the
+  kind's sidecars in the surface asset tree, so the declaration gives the author
+  the channel's existence and depth and nothing else; two documents declaring
+  one kind's pair is an address collision, and no document declaring it is a
+  plan refusal.
 - **Reach.** Every grant word, every binding and every channel the fragment
   declares must fit under the ceiling. Declaring a channel confers nothing: an
   address the ceiling reaches on neither plane is refused at the declaration, so
