@@ -1,5 +1,33 @@
 # TODOs
 
+## `harness-host-rule-parity`
+
+`surface/page-harness` sells itself, and `docs/component-packages.md` sells it,
+as refusing what the kernel and backend hosts refuse: a `dom.listen` outside the
+declared `sync` ports, a publish outside `out`/`io`, an activation windowing a
+port the class does not bind. It reads those vocabularies off the authored
+`.brenn` through `brenn_dsl::scaffold::port_vocabulary`; the hosts read theirs
+off the *resolved* model, in `brenn-lib/src/config/dsl_lower.rs`
+(`declared_out_ports`, `sync_ports`, `call_ports`). The `listen` half is held by
+the type system now — a guest can only name a generated `SyncPort` — but the
+publish and window halves are two readings of one rule with nothing comparing
+them. Narrow the publish rule on the host side and an out-of-tree author's suite
+stays green against a component the host refuses, which is the population the
+harness exists for.
+
+What to decide first is which reading is canonical and where the gate lives: a
+parity test in the shape of `brenn-dsl/src/grant_parity.rs`, or the harness
+reading the lowered model rather than the AST, or `dsl_lower`'s predicates
+moving into `brenn-dsl` beside the AST ones. The first needs `dsl_lower`'s
+private helpers exposed to a test; the second changes what a `testonly` crate
+depends on. It is a design question, not a missing assertion.
+
+Code sites (`TODO(harness-host-rule-parity)`):
+`surface/page-harness/src/lib.rs`, at `Declared::from_spec`.
+
+Done = one mechanical gate holds the harness's refusal vocabulary equal to the
+one the hosts refuse outside of, for every direction.
+
 ## `ceiling-channel-depth`
 
 A ceiling caps *reach*, not *size*. A config-carrying mount's author declares
@@ -2450,7 +2478,7 @@ idiom, and an out-of-tree author gets no help with it from the SDK.
 Two shapes, and choosing between them is the work: a `dom::Mounted<V>` cell in
 the guest SDK (a data type; every kind keeps its own mount arm), or a
 `Processor::mount()` trait method that `export_processor!` dispatches to when
-the activation names `dom::MOUNT`, leaving `receive` to see only deliveries and
+the activation names `brenn_guest::MOUNT`, leaving `receive` to see only deliveries and
 gestures. The second is the better shape and is a change to the guest SDK's
 `Processor` trait — the first-class out-of-tree extension surface — so it wants
 a design cycle rather than a drive-by: it moves what a component author must
@@ -2464,7 +2492,7 @@ an out-of-tree author has to do. So the SDK-owned lifecycle has a customer whose
 copy no change here can update.
 
 Code sites (`TODO(surface-guest-mount-idiom)`):
-`brenn-wasm/components/guest/src/lib.rs`, at `dom::MOUNT`.
+`brenn-wasm/components/guest/src/lib.rs`, at `brenn_guest::MOUNT`.
 
 Done = one home for the mount lifecycle in the SDK, and the five kinds' copies
 of the `Option<View>`/`expect`/mount-arm idiom deleted.

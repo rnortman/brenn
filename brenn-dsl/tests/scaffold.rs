@@ -226,6 +226,121 @@ fn outbound_ports_colliding_only_as_payload_traits_are_refused() {
     assert_eq!(error.related.len(), 1, "{}", error.render());
 }
 
+/// A `call` port's handle and an `out` port's publish handle are both functions
+/// in one module, so they share one namespace. Neither word names the clash, so
+/// the refusal names the namespace instead.
+#[test]
+fn a_call_handle_colliding_with_a_publish_handle_is_a_handle_collision() {
+    let error = refusal(
+        &processor("  out push-events;\n  call push_events;\n"),
+        None,
+    );
+    assert!(
+        error
+            .message
+            .contains("both map to the handle `push_events`"),
+        "{}",
+        error.message
+    );
+    assert_eq!(error.related.len(), 1, "{}", error.render());
+}
+
+/// Two `call` ports reach the namespace by one kind of spelling, so their
+/// refusal names the kind — as two `out` ports' does.
+#[test]
+fn call_ports_differing_only_in_punctuation_collide_as_call_handles() {
+    let error = refusal(
+        &processor("  call push-events;\n  call push_events;\n"),
+        None,
+    );
+    assert!(
+        error
+            .message
+            .contains("both map to the call handle `push_events`"),
+        "{}",
+        error.message
+    );
+}
+
+/// A `sync` port's variant lives on `SyncPort`, which is not `InPort`, so an
+/// inbound port of the same spelling is no collision — and two sync ports of
+/// one spelling still are.
+#[test]
+fn a_sync_variant_collides_only_with_another_sync_variant() {
+    let module = module(&processor("  in send;\n  sync send-now;\n"), None);
+    assert!(module.contains("InPort::Send => \"send\""), "{module}");
+    assert!(
+        module.contains("SyncPort::SendNow => \"send-now\""),
+        "{module}"
+    );
+
+    let error = refusal(
+        &processor("  sync push-events;\n  sync push_events;\n"),
+        None,
+    );
+    assert!(
+        error
+            .message
+            .contains("both map to the enum variant `PushEvents`"),
+        "{}",
+        error.message
+    );
+}
+
+/// Every sync cause goes through `from_name`, the mount included, so the one
+/// cause no specification declares comes back a refusal. A special case that
+/// answered `Ok(None)` for it would let a guest that forgot its mount arm treat
+/// a mount as an asynchronous activation, which is the failure this shape is
+/// chosen to prevent — and the goldens state it only by example.
+#[test]
+fn the_sync_classifier_routes_every_cause_through_from_name() {
+    let module = module(&processor("  sync press;\n"), None);
+    assert!(
+        module.contains("match SyncPort::from_name(port)"),
+        "{module}"
+    );
+    assert!(!module.contains("brenn:mount"), "{module}");
+}
+
+/// A gesture may be wired to a declared port and to nothing else: the generated
+/// enum is the SDK's only `ListenPort`, which is what leaves the mount cause —
+/// a `SyncPortName` — unable to reach `dom::listen`.
+#[test]
+fn the_sync_enum_is_what_a_gesture_may_be_wired_to() {
+    let module = module(&processor("  sync press;\n"), None);
+    assert!(
+        module.contains("impl brenn_guest::ListenPort for SyncPort {}"),
+        "{module}"
+    );
+}
+
+/// The keyword refusal covers all four directions: a `sync` port mints a
+/// variant and a `call` port a function, refused on the same terms as `in` and
+/// `out`.
+#[test]
+fn a_call_port_spelling_a_keyword_is_refused() {
+    let error = refusal(&processor("  call match;\n"), None);
+    assert!(
+        error
+            .message
+            .contains("maps to `match`, which is a Rust keyword"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn a_sync_port_spelling_a_keyword_is_refused() {
+    let error = refusal(&processor("  sync self;\n"), None);
+    assert!(
+        error
+            .message
+            .contains("maps to `Self`, which is a Rust keyword"),
+        "{}",
+        error.message
+    );
+}
+
 #[test]
 fn an_outbound_port_spelling_a_keyword_is_refused() {
     let error = refusal(&processor("  out match;\n"), None);

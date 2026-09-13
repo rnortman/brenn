@@ -16,5 +16,6 @@ description = "A recording page host for surface-placed components: one instanti
 [dependencies]
 wasmtime = { version = "47", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
 serde_json = "1"
+brenn-dsl = { version = "0.1.0", path = "../../brenn-dsl" }
 brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope", features = ["testutils"] }
 brenn-surface-contract = { version = "0.1.0", path = "../contract" }

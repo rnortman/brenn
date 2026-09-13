@@ -12,22 +12,22 @@
 // tree runs, so a migrated UI kind's actual element calls, gesture handling and
 // publish taxonomy are executable coverage rather than inspection.
 //
-// What is left here is this suite's own: which three artifacts it drives, the
-// grant profile each is linked with, their port and marker vocabularies, and
-// the scripted fixtures built out of the harness's activation constructors.
+// What is left here is this suite's own: which artifacts it drives, their
+// marker vocabularies, and the scripted fixtures built out of the harness's
+// activation constructors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brenn_chrome::spec::port::{SURFACE_STATE, TOAST};
 use brenn_chrome::wire::{
     CONTROL_PLANE_VERSION, InstanceState, SurfaceStateBody, SurfaceStateInstance, ToastBody,
     ToastSeverity, ToastSource,
 };
-use brenn_envelope::grants::ComponentGrant::{Alert, Config, Dom, Log, PageDom, Ports};
+use brenn_envelope::grants::ComponentGrant::{Alert, Config, Dom, Log, Ports, Store};
 use brenn_envelope::testutils::NOW_MS;
 use brenn_meeting::logic::{AckTarget, SNOOZE_SECS, dismiss_body, snooze_body};
 use brenn_page_harness::{
-    Harness, Listener, Page, ROOT, delivery_on, gesture, gesture_at, mount, ports, types,
+    Declared, Harness, Listener, Page, ROOT, delivery_on, gesture, gesture_at, mount, ports, types,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -42,8 +42,8 @@ const ECHO_OUT_PORT: &str = "out";
 /// The `io` port its state rides between activations.
 const ECHO_STATE_PORT: &str = "state";
 
-/// Echo-stub's sync port names, its own vocabulary — not bound in the
-/// specification.
+/// Echo-stub's three sync ports. Literals because this suite does not depend on
+/// its crate; must match the specification or the harness panics.
 const SEND: &str = "send";
 const SEND_CUSTOM: &str = "send-custom";
 const PANIC: &str = "panic";
@@ -59,8 +59,8 @@ const MAX_SCROLLBACK_ENTRIES: usize = 100;
 /// meeting's two bound ports, and the two sync ports its buttons ask for.
 const AGENDA_PORT: &str = "agenda";
 const ACKS_PORT: &str = "acks";
-const DISMISS: &str = "dismiss";
-const SNOOZE: &str = "snooze";
+const DISMISS: &str = brenn_meeting::spec::SyncPort::Dismiss.name();
+const SNOOZE: &str = brenn_meeting::spec::SyncPort::Snooze.name();
 
 /// The `io` port meeting's state rides between activations, and the `out` port
 /// it announces a takeover transition on.
@@ -72,9 +72,8 @@ const MEETING_TAKEOVER_PORT: &str = "takeover";
 const CHROME_INSTANCE: &str = "chrome";
 const SIBLING_INSTANCE: &str = "panel-1";
 
-/// The sync port chrome's one delegated toast listener asks for. Its own
-/// vocabulary, bound to nothing in the specification.
-const TOAST_DISMISS: &str = "toast-dismiss";
+/// The sync port chrome's one delegated toast listener asks for.
+const TOAST_DISMISS: &str = brenn_chrome::spec::SyncPort::ToastDismiss.name();
 
 /// The `io` port chrome's state rides between activations.
 const CHROME_STATE_PORT: &str = "state";
@@ -83,8 +82,8 @@ const CHROME_STATE_PORT: &str = "state";
 fn echo_stub() -> Harness {
     Harness::new(
         &common::artifact_path("brenn_echo_stub"),
+        &common::spec_path("echo-stub"),
         Page::new(),
-        &[Ports, Log, Dom],
     )
     .retaining_state(ECHO_STATE_PORT)
 }
@@ -106,8 +105,8 @@ const MODE_THEME_PORT: &str = "theme";
 fn mode_clock() -> Harness {
     Harness::new(
         &common::artifact_path("brenn_mode_clock"),
+        &common::spec_path("mode-clock"),
         Page::new(),
-        &[Ports, Log, Dom],
     )
     .retaining_state(MODE_STATE_PORT)
 }
@@ -123,8 +122,8 @@ const PROTOBAR_STATUS_MARKER: &str = "data-protobar-status";
 fn protobar() -> Harness {
     Harness::new(
         &common::artifact_path("brenn_protobar"),
+        &common::spec_path("protobar"),
         Page::new(),
-        &[Ports, Log, Dom],
     )
     .retaining_state(PROTOBAR_STATE_PORT)
 }
@@ -132,8 +131,8 @@ fn protobar() -> Harness {
 fn meeting_unmounted() -> Harness {
     Harness::new(
         &common::artifact_path("brenn_meeting"),
+        &common::spec_path("meeting"),
         Page::new(),
-        &[Ports, Log, Dom],
     )
     .retaining_state(MEETING_STATE_PORT)
 }
@@ -146,8 +145,8 @@ fn meeting() -> Harness {
 fn chrome_unmounted() -> Harness {
     Harness::new(
         &common::artifact_path("brenn_chrome"),
+        &common::spec_path("chrome"),
         Page::with_page_authority(CHROME_INSTANCE, SIBLING_INSTANCE),
-        &[Ports, Log, Dom, PageDom],
     )
     .retaining_state(CHROME_STATE_PORT)
 }
@@ -300,8 +299,8 @@ fn state_writes(transcript: Vec<String>) -> Vec<String> {
 fn an_unbound_state_port_refuses_the_activation_by_name() {
     let mut harness = Harness::new(
         &common::artifact_path("brenn_echo_stub"),
+        &common::spec_path("echo-stub"),
         Page::new(),
-        &[Ports, Log, Dom],
     );
     let refusal = harness.call_expecting_a_refusal(mount());
     let refusal = format!("{refusal:?}");
@@ -541,18 +540,32 @@ fn the_panic_gesture_traps_the_instance() {
     harness.call_expecting_a_trap(gesture(PANIC, panic_button));
 }
 
+/// A script that names a sync port the specification does not declare is a
+/// broken script: no host can raise that activation, since the kernel refuses
+/// the listen that would cause it. It fails here, at the activation, rather
+/// than reaching the guest's own refusal.
 #[test]
-fn a_gesture_on_a_port_the_component_wired_nothing_to_is_refused_not_trapped() {
-    // A sync port the component does not know is a wiring bug, not a memory
-    // one: it answers err, keeps running, and the page keeps its instance.
+#[should_panic(expected = "does not declare `sync`")]
+fn a_gesture_on_a_port_the_specification_does_not_declare_sync_fails_the_script() {
     let mut harness = echo_stub_mounted();
-    let refusal = harness.call_expecting_a_refusal(gesture("no-such-port", ROOT));
-    match refusal {
-        types::ReceiveError::ProcessingFailed(why) => {
-            assert!(why.contains("no-such-port"), "{why}")
-        }
-        other => panic!("{other:?}"),
-    }
+    let _ = harness.receive(&gesture("no-such-port", ROOT));
+}
+
+/// Retention is the `io state` port's, and a port that is not `io` cannot carry
+/// state between activations however a script names it.
+#[test]
+#[should_panic(expected = "not declared `io`")]
+fn retaining_state_on_a_port_that_is_not_io_fails_the_script() {
+    let _ = echo_stub().retaining_state(ECHO_OUT_PORT);
+}
+
+/// A delivery windows a port the class binds. One the specification does not
+/// declare `in` or `io` is a window no kernel would build.
+#[test]
+#[should_panic(expected = "does not declare `in` or `io`")]
+fn a_delivery_windowing_an_undeclared_port_fails_the_script() {
+    let mut harness = echo_stub_mounted();
+    let _ = harness.receive(&delivery_on("no-such-port", &[], &["{}"], 0));
 }
 
 #[test]
@@ -753,18 +766,6 @@ fn a_state_body_meeting_cannot_read_refuses_the_activation() {
     );
 }
 
-#[test]
-fn a_press_on_a_port_meeting_wired_nothing_to_is_refused_not_trapped() {
-    let mut harness = escalated_meeting();
-    let refusal = harness.call_expecting_a_refusal(gesture("no-such-port", ROOT));
-    match refusal {
-        types::ReceiveError::ProcessingFailed(why) => {
-            assert!(why.contains("no-such-port"), "{why}")
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // chrome: page authority, which no other kind holds
 // ---------------------------------------------------------------------------
@@ -956,7 +957,16 @@ fn headless(
     grants: &[brenn_envelope::grants::ComponentGrant],
     page: Page,
 ) -> Harness {
-    Harness::new(&common::artifact_path(artifact), page, grants)
+    // Neither fixture has an authored `.brenn`, so its vocabulary is stated
+    // here: the one directive port it reads and the one port it answers on.
+    let declared = Declared {
+        grants: grants.iter().copied().collect(),
+        inbound: BTreeSet::from([DIRECTIVE_PORT.to_string()]),
+        outbound: BTreeSet::from([DIRECTIVE_OUT.to_string()]),
+        sync_ports: BTreeSet::new(),
+        call_ports: BTreeSet::new(),
+    };
+    brenn_page_harness::Kind::compile(&common::artifact_path(artifact), declared).instantiate(page)
 }
 
 /// The directive port both headless fixtures read, and the one they answer on.
@@ -972,18 +982,41 @@ fn a_grant_the_caller_did_not_name_is_not_linked() {
     // Instantiation is inside the activation (linear memory is
     // activation-scoped), so mounting is not what refuses; the first
     // activation is.
-    let refused = std::panic::catch_unwind(|| {
-        let mut harness = Harness::new(
-            &common::artifact_path("brenn_echo_stub"),
-            Page::new(),
-            &[Ports, Log],
-        );
+    //
+    // Everything but the activation is built outside the `catch_unwind`, so the
+    // only panic this can catch is the instantiation one — a mistyped spec path
+    // or a windowing rule the harness later grows would otherwise pass this
+    // test for a reason that is not the linker's.
+    let mut declared = Declared::from_spec(&common::spec_path("echo-stub"), None);
+    declared.grants.retain(|grant| *grant != Dom);
+    let kind =
+        brenn_page_harness::Kind::compile(&common::artifact_path("brenn_echo_stub"), declared);
+    let mut harness = kind.instantiate(Page::new());
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         harness.call(brenn_page_harness::mount());
-    });
+    }));
+    let panic = refused.expect_err("echo-stub imports `dom`, which nothing here linked");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
     assert!(
-        refused.is_err(),
-        "echo-stub imports `dom`, which nothing here linked"
+        message.contains("brenn:processor/dom"),
+        "the refusal names the import nothing linked: {message}"
     );
+}
+
+/// A specification read off disk may name a capability that is not the surface
+/// profile's — `store`, `calls`, `mqtt` — which for a page-hosted kind is an
+/// authoring mistake, and the harness says which word it was rather than
+/// linking nothing and failing later with a wasmtime import error.
+#[test]
+#[should_panic(expected = "is not a capability a page can satisfy")]
+fn a_grant_no_page_can_satisfy_is_refused_by_name() {
+    let mut declared = Declared::from_spec(&common::spec_path("echo-stub"), None);
+    declared.grants.insert(Store);
+    brenn_page_harness::Kind::compile(&common::artifact_path("brenn_echo_stub"), declared);
 }
 
 #[test]

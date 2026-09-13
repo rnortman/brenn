@@ -39,6 +39,15 @@ pub fn artifact_path(stem: &str) -> PathBuf {
         .join(format!("{stem}.wasm"))
 }
 
+/// The authored specification of a kind shipped from `config/specs/`, by kind
+/// name (e.g. `"echo-stub"` → `config/specs/echo-stub.brenn`).
+///
+/// The runfiles root is the working directory, so the workspace-relative path
+/// resolves directly.
+pub fn spec_path(kind: &str) -> PathBuf {
+    PathBuf::from("config/specs").join(format!("{kind}.brenn"))
+}
+
 /// The production replay component artifact path.
 pub fn replay_artifact() -> PathBuf {
     artifact_path("brenn_replay")

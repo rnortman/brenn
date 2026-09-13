@@ -107,7 +107,7 @@ brenn_guest::export_processor!(ProtobarComponent);
 /// the state machine, then render once — not once per message — and park the
 /// next expiry wake.
 fn on_activation(activation: &Activation, bar: &mut Protobar) -> Result<(), Error> {
-    if activation.sync_is(dom::MOUNT) {
+    if activation.sync_is(brenn_guest::MOUNT) {
         bar.view = Some(build_view());
     }
     let now = activation_instant(activation)?;

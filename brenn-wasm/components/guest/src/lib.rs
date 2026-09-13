@@ -124,6 +124,60 @@ fn publish_error(port: &str, e: bindings::brenn::processor::ports::PublishError)
 
 // ── activation / dispatch ─────────────────────────────────────────────────────
 
+/// A port the specification declares `sync`, or the reserved mount cause.
+///
+/// Implemented by the scaffold's generated `SyncPort` enum and by [`Mount`]; a
+/// guest never implements it. It is what holds the two halves of a gesture to
+/// one spelling — [`dom::listen`] wires a port and [`Activation::sync_is`]
+/// matches on the same item — and what holds both halves to the specification,
+/// since the only inhabited implementor a guest can name is generated from it.
+pub trait SyncPortName: Copy {
+    /// The port name as the host spells it.
+    fn name(self) -> &'static str;
+}
+
+/// A sync port a gesture may be wired to: one the specification declares
+/// `sync`.
+///
+/// Implemented by the scaffold's generated `SyncPort` enum and by nothing else.
+/// [`Mount`] is a [`SyncPortName`] — it is a cause [`Activation::sync_is`] asks
+/// about — and deliberately not a `ListenPort`: the mount cause is the host's
+/// to mint, no specification declares it, and every host refuses a listen on
+/// it. Separating the two bounds is what makes that refusal a compile error at
+/// the [`dom::listen`] call instead of a dead instance in a browser.
+pub trait ListenPort: SyncPortName {}
+
+/// The reserved cause of a mount activation: the instance's first call, where a
+/// `dom`-granted component builds its UI, and the one sync cause no
+/// specification declares.
+///
+/// It lives at the crate root rather than in [`dom`] because a backend host
+/// mints mount activations too, and a backend guest holds no `dom` grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Mount;
+
+// The one spelling of the mount cause on this side of the ABI. The host's half
+// is `MOUNT_SYNC_PORT` in `brenn-surface-contract`, held equal to this line by
+// `the_guest_half_of_the_mount_port_spells_the_same_string`. Reserved by its
+// colon, which no specification identifier can spell.
+const MOUNT_PORT_NAME: &str = "brenn:mount";
+
+/// The mount cause, to pass to [`Activation::sync_is`].
+pub const MOUNT: Mount = Mount;
+
+impl SyncPortName for Mount {
+    fn name(self) -> &'static str {
+        MOUNT_PORT_NAME
+    }
+}
+
+// TODO(surface-guest-mount-idiom): every UI kind hand-copies the same mount
+// bookkeeping around this constant — an `Option<View>` field, an identical
+// `expect`, and a mount arm in its handler. The SDK should own the lifecycle;
+// which shape it takes is a `Processor`-trait decision. There is an out-of-tree
+// copy, so the shape is one an author outside this repository reproduces from
+// an example.
+
 /// Trait for processor logic. Implement this and wire with `export_processor!`.
 pub trait Processor {
     /// Process one activation. Published messages are buffered and flushed
@@ -189,10 +243,11 @@ impl Activation {
 
     /// Is this a sync-call activation on `port`?
     ///
-    /// The comparison a handler writes against the same [`dom::SyncPort`] item
+    /// The comparison a handler writes against the same [`SyncPortName`] item
     /// it passed to [`dom::listen`], so the two halves of a gesture share one
-    /// spelling instead of two string literals.
-    pub fn sync_is(&self, port: dom::SyncPort) -> bool {
+    /// spelling instead of two string literals. [`MOUNT`] is the item a
+    /// mounting kind asks about first.
+    pub fn sync_is<P: SyncPortName>(&self, port: P) -> bool {
         self.sync() == Some(port.name())
     }
 
@@ -1199,10 +1254,12 @@ pub mod calls {
     //! absent the host does not link the `brenn:processor/calls` interface and
     //! any import of it causes a load-time panic.
     //!
-    //! The port names a `call` port the specification declares and the document
-    //! wires to a peer's `sync` port. A name the specification does not declare
-    //! ends the activation, exactly as a publish to an undeclared port does; a
-    //! declared port the deployer left unbound answers [`CallError::Unwired`].
+    //! A [`CallPort`] names a `call` port the specification declares and the
+    //! document wires to a peer's `sync` port; the specification's generated
+    //! module hands out one handle per declared port. A name the specification
+    //! does not declare ends the activation, exactly as a publish to an
+    //! undeclared port does; a declared port the deployer left unbound answers
+    //! [`CallError::Unwired`].
     //!
     //! **Not transactional with the activation outcome.** The peer's activation
     //! runs to completion and its ok flushes its own buffer before the call
@@ -1219,8 +1276,8 @@ pub mod calls {
     use crate::bindings::brenn::processor::calls::{self as raw};
 
     /// Why a call did not answer, for a guest that classifies before it gives
-    /// up. [`call`] flattens this into an [`Error`]; reach for [`try_call`] to
-    /// keep it.
+    /// up. [`CallPort::call`] flattens this into an [`Error`]; reach for
+    /// [`CallPort::try_call`] to keep it.
     pub use crate::bindings::brenn::processor::calls::CallError;
 
     /// Whether a later activation may retry this failure. Only a peer that did
@@ -1245,38 +1302,64 @@ pub mod calls {
         Error::failed(format!("call {port}: {variant}"))
     }
 
-    /// Call the peer wired to `port`, keeping the failure variant.
+    /// A `call` port the specification declares, and the only way to make one.
     ///
-    /// `Ok(None)` is a peer that ran and answered nothing, which is a
-    /// conforming answer and not a failure.
-    pub fn try_call(port: &str, payload: &str) -> Result<Option<String>, CallError> {
-        raw::call(port, payload)
+    /// Shaped as [`crate::OutPort`], and public on the same terms: the
+    /// scaffold's generated handle accessors call [`CallPort::new`], and a
+    /// fixture with no specification of its own writes it directly. A port name
+    /// the specification does not declare ends the activation at the host, so
+    /// reaching a port through its generated handle is what makes a typo a
+    /// compile error.
+    pub struct CallPort {
+        name: &'static str,
     }
 
-    /// Call the peer wired to `port`.
-    ///
-    /// Diagnostic on error: `"call {port}: {variant}"`.
-    pub fn call(port: &str, payload: &str) -> Result<Option<String>, Error> {
-        try_call(port, payload).map_err(|e| call_err(port, e))
-    }
+    impl CallPort {
+        /// Create a handle on the `call` port named `name`.
+        pub const fn new(name: &'static str) -> CallPort {
+            CallPort { name }
+        }
 
-    /// Call the peer wired to `port` with a JSON-serialized request, and
-    /// deserialize its reply.
-    ///
-    /// A peer that answers nothing is `Ok(None)`; a peer whose reply does not
-    /// deserialize is an [`Error::MalformedEnvelope`], because the two ends of
-    /// a call agree on a dialect the same way two ends of a channel do.
-    pub fn call_json<Req: serde::Serialize, Rep: serde::de::DeserializeOwned>(
-        port: &str,
-        request: &Req,
-    ) -> Result<Option<Rep>, Error> {
-        let body = serde_json::to_string(request)
-            .map_err(|e| Error::failed(format!("call {port}: serialize request: {e}")))?;
-        match call(port, &body)? {
-            None => Ok(None),
-            Some(reply) => serde_json::from_str(&reply).map(Some).map_err(|e| {
-                Error::MalformedEnvelope(format!("call {port}: deserialize reply: {e}"))
-            }),
+        /// The port name this handle calls out through.
+        pub const fn name(&self) -> &'static str {
+            self.name
+        }
+
+        /// Call the peer wired to this port, keeping the failure variant.
+        ///
+        /// `Ok(None)` is a peer that ran and answered nothing, which is a
+        /// conforming answer and not a failure.
+        pub fn try_call(&self, payload: &str) -> Result<Option<String>, CallError> {
+            raw::call(self.name, payload)
+        }
+
+        /// Call the peer wired to this port.
+        ///
+        /// Diagnostic on error: `"call {port}: {variant}"`.
+        pub fn call(&self, payload: &str) -> Result<Option<String>, Error> {
+            self.try_call(payload).map_err(|e| call_err(self.name, e))
+        }
+
+        /// Call the peer wired to this port with a JSON-serialized request, and
+        /// deserialize its reply.
+        ///
+        /// A peer that answers nothing is `Ok(None)`; a peer whose reply does
+        /// not deserialize is an [`Error::MalformedEnvelope`], because the two
+        /// ends of a call agree on a dialect the same way two ends of a channel
+        /// do.
+        pub fn call_json<Req: serde::Serialize, Rep: serde::de::DeserializeOwned>(
+            &self,
+            request: &Req,
+        ) -> Result<Option<Rep>, Error> {
+            let port = self.name;
+            let body = serde_json::to_string(request)
+                .map_err(|e| Error::failed(format!("call {port}: serialize request: {e}")))?;
+            match self.call(&body)? {
+                None => Ok(None),
+                Some(reply) => serde_json::from_str(&reply).map(Some).map_err(|e| {
+                    Error::MalformedEnvelope(format!("call {port}: deserialize reply: {e}"))
+                }),
+            }
         }
     }
 }
@@ -1627,50 +1710,6 @@ pub mod dom {
         raw::set_value(node.0, value);
     }
 
-    /// A reserved port a sync-call activation can name.
-    ///
-    /// Gesture ports are sync-only vocabulary — no specification declares them,
-    /// so nothing generates them. Naming one as a `const` of this type is how a
-    /// kind keeps [`listen`] and its
-    /// [`crate::Activation::sync_is`] match on one item rather than two
-    /// literals that can drift apart silently.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-    pub struct SyncPort(pub &'static str);
-
-    impl SyncPort {
-        /// The port name as the host spells it.
-        pub fn name(self) -> &'static str {
-            self.0
-        }
-    }
-
-    /// Compare a host-spelled port name against a declared port, so a kind
-    /// dispatching on [`crate::Activation::sync`] matches on the same item it
-    /// wired with [`listen`] rather than unwrapping the newtype at every arm.
-    impl PartialEq<&str> for SyncPort {
-        fn eq(&self, other: &&str) -> bool {
-            self.0 == *other
-        }
-    }
-
-    impl PartialEq<SyncPort> for &str {
-        fn eq(&self, other: &SyncPort) -> bool {
-            *self == other.0
-        }
-    }
-
-    // TODO(surface-guest-mount-idiom): every UI kind hand-copies the same mount
-    // bookkeeping around this constant — an `Option<View>` field, an identical
-    // `expect`, and a mount arm in its handler. The SDK should own the
-    // lifecycle; which shape it takes is a `Processor`-trait decision. There is
-    // an out-of-tree copy, so the shape is one an author outside this
-    // repository reproduces from an example.
-
-    /// The port a mount activation names: the instance's first call, where it
-    /// builds its UI. Reserved by its colon, which no specification identifier
-    /// can spell.
-    pub const MOUNT: SyncPort = SyncPort("brenn:mount");
-
     /// Wire a gesture: the host listens for `event` on the node and answers it
     /// with a sync-call activation on `port`.
     ///
@@ -1678,7 +1717,14 @@ pub mod dom {
     /// events, and detaching is what destroys it. The activation runs on the
     /// event's own stack, so what the handler reads through [`value`] is the
     /// state at event time.
-    pub fn listen(node: Node, event: &str, port: SyncPort) {
+    ///
+    /// `port` is a [`crate::ListenPort`]: the generated `spec::SyncPort`
+    /// variant for a port the specification declares `sync`, and nothing else a
+    /// guest can construct. A listen on a port the specification does not
+    /// declare is refused by the host, so it is refused here at compile instead
+    /// — the reserved [`crate::MOUNT`] cause included, which is a
+    /// [`crate::SyncPortName`] but not a `ListenPort`.
+    pub fn listen<P: crate::ListenPort>(node: Node, event: &str, port: P) {
         raw::listen(node.0, event, port.name());
     }
 

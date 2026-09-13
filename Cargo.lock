@@ -964,6 +964,7 @@ dependencies = [
 name = "brenn-page-harness"
 version = "0.1.0"
 dependencies = [
+ "brenn-dsl",
  "brenn-envelope",
  "brenn-surface-contract",
  "serde_json",

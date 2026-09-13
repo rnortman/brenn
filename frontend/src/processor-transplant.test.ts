@@ -366,7 +366,8 @@ describe("processor transplant — surface hosting", () => {
         );
         expect(answered).toEqual({
             reply:
-                `replied:${port}:mount=true:request=__reply__:` +
+                `replied:${port}:mount=true:classified=undeclared:` +
+                `request=__reply__:` +
                 `bare-identity=true:delivered=[in]`,
         });
 

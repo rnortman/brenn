@@ -100,11 +100,14 @@ rust_test(
     name = "page_harness_test",
     size = "small",
     srcs = ["tests/page_harness.rs"],
-    data = [":component"],
-    edition = "2024",
-    env = {"EXAMPLE_CASER_WASM": "$(rootpath :component)"},
-    deps = [
-        "@brenn//brenn-envelope",
-        "@brenn//surface/page-harness",
+    data = [
+        "spec/example-caser.brenn",
+        ":component",
     ],
+    edition = "2024",
+    env = {
+        "EXAMPLE_CASER_SPEC": "$(rootpath spec/example-caser.brenn)",
+        "EXAMPLE_CASER_WASM": "$(rootpath :component)",
+    },
+    deps = ["@brenn//surface/page-harness"],
 )

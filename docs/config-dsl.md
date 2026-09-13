@@ -520,12 +520,16 @@ component Chrome {
   binds it. A `sync` port with no caller is legal and ordinary — a gesture port
   has no caller anywhere in the document. A `dom.listen` on a name the class
   does not declare `sync` ends the activation, on the same terms a publish to
-  an undeclared port does.
+  an undeclared port does. The scaffold generates a `SyncPort` enum whose
+  variants are exactly the class's `sync` ports, and `dom.listen` takes nothing
+  else, so a name the class does not declare does not compile.
 - A `call` port is the other end of that, and bound to no channel for the same
   reason: it names one peer, not an address. It carries no tuning and no
   doctype, and `optional` on it is a compile error — a `call` port an instance
   leaves unbound is already legal, and the import answers `unwired`. Which peer
-  it reaches is the deployer's, written as a `call` binding on the instance.
+  it reaches is the deployer's, written as a `call` binding on the instance. The
+  scaffold generates one `CallPort` handle per `call` port, which is how a guest
+  reaches the import; there is no spelling of the port name in guest code.
 - `optional` before the direction is the author saying an instance may
   legitimately leave this port unwired. Every port without it must be bound by
   every instance, at every placement; the resolver refuses the instance

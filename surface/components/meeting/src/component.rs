@@ -32,20 +32,13 @@ use crate::logic::{
     TakeoverBody, WarningLevel, dismiss_body, snooze_body,
 };
 use crate::spec::{
-    InPort,
+    InPort, SyncPort,
     port::{ACKS, TICK},
 };
 
 /// The body of a boundary wake. The tick's payload is irrelevant — the wake is
 /// the message — but every body on this bus is JSON.
 const TICK_BODY: &str = "{}";
-
-/// The sync port the Dismiss button's press arrives on. Not `acks`: that is a
-/// bound input port, and the kernel refuses a sync port that collides with one.
-const DISMISS_PORT: dom::SyncPort = dom::SyncPort("dismiss");
-
-/// The sync port the Snooze button's press arrives on.
-const SNOOZE_PORT: dom::SyncPort = dom::SyncPort("snooze");
 
 /// The marker attribute on this instance's host element. Every meeting rule in
 /// `surface.css` and both skins descends from it, so dropping the stamp
@@ -137,9 +130,9 @@ fn on_activation(activation: &Activation, panel: &mut Panel) -> Result<(), Error
         Error::failed(format!("meeting: {now_ms} is not a representable instant"))
     })?;
 
-    if activation.sync_is(dom::MOUNT) {
+    if activation.sync_is(brenn_guest::MOUNT) {
         panel.view = Some(build_view());
-    } else if let Some(port) = activation.sync() {
+    } else if let Some(port) = SyncPort::of(activation)? {
         on_gesture(port, panel, now)?;
     }
     for window in activation.delivered_windows() {
@@ -183,17 +176,12 @@ fn on_activation(activation: &Activation, panel: &mut Panel) -> Result<(), Error
 }
 
 /// Publish the ack the pressed button asked for.
-fn on_gesture(port: &str, panel: &mut Panel, now: DateTime<Utc>) -> Result<(), Error> {
-    let action = if port == DISMISS_PORT {
-        AckAction::Dismiss
-    } else if port == SNOOZE_PORT {
-        AckAction::Snooze {
+fn on_gesture(port: SyncPort, panel: &mut Panel, now: DateTime<Utc>) -> Result<(), Error> {
+    let action = match port {
+        SyncPort::Dismiss => AckAction::Dismiss,
+        SyncPort::Snooze => AckAction::Snooze {
             until: now + chrono::Duration::seconds(SNOOZE_SECS),
-        }
-    } else {
-        return Err(Error::failed(format!(
-            "meeting wired no gesture to sync port {port:?}"
-        )));
+        },
     };
     // A press with nothing on screen acks nothing: the buttons are hidden
     // outside the escalated phases, so this is only reachable through a
@@ -267,8 +255,8 @@ fn build_view() -> View {
         dom::append(root, child);
     }
 
-    dom::listen(dismiss, "click", DISMISS_PORT);
-    dom::listen(snooze, "click", SNOOZE_PORT);
+    dom::listen(dismiss, "click", SyncPort::Dismiss);
+    dom::listen(snooze, "click", SyncPort::Snooze);
 
     View {
         root,

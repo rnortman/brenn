@@ -43,7 +43,6 @@ use brenn_attach_client::driver::{flush_stamps, new_stamp};
 use brenn_attach_client::router::{Origin, RouteOutcome, RouteRequest};
 use brenn_attach_proto::SubscribeOutcome;
 use brenn_envelope::Urgency;
-use brenn_envelope::grants::ComponentGrant;
 use brenn_page_harness::{Kind, Page, types};
 use brenn_surface_contract::ActivationError;
 use brenn_surface_kernel::ActivationOutcome;
@@ -66,6 +65,9 @@ use crate::{BODY_CAP, Host, MountSpec, Report, TrapDisposition, port, scenarios}
 
 /// Workspace-relative, as every runfiles tree is laid out like the workspace.
 const PROBE_WASM: &str = "brenn-wasm/target/components/brenn_processor_transplant.wasm";
+
+/// The probe's specification, declaring grants and port vocabulary.
+const PROBE_SPEC: &str = "config/specs/processor-transplant.brenn";
 
 const PROBE: &str = "probe";
 
@@ -288,11 +290,7 @@ impl Surface {
             page,
             kind: Kind::compile(
                 std::path::Path::new(PROBE_WASM),
-                &[
-                    ComponentGrant::Ports,
-                    ComponentGrant::Log,
-                    ComponentGrant::Config,
-                ],
+                brenn_page_harness::Declared::from_spec(std::path::Path::new(PROBE_SPEC), None),
             ),
             config,
             channels,

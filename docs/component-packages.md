@@ -101,9 +101,11 @@ complete on brenn's side; a consumer repository's CI at its next pin bump is
 where the cut is paid.
 
 A cut of this kind in force now: **a `dom.listen` port must be declared `sync`
-in the specification.** A `dom`-granted kind that calls `listen` adds a
-`sync <name>;` line per port it listens on, or its mount activation ends the
-first time it installs a listener. The specification and the artifact travel
+in the specification, and is reached through the generated `spec::SyncPort`.**
+A `dom`-granted kind that calls `listen` adds a `sync <name>;` line per port it
+listens on and passes the variant the scaffold emits for it; there is no
+hand-spelled port newtype to pass instead, so a port the specification does not
+declare has no value to name it. The specification and the artifact travel
 together and are hash-bound, so this is a rebuild per kind at the next pin bump,
 never a deployment skew. A `dom`-granted kind that never calls `listen` is
 untouched.
@@ -506,18 +508,42 @@ it on or off.
 DOM kinds are tested against: a fake element tree with a transcript of every
 `create-element`, `set-text`, `append` and `listen` call, publish and park
 records, and recording `alert` and `config` implementations.
-`Harness::new(artifact, page, grants)` links exactly the grants given, so a
-component reaching for a capability its specification does not declare fails to
-instantiate rather than working in a test and refusing at boot.
+`Harness::new(artifact, spec, page)` reads the class's whole vocabulary off the
+specification the artifact was built from — the grants it links, and the ports
+it admits — so nothing about the profile is typed at the call site.
 
-Both take the artifact as a path, which is what a `rust_test` has to be told:
+What it then refuses, each as a panic naming the port, is what the kernel host
+refuses:
+
+- a `dom.listen` on a port the specification does not declare `sync`;
+- a publish on a port it does not declare `out` or `io`;
+- a scripted activation whose sync cause is neither the reserved mount port nor
+  a declared `sync` port;
+- a scripted window on a port it does not declare `in` or `io`;
+- `retaining_state` on a port that is not `io`.
+
+So a component reaching for a capability or a port its specification does not
+declare fails in the author's own suite rather than working in a test and
+refusing at boot. `Kind::compile(artifact, Declared)` is the same thing one
+level down, and `Declared` is hand-constructible for a fixture that has no
+`.brenn` at all.
+
+Both hosts take the artifact as a path, and the page harness takes the
+specification as a second one, which is what a `rust_test` has to be told:
 
 ```
 rust_test(
     name = "tests",
-    data = ["//demo-counter:component", "//demo-panel:component"],
+    data = [
+        "//demo-counter:component",
+        "//demo-panel:component",
+        "//spec:demo-counter.brenn",
+        "//spec:demo-panel.brenn",
+    ],
     env = {
+        "DEMO_COUNTER_SPEC": "$(rootpath //spec:demo-counter.brenn)",
         "DEMO_COUNTER_WASM": "$(rootpath //demo-counter:component)",
+        "DEMO_PANEL_SPEC": "$(rootpath //spec:demo-panel.brenn)",
         "DEMO_PANEL_WASM": "$(rootpath //demo-panel:component)",
     },
     deps = [

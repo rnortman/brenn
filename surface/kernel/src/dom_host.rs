@@ -750,12 +750,18 @@ mod tests {
     }
 
     /// Build a rig whose instances hold exactly the grants named, each mounted
-    /// with a host element of its own so `dom.root` resolves.
+    /// with a host element of its own so `dom.root` resolves, and each declaring
+    /// [`PRESS`] as its one `sync` port — the vocabulary `dom.listen` is judged
+    /// against, so a suite about gestures has a port to listen on.
     fn rig(instances: &[(&str, &[&str])]) -> Rig {
         fresh_root();
         let mut components: Vec<_> = instances
             .iter()
-            .map(|(instance, grants)| fixtures::component_with_grants(instance, instance, grants))
+            .map(|(instance, grants)| {
+                let mut entry = fixtures::component_with_grants(instance, instance, grants);
+                entry.sync_ports = vec![PRESS.to_string()];
+                entry
+            })
             .collect();
         components.push(fixtures::component(fixtures::CHROME));
         let mut doc = fixtures::doc(components, vec![], vec![], vec![]);
@@ -835,6 +841,12 @@ mod tests {
     }
 
     const DOM: &str = "wbt-dom";
+
+    /// The one `sync` port every rig instance declares.
+    const PRESS: &str = "press";
+
+    /// A name no rig instance declares `sync`.
+    const UNDECLARED: &str = "wbt-undeclared";
 
     #[wasm_bindgen_test]
     fn create_element_admits_the_allow_list_and_traps_on_everything_else() {
@@ -1425,6 +1437,35 @@ mod tests {
         assert!(rig.host.listen("wbt-mute", 1, "click", "press").is_err());
         let message = rig.report().expect("the refusal leaves a breadcrumb");
         assert!(message.contains("dom.listen"), "{message}");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_listen_on_an_undeclared_sync_port_wires_no_listener() {
+        // The grant is held and the node is live: the only thing wrong is the
+        // port, which the instance's entry does not declare `sync`. A listener
+        // wired here would fail once per gesture and name nothing, so the
+        // refusal is at the `listen` and the element stays inert.
+        const WHO: &str = "wbt-undeclared-port";
+        let rig = rig(&[(WHO, &["dom"])]);
+        let root = rig.host.root(WHO).expect("mounted");
+        let button = rig.host.create_element(WHO, "button").expect("create");
+        rig.host.append(WHO, root, button).expect("append");
+
+        let refusal = rig
+            .host
+            .listen(WHO, button, "click", UNDECLARED)
+            .expect_err("an undeclared sync port is refused");
+        assert!(refusal.contains(UNDECLARED), "{refusal}");
+
+        rig.host
+            .element(WHO, button)
+            .expect("a live handle")
+            .dispatch_event(&cancelable_click())
+            .expect("dispatch");
+        assert!(
+            rig.seen.borrow().is_empty(),
+            "a refused listen leaves the element inert"
+        );
     }
 
     #[wasm_bindgen_test]

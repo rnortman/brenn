@@ -3,8 +3,8 @@
 //! A specification exercising the whole generated processor surface: both port
 //! directions, an `io` port, the `io state` port a component's retained state
 //! lives on, an optional port, the substrate-wired tool-result inbox its
-//! `tools` requirement obliges, doctypes, and every capability word that names
-//! an SDK module.
+//! `tools` requirement obliges, the two call directions, doctypes, and every
+//! capability word that names an SDK module.
 //!
 //! The prose is carried into the generated module, so this paragraph is part of
 //! what the golden pins.
@@ -78,6 +78,78 @@ impl InPort {
     }
 }
 
+/// The ports the specification declares `sync` — the causes this component
+/// answers a call on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPort {
+    Press,
+    DismissAll,
+}
+
+impl SyncPort {
+    /// Every sync port, in the order the specification declares them.
+    pub const ALL: [SyncPort; 2] = [SyncPort::Press, SyncPort::DismissAll];
+
+    /// The name this port is called on.
+    pub const fn name(self) -> &'static str {
+        match self {
+            SyncPort::Press => "press",
+            SyncPort::DismissAll => "dismiss-all",
+        }
+    }
+
+    /// The port a name spells, or nothing where it spells none.
+    pub fn from_name(name: &str) -> Option<SyncPort> {
+        match name {
+            "press" => Some(SyncPort::Press),
+            "dismiss-all" => Some(SyncPort::DismissAll),
+            _ => None,
+        }
+    }
+
+    /// The declared sync port this activation was called on: `Ok(None)` on an
+    /// asynchronous activation, `Ok(Some(_))` on a sync call to a declared
+    /// port.
+    ///
+    /// Any other sync cause — a name the specification does not declare, and
+    /// the reserved mount port, which no specification declares — fails the
+    /// activation: the artifact is hash-bound to the specification that
+    /// generated this module, so the host handed over a cause it could not
+    /// have been configured to produce. A kind that mounts asks
+    /// `sync_is(MOUNT)` before classifying, as it must build its view before
+    /// it handles anything.
+    #[cfg(target_arch = "wasm32")]
+    pub fn of(
+        activation: &brenn_guest::Activation,
+    ) -> Result<Option<SyncPort>, brenn_guest::Error> {
+        let Some(port) = activation.sync() else {
+            return Ok(None);
+        };
+        match SyncPort::from_name(port) {
+            Some(port) => Ok(Some(port)),
+            None => Err(brenn_guest::Error::failed(format!(
+                "sync call on port `{port}`, which this component does not declare",
+            ))),
+        }
+    }
+}
+
+// The SDK takes a declared port and nothing else: `Activation::sync_is` is
+// generic over this trait, and the only other implementor is the reserved
+// mount cause.
+#[cfg(target_arch = "wasm32")]
+impl brenn_guest::SyncPortName for SyncPort {
+    fn name(self) -> &'static str {
+        self.name()
+    }
+}
+
+// A gesture may be wired to a declared port and to nothing else:
+// `dom::listen` is generic over this trait, which the mount cause does not
+// implement, and this enum is its only implementor.
+#[cfg(target_arch = "wasm32")]
+impl brenn_guest::ListenPort for SyncPort {}
+
 /// The payload types this guest publishes on the `results` port. Bind a type to
 /// the port once, as an impl:
 /// `impl spec::ResultsPayload for Body<'_> {}`
@@ -128,6 +200,13 @@ pub const fn state<T: StatePayload>() -> brenn_guest::OutPort<T> {
     brenn_guest::OutPort::new("state")
 }
 
+/// A handle on the `ask` call port, wired by the document to one peer's
+/// `sync` port: `spec::ask().call(&body)?`.
+#[cfg(target_arch = "wasm32")]
+pub const fn ask() -> brenn_guest::calls::CallPort {
+    brenn_guest::calls::CallPort::new("ask")
+}
+
 /// The port names as text, for the parts of the SDK that take one.
 pub mod port {
     /// Doctype: `brenn.scaffold.commands@1`.
@@ -138,6 +217,9 @@ pub mod port {
     pub const RESULTS: &str = "results";
     pub const TICK: &str = "tick";
     pub const STATE: &str = "state";
+    pub const PRESS: &str = "press";
+    pub const DISMISS_ALL: &str = "dismiss-all";
+    pub const ASK: &str = "ask";
 }
 
 // One re-export per capability the specification declares. Reaching a
@@ -145,6 +227,8 @@ pub mod port {
 // specification break the guest compile.
 #[cfg(target_arch = "wasm32")]
 pub use brenn_guest::alert;
+#[cfg(target_arch = "wasm32")]
+pub use brenn_guest::calls;
 #[cfg(target_arch = "wasm32")]
 pub use brenn_guest::config;
 #[cfg(target_arch = "wasm32")]

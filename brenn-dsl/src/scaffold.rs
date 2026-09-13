@@ -6,9 +6,11 @@
 //! spelled as a free string on both sides of the ABI today, so a typo is caught
 //! at first publish rather than at compile. This module turns the class into a
 //! Rust module the guest crate compiles: an enum over the inbound ports, a
-//! payload marker trait and a typed publish handle per outbound port, the raw
-//! names for the string-taking parts of the SDK, and a re-export per capability
-//! the spec declares.
+//! second one over the ports it answers sync calls on, a payload marker trait
+//! and a typed publish handle per outbound port, a call handle per `call` port,
+//! the raw names for the parts of the SDK that still take one, and a re-export
+//! per capability the spec declares. No SDK entry point for a sync or a call
+//! port takes a string; the string constants remain for `publish` and its kin.
 //!
 //! The specification is the source of truth, and the bytes generated from are
 //! the bytes the package embeds and the host hash-binds at boot, so a guest
@@ -25,6 +27,7 @@
 //! say; this module refuses only what it cannot emit, so it never becomes a
 //! second opinion on legality.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use brenn_envelope::grants::ComponentGrant;
@@ -125,8 +128,10 @@ pub fn generate(
         let _ = write!(out, "\n{GUEST_ONLY}use brenn_guest::serde;\n");
     }
     write_in_port(&mut out, &ports, abi);
+    write_sync_port(&mut out, &ports, abi);
     if abi == Abi::Processor {
         write_publish_handles(&mut out, &ports);
+        write_call_handles(&mut out, &ports);
     }
     write_port_names(&mut out, &ports);
     if abi == Abi::Processor {
@@ -182,12 +187,83 @@ struct PortName {
 
 impl PortName {
     fn inbound(&self) -> bool {
-        matches!(self.dir, PortDir::Into | PortDir::Both)
+        inbound(&self.dir)
     }
 
     fn outbound(&self) -> bool {
-        matches!(self.dir, PortDir::Outof | PortDir::Both)
+        outbound(&self.dir)
     }
+
+    fn sync(&self) -> bool {
+        sync(&self.dir)
+    }
+
+    fn call(&self) -> bool {
+        call(&self.dir)
+    }
+}
+
+// ── port directions ──────────────────────────────────────────────────────────
+//
+// What each direction means to a class's vocabulary, stated once. Everything
+// that reads an authored class's ports — this module's emitters, the identifier
+// refusals, and the page harness through [`port_vocabulary`] — answers these
+// four predicates rather than matching the enum again, so a direction that
+// gains a meaning gains it everywhere.
+
+/// An activation may window this port: `in` and both halves of `io`.
+pub fn inbound(dir: &PortDir) -> bool {
+    matches!(dir, PortDir::Into | PortDir::Both)
+}
+
+/// A publish may name this port: `out` and both halves of `io`.
+pub fn outbound(dir: &PortDir) -> bool {
+    matches!(dir, PortDir::Outof | PortDir::Both)
+}
+
+/// A sync call may name this port, and a `dom.listen` may cause one on it.
+pub fn sync(dir: &PortDir) -> bool {
+    matches!(dir, PortDir::Sync)
+}
+
+/// The guest may call out on this port.
+pub fn call(dir: &PortDir) -> bool {
+    matches!(dir, PortDir::Call)
+}
+
+/// One class's port names, split by what each direction admits.
+///
+/// An `io` port is in both `inbound` and `outbound`, which is the whole reason
+/// this is four sets rather than a map from name to direction: a reader asks
+/// "may this port be published on", not "which word was it written with".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PortVocabulary {
+    pub inbound: BTreeSet<String>,
+    pub outbound: BTreeSet<String>,
+    pub sync: BTreeSet<String>,
+    pub call: BTreeSet<String>,
+}
+
+/// Read one class's port vocabulary off its declarations.
+pub fn port_vocabulary(class: &ComponentClass) -> PortVocabulary {
+    let mut vocabulary = PortVocabulary::default();
+    for port in &class.ports {
+        let name = port.name.value();
+        let dir = port.dir.value();
+        if inbound(dir) {
+            vocabulary.inbound.insert(name.clone());
+        }
+        if outbound(dir) {
+            vocabulary.outbound.insert(name.clone());
+        }
+        if sync(dir) {
+            vocabulary.sync.insert(name.clone());
+        }
+        if call(dir) {
+            vocabulary.call.insert(name.clone());
+        }
+    }
+    vocabulary
 }
 
 /// Every port of one class, mapped and checked for collisions.
@@ -212,6 +288,14 @@ impl PortNames {
 
     fn outbound(&self) -> impl Iterator<Item = &PortName> {
         self.ports.iter().filter(|port| port.outbound())
+    }
+
+    fn sync(&self) -> impl Iterator<Item = &PortName> {
+        self.ports.iter().filter(|port| port.sync())
+    }
+
+    fn call(&self) -> impl Iterator<Item = &PortName> {
+        self.ports.iter().filter(|port| port.call())
     }
 
     /// Two ports whose names differ only in punctuation map to one identifier.
@@ -260,6 +344,7 @@ enum Spelling {
     Variant,
     PayloadTrait,
     Handle,
+    CallHandle,
     Constant,
 }
 
@@ -269,22 +354,30 @@ impl Spelling {
             Spelling::Variant => "enum variant",
             Spelling::PayloadTrait => "payload marker trait",
             Spelling::Handle => "publish handle",
+            Spelling::CallHandle => "call handle",
             Spelling::Constant => "port-name constant",
         }
     }
 }
 
-/// One of the three Rust namespaces a port name reaches.
+/// One of the Rust namespaces a port name reaches.
 ///
-/// A collision is a collision within one of them; the three cannot collide with
-/// each other, because a type, a function and a constant are three different
-/// kinds of name. The type namespace holds two spellings — an inbound port's
-/// enum variant and an outbound port's payload marker trait — kept together so
-/// a reader is never asked to tell one `FooPayload` from another.
+/// A collision is a collision within one of them; they cannot collide with each
+/// other, because a type, a function and a constant are three different kinds of
+/// name. The type namespace holds two spellings — an inbound port's enum variant
+/// and an outbound port's payload marker trait — kept together so a reader is
+/// never asked to tell one `FooPayload` from another, and the handle namespace
+/// holds two for the same reason: an outbound port's publish handle and a `call`
+/// port's call handle are both functions in one module.
+///
+/// A `sync` port's variant is checked on its own rather than beside an inbound
+/// port's, because `SyncPort` is a separate enum from `InPort` — `InPort::Send`
+/// and `SyncPort::Send` are two names in two types and cannot clash.
 #[derive(Clone, Copy)]
 enum Namespace {
     TypeName,
     Handle,
+    SyncVariant,
     Constant,
 }
 
@@ -292,16 +385,22 @@ impl Namespace {
     // The handle is checked first: two outbound ports that differ only in
     // punctuation collide as handles and as payload traits both, and the handle
     // is the plainer of the two names to be told about.
-    const ALL: [Namespace; 3] = [Namespace::Handle, Namespace::TypeName, Namespace::Constant];
+    const ALL: [Namespace; 4] = [
+        Namespace::Handle,
+        Namespace::TypeName,
+        Namespace::SyncVariant,
+        Namespace::Constant,
+    ];
 
     /// What a refusal calls this namespace where the two ports reach it by
-    /// different kinds of spelling, for the one namespace that holds more than
-    /// one kind. The others can only ever collide with themselves, so their
-    /// refusal names the kind directly.
+    /// different kinds of spelling, for a namespace that holds more than one
+    /// kind. The others can only ever collide with themselves, so their refusal
+    /// names the kind directly.
     fn mixed_label(self) -> Option<&'static str> {
         match self {
             Namespace::TypeName => Some("type name"),
-            Namespace::Handle | Namespace::Constant => None,
+            Namespace::Handle => Some("handle"),
+            Namespace::SyncVariant | Namespace::Constant => None,
         }
     }
 
@@ -322,8 +421,19 @@ impl Namespace {
                 }
                 out
             }
-            Namespace::Handle => publishes
-                .then_some((port.handle.as_str(), Spelling::Handle))
+            Namespace::Handle => {
+                let mut out = Vec::new();
+                if publishes {
+                    out.push((port.handle.as_str(), Spelling::Handle));
+                }
+                if port.call() && abi == Abi::Processor {
+                    out.push((port.handle.as_str(), Spelling::CallHandle));
+                }
+                out
+            }
+            Namespace::SyncVariant => port
+                .sync()
+                .then_some((port.variant.as_str(), Spelling::Variant))
                 .into_iter()
                 .collect(),
             Namespace::Constant => vec![(port.constant.as_str(), Spelling::Constant)],
@@ -384,15 +494,11 @@ fn map_port(decl: &PortDecl, abi: Abi) -> Result<PortName, Diagnostic> {
     // so the keyword its publish handle would have been is never written. A dom
     // class writes no handle at all.
     let dir = decl.dir.value();
-    let emitted: [(&str, bool); 2] = [
-        (
-            variant.as_str(),
-            matches!(dir, PortDir::Into | PortDir::Both),
-        ),
-        (
-            handle.as_str(),
-            matches!(dir, PortDir::Outof | PortDir::Both) && abi == Abi::Processor,
-        ),
+    let emitted: [(&str, bool); 4] = [
+        (variant.as_str(), inbound(dir)),
+        (handle.as_str(), outbound(dir) && abi == Abi::Processor),
+        (variant.as_str(), sync(dir)),
+        (handle.as_str(), call(dir) && abi == Abi::Processor),
     ];
     for (identifier, emitted) in emitted {
         if emitted && is_keyword(identifier) {
@@ -510,13 +616,12 @@ fn sdk_module(grant: ComponentGrant) -> Option<&'static str> {
     }
 }
 
-/// The SDK modules a class's declared grants name, in vocabulary order.
+/// The capabilities a class declares (`requires` ∪ `optional`).
 ///
-/// Both lists are read: a capability the component can run without is still a
-/// capability it reaches for, and reaching it through this module is what makes
-/// deleting the word from the specification break the guest compile.
-fn grant_modules(class: &ComponentClass) -> Result<Vec<&'static str>, Diagnostic> {
-    let mut declared: Vec<ComponentGrant> = Vec::new();
+/// A set rather than a list: nothing downstream may depend on the order a
+/// specification happens to spell its words in.
+pub fn declared_grants(class: &ComponentClass) -> Result<BTreeSet<ComponentGrant>, Diagnostic> {
+    let mut declared: BTreeSet<ComponentGrant> = BTreeSet::new();
     for attr in [class.attrs.requires.as_ref(), class.attrs.optional.as_ref()]
         .into_iter()
         .flatten()
@@ -534,16 +639,18 @@ fn grant_modules(class: &ComponentClass) -> Result<Vec<&'static str>, Diagnostic
                     word.name.span().clone(),
                 ));
             };
-            declared.push(grant);
+            declared.insert(grant);
         }
     }
+    Ok(declared)
+}
+
+/// The SDK modules a class's declared grants name.
+fn grant_modules(class: &ComponentClass) -> Result<Vec<&'static str>, Diagnostic> {
+    let declared = declared_grants(class)?;
     // Alphabetical rather than vocabulary order, which is the order a reader of
     // the emitted file finds them in.
-    let mut modules: Vec<&'static str> = ComponentGrant::ALL
-        .into_iter()
-        .filter(|grant| declared.contains(grant))
-        .filter_map(sdk_module)
-        .collect();
+    let mut modules: Vec<&'static str> = declared.into_iter().filter_map(sdk_module).collect();
     modules.sort_unstable();
     Ok(modules)
 }
@@ -673,6 +780,153 @@ fn write_in_port(out: &mut String, ports: &PortNames, abi: Abi) {
         );
     }
     out.push_str("}\n");
+}
+
+/// The ports the class answers a sync call on, as an enum over the declarations.
+///
+/// Shaped exactly as [`write_in_port`]'s, and a separate type rather than more
+/// variants on that one: the two are dispatched on at different moments — a
+/// window is classified, a cause is — and a port is never both. The enum is
+/// what makes a gesture's two halves one spelling, because the only inhabited
+/// `SyncPortName` a guest can name is a variant of it.
+fn write_sync_port(out: &mut String, ports: &PortNames, abi: Abi) {
+    let sync: Vec<&PortName> = ports.sync().collect();
+    out.push_str(
+        "\n/// The ports the specification declares `sync` — the causes this component\n\
+         /// answers a call on.\n\
+         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n",
+    );
+    if sync.is_empty() {
+        // Uninhabited, and legal: such a class answers no call at all. It may
+        // still be mounted, which is a cause no specification declares.
+        out.push_str("pub enum SyncPort {}\n");
+    } else {
+        out.push_str("pub enum SyncPort {\n");
+        for port in &sync {
+            let _ = writeln!(out, "    {},", port.variant);
+        }
+        out.push_str("}\n");
+    }
+    out.push_str("\nimpl SyncPort {\n");
+
+    out.push_str("    /// Every sync port, in the order the specification declares them.\n");
+    let variants: Vec<String> = sync
+        .iter()
+        .map(|port| format!("SyncPort::{}", port.variant))
+        .collect();
+    let _ = writeln!(
+        out,
+        "    pub const ALL: [SyncPort; {}] = [{}];",
+        sync.len(),
+        variants.join(", ")
+    );
+    out.push('\n');
+
+    out.push_str("    /// The name this port is called on.\n");
+    out.push_str("    pub const fn name(self) -> &'static str {\n");
+    if sync.is_empty() {
+        out.push_str("        match self {}\n");
+    } else {
+        out.push_str("        match self {\n");
+        for port in &sync {
+            let _ = writeln!(
+                out,
+                "            SyncPort::{} => \"{}\",",
+                port.variant, port.raw
+            );
+        }
+        out.push_str("        }\n");
+    }
+    out.push_str("    }\n\n");
+
+    out.push_str("    /// The port a name spells, or nothing where it spells none.\n");
+    if sync.is_empty() {
+        out.push_str(
+            "    pub fn from_name(_name: &str) -> Option<SyncPort> {\n        None\n    }\n",
+        );
+    } else {
+        out.push_str(
+            "    pub fn from_name(name: &str) -> Option<SyncPort> {\n        match name {\n",
+        );
+        for port in &sync {
+            let _ = writeln!(
+                out,
+                "            \"{}\" => Some(SyncPort::{}),",
+                port.raw, port.variant
+            );
+        }
+        out.push_str("            _ => None,\n        }\n    }\n");
+    }
+
+    if abi == Abi::Processor {
+        out.push_str(
+            "\n    /// The declared sync port this activation was called on: `Ok(None)` on an\n\
+             \x20   /// asynchronous activation, `Ok(Some(_))` on a sync call to a declared\n\
+             \x20   /// port.\n\
+             \x20   ///\n\
+             \x20   /// Any other sync cause — a name the specification does not declare, and\n\
+             \x20   /// the reserved mount port, which no specification declares — fails the\n\
+             \x20   /// activation: the artifact is hash-bound to the specification that\n\
+             \x20   /// generated this module, so the host handed over a cause it could not\n\
+             \x20   /// have been configured to produce. A kind that mounts asks\n\
+             \x20   /// `sync_is(MOUNT)` before classifying, as it must build its view before\n\
+             \x20   /// it handles anything.\n\
+             \x20   #[cfg(target_arch = \"wasm32\")]\n\
+             \x20   pub fn of(\n\
+             \x20       activation: &brenn_guest::Activation,\n\
+             \x20   ) -> Result<Option<SyncPort>, brenn_guest::Error> {\n\
+             \x20       let Some(port) = activation.sync() else {\n\
+             \x20           return Ok(None);\n\
+             \x20       };\n\
+             \x20       match SyncPort::from_name(port) {\n\
+             \x20           Some(port) => Ok(Some(port)),\n\
+             \x20           None => Err(brenn_guest::Error::failed(format!(\n\
+             \x20               \"sync call on port `{port}`, which this component does not declare\",\n\
+             \x20           ))),\n\
+             \x20       }\n\
+             \x20   }\n",
+        );
+    }
+    out.push_str("}\n");
+
+    if abi == Abi::Processor {
+        out.push_str(
+            "\n// The SDK takes a declared port and nothing else: `Activation::sync_is` is\n\
+             // generic over this trait, and the only other implementor is the reserved\n\
+             // mount cause.\n\
+             #[cfg(target_arch = \"wasm32\")]\n\
+             impl brenn_guest::SyncPortName for SyncPort {\n\
+             \x20   fn name(self) -> &'static str {\n\
+             \x20       self.name()\n\
+             \x20   }\n\
+             }\n\
+             \n\
+             // A gesture may be wired to a declared port and to nothing else:\n\
+             // `dom::listen` is generic over this trait, which the mount cause does not\n\
+             // implement, and this enum is its only implementor.\n\
+             #[cfg(target_arch = \"wasm32\")]\n\
+             impl brenn_guest::ListenPort for SyncPort {}\n",
+        );
+    }
+}
+
+/// A typed handle per `call` port, the shape the publish handles have.
+///
+/// A call port is invoked rather than dispatched on, so the handle is the right
+/// shape for it — and reaching the port through the handle is what holds the
+/// name the guest calls on equal to the one the specification declares.
+fn write_call_handles(out: &mut String, ports: &PortNames) {
+    for port in ports.call() {
+        let _ = write!(
+            out,
+            "\n/// A handle on the `{}` call port, wired by the document to one peer's\n\
+             /// `sync` port: `spec::{}().call(&body)?`.\n\
+             {}pub const fn {}() -> brenn_guest::calls::CallPort {{\n\
+             \x20   brenn_guest::calls::CallPort::new(\"{}\")\n\
+             }}\n",
+            port.raw, port.handle, GUEST_ONLY, port.handle, port.raw
+        );
+    }
 }
 
 /// The payload marker trait and the publish handle for each outbound port.

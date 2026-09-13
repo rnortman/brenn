@@ -113,7 +113,8 @@ describe("the golden activation", () => {
             .filter((port) => port !== parsed.sync);
         expect(answer).toEqual({
             reply:
-                `replied:${parsed.sync}:mount=true:request=__reply__:` +
+                `replied:${parsed.sync}:mount=true:classified=undeclared:` +
+                `request=__reply__:` +
                 `bare-identity=true:delivered=[${delivered.join(",")}]`,
         });
     });

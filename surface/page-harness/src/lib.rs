@@ -8,9 +8,10 @@
 //!
 //! This is not a second hosting. The backend host refuses `dom` structurally,
 //! and nothing here goes through it: the harness builds its own linker over the
-//! same WIT and links exactly the grants the caller names, so an artifact that
-//! acquired another import fails at instantiation rather than at boot. One
-//! difference from the backend host is deliberate and is what makes the fixture
+//! same WIT and links exactly the grants the class's specification declares, so
+//! an artifact that acquired another import fails at instantiation rather than
+//! at boot. One difference from the backend host is deliberate and is what
+//! makes the fixture
 //! faithful to the page: activations may be sync calls, which is how a mount and
 //! a gesture arrive.
 //!
@@ -32,14 +33,18 @@
 //!
 //! The recording host is held to the real vocabulary: the allow-list
 //! predicates, the mount port and the gesture body field names all come from
-//! `brenn-surface-contract`, so a component that steps outside what the kernel
-//! host would admit fails here instead of in a browser.
+//! `brenn-surface-contract`, and the grants, the port directions and the sync
+//! vocabulary come from the class's own `.brenn` through [`Declared`], so a
+//! component — or a script — that steps outside what the kernel host would
+//! admit fails here instead of in a browser.
 //!
-//! The artifact arrives as a path, so a consumer outside this repository points
-//! the harness at whatever its own build produced.
+//! The artifact and the specification both arrive as paths, so a consumer
+//! outside this repository points the harness at whatever its own build
+//! produced.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use brenn_envelope::grants::ComponentGrant;
 use brenn_envelope::testutils::{NOW_MS, envelope};
@@ -60,6 +65,56 @@ pub mod bindings {
 }
 
 pub use bindings::brenn::processor::{alert, config, dom, log, page_dom, ports, types};
+
+/// What a class declares: the grants the page links and the port vocabulary it
+/// holds the guest to.
+///
+/// A packaged component always has a specification, so [`Self::from_spec`] is
+/// the normal route. Hand construction is public for a fixture that has no
+/// `.brenn` at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Declared {
+    /// `requires` ∪ `optional`. Both are linked: only a word with no interface
+    /// behind it may be optional, so the distinction is documentary.
+    pub grants: BTreeSet<ComponentGrant>,
+    /// `in` and `io`: the ports an activation may window.
+    pub inbound: BTreeSet<String>,
+    /// `out` and `io`: the ports a publish may name.
+    pub outbound: BTreeSet<String>,
+    pub sync_ports: BTreeSet<String>,
+    pub call_ports: BTreeSet<String>,
+}
+
+impl Declared {
+    /// Parse `spec` and read the vocabulary of its one class, or of the class
+    /// `class` names.
+    ///
+    /// Delegates to `brenn_dsl::scaffold` so that what a grant word means and
+    /// what a port direction admits are the compiler's, not this crate's.
+    ///
+    /// Panics on a parse failure, an unknown grant word or an unresolvable
+    /// class name: the specification is the test subject's own file, and a
+    /// malformed one is a broken fixture rather than a condition to tolerate.
+    // TODO(harness-host-rule-parity): nothing mechanically holds these refusals
+    // equal to the ones the production hosts make.
+    pub fn from_spec(spec: &Path, class: Option<&str>) -> Declared {
+        let filename = spec.display().to_string();
+        let file = brenn_dsl::parse_file(spec)
+            .unwrap_or_else(|error| panic!("the specification {filename}: {error}"));
+        let class = brenn_dsl::scaffold::select_class(&file, class, &filename)
+            .unwrap_or_else(|error| panic!("the specification {filename}: {error}"));
+        let grants = brenn_dsl::scaffold::declared_grants(class)
+            .unwrap_or_else(|error| panic!("the specification {filename}: {error}"));
+        let ports = brenn_dsl::scaffold::port_vocabulary(class);
+        Declared {
+            grants,
+            inbound: ports.inbound,
+            outbound: ports.outbound,
+            sync_ports: ports.sync,
+            call_ports: ports.call,
+        }
+    }
+}
 
 /// One element of the fake page.
 #[derive(Default)]
@@ -121,6 +176,9 @@ pub struct Page {
     pub page_root: Option<u64>,
     pub body: Option<u64>,
     pub instance_wrappers: BTreeMap<String, u64>,
+    /// The vocabulary this page holds its guest to, stamped by
+    /// [`Kind::instantiate`] or by [`Page::declare`].
+    declared: Option<Arc<Declared>>,
 }
 
 /// The instance's host element: the kernel mounts it before the mount
@@ -147,7 +205,35 @@ impl Page {
             page_root: None,
             body: None,
             instance_wrappers: BTreeMap::new(),
+            declared: None,
         }
+    }
+
+    /// Hold this page to `declared` without going through a [`Kind`]: for a
+    /// test that drives the host functions directly.
+    ///
+    /// Panics if the page already carries a vocabulary, so this route and
+    /// [`Kind::instantiate`] cannot silently disagree.
+    pub fn declare(&mut self, declared: Declared) {
+        self.declare_shared(Arc::new(declared));
+    }
+
+    fn declare_shared(&mut self, declared: Arc<Declared>) {
+        assert!(
+            self.declared.is_none(),
+            "this page already carries a declared vocabulary"
+        );
+        self.declared = Some(declared);
+    }
+
+    /// The vocabulary this page holds its guest to.
+    fn declared(&self) -> &Declared {
+        self.declared.as_deref().unwrap_or_else(|| {
+            panic!(
+                "this page carries no declared vocabulary; build it through `Kind::instantiate` \
+                 or stamp one with `Page::declare`"
+            )
+        })
     }
 
     /// The fixture a page-authority holder runs against: this instance's host
@@ -382,6 +468,12 @@ impl dom::Host for Page {
     }
 
     fn listen(&mut self, node: u64, event: String, port: String) {
+        // A listen must name a port the specification declares `sync`.
+        assert!(
+            self.declared().sync_ports.contains(&port),
+            "dom: this instance listens on port {port:?}, which its specification does not \
+             declare `sync`"
+        );
         self.record(format!("dom.listen({}, {event}, {port})", n(node)));
         self.listeners.push(Listener { node, event, port });
     }
@@ -393,8 +485,15 @@ impl dom::Host for Page {
 }
 
 impl Page {
-    /// What a publish on `port` answers: the port's own refusal where one is
-    /// set, the blanket one otherwise, and `None` for acceptance.
+    /// A publish must name a port the specification declares `out` or `io`.
+    fn assert_outbound(&self, port: &str) {
+        assert!(
+            self.declared().outbound.contains(port),
+            "ports: this instance publishes on port {port:?}, which its specification does not \
+             declare `out` or `io`"
+        );
+    }
+
     fn publish_refusal(&self, port: &str) -> Option<ports::PublishError> {
         self.publish_answer_on
             .get(port)
@@ -405,6 +504,7 @@ impl Page {
 
 impl ports::Host for Page {
     fn publish(&mut self, port: String, payload: String) -> Result<(), ports::PublishError> {
+        self.assert_outbound(&port);
         self.record(format!("ports.publish({port}, {payload:?})"));
         match self.publish_refusal(&port) {
             None => {
@@ -421,6 +521,7 @@ impl ports::Host for Page {
         payload: String,
         urgency: ports::Urgency,
     ) -> Result<(), ports::PublishError> {
+        self.assert_outbound(&port);
         self.record(format!(
             "ports.publish-with-urgency({port}, {payload:?}, {urgency:?})"
         ));
@@ -439,6 +540,7 @@ impl ports::Host for Page {
         payload: String,
         deliver_after: u64,
     ) -> Result<(), ports::PublishError> {
+        self.assert_outbound(&port);
         self.record(format!(
             "ports.publish-deferred({port}, {payload:?}, {deliver_after})"
         ));
@@ -574,15 +676,11 @@ struct RetainedState {
 }
 
 impl Harness {
-    /// Link exactly the grants named and instantiate once. An artifact that
-    /// acquired another import fails here, which is the deny-by-default the
-    /// production host has.
-    ///
-    /// `Takeover` names no WIT interface — it is a binding right, not an import
-    /// — so it links nothing and is accepted for the symmetry with a
-    /// specification's `requires` list.
-    pub fn new(artifact: &Path, page: Page, grants: &[ComponentGrant]) -> Harness {
-        Kind::compile(artifact, grants).instantiate(page)
+    /// Compile `artifact` against the one class `spec` declares and mount one
+    /// instance of it over `page`.  Grants, port directions and sync vocabulary
+    /// are all read from `spec`.
+    pub fn new(artifact: &Path, spec: &Path, page: Page) -> Harness {
+        Kind::compile(artifact, Declared::from_spec(spec, None)).instantiate(page)
     }
 }
 
@@ -597,22 +695,24 @@ pub struct Kind {
     engine: Engine,
     component: Component,
     linker: Linker<Page>,
+    declared: Arc<Declared>,
 }
 
 impl Kind {
-    /// Compile `artifact` and link exactly the grants named. An artifact that
-    /// acquired another import fails at the first [`Self::instantiate`], which is
-    /// the deny-by-default the production host has.
+    /// Compile `artifact` and link exactly the grants `declared` names. An
+    /// artifact that acquired another import fails at the first
+    /// [`Self::instantiate`], which is the deny-by-default the production host
+    /// has.
     ///
     /// `Takeover` names no WIT interface — it is a binding right, not an import
     /// — so it links nothing and is accepted for the symmetry with a
     /// specification's `requires` list.
-    pub fn compile(artifact: &Path, grants: &[ComponentGrant]) -> Kind {
+    pub fn compile(artifact: &Path, declared: Declared) -> Kind {
         let engine = Engine::new(&Config::new()).expect("wasmtime engine");
         let component = Component::from_file(&engine, artifact)
             .unwrap_or_else(|err| panic!("the component artifact {}: {err}", artifact.display()));
         let mut linker: Linker<Page> = Linker::new(&engine);
-        for grant in grants {
+        for grant in &declared.grants {
             match grant {
                 ComponentGrant::Ports => {
                     ports::add_to_linker::<_, HasSelf<Page>>(&mut linker, |page| page)
@@ -649,6 +749,7 @@ impl Kind {
             engine,
             component,
             linker,
+            declared: Arc::new(declared),
         }
     }
 
@@ -656,7 +757,8 @@ impl Kind {
     ///
     /// Nothing is instantiated here: a guest exists only inside an activation,
     /// so the first linear memory is built by the first [`Harness::receive`].
-    pub fn instantiate(&self, page: Page) -> Harness {
+    pub fn instantiate(&self, mut page: Page) -> Harness {
+        page.declare_shared(Arc::clone(&self.declared));
         Harness {
             store: Store::new(&self.engine, page),
             kind: self.clone(),
@@ -674,6 +776,11 @@ impl Harness {
     /// drives one instance or one per activation — the port is where its state
     /// lives either way.
     pub fn retaining_state(mut self, port: &str) -> Harness {
+        let declared = self.store.data().declared();
+        assert!(
+            declared.inbound.contains(port) && declared.outbound.contains(port),
+            "ports: the retained-state port {port:?} is not declared `io` by this specification"
+        );
         self.state = Some(RetainedState {
             port: port.to_string(),
             body: None,
@@ -732,6 +839,7 @@ impl Harness {
         &mut self,
         activation: &types::Activation,
     ) -> wasmtime::Result<Result<Option<String>, types::ReceiveError>> {
+        self.assert_declared(activation);
         let activation = self.windowed(activation);
         // A fresh store and a fresh instance per activation: its statics, its
         // heap and its `thread_local!`s start empty, and the store they live in
@@ -756,6 +864,35 @@ impl Harness {
             self.retain_state(published_from);
         }
         outcome
+    }
+
+    /// A scripted activation names only what the class declares: a sync cause
+    /// is the reserved mount port or a declared `sync` port, and every other
+    /// window is a bound `in` or `io` port.
+    ///
+    /// The window named by the sync cause is exempt from the inbound rule: a
+    /// sync-call activation carries its one synthesized request as a window on
+    /// the sync port itself.
+    fn assert_declared(&self, activation: &types::Activation) {
+        let declared = self.store.data().declared();
+        if let Some(cause) = &activation.sync {
+            assert!(
+                cause == MOUNT_SYNC_PORT || declared.sync_ports.contains(cause),
+                "the activation is a sync call on port {cause:?}, which this specification does \
+                 not declare `sync`"
+            );
+        }
+        for window in &activation.ports {
+            if Some(&window.port) == activation.sync.as_ref() {
+                continue;
+            }
+            assert!(
+                declared.inbound.contains(&window.port),
+                "the activation windows port {:?}, which this specification does not declare \
+                 `in` or `io`",
+                window.port
+            );
+        }
     }
 
     /// The caller's activation with the retained-state window appended, where
@@ -920,12 +1057,29 @@ mod tests {
     use super::*;
     use bindings::brenn::processor::ports::Host as _;
 
+    use bindings::brenn::processor::dom::Host as _;
+
+    fn echo_stub_spec() -> String {
+        std::env::var("ECHO_STUB_SPEC").expect("the build names the specification")
+    }
+
+    /// echo-stub's vocabulary: the fixture every page-level check below is
+    /// driven against.
+    fn echo_stub_declared() -> Declared {
+        Declared::from_spec(Path::new(&echo_stub_spec()), None)
+    }
+
+    fn names(ports: &BTreeSet<String>) -> Vec<&str> {
+        ports.iter().map(String::as_str).collect()
+    }
+
     /// Urgency is a port-level choice a guest may make on any publish. The
     /// recording host answers it like a plain publish and keeps the urgency in
     /// the transcript, so a test can assert which one was chosen.
     #[test]
     fn publishing_with_urgency_records_and_publishes() {
         let mut page = Page::new();
+        page.declare(echo_stub_declared());
         page.publish_with_urgency("out".to_string(), "{}".to_string(), ports::Urgency::High)
             .expect("the bus accepts it");
         assert_eq!(page.published_on("out"), vec!["{}"]);
@@ -940,6 +1094,7 @@ mod tests {
     #[test]
     fn an_urgent_publish_carries_the_fixtures_refusal() {
         let mut page = Page::new();
+        page.declare(echo_stub_declared());
         page.publish_answer = Some(ports::PublishError::NotPermitted);
         let answer =
             page.publish_with_urgency("out".to_string(), "{}".to_string(), ports::Urgency::Low);
@@ -966,5 +1121,168 @@ mod tests {
                 NOW_MS + 1_000
             )],
         );
+    }
+
+    /// Every host function reads the page's vocabulary, so a page nobody
+    /// declared has no answer to give; the panic names both ways to stamp one.
+    #[test]
+    #[should_panic(expected = "Page::declare")]
+    fn a_host_call_on_an_undeclared_page_names_both_routes() {
+        let mut page = Page::new();
+        let _ = page.publish("out".to_string(), "{}".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "does not declare `sync`")]
+    fn listening_on_an_undeclared_port_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.listen(ROOT, "click".to_string(), "no-such-port".to_string());
+    }
+
+    #[test]
+    fn listening_on_a_declared_sync_port_records_the_listener() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.listen(ROOT, "click".to_string(), "send".to_string());
+        assert_eq!(
+            page.listeners,
+            vec![Listener {
+                node: ROOT,
+                event: "click".to_string(),
+                port: "send".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "does not declare `out` or `io`")]
+    fn publishing_on_an_undeclared_port_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        let _ = page.publish("no-such-port".to_string(), "{}".to_string());
+    }
+
+    /// An `io` port publishes like an `out` one: it is the same half of the
+    /// direction.
+    #[test]
+    fn publishing_on_an_out_or_io_port_is_recorded() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.publish("out".to_string(), "{}".to_string())
+            .expect("the bus accepts it");
+        page.publish("state".to_string(), "[]".to_string())
+            .expect("the bus accepts it");
+        assert_eq!(page.published_on("out"), vec!["{}"]);
+        assert_eq!(page.published_on("state"), vec!["[]"]);
+    }
+
+    #[test]
+    fn from_spec_reads_the_grants_and_every_port_direction() {
+        let declared = Declared::from_spec(Path::new(&echo_stub_spec()), None);
+        assert_eq!(
+            declared.grants,
+            BTreeSet::from([
+                ComponentGrant::Ports,
+                ComponentGrant::Log,
+                ComponentGrant::Dom
+            ])
+        );
+        assert_eq!(
+            names(&declared.sync_ports),
+            ["panic", "send", "send-custom"]
+        );
+        assert_eq!(names(&declared.inbound), ["messages", "state"]);
+        assert_eq!(names(&declared.outbound), ["out", "state"]);
+        assert!(declared.call_ports.is_empty());
+    }
+
+    /// A module with more than one class has no single port surface, so an
+    /// unnamed read is `select_class`'s diagnostic rather than a guess.
+    #[test]
+    #[should_panic(expected = "component classes")]
+    fn from_spec_over_a_two_class_module_without_a_name_panics() {
+        let spec = std::env::var("TWO_CLASS_SPEC").expect("the build names the fixture");
+        Declared::from_spec(Path::new(&spec), None);
+    }
+
+    /// Which direction a port is declared in decides which set it lands in, and
+    /// `io` lands in two. The one fixture that declares all five states it.
+    #[test]
+    fn from_spec_separates_the_four_port_vocabularies() {
+        let spec = std::env::var("ALL_DIRECTIONS_SPEC").expect("the build names the fixture");
+        let declared = Declared::from_spec(Path::new(&spec), None);
+        assert_eq!(names(&declared.inbound), ["orders", "state"]);
+        assert_eq!(names(&declared.outbound), ["receipts", "state"]);
+        assert_eq!(names(&declared.sync_ports), ["press"]);
+        assert_eq!(names(&declared.call_ports), ["ask"]);
+    }
+
+    /// A specification that does not parse is a broken fixture, and the panic
+    /// names the file so its author knows which one.
+    #[test]
+    #[should_panic(expected = "malformed.brenn")]
+    fn from_spec_over_a_malformed_specification_names_the_file() {
+        let spec = std::env::var("MALFORMED_SPEC").expect("the build names the fixture");
+        Declared::from_spec(Path::new(&spec), None);
+    }
+
+    /// So does a grant word no capability answers to — the failure a pin bump
+    /// that renamed one produces.
+    #[test]
+    #[should_panic(expected = "unknown-grant.brenn")]
+    fn from_spec_over_an_unknown_grant_word_names_the_file() {
+        let spec = std::env::var("UNKNOWN_GRANT_SPEC").expect("the build names the fixture");
+        Declared::from_spec(Path::new(&spec), None);
+    }
+
+    /// The two stamping routes may not disagree, so the second stamp is a
+    /// panic rather than an overwrite.
+    #[test]
+    #[should_panic(expected = "already carries a declared vocabulary")]
+    fn declaring_a_page_twice_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.declare(echo_stub_declared());
+    }
+
+    /// The mixed path, at the call `Kind::instantiate` makes: a page the caller
+    /// stamped, handed to a kind that would stamp its own.
+    #[test]
+    #[should_panic(expected = "already carries a declared vocabulary")]
+    fn stamping_a_kinds_vocabulary_over_a_declared_page_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        page.declare_shared(Arc::new(echo_stub_declared()));
+    }
+
+    /// The urgent and the deferred publish carry the same rule as the plain
+    /// one: three doors, one check.
+    #[test]
+    #[should_panic(expected = "does not declare `out` or `io`")]
+    fn publishing_with_urgency_on_an_undeclared_port_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        let _ = page.publish_with_urgency(
+            "no-such-port".to_string(),
+            "{}".to_string(),
+            ports::Urgency::High,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "does not declare `out` or `io`")]
+    fn publishing_deferred_on_an_undeclared_port_panics() {
+        let mut page = Page::new();
+        page.declare(echo_stub_declared());
+        let _ = page.publish_deferred("no-such-port".to_string(), "{}".to_string(), NOW_MS);
+    }
+
+    #[test]
+    fn from_spec_takes_the_class_it_is_named() {
+        let spec = std::env::var("TWO_CLASS_SPEC").expect("the build names the fixture");
+        let declared = Declared::from_spec(Path::new(&spec), Some("Second"));
+        assert_eq!(names(&declared.outbound), ["out"]);
+        assert!(declared.inbound.is_empty());
     }
 }

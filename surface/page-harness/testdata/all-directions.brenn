@@ -1,0 +1,11 @@
+/// Every port direction at once, which is what holds each one to the set it
+/// lands in when a specification is read as a vocabulary.
+component EveryDirection {
+  abi = processor;
+  requires = [ports, calls];
+  in orders;
+  out receipts;
+  io state;
+  sync press;
+  call ask;
+}

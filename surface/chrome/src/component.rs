@@ -29,7 +29,7 @@ use crate::logic::{
     ActivationWindow, BannerState, ChromeAction, ChromeCore, LayoutPlacement, LogLevel, fold_window,
 };
 use crate::spec::{
-    InPort,
+    InPort, SyncPort,
     port::{OVERLAY_STATE, TOAST_TICK},
 };
 use crate::wire::{SurfaceStateBody, ToastSeverity, ToastSource};
@@ -37,9 +37,6 @@ use crate::wire::{SurfaceStateBody, ToastSeverity, ToastSource};
 /// The body of an expiry wake. The tick's payload is irrelevant — the wake is
 /// the message — but every body on this bus is JSON.
 const TICK_BODY: &str = "{}";
-
-/// The sync port a click anywhere in the toast container arrives on.
-const TOAST_DISMISS_PORT: dom::SyncPort = dom::SyncPort("toast-dismiss");
 
 /// The surface-root attribute naming the active layout, targeted by skin CSS
 /// grid templates.
@@ -178,9 +175,9 @@ fn on_activation(activation: &Activation, chrome: &mut Chrome) -> Result<(), Err
         .now()
         .ok_or_else(|| Error::failed("chrome: the host stamped no wall clock"))?;
 
-    if activation.sync_is(dom::MOUNT) {
+    if activation.sync_is(brenn_guest::MOUNT) {
         chrome.view = Some(build_view());
-    } else if let Some(port) = activation.sync() {
+    } else if let Some(port) = SyncPort::of(activation)? {
         on_gesture(port, activation, chrome)?;
     }
     for window in activation.delivered_windows() {
@@ -214,12 +211,10 @@ fn on_activation(activation: &Activation, chrome: &mut Chrome) -> Result<(), Err
 }
 
 /// Dismiss the toast the click landed on.
-fn on_gesture(port: &str, activation: &Activation, chrome: &mut Chrome) -> Result<(), Error> {
-    if port != TOAST_DISMISS_PORT {
-        return Err(Error::failed(format!(
-            "chrome wired no gesture to sync port {port:?}"
-        )));
-    }
+fn on_gesture(port: SyncPort, activation: &Activation, chrome: &mut Chrome) -> Result<(), Error> {
+    // Exhaustive on purpose, and on nothing else: a second `sync` port in the
+    // specification must not fall through to the toast-dismiss path.
+    let SyncPort::ToastDismiss = port;
     let (_, request) = activation
         .sync_request()
         .ok_or_else(|| Error::failed("chrome: a sync-call activation carried no request"))?;
@@ -345,7 +340,7 @@ fn build_view() -> View {
     let toast_container = dom::marked("div", TOAST_CONTAINER_MARKER);
     dom::append(page_root, banner);
     dom::append(page_root, toast_container);
-    dom::listen(toast_container, "click", TOAST_DISMISS_PORT);
+    dom::listen(toast_container, "click", SyncPort::ToastDismiss);
     View {
         page_root,
         body: page_dom::body(),

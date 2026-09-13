@@ -526,14 +526,18 @@ pub mod a_sync_call_is_an_activation_plus_a_reply {
 
         let answer = host.sync_call(port::ASK, "__reply__").await;
         // The probe's reply names the port it was asked on, that port read back
-        // as an item, the request body, whether the request is attributed to the
+        // as an item, what the generated classifier makes of the cause — the
+        // declared port here, a refusal on a mount — the request body, whether
+        // the request is attributed to the
         // target's own bare name — the same answer on both hosts, where a
         // participant-vocabulary spelling would differ — and the ports the
         // activation *delivered*, the whole window list minus the request's own.
         assert_eq!(
             answer,
             SyncAnswer::Ok(Some(format!(
-                "replied:{}:mount=false:request=__reply__:bare-identity=true:delivered=[{},{}]",
+                "replied:{}:mount=false:classified={}:request=__reply__:\
+                 bare-identity=true:delivered=[{},{}]",
+                port::ASK,
                 port::ASK,
                 port::IN,
                 port::SAMPLED,

@@ -579,7 +579,7 @@ pub const GESTURE_CANCEL_FIELD: &str = "cancel";
 ///
 /// Reserved by its colon: no specification identifier can spell one, so the
 /// name cannot collide with a bound input port. The guest SDK spells the same
-/// string as `dom::MOUNT`, held to this constant by
+/// string as `MOUNT_PORT_NAME`, held to this constant by
 /// `the_guest_half_of_the_mount_port_spells_the_same_string`.
 pub const MOUNT_SYNC_PORT: &str = "brenn:mount";
 
@@ -921,7 +921,7 @@ mod tests {
         // on its own copy; a drift means every migrated UI kind renders nothing,
         // silently, in the stack CI does not run.
         const GUEST: &str = include_str!("../../../brenn-wasm/components/guest/src/lib.rs");
-        let needle = format!("pub const MOUNT: SyncPort = SyncPort(\"{MOUNT_SYNC_PORT}\");");
+        let needle = format!("const MOUNT_PORT_NAME: &str = \"{MOUNT_SYNC_PORT}\";");
         assert!(
             GUEST.contains(&needle),
             "the guest spells no `{needle}`; the two halves of the mount port have drifted"
@@ -930,104 +930,6 @@ mod tests {
         // one, so no class can declare this name and nothing can collide with the
         // kernel's own mount cause.
         assert!(MOUNT_SYNC_PORT.contains(':'));
-    }
-
-    #[test]
-    fn every_listened_port_is_declared_sync_in_its_kinds_specification() {
-        // `dom.listen` on a port the specification does not declare `sync` traps
-        // the activation that installs the listener — which is the mount, in the
-        // browser, in the stack CI does not run. So the two halves are held
-        // together here instead: the kind's source names the ports it listens
-        // on, its specification declares them, and a typo in either half is this
-        // test rather than a component that renders nothing on a live page.
-        //
-        // Same shape as the mount-port check above, and the same reason. The row
-        // set is not a judgement about which kinds listen — it is every staged
-        // kind, held complete against the served tree below, so a new kind that
-        // listens cannot be missed by being left out.
-        const KINDS: [(&str, &str, &str); 6] = [
-            (
-                "chrome",
-                include_str!("../../chrome/src/component.rs"),
-                include_str!("../../../config/specs/chrome.brenn"),
-            ),
-            (
-                "echo-stub",
-                include_str!("../../components/echo-stub/src/component.rs"),
-                include_str!("../../../config/specs/echo-stub.brenn"),
-            ),
-            (
-                "meeting",
-                include_str!("../../components/meeting/src/component.rs"),
-                include_str!("../../../config/specs/meeting.brenn"),
-            ),
-            (
-                "mode-clock",
-                include_str!("../../components/mode-clock/src/component.rs"),
-                include_str!("../../../config/specs/mode-clock.brenn"),
-            ),
-            (
-                "protobar",
-                include_str!("../../components/protobar/src/component.rs"),
-                include_str!("../../../config/specs/protobar.brenn"),
-            ),
-            (
-                "processor-transplant",
-                include_str!("../../../brenn-wasm/components/processor-transplant/src/lib.rs"),
-                include_str!("../../../config/specs/processor-transplant.brenn"),
-            ),
-        ];
-
-        // The served tree is the kind set: a kind reaches a page by being staged
-        // into it, so a kind staged with no row here is a kind this gate does not
-        // read. Derived rather than trusted to a comment, because the failure of
-        // a hand-maintained table is silent and browser-only.
-        const PATHS: &str = include_str!("../../dist-paths.txt");
-        let mut staged: Vec<&str> = PATHS
-            .lines()
-            .filter_map(|line| line.strip_prefix("processor/"))
-            .filter_map(|rest| rest.split('/').next())
-            .collect();
-        staged.sort_unstable();
-        staged.dedup();
-        assert!(!staged.is_empty(), "no kind is staged at all");
-        for kind in &staged {
-            assert!(
-                KINDS.iter().any(|(named, _, _)| named == kind),
-                "the staged kind {kind:?} has no row here, so nothing holds its `listen` calls                  against its specification — add one"
-            );
-        }
-
-        let mut listened_anywhere = 0;
-        for (kind, source, spec) in KINDS {
-            assert!(
-                staged.contains(&kind),
-                "{kind} is not staged into the served tree, so this row reads a kind no page                  loads — drop it"
-            );
-            let mut listened = Vec::new();
-            for tail in source.split("dom::SyncPort(\"").skip(1) {
-                let name = tail
-                    .split_once('"')
-                    .unwrap_or_else(|| panic!("{kind}: an unterminated `dom::SyncPort(\"` literal"))
-                    .0;
-                listened.push(name);
-            }
-            listened_anywhere += listened.len();
-            for port in listened {
-                let declaration = format!("sync {port};");
-                assert!(
-                    spec.lines().any(|line| line.trim() == declaration),
-                    "{kind} listens on port {port:?}, which config/specs/{kind}.brenn does not \
-                     declare (`{declaration}`) — the kernel would trap the mount activation that \
-                     installs the listener"
-                );
-            }
-        }
-        assert!(
-            listened_anywhere > 0,
-            "no kind listens on anything, which means the literal form changed and this scan \
-             now matches nothing"
-        );
     }
 
     #[test]

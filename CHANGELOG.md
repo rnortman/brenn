@@ -4,6 +4,28 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.23.1] — 2026-09-13
+
+- **BREAKING: `sync` and `call` ports are typed.** The specification is now the
+  only place either is spelled. `brenn-guest` drops `dom::SyncPort` and
+  `dom::MOUNT`; `Activation::sync_is` takes a `brenn_guest::SyncPortName`, whose
+  only implementors are `brenn_guest::MOUNT` and the scaffold's generated
+  `spec::SyncPort`, and `dom::listen` takes a `brenn_guest::ListenPort`, which
+  only the generated `spec::SyncPort` implements, so the mount cause cannot be
+  wired to a gesture. `calls::{call, try_call, call_json}` are replaced by
+  methods on `calls::CallPort`, one handle per declared `call` port.
+  `surface/page-harness` takes the class's vocabulary from the specification
+  instead of the caller: `Harness::new(artifact, spec, page)` and
+  `Kind::compile(artifact, Declared)`, and the harness refuses an undeclared
+  listen, publish, sync cause or inbound window the way the hosts do.
+- Out-of-tree migration at the next pin bump, four lines: add `sync <name>;` (and
+  `call <name>;`) to the specification, replace hand-spelled port constants with
+  `spec::SyncPort::<Variant>` / the generated call handle, replace `dom::MOUNT`
+  with `brenn_guest::MOUNT`, and call `Harness::new(artifact, spec, page)` with
+  the specification carried as `data`/`env` in the test target. Nothing about an
+  already-built artifact's behaviour changes: no runtime contract, package record
+  version or bindings-document version moves.
+
 ## [0.23.0] — 2026-09-13
 
 - **Component-to-component synchronous calls.** A component can now call a

@@ -1,0 +1,7 @@
+/// A grant word no capability answers to: the failure an author hits when a
+/// pin bump renames one.
+component UnknownGrant {
+  abi = processor;
+  requires = [telepathy];
+  in orders;
+}

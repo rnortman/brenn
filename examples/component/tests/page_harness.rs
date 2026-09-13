@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use brenn_envelope::grants::ComponentGrant;
 use brenn_page_harness::{Harness, Page};
 
 /// An out-of-tree consumer's artifact path comes from the build, not a tree
@@ -17,13 +16,14 @@ fn artifact() -> PathBuf {
     PathBuf::from(std::env::var("EXAMPLE_CASER_WASM").expect("the build names the artifact"))
 }
 
+/// The component's specification, declaring grants and port vocabulary.
+fn spec() -> PathBuf {
+    PathBuf::from(std::env::var("EXAMPLE_CASER_SPEC").expect("the build names the specification"))
+}
+
 #[test]
 fn the_example_component_instantiates_against_the_page_host() {
-    let harness = Harness::new(
-        &artifact(),
-        Page::new(),
-        &[ComponentGrant::Ports, ComponentGrant::Log],
-    );
+    let harness = Harness::new(&artifact(), &spec(), Page::new());
     // Instantiation is the first assertion: an artifact whose imports the linked
     // profile does not cover panics inside `new`.
     drop(harness);
@@ -37,11 +37,7 @@ fn the_example_component_instantiates_against_the_page_host() {
 /// only across this boundary.
 #[test]
 fn a_delivery_driven_from_another_module_publishes_and_logs() {
-    let mut harness = Harness::new(
-        &artifact(),
-        Page::new(),
-        &[ComponentGrant::Ports, ComponentGrant::Log],
-    );
+    let mut harness = Harness::new(&artifact(), &spec(), Page::new());
     harness.call(brenn_page_harness::delivery_on(
         "text",
         &[],
@@ -51,11 +47,16 @@ fn a_delivery_driven_from_another_module_publishes_and_logs() {
 
     let published = harness.page().published_on("cased");
     assert_eq!(published.len(), 1, "{published:?}");
-    assert!(published[0].contains(r#""kebab":"hello-world""#), "{published:?}");
+    assert!(
+        published[0].contains(r#""kebab":"hello-world""#),
+        "{published:?}"
+    );
 
     let transcript = harness.transcript();
     assert!(
-        transcript.iter().any(|call| call.starts_with("ports.publish(cased,")),
+        transcript
+            .iter()
+            .any(|call| call.starts_with("ports.publish(cased,")),
         "{transcript:?}",
     );
 }

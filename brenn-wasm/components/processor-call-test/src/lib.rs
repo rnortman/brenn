@@ -19,10 +19,12 @@
 // happens and the reply is published and not returned, because answering an
 // activation that asked nothing is a trap.
 
-use brenn_guest::{Activation, Error, Processor, calls, publish};
+use brenn_guest::{Activation, Error, Processor, calls::CallPort, publish};
 
-/// The declared `call` port every call here goes out through.
-const ASK: &str = "ask";
+/// The declared `call` port every call here goes out through. Spelled by hand
+/// rather than reached through a generated handle: this fixture has no
+/// specification of its own, so there is no module to generate one into.
+const ASK: CallPort = CallPort::new("ask");
 /// The declared output port the answer is also published to.
 const OUT: &str = "out";
 /// Body prefix selecting the caller role.
@@ -44,7 +46,7 @@ impl Processor for ProcessorCallTest {
         let body = envelope?.body;
 
         let answer = match body.strip_prefix(CALL) {
-            Some(rest) => match calls::call(ASK, rest)? {
+            Some(rest) => match ASK.call(rest)? {
                 Some(reply) => format!("via:{reply}"),
                 None => "via:none".to_string(),
             },

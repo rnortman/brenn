@@ -15,17 +15,7 @@ use std::collections::VecDeque;
 use brenn_guest::{Activation, Error, Processor, RetainedState, StateLoss, dom, log, publish};
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{InPort, port::OUT};
-
-/// The sync port the counter button's press arrives on. Not bound to any
-/// input port; must not collide with one.
-const SEND_PORT: dom::SyncPort = dom::SyncPort("send");
-
-/// The sync port the free-form field's send button arrives on.
-const SEND_CUSTOM_PORT: dom::SyncPort = dom::SyncPort("send-custom");
-
-/// The sync port the panic button arrives on. Answering it traps.
-const PANIC_PORT: dom::SyncPort = dom::SyncPort("panic");
+use crate::spec::{InPort, SyncPort, port::OUT};
 
 /// Cap on retained scrollback entries: once exceeded, the oldest entry is
 /// removed, which bounds what the page renders, what this component holds, and
@@ -121,9 +111,9 @@ brenn_guest::export_processor!(EchoStubComponent);
 /// Answers whether a [`FAIL_AFTER_STORE`] body was among the new envelopes,
 /// which the caller turns into a failure once the state has been written.
 fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<bool, Error> {
-    if activation.sync_is(dom::MOUNT) {
+    if activation.sync_is(brenn_guest::MOUNT) {
         echo.view = Some(build_view());
-    } else if let Some(port) = activation.sync() {
+    } else if let Some(port) = SyncPort::of(activation)? {
         on_gesture(port, echo)?;
     }
     let mut new_entries = 0usize;
@@ -185,20 +175,14 @@ fn trim_scrollback(echo: &mut EchoStub) {
 /// The counter is bumped where the publish either happens or does not: a
 /// refusal that left it advanced would make the status line claim a message the
 /// bus never saw.
-fn on_gesture(port: &str, echo: &mut EchoStub) -> Result<(), Error> {
-    let body = if port == SEND_PORT {
-        format!("echo-stub message #{}", echo.sent + 1)
-    } else if port == SEND_CUSTOM_PORT {
+fn on_gesture(port: SyncPort, echo: &mut EchoStub) -> Result<(), Error> {
+    let body = match port {
+        SyncPort::Send => format!("echo-stub message #{}", echo.sent + 1),
         // The sync-call body carries no element content, so the field must be
         // read here. The sync call runs on the press's own event stack, so
         // this is the field's value at press time.
-        dom::value(echo.view().input)
-    } else if port == PANIC_PORT {
-        panic!("echo-stub panic button pressed");
-    } else {
-        return Err(Error::failed(format!(
-            "echo-stub wired no gesture to sync port {port:?}"
-        )));
+        SyncPort::SendCustom => dom::value(echo.view().input),
+        SyncPort::Panic => panic!("echo-stub panic button pressed"),
     };
     match publish(OUT, &body) {
         Ok(()) => echo.sent += 1,
@@ -238,9 +222,9 @@ fn build_view() -> View {
         dom::append(root, child);
     }
 
-    dom::listen(send, "click", SEND_PORT);
-    dom::listen(send_custom, "click", SEND_CUSTOM_PORT);
-    dom::listen(panic_button, "click", PANIC_PORT);
+    dom::listen(send, "click", SyncPort::Send);
+    dom::listen(send_custom, "click", SyncPort::SendCustom);
+    dom::listen(panic_button, "click", SyncPort::Panic);
 
     View {
         status,

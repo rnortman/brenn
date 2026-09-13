@@ -8,12 +8,6 @@ policy_srcs()
 # half so both drive the component from one source.
 exports_files(["transplant.json"])
 
-# The probe's source, for `//surface/contract`'s test that every port a staged
-# kind listens on is declared `sync` in its specification. The probe listens on
-# none; the test reads every staged kind so that the one that starts listening
-# is read without a build edit.
-exports_files(["src/lib.rs"])
-
 # Bindings come from the brenn-guest SDK's `generate!`; this crate names no
 # WIT of its own.
 # The port surface, generated from the authored specification this

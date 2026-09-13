@@ -1,0 +1,5 @@
+// A specification that does not parse: the failure an author hits first, whose
+// diagnostic must still name this file.
+component Broken {
+  abi = processor
+  requires = [ports];

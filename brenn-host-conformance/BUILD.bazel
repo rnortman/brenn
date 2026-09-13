@@ -29,7 +29,10 @@ rust_test(
     name = "brenn-host-conformance_test",
     size = "large",
     crate = ":brenn-host-conformance",
-    data = ["//brenn-wasm:fixture_processor_transplant"],
+    data = [
+        "//:config/specs/processor-transplant.brenn",
+        "//brenn-wasm:fixture_processor_transplant",
+    ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + [

@@ -31,6 +31,7 @@ rust_library(
     testonly = True,
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True) + [
+        "//brenn-dsl",
         "//brenn-envelope",
         "//surface/contract",
     ],
@@ -46,6 +47,20 @@ rust_test(
     size = "small",
     compile_data = [":wit"],
     crate = ":page-harness",
+    data = [
+        "testdata/all-directions.brenn",
+        "testdata/malformed.brenn",
+        "testdata/two-classes.brenn",
+        "testdata/unknown-grant.brenn",
+        "//:config/specs/echo-stub.brenn",
+    ],
+    env = {
+        "ALL_DIRECTIONS_SPEC": "$(rootpath testdata/all-directions.brenn)",
+        "ECHO_STUB_SPEC": "$(rootpath //:config/specs/echo-stub.brenn)",
+        "MALFORMED_SPEC": "$(rootpath testdata/malformed.brenn)",
+        "TWO_CLASS_SPEC": "$(rootpath testdata/two-classes.brenn)",
+        "UNKNOWN_GRANT_SPEC": "$(rootpath testdata/unknown-grant.brenn)",
+    },
     rustc_env = {"CARGO_MANIFEST_DIR": "$(execpath :wit)"},
     target_compatible_with = HOST_ONLY,
 )

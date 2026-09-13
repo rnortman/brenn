@@ -1,0 +1,13 @@
+/// Two component classes in one module, which is the shape that makes an
+/// unnamed `Declared::from_spec` ambiguous.
+component First {
+  abi = processor;
+  requires = [ports];
+  in messages;
+}
+
+component Second {
+  abi = processor;
+  requires = [ports];
+  out out;
+}

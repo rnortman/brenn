@@ -305,7 +305,13 @@ WASM_TEST_SUITES = [
             "processor-log",
             "protobar",
         ],
-        [],
+        [
+            "//:config/specs/chrome.brenn",
+            "//:config/specs/echo-stub.brenn",
+            "//:config/specs/meeting.brenn",
+            "//:config/specs/mode-clock.brenn",
+            "//:config/specs/protobar.brenn",
+        ],
         [
             "//surface/chrome",
             "//surface/components/meeting",

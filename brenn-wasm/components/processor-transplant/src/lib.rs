@@ -33,7 +33,9 @@
 //                                   questions in the host's place.
 //   "__reply__"                   — answer the activation, reporting the sync
 //                                   port it arrived on, that port compared
-//                                   against the mount item, the request body,
+//                                   against the mount item, what the generated
+//                                   classifier makes of the cause, the request
+//                                   body,
 //                                   whether the request is attributed to the
 //                                   target's own bare name, and the ports the
 //                                   activation delivered.
@@ -306,10 +308,11 @@ impl Processor for ProcessorTransplant {
             Some(Marker::Trap) => unreachable!("transplant: deliberate trap sentinel"),
             // The reply reports every sync accessor at once: the port the
             // request names, that port read back as an item rather than a
-            // literal, the request body, and the ports this activation
-            // *delivered* — which is the whole list minus the request's own. A
-            // host that lost `sync` on the way in shows it here, and so does an
-            // exclusion that stopped excluding.
+            // literal, what the generated classifier makes of the cause, the
+            // request body, and the ports this activation *delivered* — which
+            // is the whole list minus the request's own. A host that lost
+            // `sync` on the way in shows it here, and so does an exclusion that
+            // stopped excluding.
             Some(Marker::Reply) => {
                 let (port, request) = activation.sync_request().ok_or_else(|| {
                     Error::failed("__reply__ on an activation that is no sync call")
@@ -319,6 +322,16 @@ impl Processor for ProcessorTransplant {
                     .map(|window| window.port())
                     .collect();
                 let request = request?;
+                // The declared port the cause classifies as: the `ask` variant
+                // on a sync call the document admits, and a refusal on the
+                // mount cause, which no specification declares. Reported rather
+                // than propagated, because the probe's job is to say what the
+                // host handed over and a mount is a legitimate cause here.
+                let classified = match spec::SyncPort::of(&activation) {
+                    Ok(Some(port)) => port.name(),
+                    Ok(None) => "none",
+                    Err(_) => "undeclared",
+                };
                 // The request is attributed to the target itself, by the name
                 // its own placement knows it as — not by either host's
                 // participant vocabulary, which would spell the same instance
@@ -329,8 +342,9 @@ impl Processor for ProcessorTransplant {
                     && !request.sender.is_empty()
                     && !request.sender.contains(':');
                 Ok(Some(format!(
-                    "replied:{port}:mount={}:request={}:bare-identity={bare_identity}:delivered=[{}]",
-                    activation.sync_is(brenn_guest::dom::MOUNT),
+                    "replied:{port}:mount={}:classified={classified}:request={}:\
+                     bare-identity={bare_identity}:delivered=[{}]",
+                    activation.sync_is(brenn_guest::MOUNT),
                     request.body,
                     delivered.join(","),
                 )))
