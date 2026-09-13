@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-13
+
 - **Component-to-component synchronous calls.** A component can now call a
   peer and receive its reply inline, on either host, through a new `calls` WIT
   import (`brenn:processor/calls`). The caller declares a `call` port; the
