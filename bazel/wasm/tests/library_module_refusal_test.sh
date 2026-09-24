@@ -21,7 +21,7 @@ if out=$("$dsl_cli" check --modules "$(dirname "$module")" "$root" 2>&1); then
     echo "FAIL: a library module that instantiates was accepted: $out"
     exit 1
 fi
-if ! printf '%s' "$out" | grep -qF -e "instantiates nothing"; then
+if ! grep -qF -e "instantiates nothing" <<< "$out"; then
     echo "FAIL: the refusal does not name the discipline: $out"
     exit 1
 fi

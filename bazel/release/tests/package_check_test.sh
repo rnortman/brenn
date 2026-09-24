@@ -129,7 +129,7 @@ reject() {
     local label="$1" needle="$2" linkage="${3:-dynamic}" out
     if out=$("$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" "$linkage" "$stage_lib" 2>&1); then
         fail "$label should be rejected, exited 0: $out"
-    elif ! printf '%s' "$out" | grep -qF "$needle"; then
+    elif ! grep -qF "$needle" <<< "$out"; then
         fail "$label: the rejection does not name the problem: $out"
     fi
 }
@@ -317,7 +317,7 @@ reject "a tree with no module root" "modules/ is missing"
 # An absent module root must not abort the gate early; later checks and the
 # summary must still run.
 out=$("$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" dynamic "$stage_lib" 2>&1 || true)
-if ! printf '%s' "$out" | grep -qF "problem(s) with the staged tree"; then
+if ! grep -qF "problem(s) with the staged tree" <<< "$out"; then
     fail "a tree with no module root: the gate stopped before its summary: $out"
 fi
 
@@ -358,7 +358,7 @@ reject "a file in the module root that is not a module" \
 # And the gate's own preconditions.
 if out=$("$check" "$bundle_check" "$names" "$record_lib" "$tmp/absent" "$manifest" dynamic "$stage_lib" 2>&1); then
     fail "a package dir that does not exist should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "not a directory"; then
+elif ! grep -qF "not a directory" <<< "$out"; then
     fail "the rejection does not say what went wrong: $out"
 fi
 if "$check" "$bundle_check" "$names" "$record_lib" "$pkg" "$manifest" sideways "$stage_lib" > /dev/null 2>&1; then

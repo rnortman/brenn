@@ -48,7 +48,7 @@ printf 'one\n' > "$tmp/diff1/clash.js"
 printf 'other\n' > "$tmp/diff2/clash.js"
 if out=$("$merge" "$tmp/conflict" "$tmp/diff1" "$tmp/diff2" 2>&1); then
     fail "a differing duplicate should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "clash.js"; then
+elif ! grep -qF "clash.js" <<< "$out"; then
     fail "the rejection does not name the clashing path: $out"
 fi
 
@@ -64,7 +64,7 @@ fi
 printf 'not a stage\n' > "$tmp/regular-file"
 if out=$("$merge" "$tmp/notdir" "$tmp/regular-file" 2>&1); then
     fail "a non-directory stage should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "not a directory"; then
+elif ! grep -qF "not a directory" <<< "$out"; then
     fail "the rejection does not say what went wrong: $out"
 fi
 

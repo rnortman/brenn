@@ -64,13 +64,13 @@ expect_names "a file with no entries" ''
 # wrong cause.
 if out=$("$names" "$tmp/absent" 2>&1); then
     fail "a manifest that does not exist should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "not a readable file"; then
+elif ! grep -qF "not a readable file" <<< "$out"; then
     fail "the rejection does not say what went wrong: $out"
 fi
 
 if out=$("$names" 2>&1); then
     fail "no manifest argument should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "usage:"; then
+elif ! grep -qF "usage:" <<< "$out"; then
     fail "the usage error does not state the usage: $out"
 fi
 

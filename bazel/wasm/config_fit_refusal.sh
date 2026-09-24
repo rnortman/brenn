@@ -15,7 +15,7 @@ if out=$("$dsl_cli" "$@" 2>&1); then
     echo "FAIL: a document that must not compile was accepted: $out"
     exit 1
 fi
-if ! printf '%s' "$out" | grep -qF -e "$expect"; then
+if ! grep -qF -e "$expect" <<< "$out"; then
     echo "FAIL: the refusal is not the one this case is about."
     echo "  expected to find: $expect"
     echo "  got: $out"

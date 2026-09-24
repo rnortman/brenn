@@ -83,7 +83,7 @@ reject() {
     shift 2
     if out=$(run "$@" 2>&1); then
         fail "$label should be rejected, exited 0: $out"
-    elif ! printf '%s' "$out" | grep -qF -e "$needle"; then
+    elif ! grep -qF -e "$needle" <<< "$out"; then
         fail "$label: the rejection does not name the problem: $out"
     fi
 }

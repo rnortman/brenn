@@ -32,7 +32,7 @@ expect() {
         failures=$((failures + 1))
         return
     fi
-    if [ -n "$needle" ] && ! printf '%s' "$out" | grep -qF "$needle"; then
+    if [ -n "$needle" ] && ! grep -qF "$needle" <<< "$out"; then
         echo "FAIL: $name output does not mention '$needle': $out"
         failures=$((failures + 1))
     fi

@@ -37,7 +37,7 @@ fi
 printf 'c\n' > "$tmp/tree/stray.map"
 if out=$("$check" "$tmp/tree" "$tmp/expected.txt" dist 2>&1); then
     fail "an unlisted file should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "stray.map"; then
+elif ! grep -qF "stray.map" <<< "$out"; then
     fail "the rejection does not name the unlisted file: $out"
 fi
 rm "$tmp/tree/stray.map"
@@ -46,7 +46,7 @@ rm "$tmp/tree/stray.map"
 mv "$tmp/tree/one.js" "$tmp/one.js.stash"
 if out=$("$check" "$tmp/tree" "$tmp/expected.txt" dist 2>&1); then
     fail "a missing file should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "one.js"; then
+elif ! grep -qF "one.js" <<< "$out"; then
     fail "the rejection does not name the missing file: $out"
 fi
 mv "$tmp/one.js.stash" "$tmp/tree/one.js"
@@ -63,7 +63,7 @@ fi
 printf '# only a comment\n\n' > "$tmp/empty.txt"
 if out=$("$check" "$tmp/tree" "$tmp/empty.txt" dist 2>&1); then
     fail "an empty expected list should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "names no paths"; then
+elif ! grep -qF "names no paths" <<< "$out"; then
     fail "the rejection does not say the list is empty: $out"
 fi
 
@@ -71,14 +71,14 @@ fi
 mkdir -p "$tmp/unbuilt"
 if out=$("$check" "$tmp/unbuilt" "$tmp/expected.txt" dist 2>&1); then
     fail "an empty tree should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "holds no files"; then
+elif ! grep -qF "holds no files" <<< "$out"; then
     fail "the rejection does not say the tree is empty: $out"
 fi
 
 # A path that is not a directory at all.
 if out=$("$check" "$tmp/expected.txt" "$tmp/expected.txt" dist 2>&1); then
     fail "a non-directory tree should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "not a directory"; then
+elif ! grep -qF "not a directory" <<< "$out"; then
     fail "the rejection does not say what went wrong: $out"
 fi
 

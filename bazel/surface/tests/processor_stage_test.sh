@@ -113,7 +113,7 @@ fi
 if out_text=$("$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/empty-version.txt" \
     "$tmp/demo.brenn" "$emitter" "$dsl_cli" "$tmp/out_empty" 2>&1); then
     fail "an empty version file should be rejected, exited 0: $out_text"
-elif ! printf '%s' "$out_text" | grep -qF "empty-version.txt"; then
+elif ! grep -qF "empty-version.txt" <<< "$out_text"; then
     fail "the rejection does not name the version file: $out_text"
 fi
 
@@ -125,7 +125,7 @@ if out_text=$("$stage" demo-panel "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/versi
     fail "a kind that is not the class's wire kind should be rejected, exited 0: $out_text"
 else
     for needle in demo-panel demo demo.brenn; do
-        if ! printf '%s' "$out_text" | grep -qF "$needle"; then
+        if ! grep -qF "$needle" <<< "$out_text"; then
             fail "the kind rejection does not name $needle: $out_text"
         fi
     done

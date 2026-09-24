@@ -47,16 +47,16 @@ library=$(write_list library.txt 'surface-description.brenn')
 out=$(run_gate "$offered" "$packages" "$library")
 status=$?
 [ "$status" -eq 0 ] || fail "equal lists were refused: $out"
-printf '%s' "$out" | grep -qF "PASS:" || fail "the passing run printed no verdict: $out"
+grep -qF "PASS:" <<< "$out" || fail "the passing run printed no verdict: $out"
 
 # ── An offered name nothing ships is refused ──────────────────────────────
 offered=$(write_list offered.txt $'chrome.brenn\nphantom.brenn')
 out=$(run_gate "$offered" "$packages")
 status=$?
 [ "$status" -eq 1 ] || fail "a specification shipped by nothing was accepted: $out"
-printf '%s' "$out" | grep -qF "config/specs/phantom.brenn is offered by //:modules and shipped by nothing" ||
+grep -qF "config/specs/phantom.brenn is offered by //:modules and shipped by nothing" <<< "$out" ||
     fail "the refusal does not name the unaccounted file: $out"
-printf '%s' "$out" | grep -qF "BRENN_LIBRARY_MODULES" ||
+grep -qF "BRENN_LIBRARY_MODULES" <<< "$out" ||
     fail "the refusal does not name the three shipping mechanisms: $out"
 
 # ── A shipped name that does not exist is refused ─────────────────────────
@@ -65,7 +65,7 @@ missing=$(write_list library.txt 'gone.brenn')
 out=$(run_gate "$offered" "$packages" "$missing")
 status=$?
 [ "$status" -eq 1 ] || fail "a shipping list naming a file that does not exist was accepted: $out"
-printf '%s' "$out" | grep -qF "gone.brenn is named as a shipped specification and does not exist" ||
+grep -qF "gone.brenn is named as a shipped specification and does not exist" <<< "$out" ||
     fail "the refusal does not name the missing file: $out"
 
 # ── Two lists with no trailing newline stay two names ─────────────────────

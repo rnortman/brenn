@@ -79,7 +79,7 @@ fi
 
 if out="$("$export_sh" out_overshoot ./overshoot export_bindings_ 2>&1)"; then
     fail "an export climbing past the collection dir was accepted"
-elif ! printf '%s' "$out" | grep -qF "outside the collection dir"; then
+elif ! grep -qF "outside the collection dir" <<< "$out"; then
     fail "the rejection does not say the export escaped: $out"
 fi
 

@@ -38,35 +38,35 @@ fi
 # The release failure: a placeholder that no stamp replaced.
 if out=$("$check" stamped "$tmp/dev" main.js -- surface.js 2>&1); then
     fail "a placeholder in a stamped bundle should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "main.js"; then
+elif ! grep -qF "main.js" <<< "$out"; then
     fail "the rejection does not name the bundle: $out"
 fi
 
 # The dev failure: the define dropped, so nothing substitutes anything.
 if out=$("$check" unstamped "$tmp/rel" main.js -- surface.js 2>&1); then
     fail "an unstamped bundle with no placeholder should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "main.js"; then
+elif ! grep -qF "main.js" <<< "$out"; then
     fail "the rejection does not name the bundle: $out"
 fi
 
 # A bundle that takes no build id must not have acquired one.
 if out=$("$check" stamped "$tmp/leak" main.js -- surface.js 2>&1); then
     fail "a no-id bundle carrying the placeholder should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "surface.js"; then
+elif ! grep -qF "surface.js" <<< "$out"; then
     fail "the rejection does not name the no-id bundle: $out"
 fi
 
 # A bundle that stopped being produced.
 if out=$("$check" unstamped "$tmp/dev" main.js absent.js -- surface.js 2>&1); then
     fail "a missing bundle should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "absent.js"; then
+elif ! grep -qF "absent.js" <<< "$out"; then
     fail "the rejection does not name the missing bundle: $out"
 fi
 
 # Nothing to check is not the same as everything being fine.
 if out=$("$check" unstamped "$tmp/dev" -- surface.js 2>&1); then
     fail "an invocation naming no build-id bundles should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "assert nothing"; then
+elif ! grep -qF "assert nothing" <<< "$out"; then
     fail "the rejection does not say why: $out"
 fi
 

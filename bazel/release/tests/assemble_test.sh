@@ -164,7 +164,7 @@ expect_failure() {
     if out=$("$@" 2>&1); then
         fail "$label should be rejected, exited 0: $out"
     # `--` because a needle can name a flag, which grep would read as its own.
-    elif ! printf '%s' "$out" | grep -qF -- "$needle"; then
+    elif ! grep -qF -- "$needle" <<< "$out"; then
         fail "$label: the rejection does not name the problem: $out"
     fi
 }

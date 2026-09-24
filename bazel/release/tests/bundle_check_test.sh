@@ -145,7 +145,7 @@ reject() {
     shift 2
     if out=$("$check" "$names" "$record_lib" "$tree" "$@" 2>&1); then
         fail "$label should be rejected, exited 0: $out"
-    elif ! printf '%s' "$out" | grep -qF "$needle"; then
+    elif ! grep -qF "$needle" <<< "$out"; then
         fail "$label: the rejection does not name the problem: $out"
     fi
 }
@@ -276,14 +276,14 @@ reject "an unlisted, unowned module" \
 build_tree "$tree" surface
 if out=$("$check" "$names" "$record_lib" "$tree" --module-candidate "$tree/nowhere/*.brenn" 2>&1); then
     fail "a candidate glob matching nothing should leave every module unbacked: $out"
-elif ! printf '%s' "$out" | grep -qF "modules/panel.brenn is byte-identical to no packaged specification"; then
+elif ! grep -qF "modules/panel.brenn is byte-identical to no packaged specification" <<< "$out"; then
     fail "a candidate glob matching nothing: the rejection does not name the problem: $out"
 fi
 
 # And the gate's own preconditions.
 if out=$("$check" "$names" "$record_lib" "$tmp/absent" 2>&1); then
     fail "a tree that does not exist should be rejected, exited 0: $out"
-elif ! printf '%s' "$out" | grep -qF "not a directory"; then
+elif ! grep -qF "not a directory" <<< "$out"; then
     fail "the rejection does not say what went wrong: $out"
 fi
 
