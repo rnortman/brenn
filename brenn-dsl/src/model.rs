@@ -1196,6 +1196,10 @@ vocabulary! {
         opt allowed_users: V,
         opt disabled_tools: V,
         opt cc_extra_args: V,
+        /// Extra environment for this agent's Claude Code process: a table of
+        /// strings, the same value form `mcp_server`'s `env` takes. Plaintext;
+        /// not for secrets.
+        opt env: V,
         opt integrations: V,
         opt extra_mounts: V,
         opt prefix_username: V,

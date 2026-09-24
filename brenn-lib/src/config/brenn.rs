@@ -224,6 +224,7 @@ pub fn sort_order_dead_collections(config: &mut BrennConfig) {
             post_pull_hooks: _,
             startup_hooks: _,
             cc_extra_args: _,
+            env: _,
             claude_profiles: _,
             approval_rules: _,
             attachment_targets: _,

@@ -14,7 +14,9 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use brenn_lib::config::{AppClaudeProfiles, ClaudeProfile, SecretString};
+use brenn_lib::config::{
+    AppClaudeProfiles, ClaudeProfile, OUTRANKING_CREDENTIAL_VARS, SecretString,
+};
 use brenn_lib::messaging::ChannelScheme;
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
@@ -23,24 +25,6 @@ use tracing::{info, warn};
 /// Component name of the system participant that subscribes to every goal
 /// channel. Its bus identity is `system:cc-profile`.
 pub const CC_PROFILE_COMPONENT: &str = "cc-profile";
-
-/// The environment variable Claude Code reads a `claude setup-token` token from.
-pub const CLAUDE_OAUTH_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
-
-/// The credential-selecting environment variables no profiled agent may carry
-/// from anywhere but its profile: the five Claude Code ranks *above* the token,
-/// plus the token variable itself. Any of them wins silently over the profile,
-/// so both places Brenn can see one refuse to run — the spawn config build, for
-/// an integration's contribution, and [`refuse_outranking_server_env`] for the
-/// server's own environment, which a bare child inherits wholesale.
-pub const OUTRANKING_CREDENTIAL_VARS: [&str; 6] = [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    CLAUDE_OAUTH_TOKEN_VAR,
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-];
 
 /// Refuse to boot when the server's own environment carries a credential that
 /// outranks the token and any **bare** agent runs under a profile.

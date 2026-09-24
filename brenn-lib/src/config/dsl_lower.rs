@@ -83,7 +83,10 @@ use super::attachment::{AttachmentHandlerConfig, AttachmentTargetRaw, default_ti
 use super::automation::AutomationGlobalConfig;
 use super::brenn::BrennConfig;
 use super::claude_defaults::ClaudeDefaultsConfig;
-use super::claude_profile::{AppClaudeProfiles, ClaudeProfileRaw, default_token_file_name};
+use super::claude_profile::{
+    AppClaudeProfiles, CLAUDE_OAUTH_TOKEN_VAR, ClaudeProfileRaw, OUTRANKING_CREDENTIAL_VARS,
+    default_token_file_name,
+};
 use super::container::{ContainerConfig, default_container_home};
 use super::events::EventsConfig;
 use super::hooks::{PostPullHooksConfig, StartHooksConfig, StartupHooksConfig};
@@ -1652,16 +1655,20 @@ fn apps(
         .collect()
 }
 
-/// The three agent attrs the Claude-account lowering reads together.
+/// The four agent attrs the Claude-account lowering reads together.
 ///
 /// `cc_extra_args` rides along because `--bare` and a profile are mutually
 /// exclusive: under `--bare` Claude Code ignores `CLAUDE_CODE_OAUTH_TOKEN` and
-/// bills the home's login instead, so the profile would be a lie.
+/// bills the home's login instead, so the profile would be a lie. `env` rides
+/// along for the same reason: an outranking credential in it and a profile are
+/// mutually exclusive.
 struct StatedAppProfiles<'a> {
     profiles: Option<&'a Attr<RVal>>,
     goal: Option<&'a Attr<RVal>>,
     cc_extra_args: &'a [String],
     cc_extra_args_at: Option<&'a Attr<RVal>>,
+    env: &'a BTreeMap<String, String>,
+    env_at: Option<&'a Attr<RVal>>,
 }
 
 /// The accounts one agent may run under, and where its goal comes from.
@@ -1733,6 +1740,27 @@ fn app_claude_profiles(
             at.value.span().clone(),
         ));
         admitted = false;
+    }
+    if let Some(at) = stated.env_at {
+        for key in stated.env.keys() {
+            // Refused unconditionally in `app`, profiles or not; a second
+            // diagnostic here would claim the variable outranks itself.
+            if key == CLAUDE_OAUTH_TOKEN_VAR {
+                continue;
+            }
+            if OUTRANKING_CREDENTIAL_VARS.contains(&key.as_str()) {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`env` sets `{key}`, which Claude Code ranks above \
+                         `{CLAUDE_OAUTH_TOKEN_VAR}`: the profile this agent runs under \
+                         would name one account while Claude Code billed another. Drop \
+                         the variable or the `claude_profiles`"
+                    ),
+                    at.value.span().clone(),
+                ));
+                admitted = false;
+            }
+        }
     }
     let goal = match stated.goal {
         Some(at) => {
@@ -1883,6 +1911,7 @@ fn app(
         allowed_users,
         disabled_tools,
         cc_extra_args,
+        env,
         integrations,
         extra_mounts,
         prefix_username,
@@ -1898,6 +1927,33 @@ fn app(
     let (start_hooks, post_pull_hooks, startup_hooks) = hook_blocks(&agent.hooks, errors);
     let extra_args =
         opt_strings(cc_extra_args.as_ref(), "cc_extra_args", errors).unwrap_or_default();
+    let agent_env: BTreeMap<String, String> = env
+        .as_ref()
+        .and_then(|attr| expect_string_map(&attr.value, "env", errors))
+        .unwrap_or_default();
+    if let Some(attr) = env {
+        for key in agent_env.keys() {
+            if key == CLAUDE_OAUTH_TOKEN_VAR {
+                errors.push(Diagnostic::at(
+                    format!(
+                        "`env` names `{CLAUDE_OAUTH_TOKEN_VAR}`: a Claude account is a \
+                         `claude_profile` with its token in a 0600 file, never a token in the \
+                         document. Declare a profile and state `claude_profiles`"
+                    ),
+                    attr.value.span().clone(),
+                ));
+            }
+            if key == "HOME" {
+                errors.push(Diagnostic::at(
+                    "`env` names `HOME`: a container's home is set by Brenn from the \
+                     `container` block, and a second `HOME` would move `.claude/` out from \
+                     under the mounted home. Drop it"
+                        .to_string(),
+                    attr.value.span().clone(),
+                ));
+            }
+        }
+    }
     let app_profiles = app_claude_profiles(
         resolved,
         declared_profiles,
@@ -1906,6 +1962,8 @@ fn app(
             goal: claude_profile_goal.as_ref(),
             cc_extra_args: &extra_args,
             cc_extra_args_at: cc_extra_args.as_ref(),
+            env: &agent_env,
+            env_at: env.as_ref(),
         },
         errors,
     );
@@ -1971,6 +2029,7 @@ fn app(
         post_pull_hooks,
         startup_hooks,
         cc_extra_args: extra_args,
+        env: agent_env,
         claude_profiles: app_profiles,
         // No attr spelling: a nested table of rule patterns.
         approval_rules: Vec::new(),

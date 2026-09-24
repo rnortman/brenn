@@ -39,7 +39,10 @@ use crate::config::server::{DatabaseConfig, ServerConfig};
 use crate::config::surface_description::SurfaceDescriptionConfig;
 use crate::config::wasm::WasmConfig;
 use crate::config::watchdog::WatchdogConfig;
-use crate::config::{BrennConfig, PACKAGED_MODULE, config_from_dsl, lower_document, sole_refusal};
+use crate::config::{
+    BrennConfig, CLAUDE_OAUTH_TOKEN_VAR, OUTRANKING_CREDENTIAL_VARS, PACKAGED_MODULE,
+    config_from_dsl, lower_document, sole_refusal,
+};
 use crate::messaging::AttachGrant;
 use crate::messaging::ComponentGrant;
 use crate::messaging::Urgency;
@@ -1752,6 +1755,7 @@ agent Assistant() {
     allowed_users = ["alice", "bob"];
     disabled_tools = ["WebSearch"];
     cc_extra_args = ["--verbose"];
+    env = { LLM_URL = "http://llm.example.com:8080" };
     integrations = ["calendar"];
     extra_mounts = ["/home/alice/notes"];
     prefix_username = true;
@@ -1790,6 +1794,10 @@ new alice: Assistant();
                 allowed_users: vec!["alice".to_string(), "bob".to_string()],
                 disabled_tools: vec!["WebSearch".to_string()],
                 cc_extra_args: vec!["--verbose".to_string()],
+                env: BTreeMap::from([(
+                    "LLM_URL".to_string(),
+                    "http://llm.example.com:8080".to_string(),
+                )]),
                 integrations: vec!["calendar".to_string()],
                 extra_mounts: vec!["/home/alice/notes".to_string()],
                 prefix_username: Some(true),
@@ -1824,6 +1832,90 @@ new alice: Assistant();
             ..Default::default()
         },
     );
+}
+
+/// An agent's `env` is a table of strings, so a `const` states it once for
+/// however many agents share it.
+#[test]
+fn an_agent_env_comes_from_a_const() {
+    let config = config_from_dsl(
+        r#"
+const local_llm = {
+    ANTHROPIC_BASE_URL = "http://llm.example.com:8080",
+    ANTHROPIC_MODEL = "local-model",
+};
+
+agent Assistant() {
+    env = local_llm;
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        config.apps[0].env,
+        BTreeMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://llm.example.com:8080".to_string(),
+            ),
+            ("ANTHROPIC_MODEL".to_string(), "local-model".to_string()),
+        ]),
+    );
+}
+
+#[test]
+fn an_agent_env_that_is_not_a_table_is_refused() {
+    let error = refusal(
+        r#"
+agent Assistant() {
+    env = "X";
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        error.message,
+        "`env`: expected a table of strings, got a string"
+    );
+}
+
+/// A token in the document is never right: an account is a `claude_profile`,
+/// with its token in a 0600 file. Refused whether or not the agent states
+/// accounts.
+#[test]
+fn an_agent_env_naming_the_oauth_token_is_refused() {
+    let error = refusal(
+        r#"
+agent Assistant() {
+    env = { CLAUDE_CODE_OAUTH_TOKEN = "x" };
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert!(
+        error.message.contains("CLAUDE_CODE_OAUTH_TOKEN"),
+        "{}",
+        error.render(),
+    );
+}
+
+/// Brenn sets a container's `HOME`; a second one would move `.claude/` out
+/// from under the mounted home.
+#[test]
+fn an_agent_env_naming_home_is_refused() {
+    let error = refusal(
+        r#"
+agent Assistant() {
+    env = { HOME = "/x" };
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert!(error.message.contains("`HOME`"), "{}", error.render());
 }
 
 /// Hooks are named sub-blocks, one per point in the agent's life; mcp servers
@@ -6131,7 +6223,7 @@ new alice: Assistant();
 
 /// Under `--bare` Claude Code ignores the token and bills whatever `/login`
 /// left in the home, so the profile the agent claims to run under would be a
-/// lie — and this is the one outranking credential config resolution can see.
+/// lie.
 #[test]
 fn a_bare_agent_with_accounts_is_refused() {
     let diagnostic = profile_refusal(
@@ -6144,6 +6236,80 @@ fn a_bare_agent_with_accounts_is_refused() {
         diagnostic.message.contains("--bare"),
         "{}",
         diagnostic.render(),
+    );
+}
+
+/// Each outranking credential is refused individually. The token variable
+/// is skipped here; it is refused unconditionally, tested below.
+#[test]
+fn an_agent_env_with_an_outranking_credential_and_accounts_is_refused() {
+    for var in OUTRANKING_CREDENTIAL_VARS
+        .iter()
+        .filter(|var| **var != CLAUDE_OAUTH_TOKEN_VAR)
+    {
+        let diagnostic = profile_refusal(&format!(
+            r#"
+    claude_profiles = ["main"];
+    env = {{ {var} = "k" }};
+"#
+        ));
+        assert!(
+            diagnostic.message.contains(var),
+            "{var}: {}",
+            diagnostic.render(),
+        );
+    }
+}
+
+/// The token variable is one of the outranking six, but it is refused
+/// unconditionally, so a profiled agent gets that one diagnostic and not a
+/// second saying the variable outranks itself.
+#[test]
+fn an_agent_env_naming_the_oauth_token_beside_accounts_is_refused_once() {
+    let diagnostic = profile_refusal(
+        r#"
+    claude_profiles = ["main"];
+    env = { CLAUDE_CODE_OAUTH_TOKEN = "x" };
+"#,
+    );
+    assert!(
+        diagnostic.message.contains("CLAUDE_CODE_OAUTH_TOKEN"),
+        "{}",
+        diagnostic.render(),
+    );
+    assert!(
+        diagnostic.message.contains("never a token in the document"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// Without accounts nothing claims which account the agent runs under, so an
+/// outranking credential in its `env` is the operator's business — the
+/// local-backend case.
+#[test]
+fn an_agent_env_with_an_outranking_credential_and_no_accounts_is_accepted() {
+    let config = config_from_dsl(
+        r#"
+agent Assistant() {
+    env = {
+        ANTHROPIC_AUTH_TOKEN = "local",
+        ANTHROPIC_BASE_URL = "http://llm.example.com:8080",
+    };
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        config.apps[0].env,
+        BTreeMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "local".to_string()),
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://llm.example.com:8080".to_string(),
+            ),
+        ]),
     );
 }
 

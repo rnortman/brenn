@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -118,6 +118,10 @@ pub struct AppConfigRaw {
     pub startup_hooks: Option<StartupHooksConfig>,
     /// Extra CLI arguments passed verbatim to the `claude` command.
     pub cc_extra_args: Vec<String>,
+    /// Extra environment for the `claude` process, applied over what it
+    /// would otherwise have. Ordered so the podman argv and the reload
+    /// comparison are deterministic. Plaintext, per-agent, not for secrets.
+    pub env: BTreeMap<String, String>,
     /// Which Claude accounts this app may run under, and where its goal comes
     /// from. `None` for an app that declares no profiles.
     pub claude_profiles: Option<AppClaudeProfiles>,
@@ -248,6 +252,14 @@ pub struct AppConfig {
     pub startup_hooks: StartupHooksConfig,
     /// Extra CLI arguments passed verbatim to the `claude` command.
     pub cc_extra_args: Vec<String>,
+    /// Extra environment for the `claude` process, applied over what it
+    /// would otherwise have. Ordered so the podman argv and the reload
+    /// comparison are deterministic. Plaintext, per-agent, not for secrets: in
+    /// container mode the values are on the host's world-readable podman
+    /// command line, exactly as integration env vars and `mcp_server` `env`
+    /// are; in bare mode they override inherited server-environment keys and
+    /// cannot unset one.
+    pub env: BTreeMap<String, String>,
     /// Which Claude accounts this app may run under, and where its goal comes
     /// from. `None` for an app that declares no profiles: it gets no token at
     /// spawn and authenticates with whatever `/login` left in its home.
@@ -372,6 +384,7 @@ pub struct AppSpawn<'a> {
     pub mcp_servers: std::collections::BTreeMap<&'a str, &'a McpServerConfig>,
     pub disabled_tools: &'a [String],
     pub cc_extra_args: &'a [String],
+    pub env: &'a BTreeMap<String, String>,
     pub working_dir: &'a Path,
     pub container_spawn: Option<&'a ContainerSpawnConfig>,
     pub approval_rules: &'a [brenn_approval_rules::ApprovalRuleConfig],
@@ -486,6 +499,7 @@ impl AppConfig {
             start_hooks,
             post_pull_hooks,
             cc_extra_args,
+            env,
             approval_rules,
             attachment_targets,
             history_replay_limit,
@@ -517,6 +531,7 @@ impl AppConfig {
                     .collect(),
                 disabled_tools,
                 cc_extra_args,
+                env,
                 working_dir,
                 container_spawn: container_spawn.as_ref(),
                 approval_rules,
@@ -719,6 +734,7 @@ impl Default for AppConfigRaw {
             post_pull_hooks: None,
             startup_hooks: None,
             cc_extra_args: vec![],
+            env: BTreeMap::new(),
             claude_profiles: None,
             approval_rules: vec![],
             attachment_targets: vec![],

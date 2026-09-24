@@ -2,7 +2,7 @@ use super::*;
 use crate::app::AppTool;
 use crate::config::ResolvedConfig;
 use crate::integration::{Integration, IntegrationFactory, IntegrationRegistry};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 // -----------------------------------------------------------------------
@@ -48,6 +48,43 @@ impl Integration for TestIntegration {
                 env: HashMap::new(),
             },
         )]
+    }
+
+    fn env_var_names(&self) -> &[&'static str] {
+        &["TEST_INT_KEY"]
+    }
+
+    fn env_vars(&self, _app_config: &AppConfig) -> Vec<(String, String)> {
+        vec![("TEST_INT_KEY".to_string(), "v".to_string())]
+    }
+}
+
+/// An integration that declares a key but emits nothing at resolve time.
+struct LatentFactory;
+
+impl IntegrationFactory for LatentFactory {
+    fn name(&self) -> &str {
+        "latent-int"
+    }
+
+    fn create(&self, _config: Option<&toml::Value>) -> Arc<dyn Integration> {
+        Arc::new(LatentIntegration)
+    }
+
+    fn tools(&self) -> Vec<Box<dyn AppTool>> {
+        vec![]
+    }
+}
+
+struct LatentIntegration;
+
+impl Integration for LatentIntegration {
+    fn name(&self) -> &str {
+        "latent-int"
+    }
+
+    fn env_var_names(&self) -> &[&'static str] {
+        &["LATENT_KEY"]
     }
 }
 
@@ -118,6 +155,57 @@ fn integration_per_app_override() {
     let mcp_servers = app.integrations["test-int"].mcp_servers();
     // Per-app override should take effect.
     assert_eq!(mcp_servers[0].1.command, "overridden-cmd");
+}
+
+/// An app with the given integrations enabled and the given agent `env`.
+fn resolve_with_env(integrations: Vec<String>, env: &[(&str, &str)]) -> ResolvedConfig {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = IntegrationRegistry::new(vec![Box::new(TestFactory), Box::new(LatentFactory)]);
+    let config = BrennConfig {
+        server: super::test_server_config(),
+        apps: vec![AppConfigRaw {
+            slug: "myapp".to_string(),
+            working_dir: Some(dir.path().to_path_buf()),
+            integrations,
+            env: env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    validate_and_resolve(&config, &registry, Some(super::test_runtime_dir()))
+}
+
+#[test]
+#[should_panic(expected = "already supplies")]
+fn agent_env_colliding_with_an_integration_key_panics() {
+    resolve_with_env(vec!["test-int".to_string()], &[("TEST_INT_KEY", "mine")]);
+}
+
+/// The collision is refused although the integration emits nothing at
+/// resolve time.
+#[test]
+#[should_panic(expected = "already supplies")]
+fn agent_env_colliding_with_a_key_an_integration_may_emit_later_panics() {
+    resolve_with_env(vec!["latent-int".to_string()], &[("LATENT_KEY", "mine")]);
+}
+
+#[test]
+#[should_panic(expected = "already supplies")]
+fn agent_env_setting_graf_user_tz_panics() {
+    resolve_with_env(vec![], &[("GRAF_USER_TZ", "UTC")]);
+}
+
+#[test]
+fn agent_env_disjoint_from_integration_keys_resolves() {
+    let ResolvedConfig { apps, .. } =
+        resolve_with_env(vec!["test-int".to_string()], &[("OTHER", "1")]);
+    assert_eq!(
+        apps["myapp"].env,
+        BTreeMap::from([("OTHER".to_string(), "1".to_string())])
+    );
 }
 
 #[test]

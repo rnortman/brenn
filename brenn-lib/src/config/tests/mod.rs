@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::config::*;
@@ -131,6 +131,7 @@ fn minimal_app_config_for_budget_test(
         post_pull_hooks: PostPullHooksConfig::default(),
         startup_hooks: StartupHooksConfig::default(),
         cc_extra_args: vec![],
+        env: BTreeMap::new(),
         claude_profiles: None,
         approval_rules: vec![],
         attachment_targets: vec![],

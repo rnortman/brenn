@@ -95,6 +95,11 @@ pub trait IntegrationFactory: Send + Sync + 'static {
     fn tools(&self) -> Vec<Box<dyn AppTool>>;
 }
 
+/// The one environment variable the spawn adds beside integration output:
+/// the browser's timezone, threaded per session rather than emitted by the
+/// graf integration, which sees only the static `AppConfig`.
+pub const GRAF_USER_TZ_VAR: &str = "GRAF_USER_TZ";
+
 /// A configured integration instance, bound to a specific app.
 ///
 /// Created by `IntegrationFactory::create()` with app-specific config
@@ -163,9 +168,20 @@ pub trait Integration: Send + Sync + 'static {
     /// Should panic on validation failure — this is a startup check.
     fn validate(&self, _app_config: &AppConfig) {}
 
+    /// Every key `env_vars` can ever emit, fixed at compile time. Resolve
+    /// refuses an agent `env` naming one of these; the spawn asserts
+    /// `env_vars` emits nothing outside this list. An integration may emit
+    /// a subset at any given time, so the refusal reads this, not
+    /// `env_vars`. Default: none.
+    fn env_var_names(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Environment variables this integration contributes to the CC process.
     /// For containerized apps, these become `-e KEY=VAL` podman flags.
     /// For bare apps, they're set in the subprocess environment.
+    /// Every key returned must be in `env_var_names`; the spawn panics on one
+    /// that is not.
     ///
     /// Default: no env vars.
     fn env_vars(&self, _app_config: &AppConfig) -> Vec<(String, String)> {

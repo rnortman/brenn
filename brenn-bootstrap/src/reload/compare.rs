@@ -364,6 +364,7 @@ fn compare_app(
         post_pull_hooks,
         startup_hooks,
         cc_extra_args,
+        env,
         claude_profiles,
         approval_rules,
         attachment_targets,
@@ -416,6 +417,7 @@ fn compare_app(
         post_pull_hooks: b_post_pull_hooks,
         startup_hooks: b_startup_hooks,
         cc_extra_args: b_cc_extra_args,
+        env: b_env,
         claude_profiles: b_claude_profiles,
         approval_rules: b_approval_rules,
         attachment_targets: b_attachment_targets,
@@ -487,6 +489,7 @@ fn compare_app(
         moved(mcp_servers, b_mcp_servers),
         moved(container_working_dir, b_container_working_dir),
         moved(cc_extra_args, b_cc_extra_args),
+        moved(env, b_env),
         moved(approval_rules, b_approval_rules),
         moved(extra_mounts, b_extra_mounts),
         moved(frontmatter, b_frontmatter),
@@ -806,6 +809,12 @@ mod tests {
             edited(|app| app.working_dir = Some(std::path::PathBuf::from("/srv/work"))),
             edited(|app| app.disabled_tools = vec!["Bash".to_string()]),
             edited(|app| app.cc_extra_args = vec!["--verbose".to_string()]),
+            edited(|app| {
+                app.env = BTreeMap::from([(
+                    "LLM_URL".to_string(),
+                    "http://llm.example.com:8080".to_string(),
+                )])
+            }),
             edited(|app| app.singleton = true),
             edited(|app| app.persistent = true),
             edited(|app| app.idle_timeout_secs = Some(60)),

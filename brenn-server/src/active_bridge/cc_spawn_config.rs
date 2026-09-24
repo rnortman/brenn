@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use brenn_cc::protocol::outgoing::{HookMatcher, HooksConfig};
 use brenn_cc::session::CcSessionConfig;
-use brenn_cc_profile::{CLAUDE_OAUTH_TOKEN_VAR, OUTRANKING_CREDENTIAL_VARS};
+use brenn_lib::config::{CLAUDE_OAUTH_TOKEN_VAR, OUTRANKING_CREDENTIAL_VARS};
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::transcript::TranscriptWriter;
 use tracing::info;
@@ -87,11 +87,19 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
         }]),
     };
 
-    let mut integration_env_vars: Vec<(String, String)> = app_config
-        .integrations
-        .values()
-        .flat_map(|i| i.env_vars(app_config))
-        .collect();
+    let mut spawn_env_vars: Vec<(String, String)> = Vec::new();
+    for (name, integration) in &app_config.integrations {
+        for (key, value) in integration.env_vars(app_config) {
+            assert!(
+                integration.env_var_names().contains(&key.as_str()),
+                "BUG: integration {name:?} emitted env var {key:?} for app {:?} without \
+                 declaring it in env_var_names(); the resolve-time collision check \
+                 could not have seen it",
+                app_config.slug,
+            );
+            spawn_env_vars.push((key, value));
+        }
+    }
 
     // `GRAF_USER_TZ` is session-level, not static-per-app — threaded
     // through `spawn_new` from the spawning WsConnection's `self.timezone`
@@ -106,19 +114,31 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
     // Push BEFORE the duplicate-key assertion so the assertion covers this
     // key too — a future integration emitting `GRAF_USER_TZ` would be
     // caught here rather than silently overriding it.
-    integration_env_vars.push(brenn_graf::graf_user_tz_env(user_tz));
+    spawn_env_vars.push(brenn_graf::graf_user_tz_env(user_tz));
 
-    // Panic on duplicate env var keys — two integrations emitting the same
-    // key would produce silent last-write-wins behaviour (both for bare-app
-    // `command.envs()` and podman `-e` flags). Catch it here before a future
-    // second integration silently clobbers an existing one.
+    // The agent's own environment joins the same slice so the duplicate-key
+    // and outranking assertions below cover it. A collision with an
+    // integration's key was refused at resolve time; here it is a BUG.
+    spawn_env_vars.extend(
+        app_config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+
+    // Panic on a duplicate env var key. Three sources share this slice —
+    // integrations, `GRAF_USER_TZ`, the agent's `env` — and a repeat would be
+    // silent last-write-wins in both `command.envs()` and podman `-e`. Every
+    // operator-reachable repeat is refused at resolve time; a repeat here is a
+    // BUG in the pipeline.
     {
         let mut seen = std::collections::HashSet::new();
-        for (key, _) in &integration_env_vars {
+        for (key, _) in &spawn_env_vars {
             assert!(
                 seen.insert(key.as_str()),
-                "BUG: duplicate integration env var key {key:?} — two integrations are \
-                 emitting the same key for app {:?}; one would silently override the other",
+                "BUG: env var key {key:?} is supplied twice to the Claude Code process for \
+                 app {:?} (integrations, GRAF_USER_TZ and the agent's env share one slice); \
+                 one would silently override the other",
                 app_config.slug,
             );
             // Claude Code ranks each of these above `CLAUDE_CODE_OAUTH_TOKEN`,
@@ -127,8 +147,8 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
             // be a lie.
             assert!(
                 cc_profile.is_none() || !OUTRANKING_CREDENTIAL_VARS.contains(&key.as_str()),
-                "BUG: integration env var {key:?} outranks CLAUDE_CODE_OAUTH_TOKEN in Claude \
-                 Code's credential precedence, and app {:?} runs under a claude_profile — the \
+                "BUG: env var {key:?} outranks {CLAUDE_OAUTH_TOKEN_VAR} in Claude Code's \
+                 credential precedence, and app {:?} runs under a claude_profile — the \
                  profile would name one account while CC used another",
                 app_config.slug,
             );
@@ -137,7 +157,6 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
 
     // When containerized, the host-side noop_mcp.py must be bind-mounted in
     // and the MCP config must reference the container-side path.
-    // Integration env vars are injected as -e flags.
     let (mcp_script_for_config, container) = if let Some(ref spawn) = app_config.container_spawn {
         let mut spawn = spawn.clone();
         spawn.extra_mounts.push(format!(
@@ -145,8 +164,7 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
             mcp_script_path.display(),
             CONTAINER_MCP_SCRIPT_PATH,
         ));
-        // Add integration env vars as -e flags via extra_args.
-        for (key, val) in &integration_env_vars {
+        for (key, val) in &spawn_env_vars {
             spawn.extra_args.push("-e".into());
             spawn.extra_args.push(format!("{key}={val}"));
         }
@@ -204,10 +222,9 @@ pub(crate) fn build_cc_session_config(inputs: CcSpawnInputs<'_>) -> CcSessionCon
         container_name_suffix,
         add_dirs,
         cc_extra_args: app_config.cc_extra_args.clone(),
-        // For bare apps, integration env vars go to the subprocess directly.
-        // For containerized apps, they were already injected as podman -e flags above.
+        // Containerized apps already received these as podman -e flags above.
         env_vars: if app_config.container_spawn.is_none() {
-            integration_env_vars
+            spawn_env_vars
         } else {
             vec![]
         },
@@ -778,6 +795,76 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // the agent's own `env`
+    // -----------------------------------------------------------------------
+
+    /// A bare spawn carries the agent's `env` in `env_vars`, beside the
+    /// session timezone.
+    #[tokio::test]
+    async fn build_cc_session_config_bare_carries_agent_env_in_env_vars() {
+        let mut app = minimal_test_app_config();
+        app.env = std::collections::BTreeMap::from([(
+            "LLM_URL".to_string(),
+            "http://llm.example.com:8080".to_string(),
+        )]);
+
+        let cfg = run_build_cc_session_config(&app);
+
+        assert!(
+            cfg.env_vars.contains(&(
+                "LLM_URL".to_string(),
+                "http://llm.example.com:8080".to_string()
+            )),
+            "the agent's env must reach env_vars: {:?}",
+            cfg.env_vars,
+        );
+        assert!(
+            cfg.env_vars.iter().any(|(k, _)| k == "GRAF_USER_TZ"),
+            "GRAF_USER_TZ must still be set: {:?}",
+            cfg.env_vars,
+        );
+    }
+
+    /// A containerized spawn carries the agent's `env` as podman `-e` flags
+    /// and leaves `env_vars` empty.
+    #[tokio::test]
+    async fn build_cc_session_config_containerized_carries_agent_env_as_podman_flags() {
+        let host_home = PathBuf::from("/host/home/test");
+        let container_home = PathBuf::from("/home/user");
+        let mut app = minimal_test_app_config();
+        app.state_dir = host_home.join(".config").join("brenn").join("test");
+        app.path_mapper = PathMapper::container(vec![brenn_lib::config::PathMapping {
+            host_root: host_home.clone(),
+            container_root: container_home.clone(),
+        }]);
+        app.container_spawn = Some(test_container("/host/repos/wd", "/home/user/wd"));
+        app.env = std::collections::BTreeMap::from([(
+            "LLM_URL".to_string(),
+            "http://llm.example.com:8080".to_string(),
+        )]);
+
+        let cfg = run_build_cc_session_config(&app);
+
+        assert!(
+            cfg.env_vars.is_empty(),
+            "containerized spawn must not use env_vars: {:?}",
+            cfg.env_vars,
+        );
+        let flags = &cfg
+            .container
+            .as_ref()
+            .expect("containerized spawn must have container config")
+            .extra_args;
+        let found = flags
+            .windows(2)
+            .any(|pair| pair[0] == "-e" && pair[1] == "LLM_URL=http://llm.example.com:8080");
+        assert!(
+            found,
+            "expected `-e LLM_URL=http://llm.example.com:8080` in podman extra_args: {flags:?}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // write_virtual_tools_file
     // -----------------------------------------------------------------------
 
@@ -886,10 +973,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // duplicate integration env var guard
+    // duplicate env var guard
     // -----------------------------------------------------------------------
 
-    /// Test-only integration stub that always emits a fixed env var key.
+    /// Test-only integration stub that always emits, and declares, a fixed
+    /// env var key.
     struct ConstEnvIntegration {
         name: &'static str,
         key: &'static str,
@@ -901,15 +989,55 @@ mod tests {
             self.name
         }
 
+        fn env_var_names(&self) -> &[&'static str] {
+            std::slice::from_ref(&self.key)
+        }
+
         fn env_vars(&self, _app_config: &brenn_lib::config::AppConfig) -> Vec<(String, String)> {
             vec![(self.key.to_string(), self.value.to_string())]
         }
     }
 
+    /// Test-only integration stub that emits a fixed env var key without
+    /// declaring it.
+    struct UndeclaredEnvIntegration {
+        name: &'static str,
+        key: &'static str,
+        value: &'static str,
+    }
+
+    impl brenn_lib::integration::Integration for UndeclaredEnvIntegration {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn env_vars(&self, _app_config: &brenn_lib::config::AppConfig) -> Vec<(String, String)> {
+            vec![(self.key.to_string(), self.value.to_string())]
+        }
+    }
+
+    /// An emitted key missing from `env_var_names` is one the resolve-time
+    /// collision check could not see; the spawn refuses it as a BUG.
+    #[tokio::test]
+    #[should_panic(expected = "without declaring it in env_var_names")]
+    async fn build_cc_session_config_panics_when_an_integration_emits_an_undeclared_env_key() {
+        use std::sync::Arc;
+        let mut app = minimal_test_app_config();
+        app.integrations.insert(
+            "alpha".to_string(),
+            Arc::new(UndeclaredEnvIntegration {
+                name: "alpha",
+                key: "ROGUE_KEY",
+                value: "rogue",
+            }),
+        );
+        run_build_cc_session_config(&app);
+    }
+
     /// Two integrations both emitting the same env key must panic before
     /// a silent last-write-wins clobber reaches the CC subprocess.
     #[tokio::test]
-    #[should_panic(expected = "duplicate integration env var key")]
+    #[should_panic(expected = "is supplied twice to the Claude Code process")]
     async fn build_cc_session_config_panics_on_duplicate_integration_env_key() {
         use std::sync::Arc;
         let mut app = minimal_test_app_config();
@@ -947,6 +1075,39 @@ mod tests {
                 value: "sk-ant-api-whatever",
             }),
         );
+        run_build_cc_session_config_with_profile(&app, "main", "sk-ant-oat-token");
+    }
+
+    /// An agent `env` key that repeats an integration's is refused at resolve
+    /// time; a config that bypassed resolve still trips the spawn backstop.
+    #[tokio::test]
+    #[should_panic(expected = "is supplied twice to the Claude Code process")]
+    async fn build_cc_session_config_panics_when_agent_env_repeats_an_integration_key() {
+        use std::sync::Arc;
+        let mut app = minimal_test_app_config();
+        app.integrations.insert(
+            "alpha".to_string(),
+            Arc::new(ConstEnvIntegration {
+                name: "alpha",
+                key: "MY_KEY",
+                value: "from-alpha",
+            }),
+        );
+        app.env =
+            std::collections::BTreeMap::from([("MY_KEY".to_string(), "from-env".to_string())]);
+        run_build_cc_session_config(&app);
+    }
+
+    /// An agent `env` carrying an outranking credential on a profiled agent is
+    /// refused at lowering; the spawn backstop covers it too.
+    #[tokio::test]
+    #[should_panic(expected = "outranks CLAUDE_CODE_OAUTH_TOKEN")]
+    async fn build_cc_session_config_panics_when_agent_env_outranks_the_profile() {
+        let mut app = minimal_test_app_config();
+        app.env = std::collections::BTreeMap::from([(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-ant-api-whatever".to_string(),
+        )]);
         run_build_cc_session_config_with_profile(&app, "main", "sk-ant-oat-token");
     }
 

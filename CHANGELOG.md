@@ -4,6 +4,18 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Per-agent environment variables.** A new `env` attribute on agents sets
+  environment variables on the Claude Code subprocess, enabling local LLM
+  backends (e.g. llama-server with an Anthropic-compatible API) on a per-agent
+  basis without PATH wrappers or global environment changes. Combined with
+  existing `cc_extra_args` flags (`--restricted`, `--tools`, `--system-prompt`),
+  this is enough to lock an agent down to read-only file access within its
+  working directory and a controlled tool set — suitable for untrusted or
+  demo scenarios. The attribute refuses keys that would conflict with
+  integration-emitted variables, outrank a configured Claude profile's
+  credentials, or place secrets in plaintext config.
+- Bumped rustls to 0.23.45, clearing RUSTSEC-2026-0285.
+
 ## [0.24.0] — 2026-09-13
 
 - **Mounts can now curate surfaces.** A new `extend surface "<slug>" { ... }`

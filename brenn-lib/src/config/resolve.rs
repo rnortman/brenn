@@ -876,6 +876,7 @@ pub fn resolve_apps(
             post_pull_hooks: raw.post_pull_hooks.clone().unwrap_or_default(),
             startup_hooks: raw.startup_hooks.clone().unwrap_or_default(),
             cc_extra_args: raw.cc_extra_args.clone(),
+            env: raw.env.clone(),
             claude_profiles: raw.claude_profiles.clone(),
             approval_rules: raw.approval_rules.clone(),
             attachment_targets,
@@ -909,6 +910,33 @@ pub fn resolve_apps(
             webhook_subscriptions: vec![],
             mqtt_subscriptions: vec![],
         };
+
+        // Refuse an agent `env` key that any integration may emit. Uses
+        // `env_var_names` (declared keys), not `env_vars` (currently emitted
+        // keys), because an integration may emit nothing yet at resolve time.
+        if !resolved.env.is_empty() {
+            let mut emitted: BTreeMap<String, String> = resolved
+                .integrations
+                .iter()
+                .flat_map(|(name, i)| {
+                    i.env_var_names()
+                        .iter()
+                        .map(move |key| (key.to_string(), format!("integration `{name}`")))
+                })
+                .collect();
+            emitted.insert(
+                crate::integration::GRAF_USER_TZ_VAR.to_string(),
+                "the per-session timezone Brenn sets for every agent".to_string(),
+            );
+            for (key, source) in &emitted {
+                assert!(
+                    !resolved.env.contains_key(key),
+                    "app {:?}: `env` sets {key:?}, which {source} already supplies to the \
+                     Claude Code process; drop it from `env`",
+                    raw.slug,
+                );
+            }
+        }
 
         let prev = apps.insert(raw.slug.clone(), resolved);
         assert!(prev.is_none(), "duplicate app slug {:?}", raw.slug,);

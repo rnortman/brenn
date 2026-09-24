@@ -226,7 +226,7 @@ Claude Code ranks several credentials above `CLAUDE_CODE_OAUTH_TOKEN`. If one of
 them is present, Claude Code uses it, silently, and the profile a conversation
 claims to run under is a lie — the spend lands on some other account. This
 section is the one prose home for that list; the set Brenn checks for is the
-`OUTRANKING_CREDENTIAL_VARS` constant in `brenn-cc-profile`, and it should be
+`OUTRANKING_CREDENTIAL_VARS` constant in `brenn-lib`, and it should be
 the same six names:
 
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
@@ -242,8 +242,12 @@ Brenn refuses the cases it can see:
   with profiles is treated as a bug rather than as a spawn error: building the
   spawn config panics, and the panic hook raises a Critical `Brenn PANIC` alert
   naming the variable and the app. Read that alert as your config, not as a
-  Brenn defect — this is the one refusal of the three that fires at spawn rather
+  Brenn defect — this is the one refusal of the four that fires at spawn rather
   than at startup, because integration environments are assembled per spawn.
+- **The agent's own `env`.** An `env` attr naming one of those six on an agent
+  with `claude_profiles` is a config error, refused where the document is
+  loaded. Without profiles the keys are allowed — nothing claims which account
+  such an agent runs under.
 - **`--bare`.** `cc_extra_args` containing `--bare` together with
   `claude_profiles` is a config error: under `--bare` Claude Code ignores the
   token entirely.

@@ -19,6 +19,24 @@ pub fn default_token_file_name(profile: &str) -> String {
     format!("claude-profile-{profile}.token")
 }
 
+/// The environment variable Claude Code reads a `claude setup-token` token from.
+pub const CLAUDE_OAUTH_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The credential-selecting environment variables no profiled agent may carry
+/// from anywhere but its profile: the five Claude Code ranks *above* the token,
+/// plus the token variable itself. Any of them wins silently over the profile,
+/// so every place Brenn can see one refuses to run — an agent's own `env` at
+/// lowering, an integration's contribution at the spawn config build, and the
+/// server's own environment (which a bare child inherits wholesale) at boot.
+pub const OUTRANKING_CREDENTIAL_VARS: [&str; 6] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    CLAUDE_OAUTH_TOKEN_VAR,
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+];
+
 const EXPIRY_WARNING_DAYS: i64 = 30;
 
 /// One `claude_profile` block, as the document states it.

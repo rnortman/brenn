@@ -11,7 +11,7 @@
 //! this crate's own, the remote server's, and the route rig above it — so the
 //! fleet-driver block those three assert against is written once.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use brenn_dsl::DocumentInputs;
@@ -57,6 +57,7 @@ pub fn test_app_config(slug: &str) -> AppConfig {
         post_pull_hooks: PostPullHooksConfig::default(),
         startup_hooks: StartupHooksConfig::default(),
         cc_extra_args: vec![],
+        env: BTreeMap::new(),
         claude_profiles: None,
         approval_rules: vec![],
         attachment_targets: vec![],

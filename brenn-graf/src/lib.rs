@@ -24,6 +24,8 @@ use brenn_lib::integration::{Integration, IntegrationFactory};
 /// Integration name, used in the config document and the integration registry.
 const INTEGRATION_NAME: &str = "graf";
 
+pub const GRAF_MANIFEST_VAR: &str = "GRAF_MANIFEST";
+
 /// Config for the graf integration, deserialized from the merged value tree of
 /// the `integration graf` declaration and an agent's `integration_config graf`
 /// block.
@@ -267,7 +269,7 @@ impl Integration for GrafIntegration {
         if app_config.container_spawn.is_none()
             && let Some(ref manifest) = manifest_env
         {
-            cmd.env("GRAF_MANIFEST", manifest);
+            cmd.env(GRAF_MANIFEST_VAR, manifest);
         }
 
         let output = cmd
@@ -280,6 +282,10 @@ impl Integration for GrafIntegration {
             output.status,
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    fn env_var_names(&self) -> &[&'static str] {
+        &[GRAF_MANIFEST_VAR]
     }
 
     fn env_vars(&self, app_config: &AppConfig) -> Vec<(String, String)> {
@@ -297,7 +303,7 @@ impl Integration for GrafIntegration {
 /// to ensure they find the auto-generated manifest.
 pub fn graf_manifest_env(app: &brenn_lib::config::AppConfig) -> Option<(String, String)> {
     GrafIntegration::manifest_paths(app)
-        .map(|(_, cc_path)| ("GRAF_MANIFEST".to_string(), cc_path.display().to_string()))
+        .map(|(_, cc_path)| (GRAF_MANIFEST_VAR.to_string(), cc_path.display().to_string()))
 }
 
 /// Compute the `GRAF_USER_TZ` env var for graf subprocesses.
@@ -311,7 +317,10 @@ pub fn graf_manifest_env(app: &brenn_lib::config::AppConfig) -> Option<(String, 
 /// Type matches `graf_manifest_env` so both pairs can be collected into
 /// the same `Vec<(String, String)>`.
 pub fn graf_user_tz_env(tz: chrono_tz::Tz) -> (String, String) {
-    ("GRAF_USER_TZ".to_string(), tz.name().to_string())
+    (
+        brenn_lib::integration::GRAF_USER_TZ_VAR.to_string(),
+        tz.name().to_string(),
+    )
 }
 
 /// Extract `GrafConfig` from an app's integration map.

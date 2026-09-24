@@ -321,7 +321,8 @@ so goal channels state `brenn.cc-profile.goal@1`.
 `cc_extra_args = ["--bare"]` together with `claude_profiles` is refused: under
 `--bare` Claude Code ignores `CLAUDE_CODE_OAUTH_TOKEN` and bills whatever
 `/login` left in the home, so the account the agent claims to run under would be
-a lie.
+a lie. An agent `env` naming any of the six outranking credential variables
+together with `claude_profiles` is refused for the same reason.
 
 Minting a token, rotating one, publishing a goal by hand, and the two ways an
 outranking credential can make the account a lie without Brenn noticing are in
@@ -905,6 +906,12 @@ An agent class is an application: an LLM conversation with a sandbox, mounted
 repos, MCP servers, and bus subscriptions.
 
 ```
+const local_llm = {
+  ANTHROPIC_BASE_URL = "http://llm.example.com:8080",
+  ANTHROPIC_AUTH_TOKEN = "local",
+  ANTHROPIC_MODEL = "local-model",
+};
+
 agent PersonalAssistant {
   name = "Personal Assistant";
   description = "Alice's personal assistant";
@@ -913,6 +920,7 @@ agent PersonalAssistant {
   singleton = true;
   integrations = ["graf", "pfin"];
   container = "sandbox";
+  env = local_llm;
   allowed_users = ["alice"];
   mount ws-alice { working_dir = true; }
   mount src-brenn { access = read-only; }
@@ -935,6 +943,39 @@ or the language's one inline-definition form, which exists because a server body
 may name class parameters), `subscribe`, `acl`, and named sub-blocks like
 `start_hooks`. Agents have no port bindings, so **every plane an agent reaches is
 authored** — nothing is derived from wiring.
+
+`env` is a table of strings applied to the agent's Claude Code process. Bare, it
+goes over the inherited server environment: an `env` key overrides an inherited
+one and cannot unset one. Containerized, each entry is a `-e KEY=VAL` on the
+podman command line, where the values are world-readable on the host exactly as
+`mcp_server` `env` and integration variables are. Plaintext only; there is no
+secret form. Values reach `claude` verbatim. A variable that relocates Claude
+Code's own state — `CLAUDE_CONFIG_DIR` — moves its login and the transcripts a
+resumed conversation needs with it: in container mode point it inside the
+mounted home or an `extra_mounts` entry, or every exit discards them; in bare
+mode keep it the same across spawns. Brenn does not read that directory and
+does not check the path. Refused: `CLAUDE_CODE_OAUTH_TOKEN` (an account is a
+`claude_profile`, never a token in the document); `HOME` (Brenn sets the
+container's); any of the six outranking credential variables together with
+`claude_profiles` (see [Claude accounts](#claude-accounts)); and any key an
+integration on the agent can emit (each integration declares its set, so the
+refusal does not wait on a repo being cloned), or `GRAF_USER_TZ`, refused at
+boot naming the source. An `env` edit is per-process: live sessions retire at their next idle
+moment.
+
+A lockdown is spelled in `cc_extra_args`, which Brenn passes to `claude`
+verbatim and does not interpret. A built-in tool allow-list is
+`cc_extra_args = ["--tools", "Read,Glob,Grep"]` — exact, because Brenn emits no
+`--tools` of its own unless `disabled_tools` is set. Do not combine
+`disabled_tools` with an operator `--tools`: that puts two `--tools` on one
+command line, and which wins is Claude Code's parser's business. Include
+`ToolSearch` in an operator `--tools` unless the backend is known not to defer
+MCP schemas behind it. `--restricted` is the file fence: without it, a `Read` of
+any file the server user can open is auto-approved. A `--system-prompt` or
+`--system-prompt-file` edit reaches a *resumed* conversation only with
+`--system-prompt-snapshot off`; editing only the prompt file's contents changes
+no document byte and bounces nothing. `--permission-mode` through
+`cc_extra_args` is unsupported.
 
 ### Assemblies
 
@@ -1612,7 +1653,8 @@ What converges is components, surfaces and their wiring:
   conversation and its chat history but loses its delivery positions and is no
   longer woken — the same as after a restart.
   What a Claude Code process was *spawned* with — `model`, `mcp_servers`,
-  `disabled_tools`, `working_dir`, `approval_rules`, the compaction thresholds,
+  `disabled_tools`, `cc_extra_args`, `env`, `working_dir`, `approval_rules`, the
+  compaction thresholds,
   the idle timeouts, `singleton`, and the virtual tools list its MCP shim read
   at its start — cannot be changed under a running process. Those converge at
   each live session's next idle moment: the reload retires the session and the
