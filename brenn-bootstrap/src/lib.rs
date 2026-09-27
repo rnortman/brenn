@@ -14,6 +14,7 @@ mod config_check;
 mod config_diff;
 mod config_status;
 mod consumers;
+mod conversation_epoch;
 mod mounts_cmd;
 mod mqtt;
 mod obs_config;
@@ -22,6 +23,7 @@ mod pwa_push;
 mod reload;
 mod repo_sync;
 mod shutdown;
+mod state_channel;
 #[cfg(test)]
 mod surface_boot_harness;
 #[cfg(test)]
@@ -823,6 +825,24 @@ pub async fn run_server(
         }
     };
 
+    // Conversation epochs: seeded and reconciled here, above the `AppState`
+    // literal, for the reason the profile goals are read here. Everything below
+    // is an eager spawn path, and an epoch published while the server was down
+    // must supersede the stale conversation before anything can wake it.
+    let (epoch_reconciler, conversation_epoch_inbox) = match conversation_epoch::boot(
+        &app_table,
+        messaging_result.messenger.clone(),
+        &system_notifiers,
+        &db,
+        &active_bridges,
+        guard.alert_dispatcher.clone(),
+    )
+    .await
+    {
+        Some((reconciler, inbox)) => (Some(reconciler), Some(inbox)),
+        None => (None, None),
+    };
+
     let state = AppState {
         build_id,
         db,
@@ -859,6 +879,7 @@ pub async fn run_server(
         attach_registry: brenn_attach_server::registry::AttachRegistry::default(),
         attach_heartbeat_secs: brenn_surface_server::HEARTBEAT_SECS,
         cc_profiles: cc_profiles.clone(),
+        epoch_reconciler: epoch_reconciler.clone(),
     };
 
     // One table, or a reload swaps a map some gate is not reading.
@@ -981,6 +1002,13 @@ pub async fn run_server(
                 .clone()
                 .expect("the inbox exists only when the profile goal handle does");
             cc_profile::spawn_goal_drain(inbox, goal, state.active_bridges.clone());
+        }
+
+        if let Some(inbox) = conversation_epoch_inbox {
+            let reconciler = epoch_reconciler
+                .clone()
+                .expect("the inbox exists only when the epoch handle does");
+            conversation_epoch::spawn_epoch_drain(inbox, reconciler);
         }
 
         // Last: the driver takes the consumer registry, so nothing may start

@@ -98,6 +98,43 @@ impl SystemParticipantSpec {
             subscriptions: vec![],
         }
     }
+
+    /// A subscribe-only system participant on durable channels: granted exactly
+    /// `MessagingSubscribe` plus one exact-match `brenn_subscribe` ACL per
+    /// channel, and subscribed to each. The substrate shape for a participant
+    /// that reads operator-declared state channels.
+    ///
+    /// `addrs` are canonical `brenn:` addresses, and they are the
+    /// subscriptions. The matchers carry the **bare** names. The delivery gate
+    /// splits the scheme off before matching, so an `Exact("brenn:x")` would
+    /// never match, and every message would sit undelivered with nothing but a
+    /// once-per-pair warning to show for it.
+    ///
+    /// # Panics
+    ///
+    /// On an address that is not `brenn:`. Every caller's channels are durable
+    /// by config-time rule, so another scheme is a host wiring bug.
+    pub fn subscribe_only_durable(component: &'static str, addrs: &[String]) -> Self {
+        let mut policy = AppPolicy::default();
+        policy.grants.insert(AppCapability::MessagingSubscribe);
+        for addr in addrs {
+            match ChannelScheme::split(addr) {
+                Some((ChannelScheme::Brenn, bare)) => policy
+                    .acls
+                    .brenn_subscribe
+                    .push(ChannelMatcher::Exact(bare.to_string())),
+                _ => panic!(
+                    "BUG: system participant {component:?} subscribes to {addr:?}, which is not \
+                     a durable `brenn:` address; config resolution should have refused it"
+                ),
+            }
+        }
+        Self {
+            component,
+            policy,
+            subscriptions: addrs.to_vec(),
+        }
+    }
 }
 
 /// Derive the subscriber-registry entries for a set of system participant
@@ -945,6 +982,38 @@ mod tests {
         assert_eq!(woken, json!({ "phase": "wake" }).to_string());
 
         task.abort();
+    }
+
+    /// A subscribe-only durable participant holds exactly `MessagingSubscribe`
+    /// and one bare `brenn_subscribe` matcher per address, and nothing else.
+    #[test]
+    fn subscribe_only_durable_subscribes_on_addresses_with_bare_matchers() {
+        let addrs = vec!["brenn:alpha".to_string(), "brenn:beta".to_string()];
+        let spec = SystemParticipantSpec::subscribe_only_durable("sub", &addrs);
+        assert_eq!(spec.subscriptions, addrs);
+        let mut grants = GrantSet::default();
+        grants.insert(AppCapability::MessagingSubscribe);
+        assert_eq!(
+            spec.policy,
+            AppPolicy {
+                grants,
+                acls: AclSet {
+                    brenn_subscribe: vec![
+                        ChannelMatcher::Exact("alpha".to_string()),
+                        ChannelMatcher::Exact("beta".to_string()),
+                    ],
+                    ..AclSet::default()
+                },
+                ..AppPolicy::default()
+            },
+            "only `MessagingSubscribe` and the `brenn_subscribe` family are populated",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a durable `brenn:` address")]
+    fn subscribe_only_durable_panics_on_a_non_durable_address() {
+        SystemParticipantSpec::subscribe_only_durable("sub", &["ephemeral:alpha".to_string()]);
     }
 
     /// **One scheme per participant, all the way down.** A spec must grant its

@@ -553,13 +553,40 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
         push_depth: Depth,
     ) -> Attached;
 
+    /// [`RetentionStore::attach`] for a subscriber inheriting a position:
+    /// a queue coming into existence is primed at the later of the channel's
+    /// retained-tail floor (as `attach` primes) and `floor`, in one lock scope,
+    /// so no instant exists at which it holds the primed-only position. An
+    /// existing position is kept untouched and answers `Existing`, as `attach`
+    /// does.
+    ///
+    /// `floor` is a `next_owed` seq this store handed out — in practice the
+    /// return of a [`RetentionStore::detach`] on this channel.
+    ///
+    /// # Panics
+    ///
+    /// If `push_depth` is sampled (an inherited floor implies a position), or
+    /// if `floor` is above the next seq this channel would assign.
+    async fn attach_from(
+        &self,
+        subscriber: &ParticipantId,
+        app_slug: &str,
+        push_depth: Depth,
+        floor: MessageSeq,
+    ) -> Attached;
+
     /// Tear down `subscriber`'s delivery state on this channel — the inverse of
     /// [`RetentionStore::attach`]. Its position and unread obligations go; the
     /// retained messages stay for whoever else is owed them.
     ///
+    /// Returns the `next_owed` seq of the position it dropped, or `None` when it
+    /// held none. It is one operation so that the position reported is the
+    /// position removed: a read followed by a detach would let an advance land
+    /// between the two.
+    ///
     /// Idempotent: detaching a subscriber the store never saw removes nothing
     /// and is not an error.
-    async fn detach(&self, subscriber: &ParticipantId);
+    async fn detach(&self, subscriber: &ParticipantId) -> Option<MessageSeq>;
 
     /// Commit a message into retention, immediately deliverable, and report
     /// whatever the message it displaced from the window cost a subscriber.

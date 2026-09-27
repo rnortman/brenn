@@ -21,6 +21,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "conversation-recycler",
     "guest",
     "git-forge-parser",
     "git-sync-consumer",

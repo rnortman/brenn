@@ -232,10 +232,49 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
         Attached::Created
     }
 
+    /// [`RingCore::attach`] for a queue that inherits `floor_next_owed` — the
+    /// `next_owed` of a position another subscriber just gave up on this ring.
+    /// A position that already exists keeps it untouched (`Existing`), exactly
+    /// as `attach` does.
+    ///
+    /// # Panics
+    ///
+    /// If `push_depth` is zero (an inherited floor implies a position, and a
+    /// sampled subscriber holds none), or if `floor_next_owed` is above
+    /// `newest_seq() + 1` — a floor this ring never reached.
+    pub fn attach_from(
+        &mut self,
+        subscriber: S,
+        push_depth: u64,
+        floor_next_owed: u64,
+    ) -> Attached {
+        assert!(
+            push_depth > 0,
+            "ring: attach_from with a sampled push depth, which holds no position to inherit into"
+        );
+        let head = self.ring.newest_seq();
+        assert!(
+            floor_next_owed <= head + 1,
+            "ring: attach_from floor {floor_next_owed} is above the next seq {} this ring would assign",
+            head + 1
+        );
+        if let Some(cursor) = self.cursors.get_mut(&subscriber) {
+            cursor.set_push_depth(push_depth);
+            return Attached::Existing;
+        }
+        self.cursors.insert(
+            subscriber,
+            SubscriberCursor::primed_at_least(&self.ring, push_depth, floor_next_owed),
+        );
+        Attached::Created
+    }
+
     /// Drop a subscriber's position. Its unread obligations go with it; the
     /// messages stay retained for whoever else is owed them.
-    pub fn detach(&mut self, subscriber: &S) {
-        self.cursors.remove(subscriber);
+    ///
+    /// Returns the position removed, `None` when the subscriber held none.
+    pub fn detach(&mut self, subscriber: &S) -> Option<SubscriberCursor> {
+        self.cursors.remove(subscriber)
     }
 
     /// Whether `subscriber` holds a position on this channel.
@@ -611,6 +650,55 @@ mod tests {
         c.detach(&"proc");
         assert!(!c.has_deliverable(&"proc"));
         assert_eq!(c.ring().len(), 1);
+    }
+
+    #[test]
+    fn detach_returns_the_removed_position() {
+        let mut c = core(8);
+        c.attach("proc", 4);
+        publish(&mut c, &["a", "b"]);
+        serve(&mut c, "proc", 4);
+        publish(&mut c, &["c"]);
+        let removed = c.detach(&"proc").expect("the subscriber held a position");
+        assert_eq!(removed.next_owed(), 3);
+        assert!(c.detach(&"proc").is_none(), "the position is already gone");
+        assert!(c.detach(&"ghost").is_none(), "never attached");
+    }
+
+    #[test]
+    fn attach_from_primes_at_the_later_of_tail_and_floor() {
+        let mut c = core(8);
+        publish(&mut c, &["a", "b", "c", "d"]);
+
+        // Below the primed start: depth 2 primes at 3, which wins over 1.
+        assert_eq!(c.attach_from("below", 2, 1), Attached::Created);
+        assert_eq!(c.cursors()["below"].next_owed(), 3);
+
+        // Above the primed start: depth 8 primes at 1, the floor 4 wins.
+        assert_eq!(c.attach_from("above", 8, 4), Attached::Created);
+        assert_eq!(c.cursors()["above"].next_owed(), 4);
+        assert_eq!(serve(&mut c, "above", 8).0, vec!["d"]);
+
+        // An existing position is untouched.
+        c.attach("held", 8);
+        assert_eq!(c.attach_from("held", 8, 5), Attached::Existing);
+        assert_eq!(c.cursors()["held"].next_owed(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "above the next seq")]
+    fn attach_from_a_floor_above_the_head_panics() {
+        let mut c = core(8);
+        publish(&mut c, &["a", "b"]);
+        c.attach_from("proc", 4, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "sampled push depth")]
+    fn attach_from_at_a_sampled_depth_panics() {
+        let mut c = core(8);
+        publish(&mut c, &["a"]);
+        c.attach_from("proc", 0, 1);
     }
 
     // ── Windows ───────────────────────────────────────────────────────────

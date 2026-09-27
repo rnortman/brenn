@@ -11,6 +11,7 @@ policy_srcs()
 # crate means adding it here, which is what gives it a fixture target for the
 # suites that load it directly.
 COMPONENT_NAMES = [
+    "conversation-recycler",
     "git-forge-parser",
     "git-sync-consumer",
     "processor-call-test",
@@ -41,6 +42,7 @@ COMPONENT_NAMES = [
 # The world is declared here rather than inferred, and the emitter refuses a
 # declaration the artifact's own imports contradict.
 COMPONENT_PACKAGES = {
+    "conversation-recycler": ("brenn:processor", "//:config/specs/conversation-recycler.brenn"),
     "git-forge-parser": ("brenn:processor", "//:config/specs/git-forge-parser.brenn"),
     "git-sync-consumer": ("brenn:processor", "//:config/specs/git-sync-consumer.brenn"),
     "processor-demo": ("brenn:processor", "//:config/specs/processor-demo.brenn"),

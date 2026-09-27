@@ -6313,6 +6313,186 @@ new alice: Assistant();
     );
 }
 
+const EPOCH_CHANNEL: &str = r#"
+channel cogsworth_epoch at "brenn:cogsworth.epoch" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+"#;
+
+/// The singleton, single-owner body every epoch test starts from, with `epoch_line` after it.
+fn singleton_with(epoch_line: &str) -> String {
+    format!(
+        "    singleton = true;\n    compact_soft_pct = 75;\n    allowed_users = [\"alice\"];\n{epoch_line}"
+    )
+}
+
+/// A document declaring `channel` and one agent whose body is `agent_body`.
+fn document_with_epoch(channel: &str, agent_body: &str) -> String {
+    format!(
+        r#"
+{channel}
+
+agent Cogsworth() {{
+{agent_body}
+}}
+
+new cogsworth: Cogsworth();
+"#
+    )
+}
+
+/// The lowered epoch address of the sole agent of a document built that way.
+fn epoch_of(channel: &str, agent_body: &str) -> Option<String> {
+    config_from_dsl(&document_with_epoch(channel, agent_body))
+        .apps
+        .swap_remove(0)
+        .conversation_epoch
+}
+
+#[test]
+fn a_singleton_agent_lowers_its_conversation_epoch() {
+    assert_eq!(
+        epoch_of(
+            EPOCH_CHANNEL,
+            &singleton_with("    conversation_epoch = exact cogsworth_epoch;")
+        ),
+        Some("brenn:cogsworth.epoch".to_string()),
+    );
+}
+
+#[test]
+fn an_epoch_written_as_an_address_lowers_the_same_as_a_handle() {
+    assert_eq!(
+        epoch_of(
+            EPOCH_CHANNEL,
+            &singleton_with(r#"    conversation_epoch = exact "brenn:cogsworth.epoch";"#)
+        ),
+        Some("brenn:cogsworth.epoch".to_string()),
+    );
+}
+
+#[test]
+fn an_agent_that_names_no_epoch_lowers_none() {
+    assert_eq!(epoch_of(EPOCH_CHANNEL, &singleton_with("")), None);
+}
+
+/// Only a singleton has exactly one current conversation for an epoch to
+/// decide; any other agent has a conversation list.
+#[test]
+fn an_epoch_on_a_non_singleton_agent_is_refused() {
+    let diagnostic = sole_refusal(&document_with_epoch(
+        EPOCH_CHANNEL,
+        "    conversation_epoch = exact cogsworth_epoch;",
+    ));
+    assert!(
+        diagnostic.message.contains("singleton = true"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// The epoch decides its owner's conversation; an agent with no single owner has none for it to decide.
+#[test]
+fn an_epoch_on_an_agent_open_to_every_user_is_refused() {
+    let diagnostic = sole_refusal(&document_with_epoch(
+        EPOCH_CHANNEL,
+        "    singleton = true;\n    compact_soft_pct = 75;\n    conversation_epoch = exact cogsworth_epoch;",
+    ));
+    assert!(
+        diagnostic
+            .message
+            .contains("exactly one `allowed_users` entry")
+            && diagnostic.message.contains("names 0"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+/// The epoch decides its owner's conversation; an agent with no single owner has none for it to decide.
+#[test]
+fn an_epoch_on_an_agent_with_two_allowed_users_is_refused() {
+    let diagnostic = sole_refusal(&document_with_epoch(
+        EPOCH_CHANNEL,
+        "    singleton = true;\n    compact_soft_pct = 75;\n    conversation_epoch = exact cogsworth_epoch;\n    allowed_users = [\"alice\", \"bob\"];",
+    ));
+    assert!(
+        diagnostic
+            .message
+            .contains("exactly one `allowed_users` entry")
+            && diagnostic.message.contains("names 2"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn an_epoch_channel_retained_other_than_once_is_refused() {
+    let channel = r#"
+channel cogsworth_epoch at "brenn:cogsworth.epoch" {
+    push_depth = 1;
+    retain_depth = 2;
+    standing_retain_depth = 2;
+}
+"#;
+    let diagnostic = sole_refusal(&document_with_epoch(
+        channel,
+        &singleton_with("    conversation_epoch = exact cogsworth_epoch;"),
+    ));
+    assert!(
+        diagnostic.message.contains("retain_depth = 1")
+            && diagnostic.message.contains("conversation_epoch"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn an_ephemeral_epoch_channel_is_refused() {
+    let channel = r#"
+channel cogsworth_epoch at "ephemeral:cogsworth.epoch" {
+    push_depth = 1;
+    retain_depth = 1;
+}
+"#;
+    let diagnostic = sole_refusal(&document_with_epoch(
+        channel,
+        &singleton_with("    conversation_epoch = exact cogsworth_epoch;"),
+    ));
+    assert!(
+        diagnostic.message.contains("not durable"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn a_prefix_epoch_is_refused() {
+    let diagnostic = sole_refusal(&document_with_epoch(
+        EPOCH_CHANNEL,
+        &singleton_with(r#"    conversation_epoch = prefix "brenn:cogsworth.";"#),
+    ));
+    assert!(
+        diagnostic.message.contains("`prefix`") && diagnostic.message.contains("one channel"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
+#[test]
+fn an_epoch_naming_an_undeclared_channel_is_refused() {
+    let diagnostic = sole_refusal(&document_with_epoch(
+        EPOCH_CHANNEL,
+        &singleton_with(r#"    conversation_epoch = exact "brenn:cogsworth.nobody";"#),
+    ));
+    assert!(
+        diagnostic.message.contains("not a declared channel"),
+        "{}",
+        diagnostic.render(),
+    );
+}
+
 /// A surface written by three blocks lowers as one: the body's instances first,
 /// then each contribution's in document order. A contributed component is
 /// indistinguishable from a body one on the wire — instance, kind, chrome flag

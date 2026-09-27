@@ -304,12 +304,31 @@ impl WsConnection {
         conversation: Option<&brenn_db::conversation::Conversation>,
         state: brenn_ws_types::CcState,
     ) -> WsServerMessage {
+        self.conversation_switched_inner(conversation, state, false)
+    }
+
+    /// Like `conversation_switched`, but with `reload: true`: the tab is moved
+    /// onto `conversation` and must clear and replay.
+    pub(super) fn conversation_switched_reload(
+        &self,
+        conversation: &brenn_db::conversation::Conversation,
+        state: brenn_ws_types::CcState,
+    ) -> WsServerMessage {
+        self.conversation_switched_inner(Some(conversation), state, true)
+    }
+
+    fn conversation_switched_inner(
+        &self,
+        conversation: Option<&brenn_db::conversation::Conversation>,
+        state: brenn_ws_types::CcState,
+        reload: bool,
+    ) -> WsServerMessage {
         WsServerMessage::ConversationSwitched {
             conversation_id: conversation.map(|c| c.id),
             state,
             is_owner: conversation.is_none_or(|c| c.user_id == self.user_id),
             shared: conversation.is_some_and(|c| c.shared),
-            reload: false,
+            reload,
         }
     }
 

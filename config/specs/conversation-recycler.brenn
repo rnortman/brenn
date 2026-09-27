@@ -1,0 +1,29 @@
+/// Decides when an agent's conversation should start afresh, and says so by
+/// publishing a new conversation epoch.
+///
+/// Each new message on `interactions` counts as one interaction and moves the
+/// idle clock. A message on `activity` only moves the idle clock; it counts
+/// nothing. `tick` is the component's self-timer: while anything is counted it
+/// keeps one wake parked there, and it parks nothing while the count is zero.
+/// A fire publishes a fresh decimal epoch on `epoch`, one higher than the last,
+/// and resets the count.
+///
+/// It fires when either rule holds: at least one interaction and `idle_secs`
+/// of quiet since the last activity, or at least `max_interactions`
+/// interactions and `settle_secs` of quiet. The three `config` keys are whole
+/// numbers and default to `idle_secs = "180"`, `max_interactions = "50"` and
+/// `settle_secs = "10"`; a value that does not parse, or a `max_interactions`
+/// of zero, fails the activation naming the key.
+///
+/// Its `store` keeps the count, the idle clock, a per-port high-water mark of
+/// the newest publish time it has counted, and the epoch generation, so a
+/// re-attach that redelivers the retained tail neither re-counts it nor
+/// restarts the idle clock, and the epoch keeps rising across restarts.
+component ConversationRecycler {
+  abi = processor;
+  requires = [ports, store, log, config];
+  in interactions;
+  optional in activity;
+  io tick;
+  out epoch: "brenn.conversation.epoch@1";
+}

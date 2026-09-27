@@ -24,6 +24,7 @@ mod permission_sync;
 mod profile_swap;
 mod registry;
 mod reload_retire;
+mod supersede;
 #[cfg(any(test, feature = "testutils"))]
 pub mod test_fixtures;
 #[cfg(any(test, feature = "testutils"))]

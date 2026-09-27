@@ -19,6 +19,7 @@ testutils = [
 brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
 brenn-cc-profile = { path = "../brenn-cc-profile" }
+brenn-conversation-epoch = { version = "0.1.0", path = "../brenn-conversation-epoch" }
 brenn-envelope = { path = "../brenn-envelope" }
 brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }

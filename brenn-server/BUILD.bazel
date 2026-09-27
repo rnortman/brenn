@@ -30,6 +30,7 @@ rust_library(
         "//brenn-budget",
         "//brenn-cc",
         "//brenn-cc-profile",
+        "//brenn-conversation-epoch",
         "//brenn-activation",
         "//brenn-common",
         "//brenn-envelope",

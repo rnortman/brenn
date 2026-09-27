@@ -133,6 +133,7 @@ fn minimal_app_config_for_budget_test(
         cc_extra_args: vec![],
         env: BTreeMap::new(),
         claude_profiles: None,
+        conversation_epoch: None,
         approval_rules: vec![],
         attachment_targets: vec![],
         integrations: HashMap::new(),

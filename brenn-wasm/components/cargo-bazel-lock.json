@@ -1,5 +1,5 @@
 {
-  "checksum": "79fc7cc8a271728e3e37fec301d4105e127a7bd50fab183d8616315bf5899f1c",
+  "checksum": "4f5ecff9453769ed32d88a229a872a96929d22134e512408404b7479daed540e",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -174,6 +174,24 @@
         }
       ],
       "library_target_name": "brenn_cal",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-conversation-recycler 0.1.0": {
+      "name": "brenn-conversation-recycler",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
       "common_attrs": {
         "compile_data_glob": [
           "**"
@@ -3970,6 +3988,7 @@
   "binary_crates": [],
   "workspace_members": {
     "brenn-cal 0.1.0": "brenn-wasm/components/host-crates/brenn-cal",
+    "brenn-conversation-recycler 0.1.0": "brenn-wasm/components/conversation-recycler",
     "brenn-envelope 0.1.0": "brenn-wasm/components/host-crates/brenn-envelope",
     "brenn-git-forge-parser 0.1.0": "brenn-wasm/components/git-forge-parser",
     "brenn-git-sync-consumer 0.1.0": "brenn-wasm/components/git-sync-consumer",

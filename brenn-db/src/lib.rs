@@ -355,6 +355,11 @@ pub fn run_base_migrations(conn: &Connection) {
     add_column_if_missing(conn, "device_users", "tz_override", "TEXT");
     add_column_if_missing(conn, "device_users", "tz_override_expires_at", "INTEGER");
 
+    // Add the epoch column to conversations if not present: the conversation
+    // epoch a singleton successor was minted under. NULL for every row created
+    // any other way — born before any epoch. No backfill needed.
+    add_column_if_missing(conn, "conversations", "epoch", "TEXT");
+
     // Active-devices view: the safe default for any query that should exclude
     // unenrolled devices. SQLite views are syntactic rewrites; the query planner
     // inlines `WHERE unenrolled_at IS NULL` at compile time, so there is no
@@ -829,6 +834,53 @@ mod tests {
             (total - 0.42).abs() < 1e-9,
             "sum_since must return the inserted value after migration; got {total}"
         );
+    }
+
+    #[test]
+    fn conversation_epoch_column_migrates_onto_an_existing_table() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+
+        // A database from before the column existed: `conversations` without
+        // `epoch`, holding one row.
+        conn.execute_batch(
+            "CREATE TABLE users (
+                 id INTEGER PRIMARY KEY,
+                 username TEXT NOT NULL UNIQUE,
+                 password_hash TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 user_id INTEGER NOT NULL REFERENCES users(id),
+                 cc_session_id TEXT,
+                 title TEXT,
+                 model TEXT,
+                 cwd TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 total_cost_usd REAL,
+                 app_slug TEXT NOT NULL DEFAULT '',
+                 shared INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO users (id, username, password_hash, created_at)
+                 VALUES (1, 'alice', '$argon2id$fake', '2026-01-01T00:00:00+00:00');
+             INSERT INTO conversations (id, user_id, created_at, updated_at, app_slug)
+                 VALUES (1, 1, '2026-01-01T00:00:00+00:00',
+                         '2026-01-01T00:00:00+00:00', 'pa');",
+        )
+        .expect("create the pre-epoch schema");
+        assert!(!column_exists(&conn, "conversations", "epoch"));
+
+        run_migrations(&conn);
+
+        assert!(column_exists(&conn, "conversations", "epoch"));
+        assert_eq!(crate::conversation::get_conversation(&conn, 1).epoch, None);
+
+        // Idempotent on a database that already has the column.
+        run_migrations(&conn);
+        assert!(column_exists(&conn, "conversations", "epoch"));
     }
 
     #[test]

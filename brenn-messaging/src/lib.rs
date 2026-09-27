@@ -1700,15 +1700,42 @@ impl Messenger {
         subscriber: &ParticipantId,
         push_depth: config::Depth,
     ) -> store::Attached {
+        self.attach_subscriber_from(channel_address, app_slug, subscriber, push_depth, None)
+            .await
+    }
+
+    /// [`Messenger::attach_subscriber`] for a subscriber inheriting the position
+    /// another just gave up on the same channel — `floor` is that
+    /// [`Messenger::detach_subscriber`]'s return. `Some` goes to the store's
+    /// `attach_from`, `None` (the other held no position here) to its plain
+    /// `attach`, which primes.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel.
+    pub async fn attach_subscriber_from(
+        &self,
+        channel_address: &str,
+        app_slug: &str,
+        subscriber: &ParticipantId,
+        push_depth: config::Depth,
+        floor: Option<store::MessageSeq>,
+    ) -> store::Attached {
         let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
                 "messaging: attach requested for channel {channel_address:?} not in the \
                  directory — a wired input must resolve"
             )
         });
-        self.store_for(&entry)
-            .attach(subscriber, app_slug, push_depth)
-            .await
+        let store = self.store_for(&entry);
+        match floor {
+            Some(floor) => {
+                store
+                    .attach_from(subscriber, app_slug, push_depth, floor)
+                    .await
+            }
+            None => store.attach(subscriber, app_slug, push_depth).await,
+        }
     }
 
     /// Tear down `subscriber`'s delivery state on the channel at
@@ -1716,17 +1743,25 @@ impl Messenger {
     /// tally the noise ladder kept for it. The inverse of
     /// [`Messenger::attach_subscriber`].
     ///
+    /// Returns the `next_owed` seq of the position dropped, `None` when the
+    /// subscriber held none.
+    ///
     /// # Panics
     ///
     /// If `channel_address` resolves to no channel.
-    pub async fn detach_subscriber(&self, channel_address: &str, subscriber: &ParticipantId) {
+    pub async fn detach_subscriber(
+        &self,
+        channel_address: &str,
+        subscriber: &ParticipantId,
+    ) -> Option<store::MessageSeq> {
         let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
                 "messaging: detach requested for channel {channel_address:?} not in the directory"
             )
         });
-        self.store_for(&entry).detach(subscriber).await;
+        let dropped = self.store_for(&entry).detach(subscriber).await;
         self.forget_metered_drops(&entry.address, subscriber);
+        dropped
     }
 
     /// Advance `subscriber`'s position on `channel_address` over a window it

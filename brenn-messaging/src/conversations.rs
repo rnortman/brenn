@@ -229,20 +229,50 @@ impl Messenger {
     }
 
     /// Delete every position `conversation` holds except on its own chat
-    /// channel family.
+    /// channel family, on either store class.
     ///
     /// Must match what boot's [`Messenger::reconcile_subscriber_cursors`] would
     /// delete for a conversation no `App(slug)` entry resolves to: static,
     /// dynamic-live and dormant positions alike. The conversation itself and its
     /// chat family survive, justified by their own `ChatConversation` entries.
     ///
-    /// A live-directory channel goes through [`Messenger::detach_subscriber`] so
-    /// the row and the in-process metered-drop tally go together; a row whose
-    /// channel the directory does not hold is deleted from the table directly,
-    /// in one lock scope for all of them.
+    /// Two walks. First every live-directory channel carrying an `App(app_slug)`
+    /// subscriber, through [`Messenger::detach_subscriber`], so the position and
+    /// the in-process metered-drop tally go together whichever store holds it —
+    /// a ring position included, which the table does not record. Otherwise a
+    /// former owner keeps its ring positions, and the dispatcher's ring-wake
+    /// source respawns that conversation on every publish to a non-durable
+    /// channel. Then the table, for the rows the first walk did not reach: a
+    /// row on a live-directory channel goes through `detach_subscriber` as well,
+    /// and one whose channel the directory does not hold is deleted from the
+    /// table directly, in one lock scope for all of them.
     pub async fn reap_conversation_positions(&self, app_slug: &str, conversation: i64) {
         let participant = ParticipantId::for_conversation(conversation);
         let spared: Vec<Uuid> = self.conversation_chat_channel_uuids(app_slug, conversation);
+        for entry in self.directory.list() {
+            if spared.contains(&entry.uuid) {
+                continue;
+            }
+            let subscribed = entry
+                .subscribers
+                .iter()
+                .any(|sub| matches!(&sub.kind, SubscriberEntryKind::App(slug) if slug == app_slug));
+            if !subscribed {
+                continue;
+            }
+            if self
+                .detach_subscriber(&entry.address, &participant)
+                .await
+                .is_some()
+            {
+                tracing::info!(
+                    app = %app_slug,
+                    address = %entry.address,
+                    conversation,
+                    "messaging: reaping a former owner's position",
+                );
+            }
+        }
         let rows: Vec<Uuid> = {
             let conn = self.db.lock().await;
             crate::db::subscriber_cursors_of(&conn, &participant)
@@ -284,6 +314,159 @@ impl Messenger {
                 );
             }
         }
+    }
+
+    /// Hand `old`'s positions to its singleton successor `new`, then reap what is
+    /// left of `old`'s.
+    ///
+    /// For every live-directory entry carrying a push-enabled `App(app_slug)`
+    /// subscriber — static, folded and dynamic alike, on either store class — the
+    /// old position is detached and the successor's created at the inherited
+    /// floor, in two adjacent store calls. What `old` had seen stays seen; what
+    /// landed after its position, including a message published between the two
+    /// calls, is owed to `new`. Where `old` held no position, `new` is primed.
+    ///
+    /// Then `old`'s dormant and undeclared rows go with
+    /// [`Messenger::reap_conversation_positions`], sparing its chat family, and
+    /// the app's roster is republished once.
+    ///
+    /// Idempotent: a re-run finds `old` holding nothing where the first run
+    /// reached and `new`'s positions already there, moves nothing there, and
+    /// finishes the rest. [`Messenger::finish_interrupted_supersede`] relies on
+    /// that at boot, for a handoff a process death cut short. The caller must
+    /// already have made `new` the app's singleton and provisioned its chat
+    /// family, and must not hold the database lock.
+    ///
+    /// # Panics
+    ///
+    /// If `old == new`.
+    pub async fn supersede_conversation_positions(&self, app_slug: &str, old: i64, new: i64) {
+        self.hand_over_positions(app_slug, old, new).await;
+        self.republish_chat_roster(app_slug).await;
+    }
+
+    /// Finish a singleton handoff that a process death cut short.
+    ///
+    /// [`Messenger::supersede_conversation_positions`] runs after the
+    /// successor row has committed and moves positions one store call at a
+    /// time, so a death partway leaves `old` holding the durable positions not
+    /// yet walked and `new` holding none there. Nothing at runtime revisits the
+    /// pair. Left alone, boot's cursor reconcile would delete `old`'s rows
+    /// (it is no longer the singleton) and the attach pass would prime `new`
+    /// behind the retained tail, owing it messages `old` had been served.
+    ///
+    /// The pair is `app_slug`'s last handoff
+    /// ([`brenn_db::conversation::get_singleton_handoff`]). It is unfinished
+    /// exactly when the predecessor still holds a durable position outside its
+    /// own chat family, which a completed handoff's reap never leaves; then the
+    /// walk and the reap re-run, moving only what the cut-short run did not.
+    /// Ring positions die with the process, so nothing of theirs is left to
+    /// finish. The roster is not republished here; the caller owes that.
+    ///
+    /// Boot-only, before `reconcile_subscriber_cursors`. Returns whether it
+    /// finished a handoff.
+    ///
+    /// # Panics
+    ///
+    /// If `app_slug` is not in the agent table or names no allowed user: boot
+    /// calls this only for epoch agents, which config holds to exactly one.
+    pub async fn finish_interrupted_supersede(&self, app_slug: &str) -> bool {
+        let username = {
+            let apps = self.apps.load();
+            let app = apps.get(app_slug).unwrap_or_else(|| {
+                panic!("BUG: handoff recovery for app {app_slug:?}, which the agent table lacks")
+            });
+            app.allowed_users
+                .first()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "BUG: handoff recovery for app {app_slug:?}, which names no allowed user"
+                    )
+                })
+                .clone()
+        };
+        let (old, new) = {
+            let conn = self.db.lock().await;
+            let Some(owner) = brenn_db::auth::user::get_user_by_username(&conn, &username) else {
+                return false;
+            };
+            let Some((old, new)) =
+                brenn_db::conversation::get_singleton_handoff(&conn, owner.id, app_slug)
+            else {
+                return false;
+            };
+            let spared = self.conversation_chat_channel_uuids(app_slug, old);
+            let unfinished =
+                crate::db::subscriber_cursors_of(&conn, &ParticipantId::for_conversation(old))
+                    .into_iter()
+                    .any(|(uuid, _)| !spared.contains(&uuid));
+            if !unfinished {
+                return false;
+            }
+            (old, new)
+        };
+        tracing::warn!(
+            app = %app_slug,
+            old,
+            new,
+            "messaging: finishing a conversation handoff the previous process died inside",
+        );
+        self.hand_over_positions(app_slug, old, new).await;
+        true
+    }
+
+    /// The walk and the reap of [`Messenger::supersede_conversation_positions`],
+    /// without the roster republish.
+    async fn hand_over_positions(&self, app_slug: &str, old: i64, new: i64) {
+        assert_ne!(
+            old, new,
+            "messaging: app {app_slug:?} conversation {old} superseded by itself"
+        );
+        let old_participant = ParticipantId::for_conversation(old);
+        let new_participant = ParticipantId::for_conversation(new);
+        let spared: Vec<Uuid> = self.conversation_chat_channel_uuids(app_slug, old);
+        for entry in self.directory.list() {
+            for sub in &entry.subscribers {
+                let SubscriberEntryKind::App(slug) = &sub.kind else {
+                    continue;
+                };
+                if slug != app_slug || !sub.push_depth.is_push_enabled() {
+                    continue;
+                }
+                if spared.contains(&entry.uuid) {
+                    // `old`'s own chat family: its position there is its own and
+                    // stays; the successor takes the subscription primed.
+                    self.attach_subscriber(
+                        &entry.address,
+                        app_slug,
+                        &new_participant,
+                        sub.push_depth,
+                    )
+                    .await;
+                    continue;
+                }
+                let floor = self
+                    .detach_subscriber(&entry.address, &old_participant)
+                    .await;
+                self.attach_subscriber_from(
+                    &entry.address,
+                    app_slug,
+                    &new_participant,
+                    sub.push_depth,
+                    floor,
+                )
+                .await;
+                debug!(
+                    app = %app_slug,
+                    address = %entry.address,
+                    old,
+                    new,
+                    ?floor,
+                    "messaging: successor inherits a position",
+                );
+            }
+        }
+        self.reap_conversation_positions(app_slug, old).await;
     }
 
     /// What every channel this conversation subscribes to is holding for it:
@@ -397,6 +580,7 @@ mod tests {
     use crate::db::init_db_memory;
     use crate::db::{insert_message, upsert_channels, utc_to_ns};
     use crate::query::NoopWakeRouter;
+    use crate::store::MessageSeq;
     use crate::test_support::{brenn_delivery_policy, test_app_config};
     use crate::{
         ChannelEntry, ChannelScheme, MessagingDirectory, Messenger, ParticipantId, SubscriberEntry,
@@ -918,9 +1102,9 @@ mod tests {
     // The mint provisions and announces itself.
     // -----------------------------------------------------------------------
 
-    /// A messenger wired the way boot wires one for chat: the caller's channels,
-    /// the app's boot-declared roster channel, and the roster writer's own
-    /// registration.
+    /// A messenger wired the way boot wires one for chat: the caller's channels
+    /// (durable ones in the channels table, non-durable ones on rings), the app's
+    /// boot-declared roster channel, and the roster writer's own registration.
     ///
     /// [`messenger`] deliberately holds none of that, which is why the cases
     /// above cannot see what a mint owes. Over this one both halves are
@@ -937,11 +1121,16 @@ mod tests {
         let mut all = entries;
         all.push(roster);
 
+        let (durable, non_durable): (Vec<ChannelEntry>, Vec<ChannelEntry>) = all
+            .iter()
+            .cloned()
+            .partition(|entry| entry.capabilities().durable);
+
         let db = init_db_memory();
         {
             let conn = db.lock().await;
             brenn_db::auth::user::create_user(&conn, USER, "$argon2id$fake");
-            upsert_channels(&conn, &all);
+            upsert_channels(&conn, &durable);
         }
         let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
         app.singleton = true;
@@ -964,6 +1153,7 @@ mod tests {
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
             defaults,
         )
+        .with_ring_stores(Arc::new(crate::store::RingStores::build(&non_durable)))
         .with_subscriber_registrations(crate::system::registrations_from_specs(&[spec]))
     }
 
@@ -1297,6 +1487,391 @@ mod tests {
         assert!(
             crate::db::load_subscriber_cursor(&conn, undeclared.uuid, &participant).is_none(),
             "the row is deleted from the table directly, no directory entry needed",
+        );
+    }
+
+    // ── Superseding a conversation ────────────────────────────────────────
+
+    /// The push depth every supersede case seats its subscriber at.
+    const WORK_DEPTH: Depth = Depth::Bounded(5);
+
+    /// One work channel per store class, each carrying the app's subscriber.
+    fn work_channels() -> Vec<ChannelEntry> {
+        vec![
+            transport_channel(&canonical_address("work"), ChannelScheme::Brenn, WORK_DEPTH),
+            transport_channel("ephemeral:work", ChannelScheme::Ephemeral, WORK_DEPTH),
+        ]
+    }
+
+    /// A chat messenger over `entry` with the app's conversation seated on it.
+    async fn seated(entry: &ChannelEntry) -> (Arc<Messenger>, i64) {
+        let m = chat_messenger(vec![entry.clone()]).await;
+        m.attach_conversation(&entry.address, APP, WORK_DEPTH).await;
+        let old = conversation_of(&m).await;
+        (m, old)
+    }
+
+    /// Commit one message on `address` through its store, whichever class it
+    /// is, and return the seq it took.
+    async fn append_to(m: &Messenger, address: &str, body: &str) -> MessageSeq {
+        let entry = m
+            .directory
+            .resolve(address)
+            .expect("the case declares the channel");
+        m.store_for(&entry)
+            .append(crate::store::NewMessage {
+                source: "test-source".to_string(),
+                sender: "someone".to_string(),
+                body: body.to_string(),
+                urgency: Urgency::Normal,
+                envelope_type: entry.transport_type,
+                reply_to: None,
+                delivery_deadline: None,
+                impetus: None,
+                publish_ts_ns: utc_to_ns(chrono::Utc::now()),
+            })
+            .await
+            .committed
+            .seq
+    }
+
+    /// The bodies `participant`'s window on `address` holds as new, or `None`
+    /// when it holds no position there.
+    async fn new_bodies(
+        m: &Messenger,
+        address: &str,
+        participant: &ParticipantId,
+    ) -> Option<Vec<String>> {
+        let window = m
+            .store_for_address(address)
+            .window(participant, WORK_DEPTH, Depth::Bounded(0))
+            .await?;
+        Some(
+            window
+                .new_entries()
+                .iter()
+                .map(|(_, envelope)| envelope.body.clone())
+                .collect(),
+        )
+    }
+
+    /// Read `participant`'s window on `address` and advance over it, as the
+    /// bridge does once it has rendered a batch.
+    async fn serve_all(m: &Messenger, address: &str, participant: &ParticipantId) {
+        let store = m.store_for_address(address);
+        let window = store
+            .window(participant, WORK_DEPTH, Depth::Bounded(0))
+            .await
+            .expect("the case seated this participant");
+        if let Some((through, seen_floor)) = window.advance_span() {
+            store
+                .advance(participant, through, seen_floor)
+                .await
+                .expect("the case seated this participant");
+        }
+    }
+
+    async fn has_deliverable(m: &Messenger, address: &str, participant: &ParticipantId) -> bool {
+        m.store_for_address(address)
+            .has_deliverable(participant)
+            .await
+    }
+
+    /// Mint the app's singleton successor and provision its chat family in one
+    /// lock scope, as the epoch reconcile does.
+    async fn successor(m: &Messenger) -> i64 {
+        let conn = m.db.lock().await;
+        let owner = brenn_db::auth::user::get_user_by_username(&conn, USER).expect("user exists");
+        let new = brenn_db::conversation::create_singleton_successor(&conn, owner.id, APP, "1");
+        m.provision_conversation_chat_channels(&conn, APP, new);
+        new
+    }
+
+    /// What the old conversation had seen stays seen: the successor is owed
+    /// none of it. A primed position would have owed all five.
+    #[tokio::test]
+    async fn a_successor_inherits_what_the_old_conversation_had_seen() {
+        for entry in work_channels() {
+            let (m, old) = seated(&entry).await;
+            let address = entry.address.as_str();
+            let old_p = ParticipantId::for_conversation(old);
+            for body in ["a", "b", "c", "d", "e"] {
+                append_to(&m, address, body).await;
+            }
+            serve_all(&m, address, &old_p).await;
+
+            let new = successor(&m).await;
+            m.supersede_conversation_positions(APP, old, new).await;
+
+            let new_p = ParticipantId::for_conversation(new);
+            assert!(!has_deliverable(&m, address, &new_p).await, "{address}");
+            assert_eq!(
+                new_bodies(&m, address, &new_p).await,
+                Some(Vec::new()),
+                "{address}: the successor holds a position and is owed nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_after_the_old_position_is_owed_to_the_successor() {
+        for entry in work_channels() {
+            let (m, old) = seated(&entry).await;
+            let address = entry.address.as_str();
+            let old_p = ParticipantId::for_conversation(old);
+            for body in ["a", "b", "c"] {
+                append_to(&m, address, body).await;
+            }
+            serve_all(&m, address, &old_p).await;
+            append_to(&m, address, "late").await;
+
+            let new = successor(&m).await;
+            m.supersede_conversation_positions(APP, old, new).await;
+
+            assert_eq!(
+                new_bodies(&m, address, &ParticipantId::for_conversation(new)).await,
+                Some(vec!["late".to_string()]),
+                "{address}"
+            );
+        }
+    }
+
+    /// A subscription the old conversation held no position on — one gained
+    /// since — gives the successor a primed position rather than none.
+    #[tokio::test]
+    async fn a_channel_the_old_conversation_held_nothing_on_is_primed_for_the_successor() {
+        for entry in work_channels() {
+            let (m, old) = seated(&entry).await;
+            let address = entry.address.as_str();
+            m.detach_subscriber(address, &ParticipantId::for_conversation(old))
+                .await;
+            for body in ["a", "b"] {
+                append_to(&m, address, body).await;
+            }
+
+            let new = successor(&m).await;
+            m.supersede_conversation_positions(APP, old, new).await;
+
+            assert_eq!(
+                new_bodies(&m, address, &ParticipantId::for_conversation(new)).await,
+                Some(vec!["a".to_string(), "b".to_string()]),
+                "{address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn after_a_supersede_the_old_conversation_is_owed_nothing() {
+        for entry in work_channels() {
+            let (m, old) = seated(&entry).await;
+            let address = entry.address.as_str();
+            let old_p = ParticipantId::for_conversation(old);
+
+            let new = successor(&m).await;
+            m.supersede_conversation_positions(APP, old, new).await;
+            append_to(&m, address, "after").await;
+
+            let new_p = ParticipantId::for_conversation(new);
+            assert!(!has_deliverable(&m, address, &old_p).await, "{address}");
+            assert!(has_deliverable(&m, address, &new_p).await, "{address}");
+            if entry.capabilities().durable {
+                let conn = m.db.lock().await;
+                assert!(
+                    crate::db::load_subscriber_cursor(&conn, entry.uuid, &old_p).is_none(),
+                    "{address}: the old conversation's row is gone"
+                );
+            } else {
+                assert!(
+                    !m.ring_store_for(&entry).is_attached(&old_p),
+                    "{address}: the old conversation's ring position is gone"
+                );
+            }
+        }
+    }
+
+    /// A re-run over a finished handoff, which is what boot's recovery amounts
+    /// to when nothing was left, finds the successor's positions in place and
+    /// moves nothing.
+    #[tokio::test]
+    async fn a_supersede_re_run_moves_nothing() {
+        for entry in work_channels() {
+            let (m, old) = seated(&entry).await;
+            let address = entry.address.as_str();
+            let old_p = ParticipantId::for_conversation(old);
+            for body in ["a", "b", "c"] {
+                append_to(&m, address, body).await;
+            }
+            serve_all(&m, address, &old_p).await;
+            append_to(&m, address, "pending").await;
+
+            let new = successor(&m).await;
+            m.supersede_conversation_positions(APP, old, new).await;
+            m.supersede_conversation_positions(APP, old, new).await;
+
+            assert_eq!(
+                new_bodies(&m, address, &ParticipantId::for_conversation(new)).await,
+                Some(vec!["pending".to_string()]),
+                "{address}"
+            );
+        }
+    }
+
+    /// A death after the successor row committed and before any position moved:
+    /// boot's recovery hands the old position over, so the successor is owed
+    /// only what the old conversation had not been served.
+    #[tokio::test]
+    async fn a_handoff_cut_short_before_the_walk_is_finished() {
+        let entry = channel("work", WORK_DEPTH);
+        let (m, old) = seated(&entry).await;
+        let address = entry.address.as_str();
+        let old_p = ParticipantId::for_conversation(old);
+        for body in ["a", "b", "c"] {
+            append_to(&m, address, body).await;
+        }
+        serve_all(&m, address, &old_p).await;
+        append_to(&m, address, "late").await;
+        let new = successor(&m).await;
+        let new_p = ParticipantId::for_conversation(new);
+
+        assert!(m.finish_interrupted_supersede(APP).await);
+
+        assert_eq!(
+            new_bodies(&m, address, &new_p).await,
+            Some(vec!["late".to_string()])
+        );
+        {
+            let conn = m.db.lock().await;
+            assert!(crate::db::load_subscriber_cursor(&conn, entry.uuid, &old_p).is_none());
+        }
+        assert!(
+            !m.finish_interrupted_supersede(APP).await,
+            "a finished handoff is not redone"
+        );
+    }
+
+    /// A death after one channel's position moved: recovery moves the other and
+    /// leaves the one already walked where it was.
+    #[tokio::test]
+    async fn a_handoff_cut_short_partway_is_finished_where_it_stopped() {
+        let work = channel("work", WORK_DEPTH);
+        let other = channel("other", WORK_DEPTH);
+        let m = chat_messenger(vec![work.clone(), other.clone()]).await;
+        m.attach_conversation(&work.address, APP, WORK_DEPTH).await;
+        m.attach_conversation(&other.address, APP, WORK_DEPTH).await;
+        let old = conversation_of(&m).await;
+        let old_p = ParticipantId::for_conversation(old);
+        for entry in [&work, &other] {
+            for body in ["a", "b"] {
+                append_to(&m, &entry.address, body).await;
+            }
+            serve_all(&m, &entry.address, &old_p).await;
+        }
+        let new = successor(&m).await;
+        let new_p = ParticipantId::for_conversation(new);
+
+        let floor = m.detach_subscriber(&work.address, &old_p).await;
+        m.attach_subscriber_from(&work.address, APP, &new_p, WORK_DEPTH, floor)
+            .await;
+        append_to(&m, &work.address, "w-late").await;
+        append_to(&m, &other.address, "o-late").await;
+
+        assert!(m.finish_interrupted_supersede(APP).await);
+
+        assert_eq!(
+            new_bodies(&m, &work.address, &new_p).await,
+            Some(vec!["w-late".to_string()])
+        );
+        assert_eq!(
+            new_bodies(&m, &other.address, &new_p).await,
+            Some(vec!["o-late".to_string()])
+        );
+        let conn = m.db.lock().await;
+        for entry in [&work, &other] {
+            assert!(
+                crate::db::load_subscriber_cursor(&conn, entry.uuid, &old_p).is_none(),
+                "{}",
+                entry.address
+            );
+        }
+    }
+
+    /// No handoff to finish: an app whose only row carries no epoch, and one
+    /// whose last handoff completed.
+    #[tokio::test]
+    async fn a_finished_or_absent_handoff_is_left_alone() {
+        let (m, old) = seated(&channel("work", WORK_DEPTH)).await;
+        assert!(
+            !m.finish_interrupted_supersede(APP).await,
+            "an epoch-less row is no handoff"
+        );
+
+        let new = successor(&m).await;
+        m.supersede_conversation_positions(APP, old, new).await;
+        assert!(
+            !m.finish_interrupted_supersede(APP).await,
+            "a completed handoff is left alone"
+        );
+    }
+
+    /// The supersede leaves the old conversation's own chat family alone, reaps
+    /// its row on a channel the directory no longer holds, and announces the
+    /// successor.
+    #[tokio::test]
+    async fn a_supersede_spares_the_old_chat_family_reaps_the_rest_and_announces() {
+        let entry = channel("work", WORK_DEPTH);
+        let (m, old) = seated(&entry).await;
+        let old_p = ParticipantId::for_conversation(old);
+        let command = m
+            .directory
+            .resolve(&command_leaf_address(old))
+            .expect("the command leaf is provisioned")
+            .uuid;
+
+        let undeclared = channel("gone", WORK_DEPTH);
+        {
+            let conn = m.db.lock().await;
+            upsert_channels(&conn, std::slice::from_ref(&undeclared));
+            crate::db::ensure_subscriber_cursor(&conn, undeclared.uuid, &old_p, APP, WORK_DEPTH, 0);
+        }
+
+        let new = successor(&m).await;
+        m.supersede_conversation_positions(APP, old, new).await;
+
+        {
+            let conn = m.db.lock().await;
+            assert!(
+                crate::db::load_subscriber_cursor(&conn, command, &old_p).is_some(),
+                "the old conversation keeps its command-leaf position",
+            );
+            assert!(
+                crate::db::load_subscriber_cursor(&conn, undeclared.uuid, &old_p).is_none(),
+                "the row on the undeclared channel is reaped",
+            );
+        }
+        let last = published_snapshots(&m)
+            .await
+            .pop()
+            .expect("the supersede announced the roster");
+        assert!(
+            last.contains(&old) && last.contains(&new),
+            "the last roster names both conversations: {last:?}"
+        );
+    }
+
+    /// A former owner's position on a non-durable channel lives on a ring, not
+    /// in the table, and the reap reaches it there too.
+    #[tokio::test]
+    async fn reaping_drops_a_former_owners_ring_position() {
+        let entry = transport_channel("ephemeral:work", ChannelScheme::Ephemeral, WORK_DEPTH);
+        let (m, old) = seated(&entry).await;
+        let old_p = ParticipantId::for_conversation(old);
+        assert!(m.ring_store_for(&entry).is_attached(&old_p));
+
+        m.reap_conversation_positions(APP, old).await;
+
+        assert!(
+            !m.ring_store_for(&entry).is_attached(&old_p),
+            "the ring position is reaped with the rest"
         );
     }
 }

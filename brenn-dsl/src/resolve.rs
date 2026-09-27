@@ -8958,16 +8958,16 @@ fn check_pins(
 /// it to every value would refuse a second spelling nobody spells and nothing
 /// resolves.
 ///
-/// The exception is an agent's `claude_profile_goal`, whose `exact` matcher
-/// *is* read downstream as a channel identity. Both spellings are accepted
-/// there and lowering resolves either against the declared channels, so a
-/// literal that names no declared channel is refused at that site instead of
-/// here — the failure this rule exists to prevent (an address that resolves to
-/// nothing, or to two things) cannot survive it. An agent is the deployment's
-/// to declare, so that site names no channel across an authority root. A
-/// further address-bearing attribute value must either carry that same
-/// resolution or be added to this walk; leaving it with neither is what
-/// silently unwires it.
+/// The exception is two agent attrs, `claude_profile_goal` and
+/// `conversation_epoch`, whose `exact` matcher *is* read downstream as a
+/// channel identity. Both spellings are accepted there and lowering resolves
+/// either against the declared channels, so a literal that names no declared
+/// channel is refused at those sites instead of here — the failure this rule
+/// exists to prevent (an address that resolves to nothing, or to two things)
+/// cannot survive it. An agent is the deployment's to declare, so those sites
+/// name no channel across an authority root. A further address-bearing
+/// attribute value must either carry that same resolution or be added to this
+/// walk; leaving it with neither is what silently unwires it.
 fn resolve_literals(
     config: &mut ResolvedConfig,
     declared: &HashMap<String, Declared>,

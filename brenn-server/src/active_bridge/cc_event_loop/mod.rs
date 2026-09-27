@@ -50,6 +50,9 @@ pub(in crate::active_bridge) enum ShutdownReason {
         /// agent. Set by the kill itself, not by the condemnation: a crash
         /// while a condemned bridge waits out its turn is still unexpected.
         reload: bool,
+        /// A newer conversation superseded this one, and its retirement
+        /// killed the process. Set by the kill, not by the condemnation.
+        superseded: bool,
     },
     /// Unexpected death — fire alert, mark conversation Error.
     Unexpected,
@@ -60,11 +63,13 @@ impl ShutdownReason {
         let drain = bridge.drain_on_idle.load(Ordering::SeqCst);
         let server = bridge.server_shutting_down.load(Ordering::SeqCst);
         let reload = bridge.is_reload_killing();
-        if drain || server || reload {
+        let superseded = bridge.is_superseded_killing();
+        if drain || server || reload || superseded {
             ShutdownReason::Intentional {
                 drain,
                 server,
                 reload,
+                superseded,
             }
         } else {
             ShutdownReason::Unexpected
@@ -242,12 +247,15 @@ pub(super) async fn cc_event_loop(
                     drain,
                     server,
                     reload,
+                    superseded,
                 } = shutdown_reason
                 {
                     // Intentional shutdown — not an error. `drain` is a
                     // per-conversation drain (tab close, idle); `server` is a
                     // process-wide SIGTERM; `reload` is a retirement whose
-                    // successor the wake path spawns. All skip the Warning alert
+                    // successor the wake path spawns; `superseded` is the
+                    // retirement of a conversation a newer one replaced as
+                    // the agent's current conversation. All skip the Warning alert
                     // and leave the conversation in Active state so the next
                     // restart can resume it.
                     // Still clear runtime state so a reconnecting CC sees a
@@ -262,6 +270,7 @@ pub(super) async fn cc_event_loop(
                         drain_shutdown = drain,
                         server_shutdown = server,
                         reload_retire = reload,
+                        superseded_retire = superseded,
                         "CC session ended (intentional shutdown)"
                     );
                 } else {

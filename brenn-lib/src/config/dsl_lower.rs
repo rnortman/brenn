@@ -1764,7 +1764,14 @@ fn app_claude_profiles(
     }
     let goal = match stated.goal {
         Some(at) => {
-            let address = goal_channel(resolved, at, errors);
+            let address = state_channel(
+                resolved,
+                at,
+                "claude_profile_goal",
+                "goal",
+                "the goal it carries would not survive the restart a profile change needs",
+                errors,
+            );
             admitted &= address.is_some();
             address
         }
@@ -1773,23 +1780,28 @@ fn app_claude_profiles(
     admitted.then_some(AppClaudeProfiles { allowed, goal })
 }
 
-/// The canonical address a `claude_profile_goal` names.
+/// The canonical address an agent's state-channel attr names:
+/// `claude_profile_goal` or `conversation_epoch`.
 ///
 /// An `exact` matcher, because that is the only attr-value position in which a
-/// handle resolves to a channel. The channel it names must be one the document
-/// declares, durable, and retained one deep: the goal is a state document, and
-/// the mechanism reads it by taking the latest message of that channel's
-/// window at every boot.
-fn goal_channel(
+/// handle resolves to a channel. The channel must be one the document
+/// declares, durable, and retained one deep: the mechanism reads the state by
+/// taking the latest message of that channel's window at every boot.
+///
+/// `noun` names the state in the retention message ("goal", "epoch");
+/// `durable_reason` completes "is not durable, so …".
+fn state_channel(
     resolved: &DslResolved,
     attr: &Attr<RVal>,
+    key: &str,
+    noun: &str,
+    durable_reason: &str,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<String> {
-    let key = "claude_profile_goal";
     let RValue::Matcher(matcher) = attr.value.value() else {
         errors.push(Diagnostic::at(
             format!(
-                "`{key}`: a goal is one channel, written as an `exact` matcher — \
+                "`{key}` names one channel, written as an `exact` matcher — \
                  `{key} = exact <channel>`; this is {}",
                 attr.value.value().kind(),
             ),
@@ -1800,8 +1812,7 @@ fn goal_channel(
     if *matcher.kind.value() != MatcherKind::Exact {
         errors.push(Diagnostic::at(
             format!(
-                "`{key}`: a goal is one channel, and only `exact` names one; `{}` names a \
-                 family",
+                "`{key}` names one channel, and only `exact` names one; `{}` names a family",
                 matcher.kind.value().as_str(),
             ),
             matcher.kind.span().clone(),
@@ -1818,8 +1829,8 @@ fn goal_channel(
             let Some(index) = found else {
                 errors.push(Diagnostic::at(
                     format!(
-                        "`{key}`: `{address}` is not a declared channel; a goal channel is \
-                         declared with a `channel` block like any other"
+                        "`{key}`: `{address}` is not a declared channel; the channel `{key}` \
+                         names is declared with a `channel` block like any other"
                     ),
                     matcher.val.span().clone(),
                 ));
@@ -1835,8 +1846,8 @@ fn goal_channel(
     if !durable {
         errors.push(Diagnostic::at(
             format!(
-                "`{key}`: `{address}` is not durable, so the goal it carries would not \
-                 survive the restart a profile change needs; a goal channel is `brenn:`"
+                "`{key}`: `{address}` is not durable, so {durable_reason}; the channel `{key}` \
+                 names is `brenn:`"
             ),
             matcher.val.span().clone(),
         ));
@@ -1849,9 +1860,9 @@ fn goal_channel(
     if !retained_once {
         errors.push(Diagnostic::at(
             format!(
-                "`{key}`: `{address}` must state `retain_depth = 1`; the goal is the one \
-                 message a reader takes from that window, and a window of another size \
-                 says something else"
+                "`{key}`: `{address}` must state `retain_depth = 1`; the {noun} is the one \
+                 message a reader takes from that window, and a window of another size says \
+                 something else"
             ),
             matcher.val.span().clone(),
         ));
@@ -1921,6 +1932,7 @@ fn app(
         container_working_dir,
         claude_profiles,
         claude_profile_goal,
+        conversation_epoch,
         send_budget,
     }: &AgentAttrs<RVal> = &agent.attrs;
     let label = agent.slug.value().clone();
@@ -1967,6 +1979,44 @@ fn app(
         },
         errors,
     );
+    let singleton_flag = opt_bool(singleton.as_ref(), "singleton", errors).unwrap_or_default();
+    let allowed_users =
+        opt_strings(allowed_users.as_ref(), "allowed_users", errors).unwrap_or_default();
+    let conversation_epoch = conversation_epoch.as_ref().and_then(|at| {
+        if !singleton_flag {
+            errors.push(Diagnostic::at(
+                "`conversation_epoch` requires `singleton = true`: the epoch decides which of \
+                 an agent's conversations is its current one, and only a singleton has \
+                 exactly one — any other agent has a conversation list and a \
+                 new-conversation button"
+                    .to_string(),
+                at.value.span().clone(),
+            ));
+            return None;
+        }
+        if allowed_users.len() != 1 {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`conversation_epoch` requires exactly one `allowed_users` entry, and this \
+                     agent names {}: the epoch decides its owner's current conversation, and an \
+                     agent open to several users, or to every user with no list, has no single \
+                     owner",
+                    allowed_users.len()
+                ),
+                at.value.span().clone(),
+            ));
+            return None;
+        }
+        state_channel(
+            resolved,
+            at,
+            "conversation_epoch",
+            "epoch",
+            "the epoch it carries would be forgotten at a restart while the conversation \
+             rows it decided are not",
+            errors,
+        )
+    });
     let send_budget = opt_int(send_budget.as_ref(), "send_budget", errors);
     let subs = subscriptions(resolved, agent, errors);
     // The `messaging` block is present exactly when the agent has something to
@@ -1989,7 +2039,7 @@ fn app(
         models: opt_strings(models.as_ref(), "models", errors),
         single_instance: opt_bool(single_instance.as_ref(), "single_instance", errors)
             .unwrap_or_default(),
-        singleton: opt_bool(singleton.as_ref(), "singleton", errors).unwrap_or_default(),
+        singleton: singleton_flag,
         persistent: opt_bool(persistent.as_ref(), "persistent", errors).unwrap_or_default(),
         idle_timeout_secs: opt_int(idle_timeout_secs.as_ref(), "idle_timeout_secs", errors),
         compact_reminder_pct: opt_int(
@@ -2010,8 +2060,7 @@ fn app(
         compact_hard_tokens: opt_int(compact_hard_tokens.as_ref(), "compact_hard_tokens", errors),
         compact_idle_secs: opt_int(compact_idle_secs.as_ref(), "compact_idle_secs", errors),
         idle_hook_secs: opt_int(idle_hook_secs.as_ref(), "idle_hook_secs", errors),
-        allowed_users: opt_strings(allowed_users.as_ref(), "allowed_users", errors)
-            .unwrap_or_default(),
+        allowed_users,
         disabled_tools: opt_strings(disabled_tools.as_ref(), "disabled_tools", errors)
             .unwrap_or_default(),
         mcp_servers: mcp_servers(resolved, agent, errors),
@@ -2031,6 +2080,7 @@ fn app(
         cc_extra_args: extra_args,
         env: agent_env,
         claude_profiles: app_profiles,
+        conversation_epoch,
         // No attr spelling: a nested table of rule patterns.
         approval_rules: Vec::new(),
         attachment_targets: attachment_targets(&agent.attachment_targets, &label, errors),

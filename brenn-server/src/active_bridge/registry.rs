@@ -113,6 +113,10 @@ impl ActiveBridges {
         // in yet. Asked here, under no lock the sweep holds, so the bridge is
         // condemned by whichever of the two happens second.
         bridge.condemn_if_spawned_before_a_swap();
+        // The same window as a reload's sweep: a spawn of a superseded
+        // conversation that registers after the reconcile's retirement step
+        // walked the registry is condemned here.
+        bridge.condemn_if_superseded().await;
         if let Some(messenger) = bridge.messenger() {
             messenger.dispatch_kick();
         }

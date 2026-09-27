@@ -1,5 +1,5 @@
 {
-  "checksum": "ce1ae245a5c7b6c2cb91d2d1440ca9ed6dcf646110da66799c17f21a14f7598b",
+  "checksum": "dbcd1b1e235e4e97bc253d81ccb4789412ca020b5f781fe76803917a6e69c830",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2815,6 +2815,10 @@
               "target": "tokio_tungstenite"
             },
             {
+              "id": "toml 1.1.2+spec-1.1.0",
+              "target": "toml"
+            },
+            {
               "id": "tracing-test 0.2.6",
               "target": "tracing_test"
             }
@@ -3146,6 +3150,55 @@
         "compile_data_glob": [
           "**"
         ],
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-conversation-epoch 0.1.0": {
+      "name": "brenn-conversation-epoch",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_conversation_epoch",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_conversation_epoch",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "tokio 1.52.3",
+              "target": "tokio"
+            }
+          ],
+          "selects": {}
+        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -36633,6 +36686,7 @@
     "brenn-chrome 0.1.0": "surface/chrome",
     "brenn-cli 0.1.0": "brenn-cli",
     "brenn-common 0.1.0": "brenn-common",
+    "brenn-conversation-epoch 0.1.0": "brenn-conversation-epoch",
     "brenn-db 0.1.0": "brenn-db",
     "brenn-dsl 0.1.0": "brenn-dsl",
     "brenn-echo-stub 0.1.0": "surface/components/echo-stub",

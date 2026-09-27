@@ -289,32 +289,10 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
                         }
                     }
                     BroadcastResult::Closed => {
-                        // Bridge's broadcast sender was dropped (CC exited).
-                        // Don't break — keep WS open for user to start a new conversation.
-                        // Detach cleans up presence (if bridge is still in registry).
                         reload_pending = false;
-                        conn.detach().await;
-                        if conn.app_config().persistent {
-                            // Persistent app: CC dying is abnormal. Re-spawn.
-                            // detach() cleared history_sent. Set it back — the user
-                            // already has this conversation's history in the DOM.
-                            // When BridgeSpawned fires, the handler should perform
-                            // an incremental re-replay from last_sent_seq (not full
-                            // replay). last_sent_seq is intentionally NOT cleared by
-                            // detach() so it remains valid here.
-                            conn.mark_history_already_sent();
-                            let _ = conn.send_ws(WsServerMessage::Status {
-                                state: CcState::Connecting,
-                            });
-                            let conv_id = conn
-                                .current_conversation_id
-                                .expect("persistent app always has a conversation");
-                            state.spawn_eager_wake(conv_id, conn.timezone);
-                        } else {
-                            // Non-persistent: CC exited normally (conversation done).
-                            let _ = conn.send_ws(WsServerMessage::Status {
-                                state: CcState::Idle,
-                            });
+                        if conn.on_bridge_closed().await.is_err() {
+                            // WS channel closed — connection dead.
+                            break;
                         }
                     }
                     BroadcastResult::NoBroadcast => {
@@ -369,6 +347,10 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
             notification = conn.bridge_notify_rx.recv() => {
                 match notification {
                     Ok(crate::state::BridgeSpawned { conversation_id, app_slug }) => {
+                        if conn.follow_singleton_on_spawn(conversation_id, &app_slug).await.is_err() {
+                            // WS channel closed — connection dead.
+                            break;
+                        }
                         // Auto-attach if we're viewing this conversation but have no bridge.
                         if conn.current_conversation_id == Some(conversation_id)
                             && conn.broadcast_rx.is_none()
@@ -479,6 +461,59 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
 }
 
 impl super::connection::WsConnection {
+    /// The tab's bridge closed its broadcast: its Claude Code process exited.
+    ///
+    /// The socket stays open. A singleton tab first follows its app's newest
+    /// conversation; a persistent app then respawns the conversation the tab
+    /// is on, and a non-persistent one goes idle. Err(()) when the socket
+    /// closed during a history replay.
+    pub(super) async fn on_bridge_closed(&mut self) -> Result<(), ()> {
+        // Detach cleans up presence (if the bridge is still in the registry).
+        self.detach().await;
+        let switched = self.follow_singleton().await?;
+        if switched && self.broadcast_rx.is_some() {
+            // The tab is on the live successor now, and ConversationSwitched carried
+            // its state; there is nothing to respawn.
+            return Ok(());
+        }
+        if self.app_config().persistent {
+            // Persistent app: CC dying is abnormal. Re-spawn.
+            // detach() cleared history_sent. Set it back — the user
+            // already has this conversation's history in the DOM.
+            // When BridgeSpawned fires, the handler should perform
+            // an incremental re-replay from last_sent_seq (not full
+            // replay). last_sent_seq is intentionally NOT cleared by
+            // detach() so it remains valid here.
+            self.mark_history_already_sent();
+            let _ = self.send_ws(WsServerMessage::Status {
+                state: CcState::Connecting,
+            });
+            let conv_id = self
+                .current_conversation_id
+                .expect("persistent app always has a conversation");
+            self.state.spawn_eager_wake(conv_id, self.timezone);
+        } else {
+            // Non-persistent: CC exited normally (conversation done).
+            let _ = self.send_ws(WsServerMessage::Status {
+                state: CcState::Idle,
+            });
+        }
+        Ok(())
+    }
+
+    /// A bridge spawned somewhere. A singleton tab showing another conversation
+    /// of the same app re-checks which conversation is current.
+    pub(super) async fn follow_singleton_on_spawn(
+        &mut self,
+        conversation_id: i64,
+        app_slug: &str,
+    ) -> Result<bool, ()> {
+        if self.app_slug != app_slug || self.current_conversation_id == Some(conversation_id) {
+            return Ok(false);
+        }
+        self.follow_singleton().await
+    }
+
     /// Whether this connection outlives an agent-map swap.
     ///
     /// A connection is authorized once, at connect, and nothing re-asks —
@@ -791,5 +826,351 @@ mod tests {
             matches!(msg, WsServerMessage::PushEnabled { enabled: true }),
             "expected PushEnabled(true) after subscription, got {msg:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Following the singleton
+    // -----------------------------------------------------------------------
+
+    use crate::active_bridge::ActiveBridge;
+    use crate::state::BusHold;
+
+    /// A singleton tab attached to the bridge of `old`, with `new` created
+    /// after it as the app's newest row. `ws_rx` is drained.
+    async fn singleton_tab_on_a_superseded_conversation(
+        persistent: bool,
+    ) -> (
+        super::super::connection::WsConnection,
+        tokio::sync::mpsc::Receiver<WsServerMessage>,
+        brenn_db::Db,
+        i64,
+        i64,
+        i64,
+    ) {
+        let mut apps = (*test_apps_singleton()).clone();
+        apps[TEST_APP_SLUG].persistent = persistent;
+        let (mut conn, mut ws_rx, db, user_id) =
+            test_ws_conn_for_app(std::sync::Arc::new(apps)).await;
+        let old = {
+            let db_conn = db.lock().await;
+            conversation::create_conversation(&db_conn, user_id, TEST_APP_SLUG, false)
+        };
+        let old_bridge = register_bridge(&conn, &db, user_id, old).await;
+        conn.attach_to_bridge(&old_bridge).await;
+        let new = {
+            let db_conn = db.lock().await;
+            conversation::create_singleton_successor(&db_conn, user_id, TEST_APP_SLUG, "1")
+        };
+        collect_messages(&mut ws_rx).await;
+        (conn, ws_rx, db, user_id, old, new)
+    }
+
+    /// Inject a bridge for `conv_id` and register it as live.
+    async fn register_bridge(
+        conn: &super::super::connection::WsConnection,
+        db: &brenn_db::Db,
+        user_id: i64,
+        conv_id: i64,
+    ) -> std::sync::Arc<ActiveBridge> {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel::<WsServerMessage>(64);
+        let bridge = ActiveBridge::inject_for_test(
+            user_id,
+            conv_id,
+            TEST_APP_SLUG,
+            db.clone(),
+            broadcast_tx,
+        );
+        conn.state
+            .active_bridges
+            .insert(conv_id, bridge.clone())
+            .await;
+        bridge
+    }
+
+    fn switched_to(msgs: &[WsServerMessage], id: i64) -> Option<usize> {
+        msgs.iter().position(|m| {
+            matches!(
+                m,
+                WsServerMessage::ConversationSwitched {
+                    conversation_id: Some(c),
+                    reload: true,
+                    ..
+                } if *c == id
+            )
+        })
+    }
+
+    fn any_switch(msgs: &[WsServerMessage]) -> bool {
+        msgs.iter()
+            .any(|m| matches!(m, WsServerMessage::ConversationSwitched { .. }))
+    }
+
+    fn status_position(msgs: &[WsServerMessage], state: CcState) -> Option<usize> {
+        msgs.iter()
+            .position(|m| matches!(m, WsServerMessage::Status { state: s } if *s == state))
+    }
+
+    #[tokio::test]
+    async fn a_closed_bridge_moves_a_persistent_singleton_tab_to_the_successor_and_wakes_it() {
+        let (mut conn, mut ws_rx, _db, _user_id, _old, new) =
+            singleton_tab_on_a_superseded_conversation(true).await;
+
+        assert!(conn.on_bridge_closed().await.is_ok());
+
+        assert_eq!(conn.current_conversation_id, Some(new));
+        assert!(
+            conn.broadcast_rx.is_none(),
+            "no bridge is live for the successor"
+        );
+        let msgs = collect_messages(&mut ws_rx).await;
+        let switch_idx = switched_to(&msgs, new)
+            .unwrap_or_else(|| panic!("expected a reload switch to {new}; msgs: {msgs:?}"));
+        let history_idx = msgs
+            .iter()
+            .position(|m| matches!(m, WsServerMessage::HistoryComplete { .. }))
+            .unwrap_or_else(|| panic!("expected HistoryComplete; msgs: {msgs:?}"));
+        assert!(
+            switch_idx < history_idx,
+            "the switch precedes the successor's history; msgs: {msgs:?}"
+        );
+        let connecting_idx = status_position(&msgs, CcState::Connecting)
+            .unwrap_or_else(|| panic!("expected Status(Connecting); msgs: {msgs:?}"));
+        assert!(connecting_idx > switch_idx, "msgs: {msgs:?}");
+        assert_eq!(
+            *conn.state.wake_spawns.lock().unwrap(),
+            vec![(new, BusHold::Unheld)],
+            "the respawn wakes the successor, never the superseded id",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_bridge_attaches_a_singleton_tab_to_a_live_successor() {
+        let (mut conn, mut ws_rx, db, user_id, _old, new) =
+            singleton_tab_on_a_superseded_conversation(true).await;
+        register_bridge(&conn, &db, user_id, new).await;
+
+        assert!(conn.on_bridge_closed().await.is_ok());
+
+        assert_eq!(conn.current_conversation_id, Some(new));
+        assert!(
+            conn.broadcast_rx.is_some(),
+            "attached to the live successor"
+        );
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(switched_to(&msgs, new).is_some(), "msgs: {msgs:?}");
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, WsServerMessage::Status { .. })),
+            "a live successor needs no Status; msgs: {msgs:?}"
+        );
+        assert!(conn.state.wake_spawns.lock().unwrap().is_empty());
+    }
+
+    /// The switch onto a live successor reads `shared` off the bridge, the live
+    /// flag a privacy toggle updates, not off the row.
+    #[tokio::test]
+    async fn a_switch_onto_a_live_successor_carries_the_bridges_shared_flag() {
+        let (mut conn, mut ws_rx, db, user_id, _old, new) =
+            singleton_tab_on_a_superseded_conversation(true).await;
+        let successor = register_bridge(&conn, &db, user_id, new).await;
+        successor
+            .shared
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(conn.on_bridge_closed().await.is_ok());
+
+        let msgs = collect_messages(&mut ws_rx).await;
+        let (is_owner, shared) = msgs
+            .iter()
+            .find_map(|m| match m {
+                WsServerMessage::ConversationSwitched {
+                    conversation_id: Some(c),
+                    reload: true,
+                    is_owner,
+                    shared,
+                    ..
+                } if *c == new => Some((*is_owner, *shared)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no reload switch to the successor; msgs: {msgs:?}"));
+        assert!(shared, "shared comes from the bridge; msgs: {msgs:?}");
+        assert!(is_owner, "msgs: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_closed_bridge_on_the_current_singleton_conversation_respawns_it() {
+        let mut apps = (*test_apps_singleton()).clone();
+        apps[TEST_APP_SLUG].persistent = true;
+        let (mut conn, mut ws_rx, db, user_id) =
+            test_ws_conn_for_app(std::sync::Arc::new(apps)).await;
+        let current = {
+            let db_conn = db.lock().await;
+            conversation::create_conversation(&db_conn, user_id, TEST_APP_SLUG, false)
+        };
+        let bridge = register_bridge(&conn, &db, user_id, current).await;
+        conn.attach_to_bridge(&bridge).await;
+        collect_messages(&mut ws_rx).await;
+
+        assert!(conn.on_bridge_closed().await.is_ok());
+
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(!any_switch(&msgs), "msgs: {msgs:?}");
+        assert!(
+            status_position(&msgs, CcState::Connecting).is_some(),
+            "msgs: {msgs:?}"
+        );
+        assert_eq!(
+            *conn.state.wake_spawns.lock().unwrap(),
+            vec![(current, BusHold::Unheld)],
+        );
+        assert_eq!(conn.current_conversation_id, Some(current));
+    }
+
+    #[tokio::test]
+    async fn a_closed_bridge_on_a_non_persistent_singleton_tab_switches_and_goes_idle() {
+        let (mut conn, mut ws_rx, _db, _user_id, _old, new) =
+            singleton_tab_on_a_superseded_conversation(false).await;
+
+        assert!(conn.on_bridge_closed().await.is_ok());
+
+        assert_eq!(conn.current_conversation_id, Some(new));
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(switched_to(&msgs, new).is_some(), "msgs: {msgs:?}");
+        assert!(
+            matches!(
+                msgs.last(),
+                Some(WsServerMessage::Status {
+                    state: CcState::Idle
+                })
+            ),
+            "the last message is Status(Idle); msgs: {msgs:?}"
+        );
+        assert!(conn.state.wake_spawns.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_successor_spawn_switches_a_tab_watching_an_idle_superseded_conversation() {
+        let (mut conn, mut ws_rx, db, user_id, old, new) =
+            singleton_tab_on_a_superseded_conversation(false).await;
+        conn.detach().await;
+        assert_eq!(conn.current_conversation_id, Some(old));
+        register_bridge(&conn, &db, user_id, new).await;
+
+        assert_eq!(
+            conn.follow_singleton_on_spawn(new, TEST_APP_SLUG).await,
+            Ok(true)
+        );
+
+        assert_eq!(conn.current_conversation_id, Some(new));
+        assert!(conn.broadcast_rx.is_some());
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(switched_to(&msgs, new).is_some(), "msgs: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_full_send_buffer_does_not_drop_the_reload_switch() {
+        let (mut conn, mut ws_rx, _db, _user_id, old, new) =
+            singleton_tab_on_a_superseded_conversation(false).await;
+        conn.detach().await;
+        assert_eq!(conn.current_conversation_id, Some(old));
+
+        let mut filled = 0;
+        while conn.send_ws(WsServerMessage::Status {
+            state: CcState::Idle,
+        }) == super::super::connection::SendResult::Ok
+        {
+            filled += 1;
+        }
+        assert_eq!(
+            conn.send_ws(WsServerMessage::Status {
+                state: CcState::Idle,
+            }),
+            super::super::connection::SendResult::Full
+        );
+        assert_eq!(filled, 256);
+
+        let drain = async {
+            let mut received = Vec::new();
+            while let Some(msg) = ws_rx.recv().await {
+                let done = matches!(msg, WsServerMessage::HistoryComplete { .. });
+                received.push(msg);
+                if done {
+                    while let Ok(msg) = ws_rx.try_recv() {
+                        received.push(msg);
+                    }
+                    break;
+                }
+            }
+            received
+        };
+        let (result, msgs) = tokio::join!(conn.follow_singleton(), drain);
+
+        assert_eq!(result, Ok(true));
+        assert_eq!(conn.current_conversation_id, Some(new));
+        let switch_idx = switched_to(&msgs, new)
+            .unwrap_or_else(|| panic!("expected a reload switch to {new}; msgs: {msgs:?}"));
+        let history_idx = msgs
+            .iter()
+            .position(|m| matches!(m, WsServerMessage::HistoryComplete { .. }))
+            .unwrap_or_else(|| panic!("expected HistoryComplete; msgs: {msgs:?}"));
+        assert!(
+            switch_idx < history_idx,
+            "the switch precedes the successor's history; msgs: {msgs:?}"
+        );
+        assert!(
+            switch_idx >= filled,
+            "the switch follows every filler frame; msgs: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spawn_of_a_superseded_conversation_leaves_the_tab_on_the_newest() {
+        let (mut conn, mut ws_rx, _db, _user_id, old, new) =
+            singleton_tab_on_a_superseded_conversation(false).await;
+        conn.detach().await;
+        conn.current_conversation_id = Some(new);
+
+        assert_eq!(
+            conn.follow_singleton_on_spawn(old, TEST_APP_SLUG).await,
+            Ok(false)
+        );
+
+        assert_eq!(conn.current_conversation_id, Some(new));
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(msgs.is_empty(), "msgs: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_spawn_in_another_app_is_ignored() {
+        let (mut conn, mut ws_rx, _db, _user_id, old, new) =
+            singleton_tab_on_a_superseded_conversation(false).await;
+
+        assert_eq!(
+            conn.follow_singleton_on_spawn(new, "other-app").await,
+            Ok(false)
+        );
+
+        assert_eq!(conn.current_conversation_id, Some(old));
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(msgs.is_empty(), "msgs: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn follow_singleton_is_inert_for_a_non_singleton_app() {
+        let (mut conn, mut ws_rx, db, user_id) = test_ws_conn_for_app(test_apps()).await;
+        let older = {
+            let db_conn = db.lock().await;
+            let older = conversation::create_conversation(&db_conn, user_id, TEST_APP_SLUG, false);
+            conversation::create_conversation(&db_conn, user_id, TEST_APP_SLUG, false);
+            older
+        };
+        conn.current_conversation_id = Some(older);
+
+        assert_eq!(conn.follow_singleton().await, Ok(false));
+
+        assert_eq!(conn.current_conversation_id, Some(older));
+        let msgs = collect_messages(&mut ws_rx).await;
+        assert!(msgs.is_empty(), "msgs: {msgs:?}");
     }
 }

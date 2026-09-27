@@ -120,6 +120,12 @@ impl DbStore {
     /// position it already holds, with the caches retuned), a sampled one loses
     /// whatever it held.
     ///
+    /// The primed position is the channel's retained-tail floor for
+    /// `push_depth`, raised to `floor` when one is given and later — the
+    /// inherited position of an [`RetentionStore::attach_from`]. A `floor` is
+    /// checked against the next seq this channel would assign, and panics above
+    /// it.
+    ///
     /// The sampled branch is the demotion rule: a subscription that lands at
     /// depth 0 is never delivered to again, and a position left behind would be
     /// reported against by every eviction pass forever.
@@ -133,12 +139,28 @@ impl DbStore {
         subscriber: &ParticipantId,
         app_slug: &str,
         push_depth: Depth,
+        floor: Option<MessageSeq>,
     ) -> Attached {
         if !push_depth.is_push_enabled() {
             db::delete_subscriber_cursor(conn, self.channel_uuid, subscriber);
             return Attached::Existing;
         }
-        let primed = db::primed_position(conn, self.channel_uuid, push_depth);
+        let tail = db::primed_position(conn, self.channel_uuid, push_depth);
+        let primed = match floor {
+            Some(floor) => {
+                let head = db::channel_last_retained_seq(conn, self.channel_uuid);
+                assert!(
+                    seq_column(floor) <= head + 1,
+                    "messaging store: {} inherited floor {} is above the next seq {} this \
+                     channel would assign",
+                    self.address,
+                    floor.0,
+                    head + 1
+                );
+                tail.max(seq_column(floor))
+            }
+            None => tail,
+        };
         let created = db::ensure_subscriber_cursor(
             conn,
             self.channel_uuid,
@@ -298,12 +320,35 @@ impl RetentionStore for DbStore {
         push_depth: Depth,
     ) -> Attached {
         let conn = self.db.lock().await;
-        self.maintain_cursor(&conn, subscriber, app_slug, push_depth)
+        self.maintain_cursor(&conn, subscriber, app_slug, push_depth, None)
     }
 
-    async fn detach(&self, subscriber: &ParticipantId) {
+    async fn attach_from(
+        &self,
+        subscriber: &ParticipantId,
+        app_slug: &str,
+        push_depth: Depth,
+        floor: MessageSeq,
+    ) -> Attached {
+        assert!(
+            push_depth.is_push_enabled(),
+            "messaging store: {} attach_from for {} at a sampled push depth, which holds no \
+             position to inherit into",
+            self.address,
+            subscriber.as_str()
+        );
         let conn = self.db.lock().await;
+        self.maintain_cursor(&conn, subscriber, app_slug, push_depth, Some(floor))
+    }
+
+    /// The cursor row is read and deleted under one connection hold, so the
+    /// position reported is the one removed.
+    async fn detach(&self, subscriber: &ParticipantId) -> Option<MessageSeq> {
+        let conn = self.db.lock().await;
+        let dropped = db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)
+            .map(|row| retained_seq(row.next_owed_seq));
         db::delete_subscriber_cursor(&conn, self.channel_uuid, subscriber);
+        dropped
     }
 
     /// Writes the message row, and nothing per subscriber.

@@ -125,6 +125,9 @@ pub struct AppConfigRaw {
     /// Which Claude accounts this app may run under, and where its goal comes
     /// from. `None` for an app that declares no profiles.
     pub claude_profiles: Option<AppClaudeProfiles>,
+    /// Canonical address of the channel whose latest message is this singleton
+    /// agent's conversation epoch. `None` for an agent that names none.
+    pub conversation_epoch: Option<String>,
     /// Static auto-approval rules (pattern-based). Checked before DB rules.
     pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets (e.g. "Import bank export").
@@ -264,6 +267,11 @@ pub struct AppConfig {
     /// from. `None` for an app that declares no profiles: it gets no token at
     /// spawn and authenticates with whatever `/login` left in its home.
     pub claude_profiles: Option<AppClaudeProfiles>,
+    /// Canonical address of this singleton agent's conversation-epoch channel:
+    /// a declared, durable, `retain_depth = 1` channel whose latest message is
+    /// the epoch the agent's current conversation must carry. `None` for an agent
+    /// that names none. Read at boot only.
+    pub conversation_epoch: Option<String>,
     /// Static auto-approval rules from the config document.
     pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets.
@@ -511,6 +519,7 @@ impl AppConfig {
             // Boot-shaped: refused at reload, each for its own reason.
             startup_hooks: _,
             claude_profiles: _,
+            conversation_epoch: _,
             integrations: _,
             mounts: _,
             webhook_subscriptions: _,
@@ -736,6 +745,7 @@ impl Default for AppConfigRaw {
             cc_extra_args: vec![],
             env: BTreeMap::new(),
             claude_profiles: None,
+            conversation_epoch: None,
             approval_rules: vec![],
             attachment_targets: vec![],
             integrations: vec![],

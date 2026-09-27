@@ -238,6 +238,7 @@ mod tests {
             attach_registry: Default::default(),
             attach_heartbeat_secs: 1,
             cc_profiles: None,
+            epoch_reconciler: None,
             test_wake_bridge: Default::default(),
             wake_spawns: Default::default(),
         };

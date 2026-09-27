@@ -14,7 +14,27 @@ All notable changes to Brenn are documented here.
   demo scenarios. The attribute refuses keys that would conflict with
   integration-emitted variables, outrank a configured Claude profile's
   credentials, or place secrets in plaintext config.
+- **Start an agent on a fresh conversation from the message bus.** A
+  singleton agent (one that has a single, always-on conversation) owned by
+  one user can name a `conversation_epoch` channel. Whenever a new value is
+  published there, the agent moves to a brand-new conversation instead of
+  compacting the old one. The old conversation stays in the database and in
+  the conversation list for reference; its Claude Code session shuts down at
+  its next idle moment, never mid-turn. The new conversation picks up where
+  the old one left off on the bus, so no message is replayed or lost, and
+  open browser tabs switch over on their own. Adding or changing the setting
+  needs a restart. See "Conversation epoch" in `docs/config-dsl.md`.
+- **New `conversation-recycler` component** decides when to trigger that
+  reset. It counts interactions on a channel you point it at and publishes a
+  new epoch after a quiet spell (`idle_secs`, default 180), or once
+  `max_interactions` (default 50) have piled up and a shorter `settle_secs`
+  gap (default 10) passes. Useful for kiosk and demo agents that no one is
+  watching.
 - Bumped rustls to 0.23.45, clearing RUSTSEC-2026-0285.
+- Fixed: after an agent's owner changes on reload, the former owner's
+  conversation no longer keeps its positions on non-durable (`ephemeral:`)
+  channels, so the wake no longer respawns that conversation on every publish
+  there.
 
 ## [0.24.0] — 2026-09-13
 

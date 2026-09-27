@@ -1232,13 +1232,28 @@ fn free_input_raw(port: &str) -> brenn_lib::messaging::config::WasmConsumerSubsc
     }
 }
 
-/// Boot the real messaging layer over `config` and load the demo guest against
-/// every resolved consumer, through the same lowering production boot uses.
-/// Hand-building the load spec would test the fixture, not the lowering pass.
+/// [`boot_dispatch_with`] over the demo guest.
 async fn boot_dispatch(
     config: &brenn_lib::config::BrennConfig,
     db: brenn_db::Db,
     apps: &Arc<IndexMap<String, brenn_lib::config::AppConfig>>,
+) -> (
+    brenn_messaging_boot::MessagingResult,
+    Vec<WasmConsumerConfig>,
+    tokio::task::JoinHandle<()>,
+) {
+    boot_dispatch_with(config, db, apps, DEMO_WASM).await
+}
+
+/// Boot the real messaging layer over `config` and load the guest at `wasm`
+/// against every resolved consumer, through the same lowering production boot
+/// uses. Hand-building the load spec would test the fixture, not the lowering
+/// pass.
+async fn boot_dispatch_with(
+    config: &brenn_lib::config::BrennConfig,
+    db: brenn_db::Db,
+    apps: &Arc<IndexMap<String, brenn_lib::config::AppConfig>>,
+    wasm: &str,
 ) -> (
     brenn_messaging_boot::MessagingResult,
     Vec<WasmConsumerConfig>,
@@ -1281,13 +1296,17 @@ async fn boot_dispatch(
                 input_amplification_mt,
                 mqtt_sinks,
                 config: consumer.config.clone(),
+                store_path: consumer.store_path.as_deref(),
                 grants,
                 max_page_count: consumer.max_page_count,
                 max_payload_bytes: config.messaging.max_body_bytes,
                 alerter: noop_proc_alerter(),
                 output_acl,
-                ..ProcessorLoadSpec::minimal(std::path::Path::new(DEMO_WASM), &consumer.slug)
+                ..ProcessorLoadSpec::minimal(std::path::Path::new(wasm), &consumer.slug)
             }));
+            // What a consumer's start does before its first activation; a
+            // no-op for a consumer with no store.
+            component.open_store();
             WasmConsumerConfig {
                 slug: consumer.slug.clone(),
                 component,
@@ -1730,6 +1749,293 @@ async fn renaming_a_durable_auto_channel_writes_a_fresh_row() {
             "each row is keyed by the uuid derived from its own name"
         );
     }
+}
+
+// The conversation recycler, driven through the real lowering: knobs, port
+// routing, store commit/rollback, publish and repark.
+
+/// The deployed recycler guest, staged by
+/// `//brenn-wasm:fixture_conversation_recycler`.
+const RECYCLER_WASM: &str = "brenn-wasm/target/components/brenn_conversation_recycler.wasm";
+const RECYCLER_UTTERANCE: &str = "brenn:recycler-e2e.utterance";
+const RECYCLER_SPEAK: &str = "brenn:recycler-e2e.speak";
+const RECYCLER_EPOCH: &str = "brenn:recycler-e2e.epoch";
+const RECYCLER_TICK: &str = "brenn:recycler-e2e.tick";
+
+/// One recycler, shaped like the iros booth's: interactions and activity on
+/// durable channels, a durable named tick, the epoch out, and the three knobs set
+/// so the idle rule differs from its default.
+fn recycler_config(store_path: &std::path::Path) -> brenn_lib::config::BrennConfig {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::ComponentGrant;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
+    };
+    use brenn_messaging_boot::test_fixtures::{durable_channel, minimal_wasm_consumer};
+
+    let channel = |address: &str, n: u64| ChannelConfigRaw {
+        push_depth: Some(Depth::Bounded(n)),
+        retain_depth: Some(Depth::Bounded(n)),
+        ..durable_channel(address, Depth::Bounded(n))
+    };
+    let mut knobs = toml::Table::new();
+    knobs.insert(
+        "idle_secs".to_string(),
+        toml::Value::String("60".to_string()),
+    );
+    knobs.insert(
+        "max_interactions".to_string(),
+        toml::Value::String("50".to_string()),
+    );
+    knobs.insert(
+        "settle_secs".to_string(),
+        toml::Value::String("10".to_string()),
+    );
+
+    BrennConfig {
+        channels: vec![
+            channel(RECYCLER_UTTERANCE, 8),
+            channel(RECYCLER_SPEAK, 4),
+            channel(RECYCLER_EPOCH, 4),
+            surface_index_channel(),
+        ],
+        wasm_consumers: vec![
+            WasmConsumerConfigRaw {
+                slug: "recycler".to_string(),
+                package: "conversation-recycler".to_string(),
+                grants: vec![
+                    ComponentGrant::Ports,
+                    ComponentGrant::Store,
+                    ComponentGrant::Log,
+                    ComponentGrant::Config,
+                ],
+                store_path: Some(store_path.to_path_buf()),
+                subscriptions: vec![
+                    WasmConsumerSubscriptionRaw {
+                        channel: Some(RECYCLER_UTTERANCE.to_string()),
+                        port: "interactions".to_string(),
+                        push_depth: Some(Depth::Bounded(8)),
+                        retain_depth: Some(Depth::Bounded(8)),
+                        noise: None,
+                        wake_min: None,
+                        amplification: None,
+                    },
+                    WasmConsumerSubscriptionRaw {
+                        channel: Some(RECYCLER_SPEAK.to_string()),
+                        port: "activity".to_string(),
+                        push_depth: Some(Depth::Bounded(4)),
+                        retain_depth: Some(Depth::Bounded(4)),
+                        noise: None,
+                        wake_min: None,
+                        amplification: None,
+                    },
+                ],
+                io_ports: vec![io_port_raw(
+                    "tick",
+                    Some(RECYCLER_TICK),
+                    Depth::Bounded(1),
+                    Depth::Bounded(2),
+                )],
+                outputs: vec![WasmConsumerOutputRaw {
+                    port: "epoch".to_string(),
+                    channel: Some(RECYCLER_EPOCH.to_string()),
+                    urgency: None,
+                    publish_per_activation: None,
+                    publish_capacity: None,
+                }],
+                subscribe_acl: vec![
+                    ChannelMatcherRaw::Exact("recycler-e2e.utterance".to_string()),
+                    ChannelMatcherRaw::Exact("recycler-e2e.speak".to_string()),
+                ],
+                publish_acl: vec![ChannelMatcherRaw::Exact("recycler-e2e.epoch".to_string())],
+                config: Some(knobs),
+                ..minimal_wasm_consumer()
+            }
+            .implying_its_vocabulary(),
+        ],
+        ..BrennConfig::default()
+    }
+}
+
+/// One message on `address`, published `age` ago: the recycler's clock runs on
+/// publish times.
+async fn recycler_say(
+    messenger: &brenn_messaging::Messenger,
+    address: &str,
+    age: chrono::Duration,
+) {
+    let entry = messenger
+        .directory()
+        .resolve(address)
+        .expect("the recycler's channels are declared");
+    testutils::insert_bus_message_at(
+        messenger,
+        &entry,
+        "{}",
+        ChannelScheme::Brenn,
+        (Utc::now() - age)
+            .timestamp_nanos_opt()
+            .expect("a test instant fits in i64 nanoseconds"),
+    )
+    .await;
+}
+
+/// Every epoch the recycler has published, oldest first.
+async fn recycler_epochs(messenger: &brenn_messaging::Messenger) -> Vec<String> {
+    let conn = messenger.db().lock().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.body FROM messaging_messages m \
+             JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+             WHERE c.address = 'brenn:recycler-e2e.epoch' ORDER BY m.id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// How many wakes the recycler has parked on its tick.
+async fn recycler_parked_ticks(messenger: &brenn_messaging::Messenger) -> i64 {
+    let conn = messenger.db().lock().await;
+    conn.query_row(
+        "SELECT COUNT(*) FROM messaging_messages m \
+         JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+         WHERE c.address = 'brenn:recycler-e2e.tick' AND m.deliver_after IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// The configured idle rule fires one epoch, a tick with nothing new publishes
+/// nothing, and the next fire carries the committed generation forward.
+#[tokio::test]
+async fn the_recycler_fires_once_on_its_configured_idle_and_commits_its_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, cfgs, _alert_handle) = boot_dispatch_with(
+        &recycler_config(&dir.path().join("recycler.db")),
+        init_db_memory_lib_slice(),
+        &no_apps(),
+        RECYCLER_WASM,
+    )
+    .await;
+    let messenger = result.messenger.clone().unwrap();
+    let subscriber = ParticipantId::for_wasm("recycler");
+
+    for age in [120, 119, 118] {
+        recycler_say(
+            &messenger,
+            RECYCLER_UTTERANCE,
+            chrono::Duration::seconds(age),
+        )
+        .await;
+    }
+    drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
+    assert_eq!(
+        recycler_epochs(&messenger).await,
+        vec!["1"],
+        "sixty configured seconds of quiet fire; the default 180 would not"
+    );
+    assert_eq!(
+        recycler_parked_ticks(&messenger).await,
+        0,
+        "a fire cancels the tick and parks none"
+    );
+
+    let tick = messenger
+        .directory()
+        .resolve(RECYCLER_TICK)
+        .expect("the io_port placed its tick channel");
+    testutils::insert_bus_message(&messenger, &tick, "{}", ChannelScheme::Brenn).await;
+    drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
+    assert_eq!(
+        recycler_epochs(&messenger).await,
+        vec!["1"],
+        "a tick with nothing new publishes nothing"
+    );
+
+    recycler_say(
+        &messenger,
+        RECYCLER_UTTERANCE,
+        chrono::Duration::seconds(90),
+    )
+    .await;
+    drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
+    assert_eq!(
+        recycler_epochs(&messenger).await,
+        vec!["1", "2"],
+        "the second fire continues from the committed generation"
+    );
+}
+
+/// Activity moves the idle clock and counts nothing, so it alone never fires.
+#[tokio::test]
+async fn an_activity_envelope_counts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, cfgs, _alert_handle) = boot_dispatch_with(
+        &recycler_config(&dir.path().join("recycler.db")),
+        init_db_memory_lib_slice(),
+        &no_apps(),
+        RECYCLER_WASM,
+    )
+    .await;
+    let messenger = result.messenger.clone().unwrap();
+    let subscriber = ParticipantId::for_wasm("recycler");
+
+    recycler_say(&messenger, RECYCLER_SPEAK, chrono::Duration::seconds(120)).await;
+    drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
+    assert!(
+        recycler_epochs(&messenger).await.is_empty(),
+        "activity alone never fires"
+    );
+    assert_eq!(
+        recycler_parked_ticks(&messenger).await,
+        0,
+        "a zero count parks nothing"
+    );
+}
+
+/// While a count is pending the recycler keeps exactly one wake parked: a
+/// repark replaces it.
+#[tokio::test]
+async fn a_count_short_of_the_idle_rule_parks_exactly_one_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, cfgs, _alert_handle) = boot_dispatch_with(
+        &recycler_config(&dir.path().join("recycler.db")),
+        init_db_memory_lib_slice(),
+        &no_apps(),
+        RECYCLER_WASM,
+    )
+    .await;
+    let messenger = result.messenger.clone().unwrap();
+    let subscriber = ParticipantId::for_wasm("recycler");
+
+    recycler_say(&messenger, RECYCLER_UTTERANCE, chrono::Duration::seconds(2)).await;
+    drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
+    assert!(
+        recycler_epochs(&messenger).await.is_empty(),
+        "two seconds of quiet fire nothing"
+    );
+    assert_eq!(
+        recycler_parked_ticks(&messenger).await,
+        1,
+        "a pending count parks one tick"
+    );
+
+    recycler_say(&messenger, RECYCLER_UTTERANCE, chrono::Duration::seconds(1)).await;
+    drain_step(&cfgs[0], &subscriber, MountDebt::Settled).await;
+    assert_eq!(
+        recycler_parked_ticks(&messenger).await,
+        1,
+        "the repark replaced the tick rather than adding one"
+    );
+    assert!(
+        recycler_epochs(&messenger).await.is_empty(),
+        "one second of quiet fires nothing"
+    );
 }
 
 /// The peer-call path, end to end: real consumer tasks, a real

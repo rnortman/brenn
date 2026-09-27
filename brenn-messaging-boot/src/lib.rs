@@ -1396,6 +1396,16 @@ pub async fn commit_messaging(
         }
     }
 
+    // An epoch handoff the last process died inside: its successor row
+    // committed before all its positions moved. Finished here, before the
+    // reconcile below would judge the predecessor's remaining rows orphans and
+    // the attach pass would prime the successor behind the retained tail.
+    let mut handed_over: Vec<String> = Vec::new();
+    for (slug, app) in apps.iter() {
+        if app.conversation_epoch.is_some() && messenger.finish_interrupted_supersede(slug).await {
+            handed_over.push(slug.clone());
+        }
+    }
     // The cursor rows the last boot left, judged against the directory just
     // assembled plus the dormant dynamic registrations it deliberately excludes,
     // and before this boot's attaches touch any of them: a row no registration
@@ -1446,8 +1456,12 @@ pub async fn commit_messaging(
     // anything can publish, so the position exists by the time the dispatcher
     // starts delivering here.
     messenger.attach_conversation_subscribers().await;
-    // Kick so primed consumers drain immediately rather than at the next poll.
-    if primed_any {
+    for slug in &handed_over {
+        messenger.republish_chat_roster(slug).await;
+    }
+    // Kick so primed consumers, and a successor whose handoff was just
+    // finished, drain immediately rather than at the next poll.
+    if primed_any || !handed_over.is_empty() {
         messenger.dispatch_kick();
     }
 

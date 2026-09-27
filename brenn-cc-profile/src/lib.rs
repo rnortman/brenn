@@ -17,7 +17,6 @@ use std::sync::RwLock;
 use brenn_lib::config::{
     AppClaudeProfiles, ClaudeProfile, OUTRANKING_CREDENTIAL_VARS, SecretString,
 };
-use brenn_lib::messaging::ChannelScheme;
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use tracing::{info, warn};
@@ -286,40 +285,12 @@ impl ProfileGoal {
 /// The `system:cc-profile` participant: subscribe-only, on exactly the declared
 /// goal channels.
 ///
-/// The matchers carry **bare** channel names, not canonical addresses. The
-/// delivery gate splits the scheme off before matching, so an
-/// `Exact("brenn:cc-profile.pa")` would never match and every goal would sit
-/// undelivered with nothing but a once-per-pair warning to show for it.
-///
 /// # Panics
 ///
-/// On a goal address that is not `brenn:` — goal channels are durable by
-/// config-time rule, and one scheme means one ACL family.
+/// On a goal address that is not `brenn:` (see
+/// [`SystemParticipantSpec::subscribe_only_durable`]).
 pub fn cc_profile_spec(goal_addrs: &[String]) -> SystemParticipantSpec {
-    let mut policy = brenn_lib::access::AppPolicy::default();
-    policy
-        .grants
-        .insert(brenn_envelope::grants::AppCapability::MessagingSubscribe);
-    for addr in goal_addrs {
-        let bare = match ChannelScheme::split(addr) {
-            Some((ChannelScheme::Brenn, bare)) => bare,
-            _ => panic!(
-                "BUG: claude profile goal channel {addr:?} is not a durable `brenn:` address; \
-                 config resolution should have refused it",
-            ),
-        };
-        policy
-            .acls
-            .brenn_subscribe
-            .push(brenn_lib::access::acl::ChannelMatcher::Exact(
-                bare.to_string(),
-            ));
-    }
-    SystemParticipantSpec {
-        component: CC_PROFILE_COMPONENT,
-        policy,
-        subscriptions: goal_addrs.to_vec(),
-    }
+    SystemParticipantSpec::subscribe_only_durable(CC_PROFILE_COMPONENT, goal_addrs)
 }
 
 #[cfg(test)]

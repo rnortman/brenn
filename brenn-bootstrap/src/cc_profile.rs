@@ -14,29 +14,23 @@ use tokio::sync::Notify;
 use tracing::info;
 
 /// Attach the `system:cc-profile` participant and seed `goal` from what the
-/// goal channels already retain.
-///
-/// The retained goal is learned by a *read*, not by delivery: a system
-/// subscriber's position is durable, so after the first boot the retained
-/// message is behind the cursor and never arrives as new. The returned inbox is
-/// the one that did the read, so the drain task built on it resumes from the
-/// position attached here.
+/// goal channels already retain, by the read
+/// [`crate::state_channel::attach_and_seed`] describes. An empty channel leaves
+/// the first-allowed seed in place.
 pub(crate) async fn attach_and_seed(
     goal: &ProfileGoal,
     messenger: Arc<Messenger>,
     notify: Arc<Notify>,
 ) -> SystemInbox {
-    let inbox = SystemInbox::new(CC_PROFILE_COMPONENT, messenger, notify);
-    inbox.attach().await;
-    for (address, window) in inbox.snapshot().await {
-        // Newest last, new or context alike: the channel carries state, so only
-        // the latest message means anything. An empty channel leaves the
-        // first-allowed seed in place.
-        if let Some((_, envelope)) = window.entries.last() {
-            goal.apply(&address, &envelope.body);
-        }
-    }
-    inbox
+    crate::state_channel::attach_and_seed(
+        CC_PROFILE_COMPONENT,
+        messenger,
+        notify,
+        |address, body| {
+            goal.apply(address, body);
+        },
+    )
+    .await
 }
 
 /// Spawn the cc-profile drain loop: later publishes only — the retained goals

@@ -432,9 +432,13 @@ mod tests {
                 drain,
                 server,
                 reload,
+                superseded,
             } => {
                 assert!(reload, "a retired process names the reload");
-                assert!(!drain && !server, "and neither of the other two");
+                assert!(
+                    !drain && !server && !superseded,
+                    "and none of the other three"
+                );
             }
             other => panic!("a retired process must die intentionally, got {other:?}"),
         }

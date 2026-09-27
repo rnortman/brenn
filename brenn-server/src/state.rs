@@ -173,6 +173,10 @@ pub struct AppState {
     /// that says so. `None` when no agent declares `claude_profiles`. Built
     /// once at boot, moved thereafter only by the goal channel.
     pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// Supersedes an epoch agent's conversation whose epoch is stale, and
+    /// holds the epoch handle the conversation-epoch drain moves. `None` when
+    /// no agent names a `conversation_epoch`. Built once at boot.
+    pub epoch_reconciler: Option<Arc<crate::conversation_epoch::EpochReconciler>>,
     /// Usage session gap in seconds. A new usage event that arrives more than
     /// this many seconds after `last_activity_at` closes the prior session and
     /// opens a new one. Default (and test fixture value): 1800 (30 minutes).
@@ -751,6 +755,7 @@ impl AppState {
                 automation_engine: self.automation_engine.clone(),
                 usage_session_gap_secs: self.usage_session_gap_secs,
                 cc_profiles: self.cc_profiles.clone(),
+                epoch_reconciler: self.epoch_reconciler.clone(),
                 swap_host_seed: self.swap_host_seed(),
             })
             .await?;
@@ -953,6 +958,7 @@ impl AppState {
             attach_registry: Default::default(),
             attach_heartbeat_secs: 1,
             cc_profiles: None,
+            epoch_reconciler: None,
             // These two fields, and the wake stubs that read them, exist only
             // in this crate's own test build.
             #[cfg(test)]

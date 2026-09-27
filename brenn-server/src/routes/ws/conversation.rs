@@ -1,6 +1,6 @@
 //! `handle_switch_conversation`, `handle_new_conversation`, `handle_steal_app`,
 //! `handle_set_conversation_privacy`, `try_select_requested_conversation`,
-//! `handle_reconnect`, `handle_list_conversations`.
+//! `handle_reconnect`, `handle_list_conversations`, `follow_singleton`.
 
 use brenn_db::conversation;
 use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
@@ -102,6 +102,59 @@ impl WsConnection {
         {
             self.state.spawn_eager_wake(conv_id, self.timezone);
         }
+    }
+
+    /// Make a singleton tab show its app's current conversation, the newest row.
+    ///
+    /// An epoch reset makes a new row current while a tab still shows the old
+    /// one. Ok(true) when the tab switched; Ok(false) for a non-singleton app,
+    /// an app with no row yet, or a tab already on the newest; Err(()) when the
+    /// socket closed while the switch or the history replay was being sent.
+    pub(super) async fn follow_singleton(&mut self) -> Result<bool, ()> {
+        if !self.app_config().singleton {
+            return Ok(false);
+        }
+        let newest = {
+            let db = self.state.db.lock().await;
+            conversation::get_singleton_conversation(&db, self.user_id, &self.app_slug)
+        };
+        let Some(conv) = newest else {
+            return Ok(false);
+        };
+        if self.current_conversation_id == Some(conv.id) {
+            return Ok(false);
+        }
+
+        let previous = self.current_conversation_id;
+        self.detach().await;
+        self.current_conversation_id = Some(conv.id);
+        self.viewer_only = false;
+
+        let (cc_state, attached) =
+            if let Some(bridge) = self.state.active_bridges.get(conv.id).await {
+                self.attach_to_bridge(&bridge).await;
+                let state = bridge.resolve_cc_state().await;
+                (state, Some(bridge))
+            } else {
+                (CcState::Connecting, None)
+            };
+
+        info!(
+            app = %self.app_slug,
+            from = ?previous,
+            to = conv.id,
+            "singleton tab follows the app's newest conversation"
+        );
+        let switched = match &attached {
+            Some(bridge) => self.conversation_switched_reload_from_bridge(bridge, cc_state),
+            None => self.conversation_switched_reload(&conv, cc_state),
+        };
+        self.send_ws_backpressure(switched).await?;
+        self.send_history(conv.id, None).await?;
+        if let Some(bridge) = attached {
+            self.send_pending_permissions_backpressure(&bridge).await?;
+        }
+        Ok(true)
     }
 
     /// Handle NewConversation.

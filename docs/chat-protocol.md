@@ -485,6 +485,13 @@ subscribe. That is ordinary: the subscribe answers "unavailable" rather than
 failing your attachment, and a publish into a vanished conversation returns a
 failed outcome. Wait for the next snapshot; do not retry in a loop.
 
+**Superseded conversations.** A singleton agent with a conversation epoch can
+move to a new conversation, and then the app's current conversation is the
+highest id on the roster. The conversation it left stays listed and keeps its
+channel family. A command addressed to it still spawns it and is answered, and
+its session then retires at its next idle moment. A peer that wants the current
+conversation addresses the highest id.
+
 `v` is `1` from birth and this body is an external contract: a field may be
 added within `v = 1` (metadata about each conversation is the obvious one), and
 anything else bumps the version.

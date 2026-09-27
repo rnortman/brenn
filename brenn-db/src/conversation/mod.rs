@@ -11,7 +11,7 @@ macro_rules! select_conversations {
     ($tail:expr) => {
         concat!(
             "SELECT id, user_id, cc_session_id, title, model, cwd, status, \
-             created_at, updated_at, total_cost_usd, app_slug, shared ",
+             created_at, updated_at, total_cost_usd, app_slug, shared, epoch ",
             $tail
         )
     };
@@ -102,6 +102,10 @@ pub struct Conversation {
     pub app_slug: String,
     /// Whether this conversation is shared (visible to all app users) or private (owner only).
     pub shared: bool,
+    /// The conversation epoch this row was minted under as an app's singleton
+    /// successor. `None` for a row created by any other path — one born before any
+    /// epoch, which no published epoch equals.
+    pub epoch: Option<String>,
 }
 
 /// Pre-joined conversation row for building sidebar summaries.
@@ -166,11 +170,68 @@ pub struct Message {
 /// has already missed them twice. They want one call that creates, provisions
 /// and announces, so a site added later cannot skip either.
 pub fn create_conversation(conn: &Connection, user_id: i64, app_slug: &str, shared: bool) -> i64 {
+    insert_conversation(conn, user_id, app_slug, shared, None)
+}
+
+/// Mint the successor of an app's singleton conversation under `epoch`.
+///
+/// The new row is the singleton from the moment it commits, for every resolver
+/// (`ORDER BY created_at DESC, id DESC`). That is checked, not assumed: the
+/// insert and a re-read of the newest row share one transaction, and a row that
+/// would not sort newest is refused before it commits. Private
+/// (`shared = false`) and `active`, with no `cc_session_id`, so its first spawn
+/// carries no resume.
+///
+/// Carries the same provisioning and announcement obligations as
+/// [`create_conversation`].
+///
+/// # Panics
+///
+/// If `epoch` is empty — an epoch is validated before it reaches the table.
+///
+/// If the new row would not be the newest, which means the wall clock has
+/// stepped back past the current singleton's `created_at`. Better dead than a
+/// successor that no resolver returns while it holds the app's positions.
+pub fn create_singleton_successor(
+    conn: &Connection,
+    user_id: i64,
+    app_slug: &str,
+    epoch: &str,
+) -> i64 {
+    assert!(
+        !epoch.is_empty(),
+        "singleton successor for app {app_slug:?} (user {user_id}) minted under an empty epoch"
+    );
+    let tx = conn
+        .unchecked_transaction()
+        .expect("failed to begin singleton successor transaction");
+    let new = insert_conversation(&tx, user_id, app_slug, false, Some(epoch));
+    let newest = get_singleton_conversation_id(&tx, user_id, app_slug);
+    assert_eq!(
+        newest,
+        Some(new),
+        "singleton successor {new} for app {app_slug:?} (user {user_id}) would not be the \
+         singleton: conversation {newest:?} sorts after it by created_at, so the wall clock is \
+         behind that row's creation time; refusing to commit a successor no resolver would return"
+    );
+    tx.commit().expect("failed to commit singleton successor");
+    new
+}
+
+/// Insert an `active` conversation row and return its id.
+fn insert_conversation(
+    conn: &Connection,
+    user_id: i64,
+    app_slug: &str,
+    shared: bool,
+    epoch: Option<&str>,
+) -> i64 {
     let now = format_ts_for_db(Utc::now());
     conn.execute(
-        "INSERT INTO conversations (user_id, app_slug, shared, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
-        (user_id, app_slug, shared, &now, &now),
+        "INSERT INTO conversations \
+         (user_id, app_slug, shared, status, created_at, updated_at, epoch) \
+         VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
+        (user_id, app_slug, shared, &now, &now, epoch),
     )
     .expect("failed to insert conversation");
     conn.last_insert_rowid()
@@ -586,25 +647,32 @@ pub fn get_or_create_singleton_conversation(
     user_id: i64,
     app_slug: &str,
 ) -> Conversation {
-    // Find existing — any status.
-    if let Some(conv) = conn
-        .query_row(
-            select_conversations!(
-                "FROM conversations WHERE user_id = ?1 AND app_slug = ?2 \
-                 ORDER BY created_at DESC, id DESC LIMIT 1"
-            ),
-            (user_id, app_slug),
-            |row| Ok(row_to_conversation(row)),
-        )
-        .optional()
-        .expect("failed to query singleton conversation")
-    {
+    if let Some(conv) = get_singleton_conversation(conn, user_id, app_slug) {
         return conv;
     }
 
     // No conversation exists — create one.
     let id = create_conversation(conn, user_id, app_slug, false);
     get_conversation(conn, id)
+}
+
+/// The newest conversation for `(user_id, app_slug)` — the singleton — or
+/// `None` when the app has none. Never creates.
+pub fn get_singleton_conversation(
+    conn: &Connection,
+    user_id: i64,
+    app_slug: &str,
+) -> Option<Conversation> {
+    conn.query_row(
+        select_conversations!(
+            "FROM conversations WHERE user_id = ?1 AND app_slug = ?2 \
+             ORDER BY created_at DESC, id DESC LIMIT 1"
+        ),
+        (user_id, app_slug),
+        |row| Ok(row_to_conversation(row)),
+    )
+    .optional()
+    .expect("failed to query singleton conversation")
 }
 
 /// Resolve user + app slug → singleton conversation id.
@@ -624,6 +692,32 @@ pub fn get_singleton_conversation_id(
     )
     .optional()
     .expect("failed to query singleton conversation id")
+}
+
+/// The last singleton handoff for `(user_id, app_slug)`, as
+/// `(predecessor, singleton)`: the two newest rows, when the newest was
+/// minted under an epoch by [`create_singleton_successor`]. `None` when the
+/// app has fewer than two rows or its newest carries no epoch.
+pub fn get_singleton_handoff(
+    conn: &Connection,
+    user_id: i64,
+    app_slug: &str,
+) -> Option<(i64, i64)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, epoch FROM conversations WHERE user_id = ?1 AND app_slug = ?2 \
+             ORDER BY created_at DESC, id DESC LIMIT 2",
+        )
+        .expect("failed to query singleton handoff");
+    let rows: Vec<(i64, Option<String>)> = stmt
+        .query_map((user_id, app_slug), |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("failed to query singleton handoff")
+        .collect::<Result<_, _>>()
+        .expect("failed to query singleton handoff");
+    match rows.as_slice() {
+        [(singleton, Some(_)), (predecessor, _)] => Some((*predecessor, *singleton)),
+        _ => None,
+    }
 }
 
 /// Find a conversation by its CC session_id (for --resume correlation).
@@ -656,6 +750,7 @@ fn row_to_conversation(row: &rusqlite::Row<'_>) -> Conversation {
         total_cost_usd: row.get(9).expect("failed to read total_cost_usd"),
         app_slug: row.get(10).expect("failed to read app_slug"),
         shared: shared_int != 0,
+        epoch: row.get(12).expect("failed to read epoch"),
     }
 }
 
@@ -1381,6 +1476,111 @@ mod tests {
     }
 
     #[test]
+    fn a_singleton_successor_becomes_the_singleton_and_carries_its_epoch() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let user_id = setup_user(&conn);
+
+        // Both inserts can land in one `created_at` second, so this also pins
+        // the `id DESC` tiebreak.
+        let older = create_conversation(&conn, user_id, "pa", false);
+        let successor = create_singleton_successor(&conn, user_id, "pa", "7");
+        assert_ne!(older, successor);
+
+        assert_eq!(
+            get_singleton_conversation_id(&conn, user_id, "pa"),
+            Some(successor)
+        );
+        let singleton = get_singleton_conversation(&conn, user_id, "pa")
+            .expect("the successor is the singleton");
+        assert_eq!(singleton.id, successor);
+        assert_eq!(singleton.epoch.as_deref(), Some("7"));
+        assert_eq!(
+            get_or_create_singleton_conversation(&conn, user_id, "pa").id,
+            successor
+        );
+
+        assert!(!singleton.shared);
+        assert_eq!(singleton.status, ConversationStatus::Active);
+        assert_eq!(singleton.cc_session_id, None);
+        assert_eq!(get_conversation(&conn, older).epoch, None);
+    }
+
+    /// A successor whose `created_at` would sort behind the current singleton —
+    /// the wall clock stepped back — panics and leaves no row behind.
+    #[test]
+    fn a_successor_that_would_not_sort_newest_is_refused_uncommitted() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let user_id = setup_user(&conn);
+        let current = create_conversation(&conn, user_id, "pa", false);
+        conn.execute(
+            "UPDATE conversations SET created_at = '9999-12-31 23:59:59' WHERE id = ?1",
+            [current],
+        )
+        .unwrap();
+
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_singleton_successor(&conn, user_id, "pa", "1")
+        }));
+        let payload = refused.expect_err("a successor that would not sort newest is refused");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("the refusal carries a formatted message");
+        assert!(message.contains("wall clock"), "{message}");
+
+        assert_eq!(
+            get_singleton_conversation_id(&conn, user_id, "pa"),
+            Some(current)
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the refused successor is not committed");
+    }
+
+    /// The handoff is the two newest rows while the newest carries an epoch.
+    /// The inserts share a second, so the `id DESC` tiebreak orders them.
+    #[test]
+    fn the_singleton_handoff_is_the_two_newest_rows_under_an_epoch() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let user_id = setup_user(&conn);
+
+        assert_eq!(get_singleton_handoff(&conn, user_id, "pa"), None);
+        let a = create_conversation(&conn, user_id, "pa", false);
+        assert_eq!(get_singleton_handoff(&conn, user_id, "pa"), None);
+        let b = create_singleton_successor(&conn, user_id, "pa", "1");
+        assert_eq!(get_singleton_handoff(&conn, user_id, "pa"), Some((a, b)));
+        let c = create_singleton_successor(&conn, user_id, "pa", "2");
+        assert_eq!(get_singleton_handoff(&conn, user_id, "pa"), Some((b, c)));
+        let _d = create_conversation(&conn, user_id, "pa", false);
+        assert_eq!(get_singleton_handoff(&conn, user_id, "pa"), None);
+    }
+
+    #[test]
+    fn get_singleton_conversation_never_creates() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let user_id = setup_user(&conn);
+
+        assert!(get_singleton_conversation(&conn, user_id, "pa").is_none());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .expect("count conversations");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "empty epoch")]
+    fn create_singleton_successor_refuses_an_empty_epoch() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let user_id = setup_user(&conn);
+        create_singleton_successor(&conn, user_id, "pa", "");
+    }
+
+    #[test]
     fn get_conversation_opt_returns_none_for_missing() {
         let db = init_db_memory();
         let conn = db.blocking_lock();
@@ -1770,6 +1970,7 @@ mod tests {
             total_cost_usd: None,
             app_slug: "test".to_string(),
             shared,
+            epoch: None,
         }
     }
 

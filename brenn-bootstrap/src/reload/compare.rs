@@ -366,6 +366,7 @@ fn compare_app(
         cc_extra_args,
         env,
         claude_profiles,
+        conversation_epoch,
         approval_rules,
         attachment_targets,
         integrations,
@@ -419,6 +420,7 @@ fn compare_app(
         cc_extra_args: b_cc_extra_args,
         env: b_env,
         claude_profiles: b_claude_profiles,
+        conversation_epoch: b_conversation_epoch,
         approval_rules: b_approval_rules,
         attachment_targets: b_attachment_targets,
         integrations: b_integrations,
@@ -536,6 +538,15 @@ fn compare_app(
         &field("claude_profiles"),
         claude_profiles,
         b_claude_profiles,
+        out,
+    );
+    // Boot plans a `conversation-epoch` system participant whose subscriptions
+    // are the epoch addresses and seeds the epoch handle by reading them; the
+    // participant's subscription set is fixed for the life of the process.
+    plain(
+        &field("conversation_epoch"),
+        conversation_epoch,
+        b_conversation_epoch,
         out,
     );
     AppFieldDiff {
@@ -912,6 +923,10 @@ mod tests {
                         goal: None,
                     });
                 }),
+            ),
+            (
+                "conversation_epoch",
+                edited(|app| app.conversation_epoch = Some("brenn:assistant.epoch".to_string())),
             ),
         ];
         for (field, candidate) in cases {

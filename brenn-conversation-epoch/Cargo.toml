@@ -1,0 +1,18 @@
+[package]
+name = "brenn-conversation-epoch"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Conversation epochs at runtime: each singleton agent's accepted epoch, read off its epoch channel"
+
+# Sits between the resolved config (which names each agent's epoch channel) and
+# the messaging substrate (which carries the epoch). Nothing above — the
+# reconcile path and bootstrap — is named here.
+[dependencies]
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+tracing = "0.1.44"
+
+[dev-dependencies]
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+tokio = { version = "1.50.0", features = ["macros", "rt"] }

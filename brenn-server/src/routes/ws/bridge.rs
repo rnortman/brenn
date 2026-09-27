@@ -214,6 +214,7 @@ impl WsConnection {
                     automation_engine: self.state.automation_engine.clone(),
                     usage_session_gap_secs: self.state.usage_session_gap_secs,
                     cc_profiles: self.state.cc_profiles.clone(),
+                    epoch_reconciler: self.state.epoch_reconciler.clone(),
                     swap_host_seed: self.state.swap_host_seed(),
                 })
                 .await?;

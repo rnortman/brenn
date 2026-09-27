@@ -101,6 +101,13 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     /// The swap's contact with the world. `None` (default) is right for every
     /// bridge that never swaps — any app with no `claude_profiles`.
     pub swap_host: Option<Arc<dyn super::profile_swap::ProfileSwapHost>>,
+    /// The conversation-epoch reconciler. `None` (default) makes the bridge
+    /// epoch-blind: never condemned at registration, never reconciling at an
+    /// idle moment. The fixture applies no filter on the agent's config.
+    pub epoch_reconciler: Option<Arc<crate::conversation_epoch::EpochReconciler>>,
+    /// The epoch the conversation row carried at spawn. `None` (default) is a
+    /// row born before any epoch.
+    pub spawned_epoch: Option<String>,
 }
 
 impl Default for TestBridgeConfig {
@@ -129,6 +136,8 @@ impl Default for TestBridgeConfig {
             cc_event_tx: None,
             cc_profiles: None,
             swap_host: None,
+            epoch_reconciler: None,
+            spawned_epoch: None,
         }
     }
 }
@@ -536,6 +545,8 @@ impl ActiveBridge {
             cc_event_tx,
             cc_profiles,
             swap_host,
+            epoch_reconciler,
+            spawned_epoch,
         } = cfg;
         // Resolve: None → fresh per-bridge registry; Some → caller-supplied shared registry.
         let active_bridges = active_bridges_opt.unwrap_or_else(ActiveBridges::new);
@@ -636,6 +647,10 @@ impl ActiveBridge {
             reload_killing: AtomicBool::new(false),
             spawned_generation,
             spawned_persistent,
+            epoch_reconciler,
+            spawned_epoch,
+            superseded: AtomicBool::new(false),
+            superseded_killing: AtomicBool::new(false),
             swapping: AtomicBool::new(false),
             swap_ack: std::sync::Mutex::new(None),
             cc_event_tx: cc_event_tx.unwrap_or_else(|| tokio::sync::mpsc::channel(1).0),

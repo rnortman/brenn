@@ -25,6 +25,13 @@ name = "brenn-cal"
 version = "0.1.0"
 
 [[package]]
+name = "brenn-conversation-recycler"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
 name = "brenn-envelope"
 version = "0.1.0"
 dependencies = [

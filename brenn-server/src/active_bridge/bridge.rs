@@ -292,6 +292,19 @@ pub struct ActiveBridge {
     /// from the same snapshot, and `persistent` is exactly a field a reload
     /// moves.
     pub(in crate::active_bridge) spawned_persistent: bool,
+    /// Conversation-epoch reconciler. `Some` exactly when this bridge's agent
+    /// names a `conversation_epoch`; every such agent is a singleton.
+    pub(in crate::active_bridge) epoch_reconciler:
+        Option<Arc<crate::conversation_epoch::EpochReconciler>>,
+    /// The conversation row's epoch when this process was spawned. A row's
+    /// epoch is written at insert and never changes.
+    pub(in crate::active_bridge) spawned_epoch: Option<String>,
+    /// Set when a newer conversation superseded this one. The process is
+    /// killed at the next moment it may be (`retire_if_superseded_and_idle`).
+    pub(in crate::active_bridge) superseded: AtomicBool,
+    /// Set by `retire_if_superseded_and_idle` in the instant before its kill,
+    /// and never cleared. This, not `superseded`, makes the death intentional.
+    pub(in crate::active_bridge) superseded_killing: AtomicBool,
     /// Set for the window in which a profile swap has torn the old CC process
     /// down and not yet installed its replacement. Keeps a second swap and the
     /// wedge watchdog off a bridge that is mid-swap; it says nothing about which
@@ -364,6 +377,9 @@ pub struct SpawnContext<'a> {
     /// spawn runs under is this handle resolved against `app_config.slug`, and
     /// a live bridge compares against it to tell it is on the wrong one.
     pub cc_profiles: Option<Arc<brenn_cc_profile::ProfileGoal>>,
+    /// The epoch reconciler, when any agent names an epoch channel. `spawn_new`
+    /// keeps it only for an agent that names one itself.
+    pub epoch_reconciler: Option<Arc<crate::conversation_epoch::EpochReconciler>>,
     /// The server-owned half of the swap host; `spawn_new` completes it with
     /// this bridge's transcript writer and alert dispatcher.
     pub swap_host_seed: super::profile_swap::SwapHostSeed,
@@ -436,6 +452,7 @@ impl ActiveBridge {
             automation_engine,
             usage_session_gap_secs,
             cc_profiles,
+            epoch_reconciler,
             swap_host_seed,
         } = ctx;
 
@@ -453,6 +470,7 @@ impl ActiveBridge {
         let cc_profile = cc_profiles
             .as_ref()
             .and_then(|g| g.resolve(&app_config.slug));
+        let epoch_reconciler = epoch_reconciler.filter(|_| app_config.conversation_epoch.is_some());
         let container_name_suffix =
             super::cc_spawn_config::conversation_container_suffix(conversation_id);
         let transcript_name = format!("cc-{}-{container_name_suffix}.ndjson", app_config.slug);
@@ -533,10 +551,14 @@ impl ActiveBridge {
             ApprovalRuleSet::new(&global_extra, &app_config.approval_rules, db_rule_tuples);
 
         // Seed last_total_cost_usd from the existing conversation row so that
-        // the first turn delta is correct even after a bridge restart.
-        let initial_cost = {
+        // the first turn delta is correct even after a bridge restart. The
+        // row's epoch is read in the same scope.
+        let (initial_cost, spawned_epoch) = {
             let conn = db.lock().await;
-            brenn_db::conversation::get_total_cost_usd(&conn, conversation_id)
+            (
+                brenn_db::conversation::get_total_cost_usd(&conn, conversation_id),
+                brenn_db::conversation::get_conversation(&conn, conversation_id).epoch,
+            )
         };
 
         #[cfg(test)]
@@ -637,6 +659,10 @@ impl ActiveBridge {
             reload_killing: AtomicBool::new(false),
             spawned_generation: apps_generation,
             spawned_persistent: app_config.persistent,
+            epoch_reconciler,
+            spawned_epoch,
+            superseded: AtomicBool::new(false),
+            superseded_killing: AtomicBool::new(false),
             swapping: AtomicBool::new(false),
             swap_ack: std::sync::Mutex::new(None),
             cc_event_tx,

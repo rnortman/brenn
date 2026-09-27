@@ -523,6 +523,21 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
     if !goal_addrs.is_empty() {
         system_participants.push(brenn_cc_profile::cc_profile_spec(&goal_addrs));
     }
+    // Epoch addresses are operator-declared durable channels too.
+    let epoch_addrs: Vec<String> = {
+        let mut addrs: Vec<String> = apps
+            .values()
+            .filter_map(|app| app.conversation_epoch.clone())
+            .collect();
+        addrs.sort();
+        addrs.dedup();
+        addrs
+    };
+    if !epoch_addrs.is_empty() {
+        system_participants.push(brenn_conversation_epoch::conversation_epoch_spec(
+            &epoch_addrs,
+        ));
+    }
     // Declared, not minted: the operator's two `[[channel]]` blocks are
     // already in `all_entries`, and one without the other is a refusal.
     if let Some(spec) = brenn_messaging::config_reload::config_reload_spec(&all_entries) {
@@ -786,6 +801,72 @@ mod tests {
             .push(durable_channel("brenn:surface.index", Depth::Unbounded));
         config.observability.surface_error_channel = Some("brenn:nowhere".to_string());
         plan_of(&config);
+    }
+
+    /// A singleton agent naming an epoch channel plans `system:conversation-epoch`
+    /// on exactly that channel, folded in as a subscriber like every other system
+    /// participant; the same document without the app map plans no such
+    /// participant.
+    #[test]
+    fn an_agent_naming_an_epoch_channel_plans_the_epoch_participant() {
+        use brenn_conversation_epoch::CONVERSATION_EPOCH_COMPONENT;
+        use brenn_lib::config::AppConfig;
+        use brenn_lib::messaging::SubscriberEntryKind;
+
+        let epoch = "brenn:cogsworth.epoch";
+        let mut config = BrennConfig::default();
+        config
+            .channels
+            .push(durable_channel("brenn:surface.index", Depth::Unbounded));
+        config
+            .channels
+            .push(durable_channel(epoch, Depth::Bounded(1)));
+        let apps: std::sync::Arc<indexmap::IndexMap<String, AppConfig>> =
+            std::sync::Arc::new(indexmap::IndexMap::from([(
+                "cogsworth".to_string(),
+                AppConfig {
+                    singleton: true,
+                    conversation_epoch: Some(epoch.into()),
+                    ..brenn_lib::config::test_app_config("cogsworth")
+                },
+            )]));
+        let plan = plan_messaging(&PlanInputs {
+            config: &config,
+            apps: Some(&apps),
+            mqtt_clients: &indexmap::IndexMap::new(),
+            tool_registry: None,
+            replay_store_paths: &[],
+        })
+        .expect("a document declaring channels configures messaging");
+
+        let specs: Vec<_> = plan
+            .system_participants
+            .iter()
+            .filter(|spec| spec.component == CONVERSATION_EPOCH_COMPONENT)
+            .collect();
+        assert_eq!(specs.len(), 1, "exactly one epoch participant");
+        assert_eq!(specs[0].subscriptions, vec![epoch.to_string()]);
+        let entry = plan
+            .directory
+            .list()
+            .into_iter()
+            .find(|entry| entry.address == epoch)
+            .expect("the epoch channel is a declared entry");
+        assert!(
+            entry.subscribers.iter().any(|sub| matches!(
+                &sub.kind,
+                SubscriberEntryKind::System(component) if component == CONVERSATION_EPOCH_COMPONENT
+            )),
+            "the participant reads the epoch channel"
+        );
+
+        assert!(
+            !plan_of(&config)
+                .system_participants
+                .iter()
+                .any(|spec| spec.component == CONVERSATION_EPOCH_COMPONENT),
+            "without the app map no agent names an epoch channel"
+        );
     }
 
     // ---------------------------------------------------------------------

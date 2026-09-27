@@ -94,6 +94,21 @@ impl SubscriberCursor {
         Self::new(ring.primed_from(push_depth), push_depth)
     }
 
+    /// A cursor for a queue coming into existence that inherits a position:
+    /// primed as [`SubscriberCursor::primed`] would be, then raised to
+    /// `floor_next_owed` when that is later. A floor below the primed start
+    /// cannot hand over more than `push_depth` anyway, so the later of the two is
+    /// the one that loses nothing a window could serve.
+    pub fn primed_at_least<M: Clone, Ep: Copy + PartialEq>(
+        ring: &RetainedRing<M, Ep>,
+        push_depth: u64,
+        floor_next_owed: u64,
+    ) -> Self {
+        let mut cursor = Self::primed(ring, push_depth);
+        cursor.next_owed = cursor.next_owed.max(floor_next_owed);
+        cursor
+    }
+
     fn new(last_seen: u64, push_depth: u64) -> Self {
         Self {
             next_owed: last_seen + 1,
@@ -325,6 +340,19 @@ mod tests {
         let (new, advance) = serve(&mut cursor, &ring, 2, 0);
         assert_eq!(new, vec!["c", "d"]);
         assert_eq!(advance.dropped, 0);
+    }
+
+    /// An inherited floor above the primed start wins; one below it does not,
+    /// since the primed start already owes everything a window could serve.
+    #[test]
+    fn primed_at_least_starts_at_the_later_of_primed_and_floor() {
+        let ring = ring_of(8, &["a", "b", "c", "d"]);
+        let below = SubscriberCursor::primed_at_least(&ring, 2, 1);
+        assert_eq!(below.next_owed(), 3);
+        assert_eq!(below.push_depth(), 2);
+        let mut above = SubscriberCursor::primed_at_least(&ring, 8, 4);
+        assert_eq!(above.next_owed(), 4);
+        assert_eq!(serve(&mut above, &ring, 8, 0).0, vec!["d"]);
     }
 
     #[test]

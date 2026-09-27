@@ -332,12 +332,46 @@ impl RingStore {
         attached
     }
 
+    /// [`RingStore::attach`] for a subscriber inheriting `floor_next_owed`, the
+    /// position another gave up on this channel: a queue coming into existence
+    /// starts at the later of its primed position and the floor, under one state
+    /// lock. An existing position is kept untouched. The position always exists
+    /// afterwards, so the app slug is always recorded.
+    ///
+    /// # Panics
+    ///
+    /// If `push_depth` is zero, or if `floor_next_owed` is above the next seq
+    /// this channel would assign.
+    pub fn attach_from(
+        &self,
+        subscriber: &ParticipantId,
+        app_slug: &str,
+        push_depth: u64,
+        floor_next_owed: u64,
+    ) -> Attached {
+        let mut state = self.state();
+        let attached = state
+            .core
+            .attach_from(subscriber.clone(), push_depth, floor_next_owed);
+        state
+            .app_slugs
+            .insert(subscriber.clone(), app_slug.to_string());
+        attached
+    }
+
     /// Drop a subscriber's position. Its unread obligations go with it — the
     /// messages themselves stay retained for whoever else is owed them.
-    pub fn detach(&self, subscriber: &ParticipantId) {
+    ///
+    /// Returns the `next_owed` seq of the position removed, `None` when the
+    /// subscriber held none.
+    pub fn detach(&self, subscriber: &ParticipantId) -> Option<u64> {
         let mut state = self.state();
-        state.core.detach(subscriber);
+        let dropped = state
+            .core
+            .detach(subscriber)
+            .map(|cursor| cursor.next_owed());
         state.app_slugs.remove(subscriber);
+        dropped
     }
 
     pub fn is_attached(&self, subscriber: &ParticipantId) -> bool {
@@ -791,8 +825,18 @@ impl RetentionStore for RingStore {
         RingStore::attach(self, subscriber, app_slug, depth_bound(push_depth))
     }
 
-    async fn detach(&self, subscriber: &ParticipantId) {
-        RingStore::detach(self, subscriber);
+    async fn attach_from(
+        &self,
+        subscriber: &ParticipantId,
+        app_slug: &str,
+        push_depth: Depth,
+        floor: MessageSeq,
+    ) -> Attached {
+        RingStore::attach_from(self, subscriber, app_slug, depth_bound(push_depth), floor.0)
+    }
+
+    async fn detach(&self, subscriber: &ParticipantId) -> Option<MessageSeq> {
+        RingStore::detach(self, subscriber).map(MessageSeq)
     }
 
     /// Names no targets: subscribers on a ring-backed channel carry their own

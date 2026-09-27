@@ -977,6 +977,54 @@ any file the server user can open is auto-approved. A `--system-prompt` or
 no document byte and bounces nothing. `--permission-mode` through
 `cc_extra_args` is unsupported.
 
+#### Conversation epoch
+
+A singleton agent can be moved to a fresh conversation from the bus: it names a
+state channel whose latest message is its conversation *epoch*, and a new epoch
+means a new conversation.
+
+```
+/// The PA's conversation epoch. A new value starts a fresh conversation.
+channel pa_epoch at "brenn:alice-pa.epoch" {
+  push_depth = 1;
+  retain_depth = 1;
+  standing_retain_depth = 1;
+  doctype = "brenn.conversation.epoch@1";
+}
+
+agent PersonalAssistant {
+  singleton = true;
+  allowed_users = ["alice"];
+  conversation_epoch = exact pa_epoch;
+}
+```
+
+`conversation_epoch` is an `exact` matcher naming a declared `brenn:` channel
+with `retain_depth = 1`, and it requires `singleton = true` and exactly one
+`allowed_users` entry: the epoch decides that user's current conversation. The
+latest message is an opaque epoch string: the body is trimmed, and must be non-empty and at
+most 64 bytes. Anything else is refused for the agent with a warning alert, and
+the previous epoch stands.
+
+When the app's newest conversation does not carry the channel's latest epoch,
+Brenn creates a new conversation, which becomes the current one. The successor
+inherits the old conversation's bus positions: nothing the old one already saw
+is redelivered, and whatever landed after its position is owed to the new one.
+The old conversation's rows, chat channels and roster entry remain. Its session
+is retired at its next idle moment; a turn in progress finishes first. Open
+browser tabs switch to the new conversation when the old session ends or the
+new one spawns.
+
+The check runs at boot, on every publish to the channel, and at every idle
+moment of the agent's sessions. A conversation that existed before the agent
+named a channel carries no epoch, so the first epoch ever published resets it.
+Adding, removing or changing the attr needs a restart.
+
+Anything that can publish on the channel can reset the conversation. The in-tree
+`conversation-recycler` component (`use @conversation-recycler::*;`) is one such
+publisher: it counts messages on one channel and publishes a fresh epoch once
+the conversation has gone idle.
+
 ### Assemblies
 
 An assembly is a parameterized group of entities, stamped once per deployment of
@@ -1667,7 +1715,7 @@ What converges is components, surfaces and their wiring:
   affected.
   Refused, each naming the field (`apps[assistant].mounts`): `mounts`,
   `container`, `integrations`, `integration_config`, `startup_hooks`,
-  `claude_profiles` — boot folds each of those into
+  `claude_profiles`, `conversation_epoch` — boot folds each of those into
   another subsystem's tables or runs an operator script for it — and adding,
   removing, renaming or reordering an agent, which is its existence rather than
   its configuration.

@@ -14,6 +14,7 @@ pub mod active_bridge;
 mod automation_intercept;
 mod cc_schema_drift;
 mod client_ip;
+pub mod conversation_epoch;
 pub mod db;
 mod idle_hooks;
 mod intercept_helpers;

@@ -1219,6 +1219,11 @@ vocabulary! {
         /// reference in a plain value position resolves against the `const`
         /// scope and nothing else.
         opt claude_profile_goal: V,
+        /// The channel whose latest message is this singleton agent's
+        /// conversation epoch, written as an `exact` matcher (for the reason
+        /// `claude_profile_goal` is). A conversation minted under a different
+        /// epoch than the channel's latest is superseded by a fresh one.
+        opt conversation_epoch: V,
         /// The per-conversation send budget. Lowering nests this inside the
         /// app's `messaging` table, so the key name transcribes but the
         /// nesting does not.

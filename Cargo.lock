@@ -513,6 +513,7 @@ dependencies = [
  "brenn-automation",
  "brenn-cc-profile",
  "brenn-common",
+ "brenn-conversation-epoch",
  "brenn-db",
  "brenn-dsl",
  "brenn-envelope",
@@ -549,6 +550,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "tracing",
  "tracing-test",
  "uuid",
@@ -586,7 +588,6 @@ dependencies = [
 name = "brenn-cc-profile"
 version = "0.1.0"
 dependencies = [
- "brenn-envelope",
  "brenn-lib",
  "brenn-messaging",
  "brenn-obs",
@@ -628,6 +629,16 @@ dependencies = [
 [[package]]
 name = "brenn-common"
 version = "0.1.0"
+
+[[package]]
+name = "brenn-conversation-epoch"
+version = "0.1.0"
+dependencies = [
+ "brenn-messaging",
+ "brenn-obs",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "brenn-db"
@@ -861,6 +872,7 @@ dependencies = [
  "brenn-activation",
  "brenn-budget",
  "brenn-cc-profile",
+ "brenn-conversation-epoch",
  "brenn-db",
  "brenn-envelope",
  "brenn-lib",
@@ -1095,6 +1107,7 @@ dependencies = [
  "brenn-cc",
  "brenn-cc-profile",
  "brenn-common",
+ "brenn-conversation-epoch",
  "brenn-db",
  "brenn-envelope",
  "brenn-git",

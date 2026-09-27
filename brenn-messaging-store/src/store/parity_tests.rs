@@ -1538,6 +1538,179 @@ async fn detach_tears_down_a_subscribers_delivery_state() {
     }
 }
 
+// ── Inheriting a position ───────────────────────────────────────────────────
+
+/// Append one message and return the seq retention assigned it.
+async fn append_seq(store: &dyn RetentionStore, body: &str) -> MessageSeq {
+    let msg = message_for(store, "alice", body);
+    store.append(msg).await.committed.seq
+}
+
+/// A detach reports the `next_owed` of the position it removed, and nothing for
+/// a subscriber holding none — whether it detached already or never attached.
+#[tokio::test]
+async fn detach_reports_the_position_it_dropped() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        for body in ["a", "b", "c"] {
+            append_seq(store.as_ref(), body).await;
+        }
+        serve(store.as_ref(), &sub, DEPTH, 0).await;
+        let d = append_seq(store.as_ref(), "d").await;
+
+        assert_eq!(store.detach(&sub).await, Some(d), "{}", store.address());
+        assert_eq!(store.detach(&sub).await, None, "{}", store.address());
+        assert_eq!(
+            store.detach(&wasm_sub("ghost")).await,
+            None,
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// A floor below where priming would start cannot owe more than the push depth
+/// hands over, so the queue starts at the primed tail.
+#[tokio::test]
+async fn attach_from_below_the_tail_floor_primes_at_the_tail() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        let mut seqs = Vec::new();
+        for body in ["a", "b", "c", "d", "e"] {
+            seqs.push(append_seq(store.as_ref(), body).await);
+        }
+        assert_eq!(
+            store
+                .attach_from(&sub, "proc", Depth::Bounded(2), seqs[0])
+                .await,
+            Attached::Created,
+            "{}",
+            store.address()
+        );
+        let (new, _) = serve(store.as_ref(), &sub, 8, 0).await;
+        assert_eq!(new, vec!["d", "e"], "{}", store.address());
+    }
+}
+
+/// A floor above where priming would start wins: what lies below it stays seen.
+#[tokio::test]
+async fn attach_from_above_the_tail_floor_starts_at_the_floor() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        let mut seqs = Vec::new();
+        for body in ["a", "b", "c", "d", "e"] {
+            seqs.push(append_seq(store.as_ref(), body).await);
+        }
+        assert_eq!(
+            store.attach_from(&sub, "proc", ATTACH_DEPTH, seqs[3]).await,
+            Attached::Created,
+            "{}",
+            store.address()
+        );
+        let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
+        assert_eq!(new, vec!["d", "e"], "{}", store.address());
+    }
+}
+
+/// An inherited floor never moves a position that already exists.
+#[tokio::test]
+async fn attach_from_on_an_existing_position_moves_nothing() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        let mut seqs = Vec::new();
+        for body in ["a", "b", "c", "d", "e"] {
+            seqs.push(append_seq(store.as_ref(), body).await);
+        }
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        assert_eq!(
+            store.attach_from(&sub, "proc", ATTACH_DEPTH, seqs[4]).await,
+            Attached::Existing,
+            "{}",
+            store.address()
+        );
+        let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
+        assert_eq!(new, vec!["a", "b", "c", "d", "e"], "{}", store.address());
+    }
+}
+
+/// A message landing between the detach and the attach it hands its position
+/// to is at or above the floor, so the inheriting queue is owed it.
+#[tokio::test]
+async fn a_message_appended_between_detach_and_attach_from_is_owed() {
+    for store in stores(DEPTH).await {
+        let old = wasm_sub("old");
+        let new = wasm_sub("new");
+        store.attach(&old, "proc", ATTACH_DEPTH).await;
+        for body in ["a", "b"] {
+            append_seq(store.as_ref(), body).await;
+        }
+        serve(store.as_ref(), &old, DEPTH, 0).await;
+        let floor = store
+            .detach(&old)
+            .await
+            .expect("the old subscriber held a position");
+        append_seq(store.as_ref(), "c").await;
+        store.attach_from(&new, "proc", ATTACH_DEPTH, floor).await;
+
+        let (served, _) = serve(store.as_ref(), &new, DEPTH, 0).await;
+        assert_eq!(served, vec!["c"], "{}", store.address());
+        assert!(!store.has_deliverable(&new).await, "{}", store.address());
+    }
+}
+
+fn parity_ring() -> RingStore {
+    RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH))
+}
+
+#[tokio::test]
+#[should_panic(expected = "sampled push depth")]
+async fn durable_attach_from_at_a_sampled_depth_panics() {
+    let (store, _db) = durable_store(DEPTH).await;
+    let floor = append_seq(&store, "a").await;
+    store
+        .attach_from(&wasm_sub("proc"), "proc", Depth::Bounded(0), floor)
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "sampled push depth")]
+async fn ring_attach_from_at_a_sampled_depth_panics() {
+    let store = parity_ring();
+    let floor = append_seq(&store, "a").await;
+    RetentionStore::attach_from(&store, &wasm_sub("proc"), "proc", Depth::Bounded(0), floor).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "above the next seq")]
+async fn durable_attach_from_above_the_head_panics() {
+    let (store, _db) = durable_store(DEPTH).await;
+    let head = append_seq(&store, "a").await;
+    store
+        .attach_from(
+            &wasm_sub("proc"),
+            "proc",
+            ATTACH_DEPTH,
+            MessageSeq(head.0 + 2),
+        )
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "above the next seq")]
+async fn ring_attach_from_above_the_head_panics() {
+    let store = parity_ring();
+    let head = append_seq(&store, "a").await;
+    RetentionStore::attach_from(
+        &store,
+        &wasm_sub("proc"),
+        "proc",
+        ATTACH_DEPTH,
+        MessageSeq(head.0 + 2),
+    )
+    .await;
+}
+
 // ── The window and the advance ──────────────────────────────────────────────
 
 /// Bodies of a window's new portion, oldest first.

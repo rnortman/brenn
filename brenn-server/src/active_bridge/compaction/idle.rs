@@ -40,6 +40,14 @@ pub(in crate::active_bridge) async fn set_idle_and_drain(bridge: &Arc<ActiveBrid
         crate::idle_hooks::run_idle_hooks_for_shutdown(bridge).await;
         bridge.drain_no_hooks().await;
     } else {
+        // A bridge whose conversation was superseded mid-turn dies at its turn
+        // end.
+        if bridge.retire_if_superseded_and_idle().await {
+            return;
+        }
+        // A bridge spawned under an epoch other than its agent's current one
+        // asks the reconciler.
+        bridge.reconsider_epoch();
         // A goal that changed mid-turn waited for this moment: the process can
         // only change account between turns. Cheap and synchronous unless this
         // bridge is actually on the wrong one.

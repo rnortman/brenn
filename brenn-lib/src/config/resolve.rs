@@ -370,6 +370,20 @@ pub fn resolve_apps(
             raw.slug,
         );
 
+        assert!(
+            raw.conversation_epoch.is_none() || raw.singleton,
+            "BUG: app {:?} names a conversation_epoch without `singleton = true` \
+             (config lowering should have refused this document)",
+            raw.slug,
+        );
+        assert!(
+            raw.conversation_epoch.is_none() || raw.allowed_users.len() == 1,
+            "BUG: app {:?} names a conversation_epoch with {} allowed_users entries, not \
+             exactly one (config lowering should have refused this document)",
+            raw.slug,
+            raw.allowed_users.len(),
+        );
+
         // Singleton requires compaction config. Without it, the single
         // conversation's context grows without bound and there's no way
         // to reset (no new-conversation button).
@@ -878,6 +892,7 @@ pub fn resolve_apps(
             cc_extra_args: raw.cc_extra_args.clone(),
             env: raw.env.clone(),
             claude_profiles: raw.claude_profiles.clone(),
+            conversation_epoch: raw.conversation_epoch.clone(),
             approval_rules: raw.approval_rules.clone(),
             attachment_targets,
             integrations: resolved_integrations,

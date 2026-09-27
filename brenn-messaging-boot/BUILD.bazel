@@ -12,6 +12,7 @@ FIRST_PARTY_DEPS = [
     "//brenn-budget",
     "//brenn-db",
     "//brenn-cc-profile",
+    "//brenn-conversation-epoch",
     "//brenn-envelope",
     "//brenn-lib",
     "//brenn-messaging",

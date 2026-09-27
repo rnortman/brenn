@@ -24,6 +24,7 @@ rust_library(
         "//brenn-envelope",
         "//brenn-lib",
         "//brenn-cc-profile",
+        "//brenn-conversation-epoch",
         "//brenn-messaging",
         "//brenn-messaging-store",
         "//brenn-messaging-boot",
@@ -79,6 +80,9 @@ rust_test(
     # they import; `rustc_env` below names the directory those paths hang off.
     data = [
         "//:brenn_configs",
+        # The recycler's dispatch cases drive the deployed guest through the real
+        # lowering.
+        "//brenn-wasm:fixture_conversation_recycler",
         # The config-map reload case asks a guest what its config map holds, so
         # that a `config`-only edit is observed by the activation rather than
         # only by the delta.
@@ -115,6 +119,7 @@ rust_test(
         "//brenn-envelope",
         "//brenn-lib",
         "//brenn-cc-profile",
+        "//brenn-conversation-epoch",
         "//brenn-messaging",
         "//brenn-messaging-store",
         "//brenn-messaging-boot",
@@ -199,6 +204,7 @@ rust_test(
         "//brenn-envelope",
         "//brenn-lib",
         "//brenn-cc-profile",
+        "//brenn-conversation-epoch",
         "//brenn-messaging",
         "//brenn-messaging-store",
         "//brenn-messaging-boot",
