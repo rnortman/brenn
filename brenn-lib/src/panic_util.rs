@@ -36,6 +36,12 @@ thread_local! {
     static SUPPRESS_HOOK: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    /// Panics observed on this thread that were not raised under
+    /// [`catch_quietly`]'s quiet flag.
+    static UNEXPECTED_PANICS: Cell<u64> = const { Cell::new(0) };
+}
+
 static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 /// Install the delegating hook once, for the whole process.
@@ -46,6 +52,10 @@ static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 /// the rest of the process — every later panic anywhere then prints nothing.
 /// So the real hook is captured once and wrapped, and the suppression is a
 /// thread-local flag: nothing is ever taken away from another thread.
+///
+/// A panic outside the quiet window is also counted on the panicking thread,
+/// for [`unexpected_panics`]; a quiet-window panic is neither printed nor
+/// counted.
 fn install_hook() {
     HOOK_INSTALLED.get_or_init(|| {
         let previous = std::panic::take_hook();
@@ -53,6 +63,7 @@ fn install_hook() {
             if SUPPRESS_HOOK.with(Cell::get) {
                 return;
             }
+            UNEXPECTED_PANICS.with(|n| n.set(n.get() + 1));
             previous(info);
         }));
     });
@@ -74,6 +85,17 @@ pub fn catch_quietly<R, F: FnOnce() -> R + UnwindSafe>(f: F) -> Result<R, Box<dy
     let outcome = std::panic::catch_unwind(f);
     SUPPRESS_HOOK.with(|s| s.set(previously_suppressed));
     outcome
+}
+
+/// Panics observed on this thread outside any [`catch_quietly`] window.
+///
+/// Installs the delegating hook if nothing on this process has yet, so a
+/// reading taken before any `catch_quietly` call still counts what follows.
+/// Monotonic per thread; callers compare two readings rather than testing for
+/// zero.
+pub fn unexpected_panics() -> u64 {
+    install_hook();
+    UNEXPECTED_PANICS.with(Cell::get)
 }
 
 /// The text of a panic payload, if it carries any.
@@ -135,5 +157,33 @@ mod tests {
     fn suppression_ends_with_the_call() {
         let _ = catch_quietly(|| panic!("quiet"));
         assert!(!SUPPRESS_HOOK.with(Cell::get));
+    }
+
+    // The counter tests compare two readings: libtest may reuse a thread, so
+    // an earlier test's panics can already be in the count.
+
+    #[test]
+    fn a_raw_caught_panic_is_counted() {
+        let before = unexpected_panics();
+        std::panic::catch_unwind(|| panic!("raw")).unwrap_err();
+        assert_eq!(unexpected_panics() - before, 1);
+    }
+
+    #[test]
+    fn a_quiet_panic_is_not_counted() {
+        let before = unexpected_panics();
+        catch_quietly(|| panic!("quiet")).unwrap_err();
+        assert_eq!(unexpected_panics() - before, 0);
+    }
+
+    #[test]
+    fn a_quiet_window_inside_a_raw_catch_counts_only_the_outer_panic() {
+        let before = unexpected_panics();
+        std::panic::catch_unwind(|| {
+            catch_quietly(|| panic!("inner")).unwrap_err();
+            panic!("outer");
+        })
+        .unwrap_err();
+        assert_eq!(unexpected_panics() - before, 1);
     }
 }

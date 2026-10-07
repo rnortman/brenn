@@ -64,10 +64,15 @@ pub async fn surface_harness(
 /// **Every rig this builds tears down the way a booted surface does.** The last
 /// attachment of a surface makes the route write its terminal `disconnected`
 /// stamp, which a rig missing the status channel or the telemetry grant answers
-/// with a broken-boot-invariant panic on the connection task — a panic tokio
-/// absorbs, leaving the provoking test green. So the status channel is declared
-/// and the substrate grant injected here, off the same description prefix the
-/// runtimes are built with, rather than left to each caller.
+/// with a broken-boot-invariant panic on the connection task. That panic fails
+/// the provoking test through the `TestServer` drop check only if it has run
+/// before the rig drops — the stamp is written after the client sees the
+/// close, so a test that stops at the close may finish first.
+/// TODO(test-server-teardown-wait): the suites do not yet wait on the
+/// route's quiet predicate before the rig drops, so that panic is red only on
+/// the runs where tokio polled the stamp first. The status channel is
+/// declared and the substrate grant injected here, off the same description
+/// prefix the runtimes are built with, so every caller gets a clean teardown.
 pub async fn surface_harness_with_siblings(
     db: &brenn_db::Db,
     surface: ResolvedSurface,

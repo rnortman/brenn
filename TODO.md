@@ -373,25 +373,37 @@ Code sites (`TODO(config-syntax-in-operator-messages)`):
 `brenn-messaging-boot/src/surfaces.rs` at the surface binding validators.
 
 
-## `test-task-panic-visibility`
+## `test-server-teardown-wait`
 
-A panic on a connection task spawned by `spawn_test_server`
-(brenn-server/src/test_support/http.rs) is absorbed by tokio and asserted
-against by nothing, so any regression that panics server-side after the last
-frame a test reads — the detach path, the unregistration, a telemetry publish —
-passes green across the whole brenn-server route suite. Found when four surface
-suites were panicking the server on teardown and still reporting `ok`; those
-rigs are fixed, the blindness is not.
+The `TestServer` drop check (`brenn-server/src/test_support/http.rs`) fails a
+test only for a panic that has already run on the test thread. On the surface
+route the terminal `disconnected` stamp
+(`brenn-server/src/routes/surface.rs`) is written after the client has seen
+the socket close, and its boot-invariant panics run with it. The surface WS
+suites (`brenn-server/src/routes/surface/conformance_tests.rs`,
+`brenn-bootstrap/src/surface_ws_tests.rs`) end on that close, so a stamp
+panic is red or green depending on whether tokio polled it before the rig
+dropped.
 
-Needs a design call before it can be built: a global panic hook is process-wide
-and would have to distinguish a deliberate `#[should_panic]` from a swallowed
-task panic (~2500 tests, some multi-thread, run concurrently in one process),
-and a drop-time assertion aborts on double panic. Done when a connection task
-that panics fails the test that provoked it, without breaking `#[should_panic]`.
+Each test in those suites that attaches a surface session must wait, before
+its rig drops, on `AttachRegistry::is_quiet(slug)` — the drain ticket the
+route takes around the session, released after the stamp. No timer or settle
+loop in test support. (The remote route has no post-close panic: it writes no
+stamp, and the writer's own panics run before the socket closes, so the drop
+check already counts them. Nothing to wait on there.)
 
-Code site (`TODO(test-task-panic-visibility)`):
-brenn-server/src/test_support/http.rs, `spawn_test_server`.
+Done when: reintroduce the fixture bug `43d8f722` fixed (drop the status
+channel declaration or the substrate grant injection from
+`surface_harness_with_siblings` in
+`brenn-server/src/routes/surface/test_fixtures.rs`) and every test in the two
+suites above that attaches a surface session through that rig goes red on
+every run, not some.
 
+Code site (`TODO(test-server-teardown-wait)`):
+`brenn-server/src/routes/surface/test_fixtures.rs` (`surface_harness_with_siblings`
+doc comment).
+
+---
 
 ## `section-ref-burndown`
 

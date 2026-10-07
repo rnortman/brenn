@@ -67,28 +67,89 @@ pub fn inject_extensions(mut req: Request<Body>, user_id: i64, ip: IpAddr) -> Re
     req
 }
 
-/// A running test server. Dropping the handle drops `_shutdown_tx`, which
-/// signals graceful shutdown; the serve task then winds down asynchronously and
-/// nothing awaits it, so a dropped handle does not prove the server has stopped
-/// touching shared state.
+/// A running test server.
+///
+/// Dropping the handle drops `_shutdown_tx`, which signals graceful shutdown;
+/// the serve task then winds down asynchronously and nothing awaits it, so a
+/// dropped handle does not prove the server has stopped touching shared state.
+///
+/// Dropping the handle also fails the test if any panic ran on this thread
+/// since the spawn, outside a `catch_quietly` window, and the test is not
+/// already unwinding. On the current_thread runtime the spawn insists on, that
+/// is every async task the server spawned: connection tasks, `on_upgrade`
+/// sessions, the attach and app WS writers, the serve task itself, and plain
+/// HTTP handlers — a handler panic `CatchPanicLayer` turns into a 500 still ran
+/// the panic hook here, so it fails the test too. The handle must therefore be
+/// dropped on the runtime thread that spawned it; dropping it on any other
+/// thread panics, since another thread's counter says nothing about the server's tasks.
+///
+/// It does not observe work that left the runtime thread: `spawn_blocking`
+/// closures and `std::thread` work panic on their own threads, and a
+/// `resume_unwind` re-raise of their join error runs no hook. A test that needs
+/// a panic on one of those paths to fail it asserts on the visible effect (the
+/// 500, the join error) itself.
+///
+/// A panic the runtime has not yet run is invisible too. Waiting for teardown
+/// to execute is the test's job, using a predicate that only turns true after
+/// the teardown code has run — for the surface route, its drain ticket via
+/// `AttachRegistry::is_quiet` — never a timer here. The client-side close is
+/// not such a predicate: attach teardown closes the socket and then awaits
+/// further work (the writer join, the terminal `disconnected` stamp) before it
+/// can panic.
 pub struct TestServer {
     _shutdown_tx: tokio::sync::oneshot::Sender<()>,
     _serve: tokio::task::JoinHandle<()>,
+    /// `unexpected_panics()` as read when the server was spawned.
+    panics_at_spawn: u64,
+    /// The thread whose counter `panics_at_spawn` was read from.
+    spawn_thread: std::thread::ThreadId,
 }
 
-/// Spin up a real server on a random port. Returns the base URL and a
-/// [`TestServer`]. The server runs in a background task and stops when the
-/// returned handle is dropped.
-///
-/// A panic on a spawned connection task is absorbed by tokio and reaches no
-/// assertion, so a regression that panics after the last frame a test reads
-/// leaves that test green.
-// TODO(test-task-panic-visibility): make a panicking connection task fail the
-// test that provoked it.
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        assert_eq!(
+            std::thread::current().id(),
+            self.spawn_thread,
+            "TestServer dropped on a thread other than the runtime thread that \
+             spawned it; the panic check reads a thread-local counter, so the \
+             handle must live and die on that thread"
+        );
+        let since_spawn = brenn_lib::panic_util::unexpected_panics() - self.panics_at_spawn;
+        assert_eq!(
+            since_spawn, 0,
+            "{since_spawn} task(s) under the test server panicked; the \
+             `thread … panicked at` line(s) above are the test's failure"
+        );
+    }
+}
+
+/// Spin up the production router on a random port. Returns the base URL and a
+/// [`TestServer`]; the server runs in a background task and stops when the
+/// returned handle is dropped. See [`TestServer`] for the panic check its drop
+/// performs.
 pub async fn spawn_test_server(state: AppState) -> (String, TestServer) {
     use crate::router::build_router;
-    let app =
-        build_router(state, None, 0, 2576).into_make_service_with_connect_info::<SocketAddr>();
+    spawn_test_router(build_router(state, None, 0, 2576)).await
+}
+
+/// Serve an arbitrary router the way [`spawn_test_server`] serves the
+/// production one.
+///
+/// Refuses a multi_thread runtime: the panic check reads a thread-local
+/// counter, and worker threads poll tasks where the check cannot see them.
+pub async fn spawn_test_router(app: Router) -> (String, TestServer) {
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread,
+        "spawn_test_router requires a current_thread runtime: the test server \
+         observes task panics through a thread-local counter, and a multi_thread \
+         runtime polls them on worker threads the drop check cannot see"
+    );
+    let panics_at_spawn = brenn_lib::panic_util::unexpected_panics();
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -107,6 +168,8 @@ pub async fn spawn_test_server(state: AppState) -> (String, TestServer) {
         TestServer {
             _shutdown_tx: shutdown_tx,
             _serve: serve,
+            panics_at_spawn,
+            spawn_thread: std::thread::current().id(),
         },
     )
 }
@@ -327,4 +390,112 @@ pub async fn xff_get_status(app: &Router, path: &str, xff_ip: &str) -> StatusCod
 /// keeps the bucket alive across clones).
 pub async fn auth_login_status(app: &Router, xff_ip: &str) -> StatusCode {
     xff_get_status(app, "/auth/login", xff_ip).await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::ws::WebSocketUpgrade;
+    use axum::routing::get;
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    #[should_panic(expected = "task(s) under the test server panicked")]
+    async fn a_panicking_upgrade_task_fails_the_owning_test() {
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(|socket| async move {
+                    let _socket = socket;
+                    panic!("session task died")
+                })
+            }),
+        );
+        let (base, _server) = spawn_test_router(app).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(http_to_ws_url(&base, "/ws"))
+            .await
+            .unwrap();
+        // The session task owns the socket, so the socket is dropped by the
+        // panic's unwind, after the hook ran; the client seeing the stream end
+        // proves the panic has already been counted on this thread.
+        match ws.next().await {
+            None | Some(Err(_)) => {}
+            Some(Ok(frame)) => panic!("expected the stream to end, got {frame:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "deliberate")]
+    async fn a_should_panic_test_holding_a_server_reports_only_its_own_panic() {
+        let (_base, _server) = spawn_test_router(Router::new()).await;
+        panic!("deliberate");
+    }
+
+    #[tokio::test]
+    async fn a_quiet_panic_on_the_test_thread_does_not_trip_the_check() {
+        let (_base, _server) = spawn_test_router(Router::new()).await;
+        brenn_lib::panic_util::catch_quietly(|| panic!("verdict")).unwrap_err();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "task(s) under the test server panicked")]
+    async fn a_raw_caught_panic_on_the_test_thread_trips_the_check() {
+        let (_base, _server) = spawn_test_router(Router::new()).await;
+        std::panic::catch_unwind(|| panic!("caught but not quiet")).unwrap_err();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "requires a current_thread runtime")]
+    async fn a_multi_thread_caller_is_refused_at_spawn() {
+        spawn_test_router(Router::new()).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "dropped on a thread other than the runtime thread")]
+    async fn dropping_the_handle_on_another_thread_is_refused() {
+        let (_base, server) = spawn_test_router(Router::new()).await;
+        let dropped = std::thread::spawn(move || drop(server)).join();
+        if let Err(payload) = dropped {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// A handler panic behind `CatchPanicLayer` is answered with a 500 and
+    /// still fails the owning test: the hook ran on this thread. This is
+    /// deliberate — a test asserting on a panic-backed 500 through
+    /// `spawn_test_server` has to choose that outcome explicitly rather than
+    /// have the handler's panic pass unnoticed.
+    #[tokio::test]
+    #[should_panic(expected = "task(s) under the test server panicked")]
+    async fn a_handler_panic_caught_as_a_500_fails_the_owning_test() {
+        async fn boom() -> &'static str {
+            panic!("handler died")
+        }
+        let app = Router::new()
+            .route("/boom", get(boom))
+            .layer(tower_http::catch_panic::CatchPanicLayer::new());
+        let (base, _server) = spawn_test_router(app).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let status = client
+            .get(format!("{base}/boom"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_clean_server_passes() {
+        let (base, _server) = spawn_test_router(Router::new()).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let status = client
+            .get(format!("{base}/nothing-here"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }

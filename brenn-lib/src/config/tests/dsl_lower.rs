@@ -725,8 +725,8 @@ channel presence at "ephemeral:alice-desk.presence" {
     );
 }
 
-/// `default_send_rate` is read by the same function as a channel's
-/// `send_rate`, and its refusals name the attr that was written.
+/// `default_send_rate` is validated like a channel's `send_rate`, and its
+/// refusals name the attr that was written.
 #[test]
 fn a_stray_default_send_rate_key_names_default_send_rate() {
     let refusal = refusal(

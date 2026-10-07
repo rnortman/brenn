@@ -53,6 +53,12 @@ All notable changes to Brenn are documented here.
   from the code that defines them, so a new option added there can no longer
   go without a config spelling unnoticed. What you write in config and the
   error messages for bad config are unchanged.
+- Internal (tests only): a panic in a background task started by the
+  in-process test server, such as a WebSocket session tearing down, now fails
+  the test that started the server. Before, tokio swallowed these panics and
+  the test passed. Some late-teardown panics on the surface route can still
+  slip past and are tracked in `TODO.md` (`test-server-teardown-wait`).
+  Production panic handling is unchanged.
 
 ## [0.24.0] — 2026-09-13
 
