@@ -30,7 +30,6 @@ use std::sync::LazyLock;
 use serde::de::DeserializeOwned;
 use serde::de::value::StrDeserializer;
 
-use brenn_dsl::Span;
 use brenn_dsl::derived::{
     DAclSet, DAuthority, DMatcher, DMqttClient, DMqttSub, DRemoteAuthority, DRemoteSubEntry,
     DWebhook, DerivedConfig,
@@ -43,10 +42,12 @@ use brenn_dsl::model::{
 };
 use brenn_dsl::resolve::SURFACE_CHROME_KEY;
 use brenn_dsl::resolved::{
-    ClassRef, MatcherKind, PortDir, RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer,
-    RHooks, RMatcherVal, RMcp, RNamed, RRemote, RRepoMount, RSection, RSubscribe, RSurface, RTail,
-    RToolGrant, RVal, RValue, RWebhook, RWebhookBlock, ResolvedConfig as DslResolved, scheme,
+    ClassRef, HandlePath, MatcherKind, PortDir, RAgent, RAttachmentTarget, RChanRef,
+    RComponentInst, RConsumer, RHooks, RMatcherVal, RMcp, RNamed, RRemote, RRepoMount, RSection,
+    RSubscribe, RSurface, RTail, RToolGrant, RVal, RValue, RWebhook, RWebhookBlock,
+    ResolvedConfig as DslResolved, scheme,
 };
+use brenn_dsl::{Span, Spanned};
 
 use crate::access::raw::{
     AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
@@ -2172,24 +2173,16 @@ fn mcp_servers(
     let context = format!("agent `{}`", agent.slug.value());
     for entry in &agent.mcps {
         let (key, span, attrs) = match entry {
-            RMcp::Ref(name) => {
-                // TODO(dsl-mcp-ref-index): resolution hands out an index for a
-                // channel reference and a name for an mcp reference, so this
-                // one is matched by string; an index would drop the rescan and
-                // the invariant that backs the panic below.
-                let definition = resolved
-                    .mcp_servers
-                    .iter()
-                    .find(|candidate| candidate.handle.dotted() == *name.value())
-                    .expect("a resolved mcp reference names a definition of the document");
-                (name.value().clone(), name.span().clone(), &definition.attrs)
+            RMcp::Ref { id, span } => {
+                let definition = &resolved.mcp_servers[id.0];
+                (
+                    leaf(&definition.handle).value().clone(),
+                    span.clone(),
+                    &definition.attrs,
+                )
             }
             RMcp::Inline(named) => {
-                let leaf = named
-                    .handle
-                    .0
-                    .last()
-                    .expect("an inline mcp definition carries its name");
+                let leaf = leaf(&named.handle);
                 (leaf.value().clone(), leaf.span().clone(), &named.attrs)
             }
         };
@@ -2199,6 +2192,15 @@ fn mcp_servers(
         servers.insert(key, mcp(attrs, errors));
     }
     servers
+}
+
+/// The one segment of an mcp server's handle, which is its name.
+///
+/// Top-level and inline definitions alike are `HandlePath(vec![name])`:
+/// nothing nests an mcp server, so a handle with any other shape is a
+/// resolver bug.
+fn leaf(handle: &HandlePath) -> &Spanned<String> {
+    handle.0.last().expect("an mcp server's handle is its name")
 }
 
 fn mcp(attrs: &McpServerAttrs<RVal>, errors: &mut Vec<Diagnostic>) -> McpServerConfig {

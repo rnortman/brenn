@@ -78,7 +78,7 @@ pub struct ResolvedConfig {
     pub repos: Vec<RNamed<RepoAttrs<RVal>>>,
     pub mqtt_clients: Vec<RNamed<MqttClientAttrs<RVal>>>,
     /// Top-level `mcp_server` definitions only; an agent's inline ones ride on
-    /// the agent.
+    /// the agent. An [`McpId`] indexes this vector.
     pub mcp_servers: Vec<RNamed<McpServerAttrs<RVal>>>,
     /// Declared mounts. Only a mounts document carries any: the resolver
     /// refuses a `mount` written in a deployment document, and a mounts
@@ -324,6 +324,14 @@ pub enum RMatcherVal {
 /// re-matches a channel by re-parsing text someone else already resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChanId(pub usize);
+
+/// A top-level mcp server, by position in [`ResolvedConfig::mcp_servers`].
+///
+/// The same index discipline as [`ChanId`]: an agent's reference to one is
+/// resolved once, in the scope that bound it, and nothing downstream
+/// re-matches it by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct McpId(pub usize);
 
 /// A declared link, by position in [`ResolvedConfig::links`].
 ///
@@ -748,8 +756,14 @@ pub struct RRepoMount {
 /// one defined in its own body.
 #[derive(Debug, PartialEq)]
 pub enum RMcp {
-    /// `mcp_server graf;`, resolved to the definition's handle.
-    Ref(Spanned<String>),
+    /// `mcp_server graf;` — the top-level definition it named.
+    Ref {
+        id: McpId,
+        /// Where the reference was written. The id holds no position, and a
+        /// later refusal about this entry — two entries under one key — can
+        /// point at nothing else.
+        span: Span,
+    },
     /// `mcp_server pfin { … }` — scoped to this agent, which is what lets its
     /// body name the class's parameters.
     Inline(Box<RNamed<McpServerAttrs<RVal>>>),

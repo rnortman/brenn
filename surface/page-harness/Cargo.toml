@@ -14,7 +14,7 @@ description = "A recording page host for surface-placed components: one instanti
 # frames a backend-hosted suite for the same component takes, from the same
 # place, so neither placement's fixtures live in the other's crate.
 [dependencies]
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
 serde_json = "1"
 brenn-dsl = { version = "0.1.0", path = "../../brenn-dsl" }
 brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope", features = ["testutils"] }

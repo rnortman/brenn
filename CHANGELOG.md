@@ -30,7 +30,14 @@ All notable changes to Brenn are documented here.
   `max_interactions` (default 50) have piled up and a shorter `settle_secs`
   gap (default 10) passes. Useful for kiosk and demo agents that no one is
   watching.
+- Fixed: when two config files each define an `mcp_server` with the same
+  name, an agent now gets the one its own file refers to. Previously it could
+  silently get the other file's definition — and so launch the wrong MCP
+  server command with the wrong environment.
 - Bumped rustls to 0.23.45, clearing RUSTSEC-2026-0285.
+- Bumped wasmtime from 47.0.4 to 48.0.5, clearing RUSTSEC-2026-0315,
+  RUSTSEC-2026-0316, RUSTSEC-2026-0325, RUSTSEC-2026-0326 and
+  RUSTSEC-2026-0327.
 - Fixed: after an agent's owner changes on reload, the former owner's
   conversation no longer keeps its positions on non-durable (`ephemeral:`)
   channels, so the wake no longer respawns that conversation on every publish

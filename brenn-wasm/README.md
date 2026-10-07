@@ -11,7 +11,7 @@ build fetches. Their pins are `WIT_BINDGEN_VERSION` and `WASM_TOOLS_VERSION` in
 `MODULE.bazel`, which is also where the download URLs and checksums are, so a
 bump is one edit there.
 
-These two pins are the guest build path; the host runtime is wasmtime 47 (the
+These two pins are the guest build path; the host runtime is wasmtime 48 (the
 `brenn-wasm` dep). cargo-component is retired — not installed, not invoked.
 
 ## Toolchain bump procedure

@@ -5,7 +5,7 @@
 // written to a tempfile so `ProcessorComponent::load` sees an ordinary `.wasm`
 // path — the production load path is exercised in full.
 //
-// ── wasmtime 47 behavioral note ─────────────────────────────────────────────
+// ── wasmtime 48 behavioral note ─────────────────────────────────────────────
 //
 // wasmtime does export type-checking in `ProcessorIndices::new`, which
 // `ProcessorPre::new` calls during `ProcessorComponent::load`. This means:

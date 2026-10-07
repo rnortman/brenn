@@ -97,6 +97,22 @@ pub fn lower_document(document: &str) -> Result<BrennConfig, Vec<Diagnostic>> {
     crate::config::dsl_lower::lower(compiled)
 }
 
+/// Compile a tree of sibling `.brenn` files from a tempdir and lower it.
+///
+/// `files` are `(name, source)`; the first is the root, the rest sit beside it
+/// as tree modules the root reaches by `use`. Loaded by `brenn_dsl::compile`,
+/// so the files come in the order the loader produces, not the order written
+/// here.
+pub fn lower_tree(files: &[(&str, &str)]) -> Result<BrennConfig, Vec<Diagnostic>> {
+    let dir = tempfile::tempdir().expect("a tempdir");
+    for (name, source) in files {
+        std::fs::write(dir.path().join(name), source).expect("write a tree module");
+    }
+    let (root, _) = files.first().expect("a tree has a root");
+    let compiled = brenn_dsl::compile(&DocumentInputs::bare(dir.path().join(root)))?;
+    crate::config::dsl_lower::lower(compiled)
+}
+
 /// Write a fixture document into `dir` as the root `name`, splitting its fenced
 /// half out as a module root beside it.
 ///

@@ -309,23 +309,6 @@ Code sites (`TODO(surface-instance-acl-bound)`): brenn-lib/src/config/dsl_lower.
 in `surface_components` where the per-instance authority's `grants` is read.
 
 
-## `dsl-mcp-ref-index`
-
-`RMcp::Ref` carries the referenced server's name, so lowering finds the
-definition by scanning `resolved.mcp_servers` and comparing dotted handles,
-backed by an `expect` that a match exists. Every other cross-reference in the
-resolved model carries an index (`RChanRef::Decl(ChanId)`). The scan is
-irrelevant at config scale; what it costs is a cross-crate invariant encoded as
-a string-match outcome — a differently normalised handle in resolution turns
-into a boot panic that blames the document.
-
-Fix = have resolution mint an id for an mcp reference the way it does for a
-channel, and index directly.
-
-Code sites (`TODO(dsl-mcp-ref-index)`): brenn-lib/src/config/dsl_lower.rs, in
-`mcp_servers`.
-
-
 ## `dsl-list-element-span`
 
 A projection refusal on a bad list *element* carries a span covering the whole

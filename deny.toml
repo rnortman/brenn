@@ -1,11 +1,11 @@
 # cargo-deny policy for the Brenn repository.
 # Applied to all workspace units (root + standalone WASM workspaces) via `cargo xtask deny`.
-# See design docs/adr/2026/06/13-cargo-deny-check-split/design.md for rationale.
 
 [advisories]
 # Fail on any published RUSTSEC security advisory.
-# No ignore list — the tree is expected to be red on pre-existing advisories
-# until the user evaluates and remediates them (see design §2.3.3).
+# An advisory that turns this check red is resolved by whoever's `make check`
+# first sees it, preferably by moving the pin to a fixed release. An `ignore`
+# entry is the owner's call, never an implementer's shortcut.
 version = 2
 ignore = []
 

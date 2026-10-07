@@ -42,7 +42,7 @@ use crate::model::{
 };
 use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
-    Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, PortDir, RAcl, RAgent,
+    Abi, ChanId, ClassRef, HandlePath, LinkId, MatcherKind, McpId, PortDir, RAcl, RAgent,
     RAttachmentTarget, RBinding, RCall, RChanRef, RChannel, RComponentInst, RConsumer,
     RContribution, RGrant, RHooks, RLink, RMatcher, RMatcherVal, RMcp, RMount, RNamed, RPin, RPort,
     RPrincipal, RRateLimit, RRemote, RRepoMount, RSection, RStamp, RSubscribe, RSurface,
@@ -2110,6 +2110,14 @@ pub(crate) type ChannelTable = HandleTable<ChanId>;
 /// referenced by handle and by nothing else, so nothing else can key it.
 pub(crate) type LinkTable = HandleTable<LinkId>;
 
+/// Every top-level mcp server that was emitted, found the way an agent body
+/// names one.
+///
+/// Keyed by the declaring file and the server's name, which is what
+/// [`FileScope::named`] answers with: a reference resolves to the definition
+/// its own scope bound, whichever other file spells a server the same way.
+pub(crate) type McpTable = HandleTable<McpId>;
+
 /// What an instantiation stamped, and what kind of entity it is.
 ///
 /// Keyed by the file the top-level instantiation was written in, the way
@@ -3042,7 +3050,6 @@ fn emit_entities(
     let modules: Vec<Vec<Spanned<Item>>> = files.into_iter().map(|(_, file)| file.items).collect();
     let mut config = Emitted::default();
     let (mut channels, declared, minted) = channel_addresses(index, &modules, errors);
-
     let (mut links, minted_links) = link_handles(&modules);
     let mut stamps = StampTable::default();
     // Expansion runs between the addresses and the bodies: an assembly stamps
@@ -3086,6 +3093,15 @@ fn emit_entities(
         index, &modules, &declaring, &channels, &links, &stamps, errors,
     );
     let agents = agent_classes(&modules);
+    let mcps = mcp_definitions(
+        index,
+        &modules,
+        &channels,
+        &links,
+        &stamps,
+        &mut config,
+        errors,
+    );
 
     // Section multiplicity is decided over the whole document before any body
     // is resolved: the walk is flat across every file, so the same section
@@ -3105,6 +3121,15 @@ fn emit_entities(
         errors,
     );
 
+    let tables = Tables {
+        index,
+        channels: &channels,
+        links: &links,
+        stamps: &stamps,
+        classes: &classes,
+        agents: &agents,
+        mcps: &mcps,
+    };
     for (position, items) in modules.into_iter().enumerate() {
         let site = sites[position].as_ref();
         let mut scope = Scope::top(index, position, &channels, &links, &stamps);
@@ -3126,8 +3151,7 @@ fn emit_entities(
                 item.into_value(),
                 declaration,
                 &scope,
-                &classes,
-                &agents,
+                &tables,
                 &mut config,
                 errors,
             );
@@ -3140,14 +3164,6 @@ fn emit_entities(
     // Stamped channels take the ids after every declared one, and they were
     // minted in this order: emitting them in it is what keeps a `ChanId` the
     // position it indexes.
-    let tables = Tables {
-        index,
-        channels: &channels,
-        links: &links,
-        stamps: &stamps,
-        classes: &classes,
-        agents: &agents,
-    };
     for item in stamped {
         emit_stamped(item, &tables, &mut config, errors);
     }
@@ -3225,6 +3241,75 @@ fn link_handles(modules: &[Vec<Spanned<Item>>]) -> (LinkTable, usize) {
     (links, next)
 }
 
+/// Every top-level mcp server, emitted, and the table an agent's reference to
+/// one resolves through.
+///
+/// Ahead of every agent body because an agent may name a server declared in a
+/// file emitted after its own. An id is minted only for a definition that is
+/// pushed, from the length of the list it is pushed onto, so a refused body
+/// leaves no hole and every [`McpId`] is the position it indexes.
+///
+/// After expansion, and over the tables the per-file loop uses: an attr value
+/// may be a matcher naming any channel, a stamped one included, and it resolves
+/// here exactly as it would at the definition's own item.
+fn mcp_definitions(
+    index: &Index,
+    modules: &[Vec<Spanned<Item>>],
+    channels: &ChannelTable,
+    links: &LinkTable,
+    stamps: &StampTable,
+    config: &mut Emitted,
+    errors: &mut Vec<Diagnostic>,
+) -> McpTable {
+    let mut table = McpTable::default();
+    for (position, items) in modules.iter().enumerate() {
+        let scope = Scope::top(index, position, channels, links, stamps);
+        for item in items {
+            let Item::McpServer(def) = item.value() else {
+                continue;
+            };
+            // An mcp server has no wire identity of its own, so a withheld one
+            // has no spelling to check.
+            let Some(named) = resolve_named((**def).clone(), None, &scope, config, errors) else {
+                continue;
+            };
+            let id = McpId(config.mcp_servers.len());
+            table.declare("mcp server", position, def.name.value(), id);
+            config.mcp_servers.push(named);
+        }
+    }
+    table
+}
+
+/// A `keyword name { attrs }` definition with its attrs resolved, or nothing
+/// if any of them was refused.
+///
+/// A refused definition is withheld, so the identity pass will not see it;
+/// `identity` is the family its handle is still checked as a spelling of, for
+/// a keyword that has one.
+fn resolve_named<A>(
+    def: NamedAttrDef<A>,
+    identity: Option<Family>,
+    scope: &Scope<'_>,
+    config: &mut Emitted,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<RNamed<A::Output>>
+where
+    A: MapValues<Spanned<Value>, RVal> + MapDepths,
+{
+    let NamedAttrDef { doc, name, body } = def;
+    let (attrs, refused) = resolve_attrs(body.attrs, scope, errors);
+    let handle = HandlePath(vec![name]);
+    if refused.any() {
+        if let Some(family) = identity {
+            check_charset(&named_slug(&handle), family, errors);
+        }
+        config.withhold(&handle, Grantable::No);
+        return None;
+    }
+    Some(RNamed { handle, attrs, doc })
+}
+
 /// One top-level declaration, resolved into whatever it contributes.
 ///
 /// `declaration` is a channel statement's pre-resolved address and minted id,
@@ -3233,38 +3318,18 @@ fn emit_item(
     item: Item,
     declaration: Option<ChannelDecl>,
     scope: &Scope<'_>,
-    classes: &ClassTable,
-    agents: &AgentTable,
+    tables: &Tables<'_>,
     config: &mut Emitted,
     errors: &mut Vec<Diagnostic>,
 ) {
-    /// A `keyword name { attrs }` definition: its attrs resolved, pushed onto
-    /// the vector its keyword names.
-    macro_rules! emit_named {
-        ($def:expr, $dest:expr, $identity:expr) => {{
-            let NamedAttrDef { doc, name, body } = *$def;
-            let (attrs, refused) = resolve_attrs(body.attrs, scope, errors);
-            let handle = HandlePath(vec![name]);
-            match refused.any() {
-                // Withheld, so the identity pass will not see it: its handle is
-                // still a spelling worth checking on its own.
-                true => {
-                    if let Some(family) = $identity {
-                        check_charset(&named_slug(&handle), family, errors);
-                    }
-                    config.withhold(&handle, Grantable::No);
-                }
-                false => $dest.push(RNamed { handle, attrs, doc }),
-            }
-        }};
-    }
+    let classes = tables.classes;
     match item {
         // Constants resolved in pass 3, and a class is consumed by the
         // instantiation that expands it.
         Item::ConstDef(_) | Item::Component(_) | Item::Agent(_) | Item::Assembly(_) => {}
         Item::Surface(def) => emit_surface(*def, scope, classes, config, errors),
         Item::SurfaceExt(def) => emit_surface_ext(*def, scope, classes, config, errors),
-        Item::Inst(inst) => emit_inst(*inst, scope, classes, agents, config, errors),
+        Item::Inst(inst) => emit_inst(*inst, scope, tables, config, errors),
         Item::UuidPins(pins) => {
             for pin in pins.pins {
                 match emit_pin(pin) {
@@ -3332,15 +3397,25 @@ fn emit_item(
             }
         }
         // `keyword name { attrs }` is the growth form of the language, so the
-        // one shape every such definition resolves through is written once.
-        Item::Repo(def) => emit_named!(def, config.repos, Some(Family::Repo)),
-        Item::MqttClient(def) => {
-            emit_named!(def, config.mqtt_clients, Some(Family::MqttClient))
+        // one shape every such definition resolves through is written once, in
+        // `resolve_named`.
+        Item::Repo(def) => {
+            if let Some(named) = resolve_named(*def, Some(Family::Repo), scope, config, errors) {
+                config.repos.push(named);
+            }
         }
-        // An mcp server has no wire identity of its own, so nothing to check.
-        Item::McpServer(def) => emit_named!(def, config.mcp_servers, None),
+        Item::MqttClient(def) => {
+            if let Some(named) =
+                resolve_named(*def, Some(Family::MqttClient), scope, config, errors)
+            {
+                config.mqtt_clients.push(named);
+            }
+        }
+        // Emitted by `mcp_definitions` ahead of this loop, because an agent in
+        // an earlier file may name it.
+        Item::McpServer(_) => {}
         // A mount is the one `keyword name { attrs }` form with a clause of
-        // its own, so it does not go through `emit_named!`.
+        // its own, so it does not go through `resolve_named`.
         Item::Mount(def) => {
             let MountDef {
                 doc,
@@ -5799,11 +5874,11 @@ type ParamBindings = HashMap<String, ParamVal>;
 fn emit_inst(
     inst: NewStmt,
     scope: &Scope<'_>,
-    classes: &ClassTable,
-    agents: &AgentTable,
+    tables: &Tables<'_>,
     config: &mut Emitted,
     errors: &mut Vec<Diagnostic>,
 ) {
+    let classes = tables.classes;
     let span = inst.cls.head.span().clone();
     let handle = scope.handle(inst.handle.clone());
     let symbol = match scope.class(&inst.cls, &span) {
@@ -5821,7 +5896,7 @@ fn emit_inst(
             // Declared until emitted: the emitter clears it on the one path
             // that pushes, so every early return leaves it registered.
             config.withhold(&handle, Grantable::Yes);
-            emit_agent(inst, &symbol, agents, scope, config, errors);
+            emit_agent(inst, &symbol, tables, scope, config, errors);
         }
         // An assembly stamped its entity set in pass 4d, and its items are
         // emitted from the list that pass left behind. The assembly handle is
@@ -5839,12 +5914,12 @@ fn emit_inst(
 fn emit_agent(
     inst: NewStmt,
     symbol: &Symbol,
-    agents: &AgentTable,
+    tables: &Tables<'_>,
     scope: &Scope<'_>,
     config: &mut Emitted,
     errors: &mut Vec<Diagnostic>,
 ) {
-    let Some(class) = agents.get(&(symbol.file, symbol.item)) else {
+    let Some(class) = tables.agents.get(&(symbol.file, symbol.item)) else {
         return;
     };
     if let Some(body) = &inst.body {
@@ -5902,7 +5977,7 @@ fn emit_agent(
     // anything in its body — an attr value or a statement the body could not
     // resolve — did not come out whole.
     let mounts = emit_mounts(class.mounts, &pscope, errors, &mut refused);
-    let mcps = emit_mcps(class.mcps, &pscope, errors, &mut refused);
+    let mcps = emit_mcps(class.mcps, &pscope, tables.mcps, errors, &mut refused);
     let subs = emit_subs(class.subs, &pscope, errors, &mut refused);
     let acls = emit_acls(class.acls, &pscope, errors, &mut refused);
     // One walk over the body's sub-blocks, whatever their kindwords: the
@@ -6431,6 +6506,7 @@ fn resolve_repo(path: &PathRef, scope: &Scope<'_>) -> Result<HandlePath, Diagnos
 fn emit_mcps(
     mcps: Vec<McpServerStmt>,
     scope: &Scope<'_>,
+    table: &McpTable,
     errors: &mut Vec<Diagnostic>,
     refused: &mut Refused,
 ) -> Vec<RMcp> {
@@ -6439,7 +6515,17 @@ fn emit_mcps(
         match stmt {
             McpServerStmt::Ref(name) => match scope.named(&name) {
                 Ok(symbol) if symbol.kind == SymKind::McpServer => {
-                    resolved.push(RMcp::Ref(name));
+                    match table.get(symbol.file, name.value()) {
+                        Some(id) => resolved.push(RMcp::Ref {
+                            id,
+                            span: name.span().clone(),
+                        }),
+                        // Declared, so the index found it; not in the table, so
+                        // its body was refused and withheld. That refusal is
+                        // already reported, and the agent is withheld as it is
+                        // for any part of its body that did not come out whole.
+                        None => refused.drop_part(),
+                    }
                 }
                 Ok(symbol) => {
                     errors.push(two_site(
@@ -7919,7 +8005,7 @@ impl Walk<'_> {
     }
 }
 
-/// What emitting a stamped item reads: the tables the whole document shares.
+/// What emitting an item reads: the tables the whole document shares.
 struct Tables<'a> {
     index: &'a Index,
     channels: &'a ChannelTable,
@@ -7927,6 +8013,7 @@ struct Tables<'a> {
     stamps: &'a StampTable,
     classes: &'a ClassTable,
     agents: &'a AgentTable,
+    mcps: &'a McpTable,
 }
 
 /// One stamped item, emitted under the frame its instantiation gave it.
@@ -7939,7 +8026,7 @@ fn emit_stamped(
     let scope = stamped
         .frame
         .scope(tables.index, tables.channels, tables.links, tables.stamps);
-    let (classes, agents) = (tables.classes, tables.agents);
+    let classes = tables.classes;
     let stamp = stamped.frame.stamp;
     let marks = Marks::of(config);
     match stamped.item {
@@ -7949,7 +8036,7 @@ fn emit_stamped(
         AssemblyItem::Link(stmt) => emit_link(*stmt, &scope, config),
         AssemblyItem::Surface(def) => emit_surface(*def, &scope, classes, config, errors),
         AssemblyItem::SurfaceExt(def) => emit_surface_ext(*def, &scope, classes, config, errors),
-        AssemblyItem::Inst(inst) => emit_inst(*inst, &scope, classes, agents, config, errors),
+        AssemblyItem::Inst(inst) => emit_inst(*inst, &scope, tables, config, errors),
         AssemblyItem::Grant(stmt) => match emit_grant(*stmt, &scope) {
             Ok(grant) => config.grants.push(grant),
             Err(error) => errors.push(error),
@@ -9504,7 +9591,7 @@ mod tests {
     ///
     /// The kinds `check_grants` reads are only some of the kinds an emit path
     /// can withhold; a set holding only those would be a coupling between two
-    /// distant passes, true by accident. The webhook arm and the `emit_named!`
+    /// distant passes, true by accident. The webhook arm and the `resolve_named`
     /// kinds are the ones no grant can reach today, so they are pinned here at
     /// the emitter rather than through a document-level diagnostic.
     #[test]
@@ -9567,6 +9654,55 @@ mod tests {
         assert_eq!(
             emitted.withheld.handles.keys().collect::<Vec<_>>(),
             ["alice_pa"]
+        );
+    }
+
+    /// A refused mcp server written ahead of a valid one, and an agent naming
+    /// `named`.
+    fn refused_then_valid(named: &str) -> String {
+        format!(
+            "mcp_server bad {{\n    command = nowhere;\n}}\n\
+             mcp_server good {{\n    command = \"good\";\n}}\n\
+             agent Mine() {{\n    name = \"Mine\";\n    mcp_server {named};\n}}\n\
+             new alice-pa: Mine();\n"
+        )
+    }
+
+    /// A refused definition takes no id, so the valid one after it is
+    /// position 0 and the reference to it carries that id.
+    #[test]
+    fn a_reference_past_a_refused_server_carries_its_position() {
+        let (emitted, errors) = emitted(&refused_then_valid("good"));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("nowhere"), "{errors:?}");
+        let servers = &emitted.config.mcp_servers;
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].handle.dotted(), "good");
+        let [agent] = emitted.config.agents.as_slice() else {
+            panic!("one agent: {:?}", emitted.config.agents);
+        };
+        let [RMcp::Ref { id, .. }] = agent.mcps.as_slice() else {
+            panic!("one reference: {:?}", agent.mcps);
+        };
+        assert_eq!(*id, McpId(0));
+    }
+
+    /// An agent naming a withheld server is itself withheld, and the
+    /// server's refusal is the only diagnostic.
+    #[test]
+    fn a_reference_to_a_refused_server_withholds_the_agent() {
+        let (emitted, errors) = emitted(&refused_then_valid("bad"));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("nowhere"), "{errors:?}");
+        assert!(
+            emitted.config.agents.is_empty(),
+            "{:?}",
+            emitted.config.agents
+        );
+        assert!(
+            emitted.withheld.handles.contains_key("alice-pa"),
+            "{:?}",
+            emitted.withheld.handles
         );
     }
 

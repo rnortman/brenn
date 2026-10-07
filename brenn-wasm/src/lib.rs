@@ -2,7 +2,7 @@
 //
 // The bindgen! macro generates typed Rust bindings from the WIT world at
 // compile time. The generated code may trigger clippy lints; any specific
-// lints that fire at the pinned toolchain (1.95.0) + wasmtime 47 are
+// lints that fire at the pinned toolchain (1.95.0) + wasmtime 48 are
 // suppressed with targeted #[allow(...)]. Blanket -A clippy::all is not used.
 use std::collections::HashMap;
 use std::path::Path;
@@ -919,7 +919,7 @@ pub const PROCESSOR_FUEL_MINIMUM: u64 = 50_000_000;
 /// `ProcessorOutcome::Trap` regardless of the guest's allocator behavior.
 pub const PROCESSOR_MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum elements **per table** a processor guest's store may hold. wasmtime's
-/// `table_elements` ceiling is applied to each table individually (wasmtime 47
+/// `table_elements` ceiling is applied to each table individually (wasmtime 48
 /// `StoreLimitsBuilder::table_elements` docs), NOT as a store-wide total.
 pub const PROCESSOR_MAX_TABLE_ELEMENTS: usize = 65_536;
 /// Maximum WASM instances a processor guest's store may hold.

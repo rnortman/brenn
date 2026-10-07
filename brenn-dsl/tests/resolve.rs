@@ -7,12 +7,12 @@ mod support;
 
 use brenn_dsl::model::IntOrWord;
 use brenn_dsl::resolved::{
-    ChanId, MatcherKind, RCall, RChanRef, RMatcherVal, RTail, RValue, ResolvedConfig,
+    ChanId, MatcherKind, RCall, RChanRef, RMatcherVal, RMcp, RTail, RValue, ResolvedConfig,
 };
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use support::{
-    PACKAGED, at, compile, compile_tree, messages, mounts_refusals, packaged, refusal,
+    PACKAGED, at, compile, compile_tree, durable, messages, mounts_refusals, packaged, refusal,
     refusal_tree, refusals, refusals_tree, resolve_errors, resolved, resolved_mounts,
     resolved_tree,
 };
@@ -3891,6 +3891,106 @@ fn a_withheld_mcp_server_has_no_identity_to_check() {
     let errors = refusals("mcp_server alice_tools {\n    command = nowhere;\n}\n");
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("nowhere"), "{errors:?}");
+}
+
+/// The `command` of the top-level server an agent's first mcp entry names.
+fn referenced_command(config: &ResolvedConfig, agent: &str) -> String {
+    let agent = config
+        .agents
+        .iter()
+        .find(|candidate| candidate.handle.dotted() == agent)
+        .expect("the agent was emitted");
+    let RMcp::Ref { id, .. } = &agent.mcps[0] else {
+        panic!("a reference, not an inline definition: {:?}", agent.mcps[0]);
+    };
+    match config.mcp_servers[id.0].attrs.command.value.value() {
+        RValue::Str(command) => command.clone(),
+        other => panic!("a string command: {other:?}"),
+    }
+}
+
+#[test]
+fn an_mcp_reference_binds_the_server_its_own_file_declares() {
+    // Both files spell their server `foo`; each agent gets its own file's.
+    let config = resolved_tree(&[
+        (
+            "",
+            concat!(
+                "use b::Other;\n",
+                "mcp_server foo {\n    command = \"main-tools\";\n}\n",
+                "agent Mine() {\n    name = \"Mine\";\n    mcp_server foo;\n}\n",
+                "new alice-pa: Mine();\n",
+                "new bob-pa: Other();\n",
+            ),
+        ),
+        (
+            "b",
+            concat!(
+                "mcp_server foo {\n    command = \"b-tools\";\n}\n",
+                "agent Other() {\n    name = \"Other\";\n    mcp_server foo;\n}\n",
+            ),
+        ),
+    ]);
+    assert_eq!(config.mcp_servers.len(), 2);
+    assert_eq!(referenced_command(&config, "alice-pa"), "main-tools");
+    assert_eq!(referenced_command(&config, "bob-pa"), "b-tools");
+}
+
+#[test]
+fn an_mcp_reference_reaches_a_server_declared_in_a_later_file() {
+    // The root is emitted first, so the server it imports is not yet pushed
+    // when the root's own items come up.
+    let config = resolved_tree(&[
+        (
+            "",
+            concat!(
+                "use b::foo;\n",
+                "agent Mine() {\n    name = \"Mine\";\n    mcp_server foo;\n}\n",
+                "new alice-pa: Mine();\n",
+            ),
+        ),
+        ("b", "mcp_server foo {\n    command = \"b-tools\";\n}\n"),
+    ]);
+    assert_eq!(referenced_command(&config, "alice-pa"), "b-tools");
+}
+
+#[test]
+fn a_stamped_agent_binds_the_server_its_class_file_declares() {
+    // The assembly is instantiated from the root, which declares a `foo` of
+    // its own; the stamped agent's class is `b`'s, and so is its server.
+    let config = resolved_tree(&[
+        (
+            "",
+            concat!(
+                "use b::Pod;\n",
+                "mcp_server foo {\n    command = \"main-tools\";\n}\n",
+                "new alice: Pod(slug = \"alice\");\n",
+            ),
+        ),
+        (
+            "b",
+            concat!(
+                "mcp_server foo {\n    command = \"b-tools\";\n}\n",
+                "agent Other(slug: String) {\n    slug = slug;\n    mcp_server foo;\n}\n",
+                "assembly Pod(slug: String) {\n    new pa: Other(slug = f\"{slug}-pa\");\n}\n",
+            ),
+        ),
+    ]);
+    assert_eq!(referenced_command(&config, "alice.pa"), "b-tools");
+}
+
+/// A matcher in a top-level server's body resolves under the document's
+/// channels, a stamped one included; whether a matcher is a legal mcp value is
+/// lowering's question, not the resolver's.
+#[test]
+fn a_top_level_server_body_resolves_channel_matchers() {
+    let config = resolved(&format!(
+        "{POD}{}new alice: Pod(slug = \"alice\");\n\
+         mcp_server tools {{\n    command = \"tools\";\n    \
+         env = {{ declared = exact notes, stamped = exact alice.messages }};\n}}\n",
+        durable("notes", "brenn:bob.notes"),
+    ));
+    assert_eq!(config.mcp_servers.len(), 1);
 }
 
 #[test]

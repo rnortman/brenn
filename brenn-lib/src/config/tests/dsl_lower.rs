@@ -41,7 +41,7 @@ use crate::config::wasm::WasmConfig;
 use crate::config::watchdog::WatchdogConfig;
 use crate::config::{
     BrennConfig, CLAUDE_OAUTH_TOKEN_VAR, OUTRANKING_CREDENTIAL_VARS, PACKAGED_MODULE,
-    config_from_dsl, lower_document, sole_refusal,
+    config_from_dsl, lower_document, lower_tree, sole_refusal,
 };
 use crate::messaging::AttachGrant;
 use crate::messaging::ComponentGrant;
@@ -2395,6 +2395,194 @@ new alice: Assistant();
         "agent `alice` states `graf` once, and this is the second"
     );
     assert_eq!(error.related.len(), 1);
+}
+
+/// A tree of sibling files that must lower.
+fn lowered_tree(files: &[(&str, &str)]) -> BrennConfig {
+    lower_tree(files)
+        .unwrap_or_else(|errors| panic!("the fixture tree must load:\n{}", render_all(&errors)))
+}
+
+/// The `command` an app's `key` mcp server lowered to.
+fn mcp_command(config: &BrennConfig, slug: &str, key: &str) -> String {
+    let app = config
+        .apps
+        .iter()
+        .find(|app| app.slug == slug)
+        .expect("the app was lowered");
+    app.mcp_servers[key].command.clone()
+}
+
+/// Two files each spelling a server `foo`: each agent gets the one its own
+/// file declares, whichever the loader emitted first.
+#[test]
+fn an_mcp_reference_lowers_the_server_its_own_file_declares() {
+    let config = lowered_tree(&[
+        (
+            "main.brenn",
+            r#"
+use b::Other;
+
+mcp_server foo {
+    command = "main-tools";
+}
+
+agent Mine() {
+    mcp_server foo;
+}
+
+new alice: Mine();
+"#,
+        ),
+        (
+            "b.brenn",
+            r#"
+mcp_server foo {
+    command = "b-tools";
+}
+
+agent Other() {
+    mcp_server foo;
+}
+
+new bob: Other();
+"#,
+        ),
+    ]);
+    assert_eq!(mcp_command(&config, "alice", "foo"), "main-tools");
+    assert_eq!(mcp_command(&config, "bob", "foo"), "b-tools");
+}
+
+/// The root imports only a class; the class's reference binds the server of
+/// the file that declared the class, not the root's server of the same name.
+#[test]
+fn an_imported_class_lowers_the_server_its_defining_file_declares() {
+    let config = lowered_tree(&[
+        (
+            "main.brenn",
+            r#"
+use b::Assistant;
+
+mcp_server foo {
+    command = "main-tools";
+}
+
+new alice: Assistant();
+"#,
+        ),
+        (
+            "b.brenn",
+            r#"
+mcp_server foo {
+    command = "b-tools";
+}
+
+agent Assistant() {
+    mcp_server foo;
+}
+"#,
+        ),
+    ]);
+    assert_eq!(mcp_command(&config, "alice", "foo"), "b-tools");
+}
+
+/// The root names a server declared in a file the loader reaches after it.
+#[test]
+fn an_mcp_reference_into_a_later_loaded_file_lowers() {
+    let config = lowered_tree(&[
+        (
+            "main.brenn",
+            r#"
+use b::foo;
+
+agent Mine() {
+    mcp_server foo;
+}
+
+new alice: Mine();
+"#,
+        ),
+        (
+            "b.brenn",
+            r#"
+mcp_server foo {
+    command = "b-tools";
+}
+"#,
+        ),
+    ]);
+    assert_eq!(mcp_command(&config, "alice", "foo"), "b-tools");
+}
+
+/// A refused server ahead of a valid one is refused for its body alone: the
+/// reference to the valid one adds no diagnostic, and nothing panics on the
+/// way to the refusal.
+#[test]
+fn a_refused_mcp_server_before_a_valid_one_refuses_only_its_body() {
+    let errors = refusals(
+        r#"
+mcp_server bad {
+    command = nowhere;
+}
+
+mcp_server good {
+    command = "good";
+}
+
+agent Assistant() {
+    mcp_server good;
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(errors.len(), 1, "{}", render_all(&errors));
+    assert!(
+        errors[0].message.contains("nowhere"),
+        "{}",
+        render_all(&errors)
+    );
+}
+
+/// A channel matcher in an mcp body is refused for what it is, whether the body
+/// is a top-level definition or written inside the agent.
+#[test]
+fn a_channel_matcher_in_an_mcp_body_is_refused_as_a_matcher_in_either_form() {
+    let notes = r#"
+channel notes at "brenn:alice.notes" {
+    push_depth = 1;
+    retain_depth = 1;
+    standing_retain_depth = 1;
+}
+"#;
+    let top_level = refusal(&format!(
+        r#"{notes}
+mcp_server tools {{
+    command = "tools";
+    env = exact notes;
+}}
+
+agent Assistant() {{
+    mcp_server tools;
+}}
+
+new alice: Assistant();
+"#
+    ));
+    let inline = refusal(&format!(
+        r#"{notes}
+agent Assistant() {{
+    mcp_server tools {{
+        command = "tools";
+        env = exact notes;
+    }}
+}}
+
+new alice: Assistant();
+"#
+    ));
+    assert_eq!(top_level.message, "`env`: a matcher is not a value here");
+    assert_eq!(inline.message, top_level.message);
 }
 
 // ---------------------------------------------------------------------------
