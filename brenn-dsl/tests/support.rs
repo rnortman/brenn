@@ -43,16 +43,27 @@ pub fn corpus_file(name: &str) -> File {
 
 /// A disk-backed declaration with the three depths every one of them states.
 pub fn durable(handle: &str, address: &str) -> String {
+    durable_with(handle, address, "")
+}
+
+/// [`durable`] with `extra` attribute lines appended to the body.
+pub fn durable_with(handle: &str, address: &str, extra: &str) -> String {
     format!(
         "channel {handle} at \"{address}\" {{\n    push_depth = 4;\n    \
-         retain_depth = 16;\n    standing_retain_depth = 64;\n}}\n"
+         retain_depth = 16;\n    standing_retain_depth = 64;\n{extra}}}\n"
     )
 }
 
 /// A declaration on a scheme whose retention is its retained window alone.
 pub fn nondurable(handle: &str, address: &str) -> String {
+    nondurable_with(handle, address, "")
+}
+
+/// [`nondurable`] with `extra` attribute lines appended to the body.
+pub fn nondurable_with(handle: &str, address: &str, extra: &str) -> String {
     format!(
-        "channel {handle} at \"{address}\" {{\n    push_depth = 4;\n    retain_depth = 16;\n}}\n"
+        "channel {handle} at \"{address}\" {{\n    push_depth = 4;\n    \
+         retain_depth = 16;\n{extra}}}\n"
     )
 }
 

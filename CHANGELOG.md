@@ -30,6 +30,21 @@ All notable changes to Brenn are documented here.
   `max_interactions` (default 50) have piled up and a shorter `settle_secs`
   gap (default 10) passes. Useful for kiosk and demo agents that no one is
   watching.
+- **BREAKING (config-carrying mounts): channels declared by a mounted
+  fragment can no longer set the host's resource knobs.** A document mounted
+  with `mount X under <principal>` (a "ceiling" that limits which addresses
+  it may use) may still declare channels inside that reach, with any finite
+  depth, but `config-check` now refuses three settings on them: an
+  `unbounded` depth (which keeps the channel's history from ever being
+  cleaned up), `send_rate` (which could raise the publish rate above the
+  host default), and `sink` (which writes evicted messages into the
+  operator's archive file). Those stay at the host's defaults; only the
+  operator's own documents may set them. No checked-in deployment uses
+  `mount … under` today. The security-posture document's "Exhausting the
+  host's storage" entry (B10) is rewritten to say what this does and does
+  not bound — total storage across a fragment's channels is still not
+  accounted — and drops its claims of a filesystem quota and alert channel
+  that never existed.
 - Fixed: when two config files each define an `mcp_server` with the same
   name, an agent now gets the one its own file refers to. Previously it could
   silently get the other file's definition — and so launch the wrong MCP

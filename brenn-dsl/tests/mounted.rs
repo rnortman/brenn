@@ -16,7 +16,7 @@ use brenn_dsl::resolved::{
 use brenn_dsl::{DocumentInputs, DocumentRole, compile};
 use support::{
     compile_with_mount, compile_with_mounts, derive_with_mount, derive_with_mounts, durable,
-    messages,
+    durable_with, messages, nondurable_with,
 };
 
 /// A deployment root that declares the ceiling and nothing else.
@@ -708,6 +708,229 @@ fn a_fragment_channel_inside_the_ceilings_reach_compiles() {
         &[("", &durable("digest", "brenn:automations.digest"))],
     )
     .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+/// A ceiling delegates addresses, not the host's resources. An `unbounded`
+/// depth opts the channel out of the reaper, so a fragment writes none, on any
+/// of the three depth keys.
+#[test]
+fn a_fragment_channel_with_an_unbounded_depth_is_refused() {
+    for key in ["push_depth", "retain_depth", "standing_retain_depth"] {
+        let depths = [
+            ("push_depth", "4"),
+            ("retain_depth", "16"),
+            ("standing_retain_depth", "64"),
+        ]
+        .map(|(word, count)| {
+            let value = if word == key { "unbounded" } else { count };
+            format!("    {word} = {value};\n")
+        })
+        .concat();
+        let refusals = derive_with_mount(
+            &[("", CEILING)],
+            "automations",
+            "automator",
+            &[(
+                "",
+                &format!("channel digest at \"brenn:automations.digest\" {{\n{depths}}}\n"),
+            )],
+        )
+        .expect_err("an unbounded depth under a ceiling does not compile");
+        assert_eq!(
+            messages(&refusals),
+            [format!(
+                "`automations` declares `brenn:automations.digest` with `{key} = unbounded`; a \
+                 channel under `automator` stays within the reaper's reach, and opting one out \
+                 of it is the operator's to write"
+            )],
+        );
+        assert_eq!(refusals[0].span.text_str(), Some("unbounded"));
+    }
+}
+
+/// A channel the fragment stamps through an assembly of its own, under a
+/// principal it slices for itself, was still written by the fragment: the rule
+/// follows the stamp ancestry down to the mount.
+#[test]
+fn a_nested_fragment_channel_under_a_fragment_principal_is_refused() {
+    let refusals = derive_with_mount(
+        &[("", CEILING)],
+        "automations",
+        "automator",
+        &[(
+            "",
+            "principal q {\n    acl publish [prefix \"brenn:automations.\"];\n}\n\
+             assembly Leaf() {\n    channel c at \"local:automations.c\" {\n        \
+             push_depth = 4;\n        retain_depth = unbounded;\n    }\n}\n\
+             new leaf: Leaf() under q;\n",
+        )],
+    )
+    .expect_err("an unbounded depth in a nested fragment stamp does not compile");
+    assert!(
+        messages(&refusals).contains(
+            &"`automations` declares `local:automations.c` with `retain_depth = unbounded`; a \
+              channel under `automator` stays within the reaper's reach, and opting one out of \
+              it is the operator's to write"
+        ),
+        "{:?}",
+        messages(&refusals)
+    );
+}
+
+/// The operator's root document keeps every knob even when a mount sits beside
+/// it: the rule reads only channels a mount's config declares.
+#[test]
+fn a_root_channel_beside_a_mount_keeps_the_hosts_knobs() {
+    let root = format!(
+        "{CEILING}channel audit at \"brenn:ops.audit\" {{\n    push_depth = 4;\n    \
+         retain_depth = 16;\n    standing_retain_depth = unbounded;\n    \
+         send_rate = {{ burst = 1000, refill_interval_secs = 1, refill = 1000 }};\n    \
+         sink = archive;\n}}\n"
+    );
+    derive_with_mount(
+        &[("", &root)],
+        "automations",
+        "automator",
+        &[("", &durable("digest", "brenn:automations.digest"))],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+/// A `send_rate` is the host's publish budget for the channel; under a ceiling
+/// the channel takes the host's default.
+#[test]
+fn a_fragment_channel_with_a_send_rate_is_refused() {
+    let refusals = derive_with_mount(
+        &[("", CEILING)],
+        "automations",
+        "automator",
+        &[(
+            "",
+            &durable_with(
+                "digest",
+                "brenn:automations.digest",
+                "    send_rate = { burst = 1000, refill_interval_secs = 1, refill = 1000 };\n",
+            ),
+        )],
+    )
+    .expect_err("a send_rate under a ceiling does not compile");
+    assert_eq!(
+        messages(&refusals),
+        [
+            "`automations` declares `brenn:automations.digest` with a `send_rate`; a channel \
+             under `automator` publishes at the host's default rate, and a budget above it is \
+             the operator's to write"
+        ]
+    );
+    assert_eq!(
+        refusals[0].span.text_str(),
+        Some("{ burst = 1000, refill_interval_secs = 1, refill = 1000 }")
+    );
+}
+
+/// A `sink` on a durable channel writes the operator's archive; under a ceiling
+/// the channel evicts to the host's default sink.
+#[test]
+fn a_fragment_channel_with_a_sink_is_refused() {
+    let refusals = derive_with_mount(
+        &[("", CEILING)],
+        "automations",
+        "automator",
+        &[(
+            "",
+            &durable_with(
+                "digest",
+                "brenn:automations.digest",
+                "    sink = archive;\n",
+            ),
+        )],
+    )
+    .expect_err("a sink under a ceiling does not compile");
+    assert_eq!(
+        messages(&refusals),
+        [
+            "`automations` declares `brenn:automations.digest` with a `sink`; a channel under \
+             `automator` evicts to the host's default sink, and the operator's archive is the \
+             operator's to write"
+        ]
+    );
+    assert_eq!(refusals[0].span.text_str(), Some("archive"));
+}
+
+/// Depth values are never compared: any finite count is the author's, and
+/// `noise` describes the channel's own window, so it stays the author's too.
+#[test]
+fn a_fragment_channel_of_any_finite_depth_compiles() {
+    derive_with_mount(
+        &[("", CEILING)],
+        "automations",
+        "automator",
+        &[(
+            "",
+            "channel digest at \"brenn:automations.digest\" {\n    push_depth = 4;\n    \
+             retain_depth = 16;\n    standing_retain_depth = 100000000;\n    \
+             noise = alarm;\n}\n",
+        )],
+    )
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+}
+
+/// A `sink` or a `standing_retain_depth` on a channel that is not disk-backed
+/// is already refused by the channel model on the same token; the ceiling rule
+/// says nothing more.
+#[test]
+fn a_non_durable_fragment_channel_stating_a_durable_knob_is_refused_once() {
+    for (extra, refusal) in [
+        (
+            "    sink = archive;\n",
+            "`local:automations.scratch` is not disk-backed, so it states no sink: it evicts \
+             from memory and has nothing to archive",
+        ),
+        (
+            "    standing_retain_depth = unbounded;\n",
+            "`local:automations.scratch` is not disk-backed, so it states no \
+             standing_retain_depth: the standing buffer is the durable reaper's frontier, and \
+             this channel's retention is retain_depth alone",
+        ),
+    ] {
+        let refusals = derive_with_mount(
+            &[("", CEILING)],
+            "automations",
+            "automator",
+            &[(
+                "",
+                &nondurable_with("scratch", "local:automations.scratch", extra),
+            )],
+        )
+        .expect_err("a durable knob on a non-durable channel does not compile");
+        assert_eq!(messages(&refusals), [refusal]);
+    }
+}
+
+/// No ceiling holds a confined address, but the fragment still wrote it: the
+/// knob rule is about the author, so it reaches channels the reach rule skips.
+#[test]
+fn a_confined_fragment_channel_with_an_unbounded_depth_is_refused() {
+    let refusals = derive_with_mount(
+        &[("", CEILING)],
+        "automations",
+        "automator",
+        &[(
+            "",
+            "channel scratch at \"local:automations.scratch\" {\n    push_depth = 4;\n    \
+             retain_depth = unbounded;\n}\n",
+        )],
+    )
+    .expect_err("an unbounded depth on a confined fragment channel does not compile");
+    assert_eq!(
+        messages(&refusals),
+        [
+            "`automations` declares `local:automations.scratch` with `retain_depth = \
+             unbounded`; a channel under `automator` stays within the reaper's reach, and \
+             opting one out of it is the operator's to write"
+        ]
+    );
+    assert_eq!(refusals[0].span.text_str(), Some("unbounded"));
 }
 
 /// A ceiling over a fragment that declares nothing keeps its words and its

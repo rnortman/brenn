@@ -1408,6 +1408,15 @@ the declaration. The practical shape is an operator who writes
 `acl publish [prefix "brenn:automations."];` and its `subscribe` twin, and an
 author who builds inside that namespace.
 
+**Default knobs under a ceiling.** A fragment channel runs on the host's
+defaults. This rule compares no depth values, so any finite count passes it, but
+the channel may not write `unbounded`, `send_rate` or `sink`: those opt the
+channel out of the reaper, raise the host's publish budget or write the
+operator's archive, and a ceiling delegates addresses, not the host's
+resources. The rule reads only what a mount's config declares; the operator's
+root document is untouched by it. `noise` and `wake_min` describe the
+channel's own shape, so they remain the author's.
+
 **Principals inside a fragment.** A fragment slices its own authority for what
 it stamps: `principal q { … }` is under the mount's ceiling, `principal r under
 q { … }` is under that, and every chain bottoms out at the ceiling rather than

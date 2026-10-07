@@ -28,27 +28,6 @@ Code sites (`TODO(harness-host-rule-parity)`):
 Done = one mechanical gate holds the harness's refusal vocabulary equal to the
 one the hosts refuse outside of, for every direction.
 
-## `ceiling-channel-depth`
-
-A ceiling caps *reach*, not *size*. A config-carrying mount's author declares
-channels inside the ceiling's own address prefix and sizes them freely —
-`retain_depth = unbounded` on a durable channel is admitted, and so is a
-consumer the fragment stamps that publishes to it in a loop
-(`check_mount_channels`, `brenn-dsl/src/derive.rs`, looks only at addresses).
-The rings live in the store every entity on the host shares, so an author can
-exhaust the host's disk and take down what runs, not only what changes. That is
-past the boundary `docs/security-posture.md` B10 draws everywhere else, and B10
-says so rather than pretending otherwise.
-
-What to decide is what a ceiling says about size at all: a `retain` line on
-`principal`, or a host-wide cap on channels whose authority root is a mount, or
-that the answer is a filesystem quota and the alert channel and not the
-compiler's business. It is a design question, not a missing check.
-
-Done when a fragment's declared channels are bounded by something the operator
-writes, or when B10 records the deliberate decision that they are not and names
-what bounds them instead.
-
 ## `ceiling-tool-resources`
 
 A ceiling's `tools` word is all-or-nothing. A `principal` holding it caps *that

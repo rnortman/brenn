@@ -1133,17 +1133,47 @@ bind-mount set. Nothing the author can reach widens any of them.
   the ceiling's reach is touched either way. The operator's lever is the mounts
   document and the root — removing the `mount` line and its ceiling in one
   reload — and both are outside the mount.
-- **Exhausting the host's storage.** A ceiling caps *reach*, not *size*: a
-  fragment sizes the channels it declares, and `retain_depth = unbounded` on a
-  durable channel inside the ceiling's own prefix is admitted, as is a consumer
-  the fragment stamps that publishes to it in a loop. The store those rings live
-  in is the one every entity on the host shares, so this reaches past the
-  ceiling in a way nothing else here does — it is availability of what *runs*,
-  not only of change. Accepted for now, and named so it is not mistaken for
-  covered: the mitigations are the operator's, not the compiler's — a filesystem
-  quota on the store, and the alert channel. Closing it means bounding depth
-  under a ceiling, which is a design question about what a ceiling is, not a
-  missing check — tracked as `ceiling-channel-depth`.
+- **Exhausting the host's storage.** A standing decision, in four parts.
+  - *What the rule bounds.* Under a ceiling, a channel declaration may not
+    state an `unbounded` depth, a `send_rate` or a `sink`: those are the host's
+    resource knobs, and a ceiling delegates addresses inside the operator's
+    prefix and nothing more. So every fragment channel stays within the
+    reaper's reach, publishes at the host's default rate and evicts to the
+    host's default sink. That bounds the *rate* of growth, not the size: per
+    channel, per publisher, the *permitted* growth between reaps is the default
+    rate × `max_body_bytes` × the gap between reaps. The gap is
+    `HOURLY_INTERVAL_SECS` in steady state and
+    `BUS_GC_STAGGER_SECS + HOURLY_INTERVAL_SECS` for the first reap after boot
+    (`bus_gc_loop`): at the shipped defaults, 30 bodies/s × 64 KiB over 1 h is
+    about 6.6 GiB of transient rows, and over the 1 h 45 min post-boot gap
+    about 11.5 GiB. These are permitted-load figures, not a measured filling
+    time; a real publisher is far below them. The constants are named so that
+    whoever changes the cadence finds this paragraph by grep.
+  - *What it does not bound.* The size of one channel, and the aggregate. The
+    residue a reap leaves is the standing depth × body size, and the standing
+    depth is the author's count: the rule compares no depth values, so a large
+    finite depth is reaped and deletes nothing, holding the store as an
+    `unbounded` one would until the count is reached. The refusal of
+    `unbounded` is a statement about who may opt a channel out of the reaper,
+    not a size limit. Nor is there a limit across channels: a fragment may
+    declare any number of channels and stamp any number of publishers, and no
+    per-authority byte accounting exists in the messaging store. The SQLite
+    file never shrinks (no `auto_vacuum`, no live `VACUUM`), and the reaper's
+    first pass is 1 h 45 min after boot, hourly thereafter. Bounding either is
+    a runtime accounting feature of a different order, not commissioned for a
+    threat
+    whose author is the operator's own assistant and whose live population is
+    zero; if Brenn hosts fragments from untrusted authors, that is a new entry.
+    This is the deliberate gap.
+  - *What fires when the store fills.* Every statement on the insert path is
+    an `expect`, so a full disk is a panic on the shared database. The global
+    panic hook attempts synchronous Critical mail and queues an async Critical
+    alert. That is failure-time notification, not a capacity warning, and the
+    process may survive with the panicked task dead (`task-death-supervision`).
+  - *The operator's lever.* The `mount … under` line and its `principal`,
+    removed together in one reload, and a filesystem quota on the store's
+    volume — a deployment fact the deploy record should carry, not something
+    this repo provides.
 - **Reading the host's channels.** A fragment reaches a deployment channel by
   address, never by handle, and only where the ceiling holds the matching reach.
   An operator who writes no reach has delegated no listening.

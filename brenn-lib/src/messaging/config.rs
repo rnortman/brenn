@@ -197,7 +197,11 @@ pub enum Sink {
 /// aggregate budget is therefore (this rate × the channels its ACLs let it
 /// publish to), which is bounded because no publisher can mint a channel to
 /// widen its budget: channels come from operator config or from the server's
-/// own provisioning, and no publish reaches a creation path.
+/// own provisioning, and no publish reaches a creation path. The author of a
+/// config-carrying mount does mint channels, by declaration: under a ceiling
+/// each channel is held to the host's default rate, so the budget is bounded
+/// per channel and not across the fragment's channels — the deliberate gap
+/// `docs/security-posture.md` records under *Exhausting the host's storage*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendRate {
     /// Publishes admitted before refill matters.

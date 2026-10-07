@@ -348,7 +348,7 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     for channel in &config.channels {
         let address = channel.address.value();
         let span = channel.address.span();
-        let durable = split_spellable(address).is_some_and(|(scheme, _)| config_identified(scheme));
+        let durable = channel_is_durable(channel);
         for key in ChannelDepthKey::ALL {
             let present = match key {
                 ChannelDepthKey::PushDepth => channel.attrs.push_depth.is_some(),
@@ -425,6 +425,11 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
             ));
         }
     }
+}
+
+/// Whether a declared channel's scheme is a disk-backed one.
+fn channel_is_durable(channel: &RChannel) -> bool {
+    split_spellable(channel.address.value()).is_some_and(|(scheme, _)| config_identified(scheme))
 }
 
 /// One missing-depth refusal on a declaring block.
@@ -3623,6 +3628,12 @@ fn check_stamps(
 /// refusal per channel, and only when *neither* plane reaches it: a fragment
 /// that may publish and not subscribe is a real arrangement, and the fit rule
 /// is what says so at each binding.
+///
+/// The second rule is about who wrote the channel, not where it lives, so it
+/// covers confined channels too: a mount's channel states no `unbounded` depth,
+/// no `send_rate` and no `sink`. Those opt out of the reaper, raise the publish
+/// budget and write the archive, and a ceiling delegates addresses, not the
+/// host's resources.
 fn check_mount_channels(
     config: &ResolvedConfig,
     stamp: &RStamp,
@@ -3630,14 +3641,17 @@ fn check_mount_channels(
     effective: &Authority,
     errors: &mut Vec<Diagnostic>,
 ) {
+    let mount = stamp.handle.dotted();
+    let label = stamp
+        .under
+        .as_ref()
+        .map(HandlePath::dotted)
+        .expect("a mount stamp carries its `under` clause");
     for channel in &config.channels {
         if !ancestry(config, channel.stamp).contains(&id) {
             continue;
         }
-        // TODO(ceiling-channel-depth): the address is all this reads. A
-        // fragment sizes its own rings, so a ceiling bounds where its channels
-        // live and not how much of the store they take.
-        //
+        check_mount_channel_knobs(&mount, &label, channel, errors);
         // A confined address, or one no family is spelled over: the serving
         // host authorizes it and no ceiling holds it.
         let entries = exact_entries(channel);
@@ -3651,19 +3665,73 @@ fn check_mount_channels(
         }) {
             continue;
         }
-        let label = stamp
-            .under
-            .as_ref()
-            .map(HandlePath::dotted)
-            .expect("resolution refuses a mount that is under no one");
         errors.push(Diagnostic::at(
             format!(
-                "`{}` declares `{}` and `{label}` reaches it on no plane; a mount's \
+                "`{mount}` declares `{}` and `{label}` reaches it on no plane; a mount's \
                  channels live where its principal's reach is written",
-                stamp.handle.dotted(),
                 channel.address.value()
             ),
             channel.address.span().clone(),
+        ));
+    }
+}
+
+/// That a mount's channel leaves the host's resource knobs at the host's defaults.
+///
+/// Depth values are never compared: any finite count is the author's. A `sink`
+/// or `standing_retain_depth` on a non-durable channel is already refused by
+/// the channel-model pass on the same token, so those arms stay silent there.
+fn check_mount_channel_knobs(
+    mount: &str,
+    ceiling: &str,
+    channel: &RChannel,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let address = channel.address.value();
+    let durable = channel_is_durable(channel);
+    let attrs = &channel.attrs;
+    for key in ChannelDepthKey::ALL {
+        let (attr, admitted) = match key {
+            ChannelDepthKey::PushDepth => (&attrs.push_depth, true),
+            ChannelDepthKey::RetainDepth => (&attrs.retain_depth, true),
+            ChannelDepthKey::StandingRetainDepth => {
+                (&attrs.standing_retain_depth, standing_admitted(durable))
+            }
+        };
+        let Some(attr) = attr else { continue };
+        if !admitted || !attr.value.is_unbounded() {
+            continue;
+        }
+        errors.push(Diagnostic::at(
+            format!(
+                "`{mount}` declares `{address}` with `{} = unbounded`; a channel under \
+                 `{ceiling}` stays within the reaper's reach, and opting one out of it is \
+                 the operator's to write",
+                key.word(),
+            ),
+            int_or_word_span(&attr.value).clone(),
+        ));
+    }
+    if let Some(attr) = &attrs.send_rate {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{mount}` declares `{address}` with a `send_rate`; a channel under \
+                 `{ceiling}` publishes at the host's default rate, and a budget above it \
+                 is the operator's to write"
+            ),
+            attr.value.span().clone(),
+        ));
+    }
+    if let Some(attr) = &attrs.sink
+        && sink_admitted(durable)
+    {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{mount}` declares `{address}` with a `sink`; a channel under \
+                 `{ceiling}` evicts to the host's default sink, and the operator's \
+                 archive is the operator's to write"
+            ),
+            attr.value.name.span().clone(),
         ));
     }
 }
