@@ -48,6 +48,11 @@ All notable changes to Brenn are documented here.
   the browser chrome was the only check on the rest. A component granted
   `takeover` that sends a malformed request now gets an error report
   attributed to it.
+- Internal: the config loader now takes the `send_rate` table keys, the
+  attachment handler `type` words and the webhook signature `scheme` words
+  from the code that defines them, so a new option added there can no longer
+  go without a config spelling unnoticed. What you write in config and the
+  error messages for bad config are unchanged.
 
 ## [0.24.0] — 2026-09-13
 

@@ -253,7 +253,7 @@ fn channel(
         wake_min: opt_token(wake_min.as_ref(), "wake_min", errors),
         send_rate: rate
             .as_ref()
-            .and_then(|attr| send_rate(&attr.value, errors)),
+            .and_then(|attr| send_rate(&attr.value, "send_rate", errors)),
     }
 }
 
@@ -571,6 +571,12 @@ fn refuse_key(span: &Span, key: &str, what: &str, legal: &[&str], errors: &mut V
     ));
 }
 
+/// `keys` without `masked`, in order: the legal set a refusal names when a
+/// family's raw struct has no field for one key of the tail it shares.
+fn keys_without(keys: &'static [&'static str], masked: &str) -> Vec<&'static str> {
+    keys.iter().copied().filter(|key| *key != masked).collect()
+}
+
 /// An optional token attr, through the enum's own `Deserialize`.
 fn opt_token<T: DeserializeOwned>(
     attr: Option<&Attr<Word>>,
@@ -631,57 +637,27 @@ fn depth(value: &IntOrWord, key: &str) -> Result<Depth, Diagnostic> {
     }
 }
 
-/// The three keys a `send_rate` table states.
+/// A `send_rate` table, under `key`.
 ///
-/// A table attr with no vocabulary behind it, so the keys are matched by hand
-/// and a stray one is refused at its own token.
-///
-/// TODO(dsl-vocabulary-config-parity): this key set is a hand transcription of
-/// `SendRate`'s fields.
-const SEND_RATE_KEYS: [&str; 3] = ["burst", "refill_interval_secs", "refill"];
-
-/// A `send_rate` table.
-///
-/// Starts from `SendRate::default()` and overwrites the keys the table states,
-/// so an unstated key gets the struct's own default. A table holding two bad
-/// keys reports both.
-fn send_rate(value: &RVal, errors: &mut Vec<Diagnostic>) -> Option<SendRate> {
-    let entries = match value.value() {
-        RValue::Table(entries) => entries,
-        _ => {
-            errors.push(mismatch(value, "send_rate", "a table"));
-            return None;
-        }
-    };
+/// Read through a [`Body`] like a section: each field has a reader, a key no
+/// reader claimed is refused at its own token naming the keys that were
+/// asked for, and an unstated key gets the struct's own default. The literal
+/// is exhaustive, so a field added to `SendRate` fails to compile here; a new
+/// field answered with a hardcoded value instead of a reader is the one gap.
+fn send_rate(value: &RVal, key: &str, errors: &mut Vec<Diagnostic>) -> Option<SendRate> {
+    let entries = keep(expect_table(value, key), errors)?;
+    let mut body = Body::new(format!("a `{key}` table"), value.span().clone(), entries);
     let before = errors.len();
-    let mut rate = SendRate::default();
-    for (key, entry) in entries {
-        match key.as_str() {
-            "burst" => {
-                if let Some(count) = keep(expect_int(entry, key), errors) {
-                    rate.burst = count;
-                }
-            }
-            "refill_interval_secs" => {
-                if let Some(count) = keep(expect_int(entry, key), errors) {
-                    rate.refill_interval_secs = count;
-                }
-            }
-            "refill" => {
-                if let Some(count) = keep(expect_int(entry, key), errors) {
-                    rate.refill = count;
-                }
-            }
-            _ => errors.push(Diagnostic::at(
-                format!(
-                    "`{key}` is not a send_rate key; expected {}",
-                    or_list(SEND_RATE_KEYS)
-                ),
-                entry.span().clone(),
-            )),
-        }
-    }
-    (errors.len() == before).then_some(rate)
+    let burst = body.int("burst", errors);
+    let refill_interval_secs = body.int("refill_interval_secs", errors);
+    let refill = body.int("refill", errors);
+    body.finish(errors);
+    let defaults = SendRate::default();
+    (errors.len() == before).then_some(SendRate {
+        burst: burst.unwrap_or(defaults.burst),
+        refill_interval_secs: refill_interval_secs.unwrap_or(defaults.refill_interval_secs),
+        refill: refill.unwrap_or(defaults.refill),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +902,7 @@ impl<'a> Body<'a> {
 
     fn send_rate(&mut self, key: &'static str, errors: &mut Vec<Diagnostic>) -> Option<SendRate> {
         let value = self.take(key)?;
-        send_rate(value, errors)
+        send_rate(value, key, errors)
     }
 
     /// Refuse whatever no reader claimed.
@@ -991,11 +967,12 @@ struct StatedProfile {
     at: Span,
 }
 
-/// TODO(dsl-vocabulary-config-parity): the kindword arms below, and every key
-/// set the section bodies read, are a hand transcription of `BrennConfig`'s
-/// section fields. The raw-field direction is mechanical — each arm ends in an
-/// exhaustive struct literal — but a *new section* in the config, or a new attr
-/// in an existing one, is caught by nothing here.
+/// The kindword arms below are held to the language by test, not by this file:
+/// `brenn_dsl::model::CONFIG_BLOCK_KINDWORDS` is generated once by
+/// `kindword_dispatch!`, and `tests::dsl_lower::every_configuration_section_kindword_lowers`
+/// holds its table set-equal to that list and lowers every row, so a kindword
+/// with no arm hits the `panic!` fallthrough there rather than at boot. The key
+/// set each arm reads is held by its exhaustive struct literal.
 fn sections(list: &[RSection], errors: &mut Vec<Diagnostic>) -> Sections {
     let mut out = Sections::default();
     for section in unique(list, "a document", errors) {
@@ -2334,11 +2311,9 @@ fn attachment_target(
 /// Hand-dispatched: `StrDeserializer` builds unit variants only, and this one
 /// carries fields. The reader set per arm is what makes a stated attr the
 /// chosen type has no field for a refusal — [`Body::finish`] names exactly the
-/// keys that arm asked for.
-///
-/// TODO(dsl-vocabulary-config-parity): the type words below and each arm's
-/// field set are a hand transcription of `AttachmentHandlerConfig`'s variants.
-/// Nothing holds the two in step; the words here are the only spelling left.
+/// keys that arm asked for. The type words are the enum's own
+/// [`AttachmentHandlerConfig::TAGS`], held to lowering by
+/// `tests::dsl_lower::every_attachment_handler_type_word_lowers`.
 fn handler(
     block: &RAttachmentTarget,
     what: &str,
@@ -2356,7 +2331,7 @@ fn handler(
     // Every reader runs before the first `?`: a block missing two required
     // fields is refused for both.
     let built = match kind.as_str() {
-        "command" => {
+        AttachmentHandlerConfig::COMMAND => {
             let program = body.required_str("program", errors);
             let args = body.required_strings("args", errors);
             let file_roles = body.required_string_list_map("file_roles", errors);
@@ -2374,7 +2349,7 @@ fn handler(
             errors.push(Diagnostic::at(
                 format!(
                     "`{other}` is not an attachment handler type; expected {}",
-                    or_list(HANDLER_TYPES.as_slice())
+                    or_list(AttachmentHandlerConfig::TAGS.as_slice())
                 ),
                 at,
             ));
@@ -2388,10 +2363,6 @@ fn handler(
     }
     built
 }
-
-/// The type words a `handler` block may name, one per `AttachmentHandlerConfig`
-/// variant.
-const HANDLER_TYPES: [&str; 1] = ["command"];
 
 /// The two script lists a hook block states, each empty where it says nothing.
 fn hook_scripts(block: &RHooks, errors: &mut Vec<Diagnostic>) -> (Vec<String>, Vec<String>) {
@@ -2590,13 +2561,8 @@ const WEBHOOK_MASKED_KEY: &str = "noise";
 
 /// The keys of a `subscribe` tail that this family's raw struct has a field
 /// for, for the refusal a family-inappropriate key gets.
-static WEBHOOK_SUBSCRIPTION_KEYS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    SubscribeTail::KEYS
-        .iter()
-        .copied()
-        .filter(|key| *key != WEBHOOK_MASKED_KEY)
-        .collect()
-});
+static WEBHOOK_SUBSCRIPTION_KEYS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| keys_without(SubscribeTail::KEYS, WEBHOOK_MASKED_KEY));
 
 fn messaging_subscription(
     channel: String,
@@ -3187,11 +3153,8 @@ struct SurfaceBindings {
 /// `[[surface.component]]` per instance placed on the surface, and the bindings
 /// those instances hold.
 ///
-/// TODO(dsl-vocabulary-config-parity): the per-family key sets the two
-/// `amplification` refusals in [`surface_bindings`] name are hand lists that no
-/// reflected destructure reaches — the refusals themselves are gated, but the
-/// key set each names in its message is not. (The key set the body below reads
-/// is gated against `SurfaceComponentRaw`'s fields by `tests::dsl_key_parity`.)
+/// The key set the body below reads is gated against `SurfaceComponentRaw`'s
+/// fields by `tests::dsl_key_parity`.
 fn surface_components(
     resolved: &DslResolved,
     surface: &RSurface,
@@ -3300,7 +3263,7 @@ fn surface_bindings(
                 let mut masked = tail.clone();
                 refuse_val(
                     masked.amplification.take().as_ref(),
-                    "amplification",
+                    SURFACE_MASKED_KEY,
                     &what,
                     &SURFACE_IN_KEYS,
                     errors,
@@ -3353,7 +3316,7 @@ fn surface_bindings(
                 let mut masked = tail.clone();
                 refuse_val(
                     masked.amplification.take().as_ref(),
-                    "amplification",
+                    SURFACE_MASKED_KEY,
                     &what,
                     &SURFACE_IO_KEYS,
                     errors,
@@ -3409,19 +3372,18 @@ fn surface_bindings(
     }
 }
 
-/// The keys a surface `in` binding reads, for the refusal that says
-/// `amplification` is not one of them.
-const SURFACE_IN_KEYS: [&str; 4] = ["push_depth", "retain_depth", "noise", "wake_min"];
+/// The one `in`/`io` tail key a surface binding does not read: a page's
+/// throughput is the page's, not a knob the binding sets.
+const SURFACE_MASKED_KEY: &str = "amplification";
 
-/// The keys a surface `io` binding reads.
-const SURFACE_IO_KEYS: [&str; 6] = [
-    "push_depth",
-    "retain_depth",
-    "noise",
-    "urgency",
-    "publish_per_activation",
-    "publish_capacity",
-];
+/// The `in` tail keys a surface binding reads, for the refusal that says
+/// `amplification` is not one of them.
+static SURFACE_IN_KEYS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| keys_without(InTail::<()>::KEYS, SURFACE_MASKED_KEY));
+
+/// The `io` tail keys a surface binding reads.
+static SURFACE_IO_KEYS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| keys_without(IoTail::<()>::KEYS, SURFACE_MASKED_KEY));
 
 // ---------------------------------------------------------------------------
 // Remotes
@@ -3688,12 +3650,9 @@ fn webhook_blocks(
 /// Hand-dispatched rather than fed through the token seam: a `StrDeserializer`
 /// builds unit variants only, and each of these carries fields. The reader set
 /// per arm is what makes a stated attr the chosen variant has no field for a
-/// refusal — [`Body::finish`] names exactly the keys that arm asked for.
-///
-/// TODO(dsl-vocabulary-config-parity): the scheme words below and each arm's
-/// field set are a hand transcription of `WebhookSignatureConfigRaw`'s
-/// variants. Nothing holds the two in step; the words here are the only
-/// spelling left.
+/// refusal — [`Body::finish`] names exactly the keys that arm asked for. The
+/// scheme words are the enum's own [`WebhookSignatureConfigRaw::TAGS`], held
+/// to lowering by `tests::dsl_lower::every_signature_scheme_word_lowers`.
 fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSignatureConfigRaw> {
     let (scheme, at) = body.required_spanned_str("scheme", errors)?;
     let algorithm = |body: &mut Body, errors: &mut Vec<Diagnostic>| {
@@ -3704,7 +3663,7 @@ fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSig
     // fields is refused for both, and a key the arm does not read is refused by
     // `Body::finish` naming exactly the keys it does.
     match scheme.as_str() {
-        "hmac-raw-body" => {
+        WebhookSignatureConfigRaw::HMAC_RAW_BODY => {
             let algorithm = algorithm(body, errors);
             let header = body.required_str("header", errors);
             let format = body.required_str("format", errors);
@@ -3716,7 +3675,7 @@ fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSig
                 key_id_header,
             })
         }
-        "hmac-timestamped-body" => {
+        WebhookSignatureConfigRaw::HMAC_TIMESTAMPED_BODY => {
             let algorithm = algorithm(body, errors);
             let sig_header = body.required_str("sig_header", errors);
             let sig_format = body.required_str("sig_format", errors);
@@ -3734,7 +3693,7 @@ fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSig
                 key_id_header,
             })
         }
-        "hmac-stripe" => {
+        WebhookSignatureConfigRaw::HMAC_STRIPE => {
             let algorithm = algorithm(body, errors);
             let header = body.required_str("header", errors);
             let max_skew_secs = body.required_int("max_skew_secs", errors);
@@ -3746,7 +3705,7 @@ fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSig
                 key_id_header,
             })
         }
-        "bearer-token" => {
+        WebhookSignatureConfigRaw::BEARER_TOKEN => {
             let header = body.required_str("header", errors);
             let token_id_header = body.str("token_id_header", errors);
             Some(WebhookSignatureConfigRaw::BearerToken {
@@ -3758,7 +3717,7 @@ fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSig
             errors.push(Diagnostic::at(
                 format!(
                     "`{other}` is not a signature scheme; expected {}",
-                    or_list(SIGNATURE_SCHEMES.as_slice())
+                    or_list(WebhookSignatureConfigRaw::TAGS.as_slice())
                 ),
                 at,
             ));
@@ -3766,15 +3725,6 @@ fn signature(body: &mut Body, errors: &mut Vec<Diagnostic>) -> Option<WebhookSig
         }
     }
 }
-
-/// The scheme words a `signature` block may name — the raw enum's own kebab-case
-/// tags.
-const SIGNATURE_SCHEMES: [&str; 4] = [
-    "hmac-raw-body",
-    "hmac-timestamped-body",
-    "hmac-stripe",
-    "bearer-token",
-];
 
 /// A `key <id>` or `token <id>` block: the id is the block's name, the secret is
 /// its one attr.

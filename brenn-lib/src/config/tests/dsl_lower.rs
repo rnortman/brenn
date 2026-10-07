@@ -697,9 +697,10 @@ channel presence at "ephemeral:alice-desk.presence" {
     assert!(!message.contains("`push_depth`"), "{message}");
 }
 
-/// `send_rate` is a table with no vocabulary behind it, so its keys are matched
-/// by hand — and a stray key is refused at its own token, so a typo inside the
-/// table is caught where it was written.
+/// `send_rate` is a table with no vocabulary behind it, so its keys are read
+/// through a `Body` — and a stray key is refused at its own token, naming the
+/// keys the readers asked for, so a typo inside the table is caught where it
+/// was written.
 #[test]
 fn a_stray_send_rate_key_is_refused_with_the_legal_set() {
     let refusal = refusal(
@@ -711,10 +712,78 @@ channel presence at "ephemeral:alice-desk.presence" {
 }
 "#,
     );
-    let message = refusal.render();
-    assert!(message.contains("`refil`"), "{message}");
-    assert!(message.contains("`refill`"), "{message}");
-    assert!(message.contains("`burst`"), "{message}");
+    assert_eq!(
+        refusal.message,
+        "`refil` is not a key of a `send_rate` table; expected `burst`, \
+         `refill_interval_secs` or `refill`"
+    );
+    assert_eq!(
+        refusal.line_col(),
+        Some((5, 38)),
+        "the span is the refused key's own value: {}",
+        refusal.render()
+    );
+}
+
+/// `default_send_rate` is read by the same function as a channel's
+/// `send_rate`, and its refusals name the attr that was written.
+#[test]
+fn a_stray_default_send_rate_key_names_default_send_rate() {
+    let refusal = refusal(
+        r#"
+messaging {
+    default_send_rate = { refil = 2 };
+}
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`refil` is not a key of a `default_send_rate` table; expected `burst`, \
+         `refill_interval_secs` or `refill`"
+    );
+}
+
+/// A `send_rate` that is not a table is refused at the value.
+#[test]
+fn a_send_rate_that_is_not_a_table_is_refused() {
+    let refusal = refusal(
+        r#"
+channel presence at "ephemeral:alice-desk.presence" {
+    push_depth = 1;
+    retain_depth = 1;
+    send_rate = 4;
+}
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`send_rate`: expected a table, got an integer"
+    );
+    assert_eq!(refusal.line_col(), Some((5, 17)), "{}", refusal.render());
+}
+
+/// A bad value and a stray key in one `send_rate` table are both reported:
+/// every reader runs before the stray keys are refused.
+#[test]
+fn a_send_rate_table_reports_a_bad_value_and_a_stray_key_together() {
+    let refusals = refusals(
+        r#"
+channel presence at "ephemeral:alice-desk.presence" {
+    push_depth = 1;
+    retain_depth = 1;
+    send_rate = { burst = "x", refil = 1 };
+}
+"#,
+    );
+    let messages: Vec<&str> = refusals.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        [
+            "`burst`: expected an integer, got a string",
+            "`refil` is not a key of a `send_rate` table; expected `burst`, \
+             `refill_interval_secs` or `refill`",
+        ]
+    );
 }
 
 /// A `send_rate` that states only some of its keys gets `SendRate::default()`
@@ -1197,19 +1266,26 @@ const MINIMAL_SECTIONS: [(&str, &str); 19] = [
     ),
 ];
 
-/// Every kindword the language admits reaches a lowering arm.
-#[test]
-fn every_configuration_section_kindword_lowers() {
-    let mut covered: Vec<&str> = MINIMAL_SECTIONS
-        .iter()
-        .map(|(kindword, _)| *kindword)
-        .collect();
+/// Asserts a test table's words are exactly the words a vocabulary admits, as
+/// multisets: a missing, extra or duplicated row fails, naming `what`.
+fn assert_rows_cover<'a>(what: &str, rows: impl IntoIterator<Item = &'a str>, admitted: &[&str]) {
+    let mut covered: Vec<&str> = rows.into_iter().collect();
     covered.sort_unstable();
-    let mut admitted: Vec<&str> = brenn_dsl::model::CONFIG_BLOCK_KINDWORDS.to_vec();
+    let mut admitted: Vec<&str> = admitted.to_vec();
     admitted.sort_unstable();
     assert_eq!(
         covered, admitted,
-        "every configuration section kindword needs a row above, and a lowering arm"
+        "every {what} needs a row in its table, and a lowering arm"
+    );
+}
+
+/// Every kindword the language admits reaches a lowering arm.
+#[test]
+fn every_configuration_section_kindword_lowers() {
+    assert_rows_cover(
+        "configuration section kindword",
+        MINIMAL_SECTIONS.iter().map(|(kindword, _)| *kindword),
+        brenn_dsl::model::CONFIG_BLOCK_KINDWORDS,
     );
 
     let document: String = MINIMAL_SECTIONS
@@ -1365,13 +1441,10 @@ fn every_sub_block_kindword_lowers() {
             MINIMAL_AGENT_BLOCKS.as_slice(),
         ),
     ] {
-        let mut covered: Vec<&str> = table.iter().map(|(kindword, _, _)| *kindword).collect();
-        covered.sort_unstable();
-        let mut admitted: Vec<&str> = admitted.to_vec();
-        admitted.sort_unstable();
-        assert_eq!(
-            covered, admitted,
-            "every sub-block kindword needs a row above, and a lowering arm"
+        assert_rows_cover(
+            "sub-block kindword",
+            table.iter().map(|(kindword, _, _)| *kindword),
+            admitted,
         );
         for (kindword, document, carried) in table {
             let config = config_from_dsl(document);
@@ -5082,13 +5155,8 @@ webhook alice_inbox {
 }
 
 /// The minimal webhook: a bearer scheme and the one token it checks against.
-/// Every optional attr is omitted, so this row is where the defaults land — the
-/// wire slug falls back to the handle, and `transport_ceiling_bytes` and
-/// `content_type` to the module's own default functions.
-#[test]
-fn a_minimal_webhook_endpoint_states_only_its_scheme_and_one_token() {
-    assert_lowers(
-        r#"
+/// The `bearer-token` row of `MINIMAL_SIGNATURE_BLOCKS`.
+const MINIMAL_BEARER_TOKEN_WEBHOOK: &str = r#"
 webhook alice_inbox {
     signature {
         scheme = bearer-token;
@@ -5097,7 +5165,16 @@ webhook alice_inbox {
 
     token phone { secret_file = "/home/alice/.secrets/inbox-phone.token"; }
 }
-"#,
+"#;
+
+/// The minimal webhook lowers with every optional attr omitted, so this is
+/// where the defaults land — the wire slug falls back to the handle, and
+/// `transport_ceiling_bytes` and `content_type` to the module's own default
+/// functions.
+#[test]
+fn a_minimal_webhook_endpoint_states_only_its_scheme_and_one_token() {
+    assert_lowers(
+        MINIMAL_BEARER_TOKEN_WEBHOOK,
         BrennConfig {
             webhook_endpoints: vec![WebhookEndpointConfigRaw {
                 signature: WebhookSignatureConfigRaw::BearerToken {
@@ -5115,12 +5192,9 @@ webhook alice_inbox {
     );
 }
 
-/// The timestamped-body scheme, whose fields are the widest of the four: the
-/// signature parity row for that variant.
-#[test]
-fn the_timestamped_body_signature_scheme_lowers() {
-    assert_lowers(
-        r#"
+/// A webhook on the timestamped-body scheme, whose fields are the widest of the
+/// four. The `hmac-timestamped-body` row of `MINIMAL_SIGNATURE_BLOCKS`.
+const TIMESTAMPED_BODY_WEBHOOK: &str = r#"
 webhook alice_inbox {
     signature {
         scheme = hmac-timestamped-body;
@@ -5133,7 +5207,13 @@ webhook alice_inbox {
 
     key primary { secret_file = "/home/alice/.secrets/inbox-primary.key"; }
 }
-"#,
+"#;
+
+/// The timestamped-body scheme lowers to its variant, every field carried.
+#[test]
+fn the_timestamped_body_signature_scheme_lowers() {
+    assert_lowers(
+        TIMESTAMPED_BODY_WEBHOOK,
         BrennConfig {
             webhook_endpoints: vec![WebhookEndpointConfigRaw {
                 signature: WebhookSignatureConfigRaw::HmacTimestampedBody {
@@ -5156,11 +5236,9 @@ webhook alice_inbox {
     );
 }
 
-/// The combined-header scheme: the signature parity row for that variant.
-#[test]
-fn the_stripe_signature_scheme_lowers() {
-    assert_lowers(
-        r#"
+/// A webhook on the combined-header scheme. The `hmac-stripe` row of
+/// `MINIMAL_SIGNATURE_BLOCKS`.
+const STRIPE_WEBHOOK: &str = r#"
 webhook alice_inbox {
     signature {
         scheme = hmac-stripe;
@@ -5170,7 +5248,13 @@ webhook alice_inbox {
 
     key primary { secret_file = "/home/alice/.secrets/inbox-primary.key"; }
 }
-"#,
+"#;
+
+/// The combined-header scheme lowers to its variant, every field carried.
+#[test]
+fn the_stripe_signature_scheme_lowers() {
+    assert_lowers(
+        STRIPE_WEBHOOK,
         BrennConfig {
             webhook_endpoints: vec![WebhookEndpointConfigRaw {
                 signature: WebhookSignatureConfigRaw::HmacStripe {
@@ -5188,6 +5272,54 @@ webhook alice_inbox {
             ..Default::default()
         },
     );
+}
+
+/// A minimal webhook per signature scheme word: the scheme's required keys and
+/// the one secret it checks against.
+///
+/// Lowering dispatches on the scheme word; this table is held set-equal to the
+/// enum's own `TAGS` by the test below, which lowers every row.
+const MINIMAL_SIGNATURE_BLOCKS: [(&str, &str); 4] = [
+    (
+        "hmac-raw-body",
+        r#"
+webhook alice_inbox {
+    signature {
+        scheme = hmac-raw-body;
+        header = "x-signature";
+        format = "hex-lower";
+    }
+
+    key primary { secret_file = "/home/alice/.secrets/inbox-primary.key"; }
+}
+"#,
+    ),
+    ("hmac-timestamped-body", TIMESTAMPED_BODY_WEBHOOK),
+    ("hmac-stripe", STRIPE_WEBHOOK),
+    ("bearer-token", MINIMAL_BEARER_TOKEN_WEBHOOK),
+];
+
+/// Every scheme word `WebhookSignatureConfigRaw::TAGS` lists lowers, to the
+/// variant that names it.
+///
+/// A word added to `TAGS` with no row or no lowering arm fails here, as does an
+/// arm that builds a different variant than its word names. A variant whose
+/// word is missing from `TAGS` is not seen.
+#[test]
+fn every_signature_scheme_word_lowers() {
+    assert_rows_cover(
+        "signature scheme word",
+        MINIMAL_SIGNATURE_BLOCKS.iter().map(|(word, _)| *word),
+        &WebhookSignatureConfigRaw::TAGS,
+    );
+
+    for (word, document) in MINIMAL_SIGNATURE_BLOCKS {
+        let config = config_from_dsl(document);
+        let [endpoint] = config.webhook_endpoints.as_slice() else {
+            panic!("the `{word}` row states one webhook");
+        };
+        assert_eq!(endpoint.signature.tag(), word);
+    }
 }
 
 /// The `signature` vocabulary is the union of every scheme's fields, so an attr
@@ -5515,6 +5647,52 @@ new alice: Assistant();
             ..Default::default()
         },
     );
+}
+
+/// A minimal attachment target per handler type word: the type's required keys
+/// and nothing else.
+///
+/// Lowering dispatches on the type word; this table is held set-equal to the
+/// enum's own `TAGS` by the test below, which lowers every row.
+const MINIMAL_HANDLER_BLOCKS: [(&str, &str); 1] = [(
+    "command",
+    r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import";
+        accept = [".ofx"];
+        handler { type = command; program = "pf"; args = ["import"]; file_roles = {}; }
+    }
+}
+
+new alice: Assistant();
+"#,
+)];
+
+/// Every type word `AttachmentHandlerConfig::TAGS` lists lowers, to the variant
+/// that names it.
+///
+/// A word added to `TAGS` with no row or no lowering arm fails here, as does an
+/// arm that builds a different variant than its word names. A variant whose
+/// word is missing from `TAGS` is not seen.
+#[test]
+fn every_attachment_handler_type_word_lowers() {
+    assert_rows_cover(
+        "attachment handler type word",
+        MINIMAL_HANDLER_BLOCKS.iter().map(|(word, _)| *word),
+        &AttachmentHandlerConfig::TAGS,
+    );
+
+    for (word, document) in MINIMAL_HANDLER_BLOCKS {
+        let config = config_from_dsl(document);
+        let [app] = config.apps.as_slice() else {
+            panic!("the `{word}` row states one app");
+        };
+        let [target] = app.attachment_targets.as_slice() else {
+            panic!("the `{word}` row states one attachment target");
+        };
+        assert_eq!(target.handler.tag(), word);
+    }
 }
 
 // The union vocabulary has exactly one variant's fields in it today, so a key

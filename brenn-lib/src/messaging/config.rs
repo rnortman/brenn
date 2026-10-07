@@ -5488,13 +5488,16 @@ new pfin: Finance();
     // vocabulary and the refusals whose subject is the raw struct's shape.
     // -----------------------------------------------------------------------
 
-    /// Every `ComponentGrant` word a consumer may state lowers to its variant.
+    /// A lowering smoke test over six `ComponentGrant` words — the five a
+    /// router wants plus `alert`, which the lowering suite's every-key row does
+    /// not state.
     ///
-    /// `alert` is the reason this is not folded into the lowering suite's
-    /// every-key row: that row states the five grants a router wants, and this
-    /// one states all six the enum has today. It is not a gate on the enum: the
-    /// words are hardcoded here, so a variant added without a DSL spelling fails
-    /// nothing. That parity is held by review, per `dsl-vocabulary-config-parity`.
+    /// Not a gate on the enum, which has eleven variants: the DSL spelling of a
+    /// grant is `ComponentGrant::word()`'s exhaustive match and the serde
+    /// `kebab-case` that lowering reads through, and derivation validates every
+    /// stated word against `Capability::ALL`, built from `ComponentGrant::ALL`.
+    /// The six here are not the consumer-legal subset either (`tools` and
+    /// `calls` are also legal); they are what this one document states.
     #[test]
     fn every_consumer_grant_word_lowers_to_its_variant() {
         let config = config_from_dsl(concat!(

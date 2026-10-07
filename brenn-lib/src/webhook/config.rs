@@ -118,6 +118,46 @@ pub enum WebhookSignatureConfigRaw {
     },
 }
 
+impl WebhookSignatureConfigRaw {
+    /// The scheme word for [`Self::HmacRawBody`].
+    pub const HMAC_RAW_BODY: &'static str = "hmac-raw-body";
+    /// The scheme word for [`Self::HmacTimestampedBody`].
+    pub const HMAC_TIMESTAMPED_BODY: &'static str = "hmac-timestamped-body";
+    /// The scheme word for [`Self::HmacStripe`].
+    pub const HMAC_STRIPE: &'static str = "hmac-stripe";
+    /// The scheme word for [`Self::BearerToken`].
+    pub const BEARER_TOKEN: &'static str = "bearer-token";
+
+    /// The scheme words a `signature` block may name, one per variant, in the
+    /// order a refusal lists them.
+    ///
+    /// What holds this list to the enum is discoverability, not proof: a new
+    /// variant must be given a word in [`Self::tag`], just below, and the
+    /// compile error lands beside this array. Nothing forces that word into the
+    /// array. The lowering test that walks this list checks that every word
+    /// here lowers to the variant that names it; it cannot see a variant whose
+    /// word is missing.
+    pub const TAGS: [&'static str; 4] = [
+        Self::HMAC_RAW_BODY,
+        Self::HMAC_TIMESTAMPED_BODY,
+        Self::HMAC_STRIPE,
+        Self::BEARER_TOKEN,
+    ];
+
+    /// The scheme word that names this variant.
+    ///
+    /// No production caller: the exhaustive match makes a new variant a
+    /// compile error beside [`Self::TAGS`], and the lowering tests read it.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::HmacRawBody { .. } => Self::HMAC_RAW_BODY,
+            Self::HmacTimestampedBody { .. } => Self::HMAC_TIMESTAMPED_BODY,
+            Self::HmacStripe { .. } => Self::HMAC_STRIPE,
+            Self::BearerToken { .. } => Self::BEARER_TOKEN,
+        }
+    }
+}
+
 /// `[[webhook_endpoint.key]]` entry (HMAC variants only).
 #[derive(Clone, Debug, PartialEq)]
 pub struct WebhookKeyConfigRaw {

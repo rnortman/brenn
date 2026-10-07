@@ -33,6 +33,32 @@ pub enum AttachmentHandlerConfig {
     },
 }
 
+impl AttachmentHandlerConfig {
+    /// The type word for [`Self::Command`].
+    pub const COMMAND: &'static str = "command";
+
+    /// The type words a `handler` block may name, one per variant, in the
+    /// order a refusal lists them.
+    ///
+    /// What holds this list to the enum is discoverability, not proof: a new
+    /// variant must be given a word in [`Self::tag`], just below, and the
+    /// compile error lands beside this array. Nothing forces that word into the
+    /// array. The lowering test that walks this list checks that every word
+    /// here lowers to the variant that names it; it cannot see a variant whose
+    /// word is missing.
+    pub const TAGS: [&'static str; 1] = [Self::COMMAND];
+
+    /// The type word that names this variant.
+    ///
+    /// No production caller: the exhaustive match makes a new variant a
+    /// compile error beside [`Self::TAGS`], and the lowering tests read it.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Command { .. } => Self::COMMAND,
+        }
+    }
+}
+
 pub(crate) fn default_timeout_secs() -> u64 {
     60
 }

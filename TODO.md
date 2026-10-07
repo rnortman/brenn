@@ -115,92 +115,6 @@ sibling gap and the larger one: none of the three fit gates lowers, so no
 lowering-only refusal reaches any of them, whether or not a body was expanded.
 Closing this entry alone does not make the gates complete.
 
-## `dsl-vocabulary-config-parity`
-
-`brenn-dsl`'s attr vocabularies and rule tables were hand transcriptions of
-something in `brenn-lib` — the vocabulary of a config struct, or the behavior of
-a boot-time builder. The failure this entry exists for is a field added to a
-config struct that nobody adds a DSL key for: it surfaces as
-`` `some_new_knob` is not a server key `` to whoever migrates a config months
-later, and the fix at that point is a reconciliation across every struct pair.
-
-Most of that is now either shared-sourced or gated, and needs nothing further:
-
-- **The attr vocabularies.** `brenn-lib/src/config/dsl_lower.rs` builds the real
-  config structs with exhaustive struct literals, so a field added to a gated
-  struct fails to compile at its literal, and a vocabulary field renamed fails
-  to compile where lowering reads it. What the literal does not police is the
-  developer who answers that compile error by hardcoding a value instead of
-  adding a DSL key — that is the residual below.
-- **The resolver key tables and the statement tails.** String lists, which no
-  struct literal reaches, so they are gated:
-  `brenn-lib/src/config/tests/dsl_key_parity.rs` holds every field of
-  `SurfaceComponentRaw` / `WasmConsumerConfigRaw` to a key the DSL admits or a
-  listed omission with a reason, and
-  `brenn-lib/src/config/tests/dsl_tail_parity.rs` does the same for the mount,
-  subscribe, `in`, `out` and `io` tails against the `KEYS` each vocabulary
-  emits. The omissions ledger is those two lists, which a check reads.
-- **The addressing vocabulary** — schemes, uuid seeds, reserved segments,
-  charsets, segment boundaries — is single-sourced in
-  `brenn-envelope/src/addressing.rs` and read from there by the runtime, the
-  guests and the DSL.
-- **The grant vocabularies** — component, attach, and the `AppCapability` words
-  an agent states, with their plane-word expansions — are single-sourced in
-  `brenn-envelope/src/grants.rs`. `derive.rs` derives its compound tokens and
-  every `(plane, scheme, token)` expansion from `AppCapability::transport()` and
-  `llm_authorable()`; the policy builders read the same maps.
-- **`bindable`, `EntityKind` and `Plane`** live in `brenn-envelope/src/grants.rs`
-  as `bindable_schemes`, read by the DSL's position walk and by the boot
-  validators in `brenn-messaging-boot/src/{surfaces,wasm}.rs`.
-- **The channel-model presence rules** live in
-  `brenn-envelope/src/channel_model.rs`, read by `derive.rs`'s
-  `check_channel_model` and by both builders in
-  `brenn-lib/src/messaging/config.rs`.
-- **The ACL `Family` table** is gated by
-  `brenn-lib/src/config/tests/acl_family_parity.rs`: the four ACL-bearing raw
-  structs and `RemoteConfigRaw` are destructured field by field against
-  `Family::held_by`, so a family added on one side without the other fails to
-  compile or fails the assert.
-- **The remote-ceilings and mqtt-sink tail shapes** are `REMOTE_CEILING_KEYS` and
-  `MQTT_SINK_KEYS` in `derive.rs`, gated against their raw structs by the same
-  test.
-
-What remains transcribed is dispatch prose and one hand list — sites where the
-runtime counterpart is a set of match arms, not a struct a destructure can
-reach:
-
-- The kindword-dispatch ledgers in `brenn-lib/src/config/dsl_lower.rs`: the
-  `send_rate` key set, the configuration-section arms, the attachment-handler
-  type words and their per-variant field sets, and the webhook-signature scheme
-  words and theirs. Each arm ends in an exhaustive struct literal, so the
-  raw-field direction is held; a *new* section, type word or scheme is caught by
-  nothing.
-- The per-family key sets the two `amplification` refusals in
-  `surface_bindings` name — hand lists inside diagnostic messages, which no
-  reflected destructure reaches. (The key set the surface component body reads
-  is gated by `dsl_key_parity`.)
-- `Family::absent_reason` in `brenn-dsl/src/derive.rs`: prose stating why an
-  entity type holds no list of a family, mirroring the policy builders'
-  structure in `brenn-lib/src/access/resolve.rs`.
-- The two channel-model rules deliberately left runtime-only, named at
-  `brenn-envelope/src/channel_model.rs`: a non-durable channel's `retain_depth`
-  must be bounded, and a tuning block's must not be zero. Both are value rules,
-  not presence rules, and the DSL does not own values.
-- The hand-listed consumer grant words in
-  `brenn-lib/src/messaging/config.rs`'s `every_consumer_grant_word_lowers_to_its_variant`:
-  a variant added without a DSL spelling fails nothing there.
-
-Done = each residual above either reads a shared source the runtime also reads,
-or is gone.
-
-Code sites (`TODO(dsl-vocabulary-config-parity)`):
-`brenn-lib/src/config/dsl_lower.rs`, at the `send_rate` key set, at the
-configuration-section kindword arms, at the `amplification` refusal key sets the
-surface component's binding refusals name, at the webhook signature scheme words
-and their per-variant field sets, and at the attachment handler type words and
-their per-variant field sets.
-
-
 ## `bindings-doc-typed-grants`
 
 `ComponentEntry::grants` is `Vec<String>` while its sibling fields on the same
@@ -447,7 +361,7 @@ half-migrating is worse than either end state because a reader cannot then tell
 which mentions are stale and which are load-bearing. A grep gate — `[[` inside a
 string literal or doc line under the config, messaging, webhook, mqtt and access
 modules — is what keeps it from regrowing, and where that gate lives is the same
-open question `dsl-vocabulary-config-parity` has.
+open question `harness-host-rule-parity` has.
 
 Done = no config concept is named in table notation in a string an operator or an
 agent can see, the raw-struct field docs name the DSL spelling, and a check fails
