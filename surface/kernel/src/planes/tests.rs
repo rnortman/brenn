@@ -188,14 +188,47 @@ fn a_takeover_body_is_stamped_with_its_publisher() {
 }
 
 #[test]
-fn an_unparseable_takeover_body_is_carried_unchanged() {
+fn an_unparseable_takeover_body_is_refused() {
     let planes = planes();
-    let body = carried(planes.guard(
+    let reason = refused(planes.guard(
         LOCAL_TAKEOVER_CHANNEL,
         Origin::Sub("p1"),
         "not json".to_string(),
     ));
-    assert_eq!(body, "not json");
+    assert!(reason.contains("unparseable body"), "{reason}");
+}
+
+/// Valid JSON naming a chosen `instance` but missing `v` is the document that
+/// would otherwise reach the plane unstamped: a reader whose parser tolerated
+/// the missing field would release `victim`'s overlay on a sibling's say-so.
+#[test]
+fn a_takeover_body_naming_a_victim_but_missing_a_field_is_refused() {
+    let planes = planes();
+    let reason = refused(planes.guard(
+        LOCAL_TAKEOVER_CHANNEL,
+        Origin::Sub("p1"),
+        r#"{"action":"release","instance":"victim"}"#.to_string(),
+    ));
+    assert!(reason.contains("unparseable body"), "{reason}");
+    assert!(reason.contains("missing field `v`"), "{reason}");
+}
+
+/// The guard judges shape, not version: validating `v` is a cross-plane
+/// decision this guard does not take, so a well-shaped body at an unknown
+/// version is still stamped and carried.
+#[test]
+fn a_takeover_body_with_an_unrecognised_version_still_stamps() {
+    let planes = planes();
+    let body = serde_json::to_string(&TakeoverBody {
+        v: 7,
+        action: TakeoverAction::Request,
+        instance: "chrome".to_string(),
+    })
+    .expect("the takeover body serializes");
+    let body = carried(planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), body));
+    let parsed: TakeoverBody = serde_json::from_str(&body).expect("the stamped body parses");
+    assert_eq!(parsed.v, 7);
+    assert_eq!(parsed.instance, "p1");
 }
 
 #[test]

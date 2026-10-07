@@ -1266,7 +1266,7 @@ impl KernelCore {
                 // whether it warrants distinct handling.
                 // The one non-`Ok` status that reports nothing here: a plane
                 // guard refused the body, and the refusal already produced its
-                // own attributed `OverlayStateRejected` report carrying the
+                // own attributed `Event::PlaneRefused` report carrying the
                 // reason. A second, thinner report about the same event doubles
                 // the offender's error-channel traffic and says less. The
                 // buffered publish path, which has no publisher to answer,

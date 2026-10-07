@@ -42,6 +42,12 @@ All notable changes to Brenn are documented here.
   conversation no longer keeps its positions on non-durable (`ephemeral:`)
   channels, so the wake no longer respawns that conversation on every publish
   there.
+- Hardened: the surface kernel now rejects a malformed full-screen takeover
+  request from a component instead of passing it on unchanged. Previously the
+  kernel stamped the sender's identity only on requests it could parse, and
+  the browser chrome was the only check on the rest. A component granted
+  `takeover` that sends a malformed request now gets an error report
+  attributed to it.
 
 ## [0.24.0] — 2026-09-13
 

@@ -503,26 +503,6 @@ its false reds.
 No code site: the instances are the work list.
 
 
-## `takeover-parser-symmetry-guard`
-
-The takeover anti-spoof guarantee holds only because the router's
-parse-failure passthrough (`inject_takeover_instance`) and chrome's
-parse-failure rejection (`on_takeover`) use the identical `TakeoverBody` serde
-type with the same strictness. Nothing structural enforces that cross-crate
-symmetry; a future loosening of chrome's parser (tolerant `Value` parse,
-`#[serde(default)]` fields, a v2 body) would silently let an unstamped,
-router-forwarded body through and reopen instance forgery.
-
-Latent, not exploitable today (parsers identical). Done when the passthrough is
-closed at the trust boundary (router drops what it cannot stamp) or the
-strictness symmetry is pinned structurally.
-
-Code site (`TODO(takeover-parser-symmetry-guard)`):
-`surface/kernel/src/planes.rs`, `inject_takeover_instance` (the router's
-parse-failure passthrough, called by `SurfacePlanes::guard`).
-
----
-
 ## `plane-version-check`
 
 Every control-plane body carries a `v` version field stamped with

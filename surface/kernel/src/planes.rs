@@ -15,7 +15,9 @@
 //!
 //! - **takeover**: the payload names the instance a request, denial or release
 //!   is *from*, and chrome trusts it. The policy overwrites that field with the
-//!   authenticated publisher, so a component cannot forge a sibling's takeover.
+//!   authenticated publisher, so a component cannot forge a sibling's takeover,
+//!   and refuses a body it cannot parse, so nothing on the plane carries an
+//!   identity the kernel did not write.
 //! - **overlay-state**: only chrome may report which component holds the
 //!   fullscreen overlay, the body must parse, and a named holder must be a
 //!   component this surface declares. The kernel remembers the answer, because
@@ -172,7 +174,10 @@ impl PlanePolicy for SurfacePlanes {
                 None => GuardedBody::Carry(body),
             };
         }
-        GuardedBody::Carry(inject_takeover_instance(body, instance))
+        match inject_takeover_instance(body, instance) {
+            Ok(body) => GuardedBody::Carry(body),
+            Err(reason) => GuardedBody::Refused(reason),
+        }
     }
 
     /// Record who holds the overlay.
@@ -211,21 +216,18 @@ fn is_undefined_reserved(channel: &str) -> bool {
 }
 
 /// Overwrite the `instance` field of a takeover body with the authenticated
-/// publisher. A body that does not parse as a [`TakeoverBody`] is passed through
-/// unchanged — any receiver must reject an unparseable body, so a malformed
-/// spoof attempt gains nothing from bypassing the stamp.
-// TODO(takeover-parser-symmetry-guard): the anti-spoof guarantee rests on the
-// router and chrome sharing the exact same parse strictness for `TakeoverBody`
-// (both reject the same malformed bodies). Nothing structural enforces that
-// cross-crate symmetry; if chrome's parser is ever loosened, an unstamped body
-// the router passed through could be accepted, reopening instance forgery.
-// Close the passthrough at the trust boundary, or pin the symmetry structurally.
-fn inject_takeover_instance(body: String, instance: &str) -> String {
+/// publisher, or answer why the body is refused.
+///
+/// A body that does not parse as a [`TakeoverBody`] is one the kernel cannot
+/// stamp, so it is refused rather than carried: carrying it would make the
+/// anti-spoof guarantee depend on every reader's parser being at least as
+/// strict as this one, a cross-crate invariant nothing checks.
+fn inject_takeover_instance(body: String, instance: &str) -> Result<String, String> {
     match serde_json::from_str::<TakeoverBody>(&body) {
         Ok(mut parsed) => {
             parsed.instance = instance.to_string();
-            serde_json::to_string(&parsed).expect("a TakeoverBody serializes to JSON")
+            Ok(serde_json::to_string(&parsed).expect("a TakeoverBody serializes to JSON"))
         }
-        Err(_) => body,
+        Err(err) => Err(format!("unparseable body: {err}")),
     }
 }
