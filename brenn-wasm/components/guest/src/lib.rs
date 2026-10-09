@@ -365,6 +365,8 @@ impl DeferredEntry {
     }
 }
 
+// TODO(guest-envelope-accessors): no whole-window accessor; consumers chain
+// the two halves below by hand to read context then new in order.
 /// Messages and context for one logical input port.
 pub struct PortWindow {
     port: String,
@@ -510,6 +512,8 @@ macro_rules! export_processor {
 
 // ── envelope helpers ──────────────────────────────────────────────────────────
 
+// TODO(guest-envelope-accessors): `webhook_body` has no MQTT twin, and the
+// MQTT envelope types are not re-exported.
 /// Extension methods for `MessageEnvelope`.
 pub trait MessageEnvelopeExt {
     /// Deserialize the `body` field as `T`.

@@ -59,6 +59,8 @@ interface types {
     /// Lives in `types` because both `dom` and `page-dom` speak it.
     type node = u64;
 
+    // TODO(variadic-ports): one window per port because a port binds one
+    // channel; a variadic port needs a member key here or per envelope.
     /// Messages delivered on one logical input port for this activation.
     record port-window {
         /// Logical input port name from host config — never a raw channel address.

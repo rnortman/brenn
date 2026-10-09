@@ -185,6 +185,8 @@ pub async fn surface_page(
     // Underivable client-side: the address hangs off the operator's channel prefix.
     let config_channel_escaped = html_escape(&runtime.description.config_channel);
 
+    // TODO(kind-stylesheets): the head links brenn's two sheets only; an
+    // out-of-tree kind has no stylesheet and writes its layout inline.
     let mut response = page_html(format!(
         r#"<!DOCTYPE html>
 <html lang="en">

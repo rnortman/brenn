@@ -28,6 +28,43 @@ Code sites (`TODO(harness-host-rule-parity)`):
 Done = one mechanical gate holds the harness's refusal vocabulary equal to the
 one the hosts refuse outside of, for every direction.
 
+## `harness-flush-on-err`
+
+The page kernel buffers an activation's port calls and discards the whole
+buffer when the activation returns `Err` (`surface/kernel/src/publish_buffer.rs`,
+`flush.rs`); the backend host buffers and drains on `Ok` the same way.
+`surface/page-harness` records every `publish`, `publish_with_urgency` and
+`publish_deferred` into `published`/`parked` at call time and never discards
+them. It already applies the discard rule to the one channel it simulates — the
+retained `io state` port (`RetainedState`) — so the rule is wanted; it is just
+not applied to anything else.
+
+What it costs an out-of-tree author: a test of "this kind parked, then refused,
+and the park was dropped" cannot be written against the harness, because the
+harness reports the park as kept. A test that drives a refusal through
+`Harness::call` is safe — `call` panics on `Err` before any park assertion — so
+the gap is the negative case only.
+
+The fix is not "empty the vectors on `Err`". `brenn-host-conformance`'s
+surface adapter (`src/tests/surface.rs`, `replay`) deliberately replays the
+harness's recorded calls into a real `PublishBuffer` whatever the outcome, so
+the real kernel does the discard and charges the budget; discarding in the
+harness first would weaken that proof. The harness needs to distinguish
+*attempted* effects (what the conformance replay wants) from *committed* ones
+(what an author asserts on), and expose both. Decide the API alongside
+`harness-host-rule-parity`, which is the same question — the harness agreeing
+with the hosts — from the refusal-vocabulary side.
+
+`brenn-wasm/components/processor-transplant` already parks and then fails, so
+it is the fixture for the harness test.
+
+Done = an author can assert on the effects a failed activation's buffer would
+commit (none) and still see what it attempted, and the conformance replay keeps
+replaying attempted effects.
+
+Code sites (`TODO(harness-flush-on-err)`):
+`surface/page-harness/src/lib.rs`, at `impl ports::Host for Page`.
+
 ## `ceiling-tool-resources`
 
 A ceiling's `tools` word is all-or-nothing. A `principal` holding it caps *that
@@ -3140,3 +3177,164 @@ way it discovers a panel's, by reading two channels the `.index` names.
 
 Code sites (`TODO(component-descriptions-both-placements)`):
 brenn-lib/src/wasm_package.rs, at `PackageRecord`.
+
+
+## `guest-envelope-accessors`
+
+`brenn-guest` ships half of the reads a backend consumer actually makes, and an
+out-of-tree consumer restates the other half privately against brenn's own
+contract.
+
+- **MQTT body.** `MessageEnvelopeExt` has `webhook_body()` and nothing for
+  MQTT, though `docs/message-bus.md` says a backend consumer may subscribe to
+  an MQTT input; `MqttEnvelope` and `MqttPayloadBody` are not re-exported, so
+  a consumer that reads one takes a direct dependency on `brenn-envelope` and
+  hand-matches `Text`/`Binary` to reach the text. Two accessors close it:
+  `MessageEnvelopeExt::mqtt_body()` built like `webhook_body()` (scheme guard
+  first, then the body parse), and `MqttPayloadBody::text(&self) ->
+  Option<&str>` in `brenn-envelope`, beside the enum and its trust-boundary
+  comment, with the binary-is-a-placeholder reading in its rustdoc. Re-export
+  both MQTT types from `brenn-guest` beside `WebhookEnvelope`.
+- **Whole window.** A stateless consumer rebuilds its picture from the whole
+  window on every activation, context then new, oldest to newest — the WIT
+  ordering guarantee. `PortWindow` holds that ordered vector but exposes only
+  the two halves, and states the join in a private field comment, so every
+  consumer chains `context_envelopes()` with `new_envelopes()` by hand. Add
+  `PortWindow::envelopes()` over the vector directly (not by chaining the two
+  opaque iterators), preferably `impl DoubleEndedIterator` so a newest-first
+  walk is `.rev()`. Whether it keeps the "context envelope JSON" / "envelope
+  JSON" error distinction is this crate's call. Its rustdoc, and the public
+  rustdoc on the two existing halves, state the ordering and the
+  channel-wide-context caveat (`processor.wit`, context is most-recent on the
+  channel, not a delivery log); the stale `processor.wit:NN-NN` line citations
+  in the guest crate ride the same change.
+
+The guest crate has no test lane of its own; `brenn-envelope` does, and
+`text()` is tested there. The window ordering wants an assertion wherever the
+guest's window construction can be exercised.
+
+Done = a consumer reads an MQTT payload's text and its whole window in order
+through `brenn-guest` alone, with no direct `brenn-envelope` dependency and no
+private restatement of either contract.
+
+Code sites (`TODO(guest-envelope-accessors)`):
+brenn-wasm/components/guest/src/lib.rs, at `PortWindow` and at
+`MessageEnvelopeExt`; brenn-envelope/src/lib.rs, at `MqttPayloadBody`.
+
+
+## `guest-alert-damping`
+
+A guest's `alert` reaches the mail sink through `DispatcherAlerter`, which calls
+plain `AlertDispatcher::alert` on every call. Nothing between the guest and the
+sink damps a repeat except the process-wide rate limiter, which drops rather
+than defers and is shared with the host and every other component. A component
+that wakes on every message and tick and wants to report a persistent fault —
+its own capability failing, a misconfiguration it can only see at runtime — has
+two bad options: alert every activation, which floods mail for as long as the
+fault lasts and starves everyone else's share of the limiter, or build its own
+"said that already" memory, which is alert policy re-implemented per guest.
+
+The host already holds every ingredient: `alert_once_per_process` in
+`brenn-obs` dedupes by `(title, key)`, and `DispatcherAlerter` knows the slug,
+the clock and the prefixed title. What is missing is a guest-reachable form.
+Two shapes to choose between:
+
+- a transparent per-(slug, title) cooldown inside `DispatcherAlerter`, no WIT
+  change; or
+- an explicit WIT form the guest opts into — alert-once, or an alert with a
+  reminder interval.
+
+Whichever is chosen should re-raise while the condition persists (every N
+hours, say) rather than fire once per process: a once-only scheme loses the
+signal if the first mail is dropped by the limiter, and a fault that outlives
+one restart should not go quiet.
+
+Done = a guest can report a persistent fault on every activation and the
+operator receives one alert per cooldown window per (component, title), with
+the suppressed occurrences still in the log.
+
+Code sites (`TODO(guest-alert-damping)`):
+brenn-wasm-dispatch/src/lib.rs, at `DispatcherAlerter`.
+
+
+## `variadic-ports`
+
+A port binds exactly one channel. A component whose job is per-subject — one
+decision per agent, per account, per device — and whose subject count is a
+deployment fact rather than a spec fact has two shapes today, both bad: one
+instance per subject, each waking on the same shared input, deciding in
+isolation and unable to see what its siblings decided in the same pass; or one
+instance with positional ports (`peer_1` … `peer_N`), which writes a
+deployment's size into a published spec and into every stamp of it.
+
+Fix = a variadic port: one `in`, `out` or `io` port bound to a set of channels,
+so one instance manages all its subjects together and the set is grown in the
+stamp, not the spec. What to decide:
+
+- **Member identity.** The guest must know which member a message came from
+  and name the member it publishes to, without seeing raw channel addresses
+  (`processor.wit` promises a port name, never an address). A binding-time key
+  per member is the obvious shape; the key is what a stamp writes.
+- **Windows.** One `port-window` per member, or one window with a member key
+  per envelope. Depths, context and `dropped` are per channel today and stay
+  per channel underneath either way.
+- **Retained self-reads.** An `io` port per member must keep each member's
+  retained tail separate, so per-subject state survives the activation wipe
+  the same way a single `io` port's does.
+- **Deferred publishes.** `publish-deferred`, `defer-cancel` and `defer-edit`
+  address a port's channel; a variadic port needs the member too.
+- **DSL and lowering.** How a stamp writes the member set, how links and
+  matchers interact with it, and what the page harness and the parity checks
+  must learn so they refuse the same things the hosts do.
+
+Done = a stamp binds N channels to one port by key, the guest reads and
+publishes per member by key, and no spec names a member count.
+
+Code sites (`TODO(variadic-ports)`):
+brenn-lib/src/config/dsl_lower.rs, at `wasm_bindings`;
+brenn-wasm/wit/processor.wit, at `port-window`.
+
+
+## `kind-stylesheets`
+
+A surface page links exactly two stylesheets, both brenn's: `surface.css` and
+the skin (`brenn-server/src/routes/surface/page.rs`, `surface_page`). brenn's
+own kinds put their layout there, so they hide by the `hidden` attribute alone
+and build with few property writes. An out-of-tree kind has no stylesheet: the
+`dom` interface offers one `set-style-property` per call, no `style` attribute,
+and no way to create a `<style>` or `<link>`. So it writes its whole layout
+inline from Rust — a stylesheet compiled into the guest — which costs on the
+order of a thousand host crossings to mount a modest table, and makes hiding
+an attribute *and* a `display` write, because an inline `display` beats the
+user-agent `[hidden]` rule and the kind must remember what to restore.
+
+A batched property setter would cut the crossings and fix nothing else; it is
+not this item.
+
+Fix = a per-kind stylesheet an out-of-tree kind ships in its bundle and the
+page loads when the kind is mounted. It is a design round, not an accessor:
+
+- **Scoping and trust.** The new authority is author-supplied selectors that
+  can reach elements outside the kind's own handles. `contain: paint` on the
+  instance wrapper does not confine a global rule, and the in-tree kinds'
+  `css_parity` checks are substring checks, not validators. Choose an enforced
+  shape — rules nested under the instance wrapper, a mandatory prefix with a
+  real check, or an explicit trust decision for bundles — before any staging
+  or server work.
+- **Staging and serving.** A CSS input on `surface_processor_assets`
+  (`bazel/surface/dist.bzl`) and `component_bundle` (`bazel/wasm/defs.bzl`); a
+  manifest field, which the reject-unknown-fields reader in older servers will
+  refuse; one `<link>` per mounted kind; a cache identity that changes with the
+  bundle's CSS rather than brenn's build ID.
+- **Layout, not a repair.** The sheet must be able to carry a kind's layout —
+  grids, flex, fonts, colours — not just a `[hidden]` fix; otherwise a kind
+  that keeps building rows inline still needs the `display` write.
+- **Testing.** The page harness records property calls and computes no CSS;
+  decide what it offers an author whose layout moved into a sheet.
+
+Done = an out-of-tree kind stages a scoped stylesheet with its bundle, the page
+links it when the kind is mounted, and the kind hides by attribute and sets
+only genuinely dynamic properties from code.
+
+Code sites (`TODO(kind-stylesheets)`):
+brenn-server/src/routes/surface/page.rs, at the page head in `surface_page`.

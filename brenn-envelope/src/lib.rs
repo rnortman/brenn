@@ -381,6 +381,8 @@ pub struct WebhookEnvelope {
 /// alphabetically (`binary_placeholder`, `content_type`) so untagged
 /// serialization is byte-compatible with the `serde_json::Map` (sorted-key)
 /// output of the borrowed view.
+// TODO(guest-envelope-accessors): no `text()` accessor; consumers hand-match
+// the variants to reach the payload text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum MqttPayloadBody {

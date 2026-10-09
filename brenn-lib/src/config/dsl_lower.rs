@@ -2812,6 +2812,8 @@ struct WasmBindings {
 /// port may name none. A tail is a vocabulary, so each key is a same-name
 /// transcription; the one key a consumer holds and a surface does not —
 /// `amplification` — is read here and refused there.
+// TODO(variadic-ports): one binding is one port to one channel; a port
+// bound to a keyed set of channels is not expressible.
 fn wasm_bindings(
     resolved: &DslResolved,
     instance: &RConsumer,

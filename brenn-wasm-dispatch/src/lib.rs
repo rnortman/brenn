@@ -343,6 +343,8 @@ impl ActivationPacer {
     }
 }
 
+// TODO(guest-alert-damping): every guest alert is forwarded undamped; a
+// guest reporting a persistent fault floods the shared limiter.
 /// Bridge from `ProcessorAlerter` to the host's `AlertDispatcher`.
 ///
 /// Wraps a per-component child `AlertDispatcher` (pre-seeded with `wasm_slug`

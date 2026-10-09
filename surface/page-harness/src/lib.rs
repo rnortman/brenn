@@ -502,6 +502,8 @@ impl Page {
     }
 }
 
+// TODO(harness-flush-on-err): every port call below is recorded as kept; the
+// kernel discards a failed activation's buffer, and the harness does not.
 impl ports::Host for Page {
     fn publish(&mut self, port: String, payload: String) -> Result<(), ports::PublishError> {
         self.assert_outbound(&port);
