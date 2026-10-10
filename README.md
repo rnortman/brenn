@@ -91,6 +91,8 @@ I've thought a lot about security during architecture and development. Have a
 look at [the formal security posture document](docs/security-posture.md) if you
 like. (Full disclosure: Opus 4.8 wrote most of that, and it shows.)
 
+For a guided tour of the architecture with interactive figures, open [the explainer](docs/explainer/index.html) in a browser from a local checkout (GitHub shows its source, not the page).
+
 ## Why
 
 The philosophy is basically: LLMs are changing what it means to be a software

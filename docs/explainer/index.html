@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brenn, explained</title>
+<style>
+:root {
+  --bg: #fdfcf9; --fg: #1d1d1f; --muted: #5b5b63; --rule: #d8d6cf;
+  --panel: #f2f0ea; --accent: #2a5db0; --new: #1f7a3a; --ctx: #8a8a92;
+  --warn: #a8321e; --tier-tcb: #dfe9f8; --tier-bounded: #e6f2e6;
+  --tier-semi: #fbf0d9; --tier-untrusted: #f8e1dc; --tier-sbx: #dcf1f0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181b; --fg: #e8e6e1; --muted: #a3a3ab; --rule: #3a3b40;
+    --panel: #222328; --accent: #7fa8ee; --new: #6fcf8a; --ctx: #8d8d96;
+    --warn: #f08a72; --tier-tcb: #22324a; --tier-bounded: #213526;
+    --tier-semi: #3d3420; --tier-untrusted: #45261f; --tier-sbx: #1f3a3a;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 3rem; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 17px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+nav {
+  position: sticky; top: 0; z-index: 2; background: var(--bg);
+  border-bottom: 1px solid var(--rule); white-space: nowrap; overflow-x: auto;
+  padding: 0.5rem 16px; font-size: 0.85rem;
+}
+a { color: var(--accent); }
+nav a { color: var(--accent); text-decoration: none; margin-right: 1rem; }
+main, footer { max-width: 46rem; margin: 0 auto; padding: 0 16px; }
+section { border-bottom: 1px solid var(--rule); padding: 1.5rem 0; }
+h1 { font-size: 2rem; margin: 1.5rem 0 0.5rem; }
+h2 { font-size: 1.4rem; margin-top: 0; }
+h3 { font-size: 1.1rem; }
+blockquote {
+  margin: 1rem 0; padding: 0.25rem 1rem; border-left: 3px solid var(--accent);
+  color: var(--fg); background: var(--panel);
+}
+code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.88em; }
+pre { background: var(--panel); padding: 0.75rem; overflow-x: auto; line-height: 1.4; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+td code { overflow-wrap: anywhere; }
+th, td { border: 1px solid var(--rule); padding: 0.3rem 0.5rem; text-align: left; vertical-align: top; }
+.src { display: block; color: var(--muted); font-size: 0.8rem; margin-top: 0.25rem; }
+.src::before { content: "Source: "; }
+figure { margin: 1.5rem 0; padding: 0.75rem; border: 1px solid var(--rule); background: var(--bg); }
+figcaption { font-weight: 600; margin-bottom: 0.5rem; }
+aside { border: 1px dashed var(--rule); padding: 0.5rem 0.75rem; margin: 1rem 0; font-size: 0.92rem; }
+button, select, input { font: inherit; font-size: 0.85rem; }
+button {
+  background: var(--panel); color: var(--fg); border: 1px solid var(--rule);
+  padding: 0.2rem 0.55rem; border-radius: 4px; cursor: pointer; margin: 0.1rem;
+}
+button[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+button:disabled { opacity: 0.5; cursor: default; }
+input[type="number"] { width: 4rem; }
+.lead { font-size: 1.1rem; }
+
+/* Figure A */
+.map { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; }
+.map .wide { grid-column: 1 / -1; }
+.map details { border: 1px solid var(--rule); padding: 0.4rem 0.5rem; font-size: 0.88rem; }
+.map summary { font-weight: 600; cursor: pointer; }
+.map summary:focus-visible { outline: 2px solid var(--accent); }
+.map .inner { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.4rem; }
+.map .inner details { flex: 1 1 10rem; background: var(--bg); }
+.t-tcb { background: var(--tier-tcb); }
+.t-bounded { background: var(--tier-bounded); }
+.t-sbx { background: var(--tier-sbx); }
+.t-semi { background: var(--tier-semi); }
+.t-untrusted { background: var(--tier-untrusted); }
+.t-none { background: var(--panel); }
+.map-panel { margin-top: 0.6rem; min-height: 4.5rem; padding: 0.5rem; background: var(--panel); font-size: 0.9rem; }
+@media (max-width: 560px) { .map { grid-template-columns: 1fr; } }
+
+/* Figure B */
+.sim-controls { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; margin-bottom: 0.5rem; }
+.sim-narr { font-size: 0.9rem; background: var(--panel); padding: 0.5rem; }
+.chan { border: 1px solid var(--rule); padding: 0.5rem; margin: 0.5rem 0; }
+.chan-head { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.chan-head strong { font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; }
+.slots { display: flex; flex-wrap: wrap; gap: 3px; margin: 0.4rem 0; }
+.slot {
+  min-width: 2.4rem; padding: 0.15rem 0.25rem; text-align: center;
+  border: 1px solid var(--rule); font-size: 0.8rem; background: var(--panel);
+}
+.slot.empty { opacity: 0.35; }
+.parked { font-size: 0.8rem; color: var(--muted); }
+.subs { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: 0.5rem; }
+.sub { border: 1px solid var(--rule); padding: 0.5rem; font-size: 0.85rem; }
+.sub h4 { margin: 0 0 0.25rem; font-size: 0.92rem; }
+.chip { display: inline-block; padding: 0 0.3rem; margin: 1px; border: 1px solid var(--ctx); color: var(--ctx); font-size: 0.78rem; }
+.chip.new { border-color: var(--new); color: var(--new); font-weight: 700; }
+.drops { color: var(--warn); font-weight: 700; }
+.sim-log { max-height: 11rem; overflow-y: auto; font-size: 0.82rem; background: var(--panel); padding: 0.4rem 0.6rem; margin-top: 0.5rem; }
+.sim-log p { margin: 0.1rem 0; }
+.attach { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; font-size: 0.85rem; margin-top: 0.5rem; }
+
+/* Figure C */
+.grants { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; font-size: 0.88rem; }
+.grants fieldset { border: 1px solid var(--rule); margin: 0; }
+.grants label { display: block; }
+.grants .why { color: var(--muted); font-size: 0.78rem; margin-left: 1.4rem; display: block; }
+.verdict { margin-top: 0.5rem; padding: 0.5rem; background: var(--panel); font-size: 0.88rem; }
+.verdict .bad { color: var(--warn); }
+.verdict .good { color: var(--new); }
+@media (max-width: 560px) { .grants { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<nav aria-label="Sections">
+  <a href="#opening">Brenn</a><a href="#problem">Problem</a><a href="#map">Map</a><a href="#bus">The bus</a><a href="#sandbox">Sandbox</a><a href="#agents">Agents</a><a href="#ui">UIs</a><a href="#world">The world</a><a href="#next">Dead, not wrong</a>
+</nav>
+<main>
+
+<section id="opening">
+<h1>Brenn, explained</h1>
+<p class="lead">A guided tour of Brenn's architecture for someone who has not read the code. It describes the repository as of commit <code>2a286d46</code>, not a roadmap.</p>
+<p>The project's own one-line answer, written for infrastructure people first:</p>
+<blockquote>Brenn is a self-hosted application framework for the LLM era: a capability-sandboxed WASM component host and a pub/sub message bus, written in Rust, where LLM agents are first-class bus citizens with the same grants, ACLs, and rate limits as compiled code. It runs at personal/household/small-team scale, and it panics rather than do the wrong thing.
+<span class="src">README.md, "What Brenn is"</span></blockquote>
+<p>The claim this page sets out to earn:</p>
+<blockquote>Brenn is a self-hosted application framework for a world where most code is written by LLMs and reviewed lightly. It runs that code — compiled WASM components and LLM agents alike — inside capability sandboxes, connects them through a message bus that models channels as recent history rather than as obligations, and refuses to do the wrong thing rather than tolerate a bug.</blockquote>
+<p>(One refinement to the README's sentence comes in the agents section: agents and components share one authority vocabulary and one policy type, each enforced at its own seam; their rate-limit mechanisms are not identical.)</p>
+<p>The README says what it is good and bad at. Good at: personal-assistant applications; assistant applications with customized UI, "so that not everything is typing in a text box"; automations of all sorts. Bad at: being an agentic coding environment ("wouldn't you rather use Claude Code?"), and being a web-scale platform — "this thing <em>will not scale</em> beyond family/workgroup/small-team levels". If that last line rules Brenn out for you, it is the most useful sentence on the page.</p>
+<p>The tour: <a href="#problem">the problem</a> · <a href="#map">the system on one screen</a> · <a href="#bus">the bus</a> · <a href="#sandbox">components in the sandbox</a> · <a href="#agents">LLM agents</a> · <a href="#ui">two user interfaces</a> · <a href="#world">transports</a> · <a href="#next">better dead than wrong</a>.</p>
+</section>
+
+<section id="problem">
+<h2>The problem Brenn is built for</h2>
+<p>Imagine a personal assistant that wants to write an automation for you — something about the lights, or filtering email, or fetching a weather report. The assistant is an LLM; it can write that code. You are not going to review it carefully. The point of an assistant is to make your life easier, so you will run what it wrote with minimal review, if any. The only honest response is to run that code somewhere its bugs cannot do much damage.<span class="src">README.md, "Going deeper"</span></p>
+<p>That argument does not depend on who wrote the code. Human-written code has security bugs too; that is why breaches made the news before LLMs existed. It also applies to Brenn itself, most of which is LLM-authored under an adversarial review workflow. So Brenn hosts as much of its own machinery as it reasonably can in the same sandboxes it offers to everyone else. Two in-tree examples come back later: the policy deciding when a long-running agent's conversation should be recycled (<code>conversation-recycler</code>), and webhook replay protection (<code>replay</code>, <code>replay-generic</code>). Both are WASM guests, not host code.<span class="src">README.md, "How Brenn itself was developed"; brenn-wasm/deployed-components.txt</span></p>
+<p>The stance that follows, in the README's words: "lock it down, don't trust it, no matter who wrote it."</p>
+</section>
+
+<section id="map">
+<h2>The whole system on one screen</h2>
+<p>A browser talks to a Rust backend over websockets; the backend runs Claude Code as one subprocess per conversation and hosts WASM components; a message bus inside the backend connects all of them to each other and to the outside world. Every box below carries the trust decision the security posture document makes about it. The colours are those tiers: blue is fully trusted (the operator, and the backend as the trusted computing base), teal is sandboxed-trusted, green is authenticated but bounded, amber is semi-trusted, red is untrusted; grey boxes carry no tier of their own.</p>
+<figure id="fig-a">
+<figcaption>Figure A — the running system and its trust tiers. Select a box for its trust decision.</figcaption>
+<div class="map">
+  <details class="t-untrusted" data-box><summary>Public internet</summary>
+    <p>Inbound webhooks (<code>/webhooks/…</code>, signature-verified before anything else happens) and login traffic.</p>
+    <p><strong>Untrusted.</strong> "Anyone who can reach the listener before authenticating: login/registration traffic, URL probing, inbound webhooks. Adversarial by default."</p></details>
+  <details class="t-bounded" data-box><summary>Browsers</summary>
+    <p>The chat PWA and surfaces (touchscreens, phones), over authenticated websockets.</p>
+    <p><strong>Authenticated, bounded.</strong> A user with a valid session "is trusted to act <em>within their own authority</em>. They are <strong>not</strong> trusted to stay within it voluntarily … and must be structurally prevented from exceeding their authority."</p>
+    <div class="inner">
+      <details class="t-none" data-box><summary>Surface components</summary>
+        <p>WASM modules placed on a surface page.</p>
+        <p><strong>Not sandboxed from the page.</strong> A surface component "runs <strong>unsandboxed</strong> in the authenticated page's JS realm"; the in-page separation is "<strong>bug containment</strong> … it stops nothing a malicious module wants to do". Real enforcement is server-side.</p></details>
+    </div></details>
+  <details class="t-bounded" data-box><summary>Remote attachers</summary>
+    <p>Native daemons — the first is the sensor/voice pod — speaking the same attachment protocol as a browser page, under a bearer token and operator ACLs.</p>
+    <p><strong>Authenticated, bounded — mechanically the browser's posture.</strong> Held "to deny-by-default grants, per-scheme ACLs, budgets, and violation-as-signal exactly as a browser is."</p></details>
+  <details class="t-untrusted" data-box><summary>MQTT broker, inbound</summary>
+    <p>Home Assistant and devices. Inbound topics fan out to channels.</p>
+    <p><strong>Untrusted.</strong> "Inbound MQTT payloads are untrusted (prompt-injection vector); the broker ACL … is what keeps a client from injecting into topics it should not reach." Broker ACLs remain the authority over which topics a client may publish to.</p></details>
+  <details class="t-tcb" data-box><summary>Backend (Rust)</summary>
+    <p>The message bus; the WASM host; sessions, auth and approval routing; markdown rendering.</p>
+    <p><strong>The trusted computing base.</strong> "It is the only component that makes security decisions. Everything else is downstream of it and is constrained by it."</p>
+    <div class="inner">
+      <details class="t-sbx" data-box><summary>In-tree WASM components</summary>
+        <p><strong>Sandboxed-trusted.</strong> "First-party code, but deliberately sandboxed to contain its <em>own</em> bugs. The sandbox is a blast-radius limiter, not a statement that the code is hostile."</p></details>
+      <details class="t-untrusted" data-box><summary>Out-of-tree WASM components</summary>
+        <p><strong>Untrusted. Adversarial.</strong> "Third-party extension code is a first-class extension surface and must be assumed hostile. The sandbox is the security boundary."</p></details>
+    </div></details>
+  <details class="t-untrusted" data-box><summary>MQTT broker, outbound</summary>
+    <p>The same broker. Publishes to it are gated by the publishing app's grants and one shared gate chain (see <a href="#world">transports</a>).</p>
+    <p><strong>Untrusted</strong>, as on the inbound side: the broker's own ACLs decide what it accepts.</p></details>
+  <details class="t-semi" data-box><summary>Claude Code</summary>
+    <p>One subprocess per conversation, optionally in a podman container, talking NDJSON over stdio.</p>
+    <p><strong>Semi-trusted.</strong> "Launched by us, but its output is attacker-influenceable." Brenn trusts <em>how it is configured</em>, never <em>what it emits</em>.</p></details>
+  <details class="t-none" data-box><summary>PWA push</summary>
+    <p>Egress only: notifications encrypted for the subscribing device and posted through the browser vendors' push services (see <a href="#world">transports</a>).</p></details>
+  <details class="t-tcb" data-box><summary>Operator config</summary>
+    <p><strong>Fully trusted. The trust anchor.</strong> "Operator config defines the security policy; it is <em>not</em> an attack surface in this model. Anyone who can write operator config already owns the host."</p></details>
+</div>
+<div class="map-panel" aria-live="polite" hidden></div>
+<span class="src">docs/security-posture.md, section 2 (trust table) and section 8.2 (MQTT); surface/contract/src/lib.rs</span>
+</figure>
+<p>The asymmetry to notice is the one the posture document asks every reviewer to internalize: "we launched it" (Claude Code) and "it's our code" (in-tree WASM) do not confer trust in the content that crosses the boundary.</p>
+</section>
+
+<section id="bus">
+<h2>The bus: channels are history, not obligations</h2>
+<p>Most messaging systems are built around a transfer of custody. A message belongs to someone; it is handed to a broker; the broker owes it to a consumer; an ack settles the debt and the message ceases to exist. Brenn's bus rejects custody entirely:</p>
+<blockquote><strong>A channel is not a conduit for messages in transit. It is a rolling window over a time series that simply exists.</strong> The last N messages published to a channel are there. They are there whether anyone subscribed, whether anyone read them, whether anyone ever will.<span class="src">docs/message-bus.md, section 1</span></blockquote>
+<p>Nothing consumes. Reading does not remove. There are no acks, no redelivery, no at-least-once promise, no dead-letter queue — Brenn has none of the machinery those words name, and the rest of this page does not use them.</p>
+<h3>No backpressure, as a structural fact</h3>
+<p>Backpressure only propagates where downstream capacity constrains upstream acceptance, and that constraint only exists when delivery is an obligation. Remove the obligation and there is nothing for pressure to act on. This fits the domain because the producers are exogenous: the dishwasher finishes, email arrives, someone speaks into a microphone. None of them can be told to wait. And every queue is bounded in the end — a system that pretends otherwise gets killed for memory or runs out of disk. So Brenn drops the oldest message and increments a counter, so that the loss is visible.</p>
+<h3>N is a count; reason about it as duration</h3>
+<p>A channel has one parameter, its depth N. The same N means wildly different things at different rates:</p>
+<table>
+<thead><tr><th>Channel</th><th>Rate</th><th>N</th><th>Horizon</th></tr></thead>
+<tbody>
+<tr><td><code>power.dishwasher.finished</code></td><td>~1/day</td><td>100</td><td>~3 months</td></tr>
+<tr><td><code>mail.arrived</code></td><td>~200/day</td><td>100</td><td>~12 hours</td></tr>
+<tr><td><code>sensor.temperature.kitchen</code></td><td>1/min</td><td>10</td><td>10 minutes</td></tr>
+</tbody></table>
+<p>The design-time obligation is not "pick a number" but "pick the outage you intend to survive, then multiply."<span class="src">docs/message-bus.md, section 2.1</span></p>
+<h3>A subscription has two knobs, and they are independent</h3>
+<p><strong><code>push_depth</code> — what wakes me.</strong> Purely about activation. Zero means "never activate me on this channel". Five means "activate me on new messages; if a burst arrived while I was busy, coalesce the pending activations into one and hand me at most the five most recent."</p>
+<p><strong><code>retain_depth</code> — what I can see.</strong> Purely about visibility: a private window of the most recent M messages, never more than the channel holds (boot refuses a subscription that asks for more). It does not cause activation; a subscriber with <code>push_depth=0, retain_depth=50</code> sees fifty messages and is never woken by any of them.</p>
+<p>Coalescing is the default, not a degradation path: five temperature readings while you were busy should wake you once, with the current temperature. Where a subscriber needs to know it skipped something, its own drop counter says so. The counter is charged only for unseen messages that fell out of the subscriber's retained window, so an under-sized <code>push_depth</code> is silent while an under-sized <code>retain_depth</code> is not. Every subscriber has its own position; one can drop while another does not, and the channel's contents are identical whether it has zero subscribers or fifty.<span class="src">docs/message-bus.md, sections 2.2–2.3</span></p>
+<p>A subscription coming into existence is a delivery point: it is owed up to <code>push_depth</code> of the retained window, immediately, as unseen. A late joiner does not arrive to an empty pipe; it simply looks.</p>
+
+<figure id="fig-b">
+<figcaption>Figure B — the channel simulator.</figcaption>
+<div class="sim-static">
+  <p>A channel of depth 6 after eight publishes holds seqs 3–8; seqs 1–2 were evicted. A subscriber with <code>retain_depth 3</code> sees only 6–8:</p>
+  <pre>channel  [ 3 ][ 4 ][ 5 ][ 6 ][ 7 ][ 8 ]   N = 6
+window                  [ 6 ][ 7 ][ 8 ]   retain_depth = 3</pre>
+  <noscript><p>With JavaScript enabled, this figure is a simulator: publish to channels, mark subscribers busy, watch activations coalesce and drop counters tick, and play two scripted presets (a signal and a fact).</p></noscript>
+</div>
+<div id="sim" hidden>
+  <div class="sim-controls">
+    <label>Preset <select data-key="preset">
+      <option value="signal">Signal: kitchen temperature</option>
+      <option value="fact">Fact: dishwasher finished, paired with state</option>
+      <option value="free">Free play</option>
+    </select></label>
+    <button type="button" data-key="reset">Reset</button>
+    <button type="button" data-key="walk">Play the walk</button>
+  </div>
+  <p class="sim-narr"></p>
+  <div class="sim-chans"></div>
+  <div class="subs sim-subs"></div>
+  <div class="attach">
+    <strong>Attach a subscriber:</strong>
+    <label>on <select data-key="att-ch"></select></label>
+    <label>push <input type="number" min="0" value="2" data-key="att-push"></label>
+    <label>retain <input type="number" min="1" value="2" data-key="att-retain"></label>
+    <button type="button" data-key="att-go">Attach</button>
+  </div>
+  <div class="sim-log" aria-live="polite" role="log"></div>
+</div>
+</figure>
+
+<h3>Time and state are not subsystems</h3>
+<p>A message may carry a delivery time, <code>deliver_after</code>. That one mechanism is the substrate for every timer, timeout, retry, debounce and scheduled reminder: a component schedules its own future activation by publishing to a channel it also subscribes to. There is no scheduler subsystem and no cron. Likewise, because channels persist independently of reading, a retained channel <em>is</em> a state variable: current state is <code>retain_depth=1</code> on the channel that carries it. There is no separate key-value store.<span class="src">docs/message-bus.md, sections 2.4 and 2.5</span></p>
+<h3>Signals and facts</h3>
+<p>The model forces one question at design time: <strong>does message N+1 subsume message N?</strong> Signals — temperature, presence, bulb state — do: the newest contains everything the older ones did, and dropping old is the semantically correct operation. Facts — dishwasher finished, email arrived, "cancel the 1:1" — do not: missing one means a side effect that never happens. The bus cannot enforce the distinction. What makes fact channels safe is not a delivery guarantee but "a window horizon that exceeds the worst outage you intend to survive." The alternatives are an unbounded queue ("a promise the universe will not honor") or backpressure ("you cannot tell the dishwasher not to finish"). And the idiom that softens the rest: pair a fact channel with a state channel, so an agent that was down reconciles against current state instead of replaying history it no longer has.<span class="src">docs/message-bus.md, section 3</span></p>
+<h3>Why this fits graphs of agents</h3>
+<p>Late joiners are first-class: an automation written at 3pm subscribes to a channel that already has history. Observers are free: a logger, a debugger or an LLM asked "why did that happen?" is an ordinary subscriber that costs the channel nothing. LLMs want windows, not messages: <code>retain_depth</code> is a context window expressed in the transport. And because subscriptions are declarative and the channel is oblivious to them, an agent that writes automations is adding edges to a graph, not negotiating delivery contracts; "stop doing that" removes an edge, with nothing to drain.<span class="src">docs/message-bus.md, section 4</span></p>
+<h3>Two more axes</h3>
+<p>Channels are ephemeral (in memory, <code>ephemeral:</code>) or durable (disk-backed, <code>brenn:</code>) — a statement about whether history survives a restart, not about delivery. Separately, channels are transportable or not: <code>ephemeral:</code> and <code>brenn:</code> channels can extend across the wire; <code>local:</code> channels never leave the host that holds them.<span class="src">docs/message-bus.md, section 2.1</span></p>
+</section>
+
+<section id="sandbox">
+<h2>Components in the sandbox</h2>
+<p>A Brenn component is a WebAssembly component targeting a WIT world. The general world is <code>brenn:processor</code>: a component exports one function, <code>receive(activation)</code>, and may import up to ten host interfaces — <code>ports</code>, <code>store</code>, <code>log</code>, <code>alert</code>, <code>config</code>, <code>mqtt</code>, <code>tools</code>, <code>calls</code>, <code>dom</code>, <code>page-dom</code>. (There is also a narrow <code>brenn:replay</code> world for webhook replay checks, importing only <code>store</code> and <code>config</code> and exporting <code>check</code>; the <code>replay</code> guests implement it, <code>conversation-recycler</code> implements the general one. The rest of this section is about <code>processor</code>.)<span class="src">brenn-wasm/wit/processor.wit; brenn-wasm/wit/replay.wit</span></p>
+<p>What is <em>not</em> in the world matters more:</p>
+<ul>
+<li>no filesystem;</li>
+<li>no sockets, no HTTP egress;</li>
+<li>no clock — time arrives as a host-stamped <code>now</code> on the activation;</li>
+<li>no secrets;</li>
+<li>no WASI at all.</li>
+</ul>
+<p>The only persistence is the transactional <code>store</code>; the only outbound network is the MQTT broker via <code>mqtt</code> and whatever <code>tools</code> the operator granted.</p>
+<p><strong>Deny-by-default is structural.</strong> The operator's <code>grants</code> list decides which interfaces are linked at all. An artifact that imports an interface its instance was not granted fails at load with a named diagnostic.<span class="src">brenn-wasm/src/lib.rs</span></p>
+<p><strong>A guest publishes by port name, never by channel address.</strong> The operator's bindings decide where a port goes, and a publish outside the output ACL comes back as a typed <code>not-permitted</code>.</p>
+<p><strong>Each activation is a fresh instance.</strong> Linear memory lives for one activation. State is kept by publishing it to a retained port — the <code>retain_depth=1</code> idea from the bus section, showing up again.</p>
+<p><strong>Resource limits are real wasmtime limits</strong> on a backend-placed component: fuel per activation, a wall-clock deadline per activation, a memory cap that traps on over-growth, plus per-activation quotas on log, alert and tool calls.</p>
+<details><summary>The constants, as of commit 2a286d46</summary>
+<aside>
+<ul>
+<li>Fuel: the larger of 50,000,000 and 10,000,000 per delivered envelope.</li>
+<li>Deadline: 300 epoch ticks of 100 ms (30 s).</li>
+<li>Memory: 16 MiB; tables capped at 65,536 elements.</li>
+<li>Per activation: 256 log calls, 4 alert calls, 64 fast tool calls.</li>
+</ul>
+<span class="src">brenn-wasm/src/lib.rs (the <code>PROCESSOR_*</code> constants)</span>
+</aside>
+</details>
+<p><strong>Two placements, one class.</strong> The same component class, with the same activation type, can be placed at the backend top level (a <em>consumer</em>) or inside a browser surface. The class, the activation contract and the channel semantics per scheme are identical; a host-conformance suite pins that channel <em>hosting</em>, not merely admissibility, is the same for every scheme a host binds. The sandbox is not identical: the wasmtime limits above are backend facts, and a surface-placed module runs unsandboxed in the page's JavaScript realm, where the separation is bug containment only.<span class="src">docs/config-dsl.md, "Surfaces"; docs/message-bus.md, section 2.1.1</span></p>
+<p><strong>Out-of-tree components are first-class.</strong> The WIT world is an external contract, and its evolution is additive-import-only: "a new capability is a new interface, and no existing shape moves."<span class="src">brenn-wasm/wit/processor.wit</span></p>
+
+<figure id="fig-c">
+<figcaption>Figure C — the grants panel.</figcaption>
+<p>A class states what it needs (<code>requires</code>, and an <code>optional</code> list that may hold only words with no interface behind them); an instance states what it is given (<code>grants</code>). Boot checks both directions: every required word must be granted, and a word the class never asked for is refused, "because the spec is the vocabulary".<span class="src">docs/config-dsl.md, "The spec fit check"</span></p>
+<pre class="grants-static">component GitSyncConsumer {
+  abi = processor;
+  requires = [ports, log, store, alert, config, tools];
+  …
+}
+
+new sync: GitSyncConsumer {
+  grants = [ports, log, store, alert, config, tools];
+  store_path = "/home/alice/state/sync.db";
+  config = { … };
+  tool git-repo-pull { allow { repo = "notes"; } }
+  out outcomes -> sync_outcomes;
+}</pre>
+<div id="grants" hidden>
+  <div class="sim-controls">
+    <label>Class <select data-g="class"></select></label>
+    <label>Placement <select data-g="place">
+      <option value="backend">backend consumer</option>
+      <option value="surface">surface instance</option>
+    </select></label>
+  </div>
+  <div class="grants">
+    <fieldset><legend>Grant words</legend><div data-g="words"></div></fieldset>
+    <fieldset><legend>Wiring in the instance body</legend><div data-g="wiring"></div></fieldset>
+  </div>
+  <pre data-g="block"></pre>
+  <div class="verdict" aria-live="polite" data-g="verdict"></div>
+</div>
+<h4>What the guest cannot reach, whatever it is granted</h4>
+<ul>
+<li>the filesystem, other than through the transactional <code>store</code>;</li>
+<li>sockets or HTTP;</li>
+<li>a clock, other than the activation's <code>now</code>;</li>
+<li>secrets;</li>
+<li>any channel by address — only its own named ports.</li>
+</ul>
+</figure>
+</section>
+
+<section id="agents">
+<h2>LLM agents on the same bus</h2>
+<p>An agent is a Claude Code subprocess per conversation, spawned with <code>--permission-mode auto</code> and a stdio permission prompt, optionally inside a podman container whose secrets never appear on a command line.<span class="src">brenn-cc/src/session/mod.rs</span></p>
+<p><strong>How an agent reaches the bus.</strong> Through tools — <code>MessageSubscribe</code>, <code>BrennSend</code> and friends — that Claude Code sees via a no-op MCP server and that Brenn intercepts with PreToolUse/PostToolUse hooks; "the real work happens in the Brenn server". The agent's <code>acl subscribe</code> and <code>acl publish</code> matchers are checked by the same policy type, and the same predicate, that a WASM component's bindings resolve to — enforced at the agent's own seam rather than the component's. An agent may not bind <code>local:</code> at all: "a confined channel has no delivery path to an agent". Rate limiting differs in mechanism: an agent draws on a per-conversation send budget and per-channel send rates; a component on per-sink token buckets and per-activation budgets. One authority vocabulary, one policy, each enforced at its participant's seam.<span class="src">noop_mcp.py; brenn-lib/src/messaging/gates.rs; brenn-dsl/src/derive.rs</span></p>
+<p><strong>How a message wakes an agent.</strong> The bus notices a subscribed channel moved. If the conversation has no running process and the message's urgency clears the subscription's <code>wake_min</code>, Brenn spawns Claude Code (resuming the prior session) and injects the unseen messages as one user-role turn wrapped in a <code>&lt;brenn-messages&gt;</code> tag, so the model can tell host-injected turns from the human. A burst costs one turn, not forty — coalescing again.<span class="src">brenn-server/src/messaging_router.rs; brenn-render/src/system_message.rs</span></p>
+<p><strong>What stops two agents talking forever.</strong> The impetus pool. Every injected turn draws one unit from a per-conversation stock, and only evidence of live user interaction can refill it: "Nothing an LLM, a WASM component, or a transport ingress can reach mints impetus." A loop of bus legs depletes the pools it runs on and halts. Exhaustion holds the batch; it does not drop it.<span class="src">brenn-server/src/active_bridge/impetus_pool.rs</span></p>
+<h3>The approval gate, as it actually flows</h3>
+<p>Every tool call Claude Code proposes passes three authorizers, in this order.</p>
+<ol>
+<li><strong>Brenn's PreToolUse hook.</strong> Brenn observes and grants nothing — with one exception: Brenn's own intercepted tools (bus tools, automations, push, MQTT, display) are no-ops on Claude Code's side, and Brenn answers the hook for those because it performs the effect itself, under the app's grants and ACLs. For every other tool the hook returns no opinion. No operator rule runs here.</li>
+<li><strong>Claude Code's <code>auto</code> permission mode.</strong> Claude Code's own classifier approves the calls it judges safe.</li>
+<li><strong>The stdio permission prompt.</strong> Whatever Claude Code still asks about arrives in Brenn's permission handler, which auto-approves it if it matches a hardcoded read-only set or an operator rule — three layers (config file, app-wide, per-conversation), anchored regular expressions, approve-only: a rule can allow, never deny. Anything else goes to a human in the approval dialog.</li>
+</ol>
+<p><span class="src">brenn-server/src/active_bridge/approval_dispatch.rs; brenn-cc/src/protocol/builders.rs; brenn-approval-rules/src/lib.rs</span></p>
+<p>Two policies from the security posture hold across all three:</p>
+<blockquote><strong>Observation is not authorization.</strong> Hooks or interception points that merely observe a tool call must not be repurposed into granting permission; doing so can bypass the real permission decision.<br><br><strong>What executes must equal what was approved.</strong> When a human approves an action, the action that runs must be the one displayed and approved.<span class="src">docs/security-posture.md, section 7.3</span></blockquote>
+<p>Stage one is the first policy honoured, not broken: the hook grants nothing it does not execute itself, and a regression test pins that even read-only tools get no opinion from it. (The same section's two-item list of authorizers — operator rule or human — predates auto mode; the code has three, as above.)</p>
+<p><strong>Brenn's own guts in WASM.</strong> When a long-lived agent's context should be recycled is decided by a replaceable WASM policy component, <code>conversation-recycler</code>, publishing on an epoch channel. The host decides nothing: it only records which epoch each agent's current conversation must carry.<span class="src">brenn-conversation-epoch/src/lib.rs</span></p>
+<p><strong>One tool vocabulary.</strong> The same <code>tool</code> / <code>allow</code> / <code>rate_limit</code> statements appear inside an agent body or a component body and resolve into the same grant map.<span class="src">docs/config-dsl.md, "Tool grants"</span></p>
+</section>
+
+<section id="ui">
+<h2>Two user interfaces, one rule</h2>
+<p><strong>The chat UI</strong> is TypeScript and Lit custom elements. The backend renders HTML; the browser sets it. Every message type is a Rust struct with its TypeScript generated by <code>ts-rs</code>. The LLM does not generate UI: it selects from a catalogue of hand-built components through virtual tools — the approval dialog, <code>AskUserQuestion</code>, pfin's reconcile cards and batch tables, the artifact pane via <code>DisplayFile</code>, the task list. Users build muscle memory because the components do not change shape under them.<span class="src">brenn-render/src/approval_formatter.rs; brenn-ws-types/src/lib.rs</span></p>
+<p>Direct manipulation does not go through the LLM. Clicking "done" on a task sends a typed <code>TodoDone</code> message; the backend runs the <code>graf</code> CLI; the browser gets a typed result. The LLM is told only if it failed. That is the README's "it's easier to click 'done' on a to-do list item than to tell the LLM to mark it done", with code behind it — and the LLM can still mark it done for you.<span class="src">brenn-server/src/routes/ws/todos.rs</span></p>
+<p><strong>Surfaces</strong> are the newer UI: Rust compiled to WASM, running in the page. A surface is a page — transport grants, a skin, and component instances — declared in config. One privileged <code>chrome</code> component owns layout and is the only thing that may touch DOM outside its own subtree; every other component renders into its own wrapper through an allow-listed <code>dom</code> interface where text reaches the page as <code>textContent</code>, never as HTML. The websocket carries the same attachment protocol a remote daemon speaks, whose vocabulary names "no component, port, instance, DOM, or pixel".<span class="src">surface/contract/src/lib.rs; attach/proto/src/lib.rs</span></p>
+<p>The in-tree bar surface, as configured: three <code>Protobar</code> panels that an agent writes to with <code>BrennSend</code>, a <code>Meeting</code> panel that escalates from ambient to overdue on its own clock, and a headless <code>ModeClock</code> driving dark and light themes.</p>
+<pre>surface bar {
+  grants = [subscribe, publish];
+  skin = "bench";
+  new p1: Protobar { grants = [ports, log, dom]; in messages &lt;- bar_a; … }
+  new p2: Protobar { grants = [ports, log, dom]; in messages &lt;- bar_b; … }
+  new p3: Protobar { grants = [ports, log, dom]; in messages &lt;- bar_c; … }
+  new mode: ModeClock {
+    grants = [ports, log, dom];
+    in config &lt;- bar_mode { push_depth = 1; }
+    out theme -&gt; "local:brenn/theme";
+    …
+  }
+  new meeting: Meeting {
+    grants = [ports, log, takeover, dom];
+    in agenda &lt;- bar_agenda { push_depth = 1; }
+    out takeover -&gt; "local:brenn/takeover";
+    …
+  }
+}</pre>
+<p><span class="src">brenn.dev.brenn (abridged)</span></p>
+<p>The rule across both: the browser holds no authority. It renders.</p>
+</section>
+
+<section id="world">
+<h2>Talking to the world</h2>
+<p><strong>Webhooks.</strong> Per-endpoint HTTP routes with four signature schemes: raw-body HMAC (GitHub, Forgejo), timestamped HMAC (Slack), Stripe's <code>t=…,v1=…</code>, and bearer token. Unknown key ids get timing parity with known ones. Replay protection is optional and runs as a WASM guest. Scheme: <code>webhook:&lt;slug&gt;</code>.<span class="src">brenn-webhook/src/lib.rs; brenn-lib/src/webhook/scheme.rs</span></p>
+<p><strong>MQTT.</strong> One session per configured client; inbound topics fan out to every matching channel filter; outbound shares one gate chain between the LLM's tool and the WASM host function. In practice Home Assistant is the device-driver library — it gets thousands of devices speaking MQTT and JSON — and Brenn takes it from there, with WASM components handling the routine automations and LLMs stepping in where judgment is needed. Scheme: <code>mqtt:&lt;client&gt;:&lt;topic&gt;</code>.<span class="src">brenn-server/src/mqtt_router.rs; brenn-mqtt/src/egress.rs; README.md, "A note about Brenn vs Home Assistant"</span></p>
+<p><strong>PWA push.</strong> Notifications encrypted per RFC 8291, gated by the app's <code>pwa_push</code> grant and the same send budget agents draw on. Scheme: <code>pwa_push:&lt;user&gt;</code> or <code>pwa_push:&lt;user&gt;@&lt;device&gt;</code>.<span class="src">brenn-pwa-push/src/lib.rs; brenn-pwa-push/src/targets.rs</span></p>
+<p><strong>Remote attachers.</strong> A native daemon acts as one principal, <code>remote:&lt;slug&gt;</code>, with exactly the channels the operator wrote for it.<span class="src">brenn-remote-server/src/lib.rs</span></p>
+<h3>Not there</h3>
+<ul>
+<li>Discord, Telegram and Matrix transports.</li>
+<li>Peer-to-peer federation between Brenn servers.</li>
+<li>LLM harnesses other than Claude Code.</li>
+<li>A guide to a first deployment.</li>
+</ul>
+</section>
+
+<section id="next">
+<h2>Better dead than wrong</h2>
+<p>The backend principle, in the security posture's words: the backend "must <em>never do the wrong thing</em>. It fails fast: it shuts itself down rather than tolerate a bug or proceed past an unexpected condition. No fallbacks, no swallowed errors". Transient failures, such as an API briefly unavailable, are handled normally; they are not unexpected.<span class="src">docs/security-posture.md, section 1</span></p>
+<p>One concrete case: if Claude Code sends a control request Brenn does not recognize, Brenn cannot answer it safely, so it kills the session and raises an alert rather than answer with a default or a guess. In general, anything sketchy from a browser is a fail2ban signal; anything unrecognized from Claude Code is an alert to the operator's phone, probably meaning a Claude Code upgrade Brenn has to adapt to.<span class="src">docs/security-posture.md, section 7.2; brenn-cc/src/error.rs</span></p>
+<h3>Status, in the README's words</h3>
+<blockquote>
+<ul>
+<li><strong>The engine is mature.</strong> Backend, the messaging bus, the WASM host and capability model, grants/ACLs/rate limiting, MQTT/webhook/Push ingress and egress, auth, the Claude Code integration — real, tested, in daily use.</li>
+<li><strong>The WASM-in-the-browser "surface" UI is young.</strong> The framework under it is solid (frozen wire protocol, its own security model, well tested). The <em>applications</em> on top are thin — right now the flagship demo is a little bar touchscreen monitor that sits on my desk under my main monitor, and already that's made my life way better.</li>
+<li><strong>Smart home stuff is the current development frontier/focus.</strong> This is my highest priority right now for myself: Bring up a Brenn-connected <a href="https://github.com/rnortman/brenn-pod">smart speaker/voice assistant</a>, plus other sensor pods: mmWave radar (presence sensors) and a camera pipeline, plus Home Assistant interfaces.</li>
+<li><strong>Getting-started docs are not done.</strong> You can build and run it (<code>make build</code>, <code>make launchdev</code>), but standing up a real configuration is currently more archaeology than onboarding. The configuration language itself has a prose reference — <a href="../config-dsl.md">the config DSL document</a> — and one operational flow has a guide of its own, <a href="../claude-accounts.md">Claude accounts: profiles and switching</a>, but there is no guide to a first deployment. It's not ready for anybody who doesn't know what they're doing to host it yet. I'd just rather not pretend it's turnkey. So if you were looking for the install guide, there isn't one. (Your LLM can figure it out though, even if you can't.)</li>
+</ul>
+<span class="src">README.md, "What's real and what isn't" (one clause about the bar's apps omitted)</span></blockquote>
+<h3>Where to go next</h3>
+<ul>
+<li><a href="../../README.md">README.md</a> — the pitch, in the author's voice.</li>
+<li><a href="../message-bus.md">docs/message-bus.md</a> — the channel model, precisely.</li>
+<li><a href="../security-posture.md">docs/security-posture.md</a> — the threat model and review bar.</li>
+<li><a href="../config-dsl.md">docs/config-dsl.md</a> — the configuration language.</li>
+<li><a href="../component-packages.md">docs/component-packages.md</a> — packaging components.</li>
+<li>Ecosystem: <a href="https://github.com/rnortman/pfin">pfin</a>, <a href="https://github.com/rnortman/graf">graf</a>, <a href="https://github.com/rnortman/brenn-pod">brenn-pod</a>, <a href="https://github.com/rnortman/brenn-mcp">brenn-mcp</a>, <a href="https://github.com/rnortman/claude-plugins">claude-plugins</a>.</li>
+</ul>
+</section>
+</main>
+<footer>
+<p class="src">Describes commit 2a286d46. If code and this page disagree, the code is right.</p>
+</footer>
+
+<script>
+// Figure A: show a box's trust text in the shared panel on hover or focus.
+(function () {
+  "use strict";
+  var fig = document.getElementById("fig-a");
+  var panel = fig.querySelector(".map-panel");
+  panel.hidden = false;
+  panel.textContent = "Hover over or focus a box to read its trust decision here; click to expand it in place.";
+  fig.querySelectorAll("[data-box]").forEach(function (box) {
+    var summary = box.querySelector(":scope > summary");
+    function show(ev) {
+      ev.stopPropagation();
+      panel.textContent = "";
+      var title = document.createElement("strong");
+      title.textContent = summary.textContent + ": ";
+      panel.appendChild(title);
+      box.querySelectorAll(":scope > p").forEach(function (p) {
+        panel.appendChild(document.createTextNode(p.textContent + " "));
+      });
+    }
+    summary.addEventListener("mouseenter", show);
+    summary.addEventListener("focus", show);
+  });
+})();
+</script>
+
+<script>
+// Figure B: the channel simulator. Channels and subscriptions are independent
+// objects; a channel's contents never depend on who subscribes to it.
+(function () {
+  "use strict";
+  var root = document.getElementById("sim");
+  root.hidden = false;
+  document.querySelector("#fig-b .sim-static").hidden = true;
+  var q = function (sel) { return root.querySelector(sel); };
+  var model = null;
+  var timers = [];
+  var temps = ["21.4 °C", "21.6 °C", "21.5 °C", "21.9 °C", "22.1 °C", "22.0 °C"];
+
+  var PRESETS = {
+    signal: {
+      narr: "Kitchen temperature, a signal. Play the walk: the thermostat goes busy, five readings arrive, it goes idle. " +
+        "It is activated once, handed the newest reading, and its drop counter reads 4. That is correct: a stale " +
+        "temperature has no value and the newest subsumes the rest. The counter makes the loss visible; it does not " +
+        "say anything went wrong. The dashboard holds no position, so it is never charged.",
+      build: function () {
+        return {
+          channels: [mkChannel("sensor.temperature.kitchen", 4, function (seq) { return temps[(seq - 1) % temps.length]; })],
+          subs: [mkSub("thermostat", 0, 1, 1), mkSub("dashboard", 0, 0, 3)],
+        };
+      },
+      walk: function (s) {
+        var t = s.subs[0];
+        return [function () { setBusy(t, true); }]
+          .concat(repeat(5, function () { publish(0); }))
+          .concat([function () { setBusy(t, false); }]);
+      },
+    },
+    fact: {
+      narr: "Dishwasher finished, a fact, paired with a state channel. The notifier holds push 10 / retain 10 on the fact " +
+        "channel and push 0 / retain 1 on the state channel. Play the walk: it goes busy, thirteen facts arrive (an " +
+        "outage longer than the window was sized for), it goes idle. One activation hands over seqs 4–13 and the " +
+        "counter reads 3: three facts are gone and nothing subsumes them. The window horizon is the only tool there " +
+        "is for facts; sizing it for the worst outage is the operator's call. Then it reads the state channel — " +
+        "\"idle; last finished seq 13\" — and reconciles instead of replaying, which turns what the window lost from " +
+        "lost into recoverable. The state channel's evictions charge nobody: its subscriber holds no position, and " +
+        "the newest state subsumes the rest.",
+      build: function () {
+        var fact = mkChannel("dishwasher.finished", 10, function () { return "finished"; });
+        fact.pairedState = 1;
+        return {
+          channels: [fact, mkChannel("dishwasher.state", 1, null)],
+          subs: [mkSub("notifier", 0, 10, 10), mkSub("notifier", 1, 0, 1)],
+        };
+      },
+      walk: function (s) {
+        var n = s.subs[0];
+        return [function () { setBusy(n, true); }]
+          .concat(repeat(13, function () { publish(0); }))
+          .concat([function () { setBusy(n, false); }, function () { read(s.subs[1]); }]);
+      },
+    },
+    free: {
+      narr: "Free play. Subscriber A holds push 2 / retain 8. Play the walk: A goes busy, three messages arrive, A goes " +
+        "idle. It is handed the newest two as new and shown the third as context — it is still inside A's window, so " +
+        "it was seen, and nothing is charged. B is sampled: it never wakes and has no counter; \"read\" shows its window.",
+      build: function () {
+        return {
+          channels: [mkChannel("demo", 8, function (seq) { return "m" + seq; })],
+          subs: [mkSub("A", 0, 2, 8), mkSub("B", 0, 0, 4)],
+        };
+      },
+      walk: function (s) {
+        var a = s.subs[0];
+        return [function () { setBusy(a, true); }]
+          .concat(repeat(3, function () { publish(0); }))
+          .concat([function () { setBusy(a, false); }]);
+      },
+    },
+  };
+
+  function repeat(n, f) { var out = []; for (var i = 0; i < n; i++) out.push(f); return out; }
+
+  function mkChannel(name, n, gen) {
+    return { name: name, n: n, msgs: [], next: 1, gen: gen, pairedState: null, parked: [] };
+  }
+
+  var subIds = 0;
+  function mkSub(name, ch, push, retain) {
+    return {
+      id: ++subIds, name: name, ch: ch, push: push, retain: retain,
+      cursor: 0, accounted: 0, drops: 0, busy: false, pending: false, last: null,
+    };
+  }
+
+  function head(ch) { return ch.next - 1; }
+  function chanOf(sub) { return model.channels[sub.ch]; }
+  function windowStart(sub) { return Math.max(1, head(chanOf(sub)) - sub.retain + 1); }
+  function windowMsgs(sub) {
+    var start = windowStart(sub);
+    return chanOf(sub).msgs.filter(function (m) { return m.seq >= start; });
+  }
+  function subsOn(ci) { return model.subs.filter(function (s) { return s.ch === ci; }); }
+
+  function say(text) {
+    var p = document.createElement("p");
+    p.textContent = text;
+    var log = q(".sim-log");
+    log.appendChild(p);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // Charge the drop counter for unseen sequences that have left the window.
+  function account(sub) {
+    if (sub.push === 0) return;
+    var lostThrough = windowStart(sub) - 1;
+    if (lostThrough > sub.accounted) {
+      var lost = lostThrough - sub.accounted;
+      sub.drops += lost;
+      sub.accounted = lostThrough;
+      say(sub.name + ": " + lost + " unseen message" + (lost > 1 ? "s" : "") +
+        " left its retained window; drop counter now " + sub.drops + ".");
+    }
+  }
+
+  function activate(sub) {
+    var win = windowMsgs(sub);
+    var unseen = win.filter(function (m) { return m.seq > sub.cursor; });
+    if (unseen.length === 0) { say(sub.name + ": nothing unseen; no activation."); return; }
+    var k = Math.min(sub.push, unseen.length);
+    var fresh = unseen.slice(unseen.length - k).map(function (m) { return m.seq; });
+    sub.last = {
+      label: "Last activation",
+      entries: win.map(function (m) { return { seq: m.seq, text: m.text, isNew: fresh.indexOf(m.seq) >= 0 }; }),
+    };
+    sub.cursor = head(chanOf(sub));
+    sub.accounted = sub.cursor;
+    say(sub.name + " activated on " + chanOf(sub).name + ": handed seq" + (k > 1 ? "s " : " ") +
+      fresh[0] + (k > 1 ? "–" + fresh[k - 1] : "") + " as new" +
+      (win.length > k ? ", " + (win.length - k) + " more as context" : "") + ".");
+  }
+
+  function publish(ci, text) {
+    var ch = model.channels[ci];
+    var seq = ch.next++;
+    var m = { seq: seq, text: text !== undefined ? text : (ch.gen ? ch.gen(seq) : "#" + seq) };
+    ch.msgs.push(m);
+    while (ch.msgs.length > ch.n) ch.msgs.shift();
+    say("Published seq " + seq + " (" + m.text + ") on " + ch.name + ".");
+    subsOn(ci).forEach(function (sub) {
+      if (sub.push === 0) return;
+      account(sub);
+      if (sub.busy) {
+        if (!sub.pending) say(sub.name + " is busy: one activation is now pending; later publishes coalesce into it.");
+        sub.pending = true;
+      } else {
+        activate(sub);
+      }
+    });
+    if (ch.pairedState !== null) publish(ch.pairedState, "idle; last finished seq " + seq);
+    render();
+  }
+
+  function publishLater(ci) {
+    var ch = model.channels[ci];
+    var item = { due: new Date(Date.now() + 3000) };
+    ch.parked.push(item);
+    say("Parked a message on " + ch.name + " with deliver_after = now + 3 s.");
+    var t = setTimeout(function () {
+      ch.parked.splice(ch.parked.indexOf(item), 1);
+      say("deliver_after reached on " + ch.name + ".");
+      publish(ci);
+    }, 3000);
+    timers.push(t);
+    render();
+  }
+
+  function setBusy(sub, busy) {
+    sub.busy = busy;
+    say(sub.name + (busy ? " is busy (mid-activation)." : " is idle."));
+    if (!busy && sub.pending) { sub.pending = false; activate(sub); }
+    render();
+  }
+
+  function read(sub) {
+    sub.last = {
+      label: "Read (all context)",
+      entries: windowMsgs(sub).map(function (m) { return { seq: m.seq, text: m.text, isNew: false }; }),
+    };
+    say(sub.name + " read its window on " + chanOf(sub).name + ": " +
+      (sub.last.entries.map(function (e) { return e.text; }).join(", ") || "empty") + ".");
+    render();
+  }
+
+  function setN(ci, n) {
+    var ch = model.channels[ci];
+    var min = Math.max.apply(null, [1].concat(subsOn(ci).map(function (s) { return s.retain; })));
+    if (!(n >= min)) {
+      say("Refused: N = " + n + " on " + ch.name + " is below a subscriber's retain_depth (" + min + ").");
+      render();
+      return;
+    }
+    ch.n = n;
+    while (ch.msgs.length > ch.n) ch.msgs.shift();
+    say("N on " + ch.name + " is now " + n + ".");
+    render();
+  }
+
+  function attach(ci, push, retain) {
+    var ch = model.channels[ci];
+    if (!(push >= 0) || !(retain >= 1)) { say("Refused: push_depth must be 0 or more and retain_depth 1 or more."); return; }
+    if (retain > ch.n) { say("Refused: retain_depth " + retain + " exceeds " + ch.name + "'s N = " + ch.n + ", as boot refuses it."); return; }
+    var sub = mkSub("late-" + (model.subs.length + 1), ci, push, retain);
+    model.subs.push(sub);
+    say("Attached " + sub.name + " to " + ch.name + " (push " + push + " / retain " + retain + ").");
+    if (push > 0) {
+      sub.cursor = Math.max(windowStart(sub) - 1, head(ch) - push);
+      sub.accounted = sub.cursor;
+      if (sub.cursor < head(ch)) activate(sub);
+    }
+    render();
+  }
+
+  function el(tag, props, kids) {
+    var e = document.createElement(tag);
+    Object.keys(props || {}).forEach(function (k) {
+      if (k === "text") e.textContent = props[k];
+      else if (k === "on") e.addEventListener("click", props[k]);
+      else e.setAttribute(k, props[k]);
+    });
+    (kids || []).forEach(function (c) { if (c) e.appendChild(c); });
+    return e;
+  }
+
+  function render() {
+    var focusKey = document.activeElement && root.contains(document.activeElement) ?
+      document.activeElement.getAttribute("data-key") : null;
+    var chans = q(".sim-chans");
+    chans.textContent = "";
+    model.channels.forEach(function (ch, ci) {
+      var nInput = el("input", { type: "number", value: String(ch.n), "data-key": "n-" + ci, "aria-label": "N for " + ch.name });
+      nInput.addEventListener("change", function () { setN(ci, parseInt(nInput.value, 10)); });
+      var slots = el("div", { "class": "slots" });
+      for (var i = 0; i < ch.n; i++) {
+        var m = ch.msgs[i];
+        slots.appendChild(m ? el("span", { "class": "slot", title: m.text, text: String(m.seq) }) :
+          el("span", { "class": "slot empty", text: "·" }));
+      }
+      var kids = [
+        el("div", { "class": "chan-head" }, [
+          el("strong", { text: ch.name }),
+          el("label", { text: "N " }, [nInput]),
+          el("button", { type: "button", "data-key": "pub-" + ci, text: "Publish", on: function () { publish(ci); } }),
+          el("button", { type: "button", "data-key": "pub5-" + ci, text: "Publish ×5", on: function () { for (var j = 0; j < 5; j++) publish(ci); } }),
+          el("button", { type: "button", "data-key": "later-" + ci, text: "Publish in 3 s", on: function () { publishLater(ci); } }),
+        ]),
+        slots,
+      ];
+      ch.parked.forEach(function (p) {
+        kids.push(el("div", { "class": "parked", text: "Parked: lands at " + p.due.toLocaleTimeString() }));
+      });
+      chans.appendChild(el("div", { "class": "chan" }, kids));
+    });
+
+    var subs = q(".sim-subs");
+    subs.textContent = "";
+    model.subs.forEach(function (s) {
+      var lines = [
+        el("h4", { text: s.name + " on " + chanOf(s).name }),
+        el("div", { text: "push " + s.push + " / retain " + s.retain }),
+      ];
+      if (s.push > 0) {
+        lines.push(el("div", { text: "cursor: seq " + s.cursor + (s.pending ? " · activation pending" : "") }));
+        lines.push(el("div", {}, [document.createTextNode("drops: "), el("span", { "class": "drops", text: String(s.drops) })]));
+        lines.push(el("button", {
+          type: "button", "data-key": "busy-" + s.id, "aria-pressed": String(s.busy),
+          text: s.busy ? "Busy — set idle" : "Idle — set busy", on: function () { setBusy(s, !s.busy); },
+        }));
+      } else {
+        lines.push(el("div", { text: "sampled: never activates, holds no cursor or counter" }));
+        lines.push(el("button", { type: "button", "data-key": "read-" + s.id, text: "Read", on: function () { read(s); } }));
+      }
+      if (s.last) {
+        var chips = s.last.entries.map(function (e) {
+          return el("span", { "class": e.isNew ? "chip new" : "chip", title: e.text, text: e.seq + (e.isNew ? " new" : "") });
+        });
+        lines.push(el("div", { text: s.last.label + ": " }, chips.length ? chips : [document.createTextNode("empty")]));
+      }
+      subs.appendChild(el("div", { "class": "sub" }, lines));
+    });
+
+    var sel = q('[data-key="att-ch"]');
+    var prev = sel.value;
+    sel.textContent = "";
+    model.channels.forEach(function (ch, ci) { sel.appendChild(el("option", { value: String(ci), text: ch.name })); });
+    if (prev && prev < model.channels.length) sel.value = prev;
+
+    if (focusKey) {
+      var f = root.querySelector('[data-key="' + focusKey + '"]');
+      if (f) f.focus();
+    }
+  }
+
+  function load(name) {
+    timers.forEach(clearTimeout);
+    timers = [];
+    model = PRESETS[name].build();
+    model.preset = name;
+    q(".sim-narr").textContent = PRESETS[name].narr;
+    q(".sim-log").textContent = "";
+    say("Loaded the " + name + " preset.");
+    render();
+  }
+
+  function walk() {
+    load(model.preset);
+    var steps = PRESETS[model.preset].walk(model);
+    steps.forEach(function (step, i) { timers.push(setTimeout(step, 350 * (i + 1))); });
+  }
+
+  q('[data-key="preset"]').addEventListener("change", function (ev) { load(ev.target.value); });
+  q('[data-key="reset"]').addEventListener("click", function () { load(model.preset); });
+  q('[data-key="walk"]').addEventListener("click", walk);
+  q('[data-key="att-go"]').addEventListener("click", function () {
+    attach(parseInt(q('[data-key="att-ch"]').value, 10),
+      parseInt(q('[data-key="att-push"]').value, 10),
+      parseInt(q('[data-key="att-retain"]').value, 10));
+  });
+  load("signal");
+})();
+</script>
+
+<script>
+// Figure C: the grants panel. Evaluates a class's spec, an instance's grants
+// and its wiring against the spec fit check, placement legality and the
+// grant/wiring pairing rules.
+(function () {
+  "use strict";
+  var root = document.getElementById("grants");
+  root.hidden = false;
+  document.querySelector("#fig-c .grants-static").hidden = true;
+  var g = function (k) { return root.querySelector('[data-g="' + k + '"]'); };
+
+  var WORDS = ["ports", "store", "log", "alert", "config", "mqtt", "tools", "calls", "takeover", "dom", "page-dom"];
+  var BACKEND_ONLY = { store: 1, mqtt: 1, tools: 1 };
+  var SURFACE_ONLY = { dom: 1, "page-dom": 1, takeover: 1 };
+  var CLASSES = {
+    GitSyncConsumer: { requires: ["ports", "log", "store", "alert", "config", "tools"], optional: [], place: "backend" },
+    ConversationRecycler: { requires: ["ports", "store", "log", "config"], optional: [], place: "backend" },
+    Chrome: { requires: ["ports", "log", "dom", "page-dom"], optional: ["takeover"], place: "surface" },
+    Meeting: { requires: ["ports", "log", "takeover", "dom"], optional: [], place: "surface" },
+    Protobar: { requires: ["ports", "log", "dom"], optional: [], place: "surface" },
+    LightSwitch: { requires: ["ports", "log", "mqtt"], optional: [], place: "backend", illustrative: true },
+  };
+  var WIRING = [
+    { key: "out", label: "binds an output port", line: "out out -> demo_out;" },
+    { key: "pub", label: "states a publish entry", line: 'acl publish [prefix "brenn:demo.out."];' },
+    { key: "tool", label: "has a tool statement", line: 'tool git-repo-pull { allow { repo = "notes"; } }' },
+    { key: "mqttpub", label: "has an mqtt_publish entry", line: 'acl publish [client "mqtt:broker"];' },
+    { key: "store", label: "states a store_path", line: 'store_path = "/home/alice/state/demo.db";' },
+    { key: "config", label: "states a config map", line: "config = { … };" },
+    { key: "alert", label: "enclosing surface grants alert", surfaceOnly: true },
+    { key: "takeover", label: "binds a takeover-plane channel", line: 'out takeover -> "local:brenn/takeover";' },
+  ];
+  var granted = {};
+  var wired = {};
+
+  Object.keys(CLASSES).forEach(function (name) {
+    var o = document.createElement("option");
+    o.value = name;
+    o.textContent = name + (CLASSES[name].illustrative ? " (illustrative, not in-tree)" : "");
+    g("class").appendChild(o);
+  });
+
+  function cls() { return CLASSES[g("class").value]; }
+  function place() { return g("place").value; }
+  function has(list, w) { return list.indexOf(w) >= 0; }
+
+  // A fresh class starts from a well-formed instance: required words granted,
+  // optional words not, and exactly the wiring those grants pair with.
+  function reset() {
+    var c = cls();
+    g("place").value = c.place;
+    granted = {};
+    WORDS.forEach(function (w) { granted[w] = has(c.requires, w); });
+    wired = {
+      out: granted.ports, pub: false, tool: granted.tools, mqttpub: granted.mqtt,
+      store: granted.store, config: granted.config, alert: granted.alert, takeover: granted.takeover,
+    };
+    render();
+  }
+
+  function checkbox(checked, disabled, label, why, onChange) {
+    var l = document.createElement("label");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = checked;
+    box.disabled = disabled;
+    box.addEventListener("change", function () { onChange(box.checked); });
+    l.appendChild(box);
+    l.appendChild(document.createTextNode(" " + label));
+    if (why) {
+      var s = document.createElement("span");
+      s.className = "why";
+      s.textContent = why;
+      l.appendChild(s);
+    }
+    return l;
+  }
+
+  function verdicts() {
+    var p = place(), out = [];
+    var top = p === "backend";
+    WORDS.forEach(function (w) {
+      if (!granted[w]) return;
+      if (top && SURFACE_ONLY[w]) out.push("`" + w + "` is a page capability; a backend consumer has no page.");
+      if (!top && BACKEND_ONLY[w]) out.push("`" + w + "` is backend-only; a surface-placed instance cannot be granted it.");
+    });
+    var sends = wired.out || wired.pub;
+    if (sends && !granted.ports) out.push("It sends but does not grant `ports`.");
+    if (granted.ports && !sends) out.push("`ports` is granted but it neither binds an output nor states a publish entry: the interface reaches nothing.");
+    if (granted.tools !== !!wired.tool && top) out.push(granted.tools ? "`tools` is granted with no `tool` statement." : "A `tool` statement with no `tools` grant is authority nobody granted.");
+    if (!top && wired.tool) out.push("A `tool` statement on a surface-placed instance: the surface host links no tools interface.");
+    if (top && granted.mqtt !== !!wired.mqttpub) out.push(granted.mqtt ? "`mqtt` is granted with no `mqtt_publish` entry." : "An `mqtt_publish` entry with no `mqtt` grant.");
+    if (top && granted.store !== !!wired.store) out.push(granted.store ? "`store` is granted with no `store_path`." : "A `store_path` with no `store` grant.");
+    if (granted.config !== !!wired.config) out.push(granted.config ? "`config` is granted but there is no `config` map to read." : "A `config` map that no component may read.");
+    if (!top && granted.alert && !wired.alert) out.push("`alert` is granted but the enclosing surface does not grant `alert`.");
+    if (!top && granted.takeover !== !!wired.takeover) out.push(granted.takeover ? "`takeover` is granted but binds no takeover plane." : "A takeover binding without the `takeover` grant.");
+    return out;
+  }
+
+  function render() {
+    var c = cls(), p = place();
+    var words = g("words");
+    words.textContent = "";
+    WORDS.forEach(function (w) {
+      var why = null, disabled = false;
+      if (has(c.requires, w)) { disabled = true; why = "in the class's requires: cannot be omitted"; }
+      else if (!has(c.optional, w)) { disabled = true; why = "not in requires ∪ optional: the spec fit check refuses it"; }
+      else why = "optional: no interface behind it";
+      words.appendChild(checkbox(!!granted[w], disabled, w, why, function (v) { granted[w] = v; render(); }));
+    });
+    var wiring = g("wiring");
+    wiring.textContent = "";
+    WIRING.forEach(function (x) {
+      var off = x.surfaceOnly && p !== "surface";
+      wiring.appendChild(checkbox(!!wired[x.key] && !off, off, x.label, off ? "only a surface instance has an enclosing surface" : null,
+        function (v) { wired[x.key] = v; render(); }));
+    });
+
+    var grantList = WORDS.filter(function (w) { return granted[w]; });
+    var body = ["  grants = [" + grantList.join(", ") + "];"];
+    WIRING.forEach(function (x) { if (x.line && wired[x.key]) body.push("  " + x.line); });
+    var name = g("class").value;
+    var inst = ["new demo: " + name + " {"].concat(body, ["}"]);
+    var spec = "component " + name + " {\n  abi = processor;\n  requires = [" + c.requires.join(", ") + "];\n" +
+      (c.optional.length ? "  optional = [" + c.optional.join(", ") + "];\n" : "") + "  …\n}\n\n";
+    var text = p === "surface" ?
+      "surface demo {\n  grants = [subscribe, publish" + (wired.alert ? ", alert" : "") + "];\n" +
+        inst.map(function (l) { return "  " + l; }).join("\n") + "\n}" :
+      inst.join("\n");
+    g("block").textContent = spec + text;
+
+    var v = g("verdict");
+    v.textContent = "";
+    var imports = grantList.filter(function (w) { return w !== "takeover"; })
+      .map(function (w) { return "brenn:processor/" + w; });
+    var li = document.createElement("p");
+    li.textContent = "Interfaces linked: " + (imports.join(", ") || "none") +
+      (granted.takeover ? " (takeover links no interface: it is consent to a binding)" : "") + ".";
+    v.appendChild(li);
+    var problems = verdicts();
+    var head = document.createElement("p");
+    head.className = problems.length ? "bad" : "good";
+    head.textContent = problems.length ? "Refused at boot:" : "Accepted: the spec fits, the placement is legal and every grant pairs with its wiring.";
+    v.appendChild(head);
+    if (problems.length) {
+      var ul = document.createElement("ul");
+      problems.forEach(function (t) { var i = document.createElement("li"); i.textContent = t; ul.appendChild(i); });
+      v.appendChild(ul);
+    }
+  }
+
+  g("class").addEventListener("change", reset);
+  g("place").addEventListener("change", render);
+  reset();
+})();
+</script>
+</body>
+</html>
