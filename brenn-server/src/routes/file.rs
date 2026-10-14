@@ -274,6 +274,7 @@ async fn render_file_response(
             .unwrap_or("");
         if extension == "md" {
             brenn_render::frontmatter::render_markdown_with_frontmatter(
+                path,
                 &content_str,
                 frontmatter_cfg,
             )

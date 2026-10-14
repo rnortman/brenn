@@ -282,6 +282,7 @@ pub fn build_history(
                         });
 
                     let rendered_html = crate::frontmatter::render_markdown_with_frontmatter(
+                        file_path,
                         content,
                         frontmatter_cfg,
                     );

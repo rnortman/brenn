@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 /// Maximum file size for artifact display (1 MB).
-const MAX_FILE_SIZE: u64 = 1024 * 1024;
+pub(crate) const MAX_FILE_SIZE: u64 = 1024 * 1024;
 
 /// A repo mount permitted as a source for artifact display.
 ///

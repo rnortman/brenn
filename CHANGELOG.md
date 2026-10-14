@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-10-14
+
 - **Per-agent environment variables.** A new `env` attribute on agents sets
   environment variables on the Claude Code subprocess, enabling local LLM
   backends (e.g. llama-server with an Anthropic-compatible API) on a per-agent
@@ -49,10 +51,21 @@ All notable changes to Brenn are documented here.
   name, an agent now gets the one its own file refers to. Previously it could
   silently get the other file's definition — and so launch the wrong MCP
   server command with the wrong environment.
-- Bumped rustls to 0.23.45, clearing RUSTSEC-2026-0285.
-- Bumped wasmtime from 47.0.4 to 48.0.5, clearing RUSTSEC-2026-0315,
-  RUSTSEC-2026-0316, RUSTSEC-2026-0325, RUSTSEC-2026-0326 and
-  RUSTSEC-2026-0327.
+- **Frontmatter is parsed with a new YAML library.** The YAML header at the
+  top of a markdown file ("frontmatter") is now read by `saphyr` instead of
+  the deprecated `serde_yaml`, whose underlying parser (`unsafe-libyaml`) is
+  unmaintained (RUSTSEC-2024-0449); graf is pinned to a revision that made
+  the same move. Visible differences: numbers display exactly as written
+  (`012`, `0x1F`, `+5`); frontmatter that uses YAML anchors or aliases, nests
+  deeper than 128 levels, holds more than 100 000 nodes, or carries more
+  than 4 MiB of text now renders as an error block instead of the parsed
+  header; and parse-error messages are worded differently.
+- Bumped rustls to 0.23.46, clearing RUSTSEC-2026-0285 and
+  RUSTSEC-2026-0346 through RUSTSEC-2026-0349.
+- Bumped wasmtime from 47.0.4 to 48.0.6, clearing RUSTSEC-2026-0315,
+  RUSTSEC-2026-0316, RUSTSEC-2026-0325 through RUSTSEC-2026-0327,
+  RUSTSEC-2026-0353 through RUSTSEC-2026-0359, and RUSTSEC-2026-0361 through
+  RUSTSEC-2026-0364.
 - Fixed: after an agent's owner changes on reload, the former owner's
   conversation no longer keeps its positions on non-durable (`ephemeral:`)
   channels, so the wake no longer respawns that conversation on every publish

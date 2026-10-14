@@ -114,6 +114,7 @@ pub(super) async fn handle(
                     };
 
                     let rendered_html = brenn_render::frontmatter::render_markdown_with_frontmatter(
+                        &display_path,
                         &raw_content,
                         &bridge.frontmatter,
                     );

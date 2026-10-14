@@ -208,7 +208,7 @@ pub fn load_artifact_snapshot(
         .expect("artifact payload must have version") as i32;
 
     let rendered_html =
-        crate::frontmatter::render_markdown_with_frontmatter(content, frontmatter_cfg);
+        crate::frontmatter::render_markdown_with_frontmatter(&file_path, content, frontmatter_cfg);
 
     // Count total versions for this file_path.
     let total_versions: i32 = conn
