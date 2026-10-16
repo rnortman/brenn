@@ -3338,3 +3338,30 @@ only genuinely dynamic properties from code.
 
 Code sites (`TODO(kind-stylesheets)`):
 brenn-server/src/routes/surface/page.rs, at the page head in `surface_page`.
+
+## `apple-touch-icon`
+
+iOS Safari probes for a home-screen icon when a page is bookmarked or added to
+the home screen: `/apple-touch-icon.png`, `/apple-touch-icon-precomposed.png`,
+and size variants such as `/apple-touch-icon-180x180.png`, several in a burst.
+Brenn serves none of them, so each lands in the global `not_found` fallback and
+logs an `unrecognized_url` security event. The fail2ban jail allows 5 of those
+in 10 minutes; one "Add to Home Screen" produced 6 in about 30 seconds and
+banned the owner's own IP from port 443. The service itself stayed healthy —
+the ban was the whole outage.
+
+The fix belongs in brenn, not in loosening the jail: a legitimate first-party
+client doing what every iPhone does must not look like a scanner. Serve the
+icon — a compiled-in PNG beside `ICON_192`/`ICON_512`, routed in
+`utility_routes` outside `require_auth` like `/favicon.ico` — and declare it
+with `<link rel="apple-touch-icon">` in the page heads so Safari fetches the
+declared URL instead of probing. Decide whether the size and `-precomposed`
+variants get routes too (they are still probed by some iOS versions and by
+other crawlers) or stay as 404s once the declared link is in place; whatever
+remains a 404 must not be reachable by one ordinary bookmark action.
+
+Code sites (`TODO(apple-touch-icon)`):
+`brenn-server/src/router.rs`, at the `/favicon.ico` route in `utility_routes`.
+
+Done = adding a Brenn page to the iOS home screen fetches only URLs Brenn
+serves, logs no `unrecognized_url` events, and shows the Brenn icon.

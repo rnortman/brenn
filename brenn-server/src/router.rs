@@ -378,6 +378,9 @@ pub fn build_router(
     // Utility routes (no auth, global rate limit only).
     let utility_routes = Router::new()
         .route("/health", get(health))
+        // TODO(apple-touch-icon): iOS probes `/apple-touch-icon*.png` on
+        // bookmark/home-screen add; unserved, the burst trips the
+        // unrecognized-URL fail2ban jail against a legitimate client.
         .route("/favicon.ico", get(statics::favicon))
         .route("/sw.js", get(statics::service_worker))
         // PWA manifest + manifest-referenced icons. Browsers fetch
