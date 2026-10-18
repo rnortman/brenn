@@ -202,13 +202,46 @@ reject "a package with no binding record" "holds no package.json" \
     --manifest "$manifest" "${pkg_args[@]}"
 
 # ---------------------------------------------------------------------------
-# The surface arm. A bundle's surface root is kinds alone: the kernel and the
-# flat sidecars are brenn's tree, and a second copy of them is a second kernel
-# the host refuses at boot.
+# The surface arm. A bundle's surface root is kinds and their own documentation
+# sidecars alone: the kernel and brenn's own sidecars are brenn's tree, and a
+# second copy of them is a second kernel the host refuses at boot.
 # ---------------------------------------------------------------------------
 setup
 printf 'export {};\n' > "$tmp/stage-b/brenn_surface_kernel.js"
 reject "a stage carrying entries outside processor/" "carries entries outside processor/" \
+    --surface-stage "$tmp/stage-b"
+
+# A kind's sidecars ride beside `processor/` under its stem, hyphens folded to
+# underscores, and land flat in `surface/` where the server reads them.
+setup
+printf '# Demo panel\n' > "$tmp/stage-b/brenn_demo_panel.help.md"
+printf '{"type": "object"}\n' > "$tmp/stage-b/brenn_demo_panel.schema.json"
+if ! out=$(run --surface-stage "$tmp/stage-b" --spec "$panel_spec" 2>&1); then
+    fail "a stage carrying its kind's sidecars should stage: $out"
+else
+    for sidecar in brenn_demo_panel.help.md brenn_demo_panel.schema.json; do
+        if ! cmp -s "$tmp/stage-b/$sidecar" "$tmp/out/surface/$sidecar"; then
+            fail "surface/$sidecar is not the staged sidecar: $(entries)"
+        fi
+    done
+fi
+
+# The stem is the fold, not the kind: the server never reads a hyphenated name.
+setup
+printf '# Demo panel\n' > "$tmp/stage-b/brenn_demo-panel.help.md"
+reject "a sidecar under the unfolded kind" "brenn_demo-panel.help.md" \
+    --surface-stage "$tmp/stage-b"
+
+# A sidecar is its own stage's kind's: one naming a kind another stage ships is
+# documentation smuggled past the stage that owns the kind.
+setup
+printf '# Demo counter\n' > "$tmp/stage-b/brenn_demo_counter.help.md"
+reject "a sidecar naming a kind its stage does not ship" "brenn_demo_counter.help.md" \
+    --surface-stage "$tmp/stage-a" --surface-stage "$tmp/stage-b"
+
+setup
+printf '# Other\n' > "$tmp/stage-b/brenn_demo_panel.notes.md"
+reject "a stage carrying a kind-named file that is no sidecar" "brenn_demo_panel.notes.md" \
     --surface-stage "$tmp/stage-b"
 
 setup

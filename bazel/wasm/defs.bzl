@@ -830,7 +830,8 @@ def component_bundle(
             Exactly the manifest's set — a bundle repository has no unshipped
             packages, so the assembly holds the two equal in both directions.
         surface_kinds: the `surface_processor_assets` targets whose transpiled
-            trees stage under `surface/`.
+            trees stage under `surface/`, with the documentation sidecars each
+            was given beside them.
         manifest: the manifest naming the shipped packages; required iff
             `packages` is non-empty, and refused otherwise.
         library_modules: authored `.brenn` modules this bundle ships that no

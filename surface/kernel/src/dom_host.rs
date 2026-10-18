@@ -56,11 +56,13 @@ use js_sys::Reflect;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
-use web_sys::{Document, Element, Event, HtmlElement};
+use wasm_bindgen::prelude::wasm_bindgen;
+use web_sys::{Document, Element, Event, HtmlElement, KeyboardEvent, MouseEvent, PointerEvent};
 
 use crate::contract::{
-    GESTURE_CANCEL_FIELD, GESTURE_EVENT_FIELD, GESTURE_LISTENER_FIELD, GESTURE_TARGET_FIELD,
-    SURFACE_ROOT_ID, dom_attribute_allowed, dom_tag_allowed,
+    ANIMATE_ITERATIONS_FIELD, ANIMATE_ITERATIONS_INFINITE, GESTURE_CANCEL_FIELD, GestureBody,
+    GestureDetail, GestureKey, GestureModifiers, GesturePointer, SURFACE_ROOT_ID,
+    dom_attribute_allowed, dom_attribute_value_allowed, dom_tag_allowed,
 };
 use crate::dom;
 use crate::dom_table::HandleTable;
@@ -225,7 +227,8 @@ impl DomHost {
         Ok(self.table(instance, |table| table.mint(&element)))
     }
 
-    /// `dom.set-attribute`: an allowed name, and a value the host never reads.
+    /// `dom.set-attribute`: an allowed name, and a value the host reads only to
+    /// hold `tabindex` to its admitted values.
     pub fn set_attribute(
         &self,
         instance: &str,
@@ -236,6 +239,9 @@ impl DomHost {
         self.granted(instance, ComponentGrant::Dom, "dom.set-attribute")?;
         if !dom_attribute_allowed(name) {
             return Err(format!("dom: `{name}` is not a settable attribute"));
+        }
+        if !dom_attribute_value_allowed(name, value) {
+            return Err(format!("dom: `{value}` is not a settable `{name}`"));
         }
         self.element(instance, node)?
             .set_attribute(name, value)
@@ -387,6 +393,57 @@ impl DomHost {
         Ok(-(date.get_timezone_offset() as i32))
     }
 
+    /// `dom.animate`: start a Web Animations API animation on the node.
+    ///
+    /// Two failure layers. The outer `Err` is the component's own malformed
+    /// call — no grant, a handle it does not hold, keyframes text that is not a
+    /// JSON array or options text that is not a JSON object — and traps like
+    /// every other refusal here. The inner `Err` is the browser's
+    /// `KeyframeEffect` constructor refusing data a component may have taken
+    /// from a message (an easing, an offset, a timing field), carried as the
+    /// browser's own message so the component can report it and keep running.
+    /// The constructor throws before any effect is attached, so a refused call
+    /// leaves the node as it was. The returned `Animation` is dropped: the
+    /// element owns it and it ends with the element.
+    pub fn animate(
+        &self,
+        instance: &str,
+        node: u64,
+        keyframes: &str,
+        options: &str,
+    ) -> Result<Result<(), String>, String> {
+        self.granted(instance, ComponentGrant::Dom, "dom.animate")?;
+        let element = self.element(instance, node)?;
+        let keyframes = js_sys::JSON::parse(keyframes)
+            .ok()
+            .filter(js_sys::Array::is_array)
+            .ok_or_else(|| "dom: the animate keyframes are not a JSON array".to_string())?;
+        let options = js_sys::JSON::parse(options)
+            .ok()
+            .filter(|options| options.is_object() && !js_sys::Array::is_array(options))
+            .ok_or_else(|| "dom: the animate options are not a JSON object".to_string())?;
+        substitute_infinite_iterations(&options);
+        Ok(element_animate(&element, &keyframes, &options)
+            .map(|_animation| ())
+            .map_err(|thrown| refusal_message(&thrown)))
+    }
+
+    /// `dom.prefers-reduced-motion`: whether the page environment asks for
+    /// reduced motion, read at the call.
+    pub fn prefers_reduced_motion(&self, instance: &str) -> Result<bool, String> {
+        self.granted(instance, ComponentGrant::Dom, "dom.prefers-reduced-motion")?;
+        let window = web_sys::window().expect("surface kernel: no window");
+        // `matchMedia` evaluates an unparseable query as `not all` rather than
+        // throwing, and the query is a well-formed constant, so only the
+        // `Ok(Some(_))` arm is reached; `false` is the browser's own answer for a
+        // query it cannot evaluate.
+        Ok(window
+            .match_media(REDUCED_MOTION_QUERY)
+            .ok()
+            .flatten()
+            .is_some_and(|list| list.matches()))
+    }
+
     /// `dom.listen`: attach a kernel-owned listener that answers the event with a
     /// sync-call activation on `port`.
     ///
@@ -441,7 +498,8 @@ impl DomHost {
     ///
     /// The body names the event, the node whose listener fired, and the nearest
     /// handle-mapped ancestor of the event's target — which is how a delegated
-    /// listener on a container tells apart which child was hit. A target that
+    /// listener on a container tells apart which child was hit — plus the
+    /// pointer, key and modifier detail of [`gesture_detail`]. A target that
     /// maps to nothing (the event fired on a node this instance never named) is
     /// reported as the listening node itself, since that is the nearest thing the
     /// component can be told about.
@@ -458,12 +516,18 @@ impl DomHost {
             .and_then(|target| target.dyn_into::<Element>().ok())
             .and_then(|target| self.nearest_mapped(instance, target))
             .unwrap_or(listener);
-        let body = serde_json::json!({
-            GESTURE_EVENT_FIELD: event_type,
-            GESTURE_LISTENER_FIELD: listener,
-            GESTURE_TARGET_FIELD: target,
-        })
-        .to_string();
+        // While a listener runs, `currentTarget` is the element it is on.
+        let listening = fired
+            .current_target()
+            .and_then(|current| current.dyn_into::<Element>().ok())
+            .expect("dom: a listener ran without its element as currentTarget");
+        let body = GestureBody {
+            event: event_type.to_string(),
+            listener,
+            target,
+            detail: gesture_detail(fired, &listening),
+        };
+        let body = serde_json::to_string(&body).expect("dom: serializing a gesture body");
         match self.door.request(instance, port, body) {
             SyncAnswer::Ok(Some(reply)) if cancels(&reply) => fired.prevent_default(),
             // Anything else lets the event proceed: no reply, a reply that did not
@@ -539,6 +603,124 @@ impl DomHost {
 
 /// The JS property both halves of the form-control seam name.
 const VALUE_PROPERTY: &str = "value";
+
+/// The media query `dom.prefers-reduced-motion` answers.
+const REDUCED_MOTION_QUERY: &str = "(prefers-reduced-motion: reduce)";
+
+/// A kernel-local binding for `Element.animate`, which `web-sys` binds only
+/// behind its unstable-API cfg and without `catch`: the throw must arrive as an
+/// `Err` rather than unwind through the kernel's frames. The receiver type is a
+/// local view of an `Element`, reached by `unchecked_ref`, because a binding
+/// can add methods only to a type of its own crate.
+#[wasm_bindgen]
+extern "C" {
+    type AnimatableElement;
+
+    #[wasm_bindgen(catch, method, structural, js_name = animate)]
+    fn animate(
+        this: &AnimatableElement,
+        keyframes: &JsValue,
+        options: &JsValue,
+    ) -> Result<JsValue, JsValue>;
+}
+
+/// `Element.animate(keyframes, options)`, its throw caught as the `Err`.
+fn element_animate(
+    element: &Element,
+    keyframes: &JsValue,
+    options: &JsValue,
+) -> Result<JsValue, JsValue> {
+    element
+        .unchecked_ref::<AnimatableElement>()
+        .animate(keyframes, options)
+}
+
+/// Replace an `iterations` of `"infinite"` on a parsed options object with
+/// `Infinity`, the one value JSON cannot carry. Anything else is left for the
+/// browser to accept or refuse.
+fn substitute_infinite_iterations(options: &JsValue) {
+    let key = JsValue::from_str(ANIMATE_ITERATIONS_FIELD);
+    let iterations = Reflect::get(options, &key).expect("dom: reading a parsed options object");
+    if iterations.as_string().as_deref() == Some(ANIMATE_ITERATIONS_INFINITE) {
+        Reflect::set(options, &key, &JsValue::from_f64(f64::INFINITY))
+            .expect("dom: writing a parsed options object");
+    }
+}
+
+/// The detail objects of a gesture body, each present only for the event class
+/// that carries it: `pointer` for a `MouseEvent`, `key` for a `KeyboardEvent`,
+/// `modifiers` for either. Pointer coordinates are relative to `listening`,
+/// the node the listener is on.
+fn gesture_detail(fired: &Event, listening: &Element) -> GestureDetail {
+    if let Some(mouse) = fired.dyn_ref::<MouseEvent>() {
+        let rect = listening.get_bounding_client_rect();
+        GestureDetail {
+            pointer: Some(GesturePointer {
+                // `clientX`/`clientY` are doubles in the browser; web-sys binds
+                // them as integers, so they are read as properties to keep the
+                // fraction.
+                x: number(fired, "clientX") - rect.left(),
+                y: number(fired, "clientY") - rect.top(),
+                width: rect.width(),
+                height: rect.height(),
+                button: mouse.button(),
+                buttons: mouse.buttons(),
+                pointer_type: fired
+                    .dyn_ref::<PointerEvent>()
+                    .map(|pointer| pointer.pointer_type()),
+            }),
+            key: None,
+            modifiers: Some(GestureModifiers {
+                alt: mouse.alt_key(),
+                ctrl: mouse.ctrl_key(),
+                meta: mouse.meta_key(),
+                shift: mouse.shift_key(),
+            }),
+        }
+    } else if let Some(keyboard) = fired.dyn_ref::<KeyboardEvent>() {
+        GestureDetail {
+            pointer: None,
+            key: Some(GestureKey {
+                key: keyboard.key(),
+                code: keyboard.code(),
+                repeat: keyboard.repeat(),
+            }),
+            modifiers: Some(GestureModifiers {
+                alt: keyboard.alt_key(),
+                ctrl: keyboard.ctrl_key(),
+                meta: keyboard.meta_key(),
+                shift: keyboard.shift_key(),
+            }),
+        }
+    } else {
+        GestureDetail::default()
+    }
+}
+
+/// A numeric property of a fired `MouseEvent`, which the browser always
+/// defines; anything else is not a `MouseEvent` and panics.
+fn number(event: &Event, property: &str) -> f64 {
+    Reflect::get(event, &JsValue::from_str(property))
+        .ok()
+        .and_then(|value| value.as_f64())
+        .unwrap_or_else(|| panic!("dom: a MouseEvent without a numeric `{property}`"))
+}
+
+/// The browser's message for a thrown refusal: an `Error`'s own `message`, a
+/// thrown string as itself, and a fixed sentence for anything else so the
+/// component never receives an empty reason.
+fn refusal_message(thrown: &JsValue) -> String {
+    let message = thrown
+        .dyn_ref::<js_sys::Error>()
+        .map(|error| String::from(error.message()))
+        .or_else(|| thrown.as_string())
+        .unwrap_or_default();
+    if message.is_empty() {
+        "the browser refused the animation without a message".to_string()
+    } else {
+        message
+    }
+}
 
 /// The page document. A missing one is not a page, so this panics rather than
 /// growing an absence arm every caller would have to carry.
@@ -881,7 +1063,7 @@ mod tests {
             assert_eq!(
                 element.get_attribute(name).as_deref(),
                 Some("v"),
-                "the value reaches the element unread — the host inspects names,                  never values"
+                "the value reaches the element as given"
             );
             rig.host
                 .remove_attribute(DOM, node, name)
@@ -910,6 +1092,32 @@ mod tests {
                 rig.host.remove_attribute(DOM, node, name).is_err(),
                 "{name:?} is not removable either — a removal it could not have \
                  written is a reach at what another layer put there"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn tabindex_is_set_only_to_zero_or_minus_one() {
+        let rig = dom_rig();
+        let node = rig.host.create_element(DOM, "div").expect("an allowed tag");
+        let element = rig.host.element(DOM, node).expect("a live handle");
+        for value in ["0", "-1"] {
+            rig.host
+                .set_attribute(DOM, node, "tabindex", value)
+                .unwrap_or_else(|err| panic!("tabindex={value} is settable: {err}"));
+            assert_eq!(element.get_attribute("tabindex").as_deref(), Some(value));
+        }
+        for value in ["1", "+0", " 0", ""] {
+            assert!(
+                rig.host
+                    .set_attribute(DOM, node, "tabindex", value)
+                    .is_err(),
+                "tabindex={value:?} is not settable"
+            );
+            assert_eq!(
+                element.get_attribute("tabindex").as_deref(),
+                Some("-1"),
+                "a refused value leaves the attribute as it was"
             );
         }
     }
@@ -1332,6 +1540,395 @@ mod tests {
         );
     }
 
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(method, structural, js_name = getAnimations)]
+        fn get_animations(this: &AnimatableElement) -> js_sys::Array;
+    }
+
+    /// How many animations the browser holds for `element`.
+    fn animation_count(element: &Element) -> u32 {
+        element
+            .unchecked_ref::<AnimatableElement>()
+            .get_animations()
+            .length()
+    }
+
+    const FADE: &str = r#"[{"opacity":0.5},{"opacity":1}]"#;
+
+    /// A mounted element of the dom rig's instance and its handle.
+    fn animatable(rig: &Rig) -> (u64, Element) {
+        let root = rig.host.root(DOM).expect("mounted");
+        let node = rig.host.create_element(DOM, "div").expect("an allowed tag");
+        rig.host.append(DOM, root, node).expect("append");
+        let element = rig
+            .host
+            .element(DOM, node)
+            .expect("the handle was just minted");
+        (node, element)
+    }
+
+    #[wasm_bindgen_test]
+    fn an_accepted_animation_runs_on_the_node() {
+        let rig = dom_rig();
+        let (node, element) = animatable(&rig);
+        assert_eq!(
+            rig.host
+                .animate(DOM, node, FADE, r#"{"duration":200,"easing":"ease-out"}"#),
+            Ok(Ok(()))
+        );
+        assert_eq!(animation_count(&element), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn a_browser_refusal_is_a_value_and_leaves_the_node_alone() {
+        let mut rig = dom_rig();
+        let (node, element) = animatable(&rig);
+        let answer = rig
+            .host
+            .animate(
+                DOM,
+                node,
+                FADE,
+                r#"{"duration":200,"easing":"ease-out-back"}"#,
+            )
+            .expect("a well-formed call is not a trap");
+        let message = answer.expect_err("no browser parses `ease-out-back`");
+        assert!(!message.is_empty(), "the browser's message is carried");
+        assert_eq!(animation_count(&element), 0);
+        assert_eq!(rig.report(), None, "a refusal reports nothing on its own");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_malformed_animate_call_and_a_foreign_handle_trap() {
+        let mut rig = rig(&[("wbt-anim-mine", &["dom"]), ("wbt-anim-yours", &["dom"])]);
+        let mine = rig
+            .host
+            .create_element("wbt-anim-mine", "div")
+            .expect("an allowed tag");
+        assert!(
+            rig.host
+                .animate("wbt-anim-yours", mine, FADE, "{}")
+                .is_err(),
+            "the neighbour's handle names nothing here"
+        );
+        for (keyframes, options) in [
+            ("[{", "{}"),
+            (r#"{"opacity":0}"#, "{}"),
+            (FADE, "{"),
+            (FADE, "[200]"),
+            (FADE, "null"),
+        ] {
+            assert!(
+                rig.host
+                    .animate("wbt-anim-mine", mine, keyframes, options)
+                    .is_err(),
+                "{keyframes} / {options} is the component's own malformed call"
+            );
+        }
+        assert_eq!(
+            rig.report(),
+            None,
+            "a malformed call is a trap, not a refusal"
+        );
+    }
+
+    /// The `iterations` the browser holds for the node's one animation.
+    fn iterations(element: &Element) -> Option<f64> {
+        let animation = element
+            .unchecked_ref::<AnimatableElement>()
+            .get_animations()
+            .get(0);
+        let effect = Reflect::get(&animation, &"effect".into()).expect("an effect");
+        let timing = Reflect::get(&effect, &"getTiming".into())
+            .expect("getTiming")
+            .unchecked_into::<js_sys::Function>()
+            .call0(&effect)
+            .expect("the timing reads");
+        Reflect::get(&timing, &"iterations".into())
+            .expect("iterations")
+            .as_f64()
+    }
+
+    #[wasm_bindgen_test]
+    fn infinite_iterations_loop_forever() {
+        let rig = dom_rig();
+        let (node, element) = animatable(&rig);
+        assert_eq!(
+            rig.host.animate(
+                DOM,
+                node,
+                FADE,
+                r#"{"duration":200,"iterations":"infinite"}"#
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(iterations(&element), Some(f64::INFINITY));
+    }
+
+    #[wasm_bindgen_test]
+    fn only_the_infinite_string_is_substituted() {
+        let rig = dom_rig();
+        let (node, element) = animatable(&rig);
+        assert_eq!(
+            rig.host
+                .animate(DOM, node, FADE, r#"{"duration":200,"iterations":3}"#),
+            Ok(Ok(()))
+        );
+        assert_eq!(iterations(&element), Some(3.0), "a count stays a count");
+
+        let (node, element) = animatable(&rig);
+        let answer = rig
+            .host
+            .animate(
+                DOM,
+                node,
+                FADE,
+                r#"{"duration":200,"iterations":"forever"}"#,
+            )
+            .expect("a well-formed call is not a trap");
+        assert!(
+            answer.is_err(),
+            "any other string reaches the browser as itself, which refuses it"
+        );
+        assert_eq!(animation_count(&element), 0);
+    }
+
+    /// The request body of the newest activation on the `press` port.
+    fn press_body(rig: &Rig) -> GestureBody {
+        let activation = rig.seen.borrow().last().cloned().expect("the entry ran");
+        let body = activation
+            .ports
+            .iter()
+            .find(|window| window.port == "press")
+            .and_then(|window| window.envelopes.last())
+            .map(|json| brenn_surface_test_fixtures::parse_envelope(json).body)
+            .expect("the sync window carries the request");
+        serde_json::from_str(&body).expect("the body is a gesture")
+    }
+
+    /// An event built by its own constructor, which `web-sys` binds only
+    /// behind features the kernel does not otherwise need.
+    fn constructed(class: &str, event_type: &str, init: &str) -> Event {
+        js_sys::Function::new_with_args("", &format!("return new {class}('{event_type}', {init});"))
+            .call0(&JsValue::NULL)
+            .expect("the event constructs")
+            .unchecked_into()
+    }
+
+    /// A listened, positioned container of the dom rig's instance.
+    fn positioned_listener(rig: &Rig, event: &str) -> (u64, Element) {
+        let root = rig.host.root(DOM).expect("mounted");
+        let node = rig.host.create_element(DOM, "div").expect("create");
+        rig.host.append(DOM, root, node).expect("append");
+        for (name, value) in [
+            ("position", "fixed"),
+            ("left", "100px"),
+            ("top", "50px"),
+            ("width", "400px"),
+            ("height", "200px"),
+        ] {
+            rig.host
+                .set_style_property(DOM, node, name, value)
+                .expect("style");
+        }
+        rig.host.listen(DOM, node, event, "press").expect("granted");
+        let element = rig.host.element(DOM, node).expect("a live handle");
+        (node, element)
+    }
+
+    #[wasm_bindgen_test]
+    fn a_pointer_gesture_carries_its_position_on_the_listener() {
+        let rig = dom_rig();
+        let (_, element) = positioned_listener(&rig, "click");
+        let event = constructed(
+            "MouseEvent",
+            "click",
+            "{bubbles: true, clientX: 223.5, clientY: 90, button: 0, buttons: 1, shiftKey: true}",
+        );
+        element.dispatch_event(&event).expect("dispatch");
+        assert_eq!(
+            press_body(&rig).detail,
+            GestureDetail {
+                pointer: Some(GesturePointer {
+                    x: 123.5,
+                    y: 40.0,
+                    width: 400.0,
+                    height: 200.0,
+                    button: 0,
+                    buttons: 1,
+                    // A MouseEvent is not a PointerEvent.
+                    pointer_type: None,
+                }),
+                key: None,
+                modifiers: Some(GestureModifiers {
+                    shift: true,
+                    ..GestureModifiers::default()
+                }),
+            }
+        );
+    }
+
+    /// Each modifier held alone, with the detail it must yield: one held key at
+    /// a time tells a swapped or duplicated mapping apart.
+    fn modifiers_one_at_a_time() -> [(&'static str, GestureModifiers); 4] {
+        let none = GestureModifiers::default();
+        [
+            ("altKey", GestureModifiers { alt: true, ..none }),
+            ("ctrlKey", GestureModifiers { ctrl: true, ..none }),
+            ("metaKey", GestureModifiers { meta: true, ..none }),
+            (
+                "shiftKey",
+                GestureModifiers {
+                    shift: true,
+                    ..none
+                },
+            ),
+        ]
+    }
+
+    #[wasm_bindgen_test]
+    fn a_pointer_gesture_maps_each_modifier_to_its_own_field() {
+        let rig = dom_rig();
+        let (_, element) = positioned_listener(&rig, "click");
+        for (held, expected) in modifiers_one_at_a_time() {
+            let event = constructed(
+                "MouseEvent",
+                "click",
+                &format!("{{bubbles: true, {held}: true}}"),
+            );
+            element.dispatch_event(&event).expect("dispatch");
+            assert_eq!(
+                press_body(&rig).detail.modifiers,
+                Some(expected),
+                "a click with `{held}` held"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn a_delegated_pointer_gesture_is_measured_on_the_listener_not_the_target() {
+        let rig = dom_rig();
+        let (listener, _) = positioned_listener(&rig, "click");
+        let child = rig.host.create_element(DOM, "div").expect("create");
+        rig.host.append(DOM, listener, child).expect("append");
+        for (name, value) in [
+            ("position", "fixed"),
+            ("left", "300px"),
+            ("top", "120px"),
+            ("width", "50px"),
+            ("height", "20px"),
+        ] {
+            rig.host
+                .set_style_property(DOM, child, name, value)
+                .expect("style");
+        }
+        let event = constructed(
+            "MouseEvent",
+            "click",
+            "{bubbles: true, clientX: 310, clientY: 130}",
+        );
+        rig.host
+            .element(DOM, child)
+            .expect("a live handle")
+            .dispatch_event(&event)
+            .expect("dispatch");
+        let body = press_body(&rig);
+        assert_eq!(body.listener, listener);
+        assert_eq!(body.target, child);
+        let pointer = body.detail.pointer.expect("a pointer detail");
+        assert_eq!(
+            (pointer.x, pointer.y, pointer.width, pointer.height),
+            (210.0, 80.0, 400.0, 200.0),
+            "the listener's rect, not the child's"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_pointer_event_carries_its_pointer_type() {
+        let rig = dom_rig();
+        let (_, element) = positioned_listener(&rig, "pointerdown");
+        let event = constructed(
+            "PointerEvent",
+            "pointerdown",
+            "{bubbles: true, clientX: 100, clientY: 50, pointerType: 'touch'}",
+        );
+        element.dispatch_event(&event).expect("dispatch");
+        let pointer = press_body(&rig).detail.pointer.expect("a pointer detail");
+        assert_eq!(pointer.pointer_type.as_deref(), Some("touch"));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_key_gesture_carries_its_key_and_modifiers() {
+        let rig = dom_rig();
+        let (_, element) = positioned_listener(&rig, "keydown");
+        let event = constructed(
+            "KeyboardEvent",
+            "keydown",
+            "{bubbles: true, key: 'ArrowLeft', code: 'ArrowLeft', repeat: true, ctrlKey: true}",
+        );
+        element.dispatch_event(&event).expect("dispatch");
+        assert_eq!(
+            press_body(&rig).detail,
+            GestureDetail {
+                pointer: None,
+                key: Some(GestureKey {
+                    key: "ArrowLeft".to_string(),
+                    code: "ArrowLeft".to_string(),
+                    repeat: true,
+                }),
+                modifiers: Some(GestureModifiers {
+                    ctrl: true,
+                    ..GestureModifiers::default()
+                }),
+            }
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_key_gesture_maps_each_modifier_to_its_own_field() {
+        let rig = dom_rig();
+        let (_, element) = positioned_listener(&rig, "keydown");
+        for (held, expected) in modifiers_one_at_a_time() {
+            let event = constructed(
+                "KeyboardEvent",
+                "keydown",
+                &format!("{{bubbles: true, key: 'a', code: 'KeyA', {held}: true}}"),
+            );
+            element.dispatch_event(&event).expect("dispatch");
+            assert_eq!(
+                press_body(&rig).detail.modifiers,
+                Some(expected),
+                "a keydown with `{held}` held"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn a_custom_event_carries_no_detail() {
+        let rig = dom_rig();
+        let (_, element) = positioned_listener(&rig, "click");
+        element
+            .dispatch_event(&cancelable_click())
+            .expect("dispatch");
+        assert_eq!(press_body(&rig).detail, GestureDetail::default());
+    }
+
+    #[wasm_bindgen_test]
+    fn reduced_motion_answers_the_media_query() {
+        let rig = dom_rig();
+        let window = web_sys::window().expect("a window");
+        let expected = window
+            .match_media(REDUCED_MOTION_QUERY)
+            .expect("the query parses")
+            .expect("a window answers a media query")
+            .matches();
+        assert_eq!(
+            rig.host.prefers_reduced_motion(DOM).expect("granted"),
+            expected
+        );
+    }
+
     #[wasm_bindgen_test]
     fn a_gesture_reports_the_nearest_mapped_ancestor_of_its_target() {
         // A delegated listener: one listener on the container, and the body must
@@ -1368,11 +1965,11 @@ mod tests {
             .and_then(|window| window.envelopes.last())
             .map(|json| brenn_surface_test_fixtures::parse_envelope(json).body)
             .expect("the sync window carries the request");
-        let body: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
-        assert_eq!(body[GESTURE_EVENT_FIELD], "click");
-        assert_eq!(body[GESTURE_LISTENER_FIELD], container);
+        let body: GestureBody = serde_json::from_str(&body).expect("the body is a gesture");
+        assert_eq!(body.event, "click");
+        assert_eq!(body.listener, container);
         assert_eq!(
-            body[GESTURE_TARGET_FIELD], row,
+            body.target, row,
             "the target is the nearest ancestor the instance holds a handle for"
         );
     }
@@ -1522,6 +2119,13 @@ mod tests {
             .listen(WHO, child, "click", "press")
             .expect("listen");
         rig.host.utc_offset_minutes(WHO, 0).expect("utc-offset");
+        rig.host
+            .animate(WHO, child, r#"[{"opacity":0},{"opacity":1}]"#, "{}")
+            .expect("animate")
+            .expect("the browser accepts it");
+        rig.host
+            .prefers_reduced_motion(WHO)
+            .expect("prefers-reduced-motion");
 
         // And every `page-dom` entry, which reaches further into the document
         // and no further into the kernel.

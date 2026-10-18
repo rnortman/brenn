@@ -17,7 +17,7 @@ Chrome reads 6 ports. Bind each to the channel it carries:
 |---|---|---|
 | `layout` | a `brenn:` layout channel (retained, depth ≥ 1) | the layout doc (below) |
 | `theme` | `local:brenn/theme` | `{ v, theme }` — the runtime theme axis |
-| `takeover` | `local:brenn/takeover` | a component's fullscreen request/release (needs the surface `takeover` grant) |
+| `takeover` | `local:brenn/takeover` | a component's request/release of the screen, `{ v, action, mode, instance }` — `mode` is `takeover` (replace the layout, and the default when absent) or `overlay` (draw over it); a `takeover` request preempts an `overlay` holder (needs the instance's `takeover` grant) |
 | `link-state` | `local:brenn/link-state` | `{ v, state }` — the connection banner |
 | `surface-state` | `local:brenn/surface-state` | the mounted-instance set chrome arranges |
 | `toast` | `local:brenn/toast` | transient notices (live-only, retains nothing) |
@@ -43,6 +43,26 @@ port unbound still renders identically, but its status document reports no
 overlay whether or not one is held — the instrument is dark, and a wedged bar is
 indistinguishable from a healthy one. The kernel draws one warn at connect when
 a takeover-granted surface's chrome has no `overlay-state` output.
+
+## Takeover modes
+
+One instance holds the takeover plane at a time, in the mode its request named
+(`mode` is optional and defaults to `takeover`):
+
+- `takeover` replaces the layout with the holder alone, and `#surface-root`
+  carries `data-takeover`.
+- `overlay` keeps the layout applied and visible and draws the holder's section
+  full-viewport above it, transparent and inert to the pointer unless the
+  holder's own content opts in; `#surface-root` and that section carry
+  `data-overlay`.
+
+A request on a free plane is granted. A `takeover` request while another
+instance holds `overlay` preempts it: the overlay pops and the takeover is
+pushed in one transition, so `overlay-state` names the new holder once. Every
+other request while another instance holds the plane is denied with a warn and
+nothing sent back; a holder asking for the other mode is ignored, and changes
+mode by releasing first. A release pops whichever mode its sender holds. A
+holder that fails or leaves is popped on the next `surface-state`.
 
 ## The layout doc
 
@@ -78,5 +98,6 @@ Each panel's `instance` must be a mounted, arrangeable instance (not chrome itse
 
 Chrome keeps the **last valid** layout on screen: a doc that fails to parse or
 names an unknown instance is dropped and reported, never partially applied, and
-never blanks the surface. A doc published while a takeover overlay is up is
-stored and applied when the overlay pops.
+never blanks the surface. A doc published while a `takeover`-mode holder is up
+is stored and applied when the holder pops; under an `overlay`-mode holder it
+applies at once.

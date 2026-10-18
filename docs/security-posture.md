@@ -1267,14 +1267,23 @@ every handle derives from its own host element or its own `create-element`, and
 a handle another instance minted names nothing. *What it may build* is an
 allow-list, in the same construction-not-sanitization shape as the markdown path
 above: a fixed set of tags and a fixed set of attribute names (plus the `data-`
-and `aria-` prefixes), matched exactly, everything else a trap. Attribute values
-are never inspected, because no admitted name can carry a URL or an event
-handler. The admission rule for a new entry is that on every allowed tag it
-causes no script execution, no navigation, no resource fetch, and no effect
-outside the instance's subtree — which excludes `script`, `iframe`, `object`,
-`embed`, `template`, `meta`, `base`, `style`, `link`, `form`, `a`, every `on*`
-attribute and the element id, without enumerating them. Reaching outside one's
-own subtree at all is a second capability, `page-dom`, which exactly one
+and `aria-` prefixes), matched exactly, everything else a trap. No attribute
+value is parsed, because no admitted name can carry a URL or an event handler;
+the one value rule is `tabindex`'s, below. The admission rule for a new entry
+is that on every allowed tag it causes no script execution, no navigation, no
+resource fetch, and no effect outside the instance's subtree — which excludes
+`script`, `iframe`, `object`, `embed`, `template`, `meta`, `base`, `style`,
+`link`, `form`, `a`, every `on*` attribute and the element id, without
+enumerating them. `tabindex` passes it only with the value `0` or `-1`, matched
+exactly, and any other value traps: those two affect only whether the element
+it is on can take focus and whether it takes its document-order place in the
+keyboard sequence, which a `button` or `input` the component creates already
+does. A positive value would move the element ahead of every other focusable
+element on the page, chrome's included, which is an effect outside the
+subtree. The user's own tap is what focuses it, and there is deliberately no
+`focus()` import, because moving focus programmatically takes it from whatever
+had it — an effect outside the subtree. Reaching outside one's own subtree at
+all is a second capability, `page-dom`, which exactly one
 instance per surface — its chrome — holds. This remains containment, not a
 security boundary: the backend is the boundary, and it is unchanged.
 

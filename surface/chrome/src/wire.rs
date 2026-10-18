@@ -148,11 +148,37 @@ pub enum TakeoverAction {
     Release,
 }
 
+/// How a [`TakeoverBody`] request asks to be drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TakeoverMode {
+    /// Replace the layout with the holder alone.
+    #[default]
+    Takeover,
+    /// Draw the holder full-viewport above the base layout, which stays applied
+    /// underneath.
+    Overlay,
+}
+
+impl TakeoverMode {
+    /// The wire word, for warnings that name a holder's mode.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            TakeoverMode::Takeover => "takeover",
+            TakeoverMode::Overlay => "overlay",
+        }
+    }
+}
+
 /// The body published on `local:brenn/takeover`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakeoverBody {
     pub v: u8,
     pub action: TakeoverAction,
+    /// The drawing mode a request asks for; ignored on a release. Absent means
+    /// `takeover`, the kernel's default too.
+    #[serde(default)]
+    pub mode: TakeoverMode,
     /// The requesting instance. The kernel's local router injects it from its
     /// own port wiring, overwriting whatever the publisher supplied, so a
     /// component cannot name another instance as the holder.
@@ -304,11 +330,36 @@ mod parity_tests {
             proto::TakeoverAction::Request,
             proto::TakeoverAction::Release,
         ] {
-            round_trip::<_, TakeoverBody>(&proto::TakeoverBody {
-                v: proto::CONTROL_PLANE_VERSION,
-                action,
-                instance: "panel".to_string(),
-            });
+            for mode in [proto::TakeoverMode::Takeover, proto::TakeoverMode::Overlay] {
+                round_trip::<_, TakeoverBody>(&proto::TakeoverBody {
+                    v: proto::CONTROL_PLANE_VERSION,
+                    action,
+                    mode,
+                    instance: "panel".to_string(),
+                });
+            }
+        }
+    }
+
+    /// A body without `mode` reads as a takeover in both spellings.
+    #[test]
+    fn a_mode_less_takeover_body_defaults_alike() {
+        let body = r#"{"v":1,"action":"request","instance":"panel"}"#;
+        let ours: TakeoverBody = serde_json::from_str(body).expect("chrome's spelling reads it");
+        let theirs: proto::TakeoverBody =
+            serde_json::from_str(body).expect("the kernel's spelling reads it");
+        assert_eq!(ours.mode, TakeoverMode::Takeover);
+        assert_eq!(theirs.mode, proto::TakeoverMode::Takeover);
+    }
+
+    /// The warning words are the serde words.
+    #[test]
+    fn the_takeover_mode_wire_strings_are_what_serde_emits() {
+        for mode in [TakeoverMode::Takeover, TakeoverMode::Overlay] {
+            assert_eq!(
+                serde_json::to_value(mode).expect("a mode serializes"),
+                serde_json::json!(mode.as_wire_str()),
+            );
         }
     }
 

@@ -295,6 +295,20 @@ impl Activation {
         Some((window.port(), request))
     }
 
+    /// The live request of a sync-call activation, parsed as the gesture a
+    /// `dom::listen` listener synthesized, or `None` on an asynchronous one.
+    ///
+    /// For a handler on a port it listened with: the request on any other sync
+    /// port is not a gesture, and parsing it as one is the `Err`.
+    pub fn gesture(&self) -> Option<Result<dom::Gesture, Error>> {
+        let (port, request) = self.sync_request()?;
+        Some(request.and_then(|envelope| {
+            serde_json::from_str(&envelope.body).map_err(|e| {
+                Error::malformed(format!("the gesture request on sync port {port:?}: {e}"))
+            })
+        }))
+    }
+
     /// Every window this activation *delivered*: its ports, minus the sync
     /// request's. The request is not a message anyone published, so it belongs
     /// in no delivery fold.
@@ -1738,17 +1752,49 @@ pub mod dom {
         raw::utc_offset_minutes(epoch_ms)
     }
 
+    /// Why the browser refused an [`animate`] call: `Refused` carries the
+    /// browser's own message.
+    pub use crate::bindings::brenn::processor::dom::AnimateError;
+
+    /// Start a Web Animations API animation on the node. `keyframes` is the
+    /// JSON text of the keyframe array `Element.animate` takes and `options`
+    /// the JSON text of its options object.
+    ///
+    /// Text that is not a JSON array / JSON object is a malformed call and
+    /// traps. A call the browser's `KeyframeEffect` constructor refuses — an
+    /// easing it cannot parse, offsets out of order, an unknown `fill` — is
+    /// `Err(AnimateError::Refused(message))` and leaves the node as it was,
+    /// because such data may have come from a message and engines differ on
+    /// what they refuse. A property value the browser cannot parse is neither:
+    /// it is dropped from the keyframe and the animation runs without it.
+    ///
+    /// Nothing tracks the animation afterwards: it belongs to the element and
+    /// ends with it, so a component that needs to know when it is over parks
+    /// its own wake.
+    pub fn animate(node: Node, keyframes: &str, options: &str) -> Result<(), AnimateError> {
+        raw::animate(node.0, keyframes, options)
+    }
+
+    /// Whether the page environment asks for reduced motion
+    /// (`prefers-reduced-motion: reduce`), read at the call.
+    pub fn prefers_reduced_motion() -> bool {
+        raw::prefers_reduced_motion()
+    }
+
     /// The synthesized body of a gesture's sync-call request.
     ///
     /// The host names the event, the node whose listener fired, and the nearest
     /// handle-mapped ancestor of the event target — which is how a delegated
     /// listener on a container tells apart which child was hit.
     ///
-    /// The three field names are a wire contract with the host that synthesizes
-    /// them, spelled once on each side: `GESTURE_*_FIELD` in
-    /// `brenn-surface-contract` is the host's half, pinned to these literals
-    /// there.
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    /// The detail objects are each present only for the event class that
+    /// carries them, and absent from a body an older host synthesized.
+    ///
+    /// The field names are a wire contract with the host that synthesizes
+    /// them, spelled once on each side: `GestureBody` in
+    /// `brenn-surface-contract` is the host's half, and a test there holds
+    /// these structs' field names to it.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct Gesture {
         /// The DOM event type, as passed to [`listen`].
         pub event: String,
@@ -1756,6 +1802,62 @@ pub mod dom {
         pub listener: Node,
         /// The nearest handle-mapped ancestor of the event target.
         pub target: Node,
+        /// Where the pointer was, for a `MouseEvent` (every pointer, mouse,
+        /// click and wheel event). A `click` from keyboard or assistive
+        /// activation has no pointer and reads as client position 0,0; see
+        /// [`Pointer::pointer_type`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pointer: Option<Pointer>,
+        /// Which key, for a `KeyboardEvent`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub key: Option<Key>,
+        /// The modifier keys held, for a `MouseEvent` or a `KeyboardEvent`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub modifiers: Option<Modifiers>,
+    }
+
+    /// A gesture's pointer detail. Positions and sizes are CSS pixels, relative
+    /// to the listening node's bounding rect, not the target's: a delegating
+    /// listener on a container gets container coordinates.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct Pointer {
+        /// The event's client x less the listening node's left edge.
+        pub x: f64,
+        /// The event's client y less the listening node's top edge.
+        pub y: f64,
+        /// The listening node's width.
+        pub width: f64,
+        /// The listening node's height.
+        pub height: f64,
+        /// The event's `button`: which button changed state.
+        pub button: i16,
+        /// The event's `buttons`: the bitmask of buttons held.
+        pub buttons: u16,
+        /// The event's `pointerType` (`mouse`, `pen`, `touch`), for a
+        /// `PointerEvent` only; empty on a `click` with no pointer behind it,
+        /// such as one from keyboard activation.
+        #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+        pub pointer_type: Option<String>,
+    }
+
+    /// A gesture's key detail.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Key {
+        /// The key's value under the current layout (`ArrowLeft`, `a`, `A`).
+        pub key: String,
+        /// The physical key (`ArrowLeft`, `KeyA`).
+        pub code: String,
+        /// Whether the key is held and auto-repeating.
+        pub repeat: bool,
+    }
+
+    /// The modifier keys held when a gesture's event fired.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Modifiers {
+        pub alt: bool,
+        pub ctrl: bool,
+        pub meta: bool,
+        pub shift: bool,
     }
 
     /// The one key the gesture reply dialect has: whether the host should call

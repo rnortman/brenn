@@ -2,13 +2,22 @@
 # Assemble one processor kind's slice of the surface asset tree.
 #
 # Usage: processor_stage.sh <kind> <component.wasm> <transpiled-dir> \
-#            <jco-version-file> <spec.brenn> <emitter> <dsl-cli> <out-dir>
+#            <jco-version-file> <spec.brenn> <emitter> <dsl-cli> <out-dir> \
+#            --stage-lib FILE [--help FILE] [--schema FILE]
 #
 # The output holds `processor/<kind>/`: jco's transpiled module tree, the
 # component bytes it came from (copied beside the output so boot validation
 # verifies provenance against the actual bytes), a verbatim copy of the
 # component's authored specification, and the manifest, written last because it
 # lists the files it sits among.
+#
+# `--help` and `--schema` are the kind's documentation sidecars. They land at the
+# output's root as `brenn_<kind_underscored>.help.md` / `.schema.json`, beside
+# `processor/` rather than in it: the server reads a kind's sidecars from the root
+# that serves it, under the stem `sidecar_stem` spells, and the record's file list
+# must equal `processor/<kind>/`'s contents. `--stage-lib` is
+# `bazel/release/stage_lib.sh`, whose `stage_sidecar_stem` is the stem the
+# bundle assembler and the release checker hold these names to.
 #
 # WASM_TOOLS points the emitter at the pinned binary; without it the emitter
 # falls back to a `wasm-tools` on PATH, which no sandbox carries. WIT_LIB points
@@ -24,6 +33,25 @@ spec="$5"
 emitter="$6"
 dsl_cli="$7"
 out="$8"
+shift 8
+
+stage_lib=""
+help=""
+schema=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --stage-lib) stage_lib="$2"; shift 2 ;;
+        --help) help="$2"; shift 2 ;;
+        --schema) schema="$2"; shift 2 ;;
+        *) echo "processor_stage: unrecognized argument: $1" >&2; exit 2 ;;
+    esac
+done
+if [ -z "$stage_lib" ]; then
+    echo "processor_stage: --stage-lib is required" >&2
+    exit 2
+fi
+# shellcheck source=/dev/null
+. "$stage_lib"
 
 # The served kind is the kebab fold of the specification's component class name;
 # the directory staged here is the string the BUILD author typed. Nothing
@@ -58,3 +86,13 @@ cp -L "$spec" "$dest/$spec_name"
 chmod u+w "$dest/$spec_name"
 
 "$emitter" "$kind" "$component" "$dest" "$version" "$dest/$spec_name"
+
+stem="$(stage_sidecar_stem "$kind")"
+if [ -n "$help" ]; then
+    cp -L "$help" "$out/$stem.help.md"
+    chmod u+w "$out/$stem.help.md"
+fi
+if [ -n "$schema" ]; then
+    cp -L "$schema" "$out/$stem.schema.json"
+    chmod u+w "$out/$stem.schema.json"
+fi

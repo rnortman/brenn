@@ -4,6 +4,39 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-10-18
+
+- **Components can animate.** Two new imports on the WASM `dom` interface:
+  `animate(node, keyframes, options)` runs a browser Web Animations
+  animation described entirely as JSON data (no stylesheet needed), and
+  `prefers-reduced-motion()` reports the user's reduced-motion setting.
+  Loops work: `"iterations": "infinite"` is read as endless. A value the
+  browser rejects comes back as an error rather than a crash, so a component
+  animating from bus messages survives bad input. Exposed in the guest SDK as
+  `brenn_guest::dom`; existing components keep working unchanged.
+- **Surface takeovers gain an overlay mode.** A request on
+  `local:brenn/takeover` (the channel chrome uses to grant the single
+  full-screen slot) may now carry `mode: "overlay"`, which draws full-screen
+  *over* the layout instead of replacing it, letting taps through except
+  where its content opts in. `mode` defaults to `"takeover"`, so existing
+  requests are unchanged, and a takeover always preempts an overlay — a
+  meeting alarm can never be blocked. See chrome's help page.
+- **Gestures carry where and what was pressed.** A `dom.listen` gesture now
+  includes, when the event has them, pointer position and size relative to
+  the element, the key pressed, and modifier keys. The fields are optional,
+  so components built against an older guest SDK keep working. Each event is
+  still one activation, so listening on `pointermove` costs one per move.
+- **Out-of-tree component kinds can ship their own help and schema** pages
+  in their bundle, instead of getting only a generated stub.
+- **Motion colour tokens in the skins:** `--motion-1` … `--motion-5` and
+  `--motion-blend`, defined for bench dark/light and foundry.
+- `tabindex` (`0` or `-1` only) is now allowed on `dom`-created elements, so
+  a component can take keyboard focus and receive key events.
+- Fixed: the meeting takeover card kept a panel shadow the skins meant to
+  drop.
+- The test page harness can simulate animation refusal, reduced motion and
+  detailed gestures; the echo-stub test component gains an `animate` button.
+
 ## [0.25.0] — 2026-10-14
 
 - **Per-agent environment variables.** A new `env` attribute on agents sets

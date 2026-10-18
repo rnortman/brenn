@@ -66,6 +66,16 @@ body[data-skin="foundry"] {
     --green: #38b764;
     --red: #b13e53;
     --slate: #94b0c2;
+
+    /* Motion palette, read by a kind as `var(--motion-N, var(--accent))`:
+     * the palette's own accents, never its red, which is the meeting's.
+     * `--motion-blend` is the blend particles take over a headline. */
+    --motion-1: var(--cyan);
+    --motion-2: var(--yellow);
+    --motion-3: var(--green);
+    --motion-4: var(--slate);
+    --motion-5: var(--paper);
+    --motion-blend: screen;
 }
 
 body {
@@ -368,6 +378,14 @@ body {
 
 /* Full-bleed takeover tile: the overlaid section owns the whole viewport; drop
  * its offset shadow so the escalation frame owns the edge. */
-#surface-root[data-skin="foundry"][data-takeover="true"] > section[data-instance] {
+#surface-root[data-skin="foundry"][data-takeover] > section[data-instance] {
     box-shadow: none;
+}
+
+/* An overlay-mode holder draws over the tiles, not as one: no tile dressing. */
+#surface-root[data-skin="foundry"] > section[data-instance][data-overlay] {
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    padding: 0;
 }

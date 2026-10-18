@@ -570,11 +570,30 @@ pub enum TakeoverAction {
     Release,
 }
 
+/// How a [`TakeoverBody`] request asks to be drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TakeoverMode {
+    /// Replace the layout with the holder alone.
+    #[default]
+    Takeover,
+    /// Draw the holder full-viewport above the base layout, which stays applied
+    /// and visible underneath. A `Takeover` request from another instance
+    /// preempts it.
+    Overlay,
+}
+
 /// The body published on [`LOCAL_TAKEOVER_CHANNEL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakeoverBody {
     pub v: u8,
     pub action: TakeoverAction,
+    /// The drawing mode a request asks for; chrome ignores it on a release,
+    /// where a holder releases in whichever mode it holds. Absent means
+    /// `takeover`. Serialisation always writes it, so the router's stamp carries an absent
+    /// `mode` onto the plane as `"takeover"`.
+    #[serde(default)]
+    pub mode: TakeoverMode,
     /// The requesting instance. The kernel's local router injects it from its own
     /// port wiring, overwriting any value the publisher supplied, so a component
     /// cannot name another instance as the takeover holder; chrome's `on_takeover`

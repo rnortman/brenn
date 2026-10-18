@@ -632,8 +632,9 @@ interface config {
 /// Element *authority* is confined the same way, by construction rather than
 /// by inspection: the host creates only the tags listed at the end of this doc
 /// and sets only the attribute names listed with them, and everything else
-/// traps as flatly as a foreign handle does. Attribute values are never
-/// examined, because no name on the list can carry a URL or an event handler.
+/// traps as flatly as a foreign handle does. No attribute value is parsed,
+/// because no name on the list can carry a URL or an event handler; the one
+/// value rule is `tabindex`'s, on `set-attribute` below.
 /// The admission rule for any future entry, in tree or out: on every allowed
 /// tag, the entry must cause no script execution, no navigation, no resource
 /// fetch, and no effect outside the instance's own subtree. That rule excludes
@@ -679,8 +680,8 @@ interface config {
 /// Allowed attribute names, by the same match, and the two inert families
 /// admitted by prefix:
 ///
-/// `class`, `disabled`, `hidden`, `placeholder`, `role`, `start`, `title`,
-/// `type`, `aria-`, `data-`.
+/// `class`, `disabled`, `hidden`, `placeholder`, `role`, `start`, `tabindex`,
+/// `title`, `type`, `aria-`, `data-`.
 interface dom {
     use types.{node};
 
@@ -692,7 +693,10 @@ interface dom {
     create-element: func(tag: string) -> node;
 
     /// Set an attribute. `name` must be one of the allowed attribute names
-    /// above; anything else traps. The value is never inspected.
+    /// above; anything else traps. `tabindex` takes only `0` or `-1`, matched
+    /// exactly, and any other value traps: a positive one would move the
+    /// element ahead of the rest of the page in the keyboard focus order. No
+    /// other value is inspected.
     set-attribute: func(n: node, name: string, value: string);
     remove-attribute: func(n: node, name: string);
 
@@ -723,8 +727,26 @@ interface dom {
 
     /// Attach a host-owned listener for `event` on the node. The host answers
     /// the event with a sync-call activation on `port`, carrying a synthesized
-    /// request body naming the event, the listening node and the nearest
-    /// handle-mapped ancestor of the event target.
+    /// JSON request body: `event` (the event type), `listener` (the listening
+    /// node), `target` (the nearest handle-mapped ancestor of the event
+    /// target), and up to three detail objects, each present only for the
+    /// event class that carries it:
+    ///
+    /// - `pointer`, for a `MouseEvent` (every pointer, mouse, click and wheel
+    ///   event): `x` and `y`, the event's client position less the listening
+    ///   node's bounding rect origin, and `width` and `height`, that rect's
+    ///   size, all in CSS pixels; `button` and `buttons`; and `type`, the
+    ///   `pointerType`, for a `PointerEvent` only. A `click` the browser fires
+    ///   for keyboard or assistive-technology activation of a `button` has no
+    ///   pointer behind it and a client position of 0,0, so its `x` and `y`
+    ///   are the rect origin negated, and its `type`, when present, is empty.
+    ///   A listener that maps position to a hit listens on `pointerdown` or
+    ///   `pointerup`, which only a pointer fires.
+    /// - `key`, for a `KeyboardEvent`: `key`, `code` and `repeat`.
+    /// - `modifiers`, for either: `alt`, `ctrl`, `meta` and `shift`.
+    ///
+    /// Nothing else is read from the event. Every event is its own activation,
+    /// uncoalesced: a listener on `pointermove` costs one activation per move.
     ///
     /// A listener dies with its element: an element receives no UI events once
     /// detached, and detaching is what destroys it, so a listener inside a
@@ -736,6 +758,53 @@ interface dom {
     /// from the activation clock, and it rides here rather than earning a grant
     /// word of its own.
     utc-offset-minutes: func(epoch-ms: u64) -> s32;
+
+    variant animate-error {
+        /// The browser's `KeyframeEffect` constructor refused the call: an
+        /// easing it cannot parse, keyframe offsets that are not non-decreasing
+        /// within 0..1, an unknown `direction`, `fill` or `composite`, a negative
+        /// `duration`, `iterations` or `iterationStart`. Carries the browser's
+        /// own message. Reported, not trapped: the arguments are data a
+        /// component may have taken from a message, and two browser engines
+        /// need not agree on what they refuse.
+        refused(string),
+    }
+
+    /// Start a Web Animations API animation on the node and return. `keyframes`
+    /// is the JSON text of the keyframe array `Element.animate` takes; `options`
+    /// is the JSON text of its options object (`duration`, `delay`, `easing`,
+    /// `iterations`, `direction`, `fill`, `endDelay`, `composite`). Both are
+    /// parsed by the host; text that is not a JSON array / JSON object is the
+    /// component's own malformed call and traps, as an unknown handle does. A
+    /// call the browser refuses is `err(refused)` and leaves the node as it was.
+    /// One value is substituted before the call: an `iterations` whose value
+    /// is the string `"infinite"` becomes `Infinity`, which JSON cannot spell,
+    /// so a loop is `"iterations": "infinite"`. Everything else in `options`
+    /// is passed verbatim.
+    /// A property value that fails to parse is neither: the browser drops that
+    /// value from the keyframe and the animation runs without it. Nothing else
+    /// is returned: an animation is owned by the element and ends with it, and a
+    /// component that needs to know when it is over schedules its own wake.
+    /// Admitted under the same rule as every other `dom` entry — it executes no
+    /// script, fetches nothing, navigates nowhere, and affects only the node it
+    /// is called on.
+    ///
+    /// The browser behaviour this entry relies on: CSP `style-src` does not
+    /// govern `Element.animate`; an animation on a node that is later removed
+    /// has no further effect and is collected with the node, because the host
+    /// keeps no reference to it; the `KeyframeEffect` constructor throws for a
+    /// bad easing (`steps(1, jump-none)` among them), offsets out of order or
+    /// range, an unknown `direction`/`fill`/`composite` or a negative
+    /// `duration`, `iterations` or `iterationStart`, accepts a negative
+    /// `delay`/`endDelay`, and drops — does not throw on — a property value or
+    /// property name it cannot parse.
+    animate: func(n: node, keyframes: string, options: string) -> result<_, animate-error>;
+
+    /// Whether the page environment asks for reduced motion
+    /// (`prefers-reduced-motion: reduce`), read at the call. A page fact rather
+    /// than a DOM operation, admitted beside `utc-offset-minutes` for the same
+    /// reason: a component cannot compute it and it earns no grant word.
+    prefers-reduced-motion: func() -> bool;
 }
 
 /// Page-DOM authority: the ability to reach outside one's own subtree.

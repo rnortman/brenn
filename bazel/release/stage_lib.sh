@@ -6,15 +6,18 @@
 # `assemble.sh` already uses for `--record-lib`. Both trees are certified by one
 # `bazel/release/bundle_check.sh`, so the staging that produces them is one
 # implementation too: a packaging rule added to one half and not the other is a
-# green build and a tree the shared checker rejects.
+# green build and a tree the shared checker rejects. The checker sources it as
+# well, and so does `bazel/surface/processor_stage.sh`, for the sidecar names.
 #
-# What is here is what both callers do with `components/` and `modules/`. What
-# is not: brenn's binaries, asset trees and offer-all-ship-listed manifest loop,
-# and the bundle's manifest-equals-packages set check, per-stage shape checks
-# and authored-root equality. Those are each one caller's own.
+# What is here is what both callers do with `components/` and `modules/`, and
+# the naming rule for a surface kind's documentation sidecars. What is not:
+# brenn's binaries, asset trees and offer-all-ship-listed manifest loop, and the
+# bundle's manifest-equals-packages set check, per-stage shape checks and
+# authored-root equality. Those are each one caller's own.
 #
 # Every function refuses by writing to stderr and exiting non-zero, so a caller
-# reads a return value from none of them.
+# reads a return value from none of them. The two sidecar functions answer on
+# stdout and refuse nothing.
 #
 # Two globals carry the association from `stage_associate_packages` to
 # `stage_package`, because a bash array cannot cross a function boundary by
@@ -63,6 +66,32 @@ stage_manifest() {
     cp -L "$manifest" "$out/components/deployed-components.txt"
     cp -L "$names" "$out/scripts/manifest_names.sh"
     chmod +x "$out/scripts/manifest_names.sh"
+}
+
+# A surface kind's sidecar stem: `brenn_` and the kind with every hyphen an
+# underscore, the stem the server's `sidecar_stem` reads `<stem>.help.md` and
+# `<stem>.schema.json` under, flat beside `processor/`.
+stage_sidecar_stem() {
+    printf 'brenn_%s\n' "${1//-/_}"
+}
+
+# The kind under `<surface>/processor/` whose sidecar `entry` is, printed; nothing
+# when `entry` is not a sidecar name or its stem is no kind staged there.
+stage_sidecar_owner() {
+    local surface="$1" entry="$2" stem kind_dir kind
+    case "$entry" in
+        brenn_*.help.md) stem="${entry%.help.md}" ;;
+        brenn_*.schema.json) stem="${entry%.schema.json}" ;;
+        *) return 0 ;;
+    esac
+    for kind_dir in "$surface"/processor/*/; do
+        [ -d "$kind_dir" ] || continue
+        kind="$(basename "$kind_dir")"
+        if [ "$stem" = "$(stage_sidecar_stem "$kind")" ]; then
+            printf '%s\n' "$kind"
+            return 0
+        fi
+    done
 }
 
 # One package directory, plus the module it owes. A processor-world package

@@ -16,11 +16,12 @@ This file is loaded across module boundaries: a repository that declares
 it, so it is an external API with the same standing as `//bazel/wasm:defs.bzl`.
 The contract is exactly one macro:
 
-  `surface_processor_assets(name, kind, component, spec)`.
+  `surface_processor_assets(name, kind, component, spec, help, schema)`.
 
 Three are not. `surface_crate_stage` and `surface_dist` assemble *this* tree —
-the kernel bundle, the flat sidecars, the merge — and a bundle's surface root
-carries none of that. `//bazel/surface:defs.bzl`'s `surface_processor_component`
+the kernel bundle, brenn's own kinds' flat sidecars, the merge — and a bundle's
+surface root carries none of that; an out-of-tree kind's sidecars are the
+macro's `help` and `schema`. `//bazel/surface:defs.bzl`'s `surface_processor_component`
 is the in-tree wrapper that also builds a host half and generates help; the
 guest half it builds is the `wasm_guest_cdylib` + `wasm_component` pair
 `//bazel/wasm:defs.bzl` already exports, which is what an out-of-tree caller
@@ -90,6 +91,14 @@ def _processor_stage_impl(ctx):
     args.add(ctx.file._emitter)
     args.add(ctx.executable._dsl_cli)
     args.add(out.path)
+    args.add("--stage-lib", ctx.file._stage_lib)
+    sidecars = []
+    if ctx.file.help:
+        args.add("--help", ctx.file.help)
+        sidecars.append(ctx.file.help)
+    if ctx.file.schema:
+        args.add("--schema", ctx.file.schema)
+        sidecars.append(ctx.file.schema)
 
     ctx.actions.run(
         outputs = [out],
@@ -100,8 +109,9 @@ def _processor_stage_impl(ctx):
             ctx.file.spec,
             ctx.file._emitter,
             ctx.file._wit_lib,
-        ],
+        ] + sidecars,
         tools = [
+            ctx.file._stage_lib,
             ctx.file._wasm_tools,
             ctx.attr._dsl_cli[DefaultInfo].files_to_run,
         ],
@@ -120,6 +130,9 @@ _processor_stage = rule(
     implementation = _processor_stage_impl,
     doc = """`processor/<kind>/`: the transpiled tree, the component, the manifest.
 
+    Beside it, at the output's root, the kind's documentation sidecars when they
+    are given, named by the kind's sidecar stem.
+
     The manifest is emitted by the same script the component build runs, so the
     staged manifest and the component's own are comparable byte for byte.
 
@@ -134,12 +147,20 @@ _processor_stage = rule(
             mandatory = True,
             doc = "The component artifact the transpile consumed.",
         ),
+        "help": attr.label(
+            allow_single_file = [".md"],
+            doc = "The kind's help page, staged as `brenn_<kind_underscored>.help.md`.",
+        ),
         "jco_version": attr.label(
             allow_single_file = True,
             mandatory = True,
             doc = "A file holding the jco version, recorded in the manifest.",
         ),
         "kind": attr.string(mandatory = True),
+        "schema": attr.label(
+            allow_single_file = [".json"],
+            doc = "The kind's input schema, staged as `brenn_<kind_underscored>.schema.json`.",
+        ),
         "spec": attr.label(
             allow_single_file = [".brenn"],
             mandatory = True,
@@ -163,6 +184,10 @@ _processor_stage = rule(
             allow_single_file = True,
             default = Label("//bazel/surface:processor_stage.sh"),
         ),
+        "_stage_lib": attr.label(
+            allow_single_file = True,
+            default = Label("//bazel/release:stage_lib.sh"),
+        ),
         "_wasm_tools": attr.label(
             allow_single_file = True,
             cfg = "exec",
@@ -175,7 +200,7 @@ _processor_stage = rule(
     },
 )
 
-def surface_processor_assets(name, kind, component, spec, visibility = ["//visibility:public"]):
+def surface_processor_assets(name, kind, component, spec, help = None, schema = None, visibility = ["//visibility:public"]):
     """Transpile one processor component and stage the result for `surface/dist`.
 
     `--instantiation async` is load-bearing: it makes the emitted module export
@@ -192,6 +217,13 @@ def surface_processor_assets(name, kind, component, spec, visibility = ["//visib
         spec: the component's authored specification. Its
             hash is the manifest's binding to the configuration that names this
             kind, so a kind whose spec is unauthored has no build.
+        help: the kind's help page, or None. Staged at the output's root as
+            `brenn_<kind_underscored>.help.md`, where the server reads it; with
+            none, the server publishes a stub and warns at boot. brenn's own
+            kinds stage theirs through their crate packages and leave this
+            unset.
+        schema: the kind's input schema, or None; staged beside the help page as
+            `brenn_<kind_underscored>.schema.json`.
         visibility: visibility of the staging directory.
     """
     transpiled = name + "_transpile"
@@ -239,8 +271,10 @@ def surface_processor_assets(name, kind, component, spec, visibility = ["//visib
         # Not an argument: the version recorded in a manifest is the version of
         # the binary that ran, and a caller who could pass one could pass a
         # version nothing transpiled with.
+        help = help,
         jco_version = Label("//surface:jco_version"),
         kind = kind,
+        schema = schema,
         spec = spec,
         target_compatible_with = HOST_ONLY,
         transpiled = ":" + transpiled,

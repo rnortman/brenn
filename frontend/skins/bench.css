@@ -94,6 +94,18 @@ body[data-skin="bench"] {
     --meeting-btn-border: #333b3e;
     --meeting-btn-text: #e6eae6;
     --meeting-btn-active-bg: #262d30;
+
+    /* Motion palette, read by a kind as `var(--motion-N, var(--accent))`:
+     * the amber and phosphor of state and countdown, then paper, sky and orchid,
+     * which the skin never spends on state. No red: red is the meeting's.
+     * `--motion-blend` is the blend particles take over a headline, a theme fact
+     * because a kind cannot read `data-theme`. */
+    --motion-1: #ffb02e;
+    --motion-2: #7ce38b;
+    --motion-3: #f2efe9;
+    --motion-4: #7cc4ff;
+    --motion-5: #e58cff;
+    --motion-blend: screen;
 }
 
 /* Light theme (bench only): kitchen-context palette from the mockup — field
@@ -139,6 +151,13 @@ body[data-skin="bench"][data-theme="light"] {
     --meeting-btn-border: #b3aea2;
     --meeting-btn-text: #1b1d1b;
     --meeting-btn-active-bg: #bdb9ae;
+
+    --motion-1: #b5760a;
+    --motion-2: #2f8f45;
+    --motion-3: #4a4d4a;
+    --motion-4: #2a6fb0;
+    --motion-5: #8a3fb0;
+    --motion-blend: multiply;
 }
 
 /* Field + base type. */
@@ -475,6 +494,14 @@ body {
 
 /* Takeover chrome: the overlaid section runs full-bleed; drop the milled inset
  * so the escalation strobe owns the panel edge. */
-#surface-root[data-skin="bench"][data-takeover="true"] > section[data-instance] {
+#surface-root[data-skin="bench"][data-takeover] > section[data-instance] {
     box-shadow: none;
+}
+
+/* An overlay-mode holder draws over the panels, not as one: no recess. */
+#surface-root[data-skin="bench"] > section[data-instance][data-overlay] {
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    padding: 0;
 }

@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use crate::layout::{LayoutDoc, LayoutKind, Panel};
 use crate::wire::{
     CONTROL_PLANE_VERSION, InstanceState, LinkState, LinkStateBody, OverlayStateBody,
-    SurfaceStateBody, THEME_DARK, THEME_LIGHT, TakeoverAction, TakeoverBody, ThemeBody, ToastBody,
-    ToastSeverity, ToastSource,
+    SurfaceStateBody, THEME_DARK, THEME_LIGHT, TakeoverAction, TakeoverBody, TakeoverMode,
+    ThemeBody, ToastBody, ToastSeverity, ToastSource,
 };
 
 /// The severity of a breadcrumb [`ChromeAction::Log`] carries.
@@ -177,21 +177,29 @@ pub enum ChromeAction {
     SetTheme(Theme),
     /// Set the connection banner to this state.
     SetBanner(BannerState),
-    /// Set (or clear) the takeover chrome flag: write `data-takeover="true"` on
-    /// `#surface-root` when `true`, remove the attribute when `false`.
+    /// Set (or clear) the takeover chrome flag: write `data-takeover` (empty,
+    /// selected by presence) on `#surface-root` when `true`, remove the
+    /// attribute when `false`.
     SetTakeover(bool),
+    /// Set (or clear) the overlay chrome flag: write `data-overlay` (empty,
+    /// selected by presence) on `#surface-root` when `true`, remove the
+    /// attribute when `false`.
+    SetOverlay(bool),
     /// Apply a layout to the surface, atomically. The DOM half sets
     /// `data-layout = kind` on `#surface-root` and, when `ratio` is present, the
     /// `--surface-ratio` custom property; then reparents each instance's wrapper
     /// into its layout section and stamps `data-panel` + label, clearing both on
     /// every other section. `instances` is every arrangeable instance in
     /// configured order (chrome's own instance excluded), so the executor never
-    /// asks the DOM what exists.
+    /// asks the DOM what exists. `overlay` names the overlay-mode holder, whose
+    /// section gets `data-overlay` in place of a panel slot; every other section
+    /// has `data-overlay` cleared. `panels` never names it.
     ApplyLayout {
         kind: LayoutKind,
         ratio: Option<String>,
         panels: Vec<LayoutPlacement>,
         instances: Vec<String>,
+        overlay: Option<String>,
     },
     /// Render a new toast. `id` is chrome's page-lifetime handle for a later
     /// [`ChromeAction::DismissToast`].
@@ -222,12 +230,18 @@ fn format_ratio(ratio: f64) -> String {
 /// Map a **validated** [`LayoutDoc`] to the [`ChromeAction::ApplyLayout`] it
 /// applies. Slots are emitted in the kind's render order; every slot key is
 /// present because the doc passed [`LayoutDoc::validate`] (or was synthesized
-/// with exactly those slots).
-fn layout_doc_to_action(doc: &LayoutDoc, instances: Vec<String>) -> ChromeAction {
+/// with exactly those slots). A slot the doc gives to the overlay-mode holder
+/// is left out: that instance's section is the overlay, not a panel.
+fn layout_doc_to_action(
+    doc: &LayoutDoc,
+    instances: Vec<String>,
+    overlay: Option<&str>,
+) -> ChromeAction {
     let panels = doc
         .kind
         .slots()
         .iter()
+        .filter(|slot| Some(doc.panels[**slot].instance.as_str()) != overlay)
         .map(|slot| {
             let panel = &doc.panels[*slot];
             LayoutPlacement {
@@ -242,6 +256,7 @@ fn layout_doc_to_action(doc: &LayoutDoc, instances: Vec<String>) -> ChromeAction
         ratio: doc.ratio.map(format_ratio),
         panels,
         instances,
+        overlay: overlay.map(str::to_string),
     }
 }
 
@@ -305,6 +320,21 @@ fn overlay_layout_doc(instance: &str) -> LayoutDoc {
     }
 }
 
+/// The instance holding the takeover plane and the mode it holds it in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Held {
+    instance: String,
+    mode: TakeoverMode,
+}
+
+/// The chrome flag that marks a holder's mode on `#surface-root`.
+fn mode_flag(mode: TakeoverMode, on: bool) -> ChromeAction {
+    match mode {
+        TakeoverMode::Takeover => ChromeAction::SetTakeover(on),
+        TakeoverMode::Overlay => ChromeAction::SetOverlay(on),
+    }
+}
+
 /// One arrangeable instance, as learned from the surface-state plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ArrangeInstance {
@@ -346,12 +376,13 @@ pub struct ChromeCore {
     instances: Vec<ArrangeInstance>,
     /// The current base layout — the last valid layout doc, or `None` before any
     /// doc (then the default is synthesized from `instances`). A doc published
-    /// while an overlay is up updates this but is not applied until the overlay
-    /// pops.
+    /// while a takeover-mode holder is up updates this but is not applied until
+    /// the holder pops.
     base_layout: Option<LayoutDoc>,
-    /// The instance whose fullscreen takeover overlay is pushed, or `None`.
-    /// Depth ≤ 1: a second request from a different instance is denied.
-    overlay: Option<String>,
+    /// The holder of the takeover plane, or `None`. Depth ≤ 1: a second request
+    /// from a different instance is denied, except that a takeover-mode request
+    /// preempts an overlay-mode holder.
+    overlay: Option<Held>,
     /// The current banner (before any link-state delivery, `Connecting` — the
     /// same starting point the kernel's pre-chrome indicator paints).
     banner: BannerState,
@@ -410,10 +441,11 @@ impl ChromeCore {
         self.instances.iter().any(|i| i.instance == instance)
     }
 
-    /// The effective layout doc: the overlay's synthesized layout while a
-    /// takeover is up, else the base layout, else the synthesized default.
+    /// The effective layout doc: the synthesized single-slot layout while a
+    /// takeover-mode holder is up, else the base layout, else the synthesized
+    /// default. An overlay-mode holder leaves the base layout in place.
     fn effective_layout(&self) -> Option<LayoutDoc> {
-        if let Some(instance) = &self.overlay {
+        if let Some(instance) = self.takeover_instance() {
             return Some(overlay_layout_doc(instance));
         }
         if let Some(doc) = &self.base_layout {
@@ -426,9 +458,34 @@ impl ChromeCore {
     /// empty vec when nothing is arrangeable.
     fn apply_effective_layout(&self) -> Vec<ChromeAction> {
         match self.effective_layout() {
-            Some(doc) => vec![layout_doc_to_action(&doc, self.arranged_instances())],
+            Some(doc) => vec![self.apply(&doc)],
             None => Vec::new(),
         }
+    }
+
+    /// The [`ChromeAction::ApplyLayout`] for `doc` under the current holder.
+    fn apply(&self, doc: &LayoutDoc) -> ChromeAction {
+        layout_doc_to_action(doc, self.arranged_instances(), self.overlay_instance())
+    }
+
+    /// The takeover-mode holder, or `None` when the plane is free or held in
+    /// overlay mode.
+    fn takeover_instance(&self) -> Option<&str> {
+        self.holder_in(TakeoverMode::Takeover)
+    }
+
+    /// The overlay-mode holder, or `None` when the plane is free or held in
+    /// takeover mode.
+    fn overlay_instance(&self) -> Option<&str> {
+        self.holder_in(TakeoverMode::Overlay)
+    }
+
+    /// The holder, when it holds the plane in `mode`.
+    fn holder_in(&self, mode: TakeoverMode) -> Option<&str> {
+        self.overlay
+            .as_ref()
+            .filter(|held| held.mode == mode)
+            .map(|held| held.instance.as_str())
     }
 
     /// Fold a `local:brenn/theme` payload. Sets the theme on a real change;
@@ -470,8 +527,8 @@ impl ChromeCore {
     /// Fold a `local:brenn/surface-state` payload: refresh the arrangeable
     /// instance set and re-arrange.
     ///
-    /// Chrome learns what exists here, never from DOM queries. A takeover overlay
-    /// held by an instance that is no longer mounted is popped — a dead instance
+    /// Chrome learns what exists here, never from DOM queries. The plane held, in
+    /// either mode, by an instance that is no longer mounted is popped — a dead instance
     /// can never publish a release, so without this the surface would be stuck
     /// fullscreen on its error card. The layout is re-applied whenever the
     /// arrangeable set changes (the DOM half skips no-op reparents).
@@ -505,10 +562,10 @@ impl ChromeCore {
             let alive = self
                 .instances
                 .iter()
-                .any(|i| i.instance == current && i.state != InstanceState::Failed);
+                .any(|i| i.instance == current.instance && i.state != InstanceState::Failed);
             if !alive {
                 self.overlay = None;
-                actions.push(ChromeAction::SetTakeover(false));
+                actions.push(mode_flag(current.mode, false));
                 actions.push(self.overlay_state_action(now_ms));
             }
         }
@@ -523,9 +580,10 @@ impl ChromeCore {
     /// layout change, so the last-good layout stays on screen — the doc's writer
     /// is an LLM that will sometimes emit a bad doc, and a kiosk must never blank
     /// or partially apply. A valid doc always becomes the new base; it is applied
-    /// immediately only when no takeover overlay is active (while one is up the
-    /// base is stored but deferred, so republishing layout mid-takeover cannot
-    /// cancel an active alert — the overlay pop re-applies it).
+    /// immediately unless a takeover-mode holder is up (then the base is stored
+    /// but deferred, so republishing layout mid-takeover cannot cancel an active
+    /// alert — the pop re-applies it). An overlay-mode holder covers nothing the
+    /// base layout would uncover, so under one the doc applies at once.
     pub fn on_layout(&mut self, body: &str) -> Vec<ChromeAction> {
         let doc: LayoutDoc = match serde_json::from_str(body) {
             Ok(doc) => doc,
@@ -535,26 +593,33 @@ impl ChromeCore {
             return vec![self.warn(format!("rejected layout doc: {reason}"))];
         }
         self.base_layout = Some(doc.clone());
-        if self.overlay.is_some() {
+        if self.takeover_instance().is_some() {
             return vec![ChromeAction::Log {
                 level: LogLevel::Debug,
                 message: "stored base layout deferred: takeover overlay active".to_string(),
             }];
         }
-        vec![layout_doc_to_action(&doc, self.arranged_instances())]
+        vec![self.apply(&doc)]
     }
 
     /// Fold a `local:brenn/takeover` payload.
     ///
     /// The kernel's router gates the *binding* against the surface's takeover
     /// grant (capability-as-binding), so an ungranted surface never delivers here
-    /// at all — chrome does no grant check. `request` from a fresh state pushes
-    /// the overlay (stamp the takeover flag + apply the synthesized fullscreen
-    /// `single` layout); a request from the incumbent is idempotent; a request
-    /// from a *different* instance while one is overlaid is denied (only one
-    /// takeover-capable component exists). `release` from the holder pops; a
-    /// release from anyone else is a no-op breadcrumb. An instance the payload
-    /// names that is not arrangeable is dropped-and-reported.
+    /// at all — chrome does no grant check. A `request` on a free plane pushes the
+    /// requester in the mode it asked for: `takeover` stamps the takeover flag and
+    /// applies the synthesized fullscreen `single` layout; `overlay` stamps the
+    /// overlay flag and keeps the base layout, with the holder's section drawn
+    /// over it. A re-request from the holder in its own mode is idempotent; in the
+    /// other mode it is reported and ignored (a holder changes mode by releasing
+    /// first). A `takeover` request while another instance holds `overlay`
+    /// preempts it: the overlay pops and the takeover is pushed in one fold, with
+    /// one overlay-state publish naming the new holder — which is what keeps a
+    /// celebration from ever denying the alarm's single request. Every other
+    /// request while another instance holds the plane is denied. `release` from
+    /// the holder pops either mode; a release from anyone else is a no-op
+    /// breadcrumb. An instance the payload names that is not arrangeable is
+    /// dropped-and-reported.
     pub fn on_takeover(&mut self, body: &str, now_ms: u64) -> Vec<ChromeAction> {
         let parsed: TakeoverBody = match serde_json::from_str(body) {
             Ok(b) => b,
@@ -568,23 +633,9 @@ impl ChromeCore {
             ))];
         }
         match parsed.action {
-            TakeoverAction::Request => match self.overlay.as_deref() {
-                Some(current) if current == instance => Vec::new(),
-                Some(current) => vec![self.warn(format!(
-                    "denied takeover request from {instance}: {current} already holds the overlay"
-                ))],
-                None => {
-                    self.overlay = Some(instance.clone());
-                    let mut actions = vec![
-                        ChromeAction::SetTakeover(true),
-                        self.overlay_state_action(now_ms),
-                    ];
-                    actions.extend(self.apply_effective_layout());
-                    actions
-                }
-            },
-            TakeoverAction::Release => match self.overlay.as_deref() {
-                Some(current) if current == instance => self.pop_overlay(now_ms),
+            TakeoverAction::Request => self.on_request(instance, parsed.mode, now_ms),
+            TakeoverAction::Release => match &self.overlay {
+                Some(current) if current.instance == instance => self.pop_overlay(now_ms),
                 _ => vec![self.warn(format!(
                     "dropped takeover release from {instance}: it does not hold the overlay"
                 ))],
@@ -592,12 +643,63 @@ impl ChromeCore {
         }
     }
 
-    /// Pop the active overlay: clear the flag, report the transition, and
+    /// Fold a request from `instance` for the plane in `mode`.
+    fn on_request(
+        &mut self,
+        instance: String,
+        mode: TakeoverMode,
+        now_ms: u64,
+    ) -> Vec<ChromeAction> {
+        let mut actions = Vec::new();
+        match self.overlay.clone() {
+            None => {}
+            Some(current) if current.instance == instance => {
+                if current.mode == mode {
+                    return Vec::new();
+                }
+                return vec![self.warn(format!(
+                    "ignored {} request from {instance}: it holds the plane in {} mode; \
+                     release first to change mode",
+                    mode.as_wire_str(),
+                    current.mode.as_wire_str()
+                ))];
+            }
+            Some(current)
+                if mode == TakeoverMode::Takeover && current.mode == TakeoverMode::Overlay =>
+            {
+                actions.push(ChromeAction::Log {
+                    level: LogLevel::Debug,
+                    message: format!(
+                        "takeover request from {instance} preempted {}'s overlay",
+                        current.instance
+                    ),
+                });
+                actions.push(ChromeAction::SetOverlay(false));
+            }
+            Some(current) => {
+                return vec![self.warn(format!(
+                    "denied {} request from {instance}: {} already holds the overlay in {} mode",
+                    mode.as_wire_str(),
+                    current.instance,
+                    current.mode.as_wire_str()
+                ))];
+            }
+        }
+        self.overlay = Some(Held { instance, mode });
+        actions.push(mode_flag(mode, true));
+        actions.push(self.overlay_state_action(now_ms));
+        actions.extend(self.apply_effective_layout());
+        actions
+    }
+
+    /// Pop the active holder: clear its mode's flag, report the transition, and
     /// re-apply the effective (base or default) layout.
     fn pop_overlay(&mut self, now_ms: u64) -> Vec<ChromeAction> {
-        self.overlay = None;
+        let Some(held) = self.overlay.take() else {
+            return Vec::new();
+        };
         let mut actions = vec![
-            ChromeAction::SetTakeover(false),
+            mode_flag(held.mode, false),
             self.overlay_state_action(now_ms),
         ];
         actions.extend(self.apply_effective_layout());
@@ -718,7 +820,7 @@ impl ChromeCore {
     fn overlay_state_action(&self, now_ms: u64) -> ChromeAction {
         let body = OverlayStateBody {
             v: CONTROL_PLANE_VERSION,
-            holder: self.overlay.clone(),
+            holder: self.overlay.as_ref().map(|held| held.instance.clone()),
             since_stamp: now_ms,
         };
         ChromeAction::PublishOverlayState {
@@ -823,7 +925,10 @@ fn input_port_doc(port: InPort) -> Option<PortDoc> {
         ),
         InPort::Takeover => (
             PortChannel::Address(proto::LOCAL_TAKEOVER_CHANNEL),
-            "a component's fullscreen request/release (needs the surface `takeover` grant)",
+            "a component's request/release of the screen, `{ v, action, mode, instance }` — \
+             `mode` is `takeover` (replace the layout, and the default when absent) or \
+             `overlay` (draw over it); a `takeover` request preempts an `overlay` holder \
+             (needs the instance's `takeover` grant)",
         ),
         InPort::LinkState => (
             PortChannel::Address(proto::LOCAL_LINK_STATE_CHANNEL),
@@ -1148,6 +1253,7 @@ mod tests {
                     },
                 ],
                 instances: vec!["p1".to_string(), "p2".to_string(), "p3".to_string()],
+                overlay: None,
             }]
         );
     }
@@ -1259,6 +1365,7 @@ mod tests {
         let request = serde_json::to_string(&TakeoverBody {
             v: CONTROL_PLANE_VERSION,
             action: TakeoverAction::Request,
+            mode: TakeoverMode::Takeover,
             instance: "p2".to_string(),
         })
         .unwrap();
@@ -1283,6 +1390,7 @@ mod tests {
         let release = serde_json::to_string(&TakeoverBody {
             v: CONTROL_PLANE_VERSION,
             action: TakeoverAction::Release,
+            mode: TakeoverMode::Takeover,
             instance: "p2".to_string(),
         })
         .unwrap();
@@ -1300,6 +1408,7 @@ mod tests {
             serde_json::to_string(&TakeoverBody {
                 v: CONTROL_PLANE_VERSION,
                 action: TakeoverAction::Request,
+                mode: TakeoverMode::Takeover,
                 instance: instance.to_string(),
             })
             .unwrap()
@@ -1324,6 +1433,7 @@ mod tests {
         let req = serde_json::to_string(&TakeoverBody {
             v: CONTROL_PLANE_VERSION,
             action: TakeoverAction::Request,
+            mode: TakeoverMode::Takeover,
             instance: "p2".to_string(),
         })
         .unwrap();
@@ -1348,6 +1458,7 @@ mod tests {
         let req = serde_json::to_string(&TakeoverBody {
             v: CONTROL_PLANE_VERSION,
             action: TakeoverAction::Request,
+            mode: TakeoverMode::Takeover,
             instance: "ghost".to_string(),
         })
         .unwrap();
@@ -1364,9 +1475,15 @@ mod tests {
 
     /// A takeover body naming `instance`.
     fn takeover(action: TakeoverAction, instance: &str) -> String {
+        takeover_in(action, TakeoverMode::Takeover, instance)
+    }
+
+    /// A takeover body naming `instance` in `mode`.
+    fn takeover_in(action: TakeoverAction, mode: TakeoverMode, instance: &str) -> String {
         serde_json::to_string(&TakeoverBody {
             v: CONTROL_PLANE_VERSION,
             action,
+            mode,
             instance: instance.to_string(),
         })
         .unwrap()
@@ -1858,7 +1975,237 @@ mod tests {
             overlay_states(&actions).is_empty(),
             "the holder is still alive: {actions:?}"
         );
-        assert_eq!(c.overlay.as_deref(), Some("p2"));
+        assert_eq!(
+            c.overlay,
+            Some(Held {
+                instance: "p2".to_string(),
+                mode: TakeoverMode::Takeover
+            })
+        );
+    }
+
+    // ── Overlay mode ────────────────────────────────────────────────────────
+
+    /// A columns-3 base layout over p1/p2/p3, applied.
+    fn seed_three_columns(core: &mut ChromeCore) {
+        seed_three(core);
+        core.on_layout(
+            &json!({
+                "v": 1, "kind": "columns-3",
+                "panels": {
+                    "a": { "instance": "p1" }, "b": { "instance": "p2" }, "c": { "instance": "p3" }
+                }
+            })
+            .to_string(),
+        );
+    }
+
+    /// The `overlay` field of the one `ApplyLayout` in `actions`.
+    fn applied_overlay(actions: &[ChromeAction]) -> Option<String> {
+        let mut applied = actions.iter().filter_map(|a| match a {
+            ChromeAction::ApplyLayout { overlay, .. } => Some(overlay.clone()),
+            _ => None,
+        });
+        let first = applied
+            .next()
+            .unwrap_or_else(|| panic!("no ApplyLayout in {actions:?}"));
+        assert!(
+            applied.next().is_none(),
+            "more than one ApplyLayout: {actions:?}"
+        );
+        first
+    }
+
+    #[test]
+    fn an_overlay_request_keeps_the_base_layout_and_stamps_the_overlay() {
+        let mut c = core();
+        seed_three_columns(&mut c);
+        let actions = c.on_takeover(
+            &takeover_in(TakeoverAction::Request, TakeoverMode::Overlay, "p2"),
+            NOW,
+        );
+        assert_eq!(actions[0], ChromeAction::SetOverlay(true));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::SetTakeover(_))),
+            "{actions:?}"
+        );
+        // The base layout stays, minus the holder's slot: its section is the
+        // overlay now, not a panel.
+        assert_eq!(layout_kind(&actions), Some(LayoutKind::Columns3));
+        assert_eq!(
+            placed(&actions),
+            vec![vec!["p1".to_string(), "p3".to_string()]]
+        );
+        assert_eq!(applied_overlay(&actions).as_deref(), Some("p2"));
+        let published = overlay_states(&actions);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].holder.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn a_takeover_request_preempts_an_overlay_holder_in_one_transition() {
+        let mut c = core();
+        seed_three_columns(&mut c);
+        c.on_takeover(
+            &takeover_in(TakeoverAction::Request, TakeoverMode::Overlay, "p2"),
+            NOW,
+        );
+        let actions = c.on_takeover(&takeover(TakeoverAction::Request, "p3"), NOW + 1);
+
+        let flags: Vec<&ChromeAction> = actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    ChromeAction::SetOverlay(_) | ChromeAction::SetTakeover(_)
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                &ChromeAction::SetOverlay(false),
+                &ChromeAction::SetTakeover(true)
+            ]
+        );
+        let published = overlay_states(&actions);
+        assert_eq!(published.len(), 1, "one transition: {actions:?}");
+        assert_eq!(published[0].holder.as_deref(), Some("p3"));
+        assert_eq!(published[0].since_stamp, NOW + 1);
+        // The takeover's synthesized layout, with no overlay section left.
+        assert_eq!(placed(&actions), vec![vec!["p3".to_string()]]);
+        assert_eq!(applied_overlay(&actions), None);
+        assert!(logs_at(&actions, LogLevel::Warn).is_empty(), "{actions:?}");
+        assert_eq!(
+            c.overlay,
+            Some(Held {
+                instance: "p3".to_string(),
+                mode: TakeoverMode::Takeover
+            })
+        );
+    }
+
+    #[test]
+    fn an_overlay_request_is_denied_while_another_instance_holds_either_mode() {
+        for held in [TakeoverMode::Takeover, TakeoverMode::Overlay] {
+            let mut c = core();
+            seed_three(&mut c);
+            c.on_takeover(&takeover_in(TakeoverAction::Request, held, "p1"), NOW);
+            let actions = c.on_takeover(
+                &takeover_in(TakeoverAction::Request, TakeoverMode::Overlay, "p2"),
+                NOW,
+            );
+            let warns = logs_at(&actions, LogLevel::Warn);
+            assert_eq!(actions.len(), 1, "{actions:?}");
+            assert_eq!(warns.len(), 1, "{actions:?}");
+            assert!(warns[0].contains("p1"), "{}", warns[0]);
+            assert!(warns[0].contains(held.as_wire_str()), "{}", warns[0]);
+            assert_eq!(c.overlay.as_ref().map(|h| h.mode), Some(held));
+        }
+    }
+
+    #[test]
+    fn a_holder_asking_for_the_other_mode_is_ignored() {
+        for (held, asked) in [
+            (TakeoverMode::Takeover, TakeoverMode::Overlay),
+            (TakeoverMode::Overlay, TakeoverMode::Takeover),
+        ] {
+            let mut c = core();
+            seed_three(&mut c);
+            c.on_takeover(&takeover_in(TakeoverAction::Request, held, "p2"), NOW);
+            let actions = c.on_takeover(&takeover_in(TakeoverAction::Request, asked, "p2"), NOW);
+            assert_eq!(logs_at(&actions, LogLevel::Warn).len(), 1, "{actions:?}");
+            assert_eq!(actions.len(), 1, "{actions:?}");
+            assert_eq!(c.overlay.as_ref().map(|h| h.mode), Some(held));
+            // The same mode again is the idempotent re-request.
+            assert_eq!(
+                c.on_takeover(&takeover_in(TakeoverAction::Request, held, "p2"), NOW),
+                Vec::new()
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_pops_an_overlay_holder() {
+        let mut c = core();
+        seed_three_columns(&mut c);
+        c.on_takeover(
+            &takeover_in(TakeoverAction::Request, TakeoverMode::Overlay, "p2"),
+            NOW,
+        );
+        // A release from someone else changes nothing.
+        let actions = c.on_takeover(&takeover(TakeoverAction::Release, "p1"), NOW);
+        assert_eq!(logs_at(&actions, LogLevel::Warn).len(), 1, "{actions:?}");
+        assert!(c.overlay.is_some());
+
+        // The release mode is not read: the holder pops whatever it holds.
+        let actions = c.on_takeover(&takeover(TakeoverAction::Release, "p2"), NOW + 3);
+        assert_eq!(actions[0], ChromeAction::SetOverlay(false));
+        let published = overlay_states(&actions);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].holder, None);
+        assert_eq!(
+            placed(&actions),
+            vec![vec!["p1".to_string(), "p2".to_string(), "p3".to_string()]]
+        );
+        assert_eq!(applied_overlay(&actions), None);
+        assert!(c.overlay.is_none());
+    }
+
+    #[test]
+    fn a_layout_published_under_an_overlay_applies_at_once() {
+        let mut c = core();
+        seed_three_columns(&mut c);
+        c.on_takeover(
+            &takeover_in(TakeoverAction::Request, TakeoverMode::Overlay, "p3"),
+            NOW,
+        );
+        let actions = c.on_layout(
+            &json!({
+                "v": 1, "kind": "columns-2",
+                "panels": { "a": { "instance": "p2" }, "b": { "instance": "p1" } }
+            })
+            .to_string(),
+        );
+        assert_eq!(layout_kind(&actions), Some(LayoutKind::Columns2));
+        assert_eq!(
+            placed(&actions),
+            vec![vec!["p2".to_string(), "p1".to_string()]]
+        );
+        assert_eq!(applied_overlay(&actions).as_deref(), Some("p3"));
+    }
+
+    #[test]
+    fn an_overlay_holder_death_pops_the_overlay() {
+        let mut c = core();
+        seed_three(&mut c);
+        c.on_takeover(
+            &takeover_in(TakeoverAction::Request, TakeoverMode::Overlay, "p2"),
+            NOW,
+        );
+        let actions = c.on_surface_state(
+            &surface_state(&[
+                ("p1", InstanceState::Mounted),
+                ("p2", InstanceState::Failed),
+                ("p3", InstanceState::Mounted),
+            ]),
+            NOW + 9,
+        );
+        assert!(
+            actions.contains(&ChromeAction::SetOverlay(false)),
+            "{actions:?}"
+        );
+        assert!(
+            !actions.contains(&ChromeAction::SetTakeover(false)),
+            "{actions:?}"
+        );
+        let published = overlay_states(&actions);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].holder, None);
+        assert_eq!(applied_overlay(&actions), None);
+        assert!(c.overlay.is_none());
     }
 
     // ── Toast queue ─────────────────────────────────────────────────────────

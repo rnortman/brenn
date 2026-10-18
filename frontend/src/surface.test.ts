@@ -858,6 +858,15 @@ describe("surface processor bring-up", () => {
             brenn_dom_utc_offset_minutes: vi.fn(
                 (_i: string, _e: bigint) => 0,
             ),
+            brenn_dom_animate: vi.fn(
+                (
+                    _i: string,
+                    _n: bigint,
+                    _k: string,
+                    _o: string,
+                ): string | undefined => undefined,
+            ),
+            brenn_dom_prefers_reduced_motion: vi.fn((_i: string) => false),
             brenn_dom_page_root: vi.fn((_i: string) => 1n),
             brenn_dom_page_body: vi.fn((_i: string) => 1n),
             brenn_dom_instance_wrapper: vi.fn(
@@ -1225,6 +1234,18 @@ describe("surface processor bring-up", () => {
             [1700000000000n],
             "brenn_dom_utc_offset_minutes",
         ],
+        [
+            "brenn:processor/dom",
+            "animate",
+            [3n, '[{"opacity":0}]', '{"duration":200}'],
+            "brenn_dom_animate",
+        ],
+        [
+            "brenn:processor/dom",
+            "prefersReducedMotion",
+            [],
+            "brenn_dom_prefers_reduced_motion",
+        ],
         ["brenn:processor/page-dom", "pageRoot", [], "brenn_dom_page_root"],
         ["brenn:processor/page-dom", "pageBody", [], "brenn_dom_page_body"],
         [
@@ -1284,6 +1305,27 @@ describe("surface processor bring-up", () => {
             ] as unknown as ReturnType<typeof vi.fn>;
             expect(forwarded).toHaveBeenCalledWith("p1", ...args);
         }
+    });
+
+    it("throws a browser-refused animation as animate-error's refused", async () => {
+        const kernel = fakeKernel();
+        kernel.brenn_dom_animate = vi.fn(
+            (_i: string, _n: bigint, _k: string, _o: string) =>
+                "Invalid easing",
+        );
+        const captured = await capturedImports(kernel, "p1");
+        const dom = captured["brenn:processor/dom"] as {
+            animate: (node: bigint, keyframes: string, options: string) => void;
+        };
+        let thrown: unknown;
+        try {
+            dom.animate(3n, "[]", "{}");
+        } catch (err) {
+            thrown = err;
+        }
+        expect(thrown).toEqual({
+            payload: { tag: "refused", val: "Invalid easing" },
+        });
     });
 
     it("omits an absent insert-before reference rather than inventing one", async () => {

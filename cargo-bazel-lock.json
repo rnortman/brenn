@@ -1,5 +1,5 @@
 {
-  "checksum": "dc7f664da090c929c16ab7150baf9c1a01e84fbad4ce864c52a5a5adccc7078a",
+  "checksum": "98e30fed42f8679f4159c4cc8f92293221fae97066ca773360414c9872c7601d",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -5289,6 +5289,24 @@
         "compile_data_glob": [
           "**"
         ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde 1.0.228",
+              "target": "serde"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            }
+          ],
+          "selects": {}
+        },
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -33267,16 +33285,23 @@
             "CustomEvent",
             "CustomEventInit",
             "Document",
+            "DomRect",
+            "DomRectReadOnly",
             "Element",
             "ErrorEvent",
             "Event",
             "EventTarget",
             "HtmlElement",
+            "KeyboardEvent",
             "Location",
+            "MediaQueryList",
             "MessageEvent",
+            "MouseEvent",
             "Node",
             "NodeList",
             "Performance",
+            "PointerEvent",
+            "UiEvent",
             "WebSocket",
             "Window",
             "console",

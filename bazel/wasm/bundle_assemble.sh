@@ -15,8 +15,8 @@
 # A bundle is the release of a component repository: up to three of the
 # subdirectories brenn's own tarball carries, and nothing else. `components/`
 # holds one package directory per shipped backend component beside the manifest
-# naming them; `surface/` holds `processor/<kind>/` per page-hosted kind;
-# `modules/` holds the authored module of every one of them, flat, which is what
+# naming them; `surface/` holds `processor/<kind>/` per page-hosted kind, with
+# that kind's documentation sidecars flat beside `processor/`; `modules/` holds the authored module of every one of them, flat, which is what
 # a deployment's `use @<name>::…` imports resolve against. Each installs into a
 # root of its own on the target host, named by one boot flag apiece.
 #
@@ -142,17 +142,35 @@ fi
 # surface/
 # ---------------------------------------------------------------------------
 
-# A staging target's output directory holds `processor/<kind>/` and nothing
-# else; the kernel bundle and the flat sidecars are brenn's tree, and a bundle
-# that carried a second copy of them would be a second kernel the host refuses.
+# A staging target's output directory holds `processor/<kind>/` and, beside it,
+# that kind's documentation sidecars: `brenn_<k>.help.md` / `brenn_<k>.schema.json`
+# for a kind `k` in the same stage, where `<k>` is the kind with every hyphen an
+# underscore (`stage_sidecar_owner`). Nothing else: the kernel bundle and brenn's own
+# sidecars are brenn's tree, and a bundle that carried a second copy of them
+# would be a second kernel the host refuses.
 for stage in ${stages[@]+"${stages[@]}"}; do
     if [ ! -d "$stage" ]; then
         echo "ERROR: $stage is not a directory" >&2
         exit 1
     fi
-    outside="$(cd "$stage" && find -L . -mindepth 1 -maxdepth 1 ! -name processor -printf '%P\n' | LC_ALL=C sort)"
-    if [ -n "$outside" ]; then
-        echo "ERROR: $stage carries entries outside processor/: $(echo "$outside" | tr '\n' ' ')" >&2
+    sidecars=()
+    outside=()
+    while read -r entry; do
+        [ -n "$entry" ] || continue
+        [ "$entry" = processor ] && continue
+        owner=""
+        if [ -f "$stage/$entry" ]; then
+            owner="$(stage_sidecar_owner "$stage" "$entry")"
+        fi
+        if [ -n "$owner" ]; then
+            sidecars+=("$entry")
+        else
+            outside+=("$entry")
+        fi
+    done < <(cd "$stage" && find -L . -mindepth 1 -maxdepth 1 -printf '%P\n' | LC_ALL=C sort)
+    if [ "${#outside[@]}" -gt 0 ]; then
+        echo "ERROR: $stage carries entries outside processor/ that are no staged kind's" \
+             "brenn_<kind>.help.md or brenn_<kind>.schema.json: ${outside[*]}" >&2
         exit 1
     fi
     mkdir -p "$out/surface/processor"
@@ -171,6 +189,12 @@ for stage in ${stages[@]+"${stages[@]}"}; do
         # paths in the tarball.
         cp -RL "$kind_dir." "$dest/"
         chmod -R u+w "$dest"
+    done
+    # A sidecar names its kind, and the kind was refused above if a second stage
+    # also ships it, so two stages never stage one sidecar.
+    for entry in ${sidecars[@]+"${sidecars[@]}"}; do
+        cp -L "$stage/$entry" "$out/surface/$entry"
+        chmod u+w "$out/surface/$entry"
     done
 done
 

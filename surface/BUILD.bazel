@@ -121,8 +121,34 @@ component_bundle(
     ],
     surface_kinds = [
         ":echo-stub_assets",
-        ":mode-clock_assets",
+        ":mode-clock_fixture_assets",
     ],
+)
+
+# A second staging of mode-clock, given the documentation sidecars an
+# out-of-tree kind passes, so the inputs reach the stage, the assembly and the
+# contract test above through the macro a consumer calls. Not the served
+# `mode-clock_assets`: that kind's sidecars reach `dist` through its crate
+# package, and a second copy there would collide in the merge.
+surface_processor_assets(
+    name = "mode-clock_fixture_assets",
+    component = "//surface/components/mode-clock:mode-clock_component",
+    help = ":mode-clock_fixture_help",
+    kind = "mode-clock",
+    schema = ":mode-clock_fixture_schema",
+    spec = _KIND_SPEC.format(kind = "mode-clock"),
+)
+
+write_file(
+    name = "mode-clock_fixture_help",
+    out = "mode-clock-fixture/help.md",
+    content = ["# mode-clock (bundle fixture)", ""],
+)
+
+write_file(
+    name = "mode-clock_fixture_schema",
+    out = "mode-clock-fixture/schema.json",
+    content = ['{"type": "object"}', ""],
 )
 
 # Derived, not retyped. `surface_processor_component()` mints `<kind>_dist` in every

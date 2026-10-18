@@ -16,6 +16,10 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  *  5. A malformed layout doc is rejected and the last-good layout stays — never
  *     a blank screen.
  *  6. Reload restores the retained layout and panel content (durable snapshot).
+ *  7. A browser refusal of `dom.animate` reaches the component as a value: the
+ *     instance reports it and keeps working.
+ *  8. A press carries its pointer position, relative to the listening node,
+ *     through the kernel's gesture body to the component.
  *
  * Runs single-worker in declaration order (playwright.config.ts) against the
  * `brenn.e2e.brenn` bar surfaces (`bar`, `bar-pixel`, `bar-feeder`). The bar
@@ -384,6 +388,89 @@ test("reload restores the retained layout and panel content", async ({
   await expect(panelMessage(page, "p2")).toHaveText(contentMarker, {
     timeout: CHAIN_TIMEOUT,
   });
+
+  await feeder.close();
+});
+
+test("a browser-refused animation is reported and the instance carries on", async ({
+  context,
+}) => {
+  // echo-stub's `animate` button asks for an `ease-out-back` easing, which no
+  // browser parses. The refusal must reach the guest as
+  // `err(refused(message))`, which the component writes out; a trap would
+  // error-card the instance instead.
+  const bar = await context.newPage();
+  await openSurface(bar, "bar");
+  await expect(surfaceRoot(bar)).toHaveAttribute("data-layout", /.+/, {
+    timeout: CHAIN_TIMEOUT,
+  });
+
+  const feeder = await context.newPage();
+  await openSurface(feeder, "bar-feeder");
+  const stub = feeder.locator(
+    'div[data-kind="echo-stub"][data-instance="feed-b"]',
+  );
+  await expect(stub).toBeAttached({ timeout: CHAIN_TIMEOUT });
+  await stub.evaluate((node: Element) => {
+    const animate = node.querySelector("[data-echo-animate]");
+    if (!(animate instanceof HTMLElement)) {
+      throw new Error("the echo-stub's animate button is not rendered");
+    }
+    animate.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+
+  await expect(stub.locator("[data-echo-animate-result]")).toHaveText(
+    /^refused: .+/,
+    { timeout: CHAIN_TIMEOUT },
+  );
+  await expect(stub.locator("[data-surface-error]")).toHaveCount(0);
+
+  // Still live: its next publish reaches the panel bound to its channel.
+  const marker = "bar-animate-refusal-survived";
+  await publishVia(feeder, "feed-b", marker);
+  await expect(panelMessage(bar, "p2")).toHaveText(marker, {
+    timeout: CHAIN_TIMEOUT,
+  });
+
+  await feeder.close();
+  await bar.close();
+});
+
+test("a press carries its position on the button to the component", async ({
+  context,
+}) => {
+  // A real click, through the browser's input pipeline, at a known offset
+  // into the send button. Playwright's offset is from the padding box and the
+  // kernel subtracts the border box, so the button's border is added back;
+  // echo-stub writes the result after its counters.
+  const feeder = await context.newPage();
+  await openSurface(feeder, "bar-feeder");
+  const stub = feeder.locator(
+    'div[data-kind="echo-stub"][data-instance="feed-b"]',
+  );
+  const send = stub.locator("[data-echo-send]");
+  await expect(send).toBeVisible({ timeout: CHAIN_TIMEOUT });
+  await send.click({ position: { x: 12, y: 3 } });
+  const border = await send.evaluate((node: Element) => {
+    const style = getComputedStyle(node);
+    return {
+      left: parseFloat(style.borderLeftWidth),
+      top: parseFloat(style.borderTopWidth),
+    };
+  });
+
+  const status = stub.locator("[data-echo-status]");
+  await expect(status).toHaveText(/ at -?[\d.e-]+,-?[\d.e-]+$/, {
+    timeout: CHAIN_TIMEOUT,
+  });
+  const match = / at (-?[\d.e-]+),(-?[\d.e-]+)$/.exec(
+    (await status.textContent()) ?? "",
+  );
+  if (match === null) {
+    throw new Error("the status line carries no position");
+  }
+  expect(Number(match[1])).toBeCloseTo(12 + border.left, 0);
+  expect(Number(match[2])).toBeCloseTo(3 + border.top, 0);
 
   await feeder.close();
 });

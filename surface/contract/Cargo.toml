@@ -13,8 +13,14 @@ description = "Brenn surface component contract v1 — the DOM-event seam betwee
 # carrier, never a re-typed copy of it — and on `brenn-activation` for the
 # activation shape itself, which the wasmtime host declares from the same
 # crate. All three dependencies run seam → wire/carrier and never back, so those
-# crates stay what they say they are.
+# crates stay what they say they are. `serde` derives the one body the seam
+# types itself, the gesture request, so the kernel that writes it and the page
+# harness that stands in for the kernel share one serializer.
 [dependencies]
 brenn-activation = { version = "0.1.0", path = "../../brenn-activation", features = ["serde"] }
 brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope" }
 brenn-surface-schema = { version = "0.1.0", path = "../schema" }
+serde = { version = "1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0.149"

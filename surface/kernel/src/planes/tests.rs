@@ -9,7 +9,7 @@ use brenn_surface_schema::bindings::{
 use brenn_surface_schema::{
     CONTROL_PLANE_VERSION, ComponentEntry, LOCAL_LINK_STATE_CHANNEL, LOCAL_OVERLAY_STATE_CHANNEL,
     LOCAL_TAKEOVER_CHANNEL, LOCAL_THEME_CHANNEL, LocalChannel, OverlayStateBody, TakeoverAction,
-    TakeoverBody,
+    TakeoverBody, TakeoverMode,
 };
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -89,6 +89,7 @@ fn takeover_body(instance: &str) -> String {
     serde_json::to_string(&TakeoverBody {
         v: CONTROL_PLANE_VERSION,
         action: TakeoverAction::Request,
+        mode: TakeoverMode::Takeover,
         instance: instance.to_string(),
     })
     .expect("the takeover body serializes")
@@ -198,6 +199,39 @@ fn an_unparseable_takeover_body_is_refused() {
     assert!(reason.contains("unparseable body"), "{reason}");
 }
 
+/// The stamp re-serialises the kernel's struct, so a field it did not carry
+/// would be stripped here; `mode` is what chrome decides preemption on.
+#[test]
+fn a_takeover_body_keeps_its_mode_through_the_stamp() {
+    let planes = planes();
+    let body = serde_json::to_string(&TakeoverBody {
+        v: CONTROL_PLANE_VERSION,
+        action: TakeoverAction::Request,
+        mode: TakeoverMode::Overlay,
+        instance: "chrome".to_string(),
+    })
+    .expect("the takeover body serializes");
+    let body = carried(planes.guard(LOCAL_TAKEOVER_CHANNEL, Origin::Sub("p1"), body));
+    let parsed: TakeoverBody = serde_json::from_str(&body).expect("the stamped body parses");
+    assert_eq!(parsed.mode, TakeoverMode::Overlay);
+    assert_eq!(parsed.instance, "p1");
+}
+
+/// The stamp writes out the default for a body without `mode`, so chrome reads
+/// `takeover`.
+#[test]
+fn a_takeover_body_without_a_mode_is_stamped_as_a_takeover() {
+    let planes = planes();
+    let body = carried(planes.guard(
+        LOCAL_TAKEOVER_CHANNEL,
+        Origin::Sub("p1"),
+        r#"{"v":1,"action":"request","instance":"p1"}"#.to_string(),
+    ));
+    assert!(body.contains(r#""mode":"takeover""#), "{body}");
+    let parsed: TakeoverBody = serde_json::from_str(&body).expect("the stamped body parses");
+    assert_eq!(parsed.mode, TakeoverMode::Takeover);
+}
+
 /// Valid JSON naming a chosen `instance` but missing `v` is the document that
 /// would otherwise reach the plane unstamped: a reader whose parser tolerated
 /// the missing field would release `victim`'s overlay on a sibling's say-so.
@@ -222,6 +256,7 @@ fn a_takeover_body_with_an_unrecognised_version_still_stamps() {
     let body = serde_json::to_string(&TakeoverBody {
         v: 7,
         action: TakeoverAction::Request,
+        mode: TakeoverMode::Takeover,
         instance: "chrome".to_string(),
     })
     .expect("the takeover body serializes");

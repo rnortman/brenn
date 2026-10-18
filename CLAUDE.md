@@ -139,7 +139,7 @@ UI components are hand-crafted, not LLM-generated on the fly. Claude selects fro
 
 There is a wasmtime extension capability here. The purpose of this is two fold: first to provide an *external* extension surface for out-of-tree components. Second to sandbox as much of Brenn itself as can be done without creating performance problems to limit the damage caused by bugs within Brenn. Both uses of WASM are legitimate and first-class.
 
-In particular, whenever considering WASM-related design questions, remember: out-of-tree components are first class extension mechanisms. This means we need to look not only for in-tree impacts but consider the out-of-tree impacts as well.
+In particular, whenever considering WASM-related design questions, remember: out-of-tree components are first class extension mechanisms. This means we need to look not only for in-tree impacts but consider the out-of-tree impacts as well. You cannot make a decision based only on what components are visible to you; there may be arbtrary out-of-tree components.
 
 ### Building
 

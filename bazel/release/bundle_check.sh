@@ -11,7 +11,7 @@
 #
 # Three subdirectories are checked, each only if it is there: `components/` with
 # its manifest and one package directory per entry, `surface/` with one record
-# per `processor/<kind>/`, and `modules/`, which is always required because a
+# per `processor/<kind>/` and the kinds' flat documentation sidecars, and `modules/`, which is always required because a
 # tree that ships either of the other two ships importable vocabulary.
 #
 # A package is a directory named for the component, holding its `package.json`
@@ -348,6 +348,26 @@ if [ -d "$pkg/surface" ]; then
             fail "surface/processor/$kind/ does not hold exactly the files its record lists."
             diff -u <(echo "$want_listed") <(echo "$have_listed") \
                 --label "$label" --label "surface/processor/$kind/" || true
+        fi
+    done
+
+    # A kind's documentation sidecars sit flat in `surface/`, named by the
+    # kind's stem — the kind with every hyphen an underscore,
+    # `stage_sidecar_owner` — which is the one name the server looks under. A sidecar whose stem is no
+    # staged kind's is documentation nothing reads, and an empty one publishes
+    # an empty help page where the server would otherwise warn and stub. The
+    # parse checks are the server's boot panic on malformed JSON and each
+    # kind's own parity test, not this gate.
+    shopt -s nullglob
+    surface_sidecars=("$pkg"/surface/brenn_*.help.md "$pkg"/surface/brenn_*.schema.json)
+    shopt -u nullglob
+    for sidecar in ${surface_sidecars[@]+"${surface_sidecars[@]}"}; do
+        name="$(basename "$sidecar")"
+        owner="$(stage_sidecar_owner "$pkg/surface" "$name")"
+        if [ -z "$owner" ]; then
+            fail "surface/$name names no staged kind; a kind's sidecars are brenn_<kind, hyphens as underscores> beside surface/processor/<kind>/"
+        elif [ ! -s "$sidecar" ]; then
+            fail "surface/$name is empty; kind $owner would serve it as its documentation"
         fi
     done
 fi

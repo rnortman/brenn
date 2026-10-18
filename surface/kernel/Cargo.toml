@@ -63,6 +63,11 @@ web-sys = { version = "0.3.102", features = [
     "CssStyleDeclaration",
     "NodeList",
     "Location",
+    "MediaQueryList",
+    "MouseEvent",
+    "PointerEvent",
+    "KeyboardEvent",
+    "DomRect",
     "Performance",
     "console",
 ] }

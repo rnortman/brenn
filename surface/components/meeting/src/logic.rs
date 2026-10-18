@@ -905,6 +905,10 @@ impl TakeoverAction {
     }
 }
 
+/// The `TakeoverBody.mode` the meeting always sends: replace the layout, and
+/// preempt any overlay-mode holder.
+pub const TAKEOVER_MODE: &str = "takeover";
+
 /// The body published on the `takeover` port.
 ///
 /// `instance` is always empty here: the kernel's local router overwrites it with
@@ -914,6 +918,7 @@ impl TakeoverAction {
 pub struct TakeoverBody {
     pub v: u8,
     pub action: &'static str,
+    pub mode: &'static str,
     pub instance: &'static str,
 }
 
@@ -923,6 +928,7 @@ impl TakeoverBody {
         TakeoverBody {
             v: CONTROL_PLANE_VERSION,
             action: action.as_wire_str(),
+            mode: TAKEOVER_MODE,
             instance: "",
         }
     }
@@ -2066,6 +2072,7 @@ mod tests {
                     TakeoverAction::Request => brenn_surface_schema::TakeoverAction::Request,
                     TakeoverAction::Release => brenn_surface_schema::TakeoverAction::Release,
                 },
+                mode: brenn_surface_schema::TakeoverMode::Takeover,
                 instance: String::new(),
             };
             assert_eq!(

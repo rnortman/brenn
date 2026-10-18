@@ -1,4 +1,5 @@
-//! The banner's styling seam, pinned across the two languages that spell it.
+//! Chrome's styling seams — the banner's markers and the takeover and overlay
+//! flags — pinned across the two languages that spell them.
 //!
 //! Chrome stamps its connection banner with marker attributes and the
 //! stylesheets dress it by selecting on them. The two are independent
@@ -60,6 +61,34 @@ fn every_stylesheet_dresses_the_banner_by_the_marker_chrome_stamps() {
                  stamps as `{name}`; the banner would render unstyled"
             );
         }
+    }
+}
+
+/// The surface-root and section flags chrome stamps with
+/// `set_attribute_present`, whose value is the empty string: only a presence
+/// selector matches one, so a stylesheet that writes `[data-takeover="true"]`
+/// selects nothing while still containing the open-bracket needle above.
+#[test]
+fn every_presence_flag_is_selected_by_presence() {
+    for name in ["TAKEOVER_ATTR", "OVERLAY_ATTR"] {
+        let marker = glue_marker(GLUE, name);
+        let open = format!("[{marker}");
+        let closed = format!("[{marker}]");
+        let mut selected = false;
+        for (path, css) in stylesheets() {
+            let opens = css.matches(&open).count();
+            let closes = css.matches(&closed).count();
+            assert_eq!(
+                opens, closes,
+                "{path} selects `{marker}` by value; chrome stamps it as `{name}` \
+                 with an empty value, so only `{closed}` matches"
+            );
+            selected |= closes > 0;
+        }
+        assert!(
+            selected,
+            "no stylesheet selects `{closed}`, which chrome stamps as `{name}`"
+        );
     }
 }
 

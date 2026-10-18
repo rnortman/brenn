@@ -403,6 +403,8 @@ surface_processor_assets(
     kind = "demo-panel",
     component = "//demo-panel:component",
     spec = "//spec:demo-panel.brenn",
+    help = "//demo-panel:help.md",          # optional
+    schema = "//demo-panel:schema.json",    # optional
 )
 ```
 
@@ -413,6 +415,16 @@ the version of the binary that ran — and emits one directory,
 the packaged specification `<kind>.spec.brenn`, and the `manifest.json` that
 binds them. `grant_parity_test` arrives with it, exactly as it does for a
 backend package.
+
+`help` and `schema` are the kind's documentation sidecars, the files the server
+publishes on its help channel. Each is staged beside `processor/`, not in it, as
+`brenn_<k>.help.md` / `brenn_<k>.schema.json`, where `<k>` is the kind with every
+hyphen an underscore (`demo-panel` → `brenn_demo_panel.help.md`): the server
+reads a kind's sidecars from the root that serves it under that stem, and the
+record's file list stays exactly `processor/<kind>/`. A kind given no `help`
+boots with a warning and a generated stub page; a `schema` that is not JSON is a
+boot refusal, so a kind that generates its schema pins the committed copy with a
+parity test of its own.
 
 One naming rule is worth stating because it used to be a build-green,
 boot-refusing trap: **the `kind` must be the wire fold of the component class's
@@ -465,8 +477,11 @@ required exactly when `packages` is non-empty, and refused otherwise.
   bundle repository has no unshipped packages — and the assembly holds the two
   equal in both directions.
 - `surface/processor/<kind>/` per `surface_processor_assets`, each staging
-  target's directory copied whole. No kernel and no flat sidecars: exactly one
-  surface root holds the kernel and that one is brenn's.
+  target's directory copied whole. No kernel; flat sidecars only as
+  `brenn_<k>.help.md` / `brenn_<k>.schema.json` for a kind `k` staged in the
+  same bundle, copied from that kind's own stage to `surface/`. Exactly one
+  surface root holds the kernel and that one is brenn's; anything else beside
+  `processor/` in a stage fails the assembly.
 - `modules/<name>.brenn`, the packaged specification of every package and every
   kind, flat. A component shipped for both hostings is staged once and the two
   copies must be byte-identical or the build fails naming both.
@@ -764,7 +779,9 @@ scan runs when the configuration loads; the package scan runs immediately after,
 before anything is served. Both run again on every reload, so a mount installed
 since boot is checked against the ones that were already there.
 
-No kernel bundle and no flat sidecars: exactly one `surface/` tree holds the
+No kernel bundle; flat sidecars only as `brenn_<k>.help.md` /
+`brenn_<k>.schema.json` for a kind `k` the same mount ships, which is where the
+server reads that kind's documentation. Exactly one `surface/` tree holds the
 kernel, and that one is brenn's.
 
 ### Bundles

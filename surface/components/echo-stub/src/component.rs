@@ -6,9 +6,12 @@
 //! a press causes is made from inside one.
 //!
 //! The conformance fixture for the page-hosted seam: its scrollback shows each
-//! activation's new envelopes, its status line the summed `dropped`, and its
+//! activation's new envelopes, its status line the summed `dropped`, its
 //! third button traps, which is how the error-card path is exercised from a
-//! real component.
+//! real component, and its fourth asks the browser for an animation it
+//! refuses, which is how the `dom.animate` refusal path is exercised. A press
+//! that carries a pointer position appends it to the status line, which is how
+//! the gesture detail is exercised.
 
 use std::collections::VecDeque;
 
@@ -24,6 +27,12 @@ use crate::spec::{InPort, SyncPort, port::OUT};
 const MAX_SCROLLBACK_ENTRIES: usize = 100;
 
 const AWAITING: &str = "awaiting data";
+
+/// The animation the `animate` button asks for. `ease-out-back` is no CSS
+/// easing, so every browser's `KeyframeEffect` constructor refuses it — the
+/// refusal is the point: it drives the kernel's refusal chain end to end.
+const ANIMATE_KEYFRAMES: &str = r#"[{"opacity":0.5},{"opacity":1}]"#;
+const ANIMATE_OPTIONS: &str = r#"{"duration":200,"easing":"ease-out-back"}"#;
 
 /// A delivered body that makes the activation fail *after* its state has been
 /// stored.
@@ -61,6 +70,9 @@ struct View {
     scrollback: dom::Node,
     /// The free-form body field, read at press time through [`dom::value`].
     input: dom::Node,
+    /// Where the `animate` button's outcome is written: `animated` or
+    /// `refused: <the browser's message>`. Empty until the first press.
+    animate_result: dom::Node,
 }
 
 impl EchoStub {
@@ -92,8 +104,8 @@ impl Processor for EchoStubComponent {
                 "echo-stub: {FAIL_AFTER_STORE} was delivered"
             )));
         }
-        // Mount and both send gestures are answered with nothing: the mount call
-        // has no reply dialect, and neither button's default action is one this
+        // Mount and every gesture are answered with nothing: the mount call has
+        // no reply dialect, and no button's default action is one this
         // component cancels.
         Ok(None)
     }
@@ -111,9 +123,14 @@ brenn_guest::export_processor!(EchoStubComponent);
 /// Answers whether a [`FAIL_AFTER_STORE`] body was among the new envelopes,
 /// which the caller turns into a failure once the state has been written.
 fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<bool, Error> {
+    let mut pressed_at = None;
     if activation.sync_is(brenn_guest::MOUNT) {
         echo.view = Some(build_view());
     } else if let Some(port) = SyncPort::of(activation)? {
+        pressed_at = activation
+            .gesture()
+            .ok_or_else(|| Error::failed("echo-stub: a sync-call activation carried no request"))??
+            .pointer;
         on_gesture(port, echo)?;
     }
     let mut new_entries = 0usize;
@@ -155,7 +172,7 @@ fn on_activation(activation: &Activation, echo: &mut EchoStub) -> Result<bool, E
     if new_entries > 0 {
         trim_scrollback(echo);
     }
-    update_status(echo);
+    update_status(echo, pressed_at.as_ref());
     Ok(fail_after_store)
 }
 
@@ -183,6 +200,10 @@ fn on_gesture(port: SyncPort, echo: &mut EchoStub) -> Result<(), Error> {
         // this is the field's value at press time.
         SyncPort::SendCustom => dom::value(echo.view().input),
         SyncPort::Panic => panic!("echo-stub panic button pressed"),
+        SyncPort::Animate => {
+            animate_status(echo.view());
+            return Ok(());
+        }
     };
     match publish(OUT, &body) {
         Ok(()) => echo.sent += 1,
@@ -202,7 +223,17 @@ fn on_gesture(port: SyncPort, echo: &mut EchoStub) -> Result<(), Error> {
     Ok(())
 }
 
-/// Build the UI under this instance's host element and wire its three gestures.
+/// Ask for the animation on the status line and write what the browser said.
+/// A refusal is an answer, not a failure: the activation carries on.
+fn animate_status(view: &View) {
+    let outcome = match dom::animate(view.status, ANIMATE_KEYFRAMES, ANIMATE_OPTIONS) {
+        Ok(()) => "animated".to_string(),
+        Err(dom::AnimateError::Refused(message)) => format!("refused: {message}"),
+    };
+    dom::set_text(view.animate_result, &outcome);
+}
+
+/// Build the UI under this instance's host element and wire its four gestures.
 ///
 /// Called once, from the mount activation. Listeners are the kernel's and are
 /// page-lifetime: each press arrives as a sync-call activation on its port.
@@ -217,19 +248,32 @@ fn build_view() -> View {
     dom::set_attribute(input, "type", "text");
     let send_custom = button("data-echo-send-custom", "send custom");
     let panic_button = button("data-echo-panic", "panic");
+    let animate_button = button("data-echo-animate", "animate");
+    let animate_result = dom::marked("div", "data-echo-animate-result");
 
-    for child in [status, scrollback, send, input, send_custom, panic_button] {
+    for child in [
+        status,
+        scrollback,
+        send,
+        input,
+        send_custom,
+        panic_button,
+        animate_button,
+        animate_result,
+    ] {
         dom::append(root, child);
     }
 
     dom::listen(send, "click", SyncPort::Send);
     dom::listen(send_custom, "click", SyncPort::SendCustom);
     dom::listen(panic_button, "click", SyncPort::Panic);
+    dom::listen(animate_button, "click", SyncPort::Animate);
 
     View {
         status,
         scrollback,
         input,
+        animate_result,
     }
 }
 
@@ -239,9 +283,12 @@ fn button(marker: &str, label: &str) -> dom::Node {
     node
 }
 
-fn update_status(echo: &EchoStub) {
-    dom::set_text(
-        echo.view().status,
-        &format!("sent: {}  drops: {}", echo.sent, echo.drops),
-    );
+/// Write the counters, and where the press landed on its button when the
+/// gesture that caused this activation carried a position.
+fn update_status(echo: &EchoStub, pressed_at: Option<&dom::Pointer>) {
+    let mut status = format!("sent: {}  drops: {}", echo.sent, echo.drops);
+    if let Some(pointer) = pressed_at {
+        status.push_str(&format!(" at {},{}", pointer.x, pointer.y));
+    }
+    dom::set_text(echo.view().status, &status);
 }

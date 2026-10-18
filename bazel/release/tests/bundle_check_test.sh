@@ -206,6 +206,26 @@ build_tree "$tree" surface; rm "$tree/surface/processor/panel/panel.js"
 reject "a transpiled file the record lists and the tree lacks" \
     "surface/processor/panel/ does not hold exactly the files its record lists"
 
+# A kind's documentation sidecars, flat beside `processor/` under the stem the
+# server reads. The pair passes; one naming no staged kind is documentation
+# nothing serves, and an empty one is a blank help page served in place of the
+# server's stub.
+build_tree "$tree" surface
+printf '# Panel\n' > "$tree/surface/brenn_panel.help.md"
+printf '{"type": "object"}\n' > "$tree/surface/brenn_panel.schema.json"
+if ! "$check" "$names" "$record_lib" "$tree" > "$tmp/sidecars.log" 2>&1; then
+    fail "a kind's help and schema sidecars should pass: $(cat "$tmp/sidecars.log")"
+fi
+
+build_tree "$tree" surface; printf '# Other\n' > "$tree/surface/brenn_other.help.md"
+reject "a help sidecar naming no staged kind" "surface/brenn_other.help.md names no staged kind"
+
+build_tree "$tree" surface; printf '{}\n' > "$tree/surface/brenn_other.schema.json"
+reject "a schema sidecar naming no staged kind" "surface/brenn_other.schema.json names no staged kind"
+
+build_tree "$tree" surface; : > "$tree/surface/brenn_panel.help.md"
+reject "an empty sidecar" "surface/brenn_panel.help.md is empty"
+
 # ---------------------------------------------------------------------------
 # The module root. Each of these reaches the target host as a configuration that
 # cannot compile, or as one that compiles against bytes nothing installed binds.

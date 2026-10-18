@@ -564,7 +564,10 @@ assembly StandardChrome(slug: String, layout: Channel) {
   channel, no `push_depth`, no `retain_depth`, no `noise` rung, no doctype and
   no `optional`; each of those is a compile error on it, and an instance never
   binds it. A `sync` port with no caller is legal and ordinary — a gesture port
-  has no caller anywhere in the document. A `dom.listen` on a name the class
+  has no caller anywhere in the document. A gesture's request body names the
+  event, the listening node and the target, and carries `pointer`, `key` and
+  `modifiers` detail for the event classes that have them (the `listen` doc in
+  `processor.wit` lists the fields). A `dom.listen` on a name the class
   does not declare `sync` ends the activation, on the same terms a publish to
   an undeclared port does. The scaffold generates a `SyncPort` enum whose
   variants are exactly the class's `sync` ports, and `dom.listen` takes nothing
@@ -650,9 +653,10 @@ The rules are small:
 
 Adopt a tag only where the payload contract is verifiable at both ends against
 the schema the two ends compile against. A guessed tag is worse than an
-untagged port. The control-plane bodies take `brenn.surface.<plane>@1`, whose
-version is `CONTROL_PLANE_VERSION`; a test over the shipped configs holds the
-two equal, since nothing else would notice the day that constant moves.
+untagged port. The control-plane bodies take `brenn.surface.<plane>@<version>`,
+whose `<version>` is `CONTROL_PLANE_VERSION`; a test over the shipped configs
+holds the two equal, since nothing else would notice the day that constant
+moves.
 
 ### Instances and bindings
 

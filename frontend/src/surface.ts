@@ -576,6 +576,13 @@ export interface KernelModule extends WasmModule {
         port: string,
     ): void;
     brenn_dom_utc_offset_minutes(instance: string, epochMs: bigint): number;
+    brenn_dom_animate(
+        instance: string,
+        node: bigint,
+        keyframes: string,
+        options: string,
+    ): string | undefined;
+    brenn_dom_prefers_reduced_motion(instance: string): boolean;
     brenn_dom_page_root(instance: string): bigint;
     brenn_dom_page_body(instance: string): bigint;
     brenn_dom_instance_wrapper(
@@ -783,8 +790,9 @@ function coreBasename(url: string): string {
  * `--instantiation` module per kind. Build-artifact-forced, which is the whole
  * reason the loader forks here and nowhere else.
  *
- * A refused publish reaches the guest as the WIT `publish-error` variant, and a
- * refused deferred-message control op as the `defer-error` variant: the glue's
+ * A refused publish reaches the guest as the WIT `publish-error` variant, a
+ * refused deferred-message control op as the `defer-error` variant, and a
+ * browser-refused animation as `animate-error`'s `refused`: the glue's
  * `getErrorPayload` reads a thrown value's own `payload` property, so the shim
  * throws the variant rather than returning it.
  *
@@ -903,6 +911,21 @@ function processorImports(
                 kernel.brenn_dom_listen(instance, node, event, port),
             utcOffsetMinutes: (epochMs: bigint) =>
                 kernel.brenn_dom_utc_offset_minutes(instance, epochMs),
+            // The kernel answers a browser refusal with its message, and the
+            // glue lowers a thrown `payload` into `err(refused(message))`.
+            animate: (node: bigint, keyframes: string, options: string) => {
+                const refused = kernel.brenn_dom_animate(
+                    instance,
+                    node,
+                    keyframes,
+                    options,
+                );
+                if (refused !== undefined) {
+                    throw { payload: { tag: "refused", val: refused } };
+                }
+            },
+            prefersReducedMotion: () =>
+                kernel.brenn_dom_prefers_reduced_motion(instance),
         },
         "brenn:processor/page-dom": {
             pageRoot: () => kernel.brenn_dom_page_root(instance),

@@ -49,8 +49,8 @@ use std::sync::Arc;
 use brenn_envelope::grants::ComponentGrant;
 use brenn_envelope::testutils::{NOW_MS, envelope};
 use brenn_surface_contract::{
-    GESTURE_EVENT_FIELD, GESTURE_LISTENER_FIELD, GESTURE_TARGET_FIELD, MOUNT_SYNC_PORT,
-    dom_attribute_allowed, dom_tag_allowed,
+    GestureBody, MOUNT_SYNC_PORT, dom_attribute_allowed, dom_attribute_value_allowed,
+    dom_tag_allowed,
 };
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
@@ -176,6 +176,14 @@ pub struct Page {
     pub page_root: Option<u64>,
     pub body: Option<u64>,
     pub instance_wrappers: BTreeMap<String, u64>,
+    /// What `dom.prefers-reduced-motion` answers.
+    pub reduced_motion: bool,
+    /// The `dom.animate` call of the next activation, counted from 1, that the
+    /// browser refuses, and the message it refuses it with. Cleared when that
+    /// activation ends, whatever it did.
+    animate_refusal: Option<(usize, String)>,
+    /// How many `dom.animate` calls the current activation has made.
+    animate_calls: usize,
     /// The vocabulary this page holds its guest to, stamped by
     /// [`Kind::instantiate`] or by [`Page::declare`].
     declared: Option<Arc<Declared>>,
@@ -205,8 +213,38 @@ impl Page {
             page_root: None,
             body: None,
             instance_wrappers: BTreeMap::new(),
+            reduced_motion: false,
+            animate_refusal: None,
+            animate_calls: 0,
             declared: None,
         }
+    }
+
+    /// Answer `dom.prefers-reduced-motion` with `reduced` from now on.
+    pub fn with_reduced_motion(&mut self, reduced: bool) -> &mut Page {
+        self.reduced_motion = reduced;
+        self
+    }
+
+    /// Make the `nth` `dom.animate` call (from 1) of the next activation answer
+    /// `Refused(message)`, and every other call `Ok` — how a kind's suite drives
+    /// the browser refusal the page otherwise owns. Cleared when that activation
+    /// ends.
+    pub fn with_animate_refusal(&mut self, nth: usize, message: &str) -> &mut Page {
+        assert!(nth >= 1, "animate calls are counted from 1");
+        self.animate_refusal = Some((nth, message.to_string()));
+        self
+    }
+
+    /// Start an activation's `dom.animate` count from zero.
+    fn begin_activation(&mut self) {
+        self.animate_calls = 0;
+    }
+
+    /// Drop what was scripted for the activation that just ended.
+    fn end_activation(&mut self) {
+        self.animate_refusal = None;
+        self.animate_calls = 0;
     }
 
     /// Hold this page to `declared` without going through a [`Kind`]: for a
@@ -392,6 +430,10 @@ impl dom::Host for Page {
             dom_attribute_allowed(&name),
             "`{name}` is not a settable attribute"
         );
+        assert!(
+            dom_attribute_value_allowed(&name, &value),
+            "`{value}` is not a settable `{name}`"
+        );
         self.record(format!("dom.set-attribute({}, {name}, {value:?})", n(node)));
         self.element(node).attributes.insert(name, value);
     }
@@ -481,6 +523,46 @@ impl dom::Host for Page {
     fn utc_offset_minutes(&mut self, epoch_ms: u64) -> i32 {
         self.record(format!("dom.utc-offset-minutes({epoch_ms})"));
         0
+    }
+
+    fn animate(
+        &mut self,
+        node: u64,
+        keyframes: String,
+        options: String,
+    ) -> Result<(), dom::AnimateError> {
+        // The kernel traps on text that is not a JSON array / object; the
+        // harness fails the suite on it, which is the same statement here.
+        assert!(
+            matches!(
+                serde_json::from_str::<serde_json::Value>(&keyframes),
+                Ok(serde_json::Value::Array(_))
+            ),
+            "dom: the animate keyframes are not a JSON array: {keyframes}"
+        );
+        assert!(
+            matches!(
+                serde_json::from_str::<serde_json::Value>(&options),
+                Ok(serde_json::Value::Object(_))
+            ),
+            "dom: the animate options are not a JSON object: {options}"
+        );
+        // An unknown handle fails the test here as it traps on the page.
+        self.element(node);
+        self.record(format!("dom.animate({}, {keyframes}, {options})", n(node)));
+        self.animate_calls += 1;
+        match &self.animate_refusal {
+            Some((nth, message)) if *nth == self.animate_calls => {
+                Err(dom::AnimateError::Refused(message.clone()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn prefers_reduced_motion(&mut self) -> bool {
+        let reduced = self.reduced_motion;
+        self.record(format!("dom.prefers-reduced-motion -> {reduced}"));
+        reduced
     }
 }
 
@@ -861,7 +943,9 @@ impl Harness {
         // the life of the harness, and a body an earlier activation published
         // and then discarded by failing must not be retained by a later one.
         let published_from = self.store.data().published.len();
+        self.store.data_mut().begin_activation();
         let outcome = instance.call_receive(&mut self.store, &activation);
+        self.store.data_mut().end_activation();
         if matches!(outcome, Ok(Ok(_))) {
             self.retain_state(published_from);
         }
@@ -1017,12 +1101,32 @@ pub fn gesture(port: &str, listener: u64) -> types::Activation {
 /// A gesture whose target is not the listening node — a click that landed on a
 /// descendant of a delegated listener, or on the gap between them.
 pub fn gesture_at(port: &str, listener: u64, target: u64) -> types::Activation {
-    let body = serde_json::json!({
-        GESTURE_EVENT_FIELD: "click",
-        GESTURE_LISTENER_FIELD: listener,
-        GESTURE_TARGET_FIELD: target,
-    })
-    .to_string();
+    gesture_with(port, "click", listener, target, &GestureDetail::default())
+}
+
+/// The detail objects a gesture body carries, and their parts — the kernel's
+/// own types, so a body scripted here is serialized exactly as the page writes
+/// one. The harness sends whatever is set, so a suite scripts the body a given
+/// event would produce.
+pub use brenn_surface_contract::{GestureDetail, GestureKey, GestureModifiers, GesturePointer};
+
+/// A gesture of any event type, carrying `detail` as the kernel's listener
+/// synthesizes it — a tap at a position, a key press — so a kind's suite
+/// drives input without a browser.
+pub fn gesture_with(
+    port: &str,
+    event: &str,
+    listener: u64,
+    target: u64,
+    detail: &GestureDetail,
+) -> types::Activation {
+    let body = GestureBody {
+        event: event.to_string(),
+        listener,
+        target,
+        detail: detail.clone(),
+    };
+    let body = serde_json::to_string(&body).expect("a gesture body serializes");
     sync_call(port, envelope("gesture", &body))
 }
 
@@ -1192,7 +1296,7 @@ mod tests {
         );
         assert_eq!(
             names(&declared.sync_ports),
-            ["panic", "send", "send-custom"]
+            ["animate", "panic", "send", "send-custom"]
         );
         assert_eq!(names(&declared.inbound), ["messages", "state"]);
         assert_eq!(names(&declared.outbound), ["out", "state"]);
@@ -1278,6 +1382,151 @@ mod tests {
         let mut page = Page::new();
         page.declare(echo_stub_declared());
         let _ = page.publish_deferred("no-such-port".to_string(), "{}".to_string(), NOW_MS);
+    }
+
+    const KEYFRAMES: &str = r#"[{"opacity":0},{"opacity":1}]"#;
+    const OPTIONS: &str = r#"{"duration":200}"#;
+
+    fn animate(page: &mut Page) -> Result<(), dom::AnimateError> {
+        page.animate(ROOT, KEYFRAMES.to_string(), OPTIONS.to_string())
+    }
+
+    #[test]
+    fn an_animation_is_recorded_with_its_text_verbatim() {
+        let mut page = Page::new();
+        assert!(animate(&mut page).is_ok());
+        assert_eq!(
+            page.transcript,
+            vec![format!("dom.animate(n1, {KEYFRAMES}, {OPTIONS})")],
+        );
+    }
+
+    /// The harness substitutes nothing: options naming `"infinite"` are
+    /// accepted and recorded verbatim.
+    #[test]
+    fn infinite_iterations_text_is_recorded_verbatim() {
+        let mut page = Page::new();
+        let options = r#"{"duration":200,"iterations":"infinite"}"#;
+        assert!(
+            page.animate(ROOT, KEYFRAMES.to_string(), options.to_string())
+                .is_ok()
+        );
+        assert_eq!(
+            page.transcript,
+            vec![format!("dom.animate(n1, {KEYFRAMES}, {options})")],
+        );
+    }
+
+    /// The synthesized request of a sync-call activation, parsed.
+    fn gesture_body(activation: &types::Activation) -> serde_json::Value {
+        let envelope: serde_json::Value =
+            serde_json::from_str(&activation.ports[0].envelopes[0]).expect("envelope JSON");
+        let body = envelope["body"]
+            .as_str()
+            .expect("the envelope carries a body");
+        serde_json::from_str(body).expect("the body is JSON")
+    }
+
+    /// The detail objects land under the contract's names, and an unset one is
+    /// absent rather than null.
+    #[test]
+    fn a_gesture_with_detail_carries_it_verbatim() {
+        let detail = GestureDetail {
+            pointer: Some(GesturePointer {
+                x: 123.5,
+                y: 40.0,
+                width: 1920.0,
+                height: 720.0,
+                button: 0,
+                buttons: 1,
+                pointer_type: Some("touch".to_string()),
+            }),
+            key: None,
+            modifiers: Some(GestureModifiers {
+                shift: true,
+                ..GestureModifiers::default()
+            }),
+        };
+        assert_eq!(
+            gesture_body(&gesture_with("press", "pointerdown", 7, 12, &detail)),
+            serde_json::json!({
+                "event": "pointerdown", "listener": 7, "target": 12,
+                "pointer": {"x": 123.5, "y": 40.0, "width": 1920.0, "height": 720.0,
+                            "button": 0, "buttons": 1, "type": "touch"},
+                "modifiers": {"alt": false, "ctrl": false, "meta": false, "shift": true},
+            })
+        );
+
+        let keyed = GestureDetail {
+            key: Some(GestureKey {
+                key: "ArrowLeft".to_string(),
+                code: "ArrowLeft".to_string(),
+                repeat: false,
+            }),
+            ..GestureDetail::default()
+        };
+        assert_eq!(
+            gesture_body(&gesture_with("press", "keydown", 7, 7, &keyed)),
+            serde_json::json!({
+                "event": "keydown", "listener": 7, "target": 7,
+                "key": {"key": "ArrowLeft", "code": "ArrowLeft", "repeat": false},
+            })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "keyframes are not a JSON array")]
+    fn animate_keyframes_that_are_not_an_array_panic() {
+        let mut page = Page::new();
+        let _ = page.animate(ROOT, r#"{"opacity":0}"#.to_string(), OPTIONS.to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "keyframes are not a JSON array")]
+    fn animate_keyframes_that_do_not_parse_panic() {
+        let mut page = Page::new();
+        let _ = page.animate(ROOT, "[{".to_string(), OPTIONS.to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "options are not a JSON object")]
+    fn animate_options_that_are_not_an_object_panic() {
+        let mut page = Page::new();
+        let _ = page.animate(ROOT, KEYFRAMES.to_string(), "[200]".to_string());
+    }
+
+    /// The scripted refusal lands on the named call alone, and does not
+    /// outlive the activation it was scripted for.
+    #[test]
+    fn a_scripted_refusal_answers_the_named_call_and_is_cleared_after() {
+        let mut page = Page::new();
+        page.with_animate_refusal(2, "boom");
+        page.begin_activation();
+        assert!(animate(&mut page).is_ok());
+        assert!(matches!(
+            animate(&mut page),
+            Err(dom::AnimateError::Refused(message)) if message == "boom"
+        ));
+        assert!(animate(&mut page).is_ok());
+        page.end_activation();
+        page.begin_activation();
+        assert!(animate(&mut page).is_ok());
+        assert!(animate(&mut page).is_ok());
+    }
+
+    #[test]
+    fn reduced_motion_answers_what_the_page_was_given() {
+        let mut page = Page::new();
+        assert!(!page.prefers_reduced_motion());
+        page.with_reduced_motion(true);
+        assert!(page.prefers_reduced_motion());
+        assert_eq!(
+            page.transcript,
+            vec![
+                "dom.prefers-reduced-motion -> false".to_string(),
+                "dom.prefers-reduced-motion -> true".to_string(),
+            ],
+        );
     }
 
     #[test]

@@ -817,6 +817,29 @@ pub fn brenn_dom_utc_offset_minutes(instance: &str, epoch_ms: u64) -> Result<i32
     })
 }
 
+/// `dom.animate`. The one `dom` entry with a recoverable arm: a malformed call
+/// throws like every other, and a browser refusal is answered as its message,
+/// `None` on success, which the loader shim lowers to `err(refused)`.
+#[wasm_bindgen]
+pub fn brenn_dom_animate(
+    instance: &str,
+    node: u64,
+    keyframes: &str,
+    options: &str,
+) -> Result<Option<String>, JsValue> {
+    with_dom_host("dom animate", |host| {
+        trap(host.animate(instance, node, keyframes, options)).map(Result::err)
+    })
+}
+
+/// `dom.prefers-reduced-motion`.
+#[wasm_bindgen]
+pub fn brenn_dom_prefers_reduced_motion(instance: &str) -> Result<bool, JsValue> {
+    with_dom_host("dom prefers-reduced-motion", |host| {
+        trap(host.prefers_reduced_motion(instance))
+    })
+}
+
 /// `page-dom.page-root`.
 #[wasm_bindgen]
 pub fn brenn_dom_page_root(instance: &str) -> Result<u64, JsValue> {

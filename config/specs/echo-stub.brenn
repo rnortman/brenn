@@ -3,7 +3,7 @@
 /// optional; every instance drives `out`.
 ///
 /// It holds `dom` because it draws: a status line, a scrollback of the
-/// envelopes each activation delivered, and the three buttons whose presses
+/// envelopes each activation delivered, and the four buttons whose presses
 /// arrive as sync-call activations. Its view handles and counters ride the
 /// retained `state` port between activations, because linear memory does not.
 component EchoStub {
@@ -13,6 +13,7 @@ component EchoStub {
   sync send;
   sync send-custom;
   sync panic;
+  sync animate;
   out out;
   io state;
 }

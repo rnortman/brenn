@@ -180,6 +180,16 @@
 //!   it once at mount and keep the answer.
 //! - `dom.*` / `page-dom.*` — the DOM capability. Element vocabulary is an
 //!   allow-list ([`DOM_ALLOWED_TAGS`], [`DOM_ALLOWED_ATTRIBUTES`]); misuse traps.
+//!   One entry has a recoverable arm: `dom.animate` answers a browser refusal
+//!   of its keyframes or options as `animate-error.refused`, because that data
+//!   may have come from a message, and traps only on its own malformed call;
+//!   it substitutes one value, an `iterations` of
+//!   [`ANIMATE_ITERATIONS_INFINITE`], with `Infinity`. `dom.listen` answers
+//!   each event with a sync-call activation whose body names the event, the
+//!   listener and the target, plus pointer, key and modifier detail for the
+//!   event classes that carry them ([`GestureBody`]).
+//!   `dom.prefers-reduced-motion` and `dom.utc-offset-minutes` are page facts
+//!   riding the same grant.
 //!
 //! A component's death is not on this list either: it panics, the host catches
 //! the trap, and the kernel error-cards that one instance. There is no way for a
@@ -399,6 +409,7 @@ pub use brenn_activation::sync::{SYNC_CHANNEL_PREFIX, sync_channel};
 /// Re-exported rather than aliased at an envelope type: a parked message is a body
 /// and a release time, so the carrier is the same on every hosting.
 pub use brenn_activation::{DeferredEntry, DeferredWindow};
+use serde::{Deserialize, Serialize};
 
 /// Why a buffered publish was refused, returned synchronously to the component
 /// from inside its activation entry.
@@ -547,22 +558,82 @@ pub fn publish_status_str(status: Result<(), PublishError>) -> &'static str {
 
 // ── The gesture seam (kernel → component, and back) ─────────────────────────
 
-/// The gesture request's field naming the DOM event type that fired.
+/// A gesture request: the body the kernel synthesizes when a listener's event
+/// fires, and the guest SDK's `dom::Gesture` parses.
 ///
-/// A gesture request is a body the kernel synthesizes and the guest SDK parses,
-/// so its field names are a seam between two crates that cannot share a type:
-/// the SDK is built for wasm32 and links none of this. They are spelled here,
-/// pinned to their literals by `gesture_body_field_names_frozen`, and spelled
-/// once more on the guest's `Gesture` struct.
-pub const GESTURE_EVENT_FIELD: &str = "event";
+/// The SDK is built for wasm32 and links none of this crate, so the field names
+/// are spelled twice: here, through the derive, pinned to a golden body by
+/// `gesture_body_field_names_frozen`, and on the guest's structs, held to these
+/// by `the_guest_half_of_the_gesture_seam_spells_the_same_names`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GestureBody {
+    /// The DOM event type that fired.
+    pub event: String,
+    /// The node whose listener fired, as that instance's own handle.
+    pub listener: u64,
+    /// The nearest handle-mapped ancestor of the event's target — how a
+    /// delegated listener tells apart which child was hit.
+    pub target: u64,
+    /// The detail objects, which sit beside the three fields above.
+    #[serde(flatten)]
+    pub detail: GestureDetail,
+}
 
-/// The gesture request's field naming the node whose listener fired, as that
-/// instance's own handle.
-pub const GESTURE_LISTENER_FIELD: &str = "listener";
+/// The detail objects of a [`GestureBody`], each present only for the event
+/// class that carries it on the page: `pointer` for a `MouseEvent` (every
+/// pointer, mouse, click and wheel event), `key` for a `KeyboardEvent`,
+/// `modifiers` for either. An unset one is absent from the body, not `null`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GestureDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<GesturePointer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<GestureKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifiers: Option<GestureModifiers>,
+}
 
-/// The gesture request's field naming the nearest handle-mapped ancestor of the
-/// event's target — how a delegated listener tells apart which child was hit.
-pub const GESTURE_TARGET_FIELD: &str = "target";
+/// A gesture's pointer detail, in CSS pixels relative to the listening node's
+/// bounding rect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GesturePointer {
+    /// `clientX` less the listening node's left edge.
+    pub x: f64,
+    /// `clientY` less the listening node's top edge.
+    pub y: f64,
+    /// The listening node's width.
+    pub width: f64,
+    /// The listening node's height.
+    pub height: f64,
+    /// The event's `button`: which button changed state.
+    pub button: i16,
+    /// The event's `buttons`: the bitmask of buttons held.
+    pub buttons: u16,
+    /// The event's `pointerType` (`mouse`, `pen`, `touch`), present only when
+    /// the event is a `PointerEvent`.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub pointer_type: Option<String>,
+}
+
+/// A gesture's key detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GestureKey {
+    /// The key's value under the current layout.
+    pub key: String,
+    /// The physical key.
+    pub code: String,
+    /// Whether the key is held and auto-repeating.
+    pub repeat: bool,
+}
+
+/// The modifier keys held when a gesture's event fired.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GestureModifiers {
+    pub alt: bool,
+    pub ctrl: bool,
+    pub meta: bool,
+    pub shift: bool,
+}
 
 /// The one key a gesture reply has: `true` asks the kernel to `preventDefault`
 /// the event that caused the activation, `false` lets it proceed.
@@ -572,6 +643,14 @@ pub const GESTURE_TARGET_FIELD: &str = "target";
 /// reading it as "do not cancel". No reply at all is the other way to let the
 /// event proceed.
 pub const GESTURE_CANCEL_FIELD: &str = "cancel";
+
+/// The `dom.animate` options value of `iterations` the host replaces with
+/// `Infinity` before calling `Element.animate`: JSON cannot spell `Infinity`,
+/// and this is how an endless animation is asked for.
+pub const ANIMATE_ITERATIONS_FIELD: &str = "iterations";
+
+/// See [`ANIMATE_ITERATIONS_FIELD`]: the one string the host substitutes.
+pub const ANIMATE_ITERATIONS_INFINITE: &str = "infinite";
 
 /// The port a mount activation names — the sync-call activation the kernel
 /// mints for a `dom`-granted instance's first invocation, where it builds its
@@ -627,9 +706,9 @@ pub const DOM_ALLOWED_TAGS: &[&str] = &[
 /// of [`DOM_ALLOWED_ATTRIBUTE_PREFIXES`]. Anything else traps.
 ///
 /// Admitted by the same rule as [`DOM_ALLOWED_TAGS`], which is why no
-/// URL-bearing name and no `on*` name is here — and why attribute *values* are
-/// never inspected: with no name that can carry a URL or a handler, there is
-/// nothing in a value to parse.
+/// URL-bearing name and no `on*` name is here. With no name that can carry a
+/// URL or a handler, no value is parsed; the one value rule is
+/// [`dom_attribute_value_allowed`]'s exact match on `tabindex`.
 ///
 /// `id` is absent deliberately. Ids live in the page-global namespace and the
 /// surface's chrome resolves its own furniture through it, so an id set inside
@@ -641,6 +720,7 @@ pub const DOM_ALLOWED_ATTRIBUTES: &[&str] = &[
     "placeholder",
     "role",
     "start",
+    "tabindex",
     "title",
     "type",
 ];
@@ -666,6 +746,22 @@ pub fn dom_attribute_allowed(name: &str) -> bool {
         || DOM_ALLOWED_ATTRIBUTE_PREFIXES
             .iter()
             .any(|prefix| name.starts_with(prefix))
+}
+
+/// The only values the host will set `tabindex` to, matched exactly.
+///
+/// `0` puts the element in the page's sequential focus order where it stands in
+/// the document, as a `button` already is; `-1` makes it focusable without a
+/// place in that order. A positive value moves the element ahead of every
+/// element without one across the whole page, chrome's controls included,
+/// which is an effect outside the instance's subtree.
+pub const DOM_TABINDEX_VALUES: &[&str] = &["0", "-1"];
+
+/// Whether the host will set an attribute already admitted by
+/// [`dom_attribute_allowed`] to `value`: any value, except that `tabindex`
+/// takes only one of [`DOM_TABINDEX_VALUES`].
+pub fn dom_attribute_value_allowed(name: &str, value: &str) -> bool {
+    name != "tabindex" || DOM_TABINDEX_VALUES.contains(&value)
 }
 
 // ── The deferred-message ops (component → kernel) ───────────────────────────
@@ -874,14 +970,60 @@ mod tests {
         assert_eq!(call_error_str(&CallError::QuotaExceeded), "quota-exceeded");
     }
 
+    /// A gesture body with every detail object present.
+    fn full_gesture() -> GestureBody {
+        GestureBody {
+            event: "pointerdown".to_string(),
+            listener: 7,
+            target: 12,
+            detail: GestureDetail {
+                pointer: Some(GesturePointer {
+                    x: 123.5,
+                    y: 40.0,
+                    width: 1920.0,
+                    height: 720.0,
+                    button: 0,
+                    buttons: 1,
+                    pointer_type: Some("touch".to_string()),
+                }),
+                key: Some(GestureKey {
+                    key: "ArrowLeft".to_string(),
+                    code: "ArrowLeft".to_string(),
+                    repeat: false,
+                }),
+                modifiers: Some(GestureModifiers {
+                    shift: true,
+                    ..GestureModifiers::default()
+                }),
+            },
+        }
+    }
+
     #[test]
     fn gesture_body_field_names_frozen() {
         // The kernel writes this body and a guest SDK it cannot link parses it;
         // a rename on one side alone is a gesture that silently stops carrying
         // its target.
-        assert_eq!(GESTURE_EVENT_FIELD, "event");
-        assert_eq!(GESTURE_LISTENER_FIELD, "listener");
-        assert_eq!(GESTURE_TARGET_FIELD, "target");
+        let full = serde_json::to_value(full_gesture()).expect("serialize");
+        assert_eq!(
+            full,
+            serde_json::json!({
+                "event": "pointerdown", "listener": 7, "target": 12,
+                "pointer": {"x": 123.5, "y": 40.0, "width": 1920.0, "height": 720.0,
+                            "button": 0, "buttons": 1, "type": "touch"},
+                "key": {"key": "ArrowLeft", "code": "ArrowLeft", "repeat": false},
+                "modifiers": {"alt": false, "ctrl": false, "meta": false, "shift": true},
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<GestureBody>(full).expect("parse"),
+            full_gesture()
+        );
+        // An unset detail object is absent, and a body without one parses.
+        let bare = r#"{"event":"click","listener":3,"target":3}"#;
+        let parsed: GestureBody = serde_json::from_str(bare).expect("parse");
+        assert_eq!(parsed.detail, GestureDetail::default());
+        assert_eq!(serde_json::to_string(&parsed).expect("serialize"), bare);
         assert_eq!(GESTURE_CANCEL_FIELD, "cancel");
     }
 
@@ -889,24 +1031,56 @@ mod tests {
     ///
     /// The guest SDK is built for wasm32, links none of this crate, and has no
     /// test target of its own, so its `Gesture` field names and its cancel key
-    /// are independent literals held to these constants by nothing but prose.
-    /// Its source is compile data here, and the needles are built from the
-    /// constants: rename either side alone and this fails, instead of every
-    /// gesture body silently losing a field the day the kernel synthesizer
-    /// lands.
+    /// are independent literals held to this crate's by nothing but prose. Its
+    /// source is compile data here, and the needles are the field names this
+    /// crate's [`GestureBody`] serializes: rename either side alone and this
+    /// fails, instead of every gesture body silently losing a field.
     #[test]
     fn the_guest_half_of_the_gesture_seam_spells_the_same_names() {
         const GUEST: &str = include_str!("../../../brenn-wasm/components/guest/src/lib.rs");
-        for field in [
-            GESTURE_EVENT_FIELD,
-            GESTURE_LISTENER_FIELD,
-            GESTURE_TARGET_FIELD,
+        /// The body of the guest's `pub struct {name} { … }`.
+        fn guest_struct(name: &str) -> &'static str {
+            let opening = format!("pub struct {name} {{");
+            let start = GUEST
+                .find(&opening)
+                .unwrap_or_else(|| panic!("the guest declares no `{opening}`"));
+            let rest = &GUEST[start..];
+            let end = rest
+                .find("\n    }")
+                .unwrap_or_else(|| panic!("the guest's `{opening}` has no closing brace"));
+            &rest[..end]
+        }
+        /// The field names of a serialized object.
+        fn names(object: &serde_json::Value) -> Vec<&str> {
+            object
+                .as_object()
+                .expect("a gesture object")
+                .keys()
+                .map(String::as_str)
+                .collect()
+        }
+
+        // A field whose wire name is a Rust keyword is renamed onto it; every
+        // other field is spelled as its wire name.
+        let declares = |body: &str, field: &str| {
+            body.contains(&format!("pub {field}: "))
+                || body.contains(&format!("#[serde(rename = \"{field}\""))
+        };
+        let full = serde_json::to_value(full_gesture()).expect("serialize");
+        for (name, fields) in [
+            ("Gesture", names(&full)),
+            ("Pointer", names(&full["pointer"])),
+            ("Key", names(&full["key"])),
+            ("Modifiers", names(&full["modifiers"])),
         ] {
-            let needle = format!("pub {field}: ");
-            assert!(
-                GUEST.contains(&needle),
-                "the guest's `Gesture` declares no `{needle}`; the two halves of the gesture                  body have drifted"
-            );
+            let body = guest_struct(name);
+            for field in fields {
+                assert!(
+                    declares(body, field),
+                    "the guest's `{name}` declares no `{field}`; the two halves of the gesture \
+                     body have drifted"
+                );
+            }
         }
         let key = format!("const CANCEL_KEY: &str = \"{GESTURE_CANCEL_FIELD}\";");
         assert!(
@@ -947,6 +1121,7 @@ mod tests {
         assert!(dom_attribute_allowed("class"));
         assert!(dom_attribute_allowed("data-instance"));
         assert!(dom_attribute_allowed("aria-label"));
+        assert!(dom_attribute_allowed("tabindex"));
         // The prefix is a prefix, not a substring.
         assert!(!dom_attribute_allowed("x-data-instance"));
         for refused in [
@@ -954,6 +1129,17 @@ mod tests {
         ] {
             assert!(!dom_attribute_allowed(refused), "`{refused}` is settable");
         }
+        assert!(dom_attribute_value_allowed("tabindex", "0"));
+        assert!(dom_attribute_value_allowed("tabindex", "-1"));
+        // The match is exact: no spelling of a number is repaired.
+        for refused in ["1", "32767", "+0", "00", " 0", "-2", ""] {
+            assert!(
+                !dom_attribute_value_allowed("tabindex", refused),
+                "`tabindex={refused:?}` is settable"
+            );
+        }
+        assert!(dom_attribute_value_allowed("class", "1"));
+        assert!(dom_attribute_value_allowed("data-tabindex", "1"));
     }
 
     /// The lists are contract vocabulary an out-of-tree author reads off the WIT
@@ -997,6 +1183,17 @@ mod tests {
         assert_eq!(
             names, expected_names,
             "the WIT's attribute list and DOM_ALLOWED_ATTRIBUTE{{S,_PREFIXES}} have drifted"
+        );
+
+        let values = DOM_TABINDEX_VALUES
+            .iter()
+            .map(|value| format!("`{value}`"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let rule = format!("`tabindex` takes only {values}");
+        assert!(
+            WIT.contains(&rule),
+            "the WIT does not state `{rule}`, which DOM_TABINDEX_VALUES holds"
         );
     }
 

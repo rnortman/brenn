@@ -40,6 +40,7 @@ pub fn help_markdown() -> String {
     out.push_str("\n## Output (bind this on the chrome instance)\n");
     port_table(&mut out, [&OUTPUT_PORT_DOC]);
     out.push_str(OVERLAY_STATE_PROSE);
+    out.push_str(TAKEOVER_MODES_PROSE);
     layout_doc_section(&mut out);
     out
 }
@@ -73,13 +74,38 @@ indistinguishable from a healthy one. The kernel draws one warn at connect when
 a takeover-granted surface's chrome has no `overlay-state` output.
 ";
 
+/// The two takeover modes and who wins the plane. Behavior with no enumerable
+/// counterpart.
+const TAKEOVER_MODES_PROSE: &str = "
+## Takeover modes
+
+One instance holds the takeover plane at a time, in the mode its request named
+(`mode` is optional and defaults to `takeover`):
+
+- `takeover` replaces the layout with the holder alone, and `#surface-root`
+  carries `data-takeover`.
+- `overlay` keeps the layout applied and visible and draws the holder's section
+  full-viewport above it, transparent and inert to the pointer unless the
+  holder's own content opts in; `#surface-root` and that section carry
+  `data-overlay`.
+
+A request on a free plane is granted. A `takeover` request while another
+instance holds `overlay` preempts it: the overlay pops and the takeover is
+pushed in one transition, so `overlay-state` names the new holder once. Every
+other request while another instance holds the plane is denied with a warn and
+nothing sent back; a holder asking for the other mode is ignored, and changes
+mode by releasing first. A release pops whichever mode its sender holds. A
+holder that fails or leaves is popped on the next `surface-state`.
+";
+
 /// How chrome treats a layout doc it cannot apply. Behavior with no enumerable
 /// counterpart.
 const LAST_VALID_WINS_PROSE: &str = "\
 Chrome keeps the **last valid** layout on screen: a doc that fails to parse or
 names an unknown instance is dropped and reported, never partially applied, and
-never blanks the surface. A doc published while a takeover overlay is up is
-stored and applied when the overlay pops.
+never blanks the surface. A doc published while a `takeover`-mode holder is up
+is stored and applied when the holder pops; under an `overlay`-mode holder it
+applies at once.
 ";
 
 /// A markdown table of port rows, followed by a blank line.

@@ -25,8 +25,14 @@ native_test(
     name = "processor_stage_test",
     size = "small",
     src = "processor_stage_test.sh",
-    args = ["$(rootpath //bazel/surface:processor_stage.sh)"],
-    data = ["//bazel/surface:processor_stage.sh"],
+    args = [
+        "$(rootpath //bazel/surface:processor_stage.sh)",
+        "$(rootpath //bazel/release:stage_lib.sh)",
+    ],
+    data = [
+        "//bazel/release:stage_lib.sh",
+        "//bazel/surface:processor_stage.sh",
+    ],
     out = "processor_stage_test.run",
     target_compatible_with = HOST_ONLY,
 )

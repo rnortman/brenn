@@ -18,16 +18,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use brenn_chrome::spec::port::{SURFACE_STATE, TOAST};
+use brenn_chrome::spec::port::{SURFACE_STATE, TAKEOVER, TOAST};
 use brenn_chrome::wire::{
-    CONTROL_PLANE_VERSION, InstanceState, SurfaceStateBody, SurfaceStateInstance, ToastBody,
-    ToastSeverity, ToastSource,
+    CONTROL_PLANE_VERSION, InstanceState, SurfaceStateBody, SurfaceStateInstance, TakeoverAction,
+    TakeoverBody, TakeoverMode, ToastBody, ToastSeverity, ToastSource,
 };
 use brenn_envelope::grants::ComponentGrant::{Alert, Config, Dom, Log, Ports, Store};
-use brenn_envelope::testutils::NOW_MS;
+use brenn_envelope::testutils::{NOW_MS, envelope};
 use brenn_meeting::logic::{AckTarget, SNOOZE_SECS, dismiss_body, snooze_body};
 use brenn_page_harness::{
-    Declared, Harness, Listener, Page, ROOT, delivery_on, gesture, gesture_at, mount, ports, types,
+    Declared, GestureDetail, GestureModifiers, GesturePointer, Harness, Listener, Page, ROOT,
+    delivery_on, gesture, gesture_at, gesture_with, mount, ports, sync_call, types,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -42,11 +43,17 @@ const ECHO_OUT_PORT: &str = "out";
 /// The `io` port its state rides between activations.
 const ECHO_STATE_PORT: &str = "state";
 
-/// Echo-stub's three sync ports. Literals because this suite does not depend on
+/// Echo-stub's four sync ports. Literals because this suite does not depend on
 /// its crate; must match the specification or the harness panics.
 const SEND: &str = "send";
 const SEND_CUSTOM: &str = "send-custom";
 const PANIC: &str = "panic";
+const ANIMATE: &str = "animate";
+
+/// What echo-stub's `animate` button hands `dom.animate`, as the transcript
+/// records it: an easing no browser accepts, so the page refuses it.
+const ECHO_ANIMATE_CALL: &str = "dom.animate(n2, [{\"opacity\":0.5},{\"opacity\":1}], \
+     {\"duration\":200,\"easing\":\"ease-out-back\"})";
 
 /// The delivered body that makes echo-stub fail *after* its state has been
 /// stored.
@@ -71,6 +78,10 @@ const MEETING_TAKEOVER_PORT: &str = "takeover";
 /// already registered on the page it arranges.
 const CHROME_INSTANCE: &str = "chrome";
 const SIBLING_INSTANCE: &str = "panel-1";
+
+/// A second sibling, registered by the takeover tests beside the first so one
+/// can hold the plane while the other is the panel it covers or hides.
+const SECOND_SIBLING: &str = "panel-2";
 
 /// The sync port chrome's one delegated toast listener asks for.
 const TOAST_DISMISS: &str = brenn_chrome::spec::SyncPort::ToastDismiss.name();
@@ -183,20 +194,28 @@ const MOUNT_TRANSCRIPT: &[&str] = &[
     "dom.create-element(button) -> n7",
     "dom.set-attribute(n7, data-echo-panic, \"\")",
     "dom.set-text(n7, \"panic\")",
+    "dom.create-element(button) -> n8",
+    "dom.set-attribute(n8, data-echo-animate, \"\")",
+    "dom.set-text(n8, \"animate\")",
+    "dom.create-element(div) -> n9",
+    "dom.set-attribute(n9, data-echo-animate-result, \"\")",
     "dom.append(n1, n2)",
     "dom.append(n1, n3)",
     "dom.append(n1, n4)",
     "dom.append(n1, n5)",
     "dom.append(n1, n6)",
     "dom.append(n1, n7)",
+    "dom.append(n1, n8)",
+    "dom.append(n1, n9)",
     "dom.listen(n4, click, send)",
     "dom.listen(n6, click, send-custom)",
     "dom.listen(n7, click, panic)",
+    "dom.listen(n8, click, animate)",
     "dom.set-text(n2, \"sent: 0  drops: 0\")",
     // The last thing every activation does: the state the next one reads back.
     // The handles in it are the elements built above, which the mount owns and
     // the memory does not.
-    "ports.publish(state, \"{\\\"view\\\":{\\\"status\\\":2,\\\"scrollback\\\":3,\\\"input\\\":5},\\\"entries\\\":[],\\\"drops\\\":0,\\\"sent\\\":0}\")",
+    "ports.publish(state, \"{\\\"view\\\":{\\\"status\\\":2,\\\"scrollback\\\":3,\\\"input\\\":5,\\\"animate_result\\\":9},\\\"entries\\\":[],\\\"drops\\\":0,\\\"sent\\\":0}\")",
 ];
 
 #[test]
@@ -206,7 +225,7 @@ fn the_mount_activation_builds_the_view_and_wires_its_gestures() {
     assert_eq!(harness.transcript(), MOUNT_TRANSCRIPT);
 
     let root_children = harness.page().children(ROOT);
-    assert_eq!(root_children.len(), 6, "{root_children:?}");
+    assert_eq!(root_children.len(), 8, "{root_children:?}");
     assert_eq!(
         harness.page().listeners,
         vec![
@@ -224,6 +243,11 @@ fn the_mount_activation_builds_the_view_and_wires_its_gestures() {
                 node: 7,
                 event: "click".to_string(),
                 port: PANIC.to_string()
+            },
+            Listener {
+                node: 8,
+                event: "click".to_string(),
+                port: ANIMATE.to_string()
             },
         ]
     );
@@ -465,6 +489,58 @@ fn a_press_publishes_a_numbered_message_and_the_status_counts_it() {
     assert_eq!(harness.page().text_of(status), "sent: 2  drops: 0");
 }
 
+/// A press that carries a pointer position says where it landed on its button;
+/// one that carries none says nothing more than the counters.
+#[test]
+fn a_press_with_a_position_appends_it_to_the_status_line() {
+    let mut harness = echo_stub_mounted();
+    let send = harness.page().marked_child(ROOT, "data-echo-send");
+    let at = GestureDetail {
+        pointer: Some(GesturePointer {
+            x: 12.5,
+            y: 7.0,
+            width: 60.0,
+            height: 20.0,
+            button: 0,
+            buttons: 0,
+            pointer_type: None,
+        }),
+        modifiers: Some(GestureModifiers::default()),
+        ..GestureDetail::default()
+    };
+    harness.call(gesture_with(SEND, "click", send, send, &at));
+    let status = harness.page().marked_child(ROOT, "data-echo-status");
+    assert_eq!(
+        harness.page().text_of(status),
+        "sent: 1  drops: 0 at 12.5,7"
+    );
+
+    harness.call(gesture(SEND, send));
+    assert_eq!(harness.page().text_of(status), "sent: 2  drops: 0");
+}
+
+/// A request on a gesture port that is no gesture body is refused, naming the
+/// port, rather than trapping or being read as a default press.
+#[test]
+fn a_request_that_is_no_gesture_is_refused_with_its_port() {
+    let mut harness = echo_stub_mounted();
+    let refused = harness
+        .receive(&sync_call(SEND, envelope("not-a-gesture", "{}")))
+        .expect("a malformed request is a refusal, not a trap")
+        .expect_err("a body without `event`, `listener` and `target` is no gesture");
+    let types::ReceiveError::MalformedEnvelope(message) = refused else {
+        panic!("the parse failure is a malformed request: {refused:?}");
+    };
+    assert!(
+        message.starts_with(&format!("the gesture request on sync port {SEND:?}: ")),
+        "{message}"
+    );
+    assert!(
+        harness.page().published_on(ECHO_OUT_PORT).is_empty(),
+        "nothing was sent"
+    );
+}
+
 #[test]
 fn the_custom_send_publishes_the_field_as_it_stood_at_press_time() {
     let mut harness = echo_stub_mounted();
@@ -538,6 +614,48 @@ fn the_panic_gesture_traps_the_instance() {
     let mut harness = echo_stub_mounted();
     let panic_button = harness.page().marked_child(ROOT, "data-echo-panic");
     harness.call_expecting_a_trap(gesture(PANIC, panic_button));
+}
+
+/// The `animate` button asks for its animation on the status line and writes
+/// what the page answered.
+#[test]
+fn the_animate_gesture_animates_the_status_line_and_says_so() {
+    let mut harness = echo_stub_mounted();
+    let animate = harness.page().marked_child(ROOT, "data-echo-animate");
+    harness.call(gesture(ANIMATE, animate));
+
+    let transcript = harness.transcript();
+    assert!(
+        transcript.iter().any(|line| line == ECHO_ANIMATE_CALL),
+        "{transcript:?}"
+    );
+    let result = harness
+        .page()
+        .marked_child(ROOT, "data-echo-animate-result");
+    assert_eq!(harness.page().text_of(result), "animated");
+}
+
+/// A browser refusal is a value the guest SDK hands back, not a trap: echo-stub
+/// writes the message, the activation stands, and the instance answers the
+/// next press.
+#[test]
+fn a_refused_animation_is_reported_and_the_instance_carries_on() {
+    let mut harness = echo_stub_mounted();
+    let animate = harness.page().marked_child(ROOT, "data-echo-animate");
+    harness.page().with_animate_refusal(1, "boom");
+    harness.call(gesture(ANIMATE, animate));
+
+    let result = harness
+        .page()
+        .marked_child(ROOT, "data-echo-animate-result");
+    assert_eq!(harness.page().text_of(result), "refused: boom");
+
+    let send = harness.page().marked_child(ROOT, "data-echo-send");
+    harness.call(gesture(SEND, send));
+    assert_eq!(
+        harness.page().published_on(ECHO_OUT_PORT),
+        ["echo-stub message #1"]
+    );
 }
 
 /// A script that names a sync port the specification does not declare is a
@@ -746,6 +864,13 @@ fn the_takeover_announcement_is_made_once_across_activations() {
     let after_second = harness.page().published_on(MEETING_TAKEOVER_PORT).len();
 
     assert_eq!(after_first, 1, "the escalation announced the takeover once");
+    let announced: serde_json::Value =
+        serde_json::from_str(harness.page().published_on(MEETING_TAKEOVER_PORT)[0])
+            .expect("the announcement is JSON");
+    assert_eq!(
+        announced["mode"], "takeover",
+        "the alarm asks to replace the layout, which preempts an overlay"
+    );
     assert_eq!(
         after_second, after_first,
         "the second recompute saw the announcement the first one recorded"
@@ -861,6 +986,146 @@ fn a_click_on_a_toast_dismisses_that_toast_and_a_click_on_the_gap_dismisses_none
     assert!(
         harness.page().children(container).is_empty(),
         "the toast the click landed on is gone"
+    );
+}
+
+/// chrome, mounted on a page with a second registered sibling, arranged into
+/// its default two-column layout.
+fn chrome_with_two_siblings() -> Harness {
+    let mut page = Page::with_page_authority(CHROME_INSTANCE, SIBLING_INSTANCE);
+    let page_root = page.page_root.expect("the fixture has a page root");
+    let wrapper = page.mint();
+    page.link(page_root, wrapper);
+    page.instance_wrappers
+        .insert(SECOND_SIBLING.to_string(), wrapper);
+    let mut harness = Harness::mount(
+        Harness::new(
+            &common::artifact_path("brenn_chrome"),
+            &common::spec_path("chrome"),
+            page,
+        )
+        .retaining_state(CHROME_STATE_PORT),
+    );
+    let row = |instance: &str| SurfaceStateInstance {
+        instance: instance.to_string(),
+        kind: "protobar".to_string(),
+        state: InstanceState::Mounted,
+        reason: None,
+    };
+    let roster = serde_json::to_string(&SurfaceStateBody {
+        v: CONTROL_PLANE_VERSION,
+        instances: vec![
+            row(CHROME_INSTANCE),
+            row(SIBLING_INSTANCE),
+            row(SECOND_SIBLING),
+        ],
+    })
+    .expect("the roster serializes");
+    harness.call(delivery_on(SURFACE_STATE, &[], &[&roster], 0));
+    harness
+}
+
+/// A takeover-plane body from `instance`.
+fn takeover_body(action: TakeoverAction, mode: TakeoverMode, instance: &str) -> String {
+    serde_json::to_string(&TakeoverBody {
+        v: CONTROL_PLANE_VERSION,
+        action,
+        mode,
+        instance: instance.to_string(),
+    })
+    .expect("the takeover body serializes")
+}
+
+/// The attributes of the section `instance`'s wrapper hangs under.
+fn section_attributes(harness: &mut Harness, instance: &str) -> BTreeMap<String, String> {
+    let wrapper = harness.page().wrapper_of(instance);
+    let section = harness
+        .page()
+        .element(wrapper)
+        .parent
+        .expect("the wrapper was adopted into a section");
+    harness.page().element(section).attributes.clone()
+}
+
+/// The attributes on the surface root.
+fn page_root_attributes(harness: &mut Harness) -> BTreeMap<String, String> {
+    let page_root = harness
+        .page()
+        .page_root
+        .expect("the fixture has a page root");
+    harness.page().element(page_root).attributes.clone()
+}
+
+#[test]
+fn an_overlay_request_stamps_the_holders_section_and_leaves_the_panels_in_place() {
+    let mut harness = chrome_with_two_siblings();
+    assert_eq!(
+        section_attributes(&mut harness, SECOND_SIBLING).get("data-panel"),
+        Some(&"b".to_string()),
+        "the default layout placed both siblings"
+    );
+
+    harness.call(delivery_on(
+        TAKEOVER,
+        &[],
+        &[&takeover_body(
+            TakeoverAction::Request,
+            TakeoverMode::Overlay,
+            SECOND_SIBLING,
+        )],
+        0,
+    ));
+    let holder = section_attributes(&mut harness, SECOND_SIBLING);
+    assert_eq!(holder.get("data-overlay"), Some(&String::new()));
+    assert_eq!(holder.get("data-panel"), None, "the overlay is not a panel");
+    let sibling = section_attributes(&mut harness, SIBLING_INSTANCE);
+    assert_eq!(sibling.get("data-panel"), Some(&"a".to_string()));
+    assert_eq!(sibling.get("data-overlay"), None);
+    let root = page_root_attributes(&mut harness);
+    assert_eq!(root.get("data-overlay"), Some(&String::new()));
+    assert_eq!(root.get("data-takeover"), None);
+
+    harness.call(delivery_on(
+        TAKEOVER,
+        &[],
+        &[&takeover_body(
+            TakeoverAction::Release,
+            TakeoverMode::Overlay,
+            SECOND_SIBLING,
+        )],
+        0,
+    ));
+    let holder = section_attributes(&mut harness, SECOND_SIBLING);
+    assert_eq!(holder.get("data-overlay"), None);
+    assert_eq!(holder.get("data-panel"), Some(&"b".to_string()));
+    assert_eq!(page_root_attributes(&mut harness).get("data-overlay"), None);
+}
+
+#[test]
+fn a_takeover_request_stamps_the_root_and_hides_the_sibling() {
+    let mut harness = chrome_with_two_siblings();
+    harness.call(delivery_on(
+        TAKEOVER,
+        &[],
+        &[&takeover_body(
+            TakeoverAction::Request,
+            TakeoverMode::Takeover,
+            SECOND_SIBLING,
+        )],
+        0,
+    ));
+    let root = page_root_attributes(&mut harness);
+    assert_eq!(root.get("data-takeover"), Some(&String::new()));
+    assert_eq!(root.get("data-overlay"), None);
+    assert_eq!(root.get("data-layout"), Some(&"single".to_string()));
+    assert_eq!(
+        section_attributes(&mut harness, SECOND_SIBLING).get("data-panel"),
+        Some(&"a".to_string())
+    );
+    assert_eq!(
+        section_attributes(&mut harness, SIBLING_INSTANCE).get("data-panel"),
+        None,
+        "the sibling's section is unassigned, which the base CSS hides"
     );
 }
 

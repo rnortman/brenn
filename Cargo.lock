@@ -1189,6 +1189,8 @@ dependencies = [
  "brenn-activation",
  "brenn-envelope",
  "brenn-surface-schema",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

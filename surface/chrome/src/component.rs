@@ -52,8 +52,12 @@ const RATIO_PROP: &str = "--surface-ratio";
 const PANEL_LABEL_ATTR: &str = "data-panel-label";
 /// The `<body>` attribute carrying the runtime theme axis.
 const THEME_ATTR: &str = "data-theme";
-/// The surface-root attribute set while a takeover overlay is active.
+/// The surface-root attribute set while a takeover-mode holder is up.
 const TAKEOVER_ATTR: &str = "data-takeover";
+/// The attribute set while an overlay-mode holder is up: on the surface root,
+/// and on the holder's own section, which the base CSS draws full-viewport over
+/// the layout.
+const OVERLAY_ATTR: &str = "data-overlay";
 /// The marker attribute identifying chrome's single connection banner. Every
 /// banner rule in `surface.css` and both skins selects on it, so dropping the
 /// stamp unstyles the banner with nothing raising an error.
@@ -215,11 +219,9 @@ fn on_gesture(port: SyncPort, activation: &Activation, chrome: &mut Chrome) -> R
     // Exhaustive on purpose, and on nothing else: a second `sync` port in the
     // specification must not fall through to the toast-dismiss path.
     let SyncPort::ToastDismiss = port;
-    let (_, request) = activation
-        .sync_request()
-        .ok_or_else(|| Error::failed("chrome: a sync-call activation carried no request"))?;
-    let gesture: dom::Gesture = serde_json::from_str(&request?.body)
-        .map_err(|e| Error::failed(format!("chrome: the gesture body did not parse: {e}")))?;
+    let gesture = activation
+        .gesture()
+        .ok_or_else(|| Error::failed("chrome: a sync-call activation carried no request"))??;
     // The container's one delegated listener covers every toast and the gaps
     // between them, so a click that landed on no toast dismisses nothing.
     let Some(id) = chrome
@@ -280,12 +282,23 @@ fn apply_actions(chrome: &mut Chrome, actions: &[ChromeAction]) {
             ChromeAction::SetTakeover(on) => {
                 dom::set_attribute_present(chrome.view().page_root, TAKEOVER_ATTR, *on);
             }
+            ChromeAction::SetOverlay(on) => {
+                dom::set_attribute_present(chrome.view().page_root, OVERLAY_ATTR, *on);
+            }
             ChromeAction::ApplyLayout {
                 kind,
                 ratio,
                 panels,
                 instances,
-            } => apply_layout(chrome, *kind, ratio.as_deref(), panels, instances),
+                overlay,
+            } => apply_layout(
+                chrome,
+                *kind,
+                ratio.as_deref(),
+                panels,
+                instances,
+                overlay.as_deref(),
+            ),
             ChromeAction::ShowToast {
                 id,
                 severity,
@@ -392,7 +405,8 @@ fn banner_state_name(state: BannerState) -> &'static str {
 /// Apply a layout atomically: set the root's layout attribute (and the ratio
 /// custom property when present, else clear it), then place each of the
 /// surface's `instances` — one named in `panels` gets its slot and label header;
-/// every other has both cleared.
+/// the `overlay` holder gets the overlay marker and neither; every other has
+/// all three cleared.
 ///
 /// The one place that exercises chrome's page-DOM authority: it reparents each
 /// instance's kernel-owned wrapper into that instance's layout section and
@@ -405,6 +419,7 @@ fn apply_layout(
     ratio: Option<&str>,
     panels: &[LayoutPlacement],
     instances: &[String],
+    overlay: Option<&str>,
 ) {
     let page_root = chrome.view().page_root;
     dom::set_attribute(page_root, LAYOUT_ATTR, kind.as_wire_str());
@@ -415,6 +430,7 @@ fn apply_layout(
 
     for instance in instances {
         let section = section_for(chrome, instance);
+        dom::set_attribute_present(section, OVERLAY_ATTR, overlay == Some(instance.as_str()));
         match panels.iter().find(|p| &p.instance == instance) {
             Some(placement) => {
                 dom::set_attribute(section, PANEL_ATTR, &placement.slot);

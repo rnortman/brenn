@@ -11,13 +11,20 @@
 # component must land writable, because the emitter runs over the staged tree.
 set -uo pipefail
 
-stage="$1"
+stage_script="$1"
+stage_lib="$2"
 tmp="${TEST_TMPDIR:?TEST_TMPDIR must be set}"
 failures=0
 
 fail() {
     echo "FAIL: $1"
     failures=$((failures + 1))
+}
+
+# Every case stages with the shared library, which is where the sidecar stem is
+# spelled; a trailing flag is as good as a leading one to the script's parser.
+stage() {
+    "$stage_script" "$@" --stage-lib "$stage_lib"
 }
 
 # The real emitter shells out to wasm-tools; this one only records that it was
@@ -66,7 +73,7 @@ chmod a-w "$tmp/demo.brenn"
 printf 'demo' > "$tmp/wire-kind.txt"
 
 out="$tmp/out"
-if ! "$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" "$tmp/demo.brenn" \
+if ! stage demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" "$tmp/demo.brenn" \
     "$emitter" "$dsl_cli" "$out" > "$tmp/stage.log" 2>&1; then
     fail "staging a well-formed transpile failed: $(cat "$tmp/stage.log")"
 fi
@@ -110,7 +117,7 @@ fi
 # A version file the derivation left empty would put an empty jco version in
 # every manifest.
 : > "$tmp/empty-version.txt"
-if out_text=$("$stage" demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/empty-version.txt" \
+if out_text=$(stage demo "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/empty-version.txt" \
     "$tmp/demo.brenn" "$emitter" "$dsl_cli" "$tmp/out_empty" 2>&1); then
     fail "an empty version file should be rejected, exited 0: $out_text"
 elif ! grep -qF "empty-version.txt" <<< "$out_text"; then
@@ -120,7 +127,7 @@ fi
 # A kind the BUILD author typed that is not the fold of the class name in the
 # specification beside it. Every file would stage, every hash would verify, and
 # the page would ask for a directory that does not exist.
-if out_text=$("$stage" demo-panel "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" \
+if out_text=$(stage demo-panel "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" \
     "$tmp/demo.brenn" "$emitter" "$dsl_cli" "$tmp/out_mismatch" 2>&1); then
     fail "a kind that is not the class's wire kind should be rejected, exited 0: $out_text"
 else
@@ -132,6 +139,46 @@ else
     if [ -e "$tmp/out_mismatch/processor" ]; then
         fail "a rejected kind staged files anyway"
     fi
+fi
+
+# No sidecars given, none staged: the output root is `processor/` alone, which
+# is what every in-tree kind stages.
+if [ "$(cd "$out" && find . -mindepth 1 -maxdepth 1 -printf '%P\n')" != "processor" ]; then
+    fail "a stage given no sidecars holds more than processor/: $(cd "$out" && ls -A)"
+fi
+
+# Sidecars land at the output's root under the kind's stem — hyphens folded to
+# underscores, the one name the server reads — outside the record's directory,
+# so the record's file list does not name them.
+printf 'demo-panel' > "$tmp/wire-kind.txt"
+printf '# Demo panel\n' > "$tmp/help.md"
+printf '{"type": "object"}\n' > "$tmp/schema.json"
+chmod a-w "$tmp/help.md" "$tmp/schema.json"
+out_side="$tmp/out_sidecars"
+if ! stage demo-panel "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" "$tmp/demo.brenn" \
+    "$emitter" "$dsl_cli" "$out_side" --help "$tmp/help.md" --schema "$tmp/schema.json" \
+    > "$tmp/sidecars.log" 2>&1; then
+    fail "staging with sidecars failed: $(cat "$tmp/sidecars.log")"
+else
+    if ! cmp -s "$tmp/help.md" "$out_side/brenn_demo_panel.help.md"; then
+        fail "the help sidecar is not staged as brenn_demo_panel.help.md: $(cd "$out_side" && ls -A)"
+    fi
+    if ! cmp -s "$tmp/schema.json" "$out_side/brenn_demo_panel.schema.json"; then
+        fail "the schema sidecar is not staged as brenn_demo_panel.schema.json: $(cd "$out_side" && ls -A)"
+    fi
+    if grep -qF "brenn_demo_panel" "$out_side/processor/demo-panel/manifest.json"; then
+        fail "the record lists a sidecar: $(cat "$out_side/processor/demo-panel/manifest.json")"
+    fi
+    if [ -n "$(find "$out_side/processor" -name 'brenn_*' -print -quit)" ]; then
+        fail "a sidecar was staged inside processor/"
+    fi
+fi
+
+if out_text=$(stage demo-panel "$tmp/demo.wasm" "$tmp/transpiled" "$tmp/version.txt" \
+    "$tmp/demo.brenn" "$emitter" "$dsl_cli" "$tmp/out_bad_flag" --readme "$tmp/help.md" 2>&1); then
+    fail "an unknown flag should be rejected, exited 0: $out_text"
+elif ! grep -qF -e "--readme" <<< "$out_text"; then
+    fail "the flag rejection does not name the flag: $out_text"
 fi
 
 if [ "$failures" -ne 0 ]; then
